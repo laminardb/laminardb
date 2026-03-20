@@ -496,6 +496,13 @@ pub struct KafkaSourceConfig {
     /// Consumer heartbeat interval (default: 10s). Must satisfy
     /// `heartbeat_interval * 3 < session_timeout` per Kafka broker requirement.
     pub heartbeat_interval: Duration,
+    /// Maximum interval between calls to `rd_kafka_consumer_poll()` before
+    /// the broker considers this consumer dead and triggers a rebalance.
+    ///
+    /// Default: 600s (10 minutes). rdkafka's default is 300s, but with
+    /// reader-side pause/resume the reader keeps polling even under
+    /// backpressure, so this is a safety margin. Must be >= 60s.
+    pub max_poll_interval: Duration,
     /// Maximum per-partition pre-fetch queue size in kbytes (default: 16384 = 16MB).
     /// rdkafka's 64MB default is too aggressive for an embedded database.
     pub queued_max_messages_kbytes: u32,
@@ -584,6 +591,7 @@ impl Default for KafkaSourceConfig {
             alignment_mode: None,
             session_timeout: Duration::from_secs(45),
             heartbeat_interval: Duration::from_secs(10),
+            max_poll_interval: Duration::from_secs(600),
             queued_max_messages_kbytes: 16384,
             broker_commit_interval: Duration::from_secs(60),
             reader_channel_capacity: 1024,
@@ -758,6 +766,9 @@ impl KafkaSourceConfig {
         let queued_max_messages_kbytes = config
             .get_parsed::<u32>("queued.max.messages.kbytes")?
             .unwrap_or(16384);
+        let max_poll_interval_ms = config
+            .get_parsed::<u64>("max.poll.interval.ms")?
+            .unwrap_or(600_000);
 
         let broker_commit_interval_ms = config
             .get_parsed::<u64>("broker.commit.interval.ms")?
@@ -816,6 +827,7 @@ impl KafkaSourceConfig {
             alignment_mode,
             session_timeout: Duration::from_millis(session_timeout_ms),
             heartbeat_interval: Duration::from_millis(heartbeat_interval_ms),
+            max_poll_interval: Duration::from_millis(max_poll_interval_ms),
             queued_max_messages_kbytes,
             broker_commit_interval: Duration::from_millis(broker_commit_interval_ms),
             reader_channel_capacity,
@@ -897,6 +909,13 @@ impl KafkaSourceConfig {
                     ));
                 }
             }
+        }
+
+        if self.max_poll_interval.as_secs() < 60 {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "max.poll.interval.ms ({}) must be >= 60000 (60s)",
+                self.max_poll_interval.as_millis()
+            )));
         }
 
         // Kafka broker requires heartbeat_interval * 3 < session_timeout.
@@ -983,6 +1002,10 @@ impl KafkaSourceConfig {
             "queued.max.messages.kbytes",
             self.queued_max_messages_kbytes.to_string(),
         );
+        config.set(
+            "max.poll.interval.ms",
+            self.max_poll_interval.as_millis().to_string(),
+        );
 
         if let Some(fetch_min) = self.fetch_min_bytes {
             config.set("fetch.min.bytes", fetch_min.to_string());
@@ -1036,6 +1059,7 @@ fn is_blocked_passthrough_key(key: &str) -> bool {
                 | "enable.idempotence"
                 | "session.timeout.ms"
                 | "heartbeat.interval.ms"
+                | "max.poll.interval.ms"
                 | "queued.max.messages.kbytes"
         )
 }
@@ -1269,13 +1293,21 @@ mod tests {
         let cfg = KafkaSourceConfig::from_config(&make_config(&[
             ("kafka.session.timeout.ms", "30000"),
             ("kafka.max.poll.interval.ms", "300000"),
+            ("kafka.fetch.message.max.bytes", "2097152"),
         ]))
         .unwrap();
 
-        assert_eq!(cfg.kafka_properties.len(), 2);
+        assert_eq!(cfg.kafka_properties.len(), 3);
+        // session.timeout.ms and max.poll.interval.ms are passed through as
+        // kafka_properties, but blocked by is_blocked_passthrough_key() in
+        // to_rdkafka_config() — they won't override explicit settings.
         assert_eq!(
             cfg.kafka_properties.get("session.timeout.ms"),
             Some(&"30000".to_string())
+        );
+        assert_eq!(
+            cfg.kafka_properties.get("max.poll.interval.ms"),
+            Some(&"300000".to_string())
         );
     }
 

@@ -93,6 +93,10 @@ pub struct LaminarConsumerContext {
     /// this value using `Relaxed` ordering, and only locks the mutex when
     /// a change is detected.
     revoke_generation: Arc<AtomicU64>,
+    /// Shared flag indicating whether the reader task has paused Kafka
+    /// partitions for backpressure. On `Assign`, newly assigned partitions
+    /// must be re-paused if this flag is true.
+    reader_paused: Arc<AtomicBool>,
 }
 
 impl LaminarConsumerContext {
@@ -103,6 +107,7 @@ impl LaminarConsumerContext {
         rebalance_state: Arc<Mutex<RebalanceState>>,
         rebalance_metric: Arc<AtomicU64>,
         revoke_generation: Arc<AtomicU64>,
+        reader_paused: Arc<AtomicBool>,
     ) -> Self {
         Self {
             checkpoint_requested,
@@ -110,6 +115,7 @@ impl LaminarConsumerContext {
             rebalance_state,
             rebalance_metric,
             revoke_generation,
+            reader_paused,
         }
     }
 
@@ -193,6 +199,30 @@ impl ConsumerContext for LaminarConsumerContext {
             }
         }
     }
+
+    fn post_rebalance(
+        &self,
+        base_consumer: &rdkafka::consumer::BaseConsumer<Self>,
+        rebalance: &rdkafka::consumer::Rebalance<'_>,
+    ) {
+        use rdkafka::consumer::Rebalance;
+
+        // After an Assign, the new partitions are committed to the consumer.
+        // If the reader task has paused partitions for backpressure, re-pause
+        // the newly assigned partitions before the next poll delivers messages.
+        if let Rebalance::Assign(tpl) = rebalance {
+            if self.reader_paused.load(Ordering::Relaxed) {
+                if let Err(e) = base_consumer.pause(tpl) {
+                    warn!(error = %e, "failed to re-pause newly assigned partitions");
+                } else {
+                    info!(
+                        partitions = tpl.count(),
+                        "re-paused newly assigned partitions (reader backpressure active)"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -253,7 +283,14 @@ mod tests {
         let state = Arc::new(Mutex::new(RebalanceState::new()));
         let metric = Arc::new(AtomicU64::new(0));
         let revoke_gen = Arc::new(AtomicU64::new(0));
-        let ctx = LaminarConsumerContext::new(Arc::clone(&flag), state, metric, revoke_gen);
+        let reader_paused = Arc::new(AtomicBool::new(false));
+        let ctx = LaminarConsumerContext::new(
+            Arc::clone(&flag),
+            state,
+            metric,
+            revoke_gen,
+            reader_paused,
+        );
         (flag, ctx)
     }
 
