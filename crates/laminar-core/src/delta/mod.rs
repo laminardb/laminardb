@@ -29,7 +29,8 @@
 //! - `discovery`: Node discovery (static seeds, gossip, Kafka groups)
 //! - `coordination`: Raft-based metadata consensus
 //! - `partition`: Epoch-fenced partition ownership and migration
-//! - `rpc`: gRPC services for inter-node communication
+//! - `remote_state`: Remote state proxy with LRU caching
+//! - `routing`: Partition-aware batch routing
 
 /// Node discovery and membership.
 pub mod discovery;
@@ -39,3 +40,9 @@ pub mod coordination;
 
 /// Epoch-fenced partition ownership, assignment, and migration.
 pub mod partition;
+
+/// Remote state proxy for distributed lookups with LRU caching.
+pub mod remote_state;
+
+/// Partition-aware batch routing for distributed mode.
+pub mod routing;
