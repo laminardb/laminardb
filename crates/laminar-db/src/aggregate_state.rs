@@ -3297,4 +3297,107 @@ mod tests {
         assert_eq!(js.right_batches, vec![vec![4, 5, 6]]);
         assert_eq!(js.last_evicted_watermark, 42);
     }
+
+    /// Checkpoint round-trip with NULL group key values.
+    ///
+    /// Verifies that groups keyed by `NULL` survive serialization through
+    /// `scalar_to_json` / `json_to_scalar` and produce correct aggregate
+    /// results after restore.
+    #[tokio::test]
+    async fn test_agg_checkpoint_roundtrip_null_group_keys() {
+        // Register a table with nullable group column.
+        let ctx = laminar_sql::create_session_context();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("category", DataType::Utf8, true),
+            Field::new("amount", DataType::Float64, true),
+        ]));
+        let dummy = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![0.0])),
+            ],
+        )
+        .unwrap();
+        let mem_table =
+            datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
+                .unwrap();
+        ctx.register_table("items", Arc::new(mem_table)).unwrap();
+
+        let mut state = IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT category, SUM(amount) as total FROM items GROUP BY category",
+        )
+        .await
+        .unwrap()
+        .expect("expected aggregate state");
+
+        // Build a batch with NULL group keys: two NULLs and one non-NULL.
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("category", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Float64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&pre_agg_schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec![
+                    None,
+                    Some("food"),
+                    None,
+                    Some("food"),
+                ])),
+                Arc::new(arrow::array::Float64Array::from(vec![5.0, 10.0, 7.0, 3.0])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&batch).unwrap();
+
+        // Checkpoint and restore.
+        let cp = state.checkpoint_groups().unwrap();
+        assert_eq!(cp.groups.len(), 2, "should have NULL group + 'food' group");
+
+        let mut state2 = IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT category, SUM(amount) as total FROM items GROUP BY category",
+        )
+        .await
+        .unwrap()
+        .expect("expected aggregate state");
+        let restored_count = state2.restore_groups(&cp).unwrap();
+        assert_eq!(restored_count, 2);
+
+        let result = state2.emit().unwrap();
+        assert_eq!(result.len(), 1);
+        let batch = &result[0];
+        assert_eq!(batch.num_rows(), 2);
+
+        // Verify both groups have correct sums.
+        let categories = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let totals = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .unwrap();
+        use arrow::array::Array;
+        for i in 0..batch.num_rows() {
+            if categories.is_null(i) {
+                assert!(
+                    (totals.value(i) - 12.0).abs() < f64::EPSILON,
+                    "NULL group SUM should be 12.0 (5+7), got {}",
+                    totals.value(i)
+                );
+            } else {
+                assert_eq!(categories.value(i), "food");
+                assert!(
+                    (totals.value(i) - 13.0).abs() < f64::EPSILON,
+                    "'food' group SUM should be 13.0 (10+3), got {}",
+                    totals.value(i)
+                );
+            }
+        }
+    }
 }

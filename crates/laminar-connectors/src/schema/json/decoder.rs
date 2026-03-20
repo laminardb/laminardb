@@ -4,6 +4,17 @@
 //! Constructed once at `CREATE SOURCE` time with a frozen Arrow schema;
 //! the decoder is stateless after construction so the Ring 1 hot path
 //! has zero schema lookups.
+//!
+//! # JSON parser: `sonic-rs`
+//!
+//! The decode hot path uses [`sonic_rs`] for JSON deserialization instead of
+//! `serde_json`. `sonic-rs` leverages SIMD instructions (SSE2/AVX2 on x86-64,
+//! NEON on `AArch64`) for significantly faster parsing of large JSON payloads.
+//!
+//! On ARM targets **without** NEON support (e.g., `ARMv6` Raspberry Pi Zero/1),
+//! `sonic-rs` falls back to a scalar code path. There is no regression versus
+//! `serde_json` in this case, but also no SIMD benefit. The encoder, schema
+//! inference, and WebSocket paths remain on `serde_json`.
 #![allow(clippy::disallowed_types)] // cold path: schema management
 
 use std::collections::HashMap;
