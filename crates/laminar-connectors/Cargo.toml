@@ -27,6 +27,9 @@ deadpool-postgres = { version = "0.14", optional = true }
 pgwire-replication = { version = "0.2", optional = true }
 # MySQL async driver with rustls (no OpenSSL required)
 mysql_async = { version = "0.36", optional = true, default-features = false, features = ["rustls-tls", "binlog", "minimal-rust"] }
+# MongoDB driver (optional, for mongodb-cdc feature)
+mongodb = { version = "3", optional = true }
+bson = { version = "2", optional = true }
 tokio-stream = { workspace = true, optional = true }
 
 # Delta Lake
@@ -89,6 +92,8 @@ postgres-cdc = ["dep:tokio-postgres", "dep:pgwire-replication", "dep:deadpool-po
 postgres-sink = ["dep:tokio-postgres", "dep:postgres-types", "dep:deadpool-postgres", "dep:pgpq", "dep:futures-util"]
 # mysql-cdc: Business logic + mysql_async driver with rustls (no OpenSSL required)
 mysql-cdc = ["dep:mysql_async", "dep:tokio-stream"]
+# MongoDB CDC source and sink
+mongodb-cdc = ["dep:mongodb", "dep:bson", "dep:tokio-stream", "dep:futures-util"]
 # Delta Lake
 delta-lake = ["dep:deltalake", "dep:url", "dep:datafusion", "deltalake/datafusion", "dep:tokio-util", "dep:tokio-stream"]
 delta-lake-s3 = ["delta-lake", "deltalake/s3"]
@@ -110,3 +115,9 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "mongodb_throughput"
+harness = false
+required-features = ["mongodb-cdc"]
