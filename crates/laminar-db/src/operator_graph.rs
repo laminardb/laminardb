@@ -1106,8 +1106,7 @@ mod tests {
         // No source data → empty results (or no entry)
         let total: usize = results
             .get("q1")
-            .map(|bs| bs.iter().map(|b| b.num_rows()).sum())
-            .unwrap_or(0);
+            .map_or(0, |bs| bs.iter().map(|b| b.num_rows()).sum());
         assert_eq!(total, 0);
     }
 
@@ -1164,8 +1163,7 @@ mod tests {
     fn total_rows(results: &FxHashMap<Arc<str>, Vec<RecordBatch>>, key: &str) -> usize {
         results
             .get(key)
-            .map(|bs| bs.iter().map(|b| b.num_rows()).sum())
-            .unwrap_or(0)
+            .map_or(0, |bs| bs.iter().map(|b| b.num_rows()).sum())
     }
 
     /// Creates a graph with streaming functions registered and generous budget.
@@ -1262,8 +1260,8 @@ mod tests {
             .unwrap();
         for i in 0..agg_batches[0].num_rows() {
             match symbol_col.value(i) {
-                "AAPL" => assert_eq!(price_col.value(i), 300.0),
-                "GOOG" => assert_eq!(price_col.value(i), 5600.0),
+                "AAPL" => assert!((price_col.value(i) - 300.0).abs() < f64::EPSILON),
+                "GOOG" => assert!((price_col.value(i) - 5600.0).abs() < f64::EPSILON),
                 other => panic!("unexpected symbol: {other}"),
             }
         }

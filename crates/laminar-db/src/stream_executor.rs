@@ -3937,6 +3937,8 @@ mod tests {
         let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
+        // Debug builds on Windows can be slow — use a generous budget for 3-level cascade.
+        executor.set_query_budget_ns(5_000_000_000);
 
         // level1: pass through
         executor.add_query(
