@@ -4,6 +4,7 @@
 #![allow(clippy::disallowed_types)] // cold path
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -71,6 +72,10 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) checkpoint_interval: Option<std::time::Duration>,
     pub(crate) pipeline_hash: Option<u64>,
     pub(crate) delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee,
+    pub(crate) sink_write_timeout: Duration,
+    /// Set when a sink write times out in this cycle. Suppresses the next
+    /// periodic checkpoint to avoid advancing offsets past dropped batches.
+    pub(crate) sink_timed_out: bool,
     /// Cycle duration histogram for percentile tracking (single-threaded access).
     pub(crate) cycle_histogram:
         std::cell::RefCell<crate::checkpoint_coordinator::DurationHistogram>,
@@ -177,6 +182,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         // Lazy-compile any pending sink filters.
         self.compile_pending_sink_filters(results).await;
 
+        // Shared flag — set by any sink future on timeout, read after join_all.
+        let had_timeout = std::sync::atomic::AtomicBool::new(false);
+        let is_exactly_once = self.delivery_guarantee
+            == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce;
+        let write_timeout = self.sink_write_timeout;
+
         // Route results to sinks concurrently, filtered by FROM clause.
         let filter_ctx = self.filter_ctx.clone(); // Arc bump — cheap
         let sink_futures: Vec<_> = self
@@ -198,6 +209,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 let filter_expr = filter_expr.clone();
                 let batches = batches.clone();
                 let ctx = filter_ctx.clone();
+                let had_timeout = &had_timeout;
                 Some(async move {
                     for batch in &batches {
                         let filtered = if let Some(ref phys) = compiled_filter {
@@ -234,12 +246,35 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         };
 
                         if filtered.num_rows() > 0 {
-                            if let Err(e) = handle.write_batch(filtered).await {
-                                tracing::warn!(
-                                    sink = %sink_name,
-                                    error = %e,
-                                    "Sink write error"
-                                );
+                            match tokio::time::timeout(write_timeout, handle.write_batch(filtered))
+                                .await
+                            {
+                                Ok(Err(e)) => {
+                                    tracing::warn!(
+                                        sink = %sink_name,
+                                        error = %e,
+                                        "Sink write error"
+                                    );
+                                }
+                                Err(_elapsed) => {
+                                    had_timeout.store(true, Ordering::Relaxed);
+                                    if is_exactly_once {
+                                        tracing::error!(
+                                            sink = %sink_name,
+                                            timeout_secs = write_timeout.as_secs(),
+                                            "[LDB-5040] Sink write timed out, batch dropped \
+                                             (EXACTLY-ONCE VIOLATION — next checkpoint suppressed)"
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            sink = %sink_name,
+                                            timeout_secs = write_timeout.as_secs(),
+                                            "[LDB-5040] Sink write timed out, batch dropped \
+                                             (next checkpoint suppressed to allow replay)"
+                                        );
+                                    }
+                                }
+                                Ok(Ok(())) => {}
                             }
                         }
                     }
@@ -247,6 +282,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             })
             .collect();
         futures::future::join_all(sink_futures).await;
+
+        if had_timeout.load(Ordering::Relaxed) {
+            self.sink_timed_out = true;
+        }
     }
 
     fn extract_watermark(&mut self, source_name: &str, batch: &RecordBatch) {
@@ -345,6 +384,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .load(std::sync::atomic::Ordering::Relaxed)
             == 0
         {
+            return false;
+        }
+
+        // After a sink timeout, skip one checkpoint cycle so that source
+        // offsets don't advance past the dropped batch. The NEXT cycle will
+        // clear this flag and checkpoint normally. This preserves at-least-once:
+        // on recovery, the source replays from the pre-drop checkpoint.
+        if !force && self.sink_timed_out {
+            self.sink_timed_out = false;
+            tracing::info!("skipping checkpoint after sink timeout to preserve replay window");
             return false;
         }
 
@@ -482,6 +531,17 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             return false;
         }
 
+        // A sink timeout in this cycle means some data was dropped.
+        // Committing offsets would skip that data on recovery.
+        // Do NOT clear the flag here — maybe_checkpoint is the sole consumer,
+        // ensuring both paths are suppressed in the same coordinator cycle.
+        if self.sink_timed_out {
+            tracing::warn!(
+                "skipping barrier checkpoint after sink timeout to preserve replay window"
+            );
+            return false;
+        }
+
         // Capture table source offsets.
         let mut extra_tables = HashMap::with_capacity(self.table_sources.len());
         for (name, source, _) in &self.table_sources {
@@ -581,16 +641,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .load(std::sync::atomic::Ordering::Relaxed);
         if cycle_count.is_multiple_of(100) {
             let (p50, p95, p99) = self.cycle_histogram.borrow().percentiles();
-            // DurationHistogram records in milliseconds; convert to nanoseconds.
+            // DurationHistogram records in microseconds; convert to nanoseconds.
             self.counters
                 .cycle_p50_ns
-                .store(p50 * 1_000_000, std::sync::atomic::Ordering::Relaxed);
+                .store(p50 * 1_000, std::sync::atomic::Ordering::Relaxed);
             self.counters
                 .cycle_p95_ns
-                .store(p95 * 1_000_000, std::sync::atomic::Ordering::Relaxed);
+                .store(p95 * 1_000, std::sync::atomic::Ordering::Relaxed);
             self.counters
                 .cycle_p99_ns
-                .store(p99 * 1_000_000, std::sync::atomic::Ordering::Relaxed);
+                .store(p99 * 1_000, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
