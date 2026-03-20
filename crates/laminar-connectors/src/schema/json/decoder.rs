@@ -273,7 +273,9 @@ impl FormatDecoder for JsonDecoder {
         let num_fields = self.schema.fields().len();
         let capacity = records.len();
 
-        // Initialise one builder per schema column.
+        // Allocate fresh builders each call. Arrow's `finish()` drains internal
+        // buffers via `std::mem::take()`, so pooled builders would be zero-capacity
+        // shells — the reuse never actually saved allocations.
         let mut builders = create_builders(&self.schema, capacity);
 
         // Optional _extra JSONB column for CollectExtra strategy.
@@ -478,8 +480,8 @@ impl FormatDecoder for JsonDecoder {
             }
         }
 
-        // Finish all builders into arrays.
-        let mut columns: Vec<ArrayRef> = builders.into_iter().map(|mut b| b.finish()).collect();
+        // Finish all builders into arrays; builders are now empty and reusable.
+        let mut columns: Vec<ArrayRef> = builders.iter_mut().map(|b| b.finish()).collect();
 
         // Append _extra column if present.
         let final_schema = if let Some(mut eb) = extra_builder {

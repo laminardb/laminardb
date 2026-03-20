@@ -255,16 +255,36 @@ pub(crate) struct StreamQuery {
     /// and excluded from checkpoints. Used by the control channel to remove
     /// queries without invalidating indices in state maps.
     removed: bool,
+    /// Top-level execution path, determined once at registration time.
+    /// Eliminates per-cycle branch misprediction from the if/else chain.
+    execution_path: QueryExecutionPath,
 }
 
-impl StreamQuery {
-    /// Returns `true` if this query suppresses intermediate results
-    /// (i.e., uses `EMIT ON WINDOW CLOSE` or `EMIT FINAL`).
-    fn suppresses_intermediate(&self) -> bool {
-        self.emit_clause
-            .as_ref()
-            .is_some_and(|ec| matches!(ec, EmitClause::OnWindowClose | EmitClause::Final))
-    }
+/// Top-level execution path for a query, determined once at registration time.
+///
+/// Replaces the per-cycle `if/else` chain that tested `is_eowc`, `has_asof`,
+/// `has_temporal`, `has_stream_join` every cycle. Since query type is fixed at
+/// `CREATE STREAM` time, we classify once and dispatch via `match`.
+///
+/// # Immutability after registration
+///
+/// The execution path is computed once during `register_stream_query` and
+/// stored immutably on the `RegisteredQuery`. If the query semantics change
+/// at runtime (e.g., `ALTER STREAM` adds an ASOF join clause), the query
+/// must be re-registered (`DROP STREAM` + `CREATE STREAM`) -- the path is
+/// **not** re-evaluated on existing queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QueryExecutionPath {
+    /// EMIT ON WINDOW CLOSE / EMIT FINAL — suppresses intermediate results.
+    Eowc,
+    /// ASOF join query.
+    AsofJoin,
+    /// Temporal (versioned) join query.
+    TemporalJoin,
+    /// Stream-stream interval join query.
+    StreamJoin,
+    /// Standard path: compiled projection, incremental agg, or `DataFusion` fallback.
+    Standard,
 }
 
 /// Maximum rows an EOWC accumulator may hold before forcing emission.
@@ -361,6 +381,10 @@ pub(crate) struct StreamExecutor {
     /// compiled paths (no `ctx.sql()` needed), allowing `register_source_tables()`
     /// to be skipped entirely. `None` = not yet determined.
     all_queries_compiled: Option<bool>,
+    /// Pre-computed set of source table names that non-compiled queries need.
+    /// Rebuilt when queries are added/removed or when `all_queries_compiled`
+    /// is invalidated. Avoids recomputing per cycle.
+    cached_required_tables: FxHashSet<String>,
     /// Lazily compiled post-join projection expressions for ASOF/temporal joins.
     /// Keyed by query index. Compiled on first execution when join output schema
     /// is known.
@@ -418,6 +442,7 @@ impl StreamExecutor {
             cycle_results: FxHashMap::default(),
             cycle_intermediates: Vec::new(),
             all_queries_compiled: None,
+            cached_required_tables: FxHashSet::default(),
             compiled_post_projections: FxHashMap::default(),
             post_projection_compile_failed: FxHashSet::default(),
             cached_having_plans: FxHashMap::default(),
@@ -527,21 +552,45 @@ impl StreamExecutor {
 
         let table_refs = extract_table_references(&sql);
         let idx = self.queries.len();
+
+        // Determine the execution path once at registration time.
+        // Priority mirrors the original if/else chain: EOWC > ASOF > temporal > stream join > standard.
+        let asof_arc = asof_config.map(Arc::new);
+        let temporal_arc = temporal_config.map(Arc::new);
+        let stream_join_arc = stream_join_config.map(Arc::new);
+
+        let suppresses = emit_clause
+            .as_ref()
+            .is_some_and(|ec| matches!(ec, EmitClause::OnWindowClose | EmitClause::Final));
+
+        let execution_path = if suppresses {
+            QueryExecutionPath::Eowc
+        } else if asof_arc.is_some() {
+            QueryExecutionPath::AsofJoin
+        } else if temporal_arc.is_some() {
+            QueryExecutionPath::TemporalJoin
+        } else if stream_join_arc.is_some() {
+            QueryExecutionPath::StreamJoin
+        } else {
+            QueryExecutionPath::Standard
+        };
+
         let query = StreamQuery {
             name: Arc::from(name),
             sql,
-            asof_config: asof_config.map(Arc::new),
+            asof_config: asof_arc,
             projection_sql: projection_sql.map(|s| Arc::from(s.as_str())),
-            temporal_config: temporal_config.map(Arc::new),
-            stream_join_config: stream_join_config.map(Arc::new),
+            temporal_config: temporal_arc,
+            stream_join_config: stream_join_arc,
             emit_clause,
             window_config: window_config.map(Arc::new),
             order_config,
             table_refs,
             removed: false,
+            execution_path,
         };
-        // Initialize EOWC state for queries that suppress intermediate results
-        if query.suppresses_intermediate() {
+        // Initialize EOWC state for queries on the EOWC execution path.
+        if execution_path == QueryExecutionPath::Eowc {
             self.eowc_states.insert(
                 idx,
                 EowcState {
@@ -553,6 +602,8 @@ impl StreamExecutor {
         }
         self.queries.push(query);
         self.topo_dirty = true;
+        // Invalidate compiled-path and required-tables caches.
+        self.all_queries_compiled = None;
     }
 
     /// Remove a query by name using a tombstone (sets `removed = true`).
@@ -695,7 +746,11 @@ impl StreamExecutor {
         // cycle until it settles to true (states are lazily populated).
         if self.all_queries_compiled != Some(true) {
             let all_compiled = self.topo_order.iter().all(|&idx| {
-                self.plain_compiled.contains_key(&idx)
+                // Skip tombstoned queries — they have no state maps and would
+                // always evaluate as non-compiled, preventing the flag from
+                // ever becoming true after a remove_query().
+                self.queries[idx].removed
+                    || self.plain_compiled.contains_key(&idx)
                     || self
                         .agg_states
                         .get(&idx)
@@ -709,14 +764,25 @@ impl StreamExecutor {
                         .get(&idx)
                         .is_some_and(|s| s.compiled_projection().is_some())
             });
+            let prev = self.all_queries_compiled;
             self.all_queries_compiled = Some(all_compiled);
+            // Rebuild cached required tables when the compiled status changes,
+            // or while not all queries are compiled (per-query tier transitions
+            // can change which tables are needed even if the global flag stays false).
+            if prev != Some(all_compiled) || !all_compiled {
+                self.cached_required_tables = self.collect_required_source_tables();
+            }
         }
 
         // Skip MemTable registration when all queries use compiled projections.
         // Intermediate result registration (for downstream queries) still runs
         // inside the loop — this only skips SOURCE table registration.
-        if self.all_queries_compiled != Some(true) {
-            self.register_source_tables(source_batches)?;
+        //
+        // When only SOME queries are compiled, use the pre-computed required
+        // tables set to skip registration for tables that only compiled-path
+        // queries reference.
+        if self.all_queries_compiled != Some(true) && !self.cached_required_tables.is_empty() {
+            self.register_source_tables(source_batches, &self.cached_required_tables.clone())?;
         }
 
         // Reuse per-cycle allocations: take the pre-allocated maps out of
@@ -758,85 +824,88 @@ impl StreamExecutor {
                 }
             }
 
-            let is_eowc = self.queries[idx].suppresses_intermediate();
-            let has_asof = self.queries[idx].asof_config.is_some();
-            let has_temporal = self.queries[idx].temporal_config.is_some();
-            let has_stream_join = self.queries[idx].stream_join_config.is_some();
-
-            let query_result = if is_eowc {
-                let query_name = Arc::clone(&self.queries[idx].name);
-                let window_config = self.queries[idx].window_config.as_ref().map(Arc::clone);
-                let asof_config = self.queries[idx].asof_config.as_ref().map(Arc::clone);
-                let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
-                self.execute_eowc_query(
-                    idx,
-                    &query_name,
-                    window_config.as_deref(),
-                    asof_config.as_deref(),
-                    projection_sql.as_deref(),
-                    source_batches,
-                    &results,
-                    current_watermark,
-                )
-                .await
-            } else if has_asof {
-                let query_name = Arc::clone(&self.queries[idx].name);
-                let cfg = Arc::clone(
-                    self.queries[idx]
-                        .asof_config
-                        .as_ref()
-                        .expect("has_asof guard ensures asof_config is Some"),
-                );
-                let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
-                self.execute_asof_query(
-                    idx,
-                    &query_name,
-                    &cfg,
-                    projection_sql.as_deref(),
-                    source_batches,
-                    &results,
-                )
-                .await
-            } else if has_temporal {
-                let query_name = Arc::clone(&self.queries[idx].name);
-                let cfg = Arc::clone(
-                    self.queries[idx]
-                        .temporal_config
-                        .as_ref()
-                        .expect("has_temporal guard ensures temporal_config is Some"),
-                );
-                let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
-                self.execute_temporal_query(
-                    idx,
-                    &query_name,
-                    &cfg,
-                    projection_sql.as_deref(),
-                    source_batches,
-                    &results,
-                )
-                .await
-            } else if has_stream_join {
-                let query_name = Arc::clone(&self.queries[idx].name);
-                let cfg = Arc::clone(
-                    self.queries[idx]
-                        .stream_join_config
-                        .as_ref()
-                        .expect("has_stream_join guard ensures stream_join_config is Some"),
-                );
-                let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
-                self.execute_interval_join_query(
-                    idx,
-                    &query_name,
-                    &cfg,
-                    projection_sql.as_deref(),
-                    source_batches,
-                    &results,
-                    current_watermark,
-                )
-                .await
-            } else {
-                self.execute_standard_query(idx, source_batches, &results)
+            // Dispatch on pre-computed execution path (determined once at
+            // registration time) instead of re-testing config flags every cycle.
+            let query_result = match self.queries[idx].execution_path {
+                QueryExecutionPath::Eowc => {
+                    let query_name = Arc::clone(&self.queries[idx].name);
+                    let window_config = self.queries[idx].window_config.as_ref().map(Arc::clone);
+                    let asof_config = self.queries[idx].asof_config.as_ref().map(Arc::clone);
+                    let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
+                    self.execute_eowc_query(
+                        idx,
+                        &query_name,
+                        window_config.as_deref(),
+                        asof_config.as_deref(),
+                        projection_sql.as_deref(),
+                        source_batches,
+                        &results,
+                        current_watermark,
+                    )
                     .await
+                }
+                QueryExecutionPath::AsofJoin => {
+                    let query_name = Arc::clone(&self.queries[idx].name);
+                    let cfg = Arc::clone(
+                        self.queries[idx]
+                            .asof_config
+                            .as_ref()
+                            .expect("AsofJoin path guarantees asof_config is Some"),
+                    );
+                    let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
+                    self.execute_asof_query(
+                        idx,
+                        &query_name,
+                        &cfg,
+                        projection_sql.as_deref(),
+                        source_batches,
+                        &results,
+                    )
+                    .await
+                }
+                QueryExecutionPath::TemporalJoin => {
+                    let query_name = Arc::clone(&self.queries[idx].name);
+                    let cfg = Arc::clone(
+                        self.queries[idx]
+                            .temporal_config
+                            .as_ref()
+                            .expect("TemporalJoin path guarantees temporal_config is Some"),
+                    );
+                    let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
+                    self.execute_temporal_query(
+                        idx,
+                        &query_name,
+                        &cfg,
+                        projection_sql.as_deref(),
+                        source_batches,
+                        &results,
+                    )
+                    .await
+                }
+                QueryExecutionPath::StreamJoin => {
+                    let query_name = Arc::clone(&self.queries[idx].name);
+                    let cfg = Arc::clone(
+                        self.queries[idx]
+                            .stream_join_config
+                            .as_ref()
+                            .expect("StreamJoin path guarantees stream_join_config is Some"),
+                    );
+                    let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
+                    self.execute_interval_join_query(
+                        idx,
+                        &query_name,
+                        &cfg,
+                        projection_sql.as_deref(),
+                        source_batches,
+                        &results,
+                        current_watermark,
+                    )
+                    .await
+                }
+                QueryExecutionPath::Standard => {
+                    self.execute_standard_query(idx, source_batches, &results)
+                        .await
+                }
             };
 
             // Queries that depend on other stream queries may fail during
@@ -976,17 +1045,68 @@ impl StreamExecutor {
         Ok(results)
     }
 
+    /// Collect the set of source table names that non-compiled queries need
+    /// registered in the `DataFusion` catalog.
+    ///
+    /// Standard-path queries that use cached logical plans or haven't been
+    /// classified yet need their referenced source tables as `MemTable`s.
+    /// Compiled queries (`PhysicalExpr` projections, compiled aggregates) read
+    /// from `source_batches` directly. EOWC/ASOF/Temporal/`StreamJoin` queries
+    /// manage their own table registration.
+    fn collect_required_source_tables(&self) -> FxHashSet<String> {
+        let mut required = FxHashSet::default();
+        for &idx in &self.topo_order {
+            if self.queries[idx].removed {
+                continue;
+            }
+            // ASOF, Temporal, and StreamJoin manage their own table registration.
+            // Standard and EOWC paths need DataFusion tables (EOWC falls through
+            // to ctx.sql() for non-aggregate queries).
+            match self.queries[idx].execution_path {
+                QueryExecutionPath::Standard | QueryExecutionPath::Eowc => {}
+                _ => continue,
+            }
+            // Skip queries that are fully compiled (no DataFusion needed).
+            let is_compiled = self.plain_compiled.contains_key(&idx)
+                || self
+                    .agg_states
+                    .get(&idx)
+                    .is_some_and(|s| s.compiled_projection().is_some())
+                || self
+                    .eowc_agg_states
+                    .get(&idx)
+                    .is_some_and(|s| s.compiled_projection().is_some())
+                || self
+                    .core_window_states
+                    .get(&idx)
+                    .is_some_and(|s| s.compiled_projection().is_some());
+            if is_compiled {
+                continue;
+            }
+            // This query needs DataFusion tables — add its table_refs.
+            for table_ref in &self.queries[idx].table_refs {
+                required.insert(table_ref.clone());
+            }
+        }
+        required
+    }
+
     /// Register source batches as temporary `MemTable` providers.
     ///
+    /// Only registers tables whose names appear in `required_tables`.
     /// Sources with data get their batches registered. Sources with known
     /// schemas but no data this cycle get an empty `MemTable` so that
     /// `DataFusion` can still plan queries that reference them.
     fn register_source_tables(
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        required_tables: &FxHashSet<String>,
     ) -> Result<(), DbError> {
         for (name, batches) in source_batches {
             if batches.is_empty() {
+                continue;
+            }
+            if !required_tables.contains(&**name) {
                 continue;
             }
 
@@ -1008,6 +1128,9 @@ impl StreamExecutor {
         // Register empty tables for known sources that had no data this cycle
         for (name, schema) in &self.source_schemas {
             if source_batches.contains_key(name.as_str()) {
+                continue;
+            }
+            if !required_tables.contains(name) {
                 continue;
             }
             let empty = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]])
@@ -1917,16 +2040,7 @@ impl StreamExecutor {
                     // Coalesce when batch count exceeds threshold to reduce
                     // per-batch overhead and memory fragmentation.
                     if entry.len() > EOWC_COALESCE_BATCH_THRESHOLD {
-                        let schema = entry[0].schema();
-                        match arrow::compute::concat_batches(&schema, entry.as_slice()) {
-                            Ok(coalesced) => *entry = vec![coalesced],
-                            Err(e) => tracing::warn!(
-                                table = %table_name,
-                                batches = entry.len(),
-                                "EOWC batch coalescing failed, \
-                                 keeping fragmented batches: {e}"
-                            ),
-                        }
+                        coalesce_batches(entry, "EOWC batch");
                     }
                 }
             }
@@ -1961,13 +2075,7 @@ impl StreamExecutor {
                 // Coalesce to reduce fragmentation without changing semantics
                 if let Some(eowc) = self.eowc_states.get_mut(&idx) {
                     for batches in eowc.accumulated_sources.values_mut() {
-                        if batches.len() > 1 {
-                            let schema = batches[0].schema();
-                            match arrow::compute::concat_batches(&schema, batches.as_slice()) {
-                                Ok(coalesced) => *batches = vec![coalesced],
-                                Err(e) => tracing::warn!("EOWC pressure coalescing failed: {e}"),
-                            }
-                        }
+                        coalesce_batches(batches, "EOWC pressure");
                     }
                 }
             }
@@ -2029,21 +2137,8 @@ impl StreamExecutor {
                     }
                 }
                 if !filtered_batches.is_empty() {
-                    let schema = filtered_batches[0].schema();
-                    match arrow::compute::concat_batches(&schema, &filtered_batches) {
-                        Ok(coalesced) => {
-                            filtered_sources.insert(table_name.clone(), vec![coalesced]);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                table = %table_name,
-                                batches = filtered_batches.len(),
-                                "EOWC filtered batch coalescing failed, \
-                                 keeping fragmented: {e}"
-                            );
-                            filtered_sources.insert(table_name.clone(), filtered_batches);
-                        }
-                    }
+                    coalesce_batches(&mut filtered_batches, "EOWC filtered batch");
+                    filtered_sources.insert(table_name.clone(), filtered_batches);
                 }
                 if !retained_batches.is_empty() {
                     retained_sources.insert(table_name.clone(), retained_batches);
@@ -2969,6 +3064,20 @@ impl StreamExecutor {
 /// `AsofJoinTranslatorConfig` and build a projection SQL string.
 ///
 /// Returns `(None, None)` for non-ASOF queries.
+/// Coalesce multiple `RecordBatch`es into a single batch, replacing the input
+/// `Vec` in-place. On failure, logs a warning and leaves the original batches
+/// untouched to avoid data loss.
+fn coalesce_batches(batches: &mut Vec<RecordBatch>, context: &str) {
+    if batches.len() <= 1 {
+        return;
+    }
+    let schema = batches[0].schema();
+    match arrow::compute::concat_batches(&schema, batches.as_slice()) {
+        Ok(coalesced) => *batches = vec![coalesced],
+        Err(e) => tracing::warn!("{context} coalescing failed, keeping fragmented: {e}"),
+    }
+}
+
 /// Compute the closed-window boundary from the current watermark and window config.
 ///
 /// All input data with `ts < boundary` belongs to **only** closed windows.
