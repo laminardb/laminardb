@@ -19,6 +19,7 @@ pub use barrier::{
     flags, BarrierPollHandle, CheckpointBarrier, CheckpointBarrierInjector, StreamMessage,
 };
 pub use unaligned::{
-    InFlightChannelData, TrackerEvent, TrackerPhase, UnalignedAction, UnalignedBarrierTracker,
-    UnalignedCheckpointConfig, UnalignedSnapshot,
+    InFlightChannelData, InputLivenessState, TrackerEvent, TrackerPhase, UnalignedAction,
+    UnalignedBarrierTracker, UnalignedCheckpointConfig, UnalignedCheckpointError,
+    UnalignedSnapshot,
 };

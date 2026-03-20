@@ -35,6 +35,9 @@ pub struct UnalignedCheckpointConfig {
     pub max_inflight_buffer_bytes: usize,
     /// Force unaligned mode for all checkpoints (skip aligned attempt).
     pub force_unaligned: bool,
+    /// Duration after which a silent input is considered dead.
+    /// Default: 60 seconds.
+    pub dead_source_timeout: Duration,
 }
 
 impl Default for UnalignedCheckpointConfig {
@@ -44,6 +47,90 @@ impl Default for UnalignedCheckpointConfig {
             alignment_timeout_threshold: Duration::from_secs(10),
             max_inflight_buffer_bytes: 256 * 1024 * 1024,
             force_unaligned: false,
+            dead_source_timeout: Duration::from_secs(60),
+        }
+    }
+}
+
+/// Errors specific to the unaligned checkpoint protocol.
+#[derive(Debug)]
+pub enum UnalignedCheckpointError {
+    /// A source was detected as dead during barrier alignment.
+    DeadSource {
+        /// The input index that was detected as dead.
+        input_id: usize,
+        /// How long the source has been silent.
+        silent_duration: Duration,
+    },
+    /// In-flight buffer exceeded the configured maximum.
+    BufferOverflow {
+        /// Current buffer size in bytes.
+        current_bytes: usize,
+        /// Configured maximum.
+        max_bytes: usize,
+    },
+}
+
+impl std::fmt::Display for UnalignedCheckpointError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeadSource {
+                input_id,
+                silent_duration,
+            } => write!(
+                f,
+                "source input {input_id} is dead (silent for {:.1}s)",
+                silent_duration.as_secs_f64()
+            ),
+            Self::BufferOverflow {
+                current_bytes,
+                max_bytes,
+            } => write!(
+                f,
+                "in-flight buffer overflow: {current_bytes} exceeds {max_bytes}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UnalignedCheckpointError {}
+
+/// Per-input liveness state tracked during barrier alignment.
+#[derive(Debug, Clone)]
+pub struct InputLivenessState {
+    /// Input index.
+    pub input_id: usize,
+    /// Timestamp of the last received event from this input.
+    pub last_event_time: Option<Instant>,
+    /// Whether the upstream channel is still connected.
+    pub channel_connected: bool,
+}
+
+impl InputLivenessState {
+    /// Creates a new liveness state for an input.
+    #[must_use]
+    pub fn new(input_id: usize) -> Self {
+        Self {
+            input_id,
+            last_event_time: None,
+            channel_connected: true,
+        }
+    }
+
+    /// Records an event from this input.
+    pub fn record_event(&mut self) {
+        self.last_event_time = Some(Instant::now());
+    }
+
+    /// Returns `true` if this input should be considered dead.
+    #[must_use]
+    pub fn is_dead(&self, timeout: Duration) -> bool {
+        if self.channel_connected {
+            return false;
+        }
+        match self.last_event_time {
+            Some(t) => t.elapsed() > timeout,
+            None => true,
         }
     }
 }
@@ -255,6 +342,55 @@ impl UnalignedBarrierTracker {
         })
     }
 
+    /// Like [`check_timeout`](Self::check_timeout), but checks for dead sources first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnalignedCheckpointError::DeadSource`] if any missing source is dead.
+    pub fn check_timeout_with_liveness(
+        &mut self,
+        liveness: &[InputLivenessState],
+    ) -> Result<Option<TrackerEvent>, UnalignedCheckpointError> {
+        if self.phase != TrackerPhase::Aligning {
+            return Ok(None);
+        }
+
+        let Some(started) = self.started_at else {
+            return Ok(None);
+        };
+
+        if started.elapsed() < self.config.alignment_timeout_threshold {
+            return Ok(None);
+        }
+
+        let dead_source_timeout = self.config.dead_source_timeout;
+        for idx in 0..self.sources_total {
+            if self.aligned_sources.contains(&idx) {
+                continue;
+            }
+            if let Some(state) = liveness.get(idx) {
+                if state.is_dead(dead_source_timeout) {
+                    let silent_duration = state
+                        .last_event_time
+                        .map_or(dead_source_timeout, |t| t.elapsed());
+                    self.cancel();
+                    return Err(UnalignedCheckpointError::DeadSource {
+                        input_id: idx,
+                        silent_duration,
+                    });
+                }
+            }
+        }
+
+        self.phase = TrackerPhase::Unaligned;
+        let missing: Vec<usize> = (0..self.sources_total)
+            .filter(|idx| !self.aligned_sources.contains(idx))
+            .collect();
+        Ok(Some(TrackerEvent::SwitchedToUnaligned {
+            missing_sources: missing,
+        }))
+    }
+
     /// Cancel the current tracking (e.g., on hard timeout from the coordinator).
     pub fn cancel(&mut self) {
         self.phase = TrackerPhase::Idle;
@@ -273,6 +409,7 @@ mod tests {
             alignment_timeout_threshold: Duration::from_millis(100),
             max_inflight_buffer_bytes: 1024,
             force_unaligned: false,
+            dead_source_timeout: Duration::from_secs(60),
         }
     }
 
@@ -378,5 +515,54 @@ mod tests {
     fn test_check_timeout_while_idle() {
         let mut tracker = UnalignedBarrierTracker::new(default_config());
         assert!(tracker.check_timeout().is_none());
+    }
+
+    #[test]
+    fn test_dead_source_fails_instead_of_unaligned() {
+        let config = UnalignedCheckpointConfig {
+            alignment_timeout_threshold: Duration::from_millis(0),
+            dead_source_timeout: Duration::from_millis(0),
+            ..default_config()
+        };
+        let mut tracker = UnalignedBarrierTracker::new(config);
+        tracker.begin(1, 3);
+        tracker.barrier_received(0);
+        std::thread::sleep(Duration::from_millis(1));
+        let mut liveness = vec![
+            InputLivenessState::new(0),
+            InputLivenessState::new(1),
+            InputLivenessState::new(2),
+        ];
+        liveness[1].channel_connected = false;
+        let result = tracker.check_timeout_with_liveness(&liveness);
+        assert!(result.is_err());
+        assert_eq!(tracker.phase(), TrackerPhase::Idle);
+    }
+
+    #[test]
+    fn test_slow_connected_source_triggers_unaligned() {
+        let config = UnalignedCheckpointConfig {
+            alignment_timeout_threshold: Duration::from_millis(0),
+            dead_source_timeout: Duration::from_millis(0),
+            ..default_config()
+        };
+        let mut tracker = UnalignedBarrierTracker::new(config);
+        tracker.begin(1, 2);
+        tracker.barrier_received(0);
+        std::thread::sleep(Duration::from_millis(1));
+        let liveness = vec![InputLivenessState::new(0), InputLivenessState::new(1)];
+        let result = tracker.check_timeout_with_liveness(&liveness);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn test_input_liveness_state() {
+        let mut state = InputLivenessState::new(0);
+        assert!(!state.is_dead(Duration::from_secs(1)));
+        state.channel_connected = false;
+        assert!(state.is_dead(Duration::from_secs(0)));
+        state.record_event();
+        assert!(!state.is_dead(Duration::from_secs(60)));
     }
 }

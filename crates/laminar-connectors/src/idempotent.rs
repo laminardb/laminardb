@@ -10,6 +10,16 @@
 //! exactly-once: the dedup table is in-memory and lost on crash, so a batch
 //! that was written but not yet committed can be replayed after recovery.
 //!
+//! # Persistence Limitation (CRITICAL)
+//!
+//! **The dedup state is stored in-memory only.** On process crash, all dedup
+//! state is lost.
+//!
+//! # TODO: Persistent Dedup State
+//!
+//! - Persist dedup set to sidecar file during commit_epoch()
+//! - Reload sidecar on open() to restore dedup state after crash
+//!
 //! ## Usage
 //!
 //! Configure via `delivery.guarantee = 'idempotent'` in sink config.
@@ -43,12 +53,18 @@ pub struct IdempotentConfig {
     /// Entries from epochs older than `current_epoch - max_retained_epochs`
     /// are pruned on each `commit_epoch()`.
     pub max_retained_epochs: u64,
+
+    /// Emit a `tracing::warn` on startup when dedup state is volatile.
+    ///
+    /// Default: `true`.
+    pub warn_on_volatile_dedup: bool,
 }
 
 impl Default for IdempotentConfig {
     fn default() -> Self {
         Self {
             max_retained_epochs: 3,
+            warn_on_volatile_dedup: true,
         }
     }
 }
@@ -75,6 +91,8 @@ pub struct IdempotentSinkWrapper {
     committed: HashMap<u64, HashSet<u64>>,
     /// Pending dedup entries for the current (uncommitted) epoch.
     pending: HashSet<u64>,
+    /// Whether the startup warning has been emitted.
+    startup_warned: bool,
 }
 
 impl IdempotentSinkWrapper {
@@ -88,6 +106,7 @@ impl IdempotentSinkWrapper {
             batch_counter: 0,
             committed: HashMap::new(),
             pending: HashSet::new(),
+            startup_warned: false,
         }
     }
 
@@ -104,6 +123,10 @@ impl IdempotentSinkWrapper {
 #[async_trait]
 impl SinkConnector for IdempotentSinkWrapper {
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
+        if self.config.warn_on_volatile_dedup && !self.startup_warned {
+            tracing::warn!("[LDB-6018] IdempotentSinkWrapper: dedup state is in-memory only");
+            self.startup_warned = true;
+        }
         self.inner.open(config).await
     }
 
@@ -303,6 +326,7 @@ mod tests {
         let (sink, _writes) = CountingSink::new();
         let config = IdempotentConfig {
             max_retained_epochs: 2,
+            ..IdempotentConfig::default()
         };
         let mut wrapper = IdempotentSinkWrapper::new(Box::new(sink), config);
 

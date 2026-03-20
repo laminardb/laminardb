@@ -52,8 +52,14 @@ pub(crate) enum SinkCommand {
         epoch: u64,
         ack: oneshot::Sender<Result<(), ConnectorError>>,
     },
-    /// Abort a failed epoch.
+    /// Abort a failed epoch (fire-and-forget).
     RollbackEpoch { epoch: u64 },
+    /// Abort a failed epoch with confirmation.
+    #[allow(dead_code)]
+    RollbackEpochConfirmed {
+        epoch: u64,
+        ack: oneshot::Sender<Result<(), ConnectorError>>,
+    },
     /// Flush + close the connector and exit the task (test-only).
     #[cfg(test)]
     Close,
@@ -230,8 +236,60 @@ impl SinkTaskHandle {
     }
 
     /// Abort a failed epoch (fire-and-forget).
+    ///
+    /// **At-most-once gap:** No confirmation is received.
     pub async fn rollback_epoch(&self, epoch: u64) {
-        let _ = self.tx.send(SinkCommand::RollbackEpoch { epoch }).await;
+        if self
+            .tx
+            .send(SinkCommand::RollbackEpoch { epoch })
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                sink = %self.name,
+                epoch,
+                "[LDB-6016] fire-and-forget rollback failed: sink task channel closed"
+            );
+        }
+    }
+
+    /// Abort a failed epoch with confirmation and timeout.
+    #[allow(dead_code)]
+    pub async fn rollback_epoch_confirmed(
+        &self,
+        epoch: u64,
+        timeout: Duration,
+    ) -> Result<(), ConnectorError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.tx
+            .send(SinkCommand::RollbackEpochConfirmed { epoch, ack: ack_tx })
+            .await
+            .map_err(|_| {
+                ConnectorError::ConnectionFailed(format!(
+                    "sink task '{}' closed unexpectedly",
+                    self.name
+                ))
+            })?;
+        match tokio::time::timeout(timeout, ack_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(ConnectorError::ConnectionFailed(format!(
+                "sink task '{}' dropped rollback confirmation",
+                self.name
+            ))),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    sink = %self.name,
+                    epoch,
+                    timeout_ms = timeout.as_millis(),
+                    "[LDB-6017] confirmed rollback timed out"
+                );
+                Err(ConnectorError::ConnectionFailed(format!(
+                    "sink task '{}' rollback timed out after {}ms",
+                    self.name,
+                    timeout.as_millis()
+                )))
+            }
+        }
     }
 
     /// Signals the sink task to close and waits for it to finish (30s timeout).
@@ -336,9 +394,21 @@ async fn run_sink_task(
                                 sink = %name,
                                 epoch,
                                 error = %e,
-                                "[LDB-6004] Sink rollback failed"
+                                "[LDB-6004] Sink rollback failed (fire-and-forget)"
                             );
                         }
+                    }
+                    SinkCommand::RollbackEpochConfirmed { epoch, ack } => {
+                        let result = sink.rollback_epoch(epoch).await;
+                        if let Err(ref e) = result {
+                            tracing::warn!(
+                                sink = %name,
+                                epoch,
+                                error = %e,
+                                "[LDB-6004] Sink rollback failed (confirmed)"
+                            );
+                        }
+                        let _ = ack.send(result);
                     }
                     #[cfg(test)]
                     SinkCommand::Close => {

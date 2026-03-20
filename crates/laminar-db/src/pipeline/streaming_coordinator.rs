@@ -1112,6 +1112,7 @@ mod tests {
                     alignment_timeout_threshold: Duration::ZERO,
                     max_inflight_buffer_bytes: 1024,
                     force_unaligned: false,
+                    dead_source_timeout: Duration::from_secs(60),
                 }),
             },
             rx: mpsc::channel(64).1,
@@ -1132,6 +1133,7 @@ mod tests {
                     alignment_timeout_threshold: Duration::ZERO,
                     max_inflight_buffer_bytes: 1024,
                     force_unaligned: false,
+                    dead_source_timeout: Duration::from_secs(60),
                 },
             )),
         };
