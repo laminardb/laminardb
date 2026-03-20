@@ -18,6 +18,7 @@ hwloc = ["dep:hwlocality"]
 # Enable distributed delta mode (multi-node) — heavy deps, server-only
 delta = [
     "dep:chitchat", "dep:tokio-util", "dep:xxhash-rust",
+    "dep:tonic", "dep:prost",
 ]
 [dependencies]
 # Performance critical - no allocations on hot path
@@ -68,6 +69,8 @@ sqlparser = { workspace = true }
 chitchat = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 xxhash-rust = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
 
 # Observability
 tracing = { workspace = true }
@@ -88,6 +91,9 @@ libc = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
+
+[build-dependencies]
+tonic-build = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

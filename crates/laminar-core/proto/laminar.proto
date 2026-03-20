@@ -1,0 +1,162 @@
+syntax = "proto3";
+package laminar.rpc;
+
+// ---------------------------------------------------------------------------
+// Inter-node data routing
+// ---------------------------------------------------------------------------
+
+service PartitionRouter {
+    // Route a batch to the partition owner.
+    rpc RouteBatch(RouteBatchRequest) returns (RouteBatchResponse);
+    // Stream batches to a node (sustained throughput).
+    rpc StreamBatches(stream BatchChunk) returns (StreamBatchesResponse);
+}
+
+message RouteBatchRequest {
+    // Target partition ID.
+    uint32 partition_id = 1;
+    // Arrow IPC-encoded RecordBatch bytes.
+    bytes batch_ipc = 2;
+    // Epoch of the sender — receiver rejects if stale.
+    uint64 epoch = 3;
+    // Originating node ID.
+    uint64 source_node_id = 4;
+}
+
+message RouteBatchResponse {
+    bool accepted = 1;
+    // Non-empty when accepted == false.
+    string error = 2;
+    // Rows written by the receiver.
+    uint64 rows_written = 3;
+}
+
+message BatchChunk {
+    uint32 partition_id = 1;
+    bytes batch_ipc = 2;
+    uint64 epoch = 3;
+    uint64 source_node_id = 4;
+    // Sequence number within the stream (monotonic).
+    uint64 sequence = 5;
+}
+
+message StreamBatchesResponse {
+    uint64 chunks_accepted = 1;
+    uint64 total_rows = 2;
+    string error = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Cross-node state access (for lookup joins, enrichment)
+// ---------------------------------------------------------------------------
+
+service RemoteState {
+    // Point lookup of a single key.
+    rpc Lookup(LookupRequest) returns (LookupResponse);
+    // Batch lookup for join enrichment.
+    rpc BatchLookup(BatchLookupRequest) returns (BatchLookupResponse);
+}
+
+message LookupRequest {
+    // State store name.
+    string store_name = 1;
+    // Key bytes (caller-defined encoding).
+    bytes key = 2;
+    // Optional partition hint to skip routing.
+    uint32 partition_id = 3;
+}
+
+message LookupResponse {
+    bool found = 1;
+    // Arrow IPC-encoded single-row RecordBatch (empty if not found).
+    bytes value_ipc = 2;
+}
+
+message BatchLookupRequest {
+    string store_name = 1;
+    // Multiple keys to resolve in one round-trip.
+    repeated bytes keys = 2;
+    uint32 partition_id = 3;
+}
+
+message BatchLookupResponse {
+    // One entry per key in the request, in the same order.
+    repeated LookupResult results = 1;
+}
+
+message LookupResult {
+    bool found = 1;
+    bytes value_ipc = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Distributed checkpoint coordination
+// ---------------------------------------------------------------------------
+
+service CheckpointService {
+    // Forward a checkpoint barrier to a peer.
+    rpc ForwardBarrier(BarrierRequest) returns (BarrierResponse);
+    // Query checkpoint status on a peer.
+    rpc CheckpointStatus(StatusRequest) returns (StatusResponse);
+}
+
+message BarrierRequest {
+    // Globally unique checkpoint ID.
+    uint64 checkpoint_id = 1;
+    // Epoch at which the barrier was injected.
+    uint64 epoch = 2;
+    // Node that initiated the checkpoint.
+    uint64 coordinator_node_id = 3;
+    // Unix millis timestamp of barrier injection.
+    int64 timestamp_ms = 4;
+}
+
+message BarrierResponse {
+    bool acknowledged = 1;
+    string error = 2;
+}
+
+message StatusRequest {
+    uint64 checkpoint_id = 1;
+}
+
+message StatusResponse {
+    enum Phase {
+        UNKNOWN = 0;
+        PENDING = 1;
+        IN_PROGRESS = 2;
+        COMPLETED = 3;
+        FAILED = 4;
+        ABORTED = 5;
+    }
+    Phase phase = 1;
+    // Partitions that have completed on this node.
+    repeated uint32 completed_partitions = 2;
+    // Partitions still in progress.
+    repeated uint32 pending_partitions = 3;
+    string error = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Cross-node aggregation exchange (partial-merge)
+// ---------------------------------------------------------------------------
+
+service AggregateExchange {
+    // Send partial aggregation results for merge.
+    rpc ExchangePartials(PartialsRequest) returns (PartialsResponse);
+}
+
+message PartialsRequest {
+    // Operator / aggregation group identifier.
+    string aggregation_id = 1;
+    // Arrow IPC-encoded partial aggregate RecordBatch.
+    bytes partials_ipc = 2;
+    // Window or epoch this partial belongs to.
+    uint64 epoch = 3;
+    uint64 source_node_id = 4;
+}
+
+message PartialsResponse {
+    bool accepted = 1;
+    string error = 2;
+}
