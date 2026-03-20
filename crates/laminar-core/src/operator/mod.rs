@@ -26,7 +26,7 @@ pub struct Event {
     pub timestamp: i64,
     /// Event payload as Arrow `RecordBatch` wrapped in `Arc` for zero-copy multicast.
     ///
-    /// Cloning an `Event` increments the `Arc` reference count (~2ns, O(1))
+    /// Cloning an `Event` increments the `Arc` reference count (O(1))
     /// instead of copying all column `Arc` pointers (O(columns)).
     pub data: Arc<RecordBatch>,
 }

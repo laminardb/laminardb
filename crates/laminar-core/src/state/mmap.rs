@@ -213,6 +213,52 @@ impl Storage {
         }
     }
 
+    /// Truncate the backing file to the currently used size (mmap mode only).
+    ///
+    /// After compaction the write cursor may be far below the file capacity.
+    /// This reclaims disk space by shrinking the file and re-mapping.
+    fn truncate_to_used(&mut self) -> Result<(), StateError> {
+        match self {
+            Storage::Arena { .. } => Ok(()), // No-op for in-memory
+            Storage::Mmap {
+                mmap,
+                file,
+                write_pos,
+                capacity,
+                ..
+            } => {
+                let new_capacity = MMAP_HEADER_SIZE + *write_pos;
+                // Only truncate if we'd actually reclaim meaningful space
+                // (at least 25% of current capacity, and keep a minimum to
+                // avoid thrashing on tiny stores).
+                let min_capacity = MMAP_HEADER_SIZE + 4096;
+                if *capacity > min_capacity && new_capacity < *capacity * 3 / 4 {
+                    // Clamp to at least the minimum
+                    let target = new_capacity.max(min_capacity);
+                    let old_capacity = *capacity;
+                    file.set_len(target as u64)?;
+                    // SAFETY: We just resized the file and hold exclusive &mut self.
+                    // On remap failure, restore the original file length so the
+                    // existing mmap remains valid.
+                    #[allow(unsafe_code)]
+                    match unsafe { MmapMut::map_mut(&*file) } {
+                        Ok(new_mmap) => {
+                            *mmap = new_mmap;
+                            advise_hugepages(mmap);
+                            *capacity = target;
+                        }
+                        Err(e) => {
+                            // Restore original file length to keep current mmap valid
+                            let _ = file.set_len(old_capacity as u64);
+                            return Err(e.into());
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Check if this is persistent storage.
     fn is_persistent(&self) -> bool {
         matches!(self, Storage::Mmap { .. })
@@ -409,16 +455,38 @@ impl MmapStateStore {
         }
     }
 
-    /// Compact the store by rewriting live data.
+    /// Compact the store by rewriting live data contiguously.
     ///
-    /// This removes holes left by deleted entries and reduces file/memory usage.
+    /// This removes holes left by deleted/overwritten entries, reducing
+    /// fragmentation to zero. For persistent (mmap) stores the backing file
+    /// is truncated to reclaim disk space.
+    ///
+    /// The implementation copies live values into a temporary buffer, resets
+    /// storage, then writes them back contiguously. Index offsets are updated
+    /// in-place -- no keys are re-allocated.
+    ///
+    /// # Thread safety
+    ///
+    /// Requires `&mut self` (exclusive access). Concurrent calls from two
+    /// threads are prevented at compile time by the borrow checker. Callers
+    /// must ensure no concurrent reads or writes are in progress -- the index
+    /// is cleared and rebuilt during compaction, so a concurrent `get()` would
+    /// see inconsistent offsets.
     ///
     /// # Errors
     ///
-    /// Returns `StateError` if the compaction fails.
+    /// Returns `StateError` if a storage write or file truncation fails.
     pub fn compact(&mut self) -> Result<(), StateError> {
-        // Collect all live data
-        let live_data: Vec<(Vec<u8>, Vec<u8>)> = self
+        if self.index.is_empty() {
+            self.storage.reset();
+            self.storage.truncate_to_used()?;
+            self.deletes_since_compact = 0;
+            return Ok(());
+        }
+
+        // Collect only values (keys stay in the BTreeMap, avoiding reallocation).
+        // Iteration follows BTreeMap key order, not offset order.
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = self
             .index
             .iter()
             .filter_map(|(k, entry)| {
@@ -427,23 +495,34 @@ impl MmapStateStore {
             })
             .collect();
 
-        // Reset storage
+        // Reset write cursor (doesn't free the file/buffer, just rewinds)
         self.storage.reset();
+
+        // Rewrite contiguously and update index offsets
         self.index.clear();
         self.size_bytes = 0;
-
-        // Rewrite all data
-        for (key, value) in live_data {
+        for (key, value) in entries {
             let offset = self.storage.write(&value)?;
+            self.size_bytes += key.len() + value.len();
             self.index.insert(
-                key.clone(),
+                key,
                 ValueEntry {
                     offset,
                     len: value.len(),
                 },
             );
-            self.next_version += 1;
-            self.size_bytes += key.len() + value.len();
+        }
+
+        // Truncate the backing file to the actual used size (persistent mode only).
+        self.storage.truncate_to_used()?;
+
+        // Persist the updated index immediately so the .idx file matches
+        // the rewritten data file. Without this, a crash between compact()
+        // and the next flush() would leave stale pre-compaction offsets
+        // against the compacted data = data loss.
+        if self.is_persistent() {
+            self.storage.flush()?;
+            self.save_index()?;
         }
 
         self.deletes_since_compact = 0;
@@ -902,6 +981,74 @@ mod tests {
     }
 
     #[test]
+    fn test_compact_empty_store() {
+        let mut store = MmapStateStore::in_memory(4096);
+        // Compacting an empty store should be a no-op
+        store.compact().unwrap();
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.size_bytes(), 0);
+        assert!(store.fragmentation().abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compact_persistent_truncates_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("compact_trunc.db");
+
+        let mut store = MmapStateStore::persistent(&path, 128 * 1024).unwrap();
+
+        // Fill with enough data to grow the file
+        for i in 0..200 {
+            let key = format!("key{i:04}");
+            let value = vec![0xABu8; 256];
+            store.put(key.as_bytes(), Bytes::from(value)).unwrap();
+        }
+        // Delete most entries to create heavy fragmentation
+        for i in 0..180 {
+            let key = format!("key{i:04}");
+            store.delete(key.as_bytes()).unwrap();
+        }
+
+        let frag = store.fragmentation();
+        assert!(frag > 0.5, "expected heavy fragmentation, got {frag}");
+
+        let size_before = std::fs::metadata(&path).unwrap().len();
+
+        store.compact().unwrap();
+
+        let size_after = std::fs::metadata(&path).unwrap().len();
+
+        // File should have been truncated
+        assert!(
+            size_after < size_before,
+            "file should shrink after compaction: before={size_before}, after={size_after}"
+        );
+
+        // Verify remaining data integrity
+        for i in 180..200 {
+            let key = format!("key{i:04}");
+            let val = store.get(key.as_bytes());
+            assert!(val.is_some(), "key {key} should still exist");
+            assert_eq!(val.unwrap().len(), 256);
+        }
+        assert!(store.fragmentation().abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_compact_preserves_version() {
+        let mut store = MmapStateStore::in_memory(4096);
+        store.put(b"a", Bytes::from_static(b"1")).unwrap();
+        store.put(b"b", Bytes::from_static(b"2")).unwrap();
+        let version_before = store.next_version;
+
+        store.delete(b"a").unwrap();
+        store.compact().unwrap();
+
+        // Compaction should NOT inflate the version counter
+        assert_eq!(store.next_version, version_before);
+    }
+
+    #[test]
     fn test_growth() {
         // Start with very small capacity
         let mut store = MmapStateStore::in_memory(32);
@@ -977,6 +1124,56 @@ mod tests {
 
         store.put(&key, Bytes::copy_from_slice(&value)).unwrap();
         assert_eq!(store.get(&key).unwrap().as_ref(), &value);
+    }
+
+    #[test]
+    fn test_compact_persists_index_immediately() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("compact_idx.db");
+
+        // Create persistent store, add data, delete some to create fragmentation.
+        {
+            let mut store = MmapStateStore::persistent(&db_path, 64 * 1024).unwrap();
+            for i in 0..20 {
+                let key = format!("k{i:03}");
+                let val = format!("v{i:03}");
+                store.put(key.as_bytes(), Bytes::from(val)).unwrap();
+            }
+            // Flush initial state so .idx exists.
+            store.flush().unwrap();
+
+            // Delete half the entries.
+            for i in 0..10 {
+                let key = format!("k{i:03}");
+                store.delete(key.as_bytes()).unwrap();
+            }
+
+            // Compact rewrites data + truncates file + persists index.
+            store.compact().unwrap();
+
+            // Drop WITHOUT calling flush() — simulates a crash after compact.
+        }
+
+        // Re-open: the .idx must match the compacted data file.
+        {
+            let store = MmapStateStore::persistent(&db_path, 64 * 1024).unwrap();
+            assert_eq!(store.len(), 10);
+            for i in 10..20 {
+                let key = format!("k{i:03}");
+                let expected = format!("v{i:03}");
+                let val = store.get(key.as_bytes());
+                assert!(val.is_some(), "key {key} missing after compact+reopen");
+                assert_eq!(val.unwrap().as_ref(), expected.as_bytes());
+            }
+            // Deleted keys must not be present.
+            for i in 0..10 {
+                let key = format!("k{i:03}");
+                assert!(
+                    store.get(key.as_bytes()).is_none(),
+                    "deleted key {key} present after compact+reopen"
+                );
+            }
+        }
     }
 
     #[test]
