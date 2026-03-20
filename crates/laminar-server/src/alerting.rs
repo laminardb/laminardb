@@ -7,10 +7,34 @@
 //!
 //! The [`AlertManager`] runs a background evaluation loop that:
 //! 1. Reads current metrics from the `LaminarDB` instance
-//! 2. Evaluates each [`AlertRule`] condition against those metrics
+//! 2. Evaluates each [`AlertRule`] condition against those metrics **sequentially**
 //! 3. Respects per-rule cooldown to prevent alert storms
 //! 4. Dispatches alerts through configured [`AlertChannel`]s
 //! 5. Maintains a ring buffer of recent alert history
+//!
+//! # Sequential evaluation model
+//!
+//! Rules are evaluated **one at a time** on a single async task.  Each rule
+//! that fires dispatches to all of its channels (including potentially slow
+//! HTTP webhooks) before the next rule is evaluated.  This means:
+//!
+//! - If many rules fire simultaneously, the tail-end rules experience
+//!   increased dispatch latency equal to the sum of all preceding
+//!   webhook round-trips.
+//! - Webhook timeouts (default 30 s) during a storm can delay evaluation
+//!   by `N_rules * 30 s` in the worst case.
+//!
+//! **Recommendation**: keep the total rule count under ~50 and ensure
+//! webhook endpoints respond quickly (< 1 s).  For high-fanout alerting,
+//! dispatch to a single aggregator (e.g., PagerDuty, Alertmanager) and
+//! let it handle routing.
+//!
+//! # Cooldown persistence
+//!
+//! Per-rule cooldown state is held **in memory only**.  On process restart
+//! all cooldowns are reset, which means an alert that fired moments before
+//! shutdown may fire again immediately after startup.  This is acceptable
+//! for most deployments but worth noting in runbooks.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -311,6 +335,10 @@ pub struct AlertManager {
     /// Evaluation interval.
     interval: Duration,
     /// Per-rule last-fired instant for cooldown enforcement.
+    ///
+    /// **Not persisted**: on process restart all cooldowns reset to zero,
+    /// meaning alerts may re-fire immediately even if they fired moments
+    /// before the previous shutdown.  See module-level docs for details.
     last_fired: RwLock<HashMap<String, Instant>>,
     /// Ring buffer of recent alerts (most recent last).
     history: RwLock<Vec<AlertEvent>>,
@@ -644,18 +672,27 @@ impl AlertManager {
                     req = req.header("content-type", "application/json");
                 }
 
+                // NOTE: Webhook delivery is **best-effort, fire-and-forget**.
+                // A failed request (network error, 5xx, timeout) is logged
+                // but not retried.  The alert is still recorded in the
+                // history ring buffer and the log channel (if configured).
+                //
+                // TODO: add configurable retry with exponential backoff
+                // (e.g., 3 attempts at 1 s / 4 s / 16 s) for transient
+                // failures.  Requires a per-channel retry budget to avoid
+                // blocking the evaluation loop during widespread outages.
                 match req.body(body).send().await {
                     Ok(resp) => {
                         if !resp.status().is_success() {
                             warn!(
                                 url = %url,
                                 status = %resp.status(),
-                                "Webhook alert delivery failed"
+                                "Webhook alert delivery failed (no retry)"
                             );
                         }
                     }
                     Err(e) => {
-                        error!(url = %url, error = %e, "Webhook alert delivery error");
+                        error!(url = %url, error = %e, "Webhook alert delivery error (no retry)");
                     }
                 }
             }
@@ -664,8 +701,19 @@ impl AlertManager {
                     "[{}] {} severity={} {}\n",
                     event.fired_at, event.name, event.severity, event.message
                 );
+                // Gracefully handle write failures (disk full, read-only
+                // filesystem, permission denied, etc.) so the alert
+                // evaluation loop continues processing other rules and
+                // channels.  The alert is still recorded in the in-memory
+                // history and the log channel.
                 if let Err(e) = append_to_file(path, &line).await {
-                    error!(path = %path.display(), error = %e, "Failed to write alert to file");
+                    error!(
+                        path = %path.display(),
+                        error = %e,
+                        alert_name = %event.name,
+                        "Failed to write alert to file (disk full? read-only filesystem?). \
+                         Alert was still dispatched to other channels."
+                    );
                 }
             }
         }
