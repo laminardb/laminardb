@@ -260,6 +260,14 @@ pub(crate) struct StreamQuery {
 /// Replaces the per-cycle `if/else` chain that tested `is_eowc`, `has_asof`,
 /// `has_temporal`, `has_stream_join` every cycle. Since query type is fixed at
 /// `CREATE STREAM` time, we classify once and dispatch via `match`.
+///
+/// # Immutability after registration
+///
+/// The execution path is computed once during `register_stream_query` and
+/// stored immutably on the `RegisteredQuery`. If the query semantics change
+/// at runtime (e.g., `ALTER STREAM` adds an ASOF join clause), the query
+/// must be re-registered (`DROP STREAM` + `CREATE STREAM`) -- the path is
+/// **not** re-evaluated on existing queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueryExecutionPath {
     /// EMIT ON WINDOW CLOSE / EMIT FINAL — suppresses intermediate results.
