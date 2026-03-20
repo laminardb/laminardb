@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rdkafka::consumer::ConsumerContext;
+use rdkafka::consumer::{Consumer, ConsumerContext};
 use rdkafka::ClientContext;
 use tracing::{info, warn};
 
