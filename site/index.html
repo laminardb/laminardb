@@ -539,6 +539,10 @@ CREATE SINK lake INTO DELTA_LAKE (
               for Linux (x86_64, aarch64, musl), macOS (x86_64, Apple Silicon), and Windows.
               Or <code>cargo install laminar-server</code>. Docker image and Helm chart available.
             </p>
+            <p>
+              TOML configuration with <code>${ENV_VAR}</code> substitution.
+              REST API, Prometheus metrics, ad-hoc SQL, and hot-reload (edit config &rarr; automatic apply).
+            </p>
             <p>Use for: CDC pipelines, stream-to-lakehouse, event routing.</p>
           </div>
           <div class="deploy-card">
@@ -780,8 +784,8 @@ CREATE SINK lake INTO DELTA_LAKE (
               <li>All 10 connectors (Kafka, CDC, MongoDB, Delta, WS, files)</li>
               <li>Barrier-based checkpointing with 2PC exactly-once</li>
               <li>Per-core WAL for durability</li>
-              <li>Standalone server with REST API</li>
-              <li>Docker and Helm chart deployment</li>
+              <li>Standalone server with REST API, Prometheus metrics, hot-reload</li>
+              <li>Docker (multi-arch) and Helm chart deployment</li>
             </ul>
           </div>
           <div class="status-col experimental">

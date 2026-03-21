@@ -368,6 +368,8 @@
       <a href="#state-config">State Store</a>
       <a href="#checkpoint-config">Checkpoints</a>
       <a href="#rest-api">REST API</a>
+      <a href="#hot-reload">Hot Reload</a>
+      <a href="#prometheus">Prometheus Metrics</a>
 
       <h4>Pipelines</h4>
       <a href="#sources">Sources</a>
@@ -405,12 +407,40 @@
     <!-- Content -->
     <main class="docs-content">
 
-      <h1 style="font-size: 1.75rem; margin-bottom: 0.5rem;">Configuration Reference</h1>
-      <p style="color: var(--text-dim); margin-bottom: 2rem;">
+      <h1 style="font-size: 1.75rem; margin-bottom: 0.5rem;">Standalone Server &amp; Configuration Reference</h1>
+      <p style="color: var(--text-dim); margin-bottom: 1rem;">
+        The <code>laminardb</code> binary reads a TOML configuration file, constructs streaming pipelines, and serves a REST API with Prometheus metrics.
         Every field on this page is verified against
         <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs</a>.
-        TOML examples use exact field names from the Rust structs.
       </p>
+
+      <h3>Install</h3>
+      <div class="toml-block">
+        <div class="toml-header">Install &amp; run</div>
+        <pre><code class="language-bash"># Pre-built binary (Linux x86_64)
+curl -LO "https://github.com/laminardb/laminardb/releases/latest/download/laminardb-server-x86_64-unknown-linux-gnu-v0.18.12.tar.gz"
+tar xzf laminardb-server-*.tar.gz
+
+# Or build from source
+cargo install laminar-server
+
+# Or Docker
+docker run -d -p 8080:8080 ghcr.io/laminardb/laminardb-server:latest
+
+# Run
+./laminardb --config laminardb.toml</code></pre>
+      </div>
+
+      <h3>CLI Options</h3>
+      <table class="config-table">
+        <thead><tr><th>Flag</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">--config &lt;FILE&gt;</td><td class="field-default">laminardb.toml</td><td>TOML configuration file path</td></tr>
+          <tr><td class="field-name">--log-level &lt;LEVEL&gt;</td><td class="field-default">info</td><td>trace, debug, info, warn, error</td></tr>
+          <tr><td class="field-name">--admin-bind &lt;ADDR&gt;</td><td></td><td>Override HTTP bind address from config</td></tr>
+          <tr><td class="field-name">--validate-checkpoints</td><td></td><td>Validate all stored checkpoints and exit</td></tr>
+        </tbody>
+      </table>
 
       <!-- ============================================================ -->
       <!-- SERVER CONFIG -->
@@ -589,6 +619,48 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
           <span class="endpoint-desc">Cluster status (delta mode only)</span>
         </div>
       </div>
+
+      <!-- HOT RELOAD -->
+      <h2 id="hot-reload">Hot Reload</h2>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/reload.rs" target="_blank" rel="noopener">crates/laminar-server/src/reload.rs</a></div>
+
+      <p>
+        Edit the TOML config file while the server is running. A file watcher detects changes
+        (500ms debounce, content-hash comparison), diffs the old and new configs, and applies
+        incremental DDL. Or trigger manually via <code>POST /api/v1/reload</code>.
+      </p>
+
+      <p><strong>What reloads without restart:</strong> sources, pipelines, sinks, lookups (add, remove, or change).</p>
+      <p><strong>What requires restart:</strong> <code>[server]</code>, <code>[state]</code>, <code>[checkpoint]</code> sections. A warning is returned if these sections change.</p>
+
+      <p style="font-size: 0.8rem; color: var(--text-dim);">
+        Reload order: remove changed/deleted sinks &rarr; pipelines &rarr; lookups &rarr; sources,
+        then recreate sources &rarr; lookups &rarr; pipelines &rarr; sinks.
+        Disable file watcher with <code>LAMINAR_DISABLE_FILE_WATCH=1</code>.
+      </p>
+
+      <!-- PROMETHEUS -->
+      <h2 id="prometheus">Prometheus Metrics</h2>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/http.rs" target="_blank" rel="noopener">crates/laminar-server/src/http.rs</a></div>
+
+      <p><code>GET /metrics</code> returns Prometheus text format. Key metrics:</p>
+
+      <table class="config-table">
+        <thead><tr><th>Metric</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">laminardb_events_ingested_total</td><td class="field-type">counter</td><td>Total events ingested across all sources</td></tr>
+          <tr><td class="field-name">laminardb_events_emitted_total</td><td class="field-type">counter</td><td>Total events emitted to sinks</td></tr>
+          <tr><td class="field-name">laminardb_source_events_total</td><td class="field-type">counter</td><td>Events per source (label: <code>source</code>)</td></tr>
+          <tr><td class="field-name">laminardb_checkpoints_completed_total</td><td class="field-type">counter</td><td>Successful checkpoints</td></tr>
+          <tr><td class="field-name">laminardb_checkpoints_failed_total</td><td class="field-type">counter</td><td>Failed checkpoints</td></tr>
+          <tr><td class="field-name">laminardb_checkpoint_epoch</td><td class="field-type">gauge</td><td>Current checkpoint epoch</td></tr>
+          <tr><td class="field-name">laminardb_checkpoint_last_duration_ms</td><td class="field-type">gauge</td><td>Last checkpoint duration (ms)</td></tr>
+          <tr><td class="field-name">laminardb_cycle_duration_p99_ns</td><td class="field-type">gauge</td><td>p99 processing cycle latency (ns)</td></tr>
+          <tr><td class="field-name">laminardb_uptime_seconds</td><td class="field-type">gauge</td><td>Server uptime</td></tr>
+          <tr><td class="field-name">laminardb_pipeline_state_info</td><td class="field-type">gauge</td><td>Pipeline state (label: <code>state</code>)</td></tr>
+          <tr><td class="field-name">laminardb_reload_total</td><td class="field-type">counter</td><td>Config reload count</td></tr>
+        </tbody>
+      </table>
 
       <!-- ============================================================ -->
       <!-- PIPELINES -->

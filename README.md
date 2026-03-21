@@ -90,7 +90,7 @@ Three deployment modes:
 | Mode | How | Status |
 |------|-----|--------|
 | **Embedded** | `cargo add laminar-db` — runs inside your Rust process | ✅ Implemented |
-| **Standalone** | `laminardb` binary with HTTP API, configurable via TOML | ✅ Implemented |
+| **Standalone** | `laminardb` binary — TOML config, REST API, Prometheus metrics, hot-reload | ✅ Implemented |
 | **Distributed** | Multi-node via gossip discovery, Raft consensus, gRPC — `--features delta` | 📋 Planned (skeleton only; Phase 6c) |
 
 The embedded mode is the primary deployment target. You get a `LaminarDB` handle, register sources with SQL DDL, push `RecordBatch` data in, subscribe to output streams, and let the engine handle windowing, joins, checkpointing, and exactly-once delivery.
@@ -299,7 +299,7 @@ Custom connectors can be built by implementing the `SourceConnector` or `SinkCon
 
 - **Streaming coordinator** — Single tokio task driving SQL execution cycles. Source connectors push batches via mpsc channels; the coordinator runs compiled projections / cached logical plans, routes results to sinks, and manages checkpoint barriers. Sub-microsecond for compiled single-source projections; microseconds for incremental aggregations and cached-plan queries; DataFusion fallback for complex queries.
 - **Background I/O** — Tokio async runtime handling WAL writes, checkpointing, connector I/O, and changelog draining.
-- **Admin** — HTTP admin API, metrics, configuration management. Auth and observability are planned (Phase 4/5).
+- **Admin** — HTTP REST API (Axum), Prometheus metrics, ad-hoc SQL, hot-reload, checkpoint triggers. Auth is planned (Phase 4).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 
