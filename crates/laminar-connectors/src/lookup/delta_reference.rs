@@ -482,7 +482,7 @@ mod tests {
             .unwrap()
         }
 
-        async fn write_delta_version(path: &str, batches: Vec<RecordBatch>, epoch: i64) -> i64 {
+        async fn write_delta_version(path: &str, batches: Vec<RecordBatch>, epoch: u64) -> i64 {
             use crate::lakehouse::delta_io;
             use deltalake::protocol::SaveMode;
 
