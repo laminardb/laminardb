@@ -227,7 +227,22 @@ fn evaluate_condition(
 /// Compare two values numerically.
 ///
 /// Returns `Err` if either side is non-numeric, so the caller can fail closed.
+///
+/// Uses `i128` for exact integer comparison when both operands are integers,
+/// avoiding f64 precision loss beyond 2^53. Falls back to `f64` for decimals.
 fn compare_numeric(lhs: &str, rhs: &str, num_cmp: fn(f64, f64) -> bool) -> Result<bool, AuthError> {
+    // Try exact integer comparison first (no f64 precision loss for values > 2^53).
+    if !lhs.contains('.') && !rhs.contains('.') {
+        if let (Ok(l), Ok(r)) = (lhs.parse::<i128>(), rhs.parse::<i128>()) {
+            // Map i128 ordering to the f64 comparator without casting the actual values.
+            let result = match l.cmp(&r) {
+                std::cmp::Ordering::Less => num_cmp(-1.0, 0.0),
+                std::cmp::Ordering::Equal => num_cmp(0.0, 0.0),
+                std::cmp::Ordering::Greater => num_cmp(1.0, 0.0),
+            };
+            return Ok(result);
+        }
+    }
     let l = lhs
         .parse::<f64>()
         .map_err(|_| AuthError::AccessDenied(format!("non-numeric attribute value: {lhs:?}")))?;
