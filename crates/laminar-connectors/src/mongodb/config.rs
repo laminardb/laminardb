@@ -458,6 +458,36 @@ impl MongoDbSinkConfig {
         if let Some(ordered) = config.get_parsed::<bool>("ordered")? {
             cfg.ordered = ordered;
         }
+        if let Some(mode) = config.get("write.mode") {
+            cfg.write_mode = match mode {
+                "insert" => WriteMode::Insert,
+                "cdc_replay" | "cdc-replay" => WriteMode::CdcReplay,
+                "upsert" => {
+                    let keys = config
+                        .require("write.mode.key_fields")?
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .collect();
+                    WriteMode::Upsert { key_fields: keys }
+                }
+                "replace" => WriteMode::Replace {
+                    upsert_on_missing: config
+                        .get_parsed::<bool>("write.mode.upsert_on_missing")?
+                        .unwrap_or(false),
+                },
+                other => {
+                    return Err(ConnectorError::ConfigurationError(format!(
+                        "unknown write.mode: {other}"
+                    )));
+                }
+            };
+        }
+        if let Some(journal) = config.get_parsed::<bool>("write_concern.journal")? {
+            cfg.write_concern.journal = journal;
+        }
+        if let Some(timeout) = config.get_parsed::<u64>("write_concern.timeout_ms")? {
+            cfg.write_concern.timeout_ms = Some(timeout);
+        }
 
         cfg.validate()?;
         Ok(cfg)

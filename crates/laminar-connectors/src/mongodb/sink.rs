@@ -632,12 +632,42 @@ impl MongoDbSink {
                             let filter = mongodb::bson::to_document(dk.as_ref()).map_err(|e| {
                                 ConnectorError::WriteError(format!("filter BSON: {e}"))
                             })?;
-                            let update = mongodb::bson::to_document(ud.as_ref()).map_err(|e| {
-                                ConnectorError::WriteError(format!("update BSON: {e}"))
-                            })?;
+
+                            // Transform updateDescription into update operators.
+                            // Raw format: { "updatedFields": {...}, "removedFields": [...] }
+                            // Required:   { "$set": {...}, "$unset": {...} }
+                            let mut update = mongodb::bson::Document::new();
+                            if let Some(updated) = ud.get("updatedFields") {
+                                let bson = mongodb::bson::to_bson(updated).map_err(|e| {
+                                    ConnectorError::WriteError(format!("updatedFields BSON: {e}"))
+                                })?;
+                                update.insert("$set", bson);
+                            }
+                            if let Some(removed) =
+                                ud.get("removedFields").and_then(|v| v.as_array())
+                            {
+                                if !removed.is_empty() {
+                                    let unset_doc: mongodb::bson::Document = removed
+                                        .iter()
+                                        .filter_map(|f| f.as_str())
+                                        .map(|f| {
+                                            (
+                                                f.to_string(),
+                                                mongodb::bson::Bson::String(String::new()),
+                                            )
+                                        })
+                                        .collect();
+                                    update.insert("$unset", unset_doc);
+                                }
+                            }
+                            if update.is_empty() {
+                                continue;
+                            }
+
                             collection.update_one(filter, update).await.map_err(|e| {
                                 ConnectorError::WriteError(format!("cdc update: {e}"))
                             })?;
+                            self.metrics.record_upserts(1);
                         }
                         "R" => {
                             let dk = Self::parse_cdc_field(val, "_document_key")?;
@@ -659,6 +689,7 @@ impl MongoDbSink {
                                 .map_err(|e| {
                                     ConnectorError::WriteError(format!("cdc replace: {e}"))
                                 })?;
+                            self.metrics.record_upserts(1);
                         }
                         "D" => {
                             let dk = Self::parse_cdc_field(val, "_document_key")?;

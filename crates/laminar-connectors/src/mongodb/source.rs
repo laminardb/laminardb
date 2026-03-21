@@ -690,7 +690,7 @@ async fn run_change_stream_reader(
                             // Track resume token for reconnection.
                             last_token = Some(cs_event.id.clone());
 
-                            let change_event = parse_change_stream_event(&cs_event)?;
+                            let change_event = parse_change_stream_event(&cs_event);
 
                             if tx
                                 .send(ChangeStreamPayload::Event(Box::new(change_event)))
@@ -708,6 +708,7 @@ async fn run_change_stream_reader(
                         }
                         None => {
                             tracing::info!("change stream cursor exhausted");
+                            consecutive_failures = 0;
                             break 'recv;
                         }
                     }
@@ -766,7 +767,7 @@ async fn run_change_stream_reader(
 #[cfg(feature = "mongodb-cdc")]
 fn parse_change_stream_event(
     event: &mongodb::change_stream::event::ChangeStreamEvent<mongodb::bson::Document>,
-) -> Result<MongoDbChangeEvent, ConnectorError> {
+) -> MongoDbChangeEvent {
     use super::change_event::{Namespace, UpdateDescription};
     use mongodb::change_stream::event::OperationType as MongoOpType;
 
@@ -778,10 +779,10 @@ fn parse_change_stream_event(
         MongoOpType::Drop => OperationType::Drop,
         MongoOpType::Rename => OperationType::Rename,
         MongoOpType::Invalidate => OperationType::Invalidate,
+        MongoOpType::DropDatabase => OperationType::DropDatabase,
         ref other => {
-            return Err(ConnectorError::ReadError(format!(
-                "unknown operation type: {other:?}"
-            )));
+            tracing::warn!(?other, "unmapped MongoDB operation type");
+            OperationType::Other(format!("{other:?}"))
         }
     };
 
@@ -846,7 +847,7 @@ fn parse_change_stream_event(
     // Serialize the ResumeToken via serde (it implements Serialize).
     let resume_token = serde_json::to_string(&event.id).unwrap_or_default();
 
-    Ok(MongoDbChangeEvent {
+    MongoDbChangeEvent {
         operation_type,
         namespace,
         document_key,
@@ -856,7 +857,7 @@ fn parse_change_stream_event(
         cluster_time_inc,
         resume_token,
         wall_time_ms,
-    })
+    }
 }
 
 #[cfg(test)]

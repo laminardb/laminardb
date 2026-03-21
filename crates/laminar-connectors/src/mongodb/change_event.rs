@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 
 /// The type of operation described by a change event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum OperationType {
     /// A new document was inserted.
@@ -36,13 +36,17 @@ pub enum OperationType {
     Rename,
     /// The change stream was invalidated and must be restarted.
     Invalidate,
+    /// The database was dropped.
+    DropDatabase,
+    /// An operation type not yet mapped by this enum.
+    Other(String),
 }
 
 impl OperationType {
     /// Returns the single-character code for the operation, compatible with
     /// the CDC envelope format used elsewhere in `LaminarDB`.
     #[must_use]
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             Self::Insert => "I",
             Self::Update => "U",
@@ -51,12 +55,14 @@ impl OperationType {
             Self::Drop => "DROP",
             Self::Rename => "RENAME",
             Self::Invalidate => "INVALIDATE",
+            Self::DropDatabase => "DROP_DATABASE",
+            Self::Other(s) => s.as_str(),
         }
     }
 
     /// Returns `true` if this is a DML operation (insert/update/replace/delete).
     #[must_use]
-    pub fn is_dml(self) -> bool {
+    pub fn is_dml(&self) -> bool {
         matches!(
             self,
             Self::Insert | Self::Update | Self::Replace | Self::Delete
@@ -65,7 +71,7 @@ impl OperationType {
 
     /// Returns `true` if this is a lifecycle event (drop/rename/invalidate).
     #[must_use]
-    pub fn is_lifecycle(self) -> bool {
+    pub fn is_lifecycle(&self) -> bool {
         !self.is_dml()
     }
 }
