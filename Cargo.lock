@@ -4288,6 +4288,7 @@ dependencies = [
  "arrow-array",
  "arrow-avro",
  "arrow-cast",
+ "arrow-row",
  "arrow-schema",
  "arrow-select",
  "async-trait",

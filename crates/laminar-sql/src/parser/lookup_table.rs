@@ -62,6 +62,8 @@ pub enum ConnectorType {
     Redis,
     /// S3 Parquet connector.
     S3Parquet,
+    /// Delta Lake connector.
+    DeltaLake,
     /// Static in-memory data.
     Static,
     /// Custom connector type.
@@ -85,6 +87,7 @@ impl ConnectorType {
             "mysql-cdc" | "mysql_cdc" | "mysql" => Self::MysqlCdc,
             "redis" => Self::Redis,
             "s3-parquet" | "s3_parquet" | "s3" => Self::S3Parquet,
+            "delta-lake" | "delta_lake" | "delta" | "deltalake" => Self::DeltaLake,
             "static" | "memory" => Self::Static,
             other => Self::Custom(other.to_string()),
         })
@@ -563,6 +566,14 @@ mod tests {
         assert_eq!(
             ConnectorType::parse("static").unwrap(),
             ConnectorType::Static
+        );
+        assert_eq!(
+            ConnectorType::parse("delta-lake").unwrap(),
+            ConnectorType::DeltaLake
+        );
+        assert_eq!(
+            ConnectorType::parse("delta").unwrap(),
+            ConnectorType::DeltaLake
         );
         assert_eq!(
             ConnectorType::parse("custom-src").unwrap(),
