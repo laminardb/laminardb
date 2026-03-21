@@ -50,7 +50,7 @@ parking_lot = "0.12"  # Faster Mutex/RwLock
 memmap2 = "0.9"  # Memory-mapped files
 bumpalo = "3.20"  # Arena allocator
 uuid = { version = "1.22", features = ["v4", "v7", "serde"] }  # Unique IDs
-gethostname = "0.5"  # Pure Rust hostname lookup
+gethostname = "1.1"  # Pure Rust hostname lookup
 ahash = "0.8"  # Fast hashing for state stores
 papaya = "0.2"  # Lock-free concurrent HashMap
 foyer = { version = "0.22", features = ["serde"] }  # High-performance cache (S3-FIFO eviction, serde for HybridCache)
