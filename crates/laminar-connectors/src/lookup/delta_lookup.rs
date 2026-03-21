@@ -1,6 +1,6 @@
 //! Delta Lake on-demand lookup source for cache-miss fallback.
 //!
-//! Implements [`LookupSource`] backed by a `DataFusion` `TableProvider`.
+//! Implements `LookupSource` backed by a `DataFusion` `TableProvider`.
 //! Used as the `source` field in `PartialLookupState` for tables too
 //! large to snapshot into memory.
 

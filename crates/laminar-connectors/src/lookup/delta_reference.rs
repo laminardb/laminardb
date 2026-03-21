@@ -1,8 +1,8 @@
 //! Delta Lake reference table source for lookup/enrichment joins.
 //!
-//! Implements [`ReferenceTableSource`] to populate lookup tables from Delta
+//! Implements `ReferenceTableSource` to populate lookup tables from Delta
 //! Lake tables. Supports catalog resolution (Unity, Glue) via the existing
-//! [`delta_io::resolve_catalog_options`] function.
+//! `resolve_catalog_options` function in `delta_io`.
 
 use std::collections::VecDeque;
 
