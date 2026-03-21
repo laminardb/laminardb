@@ -36,9 +36,9 @@ cargo run --release --bin laminardb -- --log-level debug --admin-bind 0.0.0.0:80
 
 ## Related Crates
 
-This crate will depend on all other LaminarDB crates and serve as the integration point:
+This crate depends on the core LaminarDB crates:
 
 - [`laminar-db`](../laminar-db) -- Database facade
-- [`laminar-admin`](../laminar-admin) -- REST API (planned)
-- [`laminar-observe`](../laminar-observe) -- Metrics and health endpoints (planned)
-- [`laminar-auth`](../laminar-auth) -- Authentication (planned)
+- [`laminar-connectors`](../laminar-connectors) -- External system connectors
+- [`laminar-core`](../laminar-core) -- Streaming engine
+- [`laminar-storage`](../laminar-storage) -- WAL and checkpoint storage

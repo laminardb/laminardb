@@ -50,11 +50,8 @@ cargo +nightly fmt --all -- --check
 | `laminar-core` | 0 | Reactor, operators, state stores, streaming channels, JIT compiler |
 | `laminar-sql` | -- | SQL parser (streaming extensions), query planner, DataFusion integration |
 | `laminar-storage` | 1 | WAL, incremental checkpointing, checkpoint manifest |
-| `laminar-connectors` | 1 | Kafka, PostgreSQL CDC, MySQL CDC, WebSocket, Delta Lake, Iceberg, connector SDK |
+| `laminar-connectors` | 1 | Kafka, PostgreSQL CDC, MySQL CDC, MongoDB CDC, WebSocket, Delta Lake, files |
 | `laminar-db` | -- | Unified database facade, checkpoint coordination, FFI API |
-| `laminar-auth` | 2 | JWT authentication, RBAC, ABAC (stubs -- Phase 4) |
-| `laminar-admin` | 2 | REST API (Axum), Swagger UI (stubs -- Phase 5) |
-| `laminar-observe` | 2 | Prometheus metrics, OpenTelemetry tracing (stubs -- Phase 5) |
 | `laminar-derive` | -- | Proc macros: `Record`, `FromRecordBatch`, `FromRow`, `ConnectorConfig` |
 | `laminar-server` | -- | Standalone server binary |
 
@@ -119,8 +116,10 @@ Many features are optional to keep compile times manageable:
 | `postgres-cdc` | laminar-connectors, laminar-db | PostgreSQL CDC source |
 | `postgres-sink` | laminar-connectors, laminar-db | PostgreSQL sink |
 | `mysql-cdc` | laminar-connectors, laminar-db | MySQL CDC source |
+| `mongodb-cdc` | laminar-connectors, laminar-db | MongoDB CDC source and sink |
 | `websocket` | laminar-connectors, laminar-db | WebSocket source and sink |
 | `delta-lake` | laminar-connectors, laminar-db | Delta Lake sink and source |
+| `files` | laminar-connectors, laminar-db | File source and sink |
 | `delta-lake-s3` | laminar-connectors | S3 storage backend for Delta Lake |
 | `ffi` | laminar-db | C FFI layer |
 | `api` | laminar-db | FFI-friendly API module |

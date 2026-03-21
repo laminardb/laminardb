@@ -1,10 +1,10 @@
 # laminar-connectors
 
-External system connectors for LaminarDB -- Kafka, CDC, WebSocket, lakehouse sinks, and the Connector SDK.
+External system connectors for LaminarDB -- Kafka, CDC, MongoDB, WebSocket, Delta Lake, and files.
 
 ## Overview
 
-Source and sink connectors for Kafka, CDC, WebSocket, lakehouse sinks, and custom connectors. Each connector implements the `SourceConnector` or `SinkConnector` trait and supports exactly-once semantics via two-phase commit.
+Source and sink connectors for external systems. Each connector implements the `SourceConnector` or `SinkConnector` trait and supports exactly-once semantics via two-phase commit.
 
 ## Connectors
 
@@ -15,9 +15,11 @@ Source and sink connectors for Kafka, CDC, WebSocket, lakehouse sinks, and custo
 | Kafka | `kafka` | rdkafka consumer groups, Schema Registry | Implemented |
 | PostgreSQL CDC | `postgres-cdc` | pgoutput logical replication | Implemented |
 | MySQL CDC | `mysql-cdc` | Binlog decoding, GTID position tracking | Implemented |
+| MongoDB CDC | `mongodb-cdc` | Change streams, resume token tracking | Implemented |
 | WebSocket Client | `websocket` | tokio-tungstenite | Implemented |
 | WebSocket Server | `websocket` | tokio-tungstenite listener | Implemented |
 | Delta Lake Source | `delta-lake` | Version polling via deltalake crate | Implemented |
+| File Auto-Loader | `files` | Directory watch, glob pattern discovery | Implemented |
 
 ### Sink Connectors
 
@@ -25,31 +27,33 @@ Source and sink connectors for Kafka, CDC, WebSocket, lakehouse sinks, and custo
 |-----------|-------------|----------|--------|
 | Kafka | `kafka` | rdkafka transactions | Implemented |
 | PostgreSQL | `postgres-sink` | COPY BINARY, upsert, co-transactional | Implemented |
+| MongoDB | `mongodb-cdc` | Ordered/unordered writes, upsert, CDC replay | Implemented |
 | Delta Lake | `delta-lake` | Epoch-aligned Parquet commits | Implemented |
-| Apache Iceberg | -- | Buffering, partition transforms | Implemented (business logic) |
 | WebSocket Server | `websocket` | Fan-out to connected subscribers | Implemented |
 | WebSocket Client | `websocket` | Push to external server | Implemented |
+| Files | `files` | CSV, JSON, Parquet, rolling file output | Implemented |
 
 ## Key Modules
 
 | Module | Purpose |
 |--------|---------|
 | `connector` | Core traits: `SourceConnector`, `SinkConnector`, `SourceBatch`, `WriteResult` |
+| `config` | `ConnectorConfig`, `ConfigKeySpec`, `ConnectorInfo`, `ConnectorState` |
+| `registry` | `ConnectorRegistry` for registering and looking up connectors by name |
 | `kafka` | Kafka source/sink, Avro serde, schema registry, partitioner, backpressure |
 | `postgres` | PostgreSQL sink (COPY BINARY, upsert, exactly-once) |
 | `cdc/postgres` | PostgreSQL CDC source (pgoutput decoder, Z-set changelog, replication I/O) |
 | `cdc/mysql` | MySQL CDC source (binlog decoder, GTID, Z-set changelog) |
+| `mongodb` | MongoDB CDC source (change streams, resume tokens) and sink (ordered/unordered writes) |
 | `websocket` | WebSocket source/sink (client, server, fan-out, backpressure, reconnect) |
-| `lakehouse` | Delta Lake and Iceberg sinks (buffering, epoch, changelog) |
-| `storage` | Cloud storage: provider detection, credential resolver, config validation, secret masking |
-| `bridge` | DAG-to-connector bridge (source/sink bridges, runtime orchestration) |
-| `sdk` | Connector SDK: retry policies, rate limiting, circuit breaker, test harness |
-| `serde` | Format implementations: JSON, CSV, raw, Debezium, Avro |
-| `schema` | Schema framework: inference, resolution, evolution, decoders (JSON/CSV/Avro/Parquet), DLQ |
-| `registry` | `ConnectorRegistry` for registering and looking up connectors by name |
-| `lookup` | Lookup table support for enrichment joins |
+| `lakehouse` | Delta Lake source and sink (buffering, epoch, changelog) |
+| `files` | File source (auto-loader, glob, watch) and sink (rolling, CSV/JSON/Parquet) |
+| `lookup` | Lookup table support: PostgreSQL and Parquet reference tables |
 | `reference` | Reference table source trait and refresh modes |
-| `error_handling` | Dead letter queue and error routing for malformed records |
+| `storage` | Cloud storage: provider detection, credential resolver, config validation, secret masking |
+| `serde` | Format implementations: JSON, CSV, raw, Debezium, Avro |
+| `schema` | Schema framework: inference, resolution, evolution, decoders (JSON/CSV/Avro/Parquet) |
+| `testing` | Mock connectors for unit testing |
 
 ## Schema Framework
 
@@ -73,6 +77,7 @@ Source and sink connectors for Kafka, CDC, WebSocket, lakehouse sinks, and custo
 | `postgres-cdc` | PostgreSQL CDC via pgwire-replication |
 | `postgres-sink` | PostgreSQL sink via tokio-postgres |
 | `mysql-cdc` | MySQL CDC via mysql_async (rustls, no OpenSSL) |
+| `mongodb-cdc` | MongoDB CDC source/sink via mongodb crate |
 | `delta-lake` | Delta Lake sink/source via deltalake crate |
 | `delta-lake-s3` | S3 storage backend for Delta Lake |
 | `delta-lake-azure` | Azure storage backend for Delta Lake |
@@ -81,27 +86,21 @@ Source and sink connectors for Kafka, CDC, WebSocket, lakehouse sinks, and custo
 | `delta-lake-glue` | AWS Glue catalog for Delta Lake |
 | `parquet-lookup` | Parquet file lookup source |
 | `websocket` | WebSocket source and sink (tokio-tungstenite) |
+| `files` | File source (auto-loader) and sink (rolling files) |
 | `kafka-discovery` | Kafka-based discovery for delta mode |
 
-## Connector SDK
+## Custom Connectors
 
-Build custom connectors with operational resilience:
+Build custom connectors by implementing the `SourceConnector` or `SinkConnector` trait and registering with the `ConnectorRegistry`:
 
 ```rust
 use laminar_connectors::connector::{SourceConnector, SinkConnector};
-use laminar_connectors::sdk::{RetryPolicy, CircuitBreaker, RateLimiter};
 use laminar_connectors::registry::ConnectorRegistry;
 
 // Register a custom source
 let registry = ConnectorRegistry::new();
 registry.register_source("my-source", info, factory_fn);
 ```
-
-The SDK provides:
-- **RetryPolicy** -- configurable retry with exponential backoff
-- **CircuitBreaker** -- fail-fast when downstream is unavailable
-- **RateLimiter** -- rate-limit source polling or sink writes
-- **Test Harness** -- mock connectors for unit testing
 
 ## Related Crates
 
