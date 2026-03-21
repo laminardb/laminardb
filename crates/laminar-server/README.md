@@ -123,6 +123,8 @@ format = "json"
 | POST | `/api/v1/sql` | Execute ad-hoc SQL (`{"sql": "..."}`) |
 | POST | `/api/v1/reload` | Hot-reload configuration |
 | GET | `/api/v1/cluster` | Cluster status (delta mode only) |
+| POST | `/api/v1/pause` | Pause pipeline (stub — returns 501) |
+| POST | `/api/v1/resume` | Resume pipeline (stub — returns 501) |
 
 ## Hot Reload
 

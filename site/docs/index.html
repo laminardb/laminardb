@@ -618,6 +618,16 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
           <span class="endpoint-path">/api/v1/cluster</span>
           <span class="endpoint-desc">Cluster status (delta mode only)</span>
         </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-post">POST</span>
+          <span class="endpoint-path">/api/v1/pause</span>
+          <span class="endpoint-desc">Pause pipeline (not yet implemented &mdash; returns 501)</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-post">POST</span>
+          <span class="endpoint-path">/api/v1/resume</span>
+          <span class="endpoint-desc">Resume pipeline (not yet implemented &mdash; returns 501)</span>
+        </div>
       </div>
 
       <!-- HOT RELOAD -->
@@ -650,15 +660,22 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
         <tbody>
           <tr><td class="field-name">laminardb_events_ingested_total</td><td class="field-type">counter</td><td>Total events ingested across all sources</td></tr>
           <tr><td class="field-name">laminardb_events_emitted_total</td><td class="field-type">counter</td><td>Total events emitted to sinks</td></tr>
+          <tr><td class="field-name">laminardb_events_dropped_total</td><td class="field-type">counter</td><td>Total events dropped (late data, errors)</td></tr>
           <tr><td class="field-name">laminardb_source_events_total</td><td class="field-type">counter</td><td>Events per source (label: <code>source</code>)</td></tr>
+          <tr><td class="field-name">laminardb_source_count</td><td class="field-type">gauge</td><td>Number of configured sources</td></tr>
+          <tr><td class="field-name">laminardb_stream_count</td><td class="field-type">gauge</td><td>Number of running streams</td></tr>
+          <tr><td class="field-name">laminardb_sink_count</td><td class="field-type">gauge</td><td>Number of configured sinks</td></tr>
           <tr><td class="field-name">laminardb_checkpoints_completed_total</td><td class="field-type">counter</td><td>Successful checkpoints</td></tr>
           <tr><td class="field-name">laminardb_checkpoints_failed_total</td><td class="field-type">counter</td><td>Failed checkpoints</td></tr>
           <tr><td class="field-name">laminardb_checkpoint_epoch</td><td class="field-type">gauge</td><td>Current checkpoint epoch</td></tr>
           <tr><td class="field-name">laminardb_checkpoint_last_duration_ms</td><td class="field-type">gauge</td><td>Last checkpoint duration (ms)</td></tr>
+          <tr><td class="field-name">laminardb_cycle_duration_p50_ns</td><td class="field-type">gauge</td><td>p50 processing cycle latency (ns)</td></tr>
+          <tr><td class="field-name">laminardb_cycle_duration_p95_ns</td><td class="field-type">gauge</td><td>p95 processing cycle latency (ns)</td></tr>
           <tr><td class="field-name">laminardb_cycle_duration_p99_ns</td><td class="field-type">gauge</td><td>p99 processing cycle latency (ns)</td></tr>
           <tr><td class="field-name">laminardb_uptime_seconds</td><td class="field-type">gauge</td><td>Server uptime</td></tr>
           <tr><td class="field-name">laminardb_pipeline_state_info</td><td class="field-type">gauge</td><td>Pipeline state (label: <code>state</code>)</td></tr>
           <tr><td class="field-name">laminardb_reload_total</td><td class="field-type">counter</td><td>Config reload count</td></tr>
+          <tr><td class="field-name">laminardb_reload_last_timestamp</td><td class="field-type">gauge</td><td>Unix timestamp of last reload</td></tr>
         </tbody>
       </table>
 
