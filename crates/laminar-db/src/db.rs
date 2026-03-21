@@ -986,6 +986,7 @@ impl LaminarDB {
                         ConnectorType::MysqlCdc => "mysql-cdc",
                         ConnectorType::Redis => "redis",
                         ConnectorType::S3Parquet => "s3-parquet",
+                        ConnectorType::DeltaLake => "delta-lake",
                         ConnectorType::Custom(s) => s.as_str(),
                         ConnectorType::Static => unreachable!(),
                     };

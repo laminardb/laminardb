@@ -268,6 +268,7 @@ impl fmt::Display for crate::parser::lookup_table::ConnectorType {
             Self::MysqlCdc => write!(f, "mysql-cdc"),
             Self::Redis => write!(f, "redis"),
             Self::S3Parquet => write!(f, "s3-parquet"),
+            Self::DeltaLake => write!(f, "delta-lake"),
             Self::Static => write!(f, "static"),
             Self::Custom(s) => write!(f, "{s}"),
         }

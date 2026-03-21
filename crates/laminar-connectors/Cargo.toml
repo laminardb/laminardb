@@ -56,6 +56,7 @@ rustc-hash = { workspace = true }
 # Arrow for RecordBatch
 arrow-array = { workspace = true }
 arrow-cast = { workspace = true }
+arrow-row = { version = "57.2", optional = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 
@@ -95,7 +96,7 @@ mysql-cdc = ["dep:mysql_async", "dep:tokio-stream"]
 # MongoDB CDC source and sink
 mongodb-cdc = ["dep:mongodb", "dep:bson", "dep:tokio-stream", "dep:futures-util"]
 # Delta Lake
-delta-lake = ["dep:deltalake", "dep:url", "dep:datafusion", "deltalake/datafusion", "dep:tokio-util", "dep:tokio-stream"]
+delta-lake = ["dep:deltalake", "dep:url", "dep:datafusion", "deltalake/datafusion", "dep:tokio-util", "dep:tokio-stream", "dep:arrow-row"]
 delta-lake-s3 = ["delta-lake", "deltalake/s3"]
 delta-lake-azure = ["delta-lake", "deltalake/azure"]
 delta-lake-gcs = ["delta-lake", "deltalake/gcs"]
