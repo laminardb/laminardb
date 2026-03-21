@@ -6,7 +6,7 @@ Storage layer for LaminarDB -- WAL, checkpointing, and recovery.
 
 Ring 1 durability: write-ahead logging with per-core segments, incremental checkpointing with directory-based snapshots, and checkpoint manifests. Never blocks Ring 0.
 
-Note: Lakehouse sinks (Delta Lake, Iceberg) are in `laminar-connectors`, not here. This crate handles LaminarDB's internal durability.
+Note: Lakehouse connectors (Delta Lake) are in `laminar-connectors`, not here. This crate handles LaminarDB's internal durability.
 
 ## Key Modules
 

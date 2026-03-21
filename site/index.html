@@ -42,7 +42,7 @@
     "url": "https://laminardb.io",
     "codeRepository": "https://github.com/laminardb/laminardb",
     "programmingLanguage": ["Rust", "Python", "SQL"],
-    "softwareVersion": "0.18.9",
+    "softwareVersion": "0.18.12",
     "author": {
       "@type": "Organization",
       "name": "LaminarDB Contributors",
@@ -66,7 +66,7 @@
           <path d="M4 32 C12 32,14 30,22 30 C30 30,32 34,36 34" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
         </svg>
         <span>LaminarDB</span>
-        <span class="version-badge" data-version="tag">v0.18.9</span>
+        <span class="version-badge" data-version="tag">v0.18.12</span>
       </a>
 
       <nav class="nav-links" aria-label="Main navigation">
@@ -470,6 +470,13 @@ CREATE SINK lake INTO DELTA_LAKE (
                 <td>Binlog replication. GTID or file+position modes.</td>
               </tr>
               <tr>
+                <td>MongoDB CDC</td>
+                <td>Source + Sink</td>
+                <td><span class="status-impl">Implemented</span></td>
+                <td><code class="feature-flag">mongodb-cdc</code></td>
+                <td>Change streams, resume tokens. Sink: ordered/unordered writes, upsert, CDC replay.</td>
+              </tr>
+              <tr>
                 <td>Delta Lake</td>
                 <td>Source + Sink</td>
                 <td><span class="status-impl">Implemented</span></td>
@@ -531,6 +538,10 @@ CREATE SINK lake INTO DELTA_LAKE (
               <a href="https://github.com/laminardb/laminardb/releases/latest" target="_blank" rel="noopener">Download pre-compiled binaries</a>
               for Linux (x86_64, aarch64, musl), macOS (x86_64, Apple Silicon), and Windows.
               Or <code>cargo install laminar-server</code>. Docker image and Helm chart available.
+            </p>
+            <p>
+              TOML configuration with <code>${ENV_VAR}</code> substitution.
+              REST API, Prometheus metrics, ad-hoc SQL, and hot-reload (edit config &rarr; automatic apply).
             </p>
             <p>Use for: CDC pipelines, stream-to-lakehouse, event routing.</p>
           </div>
@@ -627,7 +638,7 @@ CREATE SINK lake INTO DELTA_LAKE (
               </tr>
               <tr>
                 <td>Connectors</td>
-                <td class="hl">8</td>
+                <td class="hl">10</td>
                 <td class="win">100+</td>
                 <td>Kafka only</td>
                 <td class="win">15+</td>
@@ -651,7 +662,7 @@ CREATE SINK lake INTO DELTA_LAKE (
               </tr>
               <tr>
                 <td>Maturity</td>
-                <td class="hl">Pre-1.0 (<span data-version="tag">v0.18.9</span>)</td>
+                <td class="hl">Pre-1.0 (<span data-version="tag">v0.18.12</span>)</td>
                 <td class="win">Production (10+ yrs)</td>
                 <td class="win">Production (8+ yrs)</td>
                 <td class="win">Production (~2 yrs)</td>
@@ -758,7 +769,7 @@ CREATE SINK lake INTO DELTA_LAKE (
       <div class="container">
         <h2>Status</h2>
         <p class="section-desc">
-          Current version: <strong data-version="bare">0.18.9</strong> (pre-1.0).
+          Current version: <strong data-version="bare">0.18.12</strong> (pre-1.0).
           <a href="https://github.com/laminardb/laminardb/releases" target="_blank" rel="noopener">Releases</a> &middot;
           <a href="https://github.com/laminardb/laminardb/blob/main/docs/ROADMAP.md" target="_blank" rel="noopener">Roadmap</a>
         </p>
@@ -770,11 +781,11 @@ CREATE SINK lake INTO DELTA_LAKE (
               <li>Core engine (reactor, state stores, DAG executor)</li>
               <li>Window functions (tumbling, sliding, hopping, session)</li>
               <li>Joins (interval, ASOF, temporal, lookup, semi/anti)</li>
-              <li>All 8 connectors (Kafka, CDC, Delta, WS, files)</li>
+              <li>All 10 connectors (Kafka, CDC, MongoDB, Delta, WS, files)</li>
               <li>Barrier-based checkpointing with 2PC exactly-once</li>
               <li>Per-core WAL for durability</li>
-              <li>Standalone server with REST API</li>
-              <li>Docker and Helm chart deployment</li>
+              <li>Standalone server with REST API, Prometheus metrics, hot-reload</li>
+              <li>Docker (multi-arch) and Helm chart deployment</li>
             </ul>
           </div>
           <div class="status-col experimental">
@@ -789,7 +800,7 @@ CREATE SINK lake INTO DELTA_LAKE (
             <ul>
               <li>Cluster / multi-node deployment (coming soon)</li>
               <li>PostgreSQL wire protocol (planned)</li>
-              <li>MongoDB, Redis connectors</li>
+              <li>Redis connector</li>
             </ul>
           </div>
         </div>
@@ -822,13 +833,14 @@ CREATE SINK lake INTO DELTA_LAKE (
         <div class="footer-left">
           LaminarDB &middot;
           <a href="https://github.com/laminardb/laminardb/blob/main/LICENSE" target="_blank" rel="noopener">Apache 2.0</a> &middot;
-          <span data-version="tag">v0.18.9</span>
+          <span data-version="tag">v0.18.12</span>
         </div>
         <div class="footer-links">
           <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
           <a href="https://crates.io/crates/laminar-db" target="_blank" rel="noopener">Crates.io</a>
           <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API Docs</a>
           <a href="https://github.com/laminardb/laminardb/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
+          <a href="mailto:support@laminardb.io">Support</a>
         </div>
       </div>
     </div>
