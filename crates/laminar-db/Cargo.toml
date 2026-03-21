@@ -19,6 +19,7 @@ postgres-sink = ["laminar-connectors/postgres-sink"]
 delta-lake = ["laminar-connectors/delta-lake"]
 websocket = ["laminar-connectors/websocket"]
 mysql-cdc = ["laminar-connectors/mysql-cdc"]
+mongodb-cdc = ["laminar-connectors/mongodb-cdc"]
 iceberg = ["laminar-connectors/delta-lake"]  # Iceberg shares the lakehouse module
 delta-lake-s3 = ["laminar-connectors/delta-lake-s3"]
 delta-lake-azure = ["laminar-connectors/delta-lake-azure"]
