@@ -114,6 +114,10 @@ pub mod reference;
 #[cfg(feature = "websocket")]
 pub mod websocket;
 
+/// MongoDB CDC source and sink connectors.
+#[cfg(feature = "mongodb-cdc")]
+pub mod mongodb;
+
 /// AutoLoader-style file source and sink connectors.
 #[cfg(feature = "files")]
 #[allow(

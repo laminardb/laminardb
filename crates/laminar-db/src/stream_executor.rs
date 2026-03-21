@@ -3893,6 +3893,9 @@ mod tests {
         let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
+        // Debug builds on CI can exceed the default 8ms budget on level1 aggregation,
+        // causing level2 to be skipped. Use a generous budget.
+        executor.set_query_budget_ns(5_000_000_000);
 
         // level1: aggregate events
         executor.add_query(
