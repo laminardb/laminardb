@@ -8,6 +8,7 @@
 //! Run with: `cargo test --test mongodb_integration --features mongodb-cdc`
 
 #![cfg(feature = "mongodb-cdc")]
+#![cfg(not(target_os = "windows"))]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,7 +37,7 @@ async fn start_mongo() -> (testcontainers::ContainerAsync<GenericImage>, String)
             "Waiting for connections",
         ))
         // Replica set required for change streams.
-        .with_cmd(["--replSet", "rs0"])
+        .with_cmd(["mongod", "--replSet", "rs0"])
         .start()
         .await
         .expect("failed to start MongoDB container");
