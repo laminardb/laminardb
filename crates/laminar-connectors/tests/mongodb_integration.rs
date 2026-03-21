@@ -36,7 +36,7 @@ async fn start_mongo() -> (testcontainers::ContainerAsync<GenericImage>, String)
             "Waiting for connections",
         ))
         // Replica set required for change streams.
-        .with_cmd(["--replSet", "rs0"])
+        .with_cmd(["mongod", "--replSet", "rs0"])
         .start()
         .await
         .expect("failed to start MongoDB container");
