@@ -56,6 +56,12 @@ impl LaminarDB {
         self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Check if the streaming pipeline is currently running (or starting).
+    pub(crate) fn is_pipeline_running(&self) -> bool {
+        let s = self.state.load(std::sync::atomic::Ordering::Acquire);
+        s == STATE_RUNNING || s == STATE_STARTING
+    }
+
     /// Start the streaming pipeline.
     ///
     /// Activates all registered connectors and begins processing.

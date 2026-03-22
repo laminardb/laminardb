@@ -2105,6 +2105,103 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // -----------------------------------------------------------------------
+    // Pipeline-running state guards
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_create_source_with_connector_rejected_when_running() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE seed (id INT)").await.unwrap();
+        db.start().await.unwrap();
+
+        // WITH syntax
+        let result = db
+            .execute("CREATE SOURCE events (id INT) WITH ('connector' = 'kafka', 'topic' = 'x')")
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("pipeline is running"),
+            "expected pipeline-running error, got: {err}"
+        );
+
+        // FROM syntax (what server mode generates via source_to_ddl)
+        let result = db
+            .execute("CREATE SOURCE events2 (id INT) FROM KAFKA (topic = 'x')")
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("pipeline is running"),
+            "expected pipeline-running error for FROM syntax, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_source_without_connector_allowed_when_running() {
+        let db = LaminarDB::open().unwrap();
+        db.start().await.unwrap();
+
+        // Schema-only source (no connector) — used by embedded db.insert() API.
+        let result = db.execute("CREATE SOURCE events (id INT)").await;
+        assert!(
+            result.is_ok(),
+            "schema-only source should be allowed when running"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_sink_with_connector_rejected_when_running() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT)").await.unwrap();
+        db.start().await.unwrap();
+
+        let result = db
+            .execute(
+                "CREATE SINK output FROM events \
+                 WITH ('connector' = 'kafka', 'topic' = 'out')",
+            )
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("pipeline is running"),
+            "expected pipeline-running error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_source_rejected_when_running() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT)").await.unwrap();
+        db.start().await.unwrap();
+
+        let result = db.execute("DROP SOURCE events").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("pipeline is running"),
+            "expected pipeline-running error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_sink_rejected_when_running() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT)").await.unwrap();
+        db.execute("CREATE SINK output FROM events").await.unwrap();
+        db.start().await.unwrap();
+
+        let result = db.execute("DROP SINK output").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("pipeline is running"),
+            "expected pipeline-running error, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_connector_registry_accessor() {
         let db = LaminarDB::open().unwrap();
