@@ -37,6 +37,11 @@ deltalake = { version = "0.31", optional = true, default-features = false, featu
 deltalake-catalog-glue = { version = "0.15", optional = true }
 datafusion = { workspace = true, optional = true }
 url = { version = "2", optional = true }
+
+# Apache Iceberg
+iceberg = { workspace = true, optional = true }
+iceberg-catalog-rest = { workspace = true, optional = true }
+iceberg-storage-opendal = { workspace = true, optional = true }
 uuid = { workspace = true }
 
 # Bytes (for cache value types)
@@ -102,6 +107,8 @@ delta-lake-azure = ["delta-lake", "deltalake/azure"]
 delta-lake-gcs = ["delta-lake", "deltalake/gcs"]
 delta-lake-unity = ["delta-lake", "deltalake/unity-experimental", "dep:reqwest"]
 delta-lake-glue = ["delta-lake", "delta-lake-s3", "deltalake/glue", "dep:deltalake-catalog-glue"]
+# Apache Iceberg
+iceberg = ["dep:iceberg", "dep:iceberg-catalog-rest", "dep:iceberg-storage-opendal", "dep:tokio-stream", "dep:parquet"]
 # Parquet file lookup source
 parquet-lookup = ["dep:parquet", "dep:object_store"]
 # Kafka-based discovery for delta
