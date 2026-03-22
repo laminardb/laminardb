@@ -663,6 +663,82 @@ impl LaminarDB {
             }
         }
 
+        // On-demand (Manual) tables: register as Partial in the lookup
+        // registry so lookup joins use the foyer cache + source fallback path,
+        // then promote to SnapshotPlusCdc so poll_tables() calls poll_changes().
+        for (name, _source, mode) in &mut table_sources {
+            if !matches!(mode, RefreshMode::Manual) {
+                continue;
+            }
+            let Some(reg) = table_regs.get(name.as_str()) else {
+                continue;
+            };
+            let max_entries = reg.cache_max_entries.unwrap_or(65_536);
+            let Some(schema) = self.table_store.read().table_schema(name) else {
+                continue;
+            };
+            let pk_csv = &reg.primary_key;
+            let pk_cols: Vec<String> = pk_csv
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let key_sort_fields: Vec<arrow::row::SortField> = pk_cols
+                .iter()
+                .filter_map(|col| {
+                    schema
+                        .field_with_name(col)
+                        .ok()
+                        .map(|f| arrow::row::SortField::new(f.data_type().clone()))
+                })
+                .collect();
+
+            let cache = Arc::new(laminar_core::lookup::foyer_cache::FoyerMemoryCache::new(
+                0,
+                laminar_core::lookup::foyer_cache::FoyerMemoryCacheConfig {
+                    capacity: max_entries,
+                    shards: 16,
+                },
+            ));
+            // Try to create a lookup source for cache-miss fallback via
+            // the registry factory (no cross-crate type dependency).
+            let lookup_source = if let Ok(mut config) = build_table_config(reg) {
+                config.set("_primary_key_columns", pk_csv.as_str());
+                match self.connector_registry.create_lookup_source(config).await {
+                    Some(Ok(src)) => Some(src),
+                    Some(Err(e)) => {
+                        tracing::warn!(
+                            table = %name, error = %e,
+                            "lookup source creation failed; cache-only mode"
+                        );
+                        None
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            self.lookup_registry.register_partial(
+                name,
+                laminar_sql::datafusion::PartialLookupState {
+                    foyer_cache: cache,
+                    schema,
+                    key_columns: pk_cols,
+                    key_sort_fields,
+                    source: lookup_source,
+                    fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
+                },
+            );
+            *mode = RefreshMode::SnapshotPlusCdc;
+            tracing::info!(
+                table = %name,
+                max_entries,
+                pk = %pk_csv,
+                "registered on-demand lookup table (partial cache)"
+            );
+        }
+
         // Get stream source handles so results also flow to db.subscribe().
         let mut stream_sources: Vec<(String, streaming::Source<crate::catalog::ArrowRecord>)> =
             Vec::new();
