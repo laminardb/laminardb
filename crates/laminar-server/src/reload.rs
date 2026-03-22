@@ -142,6 +142,10 @@ pub fn diff_configs(old: &ServerConfig, new: &ServerConfig) -> ConfigDiff {
         diff.warnings
             .push("[discovery] section changed — requires restart".to_string());
     }
+    if old.sql != new.sql {
+        diff.warnings
+            .push("sql field changed — requires restart".to_string());
+    }
     if old.coordination != new.coordination {
         diff.warnings
             .push("[coordination] section changed — requires restart".to_string());
@@ -494,6 +498,7 @@ mod tests {
             discovery: None,
             coordination: None,
             node_id: None,
+            sql: None,
         }
     }
 

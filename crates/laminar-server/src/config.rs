@@ -187,6 +187,11 @@ pub struct ServerConfig {
     #[serde(default, rename = "sink")]
     pub sinks: Vec<SinkConfig>,
 
+    /// Raw SQL DDL executed before `start()`, as an alternative to structured
+    /// `[[source]]`/`[[pipeline]]`/`[[sink]]` sections. Supports `${VAR}` env substitution.
+    #[serde(default)]
+    pub sql: Option<String>,
+
     /// Delta mode discovery settings (optional; absent = embedded mode).
     pub discovery: Option<DiscoverySection>,
 
@@ -890,6 +895,7 @@ bind = "not-a-socket-addr"
             discovery: None,
             coordination: None,
             node_id: None,
+            sql: None,
         };
 
         assert_eq!(config.server.mode, "embedded");
