@@ -32,8 +32,10 @@ pub struct IcebergReferenceTableSource {
     snapshot_complete: bool,
     /// Buffered change batches (from newer snapshots).
     change_batches: VecDeque<RecordBatch>,
-    /// Last fully-ingested snapshot ID.
-    last_snapshot_id: Option<i64>,
+    /// Snapshot ID that has been loaded (may still have undelivered batches).
+    loaded_snapshot_id: Option<i64>,
+    /// Snapshot ID whose batches have been fully delivered — safe to checkpoint.
+    delivered_snapshot_id: Option<i64>,
     /// Time of last change poll.
     last_poll_time: Option<Instant>,
     /// Current epoch.
@@ -52,7 +54,8 @@ impl IcebergReferenceTableSource {
             snapshot_batches: VecDeque::new(),
             snapshot_complete: false,
             change_batches: VecDeque::new(),
-            last_snapshot_id: None,
+            loaded_snapshot_id: None,
+            delivered_snapshot_id: None,
             last_poll_time: None,
             epoch: 0,
             #[cfg(feature = "iceberg")]
@@ -93,7 +96,7 @@ impl IcebergReferenceTableSource {
         info!(snapshot = ?snap_id, rows, "iceberg reference: initial snapshot loaded");
 
         self.snapshot_batches.extend(batches);
-        self.last_snapshot_id = snap_id;
+        self.loaded_snapshot_id = snap_id;
         self.catalog = Some(catalog);
 
         Ok(())
@@ -126,12 +129,12 @@ impl IcebergReferenceTableSource {
 
         let current_snap = super::iceberg_io::current_snapshot_id(&table);
 
-        if current_snap == self.last_snapshot_id {
+        if current_snap == self.loaded_snapshot_id {
             return Ok(());
         }
 
         // Incremental read if we have a previous snapshot, full scan otherwise.
-        let batches = if let (Some(old), Some(new)) = (self.last_snapshot_id, current_snap) {
+        let batches = if let (Some(old), Some(new)) = (self.loaded_snapshot_id, current_snap) {
             super::iceberg_incremental::scan_incremental(
                 &table,
                 old,
@@ -145,14 +148,14 @@ impl IcebergReferenceTableSource {
 
         let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         debug!(
-            old_snapshot = ?self.last_snapshot_id,
+            old_snapshot = ?self.loaded_snapshot_id,
             new_snapshot = ?current_snap,
             rows,
             "iceberg reference: change snapshot loaded"
         );
 
         self.change_batches.extend(batches);
-        self.last_snapshot_id = current_snap;
+        self.loaded_snapshot_id = current_snap;
 
         Ok(())
     }
@@ -163,7 +166,7 @@ impl ReferenceTableSource for IcebergReferenceTableSource {
     async fn poll_snapshot(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
         if !self.snapshot_complete
             && self.snapshot_batches.is_empty()
-            && self.last_snapshot_id.is_none()
+            && self.loaded_snapshot_id.is_none()
         {
             #[cfg(feature = "iceberg")]
             self.load_initial_snapshot().await?;
@@ -173,6 +176,8 @@ impl ReferenceTableSource for IcebergReferenceTableSource {
             return Ok(Some(batch));
         }
 
+        // All snapshot batches delivered — safe to checkpoint this snapshot.
+        self.delivered_snapshot_id = self.loaded_snapshot_id;
         self.snapshot_complete = true;
         Ok(None)
     }
@@ -186,6 +191,9 @@ impl ReferenceTableSource for IcebergReferenceTableSource {
             return Ok(Some(batch));
         }
 
+        // All change batches from the previous snapshot have been delivered.
+        self.delivered_snapshot_id = self.loaded_snapshot_id;
+
         #[cfg(feature = "iceberg")]
         self.poll_for_changes().await?;
 
@@ -194,7 +202,7 @@ impl ReferenceTableSource for IcebergReferenceTableSource {
 
     fn checkpoint(&self) -> SourceCheckpoint {
         let mut cp = SourceCheckpoint::new(self.epoch);
-        if let Some(sid) = self.last_snapshot_id {
+        if let Some(sid) = self.delivered_snapshot_id {
             cp.set_offset("snapshot_id", sid.to_string());
         }
         cp.set_metadata("connector_type", "iceberg-reference");
@@ -204,11 +212,14 @@ impl ReferenceTableSource for IcebergReferenceTableSource {
     async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
         self.epoch = checkpoint.epoch();
         if let Some(sid) = checkpoint.get_offset("snapshot_id") {
-            self.last_snapshot_id = Some(sid.parse().map_err(|_| {
+            let snap: i64 = sid.parse().map_err(|_| {
                 ConnectorError::CheckpointError(format!(
                     "invalid snapshot_id in checkpoint: '{sid}'"
                 ))
-            })?);
+            })?;
+            // Both cursors restored to the last fully-delivered snapshot.
+            self.delivered_snapshot_id = Some(snap);
+            self.loaded_snapshot_id = Some(snap);
         }
         Ok(())
     }
@@ -240,13 +251,15 @@ mod tests {
         let source = IcebergReferenceTableSource::new(test_source_config());
         assert!(!source.snapshot_complete);
         assert!(source.snapshot_batches.is_empty());
-        assert!(source.last_snapshot_id.is_none());
+        assert!(source.loaded_snapshot_id.is_none());
     }
 
     #[tokio::test]
     async fn test_reference_checkpoint_round_trip() {
         let mut source = IcebergReferenceTableSource::new(test_source_config());
-        source.last_snapshot_id = Some(99);
+        // Simulate fully-delivered snapshot.
+        source.delivered_snapshot_id = Some(99);
+        source.loaded_snapshot_id = Some(99);
         source.epoch = 7;
 
         let cp = source.checkpoint();
@@ -255,14 +268,24 @@ mod tests {
 
         let mut restored = IcebergReferenceTableSource::new(test_source_config());
         restored.restore(&cp).await.unwrap();
-        assert_eq!(restored.last_snapshot_id, Some(99));
+        assert_eq!(restored.delivered_snapshot_id, Some(99));
+        assert_eq!(restored.loaded_snapshot_id, Some(99));
         assert_eq!(restored.epoch, 7);
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_only_after_delivery() {
+        let mut source = IcebergReferenceTableSource::new(test_source_config());
+        // Loaded but not yet delivered — checkpoint should NOT include snapshot_id.
+        source.loaded_snapshot_id = Some(42);
+        let cp = source.checkpoint();
+        assert_eq!(cp.get_offset("snapshot_id"), None);
     }
 
     #[tokio::test]
     async fn test_reference_empty_snapshot_completes() {
         let mut source = IcebergReferenceTableSource::new(test_source_config());
-        source.last_snapshot_id = Some(1);
+        source.loaded_snapshot_id = Some(1);
         let result = source.poll_snapshot().await.unwrap();
         assert!(result.is_none());
         assert!(source.is_snapshot_complete());

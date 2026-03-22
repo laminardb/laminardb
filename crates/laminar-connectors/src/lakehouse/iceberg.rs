@@ -217,19 +217,21 @@ impl SinkConnector for IcebergSink {
                 if let Some(schema) = config.arrow_schema() {
                     super::iceberg_io::ensure_table_exists(catalog.as_ref(), ns, tbl, &schema)
                         .await?;
-                    self.schema = Some(schema);
                 }
             }
 
             let table = super::iceberg_io::load_table(catalog.as_ref(), ns, tbl).await?;
 
+            // Always derive the canonical schema from the Iceberg table.
+            let iceberg_schema = table.current_schema_ref();
+            let table_schema = std::sync::Arc::new(
+                iceberg::arrow::schema_to_arrow_schema(&iceberg_schema).map_err(|e| {
+                    ConnectorError::SchemaMismatch(format!("iceberg→arrow schema: {e}"))
+                })?,
+            );
+
             if self.schema.is_none() {
-                let iceberg_schema = table.current_schema_ref();
-                let arrow_schema = iceberg::arrow::schema_to_arrow_schema(&iceberg_schema)
-                    .map_err(|e| {
-                        ConnectorError::SchemaMismatch(format!("iceberg→arrow schema: {e}"))
-                    })?;
-                self.schema = Some(std::sync::Arc::new(arrow_schema));
+                self.schema = Some(table_schema.clone());
             }
 
             // Recover last committed epoch from table properties.
@@ -240,12 +242,11 @@ impl SinkConnector for IcebergSink {
                 info!(writer_id = %self.config.writer_id, epoch, "recovered last committed epoch");
             }
 
-            // Validate pipeline schema against table schema if available.
+            // Validate pipeline schema against table schema, then use the
+            // pipeline schema as self.schema (it's what write_batch receives).
             if let Some(pipeline_schema) = config.arrow_schema() {
-                super::iceberg_config::validate_sink_schema(
-                    &pipeline_schema,
-                    self.schema.as_ref().unwrap(),
-                )?;
+                super::iceberg_config::validate_sink_schema(&pipeline_schema, &table_schema)?;
+                self.schema = Some(pipeline_schema);
             }
 
             self.catalog = Some(catalog);

@@ -7,7 +7,7 @@
 use arrow_array::RecordBatch;
 use iceberg::spec::ManifestStatus;
 use iceberg::table::Table;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error::ConnectorError;
 
@@ -17,8 +17,9 @@ use crate::error::ConnectorError;
 /// `added_snapshot_id > old_snapshot_id`, loads those manifests, and reads
 /// the `ADDED` data files via the table's scan API.
 ///
-/// Falls back to a full scan if manifest walking fails (e.g., old snapshot
-/// has been expired).
+/// If any manifest entry has a `Deleted` status (compaction, overwrite, or
+/// explicit delete), the incremental path is unsafe — falls back to a full
+/// scan of the new snapshot so the caller gets the complete table state.
 ///
 /// # Errors
 ///
@@ -41,7 +42,6 @@ pub async fn scan_incremental(
         .await
         .map_err(|e| ConnectorError::ReadError(format!("load manifest list: {e}")))?;
 
-    // Collect data file paths from manifests added since old_snapshot_id.
     let mut new_file_paths = Vec::new();
 
     for manifest_file in manifest_list.entries() {
@@ -55,8 +55,28 @@ pub async fn scan_incremental(
             .map_err(|e| ConnectorError::ReadError(format!("load manifest: {e}")))?;
 
         for entry in manifest.entries() {
-            if entry.status == ManifestStatus::Added {
-                new_file_paths.push(entry.file_path().to_string());
+            match entry.status {
+                ManifestStatus::Added => {
+                    new_file_paths.push(entry.file_path().to_string());
+                }
+                ManifestStatus::Deleted => {
+                    // Non-append snapshot (compaction, overwrite, or delete).
+                    // Incremental diff cannot represent deletions — fall back
+                    // to a full scan so the caller gets the complete state.
+                    warn!(
+                        old_snapshot_id,
+                        new_snapshot_id,
+                        deleted_file = entry.file_path(),
+                        "incremental scan: detected deleted entry, falling back to full scan"
+                    );
+                    return super::iceberg_io::scan_table(
+                        table,
+                        Some(new_snapshot_id),
+                        select_columns,
+                    )
+                    .await;
+                }
+                ManifestStatus::Existing => {}
             }
         }
     }
@@ -76,10 +96,6 @@ pub async fn scan_incremental(
         "incremental scan: reading new data files"
     );
 
-    // Read the new data files via a full snapshot scan filtered to only
-    // the new file paths. The iceberg-rust TableScan API does not support
-    // file-path filtering directly, so we use plan_files() and filter
-    // the FileScanTasks ourselves, then read via ArrowReader.
     read_files_via_scan(table, new_snapshot_id, select_columns, &new_file_paths).await
 }
 
