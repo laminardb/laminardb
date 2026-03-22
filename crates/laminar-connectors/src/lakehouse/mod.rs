@@ -133,6 +133,12 @@ pub fn register_delta_lake_source(registry: &ConnectorRegistry) {
                     .filter(|s| !s.is_empty())
                     .collect();
 
+                if pk_columns.is_empty() {
+                    return Err(crate::error::ConnectorError::ConfigurationError(
+                        "delta-lake lookup source requires primary key columns".into(),
+                    ));
+                }
+
                 let src_config = DeltaSourceConfig::from_config(&config)?;
 
                 let (resolved_path, resolved_opts) =

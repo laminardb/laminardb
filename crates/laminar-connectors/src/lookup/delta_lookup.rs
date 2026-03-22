@@ -102,20 +102,33 @@ impl DeltaLookupSource {
         pk_arrays: &[Arc<dyn arrow_array::Array>],
     ) -> Result<String, LookupError> {
         use arrow_cast::display::{ArrayFormatter, FormatOptions};
+        use arrow_schema::DataType;
 
         let mut conditions = Vec::with_capacity(self.config.primary_key_columns.len());
         for (col_name, array) in self.config.primary_key_columns.iter().zip(pk_arrays) {
             if array.is_null(0) {
                 conditions.push(format!("\"{col_name}\" IS NULL"));
-            } else {
-                let formatter = ArrayFormatter::try_new(array.as_ref(), &FormatOptions::default())
-                    .map_err(|e| LookupError::Internal(format!("format pk: {e}")))?;
-                let value = formatter.value(0).to_string();
-                if array.data_type().is_numeric() {
+                continue;
+            }
+            let formatter = ArrayFormatter::try_new(array.as_ref(), &FormatOptions::default())
+                .map_err(|e| LookupError::Internal(format!("format pk: {e}")))?;
+            let value = formatter.value(0).to_string();
+            match array.data_type() {
+                // Numeric and boolean: unquoted literals.
+                dt if dt.is_numeric() || matches!(dt, DataType::Boolean) => {
                     conditions.push(format!("\"{col_name}\" = {value}"));
-                } else {
+                }
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
                     let escaped = value.replace('\'', "''");
                     conditions.push(format!("\"{col_name}\" = '{escaped}'"));
+                }
+                DataType::Date32 | DataType::Date64 | DataType::Timestamp(..) => {
+                    conditions.push(format!("\"{col_name}\" = '{value}'"));
+                }
+                dt => {
+                    return Err(LookupError::Internal(format!(
+                        "unsupported PK data type for lookup: {dt} (column \"{col_name}\")"
+                    )));
                 }
             }
         }
