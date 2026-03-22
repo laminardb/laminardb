@@ -573,11 +573,8 @@ mod tests {
 
             // poll_changes should pick it up.
             let mut change_rows = 0;
-            loop {
-                match src.poll_changes().await.unwrap() {
-                    Some(batch) => change_rows += batch.num_rows(),
-                    None => break,
-                }
+            while let Some(batch) = src.poll_changes().await.unwrap() {
+                change_rows += batch.num_rows();
             }
             assert_eq!(change_rows, 1);
             assert!(src.current_version > v1);
