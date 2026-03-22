@@ -98,6 +98,11 @@ base64 = "0.22"
 # Randomness
 rand = "0.10"
 
+# Apache Iceberg
+iceberg = "0.9.0"
+iceberg-catalog-rest = "0.9.0"
+iceberg-storage-opendal = "0.9.0"
+
 # Constellation (distributed mode)
 chitchat = "0.10"
 tokio-util = { version = "0.7", features = ["rt"] }
