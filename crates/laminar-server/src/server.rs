@@ -198,6 +198,24 @@ pub async fn run_server(
         info!("Created sink: {}", sink.name);
     }
 
+    // 2b. Execute raw SQL pipeline if present (after structured DDL so
+    //     SQL can reference TOML-defined sources/lookups if needed).
+    if let Some(ref sql) = config.sql {
+        let trimmed = sql.trim();
+        if !trimmed.is_empty() {
+            db.execute(trimmed).await.map_err(|e| {
+                // Truncate for log readability; full SQL is in the TOML file.
+                let snippet: String = trimmed.chars().take(80).collect();
+                ServerError::Ddl {
+                    section: "sql".to_string(),
+                    name: snippet,
+                    source: e,
+                }
+            })?;
+            info!("Executed SQL pipeline definition");
+        }
+    }
+
     // 3. Start pipeline
     db.start()
         .await
