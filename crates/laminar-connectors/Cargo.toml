@@ -66,7 +66,7 @@ arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 
 # Parquet lookup source (optional)
-parquet = { version = "57.2", optional = true, default-features = false, features = ["arrow"] }
+parquet = { version = "58.0", optional = true, default-features = false, features = ["arrow"] }
 object_store = { version = "0.13", optional = true }
 
 # Timestamp parsing for JSON/CSV decoders

@@ -15,7 +15,7 @@ laminar-core = { path = "../laminar-core", version = "0.18.10" }
 
 # Storage
 object_store = "0.13"  # For cloud storage
-parquet = "57.2"  # For lakehouse formats
+parquet = "58.0"  # For lakehouse formats
 
 
 # Serialization (rkyv for zero-copy performance)
