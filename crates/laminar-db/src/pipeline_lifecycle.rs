@@ -56,10 +56,12 @@ impl LaminarDB {
         self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Check if the streaming pipeline is currently running (or starting).
+    /// Check if the streaming pipeline is active (starting, running, or
+    /// shutting down). DDL that requires connector instantiation or task
+    /// cancellation is unsafe in all three states.
     pub(crate) fn is_pipeline_running(&self) -> bool {
         let s = self.state.load(std::sync::atomic::Ordering::Acquire);
-        s == STATE_RUNNING || s == STATE_STARTING
+        s == STATE_RUNNING || s == STATE_STARTING || s == STATE_SHUTTING_DOWN
     }
 
     /// Start the streaming pipeline.
