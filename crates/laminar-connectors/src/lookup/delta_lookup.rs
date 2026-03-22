@@ -57,6 +57,11 @@ impl DeltaLookupSource {
     ///
     /// Returns `LookupError` if the table cannot be opened or registered.
     pub async fn open(config: DeltaLookupSourceConfig) -> Result<Self, LookupError> {
+        if config.primary_key_columns.is_empty() {
+            return Err(LookupError::Internal(
+                "primary_key_columns must not be empty".into(),
+            ));
+        }
         let ctx = SessionContext::new();
 
         crate::lakehouse::delta_table_provider::register_delta_table(

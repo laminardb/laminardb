@@ -47,6 +47,10 @@ pub struct DeltaReferenceTableSource {
     #[cfg(feature = "delta-lake")]
     table: Option<DeltaTable>,
     current_version: i64,
+    /// Version being drained. Promoted to `current_version` only when
+    /// `pending_batches` is fully consumed, so checkpoint is safe.
+    #[cfg(feature = "delta-lake")]
+    inflight_version: Option<i64>,
     pending_batches: VecDeque<RecordBatch>,
     #[cfg(feature = "delta-lake")]
     last_version_check: Option<Instant>,
@@ -64,6 +68,8 @@ impl DeltaReferenceTableSource {
             #[cfg(feature = "delta-lake")]
             table: None,
             current_version: -1,
+            #[cfg(feature = "delta-lake")]
+            inflight_version: None,
             pending_batches: VecDeque::new(),
             #[cfg(feature = "delta-lake")]
             last_version_check: None,
@@ -135,8 +141,17 @@ impl DeltaReferenceTableSource {
             b
         };
 
+        // Seed schema from table metadata if no rows returned (empty/filtered table).
         if let Some(first) = batches.first() {
             self.known_schema = Some(first.schema());
+        } else if self.known_schema.is_none() {
+            let table = self
+                .table
+                .as_ref()
+                .ok_or_else(|| ConnectorError::Internal("table not opened".into()))?;
+            if let Ok(s) = delta_io::get_table_schema(table) {
+                self.known_schema = Some(s);
+            }
         }
 
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -247,24 +262,28 @@ impl DeltaReferenceTableSource {
             )
             .await?;
 
-            if let (Some(known), Some(first)) = (&self.known_schema, batches.first()) {
+            if let Some(first) = batches.first() {
                 let new_schema = first.schema();
-                if known.as_ref() != new_schema.as_ref() {
-                    match self.config.schema_evolution_action {
-                        SchemaEvolutionAction::Warn => {
-                            warn!(version = v, "delta lookup: schema changed between versions");
-                            self.known_schema = Some(new_schema);
-                        }
-                        SchemaEvolutionAction::Error => {
-                            if v > self.current_version + 1 {
-                                self.current_version = v - 1;
+                if let Some(known) = &self.known_schema {
+                    if known.as_ref() != new_schema.as_ref() {
+                        match self.config.schema_evolution_action {
+                            SchemaEvolutionAction::Warn => {
+                                warn!(version = v, "delta lookup: schema changed between versions");
+                                self.known_schema = Some(new_schema);
                             }
-                            return Err(ConnectorError::Internal(format!(
-                                "delta lookup: schema evolution detected at version {v} \
-                                 (action=error)"
-                            )));
+                            SchemaEvolutionAction::Error => {
+                                if v > self.current_version + 1 {
+                                    self.current_version = v - 1;
+                                }
+                                return Err(ConnectorError::Internal(format!(
+                                    "delta lookup: schema evolution detected at version {v} \
+                                     (action=error)"
+                                )));
+                            }
                         }
                     }
+                } else {
+                    self.known_schema = Some(new_schema);
                 }
             }
 
@@ -282,8 +301,6 @@ impl DeltaReferenceTableSource {
             );
         }
 
-        self.current_version = target;
-
         // If more versions remain, skip throttle so next poll re-enters immediately.
         if target < latest {
             self.last_version_check = None;
@@ -294,6 +311,14 @@ impl DeltaReferenceTableSource {
         let mut batch_iter = all_batches.into_iter();
         let first = batch_iter.next();
         self.pending_batches.extend(batch_iter);
+
+        // Defer version advancement: only promote when buffer is drained,
+        // so checkpoint() never reports a version ahead of consumed data.
+        if self.pending_batches.is_empty() {
+            self.current_version = target;
+        } else {
+            self.inflight_version = Some(target);
+        }
         Ok(first)
     }
 }
@@ -341,6 +366,13 @@ impl ReferenceTableSource for DeltaReferenceTableSource {
         }
 
         if let Some(batch) = self.pending_batches.pop_front() {
+            // Promote inflight version when buffer is fully drained.
+            #[cfg(feature = "delta-lake")]
+            if self.pending_batches.is_empty() {
+                if let Some(v) = self.inflight_version.take() {
+                    self.current_version = v;
+                }
+            }
             return Ok(Some(batch));
         }
 
