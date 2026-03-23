@@ -14,14 +14,14 @@ LaminarDB development is organized into phases, each building on the previous. D
 |  | Core |----->| SQL  |--->|Harden|--------------->|Connect|  |
 |  |Engine|      |Parser|    | ing  |               | ors  |  |
 |  +------+      +------+    +------+               +------+  |
-|  DONE          DONE        DONE                   85%       |
+|  DONE          DONE        DONE                   95%       |
 |                                                                  |
 |  Phase 4       Phase 5     Phase 6a      Phase 6b    Phase 6c  |
 |  +------+      +------+    +------+      +------+    +------+  |
 |  |Secure|      |Admin |    |Partit|      |Delta |    | Prod |  |
 |  |      |      |      |    |  ion |      |Found |    |Harden|  |
 |  +------+      +------+    +------+      +------+    +------+  |
-|  Planned       Planned     93%           DONE        Planned   |
+|  Planned       40%         93%           DONE        80%       |
 |                                                                  |
 +------------------------------------------------------------------+
 ```
@@ -85,7 +85,7 @@ pipeline bridge, event time extraction) is retained for Ring 0.
 
 ---
 
-## Phase 3: Connectors & Integration -- 85% COMPLETE (85/100)
+## Phase 3: Connectors & Integration -- 95% COMPLETE (95/100)
 
 **Goal**: Connect to external systems for real-world data pipelines.
 
@@ -94,7 +94,7 @@ pipeline bridge, event time extraction) is retained for Ring 0.
 - DAG pipeline (topology, multicast, executor, checkpointing, SQL/MV integration, connector bridge) -- 7/7
 - Reactive subscriptions (change events, notification slot, registry, dispatcher, push/callback/stream subscriptions, backpressure) -- 8/8
 - Cloud storage infrastructure (credentials, validation, secret masking) -- 3/3
-- External connectors: Kafka source/sink, PostgreSQL CDC/sink, MySQL CDC, Delta Lake sink/source, Iceberg sink, Connector SDK -- 14/19
+- External connectors: Kafka source/sink, PostgreSQL CDC/sink, MySQL CDC, MongoDB CDC, Delta Lake sink/source (with recovery, compaction, schema evolution), Iceberg source/sink with I/O integration, Connector SDK -- 19/19
 - SQL extensions: ASOF JOIN, LAG/LEAD, ROW_NUMBER/RANK/DENSE_RANK, HAVING, multi-way JOINs, window frames, multi-partition scans -- 7/7
 - Stateful streaming SQL: aggregation hardening, EOWC incremental accumulators, checkpoint integration, Ring 0 SQL operator routing (tumbling/hopping/session), streaming physical optimizer, cooperative scheduling, dynamic watermark filter pushdown -- 7/7
 - Connector infrastructure: checkpoint recovery, reference tables, partial cache, RocksDB table store, Avro hardening -- 6/6
@@ -104,12 +104,9 @@ pipeline bridge, event time extraction) is retained for Ring 0.
 - FFI & language bindings (API module, C headers, Arrow C Data Interface, async callbacks) -- 4/4
 - Schema framework (trait architecture, resolver, inference registry, JSON/CSV/Avro/Parquet decoders, evolution, DLQ, JSON functions, array/struct/map functions, format bridges, schema hints) -- 15/16
 
-**Remaining (15 features, all Draft status):**
-- MongoDB CDC Source (F029)
+**Remaining (5 features):**
 - Redis Lookup Table (F030)
-- Delta Lake Recovery, Compaction, Schema Evolution (F031B-D)
-- Iceberg I/O Integration (F032A) -- blocked by iceberg-datafusion compatibility
-- Parquet File Source (F033)
+- Parquet File Source (F033) -- lookup source exists, streaming source not started
 - Async State Access (F058)
 - Historical Backfill (F061)
 - Protobuf Format Decoder (F-SCHEMA-008)
@@ -120,7 +117,7 @@ pipeline bridge, event time extraction) is retained for Ring 0.
 
 **Goal**: Add enterprise security features for production deployments.
 
-Crate stubs exist (`laminar-auth/`) but source files contain only doc comments.
+Crate stubs (`laminar-auth/`, `laminar-admin/`, `laminar-observe/`) were deleted as empty in commit a0461ef. No implementation exists.
 
 **Planned Features:**
 - F035: Authentication Framework
@@ -137,23 +134,25 @@ Crate stubs exist (`laminar-auth/`) but source files contain only doc comments.
 
 ---
 
-## Phase 5: Admin & Observability -- PLANNED (0/10)
+## Phase 5: Admin & Observability -- 40% COMPLETE (4/10)
 
 **Goal**: Provide operational tools for managing LaminarDB.
 
-Crate stubs exist (`laminar-admin/`, `laminar-observe/`) but source files contain only doc comments.
+Implemented in `laminar-server` (crate stubs deleted). REST API, Prometheus, health checks, and CLI are production-ready.
 
-**Planned Features:**
-- F046: Admin REST API
+**Completed Features (4/10):**
+- F046: Admin REST API (Axum, 13 endpoints, CORS, request logging)
+- F050: Prometheus Export (`/metrics` with 15+ counters)
+- F052: Health Check Endpoints (`/health` liveness, `/ready` readiness)
+- F055: CLI Tools (clap args, `--validate-checkpoints` mode)
+
+**Remaining Features (6/10):**
 - F047: Web Dashboard
-- F048: Real-Time Metrics
-- F049: SQL Query Console
-- F050: Prometheus Export
+- F048: Real-Time Metrics (streaming beyond Prometheus)
+- F049: SQL Query Console (interactive REPL)
 - F051: OpenTelemetry Tracing
-- F052: Health Check Endpoints
 - F053: Alerting Integration
-- F054: Configuration Management
-- F055: CLI Tools
+- F054: Configuration Management (advanced)
 
 ---
 
@@ -189,29 +188,36 @@ Crate stubs exist (`laminar-admin/`, `laminar-observe/`) but source files contai
 
 ---
 
-## Phase 6c: Delta Production Hardening -- PLANNED (0/10)
+## Phase 6c: Delta Production Hardening -- 80% COMPLETE (8/10)
 
 **Goal**: Unaligned checkpoints, exactly-once sinks, laminardb-server binary with TOML config, HTTP API, hot reload, rolling restarts.
 
-**Planned Features:**
-- Unaligned Checkpoints (F-DCKP-006)
-- Transactional Sink 2PC (F-E2E-002)
-- Idempotent Sink (F-E2E-003)
-- TOML Configuration (F-SERVER-001)
-- Engine Construction (F-SERVER-002)
-- HTTP API (F-SERVER-003)
-- Hot Reload (F-SERVER-004)
-- Delta Server Mode (F-SERVER-005)
-- Graceful Rolling Restart (F-SERVER-006)
+**Completed Features (8/10):**
+- TOML Configuration (F-SERVER-001) -- full parsing, env-var substitution, validation
+- Engine Construction (F-SERVER-002) -- config-to-DDL translation, builder API
+- HTTP API (F-SERVER-003) -- Axum, 13 REST endpoints, CORS
+- Hot Reload (F-SERVER-004) -- file watcher, config diff, incremental DDL application
+- Delta Server Mode (F-SERVER-005) -- discovery, membership, partition assignment
+- Graceful Rolling Restart (F-SERVER-006) -- signal handling, drain logic
+- Transactional Sink 2PC (F-E2E-002) -- trait + Kafka/Postgres/Delta/Files implementations
+- Idempotent Sink (F-E2E-003) -- per-sink deduplication strategies
+
+**Remaining Features (1/10):**
+- Unaligned Checkpoints (F-DCKP-006) -- config structs defined, state machine deferred
 
 (1 feature superseded: Incremental Mmap Checkpoints)
 
 ---
 
-## Performance Optimization -- PLANNED (0/12)
+## Performance Optimization -- 17% COMPLETE (2/12)
 
 Architectural performance improvements identified by audit. All actionable local fixes (40+ findings) have been implemented.
 
+**Completed:**
+- Binary JSON (JSONB) (F-POPT-008) -- compact binary encoding with O(log n) field access
+- SQL Plan Cache (F-POPT-009) -- compiled PhysicalExpr projections with cached logical plan fallback
+
+**Remaining:**
 - Zero-Copy Prefix Scan (F-POPT-001)
 - Monomorphized Reactor Dispatch (F-POPT-002)
 - AHashMapStore Key Deduplication (F-POPT-003)
@@ -219,8 +225,6 @@ Architectural performance improvements identified by audit. All actionable local
 - Zero-Copy Join Row Encoding (F-POPT-005)
 - Pooled Arrow Builders (F-POPT-006)
 - LogicalPlan Passthrough (F-POPT-007)
-- Binary JSON (JSONB) (F-POPT-008)
-- SQL Plan Cache (F-POPT-009)
 - MVCC TableStore (F-POPT-010)
 - WAL Scatter-Gather Writes (F-POPT-011)
 - Avro Decoder Reuse (F-POPT-012)
@@ -235,13 +239,13 @@ Architectural performance improvements identified by audit. All actionable local
 | Phase 1.5: SQL Parser | 1 | 1 | COMPLETE |
 | Phase 2: Hardening | 38 | 38 | COMPLETE |
 | Phase 2.5: JIT Compiler | 12 | 12 | REMOVED |
-| Phase 3: Connectors | 100 | 85 | 85% |
+| Phase 3: Connectors | 100 | 95 | 95% |
 | Phase 4: Security | 11 | 0 | Planned |
-| Phase 5: Admin | 10 | 0 | Planned |
-| Phase 6a: Partition-Parallel | 28 | 26 | 93% |
+| Phase 5: Admin | 10 | 4 | 40% |
+| Phase 6a: Partition-Parallel | 29 | 27 | 93% |
 | Phase 6b: Delta Foundation | 14 | 14 | COMPLETE |
-| Phase 6c: Delta Hardening | 10 | 0 | Planned |
-| Perf Optimization | 12 | 0 | Planned |
-| **Total** | **248** | **188** | **76%** |
+| Phase 6c: Delta Hardening | 10 | 8 | 80% |
+| Perf Optimization | 12 | 2 | 17% |
+| **Total** | **249** | **213** | **86%** |
 
-Note: Phases 4 and 5 can be developed in parallel with Phase 3 completion and Phase 6c since they build on Phase 1 independently.
+Note: Phases 4 and 5 can be developed in parallel with Phase 3 completion since they build on Phase 1 independently.
