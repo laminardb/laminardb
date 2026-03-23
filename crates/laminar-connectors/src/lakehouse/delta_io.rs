@@ -204,6 +204,7 @@ pub async fn write_batches(
     schema_evolution: bool,
     target_file_size: Option<usize>,
     create_checkpoint: bool,
+    writer_properties: Option<deltalake::parquet::file::properties::WriterProperties>,
 ) -> Result<(DeltaTable, i64), ConnectorError> {
     if batches.is_empty() {
         debug!("no batches to write, skipping");
@@ -252,6 +253,10 @@ pub async fn write_batches(
         if !cols.is_empty() {
             write_builder = write_builder.with_partition_columns(cols.to_vec());
         }
+    }
+
+    if let Some(props) = writer_properties {
+        write_builder = write_builder.with_writer_properties(props);
     }
 
     // Execute the write.
@@ -947,6 +952,7 @@ pub async fn merge_changelog(
     writer_id: &str,
     epoch: u64,
     schema_evolution: bool,
+    writer_properties: Option<deltalake::parquet::file::properties::WriterProperties>,
 ) -> Result<(DeltaTable, MergeResult), ConnectorError> {
     use datafusion::prelude::*;
     use deltalake::kernel::transaction::CommitProperties;
@@ -1043,6 +1049,10 @@ pub async fn merge_changelog(
         merge_builder = merge_builder.with_merge_schema(true);
     }
 
+    if let Some(props) = writer_properties {
+        merge_builder = merge_builder.with_writer_properties(props);
+    }
+
     let (table, metrics) = merge_builder.await.map_err(|e| {
         ConnectorError::WriteError(format!("Delta Lake changelog MERGE failed: {e}"))
     })?;
@@ -1090,6 +1100,7 @@ pub async fn run_compaction(
     table: DeltaTable,
     target_file_size: u64,
     z_order_columns: &[String],
+    writer_properties: Option<deltalake::parquet::file::properties::WriterProperties>,
 ) -> Result<(DeltaTable, CompactionResult), ConnectorError> {
     use deltalake::operations::optimize::OptimizeType;
 
@@ -1101,10 +1112,16 @@ pub async fn run_compaction(
         OptimizeType::ZOrder(z_order_columns.to_vec())
     };
 
-    let (table, metrics) = table
+    let mut optimize_builder = table
         .optimize()
         .with_type(optimize_type)
-        .with_target_size(target_file_size)
+        .with_target_size(target_file_size);
+
+    if let Some(props) = writer_properties {
+        optimize_builder = optimize_builder.with_writer_properties(props);
+    }
+
+    let (table, metrics) = optimize_builder
         .await
         .map_err(|e| ConnectorError::Internal(format!("compaction failed: {e}")))?;
 
@@ -1352,6 +1369,7 @@ mod tests {
             false,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1395,6 +1413,7 @@ mod tests {
             false,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1437,6 +1456,7 @@ mod tests {
                 false,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -1492,6 +1512,7 @@ mod tests {
             false,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1525,6 +1546,7 @@ mod tests {
             false,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1595,6 +1617,7 @@ mod tests {
             false,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1627,6 +1650,7 @@ mod tests {
             false,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1643,6 +1667,7 @@ mod tests {
             false,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1739,6 +1764,7 @@ mod tests {
             false,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1752,6 +1778,7 @@ mod tests {
             false,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1856,6 +1883,7 @@ mod tests {
             false,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1872,6 +1900,7 @@ mod tests {
             false,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1925,6 +1954,7 @@ mod tests {
             true, // schema_evolution enabled
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1954,6 +1984,7 @@ mod tests {
             true,
             None,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -1999,6 +2030,7 @@ mod tests {
                 false,
                 None,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2018,7 +2050,9 @@ mod tests {
         );
 
         // Run compaction.
-        let (table, result) = run_compaction(table, 128 * 1024 * 1024, &[]).await.unwrap();
+        let (table, result) = run_compaction(table, 128 * 1024 * 1024, &[], None)
+            .await
+            .unwrap();
         assert!(
             result.files_removed > 0,
             "compaction should have removed files"

@@ -24,8 +24,8 @@ We will:
 LaminarDB is an embedded database. Security considerations depend on your deployment model:
 
 - **Embedded (library)**: Security is inherited from the host application. LaminarDB does not open network ports unless you use the admin API or server binary.
-- **Server binary**: The standalone server exposes a network interface. Use `laminar-auth` for JWT authentication and RBAC/ABAC authorization.
-- **Connectors**: Kafka, PostgreSQL, and MySQL connectors handle credentials. Connector configurations support TLS and are subject to secret masking in logs.
+- **Server binary**: The standalone server exposes a network interface. Authentication and authorization are planned for a future release.
+- **Connectors**: Kafka, PostgreSQL, MySQL, and MongoDB connectors handle credentials. Connector configurations support TLS and are subject to secret masking in logs.
 
 ## Unsafe Code
 

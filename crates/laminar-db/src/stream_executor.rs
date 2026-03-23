@@ -1,12 +1,17 @@
-//! `DataFusion` micro-batch stream executor.
+//! `DataFusion` micro-batch stream executor (legacy).
 //!
-//! Executes registered streaming queries against source data using `DataFusion`'s
-//! SQL engine. Each processing cycle:
+//! Replaced by `OperatorGraph` for production execution. Retained for its
+//! comprehensive test suite and reusable detection functions.
 //!
-//! 1. Source batches are registered as temporary `MemTable` tables
-//! 2. Each stream query is executed via `ctx.sql()`
-//! 3. Results are collected as `RecordBatch` vectors
-//! 4. Temporary tables are cleared for the next cycle
+//! # Reusable functions (used by `OperatorGraph`)
+//! - [`extract_table_references`] — SQL table ref extraction
+//! - [`single_source_table`] — single-source detection
+//! - [`detect_asof_query`] — ASOF join detection
+//! - [`detect_temporal_query`] — temporal join detection
+//! - [`detect_stream_join_query`] — interval join detection
+//! - [`compute_closed_boundary`] — EOWC window boundary computation
+//! - [`apply_topk_filter`] — Top-K post-filtering
+#![allow(dead_code)]
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -207,11 +212,11 @@ fn collect_tables_from_factor(factor: &TableFactor, tables: &mut FxHashSet<Strin
 ///
 /// Compiled from the projection SQL (e.g., `SELECT a, b AS alias FROM __asof_tmp`)
 /// on first execution when the join output schema is known.
-struct CompiledPostProjection {
+pub(crate) struct CompiledPostProjection {
     /// Physical expressions to evaluate per output column.
-    exprs: Vec<Arc<dyn PhysicalExpr>>,
+    pub(crate) exprs: Vec<Arc<dyn PhysicalExpr>>,
     /// Output schema.
-    output_schema: SchemaRef,
+    pub(crate) output_schema: SchemaRef,
 }
 
 impl std::fmt::Debug for CompiledPostProjection {
@@ -1058,15 +1063,15 @@ pub(crate) fn evaluate_compiled_projection(
 }
 
 /// Information extracted from a simple Projection + Filter logical plan.
-struct ProjectionFilterInfo {
+pub(crate) struct ProjectionFilterInfo {
     /// Projection expressions from the top-level Projection node.
-    proj_exprs: Vec<datafusion_expr::Expr>,
+    pub(crate) proj_exprs: Vec<datafusion_expr::Expr>,
     /// Optional WHERE predicate from a Filter node below the Projection.
-    filter_predicate: Option<datafusion_expr::Expr>,
+    pub(crate) filter_predicate: Option<datafusion_expr::Expr>,
     /// `DFSchema` of the scan input (for compiling expressions).
-    input_df_schema: Arc<datafusion_common::DFSchema>,
+    pub(crate) input_df_schema: Arc<datafusion_common::DFSchema>,
     /// Source table name from the `TableScan`.
-    source_table: String,
+    pub(crate) source_table: String,
 }
 
 /// Walk an optimized `LogicalPlan` to extract a simple Projection + Filter shape.
@@ -1077,7 +1082,7 @@ struct ProjectionFilterInfo {
 ///
 /// Returns `None` if the plan has Sort, Limit, Distinct, Join, Aggregate,
 /// or any other node that `CompiledProjection` cannot handle.
-fn extract_projection_filter(plan: &LogicalPlan) -> Option<ProjectionFilterInfo> {
+pub(crate) fn extract_projection_filter(plan: &LogicalPlan) -> Option<ProjectionFilterInfo> {
     match plan {
         LogicalPlan::Projection(proj) => {
             let proj_exprs = proj.expr.clone();
@@ -1156,7 +1161,7 @@ fn extract_filter_or_scan(
 ///
 /// Walks the plan to find the Projection node, compiles each expression to a
 /// `PhysicalExpr`, and returns the expressions with the output schema.
-fn extract_projection_exprs(
+pub(crate) fn extract_projection_exprs(
     plan: &LogicalPlan,
     input_schema: &SchemaRef,
     ctx: &SessionContext,
@@ -2972,7 +2977,7 @@ impl StreamExecutor {
 /// - **Sliding**: align to slide interval — the earliest open window starts at
 ///   `((watermark - size) / slide + 1) * slide`, so data below that threshold
 ///   belongs only to closed windows.
-fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> i64 {
+pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> i64 {
     match config.window_type {
         WindowType::Tumbling => {
             #[allow(clippy::cast_possible_truncation)]
@@ -3049,7 +3054,7 @@ fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> 
 }
 
 /// Infer the `TimestampFormat` from a `RecordBatch` column's `DataType`.
-fn infer_ts_format_from_batch(
+pub(crate) fn infer_ts_format_from_batch(
     batch: &RecordBatch,
     column: &str,
 ) -> laminar_core::time::TimestampFormat {
@@ -3063,7 +3068,7 @@ fn infer_ts_format_from_batch(
     }
 }
 
-fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>, Option<String>) {
+pub(crate) fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>, Option<String>) {
     // Parse using the streaming parser which understands ASOF syntax
     let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
         return (None, None);
@@ -3102,7 +3107,9 @@ fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>, Option<Str
     (Some(config), Some(projection_sql))
 }
 
-fn detect_temporal_query(sql: &str) -> (Option<TemporalJoinTranslatorConfig>, Option<String>) {
+pub(crate) fn detect_temporal_query(
+    sql: &str,
+) -> (Option<TemporalJoinTranslatorConfig>, Option<String>) {
     let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
         return (None, None);
     };
@@ -3137,7 +3144,7 @@ fn detect_temporal_query(sql: &str) -> (Option<TemporalJoinTranslatorConfig>, Op
     (Some(config), Some(projection_sql))
 }
 
-fn detect_stream_join_query(sql: &str) -> (Option<StreamJoinConfig>, Option<String>) {
+pub(crate) fn detect_stream_join_query(sql: &str) -> (Option<StreamJoinConfig>, Option<String>) {
     let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
         return (None, None);
     };
@@ -3192,6 +3199,383 @@ fn detect_stream_join_query(sql: &str) -> (Option<StreamJoinConfig>, Option<Stri
     let projection_sql = build_stream_join_projection_sql(select, stream_analysis, &config);
 
     (Some(config), Some(projection_sql))
+}
+
+/// Detect a `TEMPORAL PROBE JOIN` in raw SQL text.
+///
+/// Not recognized by sqlparser, so detection works on the raw SQL string.
+/// Returns `(config, projection_sql)` or `(None, None)` if not detected.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn detect_temporal_probe_query(
+    sql: &str,
+) -> (
+    Option<laminar_sql::translator::TemporalProbeConfig>,
+    Option<String>,
+) {
+    let upper = sql.to_uppercase();
+    let Some(tpj_pos) = upper.find("TEMPORAL PROBE JOIN") else {
+        return (None, None);
+    };
+
+    let from_pos = upper[..tpj_pos].rfind("FROM").unwrap_or(0);
+    let between_from_and_tpj = sql[from_pos + 4..tpj_pos].trim();
+
+    let left_parts: Vec<&str> = between_from_and_tpj.split_whitespace().collect();
+    if left_parts.is_empty() {
+        return (None, None);
+    }
+    let left_table = left_parts[0].to_string();
+    let left_alias = if left_parts.len() >= 3 && left_parts[1].eq_ignore_ascii_case("AS") {
+        Some(left_parts[2].to_string())
+    } else {
+        left_parts.get(1).map(ToString::to_string)
+    };
+
+    let after_tpj = &sql[tpj_pos + "TEMPORAL PROBE JOIN".len()..];
+    let after_tpj_trimmed = after_tpj.trim_start();
+
+    let after_upper = after_tpj_trimmed.to_uppercase();
+    let Some(on_pos) = after_upper.find(" ON ") else {
+        return (None, None);
+    };
+
+    let right_part = after_tpj_trimmed[..on_pos].trim();
+    let right_parts: Vec<&str> = right_part.split_whitespace().collect();
+    if right_parts.is_empty() {
+        return (None, None);
+    }
+    let right_table = right_parts[0].to_string();
+    let right_alias = if right_parts.len() >= 3 && right_parts[1].eq_ignore_ascii_case("AS") {
+        Some(right_parts[2].to_string())
+    } else {
+        right_parts.get(1).map(ToString::to_string)
+    };
+
+    let after_on = after_tpj_trimmed[on_pos + 4..].trim_start();
+    let key_columns: Vec<String> = if let Some(rest) = after_on.strip_prefix('(') {
+        let end_paren = rest.find(')').unwrap_or(rest.len());
+        rest[..end_paren]
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        vec![after_on.split_whitespace().next().unwrap_or("").to_string()]
+    };
+
+    // Parse optional TIMESTAMPS (left_col, right_col) clause
+    let after_on_upper = after_on.to_uppercase();
+    let (left_time_column, right_time_column) =
+        if let Some(ts_pos) = after_on_upper.find("TIMESTAMPS") {
+            let ts_text = &after_on[ts_pos + "TIMESTAMPS".len()..].trim_start();
+            if let Some(rest) = ts_text.strip_prefix('(') {
+                let end_paren = rest.find(')').unwrap_or(rest.len());
+                let cols: Vec<&str> = rest[..end_paren].split(',').map(str::trim).collect();
+                (
+                    cols.first().unwrap_or(&"ts").to_string(),
+                    cols.get(1).unwrap_or(&"ts").to_string(),
+                )
+            } else {
+                ("ts".into(), "ts".into())
+            }
+        } else {
+            tracing::warn!(
+                %left_table,
+                %right_table,
+                "temporal probe join: no TIMESTAMPS clause, defaulting to 'ts'. \
+                 Use TIMESTAMPS (left_col, right_col) to specify."
+            );
+            ("ts".into(), "ts".into())
+        };
+
+    let (offsets, alias_search_start) = if let Some(range_pos) = after_on_upper.find("RANGE ") {
+        let range_text = &after_on[range_pos + 6..];
+        let range_upper = range_text.to_uppercase();
+        let from_pos = range_upper.find("FROM ").map_or(0, |p| p + 5);
+        let to_pos = range_upper.find(" TO ").unwrap_or(range_text.len());
+        let step_pos = range_upper.find(" STEP ");
+
+        let start_str = range_text[from_pos..to_pos].trim();
+        let start_ms = laminar_sql::translator::parse_interval_to_ms(start_str).unwrap_or(0);
+
+        let (end_str, step_str) = if let Some(sp) = step_pos {
+            let to_end = &range_text[to_pos + 4..sp];
+            let as_pos = range_upper[sp + 6..].find(" AS ");
+            let step_end = as_pos.map_or(range_text.len(), |p| sp + 6 + p);
+            (to_end.trim(), range_text[sp + 6..step_end].trim())
+        } else {
+            let as_pos = range_upper[to_pos + 4..].find(" AS ");
+            let end_pos = as_pos.map_or(range_text.len(), |p| to_pos + 4 + p);
+            (range_text[to_pos + 4..end_pos].trim(), "1s")
+        };
+
+        let end_ms = laminar_sql::translator::parse_interval_to_ms(end_str).unwrap_or(0);
+        let step_ms = laminar_sql::translator::parse_interval_to_ms(step_str).unwrap_or(1000);
+
+        (
+            laminar_sql::translator::ProbeOffsetSpec::Range {
+                start_ms,
+                end_ms,
+                step_ms,
+            },
+            range_pos,
+        )
+    } else if let Some(list_pos) = after_on_upper.find("LIST ") {
+        let list_text = &after_on[list_pos + 5..];
+        let Some(open_paren) = list_text.find('(') else {
+            return (None, None);
+        };
+        let Some(close_paren) = list_text.find(')') else {
+            return (None, None);
+        };
+        let items_str = &list_text[open_paren + 1..close_paren];
+        let offsets_ms: Vec<i64> = items_str
+            .split(',')
+            .filter_map(|s| laminar_sql::translator::parse_interval_to_ms(s.trim()))
+            .collect();
+        if offsets_ms.is_empty() {
+            return (None, None);
+        }
+        (
+            laminar_sql::translator::ProbeOffsetSpec::List(offsets_ms),
+            list_pos,
+        )
+    } else {
+        return (None, None);
+    };
+
+    let remaining = &after_on[alias_search_start..];
+    let remaining_upper = remaining.to_uppercase();
+    let Some(as_pos) = remaining_upper.rfind(" AS ") else {
+        return (None, None);
+    };
+
+    let after_as = remaining[as_pos + 4..].trim();
+    let probe_alias = after_as
+        .split(|c: char| c.is_whitespace() || c == ';' || c == ')')
+        .next()
+        .unwrap_or("p")
+        .to_string();
+
+    let config = laminar_sql::translator::TemporalProbeConfig::new(
+        left_table.clone(),
+        right_table.clone(),
+        left_alias.clone(),
+        right_alias.clone(),
+        key_columns,
+        left_time_column,
+        right_time_column,
+        &offsets,
+        probe_alias,
+    );
+
+    // Build projection SQL by pre-processing the original SQL into a form
+    // sqlparser can parse, then walking the AST for safe rewriting.
+    let projection_sql = build_probe_projection_via_ast(
+        sql,
+        tpj_pos,
+        &config,
+        left_alias.as_deref(),
+        right_alias.as_deref(),
+    );
+
+    (Some(config), projection_sql)
+}
+
+/// Pre-process the temporal probe SQL into a standard JOIN that sqlparser
+/// can parse, then walk the AST to build the projection SQL.
+fn build_probe_projection_via_ast(
+    original_sql: &str,
+    tpj_pos: usize,
+    config: &laminar_sql::translator::TemporalProbeConfig,
+    left_alias: Option<&str>,
+    right_alias: Option<&str>,
+) -> Option<String> {
+    let probe = &config.probe_alias;
+    let upper = original_sql.to_uppercase();
+
+    // Find end of the probe clause: last "AS <alias>" after TEMPORAL PROBE JOIN
+    let after_tpj_upper = &upper[tpj_pos..];
+    let as_needle = format!(" AS {}", probe.to_uppercase());
+    let as_off = after_tpj_upper.rfind(&as_needle)?;
+    let probe_clause_end = tpj_pos + as_off + as_needle.len();
+
+    // Build standard JOIN to replace the probe clause
+    let left_ref = left_alias.unwrap_or(&config.left_table);
+    let right_ref = right_alias.unwrap_or(&config.right_table);
+    let on_clause = config
+        .key_columns
+        .iter()
+        .map(|k| format!("{left_ref}.{k} = {right_ref}.{k}"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let right_part = right_alias.map_or_else(
+        || config.right_table.clone(),
+        |a| format!("{} {a}", config.right_table),
+    );
+    let join_clause = format!("JOIN {right_part} ON {on_clause}");
+
+    let before_probe = &original_sql[..tpj_pos];
+    let after_probe = &original_sql[probe_clause_end..];
+    let mut rewritten = format!("{before_probe}{join_clause}{after_probe}");
+
+    // Resolve probe pseudo-columns to plain identifiers before parsing
+    rewritten = rewritten.replace(&format!("{probe}.offset_ms"), &format!("{probe}_offset_ms"));
+    rewritten = rewritten.replace(&format!("{probe}.probe_ts"), &format!("{probe}_probe_ts"));
+    rewritten = rewritten.replace(&format!("{probe}.offset_us"), &format!("{probe}_offset_ms"));
+    rewritten = rewritten.replace(&format!("{probe}.timestamp"), &format!("{probe}_probe_ts"));
+
+    // Parse the rewritten SQL
+    let stmts = laminar_sql::parse_streaming_sql(&rewritten).ok()?;
+    let laminar_sql::parser::StreamingStatement::Standard(stmt) = stmts.first()? else {
+        return None;
+    };
+    let Statement::Query(query) = stmt.as_ref() else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+
+    // Walk AST to build projection SQL
+    let items: Vec<String> = select
+        .projection
+        .iter()
+        .map(|item| rewrite_probe_select_item(item, left_alias, right_alias, config))
+        .collect();
+    let select_clause = items.join(", ");
+
+    let where_clause = select.selection.as_ref().map(|expr| {
+        let r = rewrite_probe_expr(expr, left_alias, right_alias, config);
+        format!(" WHERE {r}")
+    });
+
+    let group_by = match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) if !exprs.is_empty() => {
+            let cols: Vec<String> = exprs
+                .iter()
+                .map(|e| rewrite_probe_expr(e, left_alias, right_alias, config))
+                .collect();
+            format!(" GROUP BY {}", cols.join(", "))
+        }
+        _ => String::new(),
+    };
+
+    let having = select.having.as_ref().map_or(String::new(), |expr| {
+        let r = rewrite_probe_expr(expr, left_alias, right_alias, config);
+        format!(" HAVING {r}")
+    });
+
+    Some(format!(
+        "SELECT {select_clause} FROM __temporal_probe_tmp{}{group_by}{having}",
+        where_clause.unwrap_or_default()
+    ))
+}
+
+fn rewrite_probe_select_item(
+    item: &SelectItem,
+    left_alias: Option<&str>,
+    right_alias: Option<&str>,
+    config: &laminar_sql::translator::TemporalProbeConfig,
+) -> String {
+    match item {
+        SelectItem::UnnamedExpr(expr) => rewrite_probe_expr(expr, left_alias, right_alias, config),
+        SelectItem::ExprWithAlias { expr, alias } => {
+            let r = rewrite_probe_expr(expr, left_alias, right_alias, config);
+            format!("{r} AS {alias}")
+        }
+        SelectItem::Wildcard(_) => "*".to_string(),
+        SelectItem::QualifiedWildcard(name, _) => {
+            let table = name.to_string();
+            if Some(table.as_str()) == left_alias || Some(table.as_str()) == right_alias {
+                "*".to_string()
+            } else {
+                format!("{table}.*")
+            }
+        }
+    }
+}
+
+/// AST-level expression rewriter for temporal probe projection.
+/// Same recursive structure as ASOF `rewrite_expr`, parameterized for
+/// `TemporalProbeConfig` with composite key support and time-column
+/// disambiguation heuristic.
+fn rewrite_probe_expr(
+    expr: &Expr,
+    left_alias: Option<&str>,
+    right_alias: Option<&str>,
+    config: &laminar_sql::translator::TemporalProbeConfig,
+) -> String {
+    match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let table = parts[0].value.as_str();
+            let column = parts[1].value.as_str();
+
+            let is_left = Some(table) == left_alias || table == config.left_table;
+            let is_right = Some(table) == right_alias || table == config.right_table;
+
+            if is_left {
+                column.to_string()
+            } else if is_right {
+                if config.key_columns.iter().any(|k| k == column) {
+                    column.to_string()
+                } else if column == config.left_time_column && column == config.right_time_column {
+                    format!("{}_{}", column, config.right_table)
+                } else {
+                    column.to_string()
+                }
+            } else {
+                expr.to_string()
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let l = rewrite_probe_expr(left, left_alias, right_alias, config);
+            let r = rewrite_probe_expr(right, left_alias, right_alias, config);
+            format!("{l} {op} {r}")
+        }
+        Expr::UnaryOp { op, expr: inner } => {
+            let e = rewrite_probe_expr(inner, left_alias, right_alias, config);
+            format!("{op} {e}")
+        }
+        Expr::Nested(inner) => {
+            let e = rewrite_probe_expr(inner, left_alias, right_alias, config);
+            format!("({e})")
+        }
+        Expr::Function(func) => {
+            let name = &func.name;
+            let args: Vec<String> = match &func.args {
+                sqlparser::ast::FunctionArguments::List(arg_list) => arg_list
+                    .args
+                    .iter()
+                    .map(|arg| match arg {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ) => rewrite_probe_expr(e, left_alias, right_alias, config),
+                        other => other.to_string(),
+                    })
+                    .collect(),
+                other => vec![other.to_string()],
+            };
+            format!("{name}({})", args.join(", "))
+        }
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => {
+            let e = rewrite_probe_expr(inner, left_alias, right_alias, config);
+            format!("CAST({e} AS {data_type})")
+        }
+        Expr::IsNull(inner) => {
+            let e = rewrite_probe_expr(inner, left_alias, right_alias, config);
+            format!("{e} IS NULL")
+        }
+        Expr::IsNotNull(inner) => {
+            let e = rewrite_probe_expr(inner, left_alias, right_alias, config);
+            format!("{e} IS NOT NULL")
+        }
+        _ => expr.to_string(),
+    }
 }
 
 /// Build a `SELECT ... FROM __interval_tmp` projection query from the original
@@ -3611,7 +3995,7 @@ fn rewrite_expr(
 /// `DataFusion` applies `LIMIT N` per micro-batch, but streaming Top-K
 /// needs a global limit across the combined result. This function
 /// concatenates all batches and slices to the first `k` rows.
-fn apply_topk_filter(batches: &[RecordBatch], k: usize) -> Vec<RecordBatch> {
+pub(crate) fn apply_topk_filter(batches: &[RecordBatch], k: usize) -> Vec<RecordBatch> {
     if batches.is_empty() || k == 0 {
         return Vec::new();
     }
@@ -3885,6 +4269,9 @@ mod tests {
         let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
+        // Debug builds on CI can exceed the default 8ms budget on level1 aggregation,
+        // causing level2 to be skipped. Use a generous budget.
+        executor.set_query_budget_ns(5_000_000_000);
 
         // level1: aggregate events
         executor.add_query(
@@ -3929,6 +4316,8 @@ mod tests {
         let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
+        // Debug builds on Windows can be slow — use a generous budget for 3-level cascade.
+        executor.set_query_budget_ns(5_000_000_000);
 
         // level1: pass through
         executor.add_query(
@@ -3985,6 +4374,10 @@ mod tests {
         let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
+        // Use a generous budget so all three queries execute in a single
+        // cycle even on slow CI machines (default 8ms is too tight for
+        // first-run compilation + aggregation).
+        executor.set_query_budget_ns(5_000_000_000);
 
         // Two queries from the same source
         executor.add_query(
@@ -5517,5 +5910,116 @@ mod tests {
             .get("joined")
             .map_or(0, |bs| bs.iter().map(|b| b.num_rows()).sum());
         assert_eq!(rows, 1, "Restored state should match cross-cycle");
+    }
+
+    #[test]
+    fn test_detect_temporal_probe_range() {
+        let sql = "SELECT t.symbol, p.offset_ms FROM trades t \
+                    TEMPORAL PROBE JOIN market_data m ON (symbol) \
+                    RANGE FROM 0s TO 5s STEP 1s AS p";
+        let (config, proj) = detect_temporal_probe_query(sql);
+        let config = config.expect("should detect");
+        assert_eq!(config.left_table, "trades");
+        assert_eq!(config.right_table, "market_data");
+        assert_eq!(config.left_alias, Some("t".into()));
+        assert_eq!(config.right_alias, Some("m".into()));
+        assert_eq!(config.key_columns, vec!["symbol".to_string()]);
+        assert_eq!(config.probe_alias, "p");
+        assert_eq!(
+            config.expanded_offsets_ms,
+            vec![0, 1000, 2000, 3000, 4000, 5000]
+        );
+        // Verify projection SQL rewrites aliases correctly
+        let proj = proj.expect("should have projection");
+        assert!(
+            proj.contains("p_offset_ms"),
+            "p.offset_ms should be rewritten to p_offset_ms, got: {proj}"
+        );
+        assert!(
+            !proj.contains("p.offset_ms"),
+            "p.offset_ms should not remain in projection, got: {proj}"
+        );
+        assert!(
+            proj.contains("symbol"),
+            "t.symbol should be rewritten to symbol, got: {proj}"
+        );
+    }
+
+    #[test]
+    fn test_detect_temporal_probe_list() {
+        let sql = "SELECT * FROM trades t \
+                    TEMPORAL PROBE JOIN prices p2 ON (sym) \
+                    LIST (-5s, 0s, 5s) AS probe";
+        let (config, _) = detect_temporal_probe_query(sql);
+        let config = config.expect("should detect");
+        assert_eq!(config.right_table, "prices");
+        assert_eq!(config.right_alias, Some("p2".into()));
+        assert_eq!(config.key_columns, vec!["sym".to_string()]);
+        assert_eq!(config.probe_alias, "probe");
+        assert_eq!(config.expanded_offsets_ms, vec![-5000, 0, 5000]);
+    }
+
+    #[test]
+    fn test_detect_temporal_probe_timestamps_clause() {
+        let sql = "SELECT * FROM trades t \
+                    TEMPORAL PROBE JOIN market_data m ON (symbol) \
+                    TIMESTAMPS (trade_ts, mkt_ts) \
+                    LIST (0s, 5s) AS p";
+        let (config, _) = detect_temporal_probe_query(sql);
+        let config = config.expect("should detect");
+        assert_eq!(config.left_time_column, "trade_ts");
+        assert_eq!(config.right_time_column, "mkt_ts");
+    }
+
+    #[test]
+    fn test_detect_temporal_probe_none_for_normal_sql() {
+        let sql = "SELECT symbol, avg(price) FROM trades GROUP BY symbol";
+        let (config, _) = detect_temporal_probe_query(sql);
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn test_detect_temporal_probe_default_time_columns() {
+        let sql = "SELECT * FROM trades t \
+                    TEMPORAL PROBE JOIN prices m ON (symbol) \
+                    LIST (0s) AS p";
+        let (config, _) = detect_temporal_probe_query(sql);
+        let config = config.expect("should detect");
+        assert_eq!(config.left_time_column, "ts");
+        assert_eq!(config.right_time_column, "ts");
+    }
+
+    #[test]
+    fn test_detect_temporal_probe_time_column_disambiguation() {
+        // When both sides have the same time column name, the right side
+        // should be rewritten with _{right_table} suffix.
+        let sql = "SELECT t.symbol, m.ts, p.offset_ms FROM trades t \
+                    TEMPORAL PROBE JOIN prices m ON (symbol) \
+                    LIST (0s) AS p";
+        let (config, proj) = detect_temporal_probe_query(sql);
+        let config = config.expect("should detect");
+        // Both default to "ts" — collision
+        assert_eq!(config.left_time_column, "ts");
+        assert_eq!(config.right_time_column, "ts");
+
+        let proj = proj.expect("should have projection");
+        // m.ts should become ts_prices (disambiguated), not bare ts
+        assert!(
+            proj.contains("ts_prices"),
+            "m.ts should be rewritten to ts_prices when colliding, got: {proj}"
+        );
+    }
+
+    #[test]
+    fn test_detect_temporal_probe_composite_keys() {
+        let sql = "SELECT * FROM trades t \
+                    TEMPORAL PROBE JOIN market_data m ON (symbol, venue) \
+                    TIMESTAMPS (ts, mts) LIST (0s, 5s) AS p";
+        let (config, _) = detect_temporal_probe_query(sql);
+        let config = config.expect("should detect");
+        assert_eq!(
+            config.key_columns,
+            vec!["symbol".to_string(), "venue".to_string()]
+        );
     }
 }

@@ -1,0 +1,62 @@
+name: PR Review Gate
+
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  human-review-check:
+    name: Human Review Attestation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR body for human attestation
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.pull_request.body || '';
+
+            const problems = [];
+
+            // Check that the "Why" section has real content (not just the template comment)
+            const whyMatch = body.match(/## Why\s*\n([\s\S]*?)(?=\n## )/);
+            const whyContent = whyMatch ? whyMatch[1].replace(/<!--[\s\S]*?-->/g, '').trim() : '';
+            if (!whyContent || whyContent.length < 20) {
+              problems.push('**Why section is empty or too brief.** Explain the motivation behind this change (minimum 20 characters).');
+            }
+
+            // Check that "Reviewer notes" has real content
+            const reviewerNotesMatch = body.match(/\*\*Reviewer notes\*\*[^:]*:\s*\n([\s\S]*?)(?=\n## )/);
+            const reviewerNotes = reviewerNotesMatch ? reviewerNotesMatch[1].replace(/<!--[\s\S]*?-->/g, '').trim() : '';
+            if (!reviewerNotes || reviewerNotes.length < 30) {
+              problems.push('**Reviewer notes are empty or too brief.** Write 2-3 sentences about what you verified and why this change is correct (minimum 30 characters).');
+            }
+
+            // Check that the attestation checkboxes are checked
+            const reviewedDiff = body.includes('[x] **I have personally reviewed this entire diff**');
+            const explainWhy = body.includes('[x] My review comments (if any) explain *why*');
+            if (!reviewedDiff) {
+              problems.push('**Review attestation checkbox not checked.** Check the "I have personally reviewed this entire diff" box.');
+            }
+            if (!explainWhy) {
+              problems.push('**Review reasoning checkbox not checked.** Check the "review comments explain why" box.');
+            }
+
+            if (problems.length > 0) {
+              const message = [
+                '## :x: Human Review Attestation Required',
+                '',
+                'This project requires human-engaged review for all PRs. AI-generated code is welcome, but a human must review and attest to the changes.',
+                '',
+                '### Issues found:',
+                '',
+                ...problems.map(p => `- ${p}`),
+                '',
+                'Please update the PR description to address these items. See [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md#review-policy) for details.',
+              ].join('\n');
+
+              core.setFailed(message);
+              return;
+            }
+
+            core.info('Human review attestation verified.');

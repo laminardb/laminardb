@@ -36,6 +36,13 @@
 /// CDC-to-reference-table adapter for using CDC sources as lookup tables.
 pub mod cdc_adapter;
 
+/// Delta Lake reference table source for lookup/enrichment joins.
+pub mod delta_reference;
+
+/// Delta Lake on-demand lookup source for cache-miss fallback.
+#[cfg(feature = "delta-lake")]
+pub mod delta_lookup;
+
 /// PostgreSQL lookup source with connection pooling and predicate pushdown.
 #[cfg(feature = "postgres-cdc")]
 pub mod postgres_source;

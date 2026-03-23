@@ -753,6 +753,7 @@ mod tests {
                 drain_budget_ns: 1_000_000,
                 query_budget_ns: 8_000_000,
                 background_budget_ns: 5_000_000,
+                sink_write_timeout: Duration::from_secs(30),
             },
             rx,
             source_handles: Vec::new(),
@@ -816,6 +817,7 @@ mod tests {
                 drain_budget_ns: 1_000_000,
                 query_budget_ns: 8_000_000,
                 background_budget_ns: 5_000_000,
+                sink_write_timeout: Duration::from_secs(30),
             },
             rx,
             source_handles: Vec::new(),
@@ -881,6 +883,7 @@ mod tests {
                 drain_budget_ns: 1_000_000,
                 query_budget_ns: 8_000_000,
                 background_budget_ns: 5_000_000,
+                sink_write_timeout: Duration::from_secs(30),
             },
             rx: mpsc::channel(64).1, // dummy, not used
             source_handles: Vec::new(),

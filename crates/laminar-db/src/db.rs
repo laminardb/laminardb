@@ -279,6 +279,11 @@ impl LaminarDB {
             laminar_connectors::lakehouse::register_delta_lake_sink(registry);
             laminar_connectors::lakehouse::register_delta_lake_source(registry);
         }
+        #[cfg(feature = "iceberg")]
+        {
+            laminar_connectors::lakehouse::register_iceberg_sink(registry);
+            laminar_connectors::lakehouse::register_iceberg_source(registry);
+        }
         #[cfg(feature = "websocket")]
         {
             laminar_connectors::websocket::register_websocket_source(registry);
@@ -287,6 +292,11 @@ impl LaminarDB {
         #[cfg(feature = "mysql-cdc")]
         {
             laminar_connectors::cdc::mysql::register_mysql_cdc_source(registry);
+        }
+        #[cfg(feature = "mongodb-cdc")]
+        {
+            laminar_connectors::mongodb::register_mongodb_cdc(registry);
+            laminar_connectors::mongodb::register_mongodb_sink(registry);
         }
         #[cfg(feature = "files")]
         {
@@ -986,6 +996,7 @@ impl LaminarDB {
                         ConnectorType::MysqlCdc => "mysql-cdc",
                         ConnectorType::Redis => "redis",
                         ConnectorType::S3Parquet => "s3-parquet",
+                        ConnectorType::DeltaLake => "delta-lake",
                         ConnectorType::Custom(s) => s.as_str(),
                         ConnectorType::Static => unreachable!(),
                     };
@@ -2105,6 +2116,103 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // -----------------------------------------------------------------------
+    // Pipeline-running state guards
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_create_source_with_connector_rejected_when_running() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE seed (id INT)").await.unwrap();
+        db.start().await.unwrap();
+
+        // WITH syntax
+        let result = db
+            .execute("CREATE SOURCE events (id INT) WITH ('connector' = 'kafka', 'topic' = 'x')")
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("pipeline is running"),
+            "expected pipeline-running error, got: {err}"
+        );
+
+        // FROM syntax (what server mode generates via source_to_ddl)
+        let result = db
+            .execute("CREATE SOURCE events2 (id INT) FROM KAFKA (topic = 'x')")
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("pipeline is running"),
+            "expected pipeline-running error for FROM syntax, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_source_without_connector_allowed_when_running() {
+        let db = LaminarDB::open().unwrap();
+        db.start().await.unwrap();
+
+        // Schema-only source (no connector) — used by embedded db.insert() API.
+        let result = db.execute("CREATE SOURCE events (id INT)").await;
+        assert!(
+            result.is_ok(),
+            "schema-only source should be allowed when running"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_sink_with_connector_rejected_when_running() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT)").await.unwrap();
+        db.start().await.unwrap();
+
+        let result = db
+            .execute(
+                "CREATE SINK output FROM events \
+                 WITH ('connector' = 'kafka', 'topic' = 'out')",
+            )
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("pipeline is running"),
+            "expected pipeline-running error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_source_rejected_when_running() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT)").await.unwrap();
+        db.start().await.unwrap();
+
+        let result = db.execute("DROP SOURCE events").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("pipeline is running"),
+            "expected pipeline-running error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_sink_rejected_when_running() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT)").await.unwrap();
+        db.execute("CREATE SINK output FROM events").await.unwrap();
+        db.start().await.unwrap();
+
+        let result = db.execute("DROP SINK output").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("pipeline is running"),
+            "expected pipeline-running error, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_connector_registry_accessor() {
         let db = LaminarDB::open().unwrap();
@@ -2135,6 +2243,11 @@ mod tests {
             expected_sources += 1; // delta-lake source
             expected_sinks += 1; // delta-lake sink
         }
+        #[cfg(feature = "iceberg")]
+        {
+            expected_sources += 1; // iceberg source
+            expected_sinks += 1; // iceberg sink
+        }
         #[cfg(feature = "websocket")]
         {
             expected_sources += 1; // websocket source
@@ -2143,6 +2256,11 @@ mod tests {
         #[cfg(feature = "mysql-cdc")]
         {
             expected_sources += 1; // mysql CDC source
+        }
+        #[cfg(feature = "mongodb-cdc")]
+        {
+            expected_sources += 1; // mongodb CDC source
+            expected_sinks += 1; // mongodb sink
         }
         #[cfg(feature = "files")]
         {

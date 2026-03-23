@@ -91,6 +91,18 @@ pub struct PipelineCounters {
     pub cycle_p95_ns: AtomicU64,
     /// Cycle duration p99 in nanoseconds (updated periodically).
     pub cycle_p99_ns: AtomicU64,
+
+    // ── Sink 2PC timing (checkpoint coordinator, async) ──
+    /// Duration of the last sink pre-commit phase in microseconds.
+    pub sink_precommit_duration_us: AtomicU64,
+    /// Duration of the last sink commit phase in microseconds.
+    pub sink_commit_duration_us: AtomicU64,
+
+    // ── Checkpoint size / lag ──
+    /// Size of the last checkpoint in bytes (sidecar + manifest).
+    pub last_checkpoint_size_bytes: AtomicU64,
+    /// Wall-clock timestamp (ms since epoch) of the last successful checkpoint.
+    pub last_checkpoint_timestamp_ms: AtomicU64,
 }
 
 impl PipelineCounters {
@@ -115,6 +127,10 @@ impl PipelineCounters {
             cycle_p50_ns: AtomicU64::new(0),
             cycle_p95_ns: AtomicU64::new(0),
             cycle_p99_ns: AtomicU64::new(0),
+            sink_precommit_duration_us: AtomicU64::new(0),
+            sink_commit_duration_us: AtomicU64::new(0),
+            last_checkpoint_size_bytes: AtomicU64::new(0),
+            last_checkpoint_timestamp_ms: AtomicU64::new(0),
         }
     }
 
@@ -138,6 +154,10 @@ impl PipelineCounters {
             cycle_p50_ns: self.cycle_p50_ns.load(Ordering::Relaxed),
             cycle_p95_ns: self.cycle_p95_ns.load(Ordering::Relaxed),
             cycle_p99_ns: self.cycle_p99_ns.load(Ordering::Relaxed),
+            sink_precommit_duration_us: self.sink_precommit_duration_us.load(Ordering::Relaxed),
+            sink_commit_duration_us: self.sink_commit_duration_us.load(Ordering::Relaxed),
+            last_checkpoint_size_bytes: self.last_checkpoint_size_bytes.load(Ordering::Relaxed),
+            last_checkpoint_timestamp_ms: self.last_checkpoint_timestamp_ms.load(Ordering::Relaxed),
         }
     }
 }
@@ -183,6 +203,14 @@ pub struct CounterSnapshot {
     pub cycle_p95_ns: u64,
     /// Cycle duration p99 in nanoseconds.
     pub cycle_p99_ns: u64,
+    /// Last sink pre-commit duration in microseconds.
+    pub sink_precommit_duration_us: u64,
+    /// Last sink commit duration in microseconds.
+    pub sink_commit_duration_us: u64,
+    /// Last checkpoint size in bytes.
+    pub last_checkpoint_size_bytes: u64,
+    /// Wall-clock timestamp (ms since epoch) of last successful checkpoint.
+    pub last_checkpoint_timestamp_ms: u64,
 }
 
 /// Pipeline-wide metrics snapshot.

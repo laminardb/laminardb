@@ -157,8 +157,15 @@ impl OffsetTracker {
         let mut tpl = TopicPartitionList::new();
         for (topic, partitions) in &self.topics {
             for (&partition, &offset) in partitions {
-                tpl.add_partition_offset(topic, partition, Offset::Offset(offset + 1))
-                    .ok();
+                if let Err(e) =
+                    tpl.add_partition_offset(topic, partition, Offset::Offset(offset + 1))
+                {
+                    tracing::warn!(
+                        %topic, partition, offset,
+                        error = %e,
+                        "failed to add partition offset to commit list"
+                    );
+                }
             }
         }
         tpl
@@ -215,8 +222,15 @@ impl OffsetTracker {
         for (topic, partitions) in &self.topics {
             for (&partition, &offset) in partitions {
                 if assigned.contains(&(topic.to_string(), partition)) {
-                    tpl.add_partition_offset(topic, partition, Offset::Offset(offset + 1))
-                        .ok();
+                    if let Err(e) =
+                        tpl.add_partition_offset(topic, partition, Offset::Offset(offset + 1))
+                    {
+                        tracing::warn!(
+                            %topic, partition, offset,
+                            error = %e,
+                            "failed to add partition offset to filtered commit list"
+                        );
+                    }
                 }
             }
         }

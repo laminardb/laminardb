@@ -81,8 +81,13 @@ pub struct PostgresCdcConfig {
     /// Tables to exclude from replication.
     pub table_exclude: Vec<String>,
 
-    /// Maximum events to buffer before dropping oldest (default: 100,000).
+    /// Maximum events to buffer (default: 100,000).
     pub max_buffered_events: usize,
+
+    /// High watermark ratio (0.0–1.0) of `max_buffered_events`. When the
+    /// buffer reaches this level, stop draining the WAL reader channel to
+    /// apply backpressure (default: 0.8).
+    pub backpressure_high_watermark: f64,
 }
 
 impl Default for PostgresCdcConfig {
@@ -110,11 +115,23 @@ impl Default for PostgresCdcConfig {
             table_include: Vec::new(),
             table_exclude: Vec::new(),
             max_buffered_events: 100_000,
+            backpressure_high_watermark: 0.8,
         }
     }
 }
 
 impl PostgresCdcConfig {
+    /// Returns the high watermark as an absolute event count.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    pub fn backpressure_high_watermark(&self) -> usize {
+        (self.max_buffered_events as f64 * self.backpressure_high_watermark) as usize
+    }
+
     /// Creates a new config with required fields.
     #[must_use]
     pub fn new(host: &str, database: &str, slot_name: &str, publication: &str) -> Self {
@@ -198,6 +215,9 @@ impl PostgresCdcConfig {
         }
         if let Some(max) = config.get_parsed::<usize>("max.buffered.events")? {
             cfg.max_buffered_events = max;
+        }
+        if let Some(hw) = config.get_parsed::<f64>("backpressure.high.watermark")? {
+            cfg.backpressure_high_watermark = hw;
         }
 
         cfg.validate()?;

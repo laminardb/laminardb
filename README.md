@@ -3,6 +3,7 @@
 [![docs.rs](https://docs.rs/laminar-db/badge.svg)](https://docs.rs/laminar-db)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange)](https://www.rust-lang.org)
+[![Website](https://img.shields.io/badge/website-laminardb.io-blue)](https://laminardb.io)
 
 # LaminarDB
 
@@ -89,8 +90,8 @@ Three deployment modes:
 | Mode | How | Status |
 |------|-----|--------|
 | **Embedded** | `cargo add laminar-db` — runs inside your Rust process | ✅ Implemented |
-| **Standalone** | `laminardb` binary with HTTP API, configurable via TOML | ✅ Implemented |
-| **Distributed** | Multi-node via gossip discovery, Raft consensus, gRPC — `--features delta` | 🔧 Implemented; production hardening pending (Phase 6c) |
+| **Standalone** | `laminardb` binary — TOML config, REST API, Prometheus metrics, hot-reload | ✅ Implemented |
+| **Distributed** | Multi-node via gossip discovery, Raft consensus, gRPC — `--features delta` | 📋 Planned (skeleton only; Phase 6c) |
 
 The embedded mode is the primary deployment target. You get a `LaminarDB` handle, register sources with SQL DDL, push `RecordBatch` data in, subscribe to output streams, and let the engine handle windowing, joins, checkpointing, and exactly-once delivery.
 
@@ -209,6 +210,7 @@ Feature-gated connectors for external systems. Each implements `SourceConnector`
 | Kafka | `kafka` | Consumer group, Schema Registry, Avro/JSON/CSV/Debezium | ✅ |
 | PostgreSQL CDC | `postgres-cdc` | Logical replication (pgoutput), Z-set changelog | ✅ |
 | MySQL CDC | `mysql-cdc` | Binlog replication, GTID position tracking | ✅ |
+| MongoDB CDC | `mongodb-cdc` | Change streams, resume token tracking | ✅ |
 | WebSocket Client | `websocket` | Connect to external WebSocket servers | ✅ |
 | WebSocket Server | `websocket` | Accept incoming WebSocket connections | ✅ |
 | Delta Lake | `delta-lake` | Read from Delta Lake tables, version polling | ✅ |
@@ -222,11 +224,11 @@ Feature-gated connectors for external systems. Each implements `SourceConnector`
 |-----------|-------------|-------|--------|
 | Kafka | `kafka` | Exactly-once transactions, configurable partitioning | ✅ |
 | PostgreSQL | `postgres-sink` | COPY BINARY, upsert, co-transactional exactly-once | ✅ |
+| MongoDB | `mongodb-cdc` | Ordered/unordered writes, upsert, CDC replay | ✅ |
 | Delta Lake | `delta-lake` | S3/Azure/GCS, epoch-aligned Parquet commits | ✅ |
 | WebSocket Server | `websocket` | Fan-out to connected subscribers | ✅ |
 | WebSocket Client | `websocket` | Push to external WebSocket server | ✅ |
 | Files | `files` | Parquet/CSV with timestamp/partition templates | ✅ |
-| Apache Iceberg | -- | -- | 📋 Planned |
 
 Cloud storage backends for Delta Lake: S3 (`delta-lake-s3`), Azure ADLS (`delta-lake-azure`), GCS (`delta-lake-gcs`). Supports Unity and Glue catalogs.
 
@@ -253,7 +255,7 @@ CREATE SINK trade_archive INTO DELTA_LAKE (
 
 Supported formats: `json`, `csv`, `avro` (with Schema Registry), `raw` (bytes), `debezium` (CDC envelope).
 
-Custom connectors can be built using the `SourceConnector` / `SinkConnector` traits with retry policies, circuit breakers, and rate limiters from the connector SDK.
+Custom connectors can be built by implementing the `SourceConnector` or `SinkConnector` trait and registering with `ConnectorRegistry`.
 
 ---
 
@@ -297,7 +299,7 @@ Custom connectors can be built using the `SourceConnector` / `SinkConnector` tra
 
 - **Streaming coordinator** — Single tokio task driving SQL execution cycles. Source connectors push batches via mpsc channels; the coordinator runs compiled projections / cached logical plans, routes results to sinks, and manages checkpoint barriers. Sub-microsecond for compiled single-source projections; microseconds for incremental aggregations and cached-plan queries; DataFusion fallback for complex queries.
 - **Background I/O** — Tokio async runtime handling WAL writes, checkpointing, connector I/O, and changelog draining.
-- **Admin** — HTTP admin API, metrics, configuration management. Auth and observability are planned (Phase 4/5).
+- **Admin** — HTTP REST API (Axum), Prometheus metrics, ad-hoc SQL, hot-reload, checkpoint triggers. Auth is planned (Phase 4).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 
@@ -386,7 +388,7 @@ Additional benchmark suites: `window_bench`, `join_bench`, `lookup_join_bench`, 
 
 ## Project Status
 
-**Version 0.18.0** — active development, pre-1.0. APIs may change between minor versions.
+**Version 0.18.12** — active development, pre-1.0. APIs may change between minor versions.
 
 | Phase | Description | Progress |
 |-------|-------------|----------|
@@ -415,6 +417,7 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full phase timeline.
 | `postgres-cdc` | PostgreSQL CDC source via logical replication |
 | `postgres-sink` | PostgreSQL sink via COPY BINARY |
 | `mysql-cdc` | MySQL CDC source via binlog replication |
+| `mongodb-cdc` | MongoDB CDC source and sink |
 | `delta-lake` | Delta Lake source and sink |
 | `delta-lake-s3` / `delta-lake-azure` / `delta-lake-gcs` | Cloud storage backends |
 | `websocket` | WebSocket source and sink connectors |
@@ -454,7 +457,7 @@ crates/
   laminar-core/        Core engine: reactor, operators, state, windows, joins
   laminar-sql/         SQL parser, DataFusion integration, streaming optimizer
   laminar-storage/     WAL, checkpointing, per-core WAL, recovery
-  laminar-connectors/  Kafka, CDC, WebSocket, Delta Lake, files, connector SDK
+  laminar-connectors/  Kafka, CDC, MongoDB, WebSocket, Delta Lake, files
   laminar-db/          Unified database facade, checkpoint coordination, FFI
   laminar-derive/      Derive macros: Record, FromRecordBatch, FromRow, ConnectorConfig
   laminar-server/      Standalone server binary (HTTP API, Docker, Helm)
@@ -476,6 +479,12 @@ examples/
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code style, Ring 0 rules, and the PR process.
+
+## Support
+
+- [GitHub Issues](https://github.com/laminardb/laminardb/issues) — Bug reports and feature requests
+- [GitHub Discussions](https://github.com/laminardb/laminardb/discussions) — Questions and community help
+- Email: support@laminardb.io
 
 ## License
 
