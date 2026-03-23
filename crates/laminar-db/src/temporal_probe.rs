@@ -143,11 +143,20 @@ impl RefBuffer {
         key_col: &str,
         time_col: &str,
     ) -> Result<(), DbError> {
-        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+        if batches.is_empty() {
             return Ok(());
         }
 
         let schema = batches[0].schema();
+
+        // Capture the right-side schema even when all batches are empty,
+        // so output schema includes right columns from the first cycle.
+        if batches.iter().all(|b| b.num_rows() == 0) {
+            if self.right_concat.is_none() {
+                self.right_concat = Some(RecordBatch::new_empty(schema));
+            }
+            return Ok(());
+        }
         let new_batch = concat_batches(&schema, batches)
             .map_err(|e| DbError::Pipeline(format!("ref buffer concat: {e}")))?;
 

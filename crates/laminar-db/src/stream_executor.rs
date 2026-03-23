@@ -3226,7 +3226,11 @@ pub(crate) fn detect_temporal_probe_query(
         return (None, None);
     }
     let left_table = left_parts[0].to_string();
-    let left_alias = left_parts.get(1).map(ToString::to_string);
+    let left_alias = if left_parts.len() >= 3 && left_parts[1].eq_ignore_ascii_case("AS") {
+        Some(left_parts[2].to_string())
+    } else {
+        left_parts.get(1).map(ToString::to_string)
+    };
 
     let after_tpj = &sql[tpj_pos + "TEMPORAL PROBE JOIN".len()..];
     let after_tpj_trimmed = after_tpj.trim_start();
@@ -3242,7 +3246,11 @@ pub(crate) fn detect_temporal_probe_query(
         return (None, None);
     }
     let right_table = right_parts[0].to_string();
-    let right_alias = right_parts.get(1).map(ToString::to_string);
+    let right_alias = if right_parts.len() >= 3 && right_parts[1].eq_ignore_ascii_case("AS") {
+        Some(right_parts[2].to_string())
+    } else {
+        right_parts.get(1).map(ToString::to_string)
+    };
 
     let after_on = after_tpj_trimmed[on_pos + 4..].trim_start();
     let key_column = if let Some(rest) = after_on.strip_prefix('(') {
@@ -3393,9 +3401,25 @@ fn build_temporal_probe_projection_sql(
         original_sql[pos..pos + end].trim().to_string()
     });
 
+    let where_clause = upper.find(" WHERE ").map(|pos| {
+        let end = upper[pos..]
+            .find(" GROUP BY")
+            .or_else(|| upper[pos..].find(" HAVING"))
+            .or_else(|| upper[pos..].find(" ORDER"))
+            .or_else(|| upper[pos..].find(';'))
+            .unwrap_or(original_sql.len() - pos);
+        original_sql[pos..pos + end].trim().to_string()
+    });
+
     let rewritten_select = rewrite_probe_refs(select_clause, config, left_alias, right_alias);
 
     let mut sql = format!("SELECT {rewritten_select} FROM __temporal_probe_tmp");
+
+    if let Some(wh) = where_clause {
+        let rewritten_wh =
+            rewrite_probe_refs(&wh[" WHERE".len()..], config, left_alias, right_alias);
+        let _ = write!(sql, " WHERE {rewritten_wh}");
+    }
 
     if let Some(gb) = group_by_clause {
         let rewritten_gb =

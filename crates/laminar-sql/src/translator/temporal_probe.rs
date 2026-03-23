@@ -37,9 +37,12 @@ impl ProbeOffsetSpec {
                 }
                 let mut v = Vec::new();
                 let mut cur = *start_ms;
-                while cur <= *end_ms {
+                loop {
                     v.push(cur);
-                    cur = cur.saturating_add(*step_ms);
+                    match cur.checked_add(*step_ms) {
+                        Some(next) if next <= *end_ms => cur = next,
+                        _ => break,
+                    }
                 }
                 v
             }
