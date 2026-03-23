@@ -20,7 +20,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::subscription::registry::BackpressureStrategy;
+use crate::subscription::registry::SubscriptionOverflow;
 
 // ---------------------------------------------------------------------------
 // BackpressureController
@@ -33,7 +33,7 @@ use crate::subscription::registry::BackpressureStrategy;
 /// each event to determine whether it should be delivered or dropped.
 pub struct BackpressureController {
     /// The backpressure strategy.
-    strategy: BackpressureStrategy,
+    strategy: SubscriptionOverflow,
     /// Total events dropped due to backpressure.
     dropped: u64,
     /// Counter for `Sample(n)` strategy.
@@ -45,7 +45,7 @@ pub struct BackpressureController {
 impl BackpressureController {
     /// Creates a new controller with the given strategy.
     #[must_use]
-    pub fn new(strategy: BackpressureStrategy) -> Self {
+    pub fn new(strategy: SubscriptionOverflow) -> Self {
         Self {
             strategy,
             dropped: 0,
@@ -56,7 +56,7 @@ impl BackpressureController {
 
     /// Creates a new controller with a custom lag warning threshold.
     #[must_use]
-    pub fn with_lag_threshold(strategy: BackpressureStrategy, threshold: u64) -> Self {
+    pub fn with_lag_threshold(strategy: SubscriptionOverflow, threshold: u64) -> Self {
         Self {
             strategy,
             dropped: 0,
@@ -74,10 +74,10 @@ impl BackpressureController {
     #[inline]
     pub fn should_deliver(&mut self) -> bool {
         match self.strategy {
-            BackpressureStrategy::DropOldest
-            | BackpressureStrategy::DropNewest
-            | BackpressureStrategy::Block => true,
-            BackpressureStrategy::Sample(n) => {
+            SubscriptionOverflow::DropOldest
+            | SubscriptionOverflow::DropNewest
+            | SubscriptionOverflow::Block => true,
+            SubscriptionOverflow::Sample(n) => {
                 self.sample_counter += 1;
                 if self.sample_counter.is_multiple_of(n as u64) {
                     true
@@ -102,7 +102,7 @@ impl BackpressureController {
 
     /// Returns the configured backpressure strategy.
     #[must_use]
-    pub fn strategy(&self) -> BackpressureStrategy {
+    pub fn strategy(&self) -> SubscriptionOverflow {
         self.strategy
     }
 
@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_drop_oldest() {
-        let mut ctrl = BackpressureController::new(BackpressureStrategy::DropOldest);
+        let mut ctrl = BackpressureController::new(SubscriptionOverflow::DropOldest);
         for _ in 0..100 {
             assert!(ctrl.should_deliver());
         }
@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_drop_newest() {
-        let mut ctrl = BackpressureController::new(BackpressureStrategy::DropNewest);
+        let mut ctrl = BackpressureController::new(SubscriptionOverflow::DropNewest);
         assert!(ctrl.should_deliver());
         ctrl.record_drop();
         ctrl.record_drop();
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_sample() {
-        let mut ctrl = BackpressureController::new(BackpressureStrategy::Sample(3));
+        let mut ctrl = BackpressureController::new(SubscriptionOverflow::Sample(3));
         let mut delivered = Vec::new();
         for i in 0..12 {
             if ctrl.should_deliver() {
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn test_backpressure_controller_dropped_count() {
-        let mut ctrl = BackpressureController::new(BackpressureStrategy::DropNewest);
+        let mut ctrl = BackpressureController::new(SubscriptionOverflow::DropNewest);
         assert_eq!(ctrl.dropped(), 0);
         ctrl.record_drop();
         assert_eq!(ctrl.dropped(), 1);
@@ -261,14 +261,14 @@ mod tests {
 
     #[test]
     fn test_backpressure_strategy_accessor() {
-        let ctrl = BackpressureController::new(BackpressureStrategy::Block);
-        assert_eq!(ctrl.strategy(), BackpressureStrategy::Block);
+        let ctrl = BackpressureController::new(SubscriptionOverflow::Block);
+        assert_eq!(ctrl.strategy(), SubscriptionOverflow::Block);
     }
 
     #[test]
     fn test_lagging_subscriber_detection() {
         let ctrl =
-            BackpressureController::with_lag_threshold(BackpressureStrategy::DropOldest, 500);
+            BackpressureController::with_lag_threshold(SubscriptionOverflow::DropOldest, 500);
         assert!(!ctrl.is_lagging(499));
         assert!(ctrl.is_lagging(500));
         assert!(ctrl.is_lagging(1000));

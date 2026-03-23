@@ -1,4 +1,8 @@
-//! Ring 0 DAG executor for event processing.
+//! DAG executor for per-event processing (programmatic Rust API).
+//!
+//! **Note:** The SQL pipeline uses `StreamingCoordinator` + `StreamExecutor`,
+//! not this executor. This module serves the programmatic Rust API for
+//! `DagBuilder`-defined pipelines.
 //!
 //! [`DagExecutor`] processes events through a finalized [`StreamingDag`] in
 //! topological order. It uses the pre-computed [`RoutingTable`] for O(1)
@@ -8,7 +12,7 @@
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────────────────────────┐
-//! │                      RING 0: HOT PATH                            │
+//! │                   EVENT PROCESSING PATH                          │
 //! │                                                                  │
 //! │  process_event(source, event)                                    │
 //! │       │                                                          │
@@ -26,7 +30,7 @@
 //! └──────────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! # Latency Budget
+//! # Latency Budget (per-event path)
 //!
 //! | Component | Budget |
 //! |-----------|--------|
@@ -40,23 +44,23 @@ use std::collections::VecDeque;
 
 use rustc_hash::FxHashMap;
 
-use crate::alloc::HotPathGuard;
+use crate::alloc::{HotPathGuard, PriorityClass, PriorityGuard};
 use crate::operator::{
     Event, Operator, OperatorContext, OperatorState, Output, OutputVec, SideOutputData, Timer,
 };
 use crate::state::InMemoryStore;
 use crate::time::{BoundedOutOfOrdernessGenerator, TimerService};
 
-use super::checkpoint::CheckpointBarrier;
 use super::error::DagError;
 use super::routing::RoutingTable;
 use super::topology::{DagNodeType, NodeId, StreamingDag};
 use super::watermark::{DagWatermarkCheckpoint, DagWatermarkTracker};
+use crate::checkpoint::CheckpointBarrier;
 
 /// Per-node runtime state (timer service, state store, watermark generator).
 ///
-/// Created during executor construction (Ring 2) and used during event
-/// processing (Ring 0). Temporarily moved out of the executor during
+/// Created during executor construction and used during event
+/// processing. Temporarily moved out of the executor during
 /// operator dispatch to satisfy Rust's borrow checker.
 struct NodeRuntime {
     /// Timer service for this node.
@@ -99,9 +103,7 @@ pub struct DagExecutorMetrics {
 
 /// Per-operator metrics tracked by the DAG executor.
 ///
-/// Only populated when the `dag-metrics` feature is enabled.
 /// Tracks event counts and cumulative processing time per operator node.
-#[cfg(feature = "dag-metrics")]
 #[derive(Debug, Clone, Default)]
 pub struct OperatorNodeMetrics {
     /// Total events received by this operator.
@@ -114,7 +116,7 @@ pub struct OperatorNodeMetrics {
     pub invocations: u64,
 }
 
-/// Ring 0 DAG executor for event processing.
+/// DAG executor for per-event processing.
 ///
 /// Processes events through a finalized [`StreamingDag`] in topological order
 /// using the pre-computed [`RoutingTable`] for O(1) dispatch.
@@ -163,8 +165,7 @@ pub struct DagExecutor {
     metrics: DagExecutorMetrics,
     /// DAG-native watermark tracker for topology-aware propagation.
     watermark_tracker: DagWatermarkTracker,
-    /// Per-operator node metrics (feature-gated).
-    #[cfg(feature = "dag-metrics")]
+    /// Per-operator node metrics.
     node_metrics: Vec<OperatorNodeMetrics>,
 }
 
@@ -224,7 +225,6 @@ impl DagExecutor {
             temp_events: Vec::with_capacity(64),
             metrics: DagExecutorMetrics::default(),
             watermark_tracker,
-            #[cfg(feature = "dag-metrics")]
             node_metrics: (0..slot_count)
                 .map(|_| OperatorNodeMetrics::default())
                 .collect(),
@@ -316,10 +316,7 @@ impl DagExecutor {
         // Fire timers for any nodes whose watermark advanced
         self.fire_timers(watermark);
 
-        #[cfg(feature = "dag-metrics")]
-        {
-            self.metrics.watermarks_processed += 1;
-        }
+        self.metrics.watermarks_processed += 1;
         Ok(())
     }
 
@@ -411,8 +408,7 @@ impl DagExecutor {
         &self.metrics
     }
 
-    /// Returns per-operator node metrics (only available with `dag-metrics` feature).
-    #[cfg(feature = "dag-metrics")]
+    /// Returns per-operator node metrics.
     #[must_use]
     pub fn node_metrics(&self) -> &[OperatorNodeMetrics] {
         &self.node_metrics
@@ -421,11 +417,8 @@ impl DagExecutor {
     /// Resets all executor metrics to zero.
     pub fn reset_metrics(&mut self) {
         self.metrics = DagExecutorMetrics::default();
-        #[cfg(feature = "dag-metrics")]
-        {
-            for m in &mut self.node_metrics {
-                *m = OperatorNodeMetrics::default();
-            }
+        for m in &mut self.node_metrics {
+            *m = OperatorNodeMetrics::default();
         }
     }
 
@@ -457,9 +450,9 @@ impl DagExecutor {
     /// Returns a map of `NodeId` to `OperatorState` for all nodes
     /// that have registered operators.
     #[must_use]
-    pub fn checkpoint(&self) -> FxHashMap<NodeId, OperatorState> {
+    pub fn checkpoint(&mut self) -> FxHashMap<NodeId, OperatorState> {
         let mut states = FxHashMap::default();
-        for (idx, op) in self.operators.iter().enumerate() {
+        for (idx, op) in self.operators.iter_mut().enumerate() {
             if let Some(operator) = op {
                 #[allow(clippy::cast_possible_truncation)]
                 // DAG node count bounded by topology (< u32::MAX)
@@ -529,7 +522,7 @@ impl DagExecutor {
 
     /// Snapshots all registered operators in topological order.
     ///
-    /// Takes the barrier for consistency (future use with epoch tracking).
+    /// Accepts a barrier for consistency with the Chandy-Lamport protocol.
     /// In the synchronous single-threaded executor, topological ordering
     /// guarantees upstream-first snapshots.
     #[must_use]
@@ -541,7 +534,7 @@ impl DagExecutor {
         for &node_id in &self.execution_order {
             let idx = node_id.0 as usize;
             if idx < self.slot_count {
-                if let Some(ref operator) = self.operators[idx] {
+                if let Some(ref mut operator) = self.operators[idx] {
                     states.insert(node_id, operator.checkpoint());
                 }
             }
@@ -552,10 +545,10 @@ impl DagExecutor {
     /// Processes all nodes in topological order.
     ///
     /// Drains input queues, dispatches to operators, and routes outputs
-    /// to downstream nodes. Uses [`HotPathGuard`] for zero-allocation
-    /// enforcement in debug builds.
+    /// to downstream nodes.
     fn process_dag(&mut self) {
         let _guard = HotPathGuard::enter("dag_executor");
+        let _priority = PriorityGuard::enter(PriorityClass::EventProcessing);
 
         let order_len = self.execution_order.len();
         for i in 0..order_len {
@@ -570,10 +563,7 @@ impl DagExecutor {
         let idx = node_id.0 as usize;
 
         if self.input_queues[idx].is_empty() {
-            #[cfg(feature = "dag-metrics")]
-            {
-                self.metrics.nodes_skipped += 1;
-            }
+            self.metrics.nodes_skipped += 1;
             return;
         }
 
@@ -589,13 +579,9 @@ impl DagExecutor {
         let mut runtime = self.runtimes[idx].take();
 
         for event in events.drain(..) {
-            #[cfg(feature = "dag-metrics")]
-            {
-                self.metrics.events_processed += 1;
-                self.node_metrics[idx].events_in += 1;
-            }
+            self.metrics.events_processed += 1;
+            self.node_metrics[idx].events_in += 1;
 
-            #[cfg(feature = "dag-metrics")]
             let start = std::time::Instant::now();
 
             let outputs = if let Some(op) = &mut operator {
@@ -616,13 +602,10 @@ impl DagExecutor {
                 passthrough_output(event)
             };
 
-            #[cfg(feature = "dag-metrics")]
-            {
-                #[allow(clippy::cast_possible_truncation)]
-                let elapsed = start.elapsed().as_nanos() as u64;
-                self.node_metrics[idx].total_time_ns += elapsed;
-                self.node_metrics[idx].invocations += 1;
-            }
+            #[allow(clippy::cast_possible_truncation)]
+            let elapsed = start.elapsed().as_nanos() as u64;
+            self.node_metrics[idx].total_time_ns += elapsed;
+            self.node_metrics[idx].invocations += 1;
 
             // Route all output variants to downstream nodes.
             self.route_all_outputs(node_id, outputs);
@@ -649,12 +632,9 @@ impl DagExecutor {
         for output in outputs {
             match output {
                 Output::Event(out_event) => {
-                    #[cfg(feature = "dag-metrics")]
-                    {
-                        let sidx = source.0 as usize;
-                        if sidx < self.slot_count {
-                            self.node_metrics[sidx].events_out += 1;
-                        }
+                    let sidx = source.0 as usize;
+                    if sidx < self.slot_count {
+                        self.node_metrics[sidx].events_out += 1;
                     }
                     self.route_output(source, out_event);
                 }
@@ -699,16 +679,10 @@ impl DagExecutor {
             return;
         }
 
-        #[cfg(feature = "dag-metrics")]
-        {
-            self.metrics.events_routed += 1;
-        }
+        self.metrics.events_routed += 1;
 
         if entry.is_multicast {
-            #[cfg(feature = "dag-metrics")]
-            {
-                self.metrics.multicast_publishes += 1;
-            }
+            self.metrics.multicast_publishes += 1;
             let targets = entry.target_ids();
 
             // Clone to all targets except the last, which gets the moved value.

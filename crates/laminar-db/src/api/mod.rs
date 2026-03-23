@@ -79,7 +79,8 @@ mod ingestion;
 mod query;
 mod subscription;
 
-pub use connection::{Connection, DdlInfo, ExecuteResult};
+pub use crate::DdlInfo;
+pub use connection::{Connection, ExecuteResult};
 pub use error::{codes, ApiError};
 pub use ingestion::Writer;
 pub use query::{QueryResult, QueryStream};

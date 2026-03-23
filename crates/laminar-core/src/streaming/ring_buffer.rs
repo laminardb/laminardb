@@ -20,7 +20,7 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::tpc::CachePadded;
+use crate::alloc::CachePadded;
 
 use super::config::{MAX_BUFFER_SIZE, MIN_BUFFER_SIZE};
 

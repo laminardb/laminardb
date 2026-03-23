@@ -244,6 +244,8 @@ pub struct MmapStateStore {
     size_bytes: usize,
     /// Next version number (persisted in index file for format compatibility).
     next_version: u64,
+    /// Number of deletes since last compaction — gates the O(n) fragmentation check.
+    deletes_since_compact: usize,
 }
 
 impl MmapStateStore {
@@ -264,6 +266,7 @@ impl MmapStateStore {
             },
             size_bytes: 0,
             next_version: 1,
+            deletes_since_compact: 0,
         }
     }
 
@@ -346,6 +349,7 @@ impl MmapStateStore {
             },
             size_bytes,
             next_version,
+            deletes_since_compact: 0,
         })
     }
 
@@ -442,6 +446,7 @@ impl MmapStateStore {
             self.size_bytes += key.len() + value.len();
         }
 
+        self.deletes_since_compact = 0;
         Ok(())
     }
 
@@ -581,9 +586,12 @@ impl StateStore for MmapStateStore {
             self.index.insert(key.to_vec(), entry);
         }
 
-        // Auto-compact when fragmentation exceeds 50% and store is non-trivial.
+        // Auto-compact when enough deletes have occurred to warrant the O(n) check.
         // Failure is non-fatal — the store is still correct, just wastes space.
-        if self.len() > 100 && self.fragmentation() > 0.5 {
+        if self.deletes_since_compact > 0
+            && self.deletes_since_compact > self.len() / 4
+            && self.fragmentation() > 0.5
+        {
             if let Err(e) = self.compact() {
                 tracing::warn!(error = %e, "mmap auto-compact failed, will retry later");
             }
@@ -595,6 +603,7 @@ impl StateStore for MmapStateStore {
     fn delete(&mut self, key: &[u8]) -> Result<(), StateError> {
         if let Some(entry) = self.index.remove(key) {
             self.size_bytes -= key.len() + entry.len;
+            self.deletes_since_compact += 1;
             // Note: The space in storage becomes fragmentation
             // Use compact() to reclaim it
         }
@@ -676,6 +685,7 @@ impl StateStore for MmapStateStore {
         self.storage.reset();
         self.size_bytes = 0;
         self.next_version = 1;
+        self.deletes_since_compact = 0;
 
         for (key, value) in snapshot.data() {
             let offset = self
@@ -698,6 +708,7 @@ impl StateStore for MmapStateStore {
         self.index.clear();
         self.storage.reset();
         self.size_bytes = 0;
+        self.deletes_since_compact = 0;
     }
 
     fn flush(&mut self) -> Result<(), StateError> {

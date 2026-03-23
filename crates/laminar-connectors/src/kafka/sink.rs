@@ -4,9 +4,30 @@
 //! `RecordBatch` data to Kafka topics via rdkafka's `FutureProducer`.
 //! Supports at-least-once (idempotent) and exactly-once (transactional)
 //! delivery, configurable partitioning, and dead-letter queue routing.
+//!
+//! # Exactly-once architecture
+//!
+//! Recovery uses the checkpoint **manifest** as the authoritative source of
+//! committed offsets — NOT broker consumer group state. Broker-committed
+//! offsets are advisory only (for monitoring via `kafka-consumer-groups`).
+//!
+//! `send_offsets_to_transaction()` is intentionally NOT wired. It would add
+//! cross-connector plumbing complexity for zero correctness benefit: the
+//! manifest is what recovery reads, not the broker consumer group.
+//!
+//! The 2PC protocol is:
+//! 1. `pre_commit()` / `flush()` — ensure all records are delivered to brokers
+//! 2. Manifest persist — checkpoint coordinator writes the epoch to storage
+//! 3. `commit_transaction()` — atomically commit the Kafka transaction
+//!
+//! **Known window**: a crash between `commit_transaction()` success and the
+//! manifest status update to `Committed` will cause the next recovery to
+//! replay the epoch (at-least-once for that window). This is the classic
+//! 2PC coordinator crash problem; `send_offsets_to_transaction` does not
+//! fix it.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arrow_array::{Array, StringArray};
 use arrow_schema::SchemaRef;
@@ -28,8 +49,9 @@ use super::partitioner::{
     KafkaPartitioner, KeyHashPartitioner, RoundRobinPartitioner, StickyPartitioner,
 };
 use super::schema_registry::SchemaRegistryClient;
-use super::sink_config::{DeliveryGuarantee, KafkaSinkConfig, PartitionStrategy};
+use super::sink_config::{KafkaSinkConfig, PartitionStrategy};
 use super::sink_metrics::KafkaSinkMetrics;
+use crate::connector::DeliveryGuarantee;
 
 /// Fallback partition count used only when broker metadata query fails.
 const FALLBACK_PARTITION_COUNT: i32 = 1;
@@ -570,7 +592,10 @@ impl SinkConnector for KafkaSink {
             // Allow 500ms for rdkafka's internal queue to drain before failing
             // with QueueFull. Zero timeout causes legitimate messages to be
             // rejected under transient burst load.
-            delivery_futures.push(producer.send(record, Duration::from_millis(500)));
+            delivery_futures.push((
+                Instant::now(),
+                producer.send(record, Duration::from_millis(500)),
+            ));
 
             // Intermediate flush to bound in-flight records and memory.
             if flush_threshold > 0 && (i + 1) % flush_threshold == 0 {
@@ -581,9 +606,11 @@ impl SinkConnector for KafkaSink {
         }
 
         // Phase 2: Collect delivery reports.
-        for (i, future) in delivery_futures.into_iter().enumerate() {
+        for (i, (send_time, future)) in delivery_futures.into_iter().enumerate() {
             match future.await {
                 Ok(_delivery) => {
+                    let latency_us = send_time.elapsed().as_micros() as u64;
+                    self.metrics.record_produce_latency(latency_us);
                     records_written += 1;
                     bytes_written += payloads[i].len() as u64;
                 }

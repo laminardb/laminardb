@@ -36,6 +36,13 @@
 /// CDC-to-reference-table adapter for using CDC sources as lookup tables.
 pub mod cdc_adapter;
 
+/// Delta Lake reference table source for lookup/enrichment joins.
+pub mod delta_reference;
+
+/// Delta Lake on-demand lookup source for cache-miss fallback.
+#[cfg(feature = "delta-lake")]
+pub mod delta_lookup;
+
 /// PostgreSQL lookup source with connection pooling and predicate pushdown.
 #[cfg(feature = "postgres-cdc")]
 pub mod postgres_source;
@@ -50,63 +57,10 @@ pub mod parquet_source;
 #[cfg(feature = "parquet-lookup")]
 pub use parquet_source::{ParquetLookupSource, ParquetLookupSourceConfig};
 
-use arrow_array::RecordBatch;
 use async_trait::async_trait;
-use thiserror::Error;
 
-/// Errors that can occur during table lookup operations.
-#[derive(Debug, Error)]
-pub enum LookupError {
-    /// The requested key was not found in the table.
-    #[error("Key not found")]
-    KeyNotFound,
-
-    /// Connection to the external system failed.
-    #[error("Connection failed: {0}")]
-    ConnectionFailed(String),
-
-    /// Query execution failed.
-    #[error("Query failed: {0}")]
-    QueryFailed(String),
-
-    /// Timeout waiting for response.
-    #[error("Timeout after {0}ms")]
-    Timeout(u64),
-
-    /// Serialization/deserialization error.
-    #[error("Serialization error: {0}")]
-    SerializationError(String),
-
-    /// The table loader is not available (e.g., not initialized).
-    #[error("Loader not available: {0}")]
-    NotAvailable(String),
-}
-
-/// Result of a lookup operation.
-#[derive(Debug, Clone)]
-pub enum LookupResult {
-    /// The key was found with the associated data.
-    Found(RecordBatch),
-    /// The key was not found in the table.
-    NotFound,
-}
-
-impl LookupResult {
-    /// Returns `true` if the lookup found a result.
-    #[must_use]
-    pub fn is_found(&self) -> bool {
-        matches!(self, LookupResult::Found(_))
-    }
-
-    /// Returns the found batch, or `None` if not found.
-    #[must_use]
-    pub fn into_batch(self) -> Option<RecordBatch> {
-        match self {
-            LookupResult::Found(batch) => Some(batch),
-            LookupResult::NotFound => None,
-        }
-    }
-}
+// Re-export the canonical lookup types from laminar-core.
+pub use laminar_core::lookup::{LookupError, LookupResult};
 
 /// Trait for loading data from external reference tables.
 ///
@@ -130,13 +84,9 @@ impl LookupResult {
 pub trait TableLoader: Send + Sync {
     /// Looks up a single key in the table.
     ///
-    /// # Arguments
-    ///
-    /// * `key` - The key to look up (typically the join column value)
-    ///
     /// # Returns
     ///
-    /// - `Ok(LookupResult::Found(batch))` if the key exists
+    /// - `Ok(LookupResult::Hit(batch))` if the key exists
     /// - `Ok(LookupResult::NotFound)` if the key doesn't exist
     /// - `Err(LookupError)` if the lookup failed
     async fn lookup(&self, key: &[u8]) -> Result<LookupResult, LookupError>;
@@ -146,14 +96,6 @@ pub trait TableLoader: Send + Sync {
     /// Default implementation calls [`lookup`](TableLoader::lookup) for each key.
     /// Implementations should override this for better performance when the
     /// underlying system supports batch queries.
-    ///
-    /// # Arguments
-    ///
-    /// * `keys` - The keys to look up
-    ///
-    /// # Returns
-    ///
-    /// A vector of results in the same order as the input keys.
     async fn lookup_batch(&self, keys: &[&[u8]]) -> Result<Vec<LookupResult>, LookupError> {
         let mut results = Vec::with_capacity(keys.len());
         for key in keys {
@@ -212,6 +154,9 @@ impl TableLoader for NoOpTableLoader {
 }
 
 #[cfg(test)]
+use arrow_array::RecordBatch;
+
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct InMemoryTableLoader {
     data: std::sync::Arc<parking_lot::RwLock<rustc_hash::FxHashMap<Vec<u8>, RecordBatch>>>,
@@ -258,7 +203,7 @@ impl TableLoader for InMemoryTableLoader {
     async fn lookup(&self, key: &[u8]) -> Result<LookupResult, LookupError> {
         let data = self.data.read();
         match data.get(key) {
-            Some(batch) => Ok(LookupResult::Found(batch.clone())),
+            Some(batch) => Ok(LookupResult::Hit(batch.clone())),
             None => Ok(LookupResult::NotFound),
         }
     }
@@ -268,7 +213,7 @@ impl TableLoader for InMemoryTableLoader {
         let results = keys
             .iter()
             .map(|key| match data.get(*key) {
-                Some(batch) => LookupResult::Found(batch.clone()),
+                Some(batch) => LookupResult::Hit(batch.clone()),
                 None => LookupResult::NotFound,
             })
             .collect();
@@ -322,13 +267,13 @@ mod tests {
 
         // Lookup existing key
         let result = loader.lookup(b"cust_1").await.unwrap();
-        assert!(result.is_found());
+        assert!(result.is_hit());
         let batch = result.into_batch().unwrap();
         assert_eq!(batch.num_rows(), 1);
 
         // Lookup missing key
         let result = loader.lookup(b"cust_999").await.unwrap();
-        assert!(!result.is_found());
+        assert!(!result.is_hit());
     }
 
     #[tokio::test]
@@ -341,9 +286,9 @@ mod tests {
         let results = loader.lookup_batch(&keys).await.unwrap();
 
         assert_eq!(results.len(), 3);
-        assert!(results[0].is_found()); // k1 exists
-        assert!(!results[1].is_found()); // k2 doesn't exist
-        assert!(results[2].is_found()); // k3 exists
+        assert!(results[0].is_hit()); // k1 exists
+        assert!(!results[1].is_hit()); // k2 doesn't exist
+        assert!(results[2].is_hit()); // k3 exists
     }
 
     #[tokio::test]
@@ -361,7 +306,7 @@ mod tests {
         assert_eq!(loader.len(), 0);
 
         let result = loader.lookup(b"key").await.unwrap();
-        assert!(!result.is_found());
+        assert!(!result.is_hit());
     }
 
     #[tokio::test]
@@ -369,7 +314,7 @@ mod tests {
         let loader = NoOpTableLoader::new();
 
         let result = loader.lookup(b"any_key").await.unwrap();
-        assert!(!result.is_found());
+        assert!(!result.is_hit());
         assert_eq!(loader.name(), "no_op");
     }
 

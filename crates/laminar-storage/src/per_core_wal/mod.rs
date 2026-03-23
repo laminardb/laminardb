@@ -39,7 +39,7 @@
 //! - [`PerCoreWalEntry`]: WAL entry with epoch for cross-core ordering
 //! - [`PerCoreWalReader`]: Reader for a single segment file
 //! - [`PerCoreWalManager`]: Coordinates all core writers
-//! - [`CheckpointCoordinator`]: Merges segments during checkpoint
+//! - [`PerCoreCheckpointCoordinator`]: Merges segments during checkpoint
 //! - [`PerCoreRecoveryManager`]: Recovery from multiple segments
 //!
 //! ## Core Invariant
@@ -81,7 +81,7 @@ mod reader;
 mod recovery;
 mod writer;
 
-pub use coordinator::CheckpointCoordinator;
+pub use coordinator::PerCoreCheckpointCoordinator;
 pub use entry::{PerCoreWalEntry, WalOperation};
 pub use error::PerCoreWalError;
 pub use manager::{PerCoreWalConfig, PerCoreWalManager};

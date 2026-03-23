@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rdkafka::consumer::ConsumerContext;
+use rdkafka::consumer::{Consumer, ConsumerContext};
 use rdkafka::ClientContext;
 use tracing::{info, warn};
 
@@ -86,6 +86,17 @@ pub struct LaminarConsumerContext {
     rebalance_state: Arc<Mutex<RebalanceState>>,
     /// Shared rebalance event counter for source-level metrics.
     rebalance_metric: Arc<AtomicU64>,
+    /// Monotonically increasing generation bumped on each Revoke event.
+    ///
+    /// Allows lock-free detection of revoke events from the hot path
+    /// (`poll_batch`) — the source compares its cached generation against
+    /// this value using `Relaxed` ordering, and only locks the mutex when
+    /// a change is detected.
+    revoke_generation: Arc<AtomicU64>,
+    /// Shared flag indicating whether the reader task has paused Kafka
+    /// partitions for backpressure. On `Assign`, newly assigned partitions
+    /// must be re-paused if this flag is true.
+    reader_paused: Arc<AtomicBool>,
 }
 
 impl LaminarConsumerContext {
@@ -95,12 +106,16 @@ impl LaminarConsumerContext {
         checkpoint_requested: Arc<AtomicBool>,
         rebalance_state: Arc<Mutex<RebalanceState>>,
         rebalance_metric: Arc<AtomicU64>,
+        revoke_generation: Arc<AtomicU64>,
+        reader_paused: Arc<AtomicBool>,
     ) -> Self {
         Self {
             checkpoint_requested,
             rebalance_count: AtomicU64::new(0),
             rebalance_state,
             rebalance_metric,
+            revoke_generation,
+            reader_paused,
         }
     }
 
@@ -108,6 +123,12 @@ impl LaminarConsumerContext {
     #[must_use]
     pub fn rebalance_count(&self) -> u64 {
         self.rebalance_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns the shared revoke generation counter.
+    #[must_use]
+    pub fn revoke_generation(&self) -> &Arc<AtomicU64> {
+        &self.revoke_generation
     }
 }
 
@@ -141,6 +162,8 @@ impl ConsumerContext for LaminarConsumerContext {
                         poisoned.into_inner().on_revoke(&partitions);
                     }
                 }
+                self.revoke_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.rebalance_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.rebalance_metric
@@ -173,6 +196,30 @@ impl ConsumerContext for LaminarConsumerContext {
             }
             Rebalance::Error(msg) => {
                 warn!(error = %msg, "kafka rebalance error");
+            }
+        }
+    }
+
+    fn post_rebalance(
+        &self,
+        base_consumer: &rdkafka::consumer::BaseConsumer<Self>,
+        rebalance: &rdkafka::consumer::Rebalance<'_>,
+    ) {
+        use rdkafka::consumer::Rebalance;
+
+        // After an Assign, the new partitions are committed to the consumer.
+        // If the reader task has paused partitions for backpressure, re-pause
+        // the newly assigned partitions before the next poll delivers messages.
+        if let Rebalance::Assign(tpl) = rebalance {
+            if self.reader_paused.load(Ordering::Relaxed) {
+                if let Err(e) = base_consumer.pause(tpl) {
+                    warn!(error = %e, "failed to re-pause newly assigned partitions");
+                } else {
+                    info!(
+                        partitions = tpl.count(),
+                        "re-paused newly assigned partitions (reader backpressure active)"
+                    );
+                }
             }
         }
     }
@@ -235,7 +282,15 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let state = Arc::new(Mutex::new(RebalanceState::new()));
         let metric = Arc::new(AtomicU64::new(0));
-        let ctx = LaminarConsumerContext::new(Arc::clone(&flag), state, metric);
+        let revoke_gen = Arc::new(AtomicU64::new(0));
+        let reader_paused = Arc::new(AtomicBool::new(false));
+        let ctx = LaminarConsumerContext::new(
+            Arc::clone(&flag),
+            state,
+            metric,
+            revoke_gen,
+            reader_paused,
+        );
         (flag, ctx)
     }
 

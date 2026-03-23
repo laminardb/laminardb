@@ -362,12 +362,21 @@ async fn run_sink_task(
                 }
             }
             _ = flush_timer.tick() => {
-                if let Err(e) = sink.flush().await {
-                    tracing::warn!(
-                        sink = %name,
-                        error = %e,
-                        "Periodic sink flush error"
-                    );
+                match tokio::time::timeout(flush_interval, sink.flush()).await {
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            sink = %name,
+                            error = %e,
+                            "Periodic sink flush error"
+                        );
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            sink = %name,
+                            "periodic flush timed out — sink may be stuck"
+                        );
+                    }
+                    Ok(Ok(())) => {}
                 }
             }
         }

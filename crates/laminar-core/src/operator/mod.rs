@@ -137,7 +137,7 @@ pub trait Operator: Send {
     fn on_timer(&mut self, timer: Timer, ctx: &mut OperatorContext) -> OutputVec;
 
     /// Checkpoint the operator's state
-    fn checkpoint(&self) -> OperatorState;
+    fn checkpoint(&mut self) -> OperatorState;
 
     /// Restore from a checkpoint
     ///
@@ -162,8 +162,22 @@ pub struct Timer {
 pub struct OperatorState {
     /// Operator ID
     pub operator_id: String,
+    /// State format version (for forward/backward compatibility detection)
+    pub version: u32,
     /// Serialized state data
     pub data: Vec<u8>,
+}
+
+impl OperatorState {
+    /// Create a version-1 operator state.
+    #[must_use]
+    pub fn v1(operator_id: String, data: Vec<u8>) -> Self {
+        Self {
+            operator_id,
+            version: 1,
+            data,
+        }
+    }
 }
 
 /// Errors that can occur in operators
@@ -192,22 +206,12 @@ impl From<arrow_schema::ArrowError> for OperatorError {
     }
 }
 
-#[cfg(feature = "jit")]
-impl From<datafusion_common::DataFusionError> for OperatorError {
-    fn from(e: datafusion_common::DataFusionError) -> Self {
-        Self::ProcessingFailed(e.to_string())
-    }
-}
-
-pub mod asof_join;
 pub mod changelog;
 pub mod lag_lead;
 pub mod partitioned_topk;
 pub mod session_window;
 pub mod sliding_window;
-pub mod stream_join;
 pub mod table_cache;
-pub mod temporal_join;
 pub mod topk;
 pub mod watermark_sort;
 pub mod window;

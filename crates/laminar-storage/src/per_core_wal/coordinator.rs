@@ -37,7 +37,7 @@ pub struct PerCoreCheckpointMetadata {
 /// 4. Merges segments in epoch order
 /// 5. Creates incremental checkpoint
 /// 6. Truncates all segments
-pub struct CheckpointCoordinator {
+pub struct PerCoreCheckpointCoordinator {
     /// Per-core WAL manager.
     wal_manager: PerCoreWalManager,
     /// Incremental checkpoint manager.
@@ -46,7 +46,7 @@ pub struct CheckpointCoordinator {
     checkpoint_dir: PathBuf,
 }
 
-impl CheckpointCoordinator {
+impl PerCoreCheckpointCoordinator {
     /// Creates a new checkpoint coordinator.
     ///
     /// # Errors
@@ -253,9 +253,9 @@ impl CheckpointCoordinator {
     }
 }
 
-impl std::fmt::Debug for CheckpointCoordinator {
+impl std::fmt::Debug for PerCoreCheckpointCoordinator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CheckpointCoordinator")
+        f.debug_struct("PerCoreCheckpointCoordinator")
             .field("checkpoint_dir", &self.checkpoint_dir)
             .field("epoch", &self.epoch())
             .field("num_cores", &self.wal_manager.num_cores())
@@ -269,7 +269,7 @@ mod tests {
     use crate::per_core_wal::PerCoreWalConfig;
     use tempfile::TempDir;
 
-    fn setup_coordinator(num_cores: usize) -> (CheckpointCoordinator, TempDir) {
+    fn setup_coordinator(num_cores: usize) -> (PerCoreCheckpointCoordinator, TempDir) {
         let temp_dir = TempDir::new().unwrap();
 
         let wal_dir = temp_dir.path().join("wal");
@@ -285,7 +285,8 @@ mod tests {
             .with_wal_path(&wal_dir)
             .with_max_retained(3);
 
-        let coordinator = CheckpointCoordinator::new(wal_manager, checkpoint_config).unwrap();
+        let coordinator =
+            PerCoreCheckpointCoordinator::new(wal_manager, checkpoint_config).unwrap();
 
         (coordinator, temp_dir)
     }
@@ -438,7 +439,7 @@ mod tests {
     fn test_debug_format() {
         let (coordinator, _temp_dir) = setup_coordinator(4);
         let debug_str = format!("{coordinator:?}");
-        assert!(debug_str.contains("CheckpointCoordinator"));
+        assert!(debug_str.contains("PerCoreCheckpointCoordinator"));
         assert!(debug_str.contains("num_cores"));
     }
 }

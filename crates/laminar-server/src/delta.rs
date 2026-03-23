@@ -14,16 +14,12 @@ use tokio::signal;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use laminar_core::delta::coordination::orchestrator::{DeltaManager, NodeLifecyclePhase};
+use laminar_core::delta::coordination::{DeltaManager, NodeLifecyclePhase};
 use laminar_core::delta::discovery::{
     Discovery, DiscoveryError, GossipDiscovery, GossipDiscoveryConfig, NodeId, NodeInfo,
     NodeMetadata, NodeState, StaticDiscovery, StaticDiscoveryConfig,
 };
-use laminar_core::delta::partition::assignment::{
-    AssignmentConstraints, ConsistentHashAssigner, PartitionAssigner,
-};
-use laminar_core::delta::partition::guard::PartitionGuardSet;
-
+use laminar_core::delta::partition::assignment::{AssignmentConstraints, ConsistentHashAssigner};
 /// Enum dispatch for discovery implementations.
 ///
 /// The `Discovery` trait uses `async fn` which is not dyn-compatible,
@@ -221,12 +217,10 @@ pub struct DeltaHandle {
     node_id: String,
     /// LaminarDB engine instance.
     db: Arc<LaminarDB>,
-    /// Delta lifecycle manager.
+    /// Delta lifecycle manager (owns partition guards).
     manager: DeltaManager,
     /// Discovery layer.
     discovery: DiscoveryImpl,
-    /// Epoch-fenced partition guards.
-    guard_set: PartitionGuardSet,
     /// HTTP API server task.
     api_handle: tokio::task::JoinHandle<()>,
     /// Config file watcher task.
@@ -397,8 +391,10 @@ pub async fn start_delta(
 
     // 3. Create DeltaManager and advance to Active
     let mut manager = DeltaManager::new(node_id);
-    manager.phase = NodeLifecyclePhase::Active;
-    info!("DeltaManager phase: {}", manager.phase);
+    manager.transition(NodeLifecyclePhase::FormingRaft);
+    manager.transition(NodeLifecyclePhase::WaitingForAssignment);
+    manager.transition(NodeLifecyclePhase::Active);
+    info!("DeltaManager phase: {}", manager.phase());
 
     // 4. Compute initial partition assignment
     let workers = if config.server.workers == 0 {
@@ -426,14 +422,13 @@ pub async fn start_delta(
         plan.assignments.values().filter(|&&n| n == node_id).count(),
     );
 
-    // 5. Create partition guards for partitions assigned to this node
-    let mut guard_set = PartitionGuardSet::new(node_id);
+    // 5. Populate partition guards for partitions assigned to this node
     for (&partition_id, &assigned_node) in &plan.assignments {
         if assigned_node == node_id {
-            guard_set.insert(partition_id, 1); // epoch 1 for initial assignment
+            manager.guards_mut().insert(partition_id, 1); // epoch 1 for initial assignment
         }
     }
-    info!("Created {} partition guards", guard_set.len());
+    info!("Created {} partition guards", manager.guards().len());
 
     // 6. Build LaminarDB with Profile::Delta
     let mut builder = LaminarDB::builder();
@@ -565,7 +560,7 @@ pub async fn start_delta(
     info!(
         "Delta node '{}' started with {} partitions",
         node_id_str,
-        guard_set.len()
+        manager.guards().len()
     );
 
     Ok(DeltaHandle {
@@ -573,7 +568,6 @@ pub async fn start_delta(
         db,
         manager,
         discovery,
-        guard_set,
         api_handle,
         watcher_handle,
         membership_handle,

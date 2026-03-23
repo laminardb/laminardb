@@ -249,7 +249,7 @@ impl Operator for WindowLocalSortOperator {
         self.check_and_emit_closed_windows()
     }
 
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         let mut data = Vec::new();
 
         // Write watermark
@@ -272,6 +272,7 @@ impl Operator for WindowLocalSortOperator {
 
         OperatorState {
             operator_id: self.operator_id.clone(),
+            version: 1,
             data,
         }
     }

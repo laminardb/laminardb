@@ -28,9 +28,6 @@ pub mod checkpoint_manifest;
 /// Checkpoint persistence trait and filesystem store
 pub mod checkpoint_store;
 
-/// Checkpoint batching for S3 cost optimization
-pub mod checkpoint_batcher;
-
 /// S3 storage class tiering for cost optimization
 pub mod tiering;
 
@@ -44,27 +41,26 @@ pub mod incremental;
 pub mod per_core_wal;
 
 /// Object store factory — builds S3, GCS, Azure, or local backends from URL schemes.
-pub mod object_store_factory;
+pub mod object_store_builder;
 
 // Re-export key types
 pub use changelog_drainer::ChangelogDrainer;
-pub use checkpoint::checkpointer::{verify_integrity, Checkpointer, CheckpointerError};
+pub use checkpoint::checkpointer::{verify_integrity, CheckpointerError, ObjectStoreCheckpointer};
 pub use checkpoint::layout::{
     CheckpointId, CheckpointManifestV2, CheckpointPaths, OperatorSnapshotEntry,
     PartitionSnapshotEntry, SourceOffsetEntry,
 };
 pub use checkpoint::source_offsets::{
-    DeterminismValidator, DeterminismWarning, FilePosition, GenericPosition, KafkaPartitionOffset,
-    KafkaPosition, MysqlCdcPosition, OperatorDescriptor, OperatorDeterminismWarning,
-    PostgresCdcPosition, RecoveryPlan, SourceId, SourceOffset, SourcePosition, WarningSeverity,
+    DeterminismWarning, FilePosition, GenericPosition, KafkaPartitionOffset, KafkaPosition,
+    MysqlCdcPosition, PostgresCdcPosition, RecoveryPlan, SourceId, SourceOffset, SourcePosition,
 };
 pub use checkpoint::{Checkpoint, CheckpointMetadata};
-pub use checkpoint_batcher::{decode_batch, BatchMetrics, BatchMetricsSnapshot, CheckpointBatcher};
 pub use checkpoint_manifest::{CheckpointManifest, ConnectorCheckpoint, OperatorCheckpoint};
 pub use checkpoint_store::{
     CheckpointStore, CheckpointStoreError, FileSystemCheckpointStore, ObjectStoreCheckpointStore,
     RecoveryReport, ValidationResult,
 };
+pub use laminar_core::error_codes::WarningSeverity;
 pub use tiering::{StorageClass, StorageTier, TieringPolicy};
 pub use wal::{WalEntry, WalError, WalPosition, WriteAheadLog};
 
@@ -77,7 +73,7 @@ pub use incremental::{
 
 // Re-export per-core WAL types
 pub use per_core_wal::{
-    recover_per_core, CheckpointCoordinator, CoreWalWriter, PerCoreRecoveredState,
+    recover_per_core, CoreWalWriter, PerCoreCheckpointCoordinator, PerCoreRecoveredState,
     PerCoreRecoveryManager, PerCoreWalConfig, PerCoreWalEntry, PerCoreWalError, PerCoreWalManager,
     PerCoreWalReader, SegmentStats, WalOperation,
 };

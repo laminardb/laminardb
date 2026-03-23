@@ -14,6 +14,8 @@ mod join_translator;
 pub mod order_translator;
 /// Streaming DDL (CREATE SOURCE/SINK) translator
 pub mod streaming_ddl;
+/// Temporal probe join configuration
+pub mod temporal_probe;
 mod window_translator;
 
 pub use crate::parser::order_analyzer::RankType;
@@ -26,12 +28,15 @@ pub use join_translator::{
     AsofJoinTranslatorConfig, AsofSqlJoinType, JoinOperatorConfig, LookupJoinConfig,
     LookupJoinType, StreamJoinConfig, StreamJoinType, TemporalJoinTranslatorConfig,
 };
+pub use laminar_core::streaming::config::{
+    BackpressureStrategy as StreamingBackpressure, WaitStrategy as StreamingWaitStrategy,
+};
 pub use order_translator::{
     OrderOperatorConfig, PerGroupTopKConfig, TopKConfig, WatermarkSortConfig, WindowLocalSortConfig,
 };
 pub use streaming_ddl::{
-    sql_type_to_arrow, BackpressureStrategy as StreamingBackpressure, ColumnDefinition,
-    SinkDefinition, SourceConfigOptions, SourceDefinition, WaitStrategy as StreamingWaitStrategy,
+    sql_type_to_arrow, ColumnDefinition, SinkDefinition, SourceConfigOptions, SourceDefinition,
     WatermarkSpec,
 };
+pub use temporal_probe::{parse_interval_to_ms, ProbeOffsetSpec, TemporalProbeConfig};
 pub use window_translator::{WindowOperatorConfig, WindowType};

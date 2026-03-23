@@ -45,8 +45,9 @@ pub mod sink_metrics;
 pub mod types;
 
 // Re-export primary types at module level.
+pub use crate::connector::DeliveryGuarantee;
 pub use sink::PostgresSink;
-pub use sink_config::{DeliveryGuarantee, PostgresSinkConfig, SslMode, WriteMode};
+pub use sink_config::{PostgresSinkConfig, SslMode, WriteMode};
 pub use sink_metrics::PostgresSinkMetrics;
 
 use std::sync::Arc;

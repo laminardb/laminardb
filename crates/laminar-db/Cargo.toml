@@ -13,14 +13,14 @@ description = "Unified database facade for LaminarDB"
 default = []
 api = []  # FFI-friendly API module for language bindings
 ffi = ["api", "arrow/ffi"]  # C FFI layer (extern "C" functions, cbindgen headers, Arrow C Data Interface)
-jit = ["laminar-core/jit"]  # Cranelift JIT compilation for compiled Ring 0 pipelines
 kafka = ["laminar-connectors/kafka"]
 postgres-cdc = ["laminar-connectors/postgres-cdc"]
 postgres-sink = ["laminar-connectors/postgres-sink"]
 delta-lake = ["laminar-connectors/delta-lake"]
 websocket = ["laminar-connectors/websocket"]
 mysql-cdc = ["laminar-connectors/mysql-cdc"]
-iceberg = ["laminar-connectors/delta-lake"]  # Iceberg shares the lakehouse module
+mongodb-cdc = ["laminar-connectors/mongodb-cdc"]
+iceberg = ["laminar-connectors/iceberg"]
 delta-lake-s3 = ["laminar-connectors/delta-lake-s3"]
 delta-lake-azure = ["laminar-connectors/delta-lake-azure"]
 delta-lake-gcs = ["laminar-connectors/delta-lake-gcs"]
@@ -36,10 +36,10 @@ gcs = ["laminar-storage/gcs"]
 azure = ["laminar-storage/azure"]
 
 [dependencies]
-laminar-core = { path = "../laminar-core", version = "0.18.2" }
-laminar-sql = { path = "../laminar-sql", version = "0.18.2" }
-laminar-storage = { path = "../laminar-storage", version = "0.18.2" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.18.2" }
+laminar-core = { path = "../laminar-core", version = "0.18.10" }
+laminar-sql = { path = "../laminar-sql", version = "0.18.10" }
+laminar-storage = { path = "../laminar-storage", version = "0.18.10" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.18.10" }
 
 # Arrow
 arrow = { workspace = true }
@@ -52,7 +52,7 @@ datafusion = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
 
-# Arena allocator (for JIT batch→row conversion)
+# Arena allocator
 bumpalo = { workspace = true }
 
 # Serialization
@@ -78,6 +78,9 @@ parking_lot = { workspace = true }
 # Fast hash maps (for DAG operator state maps)
 rustc-hash = { workspace = true }
 
+# Small-vec optimization for graph routing tables
+smallvec = { workspace = true }
+
 # Fast DoS-resistant hash map (for group-by keys from user SQL)
 ahash = { workspace = true }
 
@@ -87,10 +90,14 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
-laminar-derive = { path = "../laminar-derive", version = "0.18.2" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.18.2", features = ["testing"] }
+laminar-derive = { path = "../laminar-derive", version = "0.18.10" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.18.10", features = ["testing"] }
 criterion = { workspace = true }
 
 [[bench]]
 name = "recovery_bench"
+harness = false
+
+[[bench]]
+name = "stream_executor_bench"
 harness = false

@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::tpc::CachePadded;
+use crate::alloc::CachePadded;
 
 use super::config::{BackpressureStrategy, ChannelConfig, ChannelStats, WaitStrategy};
 use super::error::{RecvError, StreamingError, TryPushError};

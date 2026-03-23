@@ -90,12 +90,12 @@ pub struct LaminarDB {
     pub(crate) session_properties: parking_lot::Mutex<HashMap<String, String>>,
     /// Global pipeline watermark (min of all source watermarks).
     pub(crate) pipeline_watermark: Arc<std::sync::atomic::AtomicI64>,
-    /// Shared compiler cache for JIT-compiled pipelines.
-    /// Protected by `Mutex` — only locked during compilation, not execution.
-    #[cfg(feature = "jit")]
-    pub(crate) compiler_cache: parking_lot::Mutex<laminar_core::compiler::CompilerCache>,
     /// Shared lookup table registry for physical planning of lookup joins.
     pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
+    /// Control channel sender for live DDL to the running coordinator.
+    /// `None` before `start()` or after `shutdown()`.
+    pub(crate) control_tx:
+        parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<crate::pipeline::ControlMsg>>>,
 }
 
 /// Per-source watermark tracking state for the pipeline loop.
@@ -247,12 +247,8 @@ impl LaminarDB {
             start_time: std::time::Instant::now(),
             session_properties: parking_lot::Mutex::new(HashMap::new()),
             pipeline_watermark: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
-            #[cfg(feature = "jit")]
-            compiler_cache: parking_lot::Mutex::new(
-                laminar_core::compiler::CompilerCache::new(64)
-                    .expect("JIT compiler cache initialization"),
-            ),
             lookup_registry,
+            control_tx: parking_lot::Mutex::new(None),
         })
     }
 
@@ -283,6 +279,11 @@ impl LaminarDB {
             laminar_connectors::lakehouse::register_delta_lake_sink(registry);
             laminar_connectors::lakehouse::register_delta_lake_source(registry);
         }
+        #[cfg(feature = "iceberg")]
+        {
+            laminar_connectors::lakehouse::register_iceberg_sink(registry);
+            laminar_connectors::lakehouse::register_iceberg_source(registry);
+        }
         #[cfg(feature = "websocket")]
         {
             laminar_connectors::websocket::register_websocket_source(registry);
@@ -291,6 +292,11 @@ impl LaminarDB {
         #[cfg(feature = "mysql-cdc")]
         {
             laminar_connectors::cdc::mysql::register_mysql_cdc_source(registry);
+        }
+        #[cfg(feature = "mongodb-cdc")]
+        {
+            laminar_connectors::mongodb::register_mongodb_cdc(registry);
+            laminar_connectors::mongodb::register_mongodb_sink(registry);
         }
         #[cfg(feature = "files")]
         {
@@ -931,21 +937,7 @@ impl LaminarDB {
                 let plan_sql = query_plan.statement.to_string();
                 let logical_plan = self.ctx.state().create_logical_plan(&plan_sql).await?;
 
-                // Try JIT compilation first (when feature enabled).
-                #[cfg(feature = "jit")]
-                {
-                    if let Some(compiled) = self.try_compile_query(sql, &logical_plan) {
-                        tracing::info!(
-                            sql = %sql,
-                            compiled = compiled.metadata.compiled_pipeline_count,
-                            fallback = compiled.metadata.fallback_pipeline_count,
-                            "Query compiled via JIT"
-                        );
-                        return self.bridge_compiled_query(sql, compiled).await;
-                    }
-                }
-
-                // Fall through to DataFusion interpreted execution.
+                // DataFusion interpreted execution.
                 let df = self.ctx.execute_logical_plan(logical_plan).await?;
                 let stream = df.execute_stream().await?;
 
@@ -1004,6 +996,7 @@ impl LaminarDB {
                         ConnectorType::MysqlCdc => "mysql-cdc",
                         ConnectorType::Redis => "redis",
                         ConnectorType::S3Parquet => "s3-parquet",
+                        ConnectorType::DeltaLake => "delta-lake",
                         ConnectorType::Custom(s) => s.as_str(),
                         ConnectorType::Static => unreachable!(),
                     };
@@ -1158,135 +1151,6 @@ impl LaminarDB {
             subscription: Some(subscription),
             active: true,
         })
-    }
-
-    // ── JIT compilation integration ─────────────────────────────────
-
-    /// Attempts to compile a query via the JIT compiler stack.
-    ///
-    /// Returns `Some(compiled)` if compilation succeeds.
-    /// Returns `None` if the plan has stateful operators or compilation fails.
-    /// Compilation errors are logged at `DEBUG` level and swallowed — transparent fallback.
-    #[cfg(feature = "jit")]
-    fn try_compile_query(
-        &self,
-        sql: &str,
-        logical_plan: &datafusion::logical_expr::LogicalPlan,
-    ) -> Option<laminar_core::compiler::CompiledStreamingQuery> {
-        let Some(mut cache) = self.compiler_cache.try_lock() else {
-            tracing::debug!(sql = %sql, "Compiler cache contended, falling back to DataFusion");
-            return None;
-        };
-        let config = laminar_core::compiler::QueryConfig::default();
-        match laminar_core::compiler::compile_streaming_query(
-            sql,
-            logical_plan,
-            &mut cache,
-            &config,
-        ) {
-            Ok(result) => result,
-            Err(e) => {
-                tracing::debug!(
-                    sql = %sql,
-                    error = %e,
-                    "JIT compilation failed, falling back to DataFusion"
-                );
-                None
-            }
-        }
-    }
-
-    /// Executes a compiled query: runs the source scan via `DataFusion`, feeds
-    /// rows through the compiled pipeline, and bridges output to the subscription.
-    #[cfg(feature = "jit")]
-    async fn bridge_compiled_query(
-        &self,
-        sql: &str,
-        compiled: laminar_core::compiler::CompiledStreamingQuery,
-    ) -> Result<ExecuteResult, DbError> {
-        use laminar_core::compiler::batch_reader::BatchRowReader;
-        use laminar_core::compiler::event_time::{EventTimeConfig, RowEventTimeExtractor};
-        use laminar_core::compiler::pipeline_bridge::Ring1Action;
-
-        // 1. Execute source scan via DataFusion to get input stream.
-        let df = self.ctx.execute_logical_plan(compiled.source_plan).await?;
-        let input_stream = df.execute_stream().await?;
-        let output_schema = compiled.output_schema.arrow_schema().clone();
-
-        // 2. Set up subscription infrastructure.
-        let query_id = self.catalog.register_query(sql);
-        let source_cfg = streaming::SourceConfig::with_buffer_size(self.config.default_buffer_size);
-        let (source, sink) =
-            streaming::create_with_config::<crate::catalog::ArrowRecord>(source_cfg);
-        let subscription = sink.subscribe();
-
-        // 3. Build event time extractor (auto-detect from schema).
-        let input_schema = compiled.input_schema;
-        let time_config = EventTimeConfig::default();
-        let time_extractor = RowEventTimeExtractor::from_schema(&input_schema, &time_config);
-
-        // 4. Spawn bridge task: input stream → EventRow → compiled pipeline → output batches.
-        let source_clone = source.clone();
-        let mut query = compiled.query;
-        query
-            .start()
-            .map_err(|e| DbError::InvalidOperation(e.to_string()))?;
-
-        tokio::spawn(async move {
-            use tokio_stream::StreamExt;
-            let mut stream = input_stream;
-            let mut extractor = time_extractor;
-            let mut arena = bumpalo::Bump::with_capacity(1024 * 128);
-
-            while let Some(result) = stream.next().await {
-                match result {
-                    Ok(batch) => {
-                        let reader = BatchRowReader::new(&batch, &input_schema);
-                        for row_idx in 0..reader.row_count() {
-                            let row = reader.read_row(row_idx, &arena);
-                            let event_time = match extractor {
-                                Some(ref mut ext) => ext.extract(&row),
-                                #[allow(clippy::cast_possible_wrap)]
-                                None => row_idx as i64,
-                            };
-                            let _ = query.submit_row(&row, event_time, row_idx as u64);
-                        }
-                        // Advance watermark after each batch.
-                        if let Some(ref ext) = extractor {
-                            let _ = query.advance_watermark(ext.watermark());
-                        }
-                        // Drain compiled output.
-                        let actions = query.poll_ring1();
-                        for action in actions {
-                            if let Ring1Action::ProcessBatch(out_batch) = action {
-                                if source_clone.push_arrow(out_batch).is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                        // Reset arena for next batch — keeps underlying allocation.
-                        arena.reset();
-                    }
-                    Err(_) => break,
-                }
-            }
-            // Flush remaining output.
-            let _ = query.send_eof();
-            for action in query.poll_ring1() {
-                if let Ring1Action::ProcessBatch(batch) = action {
-                    // Best-effort push; subscription channel may be full
-                    let _ = source_clone.push_arrow(batch);
-                }
-            }
-        });
-
-        Ok(ExecuteResult::Query(QueryHandle {
-            id: query_id,
-            schema: output_schema,
-            sql: sql.to_string(),
-            subscription: Some(subscription),
-            active: true,
-        }))
     }
 
     /// Extract an ASOF join config from a query plan, if present.
@@ -1568,7 +1432,7 @@ impl LaminarDB {
         let max_retained = cp_config.max_retained.unwrap_or(3);
 
         if let Some(ref url) = self.config.object_store_url {
-            let obj_store = laminar_storage::object_store_factory::build_object_store(
+            let obj_store = laminar_storage::object_store_builder::build_object_store(
                 url,
                 &self.config.object_store_options,
             )
@@ -2252,6 +2116,103 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // -----------------------------------------------------------------------
+    // Pipeline-running state guards
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_create_source_with_connector_rejected_when_running() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE seed (id INT)").await.unwrap();
+        db.start().await.unwrap();
+
+        // WITH syntax
+        let result = db
+            .execute("CREATE SOURCE events (id INT) WITH ('connector' = 'kafka', 'topic' = 'x')")
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("pipeline is running"),
+            "expected pipeline-running error, got: {err}"
+        );
+
+        // FROM syntax (what server mode generates via source_to_ddl)
+        let result = db
+            .execute("CREATE SOURCE events2 (id INT) FROM KAFKA (topic = 'x')")
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("pipeline is running"),
+            "expected pipeline-running error for FROM syntax, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_source_without_connector_allowed_when_running() {
+        let db = LaminarDB::open().unwrap();
+        db.start().await.unwrap();
+
+        // Schema-only source (no connector) — used by embedded db.insert() API.
+        let result = db.execute("CREATE SOURCE events (id INT)").await;
+        assert!(
+            result.is_ok(),
+            "schema-only source should be allowed when running"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_sink_with_connector_rejected_when_running() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT)").await.unwrap();
+        db.start().await.unwrap();
+
+        let result = db
+            .execute(
+                "CREATE SINK output FROM events \
+                 WITH ('connector' = 'kafka', 'topic' = 'out')",
+            )
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("pipeline is running"),
+            "expected pipeline-running error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_source_rejected_when_running() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT)").await.unwrap();
+        db.start().await.unwrap();
+
+        let result = db.execute("DROP SOURCE events").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("pipeline is running"),
+            "expected pipeline-running error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_sink_rejected_when_running() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT)").await.unwrap();
+        db.execute("CREATE SINK output FROM events").await.unwrap();
+        db.start().await.unwrap();
+
+        let result = db.execute("DROP SINK output").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("pipeline is running"),
+            "expected pipeline-running error, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_connector_registry_accessor() {
         let db = LaminarDB::open().unwrap();
@@ -2282,6 +2243,11 @@ mod tests {
             expected_sources += 1; // delta-lake source
             expected_sinks += 1; // delta-lake sink
         }
+        #[cfg(feature = "iceberg")]
+        {
+            expected_sources += 1; // iceberg source
+            expected_sinks += 1; // iceberg sink
+        }
         #[cfg(feature = "websocket")]
         {
             expected_sources += 1; // websocket source
@@ -2290,6 +2256,11 @@ mod tests {
         #[cfg(feature = "mysql-cdc")]
         {
             expected_sources += 1; // mysql CDC source
+        }
+        #[cfg(feature = "mongodb-cdc")]
+        {
+            expected_sources += 1; // mongodb CDC source
+            expected_sinks += 1; // mongodb sink
         }
         #[cfg(feature = "files")]
         {

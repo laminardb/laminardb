@@ -61,33 +61,6 @@ pub struct AssignmentConstraints {
     pub node_weights: HashMap<u64, f64>,
 }
 
-/// Trait for partition assignment algorithms.
-pub trait PartitionAssigner: Send + Sync {
-    /// Generate an initial assignment for the given number of partitions.
-    fn initial_assignment(
-        &self,
-        num_partitions: u32,
-        nodes: &[NodeInfo],
-        constraints: &AssignmentConstraints,
-    ) -> AssignmentPlan;
-
-    /// Generate a rebalance plan given the current assignments and new node set.
-    fn rebalance(
-        &self,
-        current: &HashMap<u32, NodeId>,
-        nodes: &[NodeInfo],
-        constraints: &AssignmentConstraints,
-    ) -> AssignmentPlan;
-
-    /// Validate that an assignment plan satisfies the given constraints.
-    fn validate_plan(
-        &self,
-        plan: &AssignmentPlan,
-        nodes: &[NodeInfo],
-        constraints: &AssignmentConstraints,
-    ) -> Vec<String>;
-}
-
 /// Consistent-hash based partition assigner.
 ///
 /// Uses virtual nodes proportional to each node's core count for
@@ -191,16 +164,10 @@ impl ConsistentHashAssigner {
         // All excluded — fall back to default
         ring[start].1
     }
-}
 
-impl Default for ConsistentHashAssigner {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PartitionAssigner for ConsistentHashAssigner {
-    fn initial_assignment(
+    /// Generate an initial assignment for the given number of partitions.
+    #[must_use]
+    pub fn initial_assignment(
         &self,
         num_partitions: u32,
         nodes: &[NodeInfo],
@@ -249,7 +216,9 @@ impl PartitionAssigner for ConsistentHashAssigner {
         }
     }
 
-    fn rebalance(
+    /// Generate a rebalance plan given the current assignments and new node set.
+    #[must_use]
+    pub fn rebalance(
         &self,
         current: &HashMap<u32, NodeId>,
         nodes: &[NodeInfo],
@@ -283,7 +252,9 @@ impl PartitionAssigner for ConsistentHashAssigner {
         }
     }
 
-    fn validate_plan(
+    /// Validate that an assignment plan satisfies the given constraints.
+    #[must_use]
+    pub fn validate_plan(
         &self,
         plan: &AssignmentPlan,
         nodes: &[NodeInfo],
@@ -312,6 +283,12 @@ impl PartitionAssigner for ConsistentHashAssigner {
         }
 
         errors
+    }
+}
+
+impl Default for ConsistentHashAssigner {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

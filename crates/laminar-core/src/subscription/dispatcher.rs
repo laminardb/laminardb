@@ -39,6 +39,7 @@ use crate::subscription::registry::SubscriptionRegistry;
 ///
 /// Implemented by the DAG executor or streaming pipeline to provide zero-copy
 /// access to the source data referenced by [`NotificationRef::batch_offset`].
+// TODO(planned): No production implementors yet.
 pub trait NotificationDataSource: Send + Sync {
     /// Resolves a notification reference to a full change event.
     ///

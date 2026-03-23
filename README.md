@@ -3,6 +3,7 @@
 [![docs.rs](https://docs.rs/laminar-db/badge.svg)](https://docs.rs/laminar-db)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange)](https://www.rust-lang.org)
+[![Website](https://img.shields.io/badge/website-laminardb.io-blue)](https://laminardb.io)
 
 # LaminarDB
 
@@ -89,8 +90,8 @@ Three deployment modes:
 | Mode | How | Status |
 |------|-----|--------|
 | **Embedded** | `cargo add laminar-db` — runs inside your Rust process | ✅ Implemented |
-| **Standalone** | `laminardb` binary with HTTP API, configurable via TOML | ✅ Implemented |
-| **Distributed** | Multi-node via gossip discovery, Raft consensus, gRPC — `--features delta` | ✅ Implemented (not yet production-hardened; Phase 6c pending) |
+| **Standalone** | `laminardb` binary — TOML config, REST API, Prometheus metrics, hot-reload | ✅ Implemented |
+| **Distributed** | Multi-node via gossip discovery, Raft consensus, gRPC — `--features delta` | 📋 Planned (skeleton only; Phase 6c) |
 
 The embedded mode is the primary deployment target. You get a `LaminarDB` handle, register sources with SQL DDL, push `RecordBatch` data in, subscribe to output streams, and let the engine handle windowing, joins, checkpointing, and exactly-once delivery.
 
@@ -209,6 +210,7 @@ Feature-gated connectors for external systems. Each implements `SourceConnector`
 | Kafka | `kafka` | Consumer group, Schema Registry, Avro/JSON/CSV/Debezium | ✅ |
 | PostgreSQL CDC | `postgres-cdc` | Logical replication (pgoutput), Z-set changelog | ✅ |
 | MySQL CDC | `mysql-cdc` | Binlog replication, GTID position tracking | ✅ |
+| MongoDB CDC | `mongodb-cdc` | Change streams, resume token tracking | ✅ |
 | WebSocket Client | `websocket` | Connect to external WebSocket servers | ✅ |
 | WebSocket Server | `websocket` | Accept incoming WebSocket connections | ✅ |
 | Delta Lake | `delta-lake` | Read from Delta Lake tables, version polling | ✅ |
@@ -222,11 +224,11 @@ Feature-gated connectors for external systems. Each implements `SourceConnector`
 |-----------|-------------|-------|--------|
 | Kafka | `kafka` | Exactly-once transactions, configurable partitioning | ✅ |
 | PostgreSQL | `postgres-sink` | COPY BINARY, upsert, co-transactional exactly-once | ✅ |
+| MongoDB | `mongodb-cdc` | Ordered/unordered writes, upsert, CDC replay | ✅ |
 | Delta Lake | `delta-lake` | S3/Azure/GCS, epoch-aligned Parquet commits | ✅ |
 | WebSocket Server | `websocket` | Fan-out to connected subscribers | ✅ |
 | WebSocket Client | `websocket` | Push to external WebSocket server | ✅ |
 | Files | `files` | Parquet/CSV with timestamp/partition templates | ✅ |
-| Apache Iceberg | -- | -- | 📋 Planned |
 
 Cloud storage backends for Delta Lake: S3 (`delta-lake-s3`), Azure ADLS (`delta-lake-azure`), GCS (`delta-lake-gcs`). Supports Unity and Glue catalogs.
 
@@ -253,40 +255,41 @@ CREATE SINK trade_archive INTO DELTA_LAKE (
 
 Supported formats: `json`, `csv`, `avro` (with Schema Registry), `raw` (bytes), `debezium` (CDC envelope).
 
-Custom connectors can be built using the `SourceConnector` / `SinkConnector` traits with retry policies, circuit breakers, and rate limiters from the connector SDK.
+Custom connectors can be built by implementing the `SourceConnector` or `SinkConnector` trait and registering with `ConnectorRegistry`.
 
 ---
 
 ## Architecture
 
-Three-ring model separating latency-critical event processing from background I/O and the control plane:
-
 ```text
 ┌──────────────────────────────────────────────────────────────┐
-│                     RING 0: HOT PATH                         │
-│  CPU-pinned reactor, minimal allocations, SPSC queues        │
-│  ┌─────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐     │
-│  │ Reactor │→ │ Operators│→ │  State   │→ │   Emit   │     │
-│  │  Loop   │  │ (window, │  │  Store   │  │ (output) │     │
-│  │         │  │  join,   │  │ (ahash/  │  │          │     │
-│  │         │  │  filter) │  │  foyer)  │  │          │     │
-│  └─────────┘  └──────────┘  └──────────┘  └──────────┘     │
-│       │                                                      │
-│       │ SPSC queues (lock-free)                              │
-│       ▼                                                      │
+│                     SOURCE CONNECTORS                        │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                  │
+│  │ Kafka    │  │ Postgres │  │  File    │  tokio tasks      │
+│  │ Source   │  │ CDC      │  │ Source   │                   │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘                  │
+│       │ mpsc         │ mpsc        │ mpsc                    │
+│       └──────┬───────┘─────────────┘                         │
+│              ▼                                                │
 ├──────────────────────────────────────────────────────────────┤
-│                    RING 1: BACKGROUND                        │
-│  Tokio async runtime, bounded latency impact                 │
+│                  STREAMING COORDINATOR                        │
+│  Single tokio task: SQL cycles, compiled projections,         │
+│  cached logical plans, checkpoint barriers                    │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐    │
+│  │ Compiled │→ │ Operators│→ │  State   │→ │  Sink    │    │
+│  │Projection│  │ (window, │  │  Store   │  │ Writers  │    │
+│  │/ Cached  │  │  join,   │  │ (ahash/  │  │          │    │
+│  │  Plans   │  │  filter) │  │  foyer)  │  │          │    │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘    │
+├──────────────────────────────────────────────────────────────┤
+│                     BACKGROUND I/O                            │
+│  Tokio async runtime, bounded latency impact                  │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐    │
 │  │Checkpoint│  │   WAL    │  │Changelog │  │  Timer   │    │
 │  │ Manager  │  │  Writer  │  │ Drainer  │  │  Wheel   │    │
 │  └──────────┘  └──────────┘  └──────────┘  └──────────┘    │
-│       │                                                      │
-│       │ Bounded channels                                     │
-│       ▼                                                      │
 ├──────────────────────────────────────────────────────────────┤
-│                    RING 2: CONTROL PLANE                     │
-│  No latency requirements                                     │
+│                      CONTROL PLANE                            │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐                  │
 │  │  Admin   │  │ Metrics  │  │  Config  │                  │
 │  │   API    │  │  Export  │  │ Manager  │                  │
@@ -294,16 +297,16 @@ Three-ring model separating latency-critical event processing from background I/
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **Ring 0** — CPU-pinned reactor loop with thread-per-core execution. Minimal heap allocations. SPSC lock-free queues between cores. Optional Cranelift JIT compilation for query expressions (`--features jit`). Target: sub-microsecond per-event latency.
-- **Ring 1** — Tokio async runtime handling WAL writes, checkpointing, connector I/O, and changelog draining. Communicates with Ring 0 via bounded channels.
-- **Ring 2** — HTTP admin API, metrics, configuration management. Auth and observability are planned (Phase 4/5).
+- **Streaming coordinator** — Single tokio task driving SQL execution cycles. Source connectors push batches via mpsc channels; the coordinator runs compiled projections / cached logical plans, routes results to sinks, and manages checkpoint barriers. Sub-microsecond for compiled single-source projections; microseconds for incremental aggregations and cached-plan queries; DataFusion fallback for complex queries.
+- **Background I/O** — Tokio async runtime handling WAL writes, checkpointing, connector I/O, and changelog draining.
+- **Admin** — HTTP REST API (Axum), Prometheus metrics, ad-hoc SQL, hot-reload, checkpoint triggers. Auth is planned (Phase 4).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 
 ### Checkpointing and Recovery
 
-1. **Per-Core WAL** — Each CPU core writes to its own WAL segment with CRC32C checksums and torn write detection
-2. **Coordinated Snapshots** — Barrier-based checkpoint protocol across all operators and sinks
+1. **WAL** — Write-ahead log segments with CRC32C checksums and torn write detection
+2. **Coordinated Snapshots** — Barrier-based checkpoint protocol: coordinator injects barriers into all sources; operators with multiple inputs align barriers before snapshotting
 3. **Two-Phase Commit** — Sinks participate in pre-commit/commit phases for exactly-once delivery
 4. **Recovery** — `RecoveryManager` restores from the latest checkpoint manifest, replays WAL, resumes connectors from committed offsets
 
@@ -321,26 +324,26 @@ let db = LaminarDB::builder()
 
 On crash, events between the last completed checkpoint and the crash are lost. Checkpoint interval is configurable; shorter intervals reduce the data loss window at the cost of higher I/O overhead.
 
-### JIT Compilation
+### Compiled Query Execution
 
-Enable with `--features jit`. The `AdaptiveQueryRunner` runs queries interpreted first, compiles to native code via Cranelift in the background, and hot-swaps to compiled execution when ready.
+Non-aggregate single-source queries are compiled to `PhysicalExpr` projections on first execution, eliminating per-cycle SQL parsing overhead. Complex queries cache their optimized logical plans to skip repeated planning.
 
 ---
 
 ## Benchmarks
 
-Benchmark suites are in `crates/laminar-core/benches/`, `crates/laminar-storage/benches/`, and `crates/laminar-db/benches/` (18 total, using Criterion):
+Benchmark suites are in `crates/laminar-core/benches/`, `crates/laminar-storage/benches/`, and `crates/laminar-db/benches/` (14 total, using Criterion):
 
 | Metric | Target | Measured (mean) | Benchmark File |
 |--------|--------|-----------------|----------------|
 | State lookup | < 500ns | 10–105ns | `state_bench.rs` |
-| Throughput/core | 500K events/sec | 1.1–1.46M events/sec | `throughput_bench.rs` |
+| Throughput/core | 500K events/sec | 1.1–1.46M events/sec | `streaming_bench.rs` |
 | Event latency | < 10us | 0.55–1.16us | `latency_bench.rs` |
 | Checkpoint recovery | < 10s | 1.39ms | `checkpoint_bench.rs` |
 
 These are Criterion mean latencies measured on development hardware (AMD Ryzen AI 7 350, see [BENCHMARKS.md](docs/BENCHMARKS.md)) against minimal operator chains (single tumbling window for latency, single state lookup for state bench). Real pipelines with multiple operators, joins, and state lookups will show higher latency. p99 under sustained load is not yet measured. Run `cargo bench` to measure on your own hardware.
 
-Additional benchmark suites: `window_bench`, `join_bench`, `lookup_join_bench`, `cache_bench`, `compiler_bench`, `streaming_bench`, `subscription_bench`, `reactor_bench`, `tpc_bench`, `dag_bench`, `dag_stress`, `wal_bench`, `io_uring_bench`, `recovery_bench`.
+Additional benchmark suites: `window_bench`, `join_bench`, `lookup_join_bench`, `cache_bench`, `streaming_bench`, `subscription_bench`, `dag_bench`, `dag_stress`, `wal_bench`, `recovery_bench`.
 
 ---
 
@@ -363,7 +366,7 @@ Additional benchmark suites: `window_bench`, `join_bench`, `lookup_join_bench`, 
 | Deployment | Library or binary | JVM cluster | JVM library | Distributed cluster | Proprietary binary |
 | Language | Rust (+ Python, C FFI) | Java/Scala/Python | Java | Rust/Python/SQL | Q/Python |
 | Embed in your process | Yes | No | Yes (JVM) | No | No |
-| Latency (per-event, microbench) | Sub-microsecond (Ring 0) | Milliseconds–seconds | Milliseconds | Milliseconds | Microseconds |
+| Latency (per-event, microbench) | Sub-microsecond (compiled queries, microbench) | Milliseconds–seconds | Milliseconds | Milliseconds | Microseconds |
 | Operational overhead | None (embedded) or single binary | K8s operator or YARN | Kafka cluster | etcd/K8s/S3 | Vendor support |
 | SQL | Full (DataFusion) | Flink SQL | None (DSL only) | Full (Postgres-compatible) | Q language |
 | Exactly-once | Yes (checkpoint + 2PC) | Yes | Yes | Yes | No |
@@ -385,14 +388,14 @@ Additional benchmark suites: `window_bench`, `join_bench`, `lookup_join_bench`, 
 
 ## Project Status
 
-**Version 0.18.0** — active development, pre-1.0. APIs may change between minor versions.
+**Version 0.18.12** — active development, pre-1.0. APIs may change between minor versions.
 
 | Phase | Description | Progress |
 |-------|-------------|----------|
 | Phase 1 | Core Engine | ✅ 12/12 |
 | Phase 1.5 | SQL Parser | ✅ 1/1 |
 | Phase 2 | Production Hardening | ✅ 38/38 |
-| Phase 2.5 | JIT Compiler | ✅ 12/12 |
+| Phase 2.5 | JIT Compiler | ❌ Removed |
 | Phase 3 | Connectors & Integration | 🔧 85/100 |
 | Phase 4 | Enterprise Security (Auth, RBAC) | 📋 Planned |
 | Phase 5 | Admin & Observability | 📋 Planned |
@@ -414,11 +417,11 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full phase timeline.
 | `postgres-cdc` | PostgreSQL CDC source via logical replication |
 | `postgres-sink` | PostgreSQL sink via COPY BINARY |
 | `mysql-cdc` | MySQL CDC source via binlog replication |
+| `mongodb-cdc` | MongoDB CDC source and sink |
 | `delta-lake` | Delta Lake source and sink |
 | `delta-lake-s3` / `delta-lake-azure` / `delta-lake-gcs` | Cloud storage backends |
 | `websocket` | WebSocket source and sink connectors |
 | `files` | File source and sink (Parquet, CSV) |
-| `jit` | Cranelift JIT query compilation |
 | `ffi` | C FFI with Arrow C Data Interface |
 | `delta` | Distributed mode (gossip, Raft, gRPC) |
 | `parquet-lookup` | Parquet lookup source for reference tables |
@@ -454,7 +457,7 @@ crates/
   laminar-core/        Core engine: reactor, operators, state, windows, joins
   laminar-sql/         SQL parser, DataFusion integration, streaming optimizer
   laminar-storage/     WAL, checkpointing, per-core WAL, recovery
-  laminar-connectors/  Kafka, CDC, WebSocket, Delta Lake, files, connector SDK
+  laminar-connectors/  Kafka, CDC, MongoDB, WebSocket, Delta Lake, files
   laminar-db/          Unified database facade, checkpoint coordination, FFI
   laminar-derive/      Derive macros: Record, FromRecordBatch, FromRow, ConnectorConfig
   laminar-server/      Standalone server binary (HTTP API, Docker, Helm)
@@ -476,6 +479,12 @@ examples/
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code style, Ring 0 rules, and the PR process.
+
+## Support
+
+- [GitHub Issues](https://github.com/laminardb/laminardb/issues) — Bug reports and feature requests
+- [GitHub Discussions](https://github.com/laminardb/laminardb/discussions) — Questions and community help
+- Email: support@laminardb.io
 
 ## License
 

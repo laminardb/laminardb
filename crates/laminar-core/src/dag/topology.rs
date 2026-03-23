@@ -45,15 +45,15 @@ pub struct StatePartitionId(pub u32);
 /// Classification of a DAG node for ring assignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DagNodeType {
-    /// External data source (Connector SDK source, Ring 1).
+    /// External data source (connector I/O).
     Source,
-    /// Stateless operator (map, filter, project -- Ring 0).
+    /// Stateless operator (map, filter, project — event processing path).
     StatelessOperator,
-    /// Stateful operator (window, join, aggregate -- Ring 0).
+    /// Stateful operator (window, join, aggregate — event processing path).
     StatefulOperator,
-    /// Materialized view (wraps `MvPipelineExecutor` node -- Ring 0).
+    /// Materialized view (wraps `MvPipelineExecutor` node — event processing path).
     MaterializedView,
-    /// External data sink (Connector SDK sink, Ring 1).
+    /// External data sink (connector I/O).
     Sink,
 }
 
@@ -103,7 +103,7 @@ impl fmt::Debug for PartitioningStrategy {
 
 /// A node in the DAG represents an operator or stage.
 ///
-/// Nodes are created during topology construction in Ring 2
+/// Nodes are created during topology construction
 /// and are immutable once the DAG is finalized.
 pub struct DagNode {
     /// Unique node identifier.
@@ -172,8 +172,8 @@ pub struct SharedStageMetadata {
 
 /// The complete DAG topology.
 ///
-/// Constructed in Ring 2 via `DagBuilder` or from SQL `CREATE MATERIALIZED VIEW`
-/// chains. Once built, the topology is immutable and can be executed in Ring 0.
+/// Constructed at configuration time via `DagBuilder`. Once built, the topology
+/// is immutable and can be executed on the event processing path.
 pub struct StreamingDag {
     /// All nodes in the DAG, keyed by `NodeId`.
     nodes: FxHashMap<NodeId, DagNode>,

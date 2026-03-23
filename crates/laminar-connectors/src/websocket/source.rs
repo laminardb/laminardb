@@ -26,7 +26,7 @@ use crate::metrics::ConnectorMetrics;
 
 use crate::schema::json::decoder::JsonDecoderConfig;
 
-use super::backpressure::BackpressureStrategy;
+use super::backpressure::WsBackpressure;
 use super::checkpoint::WebSocketSourceCheckpoint;
 use super::connection::ConnectionManager;
 use super::metrics::WebSocketSourceMetrics;
@@ -125,7 +125,7 @@ impl WebSocketSource {
         subscribe_message: Option<String>,
         reconnect: ReconnectConfig,
         max_message_size: usize,
-        on_backpressure: BackpressureStrategy,
+        on_backpressure: WsBackpressure,
         tx: mpsc::Sender<WsMessage>,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
         data_ready: Arc<Notify>,
@@ -273,28 +273,22 @@ impl WebSocketSource {
 async fn send_with_backpressure(
     tx: &mpsc::Sender<WsMessage>,
     msg: WsMessage,
-    strategy: &BackpressureStrategy,
+    strategy: &WsBackpressure,
     data_ready: &Notify,
 ) -> Result<(), ()> {
     let result = match strategy {
-        BackpressureStrategy::Block => tx.send(msg).await.map_err(|_| ()),
-        BackpressureStrategy::DropNewest => match tx.try_send(msg) {
+        WsBackpressure::Block => tx.send(msg).await.map_err(|_| ()),
+        WsBackpressure::DropNewest => match tx.try_send(msg) {
             Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(()),
         },
-        BackpressureStrategy::DropOldest
-        | BackpressureStrategy::Buffer { .. }
-        | BackpressureStrategy::Sample { .. } => {
-            // These strategies are not yet differentiated from DropNewest.
-            // DropOldest would need drain-and-re-send, Buffer a secondary
-            // queue, and Sample a counter-based skip. All degrade to
-            // DropNewest (try_send, drop on full) for now.
-            tracing::debug!("backpressure strategy not fully implemented, using DropNewest");
-            match tx.try_send(msg) {
-                Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(()),
-            }
-        }
+        // TODO(F006): implement DropOldest, Buffer, Sample properly.
+        WsBackpressure::DropOldest
+        | WsBackpressure::Buffer { .. }
+        | WsBackpressure::Sample { .. } => match tx.try_send(msg) {
+            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(()),
+        },
     };
     if result.is_ok() {
         data_ready.notify_one();
@@ -367,6 +361,18 @@ impl SourceConnector for WebSocketSource {
             backpressure = ?self.config.on_backpressure,
             "opening WebSocket source connector (client mode)"
         );
+
+        if matches!(
+            self.config.on_backpressure,
+            WsBackpressure::DropOldest
+                | WsBackpressure::Buffer { .. }
+                | WsBackpressure::Sample { .. }
+        ) {
+            warn!(
+                strategy = ?self.config.on_backpressure,
+                "backpressure strategy not implemented, falling back to DropNewest"
+            );
+        }
 
         // Create bounded channel between reader task and poll_batch().
         let channel_capacity = 10_000;
@@ -578,7 +584,7 @@ mod tests {
                 ping_timeout: std::time::Duration::from_secs(10),
             },
             format: MessageFormat::Json,
-            on_backpressure: BackpressureStrategy::Block,
+            on_backpressure: WsBackpressure::Block,
             event_time_field: None,
             event_time_format: None,
             max_message_size: 64 * 1024 * 1024,

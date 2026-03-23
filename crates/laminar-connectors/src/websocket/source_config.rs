@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::backpressure::BackpressureStrategy;
+use super::backpressure::WsBackpressure;
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 
@@ -45,8 +45,8 @@ mod duration_millis {
 // ---------------------------------------------------------------------------
 
 /// Default backpressure strategy: block the WebSocket read loop.
-fn default_backpressure() -> BackpressureStrategy {
-    BackpressureStrategy::Block
+fn default_backpressure() -> WsBackpressure {
+    WsBackpressure::Block
 }
 
 /// Default maximum message size: 64 MiB.
@@ -110,7 +110,7 @@ pub struct WebSocketSourceConfig {
 
     /// Backpressure strategy when the Ring 0 channel is full.
     #[serde(default = "default_backpressure")]
-    pub on_backpressure: BackpressureStrategy,
+    pub on_backpressure: WsBackpressure,
 
     /// JSON field path used to extract event time from each message.
     ///
@@ -159,8 +159,8 @@ impl WebSocketSourceConfig {
         let format = Self::parse_format(config)?;
 
         let on_backpressure = match config.get("on.backpressure").map(str::to_lowercase) {
-            Some(ref s) if s == "block" => BackpressureStrategy::Block,
-            Some(ref s) if s == "drop" || s == "drop_newest" => BackpressureStrategy::DropNewest,
+            Some(ref s) if s == "block" => WsBackpressure::Block,
+            Some(ref s) if s == "drop" || s == "drop_newest" => WsBackpressure::DropNewest,
             Some(ref other) => {
                 return Err(ConnectorError::ConfigurationError(format!(
                     "invalid backpressure strategy '{other}': expected 'block' or 'drop'"
@@ -531,7 +531,7 @@ mod tests {
 
         assert!(matches!(cfg.mode, SourceMode::Client { .. }));
         assert!(matches!(cfg.format, MessageFormat::Json));
-        assert!(matches!(cfg.on_backpressure, BackpressureStrategy::Block));
+        assert!(matches!(cfg.on_backpressure, WsBackpressure::Block));
         assert_eq!(cfg.max_message_size, 64 * 1024 * 1024);
         assert!(cfg.event_time_field.is_none());
         assert!(cfg.event_time_format.is_none());
@@ -590,7 +590,7 @@ mod tests {
                 ping_timeout: Duration::from_secs(5),
             },
             format: MessageFormat::Json,
-            on_backpressure: BackpressureStrategy::Block,
+            on_backpressure: WsBackpressure::Block,
             event_time_field: Some("timestamp".into()),
             event_time_format: Some(EventTimeFormat::EpochMillis),
             max_message_size: 1024 * 1024,
@@ -642,7 +642,7 @@ mod tests {
                 path: Some("/ingest".into()),
             },
             format: MessageFormat::JsonLines,
-            on_backpressure: BackpressureStrategy::Block,
+            on_backpressure: WsBackpressure::Block,
             event_time_field: None,
             event_time_format: None,
             max_message_size: default_max_message_size(),
@@ -807,7 +807,7 @@ mod tests {
         let cfg: WebSocketSourceConfig =
             serde_json::from_str(json).expect("deserialize with defaults");
 
-        assert!(matches!(cfg.on_backpressure, BackpressureStrategy::Block));
+        assert!(matches!(cfg.on_backpressure, WsBackpressure::Block));
         assert_eq!(cfg.max_message_size, 64 * 1024 * 1024);
         assert!(cfg.event_time_field.is_none());
         assert!(cfg.auth.is_none());
@@ -943,7 +943,7 @@ mod tests {
 
         let cfg = WebSocketSourceConfig::from_config(&config).unwrap();
         assert!(matches!(cfg.format, MessageFormat::Json));
-        assert!(matches!(cfg.on_backpressure, BackpressureStrategy::Block));
+        assert!(matches!(cfg.on_backpressure, WsBackpressure::Block));
         assert_eq!(cfg.max_message_size, 64 * 1024 * 1024);
         assert!(cfg.event_time_field.is_none());
         assert!(cfg.auth.is_none());

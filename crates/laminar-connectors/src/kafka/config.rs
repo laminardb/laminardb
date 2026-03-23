@@ -206,6 +206,11 @@ impl std::str::FromStr for StartupMode {
             "group_offsets" | "group" => Ok(StartupMode::GroupOffsets),
             "earliest" => Ok(StartupMode::Earliest),
             "latest" => Ok(StartupMode::Latest),
+            "timestamp" => Err(ConnectorError::ConfigurationError(
+                "use 'startup.timestamp.ms' to start from a timestamp, \
+                 not 'startup.mode = timestamp'"
+                    .into(),
+            )),
             other => Err(ConnectorError::ConfigurationError(format!(
                 "invalid startup.mode: '{other}' (expected group-offsets/earliest/latest)"
             ))),
@@ -484,7 +489,37 @@ pub struct KafkaSourceConfig {
     /// Enforcement mode for watermark alignment.
     pub alignment_mode: Option<super::watermarks::KafkaAlignmentMode>,
 
+    // -- Consumer group timing --
+    /// Consumer session timeout (default: 45s — production-safe; rdkafka's
+    /// aggressive 10s default causes rebalance storms under GC pauses).
+    pub session_timeout: Duration,
+    /// Consumer heartbeat interval (default: 10s). Must satisfy
+    /// `heartbeat_interval * 3 < session_timeout` per Kafka broker requirement.
+    pub heartbeat_interval: Duration,
+    /// Maximum interval between calls to `rd_kafka_consumer_poll()` before
+    /// the broker considers this consumer dead and triggers a rebalance.
+    ///
+    /// Default: 600s (10 minutes). rdkafka's default is 300s, but with
+    /// reader-side pause/resume the reader keeps polling even under
+    /// backpressure, so this is a safety margin. Must be >= 60s.
+    pub max_poll_interval: Duration,
+    /// Maximum per-partition pre-fetch queue size in kbytes (default: 16384 = 16MB).
+    /// rdkafka's 64MB default is too aggressive for an embedded database.
+    pub queued_max_messages_kbytes: u32,
+
+    // -- Broker commit --
+    /// Interval at which to asynchronously commit offsets to the Kafka broker.
+    ///
+    /// This is advisory — it keeps `kafka-consumer-groups` lag monitoring
+    /// accurate. The authoritative offset state lives in `LaminarDB`'s
+    /// checkpoint system. Set to `Duration::ZERO` to disable periodic
+    /// broker commits (default: 60s).
+    pub broker_commit_interval: Duration,
+
     // -- Backpressure --
+    /// Capacity of the bounded channel between the background Kafka reader
+    /// task and `poll_batch()` (default: 1024). Must be >= `max_poll_records`.
+    pub reader_channel_capacity: usize,
     /// Channel fill ratio at which to pause consumption.
     pub backpressure_high_watermark: f64,
     /// Channel fill ratio at which to resume consumption.
@@ -554,6 +589,12 @@ impl Default for KafkaSourceConfig {
             alignment_group_id: None,
             alignment_max_drift: None,
             alignment_mode: None,
+            session_timeout: Duration::from_secs(45),
+            heartbeat_interval: Duration::from_secs(10),
+            max_poll_interval: Duration::from_secs(600),
+            queued_max_messages_kbytes: 16384,
+            broker_commit_interval: Duration::from_secs(60),
+            reader_channel_capacity: 1024,
             backpressure_high_watermark: 0.8,
             backpressure_low_watermark: 0.5,
             kafka_properties: HashMap::new(),
@@ -716,6 +757,27 @@ impl KafkaSourceConfig {
             None => None,
         };
 
+        let session_timeout_ms = config
+            .get_parsed::<u64>("session.timeout.ms")?
+            .unwrap_or(45_000);
+        let heartbeat_interval_ms = config
+            .get_parsed::<u64>("heartbeat.interval.ms")?
+            .unwrap_or(10_000);
+        let queued_max_messages_kbytes = config
+            .get_parsed::<u32>("queued.max.messages.kbytes")?
+            .unwrap_or(16384);
+        let max_poll_interval_ms = config
+            .get_parsed::<u64>("max.poll.interval.ms")?
+            .unwrap_or(600_000);
+
+        let broker_commit_interval_ms = config
+            .get_parsed::<u64>("broker.commit.interval.ms")?
+            .unwrap_or(60_000);
+
+        let reader_channel_capacity = config
+            .get_parsed::<usize>("reader.channel.capacity")?
+            .unwrap_or(1024);
+
         let backpressure_high_watermark = config
             .get_parsed::<f64>("backpressure.high.watermark")?
             .unwrap_or(0.8);
@@ -763,6 +825,12 @@ impl KafkaSourceConfig {
             alignment_group_id,
             alignment_max_drift: alignment_max_drift_ms.map(Duration::from_millis),
             alignment_mode,
+            session_timeout: Duration::from_millis(session_timeout_ms),
+            heartbeat_interval: Duration::from_millis(heartbeat_interval_ms),
+            max_poll_interval: Duration::from_millis(max_poll_interval_ms),
+            queued_max_messages_kbytes,
+            broker_commit_interval: Duration::from_millis(broker_commit_interval_ms),
+            reader_channel_capacity,
             backpressure_high_watermark,
             backpressure_low_watermark,
             kafka_properties,
@@ -809,6 +877,12 @@ impl KafkaSourceConfig {
                 "max.poll.records must be > 0".into(),
             ));
         }
+        if self.reader_channel_capacity < self.max_poll_records {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "reader.channel.capacity ({}) must be >= max.poll.records ({})",
+                self.reader_channel_capacity, self.max_poll_records
+            )));
+        }
 
         if self.security_protocol.uses_sasl() && self.sasl_mechanism.is_none() {
             return Err(ConnectorError::ConfigurationError(
@@ -835,6 +909,22 @@ impl KafkaSourceConfig {
                     ));
                 }
             }
+        }
+
+        if self.max_poll_interval.as_secs() < 60 {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "max.poll.interval.ms ({}) must be >= 60000 (60s)",
+                self.max_poll_interval.as_millis()
+            )));
+        }
+
+        // Kafka broker requires heartbeat_interval * 3 < session_timeout.
+        if self.heartbeat_interval.as_millis() * 3 >= self.session_timeout.as_millis() {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "heartbeat.interval.ms ({}) * 3 must be < session.timeout.ms ({})",
+                self.heartbeat_interval.as_millis(),
+                self.session_timeout.as_millis()
+            )));
         }
 
         if self.backpressure_high_watermark <= self.backpressure_low_watermark {
@@ -900,6 +990,22 @@ impl KafkaSourceConfig {
         }
 
         config.set("isolation.level", self.isolation_level.as_rdkafka_str());
+        config.set(
+            "session.timeout.ms",
+            self.session_timeout.as_millis().to_string(),
+        );
+        config.set(
+            "heartbeat.interval.ms",
+            self.heartbeat_interval.as_millis().to_string(),
+        );
+        config.set(
+            "queued.max.messages.kbytes",
+            self.queued_max_messages_kbytes.to_string(),
+        );
+        config.set(
+            "max.poll.interval.ms",
+            self.max_poll_interval.as_millis().to_string(),
+        );
 
         if let Some(fetch_min) = self.fetch_min_bytes {
             config.set("fetch.min.bytes", fetch_min.to_string());
@@ -951,6 +1057,10 @@ fn is_blocked_passthrough_key(key: &str) -> bool {
                 | "ssl.endpoint.identification.algorithm"
                 | "enable.auto.commit"
                 | "enable.idempotence"
+                | "session.timeout.ms"
+                | "heartbeat.interval.ms"
+                | "max.poll.interval.ms"
+                | "queued.max.messages.kbytes"
         )
 }
 
@@ -1071,6 +1181,24 @@ mod tests {
         assert!(cfg.schema_registry_url.is_none());
         assert_eq!(cfg.security_protocol, SecurityProtocol::Plaintext);
         assert!(cfg.sasl_mechanism.is_none());
+        assert_eq!(cfg.broker_commit_interval, Duration::from_secs(60));
+        assert_eq!(cfg.reader_channel_capacity, 1024);
+    }
+
+    #[test]
+    fn test_parse_broker_commit_interval() {
+        let cfg =
+            KafkaSourceConfig::from_config(&make_config(&[("broker.commit.interval.ms", "5000")]))
+                .unwrap();
+        assert_eq!(cfg.broker_commit_interval, Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn test_parse_broker_commit_interval_zero_disables() {
+        let cfg =
+            KafkaSourceConfig::from_config(&make_config(&[("broker.commit.interval.ms", "0")]))
+                .unwrap();
+        assert!(cfg.broker_commit_interval.is_zero());
     }
 
     #[test]
@@ -1165,13 +1293,21 @@ mod tests {
         let cfg = KafkaSourceConfig::from_config(&make_config(&[
             ("kafka.session.timeout.ms", "30000"),
             ("kafka.max.poll.interval.ms", "300000"),
+            ("kafka.fetch.message.max.bytes", "2097152"),
         ]))
         .unwrap();
 
-        assert_eq!(cfg.kafka_properties.len(), 2);
+        assert_eq!(cfg.kafka_properties.len(), 3);
+        // session.timeout.ms and max.poll.interval.ms are passed through as
+        // kafka_properties, but blocked by is_blocked_passthrough_key() in
+        // to_rdkafka_config() — they won't override explicit settings.
         assert_eq!(
             cfg.kafka_properties.get("session.timeout.ms"),
             Some(&"30000".to_string())
+        );
+        assert_eq!(
+            cfg.kafka_properties.get("max.poll.interval.ms"),
+            Some(&"300000".to_string())
         );
     }
 
@@ -1674,5 +1810,111 @@ mod tests {
     fn test_parse_alignment_mode_invalid() {
         let config = make_config(&[("alignment.mode", "invalid")]);
         assert!(KafkaSourceConfig::from_config(&config).is_err());
+    }
+
+    // -- startup.mode = timestamp error --
+
+    #[test]
+    fn test_startup_mode_timestamp_error() {
+        let config = make_config(&[("startup.mode", "timestamp")]);
+        let err = KafkaSourceConfig::from_config(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("startup.timestamp.ms"),
+            "error should mention startup.timestamp.ms, got: {msg}"
+        );
+    }
+
+    // -- session timeout / heartbeat interval --
+
+    #[test]
+    fn test_session_timeout_heartbeat_defaults() {
+        let cfg = KafkaSourceConfig::from_config(&make_config(&[])).unwrap();
+        assert_eq!(cfg.session_timeout, Duration::from_secs(45));
+        assert_eq!(cfg.heartbeat_interval, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_session_timeout_heartbeat_custom() {
+        let cfg = KafkaSourceConfig::from_config(&make_config(&[
+            ("session.timeout.ms", "60000"),
+            ("heartbeat.interval.ms", "15000"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.session_timeout, Duration::from_millis(60_000));
+        assert_eq!(cfg.heartbeat_interval, Duration::from_millis(15_000));
+    }
+
+    #[test]
+    fn test_session_timeout_heartbeat_validation_fails() {
+        // heartbeat=20s * 3 = 60s >= session=45s → error
+        let config = make_config(&[
+            ("session.timeout.ms", "45000"),
+            ("heartbeat.interval.ms", "20000"),
+        ]);
+        let err = KafkaSourceConfig::from_config(&config).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("heartbeat.interval.ms"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_session_timeout_heartbeat_validation_passes() {
+        // heartbeat=10s * 3 = 30s < session=45s → ok
+        let cfg = KafkaSourceConfig::from_config(&make_config(&[
+            ("session.timeout.ms", "45000"),
+            ("heartbeat.interval.ms", "10000"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.session_timeout, Duration::from_millis(45_000));
+        assert_eq!(cfg.heartbeat_interval, Duration::from_millis(10_000));
+    }
+
+    #[test]
+    fn test_session_timeout_heartbeat_in_rdkafka_config() {
+        let cfg = KafkaSourceConfig::from_config(&make_config(&[
+            ("session.timeout.ms", "60000"),
+            ("heartbeat.interval.ms", "15000"),
+        ]))
+        .unwrap();
+        let rdkafka = cfg.to_rdkafka_config();
+        assert_eq!(rdkafka.get("session.timeout.ms"), Some("60000"));
+        assert_eq!(rdkafka.get("heartbeat.interval.ms"), Some("15000"));
+    }
+
+    #[test]
+    fn test_session_timeout_passthrough_blocked() {
+        let cfg =
+            KafkaSourceConfig::from_config(&make_config(&[("kafka.session.timeout.ms", "99999")]))
+                .unwrap();
+        // The pass-through should be blocked; rdkafka config should use the default (45000).
+        let rdkafka = cfg.to_rdkafka_config();
+        assert_eq!(rdkafka.get("session.timeout.ms"), Some("45000"));
+    }
+
+    // -- queued.max.messages.kbytes --
+
+    #[test]
+    fn test_queued_max_messages_kbytes_default() {
+        let cfg = KafkaSourceConfig::from_config(&make_config(&[])).unwrap();
+        assert_eq!(cfg.queued_max_messages_kbytes, 16384);
+    }
+
+    #[test]
+    fn test_queued_max_messages_kbytes_custom() {
+        let cfg = KafkaSourceConfig::from_config(&make_config(&[(
+            "queued.max.messages.kbytes",
+            "32768",
+        )]))
+        .unwrap();
+        assert_eq!(cfg.queued_max_messages_kbytes, 32768);
+    }
+
+    #[test]
+    fn test_queued_max_messages_kbytes_in_rdkafka_config() {
+        let cfg =
+            KafkaSourceConfig::from_config(&make_config(&[("queued.max.messages.kbytes", "8192")]))
+                .unwrap();
+        let rdkafka = cfg.to_rdkafka_config();
+        assert_eq!(rdkafka.get("queued.max.messages.kbytes"), Some("8192"));
     }
 }

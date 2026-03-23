@@ -64,6 +64,9 @@ pub struct PostgresSinkConfig {
     /// Delivery guarantee level.
     pub delivery_guarantee: DeliveryGuarantee,
 
+    /// Per-query statement timeout (default: 30s).
+    pub statement_timeout: Duration,
+
     /// Sink ID for offset tracking (auto-generated if empty).
     pub sink_id: String,
 }
@@ -88,6 +91,7 @@ impl Default for PostgresSinkConfig {
             auto_create_table: false,
             changelog_mode: false,
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
+            statement_timeout: Duration::from_secs(30),
             sink_id: String::new(),
         }
     }
@@ -181,6 +185,12 @@ impl PostgresSinkConfig {
         if let Some(v) = config.get("changelog.mode") {
             cfg.changelog_mode = v.eq_ignore_ascii_case("true");
         }
+        if let Some(v) = config.get("statement.timeout.ms") {
+            let ms: u64 = v.parse().map_err(|_| {
+                ConnectorError::ConfigurationError(format!("invalid statement.timeout.ms: '{v}'"))
+            })?;
+            cfg.statement_timeout = Duration::from_millis(ms);
+        }
         if let Some(v) = config.get("delivery.guarantee") {
             cfg.delivery_guarantee = v.parse().map_err(|_| {
                 ConnectorError::ConfigurationError(format!(
@@ -221,6 +231,11 @@ impl PostgresSinkConfig {
                 "pool.size must be > 0".into(),
             ));
         }
+        if self.statement_timeout < Duration::from_secs(1) {
+            return Err(ConnectorError::ConfigurationError(
+                "statement.timeout.ms must be >= 1000 (1 second)".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -257,42 +272,8 @@ str_enum!(WriteMode, lowercase_nodash, String, "unknown write mode",
     Upsert => "upsert", "insert"
 );
 
-/// Delivery guarantee for the `PostgreSQL` sink.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeliveryGuarantee {
-    /// At-least-once: records may be duplicated on failure recovery.
-    AtLeastOnce,
-    /// Exactly-once: co-transactional offset storage in `PostgreSQL`.
-    ExactlyOnce,
-}
-
-str_enum!(DeliveryGuarantee, lowercase_nodash, String, "unknown delivery guarantee",
-    AtLeastOnce => "at_least_once", "at-least-once", "atleastonce";
-    ExactlyOnce => "exactly_once", "exactly-once", "exactlyonce"
-);
-
-/// SSL mode for `PostgreSQL` connections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SslMode {
-    /// No SSL.
-    Disable,
-    /// Use SSL if available, fall back to unencrypted.
-    Prefer,
-    /// Require SSL.
-    Require,
-    /// Require SSL and verify server certificate.
-    VerifyCa,
-    /// Require SSL, verify certificate and hostname.
-    VerifyFull,
-}
-
-str_enum!(SslMode, lowercase_nodash, String, "unknown SSL mode",
-    Disable => "disable", "off";
-    Prefer => "prefer";
-    Require => "require";
-    VerifyCa => "verify-ca", "verify_ca", "verifyca";
-    VerifyFull => "verify-full", "verify_full", "verifyfull"
-);
+pub use crate::connector::DeliveryGuarantee;
+pub use crate::connector::PostgresSslMode as SslMode;
 
 #[cfg(test)]
 mod tests {
@@ -487,8 +468,8 @@ mod tests {
 
     #[test]
     fn test_delivery_guarantee_display() {
-        assert_eq!(DeliveryGuarantee::AtLeastOnce.to_string(), "at_least_once");
-        assert_eq!(DeliveryGuarantee::ExactlyOnce.to_string(), "exactly_once");
+        assert_eq!(DeliveryGuarantee::AtLeastOnce.to_string(), "at-least-once");
+        assert_eq!(DeliveryGuarantee::ExactlyOnce.to_string(), "exactly-once");
     }
 
     #[test]

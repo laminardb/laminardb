@@ -72,30 +72,30 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             cross: true
-            # Cross builds: skip hwloc (needs target-arch libhwloc) and xdp (needs libelf);
+            # Cross builds: skip hwloc (needs target-arch libhwloc);
             # io-uring is pure syscalls so cross-compiles fine;
             # vendored-openssl compiles OpenSSL from source for the target triple
-            features: --features "allocation-tracking,io-uring,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket,vendored-openssl"
+            features: --features "io-uring,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket,vendored-openssl"
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: true
             # vendored-openssl: musl has no system libssl-dev; compile from source
-            features: --features "allocation-tracking,io-uring,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket,vendored-openssl"
+            features: --features "io-uring,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket,vendored-openssl"
           - os: macos-15  # ARM64
             target: aarch64-apple-darwin
             cross: false
-            # macOS: skip Linux-only features (hwloc, io-uring, xdp)
-            features: --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
+            # macOS: skip Linux-only features (hwloc, io-uring)
+            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
           - os: macos-15  # Cross-compile Intel from ARM64 (macos-13 deprecated)
             target: x86_64-apple-darwin
             cross: false
-            # macOS: skip Linux-only features (hwloc, io-uring, xdp)
-            features: --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
+            # macOS: skip Linux-only features (hwloc, io-uring)
+            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             cross: false
-            # Windows: skip Linux-only features (hwloc, io-uring, xdp)
-            features: --features "allocation-tracking,jit,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
+            # Windows: skip Linux-only features (hwloc, io-uring)
+            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable

@@ -11,10 +11,10 @@ LaminarDB development is organized into phases, each building on the previous. D
 |                                                                  |
 |  Phase 1       Phase 1.5    Phase 2       Phase 2.5    Phase 3  |
 |  +------+      +------+    +------+      +------+    +------+  |
-|  | Core |----->| SQL  |--->|Harden|--->  | JIT  |--->|Connect|  |
-|  |Engine|      |Parser|    | ing  |      |Compil|    | ors  |  |
-|  +------+      +------+    +------+      +------+    +------+  |
-|  DONE          DONE        DONE          DONE        85%       |
+|  | Core |----->| SQL  |--->|Harden|--------------->|Connect|  |
+|  |Engine|      |Parser|    | ing  |               | ors  |  |
+|  +------+      +------+    +------+               +------+  |
+|  DONE          DONE        DONE                   85%       |
 |                                                                  |
 |  Phase 4       Phase 5     Phase 6a      Phase 6b    Phase 6c  |
 |  +------+      +------+    +------+      +------+    +------+  |
@@ -60,7 +60,7 @@ LaminarDB development is organized into phases, each building on the previous. D
 **Goal**: Harden the engine with advanced window types, joins, per-core WAL, exactly-once sinks, and performance infrastructure.
 
 **Completed Features (38/38):**
-- Thread-per-core architecture with CPU pinning (F013-F015)
+- Thread-per-core architecture with CPU pinning (F013-F015) (superseded by StreamingCoordinator, PR #204)
 - Sliding, hopping, and session windows with merge support (F016-F018)
 - Stream-stream, lookup, temporal, and ASOF joins (F019-F021, F056-F057)
 - Incremental checkpointing and per-core WAL (F022, F062)
@@ -68,31 +68,20 @@ LaminarDB development is organized into phases, each building on the previous. D
 - FIRST/LAST aggregates, cascading materialized views (F059-F060)
 - EMIT clause extension, changelog/retraction Z-sets (F011B, F063)
 - Per-partition, keyed, and alignment group watermarks (F064-F066)
-- io_uring optimization, NUMA-aware memory (F067-F068)
-- Three-ring I/O architecture, task budget enforcement (F069-F070)
+- io_uring optimization, NUMA-aware memory (F067-F068) (feature-gated, not enabled in default builds)
+- StreamingCoordinator I/O architecture, task budget enforcement (F069-F070)
 - Zero-allocation enforcement, zero-allocation polling (F071, F073)
 - XDP/eBPF network optimization (F072)
 - Advanced DataFusion integration, composite aggregator (F005B, F074-F077)
 
 ---
 
-## Phase 2.5: JIT Compiler -- COMPLETE
+## Phase 2.5: JIT Compiler -- REMOVED
 
-**Goal**: Compile DataFusion logical plans into zero-allocation JIT functions for Ring 0.
-
-**Completed Features (12/12):**
-- Event Row Format (F078)
-- Compiled Expression Evaluator (F079)
-- Plan Compiler Core (F080)
-- Ring 0/Ring 1 Pipeline Bridge (F081)
-- Streaming Query Lifecycle (F082)
-- Batch Row Reader (F083)
-- SQL Compiler Orchestrator (F084)
-- LaminarDB JIT Query Execution (F085)
-- Adaptive Compilation Warmup (F086)
-- Compiled Stateful Pipeline Bridge (F087)
-- Schema-Aware Event Time Extraction (F088)
-- Compilation Metrics & Observability (F089)
+Cranelift JIT compilation was removed in favor of compiled `PhysicalExpr` projections
+and cached logical plans, which achieve equivalent per-cycle overhead reduction without
+the 12K LOC Cranelift dependency. Non-JIT compiler infrastructure (row format, bridge,
+pipeline bridge, event time extraction) is retained for Ring 0.
 
 ---
 
@@ -245,7 +234,7 @@ Architectural performance improvements identified by audit. All actionable local
 | Phase 1: Core Engine | 12 | 12 | COMPLETE |
 | Phase 1.5: SQL Parser | 1 | 1 | COMPLETE |
 | Phase 2: Hardening | 38 | 38 | COMPLETE |
-| Phase 2.5: JIT Compiler | 12 | 12 | COMPLETE |
+| Phase 2.5: JIT Compiler | 12 | 12 | REMOVED |
 | Phase 3: Connectors | 100 | 85 | 85% |
 | Phase 4: Security | 11 | 0 | Planned |
 | Phase 5: Admin | 10 | 0 | Planned |

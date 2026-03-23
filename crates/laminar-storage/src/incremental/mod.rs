@@ -1,17 +1,17 @@
 //! # Incremental Checkpointing
 //!
-//! Three-tier incremental checkpoint architecture that maintains Ring 0 latency (<500ns)
-//! while providing durable, incremental state snapshots.
+//! Three-tier incremental checkpoint architecture:
+//! event path writes to changelog, background I/O drains to WAL,
+//! periodic checkpoints snapshot state to disk.
 //!
 //! ## Architecture
 //!
 //! ```text
-//! Ring 0 (Hot, <500ns):
+//! Event Processing:
 //!   Event ──▶ mmap_state.put() ──▶ changelog.push(offset_ref)
-//!                                   (zero-alloc)
 //!                                        │
 //!                                        ▼ async drain when idle
-//! Ring 1 (Background):
+//! Background I/O:
 //!   changelog.drain() ──▶ wal.append() ──▶ wal.sync()
 //!                         (group commit, fdatasync)
 //!                                        │
@@ -30,7 +30,7 @@
 //! ## Key Components
 //!
 //! - [`StateChangelogEntry`]: Zero-alloc changelog entry (32 bytes)
-//! - [`StateChangelogBuffer`]: Ring 0 SPSC changelog buffer
+//! - [`StateChangelogBuffer`]: SPSC changelog buffer for the event processing path
 //! - [`IncrementalCheckpointManager`]: Directory-based incremental checkpoints
 //! - [`RecoveryManager`]: Checkpoint + WAL recovery
 //!

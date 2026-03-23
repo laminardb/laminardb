@@ -42,73 +42,12 @@ use std::time::Duration;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use sqlparser::ast::{ColumnDef, DataType as SqlDataType};
 
+use laminar_core::streaming::config::{
+    BackpressureStrategy, WaitStrategy, DEFAULT_BUFFER_SIZE, MAX_BUFFER_SIZE, MIN_BUFFER_SIZE,
+};
+
 use crate::parser::ParseError;
 use crate::parser::{CreateSinkStatement, CreateSourceStatement, SinkFrom, WatermarkDef};
-
-/// Minimum buffer size for streaming channels.
-pub const MIN_BUFFER_SIZE: usize = 4;
-
-/// Maximum buffer size for streaming channels.
-pub const MAX_BUFFER_SIZE: usize = 1 << 20; // 1M entries
-
-/// Default buffer size for streaming channels.
-pub const DEFAULT_BUFFER_SIZE: usize = 2048;
-
-/// Backpressure strategy for streaming channels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BackpressureStrategy {
-    /// Block until space is available.
-    #[default]
-    Block,
-    /// Drop oldest item to make room.
-    DropOldest,
-    /// Reject and return error immediately.
-    Reject,
-}
-
-impl std::str::FromStr for BackpressureStrategy {
-    type Err = ParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "block" | "blocking" => Ok(Self::Block),
-            "drop" | "drop_oldest" | "dropoldest" => Ok(Self::DropOldest),
-            "reject" | "error" => Ok(Self::Reject),
-            _ => Err(ParseError::ValidationError(format!(
-                "invalid backpressure strategy: '{}'. Valid values: block, drop_oldest, reject",
-                s
-            ))),
-        }
-    }
-}
-
-/// Wait strategy for streaming consumers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum WaitStrategy {
-    /// Spin-loop without yielding (lowest latency, highest CPU).
-    Spin,
-    /// Spin with occasional yields (balanced).
-    #[default]
-    SpinYield,
-    /// Park the thread (lowest CPU, higher latency).
-    Park,
-}
-
-impl std::str::FromStr for WaitStrategy {
-    type Err = ParseError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "spin" => Ok(Self::Spin),
-            "spin_yield" | "spinyield" | "yield" => Ok(Self::SpinYield),
-            "park" | "parking" => Ok(Self::Park),
-            _ => Err(ParseError::ValidationError(format!(
-                "invalid wait strategy: '{}'. Valid values: spin, spin_yield, park",
-                s
-            ))),
-        }
-    }
-}
 
 /// Watermark specification for a source.
 #[derive(Debug, Clone)]
@@ -311,10 +250,12 @@ fn parse_source_options(
                 config.buffer_size = parse_buffer_size(value)?;
             }
             "backpressure" => {
-                config.backpressure = BackpressureStrategy::from_str(value)?;
+                config.backpressure =
+                    BackpressureStrategy::from_str(value).map_err(ParseError::ValidationError)?;
             }
             "wait_strategy" | "waitstrategy" => {
-                config.wait_strategy = WaitStrategy::from_str(value)?;
+                config.wait_strategy =
+                    WaitStrategy::from_str(value).map_err(ParseError::ValidationError)?;
             }
             "track_stats" | "trackstats" | "stats" => {
                 config.track_stats = parse_bool(value)?;

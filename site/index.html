@@ -35,14 +35,14 @@
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
     "name": "LaminarDB",
-    "description": "Embedded streaming SQL engine with sub-microsecond latency. Process event streams using SQL, Rust, Apache Arrow, and DataFusion.",
+    "description": "Streaming SQL engine with sub-microsecond state lookups. Process event streams using SQL, Rust, Apache Arrow, and DataFusion.",
     "applicationCategory": "Database",
     "operatingSystem": "Linux, macOS, Windows",
     "license": "https://opensource.org/licenses/Apache-2.0",
     "url": "https://laminardb.io",
     "codeRepository": "https://github.com/laminardb/laminardb",
     "programmingLanguage": ["Rust", "Python", "SQL"],
-    "softwareVersion": "0.18.1",
+    "softwareVersion": "0.18.12",
     "author": {
       "@type": "Organization",
       "name": "LaminarDB Contributors",
@@ -66,7 +66,7 @@
           <path d="M4 32 C12 32,14 30,22 30 C30 30,32 34,36 34" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
         </svg>
         <span>LaminarDB</span>
-        <span class="version-badge">v0.18.1</span>
+        <span class="version-badge" data-version="tag">v0.18.12</span>
       </a>
 
       <nav class="nav-links" aria-label="Main navigation">
@@ -74,7 +74,8 @@
         <a href="#connectors">Connectors</a>
         <a href="#comparison">Comparison</a>
         <a href="#status">Status</a>
-        <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">Docs</a>
+        <a href="docs/">Docs</a>
+        <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API</a>
         <a href="https://github.com/laminardb/laminardb" class="github-link" target="_blank" rel="noopener">
           <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
           GitHub
@@ -90,7 +91,8 @@
         <a href="#connectors">Connectors</a>
         <a href="#comparison">Comparison</a>
         <a href="#status">Status</a>
-        <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API Docs</a>
+        <a href="docs/">Docs</a>
+        <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API</a>
         <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
       </div>
     </div>
@@ -170,12 +172,12 @@ db.start().await?;</code></pre>
           <div class="hero-metric">
             <div class="hero-metric-value">1M+<span class="unit">/s</span></div>
             <div class="hero-metric-label">events per core</div>
-            <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/throughput_bench.rs" target="_blank" rel="noopener">throughput_bench.rs</a></div>
+            <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/streaming_bench.rs" target="_blank" rel="noopener">streaming_bench.rs</a></div>
           </div>
           <div class="hero-metric">
             <div class="hero-metric-value">0</div>
             <div class="hero-metric-label">hot-path allocations</div>
-            <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/tests/zero_alloc_integration.rs" target="_blank" rel="noopener">zero_alloc_integration.rs</a></div>
+            <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/src/alloc/guard.rs" target="_blank" rel="noopener">alloc/guard.rs</a></div>
           </div>
         </div>
       </div>
@@ -215,7 +217,7 @@ db.start().await?;</code></pre>
               <span class="ring-chip">Reactor</span>
               <span class="ring-chip">Operators</span>
               <span class="ring-chip">State Store</span>
-              <span class="ring-chip">JIT</span>
+              <span class="ring-chip">SPSC Queues</span>
             </div>
           </div>
           <div class="ring-divider">SPSC queues</div>
@@ -330,36 +332,44 @@ SELECT t.symbol, t.price, q.bid, q.ask,
        t.price - q.bid AS spread
 FROM trades t
 ASOF JOIN quotes q
-    ON t.symbol = q.symbol AND t.ts &gt;= q.ts;
+    MATCH_CONDITION(t.ts &gt;= q.ts)
+    ON t.symbol = q.symbol;
 
--- Stream-stream join with time bounds
+-- Interval join: match orders to payments within 1 hour
 CREATE STREAM matched AS
-SELECT t.symbol, t.price, o.order_id
-FROM trades t
-INNER JOIN orders o ON t.symbol = o.symbol
-    AND o.ts BETWEEN t.ts - 10000 AND t.ts + 10000;</code></pre>
+SELECT o.order_id, o.amount, p.status
+FROM orders o
+INNER JOIN payments p ON o.order_id = p.order_id
+    AND p.ts BETWEEN o.ts AND o.ts + 3600000;
+
+-- Temporal join: point-in-time lookup
+SELECT o.*, r.rate
+FROM orders o
+JOIN rates FOR SYSTEM_TIME AS OF o.order_time AS r
+    ON o.currency = r.currency;</code></pre>
             </div>
 
             <div class="tab-panel" id="qs-server">
-              <pre><code class="language-bash"># Install the standalone server
+              <pre><code class="language-bash"># Option 1: Download pre-compiled binary (latest release)
+VERSION=$(curl -s https://api.github.com/repos/laminardb/laminardb/releases/latest | grep tag_name | cut -d '"' -f4)
+
+# Linux x86_64
+curl -LO "https://github.com/laminardb/laminardb/releases/download/${VERSION}/laminardb-server-x86_64-unknown-linux-gnu-${VERSION}.tar.gz"
+tar xzf laminardb-server-*.tar.gz
+
+# macOS Apple Silicon
+curl -LO "https://github.com/laminardb/laminardb/releases/download/${VERSION}/laminardb-server-aarch64-apple-darwin-${VERSION}.tar.gz"
+
+# All platforms: github.com/laminardb/laminardb/releases
+
+# Option 2: Build from source
 cargo install laminar-server
 
-# Run with a config file (see examples/ directory)
-laminardb --config laminardb.toml
-
-# Or run with Docker
+# Option 3: Docker
 docker compose up
 
-# Docker Compose includes:
-#   - laminardb (port 8080)
-#   - Redpanda/Kafka (port 19092)
-#   - Schema Registry (port 18081)
-#   - Prometheus + Grafana (optional)
-
-# Example configs in the repo:
-#   examples/laminardb.toml          — full config
-#   examples/laminardb-minimal.toml  — minimal
-#   examples/laminardb-delta.toml    — Delta Lake</code></pre>
+# Run
+./laminardb --config laminardb.toml</code></pre>
             </div>
 
             <div class="tab-panel" id="qs-kafka">
@@ -460,6 +470,13 @@ CREATE SINK lake INTO DELTA_LAKE (
                 <td>Binlog replication. GTID or file+position modes.</td>
               </tr>
               <tr>
+                <td>MongoDB CDC</td>
+                <td>Source + Sink</td>
+                <td><span class="status-impl">Implemented</span></td>
+                <td><code class="feature-flag">mongodb-cdc</code></td>
+                <td>Change streams, resume tokens. Sink: ordered/unordered writes, upsert, CDC replay.</td>
+              </tr>
+              <tr>
                 <td>Delta Lake</td>
                 <td>Source + Sink</td>
                 <td><span class="status-impl">Implemented</span></td>
@@ -518,9 +535,13 @@ CREATE SINK lake INTO DELTA_LAKE (
           <div class="deploy-card">
             <h3>Standalone Server</h3>
             <p>
-              Run the <code>laminardb</code> binary with a TOML config.
-              REST API on port 8080. Connects to Kafka, databases, Delta Lake.
-              Docker image and Helm chart available.
+              <a href="https://github.com/laminardb/laminardb/releases/latest" target="_blank" rel="noopener">Download pre-compiled binaries</a>
+              for Linux (x86_64, aarch64, musl), macOS (x86_64, Apple Silicon), and Windows.
+              Or <code>cargo install laminar-server</code>. Docker image and Helm chart available.
+            </p>
+            <p>
+              TOML configuration with <code>${ENV_VAR}</code> substitution.
+              REST API, Prometheus metrics, ad-hoc SQL, and hot-reload (edit config &rarr; automatic apply).
             </p>
             <p>Use for: CDC pipelines, stream-to-lakehouse, event routing.</p>
           </div>
@@ -593,7 +614,7 @@ CREATE SINK lake INTO DELTA_LAKE (
               </tr>
               <tr>
                 <td>Latency target</td>
-                <td class="hl">&lt;1&micro;s state lookup</td>
+                <td class="hl">10&ndash;16ns state lookup</td>
                 <td>~10ms</td>
                 <td>~1ms</td>
                 <td>~10ms</td>
@@ -617,7 +638,7 @@ CREATE SINK lake INTO DELTA_LAKE (
               </tr>
               <tr>
                 <td>Connectors</td>
-                <td class="hl">8</td>
+                <td class="hl">10</td>
                 <td class="win">100+</td>
                 <td>Kafka only</td>
                 <td class="win">15+</td>
@@ -641,7 +662,7 @@ CREATE SINK lake INTO DELTA_LAKE (
               </tr>
               <tr>
                 <td>Maturity</td>
-                <td class="hl">Pre-1.0 (v0.18.1)</td>
+                <td class="hl">Pre-1.0 (<span data-version="tag">v0.18.12</span>)</td>
                 <td class="win">Production (10+ yrs)</td>
                 <td class="win">Production (8+ yrs)</td>
                 <td class="win">Production (~2 yrs)</td>
@@ -654,7 +675,7 @@ CREATE SINK lake INTO DELTA_LAKE (
         <p class="comparison-note">
           Bold cells show where a competitor has a clear advantage.
           LaminarDB wins on latency and deployment flexibility.
-          It loses on maturity, horizontal scale (until cluster ships), and ecosystem breadth.
+          It loses on maturity, horizontal scale, and ecosystem breadth.
         </p>
 
         <h3 style="margin-bottom: 1rem;">When to choose something else</h3>
@@ -710,7 +731,7 @@ CREATE SINK lake INTO DELTA_LAKE (
                 <td>Throughput / core</td>
                 <td>500K events/s</td>
                 <td>1.1&ndash;1.46M events/s</td>
-                <td><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/throughput_bench.rs" target="_blank" rel="noopener">throughput_bench.rs</a></td>
+                <td><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/streaming_bench.rs" target="_blank" rel="noopener">streaming_bench.rs</a></td>
               </tr>
               <tr>
                 <td>Event latency (mean)</td>
@@ -736,7 +757,7 @@ CREATE SINK lake INTO DELTA_LAKE (
 
         <p style="margin-top: 1rem; font-size: 0.85rem; color: var(--text-dim);">
           Reproduce: <code>cargo bench --bench state_bench</code>,
-          <code>cargo bench --bench throughput_bench</code>,
+          <code>cargo bench --bench streaming_bench</code>,
           <code>cargo bench --bench latency_bench</code>.
           All benchmarks use <a href="https://github.com/bheisler/criterion.rs" target="_blank" rel="noopener">Criterion</a> for statistical analysis.
         </p>
@@ -748,7 +769,7 @@ CREATE SINK lake INTO DELTA_LAKE (
       <div class="container">
         <h2>Status</h2>
         <p class="section-desc">
-          Current version: <strong>0.18.1</strong> (pre-1.0).
+          Current version: <strong data-version="bare">0.18.12</strong> (pre-1.0).
           <a href="https://github.com/laminardb/laminardb/releases" target="_blank" rel="noopener">Releases</a> &middot;
           <a href="https://github.com/laminardb/laminardb/blob/main/docs/ROADMAP.md" target="_blank" rel="noopener">Roadmap</a>
         </p>
@@ -759,21 +780,19 @@ CREATE SINK lake INTO DELTA_LAKE (
             <ul>
               <li>Core engine (reactor, state stores, DAG executor)</li>
               <li>Window functions (tumbling, sliding, hopping, session)</li>
-              <li>Joins (stream-stream, ASOF, temporal, lookup)</li>
-              <li>All 8 connectors (Kafka, CDC, Delta, WS, files)</li>
-              <li>Barrier-based checkpointing and recovery</li>
-              <li>Per-core WAL with exactly-once semantics</li>
-              <li>Standalone server with REST API</li>
-              <li>Docker and Helm chart deployment</li>
-              <li>JIT compilation via Cranelift</li>
+              <li>Joins (interval, ASOF, temporal, lookup, semi/anti)</li>
+              <li>All 10 connectors (Kafka, CDC, MongoDB, Delta, WS, files)</li>
+              <li>Barrier-based checkpointing with 2PC exactly-once</li>
+              <li>Per-core WAL for durability</li>
+              <li>Standalone server with REST API, Prometheus metrics, hot-reload</li>
+              <li>Docker (multi-arch) and Helm chart deployment</li>
             </ul>
           </div>
           <div class="status-col experimental">
             <h3>Experimental</h3>
             <ul>
-              <li>io_uring storage (Linux only)</li>
+              <li>io_uring storage (Linux only, feature-gated)</li>
               <li>Incremental checkpoints</li>
-              <li>Cross-partition aggregation (gossip)</li>
             </ul>
           </div>
           <div class="status-col unimplemented">
@@ -781,7 +800,7 @@ CREATE SINK lake INTO DELTA_LAKE (
             <ul>
               <li>Cluster / multi-node deployment (coming soon)</li>
               <li>PostgreSQL wire protocol (planned)</li>
-              <li>MongoDB, Redis connectors</li>
+              <li>Redis connector</li>
             </ul>
           </div>
         </div>
@@ -814,13 +833,14 @@ CREATE SINK lake INTO DELTA_LAKE (
         <div class="footer-left">
           LaminarDB &middot;
           <a href="https://github.com/laminardb/laminardb/blob/main/LICENSE" target="_blank" rel="noopener">Apache 2.0</a> &middot;
-          v0.18.1
+          <span data-version="tag">v0.18.12</span>
         </div>
         <div class="footer-links">
           <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
           <a href="https://crates.io/crates/laminar-db" target="_blank" rel="noopener">Crates.io</a>
           <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API Docs</a>
           <a href="https://github.com/laminardb/laminardb/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
+          <a href="mailto:support@laminardb.io">Support</a>
         </div>
       </div>
     </div>

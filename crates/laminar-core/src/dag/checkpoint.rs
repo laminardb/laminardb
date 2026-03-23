@@ -1,8 +1,10 @@
 //! Chandy-Lamport barrier checkpointing for DAG pipelines.
 //!
-//! This module implements barrier-based checkpointing:
+//! Uses the shared [`CheckpointBarrier`] type from `crate::checkpoint::barrier`
+//! — one barrier type for both the DAG and SQL pipeline paths.
 //!
-//! - [`CheckpointBarrier`] — marker injected at source nodes
+//! This module provides:
+//!
 //! - [`BarrierAligner`] — buffers events at fan-in (MPSC) nodes until all
 //!   upstream inputs have delivered their barrier
 //! - [`DagCheckpointCoordinator`] — Ring 1 orchestrator that triggers
@@ -18,46 +20,21 @@ use std::time::Duration;
 
 use rustc_hash::FxHashMap;
 
+use crate::checkpoint::CheckpointBarrier;
 use crate::operator::{Event, OperatorState};
 
 use super::error::DagError;
-use super::recovery::DagCheckpointSnapshot;
+use super::recovery::DagCheckpointResult;
 use super::topology::NodeId;
-
-/// Checkpoint identifier.
-pub type CheckpointId = u64;
-
-/// Barrier type for checkpoint coordination.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BarrierType {
-    /// All inputs must deliver the barrier before the node snapshots.
-    /// Events from already-aligned inputs are buffered until alignment.
-    Aligned,
-}
-
-/// A checkpoint barrier injected at source nodes and propagated through the DAG.
-#[derive(Debug, Clone)]
-pub struct CheckpointBarrier {
-    /// Unique identifier for this checkpoint.
-    pub checkpoint_id: CheckpointId,
-    /// Monotonically increasing epoch counter.
-    pub epoch: u64,
-    /// Timestamp when the barrier was created (event-time millis).
-    pub timestamp: i64,
-    /// Barrier alignment strategy.
-    pub barrier_type: BarrierType,
-}
 
 /// Configuration for DAG checkpointing.
 #[derive(Debug, Clone)]
 pub struct DagCheckpointConfig {
     /// How often to trigger checkpoints.
     pub interval: Duration,
-    /// Barrier alignment strategy.
-    pub barrier_type: BarrierType,
     /// Maximum time to wait for barrier alignment at fan-in nodes.
     pub alignment_timeout: Duration,
-    /// Whether to use incremental checkpoints (future use).
+    /// Whether to use incremental checkpoints.
     pub incremental: bool,
     /// Maximum number of concurrent in-flight checkpoints.
     pub max_concurrent: usize,
@@ -69,7 +46,6 @@ impl Default for DagCheckpointConfig {
     fn default() -> Self {
         Self {
             interval: Duration::from_secs(60),
-            barrier_type: BarrierType::Aligned,
             alignment_timeout: Duration::from_secs(10),
             incremental: false,
             max_concurrent: 1,
@@ -110,7 +86,7 @@ pub struct BarrierAligner {
     /// Events buffered from sources that have already delivered their barrier.
     buffered_events: FxHashMap<NodeId, VecDeque<Event>>,
     /// The checkpoint currently being aligned (if any).
-    current_checkpoint_id: Option<CheckpointId>,
+    current_checkpoint_id: Option<u64>,
 }
 
 impl BarrierAligner {
@@ -165,7 +141,7 @@ impl BarrierAligner {
                 .barriers_received
                 .values()
                 .last()
-                .cloned()
+                .copied()
                 .expect("at least one barrier");
 
             AlignmentResult::Aligned {
@@ -228,7 +204,7 @@ impl BarrierAligner {
 /// Tracks progress of an in-flight checkpoint.
 struct CheckpointProgress {
     /// Checkpoint identifier.
-    checkpoint_id: CheckpointId,
+    checkpoint_id: u64,
     /// Epoch number.
     epoch: u64,
     /// Operator states reported by completed nodes.
@@ -247,10 +223,8 @@ struct CheckpointProgress {
 /// 3. [`on_node_snapshot_complete()`](Self::on_node_snapshot_complete) —
 ///    each node reports its state
 /// 4. [`finalize_checkpoint()`](Self::finalize_checkpoint) — produces a
-///    [`DagCheckpointSnapshot`]
+///    [`DagCheckpointResult`]
 pub struct DagCheckpointCoordinator {
-    /// Configuration.
-    config: DagCheckpointConfig,
     /// Source node IDs (barrier injection points).
     source_nodes: Vec<NodeId>,
     /// All node IDs in the DAG.
@@ -258,11 +232,11 @@ pub struct DagCheckpointCoordinator {
     /// Next epoch counter.
     next_epoch: u64,
     /// Next checkpoint ID counter.
-    next_checkpoint_id: CheckpointId,
+    next_checkpoint_id: u64,
     /// Currently in-flight checkpoint progress.
     in_progress: Option<CheckpointProgress>,
-    /// Completed snapshots (bounded by `max_retained`).
-    completed_snapshots: Vec<DagCheckpointSnapshot>,
+    /// Completed checkpoint results (bounded by `max_retained`).
+    completed_results: VecDeque<DagCheckpointResult>,
     /// Maximum number of snapshots to retain.
     max_retained: usize,
 }
@@ -279,18 +253,16 @@ impl DagCheckpointCoordinator {
     pub fn new(
         source_nodes: Vec<NodeId>,
         all_nodes: Vec<NodeId>,
-        config: DagCheckpointConfig,
+        config: &DagCheckpointConfig,
     ) -> Self {
-        let max_retained = config.max_retained;
         Self {
-            config,
             source_nodes,
             all_nodes,
             next_epoch: 1,
             next_checkpoint_id: 1,
             in_progress: None,
-            completed_snapshots: Vec::new(),
-            max_retained,
+            completed_results: VecDeque::new(),
+            max_retained: config.max_retained,
         }
     }
 
@@ -312,23 +284,18 @@ impl DagCheckpointCoordinator {
 
         #[allow(clippy::cast_possible_truncation)]
         // Timestamp ms fits i64 for ~292 years from epoch
-        let timestamp = std::time::SystemTime::now()
+        let triggered_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as i64);
 
-        let barrier = CheckpointBarrier {
-            checkpoint_id,
-            epoch,
-            timestamp,
-            barrier_type: self.config.barrier_type,
-        };
+        let barrier = CheckpointBarrier::new(checkpoint_id, epoch);
 
         self.in_progress = Some(CheckpointProgress {
             checkpoint_id,
             epoch,
             completed_nodes: FxHashMap::default(),
             pending_nodes: self.all_nodes.clone(),
-            triggered_at: barrier.timestamp,
+            triggered_at,
         });
 
         Ok(barrier)
@@ -348,13 +315,17 @@ impl DagCheckpointCoordinator {
         }
     }
 
-    /// Finalizes the current checkpoint, producing a snapshot.
+    /// Finalizes the current checkpoint, producing a result.
+    ///
+    /// The returned [`DagCheckpointResult`] stores operator states as
+    /// `HashMap<String, Vec<u8>>` — the same format accepted by
+    /// `CheckpointCoordinator::checkpoint()` for persistence.
     ///
     /// # Errors
     ///
     /// Returns [`DagError::NoCheckpointInProgress`] if no checkpoint is active.
     /// Returns [`DagError::CheckpointIncomplete`] if not all nodes have reported.
-    pub fn finalize_checkpoint(&mut self) -> Result<DagCheckpointSnapshot, DagError> {
+    pub fn finalize_checkpoint(&mut self) -> Result<DagCheckpointResult, DagError> {
         let progress = self
             .in_progress
             .take()
@@ -367,21 +338,21 @@ impl DagCheckpointCoordinator {
             return Err(DagError::CheckpointIncomplete { pending });
         }
 
-        let snapshot = DagCheckpointSnapshot::from_operator_states(
+        let result = DagCheckpointResult::from_operator_states(
             progress.checkpoint_id,
             progress.epoch,
             progress.triggered_at,
             &progress.completed_nodes,
         );
 
-        self.completed_snapshots.push(snapshot.clone());
+        self.completed_results.push_back(result.clone());
 
-        // Trim old snapshots.
-        while self.completed_snapshots.len() > self.max_retained {
-            self.completed_snapshots.remove(0);
+        // Trim old results.
+        while self.completed_results.len() > self.max_retained {
+            self.completed_results.pop_front();
         }
 
-        Ok(snapshot)
+        Ok(result)
     }
 
     /// Returns whether a checkpoint is currently in progress.
@@ -390,16 +361,16 @@ impl DagCheckpointCoordinator {
         self.in_progress.is_some()
     }
 
-    /// Returns completed snapshots.
+    /// Returns completed checkpoint results.
     #[must_use]
-    pub fn completed_snapshots(&self) -> &[DagCheckpointSnapshot] {
-        &self.completed_snapshots
+    pub fn completed_results(&self) -> &VecDeque<DagCheckpointResult> {
+        &self.completed_results
     }
 
-    /// Returns the latest completed snapshot (if any).
+    /// Returns the latest completed checkpoint result (if any).
     #[must_use]
-    pub fn latest_snapshot(&self) -> Option<&DagCheckpointSnapshot> {
-        self.completed_snapshots.last()
+    pub fn latest_result(&self) -> Option<&DagCheckpointResult> {
+        self.completed_results.back()
     }
 
     /// Returns the current epoch counter (next epoch to be assigned).
@@ -421,7 +392,7 @@ impl std::fmt::Debug for DagCheckpointCoordinator {
             .field("next_epoch", &self.next_epoch)
             .field("next_checkpoint_id", &self.next_checkpoint_id)
             .field("in_progress", &self.in_progress.is_some())
-            .field("completed_count", &self.completed_snapshots.len())
+            .field("completed_count", &self.completed_results.len())
             .field("source_nodes", &self.source_nodes)
             .finish_non_exhaustive()
     }

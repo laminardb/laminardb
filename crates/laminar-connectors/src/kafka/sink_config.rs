@@ -496,19 +496,7 @@ fn is_blocked_passthrough_key(key: &str) -> bool {
         )
 }
 
-/// Delivery guarantee level for the Kafka sink.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeliveryGuarantee {
-    /// At-least-once: idempotent producer, no transactions.
-    AtLeastOnce,
-    /// Exactly-once: transactional producer with epoch-aligned commits.
-    ExactlyOnce,
-}
-
-str_enum!(DeliveryGuarantee, lowercase_udash, String, "unknown delivery guarantee",
-    AtLeastOnce => "at-least-once", "atleastonce";
-    ExactlyOnce => "exactly-once", "exactlyonce"
-);
+pub use crate::connector::DeliveryGuarantee;
 
 /// Partitioning strategy for distributing records across Kafka partitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

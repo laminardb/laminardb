@@ -72,6 +72,15 @@ pub struct KafkaSource {
     rebalance_state: Arc<Mutex<RebalanceState>>,
     /// Shared rebalance counter bridging `LaminarConsumerContext` → `KafkaSourceMetrics`.
     rebalance_counter: Arc<AtomicU64>,
+    /// Monotonic counter bumped on each partition revoke event.
+    ///
+    /// Shared with `LaminarConsumerContext` for lock-free revoke detection
+    /// from `poll_batch()`. The source compares `last_seen_revoke_gen`
+    /// against this value each poll cycle and only locks `rebalance_state`
+    /// when a change is detected to purge revoked partition offsets.
+    revoke_generation: Arc<AtomicU64>,
+    /// Last observed value of `revoke_generation`, cached per poll cycle.
+    last_seen_revoke_gen: u64,
     schema_registry: Option<Arc<SchemaRegistryClient>>,
     data_ready: Arc<Notify>,
     checkpoint_request: Arc<AtomicBool>,
@@ -80,6 +89,14 @@ pub struct KafkaSource {
     reader_shutdown: Option<tokio::sync::watch::Sender<bool>>,
     offset_commit_tx: Option<tokio::sync::watch::Sender<TopicPartitionList>>,
     watermark_tracker: Option<KafkaWatermarkTracker>,
+    /// Receiver for high watermark data from the background reader task.
+    /// Each entry is `(topic, partition, high_watermark)` for lag computation.
+    #[allow(clippy::type_complexity)]
+    high_watermarks_rx: Option<tokio::sync::watch::Receiver<Vec<(Arc<str>, i32, i64)>>>,
+    /// Shared flag: `true` when the reader task has paused Kafka partitions
+    /// due to downstream backpressure. Used to re-pause newly assigned
+    /// partitions during rebalance.
+    reader_paused: Arc<AtomicBool>,
 }
 
 impl KafkaSource {
@@ -96,7 +113,7 @@ impl KafkaSource {
         let backpressure = KafkaBackpressureController::new(
             config.backpressure_high_watermark,
             config.backpressure_low_watermark,
-            config.max_poll_records * 10, // rough channel capacity estimate
+            config.reader_channel_capacity,
             Arc::clone(&channel_len),
         );
 
@@ -121,6 +138,8 @@ impl KafkaSource {
             channel_len,
             rebalance_state: Arc::new(Mutex::new(RebalanceState::new())),
             rebalance_counter: Arc::new(AtomicU64::new(0)),
+            revoke_generation: Arc::new(AtomicU64::new(0)),
+            last_seen_revoke_gen: 0,
             schema_registry: None,
             data_ready: Arc::new(Notify::new()),
             checkpoint_request: Arc::new(AtomicBool::new(false)),
@@ -129,6 +148,8 @@ impl KafkaSource {
             reader_shutdown: None,
             offset_commit_tx: None,
             watermark_tracker,
+            high_watermarks_rx: None,
+            reader_paused: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -156,7 +177,7 @@ impl KafkaSource {
         let backpressure = KafkaBackpressureController::new(
             config.backpressure_high_watermark,
             config.backpressure_low_watermark,
-            config.max_poll_records * 10,
+            config.reader_channel_capacity,
             Arc::clone(&channel_len),
         );
 
@@ -181,6 +202,8 @@ impl KafkaSource {
             channel_len,
             rebalance_state: Arc::new(Mutex::new(RebalanceState::new())),
             rebalance_counter: Arc::new(AtomicU64::new(0)),
+            revoke_generation: Arc::new(AtomicU64::new(0)),
+            last_seen_revoke_gen: 0,
             schema_registry: Some(sr),
             data_ready: Arc::new(Notify::new()),
             checkpoint_request: Arc::new(AtomicBool::new(false)),
@@ -189,6 +212,8 @@ impl KafkaSource {
             reader_shutdown: None,
             offset_commit_tx: None,
             watermark_tracker,
+            high_watermarks_rx: None,
+            reader_paused: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -245,28 +270,143 @@ impl KafkaSource {
     /// Spawns the background reader task on first `poll_batch()` call.
     ///
     /// Deferred to allow `restore()` to access the consumer directly after `open()`.
+    #[allow(clippy::too_many_lines)]
     fn ensure_reader_started(&mut self) {
         if self.reader_handle.is_some() || self.consumer.is_none() {
             return;
         }
 
-        let consumer = self.consumer.take().unwrap();
-        let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(4096);
+        // Wrap in Arc so the blocking watermark task can share the consumer
+        // with the async reader loop. librdkafka handles are thread-safe.
+        let consumer = Arc::new(self.consumer.take().unwrap());
+        let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(self.config.reader_channel_capacity);
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let (offset_tx, offset_rx) = tokio::sync::watch::channel(TopicPartitionList::new());
+        let (hwm_tx, hwm_rx) = tokio::sync::watch::channel(Vec::new());
         let data_ready = Arc::clone(&self.data_ready);
         let channel_len = Arc::clone(&self.channel_len);
         let capture_headers = self.config.include_headers;
+        let broker_commit_interval = self.config.broker_commit_interval;
+        let reader_channel_capacity = self.config.reader_channel_capacity;
+        let reader_paused = Arc::clone(&self.reader_paused);
+        let pause_threshold = self.config.backpressure_high_watermark;
+        let resume_threshold = self.config.backpressure_low_watermark;
 
         // The reader task owns the consumer. On shutdown it commits the latest
         // offsets received via the offset_rx watch channel, then unsubscribes.
         let reader_handle = tokio::spawn(async move {
             let mut cached_topic: Arc<str> = Arc::from("");
+
+            // Track seen topic-partitions for high watermark queries.
+            let mut seen_partitions: std::collections::HashSet<(Arc<str>, i32)> =
+                std::collections::HashSet::new();
+
+            // Periodic broker commit timer. Advisory — keeps kafka-consumer-groups
+            // lag monitoring accurate. Zero interval disables periodic commits.
+            let commit_enabled = !broker_commit_interval.is_zero();
+            let mut commit_timer = tokio::time::interval(if commit_enabled {
+                broker_commit_interval
+            } else {
+                // tokio::time::interval panics on Duration::ZERO; use a
+                // large interval that will never fire before shutdown.
+                std::time::Duration::from_secs(86400)
+            });
+            // Skip the first tick (fires immediately).
+            commit_timer.tick().await;
+
+            // Periodic high watermark query timer (30s).
+            let mut hwm_timer = tokio::time::interval(std::time::Duration::from_secs(30));
+            hwm_timer.tick().await; // Skip the first tick.
+
+            let mut is_paused = false;
+
             loop {
+                // Check channel fill ratio for pause/resume of Kafka partitions.
+                // This keeps consumer.recv() calling rd_kafka_consumer_poll()
+                // even when paused, preventing max.poll.interval.ms violations.
+                #[allow(clippy::cast_precision_loss)]
+                let fill = if reader_channel_capacity > 0 {
+                    channel_len.load(Ordering::Relaxed) as f64 / reader_channel_capacity as f64
+                } else {
+                    0.0
+                };
+                if fill >= pause_threshold && !is_paused {
+                    if let Ok(assignment) = consumer.assignment() {
+                        if let Err(e) = consumer.pause(&assignment) {
+                            warn!(error = %e, "failed to pause Kafka partitions");
+                        } else {
+                            is_paused = true;
+                            reader_paused.store(true, Ordering::Relaxed);
+                            debug!("reader: paused Kafka partitions (fill={fill:.2})");
+                        }
+                    }
+                } else if fill <= resume_threshold && is_paused {
+                    if let Ok(assignment) = consumer.assignment() {
+                        if let Err(e) = consumer.resume(&assignment) {
+                            warn!(error = %e, "failed to resume Kafka partitions");
+                        } else {
+                            is_paused = false;
+                            reader_paused.store(false, Ordering::Relaxed);
+                            debug!("reader: resumed Kafka partitions (fill={fill:.2})");
+                        }
+                    }
+                }
+
                 let msg_result = tokio::select! {
                     biased;
                     _ = shutdown_rx.changed() => break,
-                    msg = consumer.recv() => msg,
+                    _ = commit_timer.tick(), if commit_enabled => {
+                        let tpl = offset_rx.borrow().clone();
+                        if tpl.count() > 0 {
+                            match consumer.commit(&tpl, CommitMode::Async) {
+                                Ok(()) => info!(
+                                    partitions = tpl.count(),
+                                    "periodic broker offset commit (advisory)"
+                                ),
+                                Err(e) => warn!(
+                                    error = %e,
+                                    "periodic broker offset commit failed (advisory)"
+                                ),
+                            }
+                        }
+                        continue;
+                    },
+                    _ = hwm_timer.tick() => {
+                        // fetch_watermarks is a blocking FFI call — run on the
+                        // blocking pool to avoid stalling the async reader.
+                        if !seen_partitions.is_empty() {
+                            let partitions: Vec<_> = seen_partitions.iter().cloned().collect();
+                            let c = Arc::clone(&consumer);
+                            let watermarks = tokio::task::spawn_blocking(move || {
+                                let mut results = Vec::with_capacity(partitions.len());
+                                for (topic, partition) in &partitions {
+                                    if let Ok((_low, high)) = c.fetch_watermarks(
+                                        topic,
+                                        *partition,
+                                        std::time::Duration::from_secs(5),
+                                    ) {
+                                        results.push((Arc::clone(topic), *partition, high));
+                                    }
+                                }
+                                results
+                            })
+                            .await
+                            .unwrap_or_default();
+                            if !watermarks.is_empty() {
+                                let _ = hwm_tx.send(watermarks);
+                            }
+                        }
+                        continue;
+                    },
+                    // Timeout ensures we re-check backpressure and timers even
+                    // when paused partitions yield no messages.
+                    msg = tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        consumer.recv(),
+                    ) => match msg {
+                        Ok(result) => result,
+                        Err(_timeout) => continue,
+                    },
                 };
                 match msg_result {
                     Ok(msg) => {
@@ -275,6 +415,8 @@ impl KafkaSource {
                             if &*cached_topic != topic {
                                 cached_topic = Arc::from(topic);
                             }
+                            // Track partition for watermark queries.
+                            seen_partitions.insert((Arc::clone(&cached_topic), msg.partition()));
                             let timestamp_ms = match msg.timestamp() {
                                 rdkafka::Timestamp::CreateTime(ts)
                                 | rdkafka::Timestamp::LogAppendTime(ts) => Some(ts),
@@ -345,6 +487,7 @@ impl KafkaSource {
         self.reader_handle = Some(reader_handle);
         self.reader_shutdown = Some(shutdown_tx);
         self.offset_commit_tx = Some(offset_tx);
+        self.high_watermarks_rx = Some(hwm_rx);
     }
 }
 
@@ -420,6 +563,8 @@ impl SourceConnector for KafkaSource {
             Arc::clone(&self.checkpoint_request),
             Arc::clone(&self.rebalance_state),
             Arc::clone(&self.rebalance_counter),
+            Arc::clone(&self.revoke_generation),
+            Arc::clone(&self.reader_paused),
         );
         let consumer: StreamConsumer<LaminarConsumerContext> =
             rdkafka_config.create_with_context(context).map_err(|e| {
@@ -459,8 +604,17 @@ impl SourceConnector for KafkaSource {
                 };
                 for topic in &topics {
                     for (&partition, &offset) in offsets {
-                        tpl.add_partition_offset(topic, partition, rdkafka::Offset::Offset(offset))
-                            .ok();
+                        if let Err(e) = tpl.add_partition_offset(
+                            topic,
+                            partition,
+                            rdkafka::Offset::Offset(offset),
+                        ) {
+                            tracing::warn!(
+                                %topic, partition, offset,
+                                error = %e,
+                                "failed to add specific offset to partition list"
+                            );
+                        }
                     }
                 }
                 if tpl.count() > 0 {
@@ -491,12 +645,18 @@ impl SourceConnector for KafkaSource {
                 ) {
                     for topic_meta in metadata.topics() {
                         for partition_meta in topic_meta.partitions() {
-                            tpl.add_partition_offset(
+                            if let Err(e) = tpl.add_partition_offset(
                                 topic_meta.name(),
                                 partition_meta.id(),
                                 rdkafka::Offset::Offset(*ts_ms),
-                            )
-                            .ok();
+                            ) {
+                                tracing::warn!(
+                                    topic = topic_meta.name(),
+                                    partition = partition_meta.id(),
+                                    error = %e,
+                                    "failed to add timestamp offset to partition list"
+                                );
+                            }
                         }
                     }
                 }
@@ -529,9 +689,12 @@ impl SourceConnector for KafkaSource {
         self.consumer = Some(consumer);
         self.state = ConnectorState::Running;
 
-        // Start the background reader immediately so that `data_ready_notify()`
-        // has an active producer.
-        self.ensure_reader_started();
+        // Reader is NOT started here — deferred to first `poll_batch()`.
+        // This allows `restore()` to access the consumer directly between
+        // `open()` and the first poll, calling `consumer.assign()` to seek
+        // to checkpoint offsets. The pipeline's fallback poll interval
+        // ensures the first `poll_batch()` fires promptly even without
+        // a `data_ready_notify()` signal.
 
         info!("Kafka source connector opened successfully");
         Ok(())
@@ -549,18 +712,13 @@ impl SourceConnector for KafkaSource {
             });
         }
 
-        // Check backpressure.
+        // Update backpressure state — never skip the drain below (deadlocks).
         if self.backpressure.should_pause() {
             self.backpressure.set_paused(true);
             debug!("backpressure: pausing consumption");
-            return Ok(None);
-        }
-        if self.backpressure.should_resume() {
+        } else if self.backpressure.should_resume() {
             self.backpressure.set_paused(false);
             debug!("backpressure: resuming consumption");
-        }
-        if self.backpressure.is_paused() {
-            return Ok(None);
         }
 
         // Lazily spawn the background reader task on first poll.
@@ -653,6 +811,38 @@ impl SourceConnector for KafkaSource {
         let rebalance_events = self.rebalance_counter.swap(0, Ordering::Relaxed);
         for _ in 0..rebalance_events {
             self.metrics.record_rebalance();
+        }
+
+        // Lock-free revoke detection: check if a rebalance revoke happened
+        // since the last poll cycle. If so, purge offsets for revoked partitions.
+        let current_revoke_gen = self.revoke_generation.load(Ordering::Relaxed);
+        let had_revoke = current_revoke_gen != self.last_seen_revoke_gen;
+        if had_revoke {
+            self.last_seen_revoke_gen = current_revoke_gen;
+            let assigned = match self.rebalance_state.lock() {
+                Ok(state) => state.assigned_partitions().clone(),
+                Err(poisoned) => poisoned.into_inner().assigned_partitions().clone(),
+            };
+            let before = self.offsets.partition_count();
+            self.offsets.retain_assigned(&assigned);
+            let after = self.offsets.partition_count();
+            if before != after {
+                debug!(
+                    before,
+                    after, "purged revoked partition offsets after rebalance"
+                );
+            }
+        }
+
+        // Publish current offsets to the reader task for periodic broker commits.
+        // After retain_assigned, self.offsets only contains assigned partitions.
+        if had_revoke || !payload_offsets.is_empty() {
+            if let Some(ref tx) = self.offset_commit_tx {
+                let tpl = self.offsets.to_topic_partition_list();
+                if tx.send(tpl).is_err() {
+                    debug!("offset_commit_tx closed, reader task shutting down");
+                }
+            }
         }
 
         if payload_offsets.is_empty() {
@@ -785,16 +975,31 @@ impl SourceConnector for KafkaSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        // Push current offsets to the reader task so it can commit them on
-        // shutdown even if close() is called without a subsequent checkpoint.
+        // Filter to only currently assigned partitions — prevents revoked
+        // partition offsets from leaking into checkpoints or broker commits.
+        let assigned = match self.rebalance_state.lock() {
+            Ok(state) => state.assigned_partitions().clone(),
+            Err(poisoned) => poisoned.into_inner().assigned_partitions().clone(),
+        };
+
+        // Push filtered offsets to the reader task so it can commit them
+        // on shutdown even if close() is called without a subsequent checkpoint.
         if let Some(ref tx) = self.offset_commit_tx {
-            let tpl = self.offsets.to_topic_partition_list();
+            let tpl = self.offsets.to_topic_partition_list_filtered(&assigned);
             let _ = tx.send(tpl);
-            self.metrics.record_commit();
         }
-        self.offsets.to_checkpoint()
+
+        self.offsets.to_checkpoint_filtered(&assigned)
     }
 
+    /// Restores the consumer to checkpointed offsets.
+    ///
+    /// **Single-instance limitation**: This implementation assumes a single
+    /// consumer instance per `group.id`. Checkpoint offsets are stored in
+    /// `LaminarDB`'s manifest and restored via `consumer.assign()`, bypassing
+    /// the Kafka consumer group protocol. Running multiple instances with
+    /// the same `group.id` will cause offset conflicts between the manifest
+    /// and broker-managed group offsets.
     async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
         info!(
             epoch = checkpoint.epoch(),
@@ -835,6 +1040,23 @@ impl SourceConnector for KafkaSource {
     }
 
     fn metrics(&self) -> ConnectorMetrics {
+        // Compute consumer lag from high watermarks, filtered to currently
+        // assigned partitions so revoked partitions don't contribute stale lag.
+        if let Some(ref hwm_rx) = self.high_watermarks_rx {
+            let watermarks = hwm_rx.borrow();
+            let mut total_lag: u64 = 0;
+            for (topic, partition, high_watermark) in watermarks.iter() {
+                // Only count partitions we still track offsets for (assigned).
+                if let Some(current_offset) = self.offsets.get(topic, *partition) {
+                    let lag = high_watermark.saturating_sub(current_offset + 1);
+                    #[allow(clippy::cast_sign_loss)]
+                    if lag > 0 {
+                        total_lag += lag as u64;
+                    }
+                }
+            }
+            self.metrics.set_lag(total_lag);
+        }
         self.metrics.to_connector_metrics()
     }
 
@@ -849,11 +1071,16 @@ impl SourceConnector for KafkaSource {
     async fn close(&mut self) -> Result<(), ConnectorError> {
         info!("closing Kafka source connector");
 
-        // Send final offsets to the reader task before signaling shutdown.
-        // The reader task will commit these offsets before unsubscribing.
+        // Filter to assigned partitions — same as checkpoint().
+        let assigned = match self.rebalance_state.lock() {
+            Ok(state) => state.assigned_partitions().clone(),
+            Err(poisoned) => poisoned.into_inner().assigned_partitions().clone(),
+        };
+
+        // Send final filtered offsets to the reader task before signaling shutdown.
         if let Some(ref tx) = self.offset_commit_tx {
-            if self.offsets.partition_count() > 0 {
-                let tpl = self.offsets.to_topic_partition_list();
+            let tpl = self.offsets.to_topic_partition_list_filtered(&assigned);
+            if tpl.count() > 0 {
                 let _ = tx.send(tpl);
             }
         }
@@ -871,8 +1098,8 @@ impl SourceConnector for KafkaSource {
         // If consumer was never moved to the reader (e.g., close() called
         // before any poll_batch()), commit directly.
         if let Some(ref consumer) = self.consumer {
-            if self.offsets.partition_count() > 0 {
-                let tpl = self.offsets.to_topic_partition_list();
+            let tpl = self.offsets.to_topic_partition_list_filtered(&assigned);
+            if tpl.count() > 0 {
                 if let Err(e) = consumer.commit(&tpl, CommitMode::Sync) {
                     warn!(error = %e, "failed to commit final offsets");
                 }
@@ -957,6 +1184,12 @@ mod tests {
         source.offsets.update("events", 0, 100);
         source.offsets.update("events", 1, 200);
 
+        // Simulate rebalance assign so partitions are in the assigned set.
+        {
+            let mut state = source.rebalance_state.lock().unwrap();
+            state.on_assign(&[("events".into(), 0), ("events".into(), 1)]);
+        }
+
         let cp = source.checkpoint();
         assert_eq!(cp.get_offset("events-0"), Some("100"));
         assert_eq!(cp.get_offset("events-1"), Some("200"));
@@ -1040,5 +1273,36 @@ mod tests {
         let debug = format!("{source:?}");
         assert!(debug.contains("KafkaSource"));
         assert!(debug.contains("events"));
+    }
+
+    #[test]
+    fn test_checkpoint_filters_revoked_partitions() {
+        let mut source = KafkaSource::new(test_schema(), test_config());
+        source.offsets.update("events", 0, 100);
+        source.offsets.update("events", 1, 200);
+        source.offsets.update("events", 2, 300);
+
+        // Simulate rebalance: only partitions 0 and 2 are assigned.
+        {
+            let mut state = source.rebalance_state.lock().unwrap();
+            state.on_assign(&[("events".into(), 0), ("events".into(), 2)]);
+        }
+
+        let cp = source.checkpoint();
+        assert_eq!(cp.get_offset("events-0"), Some("100"));
+        assert_eq!(cp.get_offset("events-1"), None); // revoked — filtered out
+        assert_eq!(cp.get_offset("events-2"), Some("300"));
+    }
+
+    #[test]
+    fn test_checkpoint_empty_before_first_rebalance() {
+        let mut source = KafkaSource::new(test_schema(), test_config());
+        source.offsets.update("events", 0, 100);
+        source.offsets.update("events", 1, 200);
+
+        // No rebalance has occurred — assigned_partitions is empty.
+        // No assigned partitions means no offsets should be checkpointed.
+        let cp = source.checkpoint();
+        assert!(cp.is_empty());
     }
 }

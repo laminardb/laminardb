@@ -114,6 +114,14 @@ pub const SINK_ALREADY_EXISTS: &str = "LDB-5013";
 pub const CONNECTOR_SERDE_ERROR: &str = "LDB-5020";
 /// Schema inference or compatibility error.
 pub const CONNECTOR_SCHEMA_ERROR: &str = "LDB-5021";
+/// Exactly-once requires all sources to support replay.
+pub const EXACTLY_ONCE_NON_REPLAYABLE: &str = "LDB-5030";
+/// Exactly-once requires all sinks to support exactly-once semantics.
+pub const EXACTLY_ONCE_SINK_UNSUPPORTED: &str = "LDB-5031";
+/// Exactly-once requires checkpointing to be enabled.
+pub const EXACTLY_ONCE_NO_CHECKPOINT: &str = "LDB-5032";
+/// Mixed delivery capabilities — some sources are non-replayable.
+pub const MIXED_DELIVERY_CAPABILITIES: &str = "LDB-5033";
 
 // ── Checkpoint / Recovery (LDB-6xxx) ──
 
@@ -161,6 +169,8 @@ pub const PIPELINE_ERROR: &str = "LDB-8002";
 pub const MATERIALIZED_VIEW_ERROR: &str = "LDB-8003";
 /// Query pipeline error (stream execution context).
 pub const QUERY_PIPELINE_ERROR: &str = "LDB-8004";
+/// No compiled projection or cached plan for pre-aggregation query.
+pub const NO_COMPILED_PROJECTION: &str = "LDB-8050";
 
 // ── Ring 0 Hot Path Errors ──
 
@@ -285,4 +295,15 @@ mod tests {
         assert_eq!(CHECKPOINT_FAILED, "LDB-6001");
         assert_eq!(INTERNAL, "LDB-8001");
     }
+}
+
+/// Severity level for warnings (schema inference, recovery, etc.).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WarningSeverity {
+    /// Informational — operation succeeded but with caveats.
+    Info,
+    /// Warning — result may be inaccurate or degraded.
+    Warning,
+    /// Error — operation for this item failed; a fallback was used.
+    Error,
 }

@@ -8,6 +8,7 @@
 //! through the streaming API (`Source<T>::push_arrow()` and subscriptions).
 
 use std::fmt;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -20,6 +21,92 @@ use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 use crate::health::HealthStatus;
 use crate::metrics::ConnectorMetrics;
+
+/// Delivery guarantee level for the pipeline.
+///
+/// Configures the expected end-to-end delivery semantics. The pipeline
+/// validates at startup that all sources and sinks meet the requirements
+/// for the chosen guarantee level.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+pub enum DeliveryGuarantee {
+    /// At-least-once: records may be replayed on recovery. Requires
+    /// checkpointing but tolerates non-replayable sources (with degradation).
+    #[default]
+    AtLeastOnce,
+    /// Exactly-once: no duplicates or losses. Requires all sources to
+    /// support replay, all sinks to support exactly-once, and checkpoint
+    /// to be enabled.
+    ExactlyOnce,
+}
+
+impl std::fmt::Display for DeliveryGuarantee {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeliveryGuarantee::AtLeastOnce => write!(f, "at-least-once"),
+            DeliveryGuarantee::ExactlyOnce => write!(f, "exactly-once"),
+        }
+    }
+}
+
+impl FromStr for DeliveryGuarantee {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().replace('-', "_").as_str() {
+            "at_least_once" | "atleastonce" => Ok(Self::AtLeastOnce),
+            "exactly_once" | "exactlyonce" => Ok(Self::ExactlyOnce),
+            other => Err(format!("unknown delivery guarantee: '{other}'")),
+        }
+    }
+}
+
+/// SSL connection mode for `PostgreSQL`-compatible connectors.
+///
+/// Shared by the `PostgreSQL` sink and `PostgreSQL` CDC source. Variant names
+/// follow the `libpq` `sslmode` parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PostgresSslMode {
+    /// No SSL.
+    Disable,
+    /// Try SSL, fall back to unencrypted.
+    #[default]
+    Prefer,
+    /// Require SSL.
+    Require,
+    /// Require SSL and verify CA certificate.
+    VerifyCa,
+    /// Require SSL, verify certificate and hostname.
+    VerifyFull,
+}
+
+impl std::fmt::Display for PostgresSslMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disable => write!(f, "disable"),
+            Self::Prefer => write!(f, "prefer"),
+            Self::Require => write!(f, "require"),
+            Self::VerifyCa => write!(f, "verify-ca"),
+            Self::VerifyFull => write!(f, "verify-full"),
+        }
+    }
+}
+
+impl FromStr for PostgresSslMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().replace('-', "_").as_str() {
+            "disable" | "off" => Ok(Self::Disable),
+            "prefer" => Ok(Self::Prefer),
+            "require" => Ok(Self::Require),
+            "verify_ca" | "verifyca" => Ok(Self::VerifyCa),
+            "verify_full" | "verifyfull" => Ok(Self::VerifyFull),
+            other => Err(format!("unknown SSL mode: '{other}'")),
+        }
+    }
+}
 
 /// A batch of records read from a source connector.
 #[derive(Debug, Clone)]
@@ -299,18 +386,8 @@ pub trait SourceConnector: Send {
         None
     }
 
-    /// Returns this connector as a [`SchemaInferable`](crate::schema::SchemaInferable), if supported.
-    fn as_schema_inferable(&self) -> Option<&dyn crate::schema::SchemaInferable> {
-        None
-    }
-
     /// Returns this connector as a [`SchemaRegistryAware`](crate::schema::SchemaRegistryAware), if supported.
     fn as_schema_registry_aware(&self) -> Option<&dyn crate::schema::SchemaRegistryAware> {
-        None
-    }
-
-    /// Returns this connector as a [`SchemaEvolvable`](crate::schema::SchemaEvolvable), if supported.
-    fn as_schema_evolvable(&self) -> Option<&dyn crate::schema::SchemaEvolvable> {
         None
     }
 
@@ -472,11 +549,6 @@ pub trait SinkConnector: Send {
 
     /// Returns this connector as a [`SchemaRegistryAware`](crate::schema::SchemaRegistryAware), if supported.
     fn as_schema_registry_aware(&self) -> Option<&dyn crate::schema::SchemaRegistryAware> {
-        None
-    }
-
-    /// Returns this connector as a [`SchemaEvolvable`](crate::schema::SchemaEvolvable), if supported.
-    fn as_schema_evolvable(&self) -> Option<&dyn crate::schema::SchemaEvolvable> {
         None
     }
 }

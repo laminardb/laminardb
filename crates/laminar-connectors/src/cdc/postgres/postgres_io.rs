@@ -185,9 +185,7 @@ fn validate_pg_identifier(value: &str, field: &str) -> Result<(), ConnectorError
 
 /// Builds the `START_REPLICATION` SQL command.
 ///
-/// This returns the query string to be sent via the `CopyBoth` protocol.
-/// Currently used for documentation; will be used directly once
-/// `CopyBoth` support is available in `tokio-postgres`.
+/// Returns the query string to be sent via the `CopyBoth` protocol.
 ///
 /// # Errors
 ///
@@ -221,8 +219,7 @@ pub fn build_start_replication_query(
 /// # TLS
 ///
 /// Currently only supports `NoTls`. Non-`Disable` SSL modes will log
-/// a warning and fall back to `NoTls`. TLS support is planned as a
-/// follow-up.
+/// a warning and fall back to `NoTls`. TLS is not supported.
 ///
 /// # Errors
 ///

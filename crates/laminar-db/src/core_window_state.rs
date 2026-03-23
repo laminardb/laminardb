@@ -22,15 +22,13 @@ use datafusion::prelude::SessionContext;
 use datafusion_common::ScalarValue;
 
 use laminar_core::operator::sliding_window::SlidingWindowAssigner;
-use laminar_core::operator::window::{
-    EmitStrategy as CoreEmitStrategy, TumblingWindowAssigner, WindowAssigner,
-};
+use laminar_core::operator::window::{TumblingWindowAssigner, WindowAssigner};
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 
 use crate::aggregate_state::{
-    expr_to_sql, extract_clauses, find_aggregate, query_fingerprint, resolve_expr_type,
-    AggFuncSpec, GroupCheckpoint, WindowCheckpoint,
+    compile_having_filter, expr_to_sql, extract_clauses, find_aggregate, query_fingerprint,
+    resolve_expr_type, AggFuncSpec, CompiledProjection, GroupCheckpoint, WindowCheckpoint,
 };
 use crate::eowc_state::{extract_i64_timestamps, NULL_TIMESTAMP};
 use crate::error::DbError;
@@ -120,10 +118,11 @@ pub(crate) struct CoreWindowState {
     pre_agg_sql: String,
     time_col_index: usize,
     output_schema: SchemaRef,
-    /// Converted emit strategy from SQL `EmitClause`.
-    #[allow(dead_code)]
-    emit_strategy: CoreEmitStrategy,
     having_sql: Option<String>,
+    compiled_projection: Option<CompiledProjection>,
+    /// Cached optimized logical plan for the pre-agg SQL (multi-source queries).
+    cached_pre_agg_plan: Option<datafusion_expr::LogicalPlan>,
+    having_filter: Option<Arc<dyn PhysicalExpr>>,
     max_groups_per_window: usize,
     /// Grace period (ms) after window end before closing. Late events
     /// arriving within this window are included instead of dropped.
@@ -140,7 +139,7 @@ impl CoreWindowState {
         ctx: &SessionContext,
         sql: &str,
         window_config: &WindowOperatorConfig,
-        emit_clause: Option<&EmitClause>,
+        _emit_clause: Option<&EmitClause>,
     ) -> Result<Option<Self>, DbError> {
         let size_ms = i64::try_from(window_config.size.as_millis()).unwrap_or(i64::MAX);
 
@@ -213,6 +212,16 @@ impl CoreWindowState {
             return Ok(None);
         }
 
+        // Determine if we should attempt to compile pre-agg expressions.
+        // Use single_source_table (counts occurrences) to reject self-joins.
+        let compile_source = crate::stream_executor::single_source_table(sql);
+        let state_ref = ctx.state();
+        let compile_props = state_ref.execution_props();
+        let input_df_schema = &agg_info.input_df_schema;
+        let mut compiled_exprs: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+        let mut proj_fields: Vec<Field> = Vec::new();
+        let mut compile_ok = compile_source.is_some();
+
         // Detect post-aggregate projection: top schema differs from Aggregate
         // schema when a Projection sits above the Aggregate.
         let has_projection = {
@@ -271,6 +280,24 @@ impl CoreWindowState {
                 let group_sql = expr_to_sql(group_expr);
                 pre_agg_select_items.push(format!("{group_sql} AS \"__group_{i}\""));
             }
+
+            // Compile group expression
+            if compile_ok {
+                match create_physical_expr(group_expr, input_df_schema, compile_props) {
+                    Ok(phys) => {
+                        let dt = phys
+                            .data_type(input_df_schema.as_arrow())
+                            .unwrap_or(DataType::Utf8);
+                        let name = match group_expr {
+                            datafusion_expr::Expr::Column(col) => col.name.clone(),
+                            _ => format!("__group_{i}"),
+                        };
+                        proj_fields.push(Field::new(name, dt, true));
+                        compiled_exprs.push(phys);
+                    }
+                    Err(_) => compile_ok = false,
+                }
+            }
         }
 
         let mut next_col_idx = num_group_cols;
@@ -301,6 +328,25 @@ impl CoreWindowState {
                     pre_agg_select_items.push(format!("TRUE AS \"__agg_input_{col_idx}\""));
                     input_col_indices.push(col_idx);
                     input_types.push(DataType::Boolean);
+
+                    // Compile literal TRUE
+                    if compile_ok {
+                        match create_physical_expr(
+                            &datafusion_expr::lit(true),
+                            input_df_schema,
+                            compile_props,
+                        ) {
+                            Ok(phys) => {
+                                proj_fields.push(Field::new(
+                                    format!("__agg_input_{col_idx}"),
+                                    DataType::Boolean,
+                                    true,
+                                ));
+                                compiled_exprs.push(phys);
+                            }
+                            Err(_) => compile_ok = false,
+                        }
+                    }
                 } else {
                     for arg_expr in &agg_func.params.args {
                         let col_idx = next_col_idx;
@@ -312,9 +358,65 @@ impl CoreWindowState {
                             pre_agg_select_items.push(format!(
                                 "CASE WHEN {filter_sql} THEN {expr_sql} ELSE NULL END AS \"__agg_input_{col_idx}\""
                             ));
+
+                            // Compile: CASE WHEN filter THEN arg ELSE NULL END
+                            if compile_ok {
+                                let case_expr =
+                                    datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
+                                        expr: None,
+                                        when_then_expr: vec![(
+                                            Box::new(filter_expr.as_ref().clone()),
+                                            Box::new(arg_expr.clone()),
+                                        )],
+                                        else_expr: Some(Box::new(datafusion_expr::lit(
+                                            ScalarValue::Null,
+                                        ))),
+                                    });
+                                match create_physical_expr(
+                                    &case_expr,
+                                    input_df_schema,
+                                    compile_props,
+                                ) {
+                                    Ok(phys) => {
+                                        let dt = resolve_expr_type(
+                                            arg_expr,
+                                            &input_schema,
+                                            agg_field.data_type(),
+                                        );
+                                        proj_fields.push(Field::new(
+                                            format!("__agg_input_{col_idx}"),
+                                            dt,
+                                            true,
+                                        ));
+                                        compiled_exprs.push(phys);
+                                    }
+                                    Err(_) => compile_ok = false,
+                                }
+                            }
                         } else {
                             pre_agg_select_items
                                 .push(format!("{expr_sql} AS \"__agg_input_{col_idx}\""));
+
+                            // Compile the arg expression directly
+                            if compile_ok {
+                                match create_physical_expr(arg_expr, input_df_schema, compile_props)
+                                {
+                                    Ok(phys) => {
+                                        let dt = resolve_expr_type(
+                                            arg_expr,
+                                            &input_schema,
+                                            agg_field.data_type(),
+                                        );
+                                        proj_fields.push(Field::new(
+                                            format!("__agg_input_{col_idx}"),
+                                            dt,
+                                            true,
+                                        ));
+                                        compiled_exprs.push(phys);
+                                    }
+                                    Err(_) => compile_ok = false,
+                                }
+                            }
                         }
 
                         input_col_indices.push(col_idx);
@@ -330,6 +432,30 @@ impl CoreWindowState {
                     pre_agg_select_items.push(format!(
                         "CASE WHEN {filter_sql} THEN TRUE ELSE FALSE END AS \"__agg_filter_{col_idx}\""
                     ));
+
+                    // Compile: CASE WHEN filter THEN TRUE ELSE FALSE END
+                    if compile_ok {
+                        let case_expr = datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
+                            expr: None,
+                            when_then_expr: vec![(
+                                Box::new(filter_expr.as_ref().clone()),
+                                Box::new(datafusion_expr::lit(true)),
+                            )],
+                            else_expr: Some(Box::new(datafusion_expr::lit(false))),
+                        });
+                        match create_physical_expr(&case_expr, input_df_schema, compile_props) {
+                            Ok(phys) => {
+                                proj_fields.push(Field::new(
+                                    format!("__agg_filter_{col_idx}"),
+                                    DataType::Boolean,
+                                    true,
+                                ));
+                                compiled_exprs.push(phys);
+                            }
+                            Err(_) => compile_ok = false,
+                        }
+                    }
+
                     Some(col_idx)
                 } else {
                     None
@@ -357,6 +483,23 @@ impl CoreWindowState {
         let time_col_index = next_col_idx;
         pre_agg_select_items.push(format!("\"{}\" AS \"__cw_ts\"", window_config.time_column));
 
+        // Compile time column expression
+        if compile_ok {
+            let time_expr = datafusion_expr::Expr::Column(
+                datafusion_common::Column::new_unqualified(&window_config.time_column),
+            );
+            match create_physical_expr(&time_expr, input_df_schema, compile_props) {
+                Ok(phys) => {
+                    let dt = phys
+                        .data_type(input_df_schema.as_arrow())
+                        .unwrap_or(DataType::Int64);
+                    proj_fields.push(Field::new("__cw_ts", dt, true));
+                    compiled_exprs.push(phys);
+                }
+                Err(_) => compile_ok = false,
+            }
+        }
+
         let clauses = extract_clauses(sql);
         let pre_agg_sql = format!(
             "SELECT {} FROM {}{}",
@@ -364,6 +507,34 @@ impl CoreWindowState {
             clauses.from_clause,
             clauses.where_clause,
         );
+
+        // Build compiled projection for single-source queries.
+        let compiled_projection = if compile_ok {
+            let source_table = compile_source.unwrap();
+            // Compile WHERE predicate
+            let filter = if let Some(where_pred) = &agg_info.where_predicate {
+                if let Ok(phys) = create_physical_expr(where_pred, input_df_schema, compile_props) {
+                    Some(phys)
+                } else {
+                    compile_ok = false;
+                    None
+                }
+            } else {
+                None
+            };
+            if compile_ok {
+                Some(CompiledProjection {
+                    source_table,
+                    exprs: compiled_exprs,
+                    filter,
+                    output_schema: Arc::new(Schema::new(proj_fields)),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let mut intermediate_fields: Vec<Field> = Vec::new();
         for (name, dt) in group_col_names.iter().zip(group_types.iter()) {
@@ -388,13 +559,12 @@ impl CoreWindowState {
         let output_schema = Arc::new(Schema::new(output_fields));
 
         let post_projection = if let Some((proj_exprs, agg_df_schema)) = projection_info {
-            let state = ctx.state();
-            let props = state.execution_props();
             let mut compiled = Vec::with_capacity(proj_exprs.len());
             for expr in proj_exprs {
-                let phys = create_physical_expr(expr, &agg_df_schema, props).map_err(|e| {
-                    DbError::Pipeline(format!("compile post-aggregate projection: {e}"))
-                })?;
+                let phys =
+                    create_physical_expr(expr, &agg_df_schema, compile_props).map_err(|e| {
+                        DbError::Pipeline(format!("compile post-aggregate projection: {e}"))
+                    })?;
                 compiled.push(phys);
             }
             let mut final_fields = vec![
@@ -415,13 +585,29 @@ impl CoreWindowState {
             None
         };
 
-        let having_sql = having_predicate.as_ref().map(expr_to_sql);
+        // Compile HAVING filter.
+        let having_filter = compile_having_filter(ctx, having_predicate.as_ref(), &output_schema);
+        let having_sql = if having_filter.is_none() {
+            having_predicate.as_ref().map(expr_to_sql)
+        } else {
+            None
+        };
 
-        // Wire the SQL→Core emit strategy bridge
-        let emit_strategy = match emit_clause {
-            Some(ec) => crate::stream_executor::emit_clause_to_core(ec)
-                .unwrap_or(CoreEmitStrategy::OnWindowClose),
-            None => CoreEmitStrategy::OnWindowClose,
+        // ONE-TIME setup: cache the optimized logical plan for multi-source
+        // pre-agg queries. This ctx.sql() call runs ONLY at first-cycle
+        // initialization, never per-cycle. Fail fast if the pre-agg SQL is
+        // invalid — it would fail every cycle.
+        let cached_pre_agg_plan = if compiled_projection.is_none() {
+            match ctx.sql(&pre_agg_sql).await {
+                Ok(df) => Some(df.logical_plan().clone()),
+                Err(e) => {
+                    return Err(DbError::Pipeline(format!(
+                        "pre-agg SQL planning failed for windowed aggregate: {e}"
+                    )));
+                }
+            }
+        } else {
+            None
         };
 
         Ok(Some(Self {
@@ -435,8 +621,10 @@ impl CoreWindowState {
             pre_agg_sql,
             output_schema,
             time_col_index,
-            emit_strategy,
             having_sql,
+            compiled_projection,
+            cached_pre_agg_plan,
+            having_filter,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: i64::try_from(window_config.allowed_lateness.as_millis())
                 .unwrap_or(0),
@@ -1073,6 +1261,7 @@ impl CoreWindowState {
     }
 
     /// Pre-aggregation SQL.
+    #[allow(dead_code)] // Accessed in tests and available for diagnostics.
     pub fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql
     }
@@ -1080,6 +1269,21 @@ impl CoreWindowState {
     /// HAVING predicate SQL, if any.
     pub fn having_sql(&self) -> Option<&str> {
         self.having_sql.as_deref()
+    }
+
+    /// Compiled HAVING filter, if available.
+    pub fn having_filter(&self) -> Option<&Arc<dyn PhysicalExpr>> {
+        self.having_filter.as_ref()
+    }
+
+    /// Compiled pre-aggregation projection, if available.
+    pub fn compiled_projection(&self) -> Option<&CompiledProjection> {
+        self.compiled_projection.as_ref()
+    }
+
+    /// Cached optimized logical plan for the pre-agg SQL.
+    pub fn cached_pre_agg_plan(&self) -> Option<&datafusion_expr::LogicalPlan> {
+        self.cached_pre_agg_plan.as_ref()
     }
 
     /// Compute a fingerprint for this query (SQL + schema).
@@ -1094,6 +1298,52 @@ impl CoreWindowState {
             CoreWindowAssigner::Hopping(_) => "hopping",
             CoreWindowAssigner::Session { .. } => "session",
         }
+    }
+
+    /// Estimated memory usage in bytes across all windows and groups.
+    ///
+    /// For tumbling/hopping windows, iterates over `windows` (`BTreeMap` of
+    /// window-start to per-group accumulators). For session windows, iterates
+    /// over `session_groups`. Uses `ScalarValue::size()` for keys and
+    /// `Accumulator::size()` for accumulator state.
+    pub(crate) fn estimated_size_bytes(&self) -> usize {
+        let mut total = 0;
+        // Tumbling/hopping windows
+        for groups in self.windows.values() {
+            for (key, accs) in groups {
+                for sv in key {
+                    total += sv.size();
+                }
+                for acc in accs {
+                    total += acc.size();
+                }
+            }
+        }
+        // Session windows
+        for (key, group_state) in &self.session_groups {
+            for sv in key {
+                total += sv.size();
+            }
+            for session in group_state.sessions.values() {
+                for acc in &session.accs {
+                    total += acc.size();
+                }
+                // start/end timestamps: 2 × 8 bytes
+                total += 16;
+            }
+        }
+        total
+    }
+
+    /// Total number of distinct groups across all windows.
+    ///
+    /// For tumbling/hopping: sums group counts across all open windows.
+    /// For session: counts groups in `session_groups`.
+    #[allow(dead_code)]
+    pub(crate) fn group_count(&self) -> usize {
+        let windowed: usize = self.windows.values().map(|g| g.len()).sum();
+        let session = self.session_groups.len();
+        windowed + session
     }
 
     /// Checkpoint all per-window group states into a serializable struct.
@@ -1349,8 +1599,10 @@ mod tests {
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
-            emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
+            compiled_projection: None,
+            cached_pre_agg_plan: None,
+            having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
             post_projection: None,
@@ -1403,8 +1655,10 @@ mod tests {
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
-            emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
+            compiled_projection: None,
+            cached_pre_agg_plan: None,
+            having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
             post_projection: None,
@@ -1446,8 +1700,10 @@ mod tests {
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
-            emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
+            compiled_projection: None,
+            cached_pre_agg_plan: None,
+            having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
             post_projection: None,
@@ -1487,8 +1743,10 @@ mod tests {
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
-            emit_strategy: CoreEmit::OnWindowClose,
             having_sql: None,
+            compiled_projection: None,
+            cached_pre_agg_plan: None,
+            having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
             post_projection: None,

@@ -162,7 +162,6 @@ jobs:
         run: |
           cargo bench -p laminar-core --bench throughput_bench -- $BENCH_ARGS 2>&1 | tee results.txt
           cargo bench -p laminar-core --bench tpc_bench -- $BENCH_ARGS 2>&1 | tee -a results.txt
-          cargo bench -p laminar-core --bench io_uring_bench -- $BENCH_ARGS 2>&1 | tee -a results.txt
 
       - name: Upload results
         uses: actions/upload-artifact@v4

@@ -27,6 +27,7 @@ use std::collections::HashMap;
 
 use laminar_storage::checkpoint_manifest::{CheckpointManifest, SinkCommitStatus};
 use laminar_storage::checkpoint_store::CheckpointStore;
+use laminar_storage::ValidationResult;
 use tracing::{debug, error, info, warn};
 
 use crate::checkpoint_coordinator::{
@@ -186,11 +187,32 @@ impl<'a> RecoveryManager<'a> {
         // Fast path: try load_latest() first.
         match self.store.load_latest() {
             Ok(Some(manifest)) => {
-                let state = self
-                    .restore_from(manifest, sources, sinks, table_sources)
-                    .await;
-                self.check_strict(&state)?;
-                return Ok(Some(state));
+                if self.is_checkpoint_corrupt(&manifest) {
+                    warn!(
+                        checkpoint_id = manifest.checkpoint_id,
+                        "[LDB-6010] latest checkpoint corrupt, trying fallback"
+                    );
+                } else if Self::has_pending_sinks(&manifest) {
+                    warn!(
+                        checkpoint_id = manifest.checkpoint_id,
+                        epoch = manifest.epoch,
+                        "[LDB-6015] checkpoint has uncommitted sinks — source offsets \
+                         may be past uncommitted data, falling back to previous checkpoint"
+                    );
+                } else {
+                    let state = self
+                        .restore_from(manifest, sources, sinks, table_sources)
+                        .await;
+                    if let Err(e) = self.check_strict(&state) {
+                        warn!(
+                            checkpoint_id = state.manifest.checkpoint_id,
+                            error = %e,
+                            "latest checkpoint restore had strict errors, trying fallback"
+                        );
+                    } else {
+                        return Ok(Some(state));
+                    }
+                }
             }
             Ok(None) => {
                 info!("no checkpoint found, starting fresh");
@@ -214,11 +236,32 @@ impl<'a> RecoveryManager<'a> {
         for &(checkpoint_id, _epoch) in checkpoints.iter().rev() {
             match self.store.load_by_id(checkpoint_id) {
                 Ok(Some(manifest)) => {
+                    if self.is_checkpoint_corrupt(&manifest) {
+                        warn!(
+                            checkpoint_id,
+                            "[LDB-6010] fallback checkpoint corrupt, skipping"
+                        );
+                        continue;
+                    }
+                    if Self::has_pending_sinks(&manifest) {
+                        warn!(
+                            checkpoint_id,
+                            "[LDB-6015] fallback checkpoint has uncommitted sinks, skipping"
+                        );
+                        continue;
+                    }
                     info!(checkpoint_id, "recovering from fallback checkpoint");
                     let state = self
                         .restore_from(manifest, sources, sinks, table_sources)
                         .await;
-                    self.check_strict(&state)?;
+                    if let Err(e) = self.check_strict(&state) {
+                        warn!(
+                            checkpoint_id,
+                            error = %e,
+                            "fallback checkpoint restore had strict errors, trying next"
+                        );
+                        continue;
+                    }
                     return Ok(Some(state));
                 }
                 Ok(None) => {
@@ -243,7 +286,12 @@ impl<'a> RecoveryManager<'a> {
     /// For any operator state marked as `external`, loads the corresponding
     /// bytes from `state.bin` and replaces it with an inline entry. This
     /// makes the rest of recovery code work uniformly with inline state.
-    fn resolve_external_states(&self, manifest: &mut CheckpointManifest) {
+    ///
+    /// Returns `true` if all external states were resolved successfully.
+    /// Returns `false` if any state could not be resolved (missing sidecar,
+    /// truncated sidecar, or I/O error). In strict mode, the caller should
+    /// treat a `false` return as a corrupt checkpoint and try fallback.
+    fn resolve_external_states(&self, manifest: &mut CheckpointManifest) -> bool {
         let external_ops: Vec<String> = manifest
             .operator_states
             .iter()
@@ -252,7 +300,7 @@ impl<'a> RecoveryManager<'a> {
             .collect();
 
         if external_ops.is_empty() {
-            return;
+            return true;
         }
 
         let state_data = match self.store.load_state_data(manifest.checkpoint_id) {
@@ -261,7 +309,7 @@ impl<'a> RecoveryManager<'a> {
                 error!(
                     checkpoint_id = manifest.checkpoint_id,
                     operators = ?external_ops,
-                    "sidecar state.bin missing — external operator states \
+                    "[LDB-6010] sidecar state.bin missing — external operator states \
                      cannot be resolved; operators will start with empty state"
                 );
                 // Clear external flag so recovery doesn't attempt to
@@ -271,14 +319,14 @@ impl<'a> RecoveryManager<'a> {
                         *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
                     }
                 }
-                return;
+                return false;
             }
             Err(e) => {
                 error!(
                     checkpoint_id = manifest.checkpoint_id,
                     error = %e,
                     operators = ?external_ops,
-                    "failed to load sidecar state.bin — external operator states \
+                    "[LDB-6010] failed to load sidecar state.bin — external operator states \
                      cannot be resolved; operators will start with empty state"
                 );
                 for name in &external_ops {
@@ -286,10 +334,11 @@ impl<'a> RecoveryManager<'a> {
                         *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
                     }
                 }
-                return;
+                return false;
             }
         };
 
+        let mut all_resolved = true;
         for (name, op) in &mut manifest.operator_states {
             if op.external {
                 #[allow(clippy::cast_possible_truncation)] // Sidecar files are always < 4 GB
@@ -313,13 +362,15 @@ impl<'a> RecoveryManager<'a> {
                         offset = start,
                         length = op.external_length,
                         sidecar_len = state_data.len(),
-                        "sidecar too small for external operator state — \
+                        "[LDB-6010] sidecar too small for external operator state — \
                          operator will start with empty state"
                     );
                     *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
+                    all_resolved = false;
                 }
             }
         }
+        all_resolved
     }
 
     /// Restores pipeline state from a loaded manifest.
@@ -335,7 +386,16 @@ impl<'a> RecoveryManager<'a> {
         table_sources: &[RegisteredSource],
     ) -> RecoveredState {
         // Resolve external operator states from sidecar before recovery.
-        self.resolve_external_states(&mut manifest);
+        // In strict mode, unresolved sidecar state is recorded as a source
+        // error so check_strict() will reject this checkpoint.
+        let sidecar_ok = self.resolve_external_states(&mut manifest);
+        if !sidecar_ok && self.strict {
+            warn!(
+                checkpoint_id = manifest.checkpoint_id,
+                "[LDB-6010] sidecar resolution failed in strict mode — \
+                 checkpoint will be rejected"
+            );
+        }
 
         // Validate manifest consistency before restoring state.
         let validation_errors = manifest.validate();
@@ -419,6 +479,16 @@ impl<'a> RecoveryManager<'a> {
             source_errors: HashMap::new(),
             sink_errors: HashMap::new(),
         };
+
+        // Record sidecar failure so check_strict() rejects this checkpoint.
+        if !sidecar_ok {
+            result.source_errors.insert(
+                "__sidecar__".into(),
+                "[LDB-6010] sidecar state.bin missing or truncated — \
+                 operator state cannot be fully restored"
+                    .into(),
+            );
+        }
 
         // Step 3: Restore source offsets
         for source in sources {
@@ -516,7 +586,69 @@ impl<'a> RecoveryManager<'a> {
         result
     }
 
+    /// Checks whether a checkpoint's sidecar data is corrupt.
+    ///
+    /// Returns `true` if the checkpoint has a `state_checksum` and
+    /// [`CheckpointStore::validate_checkpoint`] reports a checksum mismatch
+    /// or missing sidecar. Returns `false` if there is no sidecar, or
+    /// if the sidecar is valid, or if validation I/O fails (we proceed
+    /// with caution rather than blocking recovery).
+    /// Returns `true` if the checkpoint fails integrity validation.
+    ///
+    /// Checks both sidecar checksum and manifest validity. Any validation
+    /// failure (sidecar corruption, missing data, or manifest issues like
+    /// epoch=0) causes the checkpoint to be rejected so fallback can try
+    /// an older one.
+    ///
+    /// Only returns `false` (proceed) when validation passes OR when the
+    /// checkpoint has no sidecar to validate.
+    fn is_checkpoint_corrupt(&self, manifest: &CheckpointManifest) -> bool {
+        // No sidecar and no state_checksum → nothing to validate beyond
+        // manifest parsing (which already succeeded if we got here).
+        if manifest.state_checksum.is_none() && manifest.operator_states.is_empty() {
+            return false;
+        }
+        match self.store.validate_checkpoint(manifest.checkpoint_id) {
+            Ok(ValidationResult {
+                valid: false,
+                ref issues,
+                ..
+            }) => {
+                error!(
+                    checkpoint_id = manifest.checkpoint_id,
+                    issues = ?issues,
+                    "[LDB-6010] checkpoint integrity check failed"
+                );
+                true
+            }
+            Ok(_) => false, // valid
+            Err(e) => {
+                // I/O errors during validation are treated as corruption —
+                // if we can't verify the checkpoint, don't trust it.
+                error!(
+                    checkpoint_id = manifest.checkpoint_id,
+                    error = %e,
+                    "[LDB-6010] checkpoint validation I/O error — \
+                     treating as corrupt for safety"
+                );
+                true
+            }
+        }
+    }
+
     /// In strict mode, returns an error if any source or sink had restore failures.
+    /// Returns true if any exactly-once sink has Pending commit status.
+    ///
+    /// A checkpoint with Pending sinks was persisted before sink commit
+    /// completed. Recovering from it would advance source offsets past
+    /// data the sinks never received — causing silent data loss.
+    fn has_pending_sinks(manifest: &CheckpointManifest) -> bool {
+        manifest
+            .sink_commit_statuses
+            .values()
+            .any(|s| matches!(s, SinkCommitStatus::Pending))
+    }
+
     fn check_strict(&self, state: &RecoveredState) -> Result<(), DbError> {
         if !self.strict || !state.has_errors() {
             return Ok(());
@@ -868,7 +1000,10 @@ mod tests {
             .insert("orphan".into(), OperatorCheckpoint::external(0, 100));
         store.save(&manifest).unwrap();
 
-        let mgr = RecoveryManager::new(&store);
+        // Use lenient mode — graceful degradation replaces missing
+        // sidecar state with empty inline. Strict mode rejects this
+        // checkpoint entirely (see test_recover_missing_sidecar_strict).
+        let mgr = RecoveryManager::lenient(&store);
         let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
 
         // Should still recover (gracefully) — external state replaced with
@@ -905,5 +1040,77 @@ mod tests {
             sink_errors: HashMap::new(),
         };
         assert!(state_with_errors.has_errors());
+    }
+
+    #[tokio::test]
+    async fn test_recover_missing_sidecar_strict_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+
+        // Manifest references external state but sidecar is missing
+        let mut manifest = CheckpointManifest::new(1, 1);
+        manifest
+            .operator_states
+            .insert("orphan".into(), OperatorCheckpoint::external(0, 100));
+        store.save(&manifest).unwrap();
+
+        // Strict mode: missing sidecar causes the checkpoint to be rejected
+        // and recovery falls back. With only one checkpoint, this means
+        // fresh start.
+        let mgr = RecoveryManager::new(&store);
+        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+        assert!(
+            result.is_none(),
+            "strict mode should reject checkpoint with missing sidecar"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_skips_pending_sinks_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+
+        // Epoch 1: fully committed checkpoint (good).
+        let mut m1 = CheckpointManifest::new(1, 1);
+        m1.sink_commit_statuses
+            .insert("delta_sink".into(), SinkCommitStatus::Committed);
+        store.save(&m1).unwrap();
+
+        // Epoch 2: crashed between manifest persist and sink commit (Pending).
+        let mut m2 = CheckpointManifest::new(2, 2);
+        m2.sink_commit_statuses
+            .insert("delta_sink".into(), SinkCommitStatus::Pending);
+        store.save(&m2).unwrap();
+
+        let mgr = RecoveryManager::new(&store);
+        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+        let state = result.expect("should recover from epoch 1 fallback");
+
+        // Must fall back to epoch 1 (the last fully committed checkpoint),
+        // not epoch 2 (which has uncommitted sink data).
+        assert_eq!(
+            state.epoch(),
+            1,
+            "recovery must skip checkpoint with Pending sinks"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recover_all_pending_starts_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = make_store(dir.path());
+
+        // Only checkpoint has Pending sinks — no safe fallback.
+        let mut m = CheckpointManifest::new(1, 1);
+        m.sink_commit_statuses
+            .insert("sink".into(), SinkCommitStatus::Pending);
+        store.save(&m).unwrap();
+
+        let mgr = RecoveryManager::new(&store);
+        let result = mgr.recover(&[], &[], &[]).await.unwrap();
+        assert!(
+            result.is_none(),
+            "should start fresh when all checkpoints have pending sinks"
+        );
     }
 }

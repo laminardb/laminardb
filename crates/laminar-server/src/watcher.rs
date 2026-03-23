@@ -13,6 +13,14 @@ use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+fn file_content_hash(path: &std::path::Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
 use crate::config;
 use crate::http::AppState;
 use crate::reload;
@@ -80,6 +88,9 @@ pub async fn watch_config(config_path: PathBuf, state: Arc<AppState>, debounce: 
 
     info!("Watching config file '{}' for changes", canonical.display());
 
+    // Track content hash to skip spurious inotify events (Docker overlay mounts)
+    let mut last_hash = file_content_hash(&canonical);
+
     // Keep the watcher alive and process debounced events
     loop {
         // Wait for first notification
@@ -92,7 +103,15 @@ pub async fn watch_config(config_path: PathBuf, state: Arc<AppState>, debounce: 
         tokio::time::sleep(debounce).await;
         while rx.try_recv().is_ok() {}
 
+        let current_hash = file_content_hash(&canonical);
+        if current_hash == last_hash {
+            debug!("File event but content unchanged, skipping");
+            continue;
+        }
+
         info!("Config file change detected, reloading...");
+
+        last_hash = current_hash;
 
         // Load new config
         let new_config = match config::load_config(&canonical) {

@@ -19,10 +19,9 @@ use arrow_array::RecordBatch;
 use tokio::sync::Notify;
 
 use laminar_connectors::checkpoint::SourceCheckpoint;
-use laminar_core::tpc::TpcConfig;
 use laminar_db::checkpoint_coordinator::{CheckpointConfig, CheckpointCoordinator};
 use laminar_db::pipeline::{
-    PipelineCallback, PipelineConfig, SourceRegistration, TpcPipelineCoordinator,
+    PipelineCallback, PipelineConfig, SourceRegistration, StreamingCoordinator,
 };
 use laminar_db::recovery_manager::RecoveryManager;
 use laminar_storage::checkpoint_store::FileSystemCheckpointStore;
@@ -52,9 +51,9 @@ impl BarrierTrackingCallback {
 impl PipelineCallback for BarrierTrackingCallback {
     async fn execute_cycle(
         &mut self,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         _watermark: i64,
-    ) -> Result<FxHashMap<String, Vec<RecordBatch>>, String> {
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
         self.cycle_count += 1;
         let records: u64 = source_batches
             .values()
@@ -66,9 +65,9 @@ impl PipelineCallback for BarrierTrackingCallback {
         Ok(FxHashMap::default())
     }
 
-    fn push_to_streams(&self, _results: &FxHashMap<String, Vec<RecordBatch>>) {}
+    fn push_to_streams(&self, _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {}
 
-    async fn write_to_sinks(&mut self, _results: &FxHashMap<String, Vec<RecordBatch>>) {}
+    async fn write_to_sinks(&mut self, _results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {}
 
     fn extract_watermark(&mut self, _source_name: &str, _batch: &RecordBatch) {}
 
@@ -80,7 +79,14 @@ impl PipelineCallback for BarrierTrackingCallback {
         0
     }
 
-    async fn maybe_checkpoint(&mut self, force: bool) -> bool {
+    async fn maybe_checkpoint(
+        &mut self,
+        force: bool,
+        _source_offsets: rustc_hash::FxHashMap<
+            String,
+            laminar_connectors::checkpoint::SourceCheckpoint,
+        >,
+    ) -> bool {
         if force {
             self.force_checkpoints += 1;
             return true;
@@ -99,25 +105,8 @@ impl PipelineCallback for BarrierTrackingCallback {
     fn record_cycle(&self, _events_ingested: u64, _batches: u64, _elapsed_ns: u64) {}
 
     async fn poll_tables(&mut self) {}
-}
 
-/// TPC config for tests. Uses 2 cores to satisfy the SPSC invariant
-/// (each source gets its own core inbox).
-fn test_tpc_config() -> TpcConfig {
-    TpcConfig {
-        num_cores: 2,
-        cpu_pinning: false,
-        ..Default::default()
-    }
-}
-
-/// Single-core TPC config for single-source tests.
-fn test_tpc_config_single() -> TpcConfig {
-    TpcConfig {
-        num_cores: 1,
-        cpu_pinning: false,
-        ..Default::default()
-    }
+    fn apply_control(&mut self, _msg: laminar_db::pipeline::ControlMsg) {}
 }
 
 /// Test that barriers are injected and aligned across multiple sources,
@@ -132,6 +121,7 @@ async fn test_barrier_aligned_checkpoint_fires() {
             ),
             config: laminar_connectors::config::ConnectorConfig::new("mock"),
             supports_replay: true,
+            restore_checkpoint: None,
         },
         SourceRegistration {
             name: "src_b".to_string(),
@@ -140,6 +130,7 @@ async fn test_barrier_aligned_checkpoint_fires() {
             ),
             config: laminar_connectors::config::ConnectorConfig::new("mock"),
             supports_replay: true,
+            restore_checkpoint: None,
         },
     ];
 
@@ -155,8 +146,10 @@ async fn test_barrier_aligned_checkpoint_fires() {
         ..PipelineConfig::default()
     };
 
-    let coordinator =
-        TpcPipelineCoordinator::new(sources, config, &test_tpc_config(), shutdown).unwrap();
+    let (_control_tx, control_rx) = tokio::sync::mpsc::channel(64);
+    let coordinator = StreamingCoordinator::new(sources, config, shutdown, control_rx)
+        .await
+        .unwrap();
 
     let should_trigger = Arc::new(AtomicBool::new(true));
     let record_counter = Arc::new(AtomicU64::new(0));
@@ -164,7 +157,7 @@ async fn test_barrier_aligned_checkpoint_fires() {
         BarrierTrackingCallback::new(Arc::clone(&should_trigger), Arc::clone(&record_counter));
 
     let handle = tokio::spawn(async move {
-        coordinator.run(Box::new(callback)).await;
+        coordinator.run(callback).await;
     });
 
     // Let the pipeline run and process data + barriers.
@@ -286,6 +279,7 @@ async fn test_single_source_barrier_checkpoint() {
         connector: Box::new(laminar_connectors::testing::MockSourceConnector::with_batches(100, 5)),
         config: laminar_connectors::config::ConnectorConfig::new("mock"),
         supports_replay: true,
+        restore_checkpoint: None,
     }];
 
     let shutdown = Arc::new(Notify::new());
@@ -299,8 +293,10 @@ async fn test_single_source_barrier_checkpoint() {
         ..PipelineConfig::default()
     };
 
-    let coordinator =
-        TpcPipelineCoordinator::new(sources, config, &test_tpc_config_single(), shutdown).unwrap();
+    let (_control_tx, control_rx) = tokio::sync::mpsc::channel(64);
+    let coordinator = StreamingCoordinator::new(sources, config, shutdown, control_rx)
+        .await
+        .unwrap();
 
     let should_trigger = Arc::new(AtomicBool::new(true));
     let record_counter = Arc::new(AtomicU64::new(0));
@@ -308,7 +304,7 @@ async fn test_single_source_barrier_checkpoint() {
         BarrierTrackingCallback::new(Arc::clone(&should_trigger), Arc::clone(&record_counter));
 
     let handle = tokio::spawn(async move {
-        coordinator.run(Box::new(callback)).await;
+        coordinator.run(callback).await;
     });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -333,6 +329,7 @@ async fn test_exhausted_sources_with_shutdown() {
             ),
             config: laminar_connectors::config::ConnectorConfig::new("mock"),
             supports_replay: true,
+            restore_checkpoint: None,
         },
         SourceRegistration {
             name: "fast_b".to_string(),
@@ -341,6 +338,7 @@ async fn test_exhausted_sources_with_shutdown() {
             ),
             config: laminar_connectors::config::ConnectorConfig::new("mock"),
             supports_replay: true,
+            restore_checkpoint: None,
         },
     ];
 
@@ -355,8 +353,10 @@ async fn test_exhausted_sources_with_shutdown() {
         ..PipelineConfig::default()
     };
 
-    let coordinator =
-        TpcPipelineCoordinator::new(sources, config, &test_tpc_config(), shutdown).unwrap();
+    let (_control_tx, control_rx) = tokio::sync::mpsc::channel(64);
+    let coordinator = StreamingCoordinator::new(sources, config, shutdown, control_rx)
+        .await
+        .unwrap();
 
     let should_trigger = Arc::new(AtomicBool::new(true));
     let record_counter = Arc::new(AtomicU64::new(0));
@@ -364,7 +364,7 @@ async fn test_exhausted_sources_with_shutdown() {
         BarrierTrackingCallback::new(Arc::clone(&should_trigger), Arc::clone(&record_counter));
 
     let handle = tokio::spawn(async move {
-        coordinator.run(Box::new(callback)).await;
+        coordinator.run(callback).await;
     });
 
     // Let sources exhaust and barriers fire, then shut down.

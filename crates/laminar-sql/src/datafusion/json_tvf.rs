@@ -1,4 +1,4 @@
-//! JSON table-valued functions (F-SCHEMA-012).
+//! JSON table-valued functions.
 //!
 //! Implements PostgreSQL-compatible JSON TVFs as DataFusion table functions:
 //!

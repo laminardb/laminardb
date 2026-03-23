@@ -4,13 +4,18 @@
 #![allow(clippy::disallowed_types)] // cold path
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::SchemaRef;
+use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
+use datafusion_common::DFSchema;
 use laminar_connectors::checkpoint::SourceCheckpoint;
+use laminar_core::alloc::{PriorityClass, PriorityGuard};
 use laminar_core::streaming;
 use rustc_hash::FxHashMap;
 
@@ -26,8 +31,14 @@ static FILTER_TABLE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// Implements [`PipelineCallback`](crate::pipeline::PipelineCallback) to bridge
 /// the event-driven pipeline coordinator to the rest of the database (stream
 /// executor, sinks, watermarks, checkpoints, table sources).
+///
+/// `ConnectorPipelineCallback` runs on a dedicated single-threaded tokio runtime
+/// (laminar-compute thread). Serialization and checkpoint I/O run inline because:
+/// 1. `tokio::spawn` on `current_thread` has no parallelism benefit
+/// 2. `spawn_blocking` on `current_thread` has no dedicated blocking pool
+/// 3. The compute thread is dedicated — blocking is acceptable
 pub(crate) struct ConnectorPipelineCallback {
-    pub(crate) executor: crate::stream_executor::StreamExecutor,
+    pub(crate) graph: crate::operator_graph::OperatorGraph,
     pub(crate) stream_sources: Vec<(String, streaming::Source<crate::catalog::ArrowRecord>)>,
     #[allow(clippy::type_complexity)]
     pub(crate) sinks: Vec<(
@@ -42,7 +53,6 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) tracker: Option<laminar_core::time::WatermarkTracker>,
     pub(crate) counters: Arc<crate::metrics::PipelineCounters>,
     pub(crate) pipeline_watermark: Arc<std::sync::atomic::AtomicI64>,
-    pub(crate) checkpoint_in_progress: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) coordinator:
         Arc<tokio::sync::Mutex<Option<crate::checkpoint_coordinator::CheckpointCoordinator>>>,
     #[allow(clippy::type_complexity)]
@@ -55,10 +65,77 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
     /// Cached `SessionContext` for sink WHERE filters (avoids per-batch allocation).
     pub(crate) filter_ctx: SessionContext,
+    /// Lazily-compiled sink filter expressions, indexed by sink position.
+    pub(crate) compiled_sink_filters: Vec<Option<Arc<dyn PhysicalExpr>>>,
     pub(crate) last_checkpoint: std::time::Instant,
     /// `None` = no automatic checkpointing (manual only via coordinator).
     pub(crate) checkpoint_interval: Option<std::time::Duration>,
     pub(crate) pipeline_hash: Option<u64>,
+    pub(crate) delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee,
+    pub(crate) sink_write_timeout: Duration,
+    /// Set when a sink write times out in this cycle. Suppresses the next
+    /// periodic checkpoint to avoid advancing offsets past dropped batches.
+    pub(crate) sink_timed_out: bool,
+    /// Cycle duration histogram for percentile tracking (single-threaded access).
+    pub(crate) cycle_histogram:
+        std::cell::RefCell<crate::checkpoint_coordinator::DurationHistogram>,
+}
+
+impl ConnectorPipelineCallback {
+    /// Snapshot operator state inline, then offload `serde_json::to_vec()`
+    /// to `spawn_blocking` so the coordinator's I/O reactor is not blocked.
+    /// The coordinator still awaits the result (no concurrent event processing).
+    async fn capture_and_serialize_operator_state(
+        &mut self,
+    ) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
+        let mut operator_states = HashMap::with_capacity(2);
+        let cp = match self.graph.snapshot_state() {
+            Ok(Some(cp)) => cp,
+            Ok(None) => return Ok(operator_states),
+            Err(e) => return Err(format!("snapshot failed: {e}")),
+        };
+        // Offload CPU-bound serialization to blocking thread pool.
+        let bytes = tokio::task::spawn_blocking(move || {
+            crate::operator_graph::OperatorGraph::serialize_checkpoint(&cp)
+        })
+        .await
+        .map_err(|e| format!("serialize join error: {e}"))?
+        .map_err(|e| format!("serialize error: {e}"))?;
+        operator_states.insert("operator_graph".to_string(), bytes);
+        Ok(operator_states)
+    }
+
+    /// Try to compile sink filter SQL to `PhysicalExpr` for sinks that haven't been compiled yet.
+    async fn compile_pending_sink_filters(
+        &mut self,
+        results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+    ) {
+        // Ensure the compiled_sink_filters vec has the right length.
+        while self.compiled_sink_filters.len() < self.sinks.len() {
+            self.compiled_sink_filters.push(None);
+        }
+
+        for (i, (_, _, filter_sql, sink_input)) in self.sinks.iter().enumerate() {
+            // Skip if no filter or already compiled.
+            if filter_sql.is_none() || self.compiled_sink_filters[i].is_some() {
+                continue;
+            }
+            // Need a batch to determine the schema.
+            let Some(batches) = results.get(sink_input.as_str()) else {
+                continue;
+            };
+            let Some(batch) = batches.first() else {
+                continue;
+            };
+            let schema = batch.schema();
+            if let Some(compiled) =
+                compile_sink_filter_sql(&self.filter_ctx, filter_sql.as_deref().unwrap(), &schema)
+                    .await
+            {
+                self.compiled_sink_filters[i] = Some(compiled);
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -66,18 +143,21 @@ pub(crate) struct ConnectorPipelineCallback {
 impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     async fn execute_cycle(
         &mut self,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         watermark: i64,
-    ) -> Result<FxHashMap<String, Vec<RecordBatch>>, String> {
-        self.executor
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
+        let results = self
+            .graph
             .execute_cycle(source_batches, watermark)
             .await
-            .map_err(|e| format!("{e}"))
+            .map_err(|e| format!("{e}"))?;
+
+        Ok(results)
     }
 
-    fn push_to_streams(&self, results: &FxHashMap<String, Vec<RecordBatch>>) {
+    fn push_to_streams(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
         for (stream_name, src) in &self.stream_sources {
-            if let Some(batches) = results.get(stream_name) {
+            if let Some(batches) = results.get(stream_name.as_str()) {
                 for batch in batches {
                     if batch.num_rows() > 0 {
                         #[allow(clippy::cast_possible_truncation)]
@@ -98,13 +178,23 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
     }
 
-    async fn write_to_sinks(&mut self, results: &FxHashMap<String, Vec<RecordBatch>>) {
+    async fn write_to_sinks(&mut self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
+        // Lazy-compile any pending sink filters.
+        self.compile_pending_sink_filters(results).await;
+
+        // Shared flag — set by any sink future on timeout, read after join_all.
+        let had_timeout = std::sync::atomic::AtomicBool::new(false);
+        let is_exactly_once = self.delivery_guarantee
+            == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce;
+        let write_timeout = self.sink_write_timeout;
+
         // Route results to sinks concurrently, filtered by FROM clause.
         let filter_ctx = self.filter_ctx.clone(); // Arc bump — cheap
         let sink_futures: Vec<_> = self
             .sinks
             .iter()
-            .filter_map(|(sink_name, handle, filter_expr, sink_input)| {
+            .enumerate()
+            .filter_map(|(sink_idx, (sink_name, handle, filter_expr, sink_input))| {
                 // Route by FROM clause: only send matching results.
                 let batches = results.get(sink_input.as_str())?;
                 if batches.is_empty() {
@@ -112,12 +202,32 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 }
                 let sink_name = sink_name.clone();
                 let handle = handle.clone();
+                let compiled_filter = self
+                    .compiled_sink_filters
+                    .get(sink_idx)
+                    .and_then(Clone::clone);
                 let filter_expr = filter_expr.clone();
                 let batches = batches.clone();
                 let ctx = filter_ctx.clone();
+                let had_timeout = &had_timeout;
                 Some(async move {
                     for batch in &batches {
-                        let filtered = if let Some(ref filter_sql) = filter_expr {
+                        let filtered = if let Some(ref phys) = compiled_filter {
+                            // Use compiled PhysicalExpr — no SQL overhead
+                            match apply_compiled_sink_filter(batch, phys) {
+                                Ok(Some(fb)) => fb,
+                                Ok(None) => continue,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        sink = %sink_name,
+                                        error = %e,
+                                        "Compiled sink filter error"
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else if let Some(ref filter_sql) = filter_expr {
+                            // Fallback to SQL-based filter
                             match apply_filter(&ctx, batch, filter_sql).await {
                                 Ok(Some(fb)) => fb,
                                 Ok(None) => continue,
@@ -136,12 +246,35 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         };
 
                         if filtered.num_rows() > 0 {
-                            if let Err(e) = handle.write_batch(filtered).await {
-                                tracing::warn!(
-                                    sink = %sink_name,
-                                    error = %e,
-                                    "Sink write error"
-                                );
+                            match tokio::time::timeout(write_timeout, handle.write_batch(filtered))
+                                .await
+                            {
+                                Ok(Err(e)) => {
+                                    tracing::warn!(
+                                        sink = %sink_name,
+                                        error = %e,
+                                        "Sink write error"
+                                    );
+                                }
+                                Err(_elapsed) => {
+                                    had_timeout.store(true, Ordering::Relaxed);
+                                    if is_exactly_once {
+                                        tracing::error!(
+                                            sink = %sink_name,
+                                            timeout_secs = write_timeout.as_secs(),
+                                            "[LDB-5040] Sink write timed out, batch dropped \
+                                             (EXACTLY-ONCE VIOLATION — next checkpoint suppressed)"
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            sink = %sink_name,
+                                            timeout_secs = write_timeout.as_secs(),
+                                            "[LDB-5040] Sink write timed out, batch dropped \
+                                             (next checkpoint suppressed to allow replay)"
+                                        );
+                                    }
+                                }
+                                Ok(Ok(())) => {}
                             }
                         }
                     }
@@ -149,6 +282,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             })
             .collect();
         futures::future::join_all(sink_futures).await;
+
+        if had_timeout.load(Ordering::Relaxed) {
+            self.sink_timed_out = true;
+        }
     }
 
     fn extract_watermark(&mut self, source_name: &str, batch: &RecordBatch) {
@@ -217,8 +354,29 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    async fn maybe_checkpoint(&mut self, force: bool) -> bool {
+    /// Timer-based checkpoint (at-least-once semantics).
+    ///
+    /// Source offsets are captured BEFORE operator state. On recovery:
+    /// consumer replays from offset → operator may re-process some
+    /// records. This is correct for at-least-once but NOT exactly-once.
+    /// For exactly-once, use barrier-aligned checkpoints instead.
+    async fn maybe_checkpoint(
+        &mut self,
+        force: bool,
+        source_offsets: FxHashMap<String, SourceCheckpoint>,
+    ) -> bool {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
+        let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
+
+        // Under exactly-once, only barrier-aligned checkpoints are consistent.
+        // Timer-based checkpoints are skipped (barrier path handles exactly-once).
+        if !force
+            && self.delivery_guarantee
+                == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce
+        {
+            tracing::debug!("skipping timer checkpoint under exactly-once (use barriers)");
+            return false;
+        }
 
         if self
             .counters
@@ -229,11 +387,13 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             return false;
         }
 
-        if !force
-            && self
-                .checkpoint_in_progress
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        // After a sink timeout, skip one checkpoint cycle so that source
+        // offsets don't advance past the dropped batch. The NEXT cycle will
+        // clear this flag and checkpoint normally. This preserves at-least-once:
+        // on recovery, the source replays from the pre-drop checkpoint.
+        if !force && self.sink_timed_out {
+            self.sink_timed_out = false;
+            tracing::info!("skipping checkpoint after sink timeout to preserve replay window");
             return false;
         }
 
@@ -246,16 +406,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
 
-        if force {
-            // Wait for any in-flight checkpoint to complete.
-            while self
-                .checkpoint_in_progress
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        }
-
         // Capture table source offsets.
         let mut extra_tables = HashMap::with_capacity(self.table_sources.len());
         for (name, source, _) in &self.table_sources {
@@ -265,17 +415,23 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             );
         }
 
-        // Capture stream executor aggregate state.
-        let mut operator_states = HashMap::with_capacity(1);
-        match self.executor.checkpoint_state() {
-            Ok(Some(bytes)) => {
-                operator_states.insert("stream_executor".to_string(), bytes);
-            }
-            Ok(None) => {}
+        // Convert source offsets from connector format to manifest format.
+        let source_overrides: HashMap<String, _> = source_offsets
+            .iter()
+            .map(|(name, cp)| (name.clone(), source_to_connector_checkpoint(cp)))
+            .collect();
+
+        // Capture stream executor aggregate state and serialize on blocking thread.
+        // Abort the checkpoint if serialization fails — persisting source
+        // offsets without matching operator state would cause data loss on
+        // recovery (offsets advance past unreplayable state).
+        let operator_states = match self.capture_and_serialize_operator_state().await {
+            Ok(states) => states,
             Err(e) => {
-                tracing::warn!(error = %e, "Stream executor checkpoint capture failed");
+                tracing::warn!(error = %e, "Stream executor checkpoint failed — skipping checkpoint");
+                return false;
             }
-        }
+        };
 
         // Collect per-source watermarks from the watermark tracker.
         let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
@@ -285,12 +441,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 per_source_watermarks.insert(name.clone(), wm);
             }
         }
-
-        // Pre-capture source offsets synchronously. These must match the
-        // operator state that was just captured above — if we defer snapshot
-        // to the spawned task, the sources may have advanced past the
-        // operator state point, breaking exactly-once on recovery.
-        let source_overrides = capture_source_offsets_from_coordinator(&self.coordinator).await;
 
         if force {
             // Blocking checkpoint at shutdown.
@@ -324,48 +474,41 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 }
             }
         } else {
-            // Non-blocking periodic checkpoint.
-            let coord_clone = Arc::clone(&self.coordinator);
-            let in_progress = Arc::clone(&self.checkpoint_in_progress);
-            in_progress.store(true, std::sync::atomic::Ordering::Relaxed);
-            let pipeline_hash = self.pipeline_hash;
-
-            tokio::spawn(async move {
-                let mut guard = coord_clone.lock().await;
-                if let Some(ref mut coord) = *guard {
-                    match coord
-                        .checkpoint_with_offsets(
-                            operator_states,
-                            None,
-                            None,
-                            extra_tables,
-                            per_source_watermarks,
-                            pipeline_hash,
-                            source_overrides,
-                        )
-                        .await
-                    {
-                        Ok(result) if result.success => {
-                            tracing::info!(
-                                epoch = result.epoch,
-                                duration_ms = result.duration.as_millis(),
-                                "Pipeline checkpoint completed"
-                            );
-                        }
-                        Ok(result) => {
-                            tracing::warn!(
-                                epoch = result.epoch,
-                                error = ?result.error,
-                                "Pipeline checkpoint failed"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Checkpoint error");
-                        }
+            // Periodic checkpoint — run inline (single-threaded runtime, no
+            // parallelism to exploit with tokio::spawn).
+            let mut guard = self.coordinator.lock().await;
+            if let Some(ref mut coord) = *guard {
+                match coord
+                    .checkpoint_with_offsets(
+                        operator_states,
+                        None,
+                        None,
+                        extra_tables,
+                        per_source_watermarks,
+                        self.pipeline_hash,
+                        source_overrides,
+                    )
+                    .await
+                {
+                    Ok(result) if result.success => {
+                        tracing::info!(
+                            epoch = result.epoch,
+                            duration_ms = result.duration.as_millis(),
+                            "Pipeline checkpoint completed"
+                        );
+                    }
+                    Ok(result) => {
+                        tracing::warn!(
+                            epoch = result.epoch,
+                            error = ?result.error,
+                            "Pipeline checkpoint failed"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Checkpoint error");
                     }
                 }
-                in_progress.store(false, std::sync::atomic::Ordering::Relaxed);
-            });
+            }
         }
 
         self.last_checkpoint = std::time::Instant::now();
@@ -377,6 +520,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
     ) -> bool {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
+        let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
 
         if self
             .counters
@@ -384,6 +528,17 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .load(std::sync::atomic::Ordering::Relaxed)
             == 0
         {
+            return false;
+        }
+
+        // A sink timeout in this cycle means some data was dropped.
+        // Committing offsets would skip that data on recovery.
+        // Do NOT clear the flag here — maybe_checkpoint is the sole consumer,
+        // ensuring both paths are suppressed in the same coordinator cycle.
+        if self.sink_timed_out {
+            tracing::warn!(
+                "skipping barrier checkpoint after sink timeout to preserve replay window"
+            );
             return false;
         }
 
@@ -397,17 +552,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         // Capture stream executor aggregate state — now consistent because
-        // all pre-barrier data has been executed.
-        let mut operator_states = HashMap::with_capacity(1);
-        match self.executor.checkpoint_state() {
-            Ok(Some(bytes)) => {
-                operator_states.insert("stream_executor".to_string(), bytes);
-            }
-            Ok(None) => {}
+        // all pre-barrier data has been executed. Serialize on blocking thread.
+        // Abort if serialization fails — persisting source offsets without
+        // matching operator state would cause data loss on recovery.
+        let operator_states = match self.capture_and_serialize_operator_state().await {
+            Ok(states) => states,
             Err(e) => {
-                tracing::warn!(error = %e, "Stream executor checkpoint capture failed");
+                tracing::warn!(error = %e, "Stream executor barrier checkpoint failed — skipping");
+                return false;
             }
-        }
+        };
 
         // Collect per-source watermarks.
         let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
@@ -474,10 +628,58 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         self.counters
             .last_cycle_duration_ns
             .store(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
+
+        // Record to histogram for percentile tracking.
+        self.cycle_histogram
+            .borrow_mut()
+            .record(std::time::Duration::from_nanos(elapsed_ns));
+
+        // Update percentile atomics every 100 cycles to amortize sort cost.
+        let cycle_count = self
+            .counters
+            .cycles
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if cycle_count.is_multiple_of(100) {
+            let (p50, p95, p99) = self.cycle_histogram.borrow().percentiles();
+            // DurationHistogram records in microseconds; convert to nanoseconds.
+            self.counters
+                .cycle_p50_ns
+                .store(p50 * 1_000, std::sync::atomic::Ordering::Relaxed);
+            self.counters
+                .cycle_p95_ns
+                .store(p95 * 1_000, std::sync::atomic::Ordering::Relaxed);
+            self.counters
+                .cycle_p99_ns
+                .store(p99 * 1_000, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn apply_control(&mut self, msg: crate::pipeline::ControlMsg) {
+        match msg {
+            crate::pipeline::ControlMsg::AddStream {
+                name,
+                sql,
+                emit_clause,
+                window_config,
+                order_config,
+            } => {
+                self.graph
+                    .add_query(name.clone(), sql, emit_clause, window_config, order_config);
+                tracing::info!(stream = %name, "Stream added via control channel");
+            }
+            crate::pipeline::ControlMsg::DropStream { name } => {
+                self.graph.remove_query(&name);
+                tracing::info!(stream = %name, "Stream removed via control channel");
+            }
+            crate::pipeline::ControlMsg::AddSourceSchema { name, schema } => {
+                self.graph.register_source_schema(name, schema);
+            }
+        }
     }
 
     async fn poll_tables(&mut self) {
         use laminar_connectors::reference::RefreshMode;
+        let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
 
         for (name, source, mode) in &mut self.table_sources {
             if matches!(mode, RefreshMode::SnapshotOnly | RefreshMode::Manual) {
@@ -608,40 +810,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 }
 
-/// Captures current source offsets from a coordinator's registered sources.
-///
-/// Locks each source connector to call `checkpoint()` and converts the
-/// result to `ConnectorCheckpoint`. Must be called at a consistent point
-/// (same time as operator state capture) before spawning async work.
-async fn capture_source_offsets_from_coordinator(
-    coordinator: &Arc<
-        tokio::sync::Mutex<Option<crate::checkpoint_coordinator::CheckpointCoordinator>>,
-    >,
-) -> HashMap<String, laminar_storage::checkpoint_manifest::ConnectorCheckpoint> {
-    use crate::checkpoint_coordinator::source_to_connector_checkpoint;
-
-    let guard = coordinator.lock().await;
-    let Some(ref coord) = *guard else {
-        return HashMap::new();
-    };
-    // Collect connector Arcs + names first, then drop the coordinator lock
-    // before locking individual sources (avoids holding two locks).
-    let source_refs: Vec<_> = coord
-        .registered_sources()
-        .iter()
-        .map(|s| (s.name.clone(), Arc::clone(&s.connector)))
-        .collect();
-    drop(guard);
-
-    let mut overrides = HashMap::with_capacity(source_refs.len());
-    for (name, connector) in source_refs {
-        let guard = connector.lock().await;
-        let cp = guard.checkpoint();
-        overrides.insert(name, source_to_connector_checkpoint(&cp));
-    }
-    overrides
-}
-
 /// Update a partial foyer cache from a CDC batch by inserting or deleting
 /// each row keyed by the primary key column(s).
 ///
@@ -653,7 +821,6 @@ fn update_partial_cache_from_batch(
     batch: &RecordBatch,
 ) {
     use arrow_array::{Array, StringArray};
-    use laminar_core::lookup::table::LookupTable;
 
     if partial.key_columns.is_empty() {
         return;
@@ -787,4 +954,83 @@ async fn apply_filter(
     let _ = ctx.deregister_table(&*table_name);
 
     result
+}
+
+/// Apply a compiled `PhysicalExpr` filter to a batch.
+fn apply_compiled_sink_filter(
+    batch: &RecordBatch,
+    filter: &Arc<dyn PhysicalExpr>,
+) -> Result<Option<RecordBatch>, DbError> {
+    if batch.num_rows() == 0 {
+        return Ok(None);
+    }
+    let result = filter
+        .evaluate(batch)
+        .map_err(|e| DbError::Pipeline(format!("sink filter evaluate: {e}")))?;
+    let mask = result
+        .into_array(batch.num_rows())
+        .map_err(|e| DbError::Pipeline(format!("sink filter to array: {e}")))?;
+    let bool_arr = mask
+        .as_any()
+        .downcast_ref::<arrow::array::BooleanArray>()
+        .ok_or_else(|| DbError::Pipeline("sink filter not boolean".into()))?;
+    let filtered = arrow::compute::filter_record_batch(batch, bool_arr)
+        .map_err(|e| DbError::Pipeline(format!("sink filter: {e}")))?;
+    if filtered.num_rows() == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(filtered))
+    }
+}
+
+/// Try to compile a sink filter SQL expression to a `PhysicalExpr`.
+///
+/// Plans the filter as a full SQL query against an empty table with the batch
+/// schema, then extracts the Filter predicate from the logical plan and
+/// compiles it. Returns `None` if compilation fails (caller falls back to
+/// SQL-based filter).
+async fn compile_sink_filter_sql(
+    ctx: &SessionContext,
+    filter_sql: &str,
+    batch_schema: &SchemaRef,
+) -> Option<Arc<dyn PhysicalExpr>> {
+    let table_name = "__compile_filter";
+    let empty =
+        datafusion::datasource::MemTable::try_new(batch_schema.clone(), vec![vec![]]).ok()?;
+    let _ = ctx.deregister_table(table_name);
+    ctx.register_table(table_name, Arc::new(empty)).ok()?;
+
+    let sql = format!("SELECT * FROM {table_name} WHERE {filter_sql}");
+    let plan = {
+        let df = ctx.sql(&sql).await.ok()?;
+        df.logical_plan().clone()
+    };
+    let _ = ctx.deregister_table(table_name);
+
+    // Walk plan to find Filter node
+    let filter_expr = find_filter_predicate(&plan)?;
+
+    // Compile against the batch schema
+    let df_schema = DFSchema::try_from(batch_schema.as_ref().clone()).ok()?;
+    let state = ctx.state();
+    let props = state.execution_props();
+    create_physical_expr(&filter_expr, &df_schema, props).ok()
+}
+
+/// Walk a logical plan to find the first Filter predicate.
+fn find_filter_predicate(plan: &datafusion_expr::LogicalPlan) -> Option<datafusion_expr::Expr> {
+    match plan {
+        datafusion_expr::LogicalPlan::Filter(f) => Some(f.predicate.clone()),
+        datafusion_expr::LogicalPlan::Projection(p) => find_filter_predicate(&p.input),
+        datafusion_expr::LogicalPlan::Sort(s) => find_filter_predicate(&s.input),
+        datafusion_expr::LogicalPlan::Limit(l) => find_filter_predicate(&l.input),
+        _ => {
+            for input in plan.inputs() {
+                if let Some(expr) = find_filter_predicate(input) {
+                    return Some(expr);
+                }
+            }
+            None
+        }
+    }
 }

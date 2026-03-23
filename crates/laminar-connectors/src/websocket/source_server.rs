@@ -435,7 +435,7 @@ mod tests {
                 path: None,
             },
             format: MessageFormat::Json,
-            on_backpressure: super::super::backpressure::BackpressureStrategy::Block,
+            on_backpressure: super::super::backpressure::WsBackpressure::Block,
             event_time_field: None,
             event_time_format: None,
             max_message_size: 64 * 1024 * 1024,

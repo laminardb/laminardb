@@ -2,9 +2,8 @@
 //!
 //! Provides:
 //!
-//! - [`DefaultSchemaEvolver`] — a general-purpose implementation of
-//!   [`SchemaEvolvable`] that performs name-based schema diffing,
-//!   compatibility evaluation, and schema merging
+//! - [`SchemaEvolution`] — a general-purpose schema evolver that performs
+//!   name-based schema diffing, compatibility evaluation, and schema merging
 //! - [`SchemaEvolutionEngine`] — orchestrates the full evolution flow:
 //!   detect → diff → evaluate → apply → record
 //! - [`SchemaHistory`] — tracks per-source schema version history
@@ -18,9 +17,7 @@ use std::time::SystemTime;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use super::error::{SchemaError, SchemaResult};
-use super::traits::{
-    ColumnProjection, CompatibilityMode, EvolutionVerdict, SchemaChange, SchemaEvolvable,
-};
+use super::traits::{ColumnProjection, CompatibilityMode, EvolutionVerdict, SchemaChange};
 
 // ── Safe widening rules ────────────────────────────────────────────
 
@@ -50,50 +47,57 @@ pub fn is_safe_widening(from: &DataType, to: &DataType) -> bool {
     )
 }
 
-// ── DefaultSchemaEvolver ───────────────────────────────────────────
+// ── SchemaEvolution ───────────────────────────────────────────
 
-/// A general-purpose implementation of [`SchemaEvolvable`] that uses
-/// name-based schema matching (suitable for JSON, CSV, Avro, etc.).
+/// A general-purpose schema evolver that uses name-based schema matching
+/// (suitable for JSON, CSV, Avro, etc.).
 ///
 /// For field-ID-based sources (Iceberg, Parquet), a specialised
 /// implementation should be used instead.
 #[derive(Debug, Clone)]
-pub struct DefaultSchemaEvolver {
+pub struct SchemaEvolution {
     /// The compatibility mode for evaluating changes.
     pub compatibility: CompatibilityMode,
 }
 
-impl DefaultSchemaEvolver {
+impl SchemaEvolution {
     /// Creates a new evolver with the given compatibility mode.
     #[must_use]
     pub fn new(compatibility: CompatibilityMode) -> Self {
         Self { compatibility }
     }
-}
 
-impl Default for DefaultSchemaEvolver {
-    fn default() -> Self {
-        Self {
-            compatibility: CompatibilityMode::None,
-        }
-    }
-}
-
-impl SchemaEvolvable for DefaultSchemaEvolver {
-    fn diff_schemas(&self, old: &SchemaRef, new: &SchemaRef) -> Vec<SchemaChange> {
+    /// Computes the differences between two schemas.
+    #[must_use]
+    pub fn diff_schemas(&self, old: &SchemaRef, new: &SchemaRef) -> Vec<SchemaChange> {
         diff_schemas_by_name(old, new)
     }
 
-    fn evaluate_evolution(&self, changes: &[SchemaChange]) -> EvolutionVerdict {
+    /// Evaluates whether a set of schema changes is acceptable.
+    #[must_use]
+    pub fn evaluate_evolution(&self, changes: &[SchemaChange]) -> EvolutionVerdict {
         evaluate_changes(changes, self.compatibility)
     }
 
-    fn apply_evolution(
+    /// Applies schema changes, returning a column projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a schema error if the evolution cannot be applied.
+    pub fn apply_evolution(
         &self,
         old: &SchemaRef,
         changes: &[SchemaChange],
     ) -> SchemaResult<ColumnProjection> {
         apply_changes(old, changes)
+    }
+}
+
+impl Default for SchemaEvolution {
+    fn default() -> Self {
+        Self {
+            compatibility: CompatibilityMode::None,
+        }
     }
 }
 
@@ -496,7 +500,7 @@ impl SchemaEvolutionEngine {
     pub fn evolve(
         &mut self,
         source_name: &str,
-        evolvable: &dyn SchemaEvolvable,
+        evolvable: &SchemaEvolution,
         current: &SchemaRef,
         proposed: &SchemaRef,
         trigger: EvolutionTrigger,
@@ -918,7 +922,7 @@ mod tests {
     #[test]
     fn test_engine_no_change() {
         let mut engine = SchemaEvolutionEngine::new(CompatibilityMode::Backward);
-        let evolver = DefaultSchemaEvolver::new(CompatibilityMode::Backward);
+        let evolver = SchemaEvolution::new(CompatibilityMode::Backward);
         let s = schema(&[("a", DataType::Int64, false)]);
 
         let result = engine
@@ -931,7 +935,7 @@ mod tests {
     #[test]
     fn test_engine_add_nullable_column() {
         let mut engine = SchemaEvolutionEngine::new(CompatibilityMode::Backward);
-        let evolver = DefaultSchemaEvolver::new(CompatibilityMode::Backward);
+        let evolver = SchemaEvolution::new(CompatibilityMode::Backward);
         let old = schema(&[("a", DataType::Int64, false)]);
         let new = schema(&[("a", DataType::Int64, false), ("b", DataType::Utf8, true)]);
 
@@ -957,7 +961,7 @@ mod tests {
     #[test]
     fn test_engine_incompatible_rejected() {
         let mut engine = SchemaEvolutionEngine::new(CompatibilityMode::Full);
-        let evolver = DefaultSchemaEvolver::new(CompatibilityMode::Full);
+        let evolver = SchemaEvolution::new(CompatibilityMode::Full);
         let old = schema(&[("a", DataType::Int32, false)]);
         let new = schema(&[("a", DataType::Int64, false)]); // widening under Full = incompatible
 
@@ -965,11 +969,11 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── DefaultSchemaEvolver integration ──────────────────────
+    // ── SchemaEvolution integration ──────────────────────
 
     #[test]
     fn test_default_evolver_diff_and_apply() {
-        let evolver = DefaultSchemaEvolver::default();
+        let evolver = SchemaEvolution::default();
         let old = schema(&[("id", DataType::Int64, false)]);
         let new = schema(&[
             ("id", DataType::Int64, false),

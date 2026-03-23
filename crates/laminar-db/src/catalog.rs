@@ -134,10 +134,7 @@ impl SourceEntry {
 }
 
 /// A registered sink in the catalog.
-#[allow(dead_code)]
 pub(crate) struct SinkEntry {
-    /// Sink name.
-    pub(crate) name: String,
     /// Input source or table name.
     pub(crate) input: String,
 }
@@ -279,7 +276,6 @@ impl SourceCatalog {
         sinks.insert(
             name.to_string(),
             SinkEntry {
-                name: name.to_string(),
                 input: input.to_string(),
             },
         );

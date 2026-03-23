@@ -29,7 +29,6 @@
 //! - `discovery`: Node discovery (static seeds, gossip, Kafka groups)
 //! - `coordination`: Raft-based metadata consensus
 //! - `partition`: Epoch-fenced partition ownership and migration
-//! - `checkpoint`: Distributed checkpoint coordination
 //! - `rpc`: gRPC services for inter-node communication
 
 /// Node discovery and membership.
@@ -40,6 +39,3 @@ pub mod coordination;
 
 /// Epoch-fenced partition ownership, assignment, and migration.
 pub mod partition;
-
-/// Distributed checkpoint coordination.
-pub mod checkpoint;

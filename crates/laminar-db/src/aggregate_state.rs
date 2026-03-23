@@ -25,8 +25,9 @@ use arrow::array::ArrayRef;
 use arrow::compute;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
-use datafusion_common::ScalarValue;
+use datafusion_common::{DFSchema, ScalarValue};
 use datafusion_expr::function::AccumulatorArgs;
 use datafusion_expr::{AggregateUDF, LogicalPlan};
 use serde_json::json;
@@ -306,22 +307,24 @@ pub(crate) struct EowcStateCheckpoint {
     pub windows: Vec<WindowCheckpoint>,
 }
 
-/// Serializable checkpoint for join state (e.g., future stateful joins).
-///
-/// Currently ASOF and temporal joins are stateless per-cycle, so this is
-/// empty. The struct provides the extension point for future stateful
-/// streaming joins (e.g., interval joins with buffer windows).
+/// Serializable checkpoint for join state (interval joins).
 #[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct JoinStateCheckpoint {
-    /// Number of buffered left-side rows (for future stateful joins).
+    /// Number of buffered left-side rows.
     #[serde(default)]
     pub left_buffer_rows: u64,
-    /// Number of buffered right-side rows (for future stateful joins).
+    /// Number of buffered right-side rows.
     #[serde(default)]
     pub right_buffer_rows: u64,
-    /// Serialized join buffer state (opaque bytes).
+    /// Serialized left-side batches (Arrow IPC).
     #[serde(default)]
-    pub buffer_state: Option<Vec<u8>>,
+    pub left_batches: Vec<Vec<u8>>,
+    /// Serialized right-side batches (Arrow IPC).
+    #[serde(default)]
+    pub right_batches: Vec<Vec<u8>>,
+    /// Last watermark used for eviction.
+    #[serde(default)]
+    pub last_evicted_watermark: i64,
 }
 
 /// Top-level checkpoint for the entire `StreamExecutor`.
@@ -329,6 +332,9 @@ pub(crate) struct JoinStateCheckpoint {
 pub(crate) struct StreamExecutorCheckpoint {
     /// Checkpoint format version.
     pub version: u32,
+    /// Virtual partition count at checkpoint time.
+    #[serde(default)]
+    pub vnode_count: u16,
     /// Non-EOWC aggregate states, keyed by query name.
     #[serde(default)]
     pub agg_states: FxHashMap<String, AggStateCheckpoint>,
@@ -352,6 +358,13 @@ pub(crate) struct StreamExecutorCheckpoint {
     #[serde(default)]
     pub raw_eowc_states: FxHashMap<String, RawEowcCheckpoint>,
 }
+
+// Compile-time assertion: StreamExecutorCheckpoint must be Send
+// so it can be offloaded to spawn_blocking for serialization.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<StreamExecutorCheckpoint>();
+};
 
 /// Checkpoint for raw-batch EOWC state (non-aggregate EOWC queries).
 ///
@@ -436,7 +449,7 @@ impl AggFuncSpec {
 /// running aggregations produce correct results.
 pub(crate) struct IncrementalAggState {
     /// SQL that computes pre-aggregation expressions (group keys + agg inputs).
-    /// This handles expression evaluation (e.g., `price * quantity`) via `DataFusion`.
+    /// Kept for `query_fingerprint()` and as fallback for multi-source queries.
     pre_agg_sql: String,
     /// Number of group-by columns in the pre-agg output (first N columns).
     num_group_cols: usize,
@@ -448,10 +461,21 @@ pub(crate) struct IncrementalAggState {
     /// Aggregate function specifications.
     agg_specs: Vec<AggFuncSpec>,
     /// Per-group accumulator state.
+    ///
+    /// `DataFusion` `Accumulator` is trait-object dispatched (~2ns vtable overhead).
+    /// Acceptable because each call processes a batch, not per-row. 50+
+    /// aggregate types preclude enum dispatch.
     groups: AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>,
     /// Output schema (group columns + aggregate results).
     output_schema: SchemaRef,
-    /// HAVING predicate SQL to apply after emitting aggregate results.
+    /// Compiled pre-agg projection (single-source queries only).
+    compiled_projection: Option<CompiledProjection>,
+    /// Cached optimized logical plan for the pre-agg SQL (multi-source queries).
+    /// Skips SQL parsing and logical optimization on subsequent cycles.
+    cached_pre_agg_plan: Option<LogicalPlan>,
+    /// Compiled HAVING predicate.
+    having_filter: Option<Arc<dyn PhysicalExpr>>,
+    /// HAVING predicate SQL fallback (when compiled filter is not available).
     having_sql: Option<String>,
     /// Maximum number of distinct groups before new groups are dropped.
     max_groups: usize,
@@ -520,6 +544,16 @@ impl IncrementalAggState {
             group_types.push(agg_field.data_type().clone());
         }
 
+        // Determine if we should attempt to compile pre-agg expressions.
+        // Use single_source_table (counts occurrences) to reject self-joins.
+        let compile_source = crate::stream_executor::single_source_table(sql);
+        let state = ctx.state();
+        let props = state.execution_props();
+        let input_df_schema = &agg_info.input_df_schema;
+        let mut compiled_exprs: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+        let mut proj_fields: Vec<Field> = Vec::new();
+        let mut compile_ok = compile_source.is_some();
+
         let mut agg_specs = Vec::new();
         let mut pre_agg_select_items: Vec<String> = Vec::new();
 
@@ -532,6 +566,24 @@ impl IncrementalAggState {
             } else {
                 let group_sql = expr_to_sql(group_expr);
                 pre_agg_select_items.push(format!("{group_sql} AS \"__group_{i}\""));
+            }
+
+            // Compile group expression
+            if compile_ok {
+                match create_physical_expr(group_expr, input_df_schema, props) {
+                    Ok(phys) => {
+                        let dt = phys
+                            .data_type(input_df_schema.as_arrow())
+                            .unwrap_or(DataType::Utf8);
+                        let name = match group_expr {
+                            datafusion_expr::Expr::Column(col) => col.name.clone(),
+                            _ => format!("__group_{i}"),
+                        };
+                        proj_fields.push(Field::new(name, dt, true));
+                        compiled_exprs.push(phys);
+                    }
+                    Err(_) => compile_ok = false,
+                }
             }
         }
 
@@ -564,6 +616,25 @@ impl IncrementalAggState {
                     pre_agg_select_items.push(format!("TRUE AS \"__agg_input_{col_idx}\""));
                     input_col_indices.push(col_idx);
                     input_types.push(DataType::Boolean);
+
+                    // Compile literal TRUE
+                    if compile_ok {
+                        match create_physical_expr(
+                            &datafusion_expr::lit(true),
+                            input_df_schema,
+                            props,
+                        ) {
+                            Ok(phys) => {
+                                proj_fields.push(Field::new(
+                                    format!("__agg_input_{col_idx}"),
+                                    DataType::Boolean,
+                                    true,
+                                ));
+                                compiled_exprs.push(phys);
+                            }
+                            Err(_) => compile_ok = false,
+                        }
+                    }
                 } else {
                     for arg_expr in &agg_func.params.args {
                         let col_idx = next_col_idx;
@@ -578,9 +649,60 @@ impl IncrementalAggState {
                             pre_agg_select_items.push(format!(
                                 "CASE WHEN {filter_sql} THEN {expr_sql} ELSE NULL END AS \"__agg_input_{col_idx}\""
                             ));
+
+                            // Compile: CASE WHEN filter THEN arg ELSE NULL END
+                            if compile_ok {
+                                let case_expr =
+                                    datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
+                                        expr: None,
+                                        when_then_expr: vec![(
+                                            Box::new(filter_expr.as_ref().clone()),
+                                            Box::new(arg_expr.clone()),
+                                        )],
+                                        else_expr: Some(Box::new(datafusion_expr::lit(
+                                            ScalarValue::Null,
+                                        ))),
+                                    });
+                                match create_physical_expr(&case_expr, input_df_schema, props) {
+                                    Ok(phys) => {
+                                        let dt = resolve_expr_type(
+                                            arg_expr,
+                                            &input_schema,
+                                            agg_field.data_type(),
+                                        );
+                                        proj_fields.push(Field::new(
+                                            format!("__agg_input_{col_idx}"),
+                                            dt,
+                                            true,
+                                        ));
+                                        compiled_exprs.push(phys);
+                                    }
+                                    Err(_) => compile_ok = false,
+                                }
+                            }
                         } else {
                             pre_agg_select_items
                                 .push(format!("{expr_sql} AS \"__agg_input_{col_idx}\""));
+
+                            // Compile the arg expression directly
+                            if compile_ok {
+                                match create_physical_expr(arg_expr, input_df_schema, props) {
+                                    Ok(phys) => {
+                                        let dt = resolve_expr_type(
+                                            arg_expr,
+                                            &input_schema,
+                                            agg_field.data_type(),
+                                        );
+                                        proj_fields.push(Field::new(
+                                            format!("__agg_input_{col_idx}"),
+                                            dt,
+                                            true,
+                                        ));
+                                        compiled_exprs.push(phys);
+                                    }
+                                    Err(_) => compile_ok = false,
+                                }
+                            }
                         }
 
                         input_col_indices.push(col_idx);
@@ -598,6 +720,30 @@ impl IncrementalAggState {
                     pre_agg_select_items.push(format!(
                             "CASE WHEN {filter_sql} THEN TRUE ELSE FALSE END AS \"__agg_filter_{col_idx}\""
                         ));
+
+                    // Compile: CASE WHEN filter THEN TRUE ELSE FALSE END
+                    if compile_ok {
+                        let case_expr = datafusion_expr::Expr::Case(datafusion_expr::expr::Case {
+                            expr: None,
+                            when_then_expr: vec![(
+                                Box::new(filter_expr.as_ref().clone()),
+                                Box::new(datafusion_expr::lit(true)),
+                            )],
+                            else_expr: Some(Box::new(datafusion_expr::lit(false))),
+                        });
+                        match create_physical_expr(&case_expr, input_df_schema, props) {
+                            Ok(phys) => {
+                                proj_fields.push(Field::new(
+                                    format!("__agg_filter_{col_idx}"),
+                                    DataType::Boolean,
+                                    true,
+                                ));
+                                compiled_exprs.push(phys);
+                            }
+                            Err(_) => compile_ok = false,
+                        }
+                    }
+
                     Some(col_idx)
                 } else {
                     None
@@ -631,6 +777,34 @@ impl IncrementalAggState {
             clauses.where_clause,
         );
 
+        // Build compiled projection for single-source queries.
+        let compiled_projection = if compile_ok {
+            let source_table = compile_source.unwrap();
+            // Compile WHERE predicate
+            let filter = if let Some(where_pred) = &agg_info.where_predicate {
+                if let Ok(phys) = create_physical_expr(where_pred, input_df_schema, props) {
+                    Some(phys)
+                } else {
+                    compile_ok = false;
+                    None
+                }
+            } else {
+                None
+            };
+            if compile_ok {
+                Some(CompiledProjection {
+                    source_table,
+                    exprs: compiled_exprs,
+                    filter,
+                    output_schema: Arc::new(Schema::new(proj_fields)),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let mut output_fields: Vec<Field> = Vec::new();
         for (name, dt) in group_col_names.iter().zip(group_types.iter()) {
             output_fields.push(Field::new(name, dt.clone(), true));
@@ -644,7 +818,31 @@ impl IncrementalAggState {
         }
         let output_schema = Arc::new(Schema::new(output_fields));
 
-        let having_sql = having_predicate.as_ref().map(expr_to_sql);
+        // Compile HAVING filter.
+        let having_filter = compile_having_filter(ctx, having_predicate.as_ref(), &output_schema);
+        let having_sql = if having_filter.is_none() {
+            having_predicate.as_ref().map(expr_to_sql)
+        } else {
+            None
+        };
+
+        // ONE-TIME setup: cache the optimized logical plan for multi-source
+        // pre-agg queries (when compiled projection is not available). This
+        // ctx.sql() call runs ONLY at first-cycle initialization, never
+        // per-cycle. Subsequent cycles use the cached plan directly.
+        // Fail fast if the pre-agg SQL is invalid — it would fail every cycle.
+        let cached_pre_agg_plan = if compiled_projection.is_none() {
+            match ctx.sql(&pre_agg_sql).await {
+                Ok(df) => Some(df.logical_plan().clone()),
+                Err(e) => {
+                    return Err(DbError::Pipeline(format!(
+                        "pre-agg SQL planning failed for aggregate: {e}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
 
         Ok(Some(Self {
             pre_agg_sql,
@@ -654,6 +852,9 @@ impl IncrementalAggState {
             agg_specs,
             groups: AHashMap::new(),
             output_schema,
+            compiled_projection,
+            cached_pre_agg_plan,
+            having_filter,
             having_sql,
             max_groups: 1_000_000,
         }))
@@ -857,18 +1058,60 @@ impl IncrementalAggState {
     }
 
     /// Pre-aggregation SQL.
+    #[allow(dead_code)] // Accessed in tests and available for diagnostics.
     pub fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql
     }
 
-    /// HAVING predicate SQL, if any.
+    /// Compiled HAVING filter, if any.
+    pub fn having_filter(&self) -> Option<&Arc<dyn PhysicalExpr>> {
+        self.having_filter.as_ref()
+    }
+
+    /// HAVING predicate SQL fallback (when compiled filter is not available).
     pub fn having_sql(&self) -> Option<&str> {
         self.having_sql.as_deref()
+    }
+
+    /// Compiled pre-agg projection (single-source queries only).
+    pub fn compiled_projection(&self) -> Option<&CompiledProjection> {
+        self.compiled_projection.as_ref()
+    }
+
+    /// Cached optimized logical plan for the pre-agg SQL.
+    ///
+    /// Present only for multi-source queries (where `compiled_projection` is
+    /// `None`). Allows skipping SQL parsing and logical optimization per cycle.
+    pub fn cached_pre_agg_plan(&self) -> Option<&LogicalPlan> {
+        self.cached_pre_agg_plan.as_ref()
     }
 
     /// Compute a fingerprint for this query (SQL + schema).
     pub(crate) fn query_fingerprint(&self) -> u64 {
         query_fingerprint(&self.pre_agg_sql, &self.output_schema)
+    }
+
+    /// Estimated memory usage in bytes across all groups.
+    ///
+    /// Sums `ScalarValue::size()` for each group key element and
+    /// `Accumulator::size()` for each per-group accumulator.
+    pub(crate) fn estimated_size_bytes(&self) -> usize {
+        let mut total = 0;
+        for (key, accs) in &self.groups {
+            for sv in key {
+                total += sv.size();
+            }
+            for acc in accs {
+                total += acc.size();
+            }
+        }
+        total
+    }
+
+    /// Number of distinct groups currently tracked.
+    #[allow(dead_code)]
+    pub(crate) fn group_count(&self) -> usize {
+        self.groups.len()
     }
 
     /// Checkpoint all group states into a serializable struct.
@@ -951,6 +1194,10 @@ pub(crate) struct AggregateInfo {
     pub(crate) input_schema: Arc<Schema>,
     /// HAVING predicate (from a Filter node directly above the Aggregate).
     pub(crate) having_predicate: Option<datafusion_expr::Expr>,
+    /// `DFSchema` of the Aggregate's input (for compiling pre-agg expressions).
+    pub(crate) input_df_schema: Arc<DFSchema>,
+    /// WHERE predicate from a Filter node below the Aggregate, if any.
+    pub(crate) where_predicate: Option<datafusion_expr::Expr>,
 }
 
 /// Walk a `DataFusion` `LogicalPlan` tree to find the first `Aggregate` node.
@@ -966,12 +1213,16 @@ fn find_aggregate_inner(
         LogicalPlan::Aggregate(agg) => {
             let schema = Arc::new(agg.schema.as_arrow().clone());
             let input_schema = Arc::new(agg.input.schema().as_arrow().clone());
+            let input_df_schema = Arc::clone(agg.input.schema());
+            let where_predicate = extract_where_predicate(&agg.input);
             Some(AggregateInfo {
                 group_exprs: agg.group_expr.clone(),
                 aggr_exprs: agg.aggr_expr.clone(),
                 schema,
                 input_schema,
                 having_predicate: parent_filter.cloned(),
+                input_df_schema,
+                where_predicate,
             })
         }
         // A Filter directly above an Aggregate is a HAVING clause
@@ -995,6 +1246,22 @@ fn find_aggregate_inner(
             }
             None
         }
+    }
+}
+
+/// Extract the WHERE predicate from a plan tree below the Aggregate.
+///
+/// Walks through common unary wrapper nodes (Projection, Sort, Limit,
+/// `SubqueryAlias`) to find a `Filter` that the optimizer may have placed
+/// below intermediate nodes.
+fn extract_where_predicate(plan: &LogicalPlan) -> Option<datafusion_expr::Expr> {
+    match plan {
+        LogicalPlan::Filter(f) => Some(f.predicate.clone()),
+        LogicalPlan::Projection(p) => extract_where_predicate(&p.input),
+        LogicalPlan::Sort(s) => extract_where_predicate(&s.input),
+        LogicalPlan::Limit(l) => extract_where_predicate(&l.input),
+        LogicalPlan::SubqueryAlias(a) => extract_where_predicate(&a.input),
+        _ => None,
     }
 }
 
@@ -1178,6 +1445,123 @@ pub(crate) fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
         Expr::Wildcard { .. } => "TRUE".to_string(),
         other => other.to_string(),
     }
+}
+
+/// Pre-compiled projection for evaluating pre-agg expressions without SQL.
+///
+/// Replaces the `ctx.sql(pre_agg_sql).await.collect().await` hot-path call
+/// with direct `PhysicalExpr::evaluate()` on the source batch, eliminating
+/// SQL parsing, logical planning, physical planning, and `MemTable` overhead.
+#[allow(dead_code)] // source_table used by legacy evaluate_compiled_projection path
+pub(crate) struct CompiledProjection {
+    /// Source table name (for looking up raw batches instead of querying `MemTable`).
+    pub(crate) source_table: String,
+    /// One `PhysicalExpr` per column in the output (group keys, agg inputs, filter bools).
+    pub(crate) exprs: Vec<Arc<dyn PhysicalExpr>>,
+    /// WHERE predicate (applied before projection), if any.
+    pub(crate) filter: Option<Arc<dyn PhysicalExpr>>,
+    /// Output schema matching what `process_batch` / `update_batch` expects.
+    pub(crate) output_schema: SchemaRef,
+}
+
+impl CompiledProjection {
+    /// Source table name.
+    pub(crate) fn source_table(&self) -> &str {
+        &self.source_table
+    }
+
+    /// Evaluate the projection against a source batch.
+    ///
+    /// Applies the WHERE filter (if any), then evaluates each expression
+    /// to produce the projected output batch.
+    pub(crate) fn evaluate(&self, batch: &RecordBatch) -> Result<RecordBatch, DbError> {
+        if batch.num_rows() == 0 {
+            return Ok(RecordBatch::new_empty(Arc::clone(&self.output_schema)));
+        }
+
+        // Apply WHERE filter first
+        let filtered = if let Some(ref filter) = self.filter {
+            let result = filter
+                .evaluate(batch)
+                .map_err(|e| DbError::Pipeline(format!("WHERE filter evaluate: {e}")))?;
+            let mask = result
+                .into_array(batch.num_rows())
+                .map_err(|e| DbError::Pipeline(format!("WHERE filter to array: {e}")))?;
+            let bool_arr = mask
+                .as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .ok_or_else(|| DbError::Pipeline("WHERE filter not boolean".into()))?;
+            arrow::compute::filter_record_batch(batch, bool_arr)
+                .map_err(|e| DbError::Pipeline(format!("WHERE filter: {e}")))?
+        } else {
+            batch.clone()
+        };
+
+        if filtered.num_rows() == 0 {
+            return Ok(RecordBatch::new_empty(Arc::clone(&self.output_schema)));
+        }
+
+        // Evaluate each projection expression
+        let mut arrays = Vec::with_capacity(self.exprs.len());
+        for expr in &self.exprs {
+            let result = expr
+                .evaluate(&filtered)
+                .map_err(|e| DbError::Pipeline(format!("projection evaluate: {e}")))?;
+            let arr = result
+                .into_array(filtered.num_rows())
+                .map_err(|e| DbError::Pipeline(format!("projection to array: {e}")))?;
+            arrays.push(arr);
+        }
+
+        RecordBatch::try_new(Arc::clone(&self.output_schema), arrays)
+            .map_err(|e| DbError::Pipeline(format!("projection batch build: {e}")))
+    }
+}
+
+/// Apply a compiled HAVING filter to emitted aggregate batches.
+///
+/// Evaluates the `PhysicalExpr` predicate against each batch and filters rows.
+pub(crate) fn apply_compiled_having(
+    batches: &[RecordBatch],
+    having_filter: &Arc<dyn PhysicalExpr>,
+) -> Result<Vec<RecordBatch>, DbError> {
+    let mut result = Vec::with_capacity(batches.len());
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let mask_result = having_filter
+            .evaluate(batch)
+            .map_err(|e| DbError::Pipeline(format!("HAVING evaluate: {e}")))?;
+        let mask = mask_result
+            .into_array(batch.num_rows())
+            .map_err(|e| DbError::Pipeline(format!("HAVING to array: {e}")))?;
+        let bool_arr = mask
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .ok_or_else(|| DbError::Pipeline("HAVING filter not boolean".into()))?;
+        let filtered = arrow::compute::filter_record_batch(batch, bool_arr)
+            .map_err(|e| DbError::Pipeline(format!("HAVING filter: {e}")))?;
+        if filtered.num_rows() > 0 {
+            result.push(filtered);
+        }
+    }
+    Ok(result)
+}
+
+/// Compile a HAVING predicate to a `PhysicalExpr`.
+///
+/// Returns `None` if compilation fails (caller should fall back to SQL).
+pub(crate) fn compile_having_filter(
+    ctx: &SessionContext,
+    having_predicate: Option<&datafusion_expr::Expr>,
+    output_schema: &SchemaRef,
+) -> Option<Arc<dyn PhysicalExpr>> {
+    let having_pred = having_predicate?;
+    let df_schema = DFSchema::try_from(output_schema.as_ref().clone()).ok()?;
+    let state = ctx.state();
+    let props = state.execution_props();
+    create_physical_expr(having_pred, &df_schema, props).ok()
 }
 
 /// Extracted FROM and WHERE clauses from a SQL query.
@@ -2599,7 +2983,7 @@ mod tests {
         laminar_sql::register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
         // No queries registered = no state
-        let result = executor.checkpoint_state().unwrap();
+        let result = executor.snapshot_state().unwrap();
         assert!(result.is_none());
     }
 
@@ -2671,12 +3055,15 @@ mod tests {
             JoinStateCheckpoint {
                 left_buffer_rows: 100,
                 right_buffer_rows: 50,
-                buffer_state: Some(vec![1, 2, 3]),
+                left_batches: vec![vec![1, 2, 3]],
+                right_batches: vec![vec![4, 5, 6]],
+                last_evicted_watermark: 42,
             },
         );
 
         let cp = StreamExecutorCheckpoint {
-            version: 1,
+            version: 2,
+            vnode_count: laminar_core::state::VNODE_COUNT,
             agg_states: FxHashMap::default(),
             eowc_states: FxHashMap::default(),
             core_window_states: FxHashMap::default(),
@@ -2691,6 +3078,8 @@ mod tests {
         let js = restored.join_states.get("enriched").unwrap();
         assert_eq!(js.left_buffer_rows, 100);
         assert_eq!(js.right_buffer_rows, 50);
-        assert_eq!(js.buffer_state, Some(vec![1, 2, 3]));
+        assert_eq!(js.left_batches, vec![vec![1, 2, 3]]);
+        assert_eq!(js.right_batches, vec![vec![4, 5, 6]]);
+        assert_eq!(js.last_evicted_watermark, 42);
     }
 }

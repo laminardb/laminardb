@@ -127,13 +127,13 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Override thread-per-core runtime settings.
-    ///
-    /// The pipeline always uses TPC mode. This method overrides the
-    /// auto-detected defaults (core count, CPU pinning, NUMA awareness).
+    /// Set the end-to-end delivery guarantee for the pipeline.
     #[must_use]
-    pub fn with_tpc(mut self, tpc: crate::config::TpcRuntimeConfig) -> Self {
-        self.config.tpc = Some(tpc);
+    pub fn delivery_guarantee(
+        mut self,
+        guarantee: laminar_connectors::connector::DeliveryGuarantee,
+    ) -> Self {
+        self.config.delivery_guarantee = guarantee;
         self
     }
 

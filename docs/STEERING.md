@@ -52,11 +52,13 @@ Reactor, state stores, tumbling windows, DataFusion integration, WAL, checkpoint
 
 ### Phase 2: Production Hardening -- COMPLETE (38/38)
 
-Thread-per-core, all window types, all join types, exactly-once sinks, two-phase commit, per-core WAL, incremental checkpointing, NUMA, io_uring, Z-set changelog, cascading MVs, watermark variants, JIT groundwork.
+All window types, all join types, exactly-once sinks, two-phase commit, per-core WAL, incremental checkpointing, Z-set changelog, cascading MVs, watermark variants. Thread-per-core (superseded by StreamingCoordinator, PR #204), NUMA (feature-gated), io_uring (feature-gated).
 
-### Phase 2.5: JIT Compiler -- COMPLETE (12/12)
+### Phase 2.5: JIT Compiler -- REMOVED
 
-Cranelift JIT compilation, adaptive compilation warmup, compiled stateful pipeline bridge.
+Cranelift JIT compilation was implemented but removed. Compiled `PhysicalExpr`
+projections in `StreamExecutor` provide the same zero-overhead per-cycle benefit
+without a JIT dependency.
 
 ### Phase 6b: Delta Foundation -- COMPLETE (14/14)
 

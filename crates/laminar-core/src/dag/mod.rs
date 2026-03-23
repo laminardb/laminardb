@@ -13,7 +13,7 @@
 //! - **`DagChannelType`**: Auto-derived channel types (SPSC/SPMC/MPSC)
 //! - **`MulticastBuffer`**: Zero-copy SPMC multicast for shared stages
 //! - **`RoutingTable`**: Pre-computed O(1) dispatch table
-//! - **`DagExecutor`**: Ring 0 event processing engine
+//! - **`DagExecutor`**: Per-event processing engine (programmatic Rust API)
 //!
 //! ## Key Design Principles
 //!
@@ -27,11 +27,11 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────┐
-//! │                     RING 2: CONTROL PLANE                       │
+//! │                    CONSTRUCTION TIME                             │
 //! │  DagBuilder constructs StreamingDag topology                    │
 //! │  ┌──────────┐   ┌──────────────┐   ┌───────────────────┐       │
 //! │  │DagBuilder│──▶│ StreamingDag │──▶│ RoutingTable      │       │
-//! │  │ (Ring 2) │   │  (immutable) │   │ (cache-aligned)   │       │
+//! │  │          │   │  (immutable) │   │ (cache-aligned)   │       │
 //! │  └──────────┘   └──────────────┘   └───────────────────┘       │
 //! │                                                                 │
 //! │  MulticastBuffer<T> per shared stage (pre-allocated slots)      │
@@ -79,17 +79,12 @@ mod tests;
 pub use builder::{DagBuilder, FanOutBuilder};
 pub use changelog::DagChangelogPropagator;
 pub use checkpoint::{
-    AlignmentResult, BarrierAligner, BarrierType, CheckpointBarrier, CheckpointId,
-    DagCheckpointConfig, DagCheckpointCoordinator,
+    AlignmentResult, BarrierAligner, DagCheckpointConfig, DagCheckpointCoordinator,
 };
 pub use error::DagError;
-#[cfg(feature = "dag-metrics")]
-pub use executor::OperatorNodeMetrics;
-pub use executor::{DagExecutor, DagExecutorMetrics};
+pub use executor::{DagExecutor, DagExecutorMetrics, OperatorNodeMetrics};
 pub use multicast::MulticastBuffer;
-pub use recovery::{
-    DagCheckpointSnapshot, DagRecoveryManager, RecoveredDagState, SerializableOperatorState,
-};
+pub use recovery::{DagCheckpointResult, OperatorStateEntry};
 pub use routing::{RoutingEntry, RoutingTable, MAX_PORTS};
 pub use topology::{
     DagChannelType, DagEdge, DagNode, DagNodeType, EdgeId, NodeId, PartitioningStrategy,

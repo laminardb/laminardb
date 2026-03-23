@@ -11,12 +11,12 @@ description = "Storage layer for LaminarDB - WAL, checkpointing, and lakehouse i
 
 [dependencies]
 # Core dependency
-laminar-core = { path = "../laminar-core", version = "0.18.2" }
+laminar-core = { path = "../laminar-core", version = "0.18.10" }
 
 # Storage
 object_store = "0.13"  # For cloud storage
 parquet = "57.2"  # For lakehouse formats
-delta_kernel = { version = "0.20", optional = true }  # Delta Lake
+
 
 # Serialization (rkyv for zero-copy performance)
 rkyv = { workspace = true }
@@ -48,7 +48,6 @@ backoff = { workspace = true }
 
 # Async
 tokio = { workspace = true }
-async-trait = { workspace = true }
 futures = { workspace = true }
 
 # Error handling
@@ -60,7 +59,7 @@ tracing = { workspace = true }
 
 [features]
 default = []
-delta = ["dep:delta_kernel"]
+
 io-uring = ["laminar-core/io-uring"]
 aws = ["object_store/aws"]
 gcs = ["object_store/gcp"]

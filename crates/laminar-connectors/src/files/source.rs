@@ -309,11 +309,6 @@ impl SourceConnector for FileSource {
     fn supports_replay(&self) -> bool {
         true
     }
-
-    fn as_schema_evolvable(&self) -> Option<&dyn crate::schema::traits::SchemaEvolvable> {
-        // Delegate to DefaultSchemaEvolver when needed.
-        None
-    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────

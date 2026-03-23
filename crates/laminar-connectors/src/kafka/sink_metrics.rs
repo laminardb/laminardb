@@ -25,6 +25,12 @@ pub struct KafkaSinkMetrics {
     pub dlq_records: AtomicU64,
     /// Total serialization errors.
     pub serialization_errors: AtomicU64,
+    /// Sum of produce delivery latencies in microseconds.
+    pub produce_latency_sum_us: AtomicU64,
+    /// Maximum produce delivery latency in microseconds.
+    pub produce_latency_max_us: AtomicU64,
+    /// Number of produce delivery latency samples.
+    pub produce_latency_count: AtomicU64,
 }
 
 impl KafkaSinkMetrics {
@@ -39,6 +45,9 @@ impl KafkaSinkMetrics {
             epochs_rolled_back: AtomicU64::new(0),
             dlq_records: AtomicU64::new(0),
             serialization_errors: AtomicU64::new(0),
+            produce_latency_sum_us: AtomicU64::new(0),
+            produce_latency_max_us: AtomicU64::new(0),
+            produce_latency_count: AtomicU64::new(0),
         }
     }
 
@@ -73,6 +82,26 @@ impl KafkaSinkMetrics {
         self.serialization_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records a produce delivery latency sample in microseconds.
+    pub fn record_produce_latency(&self, latency_us: u64) {
+        self.produce_latency_sum_us
+            .fetch_add(latency_us, Ordering::Relaxed);
+        self.produce_latency_count.fetch_add(1, Ordering::Relaxed);
+        // CAS loop for max.
+        let mut current = self.produce_latency_max_us.load(Ordering::Relaxed);
+        while latency_us > current {
+            match self.produce_latency_max_us.compare_exchange_weak(
+                current,
+                latency_us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
     /// Converts to the SDK's [`ConnectorMetrics`].
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
@@ -100,6 +129,16 @@ impl KafkaSinkMetrics {
             "kafka.serialization_errors",
             self.serialization_errors.load(Ordering::Relaxed) as f64,
         );
+        let latency_count = self.produce_latency_count.load(Ordering::Relaxed);
+        let latency_sum = self.produce_latency_sum_us.load(Ordering::Relaxed);
+        let latency_max = self.produce_latency_max_us.load(Ordering::Relaxed);
+        let latency_avg = if latency_count > 0 {
+            latency_sum as f64 / latency_count as f64
+        } else {
+            0.0
+        };
+        m.add_custom("kafka.produce_latency_avg_us", latency_avg);
+        m.add_custom("kafka.produce_latency_max_us", latency_max as f64);
         m
     }
 }
@@ -171,5 +210,48 @@ mod tests {
             .iter()
             .find(|(k, _)| k == "kafka.serialization_errors");
         assert_eq!(serde.unwrap().1, 1.0);
+    }
+
+    #[test]
+    fn test_produce_latency_recording() {
+        let m = KafkaSinkMetrics::new();
+        m.record_produce_latency(100);
+        m.record_produce_latency(200);
+        m.record_produce_latency(50);
+
+        assert_eq!(m.produce_latency_count.load(Ordering::Relaxed), 3);
+        assert_eq!(m.produce_latency_sum_us.load(Ordering::Relaxed), 350);
+        assert_eq!(m.produce_latency_max_us.load(Ordering::Relaxed), 200);
+    }
+
+    #[test]
+    fn test_produce_latency_avg_and_max_in_custom_metrics() {
+        let m = KafkaSinkMetrics::new();
+        m.record_produce_latency(100);
+        m.record_produce_latency(300);
+
+        let cm = m.to_connector_metrics();
+        let avg = cm
+            .custom
+            .iter()
+            .find(|(k, _)| k == "kafka.produce_latency_avg_us");
+        assert!((avg.unwrap().1 - 200.0).abs() < f64::EPSILON);
+
+        let max = cm
+            .custom
+            .iter()
+            .find(|(k, _)| k == "kafka.produce_latency_max_us");
+        assert!((max.unwrap().1 - 300.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_produce_latency_zero_when_no_samples() {
+        let m = KafkaSinkMetrics::new();
+        let cm = m.to_connector_metrics();
+        let avg = cm
+            .custom
+            .iter()
+            .find(|(k, _)| k == "kafka.produce_latency_avg_us");
+        assert!((avg.unwrap().1).abs() < f64::EPSILON);
     }
 }

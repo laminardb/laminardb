@@ -16,9 +16,16 @@ mod reload;
 mod server;
 mod watcher;
 
+// Platform-dependent allocator selection:
+// - Unix / non-MSVC: jemalloc (excellent fragmentation control, NUMA-aware)
+// - Windows MSVC: mimalloc (only high-perf allocator supporting MSVC)
 #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(all(feature = "mimalloc", target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::path::PathBuf;
 
@@ -57,8 +64,14 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| format!("laminardb={}", args.log_level).into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                format!(
+                    "laminar_server={l},laminar_db={l},laminar_core={l},\
+                     laminar_sql={l},laminar_connectors={l},laminar_storage={l}",
+                    l = args.log_level
+                )
+                .into()
+            }),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -128,7 +141,7 @@ fn build_checkpoint_store(
     let cp = &config.checkpoint;
     let url = &cp.url;
 
-    let obj_store = match laminar_storage::object_store_factory::build_object_store(
+    let obj_store = match laminar_storage::object_store_builder::build_object_store(
         url,
         &cp.storage,
     ) {

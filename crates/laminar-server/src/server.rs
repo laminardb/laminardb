@@ -198,6 +198,24 @@ pub async fn run_server(
         info!("Created sink: {}", sink.name);
     }
 
+    // 2b. Execute raw SQL pipeline if present (after structured DDL so
+    //     SQL can reference TOML-defined sources/lookups if needed).
+    if let Some(ref sql) = config.sql {
+        let trimmed = sql.trim();
+        if !trimmed.is_empty() {
+            db.execute(trimmed).await.map_err(|e| {
+                // Truncate for log readability; full SQL is in the TOML file.
+                let snippet: String = trimmed.chars().take(80).collect();
+                ServerError::Ddl {
+                    section: "sql".to_string(),
+                    name: snippet,
+                    source: e,
+                }
+            })?;
+            info!("Executed SQL pipeline definition");
+        }
+    }
+
     // 3. Start pipeline
     db.start()
         .await
@@ -219,20 +237,26 @@ pub async fn run_server(
     let api_handle = http::serve(router, &bind).await?;
     info!("HTTP API listening on {bind}");
 
-    // 5. Spawn config file watcher
-    let watcher_handle = {
+    // 5. Spawn config file watcher (disabled via LAMINAR_DISABLE_FILE_WATCH=1)
+    let watcher_disabled =
+        std::env::var("LAMINAR_DISABLE_FILE_WATCH").is_ok_and(|v| v == "1" || v == "true");
+    let watcher_handle = if watcher_disabled {
+        info!("Config file watcher disabled via LAMINAR_DISABLE_FILE_WATCH");
+        None
+    } else {
         let watcher_state = Arc::clone(&app_state);
         let watcher_path = config_path;
-        Some(tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             crate::watcher::watch_config(
                 watcher_path,
                 watcher_state,
                 std::time::Duration::from_millis(500),
             )
             .await;
-        }))
+        });
+        info!("Config file watcher started");
+        Some(handle)
     };
-    info!("Config file watcher started");
 
     Ok(ServerHandle::Embedded {
         db,
@@ -280,7 +304,7 @@ pub fn source_to_ddl(source: &SourceConfig) -> String {
     }
 
     // FROM CONNECTOR (...) clause
-    let connector_keyword = source.connector.to_uppercase();
+    let connector_keyword = source.connector.replace('-', "_").to_uppercase();
     let mut opts = Vec::new();
     opts.push(format!("format = '{}'", source.format));
     for (key, value) in &source.properties {
@@ -309,7 +333,7 @@ pub fn pipeline_to_ddl(pipeline: &PipelineConfig) -> String {
 /// CREATE SINK name FROM pipeline INTO KAFKA (key = 'value', ...)
 /// ```
 pub fn sink_to_ddl(sink: &SinkConfig) -> String {
-    let connector_keyword = sink.connector.to_uppercase();
+    let connector_keyword = sink.connector.replace('-', "_").to_uppercase();
     let mut opts: Vec<String> = sink
         .properties
         .iter()

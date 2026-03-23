@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use laminar_connectors::connector::DeliveryGuarantee;
 use laminar_core::streaming::{BackpressureStrategy, StreamCheckpointConfig};
 
 /// SQL identifier case sensitivity mode.
@@ -61,42 +62,6 @@ impl Default for TieringConfig {
     }
 }
 
-/// Thread-per-core runtime configuration.
-///
-/// Controls CPU pinning, core count, and NUMA settings for the TPC
-/// pipeline. When `None` on [`LaminarConfig`], auto-detected defaults
-/// are used.
-#[derive(Debug, Clone)]
-pub struct TpcRuntimeConfig {
-    /// Number of cores (`None` = auto-detect via `available_parallelism`).
-    pub num_cores: Option<usize>,
-    /// Pin core threads to CPUs starting from `cpu_start`.
-    pub cpu_pinning: bool,
-    /// First CPU ID for pinning.
-    pub cpu_start: usize,
-    /// Enable NUMA-aware memory allocation.
-    pub numa_aware: bool,
-}
-
-impl TpcRuntimeConfig {
-    /// Auto-detect system capabilities.
-    #[must_use]
-    pub fn auto() -> Self {
-        Self {
-            num_cores: None,
-            cpu_pinning: cfg!(target_os = "linux"),
-            cpu_start: 0,
-            numa_aware: cfg!(target_os = "linux"),
-        }
-    }
-}
-
-impl Default for TpcRuntimeConfig {
-    fn default() -> Self {
-        Self::auto()
-    }
-}
-
 /// Configuration for a `LaminarDB` instance.
 #[derive(Debug, Clone)]
 pub struct LaminarConfig {
@@ -116,8 +81,14 @@ pub struct LaminarConfig {
     pub object_store_options: HashMap<String, String>,
     /// S3 storage class tiering configuration (`None` = use default STANDARD).
     pub tiering: Option<TieringConfig>,
-    /// Thread-per-core runtime configuration (`None` = use tokio mode).
-    pub tpc: Option<TpcRuntimeConfig>,
+    /// End-to-end delivery guarantee (default: at-least-once).
+    pub delivery_guarantee: DeliveryGuarantee,
+    /// Maximum state bytes per operator before the query fails (`None` = unlimited).
+    ///
+    /// When set, the executor checks each aggregate/window operator's estimated
+    /// memory usage after every processing cycle. At 80% of the limit a warning
+    /// is emitted; at 100% the query returns an error.
+    pub max_state_bytes_per_operator: Option<usize>,
 }
 
 impl Default for LaminarConfig {
@@ -131,7 +102,8 @@ impl Default for LaminarConfig {
             object_store_url: None,
             object_store_options: HashMap::new(),
             tiering: None,
-            tpc: None,
+            delivery_guarantee: DeliveryGuarantee::default(),
+            max_state_bytes_per_operator: None,
         }
     }
 }
