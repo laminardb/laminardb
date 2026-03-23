@@ -2243,6 +2243,11 @@ mod tests {
             expected_sources += 1; // delta-lake source
             expected_sinks += 1; // delta-lake sink
         }
+        #[cfg(feature = "iceberg")]
+        {
+            expected_sources += 1; // iceberg source
+            expected_sinks += 1; // iceberg sink
+        }
         #[cfg(feature = "websocket")]
         {
             expected_sources += 1; // websocket source
@@ -2251,6 +2256,11 @@ mod tests {
         #[cfg(feature = "mysql-cdc")]
         {
             expected_sources += 1; // mysql CDC source
+        }
+        #[cfg(feature = "mongodb-cdc")]
+        {
+            expected_sources += 1; // mongodb CDC source
+            expected_sinks += 1; // mongodb sink
         }
         #[cfg(feature = "files")]
         {
