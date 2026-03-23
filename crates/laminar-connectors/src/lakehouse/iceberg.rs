@@ -139,7 +139,9 @@ impl IcebergSink {
         for field in target_schema.fields() {
             if let Ok(col_idx) = batch_schema.index_of(field.name()) {
                 let col = batch.column(col_idx);
-                if col.data_type() != field.data_type() {
+                if col.data_type() == field.data_type() {
+                    columns.push(col.clone());
+                } else {
                     columns.push(arrow_cast::cast(col, field.data_type()).map_err(|e| {
                         ConnectorError::WriteError(format!(
                             "cast field '{}' from {} to {}: {e}",
@@ -148,8 +150,6 @@ impl IcebergSink {
                             field.data_type(),
                         ))
                     })?);
-                } else {
-                    columns.push(col.clone());
                 }
             } else if field.is_nullable() {
                 // Nullable Iceberg column not in pipeline — fill with nulls.
@@ -195,6 +195,26 @@ impl IcebergSink {
         }
     }
 
+    /// Checks that every pipeline field still exists in the refreshed
+    /// Iceberg Arrow schema. Returns `SchemaMismatch` on drift.
+    #[cfg(feature = "iceberg")]
+    fn validate_schema_not_drifted(&self) -> Result<(), ConnectorError> {
+        if let (Some(pipeline_schema), Some(target_schema)) =
+            (&self.schema, &self.iceberg_arrow_schema)
+        {
+            for field in pipeline_schema.fields() {
+                if target_schema.field_with_name(field.name()).is_err() {
+                    return Err(ConnectorError::SchemaMismatch(format!(
+                        "pipeline field '{}' no longer exists in Iceberg table schema \
+                         (concurrent schema evolution?)",
+                        field.name(),
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Writes staged batches to Iceberg as data files and commits.
     #[cfg(feature = "iceberg")]
     async fn commit_to_iceberg(&mut self) -> Result<(), ConnectorError> {
@@ -219,22 +239,7 @@ impl IcebergSink {
         let location = table.metadata().location().to_string();
         let schema = table.current_schema_ref();
 
-        // Revalidate: every field in the pipeline schema must still exist in
-        // the (possibly refreshed) Iceberg Arrow schema. A concurrent ALTER
-        // TABLE DROP COLUMN would cause silent data loss otherwise.
-        if let (Some(pipeline_schema), Some(target_schema)) =
-            (&self.schema, &self.iceberg_arrow_schema)
-        {
-            for field in pipeline_schema.fields() {
-                if target_schema.field_with_name(field.name()).is_err() {
-                    return Err(ConnectorError::SchemaMismatch(format!(
-                        "pipeline field '{}' no longer exists in Iceberg table schema \
-                         (concurrent schema evolution?)",
-                        field.name(),
-                    )));
-                }
-            }
-        }
+        self.validate_schema_not_drifted()?;
 
         let props = parquet::file::properties::WriterProperties::builder()
             .set_compression(Self::parquet_compression(&self.config.compression))
