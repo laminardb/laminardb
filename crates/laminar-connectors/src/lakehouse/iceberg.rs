@@ -99,10 +99,12 @@ impl IcebergSink {
     /// Reprojects a pipeline `RecordBatch` onto the Iceberg-derived Arrow
     /// schema so that every field carries `PARQUET:field_id` metadata.
     ///
-    /// Columns are matched by name. Pipeline columns whose types differ from
-    /// the Iceberg schema are cast (safe widening was validated in `open()`).
-    /// Extra Iceberg columns not present in the pipeline batch are filled
-    /// with null arrays.
+    /// Fast path: when the batch schema fields match the Iceberg schema
+    /// field-for-field (same names, types, count), just swap the schema
+    /// wrapper — columns are already in the right order.
+    ///
+    /// Slow path: match columns by name, cast where types differ (safe
+    /// widening validated in `open()`), fill nullable extras with nulls.
     #[cfg(feature = "iceberg")]
     fn align_batch_to_iceberg_schema(
         &self,
@@ -116,10 +118,26 @@ impl IcebergSink {
                     actual: "iceberg arrow schema not initialized".into(),
                 })?;
 
+        // Fast path: field names, types, and count match — only metadata differs.
+        // Avoids per-column name lookup and Vec construction.
+        let batch_schema = batch.schema();
+        if batch_schema.fields().len() == target_schema.fields().len()
+            && batch_schema
+                .fields()
+                .iter()
+                .zip(target_schema.fields().iter())
+                .all(|(a, b)| a.name() == b.name() && a.data_type() == b.data_type())
+        {
+            return RecordBatch::try_new(target_schema.clone(), batch.columns().to_vec()).map_err(
+                |e| ConnectorError::WriteError(format!("align batch to iceberg schema: {e}")),
+            );
+        }
+
+        // Slow path: column reordering, type casting, or null-filling needed.
         let mut columns = Vec::with_capacity(target_schema.fields().len());
 
         for field in target_schema.fields() {
-            if let Ok(col_idx) = batch.schema().index_of(field.name()) {
+            if let Ok(col_idx) = batch_schema.index_of(field.name()) {
                 let col = batch.column(col_idx);
                 if col.data_type() != field.data_type() {
                     columns.push(arrow_cast::cast(col, field.data_type()).map_err(|e| {
