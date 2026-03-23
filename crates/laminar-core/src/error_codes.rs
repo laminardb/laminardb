@@ -169,6 +169,8 @@ pub const PIPELINE_ERROR: &str = "LDB-8002";
 pub const MATERIALIZED_VIEW_ERROR: &str = "LDB-8003";
 /// Query pipeline error (stream execution context).
 pub const QUERY_PIPELINE_ERROR: &str = "LDB-8004";
+/// No compiled projection or cached plan for pre-aggregation query.
+pub const NO_COMPILED_PROJECTION: &str = "LDB-8050";
 
 // ── Ring 0 Hot Path Errors ──
 

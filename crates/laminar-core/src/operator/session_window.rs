@@ -956,7 +956,7 @@ where
         output
     }
 
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         // Serialize pending timers: (session_id, timer_time, key_hash)
         let timer_entries: Vec<(u64, i64, u64)> = self
             .pending_timers
@@ -974,6 +974,7 @@ where
 
         OperatorState {
             operator_id: self.operator_id.clone(),
+            version: 1,
             data,
         }
     }
@@ -986,15 +987,19 @@ where
             )));
         }
 
+        if state.version != 1 {
+            return Err(OperatorError::ConfigError(format!(
+                "unsupported state version {}, expected 1",
+                state.version
+            )));
+        }
+
         if state.data.is_empty() {
             return Ok(());
         }
 
-        let archived =
-            rkyv::access::<rkyv::Archived<(Vec<(u64, i64, u64)>, u64)>, RkyvError>(&state.data)
-                .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
         let (timers, counter_val) =
-            rkyv::deserialize::<(Vec<(u64, i64, u64)>, u64), RkyvError>(archived)
+            rkyv::from_bytes::<(Vec<(u64, i64, u64)>, u64), RkyvError>(&state.data)
                 .map_err(|e| OperatorError::SerializationFailed(e.to_string()))?;
 
         self.pending_timers = timers

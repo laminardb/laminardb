@@ -1,9 +1,13 @@
 //! Unified checkpoint coordinator.
 //!
 //! Single orchestrator that replaces `StreamCheckpointManager`,
-//! `PipelineCheckpointManager`, and the persistence side of `DagRecoveryManager`.
+//! `PipelineCheckpointManager`, and the persistence side of `DagCheckpointResult`.
 //! Lives in Ring 2 (control plane). Reuses the existing
 //! `DagCheckpointCoordinator` for barrier logic.
+//!
+//! The checkpoint manifest is the source of truth for source offsets.
+//! Kafka broker commits are advisory (for monitoring tools). On recovery,
+//! offsets restore from manifest, not consumer group state.
 //!
 //! ## Checkpoint Cycle
 //!
@@ -582,14 +586,26 @@ impl CheckpointCoordinator {
     /// is configured via [`CheckpointConfig::pre_commit_timeout`].
     async fn pre_commit_sinks(&self, epoch: u64) -> Result<(), DbError> {
         let timeout_dur = self.config.pre_commit_timeout;
+        let start = std::time::Instant::now();
 
-        match tokio::time::timeout(timeout_dur, self.pre_commit_sinks_inner(epoch)).await {
-            Ok(result) => result,
-            Err(_elapsed) => Err(DbError::Checkpoint(format!(
-                "pre-commit timed out after {}s",
-                timeout_dur.as_secs()
-            ))),
+        let result =
+            match tokio::time::timeout(timeout_dur, self.pre_commit_sinks_inner(epoch)).await {
+                Ok(result) => result,
+                Err(_elapsed) => Err(DbError::Checkpoint(format!(
+                    "pre-commit timed out after {}s",
+                    timeout_dur.as_secs()
+                ))),
+            };
+
+        // Record pre-commit duration regardless of success/failure.
+        if let Some(ref counters) = self.counters {
+            #[allow(clippy::cast_possible_truncation)]
+            counters
+                .sink_precommit_duration_us
+                .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+
+        result
     }
 
     /// Inner pre-commit loop (no timeout).
@@ -619,8 +635,10 @@ impl CheckpointCoordinator {
     /// sink from blocking checkpoint completion indefinitely.
     async fn commit_sinks_tracked(&self, epoch: u64) -> HashMap<String, SinkCommitStatus> {
         let timeout_dur = self.config.commit_timeout;
+        let start = std::time::Instant::now();
 
-        match tokio::time::timeout(timeout_dur, self.commit_sinks_inner(epoch)).await {
+        let statuses = match tokio::time::timeout(timeout_dur, self.commit_sinks_inner(epoch)).await
+        {
             Ok(statuses) => statuses,
             Err(_elapsed) => {
                 error!(
@@ -643,7 +661,17 @@ impl CheckpointCoordinator {
                     })
                     .collect()
             }
+        };
+
+        // Record commit duration regardless of success/failure.
+        if let Some(ref counters) = self.counters {
+            #[allow(clippy::cast_possible_truncation)]
+            counters
+                .sink_commit_duration_us
+                .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+
+        statuses
     }
 
     /// Inner commit loop (no timeout).
@@ -888,13 +916,14 @@ impl CheckpointCoordinator {
     #[must_use]
     pub fn stats(&self) -> CheckpointStats {
         let (p50, p95, p99) = self.duration_histogram.percentiles();
+        // Histogram stores microseconds; stats fields are milliseconds.
         CheckpointStats {
             completed: self.checkpoints_completed,
             failed: self.checkpoints_failed,
             last_duration: self.last_checkpoint_duration,
-            duration_p50_ms: p50,
-            duration_p95_ms: p95,
-            duration_p99_ms: p99,
+            duration_p50_ms: p50 / 1_000,
+            duration_p95_ms: p95 / 1_000,
+            duration_p99_ms: p99 / 1_000,
             total_bytes_written: self.total_bytes_written,
             current_phase: self.phase,
             current_epoch: self.epoch,
@@ -1099,8 +1128,12 @@ impl CheckpointCoordinator {
                 );
             }
         }
-        // Track cumulative bytes written (updated after successful persist below).
-        let checkpoint_bytes = sidecar_bytes as u64;
+        // Track cumulative bytes written (manifest + sidecar).
+        // Serialize the manifest once to measure its size. This happens on the
+        // checkpoint path (not hot), and the actual persist re-serializes inside
+        // save_manifest via spawn_blocking.
+        let manifest_bytes = serde_json::to_string(&manifest).map_or(0, |s| s.len());
+        let checkpoint_bytes = (manifest_bytes + sidecar_bytes) as u64;
 
         // ── Step 5: Persist manifest (decision record — sinks are Pending) ──
         self.phase = CheckpointPhase::Persisting;
@@ -1185,6 +1218,22 @@ impl CheckpointCoordinator {
         self.last_checkpoint_duration = Some(duration);
         self.duration_histogram.record(duration);
         self.emit_checkpoint_metrics(true, epoch, duration);
+
+        // Emit checkpoint size and lag metrics.
+        if let Some(ref counters) = self.counters {
+            counters
+                .last_checkpoint_size_bytes
+                .store(checkpoint_bytes, Ordering::Relaxed);
+            #[allow(clippy::cast_possible_truncation)]
+            counters.last_checkpoint_timestamp_ms.store(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+                Ordering::Relaxed,
+            );
+        }
+
         self.adjust_interval();
 
         // ── Step 8: Begin next epoch on exactly-once sinks ──
@@ -1284,13 +1333,13 @@ impl std::fmt::Debug for CheckpointCoordinator {
     }
 }
 
-/// Fixed-size ring buffer for checkpoint duration percentile tracking.
+/// Fixed-size ring buffer for duration percentile tracking.
 ///
-/// Stores the last `CAPACITY` checkpoint durations and computes p50/p95/p99
-/// via sorted extraction. No heap allocation after construction.
+/// Stores the last `CAPACITY` durations in **microseconds** and computes
+/// p50/p95/p99 via sorted extraction. No heap allocation after construction.
 #[derive(Clone)]
 pub struct DurationHistogram {
-    /// Ring buffer of durations in milliseconds.
+    /// Ring buffer of durations in microseconds.
     samples: Box<[u64; Self::CAPACITY]>,
     /// Write cursor (wraps at `CAPACITY`).
     cursor: usize,
@@ -1298,12 +1347,18 @@ pub struct DurationHistogram {
     count: u64,
 }
 
+impl Default for DurationHistogram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DurationHistogram {
     const CAPACITY: usize = 100;
 
     /// Creates an empty histogram.
     #[must_use]
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             samples: Box::new([0; Self::CAPACITY]),
             cursor: 0,
@@ -1311,18 +1366,24 @@ impl DurationHistogram {
         }
     }
 
-    /// Records a checkpoint duration.
-    fn record(&mut self, duration: Duration) {
+    /// Records a duration sample (stored in microseconds).
+    pub fn record(&mut self, duration: Duration) {
         #[allow(clippy::cast_possible_truncation)]
-        let ms = duration.as_millis() as u64;
-        self.samples[self.cursor] = ms;
+        let us = duration.as_micros() as u64;
+        self.samples[self.cursor] = us;
         self.cursor = (self.cursor + 1) % Self::CAPACITY;
         self.count += 1;
     }
 
+    /// Returns `true` if no samples have been recorded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
     /// Returns the number of recorded samples (up to `CAPACITY`).
     #[must_use]
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         if self.count >= Self::CAPACITY as u64 {
             Self::CAPACITY
         } else {
@@ -1338,7 +1399,7 @@ impl DurationHistogram {
     ///
     /// Returns 0 if no samples have been recorded.
     #[must_use]
-    fn percentile(&self, p: f64) -> u64 {
+    pub fn percentile(&self, p: f64) -> u64 {
         let n = self.len();
         if n == 0 {
             return 0;
@@ -1354,9 +1415,9 @@ impl DurationHistogram {
         sorted[idx]
     }
 
-    /// Returns (p50, p95, p99) in milliseconds.
+    /// Returns (p50, p95, p99) in microseconds.
     #[must_use]
-    fn percentiles(&self) -> (u64, u64, u64) {
+    pub fn percentiles(&self) -> (u64, u64, u64) {
         (
             self.percentile(0.50),
             self.percentile(0.95),
@@ -1372,9 +1433,9 @@ impl std::fmt::Debug for DurationHistogram {
             .field("samples_len", &self.samples.len())
             .field("cursor", &self.cursor)
             .field("count", &self.count)
-            .field("p50_ms", &p50)
-            .field("p95_ms", &p95)
-            .field("p99_ms", &p99)
+            .field("p50_us", &p50)
+            .field("p95_us", &p95)
+            .field("p99_us", &p99)
             .finish()
     }
 }
@@ -1424,56 +1485,6 @@ pub fn connector_to_source_checkpoint(cp: &ConnectorCheckpoint) -> SourceCheckpo
         source_cp.set_metadata(k.clone(), v.clone());
     }
     source_cp
-}
-
-// ── DAG operator state conversion helpers ──
-
-/// Converts DAG operator states (from `DagCheckpointSnapshot`) to manifest format.
-///
-/// Uses `"{node_id}"` as the key and base64-encodes the state data.
-#[must_use]
-pub fn dag_snapshot_to_manifest_operators<S: std::hash::BuildHasher>(
-    node_states: &std::collections::HashMap<
-        u32,
-        laminar_core::dag::recovery::SerializableOperatorState,
-        S,
-    >,
-) -> HashMap<String, laminar_storage::checkpoint_manifest::OperatorCheckpoint> {
-    node_states
-        .iter()
-        .map(|(id, state)| {
-            (
-                id.to_string(),
-                laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(&state.data),
-            )
-        })
-        .collect()
-}
-
-/// Converts manifest operator states back to DAG format for recovery.
-///
-/// Parses string keys as node IDs and decodes base64 state data.
-#[must_use]
-pub fn manifest_operators_to_dag_states<S: std::hash::BuildHasher>(
-    operators: &HashMap<String, laminar_storage::checkpoint_manifest::OperatorCheckpoint, S>,
-) -> rustc_hash::FxHashMap<laminar_core::dag::topology::NodeId, laminar_core::operator::OperatorState>
-{
-    let mut states =
-        rustc_hash::FxHashMap::with_capacity_and_hasher(operators.len(), rustc_hash::FxBuildHasher);
-    for (key, op_ckpt) in operators {
-        if let Ok(node_id) = key.parse::<u32>() {
-            if let Some(data) = op_ckpt.decode_inline() {
-                states.insert(
-                    laminar_core::dag::topology::NodeId(node_id),
-                    laminar_core::operator::OperatorState {
-                        operator_id: key.clone(),
-                        data,
-                    },
-                );
-            }
-        }
-    }
-    states
 }
 
 #[cfg(test)]
@@ -1664,103 +1675,6 @@ mod tests {
         let debug = format!("{coord:?}");
         assert!(debug.contains("CheckpointCoordinator"));
         assert!(debug.contains("epoch: 1"));
-    }
-
-    // ── Operator state persistence tests ──
-
-    #[test]
-    fn test_dag_snapshot_to_manifest_operators() {
-        use laminar_core::dag::recovery::SerializableOperatorState;
-
-        let mut node_states = HashMap::new();
-        node_states.insert(
-            0,
-            SerializableOperatorState {
-                operator_id: "window-agg".into(),
-                data: b"window-state".to_vec(),
-            },
-        );
-        node_states.insert(
-            3,
-            SerializableOperatorState {
-                operator_id: "filter".into(),
-                data: b"filter-state".to_vec(),
-            },
-        );
-
-        let manifest_ops = dag_snapshot_to_manifest_operators(&node_states);
-        assert_eq!(manifest_ops.len(), 2);
-
-        let w = manifest_ops.get("0").unwrap();
-        assert_eq!(w.decode_inline().unwrap(), b"window-state");
-        let f = manifest_ops.get("3").unwrap();
-        assert_eq!(f.decode_inline().unwrap(), b"filter-state");
-    }
-
-    #[test]
-    fn test_manifest_operators_to_dag_states() {
-        use laminar_storage::checkpoint_manifest::OperatorCheckpoint;
-
-        let mut operators = HashMap::new();
-        operators.insert("0".into(), OperatorCheckpoint::inline(b"state-0"));
-        operators.insert("5".into(), OperatorCheckpoint::inline(b"state-5"));
-
-        let dag_states = manifest_operators_to_dag_states(&operators);
-        assert_eq!(dag_states.len(), 2);
-
-        let s0 = dag_states
-            .get(&laminar_core::dag::topology::NodeId(0))
-            .unwrap();
-        assert_eq!(s0.data, b"state-0");
-
-        let s5 = dag_states
-            .get(&laminar_core::dag::topology::NodeId(5))
-            .unwrap();
-        assert_eq!(s5.data, b"state-5");
-    }
-
-    #[test]
-    fn test_operator_state_round_trip_through_manifest() {
-        use laminar_core::dag::recovery::SerializableOperatorState;
-
-        // Original DAG states
-        let mut node_states = HashMap::new();
-        node_states.insert(
-            7,
-            SerializableOperatorState {
-                operator_id: "join".into(),
-                data: vec![1, 2, 3, 4, 5],
-            },
-        );
-
-        // DAG → manifest
-        let manifest_ops = dag_snapshot_to_manifest_operators(&node_states);
-
-        // Persist and reload (simulate)
-        let json = serde_json::to_string(&manifest_ops).unwrap();
-        let reloaded: HashMap<String, laminar_storage::checkpoint_manifest::OperatorCheckpoint> =
-            serde_json::from_str(&json).unwrap();
-
-        // Manifest → DAG
-        let recovered = manifest_operators_to_dag_states(&reloaded);
-        let state = recovered
-            .get(&laminar_core::dag::topology::NodeId(7))
-            .unwrap();
-        assert_eq!(state.data, vec![1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn test_manifest_operators_skips_invalid_keys() {
-        use laminar_storage::checkpoint_manifest::OperatorCheckpoint;
-
-        let mut operators = HashMap::new();
-        operators.insert("not-a-number".into(), OperatorCheckpoint::inline(b"data"));
-        operators.insert("42".into(), OperatorCheckpoint::inline(b"good"));
-
-        let dag_states = manifest_operators_to_dag_states(&operators);
-        // Only the numeric key should survive
-        assert_eq!(dag_states.len(), 1);
-        assert!(dag_states.contains_key(&laminar_core::dag::topology::NodeId(42)));
     }
 
     // ── WAL checkpoint coordination tests ──
@@ -2055,14 +1969,24 @@ mod tests {
         let mut h = DurationHistogram::new();
         h.record(Duration::from_millis(42));
         assert_eq!(h.len(), 1);
-        assert_eq!(h.percentile(0.50), 42);
-        assert_eq!(h.percentile(0.99), 42);
+        // 42ms = 42_000μs
+        assert_eq!(h.percentile(0.50), 42_000);
+        assert_eq!(h.percentile(0.99), 42_000);
+    }
+
+    #[test]
+    fn test_histogram_sub_millisecond() {
+        let mut h = DurationHistogram::new();
+        // 500μs — previously truncated to 0 with as_millis()
+        h.record(Duration::from_micros(500));
+        assert_eq!(h.percentile(0.50), 500);
+        assert_eq!(h.percentile(0.99), 500);
     }
 
     #[test]
     fn test_histogram_percentiles() {
         let mut h = DurationHistogram::new();
-        // Record 1..=100ms in order.
+        // Record 1..=100ms in order → 1000..=100_000 μs.
         for i in 1..=100 {
             h.record(Duration::from_millis(i));
         }
@@ -2072,11 +1996,11 @@ mod tests {
         let p95 = h.percentile(0.95);
         let p99 = h.percentile(0.99);
 
-        // With values 1..=100:
-        //   p50 ≈ 50, p95 ≈ 95, p99 ≈ 99
-        assert!((49..=51).contains(&p50), "p50={p50}");
-        assert!((94..=96).contains(&p95), "p95={p95}");
-        assert!((98..=100).contains(&p99), "p99={p99}");
+        // Values in μs: 1000..=100_000
+        //   p50 ≈ 50_000, p95 ≈ 95_000, p99 ≈ 99_000
+        assert!((49_000..=51_000).contains(&p50), "p50={p50}");
+        assert!((94_000..=96_000).contains(&p95), "p95={p95}");
+        assert!((98_000..=100_000).contains(&p99), "p99={p99}");
     }
 
     #[test]
@@ -2089,9 +2013,9 @@ mod tests {
         assert_eq!(h.len(), 100);
         assert_eq!(h.count, 150);
 
-        // Only samples 51..=150 remain in the buffer.
+        // Only samples 51..=150 remain in the buffer (51_000..=150_000 μs).
         let p50 = h.percentile(0.50);
-        assert!((99..=101).contains(&p50), "p50={p50}");
+        assert!((99_000..=101_000).contains(&p50), "p50={p50}");
     }
 
     // ── Sidecar threshold tests ──

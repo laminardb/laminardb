@@ -613,6 +613,16 @@ impl PostgresSink {
         &mut self,
         client: &tokio_postgres::Client,
     ) -> Result<WriteResult, ConnectorError> {
+        client
+            .execute(
+                &format!(
+                    "SET statement_timeout = '{}'",
+                    self.config.statement_timeout.as_millis()
+                ),
+                &[],
+            )
+            .await
+            .ok(); // non-fatal if unsupported
         match self.config.write_mode {
             WriteMode::Append => self.flush_append(client).await,
             WriteMode::Upsert => self.flush_upsert(client).await,
@@ -682,7 +692,10 @@ impl SinkConnector for PostgresSink {
         pool_cfg.dbname = Some(self.config.database.clone());
         pool_cfg.user = Some(self.config.username.clone());
         pool_cfg.password = Some(self.config.password.clone());
-        pool_cfg.pool = Some(deadpool_postgres::PoolConfig::new(self.config.pool_size));
+        let mut deadpool_cfg = deadpool_postgres::PoolConfig::new(self.config.pool_size);
+        deadpool_cfg.timeouts.wait = Some(self.config.connect_timeout);
+        deadpool_cfg.timeouts.create = Some(self.config.connect_timeout);
+        pool_cfg.pool = Some(deadpool_cfg);
 
         let pool = pool_cfg
             .create_pool(
@@ -695,6 +708,17 @@ impl SinkConnector for PostgresSink {
         let client = pool.get().await.map_err(|e| {
             ConnectorError::ConnectionFailed(format!("initial connection failed: {e}"))
         })?;
+
+        client
+            .execute(
+                &format!(
+                    "SET statement_timeout = '{}'",
+                    self.config.statement_timeout.as_millis()
+                ),
+                &[],
+            )
+            .await
+            .ok(); // non-fatal if unsupported
 
         // Auto-create target table.
         if self.config.auto_create_table {

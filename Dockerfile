@@ -150,6 +150,9 @@ VOLUME ["/etc/laminardb"]
 HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
+# Disable file watcher by default in containers (use POST /api/v1/reload instead)
+ENV LAMINAR_DISABLE_FILE_WATCH=1
+
 # Run as non-root user
 USER laminardb
 

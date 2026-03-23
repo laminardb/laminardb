@@ -1,12 +1,17 @@
-//! `DataFusion` micro-batch stream executor.
+//! `DataFusion` micro-batch stream executor (legacy).
 //!
-//! Executes registered streaming queries against source data using `DataFusion`'s
-//! SQL engine. Each processing cycle:
+//! Replaced by `OperatorGraph` for production execution. Retained for its
+//! comprehensive test suite and reusable detection functions.
 //!
-//! 1. Source batches are registered as temporary `MemTable` tables
-//! 2. Each stream query is executed via `ctx.sql()`
-//! 3. Results are collected as `RecordBatch` vectors
-//! 4. Temporary tables are cleared for the next cycle
+//! # Reusable functions (used by `OperatorGraph`)
+//! - [`extract_table_references`] — SQL table ref extraction
+//! - [`single_source_table`] — single-source detection
+//! - [`detect_asof_query`] — ASOF join detection
+//! - [`detect_temporal_query`] — temporal join detection
+//! - [`detect_stream_join_query`] — interval join detection
+//! - [`compute_closed_boundary`] — EOWC window boundary computation
+//! - [`apply_topk_filter`] — Top-K post-filtering
+#![allow(dead_code)]
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -15,6 +20,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, SchemaRef};
+use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use sqlparser::ast::{
     Expr, SelectItem, SetExpr, Statement, TableFactor, WildcardAdditionalOptions,
@@ -25,8 +31,8 @@ use sqlparser::parser::Parser;
 use laminar_sql::parser::join_parser::analyze_joins;
 use laminar_sql::parser::{EmitClause, EmitStrategy as SqlEmitStrategy};
 use laminar_sql::translator::{
-    AsofJoinTranslatorConfig, JoinOperatorConfig, OrderOperatorConfig,
-    TemporalJoinTranslatorConfig, WindowOperatorConfig, WindowType,
+    AsofJoinTranslatorConfig, JoinOperatorConfig, OrderOperatorConfig, StreamJoinConfig,
+    StreamJoinType, TemporalJoinTranslatorConfig, WindowOperatorConfig, WindowType,
 };
 
 use datafusion_expr::LogicalPlan;
@@ -42,6 +48,7 @@ use crate::error::DbError;
 /// expect `EmitStrategy::Final`. This function maps all variants correctly.
 ///
 /// Cannot use a `From` impl due to the orphan rule (neither type is local).
+#[allow(dead_code)] // Used in tests and by emit_clause_to_core.
 pub(crate) fn sql_emit_to_core(
     s: &SqlEmitStrategy,
 ) -> laminar_core::operator::window::EmitStrategy {
@@ -60,6 +67,7 @@ pub(crate) fn sql_emit_to_core(
 ///
 /// Calls `EmitClause::to_emit_strategy()` to resolve the clause to a
 /// runtime strategy, then converts via [`sql_emit_to_core`].
+#[allow(dead_code)] // Used in tests.
 pub(crate) fn emit_clause_to_core(
     clause: &EmitClause,
 ) -> Result<laminar_core::operator::window::EmitStrategy, laminar_sql::parser::ParseError> {
@@ -200,29 +208,53 @@ fn collect_tables_from_factor(factor: &TableFactor, tables: &mut FxHashSet<Strin
     }
 }
 
+/// Lazily compiled post-join projection for ASOF/temporal queries.
+///
+/// Compiled from the projection SQL (e.g., `SELECT a, b AS alias FROM __asof_tmp`)
+/// on first execution when the join output schema is known.
+pub(crate) struct CompiledPostProjection {
+    /// Physical expressions to evaluate per output column.
+    pub(crate) exprs: Vec<Arc<dyn PhysicalExpr>>,
+    /// Output schema.
+    pub(crate) output_schema: SchemaRef,
+}
+
+impl std::fmt::Debug for CompiledPostProjection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledPostProjection")
+            .field("output_schema", &self.output_schema)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A registered stream query for execution.
 #[derive(Debug, Clone)]
 pub(crate) struct StreamQuery {
-    /// Stream name.
-    pub name: String,
+    /// Stream name (Arc-shared to avoid cloning on hot path).
+    pub name: Arc<str>,
     /// SQL query text.
     pub sql: String,
-    /// ASOF join config (set when the query contains an ASOF JOIN).
-    pub asof_config: Option<AsofJoinTranslatorConfig>,
-    /// Rewritten projection SQL to apply aliases/expressions after the ASOF
-    /// join result is registered as `__asof_tmp`.
-    pub projection_sql: Option<String>,
-    /// Temporal join config (set when the query contains FOR `SYSTEM_TIME` AS OF).
-    pub temporal_config: Option<TemporalJoinTranslatorConfig>,
+    /// ASOF join config (Arc-shared to avoid cloning on hot path).
+    pub asof_config: Option<Arc<AsofJoinTranslatorConfig>>,
+    /// Rewritten projection SQL (Arc-shared to avoid cloning on hot path).
+    pub projection_sql: Option<Arc<str>>,
+    /// Temporal join config (Arc-shared to avoid cloning on hot path).
+    pub temporal_config: Option<Arc<TemporalJoinTranslatorConfig>>,
+    /// Stream-stream interval join config.
+    pub stream_join_config: Option<Arc<StreamJoinConfig>>,
     /// EMIT clause from the planner (e.g., `OnWindowClose`, `Final`).
     pub emit_clause: Option<EmitClause>,
-    /// Window configuration from the planner (window type, size, gap, etc.).
-    pub window_config: Option<WindowOperatorConfig>,
+    /// Window configuration (Arc-shared to avoid cloning on hot path).
+    pub window_config: Option<Arc<WindowOperatorConfig>>,
     /// ORDER BY configuration (Top-K, `PerGroupTopK`, etc.).
     pub order_config: Option<OrderOperatorConfig>,
     /// Pre-computed table references (extracted once at registration).
     /// Avoids re-parsing SQL for dependency analysis every cycle.
     table_refs: FxHashSet<String>,
+    /// Tombstone flag: when `true`, the query is skipped during execution
+    /// and excluded from checkpoints. Used by the control channel to remove
+    /// queries without invalidating indices in state maps.
+    removed: bool,
 }
 
 impl StreamQuery {
@@ -257,7 +289,7 @@ const EOWC_COALESCE_BATCH_THRESHOLD: usize = 32;
 /// `EOWC_COALESCE_BATCH_THRESHOLD` to mitigate fragmentation.
 struct EowcState {
     /// Accumulated source batches keyed by source table name.
-    accumulated_sources: FxHashMap<String, Vec<RecordBatch>>,
+    accumulated_sources: FxHashMap<Arc<str>, Vec<RecordBatch>>,
     /// The last closed-window boundary that was emitted.
     last_closed_boundary: i64,
     /// Total rows currently accumulated (for diagnostics).
@@ -318,10 +350,46 @@ pub(crate) struct StreamExecutor {
     /// Pending checkpoint data for deferred restore. Held until agg states
     /// are lazily initialized, then applied and cleared.
     pending_restore: Option<crate::aggregate_state::StreamExecutorCheckpoint>,
+    /// Maximum state bytes per operator before the query returns an error.
+    /// `None` = unlimited (default).
+    max_state_bytes: Option<usize>,
     /// Reusable per-cycle results map (cleared each cycle to avoid reallocation).
-    cycle_results: FxHashMap<String, Vec<RecordBatch>>,
+    cycle_results: FxHashMap<Arc<str>, Vec<RecordBatch>>,
     /// Reusable per-cycle intermediate table name list.
     cycle_intermediates: Vec<String>,
+    /// Lazily determined: `Some(true)` when all queries are on
+    /// compiled paths (no `ctx.sql()` needed), allowing `register_source_tables()`
+    /// to be skipped entirely. `None` = not yet determined.
+    all_queries_compiled: Option<bool>,
+    /// Lazily compiled post-join projection expressions for ASOF/temporal joins.
+    /// Keyed by query index. Compiled on first execution when join output schema
+    /// is known.
+    compiled_post_projections: FxHashMap<usize, CompiledPostProjection>,
+    /// Query indices for which post-projection compilation was attempted and failed.
+    post_projection_compile_failed: FxHashSet<usize>,
+    /// Cached logical plans for HAVING filter fallback paths (keyed by query index).
+    /// On first call, `ctx.sql()` parses and optimizes; subsequent cycles use
+    /// `create_physical_plan()` directly, skipping SQL parsing.
+    cached_having_plans: FxHashMap<usize, LogicalPlan>,
+    /// Cached logical plans for post-projection SQL fallback paths (keyed by query
+    /// index). Same caching pattern as `cached_having_plans`.
+    cached_post_projection_plans: FxHashMap<usize, LogicalPlan>,
+    /// Query indices that were skipped last cycle due to budget exhaustion.
+    /// These are processed first (priority) on the next cycle.
+    skipped_last_cycle: FxHashSet<usize>,
+    /// Per-query budget in nanoseconds. When elapsed time exceeds this,
+    /// remaining queries are deferred to the next cycle. Default: 8ms.
+    query_budget_ns: u64,
+    /// Shared pipeline counters for fallback monitoring.
+    counters: Option<Arc<crate::metrics::PipelineCounters>>,
+    /// Query indices for which the execution-tier has already been logged
+    /// (compiled vs cached-plan). Avoids per-cycle log spam.
+    fallback_logged: FxHashSet<usize>,
+    /// Per-query interval join state, keyed by query index.
+    interval_join_states: FxHashMap<usize, crate::interval_join::IntervalJoinState>,
+    /// Tracks the last-seen row count for temporal join tables, keyed by query index.
+    /// Used to detect table modifications and warn about missing retractions.
+    last_temporal_row_count: FxHashMap<usize, usize>,
 }
 
 impl StreamExecutor {
@@ -346,8 +414,55 @@ impl StreamExecutor {
             core_window_states: FxHashMap::default(),
             non_core_window_queries: FxHashSet::default(),
             pending_restore: None,
+            max_state_bytes: None,
             cycle_results: FxHashMap::default(),
             cycle_intermediates: Vec::new(),
+            all_queries_compiled: None,
+            compiled_post_projections: FxHashMap::default(),
+            post_projection_compile_failed: FxHashSet::default(),
+            cached_having_plans: FxHashMap::default(),
+            cached_post_projection_plans: FxHashMap::default(),
+            skipped_last_cycle: FxHashSet::default(),
+            query_budget_ns: 8_000_000,
+            counters: None,
+            fallback_logged: FxHashSet::default(),
+            interval_join_states: FxHashMap::default(),
+            last_temporal_row_count: FxHashMap::default(),
+        }
+    }
+
+    /// Set the maximum state bytes per operator before the query fails.
+    ///
+    /// `None` = unlimited (default). When set, the executor checks each
+    /// aggregate/window operator's estimated memory after every cycle.
+    pub fn set_max_state_bytes(&mut self, limit: Option<usize>) {
+        self.max_state_bytes = limit;
+    }
+
+    /// Set the per-query execution budget in nanoseconds.
+    pub fn set_query_budget_ns(&mut self, ns: u64) {
+        self.query_budget_ns = ns;
+    }
+
+    /// Set shared pipeline counters for fallback monitoring.
+    pub fn set_counters(&mut self, c: Arc<crate::metrics::PipelineCounters>) {
+        self.counters = Some(c);
+    }
+
+    /// Record whether a query uses the compiled or cached-plan execution tier.
+    /// Increments counters once per query index and logs on first occurrence.
+    fn record_query_tier(&mut self, idx: usize, compiled: bool) {
+        if !self.fallback_logged.insert(idx) {
+            return; // already recorded
+        }
+        if let Some(ref c) = self.counters {
+            if compiled {
+                c.queries_compiled
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                c.queries_cached_plan
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 
@@ -365,7 +480,7 @@ impl StreamExecutor {
     pub fn temporal_join_configs(&self) -> Vec<TemporalJoinTranslatorConfig> {
         self.queries
             .iter()
-            .filter_map(|q| q.temporal_config.clone())
+            .filter_map(|q| q.temporal_config.as_ref().map(|c| (**c).clone()))
             .collect()
     }
 
@@ -390,21 +505,40 @@ impl StreamExecutor {
     ) {
         let (asof_config, mut projection_sql) = detect_asof_query(&sql);
         let (temporal_config, temporal_projection_sql) = detect_temporal_query(&sql);
+        let (stream_join_config, stream_join_projection_sql) = detect_stream_join_query(&sql);
         if projection_sql.is_none() {
             projection_sql = temporal_projection_sql;
         }
+        if projection_sql.is_none() {
+            projection_sql = stream_join_projection_sql;
+        }
+        // Warn when a JOIN+BETWEEN query was not detected as an interval join
+        if stream_join_config.is_none() && asof_config.is_none() && temporal_config.is_none() {
+            let sql_upper = sql.to_uppercase();
+            if sql_upper.contains("JOIN") && sql_upper.contains("BETWEEN") {
+                tracing::warn!(
+                    query = %name,
+                    "Query contains JOIN with BETWEEN but was not detected as an interval join. \
+                     It will execute as a batch join (matches within one cycle only). \
+                     Ensure time columns in the BETWEEN clause are simple column references."
+                );
+            }
+        }
+
         let table_refs = extract_table_references(&sql);
         let idx = self.queries.len();
         let query = StreamQuery {
-            name,
+            name: Arc::from(name),
             sql,
-            asof_config,
-            projection_sql,
-            temporal_config,
+            asof_config: asof_config.map(Arc::new),
+            projection_sql: projection_sql.map(|s| Arc::from(s.as_str())),
+            temporal_config: temporal_config.map(Arc::new),
+            stream_join_config: stream_join_config.map(Arc::new),
             emit_clause,
-            window_config,
+            window_config: window_config.map(Arc::new),
             order_config,
             table_refs,
+            removed: false,
         };
         // Initialize EOWC state for queries that suppress intermediate results
         if query.suppresses_intermediate() {
@@ -419,6 +553,38 @@ impl StreamExecutor {
         }
         self.queries.push(query);
         self.topo_dirty = true;
+    }
+
+    /// Remove a query by name using a tombstone (sets `removed = true`).
+    ///
+    /// Tombstone approach avoids index invalidation that would break all
+    /// state map keys (`agg_states`, `eowc_states`, etc.). The query struct
+    /// remains in the `queries` Vec but is skipped during execution and
+    /// excluded from checkpoints.
+    pub fn remove_query(&mut self, name: &str) {
+        for (idx, q) in self.queries.iter_mut().enumerate() {
+            if &*q.name == name && !q.removed {
+                q.removed = true;
+                // Clean up associated state maps.
+                self.agg_states.remove(&idx);
+                self.eowc_states.remove(&idx);
+                self.eowc_agg_states.remove(&idx);
+                self.core_window_states.remove(&idx);
+                self.plain_compiled.remove(&idx);
+                self.cached_logical_plans.remove(&idx);
+                self.cached_plan_fingerprints.remove(&idx);
+                self.non_agg_queries.remove(&idx);
+                self.non_eowc_agg_queries.remove(&idx);
+                self.non_core_window_queries.remove(&idx);
+                self.fallback_logged.remove(&idx);
+                self.interval_join_states.remove(&idx);
+                self.last_temporal_row_count.remove(&idx);
+                self.topo_dirty = true;
+                // Invalidate the compiled-path cache so it's re-evaluated.
+                self.all_queries_compiled = None;
+                break;
+            }
+        }
     }
 
     /// Register a static reference table (e.g., from `CREATE TABLE`).
@@ -448,7 +614,7 @@ impl StreamExecutor {
             .queries
             .iter()
             .enumerate()
-            .map(|(i, q)| (q.name.as_str(), i))
+            .map(|(i, q)| (&*q.name, i))
             .collect();
 
         // Build in-degree counts (only count dependencies on other queries)
@@ -516,14 +682,42 @@ impl StreamExecutor {
     #[allow(clippy::too_many_lines)]
     pub async fn execute_cycle(
         &mut self,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         current_watermark: i64,
-    ) -> Result<FxHashMap<String, Vec<RecordBatch>>, DbError> {
+    ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
         if self.topo_dirty {
             self.compute_topo_order();
         }
 
-        self.register_source_tables(source_batches)?;
+        // Determine if all non-skipped queries use compiled paths.
+        // When true, we can skip MemTable registration entirely since compiled
+        // projections read from source_batches directly. Re-evaluate each
+        // cycle until it settles to true (states are lazily populated).
+        if self.all_queries_compiled != Some(true) {
+            let all_compiled = self.topo_order.iter().all(|&idx| {
+                self.plain_compiled.contains_key(&idx)
+                    || self
+                        .agg_states
+                        .get(&idx)
+                        .is_some_and(|s| s.compiled_projection().is_some())
+                    || self
+                        .core_window_states
+                        .get(&idx)
+                        .is_some_and(|s| s.compiled_projection().is_some())
+                    || self
+                        .eowc_agg_states
+                        .get(&idx)
+                        .is_some_and(|s| s.compiled_projection().is_some())
+            });
+            self.all_queries_compiled = Some(all_compiled);
+        }
+
+        // Skip MemTable registration when all queries use compiled projections.
+        // Intermediate result registration (for downstream queries) still runs
+        // inside the loop — this only skips SOURCE table registration.
+        if self.all_queries_compiled != Some(true) {
+            self.register_source_tables(source_batches)?;
+        }
 
         // Reuse per-cycle allocations: take the pre-allocated maps out of
         // self so the borrow checker allows &mut self calls while results
@@ -533,23 +727,52 @@ impl StreamExecutor {
         let mut intermediate_tables = std::mem::take(&mut self.cycle_intermediates);
         intermediate_tables.clear();
 
+        self.skipped_last_cycle.clear();
+        let cycle_start = std::time::Instant::now();
+
         let topo_len = self.topo_order.len();
         for i in 0..topo_len {
             let idx = self.topo_order[i];
+
+            // Skip tombstoned queries (removed via control channel).
+            if self.queries[idx].removed {
+                continue;
+            }
+
+            // Budget check: stop if elapsed time exceeds the per-query budget
+            // (leaves headroom for maintenance). Always execute at least one
+            // query per cycle for forward progress.
+            if i > 0 {
+                #[allow(clippy::cast_possible_truncation)]
+                let elapsed_ns = cycle_start.elapsed().as_nanos() as u64;
+                if elapsed_ns > self.query_budget_ns {
+                    for j in i..topo_len {
+                        self.skipped_last_cycle.insert(self.topo_order[j]);
+                    }
+                    tracing::debug!(
+                        skipped = topo_len - i,
+                        elapsed_ms = elapsed_ns / 1_000_000,
+                        "per-query budget exceeded — deferring remaining queries"
+                    );
+                    break;
+                }
+            }
+
             let is_eowc = self.queries[idx].suppresses_intermediate();
             let has_asof = self.queries[idx].asof_config.is_some();
             let has_temporal = self.queries[idx].temporal_config.is_some();
+            let has_stream_join = self.queries[idx].stream_join_config.is_some();
 
             let query_result = if is_eowc {
-                let query_name = self.queries[idx].name.clone();
-                let window_config = self.queries[idx].window_config.clone();
-                let asof_config = self.queries[idx].asof_config.clone();
-                let projection_sql = self.queries[idx].projection_sql.clone();
+                let query_name = Arc::clone(&self.queries[idx].name);
+                let window_config = self.queries[idx].window_config.as_ref().map(Arc::clone);
+                let asof_config = self.queries[idx].asof_config.as_ref().map(Arc::clone);
+                let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
                 self.execute_eowc_query(
                     idx,
                     &query_name,
-                    window_config.as_ref(),
-                    asof_config.as_ref(),
+                    window_config.as_deref(),
+                    asof_config.as_deref(),
                     projection_sql.as_deref(),
                     source_batches,
                     &results,
@@ -557,13 +780,16 @@ impl StreamExecutor {
                 )
                 .await
             } else if has_asof {
-                let query_name = self.queries[idx].name.clone();
-                let cfg = self.queries[idx]
-                    .asof_config
-                    .clone()
-                    .expect("has_asof guard ensures asof_config is Some");
-                let projection_sql = self.queries[idx].projection_sql.clone();
+                let query_name = Arc::clone(&self.queries[idx].name);
+                let cfg = Arc::clone(
+                    self.queries[idx]
+                        .asof_config
+                        .as_ref()
+                        .expect("has_asof guard ensures asof_config is Some"),
+                );
+                let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
                 self.execute_asof_query(
+                    idx,
                     &query_name,
                     &cfg,
                     projection_sql.as_deref(),
@@ -572,18 +798,40 @@ impl StreamExecutor {
                 )
                 .await
             } else if has_temporal {
-                let query_name = self.queries[idx].name.clone();
-                let cfg = self.queries[idx]
-                    .temporal_config
-                    .clone()
-                    .expect("has_temporal guard ensures temporal_config is Some");
-                let projection_sql = self.queries[idx].projection_sql.clone();
+                let query_name = Arc::clone(&self.queries[idx].name);
+                let cfg = Arc::clone(
+                    self.queries[idx]
+                        .temporal_config
+                        .as_ref()
+                        .expect("has_temporal guard ensures temporal_config is Some"),
+                );
+                let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
                 self.execute_temporal_query(
+                    idx,
                     &query_name,
                     &cfg,
                     projection_sql.as_deref(),
                     source_batches,
                     &results,
+                )
+                .await
+            } else if has_stream_join {
+                let query_name = Arc::clone(&self.queries[idx].name);
+                let cfg = Arc::clone(
+                    self.queries[idx]
+                        .stream_join_config
+                        .as_ref()
+                        .expect("has_stream_join guard ensures stream_join_config is Some"),
+                );
+                let projection_sql = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
+                self.execute_interval_join_query(
+                    idx,
+                    &query_name,
+                    &cfg,
+                    projection_sql.as_deref(),
+                    source_batches,
+                    &results,
+                    current_watermark,
                 )
                 .await
             } else {
@@ -601,7 +849,7 @@ impl StreamExecutor {
                     let depends_on_stream = self.queries[idx]
                         .table_refs
                         .iter()
-                        .any(|tr| self.queries.iter().any(|q| q.name == *tr));
+                        .any(|tr| self.queries.iter().any(|q| &*q.name == tr.as_str()));
                     if depends_on_stream {
                         tracing::debug!(
                             query = %self.queries[idx].name,
@@ -614,6 +862,78 @@ impl StreamExecutor {
                 }
             };
 
+            // ── State size bounds check ──
+            if let Some(limit) = self.max_state_bytes {
+                // Check incremental aggregate state
+                if let Some(state) = self.agg_states.get(&idx) {
+                    let size = state.estimated_size_bytes();
+                    if size >= limit {
+                        return Err(DbError::Pipeline(format!(
+                            "state size limit exceeded for query '{}' ({size} bytes > {limit} limit)",
+                            self.queries[idx].name
+                        )));
+                    } else if size >= limit * 4 / 5 {
+                        tracing::warn!(
+                            query = %self.queries[idx].name,
+                            size_bytes = size,
+                            limit_bytes = limit,
+                            "state size at 80% of limit"
+                        );
+                    }
+                }
+                // Check core window state
+                if let Some(state) = self.core_window_states.get(&idx) {
+                    let size = state.estimated_size_bytes();
+                    if size >= limit {
+                        return Err(DbError::Pipeline(format!(
+                            "state size limit exceeded for query '{}' ({size} bytes > {limit} limit)",
+                            self.queries[idx].name
+                        )));
+                    } else if size >= limit * 4 / 5 {
+                        tracing::warn!(
+                            query = %self.queries[idx].name,
+                            size_bytes = size,
+                            limit_bytes = limit,
+                            "state size at 80% of limit"
+                        );
+                    }
+                }
+                // Check EOWC aggregate state
+                if let Some(state) = self.eowc_agg_states.get(&idx) {
+                    let size = state.estimated_size_bytes();
+                    if size >= limit {
+                        return Err(DbError::Pipeline(format!(
+                            "state size limit exceeded for query '{}' ({size} bytes > {limit} limit)",
+                            self.queries[idx].name
+                        )));
+                    } else if size >= limit * 4 / 5 {
+                        tracing::warn!(
+                            query = %self.queries[idx].name,
+                            size_bytes = size,
+                            limit_bytes = limit,
+                            "state size at 80% of limit"
+                        );
+                    }
+                }
+                // Check interval join state
+                if let Some(state) = self.interval_join_states.get(&idx) {
+                    let size = state.estimated_size_bytes();
+                    if size >= limit {
+                        return Err(DbError::Pipeline(format!(
+                            "state size limit exceeded for query '{}' ({size} bytes > {limit} limit)",
+                            self.queries[idx].name
+                        )));
+                    } else if size >= limit * 4 / 5 {
+                        tracing::warn!(
+                            query = %self.queries[idx].name,
+                            size_bytes = size,
+                            limit_bytes = limit,
+                            "interval join state size at 80% of limit"
+                        );
+                    }
+                }
+            }
+
             // Apply Top-K post-filter if configured
             let batches = match &self.queries[idx].order_config {
                 Some(OrderOperatorConfig::TopK(config)) => apply_topk_filter(&batches, config.k),
@@ -623,27 +943,29 @@ impl StreamExecutor {
                 _ => batches,
             };
 
-            let query_name = self.queries[idx].name.clone();
+            let query_name = Arc::clone(&self.queries[idx].name);
             if !batches.is_empty() {
                 let schema = batches[0].schema();
                 if let Ok(mem_table) =
                     datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
                 {
-                    let _ = self.ctx.deregister_table(&query_name);
-                    if let Err(e) = self.ctx.register_table(&query_name, Arc::new(mem_table)) {
+                    let _ = self.ctx.deregister_table(&*query_name);
+                    if let Err(e) = self.ctx.register_table(&*query_name, Arc::new(mem_table)) {
                         tracing::warn!(
                             query = %query_name,
                             error = %e,
                             "[LDB-3015] Failed to register intermediate table"
                         );
                     }
-                    intermediate_tables.push(query_name.clone());
+                    intermediate_tables.push(query_name.to_string());
                 }
                 results.insert(query_name, batches);
             }
         }
 
-        self.cleanup_source_tables();
+        if self.all_queries_compiled != Some(true) {
+            self.cleanup_source_tables();
+        }
         for name in &intermediate_tables {
             // Cleanup: deregister failures during teardown are benign
             let _ = self.ctx.deregister_table(name);
@@ -661,7 +983,7 @@ impl StreamExecutor {
     /// `DataFusion` can still plan queries that reference them.
     fn register_source_tables(
         &mut self,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<(), DbError> {
         for (name, batches) in source_batches {
             if batches.is_empty() {
@@ -671,21 +993,21 @@ impl StreamExecutor {
             let schema = batches[0].schema();
             let mem_table =
                 datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
-                    .map_err(|e| DbError::query_pipeline(name, &e))?;
+                    .map_err(|e| DbError::query_pipeline(&**name, &e))?;
 
             // Deregister first if it exists (from previous cycle)
-            let _ = self.ctx.deregister_table(name);
+            let _ = self.ctx.deregister_table(&**name);
 
             self.ctx
-                .register_table(name, Arc::new(mem_table))
-                .map_err(|e| DbError::query_pipeline(name, &e))?;
+                .register_table(&**name, Arc::new(mem_table))
+                .map_err(|e| DbError::query_pipeline(&**name, &e))?;
 
-            self.registered_sources.push(name.clone());
+            self.registered_sources.push(name.to_string());
         }
 
         // Register empty tables for known sources that had no data this cycle
         for (name, schema) in &self.source_schemas {
-            if source_batches.contains_key(name) {
+            if source_batches.contains_key(name.as_str()) {
                 continue;
             }
             let empty = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]])
@@ -712,10 +1034,10 @@ impl StreamExecutor {
 ///
 /// Looks up the source table in both `source_batches` and `results`,
 /// then evaluates the projection against each batch.
-fn evaluate_compiled_projection(
+pub(crate) fn evaluate_compiled_projection(
     proj: &CompiledProjection,
-    source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-    results: &FxHashMap<String, Vec<RecordBatch>>,
+    source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+    results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
 ) -> Vec<RecordBatch> {
     let batches = source_batches
         .get(proj.source_table())
@@ -741,15 +1063,15 @@ fn evaluate_compiled_projection(
 }
 
 /// Information extracted from a simple Projection + Filter logical plan.
-struct ProjectionFilterInfo {
+pub(crate) struct ProjectionFilterInfo {
     /// Projection expressions from the top-level Projection node.
-    proj_exprs: Vec<datafusion_expr::Expr>,
+    pub(crate) proj_exprs: Vec<datafusion_expr::Expr>,
     /// Optional WHERE predicate from a Filter node below the Projection.
-    filter_predicate: Option<datafusion_expr::Expr>,
+    pub(crate) filter_predicate: Option<datafusion_expr::Expr>,
     /// `DFSchema` of the scan input (for compiling expressions).
-    input_df_schema: Arc<datafusion_common::DFSchema>,
+    pub(crate) input_df_schema: Arc<datafusion_common::DFSchema>,
     /// Source table name from the `TableScan`.
-    source_table: String,
+    pub(crate) source_table: String,
 }
 
 /// Walk an optimized `LogicalPlan` to extract a simple Projection + Filter shape.
@@ -760,7 +1082,7 @@ struct ProjectionFilterInfo {
 ///
 /// Returns `None` if the plan has Sort, Limit, Distinct, Join, Aggregate,
 /// or any other node that `CompiledProjection` cannot handle.
-fn extract_projection_filter(plan: &LogicalPlan) -> Option<ProjectionFilterInfo> {
+pub(crate) fn extract_projection_filter(plan: &LogicalPlan) -> Option<ProjectionFilterInfo> {
     match plan {
         LogicalPlan::Projection(proj) => {
             let proj_exprs = proj.expr.clone();
@@ -835,6 +1157,44 @@ fn extract_filter_or_scan(
     }
 }
 
+/// Extract projection expressions from a logical plan for post-join compilation.
+///
+/// Walks the plan to find the Projection node, compiles each expression to a
+/// `PhysicalExpr`, and returns the expressions with the output schema.
+pub(crate) fn extract_projection_exprs(
+    plan: &LogicalPlan,
+    input_schema: &SchemaRef,
+    ctx: &SessionContext,
+) -> Option<(Vec<Arc<dyn PhysicalExpr>>, SchemaRef)> {
+    let proj = match plan {
+        LogicalPlan::Projection(p) => p,
+        LogicalPlan::SubqueryAlias(a) => {
+            return extract_projection_exprs(&a.input, input_schema, ctx);
+        }
+        _ => return None,
+    };
+
+    let df_schema = datafusion_common::DFSchema::try_from(input_schema.as_ref().clone()).ok()?;
+    let state = ctx.state();
+    let exec_props = state.execution_props();
+
+    let mut exprs = Vec::with_capacity(proj.expr.len());
+    let mut fields = Vec::with_capacity(proj.expr.len());
+
+    for (i, expr) in proj.expr.iter().enumerate() {
+        let phys =
+            datafusion::physical_expr::create_physical_expr(expr, &df_schema, exec_props).ok()?;
+        let name = proj.schema.field(i).name().clone();
+        let dt = phys.data_type(input_schema).ok()?;
+        let nullable = phys.nullable(input_schema).unwrap_or(true);
+        fields.push(arrow::datatypes::Field::new(name, dt, nullable));
+        exprs.push(phys);
+    }
+
+    let output_schema = Arc::new(arrow::datatypes::Schema::new(fields));
+    Some((exprs, output_schema))
+}
+
 /// Compute a fast schema fingerprint from field names and types.
 fn schema_fingerprint(schema: &arrow::datatypes::Schema) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -881,11 +1241,12 @@ impl StreamExecutor {
     async fn execute_standard_query(
         &mut self,
         idx: usize,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         // Fast path: already have incremental agg state for this query
         if self.agg_states.contains_key(&idx) {
+            self.record_query_tier(idx, true);
             return self
                 .execute_incremental_agg(idx, source_batches, results)
                 .await;
@@ -893,12 +1254,14 @@ impl StreamExecutor {
 
         // Fast path: already have compiled projection for this query
         if self.plain_compiled.contains_key(&idx) {
+            self.record_query_tier(idx, true);
             let proj = &self.plain_compiled[&idx];
             return Ok(evaluate_compiled_projection(proj, source_batches, results));
         }
 
         // Fast path: already have cached logical plan for this query
         if self.cached_logical_plans.contains_key(&idx) {
+            self.record_query_tier(idx, false);
             return self.execute_cached_plan_query(idx).await;
         }
 
@@ -941,8 +1304,8 @@ impl StreamExecutor {
     async fn try_compile_plain_query(
         &mut self,
         idx: usize,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let query_sql = self.queries[idx].sql.clone();
         let query_name = self.queries[idx].name.clone();
@@ -958,7 +1321,7 @@ impl StreamExecutor {
             .ctx
             .sql(&query_sql)
             .await
-            .map_err(|e| DbError::query_pipeline(&query_name, &e))?;
+            .map_err(|e| DbError::query_pipeline(&*query_name, &e))?;
 
         let plan = df.logical_plan();
         if let Some(proj) = self.try_build_compiled_projection(plan) {
@@ -977,13 +1340,14 @@ impl StreamExecutor {
         let fingerprint = source_schemas_fingerprint(table_refs, &self.source_schemas);
         self.cached_logical_plans.insert(idx, plan);
         self.cached_plan_fingerprints.insert(idx, fingerprint);
-        tracing::debug!(
+        self.record_query_tier(idx, false);
+        tracing::info!(
             query = %query_name,
-            "Cached optimized logical plan for complex non-aggregate query"
+            "Query using DataFusion cached-plan path (physical planning per cycle)"
         );
         df.collect()
             .await
-            .map_err(|e| DbError::query_pipeline(&query_name, &e))
+            .map_err(|e| DbError::query_pipeline(&*query_name, &e))
     }
 
     /// Try to build a `CompiledProjection` from a logical plan.
@@ -1049,7 +1413,7 @@ impl StreamExecutor {
             .ctx
             .sql(&query_sql)
             .await
-            .map_err(|e| DbError::query_pipeline(&query_name, &e))?;
+            .map_err(|e| DbError::query_pipeline(&*query_name, &e))?;
 
         let plan = df.logical_plan().clone();
         let table_refs = &self.queries[idx].table_refs;
@@ -1059,7 +1423,7 @@ impl StreamExecutor {
 
         df.collect()
             .await
-            .map_err(|e| DbError::query_pipeline(&query_name, &e))
+            .map_err(|e| DbError::query_pipeline(&*query_name, &e))
     }
 
     /// Execute a query using a cached optimized logical plan.
@@ -1086,7 +1450,7 @@ impl StreamExecutor {
                     .ctx
                     .sql(&query_sql)
                     .await
-                    .map_err(|e| DbError::query_pipeline(&query_name, &e))?;
+                    .map_err(|e| DbError::query_pipeline(&*query_name, &e))?;
                 let plan = df.logical_plan().clone();
                 self.cached_logical_plans.insert(idx, plan);
                 self.cached_plan_fingerprints
@@ -1094,7 +1458,7 @@ impl StreamExecutor {
                 return df
                     .collect()
                     .await
-                    .map_err(|e| DbError::query_pipeline(&query_name, &e));
+                    .map_err(|e| DbError::query_pipeline(&*query_name, &e));
             }
         }
 
@@ -1109,12 +1473,36 @@ impl StreamExecutor {
             .state()
             .create_physical_plan(plan)
             .await
-            .map_err(|e| DbError::query_pipeline(&query_name, &e))?;
+            .map_err(|e| DbError::query_pipeline(&*query_name, &e))?;
 
         let task_ctx = self.ctx.task_ctx();
         datafusion::physical_plan::collect(physical, task_ctx)
             .await
-            .map_err(|e| DbError::query_pipeline(&query_name, &e))
+            .map_err(|e| DbError::query_pipeline(&*query_name, &e))
+    }
+
+    /// Execute a cached logical plan (physical planning only, no SQL parse).
+    ///
+    /// Physical planning runs per cycle because `MemTable` contents change each cycle.
+    /// Cost: ~5-10μs for simple scans (measured). SQL parsing and logical optimization
+    /// are eliminated by caching the `LogicalPlan`. This is the best achievable for
+    /// multi-source (JOIN) queries without reimplementing `DataFusion`'s join operators.
+    async fn execute_cached_plan(
+        &self,
+        query_name: &str,
+        plan: &LogicalPlan,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let physical = self
+            .ctx
+            .state()
+            .create_physical_plan(plan)
+            .await
+            .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+
+        let task_ctx = self.ctx.task_ctx();
+        datafusion::physical_plan::collect(physical, task_ctx)
+            .await
+            .map_err(|e| DbError::query_pipeline(query_name, &e))
     }
 
     /// Execute an aggregation query using incremental accumulators.
@@ -1125,8 +1513,8 @@ impl StreamExecutor {
     async fn execute_incremental_agg(
         &mut self,
         idx: usize,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let query_name = self.queries[idx].name.clone();
 
@@ -1134,30 +1522,19 @@ impl StreamExecutor {
             DbError::Pipeline(format!("internal: missing agg_state for query index {idx}"))
         })?;
 
-        // Use compiled projection if available, otherwise fall back to SQL.
+        // Use compiled projection if available, then cached logical plan,
+        // then fall back to full SQL parsing.
         let pre_agg_batches = if let Some(proj) = agg_state.compiled_projection() {
             evaluate_compiled_projection(proj, source_batches, results)
+        } else if let Some(plan) = agg_state.cached_pre_agg_plan() {
+            // Cached path: skip SQL parsing + logical optimization, only
+            // physical planning runs per cycle.
+            let plan = plan.clone();
+            self.execute_cached_plan(&query_name, &plan).await?
         } else {
-            let pre_agg_sql = agg_state.pre_agg_sql().to_string();
-            match self.ctx.sql(&pre_agg_sql).await {
-                Ok(df) => df
-                    .collect()
-                    .await
-                    .map_err(|e| DbError::query_pipeline(&query_name, &e))?,
-                Err(e) => {
-                    tracing::trace!(
-                        query = %query_name,
-                        error = %e,
-                        "Pre-agg SQL failed, emitting current state"
-                    );
-                    let agg_state = self.agg_states.get_mut(&idx).ok_or_else(|| {
-                        DbError::Pipeline(format!(
-                            "internal: missing agg_state for query index {idx}"
-                        ))
-                    })?;
-                    return agg_state.emit();
-                }
-            }
+            return Err(DbError::Pipeline(format!(
+                "[LDB-8050] query '{query_name}': no compiled projection or cached plan"
+            )));
         };
 
         let agg_state = self.agg_states.get_mut(&idx).ok_or_else(|| {
@@ -1176,17 +1553,20 @@ impl StreamExecutor {
             batches = apply_compiled_having(&batches, filter)?;
         } else if let Some(having_sql) = having_sql {
             batches = self
-                .apply_having_filter(&query_name, &batches, &having_sql)
+                .apply_having_filter(idx, &query_name, &batches, &having_sql)
                 .await?;
         }
 
         Ok(batches)
     }
 
-    /// Apply a HAVING predicate to emitted aggregate batches using the
-    /// session context's SQL engine.
+    /// Apply a HAVING predicate to emitted aggregate batches.
+    ///
+    /// Caches the `LogicalPlan` on first call so subsequent cycles skip SQL
+    /// parsing and only run physical planning against the new `MemTable`.
     async fn apply_having_filter(
-        &self,
+        &mut self,
+        idx: usize,
         query_name: &str,
         batches: &[RecordBatch],
         having_sql: &str,
@@ -1196,17 +1576,19 @@ impl StreamExecutor {
         }
 
         let schema = batches[0].schema();
-        let col_list: Vec<String> = schema
-            .fields()
-            .iter()
-            .map(|f| format!("\"{}\"", f.name()))
-            .collect();
-        let filter_sql = format!(
-            "SELECT {} FROM \"__having_{}\" WHERE {having_sql}",
-            col_list.join(", "),
-            query_name
-        );
         let table_name = format!("__having_{query_name}");
+
+        let col_list: Option<Vec<String>> = if self.cached_having_plans.contains_key(&idx) {
+            None
+        } else {
+            Some(
+                schema
+                    .fields()
+                    .iter()
+                    .map(|f| format!("\"{}\"", f.name()))
+                    .collect(),
+            )
+        };
 
         let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![batches.to_vec()])
             .map_err(|e| DbError::query_pipeline(query_name, &e))?;
@@ -1215,12 +1597,29 @@ impl StreamExecutor {
             .register_table(&table_name, Arc::new(mem_table))
             .map_err(|e| DbError::query_pipeline(query_name, &e))?;
 
-        let result = match self.ctx.sql(&filter_sql).await {
-            Ok(df) => df
-                .collect()
-                .await
-                .map_err(|e| DbError::query_pipeline(query_name, &e)),
-            Err(e) => Err(DbError::query_pipeline(query_name, &e)),
+        let result = if let Some(plan) = self.cached_having_plans.get(&idx) {
+            self.execute_cached_plan(query_name, plan).await
+        } else {
+            let col_list = col_list.expect("col_list built for uncached path");
+            let filter_sql = format!(
+                "SELECT {} FROM \"__having_{}\" WHERE {having_sql}",
+                col_list.join(", "),
+                query_name
+            );
+            tracing::warn!(
+                query = %query_name,
+                "HAVING filter compiled to PhysicalExpr failed — using cached SQL plan"
+            );
+            match self.ctx.sql(&filter_sql).await {
+                Ok(df) => {
+                    self.cached_having_plans
+                        .insert(idx, df.logical_plan().clone());
+                    df.collect()
+                        .await
+                        .map_err(|e| DbError::query_pipeline(query_name, &e))
+                }
+                Err(e) => Err(DbError::query_pipeline(query_name, &e)),
+            }
         };
 
         let _ = self.ctx.deregister_table(&table_name);
@@ -1237,8 +1636,8 @@ impl StreamExecutor {
         idx: usize,
         query_name: &str,
         current_watermark: i64,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let eowc_state = self.eowc_agg_states.get(&idx).ok_or_else(|| {
             DbError::Pipeline(format!(
@@ -1248,22 +1647,13 @@ impl StreamExecutor {
 
         let pre_agg_batches = if let Some(proj) = eowc_state.compiled_projection() {
             evaluate_compiled_projection(proj, source_batches, results)
+        } else if let Some(plan) = eowc_state.cached_pre_agg_plan() {
+            let plan = plan.clone();
+            self.execute_cached_plan(query_name, &plan).await?
         } else {
-            let pre_agg_sql = eowc_state.pre_agg_sql().to_string();
-            match self.ctx.sql(&pre_agg_sql).await {
-                Ok(df) => df
-                    .collect()
-                    .await
-                    .map_err(|e| DbError::query_pipeline(query_name, &e))?,
-                Err(e) => {
-                    tracing::trace!(
-                        query = %query_name,
-                        error = %e,
-                        "EOWC pre-agg SQL failed, skipping update"
-                    );
-                    Vec::new()
-                }
-            }
+            return Err(DbError::Pipeline(format!(
+                "[LDB-8050] query '{query_name}': no compiled projection or cached plan"
+            )));
         };
 
         let eowc_state = self.eowc_agg_states.get_mut(&idx).ok_or_else(|| {
@@ -1284,7 +1674,7 @@ impl StreamExecutor {
             batches = apply_compiled_having(&batches, filter)?;
         } else if let Some(having_sql) = having_sql {
             batches = self
-                .apply_having_filter(query_name, &batches, &having_sql)
+                .apply_having_filter(idx, query_name, &batches, &having_sql)
                 .await?;
         }
 
@@ -1301,8 +1691,8 @@ impl StreamExecutor {
         idx: usize,
         query_name: &str,
         current_watermark: i64,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let cw_state = self.core_window_states.get(&idx).ok_or_else(|| {
             DbError::Pipeline(format!("internal: missing cw_state for query index {idx}"))
@@ -1310,22 +1700,13 @@ impl StreamExecutor {
 
         let pre_agg_batches = if let Some(proj) = cw_state.compiled_projection() {
             evaluate_compiled_projection(proj, source_batches, results)
+        } else if let Some(plan) = cw_state.cached_pre_agg_plan() {
+            let plan = plan.clone();
+            self.execute_cached_plan(query_name, &plan).await?
         } else {
-            let pre_agg_sql = cw_state.pre_agg_sql().to_string();
-            match self.ctx.sql(&pre_agg_sql).await {
-                Ok(df) => df
-                    .collect()
-                    .await
-                    .map_err(|e| DbError::query_pipeline(query_name, &e))?,
-                Err(e) => {
-                    tracing::trace!(
-                        query = %query_name,
-                        error = %e,
-                        "core window pre-agg SQL failed, skipping update"
-                    );
-                    Vec::new()
-                }
-            }
+            return Err(DbError::Pipeline(format!(
+                "[LDB-8050] query '{query_name}': no compiled projection or cached plan"
+            )));
         };
 
         let cw_state = self.core_window_states.get_mut(&idx).ok_or_else(|| {
@@ -1344,7 +1725,7 @@ impl StreamExecutor {
             batches = apply_compiled_having(&batches, filter)?;
         } else if let Some(having_sql) = having_sql {
             batches = self
-                .apply_having_filter(query_name, &batches, &having_sql)
+                .apply_having_filter(idx, query_name, &batches, &having_sql)
                 .await?;
         }
 
@@ -1364,8 +1745,8 @@ impl StreamExecutor {
         window_config: Option<&WindowOperatorConfig>,
         asof_config: Option<&AsofJoinTranslatorConfig>,
         projection_sql: Option<&str>,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        intermediate_results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        intermediate_results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         current_watermark: i64,
     ) -> Result<Vec<RecordBatch>, DbError> {
         // Try core-window and incremental EOWC paths for aggregate queries with
@@ -1505,23 +1886,26 @@ impl StreamExecutor {
         // Fall through to raw-batch EOWC path.
         // Collect table refs as owned strings to avoid borrowing self.queries
         // while mutating self.eowc_states.
-        let table_refs: Vec<String> = self.queries[idx].table_refs.iter().cloned().collect();
+        let table_refs: Vec<Arc<str>> = self.queries[idx]
+            .table_refs
+            .iter()
+            .map(|s| Arc::from(s.as_str()))
+            .collect();
 
         // Accumulate current source batches into EOWC state.
         if let Some(eowc) = self.eowc_states.get_mut(&idx) {
             for table_name in &table_refs {
                 // Check source_batches first, then intermediate_results
-                let batches_to_add = if let Some(batches) = source_batches.get(table_name.as_str())
-                {
+                let batches_to_add = if let Some(batches) = source_batches.get(&**table_name) {
                     Some(batches)
                 } else {
-                    intermediate_results.get(table_name.as_str())
+                    intermediate_results.get(&**table_name)
                 };
 
                 if let Some(batches) = batches_to_add {
                     let entry = eowc
                         .accumulated_sources
-                        .entry(table_name.clone())
+                        .entry(Arc::clone(table_name))
                         .or_default();
                     for batch in batches {
                         if batch.num_rows() > 0 {
@@ -1598,12 +1982,12 @@ impl StreamExecutor {
             return Ok(Vec::new());
         };
 
-        let mut filtered_sources: FxHashMap<String, Vec<RecordBatch>> =
+        let mut filtered_sources: FxHashMap<Arc<str>, Vec<RecordBatch>> =
             FxHashMap::with_capacity_and_hasher(
                 eowc.accumulated_sources.len(),
                 rustc_hash::FxBuildHasher,
             );
-        let mut retained_sources: FxHashMap<String, Vec<RecordBatch>> =
+        let mut retained_sources: FxHashMap<Arc<str>, Vec<RecordBatch>> =
             FxHashMap::with_capacity_and_hasher(
                 eowc.accumulated_sources.len(),
                 rustc_hash::FxBuildHasher,
@@ -1688,19 +2072,20 @@ impl StreamExecutor {
             let schema = batches[0].schema();
             let mem_table =
                 datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
-                    .map_err(|e| DbError::query_pipeline(name, &e))?;
-            let _ = self.ctx.deregister_table(name);
+                    .map_err(|e| DbError::query_pipeline(&**name, &e))?;
+            let _ = self.ctx.deregister_table(&**name);
             self.ctx
-                .register_table(name, Arc::new(mem_table))
-                .map_err(|e| DbError::query_pipeline(name, &e))?;
-            eowc_temp_tables.push(name.clone());
+                .register_table(&**name, Arc::new(mem_table))
+                .map_err(|e| DbError::query_pipeline(&**name, &e))?;
+            eowc_temp_tables.push(name.to_string());
         }
 
         // Execute the query
-        let query_sql = &self.queries[idx].sql;
-        let temporal_config = self.queries[idx].temporal_config.as_ref();
+        let query_sql = self.queries[idx].sql.clone();
+        let temporal_config = self.queries[idx].temporal_config.clone();
         let batches = if let Some(cfg) = asof_config {
             self.execute_asof_query(
+                idx,
                 query_name,
                 cfg,
                 projection_sql,
@@ -1708,12 +2093,13 @@ impl StreamExecutor {
                 intermediate_results,
             )
             .await?
-        } else if let Some(tcfg) = temporal_config {
-            let temporal_proj = self.queries[idx].projection_sql.as_deref();
+        } else if let Some(ref tcfg) = temporal_config {
+            let temporal_proj = self.queries[idx].projection_sql.as_ref().map(Arc::clone);
             self.execute_temporal_query(
+                idx,
                 query_name,
                 tcfg,
-                temporal_proj,
+                temporal_proj.as_deref(),
                 &filtered_sources,
                 intermediate_results,
             )
@@ -1721,7 +2107,7 @@ impl StreamExecutor {
         } else {
             let df = self
                 .ctx
-                .sql(query_sql)
+                .sql(&query_sql)
                 .await
                 .map_err(|e| DbError::query_pipeline(query_name, &e))?;
             df.collect()
@@ -1753,12 +2139,13 @@ impl StreamExecutor {
     /// the join in-process. Optionally applies a projection SQL for aliases and
     /// computed columns.
     async fn execute_asof_query(
-        &self,
+        &mut self,
+        idx: usize,
         query_name: &str,
         config: &AsofJoinTranslatorConfig,
         projection_sql: Option<&str>,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        intermediate_results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        intermediate_results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         // Resolve left batches: source_batches → intermediate → DataFusion
         let left_batches = self
@@ -1777,6 +2164,30 @@ impl StreamExecutor {
 
         // Apply projection if present (handles aliases and computed columns)
         if let Some(proj_sql) = projection_sql {
+            // Try compiled post-projection (lazy compile on first call)
+            if let Some(compiled) = self.compiled_post_projections.get(&idx) {
+                let result = Self::apply_compiled_post_projection(compiled, &joined)?;
+                return Ok(vec![result]);
+            }
+
+            if !self.post_projection_compile_failed.contains(&idx) {
+                let schema = joined.schema();
+                if let Some(compiled) = self
+                    .try_compile_post_projection(proj_sql, "__asof_tmp", &schema)
+                    .await
+                {
+                    let result = Self::apply_compiled_post_projection(&compiled, &joined)?;
+                    self.compiled_post_projections.insert(idx, compiled);
+                    return Ok(vec![result]);
+                }
+                self.post_projection_compile_failed.insert(idx);
+                tracing::warn!(
+                    query = %query_name,
+                    "ASOF post-projection could not be compiled — using DataFusion SQL fallback"
+                );
+            }
+
+            // SQL fallback with plan caching
             let schema = joined.schema();
             let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![joined]])
                 .map_err(|e| DbError::query_pipeline(query_name, &e))?;
@@ -1786,15 +2197,20 @@ impl StreamExecutor {
                 .register_table("__asof_tmp", Arc::new(mem_table))
                 .map_err(|e| DbError::query_pipeline(query_name, &e))?;
 
-            let df = self
-                .ctx
-                .sql(proj_sql)
-                .await
-                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
-            let result = df
-                .collect()
-                .await
-                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+            let result = if let Some(plan) = self.cached_post_projection_plans.get(&idx) {
+                self.execute_cached_plan(query_name, plan).await?
+            } else {
+                let df = self
+                    .ctx
+                    .sql(proj_sql)
+                    .await
+                    .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+                self.cached_post_projection_plans
+                    .insert(idx, df.logical_plan().clone());
+                df.collect()
+                    .await
+                    .map_err(|e| DbError::query_pipeline(query_name, &e))?
+            };
 
             let _ = self.ctx.deregister_table("__asof_tmp");
             Ok(result)
@@ -1809,12 +2225,13 @@ impl StreamExecutor {
     /// the lookup registry. The pre-built `VersionedIndex` is reused
     /// across cycles (only rebuilt on CDC updates in `poll_tables`).
     async fn execute_temporal_query(
-        &self,
+        &mut self,
+        idx: usize,
         query_name: &str,
         config: &TemporalJoinTranslatorConfig,
         projection_sql: Option<&str>,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        intermediate_results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        intermediate_results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         let registry = self.lookup_registry.as_ref().ok_or_else(|| {
             DbError::Pipeline(format!(
@@ -1832,6 +2249,7 @@ impl StreamExecutor {
         };
 
         self.execute_versioned_temporal_query(
+            idx,
             query_name,
             config,
             projection_sql,
@@ -1843,21 +2261,38 @@ impl StreamExecutor {
     }
 
     /// Execute a temporal join against a versioned lookup table from the registry.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn execute_versioned_temporal_query(
-        &self,
+        &mut self,
+        idx: usize,
         query_name: &str,
         config: &TemporalJoinTranslatorConfig,
         projection_sql: Option<&str>,
         versioned: &laminar_sql::datafusion::VersionedLookupState,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        intermediate_results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        intermediate_results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         use datafusion::catalog::TableProvider;
         use datafusion::physical_plan::ExecutionPlan as _;
         use futures::TryStreamExt as _;
         use laminar_sql::datafusion::lookup_join::LookupJoinType;
         use laminar_sql::datafusion::lookup_join_exec::VersionedLookupJoinExec;
+
+        // Warn once per query when the temporal table is modified
+        let current_rows = versioned.batch.num_rows();
+        let last_rows = self.last_temporal_row_count.get(&idx).copied().unwrap_or(0);
+        if current_rows < last_rows {
+            tracing::warn!(
+                query = %query_name,
+                table = %config.table_name,
+                previous_rows = last_rows,
+                current_rows = current_rows,
+                "Temporal join table has been modified. \
+                 Retractions for previously-joined events are NOT emitted. \
+                 Use append-only tables for correct temporal join semantics."
+            );
+        }
+        self.last_temporal_row_count.insert(idx, current_rows);
 
         let stream_batches = self
             .resolve_table_batches(&config.stream_table, source_batches, intermediate_results)
@@ -1956,6 +2391,41 @@ impl StreamExecutor {
             if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
                 return Ok(Vec::new());
             }
+
+            // Try compiled post-projection (lazy compile on first call)
+            if let Some(compiled) = self.compiled_post_projections.get(&idx) {
+                let mut result = Vec::with_capacity(batches.len());
+                for batch in &batches {
+                    if batch.num_rows() > 0 {
+                        result.push(Self::apply_compiled_post_projection(compiled, batch)?);
+                    }
+                }
+                return Ok(result);
+            }
+
+            if !self.post_projection_compile_failed.contains(&idx) {
+                let schema = batches[0].schema();
+                if let Some(compiled) = self
+                    .try_compile_post_projection(proj_sql, "__temporal_tmp", &schema)
+                    .await
+                {
+                    let mut result = Vec::with_capacity(batches.len());
+                    for batch in &batches {
+                        if batch.num_rows() > 0 {
+                            result.push(Self::apply_compiled_post_projection(&compiled, batch)?);
+                        }
+                    }
+                    self.compiled_post_projections.insert(idx, compiled);
+                    return Ok(result);
+                }
+                self.post_projection_compile_failed.insert(idx);
+                tracing::warn!(
+                    query = %query_name,
+                    "Temporal post-projection could not be compiled — using DataFusion SQL fallback"
+                );
+            }
+
+            // SQL fallback with plan caching
             let schema = batches[0].schema();
             let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![batches])
                 .map_err(|e| DbError::query_pipeline(query_name, &e))?;
@@ -1965,15 +2435,20 @@ impl StreamExecutor {
                 .register_table("__temporal_tmp", Arc::new(mem_table))
                 .map_err(|e| DbError::query_pipeline(query_name, &e))?;
 
-            let df = self
-                .ctx
-                .sql(proj_sql)
-                .await
-                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
-            let result = df
-                .collect()
-                .await
-                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+            let result = if let Some(plan) = self.cached_post_projection_plans.get(&idx) {
+                self.execute_cached_plan(query_name, plan).await?
+            } else {
+                let df = self
+                    .ctx
+                    .sql(proj_sql)
+                    .await
+                    .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+                self.cached_post_projection_plans
+                    .insert(idx, df.logical_plan().clone());
+                df.collect()
+                    .await
+                    .map_err(|e| DbError::query_pipeline(query_name, &e))?
+            };
 
             let _ = self.ctx.deregister_table("__temporal_tmp");
             Ok(result)
@@ -1982,13 +2457,63 @@ impl StreamExecutor {
         }
     }
 
+    /// Try to compile a post-join projection SQL to physical expressions.
+    ///
+    /// On success, returns `CompiledPostProjection` that can evaluate the
+    /// projection directly on a `RecordBatch` without SQL overhead.
+    async fn try_compile_post_projection(
+        &self,
+        proj_sql: &str,
+        tmp_table_name: &str,
+        batch_schema: &SchemaRef,
+    ) -> Option<CompiledPostProjection> {
+        let empty =
+            datafusion::datasource::MemTable::try_new(batch_schema.clone(), vec![vec![]]).ok()?;
+        let _ = self.ctx.deregister_table(tmp_table_name);
+        self.ctx
+            .register_table(tmp_table_name, Arc::new(empty))
+            .ok()?;
+
+        let df = self.ctx.sql(proj_sql).await.ok()?;
+        let plan = df.logical_plan().clone();
+        let _ = self.ctx.deregister_table(tmp_table_name);
+
+        // Extract projection expressions from the logical plan
+        let (exprs, output_schema) = extract_projection_exprs(&plan, batch_schema, &self.ctx)?;
+        Some(CompiledPostProjection {
+            exprs,
+            output_schema,
+        })
+    }
+
+    /// Apply a compiled post-projection to a batch.
+    fn apply_compiled_post_projection(
+        proj: &CompiledPostProjection,
+        batch: &RecordBatch,
+    ) -> Result<RecordBatch, DbError> {
+        if batch.num_rows() == 0 {
+            return Ok(RecordBatch::new_empty(Arc::clone(&proj.output_schema)));
+        }
+        let mut arrays = Vec::with_capacity(proj.exprs.len());
+        for expr in &proj.exprs {
+            let col = expr
+                .evaluate(batch)
+                .map_err(|e| DbError::Pipeline(format!("post-projection evaluate: {e}")))?
+                .into_array(batch.num_rows())
+                .map_err(|e| DbError::Pipeline(format!("post-projection to array: {e}")))?;
+            arrays.push(col);
+        }
+        RecordBatch::try_new(Arc::clone(&proj.output_schema), arrays)
+            .map_err(|e| DbError::Pipeline(format!("post-projection batch: {e}")))
+    }
+
     /// Resolve batches for a table name by checking source batches first,
     /// then intermediate results, then falling back to the `DataFusion` context.
     async fn resolve_table_batches(
         &self,
         table_name: &str,
-        source_batches: &FxHashMap<String, Vec<RecordBatch>>,
-        intermediate_results: &FxHashMap<String, Vec<RecordBatch>>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        intermediate_results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<Vec<RecordBatch>, DbError> {
         if let Some(batches) = source_batches.get(table_name) {
             return Ok(batches.clone());
@@ -1996,11 +2521,11 @@ impl StreamExecutor {
         if let Some(batches) = intermediate_results.get(table_name) {
             return Ok(batches.clone());
         }
-        // Fall back to DataFusion context (e.g., static reference tables)
-        let sql = format!("SELECT * FROM {table_name}");
+        // Fall back to DataFusion context (e.g., static reference tables).
+        // Use ctx.table() instead of ctx.sql() to skip SQL parsing overhead.
         let df = self
             .ctx
-            .sql(&sql)
+            .table(table_name)
             .await
             .map_err(|e| DbError::query_pipeline(table_name, &e))?;
         df.collect()
@@ -2008,18 +2533,19 @@ impl StreamExecutor {
             .map_err(|e| DbError::query_pipeline(table_name, &e))
     }
 
-    /// Checkpoint all aggregate state (both running-total and EOWC).
+    /// Snapshot all aggregate state into a `StreamExecutorCheckpoint` struct.
     ///
-    /// Returns `Ok(None)` if there is no state to checkpoint (no aggregate
-    /// queries have accumulated any groups). Otherwise returns the serialized
-    /// JSON bytes.
-    pub fn checkpoint_state(&mut self) -> Result<Option<Vec<u8>>, DbError> {
+    /// This requires `&mut self` because `Accumulator::state()` is `&mut`.
+    /// Returns `Ok(None)` if there is no state to checkpoint.
+    pub fn snapshot_state(
+        &mut self,
+    ) -> Result<Option<crate::aggregate_state::StreamExecutorCheckpoint>, DbError> {
         use crate::aggregate_state::{RawEowcCheckpoint, StreamExecutorCheckpoint};
 
         let mut agg_checkpoints =
             FxHashMap::with_capacity_and_hasher(self.agg_states.len(), rustc_hash::FxBuildHasher);
         for (&idx, state) in &mut self.agg_states {
-            let name = self.queries[idx].name.clone();
+            let name = self.queries[idx].name.to_string();
             agg_checkpoints.insert(name, state.checkpoint_groups()?);
         }
 
@@ -2028,7 +2554,7 @@ impl StreamExecutor {
             rustc_hash::FxBuildHasher,
         );
         for (&idx, state) in &mut self.eowc_agg_states {
-            let name = self.queries[idx].name.clone();
+            let name = self.queries[idx].name.to_string();
             eowc_checkpoints.insert(name, state.checkpoint_windows()?);
         }
 
@@ -2037,7 +2563,7 @@ impl StreamExecutor {
             rustc_hash::FxBuildHasher,
         );
         for (&idx, state) in &mut self.core_window_states {
-            let name = self.queries[idx].name.clone();
+            let name = self.queries[idx].name.to_string();
             cw_checkpoints.insert(name, state.checkpoint_windows()?);
         }
 
@@ -2048,7 +2574,7 @@ impl StreamExecutor {
             if eowc.accumulated_rows == 0 {
                 continue;
             }
-            let name = self.queries[idx].name.clone();
+            let name = self.queries[idx].name.to_string();
             let mut sources = FxHashMap::with_capacity_and_hasher(
                 eowc.accumulated_sources.len(),
                 rustc_hash::FxBuildHasher,
@@ -2064,7 +2590,7 @@ impl StreamExecutor {
                     ipc_batches.push(ipc_bytes);
                 }
                 if !ipc_batches.is_empty() {
-                    sources.insert(src_name.clone(), ipc_batches);
+                    sources.insert(src_name.to_string(), ipc_batches);
                 }
             }
             raw_eowc_checkpoints.insert(
@@ -2077,9 +2603,28 @@ impl StreamExecutor {
             );
         }
 
-        // Join states: currently ASOF/temporal joins are stateless per-cycle,
-        // so this map is empty. Future stateful joins will populate it.
-        let join_checkpoints = FxHashMap::default();
+        // Checkpoint interval join states (compact before serializing)
+        let mut join_checkpoints = FxHashMap::with_capacity_and_hasher(
+            self.interval_join_states.len(),
+            rustc_hash::FxBuildHasher,
+        );
+        for (&idx, state) in &mut self.interval_join_states {
+            let name = self.queries[idx].name.to_string();
+            if let Some(ref cfg) = self.queries[idx].stream_join_config {
+                join_checkpoints.insert(
+                    name,
+                    state.snapshot_checkpoint(
+                        &cfg.left_key,
+                        &cfg.left_time_column,
+                        &cfg.right_key,
+                        &cfg.right_time_column,
+                    )?,
+                );
+            } else {
+                // Fallback: checkpoint without column names (shouldn't happen)
+                join_checkpoints.insert(name, state.snapshot_checkpoint("", "", "", "")?);
+            }
+        }
 
         if agg_checkpoints.is_empty()
             && eowc_checkpoints.is_empty()
@@ -2090,7 +2635,7 @@ impl StreamExecutor {
             return Ok(None);
         }
 
-        let checkpoint = StreamExecutorCheckpoint {
+        Ok(Some(StreamExecutorCheckpoint {
             version: 2,
             vnode_count: laminar_core::state::VNODE_COUNT,
             agg_states: agg_checkpoints,
@@ -2098,13 +2643,20 @@ impl StreamExecutor {
             core_window_states: cw_checkpoints,
             join_states: join_checkpoints,
             raw_eowc_states: raw_eowc_checkpoints,
-        };
+        }))
+    }
 
-        let bytes = serde_json::to_vec(&checkpoint).map_err(|e| {
+    /// Serialize a `StreamExecutorCheckpoint` to JSON bytes.
+    ///
+    /// This is a standalone function that does not require `&self`, so it
+    /// can be offloaded to `spawn_blocking` to avoid blocking the
+    /// coordinator during serialization.
+    pub fn serialize_checkpoint(
+        cp: &crate::aggregate_state::StreamExecutorCheckpoint,
+    ) -> Result<Vec<u8>, DbError> {
+        serde_json::to_vec(&cp).map_err(|e| {
             DbError::Pipeline(format!("stream executor checkpoint serialization: {e}"))
-        })?;
-
-        Ok(Some(bytes))
+        })
     }
 
     /// Restore aggregate state from a previous checkpoint.
@@ -2130,7 +2682,7 @@ impl StreamExecutor {
             .queries
             .iter()
             .enumerate()
-            .map(|(i, q)| (q.name.as_str(), i))
+            .map(|(i, q)| (&*q.name, i))
             .collect();
 
         // Immediately restore any already-initialized states
@@ -2178,7 +2730,7 @@ impl StreamExecutor {
                         total_rows += batch.num_rows();
                         batches.push(batch);
                     }
-                    accumulated_sources.insert(src_name.clone(), batches);
+                    accumulated_sources.insert(Arc::from(src_name.as_str()), batches);
                 }
                 self.eowc_states.insert(
                     idx,
@@ -2225,15 +2777,15 @@ impl StreamExecutor {
     }
 
     fn try_restore_pending_agg(&mut self, idx: usize) {
-        let name = self.queries[idx].name.clone();
+        let name = &self.queries[idx].name;
         let cp = self
             .pending_restore
             .as_ref()
-            .and_then(|p| p.agg_states.get(&name))
+            .and_then(|p| p.agg_states.get(&**name))
             .cloned();
         if let (Some(cp), Some(state)) = (cp, self.agg_states.get_mut(&idx)) {
             Self::log_restore(
-                &name,
+                name,
                 &cp,
                 state,
                 IncrementalAggState::restore_groups,
@@ -2243,15 +2795,15 @@ impl StreamExecutor {
     }
 
     fn try_restore_pending_eowc(&mut self, idx: usize) {
-        let name = self.queries[idx].name.clone();
+        let name = &self.queries[idx].name;
         let cp = self
             .pending_restore
             .as_ref()
-            .and_then(|p| p.eowc_states.get(&name))
+            .and_then(|p| p.eowc_states.get(&**name))
             .cloned();
         if let (Some(cp), Some(state)) = (cp, self.eowc_agg_states.get_mut(&idx)) {
             Self::log_restore(
-                &name,
+                name,
                 &cp,
                 state,
                 IncrementalEowcState::restore_windows,
@@ -2260,16 +2812,150 @@ impl StreamExecutor {
         }
     }
 
+    /// Execute an interval join query for one cycle.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn execute_interval_join_query(
+        &mut self,
+        idx: usize,
+        query_name: &str,
+        config: &StreamJoinConfig,
+        projection_sql: Option<&str>,
+        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        intermediate_results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        current_watermark: i64,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        // Resolve left and right batches from source tables
+        let left_batches = self
+            .resolve_table_batches(&config.left_table, source_batches, intermediate_results)
+            .await?;
+        let right_batches = self
+            .resolve_table_batches(&config.right_table, source_batches, intermediate_results)
+            .await?;
+
+        // Get or create interval join state
+        if !self.interval_join_states.contains_key(&idx) {
+            let mut new_state = crate::interval_join::IntervalJoinState::new();
+            // Try restoring from checkpoint
+            if let Some(ref pending) = self.pending_restore {
+                if let Some(cp) = pending.join_states.get(&*self.queries[idx].name) {
+                    match crate::interval_join::IntervalJoinState::from_checkpoint(
+                        cp,
+                        &config.left_key,
+                        &config.left_time_column,
+                        &config.right_key,
+                        &config.right_time_column,
+                    ) {
+                        Ok(restored) => {
+                            tracing::info!(
+                                query = %query_name,
+                                left_rows = cp.left_buffer_rows,
+                                right_rows = cp.right_buffer_rows,
+                                "Restored interval join state from checkpoint"
+                            );
+                            new_state = restored;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                query = %query_name,
+                                error = %e,
+                                "Failed to restore interval join state from checkpoint"
+                            );
+                        }
+                    }
+                }
+            }
+            self.interval_join_states.insert(idx, new_state);
+        }
+
+        let state = self
+            .interval_join_states
+            .get_mut(&idx)
+            .expect("interval join state was just inserted");
+
+        let join_result = crate::interval_join::execute_interval_join_cycle(
+            state,
+            &left_batches,
+            &right_batches,
+            config,
+            current_watermark,
+        )?;
+
+        // Apply post-projection if needed
+        if join_result.is_empty() {
+            return Ok(join_result);
+        }
+
+        if let Some(proj_sql) = projection_sql {
+            // Concatenate all result batches for projection
+            let schema = join_result[0].schema();
+            let joined = arrow::compute::concat_batches(&schema, &join_result)
+                .map_err(|e| DbError::query_pipeline_arrow("interval join (concat)", &e))?;
+
+            // Try compiled post-projection (lazy compile on first call)
+            if let Some(compiled) = self.compiled_post_projections.get(&idx) {
+                let result = Self::apply_compiled_post_projection(compiled, &joined)?;
+                return Ok(vec![result]);
+            }
+
+            if !self.post_projection_compile_failed.contains(&idx) {
+                let schema = joined.schema();
+                if let Some(compiled) = self
+                    .try_compile_post_projection(proj_sql, "__interval_tmp", &schema)
+                    .await
+                {
+                    let result = Self::apply_compiled_post_projection(&compiled, &joined)?;
+                    self.compiled_post_projections.insert(idx, compiled);
+                    return Ok(vec![result]);
+                }
+                self.post_projection_compile_failed.insert(idx);
+                tracing::warn!(
+                    query = %query_name,
+                    "Interval join post-projection could not be compiled — using DataFusion SQL fallback"
+                );
+            }
+
+            // SQL fallback with plan caching
+            let schema = joined.schema();
+            let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![joined]])
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+
+            let _ = self.ctx.deregister_table("__interval_tmp");
+            self.ctx
+                .register_table("__interval_tmp", Arc::new(mem_table))
+                .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+
+            let result = if let Some(plan) = self.cached_post_projection_plans.get(&idx) {
+                self.execute_cached_plan(query_name, plan).await?
+            } else {
+                let df = self
+                    .ctx
+                    .sql(proj_sql)
+                    .await
+                    .map_err(|e| DbError::query_pipeline(query_name, &e))?;
+                self.cached_post_projection_plans
+                    .insert(idx, df.logical_plan().clone());
+                df.collect()
+                    .await
+                    .map_err(|e| DbError::query_pipeline(query_name, &e))?
+            };
+
+            let _ = self.ctx.deregister_table("__interval_tmp");
+            Ok(result)
+        } else {
+            Ok(join_result)
+        }
+    }
+
     fn try_restore_pending_core_window(&mut self, idx: usize) {
-        let name = self.queries[idx].name.clone();
+        let name = &self.queries[idx].name;
         let cp = self
             .pending_restore
             .as_ref()
-            .and_then(|p| p.core_window_states.get(&name))
+            .and_then(|p| p.core_window_states.get(&**name))
             .cloned();
         if let (Some(cp), Some(state)) = (cp, self.core_window_states.get_mut(&idx)) {
             Self::log_restore(
-                &name,
+                name,
                 &cp,
                 state,
                 CoreWindowState::restore_windows,
@@ -2292,7 +2978,7 @@ impl StreamExecutor {
 /// - **Sliding**: align to slide interval — the earliest open window starts at
 ///   `((watermark - size) / slide + 1) * slide`, so data below that threshold
 ///   belongs only to closed windows.
-fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> i64 {
+pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> i64 {
     match config.window_type {
         WindowType::Tumbling => {
             #[allow(clippy::cast_possible_truncation)]
@@ -2369,7 +3055,7 @@ fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> 
 }
 
 /// Infer the `TimestampFormat` from a `RecordBatch` column's `DataType`.
-fn infer_ts_format_from_batch(
+pub(crate) fn infer_ts_format_from_batch(
     batch: &RecordBatch,
     column: &str,
 ) -> laminar_core::time::TimestampFormat {
@@ -2383,7 +3069,7 @@ fn infer_ts_format_from_batch(
     }
 }
 
-fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>, Option<String>) {
+pub(crate) fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>, Option<String>) {
     // Parse using the streaming parser which understands ASOF syntax
     let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
         return (None, None);
@@ -2422,7 +3108,9 @@ fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>, Option<Str
     (Some(config), Some(projection_sql))
 }
 
-fn detect_temporal_query(sql: &str) -> (Option<TemporalJoinTranslatorConfig>, Option<String>) {
+pub(crate) fn detect_temporal_query(
+    sql: &str,
+) -> (Option<TemporalJoinTranslatorConfig>, Option<String>) {
     let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
         return (None, None);
     };
@@ -2455,6 +3143,583 @@ fn detect_temporal_query(sql: &str) -> (Option<TemporalJoinTranslatorConfig>, Op
     let projection_sql = build_temporal_projection_sql(select, temporal_analysis, &config);
 
     (Some(config), Some(projection_sql))
+}
+
+pub(crate) fn detect_stream_join_query(sql: &str) -> (Option<StreamJoinConfig>, Option<String>) {
+    let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
+        return (None, None);
+    };
+
+    let Some(laminar_sql::parser::StreamingStatement::Standard(stmt)) = statements.first() else {
+        return (None, None);
+    };
+
+    let Statement::Query(query) = stmt.as_ref() else {
+        return (None, None);
+    };
+
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return (None, None);
+    };
+
+    let Ok(Some(multi)) = analyze_joins(select) else {
+        return (None, None);
+    };
+
+    // Find the first stream-stream join step (has time_bound, not ASOF/temporal/lookup)
+    let Some(stream_analysis) = multi.joins.iter().find(|j| {
+        j.time_bound.is_some() && !j.is_asof_join && !j.is_temporal_join && !j.is_lookup_join
+    }) else {
+        return (None, None);
+    };
+
+    let JoinOperatorConfig::StreamStream(config) =
+        JoinOperatorConfig::from_analysis(stream_analysis)
+    else {
+        return (None, None);
+    };
+
+    // Only route to interval join if we have time columns
+    if config.left_time_column.is_empty() || config.right_time_column.is_empty() {
+        return (None, None);
+    }
+
+    // Only INNER JOIN is supported by the interval join engine. LEFT/RIGHT/FULL
+    // would silently produce inner-join behavior (missing unmatched rows).
+    if !matches!(config.join_type, StreamJoinType::Inner) {
+        tracing::warn!(
+            join_type = %config.join_type,
+            "Stream-stream interval join only supports INNER JOIN. \
+             {} JOIN would produce incorrect results. Query will use \
+             DataFusion batch join instead.",
+            config.join_type
+        );
+        return (None, None);
+    }
+
+    let projection_sql = build_stream_join_projection_sql(select, stream_analysis, &config);
+
+    (Some(config), Some(projection_sql))
+}
+
+/// Detect a `TEMPORAL PROBE JOIN` in raw SQL text.
+///
+/// Not recognized by sqlparser, so detection works on the raw SQL string.
+/// Returns `(config, projection_sql)` or `(None, None)` if not detected.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn detect_temporal_probe_query(
+    sql: &str,
+) -> (
+    Option<laminar_sql::translator::TemporalProbeConfig>,
+    Option<String>,
+) {
+    let upper = sql.to_uppercase();
+    let Some(tpj_pos) = upper.find("TEMPORAL PROBE JOIN") else {
+        return (None, None);
+    };
+
+    let from_pos = upper[..tpj_pos].rfind("FROM").unwrap_or(0);
+    let between_from_and_tpj = sql[from_pos + 4..tpj_pos].trim();
+
+    let left_parts: Vec<&str> = between_from_and_tpj.split_whitespace().collect();
+    if left_parts.is_empty() {
+        return (None, None);
+    }
+    let left_table = left_parts[0].to_string();
+    let left_alias = if left_parts.len() >= 3 && left_parts[1].eq_ignore_ascii_case("AS") {
+        Some(left_parts[2].to_string())
+    } else {
+        left_parts.get(1).map(ToString::to_string)
+    };
+
+    let after_tpj = &sql[tpj_pos + "TEMPORAL PROBE JOIN".len()..];
+    let after_tpj_trimmed = after_tpj.trim_start();
+
+    let after_upper = after_tpj_trimmed.to_uppercase();
+    let Some(on_pos) = after_upper.find(" ON ") else {
+        return (None, None);
+    };
+
+    let right_part = after_tpj_trimmed[..on_pos].trim();
+    let right_parts: Vec<&str> = right_part.split_whitespace().collect();
+    if right_parts.is_empty() {
+        return (None, None);
+    }
+    let right_table = right_parts[0].to_string();
+    let right_alias = if right_parts.len() >= 3 && right_parts[1].eq_ignore_ascii_case("AS") {
+        Some(right_parts[2].to_string())
+    } else {
+        right_parts.get(1).map(ToString::to_string)
+    };
+
+    let after_on = after_tpj_trimmed[on_pos + 4..].trim_start();
+    let key_columns: Vec<String> = if let Some(rest) = after_on.strip_prefix('(') {
+        let end_paren = rest.find(')').unwrap_or(rest.len());
+        rest[..end_paren]
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        vec![after_on.split_whitespace().next().unwrap_or("").to_string()]
+    };
+
+    // Parse optional TIMESTAMPS (left_col, right_col) clause
+    let after_on_upper = after_on.to_uppercase();
+    let (left_time_column, right_time_column) =
+        if let Some(ts_pos) = after_on_upper.find("TIMESTAMPS") {
+            let ts_text = &after_on[ts_pos + "TIMESTAMPS".len()..].trim_start();
+            if let Some(rest) = ts_text.strip_prefix('(') {
+                let end_paren = rest.find(')').unwrap_or(rest.len());
+                let cols: Vec<&str> = rest[..end_paren].split(',').map(str::trim).collect();
+                (
+                    cols.first().unwrap_or(&"ts").to_string(),
+                    cols.get(1).unwrap_or(&"ts").to_string(),
+                )
+            } else {
+                ("ts".into(), "ts".into())
+            }
+        } else {
+            tracing::warn!(
+                %left_table,
+                %right_table,
+                "temporal probe join: no TIMESTAMPS clause, defaulting to 'ts'. \
+                 Use TIMESTAMPS (left_col, right_col) to specify."
+            );
+            ("ts".into(), "ts".into())
+        };
+
+    let (offsets, alias_search_start) = if let Some(range_pos) = after_on_upper.find("RANGE ") {
+        let range_text = &after_on[range_pos + 6..];
+        let range_upper = range_text.to_uppercase();
+        let from_pos = range_upper.find("FROM ").map_or(0, |p| p + 5);
+        let to_pos = range_upper.find(" TO ").unwrap_or(range_text.len());
+        let step_pos = range_upper.find(" STEP ");
+
+        let start_str = range_text[from_pos..to_pos].trim();
+        let start_ms = laminar_sql::translator::parse_interval_to_ms(start_str).unwrap_or(0);
+
+        let (end_str, step_str) = if let Some(sp) = step_pos {
+            let to_end = &range_text[to_pos + 4..sp];
+            let as_pos = range_upper[sp + 6..].find(" AS ");
+            let step_end = as_pos.map_or(range_text.len(), |p| sp + 6 + p);
+            (to_end.trim(), range_text[sp + 6..step_end].trim())
+        } else {
+            let as_pos = range_upper[to_pos + 4..].find(" AS ");
+            let end_pos = as_pos.map_or(range_text.len(), |p| to_pos + 4 + p);
+            (range_text[to_pos + 4..end_pos].trim(), "1s")
+        };
+
+        let end_ms = laminar_sql::translator::parse_interval_to_ms(end_str).unwrap_or(0);
+        let step_ms = laminar_sql::translator::parse_interval_to_ms(step_str).unwrap_or(1000);
+
+        (
+            laminar_sql::translator::ProbeOffsetSpec::Range {
+                start_ms,
+                end_ms,
+                step_ms,
+            },
+            range_pos,
+        )
+    } else if let Some(list_pos) = after_on_upper.find("LIST ") {
+        let list_text = &after_on[list_pos + 5..];
+        let Some(open_paren) = list_text.find('(') else {
+            return (None, None);
+        };
+        let Some(close_paren) = list_text.find(')') else {
+            return (None, None);
+        };
+        let items_str = &list_text[open_paren + 1..close_paren];
+        let offsets_ms: Vec<i64> = items_str
+            .split(',')
+            .filter_map(|s| laminar_sql::translator::parse_interval_to_ms(s.trim()))
+            .collect();
+        if offsets_ms.is_empty() {
+            return (None, None);
+        }
+        (
+            laminar_sql::translator::ProbeOffsetSpec::List(offsets_ms),
+            list_pos,
+        )
+    } else {
+        return (None, None);
+    };
+
+    let remaining = &after_on[alias_search_start..];
+    let remaining_upper = remaining.to_uppercase();
+    let Some(as_pos) = remaining_upper.rfind(" AS ") else {
+        return (None, None);
+    };
+
+    let after_as = remaining[as_pos + 4..].trim();
+    let probe_alias = after_as
+        .split(|c: char| c.is_whitespace() || c == ';' || c == ')')
+        .next()
+        .unwrap_or("p")
+        .to_string();
+
+    let config = laminar_sql::translator::TemporalProbeConfig::new(
+        left_table.clone(),
+        right_table.clone(),
+        left_alias.clone(),
+        right_alias.clone(),
+        key_columns,
+        left_time_column,
+        right_time_column,
+        &offsets,
+        probe_alias,
+    );
+
+    // Build projection SQL by pre-processing the original SQL into a form
+    // sqlparser can parse, then walking the AST for safe rewriting.
+    let projection_sql = build_probe_projection_via_ast(
+        sql,
+        tpj_pos,
+        &config,
+        left_alias.as_deref(),
+        right_alias.as_deref(),
+    );
+
+    (Some(config), projection_sql)
+}
+
+/// Pre-process the temporal probe SQL into a standard JOIN that sqlparser
+/// can parse, then walk the AST to build the projection SQL.
+fn build_probe_projection_via_ast(
+    original_sql: &str,
+    tpj_pos: usize,
+    config: &laminar_sql::translator::TemporalProbeConfig,
+    left_alias: Option<&str>,
+    right_alias: Option<&str>,
+) -> Option<String> {
+    let probe = &config.probe_alias;
+    let upper = original_sql.to_uppercase();
+
+    // Find end of the probe clause: last "AS <alias>" after TEMPORAL PROBE JOIN
+    let after_tpj_upper = &upper[tpj_pos..];
+    let as_needle = format!(" AS {}", probe.to_uppercase());
+    let as_off = after_tpj_upper.rfind(&as_needle)?;
+    let probe_clause_end = tpj_pos + as_off + as_needle.len();
+
+    // Build standard JOIN to replace the probe clause
+    let left_ref = left_alias.unwrap_or(&config.left_table);
+    let right_ref = right_alias.unwrap_or(&config.right_table);
+    let on_clause = config
+        .key_columns
+        .iter()
+        .map(|k| format!("{left_ref}.{k} = {right_ref}.{k}"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let right_part = right_alias.map_or_else(
+        || config.right_table.clone(),
+        |a| format!("{} {a}", config.right_table),
+    );
+    let join_clause = format!("JOIN {right_part} ON {on_clause}");
+
+    let before_probe = &original_sql[..tpj_pos];
+    let after_probe = &original_sql[probe_clause_end..];
+    let mut rewritten = format!("{before_probe}{join_clause}{after_probe}");
+
+    // Resolve probe pseudo-columns to plain identifiers before parsing
+    rewritten = rewritten.replace(&format!("{probe}.offset_ms"), &format!("{probe}_offset_ms"));
+    rewritten = rewritten.replace(&format!("{probe}.probe_ts"), &format!("{probe}_probe_ts"));
+    rewritten = rewritten.replace(&format!("{probe}.offset_us"), &format!("{probe}_offset_ms"));
+    rewritten = rewritten.replace(&format!("{probe}.timestamp"), &format!("{probe}_probe_ts"));
+
+    // Parse the rewritten SQL
+    let stmts = laminar_sql::parse_streaming_sql(&rewritten).ok()?;
+    let laminar_sql::parser::StreamingStatement::Standard(stmt) = stmts.first()? else {
+        return None;
+    };
+    let Statement::Query(query) = stmt.as_ref() else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+
+    // Walk AST to build projection SQL
+    let items: Vec<String> = select
+        .projection
+        .iter()
+        .map(|item| rewrite_probe_select_item(item, left_alias, right_alias, config))
+        .collect();
+    let select_clause = items.join(", ");
+
+    let where_clause = select.selection.as_ref().map(|expr| {
+        let r = rewrite_probe_expr(expr, left_alias, right_alias, config);
+        format!(" WHERE {r}")
+    });
+
+    let group_by = match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) if !exprs.is_empty() => {
+            let cols: Vec<String> = exprs
+                .iter()
+                .map(|e| rewrite_probe_expr(e, left_alias, right_alias, config))
+                .collect();
+            format!(" GROUP BY {}", cols.join(", "))
+        }
+        _ => String::new(),
+    };
+
+    let having = select.having.as_ref().map_or(String::new(), |expr| {
+        let r = rewrite_probe_expr(expr, left_alias, right_alias, config);
+        format!(" HAVING {r}")
+    });
+
+    Some(format!(
+        "SELECT {select_clause} FROM __temporal_probe_tmp{}{group_by}{having}",
+        where_clause.unwrap_or_default()
+    ))
+}
+
+fn rewrite_probe_select_item(
+    item: &SelectItem,
+    left_alias: Option<&str>,
+    right_alias: Option<&str>,
+    config: &laminar_sql::translator::TemporalProbeConfig,
+) -> String {
+    match item {
+        SelectItem::UnnamedExpr(expr) => rewrite_probe_expr(expr, left_alias, right_alias, config),
+        SelectItem::ExprWithAlias { expr, alias } => {
+            let r = rewrite_probe_expr(expr, left_alias, right_alias, config);
+            format!("{r} AS {alias}")
+        }
+        SelectItem::Wildcard(_) => "*".to_string(),
+        SelectItem::QualifiedWildcard(name, _) => {
+            let table = name.to_string();
+            if Some(table.as_str()) == left_alias || Some(table.as_str()) == right_alias {
+                "*".to_string()
+            } else {
+                format!("{table}.*")
+            }
+        }
+    }
+}
+
+/// AST-level expression rewriter for temporal probe projection.
+/// Same recursive structure as ASOF `rewrite_expr`, parameterized for
+/// `TemporalProbeConfig` with composite key support and time-column
+/// disambiguation heuristic.
+fn rewrite_probe_expr(
+    expr: &Expr,
+    left_alias: Option<&str>,
+    right_alias: Option<&str>,
+    config: &laminar_sql::translator::TemporalProbeConfig,
+) -> String {
+    match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let table = parts[0].value.as_str();
+            let column = parts[1].value.as_str();
+
+            let is_left = Some(table) == left_alias || table == config.left_table;
+            let is_right = Some(table) == right_alias || table == config.right_table;
+
+            if is_left {
+                column.to_string()
+            } else if is_right {
+                if config.key_columns.iter().any(|k| k == column) {
+                    column.to_string()
+                } else if column == config.left_time_column && column == config.right_time_column {
+                    format!("{}_{}", column, config.right_table)
+                } else {
+                    column.to_string()
+                }
+            } else {
+                expr.to_string()
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let l = rewrite_probe_expr(left, left_alias, right_alias, config);
+            let r = rewrite_probe_expr(right, left_alias, right_alias, config);
+            format!("{l} {op} {r}")
+        }
+        Expr::UnaryOp { op, expr: inner } => {
+            let e = rewrite_probe_expr(inner, left_alias, right_alias, config);
+            format!("{op} {e}")
+        }
+        Expr::Nested(inner) => {
+            let e = rewrite_probe_expr(inner, left_alias, right_alias, config);
+            format!("({e})")
+        }
+        Expr::Function(func) => {
+            let name = &func.name;
+            let args: Vec<String> = match &func.args {
+                sqlparser::ast::FunctionArguments::List(arg_list) => arg_list
+                    .args
+                    .iter()
+                    .map(|arg| match arg {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ) => rewrite_probe_expr(e, left_alias, right_alias, config),
+                        other => other.to_string(),
+                    })
+                    .collect(),
+                other => vec![other.to_string()],
+            };
+            format!("{name}({})", args.join(", "))
+        }
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => {
+            let e = rewrite_probe_expr(inner, left_alias, right_alias, config);
+            format!("CAST({e} AS {data_type})")
+        }
+        Expr::IsNull(inner) => {
+            let e = rewrite_probe_expr(inner, left_alias, right_alias, config);
+            format!("{e} IS NULL")
+        }
+        Expr::IsNotNull(inner) => {
+            let e = rewrite_probe_expr(inner, left_alias, right_alias, config);
+            format!("{e} IS NOT NULL")
+        }
+        _ => expr.to_string(),
+    }
+}
+
+/// Build a `SELECT ... FROM __interval_tmp` projection query from the original
+/// SELECT items, rewriting table-qualified references to plain column names.
+fn build_stream_join_projection_sql(
+    select: &sqlparser::ast::Select,
+    analysis: &laminar_sql::parser::join_parser::JoinAnalysis,
+    config: &StreamJoinConfig,
+) -> String {
+    let left_alias = analysis.left_alias.as_deref();
+    let right_alias = analysis.right_alias.as_deref();
+
+    let items: Vec<String> = select
+        .projection
+        .iter()
+        .map(|item| match item {
+            SelectItem::UnnamedExpr(expr) => {
+                rewrite_stream_join_expr(expr, left_alias, right_alias, config)
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                let rewritten = rewrite_stream_join_expr(expr, left_alias, right_alias, config);
+                format!("{rewritten} AS {alias}")
+            }
+            SelectItem::Wildcard(_) => "*".to_string(),
+            SelectItem::QualifiedWildcard(name, _) => {
+                let table = name.to_string();
+                if table == config.left_table
+                    || left_alias.is_some_and(|a| a == table)
+                    || table == config.right_table
+                    || right_alias.is_some_and(|a| a == table)
+                {
+                    "*".to_string()
+                } else {
+                    format!("{table}.*")
+                }
+            }
+        })
+        .collect();
+
+    let where_clause = select
+        .selection
+        .as_ref()
+        .map(|expr| {
+            let rewritten = rewrite_stream_join_expr(expr, left_alias, right_alias, config);
+            format!(" WHERE {rewritten}")
+        })
+        .unwrap_or_default();
+
+    format!(
+        "SELECT {} FROM __interval_tmp{where_clause}",
+        items.join(", ")
+    )
+}
+
+/// Rewrite table-qualified column refs for the `__interval_tmp` schema.
+fn rewrite_stream_join_expr(
+    expr: &sqlparser::ast::Expr,
+    left_alias: Option<&str>,
+    right_alias: Option<&str>,
+    config: &StreamJoinConfig,
+) -> String {
+    match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let table = &parts[0].value;
+            let col = &parts[1].value;
+            let is_left = table == &config.left_table || left_alias.is_some_and(|a| a == table);
+            let is_right = table == &config.right_table || right_alias.is_some_and(|a| a == table);
+            if is_left || is_right {
+                if is_right {
+                    format!("{col}_{}", config.right_table)
+                } else {
+                    col.clone()
+                }
+            } else {
+                expr.to_string()
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let l = rewrite_stream_join_expr(left, left_alias, right_alias, config);
+            let r = rewrite_stream_join_expr(right, left_alias, right_alias, config);
+            format!("{l} {op} {r}")
+        }
+        Expr::UnaryOp { op, expr: inner } => {
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config);
+            format!("{op} {r}")
+        }
+        Expr::Nested(inner) => {
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config);
+            format!("({r})")
+        }
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => {
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config);
+            format!("CAST({r} AS {data_type})")
+        }
+        Expr::IsNull(inner) => {
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config);
+            format!("{r} IS NULL")
+        }
+        Expr::IsNotNull(inner) => {
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config);
+            format!("{r} IS NOT NULL")
+        }
+        Expr::Between {
+            expr: inner,
+            negated,
+            low,
+            high,
+        } => {
+            let e = rewrite_stream_join_expr(inner, left_alias, right_alias, config);
+            let l = rewrite_stream_join_expr(low, left_alias, right_alias, config);
+            let h = rewrite_stream_join_expr(high, left_alias, right_alias, config);
+            if *negated {
+                format!("{e} NOT BETWEEN {l} AND {h}")
+            } else {
+                format!("{e} BETWEEN {l} AND {h}")
+            }
+        }
+        Expr::Function(func) => {
+            let name = &func.name;
+            let args_str = match &func.args {
+                sqlparser::ast::FunctionArguments::List(arg_list) => {
+                    let rewritten_args: Vec<String> = arg_list
+                        .args
+                        .iter()
+                        .map(|arg| match arg {
+                            sqlparser::ast::FunctionArg::Unnamed(
+                                sqlparser::ast::FunctionArgExpr::Expr(e),
+                            ) => rewrite_stream_join_expr(e, left_alias, right_alias, config),
+                            other => other.to_string(),
+                        })
+                        .collect();
+                    rewritten_args.join(", ")
+                }
+                other => other.to_string(),
+            };
+            format!("{name}({args_str})")
+        }
+        _ => expr.to_string(),
+    }
 }
 
 /// Build a `SELECT ... FROM __temporal_tmp` projection query from the original
@@ -2731,7 +3996,7 @@ fn rewrite_expr(
 /// `DataFusion` applies `LIMIT N` per micro-batch, but streaming Top-K
 /// needs a global limit across the combined result. This function
 /// concatenates all batches and slices to the first `k` rows.
-fn apply_topk_filter(batches: &[RecordBatch], k: usize) -> Vec<RecordBatch> {
+pub(crate) fn apply_topk_filter(batches: &[RecordBatch], k: usize) -> Vec<RecordBatch> {
     if batches.is_empty() || k == 0 {
         return Vec::new();
     }
@@ -2800,7 +4065,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -2862,7 +4127,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -2887,7 +4152,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -2914,7 +4179,7 @@ mod tests {
 
         // First cycle
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
         let r1 = executor
             .execute_cycle(&source_batches, i64::MAX)
             .await
@@ -2961,7 +4226,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -3005,6 +4270,9 @@ mod tests {
         let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
+        // Debug builds on CI can exceed the default 8ms budget on level1 aggregation,
+        // causing level2 to be skipped. Use a generous budget.
+        executor.set_query_budget_ns(5_000_000_000);
 
         // level1: aggregate events
         executor.add_query(
@@ -3024,7 +4292,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -3049,6 +4317,8 @@ mod tests {
         let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
+        // Debug builds on Windows can be slow — use a generous budget for 3-level cascade.
+        executor.set_query_budget_ns(5_000_000_000);
 
         // level1: pass through
         executor.add_query(
@@ -3076,7 +4346,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -3105,6 +4375,10 @@ mod tests {
         let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
+        // Use a generous budget so all three queries execute in a single
+        // cycle even on slow CI machines (default 8ms is too tight for
+        // first-run compilation + aggregation).
+        executor.set_query_budget_ns(5_000_000_000);
 
         // Two queries from the same source
         executor.add_query(
@@ -3132,7 +4406,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -3171,7 +4445,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -3235,7 +4509,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let result = executor.execute_cycle(&source_batches, i64::MAX).await;
         assert!(result.is_err(), "invalid SQL should surface as error");
@@ -3262,7 +4536,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let result = executor.execute_cycle(&source_batches, i64::MAX).await;
         assert!(result.is_err(), "missing column should surface as error");
@@ -3370,8 +4644,8 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("trades".to_string(), vec![trades_batch_for_asof()]);
-        source_batches.insert("quotes".to_string(), vec![quotes_batch_for_asof()]);
+        source_batches.insert(Arc::from("trades"), vec![trades_batch_for_asof()]);
+        source_batches.insert(Arc::from("quotes"), vec![quotes_batch_for_asof()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -3409,8 +4683,8 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("trades".to_string(), vec![trades_batch_for_asof()]);
-        source_batches.insert("quotes".to_string(), vec![quotes_batch_for_asof()]);
+        source_batches.insert(Arc::from("trades"), vec![trades_batch_for_asof()]);
+        source_batches.insert(Arc::from("quotes"), vec![quotes_batch_for_asof()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -3455,9 +4729,9 @@ mod tests {
 
         // Only trades, no quotes → should still work (left join with nulls)
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("trades".to_string(), vec![trades_batch_for_asof()]);
+        source_batches.insert(Arc::from("trades"), vec![trades_batch_for_asof()]);
         source_batches.insert(
-            "quotes".to_string(),
+            Arc::from("quotes"),
             vec![RecordBatch::new_empty(quotes_schema())],
         );
 
@@ -3497,8 +4771,8 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("trades".to_string(), vec![trades_batch_for_asof()]);
-        source_batches.insert("quotes".to_string(), vec![quotes_batch_for_asof()]);
+        source_batches.insert(Arc::from("trades"), vec![trades_batch_for_asof()]);
+        source_batches.insert(Arc::from("quotes"), vec![quotes_batch_for_asof()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -3528,7 +4802,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -3593,7 +4867,7 @@ mod tests {
 
         let mut source_batches = FxHashMap::default();
         source_batches.insert(
-            "trades".to_string(),
+            Arc::from("trades"),
             vec![eowc_batch(vec!["AAPL"], vec![150.0], vec![500])],
         );
 
@@ -3605,7 +4879,7 @@ mod tests {
         );
 
         // Advance watermark to 1000 → window [0, 1000) is now closed
-        let empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
+        let empty: FxHashMap<Arc<str>, Vec<RecordBatch>> = FxHashMap::default();
         let results = executor.execute_cycle(&empty, 1000).await.unwrap();
         assert!(
             results.contains_key("avg_price"),
@@ -3632,7 +4906,7 @@ mod tests {
         // Cycle 1: push data at ts=100
         let mut batches1 = FxHashMap::default();
         batches1.insert(
-            "trades".to_string(),
+            Arc::from("trades"),
             vec![eowc_batch(vec!["AAPL"], vec![100.0], vec![100])],
         );
         let r1 = executor.execute_cycle(&batches1, 200).await.unwrap();
@@ -3641,14 +4915,14 @@ mod tests {
         // Cycle 2: push more data at ts=400
         let mut batches2 = FxHashMap::default();
         batches2.insert(
-            "trades".to_string(),
+            Arc::from("trades"),
             vec![eowc_batch(vec!["AAPL"], vec![200.0], vec![400])],
         );
         let r2 = executor.execute_cycle(&batches2, 600).await.unwrap();
         assert!(!r2.contains_key("total"), "window not closed at wm=600");
 
         // Cycle 3: watermark crosses 1000 → emit accumulated
-        let empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
+        let empty: FxHashMap<Arc<str>, Vec<RecordBatch>> = FxHashMap::default();
         let r3 = executor.execute_cycle(&empty, 1000).await.unwrap();
         assert!(r3.contains_key("total"), "window closed at wm=1000");
         let batches = &r3["total"];
@@ -3682,7 +4956,7 @@ mod tests {
         // Push data spanning two windows: [0,1000) and [1000,2000)
         let mut batches = FxHashMap::default();
         batches.insert(
-            "trades".to_string(),
+            Arc::from("trades"),
             vec![eowc_batch(
                 vec!["AAPL", "AAPL", "AAPL"],
                 vec![100.0, 200.0, 300.0],
@@ -3703,7 +4977,7 @@ mod tests {
         assert_eq!(cnt, 2, "first window should have 2 rows");
 
         // Watermark at 2000 → window [1000,2000) closes, 1 row (ts=1500)
-        let empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
+        let empty: FxHashMap<Arc<str>, Vec<RecordBatch>> = FxHashMap::default();
         let r2 = executor.execute_cycle(&empty, 2000).await.unwrap();
         assert!(r2.contains_key("cnt"));
         let cnt2 = r2["cnt"][0]
@@ -3733,7 +5007,7 @@ mod tests {
 
         let mut source_batches = FxHashMap::default();
         source_batches.insert(
-            "trades".to_string(),
+            Arc::from("trades"),
             vec![eowc_batch(vec!["AAPL"], vec![150.0], vec![500])],
         );
 
@@ -3776,7 +5050,7 @@ mod tests {
 
         let mut source_batches = FxHashMap::default();
         source_batches.insert(
-            "trades".to_string(),
+            Arc::from("trades"),
             vec![eowc_batch(vec!["AAPL"], vec![150.0], vec![500])],
         );
 
@@ -3789,7 +5063,7 @@ mod tests {
         // Provide an empty batch so the "trades" table is still registered
         let mut empty_source = FxHashMap::default();
         empty_source.insert(
-            "trades".to_string(),
+            Arc::from("trades"),
             vec![RecordBatch::new_empty(eowc_test_schema())],
         );
         let results = executor.execute_cycle(&empty_source, 1000).await.unwrap();
@@ -3987,7 +5261,7 @@ mod tests {
         assert!(executor.queries[1].table_refs.contains("events"));
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]);
+        source_batches.insert(Arc::from("events"), vec![test_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -4108,7 +5382,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("events".to_string(), vec![test_batch()]); // 3 rows
+        source_batches.insert(Arc::from("events"), vec![test_batch()]); // 3 rows
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -4158,7 +5432,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("trades".to_string(), vec![mixed_case_batch()]);
+        source_batches.insert(Arc::from("trades"), vec![mixed_case_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -4193,7 +5467,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("trades".to_string(), vec![mixed_case_batch()]);
+        source_batches.insert(Arc::from("trades"), vec![mixed_case_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -4221,7 +5495,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("trades".to_string(), vec![mixed_case_batch()]);
+        source_batches.insert(Arc::from("trades"), vec![mixed_case_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -4248,7 +5522,7 @@ mod tests {
         );
 
         let mut source_batches = FxHashMap::default();
-        source_batches.insert("trades".to_string(), vec![mixed_case_batch()]);
+        source_batches.insert(Arc::from("trades"), vec![mixed_case_batch()]);
 
         let results = executor
             .execute_cycle(&source_batches, i64::MAX)
@@ -4283,7 +5557,7 @@ mod tests {
         // Cycle 1: push data in window [0, 1000) with watermark at 500
         let mut batches1 = FxHashMap::default();
         batches1.insert(
-            "trades".to_string(),
+            Arc::from("trades"),
             vec![eowc_batch(vec!["AAPL"], vec![100.0], vec![500])],
         );
         let r1 = executor.execute_cycle(&batches1, 500).await.unwrap();
@@ -4294,7 +5568,7 @@ mod tests {
         // NOT emit open-window rows.
         let mut batches2 = FxHashMap::default();
         batches2.insert(
-            "trades".to_string(),
+            Arc::from("trades"),
             vec![eowc_batch(vec!["AAPL"], vec![200.0], vec![600])],
         );
         let r2 = executor.execute_cycle(&batches2, 500).await.unwrap();
@@ -4304,7 +5578,7 @@ mod tests {
         );
 
         // Cycle 3: watermark advances to 1000 → window closes
-        let empty: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
+        let empty: FxHashMap<Arc<str>, Vec<RecordBatch>> = FxHashMap::default();
         let r3 = executor.execute_cycle(&empty, 1000).await.unwrap();
         assert!(r3.contains_key("total"), "window closed at wm=1000");
 
@@ -4320,6 +5594,433 @@ mod tests {
             (total_col.value(0) - 300.0).abs() < f64::EPSILON,
             "expected 300 (100+200), got {} — data loss from force-emit!",
             total_col.value(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_state_size_limit_fails_query() {
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+        executor.set_max_state_bytes(Some(100)); // very low limit
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        executor.register_source_schema("t".to_string(), schema.clone());
+        executor.add_query(
+            "agg".to_string(),
+            "SELECT key, SUM(val) FROM t GROUP BY key".to_string(),
+            None,
+            None,
+            None,
+        );
+
+        // Push enough distinct groups to exceed the limit
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    (0..200).map(|i| format!("key_{i}")).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from((0..200).collect::<Vec<i64>>())),
+            ],
+        )
+        .unwrap();
+        let mut source = FxHashMap::default();
+        source.insert(Arc::from("t"), vec![batch]);
+
+        let result = executor.execute_cycle(&source, i64::MIN).await;
+        assert!(result.is_err(), "should fail when state limit exceeded");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("state size limit exceeded"), "error: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_state_size_no_limit_succeeds() {
+        // Default (no limit) should succeed even with many groups
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+        // max_state_bytes defaults to None
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("val", DataType::Int64, false),
+        ]));
+        executor.register_source_schema("t".to_string(), schema.clone());
+        executor.add_query(
+            "agg".to_string(),
+            "SELECT key, SUM(val) FROM t GROUP BY key".to_string(),
+            None,
+            None,
+            None,
+        );
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    (0..200).map(|i| format!("key_{i}")).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from((0..200).collect::<Vec<i64>>())),
+            ],
+        )
+        .unwrap();
+        let mut source = FxHashMap::default();
+        source.insert(Arc::from("t"), vec![batch]);
+
+        let result = executor.execute_cycle(&source, i64::MIN).await;
+        assert!(result.is_ok(), "should succeed without limit");
+    }
+
+    // ── Interval Join Integration Tests ───────────────────────────────────
+
+    fn orders_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("amount", DataType::Float64, false),
+        ]))
+    }
+
+    fn payments_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("paid", DataType::Float64, false),
+        ]))
+    }
+
+    fn make_orders(ids: &[&str], timestamps: &[i64], amounts: &[f64]) -> RecordBatch {
+        RecordBatch::try_new(
+            orders_schema(),
+            vec![
+                Arc::new(StringArray::from(ids.to_vec())),
+                Arc::new(Int64Array::from(timestamps.to_vec())),
+                Arc::new(Float64Array::from(amounts.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn make_payments(ids: &[&str], timestamps: &[i64], amounts: &[f64]) -> RecordBatch {
+        RecordBatch::try_new(
+            payments_schema(),
+            vec![
+                Arc::new(StringArray::from(ids.to_vec())),
+                Arc::new(Int64Array::from(timestamps.to_vec())),
+                Arc::new(Float64Array::from(amounts.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_interval_join_cross_cycle_via_sql() {
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        executor.add_query(
+            "joined".to_string(),
+            "SELECT o.order_id, o.amount, p.paid \
+             FROM orders o \
+             JOIN payments p ON o.order_id = p.order_id \
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR"
+                .to_string(),
+            None,
+            None,
+            None,
+        );
+
+        // Verify interval join was detected
+        assert!(
+            executor.queries[0].stream_join_config.is_some(),
+            "Should detect interval join"
+        );
+
+        // Cycle 1: only orders
+        let mut sources = FxHashMap::default();
+        sources.insert(
+            Arc::from("orders"),
+            vec![make_orders(&["A"], &[1000], &[100.0])],
+        );
+        sources.insert(Arc::from("payments"), vec![]);
+
+        let r1 = executor.execute_cycle(&sources, 0).await.unwrap();
+        let c1_rows: usize = r1
+            .get("joined")
+            .map_or(0, |bs| bs.iter().map(|b| b.num_rows()).sum());
+        assert_eq!(c1_rows, 0, "No payments yet, no matches");
+
+        // Cycle 2: payment arrives within time bound
+        sources.clear();
+        sources.insert(Arc::from("orders"), vec![]);
+        sources.insert(
+            Arc::from("payments"),
+            vec![make_payments(&["A"], &[2000], &[100.0])],
+        );
+
+        let r2 = executor.execute_cycle(&sources, 0).await.unwrap();
+        let c2_rows: usize = r2
+            .get("joined")
+            .map_or(0, |bs| bs.iter().map(|b| b.num_rows()).sum());
+        assert_eq!(c2_rows, 1, "Cross-cycle match: order@1000 ~ payment@2000");
+    }
+
+    #[tokio::test]
+    async fn test_interval_join_null_keys_via_sql() {
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        executor.add_query(
+            "joined".to_string(),
+            "SELECT o.order_id, o.amount, p.paid \
+             FROM orders o \
+             JOIN payments p ON o.order_id = p.order_id \
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR"
+                .to_string(),
+            None,
+            None,
+            None,
+        );
+
+        // Both sides include null keys
+        let orders_schema_nullable = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Utf8, true),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("amount", DataType::Float64, false),
+        ]));
+        let orders = RecordBatch::try_new(
+            orders_schema_nullable,
+            vec![
+                Arc::new(StringArray::from(vec![Some("A"), None])),
+                Arc::new(Int64Array::from(vec![1000, 1000])),
+                Arc::new(Float64Array::from(vec![100.0, 200.0])),
+            ],
+        )
+        .unwrap();
+
+        let payments_schema_nullable = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Utf8, true),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("paid", DataType::Float64, false),
+        ]));
+        let payments = RecordBatch::try_new(
+            payments_schema_nullable,
+            vec![
+                Arc::new(StringArray::from(vec![Some("A"), None])),
+                Arc::new(Int64Array::from(vec![1500, 1500])),
+                Arc::new(Float64Array::from(vec![100.0, 200.0])),
+            ],
+        )
+        .unwrap();
+
+        let mut sources = FxHashMap::default();
+        sources.insert(Arc::from("orders"), vec![orders]);
+        sources.insert(Arc::from("payments"), vec![payments]);
+
+        let results = executor.execute_cycle(&sources, 0).await.unwrap();
+        let rows: usize = results
+            .get("joined")
+            .map_or(0, |bs| bs.iter().map(|b| b.num_rows()).sum());
+        // Only "A" matches "A"; null keys produce no matches
+        assert_eq!(rows, 1, "Null keys should not match");
+    }
+
+    #[test]
+    fn test_left_join_not_routed_to_interval() {
+        // LEFT JOIN with BETWEEN should NOT route to interval join engine
+        let (config, _) = detect_stream_join_query(
+            "SELECT * FROM orders o \
+             LEFT JOIN payments p ON o.order_id = p.order_id \
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR",
+        );
+        assert!(
+            config.is_none(),
+            "LEFT JOIN should not route to interval join engine"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_interval_join_checkpoint_roundtrip() {
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let mut executor = StreamExecutor::new(ctx);
+
+        executor.add_query(
+            "joined".to_string(),
+            "SELECT o.order_id, o.amount, p.paid \
+             FROM orders o \
+             JOIN payments p ON o.order_id = p.order_id \
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR"
+                .to_string(),
+            None,
+            None,
+            None,
+        );
+
+        // Cycle 1: buffer orders
+        let mut sources = FxHashMap::default();
+        sources.insert(
+            Arc::from("orders"),
+            vec![make_orders(&["A"], &[1000], &[100.0])],
+        );
+        sources.insert(Arc::from("payments"), vec![]);
+        let _ = executor.execute_cycle(&sources, 0).await.unwrap();
+
+        // Checkpoint
+        let checkpoint = executor.snapshot_state().unwrap();
+        assert!(checkpoint.is_some(), "Should have join state to checkpoint");
+        let cp = checkpoint.unwrap();
+        assert!(
+            !cp.join_states.is_empty(),
+            "Should have interval join state"
+        );
+
+        // Serialize then restore into new executor
+        let cp_bytes = serde_json::to_vec(&cp).unwrap();
+        let ctx2 = create_session_context();
+        register_streaming_functions(&ctx2);
+        let mut executor2 = StreamExecutor::new(ctx2);
+        executor2.add_query(
+            "joined".to_string(),
+            "SELECT o.order_id, o.amount, p.paid \
+             FROM orders o \
+             JOIN payments p ON o.order_id = p.order_id \
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR"
+                .to_string(),
+            None,
+            None,
+            None,
+        );
+        executor2.restore_state(&cp_bytes).unwrap();
+
+        // Cycle 2 on restored executor: payment matches buffered order
+        sources.clear();
+        sources.insert(Arc::from("orders"), vec![]);
+        sources.insert(
+            Arc::from("payments"),
+            vec![make_payments(&["A"], &[2000], &[100.0])],
+        );
+        let results = executor2.execute_cycle(&sources, 0).await.unwrap();
+        let rows: usize = results
+            .get("joined")
+            .map_or(0, |bs| bs.iter().map(|b| b.num_rows()).sum());
+        assert_eq!(rows, 1, "Restored state should match cross-cycle");
+    }
+
+    #[test]
+    fn test_detect_temporal_probe_range() {
+        let sql = "SELECT t.symbol, p.offset_ms FROM trades t \
+                    TEMPORAL PROBE JOIN market_data m ON (symbol) \
+                    RANGE FROM 0s TO 5s STEP 1s AS p";
+        let (config, proj) = detect_temporal_probe_query(sql);
+        let config = config.expect("should detect");
+        assert_eq!(config.left_table, "trades");
+        assert_eq!(config.right_table, "market_data");
+        assert_eq!(config.left_alias, Some("t".into()));
+        assert_eq!(config.right_alias, Some("m".into()));
+        assert_eq!(config.key_columns, vec!["symbol".to_string()]);
+        assert_eq!(config.probe_alias, "p");
+        assert_eq!(
+            config.expanded_offsets_ms,
+            vec![0, 1000, 2000, 3000, 4000, 5000]
+        );
+        // Verify projection SQL rewrites aliases correctly
+        let proj = proj.expect("should have projection");
+        assert!(
+            proj.contains("p_offset_ms"),
+            "p.offset_ms should be rewritten to p_offset_ms, got: {proj}"
+        );
+        assert!(
+            !proj.contains("p.offset_ms"),
+            "p.offset_ms should not remain in projection, got: {proj}"
+        );
+        assert!(
+            proj.contains("symbol"),
+            "t.symbol should be rewritten to symbol, got: {proj}"
+        );
+    }
+
+    #[test]
+    fn test_detect_temporal_probe_list() {
+        let sql = "SELECT * FROM trades t \
+                    TEMPORAL PROBE JOIN prices p2 ON (sym) \
+                    LIST (-5s, 0s, 5s) AS probe";
+        let (config, _) = detect_temporal_probe_query(sql);
+        let config = config.expect("should detect");
+        assert_eq!(config.right_table, "prices");
+        assert_eq!(config.right_alias, Some("p2".into()));
+        assert_eq!(config.key_columns, vec!["sym".to_string()]);
+        assert_eq!(config.probe_alias, "probe");
+        assert_eq!(config.expanded_offsets_ms, vec![-5000, 0, 5000]);
+    }
+
+    #[test]
+    fn test_detect_temporal_probe_timestamps_clause() {
+        let sql = "SELECT * FROM trades t \
+                    TEMPORAL PROBE JOIN market_data m ON (symbol) \
+                    TIMESTAMPS (trade_ts, mkt_ts) \
+                    LIST (0s, 5s) AS p";
+        let (config, _) = detect_temporal_probe_query(sql);
+        let config = config.expect("should detect");
+        assert_eq!(config.left_time_column, "trade_ts");
+        assert_eq!(config.right_time_column, "mkt_ts");
+    }
+
+    #[test]
+    fn test_detect_temporal_probe_none_for_normal_sql() {
+        let sql = "SELECT symbol, avg(price) FROM trades GROUP BY symbol";
+        let (config, _) = detect_temporal_probe_query(sql);
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn test_detect_temporal_probe_default_time_columns() {
+        let sql = "SELECT * FROM trades t \
+                    TEMPORAL PROBE JOIN prices m ON (symbol) \
+                    LIST (0s) AS p";
+        let (config, _) = detect_temporal_probe_query(sql);
+        let config = config.expect("should detect");
+        assert_eq!(config.left_time_column, "ts");
+        assert_eq!(config.right_time_column, "ts");
+    }
+
+    #[test]
+    fn test_detect_temporal_probe_time_column_disambiguation() {
+        // When both sides have the same time column name, the right side
+        // should be rewritten with _{right_table} suffix.
+        let sql = "SELECT t.symbol, m.ts, p.offset_ms FROM trades t \
+                    TEMPORAL PROBE JOIN prices m ON (symbol) \
+                    LIST (0s) AS p";
+        let (config, proj) = detect_temporal_probe_query(sql);
+        let config = config.expect("should detect");
+        // Both default to "ts" — collision
+        assert_eq!(config.left_time_column, "ts");
+        assert_eq!(config.right_time_column, "ts");
+
+        let proj = proj.expect("should have projection");
+        // m.ts should become ts_prices (disambiguated), not bare ts
+        assert!(
+            proj.contains("ts_prices"),
+            "m.ts should be rewritten to ts_prices when colliding, got: {proj}"
+        );
+    }
+
+    #[test]
+    fn test_detect_temporal_probe_composite_keys() {
+        let sql = "SELECT * FROM trades t \
+                    TEMPORAL PROBE JOIN market_data m ON (symbol, venue) \
+                    TIMESTAMPS (ts, mts) LIST (0s, 5s) AS p";
+        let (config, _) = detect_temporal_probe_query(sql);
+        let config = config.expect("should detect");
+        assert_eq!(
+            config.key_columns,
+            vec!["symbol".to_string(), "venue".to_string()]
         );
     }
 }

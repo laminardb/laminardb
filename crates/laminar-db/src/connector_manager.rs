@@ -33,7 +33,6 @@ pub(crate) struct SinkRegistration {
     /// Sink name.
     pub name: String,
     /// Input source or stream name (used for schema lookup and routing).
-    #[allow(dead_code)]
     pub input: String,
     /// Connector type (e.g., "KAFKA", "POSTGRES").
     pub connector_type: Option<String>,
@@ -64,7 +63,7 @@ pub(crate) struct StreamRegistration {
 
 /// Registration of a reference/dimension table from DDL.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[allow(dead_code)] // fields populated from DDL, read when connector support lands
 pub(crate) struct TableRegistration {
     /// Table name.
     pub name: String,

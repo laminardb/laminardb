@@ -190,6 +190,13 @@ impl SinkConnector for FileSink {
         let rows = batch.num_rows();
 
         if is_bulk {
+            let max_epoch = self.config.as_ref().map_or(10_000, |c| c.max_epoch_batches);
+            if self.epoch_batches.len() >= max_epoch {
+                return Err(ConnectorError::WriteError(format!(
+                    "file sink: epoch batch buffer full ({max_epoch} batches) — \
+                     increase max_epoch_batches or flush more frequently"
+                )));
+            }
             // Buffer for bulk write on pre_commit (Parquet).
             self.epoch_batches.push(batch.clone());
             return Ok(WriteResult::new(rows, 0));

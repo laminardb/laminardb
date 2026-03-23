@@ -225,7 +225,7 @@ impl Operator for WatermarkBoundedSortOperator {
         self.on_watermark_advance(timer.timestamp)
     }
 
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         let mut data = Vec::new();
 
         // Write last watermark
@@ -245,6 +245,7 @@ impl Operator for WatermarkBoundedSortOperator {
 
         OperatorState {
             operator_id: self.operator_id.clone(),
+            version: 1,
             data,
         }
     }

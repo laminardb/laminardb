@@ -337,7 +337,7 @@ impl Operator for StreamingTopKOperator {
         }
     }
 
-    fn checkpoint(&self) -> OperatorState {
+    fn checkpoint(&mut self) -> OperatorState {
         // Serialize entry count + sort keys + timestamps
         // For simplicity, serialize as JSON-like format
         let mut data = Vec::new();
@@ -362,6 +362,7 @@ impl Operator for StreamingTopKOperator {
 
         OperatorState {
             operator_id: self.operator_id.clone(),
+            version: 1,
             data,
         }
     }

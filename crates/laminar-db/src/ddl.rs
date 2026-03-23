@@ -22,6 +22,18 @@ impl LaminarDB {
         &self,
         create: &laminar_sql::parser::CreateSourceStatement,
     ) -> Result<ExecuteResult, DbError> {
+        // Reject connector-bearing CREATE SOURCE when pipeline is already running.
+        // Connectors are instantiated in start() which is a one-shot operation.
+        let has_connector =
+            create.connector_type.is_some() || create.with_options.contains_key("connector");
+        if has_connector && self.is_pipeline_running() {
+            let name = &create.name;
+            return Err(DbError::Pipeline(format!(
+                "Cannot create source '{name}' with connector while pipeline is running. \
+                 Stop the pipeline first."
+            )));
+        }
+
         let source_def = streaming_ddl::translate_create_source(create.clone())
             .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))?;
 
@@ -176,6 +188,16 @@ impl LaminarDB {
         &self,
         create: &laminar_sql::parser::CreateSinkStatement,
     ) -> Result<ExecuteResult, DbError> {
+        let has_connector =
+            create.connector_type.is_some() || create.with_options.contains_key("connector");
+        if has_connector && self.is_pipeline_running() {
+            let name = &create.name;
+            return Err(DbError::Pipeline(format!(
+                "Cannot create sink '{name}' with connector while pipeline is running. \
+                 Stop the pipeline first."
+            )));
+        }
+
         let name = create.name.to_string();
         let input = match &create.from {
             laminar_sql::parser::SinkFrom::Table(t) => t.to_string(),
@@ -459,6 +481,15 @@ impl LaminarDB {
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
 
+        // Reject DROP SOURCE while pipeline is running — the running source
+        // task cannot be stopped without dynamic task cancellation support.
+        if self.is_pipeline_running() {
+            return Err(DbError::Pipeline(format!(
+                "Cannot drop source '{name_str}' while pipeline is running. \
+                 Stop the pipeline first."
+            )));
+        }
+
         // Check for dependents: streams and MVs that reference this source
         if cascade {
             self.cascade_drop_dependents(&name_str);
@@ -567,6 +598,16 @@ impl LaminarDB {
         _cascade: bool,
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
+
+        // Reject DROP SINK while pipeline is running — the running sink
+        // task cannot be stopped without dynamic task cancellation support.
+        if self.is_pipeline_running() {
+            return Err(DbError::Pipeline(format!(
+                "Cannot drop sink '{name_str}' while pipeline is running. \
+                 Stop the pipeline first."
+            )));
+        }
+
         let dropped = self.catalog.drop_sink(&name_str);
         if !dropped && !if_exists {
             return Err(DbError::SinkNotFound(name_str));
@@ -609,12 +650,26 @@ impl LaminarDB {
             }
         };
 
+        let query_sql = streaming_statement_to_sql(query);
+
         // Store the query SQL for stream execution at start()
         {
             let mut mgr = self.connector_manager.lock();
             mgr.register_stream(crate::connector_manager::StreamRegistration {
                 name: name_str.clone(),
-                query_sql: streaming_statement_to_sql(query),
+                query_sql: query_sql.clone(),
+                emit_clause: plan_emit.clone(),
+                window_config: plan_window.clone(),
+                order_config: plan_order.clone(),
+            });
+        }
+
+        // If the pipeline is already running, send via control channel
+        // so the coordinator picks up the new query on the next cycle.
+        if let Some(ref tx) = *self.control_tx.lock() {
+            let _ = tx.try_send(crate::pipeline::ControlMsg::AddStream {
+                name: name_str.clone(),
+                sql: query_sql,
                 emit_clause: plan_emit,
                 window_config: plan_window,
                 order_config: plan_order,
@@ -654,6 +709,14 @@ impl LaminarDB {
             return Err(DbError::StreamNotFound(name_str));
         }
         self.connector_manager.lock().unregister_stream(&name_str);
+
+        // Notify the running coordinator to remove the query.
+        if let Some(ref tx) = *self.control_tx.lock() {
+            let _ = tx.try_send(crate::pipeline::ControlMsg::DropStream {
+                name: name_str.clone(),
+            });
+        }
+
         Ok(ExecuteResult::Ddl(DdlInfo {
             statement_type: "DROP STREAM".to_string(),
             object_name: name_str,

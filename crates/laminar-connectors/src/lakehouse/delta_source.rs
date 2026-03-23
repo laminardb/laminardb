@@ -3,21 +3,34 @@
 //! [`DeltaSource`] implements [`SourceConnector`], reading Arrow `RecordBatch`
 //! data from Delta Lake tables by polling for new versions.
 //!
+//! # Read Modes
+//!
+//! - **Incremental** (default): Walks versions one-by-one from `current_version + 1`
+//!   to latest, reading only the files added in each version. Correct for streaming.
+//! - **Snapshot**: Jumps to the latest version and reads the full table state.
+//!   Useful for batch-style materialization of small tables.
+//!
 //! # Polling Strategy
 //!
 //! The source maintains a `current_version` cursor. On each `poll_batch()`:
 //! 1. Drain any buffered batches from the previous load first
 //! 2. Throttle: skip version check if less than `poll_interval` since last check
 //! 3. Check if the table has a newer version than `current_version`
-//! 4. If yes, jump directly to the latest version (O(1) catch-up)
-//! 5. Scan bounded by `max_records` via `DataFusion` streaming execution
-//! 6. Buffer results; `current_version` only advances after the buffer is
+//! 4. **Incremental**: read one version at a time (`current_version + 1`)
+//!    **Snapshot**: jump directly to the latest version
+//! 5. Buffer results; `current_version` only advances after the buffer is
 //!    fully drained, so checkpoint always reflects fully-consumed state
+//!
+//! # Schema Evolution Detection
+//!
+//! When a new version is loaded, the source compares the table schema against
+//! the previously known schema. On mismatch, the action is controlled by
+//! `schema.evolution.action`: `warn` (log and continue) or `error` (stop).
 //!
 //! # Checkpoint / Recovery
 //!
-//! The checkpoint stores `current_version` so that on recovery the source
-//! resumes from the correct Delta Lake version.
+//! The checkpoint stores `current_version` and `read_mode` so that on recovery
+//! the source resumes from the correct Delta Lake version.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -30,6 +43,8 @@ use std::time::Instant;
 #[cfg(feature = "delta-lake")]
 use tracing::debug;
 use tracing::info;
+#[cfg(feature = "delta-lake")]
+use tracing::warn;
 
 #[cfg(feature = "delta-lake")]
 use deltalake::DeltaTable;
@@ -42,11 +57,14 @@ use crate::health::HealthStatus;
 use crate::metrics::ConnectorMetrics;
 
 use super::delta_source_config::DeltaSourceConfig;
+#[cfg(feature = "delta-lake")]
+use super::delta_source_config::{DeltaReadMode, SchemaEvolutionAction};
 
 /// Delta Lake source connector.
 ///
 /// Reads Arrow `RecordBatch` data from Delta Lake tables by polling for
-/// new table versions.
+/// new table versions. Supports both incremental (changes-only) and
+/// snapshot (full re-read) modes.
 ///
 /// # Lifecycle
 ///
@@ -70,6 +88,11 @@ pub struct DeltaSource {
     /// `current_version` is advanced to this value and the field is cleared.
     #[cfg(feature = "delta-lake")]
     inflight_version: Option<i64>,
+    /// The latest version known at the table. Used in incremental mode to
+    /// walk versions one-by-one without re-calling `get_latest_version` for
+    /// each step.
+    #[cfg(feature = "delta-lake")]
+    known_latest_version: i64,
     /// Buffered batches from the last version load.
     pending_batches: VecDeque<RecordBatch>,
     /// Total records read so far.
@@ -82,6 +105,10 @@ pub struct DeltaSource {
     /// hammering every source-adapter tick (10ms).
     #[cfg(feature = "delta-lake")]
     last_version_check: Option<Instant>,
+    /// Per-field projection: `Some(idx)` = take column idx from new batch,
+    /// `None` = emit null column. Aligned with `self.schema.fields()`.
+    #[cfg(feature = "delta-lake")]
+    projection_indices: Option<Vec<Option<usize>>>,
 }
 
 impl DeltaSource {
@@ -95,12 +122,16 @@ impl DeltaSource {
             current_version: -1,
             #[cfg(feature = "delta-lake")]
             inflight_version: None,
+            #[cfg(feature = "delta-lake")]
+            known_latest_version: -1,
             pending_batches: VecDeque::new(),
             records_read: 0,
             #[cfg(feature = "delta-lake")]
             table: None,
             #[cfg(feature = "delta-lake")]
             last_version_check: None,
+            #[cfg(feature = "delta-lake")]
+            projection_indices: None,
         }
     }
 
@@ -121,9 +152,26 @@ impl DeltaSource {
     pub fn config(&self) -> &DeltaSourceConfig {
         &self.config
     }
+
+    /// Re-opens the Delta Lake table (e.g., after a connection failure).
+    #[cfg(feature = "delta-lake")]
+    async fn reopen_table(&mut self) -> Result<(), ConnectorError> {
+        use super::delta_io;
+
+        let table = delta_io::open_or_create_table(
+            &self.config.table_path,
+            self.config.storage_options.clone(),
+            None,
+        )
+        .await?;
+
+        self.table = Some(table);
+        Ok(())
+    }
 }
 
 #[async_trait]
+#[allow(clippy::too_many_lines)]
 impl SourceConnector for DeltaSource {
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
@@ -156,14 +204,14 @@ impl SourceConnector for DeltaSource {
                 self.schema = Some(schema);
             }
 
-            // Set starting version.
-            let table_version = table.version().unwrap_or(0);
-            #[allow(clippy::cast_possible_wrap)]
+            // Start from -1 (or explicit starting_version) and let
+            // poll_batch() walk versions incrementally with bounded reads.
             if let Some(start) = self.config.starting_version {
                 self.current_version = start;
             } else {
-                self.current_version = table_version;
+                self.current_version = -1;
             }
+            let table_version = table.version().unwrap_or(0);
 
             info!(
                 table_path = %self.config.table_path,
@@ -177,16 +225,20 @@ impl SourceConnector for DeltaSource {
 
         #[cfg(not(feature = "delta-lake"))]
         {
-            // Without the delta-lake feature, we can still set up in Created state
-            // for testing business logic.
-            if let Some(start) = self.config.starting_version {
-                self.current_version = start;
-            }
+            self.state = ConnectorState::Failed;
+            return Err(ConnectorError::ConfigurationError(
+                "Delta Lake source requires the 'delta-lake' feature to be enabled. \
+                 Build with: cargo build --features delta-lake"
+                    .into(),
+            ));
         }
 
-        self.state = ConnectorState::Running;
-        info!("Delta Lake source connector opened successfully");
-        Ok(())
+        #[cfg(feature = "delta-lake")]
+        {
+            self.state = ConnectorState::Running;
+            info!("Delta Lake source connector opened successfully");
+            Ok(())
+        }
     }
 
     #[allow(unused_variables)]
@@ -222,16 +274,67 @@ impl SourceConnector for DeltaSource {
         {
             use super::delta_io;
 
+            // Recover from lost table handle (e.g., connection failure).
+            if self.table.is_none() {
+                match self.reopen_table().await {
+                    Ok(()) => {
+                        info!("Delta Lake source: re-opened table after lost handle");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Delta Lake source: reopen failed, will retry");
+                        return Ok(None);
+                    }
+                }
+            }
+
             // Throttle version checks: skip if less than poll_interval has
             // elapsed since the last check. This prevents hammering
             // get_latest_version() on every source-adapter tick (10ms).
-            if let Some(last_check) = self.last_version_check {
-                if last_check.elapsed() < self.config.poll_interval {
-                    return Ok(None);
+            // In incremental mode, skip the throttle if we already know
+            // there are more versions to process (catch-up).
+            let needs_refresh = self.known_latest_version <= self.current_version;
+            if needs_refresh {
+                if let Some(last_check) = self.last_version_check {
+                    if last_check.elapsed() < self.config.poll_interval {
+                        return Ok(None);
+                    }
                 }
-            }
-            self.last_version_check = Some(Instant::now());
+                self.last_version_check = Some(Instant::now());
 
+                let table = self
+                    .table
+                    .as_mut()
+                    .ok_or_else(|| ConnectorError::InvalidState {
+                        expected: "table initialized".into(),
+                        actual: "table not initialized".into(),
+                    })?;
+                let latest_version = match delta_io::get_latest_version(table).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(error = %e, "Delta Lake source: version check failed, will retry");
+                        return Ok(None);
+                    }
+                };
+                self.known_latest_version = latest_version;
+
+                if latest_version <= self.current_version {
+                    return Ok(None); // No new data
+                }
+
+                debug!(
+                    current_version = self.current_version,
+                    latest_version, "Delta Lake source: new version(s) available"
+                );
+            }
+
+            let target_version = match self.config.read_mode {
+                DeltaReadMode::Snapshot => self.known_latest_version,
+                DeltaReadMode::Incremental => self.current_version + 1,
+            };
+
+            // Read data first. Both read_batches_at_version and
+            // read_version_diff call load_version(target_version) internally,
+            // so the table's snapshot will be at target_version after this.
             let table = self
                 .table
                 .as_mut()
@@ -239,29 +342,130 @@ impl SourceConnector for DeltaSource {
                     expected: "table initialized".into(),
                     actual: "table not initialized".into(),
                 })?;
+            let partition_filter = self.config.partition_filter.clone();
 
-            let latest_version = delta_io::get_latest_version(table).await?;
-
-            if latest_version <= self.current_version {
-                return Ok(None); // No new data
+            // Version-gap detection: if the target commit was cleaned up,
+            // skip ahead to a snapshot at the latest available version.
+            let mut use_snapshot_fallback = false;
+            if self.config.read_mode == DeltaReadMode::Incremental && target_version > 0 {
+                let log_store = table.log_store();
+                if let Ok(None) = log_store.read_commit_entry(target_version).await {
+                    warn!(
+                        target_version,
+                        known_latest = self.known_latest_version,
+                        "version unavailable, falling back to snapshot at latest"
+                    );
+                    use_snapshot_fallback = true;
+                }
             }
 
-            debug!(
-                current_version = self.current_version,
-                latest_version, "Delta Lake source: new version(s) available"
-            );
+            // On gap fallback, override target_version so inflight_version
+            // tracks the snapshot version, not the missing one.
+            let target_version = if use_snapshot_fallback {
+                self.known_latest_version
+            } else {
+                target_version
+            };
 
-            // Jump directly to the latest version instead of incrementing
-            // one-by-one. A Delta snapshot at version N includes all data
-            // up to that version, so intermediate versions are redundant
-            // for snapshot reads. This turns O(N) catch-up into O(1).
-            let batches =
-                delta_io::read_batches_at_version(table, latest_version, max_records).await?;
+            // Incremental reads (read_version_diff, CDF) always consume the
+            // full version — each version's diff is O(new_files), not
+            // O(table_size), so unbounded reads are safe. This avoids the
+            // re-read-from-start problem when max_records truncates a version.
+            // Snapshot reads stay bounded by max_records (can be table-sized).
+            let (batches, fully_consumed) = if use_snapshot_fallback {
+                delta_io::read_batches_at_version(table, target_version, max_records).await?
+            } else if self.config.cdf_enabled
+                && self.config.read_mode == DeltaReadMode::Incremental
+                && target_version > 0
+            {
+                // CDF mode: scan_cdf() consumes the DeltaTable. Take it,
+                // read CDF batches, then re-open the table handle.
+                let taken_table =
+                    self.table
+                        .take()
+                        .ok_or_else(|| ConnectorError::InvalidState {
+                            expected: "table initialized".into(),
+                            actual: "table not initialized".into(),
+                        })?;
+                let cdf_batches =
+                    delta_io::read_cdf_batches(taken_table, target_version, target_version).await?;
 
-            // Update schema if needed.
-            if self.schema.is_none() {
-                if let Some(first) = batches.first() {
-                    self.schema = Some(first.schema());
+                // Re-open table since scan_cdf consumed it.
+                self.reopen_table().await?;
+
+                // Map CDF _change_type to LaminarDB _op.
+                let mut mapped = Vec::new();
+                for batch in &cdf_batches {
+                    if let Some(mapped_batch) = delta_io::map_cdf_to_changelog(batch)? {
+                        mapped.push(mapped_batch);
+                    }
+                }
+                (mapped, true)
+            } else {
+                match self.config.read_mode {
+                    DeltaReadMode::Snapshot => {
+                        delta_io::read_batches_at_version(table, target_version, max_records)
+                            .await?
+                    }
+                    DeltaReadMode::Incremental => {
+                        // Read full version diff — each version is one
+                        // commit's worth of files, safe to read unbounded.
+                        let (b, _) = delta_io::read_version_diff(
+                            table,
+                            target_version,
+                            usize::MAX,
+                            partition_filter.as_deref(),
+                        )
+                        .await?;
+                        (b, true)
+                    }
+                }
+            };
+
+            // Schema evolution detection: extract schema from the snapshot
+            // that read_version_diff/read_batches_at_version already loaded.
+            // This avoids a redundant load_version call.
+            {
+                let table = self
+                    .table
+                    .as_ref()
+                    .ok_or_else(|| ConnectorError::InvalidState {
+                        expected: "table initialized".into(),
+                        actual: "table not initialized".into(),
+                    })?;
+                if let Ok(snapshot) = table.snapshot() {
+                    let new_schema = snapshot.snapshot().arrow_schema();
+                    if let Some(existing) = &self.schema {
+                        if existing.fields() != new_schema.fields() {
+                            match self.config.schema_evolution_action {
+                                SchemaEvolutionAction::Warn => {
+                                    warn!(
+                                        table_path = %self.config.table_path,
+                                        old_fields = ?existing.fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+                                        new_fields = ?new_schema.fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+                                        "Delta Lake source: schema evolved, projecting to original"
+                                    );
+                                    // Map each original field to its index in the new
+                                    // schema, or None if the field was removed.
+                                    let indices: Vec<Option<usize>> = existing
+                                        .fields()
+                                        .iter()
+                                        .map(|f| new_schema.index_of(f.name()).ok())
+                                        .collect();
+                                    self.projection_indices = Some(indices);
+                                    // Do NOT update self.schema — keep the original
+                                    // for downstream stability.
+                                }
+                                SchemaEvolutionAction::Error => {
+                                    return Err(ConnectorError::SchemaMismatch(format!(
+                                        "schema evolved at version {target_version}"
+                                    )));
+                                }
+                            }
+                        }
+                    } else {
+                        self.schema = Some(new_schema);
+                    }
                 }
             }
 
@@ -269,17 +473,43 @@ impl SourceConnector for DeltaSource {
             // it is only safe to checkpoint this version after the
             // buffer is fully drained. Store it as inflight_version.
             for batch in batches {
-                if batch.num_rows() > 0 {
-                    self.pending_batches.push_back(batch);
+                if batch.num_rows() == 0 {
+                    continue;
                 }
+                // Apply schema projection if schema evolution was detected.
+                let batch = if let Some(ref indices) = self.projection_indices {
+                    let original_schema = self.schema.as_ref().unwrap();
+                    let num_rows = batch.num_rows();
+                    let columns: Vec<Arc<dyn arrow_array::Array>> = indices
+                        .iter()
+                        .zip(original_schema.fields())
+                        .map(|(idx, field)| match idx {
+                            Some(i) => batch.column(*i).clone(),
+                            None => arrow_array::new_null_array(field.data_type(), num_rows),
+                        })
+                        .collect();
+                    RecordBatch::try_new(original_schema.clone(), columns).map_err(|e| {
+                        ConnectorError::ReadError(format!(
+                            "failed to project batch to original schema: {e}"
+                        ))
+                    })?
+                } else {
+                    batch
+                };
+                self.pending_batches.push_back(batch);
             }
 
-            if self.pending_batches.is_empty() {
-                // Version had no data rows (e.g. metadata-only commit).
-                // Safe to advance immediately.
-                self.current_version = latest_version;
+            if !fully_consumed {
+                // Snapshot mode: max_records truncated the version.
+                // Don't advance — next poll re-reads the same version.
+                // (Incremental mode always reads full versions, so
+                // fully_consumed is always true there.)
+            } else if self.pending_batches.is_empty() {
+                // Version fully consumed with no data rows (metadata-only).
+                self.current_version = target_version;
             } else {
-                self.inflight_version = Some(latest_version);
+                // Version fully consumed, batches buffered. Advance after drain.
+                self.inflight_version = Some(target_version);
             }
 
             if let Some(batch) = self.pending_batches.pop_front() {
@@ -308,6 +538,7 @@ impl SourceConnector for DeltaSource {
     fn checkpoint(&self) -> SourceCheckpoint {
         let mut cp = SourceCheckpoint::new(0);
         cp.set_offset("delta_version", self.current_version.to_string());
+        cp.set_offset("read_mode", self.config.read_mode.to_string());
         cp
     }
 
@@ -371,6 +602,7 @@ impl std::fmt::Debug for DeltaSource {
         f.debug_struct("DeltaSource")
             .field("state", &self.state)
             .field("table_path", &self.config.table_path)
+            .field("read_mode", &self.config.read_mode)
             .field("current_version", &self.current_version)
             .field("pending_batches", &self.pending_batches.len())
             .field("records_read", &self.records_read)
@@ -574,5 +806,17 @@ mod tests {
         source.close().await.unwrap();
         assert_eq!(source.state(), ConnectorState::Closed);
         assert!(source.pending_batches.is_empty());
+    }
+
+    /// D020: Source open() must error without delta-lake feature.
+    #[cfg(not(feature = "delta-lake"))]
+    #[tokio::test]
+    async fn test_open_requires_feature() {
+        let mut source = DeltaSource::new(test_config());
+        let connector_config = crate::config::ConnectorConfig::new("delta-lake");
+        let result = source.open(&connector_config).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("delta-lake"), "error: {err}");
     }
 }

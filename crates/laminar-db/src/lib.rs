@@ -38,24 +38,6 @@ mod core_window_state;
 mod db;
 mod eowc_state;
 // Reopened `impl LaminarDB` modules — split from db.rs
-mod ddl;
-mod error;
-mod handle;
-mod metrics;
-mod metrics_api;
-/// Thread-per-core connector pipeline.
-pub mod pipeline;
-mod pipeline_callback;
-mod pipeline_lifecycle;
-/// Deployment profiles.
-pub mod profile;
-/// Unified recovery manager.
-pub mod recovery_manager;
-mod show_commands;
-mod sink_task;
-mod sql_utils;
-// Used in production by `ConnectorPipelineCallback` for SQL execution and
-// checkpoint state capture. Not dead code.
 /// FFI-friendly API for language bindings.
 ///
 /// Enable with the `api` feature flag:
@@ -67,15 +49,31 @@ mod sql_utils;
 /// explicit resource management, and Arrow RecordBatch at all boundaries.
 #[cfg(feature = "api")]
 pub mod api;
-#[allow(dead_code)] // Adapters constructed by SQL lowering
-mod sql_lowering;
-#[allow(dead_code)] // Adapters constructed by SQL lowering
-mod sql_operators;
+mod ddl;
+mod error;
+mod handle;
+mod interval_join;
+mod metrics;
+mod metrics_api;
+mod operator_graph;
+mod operators;
+/// Thread-per-core connector pipeline.
+pub mod pipeline;
+mod pipeline_callback;
+mod pipeline_lifecycle;
+/// Deployment profiles.
+pub mod profile;
+/// Unified recovery manager.
+pub mod recovery_manager;
+mod show_commands;
+mod sink_task;
+mod sql_utils;
 mod stream_executor;
 mod table_backend;
 mod table_cache_mode;
 mod table_provider;
 mod table_store;
+mod temporal_probe;
 
 /// C FFI layer for LaminarDB.
 ///

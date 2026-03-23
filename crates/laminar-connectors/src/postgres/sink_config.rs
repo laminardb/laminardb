@@ -64,6 +64,9 @@ pub struct PostgresSinkConfig {
     /// Delivery guarantee level.
     pub delivery_guarantee: DeliveryGuarantee,
 
+    /// Per-query statement timeout (default: 30s).
+    pub statement_timeout: Duration,
+
     /// Sink ID for offset tracking (auto-generated if empty).
     pub sink_id: String,
 }
@@ -88,6 +91,7 @@ impl Default for PostgresSinkConfig {
             auto_create_table: false,
             changelog_mode: false,
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
+            statement_timeout: Duration::from_secs(30),
             sink_id: String::new(),
         }
     }
@@ -181,6 +185,12 @@ impl PostgresSinkConfig {
         if let Some(v) = config.get("changelog.mode") {
             cfg.changelog_mode = v.eq_ignore_ascii_case("true");
         }
+        if let Some(v) = config.get("statement.timeout.ms") {
+            let ms: u64 = v.parse().map_err(|_| {
+                ConnectorError::ConfigurationError(format!("invalid statement.timeout.ms: '{v}'"))
+            })?;
+            cfg.statement_timeout = Duration::from_millis(ms);
+        }
         if let Some(v) = config.get("delivery.guarantee") {
             cfg.delivery_guarantee = v.parse().map_err(|_| {
                 ConnectorError::ConfigurationError(format!(
@@ -219,6 +229,11 @@ impl PostgresSinkConfig {
         if self.pool_size == 0 {
             return Err(ConnectorError::ConfigurationError(
                 "pool.size must be > 0".into(),
+            ));
+        }
+        if self.statement_timeout < Duration::from_secs(1) {
+            return Err(ConnectorError::ConfigurationError(
+                "statement.timeout.ms must be >= 1000 (1 second)".into(),
             ));
         }
         Ok(())

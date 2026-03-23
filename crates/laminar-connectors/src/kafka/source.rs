@@ -89,6 +89,14 @@ pub struct KafkaSource {
     reader_shutdown: Option<tokio::sync::watch::Sender<bool>>,
     offset_commit_tx: Option<tokio::sync::watch::Sender<TopicPartitionList>>,
     watermark_tracker: Option<KafkaWatermarkTracker>,
+    /// Receiver for high watermark data from the background reader task.
+    /// Each entry is `(topic, partition, high_watermark)` for lag computation.
+    #[allow(clippy::type_complexity)]
+    high_watermarks_rx: Option<tokio::sync::watch::Receiver<Vec<(Arc<str>, i32, i64)>>>,
+    /// Shared flag: `true` when the reader task has paused Kafka partitions
+    /// due to downstream backpressure. Used to re-pause newly assigned
+    /// partitions during rebalance.
+    reader_paused: Arc<AtomicBool>,
 }
 
 impl KafkaSource {
@@ -105,7 +113,7 @@ impl KafkaSource {
         let backpressure = KafkaBackpressureController::new(
             config.backpressure_high_watermark,
             config.backpressure_low_watermark,
-            config.max_poll_records * 10, // rough channel capacity estimate
+            config.reader_channel_capacity,
             Arc::clone(&channel_len),
         );
 
@@ -140,6 +148,8 @@ impl KafkaSource {
             reader_shutdown: None,
             offset_commit_tx: None,
             watermark_tracker,
+            high_watermarks_rx: None,
+            reader_paused: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -167,7 +177,7 @@ impl KafkaSource {
         let backpressure = KafkaBackpressureController::new(
             config.backpressure_high_watermark,
             config.backpressure_low_watermark,
-            config.max_poll_records * 10,
+            config.reader_channel_capacity,
             Arc::clone(&channel_len),
         );
 
@@ -202,6 +212,8 @@ impl KafkaSource {
             reader_shutdown: None,
             offset_commit_tx: None,
             watermark_tracker,
+            high_watermarks_rx: None,
+            reader_paused: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -264,19 +276,30 @@ impl KafkaSource {
             return;
         }
 
-        let consumer = self.consumer.take().unwrap();
-        let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(4096);
+        // Wrap in Arc so the blocking watermark task can share the consumer
+        // with the async reader loop. librdkafka handles are thread-safe.
+        let consumer = Arc::new(self.consumer.take().unwrap());
+        let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(self.config.reader_channel_capacity);
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let (offset_tx, offset_rx) = tokio::sync::watch::channel(TopicPartitionList::new());
+        let (hwm_tx, hwm_rx) = tokio::sync::watch::channel(Vec::new());
         let data_ready = Arc::clone(&self.data_ready);
         let channel_len = Arc::clone(&self.channel_len);
         let capture_headers = self.config.include_headers;
         let broker_commit_interval = self.config.broker_commit_interval;
+        let reader_channel_capacity = self.config.reader_channel_capacity;
+        let reader_paused = Arc::clone(&self.reader_paused);
+        let pause_threshold = self.config.backpressure_high_watermark;
+        let resume_threshold = self.config.backpressure_low_watermark;
 
         // The reader task owns the consumer. On shutdown it commits the latest
         // offsets received via the offset_rx watch channel, then unsubscribes.
         let reader_handle = tokio::spawn(async move {
             let mut cached_topic: Arc<str> = Arc::from("");
+
+            // Track seen topic-partitions for high watermark queries.
+            let mut seen_partitions: std::collections::HashSet<(Arc<str>, i32)> =
+                std::collections::HashSet::new();
 
             // Periodic broker commit timer. Advisory — keeps kafka-consumer-groups
             // lag monitoring accurate. Zero interval disables periodic commits.
@@ -291,7 +314,44 @@ impl KafkaSource {
             // Skip the first tick (fires immediately).
             commit_timer.tick().await;
 
+            // Periodic high watermark query timer (30s).
+            let mut hwm_timer = tokio::time::interval(std::time::Duration::from_secs(30));
+            hwm_timer.tick().await; // Skip the first tick.
+
+            let mut is_paused = false;
+
             loop {
+                // Check channel fill ratio for pause/resume of Kafka partitions.
+                // This keeps consumer.recv() calling rd_kafka_consumer_poll()
+                // even when paused, preventing max.poll.interval.ms violations.
+                #[allow(clippy::cast_precision_loss)]
+                let fill = if reader_channel_capacity > 0 {
+                    channel_len.load(Ordering::Relaxed) as f64 / reader_channel_capacity as f64
+                } else {
+                    0.0
+                };
+                if fill >= pause_threshold && !is_paused {
+                    if let Ok(assignment) = consumer.assignment() {
+                        if let Err(e) = consumer.pause(&assignment) {
+                            warn!(error = %e, "failed to pause Kafka partitions");
+                        } else {
+                            is_paused = true;
+                            reader_paused.store(true, Ordering::Relaxed);
+                            debug!("reader: paused Kafka partitions (fill={fill:.2})");
+                        }
+                    }
+                } else if fill <= resume_threshold && is_paused {
+                    if let Ok(assignment) = consumer.assignment() {
+                        if let Err(e) = consumer.resume(&assignment) {
+                            warn!(error = %e, "failed to resume Kafka partitions");
+                        } else {
+                            is_paused = false;
+                            reader_paused.store(false, Ordering::Relaxed);
+                            debug!("reader: resumed Kafka partitions (fill={fill:.2})");
+                        }
+                    }
+                }
+
                 let msg_result = tokio::select! {
                     biased;
                     _ = shutdown_rx.changed() => break,
@@ -311,7 +371,42 @@ impl KafkaSource {
                         }
                         continue;
                     },
-                    msg = consumer.recv() => msg,
+                    _ = hwm_timer.tick() => {
+                        // fetch_watermarks is a blocking FFI call — run on the
+                        // blocking pool to avoid stalling the async reader.
+                        if !seen_partitions.is_empty() {
+                            let partitions: Vec<_> = seen_partitions.iter().cloned().collect();
+                            let c = Arc::clone(&consumer);
+                            let watermarks = tokio::task::spawn_blocking(move || {
+                                let mut results = Vec::with_capacity(partitions.len());
+                                for (topic, partition) in &partitions {
+                                    if let Ok((_low, high)) = c.fetch_watermarks(
+                                        topic,
+                                        *partition,
+                                        std::time::Duration::from_secs(5),
+                                    ) {
+                                        results.push((Arc::clone(topic), *partition, high));
+                                    }
+                                }
+                                results
+                            })
+                            .await
+                            .unwrap_or_default();
+                            if !watermarks.is_empty() {
+                                let _ = hwm_tx.send(watermarks);
+                            }
+                        }
+                        continue;
+                    },
+                    // Timeout ensures we re-check backpressure and timers even
+                    // when paused partitions yield no messages.
+                    msg = tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        consumer.recv(),
+                    ) => match msg {
+                        Ok(result) => result,
+                        Err(_timeout) => continue,
+                    },
                 };
                 match msg_result {
                     Ok(msg) => {
@@ -320,6 +415,8 @@ impl KafkaSource {
                             if &*cached_topic != topic {
                                 cached_topic = Arc::from(topic);
                             }
+                            // Track partition for watermark queries.
+                            seen_partitions.insert((Arc::clone(&cached_topic), msg.partition()));
                             let timestamp_ms = match msg.timestamp() {
                                 rdkafka::Timestamp::CreateTime(ts)
                                 | rdkafka::Timestamp::LogAppendTime(ts) => Some(ts),
@@ -390,6 +487,7 @@ impl KafkaSource {
         self.reader_handle = Some(reader_handle);
         self.reader_shutdown = Some(shutdown_tx);
         self.offset_commit_tx = Some(offset_tx);
+        self.high_watermarks_rx = Some(hwm_rx);
     }
 }
 
@@ -466,6 +564,7 @@ impl SourceConnector for KafkaSource {
             Arc::clone(&self.rebalance_state),
             Arc::clone(&self.rebalance_counter),
             Arc::clone(&self.revoke_generation),
+            Arc::clone(&self.reader_paused),
         );
         let consumer: StreamConsumer<LaminarConsumerContext> =
             rdkafka_config.create_with_context(context).map_err(|e| {
@@ -505,8 +604,17 @@ impl SourceConnector for KafkaSource {
                 };
                 for topic in &topics {
                     for (&partition, &offset) in offsets {
-                        tpl.add_partition_offset(topic, partition, rdkafka::Offset::Offset(offset))
-                            .ok();
+                        if let Err(e) = tpl.add_partition_offset(
+                            topic,
+                            partition,
+                            rdkafka::Offset::Offset(offset),
+                        ) {
+                            tracing::warn!(
+                                %topic, partition, offset,
+                                error = %e,
+                                "failed to add specific offset to partition list"
+                            );
+                        }
                     }
                 }
                 if tpl.count() > 0 {
@@ -537,12 +645,18 @@ impl SourceConnector for KafkaSource {
                 ) {
                     for topic_meta in metadata.topics() {
                         for partition_meta in topic_meta.partitions() {
-                            tpl.add_partition_offset(
+                            if let Err(e) = tpl.add_partition_offset(
                                 topic_meta.name(),
                                 partition_meta.id(),
                                 rdkafka::Offset::Offset(*ts_ms),
-                            )
-                            .ok();
+                            ) {
+                                tracing::warn!(
+                                    topic = topic_meta.name(),
+                                    partition = partition_meta.id(),
+                                    error = %e,
+                                    "failed to add timestamp offset to partition list"
+                                );
+                            }
                         }
                     }
                 }
@@ -598,18 +712,13 @@ impl SourceConnector for KafkaSource {
             });
         }
 
-        // Check backpressure.
+        // Update backpressure state — never skip the drain below (deadlocks).
         if self.backpressure.should_pause() {
             self.backpressure.set_paused(true);
             debug!("backpressure: pausing consumption");
-            return Ok(None);
-        }
-        if self.backpressure.should_resume() {
+        } else if self.backpressure.should_resume() {
             self.backpressure.set_paused(false);
             debug!("backpressure: resuming consumption");
-        }
-        if self.backpressure.is_paused() {
-            return Ok(None);
         }
 
         // Lazily spawn the background reader task on first poll.
@@ -883,6 +992,14 @@ impl SourceConnector for KafkaSource {
         self.offsets.to_checkpoint_filtered(&assigned)
     }
 
+    /// Restores the consumer to checkpointed offsets.
+    ///
+    /// **Single-instance limitation**: This implementation assumes a single
+    /// consumer instance per `group.id`. Checkpoint offsets are stored in
+    /// `LaminarDB`'s manifest and restored via `consumer.assign()`, bypassing
+    /// the Kafka consumer group protocol. Running multiple instances with
+    /// the same `group.id` will cause offset conflicts between the manifest
+    /// and broker-managed group offsets.
     async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
         info!(
             epoch = checkpoint.epoch(),
@@ -923,6 +1040,23 @@ impl SourceConnector for KafkaSource {
     }
 
     fn metrics(&self) -> ConnectorMetrics {
+        // Compute consumer lag from high watermarks, filtered to currently
+        // assigned partitions so revoked partitions don't contribute stale lag.
+        if let Some(ref hwm_rx) = self.high_watermarks_rx {
+            let watermarks = hwm_rx.borrow();
+            let mut total_lag: u64 = 0;
+            for (topic, partition, high_watermark) in watermarks.iter() {
+                // Only count partitions we still track offsets for (assigned).
+                if let Some(current_offset) = self.offsets.get(topic, *partition) {
+                    let lag = high_watermark.saturating_sub(current_offset + 1);
+                    #[allow(clippy::cast_sign_loss)]
+                    if lag > 0 {
+                        total_lag += lag as u64;
+                    }
+                }
+            }
+            self.metrics.set_lag(total_lag);
+        }
         self.metrics.to_connector_metrics()
     }
 

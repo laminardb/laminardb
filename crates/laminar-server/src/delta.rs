@@ -19,9 +19,7 @@ use laminar_core::delta::discovery::{
     Discovery, DiscoveryError, GossipDiscovery, GossipDiscoveryConfig, NodeId, NodeInfo,
     NodeMetadata, NodeState, StaticDiscovery, StaticDiscoveryConfig,
 };
-use laminar_core::delta::partition::assignment::{
-    AssignmentConstraints, ConsistentHashAssigner, PartitionAssigner,
-};
+use laminar_core::delta::partition::assignment::{AssignmentConstraints, ConsistentHashAssigner};
 /// Enum dispatch for discovery implementations.
 ///
 /// The `Discovery` trait uses `async fn` which is not dyn-compatible,

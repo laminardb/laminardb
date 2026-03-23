@@ -193,6 +193,7 @@ pub async fn open_or_create_table(
 ///
 /// Returns `ConnectorError::WriteError` if the write fails.
 #[cfg(feature = "delta-lake")]
+#[allow(clippy::too_many_arguments)]
 pub async fn write_batches(
     table: DeltaTable,
     batches: Vec<RecordBatch>,
@@ -201,6 +202,9 @@ pub async fn write_batches(
     save_mode: SaveMode,
     partition_columns: Option<&[String]>,
     schema_evolution: bool,
+    target_file_size: Option<usize>,
+    create_checkpoint: bool,
+    writer_properties: Option<deltalake::parquet::file::properties::WriterProperties>,
 ) -> Result<(DeltaTable, i64), ConnectorError> {
     if batches.is_empty() {
         debug!("no batches to write, skipping");
@@ -229,8 +233,15 @@ pub async fn write_batches(
         .with_save_mode(save_mode)
         .with_commit_properties(
             CommitProperties::default()
-                .with_application_transaction(Transaction::new(writer_id, epoch_i64)),
+                .with_application_transaction(Transaction::new(writer_id, epoch_i64))
+                .with_create_checkpoint(create_checkpoint),
         );
+
+    // Forward target file size to delta-rs so Parquet files match the
+    // user's configured size, not just the internal default.
+    if let Some(size) = target_file_size {
+        write_builder = write_builder.with_target_file_size(size);
+    }
 
     // Enable schema evolution (additive column merge) if requested.
     if schema_evolution {
@@ -242,6 +253,10 @@ pub async fn write_batches(
         if !cols.is_empty() {
             write_builder = write_builder.with_partition_columns(cols.to_vec());
         }
+    }
+
+    if let Some(props) = writer_properties {
+        write_builder = write_builder.with_writer_properties(props);
     }
 
     // Execute the write.
@@ -332,23 +347,19 @@ pub fn get_table_schema(table: &DeltaTable) -> Result<SchemaRef, ConnectorError>
     Ok(state.snapshot().arrow_schema())
 }
 
-/// Returns the latest committed version of a Delta Lake table.
-///
-/// This refreshes the table state from storage before checking.
+/// Returns the latest committed version via the log store.
 ///
 /// # Errors
 ///
-/// Returns `ConnectorError::ReadError` if the table state cannot be refreshed.
+/// Returns `ConnectorError::ReadError` on failure.
 #[cfg(feature = "delta-lake")]
 pub async fn get_latest_version(table: &mut DeltaTable) -> Result<i64, ConnectorError> {
-    // DeltaTable::update() takes ownership, so clone and replace.
-    let (updated, _metrics) =
-        table.clone().update().await.map_err(|e| {
-            ConnectorError::ReadError(format!("failed to refresh Delta table: {e}"))
-        })?;
-
-    *table = updated;
-    Ok(table.version().unwrap_or(0))
+    let log_store = table.log_store();
+    let current = table.version().unwrap_or(0);
+    log_store
+        .get_latest_version(current)
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("failed to get latest version: {e}")))
 }
 
 /// Reads record batches from a specific Delta Lake table version.
@@ -367,12 +378,15 @@ pub async fn get_latest_version(table: &mut DeltaTable) -> Result<i64, Connector
 /// # Errors
 ///
 /// Returns `ConnectorError::ReadError` if the version cannot be loaded or scanned.
+///
+/// Returns `(batches, fully_consumed)` — `fully_consumed` is `false` when
+/// `max_records` truncated the result and more rows remain.
 #[cfg(feature = "delta-lake")]
 pub async fn read_batches_at_version(
     table: &mut DeltaTable,
     version: i64,
     max_records: usize,
-) -> Result<Vec<RecordBatch>, ConnectorError> {
+) -> Result<(Vec<RecordBatch>, bool), ConnectorError> {
     use datafusion::prelude::SessionContext;
     use tokio_stream::StreamExt;
 
@@ -431,14 +445,478 @@ pub async fn read_batches_at_version(
         }
     }
 
+    // If we stopped due to max_records, probe whether the stream has more.
+    // Without this, a version with exactly max_records rows would be
+    // misclassified as truncated and re-read forever.
+    let fully_consumed = if total_rows >= max_records {
+        stream.next().await.is_none()
+    } else {
+        true
+    };
+
     debug!(
         version,
         num_batches = batches.len(),
         total_rows,
+        fully_consumed,
         "Delta Lake: scanned version"
     );
 
+    Ok((batches, fully_consumed))
+}
+
+/// Reads only the rows added in a specific Delta Lake version.
+///
+/// Parses `_delta_log/{version:020}.json` for `add` actions, then reads
+/// only those Parquet files via the table's object store. This is
+/// `O(new_files)` per version, not `O(table_size)`.
+///
+/// For version 0, delegates to [`read_batches_at_version`] (full snapshot).
+///
+/// # Errors
+///
+/// Returns `ConnectorError::ReadError` if the version cannot be loaded or read.
+///
+/// Returns `(batches, fully_consumed)` — see [`read_batches_at_version`].
+#[cfg(feature = "delta-lake")]
+#[allow(clippy::too_many_lines)]
+pub async fn read_version_diff(
+    table: &mut DeltaTable,
+    version: i64,
+    max_records: usize,
+    partition_filter: Option<&str>,
+) -> Result<(Vec<RecordBatch>, bool), ConnectorError> {
+    // Maximum file size (256 MB) for direct in-memory Parquet reads.
+    // Files larger than this fall back to DataFusion's streaming scan.
+    const MAX_DIRECT_READ_BYTES: u64 = 256 * 1024 * 1024;
+
+    // For version 0, read the full snapshot (no previous version to diff).
+    if version <= 0 {
+        return read_batches_at_version(table, version, max_records).await;
+    }
+
+    // Read the commit JSON via delta-rs's LogStore API (handles path
+    // resolution, checkpoints, and retries correctly).
+    let log_store = table.log_store();
+    let store = log_store.object_store(None);
+
+    let commit_data = log_store
+        .read_commit_entry(version)
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("read commit {version}: {e}")))?
+        .ok_or_else(|| {
+            ConnectorError::ReadError(format!(
+                "version {version} not available (cleaned up or never existed)"
+            ))
+        })?;
+    let commit_str = std::str::from_utf8(&commit_data)
+        .map_err(|e| ConnectorError::ReadError(format!("commit log is not valid UTF-8: {e}")))?;
+
+    // Each line in the commit JSON is a separate action object.
+    // Collect both add and remove actions to compute the net-new files.
+    let mut added_paths = Vec::new();
+    let mut removed_paths = std::collections::HashSet::new();
+    for line in commit_str.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(add) = obj.get("add") {
+                if let Some(path) = add.get("path").and_then(|p| p.as_str()) {
+                    added_paths.push(decode_delta_path(path));
+                }
+            }
+            if let Some(remove) = obj.get("remove") {
+                if let Some(path) = remove.get("path").and_then(|p| p.as_str()) {
+                    removed_paths.insert(decode_delta_path(path));
+                }
+            }
+        }
+    }
+
+    // Exclude any added file whose path also appears in a remove action.
+    added_paths.retain(|p| !removed_paths.contains(p));
+
+    if added_paths.is_empty() {
+        debug!(
+            version,
+            num_removed = removed_paths.len(),
+            "Delta Lake: no net-new add actions in version"
+        );
+        return Ok((Vec::new(), true));
+    }
+
+    debug!(
+        version,
+        num_added_files = added_paths.len(),
+        num_removed_files = removed_paths.len(),
+        "Delta Lake: reading added files"
+    );
+
+    // Load the version so we have the correct schema.
+    table
+        .load_version(version)
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("failed to load version {version}: {e}")))?;
+
+    let table_schema = table
+        .snapshot()
+        .map(|s| s.snapshot().arrow_schema())
+        .map_err(|e| ConnectorError::ReadError(format!("no snapshot at version {version}: {e}")))?;
+
+    // Filter file paths by partition predicate if provided.
+    // Supports simple Hive-style equality: "col = 'val'" matches "col=val/" in path.
+    let added_paths = if let Some(filter) = partition_filter {
+        filter_paths_by_partition(&added_paths, filter)
+    } else {
+        added_paths
+    };
+
+    // Read each added Parquet file as raw bytes via delta-rs's object_store,
+    // then parse with parquet's in-memory ArrowReaderBuilder (avoids the
+    // object_store 0.12 vs 0.13 version mismatch).
+    let mut batches = Vec::new();
+    let mut total_rows: usize = 0;
+
+    for file_path in &added_paths {
+        if total_rows >= max_records {
+            break;
+        }
+
+        let obj_path = deltalake::Path::from(file_path.as_str());
+
+        // Check file size before downloading. Large files fall back to
+        // DataFusion scan to avoid OOM on multi-GB Parquet files.
+        let file_meta = store
+            .head(&obj_path)
+            .await
+            .map_err(|e| ConnectorError::ReadError(format!("failed to stat '{file_path}': {e}")))?;
+        if file_meta.size > MAX_DIRECT_READ_BYTES {
+            warn!(
+                file_path,
+                file_size = file_meta.size,
+                "file too large for direct read, falling back to DataFusion scan"
+            );
+            return read_batches_at_version(table, version, max_records).await;
+        }
+
+        let file_bytes = get_with_retry(&store, &obj_path, file_path).await?;
+
+        let parquet_reader =
+            deltalake::parquet::arrow::arrow_reader::ArrowReaderBuilder::try_new(file_bytes)
+                .map_err(|e| {
+                    ConnectorError::ReadError(format!(
+                        "failed to open Parquet file '{file_path}': {e}"
+                    ))
+                })?;
+
+        // Read one extra row to probe whether the version is fully consumed.
+        let remaining = max_records.saturating_sub(total_rows).saturating_add(1);
+        let reader = parquet_reader.with_limit(remaining).build().map_err(|e| {
+            ConnectorError::ReadError(format!("failed to build reader for '{file_path}': {e}"))
+        })?;
+
+        for result in reader {
+            let batch: RecordBatch = result.map_err(|e| {
+                ConnectorError::ReadError(format!("Parquet read error in '{file_path}': {e}"))
+            })?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            // Align the batch schema to the table schema (added files may
+            // predate schema evolution and have fewer columns).
+            let batch = if batch.schema() == table_schema {
+                batch
+            } else {
+                align_batch_to_schema(&batch, &table_schema)?
+            };
+
+            total_rows += batch.num_rows();
+            batches.push(batch);
+
+            if total_rows >= max_records {
+                break;
+            }
+        }
+    }
+
+    // We probed one extra row per file. If total_rows > max_records, there's
+    // more data — trim the excess and report not fully consumed.
+    let fully_consumed = total_rows <= max_records;
+    if !fully_consumed {
+        // Trim the last batch to remove the probe row(s).
+        let excess = total_rows - max_records;
+        let len = batches.len();
+        if len > 0 {
+            let last = &batches[len - 1];
+            if last.num_rows() > excess {
+                batches[len - 1] = last.slice(0, last.num_rows() - excess);
+            } else {
+                batches.pop();
+            }
+        }
+    }
+
+    debug!(
+        version,
+        num_batches = batches.len(),
+        fully_consumed,
+        num_added_files = added_paths.len(),
+        "Delta Lake: read version diff"
+    );
+
+    Ok((batches, fully_consumed))
+}
+
+/// Reads a file from `object_store` with retry (3x, exponential backoff).
+/// Does not retry 404s.
+#[cfg(feature = "delta-lake")]
+async fn get_with_retry(
+    store: &Arc<dyn deltalake::ObjectStore>,
+    path: &deltalake::Path,
+    display_path: &str,
+) -> Result<bytes::Bytes, ConnectorError> {
+    let backoff = [200u64, 1000, 4000];
+    let mut last_err = None;
+
+    for attempt in 0..=backoff.len() {
+        match store.get(path).await {
+            Ok(result) => {
+                return result.bytes().await.map_err(|e| {
+                    ConnectorError::ReadError(format!(
+                        "failed to read bytes of '{display_path}': {e}"
+                    ))
+                });
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("not found") || msg.contains("404") {
+                    return Err(ConnectorError::ReadError(format!(
+                        "file not found '{display_path}': {e}"
+                    )));
+                }
+                if let Some(&delay) = backoff.get(attempt) {
+                    warn!(
+                        attempt = attempt + 1,
+                        delay_ms = delay,
+                        error = %e,
+                        path = display_path,
+                        "object_store read failed, retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+
+    Err(ConnectorError::ReadError(format!(
+        "failed to read '{display_path}' after {} attempts: {}",
+        backoff.len() + 1,
+        last_err.map_or_else(|| "unknown".to_string(), |e| e.to_string())
+    )))
+}
+
+/// Filters file paths by a Hive-style partition predicate.
+///
+/// Supports simple equality predicates: `col = 'val'` matches paths
+/// containing `col=val/`. Multiple predicates joined by `AND` are all
+/// required to match. Predicates that can't be parsed are ignored
+/// (all paths pass through).
+#[cfg(feature = "delta-lake")]
+fn filter_paths_by_partition(paths: &[String], filter: &str) -> Vec<String> {
+    // Parse simple "col = 'val'" or "col = val" predicates from AND-joined expressions.
+    let mut required_segments: Vec<String> = Vec::new();
+    for clause in filter
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split(" AND ")
+    {
+        let clause = clause.trim();
+        if let Some((col, val)) = clause.split_once('=') {
+            let col = col.trim();
+            let val = val.trim().trim_matches('\'').trim_matches('"');
+            if !col.is_empty() && !val.is_empty() {
+                required_segments.push(format!("{col}={val}"));
+            }
+        }
+    }
+
+    if required_segments.is_empty() {
+        return paths.to_vec();
+    }
+
+    paths
+        .iter()
+        .filter(|path| required_segments.iter().all(|seg| path.contains(seg)))
+        .cloned()
+        .collect()
+}
+
+/// Percent-decodes a file path from a Delta Lake commit JSON.
+///
+/// Delta Lake spec requires paths in `add`/`remove` actions to be
+/// percent-encoded (e.g., `part%3D1/file.parquet` for `part=1/file.parquet`).
+#[cfg(feature = "delta-lake")]
+fn decode_delta_path(encoded: &str) -> String {
+    url::Url::parse(&format!("file:///{encoded}")).map_or_else(
+        |_| encoded.to_string(),
+        |u| {
+            let p = u.path();
+            p.strip_prefix('/').unwrap_or(p).to_string()
+        },
+    )
+}
+
+/// Aligns a `RecordBatch` to a target schema by adding null columns for
+/// missing fields. Used when reading Parquet files that predate schema
+/// evolution (fewer columns than the current table schema).
+#[cfg(feature = "delta-lake")]
+fn align_batch_to_schema(
+    batch: &RecordBatch,
+    target_schema: &SchemaRef,
+) -> Result<RecordBatch, ConnectorError> {
+    use arrow_array::new_null_array;
+
+    let mut columns = Vec::with_capacity(target_schema.fields().len());
+    for field in target_schema.fields() {
+        if let Ok(col_idx) = batch.schema().index_of(field.name()) {
+            columns.push(batch.column(col_idx).clone());
+        } else {
+            columns.push(new_null_array(field.data_type(), batch.num_rows()));
+        }
+    }
+
+    RecordBatch::try_new(target_schema.clone(), columns).map_err(|e| {
+        ConnectorError::ReadError(format!("failed to align batch to table schema: {e}"))
+    })
+}
+
+/// Reads CDF batches for a version range via `scan_cdf()`.
+///
+/// `scan_cdf(self)` consumes the `DeltaTable` — caller must re-open afterward.
+/// Output includes `_change_type`, `_commit_version`, `_commit_timestamp`.
+///
+/// # Errors
+///
+/// Returns `ConnectorError::ReadError` on scan failure.
+#[cfg(feature = "delta-lake")]
+pub async fn read_cdf_batches(
+    table: DeltaTable,
+    start_version: i64,
+    end_version: i64,
+) -> Result<Vec<RecordBatch>, ConnectorError> {
+    use datafusion::prelude::SessionContext;
+    use tokio_stream::StreamExt;
+
+    debug!(start_version, end_version, "reading CDF batches");
+
+    let ctx = SessionContext::new();
+
+    // Clone session state so the RwLockReadGuard is dropped before await.
+    let session_state = ctx.state();
+
+    let cdf_builder = table
+        .scan_cdf()
+        .with_starting_version(start_version)
+        .with_ending_version(end_version);
+
+    let plan = cdf_builder
+        .build(&session_state, None)
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("CDF scan build failed: {e}")))?;
+
+    // Execute the plan via DataFusion to get record batches.
+    let task_ctx = ctx.task_ctx();
+    let mut stream = datafusion::physical_plan::execute_stream(plan, task_ctx)
+        .map_err(|e| ConnectorError::ReadError(format!("CDF stream execution failed: {e}")))?;
+
+    let mut batches = Vec::new();
+    while let Some(result) = stream.next().await {
+        let batch: RecordBatch = result
+            .map_err(|e| ConnectorError::ReadError(format!("CDF stream batch failed: {e}")))?;
+        if batch.num_rows() > 0 {
+            batches.push(batch);
+        }
+    }
+
+    debug!(
+        start_version,
+        end_version,
+        num_batches = batches.len(),
+        "CDF scan complete"
+    );
+
     Ok(batches)
+}
+
+/// Maps CDF `_change_type` → `_op` (`I`/`U`/`D`), drops `update_preimage`
+/// rows and CDF metadata columns (`_change_type`, `_commit_version`,
+/// `_commit_timestamp`). Returns `None` if all rows were preimages.
+///
+/// # Errors
+///
+/// Returns `ConnectorError::ReadError` on Arrow operation failure.
+#[cfg(feature = "delta-lake")]
+pub fn map_cdf_to_changelog(batch: &RecordBatch) -> Result<Option<RecordBatch>, ConnectorError> {
+    use arrow_array::StringArray;
+
+    let schema = batch.schema();
+    let Ok(ct_idx) = schema.index_of("_change_type") else {
+        return Ok(Some(batch.clone()));
+    };
+
+    let change_type = batch
+        .column(ct_idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| ConnectorError::ReadError("_change_type is not Utf8".into()))?;
+
+    // Build filter (drop preimage rows) and mapped _op values in one pass.
+    let (keep, ops): (Vec<bool>, Vec<Option<&str>>) = (0..batch.num_rows())
+        .map(|i| match change_type.value(i) {
+            "update_postimage" => (true, Some("U")),
+            "delete" => (true, Some("D")),
+            "update_preimage" => (false, Some("")),
+            _ => (true, Some("I")), // insert + unknown → I
+        })
+        .unzip();
+
+    let filter = arrow_array::BooleanArray::from(keep);
+    let filtered = arrow_select::filter::filter_record_batch(batch, &filter)
+        .map_err(|e| ConnectorError::ReadError(format!("CDF filter failed: {e}")))?;
+    if filtered.num_rows() == 0 {
+        return Ok(None);
+    }
+
+    // Build _op column from filtered ops.
+    let op_arr: StringArray = ops.into_iter().collect();
+    let op_filtered = arrow_select::filter::filter(&op_arr, &filter)
+        .map_err(|e| ConnectorError::ReadError(format!("CDF op filter: {e}")))?;
+
+    // Rebuild batch: keep user columns, drop CDF metadata, append _op.
+    let cdf_meta = ["_change_type", "_commit_version", "_commit_timestamp"];
+    let mut fields = Vec::new();
+    let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::new();
+    for (i, field) in filtered.schema().fields().iter().enumerate() {
+        if !cdf_meta.contains(&field.name().as_str()) {
+            fields.push(field.clone());
+            columns.push(filtered.column(i).clone());
+        }
+    }
+    fields.push(Arc::new(arrow_schema::Field::new(
+        "_op",
+        arrow_schema::DataType::Utf8,
+        false,
+    )));
+    columns.push(op_filtered);
+
+    RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns)
+        .map(Some)
+        .map_err(|e| ConnectorError::ReadError(format!("CDF batch rebuild: {e}")))
 }
 
 /// Result of a MERGE (upsert) operation.
@@ -451,208 +929,6 @@ pub struct MergeResult {
     pub rows_updated: usize,
     /// Number of rows deleted.
     pub rows_deleted: usize,
-}
-
-/// Performs a MERGE (upsert) of a source batch into a Delta Lake table.
-///
-/// Matches source rows to target rows by `key_columns`, then:
-/// - **Matched**: update all non-key columns from source
-/// - **Not matched**: insert all columns from source
-///
-/// # Arguments
-///
-/// * `table` - The Delta Lake table handle (consumed and returned)
-/// * `source_batch` - The source `RecordBatch` to merge
-/// * `key_columns` - Columns used to match source to target rows
-/// * `writer_id` - Unique writer identifier for exactly-once deduplication
-/// * `epoch` - The epoch number for this write
-/// * `schema_evolution` - If true, auto-merge new columns into the table schema
-///
-/// # Errors
-///
-/// Returns `ConnectorError::WriteError` if the merge fails.
-#[cfg(feature = "delta-lake")]
-#[allow(clippy::too_many_lines)]
-pub async fn merge_batches(
-    table: DeltaTable,
-    source_batch: RecordBatch,
-    key_columns: &[String],
-    writer_id: &str,
-    epoch: u64,
-    schema_evolution: bool,
-) -> Result<(DeltaTable, MergeResult), ConnectorError> {
-    use datafusion::prelude::*;
-    use deltalake::kernel::transaction::CommitProperties;
-    use deltalake::kernel::Transaction;
-    if source_batch.num_rows() == 0 {
-        return Ok((
-            table,
-            MergeResult {
-                rows_inserted: 0,
-                rows_updated: 0,
-                rows_deleted: 0,
-            },
-        ));
-    }
-
-    debug!(
-        key_columns = ?key_columns,
-        source_rows = source_batch.num_rows(),
-        "performing Delta Lake MERGE"
-    );
-
-    // Register source batch as a DataFrame.
-    let ctx = SessionContext::new();
-    let source_df = ctx.read_batch(source_batch).map_err(|e| {
-        ConnectorError::WriteError(format!("failed to create source DataFrame: {e}"))
-    })?;
-
-    // Build the join predicate: target.k1 = source.k1 AND target.k2 = source.k2 ...
-    let predicate = key_columns
-        .iter()
-        .map(|k| col(format!("target.{k}")).eq(col(format!("source.{k}"))))
-        .reduce(Expr::and)
-        .ok_or_else(|| {
-            ConnectorError::ConfigurationError("merge requires at least one key column".into())
-        })?;
-
-    // Build the merge operation.
-    #[allow(clippy::cast_possible_wrap)]
-    let epoch_i64 = epoch as i64;
-
-    let source_schema = source_df.schema().clone();
-
-    // Use a HashSet for O(1) key lookups instead of O(k) linear scan.
-    let key_set: std::collections::HashSet<&str> = key_columns.iter().map(String::as_str).collect();
-
-    let all_columns: Vec<String> = source_schema
-        .fields()
-        .iter()
-        .map(|f| f.name().clone())
-        .collect();
-
-    let non_key_columns: Vec<String> = all_columns
-        .iter()
-        .filter(|c| !key_set.contains(c.as_str()))
-        .cloned()
-        .collect();
-
-    // Move into closures (no clone needed — originals are not used after).
-    let non_key_for_update = non_key_columns;
-    let all_for_insert = all_columns;
-
-    let mut merge_builder = table
-        .merge(source_df, predicate)
-        .with_source_alias("source")
-        .with_target_alias("target")
-        .with_commit_properties(
-            CommitProperties::default()
-                .with_application_transaction(Transaction::new(writer_id, epoch_i64)),
-        )
-        .when_matched_update(|update| {
-            let mut u = update;
-            for col_name in &non_key_for_update {
-                u = u.update(col_name.as_str(), col(format!("source.{col_name}")));
-            }
-            u
-        })
-        .map_err(|e| ConnectorError::WriteError(format!("merge matched-update failed: {e}")))?
-        .when_not_matched_insert(|insert| {
-            let mut ins = insert;
-            for col_name in &all_for_insert {
-                ins = ins.set(col_name.as_str(), col(format!("source.{col_name}")));
-            }
-            ins
-        })
-        .map_err(|e| ConnectorError::WriteError(format!("merge not-matched-insert failed: {e}")))?;
-
-    if schema_evolution {
-        merge_builder = merge_builder.with_merge_schema(true);
-    }
-
-    let (table, metrics) = merge_builder
-        .await
-        .map_err(|e| ConnectorError::WriteError(format!("Delta Lake MERGE failed: {e}")))?;
-
-    let result = MergeResult {
-        rows_inserted: metrics.num_target_rows_inserted,
-        rows_updated: metrics.num_target_rows_updated,
-        rows_deleted: metrics.num_target_rows_deleted,
-    };
-
-    info!(
-        writer_id,
-        epoch,
-        rows_inserted = result.rows_inserted,
-        rows_updated = result.rows_updated,
-        rows_deleted = result.rows_deleted,
-        "Delta Lake MERGE complete"
-    );
-
-    Ok((table, result))
-}
-
-/// Performs a DELETE-by-merge for rows to be removed from the target table.
-///
-/// Matches source (delete) rows by `key_columns` and deletes matching target rows.
-///
-/// # Errors
-///
-/// Returns `ConnectorError::WriteError` if the operation fails.
-#[cfg(feature = "delta-lake")]
-pub async fn delete_by_merge(
-    table: DeltaTable,
-    delete_batch: RecordBatch,
-    key_columns: &[String],
-    writer_id: &str,
-    epoch: u64,
-) -> Result<(DeltaTable, usize), ConnectorError> {
-    use datafusion::prelude::*;
-    use deltalake::kernel::transaction::CommitProperties;
-    use deltalake::kernel::Transaction;
-
-    if delete_batch.num_rows() == 0 {
-        return Ok((table, 0));
-    }
-
-    debug!(
-        delete_rows = delete_batch.num_rows(),
-        "performing Delta Lake delete-by-merge"
-    );
-
-    let ctx = SessionContext::new();
-    let source_df = ctx.read_batch(delete_batch).map_err(|e| {
-        ConnectorError::WriteError(format!("failed to create delete DataFrame: {e}"))
-    })?;
-
-    let predicate = key_columns
-        .iter()
-        .map(|k| col(format!("target.{k}")).eq(col(format!("source.{k}"))))
-        .reduce(Expr::and)
-        .ok_or_else(|| {
-            ConnectorError::ConfigurationError("delete requires at least one key column".into())
-        })?;
-
-    #[allow(clippy::cast_possible_wrap)]
-    let epoch_i64 = epoch as i64;
-
-    let (table, metrics) = table
-        .merge(source_df, predicate)
-        .with_source_alias("source")
-        .with_target_alias("target")
-        .with_commit_properties(
-            CommitProperties::default()
-                .with_application_transaction(Transaction::new(writer_id, epoch_i64)),
-        )
-        .when_matched_delete(|delete| delete)
-        .map_err(|e| ConnectorError::WriteError(format!("delete-merge setup failed: {e}")))?
-        .await
-        .map_err(|e| ConnectorError::WriteError(format!("Delta Lake delete-merge failed: {e}")))?;
-
-    let rows_deleted = metrics.num_target_rows_deleted;
-    info!(rows_deleted, "Delta Lake delete-by-merge complete");
-
-    Ok((table, rows_deleted))
 }
 
 /// Atomic changelog MERGE: inserts, updates, and deletes in one Delta commit.
@@ -676,6 +952,7 @@ pub async fn merge_changelog(
     writer_id: &str,
     epoch: u64,
     schema_evolution: bool,
+    writer_properties: Option<deltalake::parquet::file::properties::WriterProperties>,
 ) -> Result<(DeltaTable, MergeResult), ConnectorError> {
     use datafusion::prelude::*;
     use deltalake::kernel::transaction::CommitProperties;
@@ -772,6 +1049,10 @@ pub async fn merge_changelog(
         merge_builder = merge_builder.with_merge_schema(true);
     }
 
+    if let Some(props) = writer_properties {
+        merge_builder = merge_builder.with_writer_properties(props);
+    }
+
     let (table, metrics) = merge_builder.await.map_err(|e| {
         ConnectorError::WriteError(format!("Delta Lake changelog MERGE failed: {e}"))
     })?;
@@ -819,6 +1100,7 @@ pub async fn run_compaction(
     table: DeltaTable,
     target_file_size: u64,
     z_order_columns: &[String],
+    writer_properties: Option<deltalake::parquet::file::properties::WriterProperties>,
 ) -> Result<(DeltaTable, CompactionResult), ConnectorError> {
     use deltalake::operations::optimize::OptimizeType;
 
@@ -830,10 +1112,16 @@ pub async fn run_compaction(
         OptimizeType::ZOrder(z_order_columns.to_vec())
     };
 
-    let (table, metrics) = table
+    let mut optimize_builder = table
         .optimize()
         .with_type(optimize_type)
-        .with_target_size(target_file_size)
+        .with_target_size(target_file_size);
+
+    if let Some(props) = writer_properties {
+        optimize_builder = optimize_builder.with_writer_properties(props);
+    }
+
+    let (table, metrics) = optimize_builder
         .await
         .map_err(|e| ConnectorError::Internal(format!("compaction failed: {e}")))?;
 
@@ -872,7 +1160,6 @@ pub async fn run_vacuum(
     let (table, metrics) = table
         .vacuum()
         .with_retention_period(chrono_duration)
-        .with_enforce_retention_duration(false)
         .await
         .map_err(|e| ConnectorError::Internal(format!("vacuum failed: {e}")))?;
 
@@ -901,7 +1188,6 @@ pub async fn resolve_catalog_options(
     _catalog_schema: Option<&str>,
     table_path: &str,
     base_storage_options: &HashMap<String, String>,
-    catalog_properties: &HashMap<String, String>,
 ) -> Result<(String, HashMap<String, String>), ConnectorError> {
     use super::delta_config::DeltaCatalogType;
 
@@ -934,13 +1220,7 @@ pub async fn resolve_catalog_options(
                 resolved_path = %resolved,
                 "resolved table path via Glue catalog"
             );
-            let mut opts = base_storage_options.clone();
-            opts.extend(
-                catalog_properties
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone())),
-            );
-            Ok((resolved, opts))
+            Ok((resolved, base_storage_options.clone()))
         }
         #[cfg(not(feature = "delta-lake-glue"))]
         DeltaCatalogType::Glue => Err(ConnectorError::ConfigurationError(
@@ -953,24 +1233,21 @@ pub async fn resolve_catalog_options(
             workspace_url,
             access_token,
         } => {
-            // The deltalake-catalog-unity crate auto-registers a factory for
-            // uc:// URIs via #[ctor]. It reads `databricks_host` and
-            // `databricks_token` from storage options (or DATABRICKS_HOST /
-            // DATABRICKS_TOKEN env vars). We inject from config so users can
-            // specify credentials in TOML instead of env vars.
-            let mut opts = base_storage_options.clone();
-            opts.extend(
-                catalog_properties
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone())),
-            );
-            if !workspace_url.is_empty() {
-                opts.insert("databricks_host".to_string(), workspace_url.clone());
-            }
-            if !access_token.is_empty() {
-                opts.insert("databricks_token".to_string(), access_token.clone());
-            }
-            Ok((table_path.to_string(), opts))
+            // Resolve the table's actual storage location from Unity Catalog
+            // via REST API, then return that direct path (s3://, az://, gs://)
+            // instead of the uc:// URI. This bypasses delta-rs's built-in
+            // uc:// handling which requires credential vending — a feature
+            // that is denied outside Databricks compute environments.
+            let full_name = table_path.strip_prefix("uc://").unwrap_or(table_path);
+
+            let storage_location = super::unity_catalog::get_table_storage_location(
+                workspace_url,
+                access_token,
+                full_name,
+            )
+            .await?;
+
+            Ok((storage_location, base_storage_options.clone()))
         }
         #[cfg(not(feature = "delta-lake-unity"))]
         DeltaCatalogType::Unity { .. } => Err(ConnectorError::ConfigurationError(
@@ -1090,6 +1367,9 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -1131,6 +1411,9 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -1171,6 +1454,9 @@ mod tests {
                 SaveMode::Append,
                 None,
                 false,
+                None,
+                false,
+                None,
             )
             .await
             .unwrap();
@@ -1224,6 +1510,9 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -1255,6 +1544,9 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -1323,6 +1615,9 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -1353,6 +1648,9 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -1367,6 +1665,9 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -1375,14 +1676,14 @@ mod tests {
         let mut read_table = open_or_create_table(table_path, HashMap::new(), None)
             .await
             .unwrap();
-        let batches = read_batches_at_version(&mut read_table, 1, 10000)
+        let (batches, _) = read_batches_at_version(&mut read_table, 1, 10000)
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 50);
 
         // Read version 2 — should get 80 rows (cumulative).
-        let batches = read_batches_at_version(&mut read_table, 2, 10000)
+        let (batches, _) = read_batches_at_version(&mut read_table, 2, 10000)
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1461,6 +1762,9 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -1472,6 +1776,9 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -1544,7 +1851,7 @@ mod tests {
         let latest = get_latest_version(&mut table).await.unwrap();
         assert!(latest >= 1, "should have at least 1 version");
 
-        let batches = read_batches_at_version(&mut table, latest, 10000)
+        let (batches, _) = read_batches_at_version(&mut table, latest, 10000)
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1574,6 +1881,9 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -1588,6 +1898,9 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -1601,7 +1914,7 @@ mod tests {
         let mut read_table = open_or_create_table(table_path, HashMap::new(), None)
             .await
             .unwrap();
-        let batches = read_batches_at_version(&mut read_table, 2, 10000)
+        let (batches, _) = read_batches_at_version(&mut read_table, 2, 10000)
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1639,6 +1952,9 @@ mod tests {
             SaveMode::Append,
             None,
             true, // schema_evolution enabled
+            None,
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -1666,6 +1982,9 @@ mod tests {
             SaveMode::Append,
             None,
             true,
+            None,
+            false,
+            None,
         )
         .await
         .unwrap();
@@ -1681,7 +2000,7 @@ mod tests {
         let mut read_table = open_or_create_table(table_path, HashMap::new(), None)
             .await
             .unwrap();
-        let batches = read_batches_at_version(&mut read_table, 2, 10000)
+        let (batches, _) = read_batches_at_version(&mut read_table, 2, 10000)
             .await
             .unwrap();
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
@@ -1709,6 +2028,9 @@ mod tests {
                 SaveMode::Append,
                 None,
                 false,
+                None,
+                false,
+                None,
             )
             .await
             .unwrap();
@@ -1728,242 +2050,17 @@ mod tests {
         );
 
         // Run compaction.
-        let (table, result) = run_compaction(table, 128 * 1024 * 1024, &[]).await.unwrap();
+        let (table, result) = run_compaction(table, 128 * 1024 * 1024, &[], None)
+            .await
+            .unwrap();
         assert!(
             result.files_removed > 0,
             "compaction should have removed files"
         );
 
-        // Run vacuum to physically delete old files.
-        let (_table, files_deleted) = run_vacuum(table, std::time::Duration::from_secs(0))
-            .await
-            .unwrap();
-
-        // Verify fewer Parquet files remain.
-        let parquet_after: Vec<_> = std::fs::read_dir(temp_dir.path())
-            .unwrap()
-            .filter_map(Result::ok)
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "parquet"))
-            .collect();
-        assert!(
-            parquet_after.len() < parquet_before.len(),
-            "should have fewer files after compaction+vacuum: before={}, after={}, vacuumed={}",
-            parquet_before.len(),
-            parquet_after.len(),
-            files_deleted
-        );
-    }
-
-    // ── Merge (upsert) tests ──
-
-    #[tokio::test]
-    async fn test_merge_insert_only() {
-        let temp_dir = TempDir::new().unwrap();
-        let table_path = temp_dir.path().to_str().unwrap();
-
-        // Create table with initial rows.
-        let schema = test_schema();
-        let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
-            .await
-            .unwrap();
-        let initial = test_batch(3); // ids 0, 1, 2
-        let (table, _) = write_batches(
-            table,
-            vec![initial],
-            "merge-writer",
-            1,
-            SaveMode::Append,
-            None,
-            false,
-        )
-        .await
-        .unwrap();
-
-        // Merge new rows (ids 10, 11) — all inserts.
-        let source = RecordBatch::try_new(
-            test_schema(),
-            vec![
-                Arc::new(Int64Array::from(vec![10, 11])),
-                Arc::new(StringArray::from(vec!["x", "y"])),
-                Arc::new(Float64Array::from(vec![10.0, 11.0])),
-            ],
-        )
-        .unwrap();
-
-        let (table, result) =
-            merge_batches(table, source, &["id".to_string()], "merge-writer", 2, false)
-                .await
-                .unwrap();
-
-        assert_eq!(result.rows_inserted, 2);
-        assert_eq!(result.rows_updated, 0);
-
-        // Verify final row count = 5.
-        let mut read_table = open_or_create_table(table_path, HashMap::new(), None)
-            .await
-            .unwrap();
-        let latest = get_latest_version(&mut read_table).await.unwrap();
-        let batches = read_batches_at_version(&mut read_table, latest, 10000)
-            .await
-            .unwrap();
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total_rows, 5);
-
+        // Compaction itself proves file reduction via metrics.
+        // Vacuum is not tested here — delta-rs enforces a 168h minimum
+        // retention, and test files are too fresh to be vacuumed.
         drop(table);
-    }
-
-    #[tokio::test]
-    async fn test_merge_update() {
-        let temp_dir = TempDir::new().unwrap();
-        let table_path = temp_dir.path().to_str().unwrap();
-
-        // Create table with initial rows.
-        let schema = test_schema();
-        let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
-            .await
-            .unwrap();
-        let initial = RecordBatch::try_new(
-            test_schema(),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
-                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])),
-            ],
-        )
-        .unwrap();
-        let (table, _) = write_batches(
-            table,
-            vec![initial],
-            "merge-writer",
-            1,
-            SaveMode::Append,
-            None,
-            false,
-        )
-        .await
-        .unwrap();
-
-        // Merge with updated values for existing keys.
-        let source = RecordBatch::try_new(
-            test_schema(),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2])),
-                Arc::new(StringArray::from(vec!["a_updated", "b_updated"])),
-                Arc::new(Float64Array::from(vec![100.0, 200.0])),
-            ],
-        )
-        .unwrap();
-
-        let (table, result) =
-            merge_batches(table, source, &["id".to_string()], "merge-writer", 2, false)
-                .await
-                .unwrap();
-
-        assert_eq!(result.rows_updated, 2);
-        assert_eq!(result.rows_inserted, 0);
-
-        // Verify row count is still 3 (no new rows added).
-        let mut read_table = open_or_create_table(table_path, HashMap::new(), None)
-            .await
-            .unwrap();
-        let latest = get_latest_version(&mut read_table).await.unwrap();
-        let batches = read_batches_at_version(&mut read_table, latest, 10000)
-            .await
-            .unwrap();
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total_rows, 3);
-
-        drop(table);
-    }
-
-    #[tokio::test]
-    async fn test_merge_delete() {
-        let temp_dir = TempDir::new().unwrap();
-        let table_path = temp_dir.path().to_str().unwrap();
-
-        // Create table with initial rows.
-        let schema = test_schema();
-        let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
-            .await
-            .unwrap();
-        let initial = RecordBatch::try_new(
-            test_schema(),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
-                Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])),
-            ],
-        )
-        .unwrap();
-        let (table, _) = write_batches(
-            table,
-            vec![initial],
-            "merge-writer",
-            1,
-            SaveMode::Append,
-            None,
-            false,
-        )
-        .await
-        .unwrap();
-
-        // Delete rows with id=1 and id=3.
-        let delete_batch = RecordBatch::try_new(
-            test_schema(),
-            vec![
-                Arc::new(Int64Array::from(vec![1, 3])),
-                Arc::new(StringArray::from(vec!["a", "c"])),
-                Arc::new(Float64Array::from(vec![1.0, 3.0])),
-            ],
-        )
-        .unwrap();
-
-        let (table, rows_deleted) =
-            delete_by_merge(table, delete_batch, &["id".to_string()], "merge-writer", 2)
-                .await
-                .unwrap();
-
-        assert_eq!(rows_deleted, 2);
-
-        // Verify only 1 row remains.
-        let mut read_table = open_or_create_table(table_path, HashMap::new(), None)
-            .await
-            .unwrap();
-        let latest = get_latest_version(&mut read_table).await.unwrap();
-        let batches = read_batches_at_version(&mut read_table, latest, 10000)
-            .await
-            .unwrap();
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total_rows, 1);
-
-        drop(table);
-    }
-
-    #[tokio::test]
-    async fn test_merge_empty_batch_noop() {
-        let temp_dir = TempDir::new().unwrap();
-        let table_path = temp_dir.path().to_str().unwrap();
-
-        let schema = test_schema();
-        let table = open_or_create_table(table_path, HashMap::new(), Some(&schema))
-            .await
-            .unwrap();
-
-        // Merge with empty batch should be a no-op.
-        let empty = RecordBatch::new_empty(test_schema());
-        let (table, result) =
-            merge_batches(table, empty, &["id".to_string()], "merge-writer", 1, false)
-                .await
-                .unwrap();
-        assert_eq!(result.rows_inserted, 0);
-        assert_eq!(result.rows_updated, 0);
-
-        // Delete with empty batch should also be a no-op.
-        let empty_del = RecordBatch::new_empty(test_schema());
-        let (_table, deleted) =
-            delete_by_merge(table, empty_del, &["id".to_string()], "merge-writer", 2)
-                .await
-                .unwrap();
-        assert_eq!(deleted, 0);
     }
 }

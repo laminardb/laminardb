@@ -134,6 +134,9 @@ mod tests {
             SaveMode::Append,
             None,
             false,
+            None,
+            false,
+            None,
         )
         .await
         .unwrap();

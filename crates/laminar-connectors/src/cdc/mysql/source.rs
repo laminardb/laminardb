@@ -382,12 +382,27 @@ impl SourceConnector for MySqlCdcSource {
         }
 
         // Drain decoded binlog messages from background reader task.
+        //
+        // Backpressure: when the event buffer exceeds the high watermark,
+        // stop draining the reader channel. The bounded mpsc channel (4096)
+        // propagates backpressure to the binlog reader task, which in turn
+        // applies TCP backpressure to the replication connection.
         #[cfg(feature = "mysql-cdc")]
         {
-            if let Some(rx) = self.msg_rx.as_mut() {
+            let high_watermark = self.config.backpressure_high_watermark();
+
+            if self.event_buffer.len() >= high_watermark {
+                tracing::debug!(
+                    buffered = self.event_buffer.len(),
+                    high_watermark,
+                    "CDC backpressure active — pausing binlog reader drain"
+                );
+            } else if let Some(rx) = self.msg_rx.as_mut() {
                 let mut last_table_info: Option<TableInfo> = None;
 
-                while self.event_buffer.len() < max_records {
+                while self.event_buffer.len() < max_records
+                    && self.event_buffer.len() < high_watermark
+                {
                     match rx.try_recv() {
                         Ok(msg) => {
                             self.metrics.inc_events_received();

@@ -83,6 +83,12 @@ pub struct LaminarConfig {
     pub tiering: Option<TieringConfig>,
     /// End-to-end delivery guarantee (default: at-least-once).
     pub delivery_guarantee: DeliveryGuarantee,
+    /// Maximum state bytes per operator before the query fails (`None` = unlimited).
+    ///
+    /// When set, the executor checks each aggregate/window operator's estimated
+    /// memory usage after every processing cycle. At 80% of the limit a warning
+    /// is emitted; at 100% the query returns an error.
+    pub max_state_bytes_per_operator: Option<usize>,
 }
 
 impl Default for LaminarConfig {
@@ -97,6 +103,7 @@ impl Default for LaminarConfig {
             object_store_options: HashMap::new(),
             tiering: None,
             delivery_guarantee: DeliveryGuarantee::default(),
+            max_state_bytes_per_operator: None,
         }
     }
 }

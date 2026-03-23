@@ -12,7 +12,7 @@ Ring 0 crate. Everything here targets sub-microsecond execution with zero heap a
 |--------|---------|
 | `reactor` | Single-threaded event loop, CPU-pinned |
 | `operator` | Windows (tumbling, sliding, hopping, session), joins (stream, ASOF, temporal, lookup), changelog, lag/lead, ranking |
-| `state` | `StateStore` trait, `InMemoryStateStore` (AHashMap), `ChangelogAwareStore` wrapper |
+| `state` | `StateStore` trait, `InMemoryStore` (BTreeMap), `AHashMapStore`, `MmapStateStore` |
 | `time` | Event time processing, watermarks (partitioned, keyed, alignment groups) |
 | `streaming` | Ring buffer, SPSC/MPSC channels, source/sink abstractions, checkpoint manager |
 | `dag` | DAG pipeline topology, multicast routing, executor, checkpointing |
