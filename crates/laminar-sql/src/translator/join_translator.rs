@@ -125,6 +125,8 @@ pub enum JoinOperatorConfig {
     Asof(AsofJoinTranslatorConfig),
     /// Temporal join (FOR SYSTEM_TIME AS OF)
     Temporal(TemporalJoinTranslatorConfig),
+    /// Temporal probe join (multi-offset ASOF)
+    TemporalProbe(super::temporal_probe::TemporalProbeConfig),
 }
 
 impl std::fmt::Display for StreamJoinType {
@@ -230,6 +232,7 @@ impl std::fmt::Display for JoinOperatorConfig {
             JoinOperatorConfig::Lookup(c) => write!(f, "{c}"),
             JoinOperatorConfig::Asof(c) => write!(f, "{c}"),
             JoinOperatorConfig::Temporal(c) => write!(f, "{c}"),
+            JoinOperatorConfig::TemporalProbe(c) => write!(f, "{c}"),
         }
     }
 }
@@ -346,6 +349,7 @@ impl JoinOperatorConfig {
             JoinOperatorConfig::Lookup(config) => &config.stream_key,
             JoinOperatorConfig::Asof(config) => &config.key_column,
             JoinOperatorConfig::Temporal(config) => &config.stream_key_column,
+            JoinOperatorConfig::TemporalProbe(config) => &config.key_column,
         }
     }
 
@@ -357,6 +361,7 @@ impl JoinOperatorConfig {
             JoinOperatorConfig::Lookup(config) => &config.lookup_key,
             JoinOperatorConfig::Asof(config) => &config.key_column,
             JoinOperatorConfig::Temporal(config) => &config.table_key_column,
+            JoinOperatorConfig::TemporalProbe(config) => &config.key_column,
         }
     }
 }
