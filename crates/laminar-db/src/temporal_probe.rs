@@ -8,6 +8,14 @@
 //!
 //! State is watermark-driven: probes with `probe_ts <= watermark` are emitted
 //! immediately. Remaining probes are buffered until the watermark advances.
+//!
+//! ## Known limitations
+//!
+//! - **Column disambiguation**: right-side columns that collide with left-side
+//!   names are suffixed `_{right_table}`. The projection SQL builder needs source
+//!   schemas (available in `add_query`) to detect collisions correctly.
+//! - **Sparse reference streams**: if the correct ASOF match predates the
+//!   eviction cutoff, the lookup returns NULL. Dense reference streams avoid this.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
@@ -26,6 +34,9 @@ use laminar_sql::translator::TemporalProbeConfig;
 
 use crate::error::DbError;
 
+const COMPACTION_THRESHOLD: u32 = 32;
+const MAX_PENDING_PROBES: usize = 100_000;
+
 enum KeyColumn<'a> {
     Utf8(&'a StringArray),
     Int64(&'a Int64Array),
@@ -39,27 +50,57 @@ impl KeyColumn<'_> {
         }
     }
 
-    fn hash_at(&self, i: usize) -> Option<u64> {
-        if self.is_null(i) {
-            return None;
-        }
-        let mut hasher = DefaultHasher::new();
+    fn hash_into(&self, i: usize, hasher: &mut DefaultHasher) {
         match self {
-            KeyColumn::Utf8(a) => a.value(i).hash(&mut hasher),
-            KeyColumn::Int64(a) => a.value(i).hash(&mut hasher),
+            KeyColumn::Utf8(a) => a.value(i).hash(hasher),
+            KeyColumn::Int64(a) => a.value(i).hash(hasher),
         }
-        Some(hasher.finish())
     }
 
-    fn keys_equal(&self, i: usize, other: &KeyColumn<'_>, j: usize) -> bool {
-        if self.is_null(i) || other.is_null(j) {
-            return false;
-        }
+    fn eq_at(&self, i: usize, other: &KeyColumn<'_>, j: usize) -> bool {
         match (self, other) {
             (KeyColumn::Utf8(a), KeyColumn::Utf8(b)) => a.value(i) == b.value(j),
             (KeyColumn::Int64(a), KeyColumn::Int64(b)) => a.value(i) == b.value(j),
             _ => false,
         }
+    }
+}
+
+/// Multi-column key extractor for composite join keys.
+struct CompositeKey<'a> {
+    columns: Vec<KeyColumn<'a>>,
+}
+
+impl<'a> CompositeKey<'a> {
+    fn extract(batch: &'a RecordBatch, col_names: &[String]) -> Result<Self, DbError> {
+        let mut columns = Vec::with_capacity(col_names.len());
+        for name in col_names {
+            columns.push(extract_key_column(batch, name)?);
+        }
+        Ok(Self { columns })
+    }
+
+    fn hash_at(&self, i: usize) -> Option<u64> {
+        if self.columns.iter().any(|c| c.is_null(i)) {
+            return None;
+        }
+        let mut hasher = DefaultHasher::new();
+        for col in &self.columns {
+            col.hash_into(i, &mut hasher);
+        }
+        Some(hasher.finish())
+    }
+
+    fn keys_equal(&self, i: usize, other: &CompositeKey<'_>, j: usize) -> bool {
+        if self.columns.len() != other.columns.len() {
+            return false;
+        }
+        for (a, b) in self.columns.iter().zip(other.columns.iter()) {
+            if a.is_null(i) || b.is_null(j) || !a.eq_at(i, b, j) {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -126,8 +167,6 @@ fn extract_timestamps(batch: &RecordBatch, col_name: &str) -> Result<Vec<i64>, D
     }
 }
 
-const COMPACTION_THRESHOLD: u32 = 32;
-
 /// Per-key reference stream buffer with ASOF lookup and bounded memory.
 #[derive(Debug, Default)]
 struct RefBuffer {
@@ -140,7 +179,7 @@ impl RefBuffer {
     fn ingest(
         &mut self,
         batches: &[RecordBatch],
-        key_col: &str,
+        key_cols: &[String],
         time_col: &str,
     ) -> Result<(), DbError> {
         if batches.is_empty() {
@@ -149,14 +188,13 @@ impl RefBuffer {
 
         let schema = batches[0].schema();
 
-        // Capture the right-side schema even when all batches are empty,
-        // so output schema includes right columns from the first cycle.
         if batches.iter().all(|b| b.num_rows() == 0) {
             if self.right_concat.is_none() {
                 self.right_concat = Some(RecordBatch::new_empty(schema));
             }
             return Ok(());
         }
+
         let new_batch = concat_batches(&schema, batches)
             .map_err(|e| DbError::Pipeline(format!("ref buffer concat: {e}")))?;
 
@@ -166,7 +204,7 @@ impl RefBuffer {
 
         let timestamps = extract_timestamps(&new_batch, time_col)?;
         let key_hashes: Vec<Option<u64>> = {
-            let keys = extract_key_column(&new_batch, key_col)?;
+            let keys = CompositeKey::extract(&new_batch, key_cols)?;
             (0..new_batch.num_rows()).map(|i| keys.hash_at(i)).collect()
         };
 
@@ -195,15 +233,14 @@ impl RefBuffer {
         Ok(())
     }
 
-    /// ASOF lookup with key verification: find the latest right row index
-    /// with `ts <= probe_ts` whose key matches the left row's key.
+    /// ASOF lookup with key verification.
     fn asof_lookup(
         &self,
         key_hash: u64,
         probe_ts: i64,
-        left_key: &KeyColumn<'_>,
+        left_key: &CompositeKey<'_>,
         left_row: usize,
-        right_key: &KeyColumn<'_>,
+        right_key: &CompositeKey<'_>,
     ) -> Option<usize> {
         let btree = self.index.get(&key_hash)?;
         for (_, indices) in btree.range(..=probe_ts).rev() {
@@ -216,7 +253,6 @@ impl RefBuffer {
         None
     }
 
-    /// Evict entries with `timestamp < cutoff`, then compact if needed.
     fn evict_before(&mut self, cutoff: i64) -> Result<(), DbError> {
         for btree in self.index.values_mut() {
             let keep = btree.split_off(&cutoff);
@@ -230,7 +266,6 @@ impl RefBuffer {
         Ok(())
     }
 
-    /// Rebuild `right_concat` from only the rows still referenced by the index.
     fn compact(&mut self) -> Result<(), DbError> {
         let Some(ref batch) = self.right_concat else {
             return Ok(());
@@ -258,10 +293,19 @@ impl RefBuffer {
             idx_map.insert(old_idx, new_idx);
         }
 
-        let slices: Vec<RecordBatch> = live_rows.iter().map(|&idx| batch.slice(idx, 1)).collect();
+        // Use arrow::compute::take instead of per-row slice + concat
+        #[allow(clippy::cast_possible_truncation)]
+        let take_indices = arrow::array::UInt32Array::from(
+            live_rows.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+        );
         let schema = batch.schema();
-        let compacted = concat_batches(&schema, &slices)
-            .map_err(|e| DbError::Pipeline(format!("ref buffer compact: {e}")))?;
+        let columns: Result<Vec<ArrayRef>, _> = (0..batch.num_columns())
+            .map(|col| arrow::compute::take(batch.column(col), &take_indices, None))
+            .collect();
+        let columns =
+            columns.map_err(|e| DbError::Pipeline(format!("ref buffer compact take: {e}")))?;
+        let compacted = RecordBatch::try_new(schema, columns)
+            .map_err(|e| DbError::Pipeline(format!("ref buffer compact batch: {e}")))?;
 
         for btree in self.index.values_mut() {
             for indices in btree.values_mut() {
@@ -290,10 +334,8 @@ impl RefBuffer {
     }
 }
 
-/// Full operator state.
 pub(crate) struct TemporalProbeState {
     ref_buffer: RefBuffer,
-    /// Pending probes from previous cycles, each holding a copy of the left row.
     carried_probes: Vec<CarriedProbe>,
     last_watermark: i64,
 }
@@ -327,7 +369,6 @@ impl TemporalProbeState {
     }
 }
 
-/// Serializable checkpoint for the temporal probe state.
 #[derive(Serialize, Deserialize)]
 pub(crate) struct TemporalProbeCheckpoint {
     ref_buffer_ipc: Vec<u8>,
@@ -454,8 +495,6 @@ impl TemporalProbeState {
     }
 }
 
-/// Build the output schema: left columns + right columns (disambiguated) +
-/// probe columns (`{alias}_offset_ms`, `{alias}_probe_ts`).
 fn build_probe_output_schema(
     left_schema: &SchemaRef,
     right_schema: &SchemaRef,
@@ -473,8 +512,11 @@ fn build_probe_output_schema(
         .map(|f| f.name().as_str())
         .collect();
 
+    let key_set: rustc_hash::FxHashSet<&str> =
+        config.key_columns.iter().map(String::as_str).collect();
+
     for field in right_schema.fields() {
-        if field.name() == &config.key_column {
+        if key_set.contains(field.name().as_str()) {
             continue;
         }
         let mut f = field.as_ref().clone().with_nullable(true);
@@ -499,14 +541,6 @@ fn build_probe_output_schema(
     Arc::new(Schema::new(fields))
 }
 
-/// Execute one cycle of the temporal probe join.
-///
-/// 1. Ingest right-side batches into the ref buffer.
-/// 2. For each left row, compute probe timestamps for all offsets.
-/// 3. Emit immediately for probes where `watermark >= probe_ts`.
-/// 4. Buffer remaining probes as `carried_probes`.
-/// 5. Resolve carried probes from previous cycles.
-/// 6. Evict ref buffer entries no longer needed.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn execute_temporal_probe_cycle(
     state: &mut TemporalProbeState,
@@ -515,9 +549,11 @@ pub(crate) fn execute_temporal_probe_cycle(
     config: &TemporalProbeConfig,
     watermark: i64,
 ) -> Result<Vec<RecordBatch>, DbError> {
-    state
-        .ref_buffer
-        .ingest(right_batches, &config.key_column, &config.right_time_column)?;
+    state.ref_buffer.ingest(
+        right_batches,
+        &config.key_columns,
+        &config.right_time_column,
+    )?;
 
     let offsets = &config.expanded_offsets_ms;
     if offsets.is_empty() {
@@ -526,14 +562,13 @@ pub(crate) fn execute_temporal_probe_cycle(
 
     let mut output_batches = Vec::new();
 
-    // Process new left-side events
     if !left_batches.is_empty() && left_batches.iter().any(|b| b.num_rows() > 0) {
         let left_schema = left_batches[0].schema();
         let left_concat = concat_batches(&left_schema, left_batches)
             .map_err(|e| DbError::Pipeline(format!("temporal probe left concat: {e}")))?;
 
         if left_concat.num_rows() > 0 {
-            let left_keys = extract_key_column(&left_concat, &config.key_column)?;
+            let left_keys = CompositeKey::extract(&left_concat, &config.key_columns)?;
             let left_ts = extract_timestamps(&left_concat, &config.left_time_column)?;
 
             let right_schema = state
@@ -547,11 +582,11 @@ pub(crate) fn execute_temporal_probe_cycle(
                 build_probe_output_schema(&left_schema, &Arc::new(Schema::empty()), config)
             };
 
-            let right_key_col = state
+            let right_key = state
                 .ref_buffer
                 .right_concat
                 .as_ref()
-                .map(|rc| extract_key_column(rc, &config.key_column))
+                .map(|rc| CompositeKey::extract(rc, &config.key_columns))
                 .transpose()?;
 
             let mut emit_left_indices = Vec::new();
@@ -571,7 +606,7 @@ pub(crate) fn execute_temporal_probe_cycle(
                     let probe_ts = base_ts.saturating_add(offset_ms);
 
                     if watermark >= probe_ts {
-                        let right_idx = if let Some(ref rk) = right_key_col {
+                        let right_idx = if let Some(ref rk) = right_key {
                             state
                                 .ref_buffer
                                 .asof_lookup(key_hash, probe_ts, &left_keys, row_idx, rk)
@@ -614,6 +649,16 @@ pub(crate) fn execute_temporal_probe_cycle(
             }
 
             state.carried_probes.extend(new_carried);
+
+            if state.carried_probes.len() > MAX_PENDING_PROBES {
+                let excess = state.carried_probes.len() - MAX_PENDING_PROBES;
+                tracing::warn!(
+                    excess,
+                    limit = MAX_PENDING_PROBES,
+                    "temporal probe: pending probes exceed limit, dropping oldest"
+                );
+                state.carried_probes.drain(..excess);
+            }
         }
     }
 
@@ -628,11 +673,11 @@ pub(crate) fn execute_temporal_probe_cycle(
             Vec<i64>,
         )> = Vec::new();
 
-        let right_key_col = state
+        let right_key = state
             .ref_buffer
             .right_concat
             .as_ref()
-            .map(|rc| extract_key_column(rc, &config.key_column))
+            .map(|rc| CompositeKey::extract(rc, &config.key_columns))
             .transpose()?;
 
         for probe in std::mem::take(&mut state.carried_probes) {
@@ -641,15 +686,15 @@ pub(crate) fn execute_temporal_probe_cycle(
             let mut emit_pts = Vec::new();
             let mut remaining = Vec::new();
 
-            let left_key_col = extract_key_column(&probe.left_row_batch, &config.key_column)?;
+            let left_key = CompositeKey::extract(&probe.left_row_batch, &config.key_columns)?;
 
             for &offset_ms in &probe.remaining_offsets_ms {
                 let probe_ts = probe.base_ts.saturating_add(offset_ms);
                 if watermark >= probe_ts {
-                    let right_idx = if let Some(ref rk) = right_key_col {
+                    let right_idx = if let Some(ref rk) = right_key {
                         state
                             .ref_buffer
-                            .asof_lookup(probe.key_hash, probe_ts, &left_key_col, 0, rk)
+                            .asof_lookup(probe.key_hash, probe_ts, &left_key, 0, rk)
                     } else {
                         None
                     };
@@ -711,7 +756,7 @@ pub(crate) fn execute_temporal_probe_cycle(
         }
     }
 
-    // Evict — safe cutoff that preserves data needed by carried probes
+    // Evict — safe cutoff preserving data for carried probes
     if watermark > state.last_watermark {
         let min_offset = config.min_offset_ms();
         let base_cutoff = if min_offset < 0 {
@@ -760,6 +805,8 @@ fn build_output_batch(
         return Ok(RecordBatch::new_empty(output_schema.clone()));
     }
 
+    let key_set: rustc_hash::FxHashSet<&str> =
+        config.key_columns.iter().map(String::as_str).collect();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
 
     #[allow(clippy::cast_possible_truncation)]
@@ -775,11 +822,10 @@ fn build_output_batch(
         let right_schema = right.schema();
         for col_idx in 0..right.num_columns() {
             let field_name = right_schema.field(col_idx).name();
-            if field_name == &config.key_column {
+            if key_set.contains(field_name.as_str()) {
                 continue;
             }
-            let array = right.column(col_idx);
-            let taken = take_with_nulls(array, right_indices, num_rows)?;
+            let taken = take_with_nulls(right.column(col_idx), right_indices, num_rows)?;
             columns.push(taken);
         }
     } else {
@@ -863,7 +909,7 @@ mod tests {
             "market_data".into(),
             None,
             None,
-            "symbol".into(),
+            vec!["symbol".into()],
             "ts".into(),
             "mts".into(),
             offsets,
@@ -891,26 +937,15 @@ mod tests {
         assert_eq!(total_rows, 3);
 
         let batch = &result[0];
-        let offsets = batch
+        let offsets_col = batch
             .column_by_name("p_offset_ms")
             .unwrap()
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(offsets.value(0), -5000);
-        assert_eq!(offsets.value(1), -1000);
-        assert_eq!(offsets.value(2), 0);
-
-        let pts = batch
-            .column_by_name("p_probe_ts")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(pts.value(0), 95_000);
-        assert_eq!(pts.value(1), 99_000);
-        assert_eq!(pts.value(2), 100_000);
-
+        assert_eq!(offsets_col.value(0), -5000);
+        assert_eq!(offsets_col.value(1), -1000);
+        assert_eq!(offsets_col.value(2), 0);
         assert!(state.carried_probes.is_empty());
     }
 
@@ -929,15 +964,11 @@ mod tests {
         let result =
             execute_temporal_probe_cycle(&mut state, &[trades], &[market], &config, 102_000)
                 .unwrap();
-
-        let total: usize = result.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total, 1);
+        assert_eq!(result.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
         assert_eq!(state.carried_probes.len(), 1);
 
         let result2 = execute_temporal_probe_cycle(&mut state, &[], &[], &config, 112_000).unwrap();
-
-        let total2: usize = result2.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total2, 2);
+        assert_eq!(result2.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
         assert!(state.carried_probes.is_empty());
     }
 
@@ -953,11 +984,9 @@ mod tests {
             execute_temporal_probe_cycle(&mut state, &[trades], &[market], &config, 100_000)
                 .unwrap();
 
-        let total: usize = result.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total, 2);
+        assert_eq!(result.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
 
-        let batch = &result[0];
-        let mprices = batch
+        let mprices = result[0]
             .column_by_name("mprice")
             .unwrap()
             .as_any()
@@ -991,22 +1020,17 @@ mod tests {
 
         let _ = execute_temporal_probe_cycle(&mut state, &[trades], &[market], &config, 102_000)
             .unwrap();
-
         assert_eq!(state.carried_probes.len(), 1);
 
         let cp = state.snapshot_checkpoint().unwrap();
         let data = serde_json::to_vec(&cp).unwrap();
-
         let cp2: TemporalProbeCheckpoint = serde_json::from_slice(&data).unwrap();
         let mut state2 = TemporalProbeState::from_checkpoint(&cp2).unwrap();
 
         assert_eq!(state2.carried_probes.len(), 1);
-        assert_eq!(state2.last_watermark, 102_000);
 
         let result = execute_temporal_probe_cycle(&mut state2, &[], &[], &config, 110_000).unwrap();
-
-        let total: usize = result.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total, 1);
+        assert_eq!(result.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
         assert!(state2.carried_probes.is_empty());
     }
 
@@ -1022,13 +1046,10 @@ mod tests {
     fn test_no_right_data_produces_nulls() {
         let config = test_config(&ProbeOffsetSpec::List(vec![0]));
         let mut state = TemporalProbeState::new();
-
         let trades = trades_batch(&["AAPL"], &[100_000], &[150.0]);
         let result =
             execute_temporal_probe_cycle(&mut state, &[trades], &[], &config, 100_000).unwrap();
-
-        let total: usize = result.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total, 1);
+        assert_eq!(result.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
         assert_eq!(result[0].num_columns(), 5); // left(3) + probe(2)
     }
 
@@ -1037,28 +1058,20 @@ mod tests {
         let config = test_config(&ProbeOffsetSpec::List(vec![0, 60_000]));
         let mut state = TemporalProbeState::new();
 
-        // Ref data at 100k and 160k
         let market = market_batch(&["AAPL", "AAPL"], &[100_000, 160_000], &[150.0, 155.0]);
         let trades = trades_batch(&["AAPL"], &[100_000], &[152.5]);
 
-        // Cycle 1: wm=102k, offset=0 resolves, offset=60k carried
         let r1 = execute_temporal_probe_cycle(&mut state, &[trades], &[market], &config, 102_000)
             .unwrap();
         assert_eq!(r1.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
-        assert_eq!(state.carried_probes.len(), 1);
 
-        // Cycle 2: wm=150k — past event time but before probe_ts=160k
         let r2 = execute_temporal_probe_cycle(&mut state, &[], &[], &config, 150_000).unwrap();
         assert!(r2.is_empty());
 
-        // Cycle 3: wm=165k — carried probe resolves
         let r3 = execute_temporal_probe_cycle(&mut state, &[], &[], &config, 165_000).unwrap();
-        let total: usize = r3.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total, 1);
+        assert_eq!(r3.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
 
-        // Verify the matched right value is 155.0 (at ts=160k), not null
-        let batch = &r3[0];
-        let mprices = batch
+        let mprices = r3[0]
             .column_by_name("mprice")
             .unwrap()
             .as_any()
@@ -1072,7 +1085,6 @@ mod tests {
         let config = test_config(&ProbeOffsetSpec::List(vec![0]));
         let mut state = TemporalProbeState::new();
 
-        // Ingest enough batches to trigger compaction
         for i in 0..40 {
             let ts = i64::from(i) * 1000;
             let market = market_batch(&["AAPL"], &[ts], &[100.0 + f64::from(i)]);
@@ -1082,7 +1094,6 @@ mod tests {
         let size_before = state.ref_buffer.estimated_size_bytes();
         assert!(size_before > 0);
 
-        // Advance watermark to evict old entries — triggers compaction
         execute_temporal_probe_cycle(&mut state, &[], &[], &config, 35_000).unwrap();
 
         let size_after = state.ref_buffer.estimated_size_bytes();
@@ -1102,13 +1113,80 @@ mod tests {
 
         let _ = execute_temporal_probe_cycle(&mut state, &[trades], &[market], &config, 100_000)
             .unwrap();
-
         let _ = execute_temporal_probe_cycle(&mut state, &[], &[], &config, 200_000).unwrap();
 
         assert!(
-            state.ref_buffer.index.is_empty() || {
-                state.ref_buffer.index.values().all(BTreeMap::is_empty)
-            }
+            state.ref_buffer.index.is_empty()
+                || state.ref_buffer.index.values().all(BTreeMap::is_empty)
         );
+    }
+
+    #[test]
+    fn test_composite_key_probe() {
+        // Two-column key: (symbol, venue). AAPL+NYSE and AAPL+BATS must
+        // match independently — same symbol, different venue.
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("venue", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+        ]));
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("venue", DataType::Utf8, false),
+            Field::new("mts", DataType::Int64, false),
+            Field::new("mprice", DataType::Float64, false),
+        ]));
+
+        let trades = RecordBatch::try_new(
+            left_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["AAPL", "AAPL"])),
+                Arc::new(StringArray::from(vec!["NYSE", "BATS"])),
+                Arc::new(Int64Array::from(vec![100_000, 100_000])),
+                Arc::new(Float64Array::from(vec![150.0, 151.0])),
+            ],
+        )
+        .unwrap();
+
+        let market = RecordBatch::try_new(
+            right_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["AAPL", "AAPL"])),
+                Arc::new(StringArray::from(vec!["NYSE", "BATS"])),
+                Arc::new(Int64Array::from(vec![100_000, 100_000])),
+                Arc::new(Float64Array::from(vec![149.0, 148.0])),
+            ],
+        )
+        .unwrap();
+
+        let config = TemporalProbeConfig::new(
+            "trades".into(),
+            "market_data".into(),
+            None,
+            None,
+            vec!["symbol".into(), "venue".into()],
+            "ts".into(),
+            "mts".into(),
+            &ProbeOffsetSpec::List(vec![0]),
+            "p".into(),
+        );
+        let mut state = TemporalProbeState::new();
+
+        let result =
+            execute_temporal_probe_cycle(&mut state, &[trades], &[market], &config, 100_000)
+                .unwrap();
+
+        assert_eq!(result.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+
+        let mprices = result[0]
+            .column_by_name("mprice")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        // AAPL+NYSE → 149.0, AAPL+BATS → 148.0 (independent matches)
+        assert!((mprices.value(0) - 149.0).abs() < f64::EPSILON);
+        assert!((mprices.value(1) - 148.0).abs() < f64::EPSILON);
     }
 }

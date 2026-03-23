@@ -349,7 +349,9 @@ impl JoinOperatorConfig {
             JoinOperatorConfig::Lookup(config) => &config.stream_key,
             JoinOperatorConfig::Asof(config) => &config.key_column,
             JoinOperatorConfig::Temporal(config) => &config.stream_key_column,
-            JoinOperatorConfig::TemporalProbe(config) => &config.key_column,
+            JoinOperatorConfig::TemporalProbe(config) => {
+                config.key_columns.first().map_or("", String::as_str)
+            }
         }
     }
 
@@ -361,7 +363,9 @@ impl JoinOperatorConfig {
             JoinOperatorConfig::Lookup(config) => &config.lookup_key,
             JoinOperatorConfig::Asof(config) => &config.key_column,
             JoinOperatorConfig::Temporal(config) => &config.table_key_column,
-            JoinOperatorConfig::TemporalProbe(config) => &config.key_column,
+            JoinOperatorConfig::TemporalProbe(config) => {
+                config.key_columns.first().map_or("", String::as_str)
+            }
         }
     }
 }

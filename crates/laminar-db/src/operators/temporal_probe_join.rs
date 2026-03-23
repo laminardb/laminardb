@@ -131,7 +131,7 @@ mod tests {
             "market_data".into(),
             None,
             None,
-            "symbol".into(),
+            vec!["symbol".into()],
             "ts".into(),
             "mts".into(),
             &ProbeOffsetSpec::List(vec![0, 5000]),

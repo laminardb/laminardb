@@ -1560,4 +1560,75 @@ mod tests {
         assert_eq!(total_rows(&r, "q1"), 2); // AAPL + GOOG
         assert_eq!(total_rows(&r, "q2"), 1); // Only GOOG (price=2800 > 200)
     }
+
+    #[tokio::test]
+    async fn test_temporal_probe_through_graph() {
+        let ctx = laminar_sql::create_session_context();
+        laminar_sql::register_streaming_functions(&ctx);
+        let mut graph = OperatorGraph::new(ctx);
+
+        let trades_schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+        ]));
+        let market_schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("mts", DataType::Int64, false),
+            Field::new("mprice", DataType::Float64, false),
+        ]));
+
+        graph.register_source_schema("trades".to_string(), trades_schema.clone());
+        graph.register_source_schema("market_data".to_string(), market_schema);
+
+        graph.add_query(
+            "probed".to_string(),
+            "SELECT t.symbol, p.offset_ms, mprice \
+             FROM trades t \
+             TEMPORAL PROBE JOIN market_data m ON (symbol) \
+             TIMESTAMPS (ts, mts) LIST (0s, 5s) AS p"
+                .to_string(),
+            None,
+            None,
+            None,
+        );
+
+        // Cycle 1: inject both sides, watermark=102k (only offset=0 resolves)
+        let trades = RecordBatch::try_new(
+            trades_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["AAPL"])),
+                Arc::new(Int64Array::from(vec![100_000])),
+                Arc::new(Float64Array::from(vec![152.5])),
+            ],
+        )
+        .unwrap();
+        let market = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("symbol", DataType::Utf8, false),
+                Field::new("mts", DataType::Int64, false),
+                Field::new("mprice", DataType::Float64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["AAPL", "AAPL"])),
+                Arc::new(Int64Array::from(vec![100_000, 105_000])),
+                Arc::new(Float64Array::from(vec![150.0, 155.0])),
+            ],
+        )
+        .unwrap();
+
+        let mut sources = FxHashMap::default();
+        sources.insert(Arc::from("trades"), vec![trades]);
+        sources.insert(Arc::from("market_data"), vec![market]);
+
+        let r1 = graph.execute_cycle(&sources, 102_000).await.unwrap();
+        let rows1 = total_rows(&r1, "probed");
+        assert_eq!(rows1, 1, "only offset=0 should resolve at watermark=102k");
+
+        // Cycle 2: no new data, advance watermark past offset=5000 (probe_ts=105000)
+        let empty = FxHashMap::default();
+        let r2 = graph.execute_cycle(&empty, 110_000).await.unwrap();
+        let rows2 = total_rows(&r2, "probed");
+        assert_eq!(rows2, 1, "offset=5000 should resolve at watermark=110k");
+    }
 }

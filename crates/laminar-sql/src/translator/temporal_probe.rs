@@ -62,7 +62,7 @@ pub struct TemporalProbeConfig {
     pub right_table: String,
     pub left_alias: Option<String>,
     pub right_alias: Option<String>,
-    pub key_column: String,
+    pub key_columns: Vec<String>,
     pub left_time_column: String,
     pub right_time_column: String,
     /// Sorted, deduplicated offsets in milliseconds.
@@ -80,7 +80,7 @@ impl TemporalProbeConfig {
         right_table: String,
         left_alias: Option<String>,
         right_alias: Option<String>,
-        key_column: String,
+        key_columns: Vec<String>,
         left_time_column: String,
         right_time_column: String,
         offsets: &ProbeOffsetSpec,
@@ -92,7 +92,7 @@ impl TemporalProbeConfig {
             right_table,
             left_alias,
             right_alias,
-            key_column,
+            key_columns,
             left_time_column,
             right_time_column,
             expanded_offsets_ms,
@@ -117,10 +117,10 @@ impl fmt::Display for TemporalProbeConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "TemporalProbe({} × {} on {} offsets={})",
+            "TemporalProbe({} × {} on [{}] offsets={})",
             self.left_table,
             self.right_table,
-            self.key_column,
+            self.key_columns.join(", "),
             self.expanded_offsets_ms.len()
         )
     }
@@ -151,13 +151,12 @@ pub fn parse_interval_to_ms(s: &str) -> Option<i64> {
     } else if let Some(n) = s.strip_suffix('m') {
         (n, "m")
     } else {
-        // Try as raw milliseconds
         return s.parse::<i64>().ok().map(|v| if negative { -v } else { v });
     };
 
     let num: i64 = num_str.parse().ok()?;
     let ms = match unit {
-        "us" => num / 1000, // truncate sub-ms
+        "us" => num / 1000,
         "ms" => num,
         "s" => num.checked_mul(1000)?,
         "m" => num.checked_mul(60_000)?,
@@ -194,7 +193,7 @@ mod tests {
     #[test]
     fn test_parse_interval_micros() {
         assert_eq!(parse_interval_to_ms("5000us"), Some(5));
-        assert_eq!(parse_interval_to_ms("500us"), Some(0)); // truncated
+        assert_eq!(parse_interval_to_ms("500us"), Some(0));
     }
 
     #[test]
@@ -230,7 +229,7 @@ mod tests {
             "prices".into(),
             None,
             None,
-            "symbol".into(),
+            vec!["symbol".into()],
             "ts".into(),
             "ts".into(),
             &ProbeOffsetSpec::List(vec![-5000, 0, 1000, 5000, 30_000, 60_000]),
@@ -238,5 +237,25 @@ mod tests {
         );
         assert_eq!(config.max_offset_ms(), 60_000);
         assert_eq!(config.min_offset_ms(), -5000);
+    }
+
+    #[test]
+    fn test_composite_key_config() {
+        let config = TemporalProbeConfig::new(
+            "trades".into(),
+            "prices".into(),
+            None,
+            None,
+            vec!["symbol".into(), "venue".into()],
+            "ts".into(),
+            "ts".into(),
+            &ProbeOffsetSpec::List(vec![0]),
+            "p".into(),
+        );
+        assert_eq!(config.key_columns, vec!["symbol", "venue"]);
+        assert_eq!(
+            config.to_string(),
+            "TemporalProbe(trades × prices on [symbol, venue] offsets=1)"
+        );
     }
 }
