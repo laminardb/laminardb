@@ -1,6 +1,8 @@
+[workspace]
+
 [package]
 name = "microstructure"
-version = "0.18.9"
+version = "0.18.12"
 edition = "2021"
 publish = false
 description = "Market Microstructure Intelligence: 12 WebSocket streams, 36 SQL stages, sub-us latency"
@@ -10,8 +12,8 @@ name = "microstructure"
 path = "src/main.rs"
 
 [dependencies]
-laminar-db = { path = "../../crates/laminar-db", version = "0.18.9", features = ["websocket"] }
-laminar-derive = { path = "../../crates/laminar-derive", version = "0.18.9" }
+laminar-db = { path = "../../crates/laminar-db", version = "0.18.12", features = ["websocket"] }
+laminar-derive = { path = "../../crates/laminar-derive", version = "0.18.12" }
 arrow = "57.2"
 tokio = { version = "1.50", features = ["full"] }
 crossterm = "0.29"

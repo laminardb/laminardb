@@ -448,13 +448,8 @@ fn draw_latency(frame: &mut ratatui::Frame, area: Rect, s: &DashState) {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as i64;
-        let lag = now_ms.saturating_sub(s.pipeline_watermark);
-        if lag >= 0 {
-            format!("{}ms", fmt_int(lag as u64))
-        } else {
-            // Watermark ahead of local clock (clock skew) — show 0
-            "0ms".to_string()
-        }
+        let lag = (now_ms - s.pipeline_watermark).unsigned_abs();
+        format!("{}ms", fmt_int(lag))
     } else {
         "-".to_string()
     };

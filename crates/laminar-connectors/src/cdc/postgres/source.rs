@@ -413,12 +413,6 @@ impl PostgresCdcSource {
     }
 
     fn push_event(&mut self, event: ChangeEvent) {
-        let total =
-            self.event_buffer.len() + self.current_txn.as_ref().map_or(0, |t| t.events.len());
-        if total >= self.config.max_buffered_events {
-            self.metrics.record_dropped(1);
-            return;
-        }
         if let Some(txn) = &mut self.current_txn {
             txn.events.push(event);
         } else {
@@ -722,22 +716,41 @@ impl SourceConnector for PostgresCdcSource {
         // Drain WAL events from background reader task.
         // Collect into a temp vec first to avoid holding a mutable
         // borrow on self.wal_rx while calling self.process_wal_payload().
+        //
+        // Backpressure: when the event buffer exceeds the high watermark,
+        // stop draining the reader channel. The bounded mpsc channel (4096)
+        // propagates backpressure to the WAL reader task, which in turn
+        // applies TCP backpressure to the replication slot. This prevents
+        // data loss from dropping events.
         #[cfg(feature = "postgres-cdc")]
         {
+            let high_watermark = self.config.backpressure_high_watermark();
             let mut payloads = Vec::new();
             let mut reader_closed = false;
-            if let Some(ref mut rx) = self.wal_rx {
-                while payloads.len() + self.event_buffer.len() < max_records {
-                    match rx.try_recv() {
-                        Ok(payload) => payloads.push(payload),
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                            reader_closed = true;
-                            break;
+
+            if self.event_buffer.len() < high_watermark {
+                if let Some(ref mut rx) = self.wal_rx {
+                    while payloads.len() + self.event_buffer.len() < max_records
+                        && self.event_buffer.len() + payloads.len() < high_watermark
+                    {
+                        match rx.try_recv() {
+                            Ok(payload) => payloads.push(payload),
+                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                reader_closed = true;
+                                break;
+                            }
                         }
                     }
                 }
+            } else {
+                tracing::debug!(
+                    buffered = self.event_buffer.len(),
+                    high_watermark,
+                    "CDC backpressure active — pausing WAL reader drain"
+                );
             }
+
             for payload in payloads {
                 self.process_wal_payload(payload)?;
             }
@@ -751,18 +764,6 @@ impl SourceConnector for PostgresCdcSource {
 
         // Process any pending WAL messages (test injection path)
         self.process_pending_messages()?;
-
-        if self.event_buffer.len() > self.config.max_buffered_events {
-            let excess = self.event_buffer.len() - self.config.max_buffered_events;
-            tracing::warn!(
-                buffered = self.event_buffer.len(),
-                max = self.config.max_buffered_events,
-                dropped = excess,
-                "CDC event buffer exceeded max, dropping oldest events"
-            );
-            self.event_buffer.drain(..excess);
-            self.metrics.record_dropped(excess as u64);
-        }
 
         // Drain buffered events into a RecordBatch.
         // Watermark advancement: the batch contains `_ts_ms` (commit timestamp)
@@ -1666,14 +1667,17 @@ mod tests {
         assert_eq!(src.write_lsn.as_u64(), 0x2_0000_FF10);
     }
 
-    // ── Buffer cap enforcement ──
+    // ── Backpressure (no event dropping) ──
 
     #[tokio::test]
-    async fn test_event_buffer_cap_drops_oldest() {
+    async fn test_backpressure_does_not_drop_buffered_events() {
         let mut src = running_source();
         src.config.max_buffered_events = 100;
 
         // Inject 200 events directly into the event buffer.
+        // With backpressure, existing buffered events are never dropped —
+        // only channel draining is paused when the buffer exceeds the
+        // high watermark. Direct-injected events are already in the buffer.
         for i in 0..200u64 {
             src.inject_event(ChangeEvent {
                 table: "public.t".to_string(),
@@ -1686,15 +1690,11 @@ mod tests {
         }
         assert_eq!(src.event_buffer.len(), 200);
 
-        // poll_batch triggers the cap enforcement.
+        // poll_batch drains events from the buffer — no dropping.
         let batch = src.poll_batch(50).await.unwrap().unwrap();
-        // After cap enforcement (200 → 100), drain 50 → 50 remaining.
         assert_eq!(batch.records.num_rows(), 50);
-        assert!(
-            src.event_buffer.len() <= 100,
-            "event_buffer should be capped at max_buffered_events, got {}",
-            src.event_buffer.len()
-        );
-        assert!(src.metrics.events_dropped.load(Ordering::Relaxed) >= 100);
+        // 200 - 50 drained = 150 remaining. No events dropped.
+        assert_eq!(src.event_buffer.len(), 150);
+        assert_eq!(src.metrics.events_dropped.load(Ordering::Relaxed), 0);
     }
 }

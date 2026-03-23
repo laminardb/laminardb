@@ -55,6 +55,8 @@ mod handle;
 mod interval_join;
 mod metrics;
 mod metrics_api;
+mod operator_graph;
+mod operators;
 /// Thread-per-core connector pipeline.
 pub mod pipeline;
 mod pipeline_callback;
@@ -71,6 +73,7 @@ mod table_backend;
 mod table_cache_mode;
 mod table_provider;
 mod table_store;
+mod temporal_probe;
 
 /// C FFI layer for LaminarDB.
 ///

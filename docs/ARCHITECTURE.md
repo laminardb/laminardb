@@ -137,8 +137,9 @@ laminar-storage       Background I/O: WAL, incremental checkpointing, per-core W
                       changelog drainer
                       |
 laminar-connectors    Kafka source/sink, PostgreSQL CDC/sink, MySQL CDC,
-                      WebSocket source/sink, Delta Lake sink/source, Iceberg sink,
-                      connector SDK, schema framework (inference, evolution, DLQ),
+                      MongoDB CDC source/sink, WebSocket source/sink,
+                      Delta Lake sink/source, file source/sink,
+                      schema framework (inference, evolution),
                       format decoders (JSON, CSV, Avro, Parquet),
                       lookup tables, reference tables, cloud storage infrastructure
                       |
