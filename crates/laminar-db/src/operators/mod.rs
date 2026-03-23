@@ -17,6 +17,7 @@ pub(crate) mod eowc_query;
 pub(crate) mod interval_join;
 pub(crate) mod sql_query;
 pub(crate) mod temporal_join;
+pub(crate) mod temporal_probe_join;
 
 /// Try to compile a post-join projection SQL to physical expressions.
 ///
