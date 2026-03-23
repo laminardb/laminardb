@@ -22,10 +22,14 @@ use crate::error::ConnectorError;
 /// Selects the correct `OpenDalStorageFactory` based on the warehouse URL scheme.
 fn storage_factory_for_warehouse(warehouse: &str) -> Arc<dyn iceberg::io::StorageFactory> {
     if warehouse.starts_with("s3://") || warehouse.starts_with("s3a://") {
+        // Note: configured_scheme must be the bare scheme name (e.g. "s3"),
+        // NOT "s3://". The iceberg-storage-opendal crate's create_operator()
+        // builds the prefix via `format!("{}://{}/", configured_scheme, bucket)`,
+        // so including "://" here would produce "s3://://bucket/" — an invalid URL.
         let scheme = if warehouse.starts_with("s3a://") {
-            "s3a://".to_string()
+            "s3a".to_string()
         } else {
-            "s3://".to_string()
+            "s3".to_string()
         };
         Arc::new(OpenDalStorageFactory::S3 {
             configured_scheme: scheme,
