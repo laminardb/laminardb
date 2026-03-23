@@ -165,6 +165,18 @@ impl IcebergSink {
             }
         }
 
+        // Detect batch columns that would be silently dropped — every field
+        // in the source batch must map to a field in the target schema.
+        for field in batch_schema.fields() {
+            if target_schema.field_with_name(field.name()).is_err() {
+                return Err(ConnectorError::SchemaMismatch(format!(
+                    "pipeline column '{}' has no matching field in Iceberg table schema \
+                     (schema evolved since open?)",
+                    field.name(),
+                )));
+            }
+        }
+
         RecordBatch::try_new(target_schema.clone(), columns)
             .map_err(|e| ConnectorError::WriteError(format!("align batch to iceberg schema: {e}")))
     }
@@ -206,6 +218,23 @@ impl IcebergSink {
         let file_io = table.file_io().clone();
         let location = table.metadata().location().to_string();
         let schema = table.current_schema_ref();
+
+        // Revalidate: every field in the pipeline schema must still exist in
+        // the (possibly refreshed) Iceberg Arrow schema. A concurrent ALTER
+        // TABLE DROP COLUMN would cause silent data loss otherwise.
+        if let (Some(pipeline_schema), Some(target_schema)) =
+            (&self.schema, &self.iceberg_arrow_schema)
+        {
+            for field in pipeline_schema.fields() {
+                if target_schema.field_with_name(field.name()).is_err() {
+                    return Err(ConnectorError::SchemaMismatch(format!(
+                        "pipeline field '{}' no longer exists in Iceberg table schema \
+                         (concurrent schema evolution?)",
+                        field.name(),
+                    )));
+                }
+            }
+        }
 
         let props = parquet::file::properties::WriterProperties::builder()
             .set_compression(Self::parquet_compression(&self.config.compression))
