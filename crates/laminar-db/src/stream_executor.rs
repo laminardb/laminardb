@@ -3998,6 +3998,10 @@ mod tests {
         let ctx = create_session_context();
         register_streaming_functions(&ctx);
         let mut executor = StreamExecutor::new(ctx);
+        // Use a generous budget so all three queries execute in a single
+        // cycle even on slow CI machines (default 8ms is too tight for
+        // first-run compilation + aggregation).
+        executor.set_query_budget_ns(5_000_000_000);
 
         // Two queries from the same source
         executor.add_query(
