@@ -300,16 +300,29 @@ impl IcebergSink {
         )
         .await?;
 
-        // Cache the updated table so the next commit sees the new snapshot.
-        // Re-derive the Iceberg Arrow schema so it stays in sync with the
-        // table schema the ParquetWriterBuilder will use next epoch.
-        let new_iceberg_schema = updated_table.current_schema_ref();
-        self.iceberg_arrow_schema = Some(std::sync::Arc::new(
-            iceberg::arrow::schema_to_arrow_schema(&new_iceberg_schema).map_err(|e| {
-                ConnectorError::SchemaMismatch(format!("iceberg→arrow schema refresh: {e}"))
-            })?,
-        ));
+        // The Iceberg commit is durable at this point. Update table handle
+        // unconditionally so the next commit sees the new snapshot.
         self.table = Some(updated_table);
+
+        // Best-effort schema refresh — keep the cached Arrow schema in sync
+        // with the table for the next epoch. A failure here must NOT prevent
+        // epoch advancement: if commit_to_iceberg() returned Err after the
+        // durable commit, commit_epoch() would skip last_committed_epoch
+        // update, and the next retry would duplicate the append.
+        let table = self.table.as_ref().expect("just set above");
+        let new_iceberg_schema = table.current_schema_ref();
+        match iceberg::arrow::schema_to_arrow_schema(&new_iceberg_schema) {
+            Ok(arrow_schema) => {
+                self.iceberg_arrow_schema = Some(std::sync::Arc::new(arrow_schema));
+            }
+            Err(e) => {
+                warn!(
+                    epoch = self.current_epoch,
+                    error = %e,
+                    "failed to refresh Iceberg Arrow schema; keeping previous version"
+                );
+            }
+        }
 
         info!(
             epoch = self.current_epoch,
