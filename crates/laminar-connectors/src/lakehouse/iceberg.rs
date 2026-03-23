@@ -321,10 +321,14 @@ impl IcebergSink {
                 self.iceberg_arrow_schema = Some(std::sync::Arc::new(arrow_schema));
             }
             Err(e) => {
+                // Invalidate the cache so the next align_batch_to_iceberg_schema()
+                // fails with InvalidState rather than silently writing with stale
+                // field IDs that no longer match table.current_schema_ref().
+                self.iceberg_arrow_schema = None;
                 warn!(
                     epoch = self.current_epoch,
                     error = %e,
-                    "failed to refresh Iceberg Arrow schema; keeping previous version"
+                    "failed to refresh Iceberg Arrow schema; cache invalidated"
                 );
             }
         }
