@@ -344,7 +344,7 @@
           <path d="M4 32 C12 32,14 30,22 30 C30 30,32 34,36 34" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
         </svg>
         <span>LaminarDB</span>
-        <span class="version-badge" data-version="tag">v0.18.9</span>
+        <span class="version-badge" data-version="tag">v0.18.12</span>
       </a>
 
       <nav class="nav-links" aria-label="Main navigation">
@@ -368,6 +368,8 @@
       <a href="#state-config">State Store</a>
       <a href="#checkpoint-config">Checkpoints</a>
       <a href="#rest-api">REST API</a>
+      <a href="#hot-reload">Hot Reload</a>
+      <a href="#prometheus">Prometheus Metrics</a>
 
       <h4>Pipelines</h4>
       <a href="#sources">Sources</a>
@@ -380,6 +382,8 @@
       <a href="#kafka-sink">Kafka Sink</a>
       <a href="#postgres-cdc">PostgreSQL CDC</a>
       <a href="#mysql-cdc">MySQL CDC</a>
+      <a href="#mongodb-cdc">MongoDB CDC Source</a>
+      <a href="#mongodb-sink">MongoDB Sink</a>
       <a href="#postgres-sink">PostgreSQL Sink</a>
       <a href="#delta-source">Delta Lake Source</a>
       <a href="#delta-sink">Delta Lake Sink</a>
@@ -403,12 +407,40 @@
     <!-- Content -->
     <main class="docs-content">
 
-      <h1 style="font-size: 1.75rem; margin-bottom: 0.5rem;">Configuration Reference</h1>
-      <p style="color: var(--text-dim); margin-bottom: 2rem;">
+      <h1 style="font-size: 1.75rem; margin-bottom: 0.5rem;">Standalone Server &amp; Configuration Reference</h1>
+      <p style="color: var(--text-dim); margin-bottom: 1rem;">
+        The <code>laminardb</code> binary reads a TOML configuration file, constructs streaming pipelines, and serves a REST API with Prometheus metrics.
         Every field on this page is verified against
         <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs</a>.
-        TOML examples use exact field names from the Rust structs.
       </p>
+
+      <h3>Install</h3>
+      <div class="toml-block">
+        <div class="toml-header">Install &amp; run</div>
+        <pre><code class="language-bash"># Pre-built binary (Linux x86_64)
+curl -LO "https://github.com/laminardb/laminardb/releases/latest/download/laminardb-server-x86_64-unknown-linux-gnu-v0.18.12.tar.gz"
+tar xzf laminardb-server-*.tar.gz
+
+# Or build from source
+cargo install laminar-server
+
+# Or Docker
+docker run -d -p 8080:8080 ghcr.io/laminardb/laminardb-server:latest
+
+# Run
+./laminardb --config laminardb.toml</code></pre>
+      </div>
+
+      <h3>CLI Options</h3>
+      <table class="config-table">
+        <thead><tr><th>Flag</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">--config &lt;FILE&gt;</td><td class="field-default">laminardb.toml</td><td>TOML configuration file path</td></tr>
+          <tr><td class="field-name">--log-level &lt;LEVEL&gt;</td><td class="field-default">info</td><td>trace, debug, info, warn, error</td></tr>
+          <tr><td class="field-name">--admin-bind &lt;ADDR&gt;</td><td></td><td>Override HTTP bind address from config</td></tr>
+          <tr><td class="field-name">--validate-checkpoints</td><td></td><td>Validate all stored checkpoints and exit</td></tr>
+        </tbody>
+      </table>
 
       <!-- ============================================================ -->
       <!-- SERVER CONFIG -->
@@ -586,7 +618,66 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
           <span class="endpoint-path">/api/v1/cluster</span>
           <span class="endpoint-desc">Cluster status (delta mode only)</span>
         </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-post">POST</span>
+          <span class="endpoint-path">/api/v1/pause</span>
+          <span class="endpoint-desc">Pause pipeline (not yet implemented &mdash; returns 501)</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-post">POST</span>
+          <span class="endpoint-path">/api/v1/resume</span>
+          <span class="endpoint-desc">Resume pipeline (not yet implemented &mdash; returns 501)</span>
+        </div>
       </div>
+
+      <!-- HOT RELOAD -->
+      <h2 id="hot-reload">Hot Reload</h2>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/reload.rs" target="_blank" rel="noopener">crates/laminar-server/src/reload.rs</a></div>
+
+      <p>
+        Edit the TOML config file while the server is running. A file watcher detects changes
+        (500ms debounce, content-hash comparison), diffs the old and new configs, and applies
+        incremental DDL. Or trigger manually via <code>POST /api/v1/reload</code>.
+      </p>
+
+      <p><strong>What reloads without restart:</strong> sources, pipelines, sinks, lookups (add, remove, or change).</p>
+      <p><strong>What requires restart:</strong> <code>[server]</code>, <code>[state]</code>, <code>[checkpoint]</code> sections. A warning is returned if these sections change.</p>
+
+      <p style="font-size: 0.8rem; color: var(--text-dim);">
+        Reload order: remove changed/deleted sinks &rarr; pipelines &rarr; lookups &rarr; sources,
+        then recreate sources &rarr; lookups &rarr; pipelines &rarr; sinks.
+        Disable file watcher with <code>LAMINAR_DISABLE_FILE_WATCH=1</code>.
+      </p>
+
+      <!-- PROMETHEUS -->
+      <h2 id="prometheus">Prometheus Metrics</h2>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/http.rs" target="_blank" rel="noopener">crates/laminar-server/src/http.rs</a></div>
+
+      <p><code>GET /metrics</code> returns Prometheus text format. Key metrics:</p>
+
+      <table class="config-table">
+        <thead><tr><th>Metric</th><th>Type</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">laminardb_events_ingested_total</td><td class="field-type">counter</td><td>Total events ingested across all sources</td></tr>
+          <tr><td class="field-name">laminardb_events_emitted_total</td><td class="field-type">counter</td><td>Total events emitted to sinks</td></tr>
+          <tr><td class="field-name">laminardb_events_dropped_total</td><td class="field-type">counter</td><td>Total events dropped (late data, errors)</td></tr>
+          <tr><td class="field-name">laminardb_source_events_total</td><td class="field-type">counter</td><td>Events per source (label: <code>source</code>)</td></tr>
+          <tr><td class="field-name">laminardb_source_count</td><td class="field-type">gauge</td><td>Number of configured sources</td></tr>
+          <tr><td class="field-name">laminardb_stream_count</td><td class="field-type">gauge</td><td>Number of running streams</td></tr>
+          <tr><td class="field-name">laminardb_sink_count</td><td class="field-type">gauge</td><td>Number of configured sinks</td></tr>
+          <tr><td class="field-name">laminardb_checkpoints_completed_total</td><td class="field-type">counter</td><td>Successful checkpoints</td></tr>
+          <tr><td class="field-name">laminardb_checkpoints_failed_total</td><td class="field-type">counter</td><td>Failed checkpoints</td></tr>
+          <tr><td class="field-name">laminardb_checkpoint_epoch</td><td class="field-type">gauge</td><td>Current checkpoint epoch</td></tr>
+          <tr><td class="field-name">laminardb_checkpoint_last_duration_ms</td><td class="field-type">gauge</td><td>Last checkpoint duration (ms)</td></tr>
+          <tr><td class="field-name">laminardb_cycle_duration_p50_ns</td><td class="field-type">gauge</td><td>p50 processing cycle latency (ns)</td></tr>
+          <tr><td class="field-name">laminardb_cycle_duration_p95_ns</td><td class="field-type">gauge</td><td>p95 processing cycle latency (ns)</td></tr>
+          <tr><td class="field-name">laminardb_cycle_duration_p99_ns</td><td class="field-type">gauge</td><td>p99 processing cycle latency (ns)</td></tr>
+          <tr><td class="field-name">laminardb_uptime_seconds</td><td class="field-type">gauge</td><td>Server uptime</td></tr>
+          <tr><td class="field-name">laminardb_pipeline_state_info</td><td class="field-type">gauge</td><td>Pipeline state (label: <code>state</code>)</td></tr>
+          <tr><td class="field-name">laminardb_reload_total</td><td class="field-type">counter</td><td>Config reload count</td></tr>
+          <tr><td class="field-name">laminardb_reload_last_timestamp</td><td class="field-type">gauge</td><td>Unix timestamp of last reload</td></tr>
+        </tbody>
+      </table>
 
       <!-- ============================================================ -->
       <!-- PIPELINES -->
@@ -608,7 +699,7 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
             <td class="field-name">connector</td>
             <td class="field-type">String</td>
             <td><span class="field-required">required</span></td>
-            <td>"kafka", "postgres_cdc", "mysql_cdc", "websocket", "files", "delta-lake", "generator"</td>
+            <td>"kafka", "postgres_cdc", "mysql_cdc", "mongodb-cdc", "websocket", "files", "delta-lake"</td>
           </tr>
           <tr>
             <td class="field-name">format</td>
@@ -749,7 +840,7 @@ max_out_of_orderness = "5s"</code></pre>
             <td class="field-name">connector</td>
             <td class="field-type">String</td>
             <td><span class="field-required">required</span></td>
-            <td>"postgres", "mysql", "redis", "csv"</td>
+            <td>"postgres", "parquet"</td>
           </tr>
           <tr>
             <td class="field-name">strategy</td>
@@ -888,7 +979,7 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">password</td><td></td><td>Auth password</td></tr>
           <tr><td class="field-name">slot.name</td><td><span class="field-required">required</span></td><td>Logical replication slot</td></tr>
           <tr><td class="field-name">publication</td><td><span class="field-required">required</span></td><td>Publication name</td></tr>
-          <tr><td class="field-name">ssl.mode</td><td class="field-default">prefer</td><td>disable, allow, prefer, require, verify-ca, verify-full</td></tr>
+          <tr><td class="field-name">ssl.mode</td><td class="field-default">prefer</td><td>disable, prefer, require, verify-ca, verify-full</td></tr>
           <tr><td class="field-name">snapshot.mode</td><td class="field-default">initial</td><td>initial, never, always</td></tr>
           <tr><td class="field-name">table.include</td><td></td><td>Comma-separated table filter</td></tr>
           <tr><td class="field-name">table.exclude</td><td></td><td>Comma-separated table exclusions</td></tr>
@@ -939,6 +1030,72 @@ max_out_of_orderness = "5s"</code></pre>
         </tbody>
       </table>
 
+      <!-- MONGODB CDC SOURCE -->
+      <h3 id="mongodb-cdc">MongoDB CDC Source</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/mongodb/source.rs" target="_blank" rel="noopener">mongodb/source.rs</a></div>
+
+      <p>Consumes MongoDB <a href="https://www.mongodb.com/docs/manual/changeStreams/" target="_blank" rel="noopener">change streams</a>.
+         Resume tokens provide at-least-once delivery across restarts. Requires MongoDB 4.0+ (replica set) or 4.2+ (sharded cluster).</p>
+
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">connection.uri</td><td class="field-default">mongodb://localhost:27017</td><td>MongoDB connection string</td></tr>
+          <tr><td class="field-name">database</td><td><span class="field-required">required</span></td><td>Database name</td></tr>
+          <tr><td class="field-name">collection</td><td><span class="field-required">required</span></td><td>Collection name, or <code>*</code> for all collections in database</td></tr>
+          <tr><td class="field-name">full.document.mode</td><td class="field-default">delta</td><td>delta, update_lookup, required, when_available</td></tr>
+          <tr><td class="field-name">max.await.time.ms</td><td class="field-default">1000</td><td><code>getMore</code> await timeout (milliseconds)</td></tr>
+          <tr><td class="field-name">batch.size</td><td class="field-default">1000</td><td>Cursor batch size hint</td></tr>
+          <tr><td class="field-name">max.poll.records</td><td class="field-default">1000</td><td>Max records per poll batch</td></tr>
+          <tr><td class="field-name">max.buffered.events</td><td class="field-default">100000</td><td>Max buffered events before backpressure</td></tr>
+        </tbody>
+      </table>
+
+      <p style="font-size: 0.8rem; color: var(--text-dim);">
+        <strong>Full document modes:</strong>
+        <code>delta</code> — update description only (default).
+        <code>update_lookup</code> — fetches current document on updates.
+        <code>required</code> — requires <code>changeStreamPreAndPostImages</code> enabled on collection.
+        <code>when_available</code> — returns post-image when available, null otherwise.
+      </p>
+
+      <p style="font-size: 0.8rem; color: var(--text-dim);">
+        <strong>CDC envelope schema:</strong>
+        <code>_namespace</code> (Utf8), <code>_op</code> (Utf8: I/U/R/D/DROP),
+        <code>_document_key</code> (Utf8), <code>_cluster_time_s</code> (UInt32),
+        <code>_cluster_time_i</code> (UInt32), <code>_wall_time_ms</code> (Int64),
+        <code>_full_document</code> (Utf8, nullable), <code>_update_desc</code> (Utf8, nullable),
+        <code>_resume_token</code> (Utf8).
+      </p>
+
+      <!-- MONGODB SINK -->
+      <h3 id="mongodb-sink">MongoDB Sink</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/mongodb/sink.rs" target="_blank" rel="noopener">mongodb/sink.rs</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">connection.uri</td><td class="field-default">mongodb://localhost:27017</td><td>MongoDB connection string</td></tr>
+          <tr><td class="field-name">database</td><td><span class="field-required">required</span></td><td>Target database name</td></tr>
+          <tr><td class="field-name">collection</td><td><span class="field-required">required</span></td><td>Target collection name</td></tr>
+          <tr><td class="field-name">write.mode</td><td class="field-default">insert</td><td>insert, upsert, replace, cdc_replay</td></tr>
+          <tr><td class="field-name">batch.size</td><td class="field-default">500</td><td>Max documents per bulk write</td></tr>
+          <tr><td class="field-name">flush.interval.ms</td><td class="field-default">1000</td><td>Max time between flushes (ms)</td></tr>
+          <tr><td class="field-name">ordered</td><td class="field-default">true</td><td>true = fail-fast ordered writes; false = unordered (higher throughput)</td></tr>
+          <tr><td class="field-name">write.concern.w</td><td class="field-default">majority</td><td>majority or integer node count</td></tr>
+          <tr><td class="field-name">write.concern.journal</td><td class="field-default">true</td><td>Wait for journal commit</td></tr>
+        </tbody>
+      </table>
+
+      <p style="font-size: 0.8rem; color: var(--text-dim);">
+        <strong>Write modes:</strong>
+        <code>insert</code> — append-only.
+        <code>upsert</code> — replace by key fields (set via <code>upsert.key.fields</code>).
+        <code>replace</code> — full document replacement.
+        <code>cdc_replay</code> — routes by <code>_op</code> column (I→insert, U→update, R→replace, D→delete).
+        Time series collections only support <code>insert</code> mode.
+      </p>
+
       <!-- DELTA LAKE SOURCE -->
       <h3 id="delta-source">Delta Lake Source</h3>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/lakehouse/delta_source.rs" target="_blank" rel="noopener">lakehouse/delta_source.rs</a></div>
@@ -957,7 +1114,7 @@ max_out_of_orderness = "5s"</code></pre>
 
       <!-- DELTA LAKE SINK -->
       <h3 id="delta-sink">Delta Lake Sink</h3>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/lakehouse/delta_sink.rs" target="_blank" rel="noopener">lakehouse/delta_sink.rs</a></div>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/lakehouse/delta.rs" target="_blank" rel="noopener">lakehouse/delta.rs</a></div>
 
       <table class="config-table">
         <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
@@ -1448,12 +1605,13 @@ writer.id = "vwap-writer"</code></pre>
         <div class="footer-left">
           LaminarDB &middot;
           <a href="https://github.com/laminardb/laminardb/blob/main/LICENSE" target="_blank" rel="noopener">Apache 2.0</a> &middot;
-          <span data-version="tag">v0.18.9</span>
+          <span data-version="tag">v0.18.12</span>
         </div>
         <div class="footer-links">
           <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
           <a href="https://crates.io/crates/laminar-db" target="_blank" rel="noopener">Crates.io</a>
           <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API Docs</a>
+          <a href="mailto:support@laminardb.io">Support</a>
         </div>
       </div>
     </div>

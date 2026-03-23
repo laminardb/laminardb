@@ -56,6 +56,14 @@ impl LaminarDB {
         self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Check if the streaming pipeline is active (starting, running, or
+    /// shutting down). DDL that requires connector instantiation or task
+    /// cancellation is unsafe in all three states.
+    pub(crate) fn is_pipeline_running(&self) -> bool {
+        let s = self.state.load(std::sync::atomic::Ordering::Acquire);
+        s == STATE_RUNNING || s == STATE_STARTING || s == STATE_SHUTTING_DOWN
+    }
+
     /// Start the streaming pipeline.
     ///
     /// Activates all registered connectors and begins processing.
@@ -242,29 +250,29 @@ impl LaminarDB {
         use crate::connector_manager::{
             build_sink_config, build_source_config, build_table_config,
         };
+        use crate::operator_graph::OperatorGraph;
         use crate::pipeline::{PipelineConfig, SourceRegistration};
-        use crate::stream_executor::StreamExecutor;
         use laminar_connectors::reference::{ReferenceTableSource, RefreshMode};
 
-        // Build StreamExecutor
+        // Build OperatorGraph
         let ctx = laminar_sql::create_session_context();
         laminar_sql::register_streaming_functions(&ctx);
-        let mut executor = StreamExecutor::new(ctx);
-        executor.set_max_state_bytes(self.config.max_state_bytes_per_operator);
-        executor.set_lookup_registry(Arc::clone(&self.lookup_registry));
-        executor.set_counters(Arc::clone(&self.counters));
+        let mut graph = OperatorGraph::new(ctx);
+        graph.set_max_state_bytes(self.config.max_state_bytes_per_operator);
+        graph.set_lookup_registry(Arc::clone(&self.lookup_registry));
+        graph.set_counters(Arc::clone(&self.counters));
 
         // Register source schemas for ALL sources (both external connectors
-        // and catalog-bridge sources) so the executor can create empty
+        // and catalog-bridge sources) so the graph can create empty
         // placeholder tables when no data arrives in a given cycle.
         for name in source_regs.keys() {
             if let Some(entry) = self.catalog.get_source(name) {
-                executor.register_source_schema(name.clone(), entry.schema.clone());
+                graph.register_source_schema(name.clone(), entry.schema.clone());
             }
         }
 
         for reg in stream_regs.values() {
-            executor.add_query(
+            graph.add_query(
                 reg.name.clone(),
                 reg.query_sql.clone(),
                 reg.emit_clause.clone(),
@@ -274,8 +282,8 @@ impl LaminarDB {
         }
 
         // Register temporal join tables as Versioned in the lookup registry
-        // so that execute_temporal_query() can use persistent versioned state.
-        for tcfg in executor.temporal_join_configs() {
+        // so that temporal join operators can use persistent versioned state.
+        for tcfg in graph.temporal_join_configs() {
             if self.lookup_registry.get_entry(&tcfg.table_name).is_none() {
                 // Get initial data. If none exists yet, use an empty batch
                 // with the correct schema from the catalog (not Schema::empty).
@@ -435,7 +443,7 @@ impl LaminarDB {
                 continue;
             }
             if let Some(entry) = self.catalog.get_source(&name) {
-                executor.register_source_schema(name.clone(), entry.schema.clone());
+                graph.register_source_schema(name.clone(), entry.schema.clone());
                 let subscription = entry.sink.subscribe();
                 let connector = crate::catalog_connector::CatalogSourceConnector::new(
                     subscription,
@@ -563,25 +571,33 @@ impl LaminarDB {
                                 src.restore_checkpoint = Some(restored);
                             }
                         }
-                        // Restore stream executor aggregate state
-                        if let Some(op) = recovered.manifest.operator_states.get("stream_executor")
-                        {
+                        // Restore operator graph state (new format)
+                        if let Some(op) = recovered.manifest.operator_states.get("operator_graph") {
                             if let Some(bytes) = op.decode_inline() {
-                                match executor.restore_state(&bytes) {
+                                match graph.restore_from_bytes(&bytes) {
                                     Ok(n) => {
                                         tracing::info!(
                                             queries = n,
-                                            "Restored stream executor state from checkpoint"
+                                            "Restored operator graph state from checkpoint"
                                         );
                                     }
                                     Err(e) => {
                                         tracing::warn!(
                                             error = %e,
-                                            "Stream executor state restore failed, starting fresh"
+                                            "Operator graph state restore failed, starting fresh"
                                         );
                                     }
                                 }
                             }
+                        } else if recovered
+                            .manifest
+                            .operator_states
+                            .contains_key("stream_executor")
+                        {
+                            tracing::warn!(
+                                "Found old stream_executor checkpoint format; \
+                                 skipping restore (clean break). Starting fresh."
+                            );
                         }
                         tracing::info!(
                             epoch = recovered.epoch(),
@@ -647,6 +663,82 @@ impl LaminarDB {
                     },
                 );
             }
+        }
+
+        // On-demand (Manual) tables: register as Partial in the lookup
+        // registry so lookup joins use the foyer cache + source fallback path,
+        // then promote to SnapshotPlusCdc so poll_tables() calls poll_changes().
+        for (name, _source, mode) in &mut table_sources {
+            if !matches!(mode, RefreshMode::Manual) {
+                continue;
+            }
+            let Some(reg) = table_regs.get(name.as_str()) else {
+                continue;
+            };
+            let max_entries = reg.cache_max_entries.unwrap_or(65_536);
+            let Some(schema) = self.table_store.read().table_schema(name) else {
+                continue;
+            };
+            let pk_csv = &reg.primary_key;
+            let pk_cols: Vec<String> = pk_csv
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let key_sort_fields: Vec<arrow::row::SortField> = pk_cols
+                .iter()
+                .filter_map(|col| {
+                    schema
+                        .field_with_name(col)
+                        .ok()
+                        .map(|f| arrow::row::SortField::new(f.data_type().clone()))
+                })
+                .collect();
+
+            let cache = Arc::new(laminar_core::lookup::foyer_cache::FoyerMemoryCache::new(
+                0,
+                laminar_core::lookup::foyer_cache::FoyerMemoryCacheConfig {
+                    capacity: max_entries,
+                    shards: 16,
+                },
+            ));
+            // Try to create a lookup source for cache-miss fallback via
+            // the registry factory (no cross-crate type dependency).
+            let lookup_source = if let Ok(mut config) = build_table_config(reg) {
+                config.set("_primary_key_columns", pk_csv.as_str());
+                match self.connector_registry.create_lookup_source(config).await {
+                    Some(Ok(src)) => Some(src),
+                    Some(Err(e)) => {
+                        tracing::warn!(
+                            table = %name, error = %e,
+                            "lookup source creation failed; cache-only mode"
+                        );
+                        None
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            self.lookup_registry.register_partial(
+                name,
+                laminar_sql::datafusion::PartialLookupState {
+                    foyer_cache: cache,
+                    schema,
+                    key_columns: pk_cols,
+                    key_sort_fields,
+                    source: lookup_source,
+                    fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
+                },
+            );
+            *mode = RefreshMode::SnapshotPlusCdc;
+            tracing::info!(
+                table = %name,
+                max_entries,
+                pk = %pk_csv,
+                "registered on-demand lookup table (partial cache)"
+            );
         }
 
         // Get stream source handles so results also flow to db.subscribe().
@@ -788,6 +880,7 @@ impl LaminarDB {
             drain_budget_ns: 1_000_000,      // 1ms
             query_budget_ns: 8_000_000,      // 8ms
             background_budget_ns: 5_000_000, // 5ms
+            sink_write_timeout: std::time::Duration::from_secs(30),
         };
 
         // Validate delivery guarantee constraints.
@@ -866,10 +959,10 @@ impl LaminarDB {
         };
 
         // Wire per-query budget from pipeline config.
-        executor.set_query_budget_ns(pipeline_config.query_budget_ns);
+        graph.set_query_budget_ns(pipeline_config.query_budget_ns);
 
         let callback = crate::pipeline_callback::ConnectorPipelineCallback {
-            executor,
+            graph,
             stream_sources,
             sinks,
             watermark_states,
@@ -893,6 +986,8 @@ impl LaminarDB {
                 .map(std::time::Duration::from_millis),
             pipeline_hash,
             delivery_guarantee: pipeline_config.delivery_guarantee,
+            sink_write_timeout: pipeline_config.sink_write_timeout,
+            sink_timed_out: false,
             cycle_histogram: std::cell::RefCell::new(
                 crate::checkpoint_coordinator::DurationHistogram::new(),
             ),

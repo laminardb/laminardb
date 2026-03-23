@@ -3,6 +3,8 @@
 //! The `ConnectorRegistry` maintains a catalog of available connector
 //! implementations and provides factory methods to instantiate them.
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -22,6 +24,23 @@ pub type SinkFactory = Arc<dyn Fn() -> Box<dyn SinkConnector> + Send + Sync>;
 /// Factory function type for creating reference table sources.
 pub type TableSourceFactory = Arc<
     dyn Fn(&ConnectorConfig) -> Result<Box<dyn ReferenceTableSource>, ConnectorError> + Send + Sync,
+>;
+
+/// Factory function type for creating lookup sources (async, for on-demand mode).
+pub type LookupSourceFactory = Arc<
+    dyn Fn(
+            ConnectorConfig,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            Arc<dyn laminar_core::lookup::source::LookupSourceDyn>,
+                            ConnectorError,
+                        >,
+                    > + Send,
+            >,
+        > + Send
+        + Sync,
 >;
 
 /// Registry of available connector implementations.
@@ -45,6 +64,7 @@ pub struct ConnectorRegistry {
     sources: Arc<RwLock<HashMap<String, (ConnectorInfo, SourceFactory)>>>,
     sinks: Arc<RwLock<HashMap<String, (ConnectorInfo, SinkFactory)>>>,
     table_sources: Arc<RwLock<HashMap<String, (ConnectorInfo, TableSourceFactory)>>>,
+    lookup_sources: Arc<RwLock<HashMap<String, LookupSourceFactory>>>,
 }
 
 impl ConnectorRegistry {
@@ -55,6 +75,7 @@ impl ConnectorRegistry {
             sources: Arc::new(RwLock::new(HashMap::new())),
             sinks: Arc::new(RwLock::new(HashMap::new())),
             table_sources: Arc::new(RwLock::new(HashMap::new())),
+            lookup_sources: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -163,6 +184,27 @@ impl ConnectorRegistry {
     #[must_use]
     pub fn list_table_sources(&self) -> Vec<String> {
         self.table_sources.read().keys().cloned().collect()
+    }
+
+    /// Registers a lookup source factory for on-demand/partial cache mode.
+    pub fn register_lookup_source(&self, name: impl Into<String>, factory: LookupSourceFactory) {
+        self.lookup_sources.write().insert(name.into(), factory);
+    }
+
+    /// Creates a lookup source for on-demand cache-miss fallback.
+    ///
+    /// Returns `None` if no lookup source factory is registered for
+    /// the given connector type.
+    pub async fn create_lookup_source(
+        &self,
+        config: ConnectorConfig,
+    ) -> Option<Result<Arc<dyn laminar_core::lookup::source::LookupSourceDyn>, ConnectorError>>
+    {
+        let factory = {
+            let lookup_sources = self.lookup_sources.read();
+            lookup_sources.get(config.connector_type())?.clone()
+        };
+        Some(factory(config).await)
     }
 
     /// Returns information about a registered source connector.

@@ -70,6 +70,10 @@ pub struct PipelineConfig {
     /// table polling) after SQL execution (nanoseconds). When exceeded,
     /// low-priority tasks (table polling) are skipped. Default: 5ms.
     pub background_budget_ns: u64,
+
+    /// Maximum time to wait for a single sink `write_batch` before dropping
+    /// the batch. Default: 30s (accommodates slow sinks like Delta Lake).
+    pub sink_write_timeout: Duration,
 }
 
 impl Default for PipelineConfig {
@@ -86,6 +90,7 @@ impl Default for PipelineConfig {
             drain_budget_ns: 1_000_000,      // 1ms
             query_budget_ns: 8_000_000,      // 8ms
             background_budget_ns: 5_000_000, // 5ms
+            sink_write_timeout: Duration::from_secs(30),
         }
     }
 }
