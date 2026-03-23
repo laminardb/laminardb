@@ -279,6 +279,11 @@ impl LaminarDB {
             laminar_connectors::lakehouse::register_delta_lake_sink(registry);
             laminar_connectors::lakehouse::register_delta_lake_source(registry);
         }
+        #[cfg(feature = "iceberg")]
+        {
+            laminar_connectors::lakehouse::register_iceberg_sink(registry);
+            laminar_connectors::lakehouse::register_iceberg_source(registry);
+        }
         #[cfg(feature = "websocket")]
         {
             laminar_connectors::websocket::register_websocket_source(registry);
@@ -287,6 +292,11 @@ impl LaminarDB {
         #[cfg(feature = "mysql-cdc")]
         {
             laminar_connectors::cdc::mysql::register_mysql_cdc_source(registry);
+        }
+        #[cfg(feature = "mongodb-cdc")]
+        {
+            laminar_connectors::mongodb::register_mongodb_cdc(registry);
+            laminar_connectors::mongodb::register_mongodb_sink(registry);
         }
         #[cfg(feature = "files")]
         {
