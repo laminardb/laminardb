@@ -266,7 +266,7 @@ impl ConsumerContext for LaminarConsumerContext {
                         let errors: Vec<_> = result
                             .elements()
                             .iter()
-                            .filter(|e| e.error().is_some())
+                            .filter(|e| e.error().is_err())
                             .map(|e| format!("{}-{}: {:?}", e.topic(), e.partition(), e.error()))
                             .collect();
                         if errors.is_empty() {
@@ -360,7 +360,7 @@ mod tests {
         let revoke_gen = Arc::new(AtomicU64::new(0));
         let reader_paused = Arc::new(AtomicBool::new(false));
         let commit_retry = Arc::new(AtomicBool::new(false));
-        let offset_snapshot = Arc::new(Mutex::new(super::offsets::OffsetTracker::new()));
+        let offset_snapshot = Arc::new(Mutex::new(super::super::offsets::OffsetTracker::new()));
         let ctx = LaminarConsumerContext::new(
             Arc::clone(&flag),
             state,
