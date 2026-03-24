@@ -300,6 +300,7 @@ impl KafkaSource {
         let reader_channel_capacity = self.config.reader_channel_capacity;
         let reader_paused = Arc::clone(&self.reader_paused);
         let revoke_generation = Arc::clone(&self.revoke_generation);
+        let rebalance_state = Arc::clone(&self.rebalance_state);
         let commit_retry_needed = Arc::clone(&self.commit_retry_needed);
         let pause_threshold = self.config.backpressure_high_watermark;
         let resume_threshold = self.config.backpressure_low_watermark;
@@ -336,18 +337,16 @@ impl KafkaSource {
             loop {
                 // Prune seen_partitions when a revoke event has occurred, so
                 // the HWM timer stops querying watermarks for revoked partitions.
+                // Reads rebalance_state (updated in pre_rebalance) rather than
+                // consumer.assignment() which may lag the callback.
                 let current_gen = revoke_generation.load(Ordering::Relaxed);
                 if current_gen != last_revoke_gen {
                     last_revoke_gen = current_gen;
-                    if let Ok(assignment) = consumer.assignment() {
-                        let assigned_set: std::collections::HashSet<_> = assignment
-                            .elements()
-                            .iter()
-                            .map(|e| (Arc::from(e.topic()), e.partition()))
-                            .collect();
-                        seen_partitions
-                            .retain(|(t, p)| assigned_set.contains(&(Arc::clone(t), *p)));
-                    }
+                    let assigned = match rebalance_state.lock() {
+                        Ok(state) => state.assigned_partitions().clone(),
+                        Err(poisoned) => poisoned.into_inner().assigned_partitions().clone(),
+                    };
+                    seen_partitions.retain(|(t, p)| assigned.contains(&(t.to_string(), *p)));
                 }
 
                 // Check channel fill ratio for pause/resume of Kafka partitions.
@@ -387,7 +386,15 @@ impl KafkaSource {
                     _ = commit_timer.tick(), if commit_enabled => {
                         let tpl = offset_rx.borrow().clone();
                         if tpl.count() > 0 {
-                            if commit_retry_needed.load(Ordering::Acquire) {
+                            if commit_retry_needed
+                                .compare_exchange(
+                                    true,
+                                    false,
+                                    Ordering::AcqRel,
+                                    Ordering::Relaxed,
+                                )
+                                .is_ok()
+                            {
                                 // Escalate to sync commit on the blocking pool
                                 // so we don't stall the reader or block shutdown.
                                 let c = Arc::clone(&consumer);
@@ -396,16 +403,18 @@ impl KafkaSource {
                                 tokio::task::spawn_blocking(move || {
                                     match c.commit(&tpl, CommitMode::Sync) {
                                         Ok(()) => {
-                                            flag.store(false, Ordering::Release);
                                             info!(
                                                 partitions = n,
                                                 "sync offset commit retry succeeded"
                                             );
                                         }
-                                        Err(e) => warn!(
-                                            error = %e,
-                                            "sync offset commit retry failed"
-                                        ),
+                                        Err(e) => {
+                                            flag.store(true, Ordering::Release);
+                                            warn!(
+                                                error = %e,
+                                                "sync offset commit retry failed"
+                                            );
+                                        }
                                     }
                                 });
                             } else {
