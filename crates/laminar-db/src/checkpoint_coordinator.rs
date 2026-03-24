@@ -33,7 +33,6 @@ use laminar_storage::checkpoint_manifest::{
     CheckpointManifest, ConnectorCheckpoint, SinkCommitStatus,
 };
 use laminar_storage::checkpoint_store::CheckpointStore;
-use laminar_storage::per_core_wal::PerCoreWalManager;
 use tracing::{debug, error, info, warn};
 
 use crate::error::DbError;
@@ -229,18 +228,6 @@ pub(crate) struct RegisteredSink {
     pub exactly_once: bool,
 }
 
-/// Result of WAL preparation for a checkpoint.
-///
-/// Contains the WAL positions recorded after flushing changelog drainers,
-/// writing epoch barriers, and syncing all segments.
-#[derive(Debug, Clone)]
-pub struct WalPrepareResult {
-    /// Per-core WAL positions at the time of the epoch barrier.
-    pub per_core_wal_positions: Vec<u64>,
-    /// Number of changelog entries drained across all drainers.
-    pub entries_drained: u64,
-}
-
 /// Unified checkpoint coordinator.
 ///
 /// Orchestrates the full checkpoint lifecycle across sources, sinks,
@@ -258,8 +245,6 @@ pub struct CheckpointCoordinator {
     last_checkpoint_duration: Option<Duration>,
     /// Rolling histogram of checkpoint durations for percentile tracking.
     duration_histogram: DurationHistogram,
-    /// Per-core WAL manager for epoch barriers and truncation.
-    wal_manager: Option<PerCoreWalManager>,
     /// Changelog drainers to flush before checkpointing.
     changelog_drainers: Vec<ChangelogDrainer>,
     /// Shared counters for observability.
@@ -270,9 +255,6 @@ pub struct CheckpointCoordinator {
     total_bytes_written: u64,
     /// Number of checkpoints completed in unaligned mode.
     unaligned_checkpoint_count: u64,
-    /// WAL positions from the previous checkpoint, used as a truncation
-    /// safety buffer — we keep one checkpoint's worth of WAL replay data.
-    previous_wal_positions: Option<Vec<u64>>,
 }
 
 impl CheckpointCoordinator {
@@ -297,13 +279,11 @@ impl CheckpointCoordinator {
             checkpoints_failed: 0,
             last_checkpoint_duration: None,
             duration_histogram: DurationHistogram::new(),
-            wal_manager: None,
             changelog_drainers: Vec::new(),
             counters: None,
             smoothed_duration_ms: 0.0,
             total_bytes_written: 0,
             unaligned_checkpoint_count: 0,
-            previous_wal_positions: None,
         }
     }
 
@@ -390,117 +370,26 @@ impl CheckpointCoordinator {
         }
     }
 
-    // ── WAL coordination ──
-
-    /// Registers a per-core WAL manager for checkpoint coordination.
-    ///
-    /// When registered, [`prepare_wal_for_checkpoint()`](Self::prepare_wal_for_checkpoint)
-    /// will write epoch barriers and sync all segments, and
-    /// [`truncate_wal_after_checkpoint()`](Self::truncate_wal_after_checkpoint)
-    /// will reset all segments.
-    pub fn register_wal_manager(&mut self, wal_manager: PerCoreWalManager) {
-        self.wal_manager = Some(wal_manager);
-    }
+    // ── Changelog drainers ──
 
     /// Registers a changelog drainer to flush before checkpointing.
     ///
     /// Multiple drainers may be registered (one per core or per state store).
-    /// All are flushed during
-    /// [`prepare_wal_for_checkpoint()`](Self::prepare_wal_for_checkpoint).
+    /// All are flushed during [`flush_changelog_drainers()`](Self::flush_changelog_drainers).
     pub fn register_changelog_drainer(&mut self, drainer: ChangelogDrainer) {
         self.changelog_drainers.push(drainer);
     }
 
-    /// Prepares the WAL for a checkpoint.
-    ///
-    /// 1. Flushes all registered [`ChangelogDrainer`] instances (Ring 1 → Ring 0 catchup)
-    /// 2. Writes epoch barriers to all per-core WAL segments
-    /// 3. Syncs all WAL segments (`fdatasync`)
-    /// 4. Records and returns per-core WAL positions
-    ///
-    /// Call this **before** [`checkpoint()`](Self::checkpoint) and pass the returned
-    /// positions into that method.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DbError::Checkpoint` if WAL operations fail.
-    pub fn prepare_wal_for_checkpoint(&mut self) -> Result<WalPrepareResult, DbError> {
-        // Step 1: Flush changelog drainers
-        let mut total_drained: u64 = 0;
+    /// Flushes all registered changelog drainers.
+    fn flush_changelog_drainers(&mut self) {
         for drainer in &mut self.changelog_drainers {
             let count = drainer.drain();
-            total_drained += count as u64;
             debug!(
                 drained = count,
                 pending = drainer.pending_count(),
                 "changelog drainer flushed"
             );
         }
-
-        // Step 2-4: WAL epoch barriers + sync + positions
-        let per_core_wal_positions = if let Some(ref mut wal) = self.wal_manager {
-            let epoch = wal.advance_epoch();
-            wal.set_epoch_all(epoch);
-
-            wal.write_epoch_barrier_all()
-                .map_err(|e| DbError::Checkpoint(format!("WAL epoch barrier failed: {e}")))?;
-
-            wal.sync_all()
-                .map_err(|e| DbError::Checkpoint(format!("WAL sync failed: {e}")))?;
-
-            // Use synced positions — only durable data is safe for the manifest.
-            let positions = wal.synced_positions();
-            debug!(epoch, positions = ?positions, "WAL prepared for checkpoint");
-            positions
-        } else {
-            Vec::new()
-        };
-
-        Ok(WalPrepareResult {
-            per_core_wal_positions,
-            entries_drained: total_drained,
-        })
-    }
-
-    /// Truncates (resets) all per-core WAL segments after a successful checkpoint.
-    ///
-    /// Call this **after** [`checkpoint()`](Self::checkpoint) returns success.
-    /// WAL data before the checkpoint position is no longer needed.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DbError::Checkpoint` if truncation fails.
-    pub fn truncate_wal_after_checkpoint(
-        &mut self,
-        current_positions: Vec<u64>,
-    ) -> Result<(), DbError> {
-        if let Some(ref mut wal) = self.wal_manager {
-            if let Some(ref prev) = self.previous_wal_positions {
-                // Truncate to previous checkpoint's positions, keeping one
-                // checkpoint's worth of WAL data as a safety buffer.
-                wal.truncate_all(prev)
-                    .map_err(|e| DbError::Checkpoint(format!("WAL truncation failed: {e}")))?;
-                debug!("WAL segments truncated to previous checkpoint positions");
-            } else {
-                // First checkpoint — no previous positions, truncate to 0.
-                wal.reset_all()
-                    .map_err(|e| DbError::Checkpoint(format!("WAL truncation failed: {e}")))?;
-                debug!("WAL segments reset after first checkpoint");
-            }
-        }
-        self.previous_wal_positions = Some(current_positions);
-        Ok(())
-    }
-
-    /// Returns a reference to the registered WAL manager, if any.
-    #[must_use]
-    pub fn wal_manager(&self) -> Option<&PerCoreWalManager> {
-        self.wal_manager.as_ref()
-    }
-
-    /// Returns a mutable reference to the registered WAL manager, if any.
-    pub fn wal_manager_mut(&mut self) -> Option<&mut PerCoreWalManager> {
-        self.wal_manager.as_mut()
     }
 
     /// Returns a slice of registered changelog drainers.
@@ -1029,12 +918,7 @@ impl CheckpointCoordinator {
 
         info!(checkpoint_id, epoch, "starting checkpoint");
 
-        // ── Step 2b: WAL preparation (internal) ──
-        // Drain changelog, write epoch barriers, sync WAL, capture positions.
-        // This MUST happen after operator states are received (passed as args)
-        // to guarantee WAL positions reflect post-snapshot state.
-        let wal_result = self.prepare_wal_for_checkpoint()?;
-        let per_core_wal_positions = wal_result.per_core_wal_positions;
+        self.flush_changelog_drainers();
 
         // ── Step 3: Source offsets ──
         // Source offsets are provided by the caller (pre-captured at barrier
@@ -1074,8 +958,6 @@ impl CheckpointCoordinator {
         // manifest.watermark. Do NOT fabricate per-source values from the
         // global watermark, as that loses granularity on recovery.
         manifest.source_watermarks = source_watermarks;
-        // wal_position is legacy (single-writer mode); per-core positions are authoritative.
-        manifest.per_core_wal_positions = per_core_wal_positions;
         manifest.table_store_checkpoint_path = table_store_checkpoint_path;
         manifest.is_incremental = self.config.incremental;
         manifest.source_names = {
@@ -1325,7 +1207,6 @@ impl std::fmt::Debug for CheckpointCoordinator {
             .field("next_checkpoint_id", &self.next_checkpoint_id)
             .field("phase", &self.phase)
             .field("sinks", &self.sinks.len())
-            .field("has_wal_manager", &self.wal_manager.is_some())
             .field("changelog_drainers", &self.changelog_drainers.len())
             .field("completed", &self.checkpoints_completed)
             .field("failed", &self.checkpoints_failed)
@@ -1629,8 +1510,6 @@ mod tests {
 
         let loaded = coord.store().load_latest().unwrap().unwrap();
         assert_eq!(loaded.operator_states.len(), 2);
-        // No WAL manager registered → positions are empty
-        assert!(loaded.per_core_wal_positions.is_empty());
 
         let window_op = loaded.operator_states.get("window-agg").unwrap();
         assert_eq!(window_op.decode_inline().unwrap(), b"state-data");
@@ -1677,152 +1556,10 @@ mod tests {
         assert!(debug.contains("epoch: 1"));
     }
 
-    // ── WAL checkpoint coordination tests ──
-
-    #[test]
-    fn test_prepare_wal_no_wal_manager() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
-
-        // Without a WAL manager, prepare should succeed with empty positions.
-        let result = coord.prepare_wal_for_checkpoint().unwrap();
-        assert!(result.per_core_wal_positions.is_empty());
-        assert_eq!(result.entries_drained, 0);
-    }
-
-    #[test]
-    fn test_prepare_wal_with_manager() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
-
-        // Set up a per-core WAL manager
-        let wal_dir = dir.path().join("wal");
-        std::fs::create_dir_all(&wal_dir).unwrap();
-        let wal_config = laminar_storage::per_core_wal::PerCoreWalConfig::new(&wal_dir, 2);
-        let wal = laminar_storage::per_core_wal::PerCoreWalManager::new(wal_config).unwrap();
-        coord.register_wal_manager(wal);
-
-        // Write some data to WAL
-        coord
-            .wal_manager_mut()
-            .unwrap()
-            .writer(0)
-            .append_put(b"key", b"value")
-            .unwrap();
-
-        let result = coord.prepare_wal_for_checkpoint().unwrap();
-        assert_eq!(result.per_core_wal_positions.len(), 2);
-        // Positions should be > 0 (epoch barrier + data)
-        assert!(result.per_core_wal_positions.iter().any(|p| *p > 0));
-    }
-
-    #[test]
-    fn test_truncate_wal_no_manager() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
-
-        // Without a WAL manager, truncation is a no-op.
-        coord.truncate_wal_after_checkpoint(vec![]).unwrap();
-    }
-
-    #[test]
-    fn test_truncate_wal_with_manager() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
-
-        let wal_dir = dir.path().join("wal");
-        std::fs::create_dir_all(&wal_dir).unwrap();
-        let wal_config = laminar_storage::per_core_wal::PerCoreWalConfig::new(&wal_dir, 2);
-        let wal = laminar_storage::per_core_wal::PerCoreWalManager::new(wal_config).unwrap();
-        coord.register_wal_manager(wal);
-
-        // Write data
-        coord
-            .wal_manager_mut()
-            .unwrap()
-            .writer(0)
-            .append_put(b"key", b"value")
-            .unwrap();
-
-        assert!(coord.wal_manager().unwrap().total_size() > 0);
-
-        // Truncate
-        coord.truncate_wal_after_checkpoint(vec![]).unwrap();
-        assert_eq!(coord.wal_manager().unwrap().total_size(), 0);
-    }
-
-    #[test]
-    fn test_truncate_wal_safety_buffer() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
-
-        let wal_dir = dir.path().join("wal");
-        std::fs::create_dir_all(&wal_dir).unwrap();
-        let wal_config = laminar_storage::per_core_wal::PerCoreWalConfig::new(&wal_dir, 2);
-        let wal = laminar_storage::per_core_wal::PerCoreWalManager::new(wal_config).unwrap();
-        coord.register_wal_manager(wal);
-
-        // Write some data before first checkpoint
-        coord
-            .wal_manager_mut()
-            .unwrap()
-            .writer(0)
-            .append_put(b"k1", b"v1")
-            .unwrap();
-
-        // First truncation (no previous positions) — resets to 0
-        coord.truncate_wal_after_checkpoint(vec![100, 200]).unwrap();
-        assert_eq!(coord.wal_manager().unwrap().total_size(), 0);
-
-        // Write more data
-        coord
-            .wal_manager_mut()
-            .unwrap()
-            .writer(0)
-            .append_put(b"k2", b"v2")
-            .unwrap();
-        let size_after_write = coord.wal_manager().unwrap().total_size();
-        assert!(size_after_write > 0);
-
-        // Second truncation — truncates to previous positions (100, 200),
-        // not to 0. Since actual WAL positions are smaller than 100, this
-        // effectively keeps all current data as safety buffer.
-        coord.truncate_wal_after_checkpoint(vec![300, 400]).unwrap();
-        // Data should still be present (positions 100,200 are beyond what
-        // was written, so truncation is a no-op for the data range)
-        assert!(coord.wal_manager().unwrap().total_size() > 0);
-    }
-
-    #[test]
-    fn test_prepare_wal_with_changelog_drainer() {
-        use laminar_storage::incremental::StateChangelogBuffer;
-        use laminar_storage::incremental::StateChangelogEntry;
-        use std::sync::Arc;
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
-
-        // Set up a changelog buffer and drainer
-        let buf = Arc::new(StateChangelogBuffer::with_capacity(64));
-
-        // Push some entries
-        buf.push(StateChangelogEntry::put(1, 100, 0, 10));
-        buf.push(StateChangelogEntry::put(1, 200, 10, 20));
-        buf.push(StateChangelogEntry::delete(1, 300));
-
-        let drainer = ChangelogDrainer::new(buf, 100);
-        coord.register_changelog_drainer(drainer);
-
-        let result = coord.prepare_wal_for_checkpoint().unwrap();
-        assert_eq!(result.entries_drained, 3);
-        assert!(result.per_core_wal_positions.is_empty()); // No WAL manager
-
-        // Drainer should have pending entries
-        assert_eq!(coord.changelog_drainers()[0].pending_count(), 3);
-    }
+    // ── Changelog drainer tests ──
 
     #[tokio::test]
-    async fn test_full_checkpoint_with_wal_coordination() {
+    async fn test_checkpoint_flushes_changelog_drainers() {
         use laminar_storage::incremental::StateChangelogBuffer;
         use laminar_storage::incremental::StateChangelogEntry;
         use std::sync::Arc;
@@ -1830,76 +1567,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut coord = make_coordinator(dir.path());
 
-        // Set up WAL manager
-        let wal_dir = dir.path().join("wal");
-        std::fs::create_dir_all(&wal_dir).unwrap();
-        let wal_config = laminar_storage::per_core_wal::PerCoreWalConfig::new(&wal_dir, 2);
-        let wal = laminar_storage::per_core_wal::PerCoreWalManager::new(wal_config).unwrap();
-        coord.register_wal_manager(wal);
-
-        // Set up changelog drainer
         let buf = Arc::new(StateChangelogBuffer::with_capacity(64));
         buf.push(StateChangelogEntry::put(1, 100, 0, 10));
         let drainer = ChangelogDrainer::new(buf, 100);
         coord.register_changelog_drainer(drainer);
 
-        // Full cycle: checkpoint (WAL preparation is internal) → truncate
         let result = coord
             .checkpoint(HashMap::new(), Some(5000), None, HashMap::new(), None)
             .await
             .unwrap();
 
         assert!(result.success);
-
-        // Changelog drainer pending should be cleared after successful checkpoint
         assert_eq!(
             coord.changelog_drainers()[0].pending_count(),
             0,
             "pending entries should be cleared after checkpoint"
         );
-
-        // Manifest should have per-core WAL positions (captured internally)
-        let loaded = coord.store().load_latest().unwrap().unwrap();
-        assert_eq!(loaded.per_core_wal_positions.len(), 2);
-
-        // Truncate WAL
-        coord.truncate_wal_after_checkpoint(vec![]).unwrap();
-        assert_eq!(coord.wal_manager().unwrap().total_size(), 0);
-    }
-
-    #[test]
-    fn test_wal_manager_accessors() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
-
-        assert!(coord.wal_manager().is_none());
-        assert!(coord.wal_manager_mut().is_none());
-        assert!(coord.changelog_drainers().is_empty());
-
-        let wal_dir = dir.path().join("wal");
-        std::fs::create_dir_all(&wal_dir).unwrap();
-        let wal_config = laminar_storage::per_core_wal::PerCoreWalConfig::new(&wal_dir, 2);
-        let wal = laminar_storage::per_core_wal::PerCoreWalManager::new(wal_config).unwrap();
-        coord.register_wal_manager(wal);
-
-        assert!(coord.wal_manager().is_some());
-        assert!(coord.wal_manager_mut().is_some());
-    }
-
-    #[test]
-    fn test_coordinator_debug_with_wal() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
-
-        let wal_dir = dir.path().join("wal");
-        std::fs::create_dir_all(&wal_dir).unwrap();
-        let wal_config = laminar_storage::per_core_wal::PerCoreWalConfig::new(&wal_dir, 2);
-        let wal = laminar_storage::per_core_wal::PerCoreWalManager::new(wal_config).unwrap();
-        coord.register_wal_manager(wal);
-
-        let debug = format!("{coord:?}");
-        assert!(debug.contains("has_wal_manager: true"));
-        assert!(debug.contains("changelog_drainers: 0"));
     }
 
     // ── Checkpoint observability tests ──

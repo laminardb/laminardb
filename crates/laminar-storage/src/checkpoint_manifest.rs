@@ -3,7 +3,7 @@
 //! The [`CheckpointManifest`] is the single source of truth for checkpoint state,
 //! replacing the previously separate `PipelineCheckpoint`, `DagCheckpointResult`,
 //! and `CheckpointMetadata` types. One manifest captures ALL state at a point in
-//! time: source offsets, sink epochs, operator state, WAL positions, and watermarks.
+//! time: source offsets, sink epochs, operator state, and watermarks.
 //!
 //! ## Manifest Format
 //!
@@ -42,7 +42,7 @@ pub enum SinkCommitStatus {
 /// the three previously disconnected checkpoint systems:
 /// - `PipelineCheckpoint` (source offsets + sink epochs)
 /// - `DagCheckpointResult` (operator state — in-memory only)
-/// - `CheckpointMetadata` (WAL position + watermark)
+/// - `CheckpointMetadata` (watermark)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct CheckpointManifest {
     /// Manifest format version (for future evolution).
@@ -84,17 +84,6 @@ pub struct CheckpointManifest {
     /// Path to the table store checkpoint, if any.
     #[serde(default)]
     pub table_store_checkpoint_path: Option<String>,
-    /// WAL position for single-writer mode.
-    #[serde(default)]
-    pub wal_position: u64,
-    /// Per-core WAL positions at the time of operator snapshot.
-    ///
-    /// During recovery, WAL replay must start **after** these positions to
-    /// avoid replaying entries already reflected in the operator state.
-    /// Index `i` corresponds to the WAL segment for core `i`.
-    #[serde(default)]
-    pub per_core_wal_positions: Vec<u64>,
-
     // ── Time State ──
     /// Global watermark at checkpoint time.
     #[serde(default)]
@@ -306,8 +295,6 @@ impl CheckpointManifest {
             table_offsets: HashMap::new(),
             operator_states: HashMap::new(),
             table_store_checkpoint_path: None,
-            wal_position: 0,
-            per_core_wal_positions: Vec::new(),
             watermark: None,
             source_watermarks: HashMap::new(),
             source_names: Vec::new(),
@@ -527,7 +514,6 @@ mod tests {
         );
         m.sink_epochs.insert("pg-sink".into(), 9);
         m.watermark = Some(999_000);
-        m.wal_position = 4096;
         m.operator_states
             .insert("window-agg".into(), OperatorCheckpoint::inline(b"hello"));
 
@@ -537,8 +523,6 @@ mod tests {
         assert_eq!(restored.checkpoint_id, 42);
         assert_eq!(restored.epoch, 10);
         assert_eq!(restored.watermark, Some(999_000));
-        assert_eq!(restored.wal_position, 4096);
-
         let src = restored.source_offsets.get("kafka-src").unwrap();
         assert_eq!(src.offsets.get("partition-0"), Some(&"1234".into()));
         assert_eq!(restored.sink_epochs.get("pg-sink"), Some(&9));
@@ -562,7 +546,6 @@ mod tests {
         assert!(m.source_offsets.is_empty());
         assert!(m.sink_epochs.is_empty());
         assert!(m.operator_states.is_empty());
-        assert!(m.per_core_wal_positions.is_empty());
         assert!(m.watermark.is_none());
         assert!(!m.is_incremental);
     }
@@ -617,16 +600,6 @@ mod tests {
 
         assert!(restored.is_incremental);
         assert_eq!(restored.parent_id, Some(4));
-    }
-
-    #[test]
-    fn test_manifest_per_core_wal_positions() {
-        let mut m = CheckpointManifest::new(1, 1);
-        m.per_core_wal_positions = vec![100, 200, 300, 400];
-
-        let json = serde_json::to_string(&m).unwrap();
-        let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.per_core_wal_positions, vec![100, 200, 300, 400]);
     }
 
     #[test]
