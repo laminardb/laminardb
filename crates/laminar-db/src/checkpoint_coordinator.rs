@@ -373,9 +373,6 @@ impl CheckpointCoordinator {
     // ── Changelog drainers ──
 
     /// Registers a changelog drainer to flush before checkpointing.
-    ///
-    /// Multiple drainers may be registered (one per core or per state store).
-    /// All are flushed during [`flush_changelog_drainers()`](Self::flush_changelog_drainers).
     pub fn register_changelog_drainer(&mut self, drainer: ChangelogDrainer) {
         self.changelog_drainers.push(drainer);
     }
