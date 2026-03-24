@@ -960,6 +960,7 @@ impl KafkaSourceConfig {
         config.set("bootstrap.servers", &self.bootstrap_servers);
         config.set("group.id", &self.group_id);
         config.set("enable.auto.commit", "false");
+        config.set("enable.auto.offset.store", "false");
         config.set("auto.offset.reset", self.auto_offset_reset.as_rdkafka_str());
         config.set(
             "partition.assignment.strategy",
@@ -1056,6 +1057,7 @@ fn is_blocked_passthrough_key(key: &str) -> bool {
                 | "ssl.key.password"
                 | "ssl.endpoint.identification.algorithm"
                 | "enable.auto.commit"
+                | "enable.auto.offset.store"
                 | "enable.idempotence"
                 | "session.timeout.ms"
                 | "heartbeat.interval.ms"
