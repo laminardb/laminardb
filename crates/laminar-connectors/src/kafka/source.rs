@@ -97,6 +97,9 @@ pub struct KafkaSource {
     /// due to downstream backpressure. Used to re-pause newly assigned
     /// partitions during rebalance.
     reader_paused: Arc<AtomicBool>,
+    /// Set by `commit_callback` on async commit failure; reader task
+    /// escalates to `CommitMode::Sync` on the next commit timer tick.
+    commit_retry_needed: Arc<AtomicBool>,
 }
 
 impl KafkaSource {
@@ -150,6 +153,7 @@ impl KafkaSource {
             watermark_tracker,
             high_watermarks_rx: None,
             reader_paused: Arc::new(AtomicBool::new(false)),
+            commit_retry_needed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -214,6 +218,7 @@ impl KafkaSource {
             watermark_tracker,
             high_watermarks_rx: None,
             reader_paused: Arc::new(AtomicBool::new(false)),
+            commit_retry_needed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -289,6 +294,8 @@ impl KafkaSource {
         let broker_commit_interval = self.config.broker_commit_interval;
         let reader_channel_capacity = self.config.reader_channel_capacity;
         let reader_paused = Arc::clone(&self.reader_paused);
+        let revoke_generation = Arc::clone(&self.revoke_generation);
+        let commit_retry_needed = Arc::clone(&self.commit_retry_needed);
         let pause_threshold = self.config.backpressure_high_watermark;
         let resume_threshold = self.config.backpressure_low_watermark;
 
@@ -319,8 +326,25 @@ impl KafkaSource {
             hwm_timer.tick().await; // Skip the first tick.
 
             let mut is_paused = false;
+            let mut last_revoke_gen: u64 = 0;
 
             loop {
+                // Prune seen_partitions when a revoke event has occurred, so
+                // the HWM timer stops querying watermarks for revoked partitions.
+                let current_gen = revoke_generation.load(Ordering::Relaxed);
+                if current_gen != last_revoke_gen {
+                    last_revoke_gen = current_gen;
+                    if let Ok(assignment) = consumer.assignment() {
+                        let assigned_set: std::collections::HashSet<_> = assignment
+                            .elements()
+                            .iter()
+                            .map(|e| (Arc::from(e.topic()), e.partition()))
+                            .collect();
+                        seen_partitions
+                            .retain(|(t, p)| assigned_set.contains(&(Arc::clone(t), *p)));
+                    }
+                }
+
                 // Check channel fill ratio for pause/resume of Kafka partitions.
                 // This keeps consumer.recv() calling rd_kafka_consumer_poll()
                 // even when paused, preventing max.poll.interval.ms violations.
@@ -358,15 +382,38 @@ impl KafkaSource {
                     _ = commit_timer.tick(), if commit_enabled => {
                         let tpl = offset_rx.borrow().clone();
                         if tpl.count() > 0 {
-                            match consumer.commit(&tpl, CommitMode::Async) {
-                                Ok(()) => info!(
-                                    partitions = tpl.count(),
-                                    "periodic broker offset commit (advisory)"
-                                ),
-                                Err(e) => warn!(
-                                    error = %e,
-                                    "periodic broker offset commit failed (advisory)"
-                                ),
+                            if commit_retry_needed.load(Ordering::Acquire) {
+                                // Escalate to sync commit on the blocking pool
+                                // so we don't stall the reader or block shutdown.
+                                let c = Arc::clone(&consumer);
+                                let flag = Arc::clone(&commit_retry_needed);
+                                let n = tpl.count();
+                                tokio::task::spawn_blocking(move || {
+                                    match c.commit(&tpl, CommitMode::Sync) {
+                                        Ok(()) => {
+                                            flag.store(false, Ordering::Release);
+                                            info!(
+                                                partitions = n,
+                                                "sync offset commit retry succeeded"
+                                            );
+                                        }
+                                        Err(e) => warn!(
+                                            error = %e,
+                                            "sync offset commit retry failed"
+                                        ),
+                                    }
+                                });
+                            } else {
+                                match consumer.commit(&tpl, CommitMode::Async) {
+                                    Ok(()) => info!(
+                                        partitions = tpl.count(),
+                                        "periodic broker offset commit (advisory)"
+                                    ),
+                                    Err(e) => warn!(
+                                        error = %e,
+                                        "periodic broker offset commit failed"
+                                    ),
+                                }
                             }
                         }
                         continue;
@@ -453,10 +500,30 @@ impl KafkaSource {
                                 timestamp_ms,
                                 headers_json,
                             };
-                            if msg_tx.send(kp).await.is_err() {
-                                break;
+                            match msg_tx.try_send(kp) {
+                                Ok(()) => {
+                                    channel_len.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(kp)) => {
+                                    // Pause partitions BEFORE blocking so rdkafka
+                                    // stops prefetching while we wait for drain.
+                                    if !is_paused {
+                                        if let Ok(assignment) = consumer.assignment() {
+                                            if consumer.pause(&assignment).is_ok() {
+                                                is_paused = true;
+                                                reader_paused.store(true, Ordering::Relaxed);
+                                                debug!("reader: paused partitions (channel full)");
+                                            }
+                                        }
+                                    }
+                                    channel_len.fetch_add(1, Ordering::Relaxed);
+                                    if msg_tx.send(kp).await.is_err() {
+                                        channel_len.fetch_sub(1, Ordering::Relaxed);
+                                        break;
+                                    }
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                             }
-                            channel_len.fetch_add(1, Ordering::Relaxed);
                             data_ready.notify_one();
                         }
                     }
@@ -565,6 +632,7 @@ impl SourceConnector for KafkaSource {
             Arc::clone(&self.rebalance_counter),
             Arc::clone(&self.revoke_generation),
             Arc::clone(&self.reader_paused),
+            Arc::clone(&self.commit_retry_needed),
         );
         let consumer: StreamConsumer<LaminarConsumerContext> =
             rdkafka_config.create_with_context(context).map_err(|e| {

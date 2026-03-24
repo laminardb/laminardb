@@ -97,6 +97,9 @@ pub struct LaminarConsumerContext {
     /// partitions for backpressure. On `Assign`, newly assigned partitions
     /// must be re-paused if this flag is true.
     reader_paused: Arc<AtomicBool>,
+    /// Set by `commit_callback` on broker rejection; reader task escalates
+    /// to `CommitMode::Sync` on the next timer tick.
+    commit_retry_needed: Arc<AtomicBool>,
 }
 
 impl LaminarConsumerContext {
@@ -108,6 +111,7 @@ impl LaminarConsumerContext {
         rebalance_metric: Arc<AtomicU64>,
         revoke_generation: Arc<AtomicU64>,
         reader_paused: Arc<AtomicBool>,
+        commit_retry_needed: Arc<AtomicBool>,
     ) -> Self {
         Self {
             checkpoint_requested,
@@ -116,6 +120,7 @@ impl LaminarConsumerContext {
             rebalance_metric,
             revoke_generation,
             reader_paused,
+            commit_retry_needed,
         }
     }
 
@@ -196,6 +201,29 @@ impl ConsumerContext for LaminarConsumerContext {
             }
             Rebalance::Error(msg) => {
                 warn!(error = %msg, "kafka rebalance error");
+            }
+        }
+    }
+
+    fn commit_callback(
+        &self,
+        result: rdkafka::error::KafkaResult<()>,
+        offsets: &rdkafka::TopicPartitionList,
+    ) {
+        match result {
+            Ok(()) => {
+                tracing::debug!(
+                    partitions = offsets.count(),
+                    "broker offset commit confirmed"
+                );
+            }
+            Err(e) => {
+                self.commit_retry_needed.store(true, Ordering::Release);
+                warn!(
+                    error = %e,
+                    partitions = offsets.count(),
+                    "broker offset commit failed — scheduling sync retry"
+                );
             }
         }
     }
@@ -284,12 +312,14 @@ mod tests {
         let metric = Arc::new(AtomicU64::new(0));
         let revoke_gen = Arc::new(AtomicU64::new(0));
         let reader_paused = Arc::new(AtomicBool::new(false));
+        let commit_retry = Arc::new(AtomicBool::new(false));
         let ctx = LaminarConsumerContext::new(
             Arc::clone(&flag),
             state,
             metric,
             revoke_gen,
             reader_paused,
+            commit_retry,
         );
         (flag, ctx)
     }
