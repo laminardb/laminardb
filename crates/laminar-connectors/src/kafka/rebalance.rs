@@ -100,6 +100,10 @@ pub struct LaminarConsumerContext {
     /// Set by `commit_callback` on broker rejection; reader task escalates
     /// to `CommitMode::Sync` on the next timer tick.
     commit_retry_needed: Arc<AtomicBool>,
+    /// Snapshot of consumed offsets, updated once per `poll_batch()` cycle.
+    /// Read on Assign to seek newly assigned partitions to last-consumed
+    /// offset + 1, preventing duplicates after broker failures.
+    offset_snapshot: Arc<Mutex<super::offsets::OffsetTracker>>,
 }
 
 impl LaminarConsumerContext {
@@ -112,6 +116,7 @@ impl LaminarConsumerContext {
         revoke_generation: Arc<AtomicU64>,
         reader_paused: Arc<AtomicBool>,
         commit_retry_needed: Arc<AtomicBool>,
+        offset_snapshot: Arc<Mutex<super::offsets::OffsetTracker>>,
     ) -> Self {
         Self {
             checkpoint_requested,
@@ -121,6 +126,7 @@ impl LaminarConsumerContext {
             revoke_generation,
             reader_paused,
             commit_retry_needed,
+            offset_snapshot,
         }
     }
 
@@ -235,10 +241,51 @@ impl ConsumerContext for LaminarConsumerContext {
     ) {
         use rdkafka::consumer::Rebalance;
 
-        // After an Assign, the new partitions are committed to the consumer.
-        // If the reader task has paused partitions for backpressure, re-pause
-        // the newly assigned partitions before the next poll delivers messages.
         if let Rebalance::Assign(tpl) = rebalance {
+            // Seek assigned partitions to tracked offsets so we don't fall
+            // back to broker-stored group offsets (which may be stale or
+            // reset to earliest after a broker failure).
+            //
+            // Uses seek_partitions() instead of assign() to avoid clobbering
+            // the partition set under cooperative rebalancing, where the tpl
+            // contains only NEWLY assigned partitions (not the full set).
+            let assigned: Vec<(String, i32)> = tpl
+                .elements()
+                .iter()
+                .map(|e| (e.topic().to_string(), e.partition()))
+                .collect();
+
+            let seek_tpl = match self.offset_snapshot.lock() {
+                Ok(tracker) => tracker.to_seek_tpl(&assigned),
+                Err(poisoned) => poisoned.into_inner().to_seek_tpl(&assigned),
+            };
+
+            if seek_tpl.count() > 0 {
+                match base_consumer.seek_partitions(seek_tpl, std::time::Duration::ZERO) {
+                    Ok(result) => {
+                        let errors: Vec<_> = result
+                            .elements()
+                            .iter()
+                            .filter(|e| e.error().is_some())
+                            .map(|e| format!("{}-{}: {:?}", e.topic(), e.partition(), e.error()))
+                            .collect();
+                        if errors.is_empty() {
+                            info!(
+                                partitions = result.count(),
+                                "seeked assigned partitions to tracked offsets"
+                            );
+                        } else {
+                            warn!(?errors, "some partitions failed to seek to tracked offsets");
+                        }
+                    }
+                    Err(e) => warn!(
+                        error = %e,
+                        "failed to seek assigned partitions to tracked offsets"
+                    ),
+                }
+            }
+
+            // Re-pause newly assigned partitions if backpressure is active.
             if self.reader_paused.load(Ordering::Relaxed) {
                 if let Err(e) = base_consumer.pause(tpl) {
                     warn!(error = %e, "failed to re-pause newly assigned partitions");
@@ -313,6 +360,7 @@ mod tests {
         let revoke_gen = Arc::new(AtomicU64::new(0));
         let reader_paused = Arc::new(AtomicBool::new(false));
         let commit_retry = Arc::new(AtomicBool::new(false));
+        let offset_snapshot = Arc::new(Mutex::new(super::offsets::OffsetTracker::new()));
         let ctx = LaminarConsumerContext::new(
             Arc::clone(&flag),
             state,
@@ -320,6 +368,7 @@ mod tests {
             revoke_gen,
             reader_paused,
             commit_retry,
+            offset_snapshot,
         );
         (flag, ctx)
     }

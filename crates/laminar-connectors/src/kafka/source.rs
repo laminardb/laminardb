@@ -100,6 +100,9 @@ pub struct KafkaSource {
     /// Set by `commit_callback` on async commit failure; reader task
     /// escalates to `CommitMode::Sync` on the next commit timer tick.
     commit_retry_needed: Arc<AtomicBool>,
+    /// Offset snapshot shared with the rebalance callback for seek-on-assign.
+    /// Updated once per `poll_batch()` cycle (not per message).
+    offset_snapshot: Arc<Mutex<OffsetTracker>>,
 }
 
 impl KafkaSource {
@@ -154,6 +157,7 @@ impl KafkaSource {
             high_watermarks_rx: None,
             reader_paused: Arc::new(AtomicBool::new(false)),
             commit_retry_needed: Arc::new(AtomicBool::new(false)),
+            offset_snapshot: Arc::new(Mutex::new(OffsetTracker::new())),
         }
     }
 
@@ -219,6 +223,7 @@ impl KafkaSource {
             high_watermarks_rx: None,
             reader_paused: Arc::new(AtomicBool::new(false)),
             commit_retry_needed: Arc::new(AtomicBool::new(false)),
+            offset_snapshot: Arc::new(Mutex::new(OffsetTracker::new())),
         }
     }
 
@@ -633,6 +638,7 @@ impl SourceConnector for KafkaSource {
             Arc::clone(&self.revoke_generation),
             Arc::clone(&self.reader_paused),
             Arc::clone(&self.commit_retry_needed),
+            Arc::clone(&self.offset_snapshot),
         );
         let consumer: StreamConsumer<LaminarConsumerContext> =
             rdkafka_config.create_with_context(context).map_err(|e| {
@@ -902,7 +908,8 @@ impl SourceConnector for KafkaSource {
             }
         }
 
-        // Publish current offsets to the reader task for periodic broker commits.
+        // Publish current offsets to the reader task for periodic broker commits
+        // and to the rebalance callback for seek-on-assign.
         // After retain_assigned, self.offsets only contains assigned partitions.
         if had_revoke || !payload_offsets.is_empty() {
             if let Some(ref tx) = self.offset_commit_tx {
@@ -910,6 +917,10 @@ impl SourceConnector for KafkaSource {
                 if tx.send(tpl).is_err() {
                     debug!("offset_commit_tx closed, reader task shutting down");
                 }
+            }
+            match self.offset_snapshot.lock() {
+                Ok(mut snapshot) => snapshot.clone_from(&self.offsets),
+                Err(poisoned) => poisoned.into_inner().clone_from(&self.offsets),
             }
         }
 
@@ -1075,6 +1086,13 @@ impl SourceConnector for KafkaSource {
         );
 
         self.offsets = OffsetTracker::from_checkpoint(checkpoint);
+
+        // Propagate restored offsets to the rebalance callback so a
+        // rebalance before the first poll_batch() also seeks correctly.
+        match self.offset_snapshot.lock() {
+            Ok(mut snapshot) => snapshot.clone_from(&self.offsets),
+            Err(poisoned) => poisoned.into_inner().clone_from(&self.offsets),
+        }
 
         if let Some(ref consumer) = self.consumer {
             let tpl = self.offsets.to_topic_partition_list();
