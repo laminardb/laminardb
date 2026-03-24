@@ -1,185 +1,198 @@
 # Contributing to LaminarDB
 
-This guide covers development setup, code style, and the pull request process.
+Hey! Thanks for your interest in contributing. Whether it's a bug fix, a new connector, better tests, or a typo in the docs -- we appreciate it.
 
-## Prerequisites
+This guide will get you from zero to a working build in a few minutes.
 
-- **Rust 1.85+** (stable channel) -- see [rust-toolchain.toml](rust-toolchain.toml)
-- **cargo-deny** (optional) -- `cargo install cargo-deny` for dependency auditing
+## Quick Setup
 
-### Linux-only (optional features)
-
-Some features require system libraries on Linux:
+You need **Rust stable** (1.85+). That's it for the default build.
 
 ```bash
-# hwloc (NUMA topology discovery)
-sudo apt-get install libhwloc-dev
-
-# XDP/eBPF
-sudo apt-get install libelf-dev
-
-# Kafka (rdkafka)
-sudo apt-get install cmake pkg-config libsasl2-dev
-```
-
-## Getting Started
-
-```bash
-# Clone and build
 git clone https://github.com/laminardb/laminardb.git
 cd laminardb
 cargo build
-
-# Run all tests
-cargo test --all
-
-# Run tests with optional features
-cargo test --all --features kafka,postgres-cdc,mysql-cdc
-
-# Lint (must pass CI)
+cargo test --all --lib
 cargo clippy --all -- -D warnings
-
-# Format check
-cargo +nightly fmt --all -- --check
 ```
 
-## Project Structure
+If everything passes, you're good to go.
 
-| Crate | Ring | Purpose |
-|-------|------|---------|
-| `laminar-core` | 0 | Reactor, operators, state stores, streaming channels, JIT compiler |
-| `laminar-sql` | -- | SQL parser (streaming extensions), query planner, DataFusion integration |
-| `laminar-storage` | 1 | WAL, incremental checkpointing, checkpoint manifest |
-| `laminar-connectors` | 1 | Kafka, PostgreSQL CDC, MySQL CDC, MongoDB CDC, WebSocket, Delta Lake, files |
-| `laminar-db` | -- | Unified database facade, checkpoint coordination, FFI API |
-| `laminar-derive` | -- | Proc macros: `Record`, `FromRecordBatch`, `FromRow`, `ConnectorConfig` |
-| `laminar-server` | -- | Standalone server binary |
+### Optional system libraries (Linux only)
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
-
-## Development Guidelines
-
-### Code Style
-
-- Format with `cargo fmt` (nightly, default settings)
-- Lint with `cargo clippy -- -D warnings`
-- All public APIs must be documented (`#![deny(missing_docs)]`)
-- Use `thiserror` for library errors, `anyhow` for application code
-- Prefer explicit types for public APIs, inference for locals
-- Group imports: std, external crates, internal modules
-
-### Ring 0 Rules
-
-Code running on the hot path (Ring 0) must follow strict constraints:
-
-- **No heap allocations** -- Use bump/arena allocators. The `allocation-tracking` feature panics on allocation in marked sections.
-- **No locks** -- Use SPSC queues for inter-ring communication. No `Mutex`, `RwLock`, or `AtomicOrdering` beyond `Relaxed`.
-- **No system calls** -- Use io_uring (Linux) for async I/O. Avoid `println!`, file I/O, or network calls.
-- **No unbounded iteration** -- Task budget enforcement limits operator time slices.
-- **`// SAFETY:` comments** -- All `unsafe` blocks must have a safety justification comment.
-
-If you're modifying Ring 0 code, run the relevant benchmarks before and after:
+Some feature-gated connectors need extra libs. You only need these if you're working on that specific connector:
 
 ```bash
-cargo bench --bench state_bench
-cargo bench --bench throughput_bench
-cargo bench --bench latency_bench
+# Kafka (rdkafka)
+sudo apt-get install cmake pkg-config libsasl2-dev
+
+# NUMA topology (hwloc)
+sudo apt-get install libhwloc-dev
 ```
 
-### Testing
+## How the project is organized
+
+LaminarDB is a Rust workspace with 7 crates. Here's what each one does:
+
+| Crate | What it does |
+|-------|-------------|
+| **laminar-core** | The engine. Reactor, operators, state stores, DAG executor, streaming channels, checkpoint barriers. This is the hot path. |
+| **laminar-sql** | SQL parser with streaming extensions (EMIT, watermarks, windows), query planner, DataFusion integration. |
+| **laminar-storage** | WAL, incremental checkpointing, checkpoint manifests, per-core WAL segments. |
+| **laminar-connectors** | All external connectors: Kafka, PostgreSQL CDC, MySQL CDC, MongoDB CDC, Delta Lake, Iceberg, WebSocket, Parquet, files. Also the schema framework and serde layer. |
+| **laminar-db** | The main entry point. Ties everything together -- checkpoint coordination, recovery, streaming executor, FFI API. |
+| **laminar-derive** | Proc macros: `Record`, `FromRecordBatch`, `FromRow`, `ConnectorConfig`. |
+| **laminar-server** | Standalone server binary with TOML config, Axum HTTP API, hot reload, Prometheus metrics. |
+
+For the full architecture, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Where things live
+
+A few common starting points:
+
+- **Connector traits**: `crates/laminar-connectors/src/connector.rs` -- `SourceConnector` and `SinkConnector`
+- **Schema decoders**: `crates/laminar-connectors/src/schema/` -- JSON, CSV, Avro, Parquet
+- **SQL parser**: `crates/laminar-sql/src/parser/` -- streaming SQL extensions
+- **State stores**: `crates/laminar-core/src/state/` -- AHashMap, Mmap backends
+- **DAG operators**: `crates/laminar-core/src/dag/operators/` -- joins, windows, aggregations
+- **Checkpoint system**: `crates/laminar-core/src/checkpoint/` -- barriers, alignment
+- **Server HTTP API**: `crates/laminar-server/src/http.rs` -- REST endpoints
+- **FFI layer**: `crates/laminar-db/src/ffi/` -- C bindings for language interop
+- **Feature tracking**: `docs/features/INDEX.md` -- what's done, what's not
+
+## Feature flags
+
+Most connectors are behind feature flags so the default build stays fast. Here are the ones you'll see most:
+
+| Flag | What it enables |
+|------|----------------|
+| `kafka` | Kafka source/sink with Avro serde |
+| `postgres-cdc` | PostgreSQL CDC (logical replication) source |
+| `postgres-sink` | PostgreSQL sink |
+| `mysql-cdc` | MySQL CDC (binlog) source |
+| `mongodb-cdc` | MongoDB change stream source and sink |
+| `delta-lake` | Delta Lake source and sink |
+| `iceberg` | Apache Iceberg source and sink |
+| `websocket` | WebSocket source and sink |
+| `files` | File source and sink (AutoLoader-style) |
+| `parquet-lookup` | Parquet file lookup table source |
+| `ffi` | C FFI layer and Arrow C Data Interface |
+| `delta` | Distributed delta mode (Raft, gossip, gRPC) |
+
+To run tests with a specific connector:
 
 ```bash
-# Unit tests (all crates)
-cargo test --all
+cargo test --all --features kafka
+cargo test --all --features postgres-cdc,postgres-sink
+```
 
-# Specific crate
+## The hot path rules
+
+If you're touching code in `laminar-core` that runs on the event processing path (Ring 0), there are some strict rules:
+
+- **No heap allocations.** Use pre-allocated buffers, SmallVec, arena allocators.
+- **No locks.** SPSC queues for inter-ring communication. No Mutex, no RwLock.
+- **No system calls.** No println!, no file I/O, no network calls on the hot path.
+- **`// SAFETY:` comments** on every `unsafe` block. No exceptions.
+
+If you're not sure whether your code is on the hot path, it probably isn't. The hot path is the reactor loop in `laminar-core` -- most contributions (connectors, SQL, storage) run in Ring 1 where these rules don't apply.
+
+Run benchmarks before and after if you're touching performance-sensitive code:
+
+```bash
+cargo bench --bench state_bench       # State store lookups (<500ns target)
+cargo bench --bench latency_bench     # End-to-end event latency (<10us target)
+cargo bench --bench streaming_bench   # Throughput per core (500K events/sec target)
+```
+
+There are 13 benchmark suites across the workspace -- see `crates/*/benches/` for the full list.
+
+## Running tests
+
+```bash
+# All unit tests (this is what CI runs)
+cargo test --all --lib
+
+# A specific crate
 cargo test -p laminar-core
 
-# With feature flags
-cargo test --all --features kafka,postgres-cdc,mysql-cdc,delta-lake,websocket
+# A specific test by name
+cargo test -p laminar-sql test_parse_tumbling_window
 
-# Run benchmarks
-cargo bench
+# With connector features
+cargo test --all --features kafka,postgres-cdc,mysql-cdc
 
-# Specific benchmark
+# Benchmarks
 cargo bench --bench dag_bench
 ```
 
-### Feature Flags
+We have ~4,400 tests across the workspace. If you're adding new functionality, please add tests. If you're fixing a bug, a regression test is always welcome.
 
-Many features are optional to keep compile times manageable:
+## Code style
 
-| Flag | Crate | Purpose |
-|------|-------|---------|
-| `jit` | laminar-core, laminar-db | Cranelift JIT compilation |
-| `kafka` | laminar-connectors, laminar-db | Kafka source/sink, Avro serde |
-| `postgres-cdc` | laminar-connectors, laminar-db | PostgreSQL CDC source |
-| `postgres-sink` | laminar-connectors, laminar-db | PostgreSQL sink |
-| `mysql-cdc` | laminar-connectors, laminar-db | MySQL CDC source |
-| `mongodb-cdc` | laminar-connectors, laminar-db | MongoDB CDC source and sink |
-| `websocket` | laminar-connectors, laminar-db | WebSocket source and sink |
-| `delta-lake` | laminar-connectors, laminar-db | Delta Lake sink and source |
-| `files` | laminar-connectors, laminar-db | File source and sink |
-| `delta-lake-s3` | laminar-connectors | S3 storage backend for Delta Lake |
-| `ffi` | laminar-db | C FFI layer |
-| `api` | laminar-db | FFI-friendly API module |
-| `delta` | laminar-core, laminar-db | Distributed delta mode |
-| `allocation-tracking` | laminar-core | Panic on hot-path allocation |
-| `io-uring` | laminar-core | Linux io_uring integration |
-| `hwloc` | laminar-core | Enhanced NUMA topology |
-| `xdp` | laminar-core | Linux eBPF/XDP |
-| `parquet-lookup` | laminar-connectors | Parquet file lookup source |
+- **Format**: `cargo +nightly fmt --all` (we use nightly rustfmt for import grouping)
+- **Lint**: `cargo clippy --all -- -D warnings` (must be clean)
+- **Docs**: All public APIs need doc comments. We enforce `#![deny(missing_docs)]`.
+- **Errors**: Use `thiserror` in library crates, `anyhow` in the server binary.
+- **Imports**: Group as std, external crates, then internal modules.
 
-## Pull Request Process
+## Making a pull request
 
-1. **Fork** the repository and create a feature branch from `main`
-2. **Make your changes** -- keep commits focused and atomic
-3. **Add tests** for new functionality
-4. **Run the full check suite**:
+1. Fork the repo, create a branch from `main`
+2. Make your changes -- keep commits focused
+3. Add tests for new code
+4. Run the checks:
    ```bash
-   cargo fmt --all -- --check
+   cargo +nightly fmt --all -- --check
    cargo clippy --all -- -D warnings
-   cargo test --all
+   cargo test --all --lib
    ```
-5. **Update documentation** if you changed public APIs
-6. **Open a Pull Request** against `main`
+5. Open a PR against `main`
 
-### PR Checklist
-
-- [ ] Tests pass (`cargo test --all`)
-- [ ] No clippy warnings (`cargo clippy --all -- -D warnings`)
-- [ ] Code is formatted (`cargo fmt`)
-- [ ] Public APIs are documented
-- [ ] Ring 0 code verified (no allocations/locks) if applicable
-- [ ] Benchmarks run if performance-sensitive code changed
-
-### Review Policy
-
-- **Human-engaged reviews required.** AI-generated code is welcome, but every review response must be written or verified by a human. Rubber-stamping ("LGTM", "will fix") without explanation is not accepted.
-- **Explain your reasoning.** When approving or requesting changes, state *why* you agree or disagree — don't just list what you'll change. A review that says "I'll update the tests" without explaining the concern is incomplete.
-- **PRs without meaningful human review will not be merged.**
-
-### Commit Messages
+### Commit messages
 
 We use [Conventional Commits](https://www.conventionalcommits.org/):
 
 ```
-feat(core): add session window merge detection
+feat(connectors): add Redis lookup table source
 fix(sql): handle NULL in ASOF JOIN match condition
-perf(state): reduce FxHashMap lookup from 500ns to 350ns
-docs(readme): add Python quick start example
+test(checkpoint): add barrier alignment integration test
+perf(state): reduce AHashMap lookup from 500ns to 350ns
+docs(contributing): update project structure
 refactor(storage): extract WAL segment into separate module
-test(connectors): add Kafka exactly-once integration test
 chore(deps): update arrow to 57.2
 ```
 
-## Reporting Issues
+### Review policy
 
-Use the [GitHub issue templates](https://github.com/laminardb/laminardb/issues/new/choose):
+We welcome AI-assisted contributions, but we need a human in the loop.
 
-- **Bug Report** -- For bugs with reproduction steps
-- **Feature Request** -- For new feature suggestions
+**Every PR has a CI-enforced human attestation gate.** The PR template includes two checkboxes and a reviewer notes section. CI will block your PR if:
+
+- The "I have personally reviewed this entire diff" checkbox isn't checked
+- The "review comments explain why" checkbox isn't checked
+- The reviewer notes section is empty or too brief (minimum 30 characters explaining what you verified and why the change is correct)
+- The "Why" section doesn't explain the motivation (minimum 20 characters)
+
+This gate is a required status check on `main` -- there's no way around it.
+
+**AI-generated code is fine.** Use Copilot, Claude, Cursor, whatever helps you write better code faster. But *you* must understand what the code does, *you* must have run the tests, and *you* must be able to explain it in review.
+
+**Automated PR bots will be blocked.** If we see a pattern of PRs that look like an agent running on autopilot -- bulk low-quality PRs, no human in the review loop, copy-paste responses to review comments -- we'll close them and may block the account.
+
+**Open a draft PR early** if you want feedback before finishing. We'd rather help you course-correct than review a big surprise.
+
+## Good places to start
+
+Check out issues labeled [`good first issue`](https://github.com/laminardb/laminardb/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) -- these are scoped to be approachable without deep knowledge of the internals.
+
+Some areas that are especially welcoming to new contributors:
+
+- **Tests** -- We can always use more. Property tests, integration tests, edge cases.
+- **Documentation** -- Config options, connector setup guides, architecture docs.
+- **Connectors** -- Adding a new source or sink is self-contained. The `SourceConnector` and `SinkConnector` traits in `connector.rs` are the interface.
+- **Language bindings** -- Java, Node.js, .NET bindings are all open for contribution. The Python bindings and C FFI layer are the reference implementations.
 
 ## Questions?
 
-Open an issue on GitHub.
+Open an issue or drop a comment on any existing issue. There's no such thing as a dumb question. We'd rather help you get unstuck than have you give up quietly.

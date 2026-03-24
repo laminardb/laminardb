@@ -160,41 +160,6 @@ impl LaminarDB {
             let mut coord = CheckpointCoordinator::new(config, store);
             coord.set_counters(Arc::clone(&self.counters));
 
-            // Wire per-core WAL for crash recovery between checkpoints.
-            // Without this, all data since the last checkpoint is lost on crash.
-            let wal_dir = cp_config
-                .data_dir
-                .clone()
-                .or_else(|| self.config.storage_dir.clone())
-                .unwrap_or_else(|| std::path::PathBuf::from("./data"))
-                .join("wal");
-            // WAL uses one file per source (or per available core for
-            // external connectors).
-            let num_cores = if has_external {
-                std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
-            } else {
-                source_regs.len().max(1)
-            };
-            match laminar_storage::per_core_wal::PerCoreWalManager::new(
-                laminar_storage::per_core_wal::PerCoreWalConfig::new(&wal_dir, num_cores),
-            ) {
-                Ok(wal) => {
-                    tracing::info!(
-                        wal_dir = %wal_dir.display(),
-                        num_cores,
-                        "WAL manager initialized"
-                    );
-                    coord.register_wal_manager(wal);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "WAL initialization failed — running without WAL \
-                         (data between checkpoints may be lost on crash)"
-                    );
-                }
-            }
-
             *self.coordinator.lock().await = Some(coord);
         }
 

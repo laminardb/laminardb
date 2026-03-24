@@ -73,8 +73,7 @@ Durability and I/O, runs on Tokio async runtime.
 
 **Components:**
 - **Checkpoint Manager** -- Incremental checkpointing with directory-based snapshots. `CheckpointCoordinator` orchestrates two-phase commit across exactly-once sinks (`laminar-db/src/checkpoint_coordinator.rs`).
-- **WAL Writer** -- Per-core write-ahead log segments with CRC32C checksums, torn write detection, and fdatasync durability (`laminar-storage/src/per_core_wal/`).
-- **Changelog Drainer** -- Consumes changelog entries and persists them (`laminar-storage/src/changelog_drainer.rs`).
+- **Changelog Drainer** -- Consumes Ring 0 changelog entries for backpressure relief (`laminar-storage/src/changelog_drainer.rs`).
 - **Recovery Manager** -- Loads the latest checkpoint manifest and restores all operator state, connector offsets, and watermarks on startup (`laminar-db/src/recovery_manager.rs`).
 - **Connectors** -- External source/sink connectors (Kafka, CDC, Delta Lake, WebSocket) run as Tokio tasks.
 
@@ -132,9 +131,8 @@ laminar-sql           SQL parser (streaming extensions), query planner,
                       streaming physical optimizer, watermark filter pushdown,
                       cooperative scheduling, PROCTIME() UDF
                       |
-laminar-storage       Background I/O: WAL, incremental checkpointing, per-core WAL
-                      segments, checkpoint manifest, checkpoint store,
-                      changelog drainer
+laminar-storage       Background I/O: WAL, incremental checkpointing,
+                      checkpoint manifest, checkpoint store, changelog drainer
                       |
 laminar-connectors    Kafka source/sink, PostgreSQL CDC/sink, MySQL CDC,
                       MongoDB CDC source/sink, WebSocket source/sink,
@@ -330,7 +328,7 @@ Queries are planned by `StreamingPlanner` and executed via DataFusion, with comp
 | State lookup | < 500ns | 10-105ns (AHash get_ref: 10-16ns) | AHashMap, cache-aligned keys |
 | Event processing | < 1us | 0.55-1.16us | Zero allocation, inlined operators |
 | Throughput/core | 500K/s | 1.1-1.46M/s | Batch processing, Arrow columnar |
-| Checkpoint | < 10s recovery | 1.39ms | Full snapshots, per-core WAL |
+| Checkpoint | < 10s recovery | 1.39ms | Full snapshots, manifest-based recovery |
 | Window trigger | < 10us | not yet measured | Hierarchical timer wheel |
 
 See [BENCHMARKS.md](BENCHMARKS.md) for full benchmark baselines with hardware details.
