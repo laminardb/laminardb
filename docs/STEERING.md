@@ -70,7 +70,7 @@ Reactor, state stores, tumbling windows, DataFusion integration, WAL, checkpoint
 
 ### Phase 2: Production Hardening -- COMPLETE (38/38)
 
-All window types, all join types, exactly-once sinks, two-phase commit, per-core WAL, incremental checkpointing, Z-set changelog, cascading MVs, watermark variants. Thread-per-core (superseded by StreamingCoordinator, PR #204), NUMA (feature-gated), io_uring (feature-gated).
+All window types, all join types, exactly-once sinks, two-phase commit, incremental checkpointing, Z-set changelog, cascading MVs, watermark variants. Per-core WAL removed (dead code — recovery uses manifest snapshots, not WAL replay). Thread-per-core (superseded by StreamingCoordinator, PR #204), NUMA (feature-gated), io_uring (feature-gated).
 
 ### Phase 2.5: JIT Compiler -- REMOVED
 
