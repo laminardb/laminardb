@@ -57,13 +57,13 @@ LaminarDB development is organized into phases, each building on the previous. D
 
 ## Phase 2: Production Hardening -- COMPLETE
 
-**Goal**: Harden the engine with advanced window types, joins, per-core WAL, exactly-once sinks, and performance infrastructure.
+**Goal**: Harden the engine with advanced window types, joins, exactly-once sinks, and performance infrastructure.
 
 **Completed Features (38/38):**
 - Thread-per-core architecture with CPU pinning (F013-F015) (superseded by StreamingCoordinator, PR #204)
 - Sliding, hopping, and session windows with merge support (F016-F018)
 - Stream-stream, lookup, temporal, and ASOF joins (F019-F021, F056-F057)
-- Incremental checkpointing and per-core WAL (F022, F062)
+- Incremental checkpointing (F022) (per-core WAL F062 removed — dead code)
 - Exactly-once sinks with two-phase commit (F023-F024)
 - FIRST/LAST aggregates, cascading materialized views (F059-F060)
 - EMIT clause extension, changelog/retraction Z-sets (F011B, F063)

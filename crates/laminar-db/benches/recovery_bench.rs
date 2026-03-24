@@ -35,8 +35,6 @@ fn synthetic_state(size_bytes: usize) -> Vec<u8> {
 fn realistic_manifest(id: u64, num_sources: usize, num_operators: usize) -> CheckpointManifest {
     let mut m = CheckpointManifest::new(id, id);
     m.watermark = Some(1_000_000);
-    m.wal_position = 4096 * id;
-    m.per_core_wal_positions = vec![100, 200, 300, 400];
 
     for i in 0..num_sources {
         let name = format!("source_{i}");

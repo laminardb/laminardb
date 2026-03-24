@@ -91,7 +91,6 @@ pub use builder::LaminarDbBuilder;
 pub use catalog::{SourceCatalog, SourceEntry};
 pub use checkpoint_coordinator::{
     CheckpointConfig, CheckpointCoordinator, CheckpointPhase, CheckpointResult, CheckpointStats,
-    WalPrepareResult,
 };
 pub use config::{IdentifierCaseSensitivity, LaminarConfig, TieringConfig};
 pub use db::LaminarDB;
