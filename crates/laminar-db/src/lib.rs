@@ -73,6 +73,7 @@ mod table_backend;
 mod table_cache_mode;
 mod table_provider;
 mod table_store;
+mod temporal_probe;
 
 /// C FFI layer for LaminarDB.
 ///
@@ -90,7 +91,6 @@ pub use builder::LaminarDbBuilder;
 pub use catalog::{SourceCatalog, SourceEntry};
 pub use checkpoint_coordinator::{
     CheckpointConfig, CheckpointCoordinator, CheckpointPhase, CheckpointResult, CheckpointStats,
-    WalPrepareResult,
 };
 pub use config::{IdentifierCaseSensitivity, LaminarConfig, TieringConfig};
 pub use db::LaminarDB;

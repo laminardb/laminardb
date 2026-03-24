@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::DbError;
 use crate::metrics::PipelineCounters;
 use crate::stream_executor::{
-    apply_topk_filter, detect_asof_query, detect_stream_join_query, detect_temporal_query,
-    extract_table_references,
+    apply_topk_filter, detect_asof_query, detect_stream_join_query, detect_temporal_probe_query,
+    detect_temporal_query, extract_table_references,
 };
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{
@@ -238,9 +238,26 @@ impl OperatorGraph {
         order_config: Option<OrderOperatorConfig>,
     ) {
         // Detection (same as StreamExecutor::add_query)
-        let (asof_config, mut projection_sql) = detect_asof_query(&sql);
-        let (temporal_config, temporal_projection_sql) = detect_temporal_query(&sql);
-        let (stream_join_config, stream_join_projection_sql) = detect_stream_join_query(&sql);
+        let (temporal_probe_config, temporal_probe_projection_sql) =
+            detect_temporal_probe_query(&sql);
+        let (asof_config, mut projection_sql) = if temporal_probe_config.is_none() {
+            detect_asof_query(&sql)
+        } else {
+            (None, None)
+        };
+        let (temporal_config, temporal_projection_sql) = if temporal_probe_config.is_none() {
+            detect_temporal_query(&sql)
+        } else {
+            (None, None)
+        };
+        let (stream_join_config, stream_join_projection_sql) = if temporal_probe_config.is_none() {
+            detect_stream_join_query(&sql)
+        } else {
+            (None, None)
+        };
+        if projection_sql.is_none() {
+            projection_sql = temporal_probe_projection_sql;
+        }
         if projection_sql.is_none() {
             projection_sql = temporal_projection_sql;
         }
@@ -277,11 +294,15 @@ impl OperatorGraph {
             asof_config.as_ref(),
             temporal_config.as_ref(),
             stream_join_config.as_ref(),
+            temporal_probe_config.as_ref(),
             projection_sql.as_deref(),
         );
 
         // Determine input port count
-        let input_port_count = if asof_config.is_some() || stream_join_config.is_some() {
+        let input_port_count = if asof_config.is_some()
+            || stream_join_config.is_some()
+            || temporal_probe_config.is_some()
+        {
             2
         } else {
             1
@@ -307,7 +328,12 @@ impl OperatorGraph {
                     self.ensure_source_node(table_ref);
                 }
             }
-            if let Some(ref asof_cfg) = asof_config {
+            if let Some(ref tpc) = temporal_probe_config {
+                self.find_node(&tpc.left_table)
+                    .unwrap_or_else(|| self.ensure_source_node(&tpc.left_table));
+                self.find_node(&tpc.right_table)
+                    .unwrap_or_else(|| self.ensure_source_node(&tpc.right_table));
+            } else if let Some(ref asof_cfg) = asof_config {
                 self.find_node(&asof_cfg.left_table)
                     .unwrap_or_else(|| self.ensure_source_node(&asof_cfg.left_table));
                 self.find_node(&asof_cfg.right_table)
@@ -320,7 +346,12 @@ impl OperatorGraph {
             }
 
             // Create inbound edges to the replaced node
-            if let Some(ref asof_cfg) = asof_config {
+            if let Some(ref tpc) = temporal_probe_config {
+                let left_id = self.find_node(&tpc.left_table).expect("source ensured");
+                let right_id = self.find_node(&tpc.right_table).expect("source ensured");
+                self.add_edge(left_id, node_id, 0);
+                self.add_edge(right_id, node_id, 1);
+            } else if let Some(ref asof_cfg) = asof_config {
                 let left_id = self
                     .find_node(&asof_cfg.left_table)
                     .expect("source ensured");
@@ -364,7 +395,12 @@ impl OperatorGraph {
 
         // Ensure source nodes exist BEFORE creating the operator node so
         // that source node indices are stable when building edges.
-        if let Some(ref asof_cfg) = asof_config {
+        if let Some(ref tpc) = temporal_probe_config {
+            self.find_node(&tpc.left_table)
+                .unwrap_or_else(|| self.ensure_source_node(&tpc.left_table));
+            self.find_node(&tpc.right_table)
+                .unwrap_or_else(|| self.ensure_source_node(&tpc.right_table));
+        } else if let Some(ref asof_cfg) = asof_config {
             self.find_node(&asof_cfg.left_table)
                 .unwrap_or_else(|| self.ensure_source_node(&asof_cfg.left_table));
             self.find_node(&asof_cfg.right_table)
@@ -399,7 +435,16 @@ impl OperatorGraph {
         self.input_bufs.push(vec![Vec::new(); input_port_count]);
 
         // Create edges from table refs
-        if let Some(ref asof_cfg) = asof_config {
+        if let Some(ref tpc) = temporal_probe_config {
+            let left_id = self
+                .find_node(&tpc.left_table)
+                .expect("source node ensured above");
+            let right_id = self
+                .find_node(&tpc.right_table)
+                .expect("source node ensured above");
+            self.add_edge(left_id, node_id, 0);
+            self.add_edge(right_id, node_id, 1);
+        } else if let Some(ref asof_cfg) = asof_config {
             let left_id = self
                 .find_node(&asof_cfg.left_table)
                 .expect("source node ensured above");
@@ -470,9 +515,21 @@ impl OperatorGraph {
         asof_config: Option<&laminar_sql::translator::AsofJoinTranslatorConfig>,
         temporal_config: Option<&TemporalJoinTranslatorConfig>,
         stream_join_config: Option<&laminar_sql::translator::StreamJoinConfig>,
+        temporal_probe_config: Option<&laminar_sql::translator::TemporalProbeConfig>,
         projection_sql: Option<&str>,
     ) -> Box<dyn GraphOperator> {
         use crate::operators;
+
+        if let Some(cfg) = temporal_probe_config {
+            return Box::new(
+                operators::temporal_probe_join::TemporalProbeJoinOperator::new(
+                    name,
+                    cfg.clone(),
+                    projection_sql.map(Arc::from),
+                    self.ctx.clone(),
+                ),
+            );
+        }
 
         if let Some(cfg) = asof_config {
             return Box::new(operators::asof_join::AsofJoinOperator::new(
@@ -1502,5 +1559,76 @@ mod tests {
         let r = graph.execute_cycle(&source, i64::MAX).await.unwrap();
         assert_eq!(total_rows(&r, "q1"), 2); // AAPL + GOOG
         assert_eq!(total_rows(&r, "q2"), 1); // Only GOOG (price=2800 > 200)
+    }
+
+    #[tokio::test]
+    async fn test_temporal_probe_through_graph() {
+        let ctx = laminar_sql::create_session_context();
+        laminar_sql::register_streaming_functions(&ctx);
+        let mut graph = OperatorGraph::new(ctx);
+
+        let trades_schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+        ]));
+        let market_schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("mts", DataType::Int64, false),
+            Field::new("mprice", DataType::Float64, false),
+        ]));
+
+        graph.register_source_schema("trades".to_string(), trades_schema.clone());
+        graph.register_source_schema("market_data".to_string(), market_schema);
+
+        graph.add_query(
+            "probed".to_string(),
+            "SELECT t.symbol, p.offset_ms, mprice \
+             FROM trades t \
+             TEMPORAL PROBE JOIN market_data m ON (symbol) \
+             TIMESTAMPS (ts, mts) LIST (0s, 5s) AS p"
+                .to_string(),
+            None,
+            None,
+            None,
+        );
+
+        // Cycle 1: inject both sides, watermark=102k (only offset=0 resolves)
+        let trades = RecordBatch::try_new(
+            trades_schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["AAPL"])),
+                Arc::new(Int64Array::from(vec![100_000])),
+                Arc::new(Float64Array::from(vec![152.5])),
+            ],
+        )
+        .unwrap();
+        let market = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("symbol", DataType::Utf8, false),
+                Field::new("mts", DataType::Int64, false),
+                Field::new("mprice", DataType::Float64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["AAPL", "AAPL"])),
+                Arc::new(Int64Array::from(vec![100_000, 105_000])),
+                Arc::new(Float64Array::from(vec![150.0, 155.0])),
+            ],
+        )
+        .unwrap();
+
+        let mut sources = FxHashMap::default();
+        sources.insert(Arc::from("trades"), vec![trades]);
+        sources.insert(Arc::from("market_data"), vec![market]);
+
+        let r1 = graph.execute_cycle(&sources, 102_000).await.unwrap();
+        let rows1 = total_rows(&r1, "probed");
+        assert_eq!(rows1, 1, "only offset=0 should resolve at watermark=102k");
+
+        // Cycle 2: no new data, advance watermark past offset=5000 (probe_ts=105000)
+        let empty = FxHashMap::default();
+        let r2 = graph.execute_cycle(&empty, 110_000).await.unwrap();
+        let rows2 = total_rows(&r2, "probed");
+        assert_eq!(rows2, 1, "offset=5000 should resolve at watermark=110k");
     }
 }

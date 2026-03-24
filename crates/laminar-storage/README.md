@@ -4,7 +4,7 @@ Storage layer for LaminarDB -- WAL, checkpointing, and recovery.
 
 ## Overview
 
-Ring 1 durability: write-ahead logging with per-core segments, incremental checkpointing with directory-based snapshots, and checkpoint manifests. Never blocks Ring 0.
+Ring 1 durability: incremental checkpointing with directory-based snapshots, checkpoint manifests, and a single-writer WAL for the incremental subsystem. Never blocks Ring 0.
 
 Note: Lakehouse connectors (Delta Lake) are in `laminar-connectors`, not here. This crate handles LaminarDB's internal durability.
 
@@ -13,46 +13,29 @@ Note: Lakehouse connectors (Delta Lake) are in `laminar-connectors`, not here. T
 | Module | Purpose |
 |--------|---------|
 | `wal` | Write-ahead log with CRC32C checksums, torn write detection, fdatasync |
-| `per_core_wal` | Per-core WAL segments for lock-free per-core writers, epoch ordering |
 | `incremental` | Incremental checkpointing with directory-based delta snapshots |
 | `checkpoint` | Checkpoint manager, object-store checkpointer, checkpoint layout |
 | `checkpoint_manifest` | `CheckpointManifest`, `ConnectorCheckpoint`, `OperatorCheckpoint` |
 | `checkpoint_store` | `CheckpointStore` trait, `FileSystemCheckpointStore` (atomic writes) |
 | `changelog_drainer` | Ring 1 SPSC changelog consumer |
-| `wal_state_store` | Combines state store with WAL for durability |
-| `io_uring_wal` | io_uring-backed WAL for Linux 5.10+ (feature-gated) |
 
 ## Key Types
 
 - **`WriteAheadLog`** -- Core WAL with CRC32C checksums and torn write detection
-- **`PerCoreWalManager`** / **`CoreWalWriter`** -- Per-core WAL segments (one per CPU core)
 - **`IncrementalCheckpointManager`** -- Directory-based incremental checkpointing
 - **`ObjectStoreCheckpointer`** -- Cloud object store checkpoint backend
 - **`CheckpointManifest`** -- Serializable snapshot of all operator and connector state
-- **`RecoveryManager`** -- Restores state from checkpoint + WAL replay
+- **`RecoveryManager`** -- Restores state from checkpoint manifests
 - **`ChangelogDrainer`** -- Consumes Ring 0 changelog entries via SPSC queues
-- **`CheckpointCoordinator`** -- Coordinates per-core WAL checkpoint epochs
 
 ## Checkpoint Architecture
 
 ```
 Ring 0                          Ring 1
 +------------------+            +------------------+
-| ChangelogAware   |  SPSC -->  | Changelog        |
-| StateStore       |            | Drainer          |
+| Operators        |  snapshot  | Checkpoint       |
+| (FxHashMap state)|  -------> | Coordinator      |
 +------------------+            +--------+---------+
-                                         |
-                                         v
-                                +--------+---------+
-                                | Per-Core WAL     |
-                                | (CRC32C, epoch)  |
-                                +--------+---------+
-                                         |
-                                         v
-                                +--------+---------+
-                                | Incremental      |
-                                | Checkpoint Mgr   |
-                                +--------+---------+
                                          |
                                          v
                                 +--------+---------+
@@ -60,6 +43,9 @@ Ring 0                          Ring 1
                                 | (FS / Object)    |
                                 +------------------+
 ```
+
+Recovery loads the latest `CheckpointManifest` and restores operator state
+and source offsets directly -- no WAL replay.
 
 ## Benchmarks
 

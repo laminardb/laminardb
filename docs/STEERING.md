@@ -1,42 +1,60 @@
 # Steering Document
 
-> Last Updated: February 28, 2026
+> Last Updated: March 23, 2026
 
 ## Current Focus
 
-**Phase 3 Connectors & Integration** -- 85% complete (85/100 features)
+**Overall: 213/249 features complete (86%)**
 
 ### Active Work
 
-Phase 3 is nearly complete. The remaining 15 features are all in Draft status:
+Phase 3 is nearly complete with 5 remaining features. Phase 6c server infrastructure is 80% done. Phase 5 admin features are 40% done.
 
-| Feature | Priority | Notes |
-|---------|----------|-------|
-| MongoDB CDC Source (F029) | P2 | Not started |
-| Redis Lookup Table (F030) | P1 | Not started |
-| Delta Lake Recovery (F031B) | P1 | Spec written |
-| Delta Lake Compaction (F031C) | P1 | Spec written |
-| Delta Lake Schema Evolution (F031D) | P1 | Spec written |
-| Iceberg I/O Integration (F032A) | P1 | Blocked by iceberg-datafusion DF 52.0 compat |
-| Parquet File Source (F033) | P2 | Not started |
-| Async State Access (F058) | P2 | Not started |
-| Historical Backfill (F061) | P2 | Not started |
-| Protobuf Format Decoder (F-SCHEMA-008) | P2 | Spec written |
-| Stateful Streaming SQL (F-SSQL-000 through F-SSQL-006) | -- | Complete (merged PR #128) |
-| SQL audit P2 (SHOW, EXPLAIN ANALYZE, ASOF NEAREST) | -- | Complete (merged PR #136) |
-| Unified error handling with LDB-NNNN codes | -- | Complete (merged PR #134) |
+| Feature | Priority | Phase | Notes |
+|---------|----------|-------|-------|
+| Redis Lookup Table (F030) | P1 | Phase 3 | Not started |
+| Parquet Streaming Source (F033) | P2 | Phase 3 | Lookup source exists, streaming TBD |
+| Async State Access (F058) | P2 | Phase 3 | Not started |
+| Historical Backfill (F061) | P2 | Phase 3 | Not started |
+| Protobuf Format Decoder (F-SCHEMA-008) | P2 | Phase 3 | Spec written |
+| Unaligned Checkpoints (F-DCKP-006) | P2 | Phase 6c | Config structs only |
+| redb Secondary Indexes (F-IDX-001) | P2 | Phase 6a | Spec only, no implementation |
 
-### Phase 6 Status
+### Recently Completed (not previously tracked)
 
+| Feature | Phase | Notes |
+|---------|-------|-------|
+| MongoDB CDC Source (F029) | Phase 3 | Full change stream, resume tokens, testcontainers tests (4,507 LOC) |
+| Delta Lake Recovery (F031B) | Phase 3 | Epoch skip, txn actions, conflict retry |
+| Delta Lake Compaction (F031C) | Phase 3 | Adaptive interval, vacuum, background task |
+| Delta Lake Schema Evolution (F031D) | Phase 3 | Diff engine, safe widening, wired to sink |
+| Iceberg I/O Integration (F032A) | Phase 3 | REST/Glue/Hive catalogs, incremental mode |
+| MmapStateStore (F-STATE-003) | Phase 6a | Full implementation (1,008 LOC) |
+| All 6 SERVER features (F-SERVER-001 to 006) | Phase 6c | TOML config, engine, HTTP API, hot reload, delta mode, graceful shutdown |
+| Transactional Sink 2PC (F-E2E-002) | Phase 6c | Kafka/Postgres/Delta/Files implementations |
+| Idempotent Sink (F-E2E-003) | Phase 6c | Per-sink dedup strategies |
+| Admin REST API (F046) | Phase 5 | Axum, 13 endpoints |
+| Prometheus Export (F050) | Phase 5 | /metrics with 15+ counters |
+| Health Checks (F052) | Phase 5 | /health + /ready |
+| CLI Tools (F055) | Phase 5 | clap args, --validate-checkpoints |
+| JSONB (F-POPT-008) | Perf | Binary JSON codec, O(log n) field access |
+| SQL Plan Cache (F-POPT-009) | Perf | Compiled PhysicalExpr + cached plan fallback |
+
+### Phase Status
+
+- **Phase 3** (Connectors): 95/100 features complete (95%)
+- **Phase 5** (Admin & Observability): 4/10 features complete (40%)
 - **Phase 6a** (Partition-Parallel Embedded): 27/29 features complete (93%)
 - **Phase 6b** (Delta Foundation): 14/14 features complete (100%)
-- **Phase 6c** (Delta Production Hardening): 0/10 features (planned)
+- **Phase 6c** (Delta Production Hardening): 8/10 features complete (80%)
+- **Perf Optimization**: 2/12 features complete (17%)
 
 ### Next Priorities
 
-1. Complete remaining Phase 3 P1 features (Delta Lake advanced, Redis lookup)
-2. Begin Phase 6c server infrastructure (TOML config, engine construction, HTTP API)
-3. Phase 4/5 security and admin features can begin in parallel
+1. Complete remaining Phase 3 features (Redis lookup, Parquet streaming source)
+2. Phase 4 security features can begin (no implementation exists)
+3. Phase 5 remaining admin features (web dashboard, OTel, alerting)
+4. Unaligned checkpoint state machine (F-DCKP-006)
 
 ---
 
@@ -52,7 +70,7 @@ Reactor, state stores, tumbling windows, DataFusion integration, WAL, checkpoint
 
 ### Phase 2: Production Hardening -- COMPLETE (38/38)
 
-All window types, all join types, exactly-once sinks, two-phase commit, per-core WAL, incremental checkpointing, Z-set changelog, cascading MVs, watermark variants. Thread-per-core (superseded by StreamingCoordinator, PR #204), NUMA (feature-gated), io_uring (feature-gated).
+All window types, all join types, exactly-once sinks, two-phase commit, incremental checkpointing, Z-set changelog, cascading MVs, watermark variants. Per-core WAL removed (dead code — recovery uses manifest snapshots, not WAL replay). Thread-per-core (superseded by StreamingCoordinator, PR #204), NUMA (feature-gated), io_uring (feature-gated).
 
 ### Phase 2.5: JIT Compiler -- REMOVED
 
@@ -115,10 +133,11 @@ All Phase 1 P0 issues resolved:
 
 ### Remaining
 
-- [ ] Phase 4/5 crate stubs are empty (auth, admin, observe) -- implementation planned
-- [ ] Server binary is skeleton only -- Phase 6c will implement
-- [ ] Iceberg I/O integration blocked by iceberg-datafusion compatibility
-- [ ] Performance optimization features (12 identified, all planned)
+- [ ] Phase 4 security features -- no implementation exists (crate stubs deleted)
+- [ ] Phase 5 remaining: web dashboard, OTel, alerting, SQL console, advanced config
+- [ ] Performance optimization features (10 remaining of 12 identified)
+- [ ] Unaligned checkpoint state machine (F-DCKP-006)
+- [ ] redb secondary indexes (F-IDX-001) -- spec only
 
 ---
 
@@ -149,8 +168,8 @@ All Phase 1 P0 issues resolved:
 | Phase 2 Complete | 2026-01-31 | Done |
 | Phase 2.5 JIT Complete | 2026-02-03 | Done |
 | Phase 6a/6b Complete | 2026-02-15 | Done (6b), 93% (6a) |
-| Phase 3 Complete | TBD | 85% |
-| Phase 6c Server | TBD | Planned |
+| Phase 3 Complete | TBD | 95% |
+| Phase 6c Server | TBD | 80% |
 | Phase 4 Security | TBD | Planned |
-| Phase 5 Admin | TBD | Planned |
+| Phase 5 Admin | TBD | 40% |
 | First public release | TBD | Planned |

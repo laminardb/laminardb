@@ -56,6 +56,10 @@ pub struct IcebergSink {
     /// Cached table handle (updated after each commit).
     #[cfg(feature = "iceberg")]
     table: Option<iceberg::table::Table>,
+    /// Arrow schema derived from the Iceberg table schema (carries
+    /// `PARQUET:field_id` metadata required by the Iceberg Parquet writer).
+    #[cfg(feature = "iceberg")]
+    iceberg_arrow_schema: Option<SchemaRef>,
 }
 
 impl IcebergSink {
@@ -77,6 +81,8 @@ impl IcebergSink {
             catalog: None,
             #[cfg(feature = "iceberg")]
             table: None,
+            #[cfg(feature = "iceberg")]
+            iceberg_arrow_schema: None,
         }
     }
 
@@ -88,6 +94,91 @@ impl IcebergSink {
     fn clear_staged(&mut self) {
         self.staged_batches.clear();
         self.staged_rows = 0;
+    }
+
+    /// Reprojects a pipeline `RecordBatch` onto the Iceberg-derived Arrow
+    /// schema so that every field carries `PARQUET:field_id` metadata.
+    ///
+    /// Fast path: when the batch schema fields match the Iceberg schema
+    /// field-for-field (same names, types, count), just swap the schema
+    /// wrapper — columns are already in the right order.
+    ///
+    /// Slow path: match columns by name, cast where types differ (safe
+    /// widening validated in `open()`), fill nullable extras with nulls.
+    #[cfg(feature = "iceberg")]
+    fn align_batch_to_iceberg_schema(
+        &self,
+        batch: &RecordBatch,
+    ) -> Result<RecordBatch, ConnectorError> {
+        let target_schema =
+            self.iceberg_arrow_schema
+                .as_ref()
+                .ok_or_else(|| ConnectorError::InvalidState {
+                    expected: "open".into(),
+                    actual: "iceberg arrow schema not initialized".into(),
+                })?;
+
+        // Fast path: field names, types, and count match — only metadata differs.
+        // Avoids per-column name lookup and Vec construction.
+        let batch_schema = batch.schema();
+        if batch_schema.fields().len() == target_schema.fields().len()
+            && batch_schema
+                .fields()
+                .iter()
+                .zip(target_schema.fields().iter())
+                .all(|(a, b)| a.name() == b.name() && a.data_type() == b.data_type())
+        {
+            return RecordBatch::try_new(target_schema.clone(), batch.columns().to_vec()).map_err(
+                |e| ConnectorError::WriteError(format!("align batch to iceberg schema: {e}")),
+            );
+        }
+
+        // Slow path: column reordering, type casting, or null-filling needed.
+        let mut columns = Vec::with_capacity(target_schema.fields().len());
+
+        for field in target_schema.fields() {
+            if let Ok(col_idx) = batch_schema.index_of(field.name()) {
+                let col = batch.column(col_idx);
+                if col.data_type() == field.data_type() {
+                    columns.push(col.clone());
+                } else {
+                    columns.push(arrow_cast::cast(col, field.data_type()).map_err(|e| {
+                        ConnectorError::WriteError(format!(
+                            "cast field '{}' from {} to {}: {e}",
+                            field.name(),
+                            col.data_type(),
+                            field.data_type(),
+                        ))
+                    })?);
+                }
+            } else if field.is_nullable() {
+                // Nullable Iceberg column not in pipeline — fill with nulls.
+                columns.push(arrow_array::new_null_array(
+                    field.data_type(),
+                    batch.num_rows(),
+                ));
+            } else {
+                return Err(ConnectorError::SchemaMismatch(format!(
+                    "Iceberg column '{}' is NOT NULL but missing from pipeline",
+                    field.name(),
+                )));
+            }
+        }
+
+        // Detect batch columns that would be silently dropped — every field
+        // in the source batch must map to a field in the target schema.
+        for field in batch_schema.fields() {
+            if target_schema.field_with_name(field.name()).is_err() {
+                return Err(ConnectorError::SchemaMismatch(format!(
+                    "pipeline column '{}' has no matching field in Iceberg table schema \
+                     (schema evolved since open?)",
+                    field.name(),
+                )));
+            }
+        }
+
+        RecordBatch::try_new(target_schema.clone(), columns)
+            .map_err(|e| ConnectorError::WriteError(format!("align batch to iceberg schema: {e}")))
     }
 
     /// Parses compression config string to parquet Compression.
@@ -102,6 +193,26 @@ impl IcebergSink {
                 parquet::basic::ZstdLevel::try_new(3).unwrap_or_default(),
             ),
         }
+    }
+
+    /// Checks that every pipeline field still exists in the refreshed
+    /// Iceberg Arrow schema. Returns `SchemaMismatch` on drift.
+    #[cfg(feature = "iceberg")]
+    fn validate_schema_not_drifted(&self) -> Result<(), ConnectorError> {
+        if let (Some(pipeline_schema), Some(target_schema)) =
+            (&self.schema, &self.iceberg_arrow_schema)
+        {
+            for field in pipeline_schema.fields() {
+                if target_schema.field_with_name(field.name()).is_err() {
+                    return Err(ConnectorError::SchemaMismatch(format!(
+                        "pipeline field '{}' no longer exists in Iceberg table schema \
+                         (concurrent schema evolution?)",
+                        field.name(),
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Writes staged batches to Iceberg as data files and commits.
@@ -128,6 +239,8 @@ impl IcebergSink {
         let location = table.metadata().location().to_string();
         let schema = table.current_schema_ref();
 
+        self.validate_schema_not_drifted()?;
+
         let props = parquet::file::properties::WriterProperties::builder()
             .set_compression(Self::parquet_compression(&self.config.compression))
             .build();
@@ -139,6 +252,12 @@ impl IcebergSink {
             if batch.num_rows() == 0 {
                 continue;
             }
+
+            // Reproject the batch onto the Iceberg-derived Arrow schema so
+            // that every field carries PARQUET:field_id metadata. Without
+            // this the writer cannot correlate Arrow fields with Iceberg
+            // field IDs and fails with "Field id N not found in struct array".
+            let aligned = self.align_batch_to_iceberg_schema(batch)?;
 
             let file_path = format!(
                 "{location}/data/{}-{}-{idx}.parquet",
@@ -156,7 +275,7 @@ impl IcebergSink {
                 .map_err(|e| ConnectorError::WriteError(format!("build parquet writer: {e}")))?;
 
             writer
-                .write(batch)
+                .write(&aligned)
                 .await
                 .map_err(|e| ConnectorError::WriteError(format!("parquet write: {e}")))?;
 
@@ -186,8 +305,33 @@ impl IcebergSink {
         )
         .await?;
 
-        // Cache the updated table so the next commit sees the new snapshot.
+        // The Iceberg commit is durable at this point. Update table handle
+        // unconditionally so the next commit sees the new snapshot.
         self.table = Some(updated_table);
+
+        // Best-effort schema refresh — keep the cached Arrow schema in sync
+        // with the table for the next epoch. A failure here must NOT prevent
+        // epoch advancement: if commit_to_iceberg() returned Err after the
+        // durable commit, commit_epoch() would skip last_committed_epoch
+        // update, and the next retry would duplicate the append.
+        let table = self.table.as_ref().expect("just set above");
+        let new_iceberg_schema = table.current_schema_ref();
+        match iceberg::arrow::schema_to_arrow_schema(&new_iceberg_schema) {
+            Ok(arrow_schema) => {
+                self.iceberg_arrow_schema = Some(std::sync::Arc::new(arrow_schema));
+            }
+            Err(e) => {
+                // Invalidate the cache so the next align_batch_to_iceberg_schema()
+                // fails with InvalidState rather than silently writing with stale
+                // field IDs that no longer match table.current_schema_ref().
+                self.iceberg_arrow_schema = None;
+                warn!(
+                    epoch = self.current_epoch,
+                    error = %e,
+                    "failed to refresh Iceberg Arrow schema; cache invalidated"
+                );
+            }
+        }
 
         info!(
             epoch = self.current_epoch,
@@ -229,6 +373,10 @@ impl SinkConnector for IcebergSink {
                     ConnectorError::SchemaMismatch(format!("iceberg→arrow schema: {e}"))
                 })?,
             );
+
+            // Store the Iceberg-derived Arrow schema (with PARQUET:field_id
+            // metadata) for use during Parquet writes.
+            self.iceberg_arrow_schema = Some(table_schema.clone());
 
             if self.schema.is_none() {
                 self.schema = Some(table_schema.clone());
@@ -365,6 +513,7 @@ impl SinkConnector for IcebergSink {
         {
             self.catalog = None;
             self.table = None;
+            self.iceberg_arrow_schema = None;
         }
         self.state = ConnectorState::Closed;
         Ok(())
