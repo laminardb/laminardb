@@ -40,7 +40,9 @@ pub enum ServerHandle {
 }
 
 impl ServerHandle {
-    /// Block until `ctrl_c` is received, then gracefully shut down.
+    /// Block until a shutdown signal is received, then gracefully shut down.
+    ///
+    /// Handles SIGINT (Ctrl-C) on all platforms and SIGTERM on Unix.
     pub async fn wait_for_shutdown(self) -> Result<(), ServerError> {
         match self {
             Self::Embedded {
@@ -48,9 +50,7 @@ impl ServerHandle {
                 api_handle,
                 watcher_handle,
             } => {
-                signal::ctrl_c()
-                    .await
-                    .map_err(|e| ServerError::Shutdown(format!("signal handler failed: {e}")))?;
+                wait_for_termination_signal().await?;
 
                 info!("Received shutdown signal, shutting down...");
 
@@ -70,6 +70,30 @@ impl ServerHandle {
                 .await
                 .map_err(|e| ServerError::Delta(e.to_string())),
         }
+    }
+}
+
+/// Wait for SIGINT or SIGTERM (Unix) / SIGINT (Windows).
+async fn wait_for_termination_signal() -> Result<(), ServerError> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())
+            .map_err(|e| ServerError::Shutdown(format!("SIGTERM handler failed: {e}")))?;
+        tokio::select! {
+            result = signal::ctrl_c() => {
+                result.map_err(|e| ServerError::Shutdown(format!("SIGINT handler failed: {e}")))?;
+            }
+            _ = sigterm.recv() => {}
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        signal::ctrl_c()
+            .await
+            .map_err(|e| ServerError::Shutdown(format!("signal handler failed: {e}")))?;
+        Ok(())
     }
 }
 

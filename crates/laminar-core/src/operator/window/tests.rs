@@ -585,39 +585,39 @@ fn test_late_data_config_with_side_output() {
 
 #[test]
 fn test_late_data_metrics_initial() {
-    let metrics = LateDataMetrics::new();
-    assert_eq!(metrics.late_events_total(), 0);
-    assert_eq!(metrics.late_events_dropped(), 0);
-    assert_eq!(metrics.late_events_side_output(), 0);
+    let metrics = LateDataMetrics::default();
+    assert_eq!(metrics.late_events_total, 0);
+    assert_eq!(metrics.late_events_dropped, 0);
+    assert_eq!(metrics.late_events_side_output, 0);
 }
 
 #[test]
 fn test_late_data_metrics_tracking() {
-    let mut metrics = LateDataMetrics::new();
+    let mut metrics = LateDataMetrics::default();
 
     metrics.record_dropped();
     metrics.record_dropped();
     metrics.record_side_output();
 
-    assert_eq!(metrics.late_events_total(), 3);
-    assert_eq!(metrics.late_events_dropped(), 2);
-    assert_eq!(metrics.late_events_side_output(), 1);
+    assert_eq!(metrics.late_events_total, 3);
+    assert_eq!(metrics.late_events_dropped, 2);
+    assert_eq!(metrics.late_events_side_output, 1);
 }
 
 #[test]
 fn test_late_data_metrics_reset() {
-    let mut metrics = LateDataMetrics::new();
+    let mut metrics = LateDataMetrics::default();
 
     metrics.record_dropped();
     metrics.record_side_output();
 
-    assert_eq!(metrics.late_events_total(), 2);
+    assert_eq!(metrics.late_events_total, 2);
 
     metrics.reset();
 
-    assert_eq!(metrics.late_events_total(), 0);
-    assert_eq!(metrics.late_events_dropped(), 0);
-    assert_eq!(metrics.late_events_side_output(), 0);
+    assert_eq!(metrics.late_events_total, 0);
+    assert_eq!(metrics.late_events_dropped, 0);
+    assert_eq!(metrics.late_events_side_output, 0);
 }
 
 #[test]
@@ -677,8 +677,8 @@ fn test_late_event_dropped_without_side_output() {
     assert!(is_late_event, "Expected LateEvent output");
 
     // Metrics should show dropped
-    assert_eq!(operator.late_data_metrics().late_events_dropped(), 1);
-    assert_eq!(operator.late_data_metrics().late_events_side_output(), 0);
+    assert_eq!(operator.late_data_metrics().late_events_dropped, 1);
+    assert_eq!(operator.late_data_metrics().late_events_side_output, 0);
 }
 
 #[test]
@@ -725,8 +725,8 @@ fn test_late_event_routed_to_side_output() {
     assert_eq!(side_output.as_deref(), Some("late_events"));
 
     // Metrics should show side output
-    assert_eq!(operator.late_data_metrics().late_events_dropped(), 0);
-    assert_eq!(operator.late_data_metrics().late_events_side_output(), 1);
+    assert_eq!(operator.late_data_metrics().late_events_dropped, 0);
+    assert_eq!(operator.late_data_metrics().late_events_side_output, 1);
 }
 
 #[test]
@@ -772,7 +772,7 @@ fn test_event_within_lateness_not_late() {
     );
 
     // No late events recorded
-    assert_eq!(operator.late_data_metrics().late_events_total(), 0);
+    assert_eq!(operator.late_data_metrics().late_events_total, 0);
 }
 
 #[test]
@@ -802,12 +802,12 @@ fn test_reset_late_data_metrics() {
         operator.process(&late_event, &mut ctx);
     }
 
-    assert_eq!(operator.late_data_metrics().late_events_total(), 1);
+    assert_eq!(operator.late_data_metrics().late_events_total, 1);
 
     // Reset metrics
     operator.reset_late_data_metrics();
 
-    assert_eq!(operator.late_data_metrics().late_events_total(), 0);
+    assert_eq!(operator.late_data_metrics().late_events_total, 0);
 }
 
 #[test]
@@ -1011,7 +1011,7 @@ fn test_emit_strategy_final_drops_late_data() {
         "EMIT FINAL should silently drop late data"
     );
     assert_eq!(
-        operator.late_data_metrics().late_events_dropped(),
+        operator.late_data_metrics().late_events_dropped,
         1,
         "Late event should be recorded as dropped"
     );
@@ -1983,40 +1983,40 @@ fn test_f64_factory_types() {
 
 #[test]
 fn test_window_close_metrics_basic() {
-    let mut metrics = WindowCloseMetrics::new();
-    assert_eq!(metrics.windows_closed_total(), 0);
+    let mut metrics = WindowCloseMetrics::default();
+    assert_eq!(metrics.windows_closed_total, 0);
     assert_eq!(metrics.avg_close_latency_ms(), 0);
-    assert_eq!(metrics.max_close_latency_ms(), 0);
+    assert_eq!(metrics.close_latency_max_ms, 0);
 
     // Record a close with 500ms latency (window_end=1000, processing_time=1500)
     metrics.record_close(1000, 1500);
-    assert_eq!(metrics.windows_closed_total(), 1);
+    assert_eq!(metrics.windows_closed_total, 1);
     assert_eq!(metrics.avg_close_latency_ms(), 500);
-    assert_eq!(metrics.max_close_latency_ms(), 500);
+    assert_eq!(metrics.close_latency_max_ms, 500);
 
     // Record another with 200ms latency
     metrics.record_close(2000, 2200);
-    assert_eq!(metrics.windows_closed_total(), 2);
+    assert_eq!(metrics.windows_closed_total, 2);
     assert_eq!(metrics.avg_close_latency_ms(), 350); // (500+200)/2
-    assert_eq!(metrics.max_close_latency_ms(), 500);
+    assert_eq!(metrics.close_latency_max_ms, 500);
 
     // Record another with 1000ms latency (new max)
     metrics.record_close(3000, 4000);
-    assert_eq!(metrics.windows_closed_total(), 3);
-    assert_eq!(metrics.max_close_latency_ms(), 1000);
+    assert_eq!(metrics.windows_closed_total, 3);
+    assert_eq!(metrics.close_latency_max_ms, 1000);
 }
 
 #[test]
 fn test_window_close_metrics_reset() {
-    let mut metrics = WindowCloseMetrics::new();
+    let mut metrics = WindowCloseMetrics::default();
     metrics.record_close(1000, 1500);
     metrics.record_close(2000, 2200);
-    assert_eq!(metrics.windows_closed_total(), 2);
+    assert_eq!(metrics.windows_closed_total, 2);
 
     metrics.reset();
-    assert_eq!(metrics.windows_closed_total(), 0);
+    assert_eq!(metrics.windows_closed_total, 0);
     assert_eq!(metrics.avg_close_latency_ms(), 0);
-    assert_eq!(metrics.max_close_latency_ms(), 0);
+    assert_eq!(metrics.close_latency_max_ms, 0);
 }
 
 #[test]
@@ -2059,7 +2059,7 @@ fn test_tumbling_window_close_metrics_on_timer() {
         operator.on_timer(win_timer_1, &mut ctx);
     }
 
-    assert_eq!(operator.window_close_metrics().windows_closed_total(), 1);
+    assert_eq!(operator.window_close_metrics().windows_closed_total, 1);
     assert_eq!(operator.active_windows_count(), 1);
 
     // Fire window 2
@@ -2072,7 +2072,7 @@ fn test_tumbling_window_close_metrics_on_timer() {
         operator.on_timer(win_timer_2, &mut ctx);
     }
 
-    assert_eq!(operator.window_close_metrics().windows_closed_total(), 2);
+    assert_eq!(operator.window_close_metrics().windows_closed_total, 2);
     assert_eq!(operator.active_windows_count(), 0);
 }
 
@@ -2102,7 +2102,7 @@ fn test_window_close_metrics_empty_window_not_counted() {
     }
 
     assert_eq!(
-        operator.window_close_metrics().windows_closed_total(),
+        operator.window_close_metrics().windows_closed_total,
         0,
         "Empty window should not increment closed counter"
     );
@@ -2390,7 +2390,7 @@ fn test_eowc_tumbling_late_data_dropped_after_close() {
         "Late event after EOWC close must not produce a new Event"
     );
 
-    assert_eq!(operator.late_data_metrics().late_events_dropped(), 1);
+    assert_eq!(operator.late_data_metrics().late_events_dropped, 1);
 }
 
 #[test]
@@ -2455,7 +2455,7 @@ fn test_eowc_tumbling_late_data_side_output() {
         Some("late_trades"),
         "Late event should be routed to side output"
     );
-    assert_eq!(operator.late_data_metrics().late_events_side_output(), 1);
+    assert_eq!(operator.late_data_metrics().late_events_side_output, 1);
 }
 
 #[test]

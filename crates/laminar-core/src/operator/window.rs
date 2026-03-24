@@ -118,45 +118,18 @@ impl LateDataConfig {
 }
 
 /// Metrics for tracking late data.
-///
-/// These counters track the behavior of the late data handling system
-/// and can be used for monitoring and alerting.
 #[derive(Debug, Clone, Default)]
 #[allow(clippy::struct_field_names)]
 pub struct LateDataMetrics {
     /// Total number of late events received
-    late_events_total: u64,
+    pub late_events_total: u64,
     /// Number of late events dropped (no side output configured)
-    late_events_dropped: u64,
+    pub late_events_dropped: u64,
     /// Number of late events routed to side output
-    late_events_side_output: u64,
+    pub late_events_side_output: u64,
 }
 
 impl LateDataMetrics {
-    /// Creates a new metrics tracker.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns the total number of late events received.
-    #[must_use]
-    pub fn late_events_total(&self) -> u64 {
-        self.late_events_total
-    }
-
-    /// Returns the number of late events that were dropped.
-    #[must_use]
-    pub fn late_events_dropped(&self) -> u64 {
-        self.late_events_dropped
-    }
-
-    /// Returns the number of late events routed to side output.
-    #[must_use]
-    pub fn late_events_side_output(&self) -> u64 {
-        self.late_events_side_output
-    }
-
     /// Records a dropped late event.
     pub fn record_dropped(&mut self) {
         self.late_events_total += 1;
@@ -178,42 +151,19 @@ impl LateDataMetrics {
 }
 
 /// Metrics for tracking window close behavior.
-///
-/// These counters track window lifecycle events and can be used for
-/// monitoring watermark lag and window throughput. Particularly useful
-/// for [`EmitStrategy::OnWindowClose`] where each window emits exactly
-/// once.
 #[derive(Debug, Clone, Default)]
 pub struct WindowCloseMetrics {
     /// Total number of windows that have emitted and closed
-    windows_closed_total: u64,
+    pub windows_closed_total: u64,
     /// Sum of close latencies in milliseconds (for computing averages)
-    close_latency_sum_ms: i64,
+    pub close_latency_sum_ms: i64,
     /// Maximum close latency observed (milliseconds)
-    close_latency_max_ms: i64,
+    pub close_latency_max_ms: i64,
 }
 
 impl WindowCloseMetrics {
-    /// Creates a new metrics tracker.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns the total number of windows that have emitted and closed.
-    #[must_use]
-    pub fn windows_closed_total(&self) -> u64 {
-        self.windows_closed_total
-    }
-
-    /// Returns the average window close latency in milliseconds.
-    ///
-    /// Close latency measures the delay between `window_end` and the
-    /// actual emission time (`processing_time`). This reflects watermark
-    /// lag — how long after the window boundary the watermark advances
-    /// enough to trigger emission.
-    ///
-    /// Returns 0 if no windows have been closed.
+    /// Average window close latency in milliseconds. Returns 0 if no
+    /// windows have been closed.
     #[must_use]
     pub fn avg_close_latency_ms(&self) -> i64 {
         if self.windows_closed_total == 0 {
@@ -223,18 +173,7 @@ impl WindowCloseMetrics {
         }
     }
 
-    /// Returns the maximum close latency observed (milliseconds).
-    #[must_use]
-    pub fn max_close_latency_ms(&self) -> i64 {
-        self.close_latency_max_ms
-    }
-
     /// Records a window close event.
-    ///
-    /// # Arguments
-    ///
-    /// * `window_end` - The exclusive upper bound of the closed window
-    /// * `processing_time` - The wall-clock time at which the window emitted
     pub fn record_close(&mut self, window_end: i64, processing_time: i64) {
         self.windows_closed_total += 1;
         let latency = processing_time.saturating_sub(window_end).max(0);
@@ -3379,8 +3318,8 @@ where
             periodic_timer_windows: FxHashSet::default(),
             emit_strategy: EmitStrategy::default(),
             late_data_config: LateDataConfig::default(),
-            late_data_metrics: LateDataMetrics::new(),
-            window_close_metrics: WindowCloseMetrics::new(),
+            late_data_metrics: LateDataMetrics::default(),
+            window_close_metrics: WindowCloseMetrics::default(),
             operator_id: format!("tumbling_window_{operator_num}"),
             output_schema,
             last_emitted: FxHashMap::default(),
@@ -3419,8 +3358,8 @@ where
             periodic_timer_windows: FxHashSet::default(),
             emit_strategy: EmitStrategy::default(),
             late_data_config: LateDataConfig::default(),
-            late_data_metrics: LateDataMetrics::new(),
-            window_close_metrics: WindowCloseMetrics::new(),
+            late_data_metrics: LateDataMetrics::default(),
+            window_close_metrics: WindowCloseMetrics::default(),
             operator_id,
             output_schema,
             last_emitted: FxHashMap::default(),

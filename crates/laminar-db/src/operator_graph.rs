@@ -124,6 +124,9 @@ pub(crate) struct OperatorGraph {
     source_map: FxHashMap<Arc<str>, usize>,
     output_map: FxHashMap<Arc<str>, usize>,
     input_bufs: Vec<Vec<Vec<RecordBatch>>>,
+    /// Maximum batches per input port before shedding. Prevents unbounded
+    /// fan-out growth within a single cycle. `0` means unlimited (default).
+    max_input_buf_batches: usize,
     query_budget_ns: u64,
     max_state_bytes: Option<usize>,
     ctx: SessionContext,
@@ -147,6 +150,7 @@ impl OperatorGraph {
             source_map: FxHashMap::default(),
             output_map: FxHashMap::default(),
             input_bufs: Vec::new(),
+            max_input_buf_batches: 0,
             query_budget_ns: 8_000_000,
             max_state_bytes: None,
             ctx,
@@ -165,6 +169,13 @@ impl OperatorGraph {
         self.max_state_bytes = limit;
     }
 
+    /// Set maximum batches per operator input port. When fan-out would
+    /// exceed this limit, the oldest batches are shed and a warning is
+    /// logged. `0` means unlimited.
+    pub fn set_max_input_buf_batches(&mut self, cap: usize) {
+        self.max_input_buf_batches = cap;
+    }
+
     pub fn set_query_budget_ns(&mut self, ns: u64) {
         self.query_budget_ns = ns;
     }
@@ -178,6 +189,26 @@ impl OperatorGraph {
         registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
     ) {
         self.lookup_registry = Some(registry);
+    }
+
+    /// Shed oldest batches from an input buffer when it exceeds the cap.
+    fn enforce_input_buf_cap(&mut self, node: usize, port: usize) {
+        let cap = self.max_input_buf_batches;
+        if cap == 0 {
+            return;
+        }
+        let buf = &mut self.input_bufs[node][port];
+        if buf.len() > cap {
+            let shed = buf.len() - cap;
+            buf.drain(..shed);
+            tracing::warn!(
+                node = %self.nodes[node].name,
+                port,
+                shed,
+                cap,
+                "input buffer exceeded cap — shed oldest batches"
+            );
+        }
     }
 
     /// Register a source schema so that empty placeholder tables can be
@@ -867,14 +898,17 @@ impl OperatorGraph {
                 let routes = self.nodes[node_id].output_routes.clone();
                 if routes.len() == 1 {
                     let (target, port) = routes[0];
-                    if self.input_bufs[target][port as usize].is_empty() {
-                        self.input_bufs[target][port as usize] = batches;
+                    let buf = &mut self.input_bufs[target][port as usize];
+                    if buf.is_empty() {
+                        *buf = batches;
                     } else {
-                        self.input_bufs[target][port as usize].extend(batches);
+                        buf.extend(batches);
                     }
+                    self.enforce_input_buf_cap(target, port as usize);
                 } else if routes.len() > 1 {
                     for &(target, port) in &routes {
                         self.input_bufs[target][port as usize].extend(batches.iter().cloned());
+                        self.enforce_input_buf_cap(target, port as usize);
                     }
                 }
             }
