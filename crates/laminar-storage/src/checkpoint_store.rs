@@ -137,7 +137,7 @@ pub trait CheckpointStore: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`CheckpointStoreError::NotFound`] if the checkpoint does not exist.
+    /// Returns `Ok(None)` if the checkpoint does not exist.
     fn load_by_id(&self, id: u64) -> Result<Option<CheckpointManifest>, CheckpointStoreError>;
 
     /// Lists all available checkpoints as `(checkpoint_id, epoch)` pairs.
@@ -1234,8 +1234,6 @@ mod tests {
         m.operator_states
             .insert("window".into(), OperatorCheckpoint::inline(b"data"));
         m.watermark = Some(999_000);
-        m.wal_position = 4096;
-        m.per_core_wal_positions = vec![100, 200];
 
         store.save(&m).unwrap();
 
@@ -1243,8 +1241,6 @@ mod tests {
         assert_eq!(loaded.checkpoint_id, 1);
         assert_eq!(loaded.epoch, 5);
         assert_eq!(loaded.watermark, Some(999_000));
-        assert_eq!(loaded.wal_position, 4096);
-        assert_eq!(loaded.per_core_wal_positions, vec![100, 200]);
 
         let src = loaded.source_offsets.get("kafka-src").unwrap();
         assert_eq!(src.offsets.get("0"), Some(&"1000".into()));

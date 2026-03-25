@@ -7,7 +7,6 @@
 //! - [`wal`]: Write-ahead log for durability and exactly-once semantics
 //! - [`checkpoint`]: Basic checkpointing for fast recovery
 //! - [`incremental`]: Incremental checkpointing
-//! - [`per_core_wal`]: Per-core WAL segments for thread-per-core architecture
 //!
 //! **Note:** Lakehouse sinks (Delta Lake, Iceberg) are in `laminar-connectors` crate,
 //! not here. This crate handles `LaminarDB`'s internal durability, not external storage formats.
@@ -36,9 +35,6 @@ pub mod changelog_drainer;
 
 /// Incremental checkpointing - Directory-based checkpoint architecture
 pub mod incremental;
-
-/// Per-core WAL segments - Thread-per-core WAL for lock-free writes
-pub mod per_core_wal;
 
 /// Object store factory — builds S3, GCS, Azure, or local backends from URL schemes.
 pub mod object_store_builder;
@@ -69,11 +65,4 @@ pub use incremental::{
     validate_checkpoint, wal_size, CheckpointConfig, IncrementalCheckpointError,
     IncrementalCheckpointManager, IncrementalCheckpointMetadata, RecoveredState, RecoveryConfig,
     RecoveryManager, StateChangelogBuffer, StateChangelogEntry, StateOp,
-};
-
-// Re-export per-core WAL types
-pub use per_core_wal::{
-    recover_per_core, CoreWalWriter, PerCoreCheckpointCoordinator, PerCoreRecoveredState,
-    PerCoreRecoveryManager, PerCoreWalConfig, PerCoreWalEntry, PerCoreWalError, PerCoreWalManager,
-    PerCoreWalReader, SegmentStats, WalOperation,
 };

@@ -35,7 +35,7 @@ use crate::health::HealthStatus;
 use crate::metrics::ConnectorMetrics;
 
 use super::config::MongoDbSinkConfig;
-use super::metrics::MongoSinkMetrics;
+use super::metrics::MongoDbSinkMetrics;
 use super::timeseries::CollectionKind;
 use super::write_model::WriteMode;
 
@@ -63,7 +63,7 @@ pub struct MongoDbSink {
     last_flush: Instant,
 
     /// Sink metrics.
-    metrics: MongoSinkMetrics,
+    metrics: MongoDbSinkMetrics,
 
     /// `MongoDB` client (feature-gated).
     #[cfg(feature = "mongodb-cdc")]
@@ -86,7 +86,7 @@ impl MongoDbSink {
             buffer: Vec::with_capacity(buf_capacity),
             buffered_rows: 0,
             last_flush: Instant::now(),
-            metrics: MongoSinkMetrics::new(),
+            metrics: MongoDbSinkMetrics::new(),
             #[cfg(feature = "mongodb-cdc")]
             client: None,
             #[cfg(feature = "mongodb-cdc")]

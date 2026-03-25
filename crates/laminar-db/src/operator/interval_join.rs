@@ -18,7 +18,7 @@ use crate::aggregate_state::JoinStateCheckpoint;
 use crate::error::DbError;
 use crate::interval_join::{execute_interval_join_cycle, IntervalJoinState};
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
-use crate::stream_executor::CompiledPostProjection;
+use crate::sql_analysis::CompiledPostProjection;
 
 /// Checkpoint format version for interval join state.
 pub(crate) struct IntervalJoinOperator {

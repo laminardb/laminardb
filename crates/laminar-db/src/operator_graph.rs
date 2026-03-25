@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::DbError;
 use crate::metrics::PipelineCounters;
-use crate::stream_executor::{
+use crate::sql_analysis::{
     apply_topk_filter, detect_asof_query, detect_stream_join_query, detect_temporal_probe_query,
     detect_temporal_query, extract_table_references,
 };
@@ -124,6 +124,9 @@ pub(crate) struct OperatorGraph {
     source_map: FxHashMap<Arc<str>, usize>,
     output_map: FxHashMap<Arc<str>, usize>,
     input_bufs: Vec<Vec<Vec<RecordBatch>>>,
+    /// Maximum batches per input port before shedding. Prevents unbounded
+    /// fan-out growth within a single cycle. `0` means unlimited (default).
+    max_input_buf_batches: usize,
     query_budget_ns: u64,
     max_state_bytes: Option<usize>,
     ctx: SessionContext,
@@ -147,6 +150,7 @@ impl OperatorGraph {
             source_map: FxHashMap::default(),
             output_map: FxHashMap::default(),
             input_bufs: Vec::new(),
+            max_input_buf_batches: 0,
             query_budget_ns: 8_000_000,
             max_state_bytes: None,
             ctx,
@@ -165,6 +169,13 @@ impl OperatorGraph {
         self.max_state_bytes = limit;
     }
 
+    /// Set maximum batches per operator input port. When fan-out would
+    /// exceed this limit, the oldest batches are shed and a warning is
+    /// logged. `0` means unlimited.
+    pub fn set_max_input_buf_batches(&mut self, cap: usize) {
+        self.max_input_buf_batches = cap;
+    }
+
     pub fn set_query_budget_ns(&mut self, ns: u64) {
         self.query_budget_ns = ns;
     }
@@ -178,6 +189,26 @@ impl OperatorGraph {
         registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
     ) {
         self.lookup_registry = Some(registry);
+    }
+
+    /// Shed oldest batches from an input buffer when it exceeds the cap.
+    fn enforce_input_buf_cap(&mut self, node: usize, port: usize) {
+        let cap = self.max_input_buf_batches;
+        if cap == 0 {
+            return;
+        }
+        let buf = &mut self.input_bufs[node][port];
+        if buf.len() > cap {
+            let shed = buf.len() - cap;
+            buf.drain(..shed);
+            tracing::warn!(
+                node = %self.nodes[node].name,
+                port,
+                shed,
+                cap,
+                "input buffer exceeded cap — shed oldest batches"
+            );
+        }
     }
 
     /// Register a source schema so that empty placeholder tables can be
@@ -223,6 +254,105 @@ impl OperatorGraph {
         self.nodes[source].output_routes.push((target, target_port));
     }
 
+    /// Ensure source/passthrough nodes exist for all upstream tables referenced
+    /// by a query's join configs or plain table references.
+    fn ensure_query_source_nodes(
+        &mut self,
+        temporal_probe_config: Option<&laminar_sql::translator::TemporalProbeConfig>,
+        asof_config: Option<&laminar_sql::translator::AsofJoinTranslatorConfig>,
+        stream_join_config: Option<&laminar_sql::translator::StreamJoinConfig>,
+        temporal_config: Option<&TemporalJoinTranslatorConfig>,
+        table_refs: &FxHashSet<String>,
+    ) {
+        if let Some(tpc) = temporal_probe_config {
+            self.find_node(&tpc.left_table)
+                .unwrap_or_else(|| self.ensure_source_node(&tpc.left_table));
+            self.find_node(&tpc.right_table)
+                .unwrap_or_else(|| self.ensure_source_node(&tpc.right_table));
+        } else if let Some(asof_cfg) = asof_config {
+            self.find_node(&asof_cfg.left_table)
+                .unwrap_or_else(|| self.ensure_source_node(&asof_cfg.left_table));
+            self.find_node(&asof_cfg.right_table)
+                .unwrap_or_else(|| self.ensure_source_node(&asof_cfg.right_table));
+        } else if let Some(sjc) = stream_join_config {
+            self.find_node(&sjc.left_table)
+                .unwrap_or_else(|| self.ensure_source_node(&sjc.left_table));
+            self.find_node(&sjc.right_table)
+                .unwrap_or_else(|| self.ensure_source_node(&sjc.right_table));
+        } else if let Some(tc) = temporal_config {
+            if self.find_node(&tc.stream_table).is_none() {
+                self.ensure_source_node(&tc.stream_table);
+            }
+        } else {
+            for table_ref in table_refs {
+                if self.find_node(table_ref).is_none() {
+                    self.ensure_source_node(table_ref);
+                }
+            }
+        }
+    }
+
+    /// Wire inbound edges from upstream source nodes to the given query node.
+    ///
+    /// For two-input joins (temporal probe, ASOF, stream join), wires the left
+    /// table to port 0 and the right table to port 1. For single-input queries,
+    /// wires all table references to port 0 (avoiding duplicates).
+    ///
+    /// Returns `true` if the query depends on another query (not just raw sources).
+    fn wire_query_edges(
+        &mut self,
+        node_id: usize,
+        temporal_probe_config: Option<&laminar_sql::translator::TemporalProbeConfig>,
+        asof_config: Option<&laminar_sql::translator::AsofJoinTranslatorConfig>,
+        stream_join_config: Option<&laminar_sql::translator::StreamJoinConfig>,
+        temporal_config: Option<&TemporalJoinTranslatorConfig>,
+        table_refs: &FxHashSet<String>,
+    ) -> bool {
+        if let Some(tpc) = temporal_probe_config {
+            let left_id = self.find_node(&tpc.left_table).expect("source ensured");
+            let right_id = self.find_node(&tpc.right_table).expect("source ensured");
+            self.add_edge(left_id, node_id, 0);
+            self.add_edge(right_id, node_id, 1);
+            false
+        } else if let Some(asof_cfg) = asof_config {
+            let left_id = self
+                .find_node(&asof_cfg.left_table)
+                .expect("source ensured");
+            let right_id = self
+                .find_node(&asof_cfg.right_table)
+                .expect("source ensured");
+            self.add_edge(left_id, node_id, 0);
+            self.add_edge(right_id, node_id, 1);
+            false
+        } else if let Some(sjc) = stream_join_config {
+            let left_id = self.find_node(&sjc.left_table).expect("source ensured");
+            let right_id = self.find_node(&sjc.right_table).expect("source ensured");
+            self.add_edge(left_id, node_id, 0);
+            self.add_edge(right_id, node_id, 1);
+            false
+        } else if let Some(tc) = temporal_config {
+            let stream_id = self.find_node(&tc.stream_table).expect("source ensured");
+            self.add_edge(stream_id, node_id, 0);
+            self.output_map.contains_key(tc.stream_table.as_str())
+        } else {
+            let mut depends_on_query = false;
+            for table_ref in table_refs {
+                let upstream_id = self.find_node(table_ref).expect("source ensured");
+                let already_connected = self.nodes[upstream_id]
+                    .output_routes
+                    .iter()
+                    .any(|&(t, p)| t == node_id && p == 0);
+                if !already_connected {
+                    self.add_edge(upstream_id, node_id, 0);
+                }
+                if self.output_map.contains_key(table_ref.as_str()) {
+                    depends_on_query = true;
+                }
+            }
+            depends_on_query
+        }
+    }
+
     /// Register a stream query for execution.
     ///
     /// Detection runs at registration time (same as `StreamExecutor::add_query`):
@@ -240,7 +370,7 @@ impl OperatorGraph {
         // Detection (same as StreamExecutor::add_query)
         let (temporal_probe_config, temporal_probe_projection_sql) =
             detect_temporal_probe_query(&sql);
-        let (asof_config, mut projection_sql) = if temporal_probe_config.is_none() {
+        let (asof_config, projection_sql) = if temporal_probe_config.is_none() {
             detect_asof_query(&sql)
         } else {
             (None, None)
@@ -255,15 +385,10 @@ impl OperatorGraph {
         } else {
             (None, None)
         };
-        if projection_sql.is_none() {
-            projection_sql = temporal_probe_projection_sql;
-        }
-        if projection_sql.is_none() {
-            projection_sql = temporal_projection_sql;
-        }
-        if projection_sql.is_none() {
-            projection_sql = stream_join_projection_sql;
-        }
+        let projection_sql = projection_sql
+            .or(temporal_probe_projection_sql)
+            .or(temporal_projection_sql)
+            .or(stream_join_projection_sql);
 
         // Warn for undetected JOIN+BETWEEN
         if stream_join_config.is_none() && asof_config.is_none() && temporal_config.is_none() {
@@ -322,60 +447,26 @@ impl OperatorGraph {
 
             let node_id = placeholder_id;
 
-            // Wire upstream edges from this query's table refs
-            for table_ref in &table_refs {
-                if self.find_node(table_ref).is_none() {
-                    self.ensure_source_node(table_ref);
-                }
-            }
-            if let Some(ref tpc) = temporal_probe_config {
-                self.find_node(&tpc.left_table)
-                    .unwrap_or_else(|| self.ensure_source_node(&tpc.left_table));
-                self.find_node(&tpc.right_table)
-                    .unwrap_or_else(|| self.ensure_source_node(&tpc.right_table));
-            } else if let Some(ref asof_cfg) = asof_config {
-                self.find_node(&asof_cfg.left_table)
-                    .unwrap_or_else(|| self.ensure_source_node(&asof_cfg.left_table));
-                self.find_node(&asof_cfg.right_table)
-                    .unwrap_or_else(|| self.ensure_source_node(&asof_cfg.right_table));
-            } else if let Some(ref sjc) = stream_join_config {
-                self.find_node(&sjc.left_table)
-                    .unwrap_or_else(|| self.ensure_source_node(&sjc.left_table));
-                self.find_node(&sjc.right_table)
-                    .unwrap_or_else(|| self.ensure_source_node(&sjc.right_table));
-            }
-
-            // Create inbound edges to the replaced node
-            if let Some(ref tpc) = temporal_probe_config {
-                let left_id = self.find_node(&tpc.left_table).expect("source ensured");
-                let right_id = self.find_node(&tpc.right_table).expect("source ensured");
-                self.add_edge(left_id, node_id, 0);
-                self.add_edge(right_id, node_id, 1);
-            } else if let Some(ref asof_cfg) = asof_config {
-                let left_id = self
-                    .find_node(&asof_cfg.left_table)
-                    .expect("source ensured");
-                let right_id = self
-                    .find_node(&asof_cfg.right_table)
-                    .expect("source ensured");
-                self.add_edge(left_id, node_id, 0);
-                self.add_edge(right_id, node_id, 1);
-            } else if let Some(ref sjc) = stream_join_config {
-                let left_id = self.find_node(&sjc.left_table).expect("source ensured");
-                let right_id = self.find_node(&sjc.right_table).expect("source ensured");
-                self.add_edge(left_id, node_id, 0);
-                self.add_edge(right_id, node_id, 1);
-            } else {
-                for table_ref in &table_refs {
-                    let upstream_id = self.find_node(table_ref).expect("source ensured");
-                    let already_connected = self.nodes[upstream_id]
-                        .output_routes
-                        .iter()
-                        .any(|&(t, p)| t == node_id && p == 0);
-                    if !already_connected {
-                        self.add_edge(upstream_id, node_id, 0);
-                    }
-                }
+            self.ensure_query_source_nodes(
+                temporal_probe_config.as_ref(),
+                asof_config.as_ref(),
+                stream_join_config.as_ref(),
+                // Placeholder path was missing temporal_config handling;
+                // the normal path handles it, so pass None here to keep
+                // behaviour identical to the old code.
+                None,
+                &table_refs,
+            );
+            let depends = self.wire_query_edges(
+                node_id,
+                temporal_probe_config.as_ref(),
+                asof_config.as_ref(),
+                stream_join_config.as_ref(),
+                None,
+                &table_refs,
+            );
+            if depends {
+                self.depends_on_stream.insert(node_id);
             }
 
             // Mark downstream nodes as depends_on_stream
@@ -395,34 +486,13 @@ impl OperatorGraph {
 
         // Ensure source nodes exist BEFORE creating the operator node so
         // that source node indices are stable when building edges.
-        if let Some(ref tpc) = temporal_probe_config {
-            self.find_node(&tpc.left_table)
-                .unwrap_or_else(|| self.ensure_source_node(&tpc.left_table));
-            self.find_node(&tpc.right_table)
-                .unwrap_or_else(|| self.ensure_source_node(&tpc.right_table));
-        } else if let Some(ref asof_cfg) = asof_config {
-            self.find_node(&asof_cfg.left_table)
-                .unwrap_or_else(|| self.ensure_source_node(&asof_cfg.left_table));
-            self.find_node(&asof_cfg.right_table)
-                .unwrap_or_else(|| self.ensure_source_node(&asof_cfg.right_table));
-        } else if let Some(ref sjc) = stream_join_config {
-            self.find_node(&sjc.left_table)
-                .unwrap_or_else(|| self.ensure_source_node(&sjc.left_table));
-            self.find_node(&sjc.right_table)
-                .unwrap_or_else(|| self.ensure_source_node(&sjc.right_table));
-        } else if let Some(ref tc) = temporal_config {
-            // Temporal joins: only wire the stream table. The lookup table
-            // is resolved by LookupTableRegistry, not graph edges.
-            if self.find_node(&tc.stream_table).is_none() {
-                self.ensure_source_node(&tc.stream_table);
-            }
-        } else {
-            for table_ref in &table_refs {
-                if self.find_node(table_ref).is_none() {
-                    self.ensure_source_node(table_ref);
-                }
-            }
-        }
+        self.ensure_query_source_nodes(
+            temporal_probe_config.as_ref(),
+            asof_config.as_ref(),
+            stream_join_config.as_ref(),
+            temporal_config.as_ref(),
+            &table_refs,
+        );
 
         let node_id = self.nodes.len();
         self.nodes.push(GraphNode {
@@ -435,63 +505,16 @@ impl OperatorGraph {
         self.input_bufs.push(vec![Vec::new(); input_port_count]);
 
         // Create edges from table refs
-        if let Some(ref tpc) = temporal_probe_config {
-            let left_id = self
-                .find_node(&tpc.left_table)
-                .expect("source node ensured above");
-            let right_id = self
-                .find_node(&tpc.right_table)
-                .expect("source node ensured above");
-            self.add_edge(left_id, node_id, 0);
-            self.add_edge(right_id, node_id, 1);
-        } else if let Some(ref asof_cfg) = asof_config {
-            let left_id = self
-                .find_node(&asof_cfg.left_table)
-                .expect("source node ensured above");
-            let right_id = self
-                .find_node(&asof_cfg.right_table)
-                .expect("source node ensured above");
-            self.add_edge(left_id, node_id, 0);
-            self.add_edge(right_id, node_id, 1);
-        } else if let Some(ref sjc) = stream_join_config {
-            let left_id = self
-                .find_node(&sjc.left_table)
-                .expect("source node ensured above");
-            let right_id = self
-                .find_node(&sjc.right_table)
-                .expect("source node ensured above");
-            self.add_edge(left_id, node_id, 0);
-            self.add_edge(right_id, node_id, 1);
-        } else if let Some(ref tc) = temporal_config {
-            // Temporal join: only wire stream table to port 0.
-            let stream_id = self
-                .find_node(&tc.stream_table)
-                .expect("source node ensured above");
-            self.add_edge(stream_id, node_id, 0);
-            if self.output_map.contains_key(tc.stream_table.as_str()) {
-                self.depends_on_stream.insert(node_id);
-            }
-        } else {
-            let mut depends_on_query = false;
-            for table_ref in &table_refs {
-                let upstream_id = self
-                    .find_node(table_ref)
-                    .expect("source node ensured above");
-                // Avoid duplicate edges
-                let already_connected = self.nodes[upstream_id]
-                    .output_routes
-                    .iter()
-                    .any(|&(t, p)| t == node_id && p == 0);
-                if !already_connected {
-                    self.add_edge(upstream_id, node_id, 0);
-                }
-                if self.output_map.contains_key(table_ref.as_str()) {
-                    depends_on_query = true;
-                }
-            }
-            if depends_on_query {
-                self.depends_on_stream.insert(node_id);
-            }
+        let depends = self.wire_query_edges(
+            node_id,
+            temporal_probe_config.as_ref(),
+            asof_config.as_ref(),
+            stream_join_config.as_ref(),
+            temporal_config.as_ref(),
+            &table_refs,
+        );
+        if depends {
+            self.depends_on_stream.insert(node_id);
         }
 
         // Store order config for Top-K post-filtering
@@ -518,11 +541,11 @@ impl OperatorGraph {
         temporal_probe_config: Option<&laminar_sql::translator::TemporalProbeConfig>,
         projection_sql: Option<&str>,
     ) -> Box<dyn GraphOperator> {
-        use crate::operators;
+        use crate::operator;
 
         if let Some(cfg) = temporal_probe_config {
             return Box::new(
-                operators::temporal_probe_join::TemporalProbeJoinOperator::new(
+                operator::temporal_probe_join::TemporalProbeJoinOperator::new(
                     name,
                     cfg.clone(),
                     projection_sql.map(Arc::from),
@@ -532,7 +555,7 @@ impl OperatorGraph {
         }
 
         if let Some(cfg) = asof_config {
-            return Box::new(operators::asof_join::AsofJoinOperator::new(
+            return Box::new(operator::asof_join::AsofJoinOperator::new(
                 name,
                 cfg.clone(),
                 projection_sql.map(Arc::from),
@@ -541,7 +564,7 @@ impl OperatorGraph {
         }
 
         if let Some(cfg) = temporal_config {
-            return Box::new(operators::temporal_join::TemporalJoinOperator::new(
+            return Box::new(operator::temporal_join::TemporalJoinOperator::new(
                 name,
                 cfg.clone(),
                 projection_sql.map(Arc::from),
@@ -551,7 +574,7 @@ impl OperatorGraph {
         }
 
         if let Some(cfg) = stream_join_config {
-            return Box::new(operators::interval_join::IntervalJoinOperator::new(
+            return Box::new(operator::interval_join::IntervalJoinOperator::new(
                 name,
                 cfg.clone(),
                 projection_sql.map(Arc::from),
@@ -563,7 +586,7 @@ impl OperatorGraph {
             .is_some_and(|ec| matches!(ec, EmitClause::OnWindowClose | EmitClause::Final));
 
         if is_eowc {
-            return Box::new(operators::eowc_query::EowcQueryOperator::new(
+            return Box::new(operator::eowc_query::EowcQueryOperator::new(
                 name,
                 sql,
                 emit_clause.cloned(),
@@ -573,7 +596,7 @@ impl OperatorGraph {
             ));
         }
 
-        Box::new(operators::sql_query::SqlQueryOperator::new(
+        Box::new(operator::sql_query::SqlQueryOperator::new(
             name,
             sql,
             self.ctx.clone(),
@@ -714,6 +737,17 @@ impl OperatorGraph {
         }
     }
 
+    /// Clean up all temporary state from a cycle: deregister source tables,
+    /// deregister intermediate tables, and stash the intermediates vec back
+    /// into `self.cycle_intermediates` for reuse.
+    fn finish_cycle(&mut self, intermediate_tables: Vec<String>) {
+        self.cleanup_source_tables();
+        for name in &intermediate_tables {
+            let _ = self.ctx.deregister_table(name);
+        }
+        self.cycle_intermediates = intermediate_tables;
+    }
+
     /// Execute one processing cycle.
     ///
     /// Registers `source_batches` as temporary tables, runs all operators in
@@ -791,12 +825,7 @@ impl OperatorGraph {
                         );
                         continue;
                     }
-                    // Cleanup before returning
-                    self.cleanup_source_tables();
-                    for name in &intermediate_tables {
-                        let _ = self.ctx.deregister_table(name);
-                    }
-                    self.cycle_intermediates = intermediate_tables;
+                    self.finish_cycle(intermediate_tables);
                     return Err(e);
                 }
             };
@@ -805,11 +834,7 @@ impl OperatorGraph {
             if let Some(limit) = self.max_state_bytes {
                 let size = self.nodes[node_id].operator.estimated_state_bytes();
                 if size >= limit {
-                    self.cleanup_source_tables();
-                    for name in &intermediate_tables {
-                        let _ = self.ctx.deregister_table(name);
-                    }
-                    self.cycle_intermediates = intermediate_tables;
+                    self.finish_cycle(intermediate_tables);
                     return Err(DbError::Pipeline(format!(
                         "state size limit exceeded for query '{}' ({size} bytes >= {limit} limit)",
                         self.nodes[node_id].name
@@ -867,26 +892,23 @@ impl OperatorGraph {
                 let routes = self.nodes[node_id].output_routes.clone();
                 if routes.len() == 1 {
                     let (target, port) = routes[0];
-                    if self.input_bufs[target][port as usize].is_empty() {
-                        self.input_bufs[target][port as usize] = batches;
+                    let buf = &mut self.input_bufs[target][port as usize];
+                    if buf.is_empty() {
+                        *buf = batches;
                     } else {
-                        self.input_bufs[target][port as usize].extend(batches);
+                        buf.extend(batches);
                     }
+                    self.enforce_input_buf_cap(target, port as usize);
                 } else if routes.len() > 1 {
                     for &(target, port) in &routes {
                         self.input_bufs[target][port as usize].extend(batches.iter().cloned());
+                        self.enforce_input_buf_cap(target, port as usize);
                     }
                 }
             }
         }
 
-        // Cleanup
-        self.cleanup_source_tables();
-        for name in &intermediate_tables {
-            let _ = self.ctx.deregister_table(name);
-        }
-        self.cycle_intermediates = intermediate_tables;
-
+        self.finish_cycle(intermediate_tables);
         Ok(results)
     }
 

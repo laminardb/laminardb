@@ -30,6 +30,13 @@ pub(crate) const STATE_RUNNING: u8 = 2;
 pub(crate) const STATE_SHUTTING_DOWN: u8 = 3;
 pub(crate) const STATE_STOPPED: u8 = 4;
 
+/// Estimate the number of cache entries from a memory budget.
+///
+/// Assumes ~256 bytes per cache entry and enforces a minimum of 1024 entries.
+fn cache_entries_from_memory(mem: laminar_sql::parser::lookup_table::ByteSize) -> usize {
+    (mem.as_bytes() / 256).max(1024) as usize
+}
+
 /// Extract SQL text from a `StreamingStatement` for storage in the connector manager.
 pub(crate) fn streaming_statement_to_sql(stmt: &StreamingStatement) -> String {
     match stmt {
@@ -268,7 +275,7 @@ impl LaminarDB {
         }
         #[cfg(feature = "postgres-cdc")]
         {
-            laminar_connectors::cdc::postgres::register_postgres_cdc(registry);
+            laminar_connectors::cdc::postgres::register_postgres_cdc_source(registry);
         }
         #[cfg(feature = "postgres-sink")]
         {
@@ -295,7 +302,7 @@ impl LaminarDB {
         }
         #[cfg(feature = "mongodb-cdc")]
         {
-            laminar_connectors::mongodb::register_mongodb_cdc(registry);
+            laminar_connectors::mongodb::register_mongodb_cdc_source(registry);
             laminar_connectors::mongodb::register_mongodb_sink(registry);
         }
         #[cfg(feature = "files")]
@@ -303,6 +310,167 @@ impl LaminarDB {
             laminar_connectors::files::register_file_source(registry);
             laminar_connectors::files::register_file_sink(registry);
         }
+    }
+
+    /// Handle `CREATE LOOKUP TABLE` by registering the table in the
+    /// `TableStore`, `ConnectorManager`, `DataFusion` catalog, and lookup
+    /// registry.
+    fn handle_register_lookup_table(
+        &self,
+        info: laminar_sql::planner::LookupTableInfo,
+    ) -> Result<ExecuteResult, DbError> {
+        use laminar_sql::parser::lookup_table::ConnectorType;
+
+        if info.primary_key.len() != 1 {
+            return Err(DbError::InvalidOperation(
+                "Lookup table requires a single-column primary key".into(),
+            ));
+        }
+        let pk = info.primary_key[0].clone();
+
+        // Register in TableStore for PK-based upsert
+        let cache_mode = info.properties.cache_memory.map(|mem| {
+            let max_entries = cache_entries_from_memory(mem);
+            crate::table_cache_mode::TableCacheMode::Partial { max_entries }
+        });
+        if let Some(cache) = cache_mode {
+            self.table_store.write().create_table_with_cache(
+                &info.name,
+                info.arrow_schema.clone(),
+                &pk,
+                cache,
+            )?;
+        } else {
+            self.table_store
+                .write()
+                .create_table(&info.name, info.arrow_schema.clone(), &pk)?;
+        }
+
+        // For external connectors: register in ConnectorManager so
+        // start_connector_pipeline() handles snapshot + CDC loading
+        if !matches!(info.properties.connector, ConnectorType::Static) {
+            self.register_lookup_connector(&info, &pk)?;
+        }
+
+        // Register in DataFusion for SELECT/JOIN queries
+        {
+            let provider = crate::table_provider::ReferenceTableProvider::new(
+                info.name.clone(),
+                info.arrow_schema.clone(),
+                self.table_store.clone(),
+            );
+            let _ = self.ctx.deregister_table(&info.name);
+            self.ctx
+                .register_table(&info.name, Arc::new(provider))
+                .map_err(|e| {
+                    DbError::InvalidOperation(format!("Failed to register lookup table: {e}"))
+                })?;
+        }
+
+        // Register snapshot in the lookup registry so the physical
+        // planner can build LookupJoinExec nodes for JOIN queries.
+        if let Some(batch) = self.table_store.read().to_record_batch(&info.name) {
+            self.lookup_registry.register(
+                &info.name,
+                laminar_sql::datafusion::LookupSnapshot {
+                    batch,
+                    key_columns: info.primary_key.clone(),
+                },
+            );
+        }
+
+        // Register the logical optimizer rule so JOINs referencing
+        // this table are rewritten to LookupJoinNode.
+        self.refresh_lookup_optimizer_rule();
+
+        Ok(ExecuteResult::Ddl(DdlInfo {
+            statement_type: "CREATE LOOKUP TABLE".to_string(),
+            object_name: info.name,
+        }))
+    }
+
+    /// Register an external connector for a lookup table in the
+    /// `ConnectorManager` and `TableStore`.
+    #[allow(clippy::unnecessary_wraps)]
+    fn register_lookup_connector(
+        &self,
+        info: &laminar_sql::planner::LookupTableInfo,
+        pk: &str,
+    ) -> Result<(), DbError> {
+        use laminar_sql::parser::lookup_table::ConnectorType;
+
+        let connector_type_str = match &info.properties.connector {
+            ConnectorType::PostgresCdc => "postgres-cdc",
+            ConnectorType::MysqlCdc => "mysql-cdc",
+            ConnectorType::Redis => "redis",
+            ConnectorType::S3Parquet => "s3-parquet",
+            ConnectorType::DeltaLake => "delta-lake",
+            ConnectorType::Custom(s) => s.as_str(),
+            ConnectorType::Static => unreachable!(),
+        };
+
+        self.table_store
+            .write()
+            .set_connector(&info.name, connector_type_str);
+
+        let refresh = match info.properties.strategy {
+            laminar_sql::parser::lookup_table::LookupStrategy::Replicated
+            | laminar_sql::parser::lookup_table::LookupStrategy::Partitioned => {
+                Some(laminar_connectors::reference::RefreshMode::SnapshotPlusCdc)
+            }
+            laminar_sql::parser::lookup_table::LookupStrategy::OnDemand => {
+                Some(laminar_connectors::reference::RefreshMode::Manual)
+            }
+        };
+
+        // Build connector options and format options from raw WITH clause.
+        // Keys consumed by LookupTableProperties are excluded; keys starting
+        // with "format." are routed to format_options (prefix stripped).
+        let consumed = [
+            "connector",
+            "strategy",
+            "cache.memory",
+            "cache.disk",
+            "cache.ttl",
+            "pushdown",
+            "format",
+        ];
+        let mut connector_options = HashMap::with_capacity(info.raw_options.len());
+        let mut format_options = HashMap::with_capacity(4);
+        for (k, v) in &info.raw_options {
+            let lower = k.to_lowercase();
+            if consumed.contains(&lower.as_str()) {
+                continue;
+            }
+            if let Some(suffix) = lower.strip_prefix("format.") {
+                format_options.insert(suffix.to_string(), v.clone());
+            } else {
+                connector_options.insert(k.clone(), v.clone());
+            }
+        }
+
+        let table_cache_mode = info.properties.cache_memory.map(|mem| {
+            let max_entries = cache_entries_from_memory(mem);
+            crate::table_cache_mode::TableCacheMode::Partial { max_entries }
+        });
+        let cache_max = info.properties.cache_memory.map(cache_entries_from_memory);
+
+        self.connector_manager
+            .lock()
+            .register_table(crate::connector_manager::TableRegistration {
+                name: info.name.clone(),
+                primary_key: pk.to_string(),
+                connector_type: Some(connector_type_str.to_string()),
+                connector_options,
+                format: info.raw_options.get("format").cloned(),
+                format_options,
+                refresh,
+                cache_mode: table_cache_mode,
+                cache_max_entries: cache_max,
+                storage: None,
+            });
+
+        Ok(())
     }
 
     /// Replaces the `LookupJoinRewriteRule` on the `DataFusion` context
@@ -408,7 +576,7 @@ impl LaminarDB {
             storage_options,
         )
         .await
-        .map_err(|e| DbError::Connector(e.to_string()))
+        .map_err(DbError::from)
     }
 
     /// Execute a SQL statement.
@@ -657,13 +825,10 @@ impl LaminarDB {
         Ok(ExecuteResult::RowsAffected(values.len() as u64))
     }
 
-    /// Handle CREATE TABLE statement.
+    /// Handle RESTORE FROM CHECKPOINT statement (not yet implemented).
     ///
-    /// Creates a static reference/dimension table backed by a `DataFusion`
-    /// `MemTable`. If a PRIMARY KEY is specified, the table is also registered
-    /// in the `TableStore` for upsert/delete/lookup semantics.
-    /// If `WITH (...)` options include a `connector` key, the table is
-    /// registered in the `ConnectorManager` for connector-backed population.
+    /// Will eventually stop the pipeline, reload state from the checkpoint
+    /// manifest, seek source offsets, and restart the pipeline.
     #[allow(clippy::unused_self)] // will use self when restore is implemented
     fn handle_restore_checkpoint(&self, _checkpoint_id: u64) -> Result<ExecuteResult, DbError> {
         Err(DbError::Unsupported(
@@ -958,144 +1123,7 @@ impl LaminarDB {
                 }))
             }
             laminar_sql::planner::StreamingPlan::RegisterLookupTable(info) => {
-                use laminar_sql::parser::lookup_table::ConnectorType;
-
-                let pk = info
-                    .primary_key
-                    .first()
-                    .ok_or_else(|| {
-                        DbError::InvalidOperation("Lookup table requires a primary key".into())
-                    })?
-                    .clone();
-
-                // Register in TableStore for PK-based upsert
-                let cache_mode = info.properties.cache_memory.map(|mem| {
-                    let max_entries = (mem.as_bytes() / 256).max(1024) as usize;
-                    crate::table_cache_mode::TableCacheMode::Partial { max_entries }
-                });
-                if let Some(cache) = cache_mode {
-                    self.table_store.write().create_table_with_cache(
-                        &info.name,
-                        info.arrow_schema.clone(),
-                        &pk,
-                        cache,
-                    )?;
-                } else {
-                    self.table_store.write().create_table(
-                        &info.name,
-                        info.arrow_schema.clone(),
-                        &pk,
-                    )?;
-                }
-
-                // For external connectors: register in ConnectorManager so
-                // start_connector_pipeline() handles snapshot + CDC loading
-                if !matches!(info.properties.connector, ConnectorType::Static) {
-                    let connector_type_str = match &info.properties.connector {
-                        ConnectorType::PostgresCdc => "postgres-cdc",
-                        ConnectorType::MysqlCdc => "mysql-cdc",
-                        ConnectorType::Redis => "redis",
-                        ConnectorType::S3Parquet => "s3-parquet",
-                        ConnectorType::DeltaLake => "delta-lake",
-                        ConnectorType::Custom(s) => s.as_str(),
-                        ConnectorType::Static => unreachable!(),
-                    };
-
-                    self.table_store
-                        .write()
-                        .set_connector(&info.name, connector_type_str);
-
-                    let refresh = match info.properties.strategy {
-                        laminar_sql::parser::lookup_table::LookupStrategy::Replicated
-                        | laminar_sql::parser::lookup_table::LookupStrategy::Partitioned => {
-                            Some(laminar_connectors::reference::RefreshMode::SnapshotPlusCdc)
-                        }
-                        laminar_sql::parser::lookup_table::LookupStrategy::OnDemand => {
-                            Some(laminar_connectors::reference::RefreshMode::Manual)
-                        }
-                    };
-
-                    // Build connector options from raw WITH clause
-                    // (exclude keys already consumed by LookupTableProperties)
-                    let connector_options: HashMap<String, String> = info
-                        .raw_options
-                        .iter()
-                        .filter(|(k, _)| {
-                            ![
-                                "connector",
-                                "strategy",
-                                "cache.memory",
-                                "cache.disk",
-                                "cache.ttl",
-                                "pushdown",
-                            ]
-                            .contains(&k.as_str())
-                        })
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
-
-                    let table_cache_mode = info.properties.cache_memory.map(|mem| {
-                        let max_entries = (mem.as_bytes() / 256).max(1024) as usize;
-                        crate::table_cache_mode::TableCacheMode::Partial { max_entries }
-                    });
-                    let cache_max = info
-                        .properties
-                        .cache_memory
-                        .map(|mem| (mem.as_bytes() / 256).max(1024) as usize);
-
-                    self.connector_manager.lock().register_table(
-                        crate::connector_manager::TableRegistration {
-                            name: info.name.clone(),
-                            primary_key: pk,
-                            connector_type: Some(connector_type_str.to_string()),
-                            connector_options,
-                            format: info.raw_options.get("format").cloned(),
-                            format_options: HashMap::new(),
-                            refresh,
-                            cache_mode: table_cache_mode,
-                            cache_max_entries: cache_max,
-                            storage: None,
-                        },
-                    );
-                }
-
-                // Register in DataFusion for SELECT/JOIN queries
-                {
-                    let provider = crate::table_provider::ReferenceTableProvider::new(
-                        info.name.clone(),
-                        info.arrow_schema.clone(),
-                        self.table_store.clone(),
-                    );
-                    let _ = self.ctx.deregister_table(&info.name);
-                    self.ctx
-                        .register_table(&info.name, Arc::new(provider))
-                        .map_err(|e| {
-                            DbError::InvalidOperation(format!(
-                                "Failed to register lookup table: {e}"
-                            ))
-                        })?;
-                }
-
-                // Register snapshot in the lookup registry so the physical
-                // planner can build LookupJoinExec nodes for JOIN queries.
-                if let Some(batch) = self.table_store.read().to_record_batch(&info.name) {
-                    self.lookup_registry.register(
-                        &info.name,
-                        laminar_sql::datafusion::LookupSnapshot {
-                            batch,
-                            key_columns: info.primary_key.clone(),
-                        },
-                    );
-                }
-
-                // Register the logical optimizer rule so JOINs referencing
-                // this table are rewritten to LookupJoinNode.
-                self.refresh_lookup_optimizer_rule();
-
-                Ok(ExecuteResult::Ddl(DdlInfo {
-                    statement_type: "CREATE LOOKUP TABLE".to_string(),
-                    object_name: info.name,
-                }))
+                self.handle_register_lookup_table(info)
             }
             laminar_sql::planner::StreamingPlan::DropLookupTable { name } => {
                 self.table_store.write().drop_table(&name);
@@ -1241,6 +1269,8 @@ impl LaminarDB {
     /// # Errors
     ///
     /// Returns `DbError::SourceNotFound` if the source is not registered.
+    /// Returns `DbError::SchemaMismatch` if the Rust type's schema does not
+    /// match the source's SQL schema.
     pub fn source<T: laminar_core::streaming::Record>(
         &self,
         name: &str,
@@ -1486,7 +1516,7 @@ impl LaminarDB {
             DbError::Checkpoint("coordinator not initialized — call start() first".to_string())
         })?;
         coord
-            .checkpoint(HashMap::new(), None, None, HashMap::new(), None)
+            .checkpoint(crate::checkpoint_coordinator::CheckpointRequest::default())
             .await
     }
 

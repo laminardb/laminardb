@@ -14,7 +14,7 @@ exclude = [
 resolver = "2"
 
 [workspace.package]
-version = "0.18.12"
+version = "0.18.13"
 authors = ["LaminarDB Contributors"]
 edition = "2021"
 rust-version = "1.85"
@@ -48,11 +48,9 @@ mimalloc = { version = "0.1", default-features = false }  # mimalloc for Windows
 rustc-hash = "2.1"  # Faster than std HashMap (replaces unmaintained fxhash)
 parking_lot = "0.12"  # Faster Mutex/RwLock
 memmap2 = "0.9"  # Memory-mapped files
-bumpalo = "3.20"  # Arena allocator
 uuid = { version = "1.22", features = ["v4", "v7", "serde"] }  # Unique IDs
 gethostname = "0.5"  # Pure Rust hostname lookup
 ahash = "0.8"  # Fast hashing for state stores
-papaya = "0.2"  # Lock-free concurrent HashMap
 foyer = { version = "0.22", features = ["serde"] }  # High-performance cache (S3-FIFO eviction, serde for HybridCache)
 sha2 = "0.10"  # SHA-256 for checkpoint integrity
 lz4_flex = "0.12"  # Pure Rust LZ4 compression (fastest decompression for recovery)

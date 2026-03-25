@@ -17,6 +17,7 @@ use laminar_db::{DbError, LaminarDB, Profile};
 use crate::config::{
     ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
 };
+#[cfg(feature = "delta-experimental")]
 use crate::delta_config::{DeltaConfig, DeltaConfigError};
 use crate::http;
 use crate::reload::ReloadGuard;
@@ -36,11 +37,17 @@ pub enum ServerHandle {
         watcher_handle: Option<tokio::task::JoinHandle<()>>,
     },
     /// Delta (multi-node) mode.
+    ///
+    /// Only available when the `delta-experimental` feature is enabled.
+    /// This mode is not yet production-ready.
+    #[cfg(feature = "delta-experimental")]
     Delta(Box<crate::delta::DeltaHandle>),
 }
 
 impl ServerHandle {
-    /// Block until `ctrl_c` is received, then gracefully shut down.
+    /// Block until a shutdown signal is received, then gracefully shut down.
+    ///
+    /// Handles SIGINT (Ctrl-C) on all platforms and SIGTERM on Unix.
     pub async fn wait_for_shutdown(self) -> Result<(), ServerError> {
         match self {
             Self::Embedded {
@@ -48,9 +55,7 @@ impl ServerHandle {
                 api_handle,
                 watcher_handle,
             } => {
-                signal::ctrl_c()
-                    .await
-                    .map_err(|e| ServerError::Shutdown(format!("signal handler failed: {e}")))?;
+                wait_for_termination_signal().await?;
 
                 info!("Received shutdown signal, shutting down...");
 
@@ -65,11 +70,36 @@ impl ServerHandle {
                 info!("Shutdown complete");
                 Ok(())
             }
+            #[cfg(feature = "delta-experimental")]
             Self::Delta(handle) => (*handle)
                 .wait_for_shutdown()
                 .await
                 .map_err(|e| ServerError::Delta(e.to_string())),
         }
+    }
+}
+
+/// Wait for SIGINT or SIGTERM (Unix) / SIGINT (Windows).
+async fn wait_for_termination_signal() -> Result<(), ServerError> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())
+            .map_err(|e| ServerError::Shutdown(format!("SIGTERM handler failed: {e}")))?;
+        tokio::select! {
+            result = signal::ctrl_c() => {
+                result.map_err(|e| ServerError::Shutdown(format!("SIGINT handler failed: {e}")))?;
+            }
+            _ = sigterm.recv() => {}
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        signal::ctrl_c()
+            .await
+            .map_err(|e| ServerError::Shutdown(format!("signal handler failed: {e}")))?;
+        Ok(())
     }
 }
 
@@ -87,13 +117,25 @@ pub async fn run_server(
     config: ServerConfig,
     config_path: PathBuf,
 ) -> Result<ServerHandle, ServerError> {
-    let delta_cfg = DeltaConfig::from_server_config(&config)?;
+    // Delta mode: gate behind the `delta-experimental` feature flag.
+    #[cfg(feature = "delta-experimental")]
+    {
+        let delta_cfg = DeltaConfig::from_server_config(&config)?;
 
-    if let Some(delta_cfg) = delta_cfg {
-        let handle = crate::delta::start_delta(config, delta_cfg, config_path)
-            .await
-            .map_err(|e| ServerError::Delta(e.to_string()))?;
-        return Ok(ServerHandle::Delta(Box::new(handle)));
+        if let Some(delta_cfg) = delta_cfg {
+            let handle = crate::delta::start_delta(config, delta_cfg, config_path)
+                .await
+                .map_err(|e| ServerError::Delta(e.to_string()))?;
+            return Ok(ServerHandle::Delta(Box::new(handle)));
+        }
+    }
+    #[cfg(not(feature = "delta-experimental"))]
+    if config.server.mode == "delta" {
+        return Err(ServerError::Delta(
+            "Delta/cluster mode requires the 'delta-experimental' feature flag. \
+             This mode is not yet production-ready."
+                .to_string(),
+        ));
     }
 
     // 1. Build LaminarDB via builder API
@@ -465,6 +507,7 @@ pub enum ServerError {
     Delta(String),
 
     /// Delta configuration error.
+    #[cfg(feature = "delta-experimental")]
     #[error(transparent)]
     DeltaConfig(#[from] DeltaConfigError),
 }

@@ -79,18 +79,6 @@ impl RecoveredState {
         &self.manifest.operator_states
     }
 
-    /// Returns the WAL position from the manifest.
-    #[must_use]
-    pub fn wal_position(&self) -> u64 {
-        self.manifest.wal_position
-    }
-
-    /// Returns the per-core WAL positions from the manifest.
-    #[must_use]
-    pub fn per_core_wal_positions(&self) -> &[u64] {
-        &self.manifest.per_core_wal_positions
-    }
-
     /// Returns the table store checkpoint path, if any.
     #[must_use]
     pub fn table_store_checkpoint_path(&self) -> Option<&str> {
@@ -224,9 +212,7 @@ impl<'a> RecoveryManager<'a> {
         }
 
         // Fallback: iterate through all checkpoints in reverse order.
-        let checkpoints = self.store.list().map_err(|e| {
-            DbError::Checkpoint(format!("failed to list checkpoints for fallback: {e}"))
-        })?;
+        let checkpoints = self.store.list().map_err(DbError::from)?;
 
         if checkpoints.is_empty() {
             warn!("no checkpoints available for fallback, starting fresh");
@@ -676,9 +662,7 @@ impl<'a> RecoveryManager<'a> {
     ///
     /// Returns `DbError::Checkpoint` if the store fails.
     pub fn load_latest(&self) -> Result<Option<CheckpointManifest>, DbError> {
-        self.store
-            .load_latest()
-            .map_err(|e| DbError::Checkpoint(format!("failed to load checkpoint: {e}")))
+        self.store.load_latest().map_err(DbError::from)
     }
 
     /// Loads a specific checkpoint by ID.
@@ -687,9 +671,7 @@ impl<'a> RecoveryManager<'a> {
     ///
     /// Returns `DbError::Checkpoint` if the store fails.
     pub fn load_by_id(&self, checkpoint_id: u64) -> Result<Option<CheckpointManifest>, DbError> {
-        self.store.load_by_id(checkpoint_id).map_err(|e| {
-            DbError::Checkpoint(format!("failed to load checkpoint {checkpoint_id}: {e}"))
-        })
+        self.store.load_by_id(checkpoint_id).map_err(DbError::from)
     }
 }
 
@@ -767,23 +749,6 @@ mod tests {
         assert_eq!(result.operator_states().len(), 2);
         let op0 = result.operator_states().get("0").unwrap();
         assert_eq!(op0.decode_inline().unwrap(), b"window-state");
-    }
-
-    #[tokio::test]
-    async fn test_recover_wal_positions() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-
-        let mut manifest = CheckpointManifest::new(1, 2);
-        manifest.wal_position = 4096;
-        manifest.per_core_wal_positions = vec![100, 200, 300];
-        store.save(&manifest).unwrap();
-
-        let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
-
-        assert_eq!(result.wal_position(), 4096);
-        assert_eq!(result.per_core_wal_positions(), &[100, 200, 300]);
     }
 
     #[tokio::test]

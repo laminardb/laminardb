@@ -373,8 +373,8 @@ where
             periodic_timer_windows: rustc_hash::FxHashSet::default(),
             emit_strategy: EmitStrategy::default(),
             late_data_config: LateDataConfig::default(),
-            late_data_metrics: LateDataMetrics::new(),
-            window_close_metrics: WindowCloseMetrics::new(),
+            late_data_metrics: LateDataMetrics::default(),
+            window_close_metrics: WindowCloseMetrics::default(),
             operator_id: format!("sliding_window_{operator_num}"),
             output_schema,
             last_emitted: FxHashMap::default(),
@@ -410,8 +410,8 @@ where
             periodic_timer_windows: rustc_hash::FxHashSet::default(),
             emit_strategy: EmitStrategy::default(),
             late_data_config: LateDataConfig::default(),
-            late_data_metrics: LateDataMetrics::new(),
-            window_close_metrics: WindowCloseMetrics::new(),
+            late_data_metrics: LateDataMetrics::default(),
+            window_close_metrics: WindowCloseMetrics::default(),
             operator_id,
             output_schema,
             last_emitted: FxHashMap::default(),
@@ -1320,7 +1320,7 @@ mod tests {
         // Should emit LateEvent
         let is_late = outputs.iter().any(|o| matches!(o, Output::LateEvent(_)));
         assert!(is_late);
-        assert_eq!(operator.late_data_metrics().late_events_dropped(), 1);
+        assert_eq!(operator.late_data_metrics().late_events_dropped, 1);
     }
 
     #[test]
@@ -1363,7 +1363,7 @@ mod tests {
             }
         });
         assert_eq!(side_output.as_deref(), Some("late"));
-        assert_eq!(operator.late_data_metrics().late_events_side_output(), 1);
+        assert_eq!(operator.late_data_metrics().late_events_side_output, 1);
     }
 
     #[test]
@@ -1571,7 +1571,7 @@ mod tests {
             .iter()
             .any(|o| matches!(o, Output::LateEvent(_) | Output::SideOutput(_)));
         assert!(!is_late);
-        assert_eq!(operator.late_data_metrics().late_events_total(), 0);
+        assert_eq!(operator.late_data_metrics().late_events_total, 0);
     }
 
     // ========================================================================

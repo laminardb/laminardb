@@ -27,7 +27,7 @@ use super::changelog::{events_to_record_batch, tuple_to_json, CdcOperation, Chan
 use super::config::PostgresCdcConfig;
 use super::decoder::{decode_message, WalMessage};
 use super::lsn::Lsn;
-use super::metrics::CdcMetrics;
+use super::metrics::PostgresCdcMetrics;
 use super::schema::{cdc_envelope_schema, RelationCache, RelationInfo};
 /// `PostgreSQL` CDC source connector.
 ///
@@ -56,7 +56,7 @@ pub struct PostgresCdcSource {
     schema: SchemaRef,
 
     /// Lock-free metrics.
-    metrics: Arc<CdcMetrics>,
+    metrics: Arc<PostgresCdcMetrics>,
 
     /// Cached relation (table) schemas from Relation messages.
     relation_cache: RelationCache,
@@ -150,7 +150,7 @@ impl PostgresCdcSource {
             config,
             state: ConnectorState::Created,
             schema: cdc_envelope_schema(),
-            metrics: Arc::new(CdcMetrics::new()),
+            metrics: Arc::new(PostgresCdcMetrics::new()),
             relation_cache: RelationCache::new(),
             event_buffer: VecDeque::new(),
             current_txn: None,

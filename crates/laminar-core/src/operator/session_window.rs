@@ -357,8 +357,8 @@ where
             pending_timers: FxHashMap::default(),
             emit_strategy: EmitStrategy::default(),
             late_data_config: LateDataConfig::default(),
-            late_data_metrics: LateDataMetrics::new(),
-            window_close_metrics: WindowCloseMetrics::new(),
+            late_data_metrics: LateDataMetrics::default(),
+            window_close_metrics: WindowCloseMetrics::default(),
             operator_id: format!("session_window_{operator_num}"),
             output_schema,
             key_column: None,
@@ -398,8 +398,8 @@ where
             pending_timers: FxHashMap::default(),
             emit_strategy: EmitStrategy::default(),
             late_data_config: LateDataConfig::default(),
-            late_data_metrics: LateDataMetrics::new(),
-            window_close_metrics: WindowCloseMetrics::new(),
+            late_data_metrics: LateDataMetrics::default(),
+            window_close_metrics: WindowCloseMetrics::default(),
             operator_id,
             output_schema,
             key_column: None,
@@ -1551,7 +1551,7 @@ mod tests {
 
         let is_late = outputs.iter().any(|o| matches!(o, Output::LateEvent(_)));
         assert!(is_late);
-        assert_eq!(operator.late_data_metrics().late_events_dropped(), 1);
+        assert_eq!(operator.late_data_metrics().late_events_dropped, 1);
     }
 
     #[test]
@@ -1591,7 +1591,7 @@ mod tests {
             }
         });
         assert_eq!(side_output.as_deref(), Some("late"));
-        assert_eq!(operator.late_data_metrics().late_events_side_output(), 1);
+        assert_eq!(operator.late_data_metrics().late_events_side_output, 1);
     }
 
     // ---------------------------------------------------------------
@@ -1684,7 +1684,7 @@ mod tests {
         };
 
         assert!(outputs.is_empty());
-        assert_eq!(operator.late_data_metrics().late_events_dropped(), 1);
+        assert_eq!(operator.late_data_metrics().late_events_dropped, 1);
     }
 
     // ---------------------------------------------------------------
@@ -2853,6 +2853,6 @@ mod tests {
         let is_event = late_outputs.iter().any(|o| matches!(o, Output::Event(_)));
         assert!(!is_event, "Late event should not re-open closed session");
 
-        assert_eq!(operator.late_data_metrics().late_events_dropped(), 1);
+        assert_eq!(operator.late_data_metrics().late_events_dropped, 1);
     }
 }
