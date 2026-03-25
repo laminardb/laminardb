@@ -187,6 +187,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         let is_exactly_once = self.delivery_guarantee
             == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce;
         let write_timeout = self.sink_write_timeout;
+        let counters = Arc::clone(&self.counters);
 
         // Route results to sinks concurrently, filtered by FROM clause.
         let filter_ctx = self.filter_ctx.clone(); // Arc bump — cheap
@@ -210,6 +211,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 let batches = batches.clone();
                 let ctx = filter_ctx.clone();
                 let had_timeout = &had_timeout;
+                let counters = &counters;
                 Some(async move {
                     for batch in &batches {
                         let filtered = if let Some(ref phys) = compiled_filter {
@@ -250,6 +252,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                                 .await
                             {
                                 Ok(Err(e)) => {
+                                    counters.sink_write_errors.fetch_add(1, Ordering::Relaxed);
                                     tracing::warn!(
                                         sink = %sink_name,
                                         error = %e,
@@ -259,6 +262,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                                     break;
                                 }
                                 Err(_elapsed) => {
+                                    counters.sink_write_errors.fetch_add(1, Ordering::Relaxed);
                                     had_timeout.store(true, Ordering::Relaxed);
                                     if is_exactly_once {
                                         tracing::error!(
