@@ -2,8 +2,9 @@
 //!
 //! Extracts delta-specific settings from `ServerConfig` and validates
 //! them before the delta startup orchestrator runs. This module is
-//! always compiled (not feature-gated) so that non-delta builds can
-//! still detect when delta mode is requested and produce a clear error.
+//! gated behind the `delta-experimental` feature. When the feature is
+//! disabled, `server::run_server` returns a clear error before reaching
+//! any delta config code.
 
 use std::fmt;
 use std::time::Duration;

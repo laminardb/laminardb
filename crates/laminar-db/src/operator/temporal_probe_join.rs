@@ -16,7 +16,7 @@ use laminar_sql::translator::TemporalProbeConfig;
 
 use crate::error::DbError;
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
-use crate::stream_executor::CompiledPostProjection;
+use crate::sql_analysis::CompiledPostProjection;
 use crate::temporal_probe::{
     execute_temporal_probe_cycle, TemporalProbeCheckpoint, TemporalProbeState,
 };

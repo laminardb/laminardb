@@ -16,11 +16,11 @@ path = "src/main.rs"
 
 [dependencies]
 # All LaminarDB crates
-laminar-core = { path = "../laminar-core", version = "0.18.10", features = ["delta"] }
-laminar-sql = { path = "../laminar-sql", version = "0.18.10" }
-laminar-storage = { path = "../laminar-storage", version = "0.18.10" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.18.10" }
-laminar-db = { path = "../laminar-db", version = "0.18.10" }
+laminar-core = { path = "../laminar-core", version = "0.18.13" }
+laminar-sql = { path = "../laminar-sql", version = "0.18.13" }
+laminar-storage = { path = "../laminar-storage", version = "0.18.13" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.18.13" }
+laminar-db = { path = "../laminar-db", version = "0.18.13" }
 
 # CLI and configuration
 clap = { version = "4.6", features = ["derive", "env"] }
@@ -56,10 +56,10 @@ chrono = { workspace = true }
 # File watching for hot reload
 notify = { workspace = true }
 
-# Delta mode: hostname discovery and unique node IDs
-gethostname = { workspace = true }
-uuid = { workspace = true }
-xxhash-rust = { workspace = true }
+# Delta mode: hostname discovery and unique node IDs (only needed with delta-experimental)
+gethostname = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+xxhash-rust = { workspace = true, optional = true }
 
 # Vendored OpenSSL for musl cross-compilation (behind vendored-openssl feature)
 openssl = { version = "0.10", features = ["vendored"], optional = true }
@@ -127,4 +127,14 @@ hwloc = ["laminar-core/hwloc"]              # Linux/macOS: NUMA topology discove
 linux-perf = ["io-uring", "hwloc"]
 # Compile OpenSSL from source — required for musl cross-compilation where
 # system libssl-dev is not available for the target triple.
+# Delta/cluster mode: experimental multi-node support. This mode is NOT
+# production-ready — it requires Raft, inter-node RPC, and partition-aware
+# routing that are not yet functional. Gate it behind an explicit feature
+# so the binary does not present it as a first-class option.
+delta-experimental = [
+    "laminar-core/delta",
+    "dep:gethostname",
+    "dep:uuid",
+    "dep:xxhash-rust",
+]
 vendored-openssl = ["dep:openssl"]

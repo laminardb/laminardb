@@ -19,7 +19,9 @@ use arrow_array::RecordBatch;
 use tokio::sync::Notify;
 
 use laminar_connectors::checkpoint::SourceCheckpoint;
-use laminar_db::checkpoint_coordinator::{CheckpointConfig, CheckpointCoordinator};
+use laminar_db::checkpoint_coordinator::{
+    CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
+};
 use laminar_db::pipeline::{
     PipelineCallback, PipelineConfig, SourceRegistration, StreamingCoordinator,
 };
@@ -191,9 +193,11 @@ async fn test_barrier_checkpoint_recovery_round_trip() {
         b"barrier-consistent-state".to_vec(),
     );
 
-    // Simulate source offsets captured at barrier.
-    let mut extra_tables = HashMap::new();
-    extra_tables.insert(
+    // Simulate source offsets captured at barrier alignment.
+    // Use source_offset_overrides (the production barrier path) so offsets
+    // land in manifest.source_offsets — not extra_table_offsets.
+    let mut source_overrides = HashMap::new();
+    source_overrides.insert(
         "src_a".to_string(),
         laminar_storage::checkpoint_manifest::ConnectorCheckpoint {
             offsets: HashMap::from([("records".into(), "500".into())]),
@@ -201,7 +205,7 @@ async fn test_barrier_checkpoint_recovery_round_trip() {
             metadata: HashMap::new(),
         },
     );
-    extra_tables.insert(
+    source_overrides.insert(
         "src_b".to_string(),
         laminar_storage::checkpoint_manifest::ConnectorCheckpoint {
             offsets: HashMap::from([("records".into(), "300".into())]),
@@ -215,14 +219,14 @@ async fn test_barrier_checkpoint_recovery_round_trip() {
     source_watermarks.insert("src_b".to_string(), 4500_i64);
 
     let result = coord
-        .checkpoint_with_extra_tables(
+        .checkpoint_with_offsets(CheckpointRequest {
             operator_states,
-            Some(4500), // global watermark = min of sources
-            None,
-            extra_tables,
+            watermark: Some(4500), // global watermark = min of sources
+            source_offset_overrides: source_overrides,
             source_watermarks,
-            Some(0xDEAD_BEEF),
-        )
+            pipeline_hash: Some(0xDEAD_BEEF),
+            ..CheckpointRequest::default()
+        })
         .await
         .unwrap();
 
@@ -241,14 +245,14 @@ async fn test_barrier_checkpoint_recovery_round_trip() {
     assert_eq!(manifest.epoch, 1);
     assert_eq!(manifest.watermark, Some(4500));
 
-    // Verify source offsets captured at barrier.
-    let src_a = manifest.table_offsets.get("src_a").unwrap();
+    // Verify source offsets captured at barrier (production path: source_offsets).
+    let src_a = manifest.source_offsets.get("src_a").unwrap();
     assert_eq!(
         src_a.offsets.get("records"),
         Some(&"500".to_string()),
         "src_a offset should be captured at barrier point"
     );
-    let src_b = manifest.table_offsets.get("src_b").unwrap();
+    let src_b = manifest.source_offsets.get("src_b").unwrap();
     assert_eq!(
         src_b.offsets.get("records"),
         Some(&"300".to_string()),

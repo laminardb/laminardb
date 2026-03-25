@@ -86,7 +86,7 @@ impl SourceCheckpoint {
         &self.metadata
     }
 
-    /// Returns `true` if the checkpoint has any offsets.
+    /// Returns `true` if the checkpoint has no offsets.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.offsets.is_empty()

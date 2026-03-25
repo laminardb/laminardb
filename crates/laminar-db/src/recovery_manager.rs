@@ -212,9 +212,7 @@ impl<'a> RecoveryManager<'a> {
         }
 
         // Fallback: iterate through all checkpoints in reverse order.
-        let checkpoints = self.store.list().map_err(|e| {
-            DbError::Checkpoint(format!("failed to list checkpoints for fallback: {e}"))
-        })?;
+        let checkpoints = self.store.list().map_err(DbError::from)?;
 
         if checkpoints.is_empty() {
             warn!("no checkpoints available for fallback, starting fresh");
@@ -664,9 +662,7 @@ impl<'a> RecoveryManager<'a> {
     ///
     /// Returns `DbError::Checkpoint` if the store fails.
     pub fn load_latest(&self) -> Result<Option<CheckpointManifest>, DbError> {
-        self.store
-            .load_latest()
-            .map_err(|e| DbError::Checkpoint(format!("failed to load checkpoint: {e}")))
+        self.store.load_latest().map_err(DbError::from)
     }
 
     /// Loads a specific checkpoint by ID.
@@ -675,9 +671,7 @@ impl<'a> RecoveryManager<'a> {
     ///
     /// Returns `DbError::Checkpoint` if the store fails.
     pub fn load_by_id(&self, checkpoint_id: u64) -> Result<Option<CheckpointManifest>, DbError> {
-        self.store.load_by_id(checkpoint_id).map_err(|e| {
-            DbError::Checkpoint(format!("failed to load checkpoint {checkpoint_id}: {e}"))
-        })
+        self.store.load_by_id(checkpoint_id).map_err(DbError::from)
     }
 }
 

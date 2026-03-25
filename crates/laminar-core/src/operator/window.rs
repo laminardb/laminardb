@@ -5,8 +5,8 @@
 //! ## Window Types
 //!
 //! - **Tumbling**: Fixed-size, non-overlapping windows (implemented)
-//! - **Sliding**: Fixed-size, overlapping windows (future)
-//! - **Session**: Dynamic windows based on activity gaps (future)
+//! - **Sliding**: Fixed-size, overlapping windows ([`sliding_window`](super::sliding_window))
+//! - **Session**: Dynamic windows based on activity gaps ([`session_window`](super::session_window))
 //!
 //! ## Emit Strategies
 //!
@@ -311,17 +311,8 @@ impl EmitStrategy {
 
     // === Helper Methods ===
 
-    /// Returns true if this strategy emits intermediate results.
-    ///
-    /// Strategies that emit intermediate results (before window close):
-    /// - `OnUpdate`: emits after every state change
-    /// - `Periodic`: emits at fixed intervals
-    ///
-    /// Strategies that do NOT emit intermediate results:
-    /// - `OnWatermark`: waits for watermark
-    /// - `OnWindowClose`: only emits when window closes
-    /// - `Changelog`: depends on trigger, but typically on watermark
-    /// - `Final`: only emits final result
+    /// Returns true if this strategy emits intermediate results before
+    /// the window closes, meaning downstream may see partial aggregates.
     #[must_use]
     pub fn emits_intermediate(&self) -> bool {
         matches!(self, Self::OnUpdate | Self::Periodic(_))
@@ -336,12 +327,8 @@ impl EmitStrategy {
         matches!(self, Self::Changelog)
     }
 
-    /// Returns true if this strategy is suitable for append-only sinks.
-    ///
-    /// Append-only sinks (Kafka, S3, Delta Lake, Iceberg) cannot handle
-    /// retractions or updates. Only these strategies are safe:
-    /// - `OnWindowClose`: guarantees single emission per window
-    /// - `Final`: suppresses all intermediate results
+    /// Returns true if this strategy is safe for append-only sinks
+    /// (Kafka, S3, Delta Lake, Iceberg) that cannot handle retractions.
     #[must_use]
     pub fn is_append_only_compatible(&self) -> bool {
         matches!(self, Self::OnWindowClose | Self::Final)
@@ -349,15 +336,9 @@ impl EmitStrategy {
 
     /// Returns true if late data should generate retractions.
     ///
-    /// Strategies that generate retractions for late data:
-    /// - `OnWatermark`: may retract previous result
-    /// - `OnUpdate`: immediately emits updated result
-    /// - `Changelog`: emits -old/+new pair
-    ///
-    /// Strategies that do NOT generate retractions:
-    /// - `OnWindowClose`: drops late data (or routes to side output)
-    /// - `Final`: drops late data silently
-    /// - `Periodic`: depends on whether window is still open
+    /// When true, late arrivals cause a retraction of the previous result
+    /// followed by the corrected value. Strategies that suppress retractions
+    /// instead drop or side-output late data to preserve append-only output.
     #[must_use]
     pub fn generates_retractions(&self) -> bool {
         matches!(self, Self::OnWatermark | Self::OnUpdate | Self::Changelog)

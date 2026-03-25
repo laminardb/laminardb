@@ -53,7 +53,7 @@ use crate::config::{ConfigKeySpec, ConnectorInfo};
 use crate::registry::ConnectorRegistry;
 
 /// Registers the `PostgreSQL` CDC source connector with the given registry.
-pub fn register_postgres_cdc(registry: &ConnectorRegistry) {
+pub fn register_postgres_cdc_source(registry: &ConnectorRegistry) {
     let info = ConnectorInfo {
         name: "postgres-cdc".to_string(),
         display_name: "PostgreSQL CDC Source".to_string(),
@@ -136,9 +136,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_register_postgres_cdc() {
+    fn test_register_postgres_cdc_source() {
         let registry = ConnectorRegistry::new();
-        register_postgres_cdc(&registry);
+        register_postgres_cdc_source(&registry);
 
         let info = registry.source_info("postgres-cdc");
         assert!(info.is_some());

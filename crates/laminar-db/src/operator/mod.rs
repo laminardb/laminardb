@@ -10,7 +10,7 @@ use arrow::datatypes::SchemaRef;
 use datafusion::prelude::SessionContext;
 
 use crate::error::DbError;
-use crate::stream_executor::{extract_projection_exprs, CompiledPostProjection};
+use crate::sql_analysis::{extract_projection_exprs, CompiledPostProjection};
 
 pub(crate) mod asof_join;
 pub(crate) mod eowc_query;

@@ -1,7 +1,10 @@
-//! Shared Arrow IPC serialization helpers.
+//! Shared serialization helpers.
 //!
-//! Centralizes `RecordBatch` ↔ bytes conversion using the Arrow IPC stream format,
-//! eliminating copy-pasted implementations across join operators and backends.
+//! - Arrow IPC: `RecordBatch` ↔ bytes conversion using the Arrow IPC stream format.
+//! - `jsonb_tags`: Canonical JSONB binary format type tag constants.
+
+/// Canonical JSONB binary format type tag constants.
+pub mod jsonb_tags;
 
 use arrow_array::RecordBatch;
 use arrow_ipc::reader::StreamReader;

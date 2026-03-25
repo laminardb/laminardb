@@ -19,7 +19,7 @@ use crate::aggregate_state::{
 use crate::error::DbError;
 use crate::metrics::PipelineCounters;
 use crate::operator_graph::{try_evaluate_compiled, GraphOperator, OperatorCheckpoint};
-use crate::stream_executor::{extract_projection_filter, single_source_table};
+use crate::sql_analysis::{extract_projection_filter, single_source_table};
 
 /// Internal state for the query operator (lazy initialization).
 enum QueryState {

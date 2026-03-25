@@ -214,7 +214,7 @@ impl CoreWindowState {
 
         // Determine if we should attempt to compile pre-agg expressions.
         // Use single_source_table (counts occurrences) to reject self-joins.
-        let compile_source = crate::stream_executor::single_source_table(sql);
+        let compile_source = crate::sql_analysis::single_source_table(sql);
         let state_ref = ctx.state();
         let compile_props = state_ref.execution_props();
         let input_df_schema = &agg_info.input_df_schema;
@@ -1980,7 +1980,7 @@ mod tests {
 
     #[test]
     fn test_emit_clause_to_core_all_variants() {
-        use crate::stream_executor::{emit_clause_to_core, sql_emit_to_core};
+        use crate::sql_analysis::{emit_clause_to_core, sql_emit_to_core};
         use laminar_sql::parser::EmitStrategy as SqlEmit;
 
         assert_eq!(

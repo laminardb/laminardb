@@ -24,7 +24,7 @@ use crate::eowc_state::IncrementalEowcState;
 use crate::error::DbError;
 use crate::metrics::PipelineCounters;
 use crate::operator_graph::{try_evaluate_compiled, GraphOperator, OperatorCheckpoint};
-use crate::stream_executor::compute_closed_boundary;
+use crate::sql_analysis::compute_closed_boundary;
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::WindowOperatorConfig;
 
@@ -625,7 +625,7 @@ fn split_by_timestamp(
     let format = batches
         .first()
         .map_or(laminar_core::time::TimestampFormat::UnixMillis, |b| {
-            crate::stream_executor::infer_ts_format_from_batch(b, time_column)
+            crate::sql_analysis::infer_ts_format_from_batch(b, time_column)
         });
 
     let mut closed_batches = Vec::new();

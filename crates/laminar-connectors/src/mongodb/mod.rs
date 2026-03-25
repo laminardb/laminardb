@@ -69,7 +69,7 @@ use crate::config::{ConfigKeySpec, ConnectorInfo};
 use crate::registry::ConnectorRegistry;
 
 /// Registers the `MongoDB` CDC source connector with the given registry.
-pub fn register_mongodb_cdc(registry: &ConnectorRegistry) {
+pub fn register_mongodb_cdc_source(registry: &ConnectorRegistry) {
     let info = ConnectorInfo {
         name: "mongodb-cdc".to_string(),
         display_name: "MongoDB CDC Source".to_string(),
@@ -158,9 +158,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_register_mongodb_cdc() {
+    fn test_register_mongodb_cdc_source() {
         let registry = ConnectorRegistry::new();
-        register_mongodb_cdc(&registry);
+        register_mongodb_cdc_source(&registry);
 
         let info = registry.source_info("mongodb-cdc");
         assert!(info.is_some());
@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn test_factory_creates_source() {
         let registry = ConnectorRegistry::new();
-        register_mongodb_cdc(&registry);
+        register_mongodb_cdc_source(&registry);
 
         let config = crate::config::ConnectorConfig::new("mongodb-cdc");
         let source = registry.create_source(&config);

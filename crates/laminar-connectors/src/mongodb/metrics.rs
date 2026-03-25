@@ -11,7 +11,7 @@ use crate::metrics::ConnectorMetrics;
 /// All counters use relaxed atomic ordering for lock-free access
 /// from the async runtime.
 #[derive(Debug)]
-pub struct MongoSourceMetrics {
+pub struct MongoDbCdcMetrics {
     /// Total change events received.
     pub events_received: AtomicU64,
 
@@ -52,7 +52,7 @@ pub struct MongoSourceMetrics {
     pub large_events_reassembled: AtomicU64,
 }
 
-impl MongoSourceMetrics {
+impl MongoDbCdcMetrics {
     /// Creates a new metrics instance with all counters at zero.
     #[must_use]
     pub fn new() -> Self {
@@ -157,7 +157,7 @@ impl MongoSourceMetrics {
     }
 }
 
-impl Default for MongoSourceMetrics {
+impl Default for MongoDbCdcMetrics {
     fn default() -> Self {
         Self::new()
     }
@@ -165,7 +165,7 @@ impl Default for MongoSourceMetrics {
 
 /// Metrics for the `MongoDB` sink connector.
 #[derive(Debug)]
-pub struct MongoSinkMetrics {
+pub struct MongoDbSinkMetrics {
     /// Total records written.
     pub records_written: AtomicU64,
 
@@ -191,7 +191,7 @@ pub struct MongoSinkMetrics {
     pub deletes: AtomicU64,
 }
 
-impl MongoSinkMetrics {
+impl MongoDbSinkMetrics {
     /// Creates a new metrics instance with all counters at zero.
     #[must_use]
     pub fn new() -> Self {
@@ -263,7 +263,7 @@ impl MongoSinkMetrics {
     }
 }
 
-impl Default for MongoSinkMetrics {
+impl Default for MongoDbSinkMetrics {
     fn default() -> Self {
         Self::new()
     }
@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn test_source_metrics_record_events() {
-        let m = MongoSourceMetrics::new();
+        let m = MongoDbCdcMetrics::new();
         m.record_event("I");
         m.record_event("I");
         m.record_event("U");
@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn test_source_metrics_to_connector_metrics() {
-        let m = MongoSourceMetrics::new();
+        let m = MongoDbCdcMetrics::new();
         m.record_event("I");
         m.record_bytes(512);
         m.record_error();
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_sink_metrics_record_flush() {
-        let m = MongoSinkMetrics::new();
+        let m = MongoDbSinkMetrics::new();
         m.record_flush(100, 5000);
         m.record_bulk_write();
         m.record_inserts(80);
@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn test_sink_metrics_to_connector_metrics() {
-        let m = MongoSinkMetrics::new();
+        let m = MongoDbSinkMetrics::new();
         m.record_flush(50, 2500);
         m.record_error();
 

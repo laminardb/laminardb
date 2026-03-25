@@ -253,8 +253,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                                     tracing::warn!(
                                         sink = %sink_name,
                                         error = %e,
-                                        "Sink write error"
+                                        "[LDB-5030] Sink write error — \
+                                         skipping remaining batches for this sink"
                                     );
+                                    break;
                                 }
                                 Err(_elapsed) => {
                                     had_timeout.store(true, Ordering::Relaxed);
@@ -273,6 +275,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                                              (next checkpoint suppressed to allow replay)"
                                         );
                                     }
+                                    break;
                                 }
                                 Ok(Ok(())) => {}
                             }
@@ -442,22 +445,21 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
 
+        let request = crate::checkpoint_coordinator::CheckpointRequest {
+            operator_states,
+            watermark: None,
+            table_store_checkpoint_path: None,
+            extra_table_offsets: extra_tables,
+            source_watermarks: per_source_watermarks,
+            pipeline_hash: self.pipeline_hash,
+            source_offset_overrides: source_overrides,
+        };
+
         if force {
             // Blocking checkpoint at shutdown.
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
-                match coord
-                    .checkpoint_with_offsets(
-                        operator_states,
-                        None,
-                        None,
-                        extra_tables,
-                        per_source_watermarks,
-                        self.pipeline_hash,
-                        source_overrides,
-                    )
-                    .await
-                {
+                match coord.checkpoint_with_offsets(request).await {
                     Ok(result) if result.success => {
                         tracing::info!(epoch = result.epoch, "Final pipeline checkpoint saved");
                     }
@@ -478,18 +480,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             // parallelism to exploit with tokio::spawn).
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
-                match coord
-                    .checkpoint_with_offsets(
-                        operator_states,
-                        None,
-                        None,
-                        extra_tables,
-                        per_source_watermarks,
-                        self.pipeline_hash,
-                        source_overrides,
-                    )
-                    .await
-                {
+                match coord.checkpoint_with_offsets(request).await {
                     Ok(result) if result.success => {
                         tracing::info!(
                             epoch = result.epoch,
@@ -582,19 +573,18 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         let mut guard = self.coordinator.lock().await;
+        let request = crate::checkpoint_coordinator::CheckpointRequest {
+            operator_states,
+            watermark: None,
+            table_store_checkpoint_path: None,
+            extra_table_offsets: extra_tables,
+            source_watermarks: per_source_watermarks,
+            pipeline_hash: self.pipeline_hash,
+            source_offset_overrides: source_overrides,
+        };
+
         if let Some(ref mut coord) = *guard {
-            match coord
-                .checkpoint_with_offsets(
-                    operator_states,
-                    None,
-                    None,
-                    extra_tables,
-                    per_source_watermarks,
-                    self.pipeline_hash,
-                    source_overrides,
-                )
-                .await
-            {
+            match coord.checkpoint_with_offsets(request).await {
                 Ok(result) if result.success => {
                     tracing::info!(
                         epoch = result.epoch,
@@ -698,7 +688,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         update_partial_cache_from_batch(partial, &batch);
                         let mut ts = self.table_store.write();
                         if let Err(e) = ts.upsert_and_rebuild(name, &batch) {
-                            tracing::warn!(table=%name, error=%e, "Table upsert error (partial)");
+                            #[allow(clippy::cast_possible_truncation)]
+                            let dropped = batch.num_rows() as u64;
+                            self.counters
+                                .events_dropped
+                                .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+                            tracing::error!(
+                                table=%name, error=%e, rows_dropped=dropped,
+                                "[LDB-5030] Table upsert failed (partial); \
+                                 {dropped} rows dropped"
+                            );
                         }
                     } else if let Some(
                         laminar_sql::datafusion::lookup_join_exec::RegisteredLookup::Versioned(
@@ -773,13 +772,31 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         );
                         let mut ts = self.table_store.write();
                         if let Err(e) = ts.upsert_and_rebuild(name, &batch) {
-                            tracing::warn!(table=%name, error=%e, "Table upsert error (versioned)");
+                            #[allow(clippy::cast_possible_truncation)]
+                            let dropped = batch.num_rows() as u64;
+                            self.counters
+                                .events_dropped
+                                .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+                            tracing::error!(
+                                table=%name, error=%e, rows_dropped=dropped,
+                                "[LDB-5030] Table upsert failed (versioned); \
+                                 {dropped} rows dropped"
+                            );
                         }
                     } else {
                         let maybe_batch = {
                             let mut ts = self.table_store.write();
                             if let Err(e) = ts.upsert_and_rebuild(name, &batch) {
-                                tracing::warn!(table=%name, error=%e, "Table upsert error");
+                                #[allow(clippy::cast_possible_truncation)]
+                                let dropped = batch.num_rows() as u64;
+                                self.counters
+                                    .events_dropped
+                                    .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+                                tracing::error!(
+                                    table=%name, error=%e, rows_dropped=dropped,
+                                    "[LDB-5030] Table upsert failed; \
+                                     {dropped} rows dropped"
+                                );
                                 None
                             } else if ts.is_persistent(name) {
                                 None

@@ -55,8 +55,8 @@ mod handle;
 mod interval_join;
 mod metrics;
 mod metrics_api;
+mod operator;
 mod operator_graph;
-mod operators;
 /// Thread-per-core connector pipeline.
 pub mod pipeline;
 mod pipeline_callback;
@@ -67,6 +67,7 @@ pub mod profile;
 pub mod recovery_manager;
 mod show_commands;
 mod sink_task;
+mod sql_analysis;
 mod sql_utils;
 mod stream_executor;
 mod table_backend;
@@ -90,7 +91,8 @@ pub mod ffi;
 pub use builder::LaminarDbBuilder;
 pub use catalog::{SourceCatalog, SourceEntry};
 pub use checkpoint_coordinator::{
-    CheckpointConfig, CheckpointCoordinator, CheckpointPhase, CheckpointResult, CheckpointStats,
+    CheckpointConfig, CheckpointCoordinator, CheckpointPhase, CheckpointRequest, CheckpointResult,
+    CheckpointStats,
 };
 pub use config::{IdentifierCaseSensitivity, LaminarConfig, TieringConfig};
 pub use db::LaminarDB;

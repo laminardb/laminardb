@@ -69,16 +69,16 @@
 //! }
 //! ```
 
-mod changelog;
-mod config;
-mod decoder;
-mod gtid;
-mod metrics;
+pub mod changelog;
+pub mod config;
+pub mod decoder;
+pub mod gtid;
+pub mod metrics;
 #[cfg(feature = "mysql-cdc")]
 pub mod mysql_io;
-mod schema;
-mod source;
-mod types;
+pub mod schema;
+pub mod source;
+pub mod types;
 
 // Primary types
 pub use changelog::{
@@ -116,7 +116,7 @@ pub fn register_mysql_cdc_source(registry: &ConnectorRegistry) {
         version: env!("CARGO_PKG_VERSION").to_string(),
         is_source: true,
         is_sink: false,
-        config_keys: config_key_specs(),
+        config_keys: mysql_cdc_config_keys(),
     };
 
     registry.register_source(
@@ -144,9 +144,8 @@ pub fn register_mysql_cdc_source(registry: &ConnectorRegistry) {
 /// Returns the configuration key specifications for `MySQL` CDC source.
 ///
 /// This is used for configuration discovery and validation.
-#[must_use]
 #[allow(clippy::too_many_lines)]
-pub fn config_key_specs() -> Vec<ConfigKeySpec> {
+fn mysql_cdc_config_keys() -> Vec<ConfigKeySpec> {
     vec![
         // Connection settings
         ConfigKeySpec::optional("host", "MySQL server hostname", "localhost"),
@@ -232,8 +231,8 @@ mod tests {
     }
 
     #[test]
-    fn test_config_key_specs() {
-        let specs = config_key_specs();
+    fn test_mysql_cdc_config_keys() {
+        let specs = mysql_cdc_config_keys();
 
         // Should have all expected keys
         assert!(specs.len() >= 15);

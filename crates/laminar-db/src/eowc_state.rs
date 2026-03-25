@@ -197,7 +197,7 @@ impl IncrementalEowcState {
 
         // Determine if we should attempt to compile pre-agg expressions.
         // Use single_source_table (counts occurrences) to reject self-joins.
-        let compile_source = crate::stream_executor::single_source_table(sql);
+        let compile_source = crate::sql_analysis::single_source_table(sql);
         let state = ctx.state();
         let props = state.execution_props();
         let input_df_schema = &agg_info.input_df_schema;
