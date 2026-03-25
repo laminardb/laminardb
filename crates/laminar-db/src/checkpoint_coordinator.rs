@@ -160,6 +160,40 @@ impl Default for CheckpointConfig {
     }
 }
 
+/// Parameters for a checkpoint operation.
+///
+/// Groups the many `HashMap` parameters that the checkpoint methods require,
+/// improving API ergonomics and readability. Use `Default::default()` or
+/// struct update syntax to fill in only the fields you need.
+///
+/// # Example
+///
+/// ```
+/// # use laminar_db::checkpoint_coordinator::CheckpointRequest;
+/// let req = CheckpointRequest {
+///     watermark: Some(5000),
+///     pipeline_hash: Some(0xDEAD_BEEF),
+///     ..CheckpointRequest::default()
+/// };
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct CheckpointRequest {
+    /// Serialized operator states.
+    pub operator_states: HashMap<String, Vec<u8>>,
+    /// Current watermark timestamp.
+    pub watermark: Option<i64>,
+    /// Path for table store checkpoint data.
+    pub table_store_checkpoint_path: Option<String>,
+    /// Additional table offset overrides.
+    pub extra_table_offsets: HashMap<String, ConnectorCheckpoint>,
+    /// Per-source watermark timestamps.
+    pub source_watermarks: HashMap<String, i64>,
+    /// Pipeline topology hash for change detection.
+    pub pipeline_hash: Option<u64>,
+    /// Source offset overrides for recovery.
+    pub source_offset_overrides: HashMap<String, ConnectorCheckpoint>,
+}
+
 /// Phase of the checkpoint lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum CheckpointPhase {
@@ -432,38 +466,16 @@ impl CheckpointCoordinator {
     /// Performs a full checkpoint cycle (steps 3-7).
     ///
     /// Steps 1-2 (barrier propagation + operator snapshots) are handled
-    /// externally by the DAG executor and passed in as `operator_states`.
-    ///
-    /// # Arguments
-    ///
-    /// * `operator_states` — serialized operator state from `DagCheckpointCoordinator`
-    /// * `watermark` — current global watermark
-    /// * `table_store_checkpoint_path` — table store checkpoint path
-    /// * `source_watermarks` — per-source watermarks
-    /// * `pipeline_hash` — pipeline identity hash
+    /// externally by the DAG executor and passed in via [`CheckpointRequest`].
     ///
     /// # Errors
     ///
     /// Returns `DbError::Checkpoint` if any phase fails.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn checkpoint(
         &mut self,
-        operator_states: HashMap<String, Vec<u8>>,
-        watermark: Option<i64>,
-        table_store_checkpoint_path: Option<String>,
-        source_watermarks: HashMap<String, i64>,
-        pipeline_hash: Option<u64>,
+        request: CheckpointRequest,
     ) -> Result<CheckpointResult, DbError> {
-        self.checkpoint_inner(
-            operator_states,
-            watermark,
-            table_store_checkpoint_path,
-            HashMap::new(),
-            source_watermarks,
-            pipeline_hash,
-            HashMap::new(),
-        )
-        .await
+        self.checkpoint_inner(request).await
     }
 
     /// Pre-commits all exactly-once sinks (phase 1) with a timeout.
@@ -608,7 +620,7 @@ impl CheckpointCoordinator {
 
         match tokio::time::timeout(timeout_dur, task).await {
             Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(e))) => Err(DbError::Checkpoint(format!("manifest persist failed: {e}"))),
+            Ok(Ok(Err(e))) => Err(DbError::from(e)),
             Ok(Err(join_err)) => Err(DbError::Checkpoint(format!(
                 "manifest persist task failed: {join_err}"
             ))),
@@ -632,7 +644,7 @@ impl CheckpointCoordinator {
 
         match tokio::time::timeout(timeout_dur, task).await {
             Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(e))) => Err(DbError::Checkpoint(format!("manifest update failed: {e}"))),
+            Ok(Ok(Err(e))) => Err(DbError::from(e)),
             Ok(Err(join_err)) => Err(DbError::Checkpoint(format!(
                 "manifest update task failed: {join_err}"
             ))),
@@ -825,67 +837,38 @@ impl CheckpointCoordinator {
 
     /// Performs a full checkpoint cycle with additional table offsets.
     ///
-    /// Identical to [`checkpoint()`](Self::checkpoint) but merges
-    /// `extra_table_offsets` into the manifest's `table_offsets` field.
-    /// This is useful for `ReferenceTableSource` instances that are not
-    /// registered as `SourceConnector` but still need their offsets persisted.
+    /// Identical to [`checkpoint()`](Self::checkpoint) but provided as a
+    /// convenience for callers that build a [`CheckpointRequest`] with
+    /// `extra_table_offsets` populated. This is useful for
+    /// `ReferenceTableSource` instances that are not registered as
+    /// `SourceConnector` but still need their offsets persisted.
     ///
     /// # Errors
     ///
     /// Returns `DbError::Checkpoint` if any phase fails.
-    #[allow(clippy::too_many_arguments)]
     pub async fn checkpoint_with_extra_tables(
         &mut self,
-        operator_states: HashMap<String, Vec<u8>>,
-        watermark: Option<i64>,
-        table_store_checkpoint_path: Option<String>,
-        extra_table_offsets: HashMap<String, ConnectorCheckpoint>,
-        source_watermarks: HashMap<String, i64>,
-        pipeline_hash: Option<u64>,
+        request: CheckpointRequest,
     ) -> Result<CheckpointResult, DbError> {
-        self.checkpoint_inner(
-            operator_states,
-            watermark,
-            table_store_checkpoint_path,
-            extra_table_offsets,
-            source_watermarks,
-            pipeline_hash,
-            HashMap::new(),
-        )
-        .await
+        self.checkpoint_inner(request).await
     }
 
     /// Performs a full checkpoint with pre-captured source offsets.
     ///
-    /// When `source_offset_overrides` is non-empty, those sources skip the
-    /// live `snapshot_sources()` call and use the provided offsets instead.
-    /// This is essential for barrier-aligned checkpoints where source
-    /// positions must match the operator state at the barrier point.
+    /// When [`CheckpointRequest::source_offset_overrides`] is non-empty,
+    /// those sources skip the live `snapshot_sources()` call and use the
+    /// provided offsets instead. This is essential for barrier-aligned
+    /// checkpoints where source positions must match the operator state
+    /// at the barrier point.
     ///
     /// # Errors
     ///
     /// Returns `DbError::Checkpoint` if any phase fails.
-    #[allow(clippy::too_many_arguments)]
     pub async fn checkpoint_with_offsets(
         &mut self,
-        operator_states: HashMap<String, Vec<u8>>,
-        watermark: Option<i64>,
-        table_store_checkpoint_path: Option<String>,
-        extra_table_offsets: HashMap<String, ConnectorCheckpoint>,
-        source_watermarks: HashMap<String, i64>,
-        pipeline_hash: Option<u64>,
-        source_offset_overrides: HashMap<String, ConnectorCheckpoint>,
+        request: CheckpointRequest,
     ) -> Result<CheckpointResult, DbError> {
-        self.checkpoint_inner(
-            operator_states,
-            watermark,
-            table_store_checkpoint_path,
-            extra_table_offsets,
-            source_watermarks,
-            pipeline_hash,
-            source_offset_overrides,
-        )
-        .await
+        self.checkpoint_inner(request).await
     }
 
     /// Shared checkpoint implementation for all checkpoint entry points.
@@ -895,20 +878,24 @@ impl CheckpointCoordinator {
     /// states are received, so the WAL positions in the manifest always
     /// reflect the state after the operator snapshot.
     ///
-    /// When `source_offset_overrides` is non-empty, those sources use the
-    /// provided offsets instead of calling `snapshot_sources()`. This ensures
-    /// barrier-aligned and pre-captured offsets are used atomically.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    /// When [`CheckpointRequest::source_offset_overrides`] is non-empty,
+    /// those sources use the provided offsets instead of calling
+    /// `snapshot_sources()`. This ensures barrier-aligned and pre-captured
+    /// offsets are used atomically.
+    #[allow(clippy::too_many_lines)]
     async fn checkpoint_inner(
         &mut self,
-        operator_states: HashMap<String, Vec<u8>>,
-        watermark: Option<i64>,
-        table_store_checkpoint_path: Option<String>,
-        extra_table_offsets: HashMap<String, ConnectorCheckpoint>,
-        source_watermarks: HashMap<String, i64>,
-        pipeline_hash: Option<u64>,
-        source_offset_overrides: HashMap<String, ConnectorCheckpoint>,
+        request: CheckpointRequest,
     ) -> Result<CheckpointResult, DbError> {
+        let CheckpointRequest {
+            operator_states,
+            watermark,
+            table_store_checkpoint_path,
+            extra_table_offsets,
+            source_watermarks,
+            pipeline_hash,
+            source_offset_overrides,
+        } = request;
         let start = Instant::now();
         let checkpoint_id = self.next_checkpoint_id;
         let epoch = self.epoch;
@@ -1191,9 +1178,7 @@ impl CheckpointCoordinator {
     ///
     /// Returns `DbError::Checkpoint` on store errors.
     pub fn load_latest_manifest(&self) -> Result<Option<CheckpointManifest>, DbError> {
-        self.store
-            .load_latest()
-            .map_err(|e| DbError::Checkpoint(format!("failed to load latest manifest: {e}")))
+        self.store.load_latest().map_err(DbError::from)
     }
 }
 
@@ -1460,7 +1445,10 @@ mod tests {
         let mut coord = make_coordinator(dir.path());
 
         let result = coord
-            .checkpoint(HashMap::new(), Some(1000), None, HashMap::new(), None)
+            .checkpoint(CheckpointRequest {
+                watermark: Some(1000),
+                ..CheckpointRequest::default()
+            })
             .await
             .unwrap();
 
@@ -1476,7 +1464,10 @@ mod tests {
 
         // Second checkpoint should increment
         let result2 = coord
-            .checkpoint(HashMap::new(), Some(2000), None, HashMap::new(), None)
+            .checkpoint(CheckpointRequest {
+                watermark: Some(2000),
+                ..CheckpointRequest::default()
+            })
             .await
             .unwrap();
 
@@ -1499,7 +1490,10 @@ mod tests {
         ops.insert("filter".into(), b"filter-state".to_vec());
 
         let result = coord
-            .checkpoint(ops, None, None, HashMap::new(), None)
+            .checkpoint(CheckpointRequest {
+                operator_states: ops,
+                ..CheckpointRequest::default()
+            })
             .await
             .unwrap();
 
@@ -1518,13 +1512,10 @@ mod tests {
         let mut coord = make_coordinator(dir.path());
 
         let result = coord
-            .checkpoint(
-                HashMap::new(),
-                None,
-                Some("/tmp/rocksdb_cp".into()),
-                HashMap::new(),
-                None,
-            )
+            .checkpoint(CheckpointRequest {
+                table_store_checkpoint_path: Some("/tmp/rocksdb_cp".into()),
+                ..CheckpointRequest::default()
+            })
             .await
             .unwrap();
 
@@ -1570,7 +1561,10 @@ mod tests {
         coord.register_changelog_drainer(drainer);
 
         let result = coord
-            .checkpoint(HashMap::new(), Some(5000), None, HashMap::new(), None)
+            .checkpoint(CheckpointRequest {
+                watermark: Some(5000),
+                ..CheckpointRequest::default()
+            })
             .await
             .unwrap();
 
@@ -1596,7 +1590,10 @@ mod tests {
         coord.set_counters(Arc::clone(&counters));
 
         let result = coord
-            .checkpoint(HashMap::new(), Some(1000), None, HashMap::new(), None)
+            .checkpoint(CheckpointRequest {
+                watermark: Some(1000),
+                ..CheckpointRequest::default()
+            })
             .await
             .unwrap();
 
@@ -1608,7 +1605,10 @@ mod tests {
 
         // Second checkpoint
         let result2 = coord
-            .checkpoint(HashMap::new(), Some(2000), None, HashMap::new(), None)
+            .checkpoint(CheckpointRequest {
+                watermark: Some(2000),
+                ..CheckpointRequest::default()
+            })
             .await
             .unwrap();
 
@@ -1624,7 +1624,7 @@ mod tests {
         let mut coord = make_coordinator(dir.path());
 
         let result = coord
-            .checkpoint(HashMap::new(), None, None, HashMap::new(), None)
+            .checkpoint(CheckpointRequest::default())
             .await
             .unwrap();
 
@@ -1716,7 +1716,10 @@ mod tests {
         ops.insert("large".into(), vec![0xBBu8; 200]);
 
         let result = coord
-            .checkpoint(ops, None, None, HashMap::new(), None)
+            .checkpoint(CheckpointRequest {
+                operator_states: ops,
+                ..CheckpointRequest::default()
+            })
             .await
             .unwrap();
         assert!(result.success);
@@ -1748,7 +1751,10 @@ mod tests {
         ops.insert("op1".into(), b"small-state".to_vec());
 
         let result = coord
-            .checkpoint(ops, None, None, HashMap::new(), None)
+            .checkpoint(CheckpointRequest {
+                operator_states: ops,
+                ..CheckpointRequest::default()
+            })
             .await
             .unwrap();
         assert!(result.success);
@@ -1879,7 +1885,7 @@ mod tests {
         // Run 3 checkpoints.
         for _ in 0..3 {
             let result = coord
-                .checkpoint(HashMap::new(), None, None, HashMap::new(), None)
+                .checkpoint(CheckpointRequest::default())
                 .await
                 .unwrap();
             assert!(result.success);

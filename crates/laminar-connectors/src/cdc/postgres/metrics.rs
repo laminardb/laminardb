@@ -11,7 +11,7 @@ use crate::metrics::ConnectorMetrics;
 /// All counters use relaxed atomic ordering for lock-free access
 /// from the Ring 1 async runtime.
 #[derive(Debug)]
-pub struct CdcMetrics {
+pub struct PostgresCdcMetrics {
     /// Total change events received (insert + update + delete).
     pub events_received: AtomicU64,
 
@@ -49,7 +49,7 @@ pub struct CdcMetrics {
     pub events_dropped: AtomicU64,
 }
 
-impl CdcMetrics {
+impl PostgresCdcMetrics {
     /// Creates a new metrics instance with all counters at zero.
     #[must_use]
     pub fn new() -> Self {
@@ -160,7 +160,7 @@ impl CdcMetrics {
     }
 }
 
-impl Default for CdcMetrics {
+impl Default for PostgresCdcMetrics {
     fn default() -> Self {
         Self::new()
     }
@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     fn test_record_operations() {
-        let m = CdcMetrics::new();
+        let m = PostgresCdcMetrics::new();
         m.record_insert();
         m.record_insert();
         m.record_update();
@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn test_lsn_and_lag_tracking() {
-        let m = CdcMetrics::new();
+        let m = PostgresCdcMetrics::new();
         m.set_confirmed_flush_lsn(0x1234_ABCD);
         m.set_replication_lag_bytes(4096);
 
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn test_to_connector_metrics() {
-        let m = CdcMetrics::new();
+        let m = PostgresCdcMetrics::new();
         m.record_insert();
         m.record_bytes(512);
         m.record_error();

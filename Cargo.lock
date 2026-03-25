@@ -1746,32 +1746,6 @@ dependencies = [
 
 [[package]]
 name = "criterion"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2b12d017a929603d80db1831cd3a24082f8137ce19c69e6447f54f5fc8d692f"
-dependencies = [
- "anes",
- "cast",
- "ciborium",
- "clap",
- "criterion-plot 0.5.0",
- "is-terminal",
- "itertools 0.10.5",
- "num-traits",
- "once_cell",
- "oorandom",
- "plotters",
- "rayon",
- "regex",
- "serde",
- "serde_derive",
- "serde_json",
- "tinytemplate",
- "walkdir",
-]
-
-[[package]]
-name = "criterion"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "950046b2aa2492f9a536f5f4f9a3de7b9e2476e575e05bd6c333371add4d98f3"
@@ -1781,7 +1755,7 @@ dependencies = [
  "cast",
  "ciborium",
  "clap",
- "criterion-plot 0.8.2",
+ "criterion-plot",
  "itertools 0.13.0",
  "num-traits",
  "oorandom",
@@ -1793,16 +1767,6 @@ dependencies = [
  "serde_json",
  "tinytemplate",
  "walkdir",
-]
-
-[[package]]
-name = "criterion-plot"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b50826342786a51a89e2da3a28f1c32b06e387201bc2d19791f622c673706b1"
-dependencies = [
- "cast",
- "itertools 0.10.5",
 ]
 
 [[package]]
@@ -4442,30 +4406,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "is-terminal"
-version = "0.4.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
-dependencies = [
- "hermit-abi",
- "libc",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
-
-[[package]]
-name = "itertools"
-version = "0.10.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
-dependencies = [
- "either",
-]
 
 [[package]]
 name = "itertools"
@@ -4605,7 +4549,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-connectors"
-version = "0.18.12"
+version = "0.18.13"
 dependencies = [
  "arrow-array",
  "arrow-avro",
@@ -4614,11 +4558,10 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "async-trait",
- "base64 0.22.1",
  "bson",
  "bytes",
  "chrono",
- "criterion 0.5.1",
+ "criterion",
  "csv",
  "datafusion",
  "deadpool-postgres",
@@ -4631,7 +4574,6 @@ dependencies = [
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
  "laminar-core",
- "laminar-storage",
  "libc",
  "mongodb",
  "mysql_async",
@@ -4665,10 +4607,9 @@ dependencies = [
 
 [[package]]
 name = "laminar-core"
-version = "0.18.12"
+version = "0.18.13"
 dependencies = [
  "ahash",
- "anyhow",
  "arrayvec",
  "arrow",
  "arrow-array",
@@ -4676,20 +4617,16 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "async-trait",
- "bumpalo",
  "bytes",
  "chitchat",
  "chrono",
- "crc32c",
- "criterion 0.8.2",
+ "criterion",
  "equivalent",
  "foyer",
  "hwlocality",
  "io-uring",
  "libc",
  "memmap2",
- "num_cpus",
- "papaya",
  "parking_lot 0.12.5",
  "proptest",
  "rand 0.10.0",
@@ -4706,24 +4643,21 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
- "windows-sys 0.59.0",
  "xorf",
  "xxhash-rust",
 ]
 
 [[package]]
 name = "laminar-db"
-version = "0.18.12"
+version = "0.18.13"
 dependencies = [
  "ahash",
- "anyhow",
  "arrow",
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
  "async-trait",
- "bumpalo",
- "criterion 0.8.2",
+ "criterion",
  "datafusion",
  "datafusion-common",
  "datafusion-expr",
@@ -4748,7 +4682,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-derive"
-version = "0.18.12"
+version = "0.18.13"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4762,7 +4696,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-server"
-version = "0.18.12"
+version = "0.18.13"
 dependencies = [
  "anyhow",
  "axum",
@@ -4798,15 +4732,14 @@ dependencies = [
 
 [[package]]
 name = "laminar-sql"
-version = "0.18.12"
+version = "0.18.13"
 dependencies = [
- "anyhow",
  "arrow",
  "arrow-array",
  "arrow-schema",
  "async-trait",
  "chrono",
- "criterion 0.8.2",
+ "criterion",
  "datafusion",
  "datafusion-common",
  "datafusion-expr",
@@ -4825,14 +4758,14 @@ dependencies = [
 
 [[package]]
 name = "laminar-storage"
-version = "0.18.12"
+version = "0.18.13"
 dependencies = [
  "anyhow",
  "backoff",
  "base64 0.22.1",
  "bytes",
  "crc32c",
- "criterion 0.8.2",
+ "criterion",
  "futures",
  "laminar-core",
  "lz4_flex",
@@ -5821,16 +5754,6 @@ checksum = "30d5b2194ed13191c1999ae0704b7839fb18384fa22e49b57eeaa97d79ce40da"
 dependencies = [
  "libc",
  "winapi",
-]
-
-[[package]]
-name = "papaya"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f92dd0b07c53a0a0c764db2ace8c541dc47320dad97c2200c2a637ab9dd2328f"
-dependencies = [
- "equivalent",
- "seize",
 ]
 
 [[package]]
@@ -7181,16 +7104,6 @@ checksum = "cc1f0cbffaac4852523ce30d8bd3c5cdc873501d96ff467ca09b6767bb8cd5c0"
 dependencies = [
  "core-foundation-sys",
  "libc",
-]
-
-[[package]]
-name = "seize"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
-dependencies = [
- "libc",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -11,7 +11,9 @@
 
 #![allow(clippy::cast_possible_wrap)]
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use laminar_connectors::mongodb::change_event::{MongoDbChangeEvent, Namespace, OperationType};
 use laminar_connectors::mongodb::source::MongoDbCdcSource;

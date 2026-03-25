@@ -20,7 +20,7 @@ use laminar_sql::translator::TemporalJoinTranslatorConfig;
 
 use crate::error::DbError;
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
-use crate::stream_executor::CompiledPostProjection;
+use crate::sql_analysis::CompiledPostProjection;
 
 pub(crate) struct TemporalJoinOperator {
     op_name: Arc<str>,

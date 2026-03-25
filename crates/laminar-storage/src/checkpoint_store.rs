@@ -137,7 +137,7 @@ pub trait CheckpointStore: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`CheckpointStoreError::NotFound`] if the checkpoint does not exist.
+    /// Returns `Ok(None)` if the checkpoint does not exist.
     fn load_by_id(&self, id: u64) -> Result<Option<CheckpointManifest>, CheckpointStoreError>;
 
     /// Lists all available checkpoints as `(checkpoint_id, epoch)` pairs.

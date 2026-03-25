@@ -125,35 +125,14 @@ impl LaminarDB {
         }
 
         // Register connector info in ConnectorManager if external connector specified.
-        // Supports two syntax forms:
-        //   1. FROM KAFKA ('topic' = 'events', ...) — connector_type is set
-        //   2. WITH ('connector' = 'kafka', 'topic' = 'events', ...) — extract from with_options
-        let (
-            resolved_connector_type,
-            resolved_connector_options,
-            resolved_format,
-            resolved_format_options,
-        ) = if create.connector_type.is_some() {
-            (
-                create.connector_type.clone(),
-                create.connector_options.clone(),
-                create.format.as_ref().map(|f| f.format_type.clone()),
-                create
-                    .format
-                    .as_ref()
-                    .map(|f| f.options.clone())
-                    .unwrap_or_default(),
-            )
-        } else if let Some(ct) = create.with_options.get("connector") {
-            // WITH-syntax: extract connector type and options from with_options
-            let (conn_opts, fmt, fmt_opts) =
-                extract_connector_from_with_options(&create.with_options);
-            (Some(ct.to_uppercase()), conn_opts, fmt, fmt_opts)
-        } else {
-            (None, HashMap::new(), None, HashMap::new())
-        };
+        let resolved = resolve_connector_info(
+            create.connector_type.as_ref(),
+            &create.connector_options,
+            create.format.as_ref(),
+            &create.with_options,
+        );
 
-        if let Some(ref ct) = resolved_connector_type {
+        if let Some(ref ct) = resolved.connector_type {
             let normalized = normalize_connector_type(ct);
             if self.connector_registry.source_info(&normalized).is_none() {
                 return Err(DbError::Connector(format!(
@@ -162,19 +141,15 @@ impl LaminarDB {
                 )));
             }
 
-            // Validate format
-            if let Some(ref fmt_str) = resolved_format {
-                laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase())
-                    .map_err(|e| DbError::Connector(format!("Unknown format '{fmt_str}': {e}")))?;
-            }
+            validate_format(resolved.format.as_ref())?;
 
             let mut mgr = self.connector_manager.lock();
             mgr.register_source(crate::connector_manager::SourceRegistration {
                 name: name.clone(),
                 connector_type: Some(ct.clone()),
-                connector_options: resolved_connector_options,
-                format: resolved_format,
-                format_options: resolved_format_options,
+                connector_options: resolved.connector_options,
+                format: resolved.format,
+                format_options: resolved.format_options,
             });
         }
 
@@ -223,34 +198,14 @@ impl LaminarDB {
         }
 
         // Register connector info in ConnectorManager if external connector specified.
-        // Supports two syntax forms:
-        //   1. INTO KAFKA ('topic' = 'events', ...) — connector_type is set
-        //   2. WITH ('connector' = 'kafka', 'topic' = 'events', ...) — extract from with_options
-        let (
-            resolved_connector_type,
-            resolved_connector_options,
-            resolved_format,
-            resolved_format_options,
-        ) = if create.connector_type.is_some() {
-            (
-                create.connector_type.clone(),
-                create.connector_options.clone(),
-                create.format.as_ref().map(|f| f.format_type.clone()),
-                create
-                    .format
-                    .as_ref()
-                    .map(|f| f.options.clone())
-                    .unwrap_or_default(),
-            )
-        } else if let Some(ct) = create.with_options.get("connector") {
-            let (conn_opts, fmt, fmt_opts) =
-                extract_connector_from_with_options(&create.with_options);
-            (Some(ct.to_uppercase()), conn_opts, fmt, fmt_opts)
-        } else {
-            (None, HashMap::new(), None, HashMap::new())
-        };
+        let resolved = resolve_connector_info(
+            create.connector_type.as_ref(),
+            &create.connector_options,
+            create.format.as_ref(),
+            &create.with_options,
+        );
 
-        if let Some(ref ct) = resolved_connector_type {
+        if let Some(ref ct) = resolved.connector_type {
             let normalized = normalize_connector_type(ct);
             if self.connector_registry.sink_info(&normalized).is_none() {
                 return Err(DbError::Connector(format!(
@@ -259,20 +214,16 @@ impl LaminarDB {
                 )));
             }
 
-            // Validate format
-            if let Some(ref fmt_str) = resolved_format {
-                laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase())
-                    .map_err(|e| DbError::Connector(format!("Unknown format '{fmt_str}': {e}")))?;
-            }
+            validate_format(resolved.format.as_ref())?;
 
             let mut mgr = self.connector_manager.lock();
             mgr.register_sink(crate::connector_manager::SinkRegistration {
                 name: name.clone(),
                 input: input.clone(),
                 connector_type: Some(ct.clone()),
-                connector_options: resolved_connector_options,
-                format: resolved_format,
-                format_options: resolved_format_options,
+                connector_options: resolved.connector_options,
+                format: resolved.format,
+                format_options: resolved.format_options,
                 filter_expr: create.filter.as_ref().map(std::string::ToString::to_string),
             });
         }
@@ -795,7 +746,7 @@ impl LaminarDB {
         {
             let mgr = self.connector_manager.lock();
             for (stream_name, reg) in mgr.streams() {
-                let refs = crate::stream_executor::extract_table_references(&reg.query_sql);
+                let refs = crate::sql_analysis::extract_table_references(&reg.query_sql);
                 if refs.contains(name) {
                     dependents.push(stream_name.clone());
                 }
@@ -883,7 +834,7 @@ impl LaminarDB {
         };
 
         // Discover source references via AST-based extraction (not substring matching)
-        let table_refs = crate::stream_executor::extract_table_references(&query_sql);
+        let table_refs = crate::sql_analysis::extract_table_references(&query_sql);
         let catalog_sources = self.catalog.list_sources();
         let mut sources: Vec<String> = catalog_sources
             .into_iter()
@@ -1067,6 +1018,68 @@ const STREAMING_OPTION_KEYS: &[&str] = &[
     "event_time",
     "watermark_delay",
 ];
+
+/// Resolved connector metadata extracted from a CREATE SOURCE/SINK statement.
+///
+/// Both `handle_create_source` and `handle_create_sink` support two syntax
+/// forms (`FROM KAFKA (...)` vs `WITH ('connector' = ...)`). This struct
+/// captures the resolved result so the resolution logic lives in one place.
+pub(crate) struct ResolvedConnector {
+    pub connector_type: Option<String>,
+    pub connector_options: HashMap<String, String>,
+    pub format: Option<String>,
+    pub format_options: HashMap<String, String>,
+}
+
+/// Resolve connector info from a DDL statement that has `connector_type`,
+/// `connector_options`, `format`, and `with_options` fields.
+///
+/// Supports:
+///   1. `FROM KAFKA ('topic' = 'events', ...)` — `connector_type` is set
+///   2. `WITH ('connector' = 'kafka', ...)` — extracted from `with_options`
+pub(crate) fn resolve_connector_info(
+    connector_type: Option<&String>,
+    connector_options: &HashMap<String, String>,
+    format: Option<&laminar_sql::parser::FormatSpec>,
+    with_options: &HashMap<String, String>,
+) -> ResolvedConnector {
+    if connector_type.is_some() {
+        ResolvedConnector {
+            connector_type: connector_type.cloned(),
+            connector_options: connector_options.clone(),
+            format: format.map(|f| f.format_type.clone()),
+            format_options: format.map(|f| f.options.clone()).unwrap_or_default(),
+        }
+    } else if let Some(ct) = with_options
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("connector"))
+        .map(|(_, v)| v)
+    {
+        let (conn_opts, fmt, fmt_opts) = extract_connector_from_with_options(with_options);
+        ResolvedConnector {
+            connector_type: Some(ct.to_uppercase()),
+            connector_options: conn_opts,
+            format: fmt,
+            format_options: fmt_opts,
+        }
+    } else {
+        ResolvedConnector {
+            connector_type: None,
+            connector_options: HashMap::new(),
+            format: None,
+            format_options: HashMap::new(),
+        }
+    }
+}
+
+/// Validate that a resolved format string is known.
+pub(crate) fn validate_format(format: Option<&String>) -> Result<(), DbError> {
+    if let Some(fmt_str) = format {
+        laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase())
+            .map_err(|e| DbError::Connector(format!("Unknown format '{fmt_str}': {e}")))?;
+    }
+    Ok(())
+}
 
 /// Extracts connector-specific options from a `WITH (...)` clause map.
 ///

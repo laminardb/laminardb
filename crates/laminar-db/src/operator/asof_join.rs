@@ -15,7 +15,7 @@ use laminar_sql::translator::AsofJoinTranslatorConfig;
 use crate::asof_batch::execute_asof_join_batch;
 use crate::error::DbError;
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
-use crate::stream_executor::CompiledPostProjection;
+use crate::sql_analysis::CompiledPostProjection;
 
 pub(crate) struct AsofJoinOperator {
     op_name: Arc<str>,

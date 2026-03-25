@@ -9,7 +9,9 @@
 #![allow(clippy::disallowed_types)] // cold path: server startup and config only
 
 mod config;
+#[cfg(feature = "delta-experimental")]
 mod delta;
+#[cfg(feature = "delta-experimental")]
 mod delta_config;
 mod http;
 mod reload;

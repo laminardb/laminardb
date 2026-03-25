@@ -62,11 +62,17 @@ pub enum DbError {
     /// Checkpoint error
     Checkpoint(String),
 
+    /// Checkpoint store error (preserves structured source error).
+    CheckpointStore(#[from] laminar_storage::checkpoint_store::CheckpointStoreError),
+
     /// Unresolved config variable
     UnresolvedConfigVar(String),
 
     /// Connector error
     Connector(String),
+
+    /// Connector operation error (preserves structured source error).
+    ConnectorOp(#[from] laminar_connectors::error::ConnectorError),
 
     /// Pipeline error (start/shutdown lifecycle)
     Pipeline(String),
@@ -162,9 +168,9 @@ impl DbError {
             Self::SchemaMismatch(_) => error_codes::SCHEMA_MISMATCH,
             Self::InvalidOperation(_) | Self::Unsupported(_) => error_codes::INVALID_OPERATION,
             Self::Shutdown => error_codes::SHUTDOWN,
-            Self::Checkpoint(_) => error_codes::CHECKPOINT_FAILED,
+            Self::Checkpoint(_) | Self::CheckpointStore(_) => error_codes::CHECKPOINT_FAILED,
             Self::UnresolvedConfigVar(_) => error_codes::UNRESOLVED_CONFIG_VAR,
-            Self::Connector(_) => error_codes::CONNECTOR_CONNECTION_FAILED,
+            Self::Connector(_) | Self::ConnectorOp(_) => error_codes::CONNECTOR_CONNECTION_FAILED,
             Self::Pipeline(_) => error_codes::PIPELINE_ERROR,
             Self::QueryPipeline { .. } => error_codes::QUERY_PIPELINE_ERROR,
             Self::MaterializedView(_) => error_codes::MATERIALIZED_VIEW_ERROR,
@@ -176,10 +182,14 @@ impl DbError {
     /// Whether this error is transient (retryable).
     #[must_use]
     pub fn is_transient(&self) -> bool {
-        matches!(
-            self,
-            Self::Streaming(_) | Self::Connector(_) | Self::Checkpoint(_)
-        )
+        match self {
+            Self::Streaming(_)
+            | Self::Connector(_)
+            | Self::Checkpoint(_)
+            | Self::CheckpointStore(_) => true,
+            Self::ConnectorOp(e) => e.is_transient(),
+            _ => false,
+        }
     }
 }
 
@@ -236,11 +246,17 @@ impl std::fmt::Display for DbError {
             Self::Checkpoint(msg) => {
                 write!(f, "[{}] Checkpoint error: {msg}", self.code())
             }
+            Self::CheckpointStore(e) => {
+                write!(f, "[{}] Checkpoint store error: {e}", self.code())
+            }
             Self::UnresolvedConfigVar(msg) => {
                 write!(f, "[{}] Unresolved config variable: {msg}", self.code())
             }
             Self::Connector(msg) => {
                 write!(f, "[{}] Connector error: {msg}", self.code())
+            }
+            Self::ConnectorOp(e) => {
+                write!(f, "[{}] Connector error: {e}", self.code())
             }
             Self::Pipeline(msg) => {
                 write!(f, "[{}] Pipeline error: {msg}", self.code())

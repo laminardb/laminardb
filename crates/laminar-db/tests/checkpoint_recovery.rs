@@ -6,7 +6,9 @@
 
 use std::collections::HashMap;
 
-use laminar_db::checkpoint_coordinator::{CheckpointConfig, CheckpointCoordinator};
+use laminar_db::checkpoint_coordinator::{
+    CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
+};
 use laminar_db::recovery_manager::RecoveryManager;
 use laminar_storage::checkpoint_manifest::{
     CheckpointManifest, ConnectorCheckpoint, OperatorCheckpoint,
@@ -36,7 +38,11 @@ async fn test_happy_path_checkpoint_and_recovery() {
     ops.insert("window-agg".into(), b"accumulated-state".to_vec());
 
     let result = coord
-        .checkpoint(ops, Some(5000), None, HashMap::new(), None)
+        .checkpoint(CheckpointRequest {
+            operator_states: ops,
+            watermark: Some(5000),
+            ..CheckpointRequest::default()
+        })
         .await
         .unwrap();
 
@@ -177,13 +183,10 @@ async fn test_table_store_checkpoint_path_recovery() {
 
     let mut coord = make_coordinator(dir.path());
     let result = coord
-        .checkpoint(
-            HashMap::new(),
-            None,
-            Some("/data/rocksdb_cp_001".into()),
-            HashMap::new(),
-            None,
-        )
+        .checkpoint(CheckpointRequest {
+            table_store_checkpoint_path: Some("/data/rocksdb_cp_001".into()),
+            ..CheckpointRequest::default()
+        })
         .await
         .unwrap();
 
@@ -210,11 +213,17 @@ async fn test_coordinator_resumes_epoch_after_recovery() {
     {
         let mut coord = make_coordinator(dir.path());
         coord
-            .checkpoint(HashMap::new(), Some(1000), None, HashMap::new(), None)
+            .checkpoint(CheckpointRequest {
+                watermark: Some(1000),
+                ..CheckpointRequest::default()
+            })
             .await
             .unwrap();
         coord
-            .checkpoint(HashMap::new(), Some(2000), None, HashMap::new(), None)
+            .checkpoint(CheckpointRequest {
+                watermark: Some(2000),
+                ..CheckpointRequest::default()
+            })
             .await
             .unwrap();
 
@@ -242,7 +251,7 @@ async fn test_incremental_checkpoint_flag() {
     let mut coord = CheckpointCoordinator::new(config, store);
 
     let result = coord
-        .checkpoint(HashMap::new(), None, None, HashMap::new(), None)
+        .checkpoint(CheckpointRequest::default())
         .await
         .unwrap();
 

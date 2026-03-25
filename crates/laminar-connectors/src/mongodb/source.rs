@@ -33,7 +33,7 @@ use crate::metrics::ConnectorMetrics;
 
 use super::change_event::{MongoDbChangeEvent, OperationType};
 use super::config::MongoDbSourceConfig;
-use super::metrics::MongoSourceMetrics;
+use super::metrics::MongoDbCdcMetrics;
 use super::resume_token::{InMemoryResumeTokenStore, ResumeToken, ResumeTokenStore};
 
 /// Returns the Arrow schema for `MongoDB` CDC envelope records.
@@ -92,7 +92,7 @@ pub struct MongoDbCdcSource {
     schema: SchemaRef,
 
     /// Lock-free metrics.
-    metrics: Arc<MongoSourceMetrics>,
+    metrics: Arc<MongoDbCdcMetrics>,
 
     /// Buffered change events awaiting `poll_batch`.
     event_buffer: VecDeque<MongoDbChangeEvent>,
@@ -139,7 +139,7 @@ impl MongoDbCdcSource {
             config,
             state: ConnectorState::Created,
             schema: mongodb_cdc_envelope_schema(),
-            metrics: Arc::new(MongoSourceMetrics::new()),
+            metrics: Arc::new(MongoDbCdcMetrics::new()),
             event_buffer: VecDeque::new(),
             last_resume_token: None,
             resume_token_store: Box::new(InMemoryResumeTokenStore::new()),
@@ -559,7 +559,7 @@ async fn run_change_stream_reader(
     tx: tokio::sync::mpsc::Sender<ChangeStreamPayload>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     data_ready: Arc<Notify>,
-    metrics: Arc<MongoSourceMetrics>,
+    metrics: Arc<MongoDbCdcMetrics>,
 ) -> Result<(), ConnectorError> {
     use futures_util::StreamExt;
     use mongodb::options::ChangeStreamOptions;
