@@ -128,6 +128,9 @@ pub(crate) struct OperatorGraph {
     /// fan-out growth within a single cycle. `0` means unlimited (default).
     max_input_buf_batches: usize,
     query_budget_ns: u64,
+    /// Round-robin offset for deferred operator selection. Ensures fair
+    /// scheduling when budget is continuously exceeded (not checkpointed).
+    deferred_scan_offset: usize,
     max_state_bytes: Option<usize>,
     ctx: SessionContext,
     counters: Option<Arc<PipelineCounters>>,
@@ -152,6 +155,7 @@ impl OperatorGraph {
             input_bufs: Vec::new(),
             max_input_buf_batches: 0,
             query_budget_ns: 8_000_000,
+            deferred_scan_offset: 0,
             max_state_bytes: None,
             ctx,
             counters: None,
@@ -748,11 +752,126 @@ impl OperatorGraph {
         self.cycle_intermediates = intermediate_tables;
     }
 
+    /// Execute a single operator node: take inputs, process, route outputs.
+    ///
+    /// Returns `Ok(())` on success or if the operator was skipped
+    /// (depends-on-stream error). Returns `Err` on fatal errors — the caller
+    /// must call `finish_cycle` before propagating.
+    async fn execute_single_operator(
+        &mut self,
+        node_id: usize,
+        current_watermark: i64,
+        results: &mut FxHashMap<Arc<str>, Vec<RecordBatch>>,
+        intermediate_tables: &mut Vec<String>,
+    ) -> Result<(), DbError> {
+        let inputs = std::mem::take(&mut self.input_bufs[node_id]);
+
+        let output_result = self.nodes[node_id]
+            .operator
+            .process(&inputs, current_watermark)
+            .await;
+
+        let port_count = self.nodes[node_id].input_port_count;
+        self.input_bufs[node_id] = vec![Vec::new(); port_count];
+
+        let batches = match output_result {
+            Ok(b) => b,
+            Err(e) => {
+                if self.depends_on_stream.contains(&node_id) {
+                    tracing::debug!(
+                        query = %self.nodes[node_id].name,
+                        error = %e,
+                        "Query skipped (upstream not ready)"
+                    );
+                    return Ok(());
+                }
+                return Err(e);
+            }
+        };
+
+        if let Some(limit) = self.max_state_bytes {
+            let size = self.nodes[node_id].operator.estimated_state_bytes();
+            if size >= limit {
+                return Err(DbError::Pipeline(format!(
+                    "state size limit exceeded for query '{}' ({size} bytes >= {limit} limit)",
+                    self.nodes[node_id].name
+                )));
+            }
+            if size >= limit * 4 / 5 {
+                tracing::warn!(
+                    query = %self.nodes[node_id].name,
+                    size_bytes = size,
+                    limit_bytes = limit,
+                    "state size at 80% of limit"
+                );
+            }
+        }
+
+        let batches = if let Some(oc) = self.order_configs.get(&node_id) {
+            match oc {
+                OrderOperatorConfig::TopK(c) => apply_topk_filter(&batches, c.k),
+                OrderOperatorConfig::PerGroupTopK(c) => apply_topk_filter(&batches, c.k),
+                _ => batches,
+            }
+        } else {
+            batches
+        };
+
+        if !batches.is_empty() {
+            let node_name = Arc::clone(&self.nodes[node_id].name);
+
+            if !self.nodes[node_id].output_routes.is_empty() {
+                let schema = batches[0].schema();
+                if let Ok(mem_table) =
+                    datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
+                {
+                    let _ = self.ctx.deregister_table(&*node_name);
+                    if let Err(e) = self.ctx.register_table(&*node_name, Arc::new(mem_table)) {
+                        tracing::warn!(
+                            query = %node_name,
+                            error = %e,
+                            "[LDB-3015] Failed to register intermediate table"
+                        );
+                    }
+                    intermediate_tables.push(node_name.to_string());
+                }
+            }
+
+            if self.output_map.values().any(|&id| id == node_id) {
+                results.insert(node_name, batches.clone());
+            }
+
+            // Extend (not overwrite) so deferred operators retain
+            // batches accumulated from prior cycles.
+            let routes = self.nodes[node_id].output_routes.clone();
+            if routes.len() == 1 {
+                let (target, port) = routes[0];
+                let buf = &mut self.input_bufs[target][port as usize];
+                if buf.is_empty() {
+                    *buf = batches;
+                } else {
+                    buf.extend(batches);
+                }
+                self.enforce_input_buf_cap(target, port as usize);
+            } else if routes.len() > 1 {
+                for &(target, port) in &routes {
+                    self.input_bufs[target][port as usize].extend(batches.iter().cloned());
+                    self.enforce_input_buf_cap(target, port as usize);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Execute one processing cycle.
     ///
     /// Registers `source_batches` as temporary tables, runs all operators in
     /// topological order, and returns a map from stream name to result batches.
-    #[allow(clippy::too_many_lines)]
+    ///
+    /// When the per-query time budget is exceeded, one deferred operator with
+    /// non-empty input is executed to guarantee forward progress and prevent
+    /// tail-operator starvation.
     pub async fn execute_cycle(
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
@@ -781,7 +900,6 @@ impl OperatorGraph {
         for i in 0..topo_len {
             let node_id = self.topo_order[i];
 
-            // Skip tombstoned nodes
             if self.nodes[node_id].removed {
                 continue;
             }
@@ -796,115 +914,55 @@ impl OperatorGraph {
                         elapsed_ms = elapsed_ns / 1_000_000,
                         "per-query budget exceeded — deferring remaining operators"
                     );
+
+                    // Forward progress: run one deferred operator to prevent
+                    // tail-operator starvation. Round-robin ensures fair
+                    // scheduling under continuous input.
+                    let deferred_count = topo_len - i;
+                    let start = self.deferred_scan_offset % deferred_count;
+                    for offset in 0..deferred_count {
+                        let j = i + (start + offset) % deferred_count;
+                        let deferred_id = self.topo_order[j];
+                        if self.nodes[deferred_id].removed {
+                            continue;
+                        }
+                        let has_input = self.input_bufs[deferred_id]
+                            .iter()
+                            .any(|port| !port.is_empty());
+                        if !has_input {
+                            continue;
+                        }
+                        if let Err(e) = self
+                            .execute_single_operator(
+                                deferred_id,
+                                current_watermark,
+                                &mut results,
+                                &mut intermediate_tables,
+                            )
+                            .await
+                        {
+                            self.finish_cycle(intermediate_tables);
+                            return Err(e);
+                        }
+                        self.deferred_scan_offset = self.deferred_scan_offset.wrapping_add(1);
+                        break; // Only one per cycle
+                    }
+
                     break;
                 }
             }
 
-            // Take inputs for this node
-            let inputs = std::mem::take(&mut self.input_bufs[node_id]);
-
-            // Call operator
-            let output_result = self.nodes[node_id]
-                .operator
-                .process(&inputs, current_watermark)
-                .await;
-
-            // Put empty buffers back
-            let port_count = self.nodes[node_id].input_port_count;
-            self.input_bufs[node_id] = vec![Vec::new(); port_count];
-
-            // Handle result
-            let batches = match output_result {
-                Ok(b) => b,
-                Err(e) => {
-                    if self.depends_on_stream.contains(&node_id) {
-                        tracing::debug!(
-                            query = %self.nodes[node_id].name,
-                            error = %e,
-                            "Query skipped (upstream not ready)"
-                        );
-                        continue;
-                    }
-                    self.finish_cycle(intermediate_tables);
-                    return Err(e);
-                }
-            };
-
-            // State size check
-            if let Some(limit) = self.max_state_bytes {
-                let size = self.nodes[node_id].operator.estimated_state_bytes();
-                if size >= limit {
-                    self.finish_cycle(intermediate_tables);
-                    return Err(DbError::Pipeline(format!(
-                        "state size limit exceeded for query '{}' ({size} bytes >= {limit} limit)",
-                        self.nodes[node_id].name
-                    )));
-                }
-                if size >= limit * 4 / 5 {
-                    tracing::warn!(
-                        query = %self.nodes[node_id].name,
-                        size_bytes = size,
-                        limit_bytes = limit,
-                        "state size at 80% of limit"
-                    );
-                }
-            }
-
-            // Apply Top-K post-filter
-            let batches = if let Some(oc) = self.order_configs.get(&node_id) {
-                match oc {
-                    OrderOperatorConfig::TopK(c) => apply_topk_filter(&batches, c.k),
-                    OrderOperatorConfig::PerGroupTopK(c) => apply_topk_filter(&batches, c.k),
-                    _ => batches,
-                }
-            } else {
-                batches
-            };
-
-            if !batches.is_empty() {
-                let node_name = Arc::clone(&self.nodes[node_id].name);
-
-                // Register as intermediate MemTable for downstream DataFusion operators
-                if !self.nodes[node_id].output_routes.is_empty() {
-                    let schema = batches[0].schema();
-                    if let Ok(mem_table) =
-                        datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
-                    {
-                        let _ = self.ctx.deregister_table(&*node_name);
-                        if let Err(e) = self.ctx.register_table(&*node_name, Arc::new(mem_table)) {
-                            tracing::warn!(
-                                query = %node_name,
-                                error = %e,
-                                "[LDB-3015] Failed to register intermediate table"
-                            );
-                        }
-                        intermediate_tables.push(node_name.to_string());
-                    }
-                }
-
-                // Collect as result if this is an output node
-                if self.output_map.values().any(|&id| id == node_id) {
-                    results.insert(node_name, batches.clone());
-                }
-
-                // Route to downstream nodes via edges. Extend (not overwrite)
-                // so deferred operators retain batches from prior cycles.
-                let routes = self.nodes[node_id].output_routes.clone();
-                if routes.len() == 1 {
-                    let (target, port) = routes[0];
-                    let buf = &mut self.input_bufs[target][port as usize];
-                    if buf.is_empty() {
-                        *buf = batches;
-                    } else {
-                        buf.extend(batches);
-                    }
-                    self.enforce_input_buf_cap(target, port as usize);
-                } else if routes.len() > 1 {
-                    for &(target, port) in &routes {
-                        self.input_bufs[target][port as usize].extend(batches.iter().cloned());
-                        self.enforce_input_buf_cap(target, port as usize);
-                    }
-                }
+            if let Err(e) = self
+                .execute_single_operator(
+                    node_id,
+                    current_watermark,
+                    &mut results,
+                    &mut intermediate_tables,
+                )
+                .await
+            {
+                self.finish_cycle(intermediate_tables);
+                return Err(e);
             }
         }
 
@@ -1444,6 +1502,45 @@ mod tests {
         assert!(
             produced < 2,
             "with 1ns budget, at most one query should run"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_og_budget_deferred_forward_progress() {
+        // With a 1ns budget, only the first operator runs in the main loop.
+        // The deferred execution pass must guarantee every operator eventually
+        // processes its input within N cycles (N = number of deferred operators).
+        let mut graph = test_graph();
+        graph.set_query_budget_ns(1); // forces break after first operator
+
+        // Add 5 independent queries — all read from "trades"
+        for i in 0..5 {
+            graph.add_query(
+                format!("q{i}"),
+                "SELECT * FROM trades".to_string(),
+                None,
+                None,
+                None,
+            );
+        }
+
+        let mut source = FxHashMap::default();
+        source.insert(Arc::from("trades"), vec![test_batch()]);
+
+        // Run enough cycles for all 5 operators to get their turn via
+        // deferred execution (1 main + 1 deferred per cycle = 5 cycles).
+        let mut produced = FxHashSet::default();
+        for _ in 0..5 {
+            let r = graph.execute_cycle(&source, i64::MAX).await.unwrap();
+            for key in r.keys() {
+                produced.insert(key.to_string());
+            }
+        }
+
+        assert_eq!(
+            produced.len(),
+            5,
+            "all 5 operators should produce output within 5 cycles, got: {produced:?}"
         );
     }
 
