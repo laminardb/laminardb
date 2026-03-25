@@ -346,12 +346,6 @@ pub struct RetractableCountAccumulator {
 }
 
 impl RetractableCountAccumulator {
-    /// Creates a new count accumulator.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Returns the current count (may be negative during retraction).
     #[must_use]
     pub fn count(&self) -> i64 {
@@ -402,12 +396,6 @@ pub struct RetractableSumAccumulator {
 }
 
 impl RetractableSumAccumulator {
-    /// Creates a new sum accumulator.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Returns the current sum.
     #[must_use]
     pub fn sum(&self) -> i64 {
@@ -462,12 +450,6 @@ pub struct RetractableAvgAccumulator {
 }
 
 impl RetractableAvgAccumulator {
-    /// Creates a new average accumulator.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Returns the current sum.
     #[must_use]
     pub fn sum(&self) -> i64 {
@@ -532,14 +514,6 @@ pub struct RetractableMinAccumulator {
     counts: std::collections::BTreeMap<i64, usize>,
 }
 
-impl RetractableMinAccumulator {
-    /// Creates a new min accumulator.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
 impl RetractableAccumulator for RetractableMinAccumulator {
     type Input = i64;
     type Output = Option<i64>;
@@ -589,14 +563,6 @@ impl RetractableAccumulator for RetractableMinAccumulator {
 pub struct RetractableMaxAccumulator {
     /// Value → occurrence count (sorted for O(1) max access)
     counts: std::collections::BTreeMap<i64, usize>,
-}
-
-impl RetractableMaxAccumulator {
-    /// Creates a new max accumulator.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
 }
 
 impl RetractableAccumulator for RetractableMaxAccumulator {
@@ -1088,12 +1054,6 @@ pub struct RetractableFirstValueAccumulator {
 }
 
 impl RetractableFirstValueAccumulator {
-    /// Creates a new empty accumulator.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Returns the number of stored entries.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -1169,12 +1129,6 @@ pub struct RetractableLastValueAccumulator {
 }
 
 impl RetractableLastValueAccumulator {
-    /// Creates a new empty accumulator.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Returns the number of stored entries.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -1250,12 +1204,6 @@ pub struct RetractableFirstValueF64Accumulator {
 }
 
 impl RetractableFirstValueF64Accumulator {
-    /// Creates a new empty accumulator.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Returns the number of stored entries.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -1346,12 +1294,6 @@ pub struct RetractableLastValueF64Accumulator {
 }
 
 impl RetractableLastValueF64Accumulator {
-    /// Creates a new empty accumulator.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Returns the number of stored entries.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -1896,7 +1838,7 @@ mod tests {
 
     #[test]
     fn test_retractable_first_value_basic() {
-        let mut acc = RetractableFirstValueAccumulator::new();
+        let mut acc = RetractableFirstValueAccumulator::default();
         assert!(acc.is_empty());
         assert_eq!(acc.result(), None);
 
@@ -1913,7 +1855,7 @@ mod tests {
 
     #[test]
     fn test_retractable_first_value_retract_non_first() {
-        let mut acc = RetractableFirstValueAccumulator::new();
+        let mut acc = RetractableFirstValueAccumulator::default();
         acc.add((100, 10));
         acc.add((200, 20));
         acc.add((300, 30));
@@ -1926,7 +1868,7 @@ mod tests {
 
     #[test]
     fn test_retractable_first_value_retract_first() {
-        let mut acc = RetractableFirstValueAccumulator::new();
+        let mut acc = RetractableFirstValueAccumulator::default();
         acc.add((100, 10));
         acc.add((200, 20));
         acc.add((300, 30));
@@ -1939,7 +1881,7 @@ mod tests {
 
     #[test]
     fn test_retractable_first_value_retract_all() {
-        let mut acc = RetractableFirstValueAccumulator::new();
+        let mut acc = RetractableFirstValueAccumulator::default();
         acc.add((100, 10));
         acc.add((200, 20));
 
@@ -1951,7 +1893,7 @@ mod tests {
 
     #[test]
     fn test_retractable_first_value_retract_nonexistent() {
-        let mut acc = RetractableFirstValueAccumulator::new();
+        let mut acc = RetractableFirstValueAccumulator::default();
         acc.add((100, 10));
 
         // Retract something that doesn't exist → no effect
@@ -1962,7 +1904,7 @@ mod tests {
 
     #[test]
     fn test_retractable_first_value_duplicate_timestamps() {
-        let mut acc = RetractableFirstValueAccumulator::new();
+        let mut acc = RetractableFirstValueAccumulator::default();
         acc.add((100, 10));
         acc.add((100, 20)); // Same timestamp, different value
 
@@ -1979,7 +1921,7 @@ mod tests {
 
     #[test]
     fn test_retractable_last_value_basic() {
-        let mut acc = RetractableLastValueAccumulator::new();
+        let mut acc = RetractableLastValueAccumulator::default();
         assert!(acc.is_empty());
         assert_eq!(acc.result(), None);
 
@@ -1994,7 +1936,7 @@ mod tests {
 
     #[test]
     fn test_retractable_last_value_retract_non_last() {
-        let mut acc = RetractableLastValueAccumulator::new();
+        let mut acc = RetractableLastValueAccumulator::default();
         acc.add((100, 10));
         acc.add((200, 20));
         acc.add((300, 30));
@@ -2006,7 +1948,7 @@ mod tests {
 
     #[test]
     fn test_retractable_last_value_retract_last() {
-        let mut acc = RetractableLastValueAccumulator::new();
+        let mut acc = RetractableLastValueAccumulator::default();
         acc.add((100, 10));
         acc.add((200, 20));
         acc.add((300, 30));
@@ -2018,7 +1960,7 @@ mod tests {
 
     #[test]
     fn test_retractable_last_value_retract_all() {
-        let mut acc = RetractableLastValueAccumulator::new();
+        let mut acc = RetractableLastValueAccumulator::default();
         acc.add((100, 10));
         acc.retract(&(100, 10));
         assert!(acc.is_empty());
@@ -2029,8 +1971,8 @@ mod tests {
 
     #[test]
     fn test_retractable_first_value_merge() {
-        let mut acc1 = RetractableFirstValueAccumulator::new();
-        let mut acc2 = RetractableFirstValueAccumulator::new();
+        let mut acc1 = RetractableFirstValueAccumulator::default();
+        let mut acc2 = RetractableFirstValueAccumulator::default();
 
         acc1.add((200, 20));
         acc1.add((400, 40));
@@ -2045,8 +1987,8 @@ mod tests {
 
     #[test]
     fn test_retractable_last_value_merge() {
-        let mut acc1 = RetractableLastValueAccumulator::new();
-        let mut acc2 = RetractableLastValueAccumulator::new();
+        let mut acc1 = RetractableLastValueAccumulator::default();
+        let mut acc2 = RetractableLastValueAccumulator::default();
 
         acc1.add((100, 10));
         acc1.add((300, 30));
@@ -2061,15 +2003,15 @@ mod tests {
 
     #[test]
     fn test_retractable_first_value_merge_empty() {
-        let mut acc1 = RetractableFirstValueAccumulator::new();
-        let acc2 = RetractableFirstValueAccumulator::new();
+        let mut acc1 = RetractableFirstValueAccumulator::default();
+        let acc2 = RetractableFirstValueAccumulator::default();
 
         acc1.add((100, 10));
         acc1.merge(&acc2); // Merge empty into non-empty
         assert_eq!(acc1.result(), Some(10));
 
-        let mut acc3 = RetractableFirstValueAccumulator::new();
-        let acc4 = RetractableFirstValueAccumulator::new();
+        let mut acc3 = RetractableFirstValueAccumulator::default();
+        let acc4 = RetractableFirstValueAccumulator::default();
         acc3.merge(&acc4); // Merge empty into empty
         assert!(acc3.is_empty());
     }
@@ -2078,7 +2020,7 @@ mod tests {
 
     #[test]
     fn test_retractable_first_value_reset() {
-        let mut acc = RetractableFirstValueAccumulator::new();
+        let mut acc = RetractableFirstValueAccumulator::default();
         acc.add((100, 10));
         acc.add((200, 20));
         assert!(!acc.is_empty());
@@ -2090,7 +2032,7 @@ mod tests {
 
     #[test]
     fn test_retractable_last_value_reset() {
-        let mut acc = RetractableLastValueAccumulator::new();
+        let mut acc = RetractableLastValueAccumulator::default();
         acc.add((100, 10));
         acc.reset();
         assert!(acc.is_empty());
@@ -2100,7 +2042,7 @@ mod tests {
 
     #[test]
     fn test_retractable_first_value_f64_basic() {
-        let mut acc = RetractableFirstValueF64Accumulator::new();
+        let mut acc = RetractableFirstValueF64Accumulator::default();
         acc.add((200, 20.5));
         acc.add((100, 10.5));
         acc.add((300, 30.5));
@@ -2113,7 +2055,7 @@ mod tests {
 
     #[test]
     fn test_retractable_first_value_f64_retract() {
-        let mut acc = RetractableFirstValueF64Accumulator::new();
+        let mut acc = RetractableFirstValueF64Accumulator::default();
         acc.add((100, 10.5));
         acc.add((200, 20.5));
 
@@ -2125,7 +2067,7 @@ mod tests {
 
     #[test]
     fn test_retractable_last_value_f64_basic() {
-        let mut acc = RetractableLastValueF64Accumulator::new();
+        let mut acc = RetractableLastValueF64Accumulator::default();
         acc.add((100, 10.5));
         acc.add((300, 30.5));
         acc.add((200, 20.5));
@@ -2136,7 +2078,7 @@ mod tests {
 
     #[test]
     fn test_retractable_last_value_f64_retract() {
-        let mut acc = RetractableLastValueF64Accumulator::new();
+        let mut acc = RetractableLastValueF64Accumulator::default();
         acc.add((100, 10.5));
         acc.add((200, 20.5));
         acc.add((300, 30.5));
@@ -2148,8 +2090,8 @@ mod tests {
 
     #[test]
     fn test_retractable_first_value_f64_merge() {
-        let mut acc1 = RetractableFirstValueF64Accumulator::new();
-        let mut acc2 = RetractableFirstValueF64Accumulator::new();
+        let mut acc1 = RetractableFirstValueF64Accumulator::default();
+        let mut acc2 = RetractableFirstValueF64Accumulator::default();
         acc1.add((200, 20.5));
         acc2.add((100, 10.5));
         acc1.merge(&acc2);
@@ -2159,8 +2101,8 @@ mod tests {
 
     #[test]
     fn test_retractable_last_value_f64_merge() {
-        let mut acc1 = RetractableLastValueF64Accumulator::new();
-        let mut acc2 = RetractableLastValueF64Accumulator::new();
+        let mut acc1 = RetractableLastValueF64Accumulator::default();
+        let mut acc2 = RetractableLastValueF64Accumulator::default();
         acc1.add((100, 10.5));
         acc2.add((300, 30.5));
         acc1.merge(&acc2);
@@ -2172,7 +2114,7 @@ mod tests {
 
     #[test]
     fn test_retractable_first_value_single_entry() {
-        let mut acc = RetractableFirstValueAccumulator::new();
+        let mut acc = RetractableFirstValueAccumulator::default();
         acc.add((100, 42));
         assert_eq!(acc.result(), Some(42));
         acc.retract(&(100, 42));
@@ -2181,7 +2123,7 @@ mod tests {
 
     #[test]
     fn test_retractable_last_value_single_entry() {
-        let mut acc = RetractableLastValueAccumulator::new();
+        let mut acc = RetractableLastValueAccumulator::default();
         acc.add((100, 42));
         assert_eq!(acc.result(), Some(42));
         acc.retract(&(100, 42));
@@ -2190,7 +2132,7 @@ mod tests {
 
     #[test]
     fn test_retractable_first_value_negative_values() {
-        let mut acc = RetractableFirstValueAccumulator::new();
+        let mut acc = RetractableFirstValueAccumulator::default();
         acc.add((100, -10));
         acc.add((200, -20));
         assert_eq!(acc.result(), Some(-10));
@@ -2198,16 +2140,16 @@ mod tests {
 
     #[test]
     fn test_retractable_supports_efficient_retraction() {
-        let acc = RetractableFirstValueAccumulator::new();
+        let acc = RetractableFirstValueAccumulator::default();
         assert!(acc.supports_efficient_retraction());
 
-        let acc2 = RetractableLastValueAccumulator::new();
+        let acc2 = RetractableLastValueAccumulator::default();
         assert!(acc2.supports_efficient_retraction());
 
-        let acc3 = RetractableFirstValueF64Accumulator::new();
+        let acc3 = RetractableFirstValueF64Accumulator::default();
         assert!(acc3.supports_efficient_retraction());
 
-        let acc4 = RetractableLastValueF64Accumulator::new();
+        let acc4 = RetractableLastValueF64Accumulator::default();
         assert!(acc4.supports_efficient_retraction());
     }
 
@@ -2217,8 +2159,8 @@ mod tests {
     fn test_ohlc_retraction_simulation() {
         // Simulate an OHLC window where trades arrive out of order
         // and one needs to be retracted
-        let mut open_acc = RetractableFirstValueAccumulator::new();
-        let mut close_acc = RetractableLastValueAccumulator::new();
+        let mut open_acc = RetractableFirstValueAccumulator::default();
+        let mut close_acc = RetractableLastValueAccumulator::default();
 
         // Trade 1: price=100 at t=1000
         open_acc.add((1000, 100));
@@ -2247,8 +2189,8 @@ mod tests {
 
     #[test]
     fn test_ohlc_retraction_f64_simulation() {
-        let mut open_acc = RetractableFirstValueF64Accumulator::new();
-        let mut close_acc = RetractableLastValueF64Accumulator::new();
+        let mut open_acc = RetractableFirstValueF64Accumulator::default();
+        let mut close_acc = RetractableLastValueF64Accumulator::default();
 
         open_acc.add((1000, 100.50));
         close_acc.add((1000, 100.50));

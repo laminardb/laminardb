@@ -846,6 +846,7 @@ impl LaminarDB {
             query_budget_ns: 8_000_000,      // 8ms
             background_budget_ns: 5_000_000, // 5ms
             sink_write_timeout: std::time::Duration::from_secs(30),
+            max_input_buf_batches: 256,
         };
 
         // Validate delivery guarantee constraints.
@@ -923,8 +924,9 @@ impl LaminarDB {
             Some(hasher.finish())
         };
 
-        // Wire per-query budget from pipeline config.
+        // Wire per-query budget and input buffer cap from pipeline config.
         graph.set_query_budget_ns(pipeline_config.query_budget_ns);
+        graph.set_max_input_buf_batches(pipeline_config.max_input_buf_batches);
 
         let callback = crate::pipeline_callback::ConnectorPipelineCallback {
             graph,

@@ -1,31 +1,18 @@
-//! Unaligned checkpoint protocol with timeout-based fallback.
+//! Unaligned checkpoint configuration.
 //!
-//! **Future feature:** This module provides configuration and data types for
-//! unaligned checkpoints. The state machine implementation will be integrated in
-//! Phase 4 of the checkpoint remediation plan. The [`UnalignedCheckpointConfig`]
-//! is re-exported by `laminar_db::checkpoint_coordinator` for configuration.
+//! Provides [`UnalignedCheckpointConfig`] for opting into unaligned checkpoints
+//! when barrier alignment is too slow under backpressure. Re-exported by
+//! `laminar_db::checkpoint_coordinator`.
 //!
-//! When barrier alignment takes too long (due to backpressure on slow inputs),
-//! the checkpoint can fall back to an unaligned snapshot that captures in-flight
-//! data from channels. This trades larger checkpoint size for faster completion.
+//! The state machine implementation is not yet integrated — only configuration
+//! is available. When the protocol is implemented it will follow the
+//! Flink 1.11+ design:
 //!
-//! ## Protocol (Flink 1.11+ style)
-//!
-//! 1. First barrier arrives → start alignment timer
-//! 2. If all barriers arrive within timeout → normal aligned snapshot
-//! 3. If timeout fires → capture in-flight events from non-aligned inputs →
-//!    unaligned snapshot
-//! 4. Late barriers from non-aligned inputs arrive → transition to idle
-//!
-//! ## Constraints
-//!
-//! - Sink operators must NOT use unaligned mode (Flink 2.0 finding:
-//!   committables must be at the sink on commit)
-//! - In-flight buffer size is bounded to prevent OOM
+//! 1. First barrier arrives -> start alignment timer
+//! 2. All barriers arrive within timeout -> normal aligned snapshot
+//! 3. Timeout fires -> capture in-flight events -> unaligned snapshot
 
 use std::time::Duration;
-
-use super::barrier::CheckpointBarrier;
 
 /// Configuration for unaligned checkpoints.
 #[derive(Debug, Clone)]
@@ -43,53 +30,10 @@ pub struct UnalignedCheckpointConfig {
 impl Default for UnalignedCheckpointConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             alignment_timeout_threshold: Duration::from_secs(10),
             max_inflight_buffer_bytes: 256 * 1024 * 1024,
             force_unaligned: false,
         }
     }
-}
-
-/// In-flight data captured from a single input channel.
-#[derive(Debug, Clone)]
-pub struct InFlightChannelData {
-    /// Input index that the data was captured from.
-    pub input_id: usize,
-    /// Serialized events buffered in the channel.
-    pub events: Vec<Vec<u8>>,
-    /// Total bytes across all events.
-    pub size_bytes: usize,
-}
-
-/// Result of an unaligned snapshot.
-#[derive(Debug)]
-pub struct UnalignedSnapshot {
-    /// The barrier that triggered this snapshot.
-    pub barrier: CheckpointBarrier,
-    /// Operator state at snapshot time.
-    pub operator_state: Option<Vec<u8>>,
-    /// In-flight data captured from non-aligned input channels.
-    pub inflight_data: Vec<InFlightChannelData>,
-    /// Total bytes of in-flight data.
-    pub total_size_bytes: usize,
-    /// Whether the unaligned path was triggered by timeout (vs. force).
-    pub was_threshold_triggered: bool,
-}
-
-/// Actions for the unaligned checkpoint protocol.
-#[derive(Debug)]
-pub enum UnalignedAction<T> {
-    /// Forward event downstream (normal processing).
-    Forward(T),
-    /// Buffer event for in-flight capture (during alignment).
-    Buffer,
-    /// Aligned snapshot completed (all barriers arrived in time).
-    AlignedSnapshot(CheckpointBarrier),
-    /// Unaligned snapshot completed (timeout triggered).
-    UnalignedSnapshot(UnalignedSnapshot),
-    /// Drain buffered event from in-flight capture.
-    Drain(T),
-    /// Pass through a watermark.
-    WatermarkPassThrough(i64),
 }
