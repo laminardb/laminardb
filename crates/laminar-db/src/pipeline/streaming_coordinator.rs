@@ -101,11 +101,12 @@ pub struct StreamingCoordinator {
     /// cycle. Any subsequent batch from these sources goes to
     /// `post_barrier_buf`.
     barrier_seen: FxHashSet<usize>,
-    /// Latest processed source offset per source index.  Updated by
-    /// `process_msg` when a `Batch` is consumed (not when deferred).
-    /// Single source of truth for checkpoint offsets — replaces the old
-    /// `checkpoint_rx` watch channel.
+    /// Latest durably-processed source offset per source index.  Merged
+    /// from `pending_offsets` only after a successful `execute_cycle`.
     committed_offsets: Vec<Option<SourceCheckpoint>>,
+    /// Offsets staged by `process_msg`.  Merged into `committed_offsets`
+    /// after a successful `execute_cycle`, discarded on failure.
+    pending_offsets: Vec<Option<SourceCheckpoint>>,
     /// Control channel for live DDL (add/drop stream) from `LaminarDB`.
     control_rx: mpsc::Receiver<super::ControlMsg>,
 }
@@ -318,6 +319,7 @@ impl StreamingCoordinator {
             source_batches_buf: FxHashMap::default(),
             post_barrier_buf: Vec::new(),
             barrier_seen: FxHashSet::default(),
+            pending_offsets: vec![None; committed_offsets.len()],
             committed_offsets,
             control_rx,
         })
@@ -369,6 +371,7 @@ impl StreamingCoordinator {
             let event_priority = PriorityGuard::enter(PriorityClass::EventProcessing);
             self.source_batches_buf.clear();
             self.barrier_seen.clear();
+            self.discard_pending_offsets();
             barriers_buf.clear();
             let mut cycle_events: u64 = 0;
             let cycle_start = Instant::now();
@@ -418,10 +421,12 @@ impl StreamingCoordinator {
                 let wm = callback.current_watermark();
                 match callback.execute_cycle(&self.source_batches_buf, wm).await {
                     Ok(results) => {
+                        self.commit_pending_offsets();
                         callback.push_to_streams(&results);
                         callback.write_to_sinks(&results).await;
                     }
                     Err(e) => {
+                        self.discard_pending_offsets();
                         tracing::warn!(error = %e, "[LDB-3020] SQL cycle error");
                     }
                 }
@@ -490,37 +495,8 @@ impl StreamingCoordinator {
             }
         }
 
-        // ── Shutdown drain ──
-        // Drain remaining batches from rx so the final checkpoint covers
-        // all data the source tasks have already sent.
-        self.source_batches_buf.clear();
-        self.barrier_seen.clear();
-        let mut drain_barriers: Vec<(usize, CheckpointBarrier, SourceCheckpoint)> = Vec::new();
-        let mut drain_events: u64 = 0;
-
-        // Process deferred post-barrier batches first (same order as main loop).
-        let deferred = std::mem::take(&mut self.post_barrier_buf);
-        for msg in deferred {
-            self.process_msg(msg, &mut callback, &mut drain_barriers, &mut drain_events);
-        }
-        while let Ok(msg) = self.rx.try_recv() {
-            self.process_msg(msg, &mut callback, &mut drain_barriers, &mut drain_events);
-        }
-
-        if !self.source_batches_buf.is_empty() {
-            let wm = callback.current_watermark();
-            match callback.execute_cycle(&self.source_batches_buf, wm).await {
-                Ok(results) => {
-                    callback.push_to_streams(&results);
-                    callback.write_to_sinks(&results).await;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "[LDB-3020] SQL cycle error during shutdown drain");
-                }
-            }
-        }
-
-        // Signal source tasks to stop, then await completion.
+        // ── Shutdown ──
+        // Stop source tasks first so no new messages enter rx.
         for handle in &self.source_handles {
             handle.shutdown.notify_one();
         }
@@ -530,7 +506,46 @@ impl StreamingCoordinator {
             }
         }
 
-        // Final checkpoint uses committed_offsets (updated by the drain above).
+        // Stable drain: sources are stopped, so rx and post_barrier_buf
+        // cannot grow.  Loop until both are empty.
+        self.source_batches_buf.clear();
+        self.barrier_seen.clear();
+        self.discard_pending_offsets();
+        let mut drain_barriers: Vec<(usize, CheckpointBarrier, SourceCheckpoint)> = Vec::new();
+        let mut drain_events: u64 = 0;
+
+        loop {
+            let deferred = std::mem::take(&mut self.post_barrier_buf);
+            let mut got_any = !deferred.is_empty();
+            for msg in deferred {
+                self.process_msg(msg, &mut callback, &mut drain_barriers, &mut drain_events);
+            }
+            while let Ok(msg) = self.rx.try_recv() {
+                got_any = true;
+                self.process_msg(msg, &mut callback, &mut drain_barriers, &mut drain_events);
+            }
+            if !got_any {
+                break;
+            }
+        }
+
+        if !self.source_batches_buf.is_empty() {
+            let wm = callback.current_watermark();
+            match callback.execute_cycle(&self.source_batches_buf, wm).await {
+                Ok(results) => {
+                    self.commit_pending_offsets();
+                    callback.push_to_streams(&results);
+                    callback.write_to_sinks(&results).await;
+                }
+                Err(e) => {
+                    self.discard_pending_offsets();
+                    tracing::warn!(error = %e, "[LDB-3020] SQL cycle error during shutdown drain");
+                }
+            }
+        }
+
+        // Final checkpoint uses committed_offsets — only reflects data
+        // that successfully passed through execute_cycle.
         let checkpoint_enabled = self.config.checkpoint_interval.is_some();
         if checkpoint_enabled {
             let source_offsets: FxHashMap<String, SourceCheckpoint> = self
@@ -556,10 +571,6 @@ impl StreamingCoordinator {
     /// When a barrier is seen from a source, subsequent batches from that
     /// source are diverted to `post_barrier_buf` to ensure they are not
     /// included in the current checkpoint state.
-    ///
-    /// `committed_offsets` is updated only for batches that are actually
-    /// processed — deferred (post-barrier) batches retain their checkpoint
-    /// and commit it when they are processed in a future cycle.
     fn process_msg(
         &mut self,
         msg: SourceMsg,
@@ -584,9 +595,9 @@ impl StreamingCoordinator {
                     return;
                 }
 
-                // Commit offset only for actually-processed batches.
-                if source_idx < self.committed_offsets.len() {
-                    self.committed_offsets[source_idx] = Some(checkpoint);
+                // Stage offset (committed after successful execute_cycle).
+                if source_idx < self.pending_offsets.len() {
+                    self.pending_offsets[source_idx] = Some(checkpoint);
                 }
 
                 if let Some(name) = self.source_names.get(source_idx) {
@@ -611,6 +622,23 @@ impl StreamingCoordinator {
                 self.barrier_seen.insert(source_idx);
                 barriers.push((source_idx, barrier, checkpoint));
             }
+        }
+    }
+
+    /// Merge staged offsets into `committed_offsets`.  Called after a
+    /// successful `execute_cycle`.
+    fn commit_pending_offsets(&mut self) {
+        for (i, pending) in self.pending_offsets.iter_mut().enumerate() {
+            if let Some(cp) = pending.take() {
+                self.committed_offsets[i] = Some(cp);
+            }
+        }
+    }
+
+    /// Discard staged offsets.  Called when `execute_cycle` fails.
+    fn discard_pending_offsets(&mut self) {
+        for slot in &mut self.pending_offsets {
+            *slot = None;
         }
     }
 
@@ -826,6 +854,7 @@ mod tests {
             post_barrier_buf: Vec::new(),
             barrier_seen: FxHashSet::default(),
             committed_offsets: vec![None],
+            pending_offsets: vec![None],
             control_rx,
         };
 
@@ -893,6 +922,7 @@ mod tests {
             post_barrier_buf: Vec::new(),
             barrier_seen: FxHashSet::default(),
             committed_offsets: vec![None],
+            pending_offsets: vec![None],
             control_rx,
         };
 
@@ -962,6 +992,7 @@ mod tests {
             post_barrier_buf: Vec::new(),
             barrier_seen: FxHashSet::default(),
             committed_offsets: vec![None, None],
+            pending_offsets: vec![None, None],
             control_rx: control_rx2,
         };
 
@@ -1065,17 +1096,38 @@ mod tests {
             "post_barrier_buf should have 1 deferred batch"
         );
 
-        // committed_offsets: s0 should reflect the pre-barrier batch (epoch 10),
-        // NOT the post-barrier batch (epoch 20 — deferred, not committed).
+        // pending_offsets: pre-barrier only (post-barrier deferred, not staged).
+        assert_eq!(
+            coordinator.pending_offsets[0].as_ref().unwrap().epoch(),
+            10,
+            "s0 pending offset should be the pre-barrier batch"
+        );
+        assert_eq!(
+            coordinator.pending_offsets[1].as_ref().unwrap().epoch(),
+            5,
+            "s1 pending offset should be epoch 5"
+        );
+        // committed_offsets must still be None — no execute_cycle has run.
+        assert!(
+            coordinator.committed_offsets[0].is_none(),
+            "s0 committed offset should be None before execute_cycle"
+        );
+        assert!(
+            coordinator.committed_offsets[1].is_none(),
+            "s1 committed offset should be None before execute_cycle"
+        );
+
+        // Simulate successful cycle → commit.
+        coordinator.commit_pending_offsets();
         assert_eq!(
             coordinator.committed_offsets[0].as_ref().unwrap().epoch(),
             10,
-            "s0 committed offset should be the pre-barrier batch"
+            "s0 committed after cycle"
         );
         assert_eq!(
             coordinator.committed_offsets[1].as_ref().unwrap().epoch(),
             5,
-            "s1 committed offset should be epoch 5"
+            "s1 committed after cycle"
         );
 
         // Barriers should have both sources.
