@@ -36,16 +36,27 @@ use super::config::PipelineConfig;
 use crate::error::DbError;
 
 /// Message sent from a source task to the coordinator.
+///
+/// Each variant carries the [`SourceCheckpoint`] captured at the point the
+/// message was produced.  Co-locating the offset with the data guarantees
+/// the coordinator never checkpoints an offset for data it has not yet
+/// processed (eliminates the offset-before-batch race).
 enum SourceMsg {
     /// A batch of records from a source.
     Batch {
         source_idx: usize,
         batch: RecordBatch,
+        /// Offset snapshot captured *after* `poll_batch` drained the reader
+        /// channel.  Committed to `committed_offsets` only when the batch
+        /// is actually processed (not when deferred to `post_barrier_buf`).
+        checkpoint: SourceCheckpoint,
     },
     /// Checkpoint barrier injected at the source.
     Barrier {
         source_idx: usize,
         barrier: CheckpointBarrier,
+        /// Offset snapshot captured at barrier injection (consistent cut).
+        checkpoint: SourceCheckpoint,
     },
 }
 
@@ -54,7 +65,6 @@ struct SourceHandle {
     name: Arc<str>,
     shutdown: Arc<tokio::sync::Notify>,
     join: tokio::task::JoinHandle<()>,
-    checkpoint_rx: tokio::sync::watch::Receiver<SourceCheckpoint>,
     /// Injector for Chandy-Lamport checkpoint barriers.
     barrier_injector: CheckpointBarrierInjector,
 }
@@ -91,6 +101,11 @@ pub struct StreamingCoordinator {
     /// cycle. Any subsequent batch from these sources goes to
     /// `post_barrier_buf`.
     barrier_seen: FxHashSet<usize>,
+    /// Latest processed source offset per source index.  Updated by
+    /// `process_msg` when a `Batch` is consumed (not when deferred).
+    /// Single source of truth for checkpoint offsets — replaces the old
+    /// `checkpoint_rx` watch channel.
+    committed_offsets: Vec<Option<SourceCheckpoint>>,
     /// Control channel for live DDL (add/drop stream) from `LaminarDB`.
     control_rx: mpsc::Receiver<super::ControlMsg>,
 }
@@ -173,26 +188,20 @@ impl StreamingCoordinator {
         let mut source_handles = Vec::with_capacity(sources.len());
         let mut source_names = Vec::with_capacity(sources.len());
         let mut checkpoint_request_flags = Vec::new();
+        let mut committed_offsets = Vec::with_capacity(sources.len());
 
         for (idx, src) in sources.into_iter().enumerate() {
             if let Some(flag) = src.connector.checkpoint_requested() {
                 checkpoint_request_flags.push(flag);
             }
 
-            // Initialize watch with the restored checkpoint (not zero) so
-            // maybe_checkpoint() sees correct offsets from the start.
-            let initial_cp = src
-                .restore_checkpoint
-                .clone()
-                .unwrap_or_else(|| SourceCheckpoint::new(0));
-            let (cp_tx, cp_rx) = tokio::sync::watch::channel(initial_cp);
             let task_shutdown = Arc::new(tokio::sync::Notify::new());
             let task_shutdown_clone = Arc::clone(&task_shutdown);
             let task_tx = tx.clone();
             let max_poll = config.max_poll_records;
             let poll_interval = config.fallback_poll_interval;
             let src_name = src.name.clone();
-            let restore = src.restore_checkpoint;
+            let restore = src.restore_checkpoint.clone();
             let mut connector = src.connector;
             let connector_config = src.config;
 
@@ -212,8 +221,9 @@ impl StreamingCoordinator {
                 }
             }
 
-            // Publish initial offset after open/restore.
-            let _ = cp_tx.send(connector.checkpoint());
+            // Seed committed_offsets with the restore checkpoint so a
+            // shutdown before any data still checkpoints the restore position.
+            committed_offsets.push(src.restore_checkpoint);
 
             // Barrier injection: coordinator triggers → source polls → sends SourceMsg::Barrier
             let barrier_injector = CheckpointBarrierInjector::new();
@@ -233,14 +243,14 @@ impl StreamingCoordinator {
 
                     match poll_result {
                         Ok(Some(batch)) => {
-                            // Publish offset BEFORE sending the batch so
-                            // maybe_checkpoint() never sees an offset ahead
-                            // of what the coordinator has consumed.
-                            let _ = cp_tx.send(connector.checkpoint());
-
+                            // Offset travels with the batch — no separate
+                            // watch channel.  The coordinator commits the
+                            // offset only after processing the batch.
+                            let cp = connector.checkpoint();
                             let msg = SourceMsg::Batch {
                                 source_idx: idx,
                                 batch: batch.records,
+                                checkpoint: cp,
                             };
                             if task_tx.send(msg).await.is_err() {
                                 break; // Coordinator dropped
@@ -267,11 +277,11 @@ impl StreamingCoordinator {
                     // Poll for pending checkpoint barrier.
                     if let Some(barrier) = barrier_handle.poll(epoch) {
                         epoch += 1;
-                        // Capture offset at barrier point (consistent cut).
-                        let _ = cp_tx.send(connector.checkpoint());
+                        let cp = connector.checkpoint();
                         let msg = SourceMsg::Barrier {
                             source_idx: idx,
                             barrier,
+                            checkpoint: cp,
                         };
                         if task_tx.send(msg).await.is_err() {
                             break;
@@ -290,7 +300,6 @@ impl StreamingCoordinator {
                 name: Arc::clone(&arc_name),
                 shutdown: task_shutdown,
                 join,
-                checkpoint_rx: cp_rx,
                 barrier_injector,
             });
             source_names.push(arc_name);
@@ -309,6 +318,7 @@ impl StreamingCoordinator {
             source_batches_buf: FxHashMap::default(),
             post_barrier_buf: Vec::new(),
             barrier_seen: FxHashSet::default(),
+            committed_offsets,
             control_rx,
         })
     }
@@ -332,7 +342,7 @@ impl StreamingCoordinator {
         const MAX_DRAIN_PER_CYCLE: usize = 10_000;
 
         let batch_window = self.config.batch_window;
-        let mut barriers_buf: Vec<(usize, CheckpointBarrier)> = Vec::new();
+        let mut barriers_buf: Vec<(usize, CheckpointBarrier, SourceCheckpoint)> = Vec::new();
 
         loop {
             // Step: Wait for data, shutdown, or idle timeout.
@@ -439,8 +449,8 @@ impl StreamingCoordinator {
 
             // Step: Handle barriers — always process (cheap, O(num_sources)
             // hash lookups, must not be deferred for correctness).
-            for (source_idx, barrier) in &barriers_buf {
-                self.handle_barrier(*source_idx, barrier, &mut callback)
+            for (source_idx, barrier, cp) in &barriers_buf {
+                self.handle_barrier(*source_idx, barrier, cp, &mut callback)
                     .await;
             }
 
@@ -480,31 +490,64 @@ impl StreamingCoordinator {
             }
         }
 
-        // Shutdown: signal all source tasks to stop producing, then await
-        // completion so checkpoint_rx stops advancing before we read it.
-        for handle in &self.source_handles {
-            handle.shutdown.notify_one();
+        // ── Shutdown drain ──
+        // Drain remaining batches from rx so the final checkpoint covers
+        // all data the source tasks have already sent.
+        self.source_batches_buf.clear();
+        self.barrier_seen.clear();
+        let mut drain_barriers: Vec<(usize, CheckpointBarrier, SourceCheckpoint)> = Vec::new();
+        let mut drain_events: u64 = 0;
+
+        // Process deferred post-barrier batches first (same order as main loop).
+        let deferred = std::mem::take(&mut self.post_barrier_buf);
+        for msg in deferred {
+            self.process_msg(msg, &mut callback, &mut drain_barriers, &mut drain_events);
+        }
+        while let Ok(msg) = self.rx.try_recv() {
+            self.process_msg(msg, &mut callback, &mut drain_barriers, &mut drain_events);
         }
 
-        // Await each source task, then read its final (now-stable) checkpoint.
-        let checkpoint_enabled = self.config.checkpoint_interval.is_some();
-        let mut source_offsets = FxHashMap::default();
-        for (idx, handle) in std::mem::take(&mut self.source_handles)
-            .into_iter()
-            .enumerate()
-        {
-            if let Err(e) = handle.join.await {
-                tracing::warn!(source = %handle.name, error = ?e, "source task panicked");
-            }
-            if checkpoint_enabled {
-                if let Some(name) = self.source_names.get(idx) {
-                    source_offsets.insert(name.to_string(), handle.checkpoint_rx.borrow().clone());
+        if !self.source_batches_buf.is_empty() {
+            let wm = callback.current_watermark();
+            match callback.execute_cycle(&self.source_batches_buf, wm).await {
+                Ok(results) => {
+                    callback.push_to_streams(&results);
+                    callback.write_to_sinks(&results).await;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "[LDB-3020] SQL cycle error during shutdown drain");
                 }
             }
         }
 
-        if checkpoint_enabled && callback.maybe_checkpoint(true, source_offsets).await {
-            tracing::info!("final checkpoint completed before shutdown");
+        // Signal source tasks to stop, then await completion.
+        for handle in &self.source_handles {
+            handle.shutdown.notify_one();
+        }
+        for handle in std::mem::take(&mut self.source_handles) {
+            if let Err(e) = handle.join.await {
+                tracing::warn!(source = %handle.name, error = ?e, "source task panicked");
+            }
+        }
+
+        // Final checkpoint uses committed_offsets (updated by the drain above).
+        let checkpoint_enabled = self.config.checkpoint_interval.is_some();
+        if checkpoint_enabled {
+            let source_offsets: FxHashMap<String, SourceCheckpoint> = self
+                .committed_offsets
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, cp)| {
+                    cp.as_ref().and_then(|c| {
+                        self.source_names
+                            .get(idx)
+                            .map(|name| (name.to_string(), c.clone()))
+                    })
+                })
+                .collect();
+            if callback.maybe_checkpoint(true, source_offsets).await {
+                tracing::info!("final checkpoint completed before shutdown");
+            }
         }
     }
 
@@ -513,21 +556,37 @@ impl StreamingCoordinator {
     /// When a barrier is seen from a source, subsequent batches from that
     /// source are diverted to `post_barrier_buf` to ensure they are not
     /// included in the current checkpoint state.
+    ///
+    /// `committed_offsets` is updated only for batches that are actually
+    /// processed — deferred (post-barrier) batches retain their checkpoint
+    /// and commit it when they are processed in a future cycle.
     fn process_msg(
         &mut self,
         msg: SourceMsg,
         callback: &mut impl PipelineCallback,
-        barriers: &mut Vec<(usize, CheckpointBarrier)>,
+        barriers: &mut Vec<(usize, CheckpointBarrier, SourceCheckpoint)>,
         cycle_events: &mut u64,
     ) {
         match msg {
-            SourceMsg::Batch { source_idx, batch } => {
+            SourceMsg::Batch {
+                source_idx,
+                batch,
+                checkpoint,
+            } => {
                 // If this source already delivered a barrier in this drain
                 // cycle, this batch is post-barrier data — defer it.
                 if self.barrier_seen.contains(&source_idx) {
-                    self.post_barrier_buf
-                        .push(SourceMsg::Batch { source_idx, batch });
+                    self.post_barrier_buf.push(SourceMsg::Batch {
+                        source_idx,
+                        batch,
+                        checkpoint,
+                    });
                     return;
+                }
+
+                // Commit offset only for actually-processed batches.
+                if source_idx < self.committed_offsets.len() {
+                    self.committed_offsets[source_idx] = Some(checkpoint);
                 }
 
                 if let Some(name) = self.source_names.get(source_idx) {
@@ -547,9 +606,10 @@ impl StreamingCoordinator {
             SourceMsg::Barrier {
                 source_idx,
                 barrier,
+                checkpoint,
             } => {
                 self.barrier_seen.insert(source_idx);
-                barriers.push((source_idx, barrier));
+                barriers.push((source_idx, barrier, checkpoint));
             }
         }
     }
@@ -559,6 +619,7 @@ impl StreamingCoordinator {
         &mut self,
         source_idx: usize,
         barrier: &CheckpointBarrier,
+        barrier_checkpoint: &SourceCheckpoint,
         callback: &mut impl PipelineCallback,
     ) {
         if !self.pending_barrier.active
@@ -567,15 +628,12 @@ impl StreamingCoordinator {
             return;
         }
 
-        // Record this source's checkpoint.
+        // Use the checkpoint that traveled atomically with the barrier
+        // message — no watch-channel race.
         if let Some(name) = self.source_names.get(source_idx) {
-            let cp = self.source_handles[source_idx]
-                .checkpoint_rx
-                .borrow()
-                .clone();
             self.pending_barrier
                 .source_checkpoints
-                .insert(name.to_string(), cp);
+                .insert(name.to_string(), barrier_checkpoint.clone());
         }
 
         self.pending_barrier.sources_aligned.insert(source_idx);
@@ -767,6 +825,7 @@ mod tests {
             source_batches_buf: FxHashMap::default(),
             post_barrier_buf: Vec::new(),
             barrier_seen: FxHashSet::default(),
+            committed_offsets: vec![None],
             control_rx,
         };
 
@@ -779,6 +838,7 @@ mod tests {
         tx.send(SourceMsg::Batch {
             source_idx: 0,
             batch,
+            checkpoint: SourceCheckpoint::new(1),
         })
         .await
         .unwrap();
@@ -832,6 +892,7 @@ mod tests {
             source_batches_buf: FxHashMap::default(),
             post_barrier_buf: Vec::new(),
             barrier_seen: FxHashSet::default(),
+            committed_offsets: vec![None],
             control_rx,
         };
 
@@ -845,6 +906,7 @@ mod tests {
         tx.send(SourceMsg::Batch {
             source_idx: 0,
             batch,
+            checkpoint: SourceCheckpoint::new(1),
         })
         .await
         .unwrap();
@@ -899,6 +961,7 @@ mod tests {
             source_batches_buf: FxHashMap::default(),
             post_barrier_buf: Vec::new(),
             barrier_seen: FxHashSet::default(),
+            committed_offsets: vec![None, None],
             control_rx: control_rx2,
         };
 
@@ -923,6 +986,7 @@ mod tests {
             SourceMsg::Batch {
                 source_idx: 0,
                 batch: batch_1,
+                checkpoint: SourceCheckpoint::new(10),
             },
             &mut callback,
             &mut barriers,
@@ -932,6 +996,7 @@ mod tests {
             SourceMsg::Barrier {
                 source_idx: 0,
                 barrier,
+                checkpoint: SourceCheckpoint::new(10),
             },
             &mut callback,
             &mut barriers,
@@ -941,6 +1006,7 @@ mod tests {
             SourceMsg::Batch {
                 source_idx: 0,
                 batch: batch_2,
+                checkpoint: SourceCheckpoint::new(20),
             },
             &mut callback,
             &mut barriers,
@@ -957,6 +1023,7 @@ mod tests {
             SourceMsg::Batch {
                 source_idx: 1,
                 batch: batch_s1,
+                checkpoint: SourceCheckpoint::new(5),
             },
             &mut callback,
             &mut barriers,
@@ -966,6 +1033,7 @@ mod tests {
             SourceMsg::Barrier {
                 source_idx: 1,
                 barrier,
+                checkpoint: SourceCheckpoint::new(5),
             },
             &mut callback,
             &mut barriers,
@@ -995,6 +1063,19 @@ mod tests {
             coordinator.post_barrier_buf.len(),
             1,
             "post_barrier_buf should have 1 deferred batch"
+        );
+
+        // committed_offsets: s0 should reflect the pre-barrier batch (epoch 10),
+        // NOT the post-barrier batch (epoch 20 — deferred, not committed).
+        assert_eq!(
+            coordinator.committed_offsets[0].as_ref().unwrap().epoch(),
+            10,
+            "s0 committed offset should be the pre-barrier batch"
+        );
+        assert_eq!(
+            coordinator.committed_offsets[1].as_ref().unwrap().epoch(),
+            5,
+            "s1 committed offset should be epoch 5"
         );
 
         // Barriers should have both sources.
