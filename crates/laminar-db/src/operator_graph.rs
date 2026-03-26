@@ -188,6 +188,25 @@ impl OperatorGraph {
         self.counters = Some(c);
     }
 
+    /// Returns the fill ratio (0.0–1.0) of the most-full input buffer
+    /// relative to `max_input_buf_batches`. Returns 0.0 when the cap is
+    /// disabled (`max_input_buf_batches == 0`) or no buffers exist.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn input_buf_pressure(&self) -> f64 {
+        let cap = self.max_input_buf_batches;
+        if cap == 0 {
+            return 0.0;
+        }
+        let max_len = self
+            .input_bufs
+            .iter()
+            .flat_map(|ports| ports.iter())
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0);
+        (max_len as f64 / cap as f64).min(1.0)
+    }
+
     pub fn set_lookup_registry(
         &mut self,
         registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
@@ -614,9 +633,12 @@ impl OperatorGraph {
             return;
         };
 
-        // Tombstone the node
+        // Tombstone the node and release its input buffers.
         self.nodes[node_id].removed = true;
         self.nodes[node_id].operator = Box::new(TombstonedOperator);
+        for port_buf in &mut self.input_bufs[node_id] {
+            port_buf.clear();
+        }
 
         // Remove from output map
         self.output_map.remove(name);
@@ -1749,5 +1771,68 @@ mod tests {
         let r2 = graph.execute_cycle(&empty, 110_000).await.unwrap();
         let rows2 = total_rows(&r2, "probed");
         assert_eq!(rows2, 1, "offset=5000 should resolve at watermark=110k");
+    }
+
+    // ── input_buf_pressure tests ─────────────────────────────────
+
+    #[test]
+    fn test_pressure_zero_when_cap_disabled() {
+        let mut graph = test_graph();
+        graph.set_max_input_buf_batches(0); // unlimited
+        graph.add_query(
+            "q1".to_string(),
+            "SELECT * FROM trades".to_string(),
+            None,
+            None,
+            None,
+        );
+        // Push some data into the source buffer
+        if let Some(&node_id) = graph.source_map.get("trades") {
+            graph.input_bufs[node_id][0] = vec![test_batch(); 10];
+        }
+        assert!((graph.input_buf_pressure() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pressure_reflects_fill_ratio() {
+        let mut graph = test_graph();
+        graph.set_max_input_buf_batches(100);
+        graph.add_query(
+            "q1".to_string(),
+            "SELECT * FROM trades".to_string(),
+            None,
+            None,
+            None,
+        );
+        // Fill source buffer to 50% of cap
+        if let Some(&node_id) = graph.source_map.get("trades") {
+            graph.input_bufs[node_id][0] = vec![test_batch(); 50];
+        }
+        assert!((graph.input_buf_pressure() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pressure_clamped_at_one() {
+        let mut graph = test_graph();
+        graph.set_max_input_buf_batches(10);
+        graph.add_query(
+            "q1".to_string(),
+            "SELECT * FROM trades".to_string(),
+            None,
+            None,
+            None,
+        );
+        // Overfill buffer beyond cap (enforce_input_buf_cap only runs
+        // during execute_cycle routing, not here).
+        if let Some(&node_id) = graph.source_map.get("trades") {
+            graph.input_bufs[node_id][0] = vec![test_batch(); 20];
+        }
+        assert!((graph.input_buf_pressure() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_pressure_empty_graph() {
+        let graph = test_graph();
+        assert!((graph.input_buf_pressure() - 0.0).abs() < f64::EPSILON);
     }
 }

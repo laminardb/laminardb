@@ -196,6 +196,11 @@ impl KafkaWatermarkTracker {
             self.partition_watermarks[idx].is_idle = true;
             self.partition_watermarks[idx].watermark = i64::MAX; // Exclude from min
         }
+        // Truncate trailing idle entries so the Vec doesn't retain
+        // capacity for revoked high-numbered partitions.
+        while self.partition_watermarks.last().is_some_and(|s| s.is_idle) {
+            self.partition_watermarks.pop();
+        }
         self.recompute_combined();
     }
 
@@ -622,5 +627,35 @@ mod tests {
 
         // No active partitions - no watermark
         assert!(tracker.current_watermark().is_none());
+    }
+
+    #[test]
+    fn test_remove_partition_truncates_trailing() {
+        let mut tracker = KafkaWatermarkTracker::new(0, Duration::from_secs(30));
+        tracker.register_partitions(4); // 0, 1, 2, 3
+        tracker.update_partition(0, 1000);
+        tracker.update_partition(1, 1000);
+        tracker.update_partition(3, 2000);
+
+        // Remove trailing partitions — Vec should shrink.
+        // Partition 2 was never updated but is still active (idle=false).
+        // Removing partition 3 (last, now idle) truncates to len=3.
+        // Removing partition 2 marks it idle — but it's not trailing
+        // because partition 2 was registered as active (idle=false) by
+        // register_partitions. We need to remove it explicitly.
+        tracker.remove_partition(3);
+        assert_eq!(tracker.partition_count(), 3, "trailing idle p3 truncated");
+        tracker.remove_partition(2);
+        assert_eq!(tracker.partition_count(), 2, "trailing idle p2 truncated");
+
+        // Remove middle partition — Vec should NOT shrink past active.
+        tracker.register_partitions(4);
+        tracker.update_partition(3, 2000);
+        tracker.remove_partition(1);
+        assert_eq!(
+            tracker.partition_count(),
+            4,
+            "middle idle does not truncate"
+        );
     }
 }

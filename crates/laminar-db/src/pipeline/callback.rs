@@ -95,4 +95,10 @@ pub trait PipelineCallback: Send + 'static {
 
     /// Apply a DDL control message (add/drop stream) to the running pipeline.
     fn apply_control(&mut self, msg: super::ControlMsg);
+
+    /// Returns `true` when internal buffers are near capacity and the
+    /// caller should stop feeding new data. Default returns `false`.
+    fn is_backpressured(&self) -> bool {
+        false
+    }
 }

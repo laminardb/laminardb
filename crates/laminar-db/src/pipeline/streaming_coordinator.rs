@@ -95,7 +95,8 @@ pub struct StreamingCoordinator {
     source_batches_buf: FxHashMap<Arc<str>, Vec<RecordBatch>>,
     /// Batches received after a barrier from the same source in the same
     /// drain cycle. These belong to the NEXT checkpoint epoch and must not
-    /// be included in the current checkpoint state.
+    /// be included in the current checkpoint state. Bounded in practice by
+    /// `channel_capacity` (max messages available per drain cycle).
     post_barrier_buf: Vec<SourceMsg>,
     /// Source indices that have delivered a barrier during the current drain
     /// cycle. Any subsequent batch from these sources goes to
@@ -184,7 +185,7 @@ impl StreamingCoordinator {
         }
 
         // Channel for all source messages.
-        let (tx, rx) = mpsc::channel(8192);
+        let (tx, rx) = mpsc::channel(config.channel_capacity);
 
         let mut source_handles = Vec::with_capacity(sources.len());
         let mut source_names = Vec::with_capacity(sources.len());
@@ -399,11 +400,16 @@ impl StreamingCoordinator {
             }
 
             // Drain any additional buffered messages (batch coalescing).
-            // Terminates on count limit OR time budget, whichever comes first.
+            // Terminates on count limit, time budget, or backpressure.
             let mut drain_count = 0;
             let drain_budget_ns = self.config.drain_budget_ns;
+            let backpressured = callback.is_backpressured();
+            if backpressured {
+                tracing::debug!("operator graph backpressured — skipping drain");
+            }
             #[allow(clippy::cast_possible_truncation)]
-            while drain_count < MAX_DRAIN_PER_CYCLE
+            while !backpressured
+                && drain_count < MAX_DRAIN_PER_CYCLE
                 && (cycle_start.elapsed().as_nanos() as u64) < drain_budget_ns
             {
                 match self.rx.try_recv() {
@@ -1132,5 +1138,185 @@ mod tests {
 
         // Barriers should have both sources.
         assert_eq!(barriers.len(), 2, "should have barriers from both sources");
+    }
+
+    // ── Backpressure drain-skip test ─────────────────────────────
+
+    /// Mock callback that always reports backpressure. Tracks cycle count
+    /// and per-cycle event counts via shared atomics so the test can
+    /// assert on them after `run()` consumes the callback.
+    struct BackpressuredCallback {
+        inner: MockCallback,
+        cycle_count: Arc<std::sync::atomic::AtomicU32>,
+        /// Events seen per cycle, pushed after each execute_cycle.
+        events_per_cycle: Arc<std::sync::Mutex<Vec<u64>>>,
+    }
+
+    impl BackpressuredCallback {
+        fn new(
+            cycle_count: Arc<std::sync::atomic::AtomicU32>,
+            events_per_cycle: Arc<std::sync::Mutex<Vec<u64>>>,
+        ) -> Self {
+            Self {
+                inner: MockCallback::new(),
+                cycle_count,
+                events_per_cycle,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PipelineCallback for BackpressuredCallback {
+        async fn execute_cycle(
+            &mut self,
+            source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+            watermark: i64,
+        ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
+            self.cycle_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let total: u64 = source_batches
+                .values()
+                .flat_map(|bs| bs.iter())
+                .map(|b| b.num_rows() as u64)
+                .sum();
+            self.events_per_cycle.lock().unwrap().push(total);
+            self.inner.execute_cycle(source_batches, watermark).await
+        }
+
+        fn push_to_streams(&self, r: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
+            self.inner.push_to_streams(r);
+        }
+        async fn write_to_sinks(&mut self, r: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
+            self.inner.write_to_sinks(r).await;
+        }
+        fn extract_watermark(&mut self, s: &str, b: &RecordBatch) {
+            self.inner.extract_watermark(s, b);
+        }
+        fn filter_late_rows(&self, s: &str, b: &RecordBatch) -> Option<RecordBatch> {
+            self.inner.filter_late_rows(s, b)
+        }
+        fn current_watermark(&self) -> i64 {
+            self.inner.current_watermark()
+        }
+        async fn maybe_checkpoint(
+            &mut self,
+            force: bool,
+            offsets: FxHashMap<String, SourceCheckpoint>,
+        ) -> bool {
+            self.inner.maybe_checkpoint(force, offsets).await
+        }
+        async fn checkpoint_with_barrier(
+            &mut self,
+            cp: FxHashMap<String, SourceCheckpoint>,
+        ) -> bool {
+            self.inner.checkpoint_with_barrier(cp).await
+        }
+        fn record_cycle(&self, e: u64, b: u64, ns: u64) {
+            self.inner.record_cycle(e, b, ns);
+        }
+        async fn poll_tables(&mut self) {
+            self.inner.poll_tables().await;
+        }
+        fn apply_control(&mut self, msg: crate::pipeline::ControlMsg) {
+            self.inner.apply_control(msg);
+        }
+
+        fn is_backpressured(&self) -> bool {
+            true // Always backpressured — drain loop should never fire.
+        }
+    }
+
+    /// With `is_backpressured() == true`, the coordinator processes only
+    /// the first wakeup message per cycle (no drain coalescing). With 5
+    /// messages pre-loaded and `batch_window=0`, each cycle should see
+    /// exactly 1 event, spread across multiple cycles.
+    #[tokio::test]
+    async fn test_drain_skip_under_backpressure() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (tx, rx) = mpsc::channel(64);
+        let (_control_tx, control_rx) = mpsc::channel(64);
+
+        let coordinator = StreamingCoordinator {
+            config: PipelineConfig {
+                batch_window: Duration::ZERO,
+                max_poll_records: 1000,
+                channel_capacity: 64,
+                fallback_poll_interval: Duration::from_millis(10),
+                checkpoint_interval: None,
+                delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
+                barrier_alignment_timeout: BARRIER_TIMEOUT,
+                cycle_budget_ns: 10_000_000,
+                drain_budget_ns: 1_000_000,
+                query_budget_ns: 8_000_000,
+                background_budget_ns: 5_000_000,
+                sink_write_timeout: Duration::from_secs(30),
+                max_input_buf_batches: 256,
+            },
+            rx,
+            source_handles: Vec::new(),
+            source_names: vec![Arc::from("src")],
+            shutdown: Arc::clone(&shutdown),
+            pending_barrier: PendingBarrier::new(),
+            next_checkpoint_id: 1,
+            last_checkpoint: Instant::now(),
+            checkpoint_request_flags: Vec::new(),
+            source_batches_buf: FxHashMap::default(),
+            post_barrier_buf: Vec::new(),
+            barrier_seen: FxHashSet::default(),
+            committed_offsets: vec![None],
+            pending_offsets: vec![None],
+            control_rx,
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+
+        // Pre-load 5 batches (1 row each).
+        for i in 0..5 {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![i]))],
+            )
+            .unwrap();
+            tx.send(SourceMsg::Batch {
+                source_idx: 0,
+                batch,
+                checkpoint: SourceCheckpoint::new(i as u64),
+            })
+            .await
+            .unwrap();
+        }
+
+        let shutdown_clone = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            shutdown_clone.notify_one();
+        });
+
+        let cycle_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let events_per_cycle = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback =
+            BackpressuredCallback::new(Arc::clone(&cycle_count), Arc::clone(&events_per_cycle));
+        coordinator.run(callback).await;
+
+        let cycles = cycle_count.load(std::sync::atomic::Ordering::SeqCst);
+        let epc = events_per_cycle.lock().unwrap();
+        let total: u64 = epc.iter().sum();
+
+        // All 5 events must be processed (no data loss).
+        assert_eq!(total, 5, "all events must be processed, got {total}");
+        // Under backpressure each cycle gets only the wakeup message (1
+        // event), so we need at least 5 cycles for 5 messages. Without
+        // backpressure, cycle 1 would drain all 5 in one shot.
+        assert!(
+            cycles >= 5,
+            "expected >=5 cycles (1 event each), got {cycles} cycles with events/cycle: {epc:?}"
+        );
+        // Each cycle sees at most 1 event (the wakeup message; drain skipped).
+        for (i, &events) in epc.iter().enumerate() {
+            assert!(
+                events <= 1,
+                "cycle {i} saw {events} events, expected <=1 under backpressure"
+            );
+        }
     }
 }
