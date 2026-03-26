@@ -400,6 +400,7 @@ impl LaminarDB {
         use laminar_sql::parser::lookup_table::ConnectorType;
 
         let connector_type_str = match &info.properties.connector {
+            ConnectorType::Postgres => "postgres",
             ConnectorType::PostgresCdc => "postgres-cdc",
             ConnectorType::MysqlCdc => "mysql-cdc",
             ConnectorType::Redis => "redis",
@@ -416,7 +417,12 @@ impl LaminarDB {
         let refresh = match info.properties.strategy {
             laminar_sql::parser::lookup_table::LookupStrategy::Replicated
             | laminar_sql::parser::lookup_table::LookupStrategy::Partitioned => {
-                Some(laminar_connectors::reference::RefreshMode::SnapshotPlusCdc)
+                // Standalone postgres uses snapshot-only (no CDC slot needed).
+                if matches!(info.properties.connector, ConnectorType::Postgres) {
+                    Some(laminar_connectors::reference::RefreshMode::SnapshotOnly)
+                } else {
+                    Some(laminar_connectors::reference::RefreshMode::SnapshotPlusCdc)
+                }
             }
             laminar_sql::parser::lookup_table::LookupStrategy::OnDemand => {
                 Some(laminar_connectors::reference::RefreshMode::Manual)

@@ -54,6 +54,8 @@ pub struct LookupTableProperties {
 /// Connector type for lookup tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectorType {
+    /// PostgreSQL standalone connector (poll-based snapshot, no CDC).
+    Postgres,
     /// PostgreSQL CDC connector.
     PostgresCdc,
     /// MySQL CDC connector.
@@ -83,6 +85,7 @@ impl ConnectorType {
             ));
         }
         Ok(match s.to_lowercase().as_str() {
+            "postgres" => Self::Postgres,
             "postgres-cdc" | "postgres_cdc" | "postgresql" => Self::PostgresCdc,
             "mysql-cdc" | "mysql_cdc" | "mysql" => Self::MysqlCdc,
             "redis" => Self::Redis,
