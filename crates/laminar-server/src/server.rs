@@ -430,9 +430,9 @@ pub fn lookup_to_ddl(lookup: &LookupConfig) -> String {
     let mut parts = Vec::new();
     parts.push(format!("CREATE LOOKUP TABLE {}", lookup.name));
 
-    // Column definitions
+    // Column definitions + PRIMARY KEY
     if !lookup.schema.is_empty() {
-        let col_defs: Vec<String> = lookup
+        let mut col_defs: Vec<String> = lookup
             .schema
             .iter()
             .map(|c| {
@@ -440,6 +440,9 @@ pub fn lookup_to_ddl(lookup: &LookupConfig) -> String {
                 format!("{} {}{}", c.name, c.data_type, nullability)
             })
             .collect();
+        if !lookup.primary_key.is_empty() {
+            col_defs.push(format!("PRIMARY KEY ({})", lookup.primary_key.join(", ")));
+        }
         parts.push(format!("({})", col_defs.join(", ")));
     }
 
@@ -662,6 +665,7 @@ mod tests {
                 );
                 t
             },
+            primary_key: vec!["symbol".to_string()],
             schema: vec![ColumnDef {
                 name: "symbol".to_string(),
                 data_type: "VARCHAR".to_string(),
@@ -671,9 +675,30 @@ mod tests {
         let ddl = lookup_to_ddl(&lookup);
         assert!(ddl.starts_with("CREATE LOOKUP TABLE instruments"));
         assert!(ddl.contains("symbol VARCHAR NOT NULL"));
+        assert!(ddl.contains("PRIMARY KEY (symbol)"));
         assert!(ddl.contains("'connector' = 'postgres'"));
         assert!(ddl.contains("'strategy' = 'poll'"));
         assert!(ddl.contains("'connection' = 'postgresql://localhost/db'"));
+    }
+
+    #[test]
+    fn test_lookup_to_ddl_no_primary_key() {
+        let lookup = LookupConfig {
+            name: "t".to_string(),
+            connector: "postgres".to_string(),
+            strategy: "poll".to_string(),
+            pushdown: false,
+            cache: LookupCacheConfig::default(),
+            properties: toml::Table::new(),
+            primary_key: vec![],
+            schema: vec![ColumnDef {
+                name: "id".to_string(),
+                data_type: "INT".to_string(),
+                nullable: false,
+            }],
+        };
+        let ddl = lookup_to_ddl(&lookup);
+        assert!(!ddl.contains("PRIMARY KEY"));
     }
 
     #[test]

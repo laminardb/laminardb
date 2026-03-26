@@ -539,6 +539,7 @@ mod tests {
             pushdown: true,
             cache: LookupCacheConfig::default(),
             properties: toml::Table::new(),
+            primary_key: vec![],
             schema: vec![],
         }
     }
