@@ -117,9 +117,9 @@ impl LookupStrategy {
     /// Returns `ParseError` if the strategy is unknown.
     pub fn parse(s: &str) -> Result<Self, ParseError> {
         match s.to_lowercase().as_str() {
-            "replicated" | "full" => Ok(Self::Replicated),
+            "replicated" | "full" | "poll" | "snapshot" | "cdc" => Ok(Self::Replicated),
             "partitioned" | "sharded" => Ok(Self::Partitioned),
-            "on-demand" | "on_demand" | "lazy" => Ok(Self::OnDemand),
+            "on-demand" | "on_demand" | "lazy" | "manual" => Ok(Self::OnDemand),
             other => Err(ParseError::ValidationError(format!(
                 "unknown lookup strategy: '{other}' \
                  (expected: replicated, partitioned, on-demand)"
