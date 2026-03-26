@@ -1,6 +1,6 @@
 //! PostgreSQL poll-based reference table source.
 //!
-//! Implements [`ReferenceTableSource`] via a simple `SELECT * FROM table`
+//! Implements [`ReferenceTableSource`](crate::reference::ReferenceTableSource) via a simple `SELECT * FROM table`
 //! query. No replication slot or CDC configuration required — suitable for
 //! slowly-changing dimension tables that are refreshed by periodic snapshot.
 
@@ -11,7 +11,7 @@ use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 use crate::reference::ReferenceTableSource;
 
-/// A [`ReferenceTableSource`] backed by a single `SELECT *` query against
+/// A [`ReferenceTableSource`](crate::reference::ReferenceTableSource) backed by a single `SELECT *` query against
 /// a PostgreSQL table. Returns the full table as a snapshot, then completes.
 pub struct PostgresReferenceTableSource {
     config: ConnectorConfig,
