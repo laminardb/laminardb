@@ -11,7 +11,7 @@ description = "External system connectors for LaminarDB - Kafka, CDC, lookup tab
 
 [dependencies]
 # Core dependencies
-laminar-core = { path = "../laminar-core", version = "0.18.13" }
+laminar-core = { path = "../laminar-core", version = "0.18.14" }
 
 # Kafka
 rdkafka = { version = "0.39", features = ["cmake-build", "ssl-vendored"], optional = true }
