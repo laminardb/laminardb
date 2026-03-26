@@ -211,6 +211,18 @@ pub async fn run_server(
     }
 
     for lookup in &config.lookups {
+        if lookup.schema.is_empty() {
+            return Err(ServerError::Ddl {
+                section: "lookup".to_string(),
+                name: lookup.name.clone(),
+                source: DbError::Config(format!(
+                    "[[lookup]] '{}' requires a [[lookup.schema]] section with at least \
+                     one column definition (e.g. [[lookup.schema]]\nname = \"id\"\n\
+                     data_type = \"INT\"\nnullable = false)",
+                    lookup.name,
+                )),
+            });
+        }
         let ddl = lookup_to_ddl(lookup);
         db.execute(&ddl).await.map_err(|e| ServerError::Ddl {
             section: "lookup".to_string(),

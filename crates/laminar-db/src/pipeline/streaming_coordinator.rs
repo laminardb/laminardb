@@ -184,6 +184,12 @@ impl StreamingCoordinator {
             }
         }
 
+        if config.channel_capacity == 0 {
+            return Err(DbError::Config(
+                "[LDB-0010] channel_capacity must be > 0".into(),
+            ));
+        }
+
         // Channel for all source messages.
         let (tx, rx) = mpsc::channel(config.channel_capacity);
 
@@ -390,6 +396,7 @@ impl StreamingCoordinator {
                 );
             }
 
+            let had_data = msg.is_some();
             if let Some(first_msg) = msg {
                 self.process_msg(
                     first_msg,
@@ -401,9 +408,11 @@ impl StreamingCoordinator {
 
             // Drain any additional buffered messages (batch coalescing).
             // Terminates on count limit, time budget, or backpressure.
+            // Only check backpressure on active wakeups to avoid bumping
+            // the counter on idle timeouts.
             let mut drain_count = 0;
             let drain_budget_ns = self.config.drain_budget_ns;
-            let backpressured = callback.is_backpressured();
+            let backpressured = had_data && callback.is_backpressured();
             if backpressured {
                 tracing::debug!("operator graph backpressured — skipping drain");
             }
@@ -1142,17 +1151,15 @@ mod tests {
 
     // ── Backpressure drain-skip test ─────────────────────────────
 
-    /// Mock callback that always reports backpressure. Tracks cycle count
-    /// and per-cycle event counts via shared atomics so the test can
-    /// assert on them after `run()` consumes the callback.
+    #[allow(clippy::disallowed_types)] // test-only: std::sync::Mutex is fine here
     struct BackpressuredCallback {
         inner: MockCallback,
         cycle_count: Arc<std::sync::atomic::AtomicU32>,
-        /// Events seen per cycle, pushed after each execute_cycle.
         events_per_cycle: Arc<std::sync::Mutex<Vec<u64>>>,
     }
 
     impl BackpressuredCallback {
+        #[allow(clippy::disallowed_types)]
         fn new(
             cycle_count: Arc<std::sync::atomic::AtomicU32>,
             events_per_cycle: Arc<std::sync::Mutex<Vec<u64>>>,
@@ -1280,7 +1287,7 @@ mod tests {
             tx.send(SourceMsg::Batch {
                 source_idx: 0,
                 batch,
-                checkpoint: SourceCheckpoint::new(i as u64),
+                checkpoint: SourceCheckpoint::new(u64::try_from(i).unwrap()),
             })
             .await
             .unwrap();
@@ -1293,6 +1300,7 @@ mod tests {
         });
 
         let cycle_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        #[allow(clippy::disallowed_types)]
         let events_per_cycle = Arc::new(std::sync::Mutex::new(Vec::new()));
         let callback =
             BackpressuredCallback::new(Arc::clone(&cycle_count), Arc::clone(&events_per_cycle));
