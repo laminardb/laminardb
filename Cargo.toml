@@ -108,7 +108,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Testing
 criterion = { version = "0.8", features = ["html_reports"] }
-proptest = "1.10"
+proptest = "1.11"
 tempfile = "3.27"
 
 [profile.release]
