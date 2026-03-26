@@ -12,7 +12,7 @@ use crate::error::ConnectorError;
 use crate::reference::ReferenceTableSource;
 
 /// A [`ReferenceTableSource`](crate::reference::ReferenceTableSource) backed by a single `SELECT *` query against
-/// a PostgreSQL table. Returns the full table as a snapshot, then completes.
+/// a `PostgreSQL` table. Returns the full table as a snapshot, then completes.
 pub struct PostgresReferenceTableSource {
     config: ConnectorConfig,
     snapshot_done: bool,
@@ -61,8 +61,7 @@ impl PostgresReferenceTableSource {
         self.config
             .properties()
             .get("table")
-            .map(String::as_str)
-            .unwrap_or("unknown")
+            .map_or("unknown", String::as_str)
     }
 }
 
