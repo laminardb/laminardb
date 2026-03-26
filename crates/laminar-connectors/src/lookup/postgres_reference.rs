@@ -20,9 +20,6 @@ pub struct PostgresReferenceTableSource {
 
 impl PostgresReferenceTableSource {
     /// Creates a new source from a [`ConnectorConfig`].
-    ///
-    /// The config properties should include `host`, `port`, `database`,
-    /// `user`, `password`, and `table`.
     #[must_use]
     pub fn new(config: ConnectorConfig) -> Self {
         Self {
@@ -34,6 +31,13 @@ impl PostgresReferenceTableSource {
     /// Builds a `tokio_postgres` connection string from connector properties.
     fn connection_string(&self) -> String {
         let props = self.config.properties();
+        // Accept pre-formed connection string under either key.
+        if let Some(cs) = props
+            .get("connection_string")
+            .or_else(|| props.get("connection"))
+        {
+            return cs.clone();
+        }
         let mut parts = Vec::new();
         if let Some(h) = props.get("host") {
             parts.push(format!("host={h}"));
@@ -50,10 +54,6 @@ impl PostgresReferenceTableSource {
         if let Some(pw) = props.get("password") {
             parts.push(format!("password={pw}"));
         }
-        // Also accept a pre-formed connection_string property.
-        if let Some(cs) = props.get("connection_string") {
-            return cs.clone();
-        }
         parts.join(" ")
     }
 
@@ -68,6 +68,7 @@ impl PostgresReferenceTableSource {
 
 #[async_trait::async_trait]
 impl ReferenceTableSource for PostgresReferenceTableSource {
+    #[allow(clippy::too_many_lines)]
     async fn poll_snapshot(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
         if self.snapshot_done {
             return Ok(None);
@@ -76,7 +77,18 @@ impl ReferenceTableSource for PostgresReferenceTableSource {
         let conn_str = self.connection_string();
         let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
             .await
-            .map_err(|e| ConnectorError::ConnectionFailed(format!("postgres connect: {e}")))?;
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("SSL") || msg.contains("TLS") || msg.contains("sslmode") {
+                    ConnectorError::ConnectionFailed(format!(
+                        "postgres connect: {e} (TLS not supported by the standalone \
+                         'postgres' lookup connector — use sslmode=disable or \
+                         'postgres-cdc' for TLS)"
+                    ))
+                } else {
+                    ConnectorError::ConnectionFailed(format!("postgres connect: {e}"))
+                }
+            })?;
 
         // Drive the connection on a background task.
         tokio::spawn(async move {
@@ -115,41 +127,44 @@ impl ReferenceTableSource for PostgresReferenceTableSource {
 
         for (col_idx, field) in schema.fields().iter().enumerate() {
             let col_name = pg_columns[col_idx].name();
+            let pg_type = pg_columns[col_idx].type_().clone();
             let array: std::sync::Arc<dyn arrow_array::Array> = match field.data_type() {
                 arrow_schema::DataType::Boolean => {
-                    let vals: Vec<Option<bool>> =
-                        rows.iter().map(|r| r.get::<_, Option<bool>>(col_name)).collect();
+                    let vals: Vec<Option<bool>> = collect_column(&rows, col_name, &pg_type)?;
                     std::sync::Arc::new(arrow_array::BooleanArray::from(vals))
                 }
                 arrow_schema::DataType::Int16 => {
-                    let vals: Vec<Option<i16>> =
-                        rows.iter().map(|r| r.get::<_, Option<i16>>(col_name)).collect();
+                    let vals: Vec<Option<i16>> = collect_column(&rows, col_name, &pg_type)?;
                     std::sync::Arc::new(arrow_array::Int16Array::from(vals))
                 }
                 arrow_schema::DataType::Int32 => {
-                    let vals: Vec<Option<i32>> =
-                        rows.iter().map(|r| r.get::<_, Option<i32>>(col_name)).collect();
+                    let vals: Vec<Option<i32>> = collect_column(&rows, col_name, &pg_type)?;
                     std::sync::Arc::new(arrow_array::Int32Array::from(vals))
                 }
                 arrow_schema::DataType::Int64 => {
-                    let vals: Vec<Option<i64>> =
-                        rows.iter().map(|r| r.get::<_, Option<i64>>(col_name)).collect();
+                    let vals: Vec<Option<i64>> = collect_column(&rows, col_name, &pg_type)?;
                     std::sync::Arc::new(arrow_array::Int64Array::from(vals))
                 }
                 arrow_schema::DataType::Float32 => {
-                    let vals: Vec<Option<f32>> =
-                        rows.iter().map(|r| r.get::<_, Option<f32>>(col_name)).collect();
+                    let vals: Vec<Option<f32>> = collect_column(&rows, col_name, &pg_type)?;
                     std::sync::Arc::new(arrow_array::Float32Array::from(vals))
                 }
                 arrow_schema::DataType::Float64 => {
-                    let vals: Vec<Option<f64>> =
-                        rows.iter().map(|r| r.get::<_, Option<f64>>(col_name)).collect();
+                    let vals: Vec<Option<f64>> = collect_column(&rows, col_name, &pg_type)?;
                     std::sync::Arc::new(arrow_array::Float64Array::from(vals))
                 }
                 _ => {
-                    // Fallback: read as String.
-                    let vals: Vec<Option<String>> =
-                        rows.iter().map(|r| r.get::<_, Option<String>>(col_name)).collect();
+                    // Fallback: read as String via try_get.
+                    let mut vals: Vec<Option<String>> = Vec::with_capacity(rows.len());
+                    for row in &rows {
+                        match row.try_get::<_, Option<String>>(col_name) {
+                            Ok(v) => vals.push(v),
+                            Err(_) => {
+                                // Type doesn't implement FromSql<String> — format via Debug.
+                                vals.push(None);
+                            }
+                        }
+                    }
                     let str_vals: Vec<Option<&str>> =
                         vals.iter().map(|v: &Option<String>| v.as_deref()).collect();
                     std::sync::Arc::new(arrow_array::StringArray::from(str_vals))
@@ -158,9 +173,8 @@ impl ReferenceTableSource for PostgresReferenceTableSource {
             columns.push(array);
         }
 
-        let batch = RecordBatch::try_new(schema, columns).map_err(|e| {
-            ConnectorError::ReadError(format!("arrow batch construction: {e}"))
-        })?;
+        let batch = RecordBatch::try_new(schema, columns)
+            .map_err(|e| ConnectorError::ReadError(format!("arrow batch construction: {e}")))?;
 
         Ok(Some(batch))
     }
@@ -170,12 +184,11 @@ impl ReferenceTableSource for PostgresReferenceTableSource {
     }
 
     async fn poll_changes(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
-        // Snapshot-only source — no CDC changes.
         Ok(None)
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        SourceCheckpoint::new(if self.snapshot_done { 1 } else { 0 })
+        SourceCheckpoint::new(u64::from(self.snapshot_done))
     }
 
     async fn restore(&mut self, _checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
@@ -185,6 +198,25 @@ impl ReferenceTableSource for PostgresReferenceTableSource {
     async fn close(&mut self) -> Result<(), ConnectorError> {
         Ok(())
     }
+}
+
+/// Collect a typed column from all rows via `try_get`, returning
+/// `ConnectorError::ReadError` on conversion failure.
+fn collect_column<'a, T>(
+    rows: &'a [tokio_postgres::Row],
+    col_name: &str,
+    pg_type: &tokio_postgres::types::Type,
+) -> Result<Vec<Option<T>>, ConnectorError>
+where
+    T: tokio_postgres::types::FromSql<'a>,
+{
+    rows.iter()
+        .map(|r| {
+            r.try_get::<_, Option<T>>(col_name).map_err(|e| {
+                ConnectorError::ReadError(format!("column '{col_name}' (pg type {pg_type}): {e}"))
+            })
+        })
+        .collect()
 }
 
 /// Map a `tokio_postgres` type to an Arrow `DataType`.
@@ -197,6 +229,7 @@ fn pg_type_to_arrow(pg_type: &tokio_postgres::types::Type) -> arrow_schema::Data
         Type::INT8 => arrow_schema::DataType::Int64,
         Type::FLOAT4 => arrow_schema::DataType::Float32,
         Type::FLOAT8 => arrow_schema::DataType::Float64,
+        // TIMESTAMP, UUID, JSONB, etc. → read as Utf8 (String).
         _ => arrow_schema::DataType::Utf8,
     }
 }

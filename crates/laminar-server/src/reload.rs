@@ -346,7 +346,19 @@ pub async fn apply_reload(db: &LaminarDB, diff: &ConfigDiff) -> ReloadResult {
 
     // Create lookups (added + changed)
     for lookup in diff.lookups_added.iter().chain(diff.lookups_changed.iter()) {
-        let ddl = server::lookup_to_ddl(lookup);
+        let ddl = match server::lookup_to_ddl(lookup) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("Invalid lookup config '{}': {}", lookup.name, e);
+                failed.push(ReloadFailure {
+                    action: "create".to_string(),
+                    object_type: "lookup".to_string(),
+                    name: lookup.name.clone(),
+                    error: e.to_string(),
+                });
+                continue;
+            }
+        };
         match db.execute(&ddl).await {
             Ok(_) => {
                 info!("Created lookup table: {}", lookup.name);

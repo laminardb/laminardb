@@ -211,19 +211,7 @@ pub async fn run_server(
     }
 
     for lookup in &config.lookups {
-        if lookup.schema.is_empty() {
-            return Err(ServerError::Ddl {
-                section: "lookup".to_string(),
-                name: lookup.name.clone(),
-                source: DbError::Config(format!(
-                    "[[lookup]] '{}' requires a [[lookup.schema]] section with at least \
-                     one column definition (e.g. [[lookup.schema]]\nname = \"id\"\n\
-                     data_type = \"INT\"\nnullable = false)",
-                    lookup.name,
-                )),
-            });
-        }
-        let ddl = lookup_to_ddl(lookup);
+        let ddl = lookup_to_ddl(lookup)?;
         db.execute(&ddl).await.map_err(|e| ServerError::Ddl {
             section: "lookup".to_string(),
             name: lookup.name.clone(),
@@ -421,30 +409,38 @@ pub fn sink_to_ddl(sink: &SinkConfig) -> String {
 
 /// Generate `CREATE LOOKUP TABLE` DDL from a TOML lookup config.
 ///
-/// ```sql
-/// CREATE LOOKUP TABLE name (col1 TYPE, ...) WITH (
-///     'connector' = 'type', 'strategy' = '...', ...
-/// )
-/// ```
-pub fn lookup_to_ddl(lookup: &LookupConfig) -> String {
+/// # Errors
+///
+/// Returns `ServerError::Ddl` if the lookup has no schema columns.
+pub fn lookup_to_ddl(lookup: &LookupConfig) -> Result<String, ServerError> {
+    if lookup.schema.is_empty() {
+        return Err(ServerError::Ddl {
+            section: "lookup".to_string(),
+            name: lookup.name.clone(),
+            source: DbError::Config(format!(
+                "[[lookup]] '{}' requires a [[lookup.schema]] section with at least \
+                 one column definition",
+                lookup.name,
+            )),
+        });
+    }
+
     let mut parts = Vec::new();
     parts.push(format!("CREATE LOOKUP TABLE {}", lookup.name));
 
     // Column definitions + PRIMARY KEY
-    if !lookup.schema.is_empty() {
-        let mut col_defs: Vec<String> = lookup
-            .schema
-            .iter()
-            .map(|c| {
-                let nullability = if c.nullable { "" } else { " NOT NULL" };
-                format!("{} {}{}", c.name, c.data_type, nullability)
-            })
-            .collect();
-        if !lookup.primary_key.is_empty() {
-            col_defs.push(format!("PRIMARY KEY ({})", lookup.primary_key.join(", ")));
-        }
-        parts.push(format!("({})", col_defs.join(", ")));
+    let mut col_defs: Vec<String> = lookup
+        .schema
+        .iter()
+        .map(|c| {
+            let nullability = if c.nullable { "" } else { " NOT NULL" };
+            format!("{} {}{}", c.name, c.data_type, nullability)
+        })
+        .collect();
+    if !lookup.primary_key.is_empty() {
+        col_defs.push(format!("PRIMARY KEY ({})", lookup.primary_key.join(", ")));
     }
+    parts.push(format!("({})", col_defs.join(", ")));
 
     // WITH clause
     let mut opts = Vec::new();
@@ -461,7 +457,7 @@ pub fn lookup_to_ddl(lookup: &LookupConfig) -> String {
     }
     parts.push(format!("WITH ({})", opts.join(", ")));
 
-    parts.join(" ")
+    Ok(parts.join(" "))
 }
 
 /// Convert a TOML value to a SQL string literal value.
@@ -672,7 +668,7 @@ mod tests {
                 nullable: false,
             }],
         };
-        let ddl = lookup_to_ddl(&lookup);
+        let ddl = lookup_to_ddl(&lookup).unwrap();
         assert!(ddl.starts_with("CREATE LOOKUP TABLE instruments"));
         assert!(ddl.contains("symbol VARCHAR NOT NULL"));
         assert!(ddl.contains("PRIMARY KEY (symbol)"));
@@ -697,8 +693,23 @@ mod tests {
                 nullable: false,
             }],
         };
-        let ddl = lookup_to_ddl(&lookup);
+        let ddl = lookup_to_ddl(&lookup).unwrap();
         assert!(!ddl.contains("PRIMARY KEY"));
+    }
+
+    #[test]
+    fn test_lookup_to_ddl_empty_schema_rejected() {
+        let lookup = LookupConfig {
+            name: "bad".to_string(),
+            connector: "postgres".to_string(),
+            strategy: "poll".to_string(),
+            pushdown: false,
+            cache: LookupCacheConfig::default(),
+            properties: toml::Table::new(),
+            primary_key: vec![],
+            schema: vec![],
+        };
+        assert!(lookup_to_ddl(&lookup).is_err());
     }
 
     #[test]

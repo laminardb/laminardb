@@ -491,7 +491,8 @@ pub async fn start_delta(
     }
 
     for lookup in &config.lookups {
-        let ddl = server::lookup_to_ddl(lookup);
+        let ddl = server::lookup_to_ddl(lookup)
+            .map_err(|e| DeltaStartupError::EngineConstruction(format!("lookup DDL: {e}")))?;
         db.execute(&ddl)
             .await
             .map_err(|e| DeltaStartupError::EngineConstruction(format!("lookup DDL: {e}")))?;
