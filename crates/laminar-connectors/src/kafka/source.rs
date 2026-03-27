@@ -506,19 +506,19 @@ impl KafkaSource {
                             let headers_json = if capture_headers {
                                 use rdkafka::message::Headers;
                                 msg.headers().and_then(|hdrs| {
-                                    let mut map = serde_json::Map::with_capacity(hdrs.count());
-                                    for i in 0..hdrs.count() {
-                                        let h = hdrs.get(i);
-                                        let val = h
-                                            .value
-                                            .map(|v| String::from_utf8_lossy(v).into_owned())
-                                            .unwrap_or_default();
-                                        map.insert(
-                                            h.key.to_string(),
-                                            serde_json::Value::String(val),
-                                        );
-                                    }
-                                    serde_json::to_string(&map).ok()
+                                    let pairs: Vec<(String, serde_json::Value)> = (0..hdrs.count())
+                                        .map(|i| {
+                                            let h = hdrs.get(i);
+                                            let val = match h.value {
+                                                Some(v) => serde_json::Value::String(
+                                                    String::from_utf8_lossy(v).into_owned(),
+                                                ),
+                                                None => serde_json::Value::Null,
+                                            };
+                                            (h.key.to_string(), val)
+                                        })
+                                        .collect();
+                                    serde_json::to_string(&pairs).ok()
                                 })
                             } else {
                                 None

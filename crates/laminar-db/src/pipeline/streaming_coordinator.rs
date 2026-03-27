@@ -272,8 +272,12 @@ impl StreamingCoordinator {
                                 () = tokio::time::sleep(poll_interval) => {}
                             }
                         }
+                        Err(e) if !e.is_transient() => {
+                            tracing::error!(source = %src_name, error = %e, "terminal poll error");
+                            break;
+                        }
                         Err(e) => {
-                            tracing::warn!(source = %src_name, error = %e, "poll error");
+                            tracing::warn!(source = %src_name, error = %e, "poll error (retrying)");
                             tokio::select! {
                                 biased;
                                 () = task_shutdown_clone.notified() => break,
@@ -297,7 +301,21 @@ impl StreamingCoordinator {
                     }
                 }
 
-                // Close connector.
+                // Drain remaining data from the connector's internal
+                // buffer before closing — close() drops the buffer and
+                // anything not drained here is lost.
+                while let Ok(Some(batch)) = connector.poll_batch(max_poll).await {
+                    let cp = connector.checkpoint();
+                    let msg = SourceMsg::Batch {
+                        source_idx: idx,
+                        batch: batch.records,
+                        checkpoint: cp,
+                    };
+                    if task_tx.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+
                 if let Err(e) = connector.close().await {
                     tracing::warn!(source = %src_name, error = %e, "source close error");
                 }
@@ -513,18 +531,16 @@ impl StreamingCoordinator {
         }
 
         // ── Shutdown ──
-        // Stop source tasks first so no new messages enter rx.
+        // Signal source tasks to stop.
         for handle in &self.source_handles {
             handle.shutdown.notify_one();
         }
-        for handle in std::mem::take(&mut self.source_handles) {
-            if let Err(e) = handle.join.await {
-                tracing::warn!(source = %handle.name, error = ?e, "source task panicked");
-            }
-        }
 
-        // Stable drain: sources are stopped, so rx and post_barrier_buf
-        // cannot grow.  Loop until both are empty.
+        // Drain rx BEFORE joining source tasks. Source tasks may be
+        // blocked on task_tx.send() (channel full because the pipeline
+        // is slower than the source). Draining first frees channel
+        // slots so those source tasks can unblock, see the shutdown
+        // signal, and exit. Joining before draining deadlocks.
         self.source_batches_buf.clear();
         self.barrier_seen.clear();
         self.discard_pending_offsets();
@@ -546,7 +562,7 @@ impl StreamingCoordinator {
             }
         }
 
-        if !self.source_batches_buf.is_empty() {
+        if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
             let wm = callback.current_watermark();
             match callback.execute_cycle(&self.source_batches_buf, wm).await {
                 Ok(results) => {
@@ -557,6 +573,37 @@ impl StreamingCoordinator {
                 Err(e) => {
                     self.discard_pending_offsets();
                     tracing::warn!(error = %e, "[LDB-3020] SQL cycle error during shutdown drain");
+                }
+            }
+        }
+
+        // Join source tasks (unblocked by the drain above).
+        for handle in std::mem::take(&mut self.source_handles) {
+            if let Err(e) = handle.join.await {
+                tracing::warn!(source = %handle.name, error = ?e, "source task panicked");
+            }
+        }
+
+        // Final drain: pick up any messages source tasks sent between
+        // the first drain and their exit.
+        self.source_batches_buf.clear();
+        self.barrier_seen.clear();
+        self.discard_pending_offsets();
+        drain_barriers.clear();
+        while let Ok(msg) = self.rx.try_recv() {
+            self.process_msg(msg, &mut callback, &mut drain_barriers, &mut drain_events);
+        }
+        if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
+            let wm = callback.current_watermark();
+            match callback.execute_cycle(&self.source_batches_buf, wm).await {
+                Ok(results) => {
+                    self.commit_pending_offsets();
+                    callback.push_to_streams(&results);
+                    callback.write_to_sinks(&results).await;
+                }
+                Err(e) => {
+                    self.discard_pending_offsets();
+                    tracing::warn!(error = %e, "[LDB-3020] SQL cycle error during final drain");
                 }
             }
         }
@@ -618,17 +665,20 @@ impl StreamingCoordinator {
                 }
 
                 if let Some(name) = self.source_names.get(source_idx) {
-                    callback.extract_watermark(name, &batch);
                     #[allow(clippy::cast_possible_truncation)]
                     {
                         *cycle_events += batch.num_rows() as u64;
                     }
+                    // Filter BEFORE advancing the watermark — otherwise the
+                    // batch's own max timestamp advances the watermark and
+                    // then rows below that max are dropped from the same batch.
                     if let Some(filtered) = callback.filter_late_rows(name, &batch) {
                         self.source_batches_buf
                             .entry(Arc::clone(name))
                             .or_default()
                             .push(filtered);
                     }
+                    callback.extract_watermark(name, &batch);
                 }
             }
             SourceMsg::Barrier {
