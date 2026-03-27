@@ -222,6 +222,34 @@ impl LaminarDB {
         // Build OperatorGraph
         let ctx = laminar_sql::create_session_context();
         laminar_sql::register_streaming_functions(&ctx);
+
+        // Register lookup/reference tables in the operator graph's
+        // SessionContext so JOIN queries can resolve them.
+        let lookup_tables: Vec<(String, arrow::datatypes::SchemaRef)> = {
+            let ts = self.table_store.read();
+            ts.table_names()
+                .into_iter()
+                .filter_map(|name| {
+                    let schema = ts.table_schema(&name)?;
+                    Some((name, schema))
+                })
+                .collect()
+        };
+        for (name, schema) in lookup_tables {
+            let provider = crate::table_provider::ReferenceTableProvider::new(
+                name.clone(),
+                schema,
+                self.table_store.clone(),
+            );
+            if let Err(e) = ctx.register_table(&name, Arc::new(provider)) {
+                tracing::warn!(
+                    table = %name,
+                    error = %e,
+                    "failed to register lookup table in operator graph context"
+                );
+            }
+        }
+
         let mut graph = OperatorGraph::new(ctx);
         graph.set_max_state_bytes(self.config.max_state_bytes_per_operator);
         graph.set_lookup_registry(Arc::clone(&self.lookup_registry));
