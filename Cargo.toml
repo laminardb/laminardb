@@ -49,7 +49,7 @@ rustc-hash = "2.1"  # Faster than std HashMap (replaces unmaintained fxhash)
 parking_lot = "0.12"  # Faster Mutex/RwLock
 memmap2 = "0.9"  # Memory-mapped files
 uuid = { version = "1.22", features = ["v4", "v7", "serde"] }  # Unique IDs
-gethostname = "0.5"  # Pure Rust hostname lookup
+gethostname = "1.1"  # Pure Rust hostname lookup
 ahash = "0.8"  # Fast hashing for state stores
 foyer = { version = "0.22", features = ["serde"] }  # High-performance cache (S3-FIFO eviction, serde for HybridCache)
 sha2 = "0.10"  # SHA-256 for checkpoint integrity
