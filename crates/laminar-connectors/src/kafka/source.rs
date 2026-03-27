@@ -1019,29 +1019,30 @@ impl SourceConnector for KafkaSource {
         };
 
         // Append metadata columns if configured.
-        let batch = if include_metadata && !self.poll_meta_partitions.is_empty() {
-            use arrow_array::{Int32Array, Int64Array};
+        let needs_meta = include_metadata && !self.poll_meta_partitions.is_empty();
+        let needs_headers = include_headers && !self.poll_meta_headers.is_empty();
+        let batch = if needs_meta || needs_headers {
             use arrow_schema::{DataType, Field};
 
             let mut fields = batch.schema().fields().to_vec();
             let mut columns: Vec<Arc<dyn arrow_array::Array>> = batch.columns().to_vec();
 
-            fields.push(Arc::new(Field::new("_partition", DataType::Int32, false)));
-            columns.push(Arc::new(Int32Array::from(std::mem::take(
-                &mut self.poll_meta_partitions,
-            ))));
-
-            fields.push(Arc::new(Field::new("_offset", DataType::Int64, false)));
-            columns.push(Arc::new(Int64Array::from(std::mem::take(
-                &mut self.poll_meta_offsets,
-            ))));
-
-            fields.push(Arc::new(Field::new("_timestamp", DataType::Int64, true)));
-            columns.push(Arc::new(Int64Array::from(std::mem::take(
-                &mut self.poll_meta_timestamps,
-            ))));
-
-            if include_headers && !self.poll_meta_headers.is_empty() {
+            if needs_meta {
+                use arrow_array::{Int32Array, Int64Array};
+                fields.push(Arc::new(Field::new("_partition", DataType::Int32, false)));
+                columns.push(Arc::new(Int32Array::from(std::mem::take(
+                    &mut self.poll_meta_partitions,
+                ))));
+                fields.push(Arc::new(Field::new("_offset", DataType::Int64, false)));
+                columns.push(Arc::new(Int64Array::from(std::mem::take(
+                    &mut self.poll_meta_offsets,
+                ))));
+                fields.push(Arc::new(Field::new("_timestamp", DataType::Int64, true)));
+                columns.push(Arc::new(Int64Array::from(std::mem::take(
+                    &mut self.poll_meta_timestamps,
+                ))));
+            }
+            if needs_headers {
                 fields.push(Arc::new(Field::new("_headers", DataType::Utf8, true)));
                 columns.push(Arc::new(arrow_array::StringArray::from(std::mem::take(
                     &mut self.poll_meta_headers,

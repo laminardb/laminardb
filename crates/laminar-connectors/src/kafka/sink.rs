@@ -414,9 +414,12 @@ impl KafkaSink {
         timeout: Duration,
     ) -> Result<(), rdkafka::error::KafkaError> {
         let p = producer.clone();
-        tokio::task::spawn_blocking(move || p.flush(timeout))
-            .await
-            .expect("flush_producer_async: blocking task panicked")
+        match tokio::task::spawn_blocking(move || p.flush(timeout)).await {
+            Ok(result) => result,
+            Err(join_err) => Err(rdkafka::error::KafkaError::Canceled(format!(
+                "flush task failed: {join_err}"
+            ))),
+        }
     }
 
     /// Run a blocking producer operation on the thread pool. All
@@ -698,7 +701,7 @@ impl SinkConnector for KafkaSink {
                 self.transaction_active = false;
             }
 
-            Self::producer_blocking(producer, |p| p.begin_transaction())
+            Self::producer_blocking(producer, FutureProducer::begin_transaction)
                 .await
                 .map_err(|e| {
                     ConnectorError::TransactionError(format!(
@@ -868,15 +871,23 @@ impl SinkConnector for KafkaSink {
             }
         }
 
+        let mut first_err: Option<ConnectorError> = None;
+
         if let Some(ref producer) = self.producer {
             if let Err(e) = Self::flush_producer_async(producer, Duration::from_secs(30)).await {
                 warn!(error = %e, "failed to flush on close");
+                first_err.get_or_insert(ConnectorError::WriteError(format!(
+                    "flush failed on close: {e}"
+                )));
             }
         }
 
         if let Some(ref dlq) = self.dlq_producer {
             if let Err(e) = Self::flush_producer_async(dlq, Duration::from_secs(10)).await {
                 warn!(error = %e, "failed to flush DLQ producer on close");
+                first_err.get_or_insert(ConnectorError::WriteError(format!(
+                    "DLQ flush failed on close: {e}"
+                )));
             }
         }
 
@@ -884,7 +895,10 @@ impl SinkConnector for KafkaSink {
         self.dlq_producer = None;
         self.state = ConnectorState::Closed;
         info!("Kafka sink connector closed");
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
