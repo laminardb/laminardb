@@ -11,7 +11,7 @@ use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 use crate::reference::ReferenceTableSource;
 
-/// A [`ReferenceTableSource`](crate::reference::ReferenceTableSource) backed by a single `SELECT *` query against
+/// A [`ReferenceTableSource`] backed by a single `SELECT *` query against
 /// a `PostgreSQL` table. Returns the full table as a snapshot, then completes.
 pub struct PostgresReferenceTableSource {
     config: ConnectorConfig,
