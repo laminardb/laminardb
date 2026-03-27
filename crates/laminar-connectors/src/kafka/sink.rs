@@ -416,9 +416,10 @@ impl KafkaSink {
         let p = producer.clone();
         match tokio::task::spawn_blocking(move || p.flush(timeout)).await {
             Ok(result) => result,
-            Err(join_err) => Err(rdkafka::error::KafkaError::Canceled(format!(
-                "flush task failed: {join_err}"
-            ))),
+            Err(join_err) => {
+                warn!("flush blocking task failed: {join_err}");
+                Err(rdkafka::error::KafkaError::Canceled)
+            }
         }
     }
 
