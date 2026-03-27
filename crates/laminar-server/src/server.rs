@@ -412,6 +412,7 @@ pub fn sink_to_ddl(sink: &SinkConfig) -> String {
 /// # Errors
 ///
 /// Returns `ServerError::Ddl` if the lookup has no schema columns.
+#[allow(clippy::result_large_err)]
 pub fn lookup_to_ddl(lookup: &LookupConfig) -> Result<String, ServerError> {
     if lookup.schema.is_empty() {
         return Err(ServerError::Ddl {
