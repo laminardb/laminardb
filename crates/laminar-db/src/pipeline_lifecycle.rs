@@ -1060,9 +1060,13 @@ impl LaminarDB {
                 }
             }
 
+            let watcher_state = Arc::clone(&self.state);
+            let watcher_shutdown = Arc::clone(&self.shutdown_signal);
             let handle = tokio::spawn(async move {
                 if done_rx.await.is_err() {
                     tracing::error!("laminar-compute thread exited unexpectedly");
+                    watcher_state.store(STATE_STOPPED, std::sync::atomic::Ordering::Release);
+                    watcher_shutdown.notify_one();
                 }
             });
 

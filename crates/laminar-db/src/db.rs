@@ -84,7 +84,7 @@ pub struct LaminarDB {
     pub(crate) connector_registry: Arc<laminar_connectors::registry::ConnectorRegistry>,
     pub(crate) mv_registry: parking_lot::Mutex<laminar_core::mv::MvRegistry>,
     pub(crate) table_store: Arc<parking_lot::RwLock<crate::table_store::TableStore>>,
-    pub(crate) state: std::sync::atomic::AtomicU8,
+    pub(crate) state: Arc<std::sync::atomic::AtomicU8>,
     /// Handle to the background processing task (if running).
     pub(crate) runtime_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Signal to stop the processing loop.
@@ -247,7 +247,7 @@ impl LaminarDB {
             table_store: Arc::new(parking_lot::RwLock::new(
                 crate::table_store::TableStore::new(),
             )),
-            state: std::sync::atomic::AtomicU8::new(STATE_CREATED),
+            state: Arc::new(std::sync::atomic::AtomicU8::new(STATE_CREATED)),
             runtime_handle: parking_lot::Mutex::new(None),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             counters: Arc::new(crate::metrics::PipelineCounters::new()),
