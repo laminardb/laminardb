@@ -89,6 +89,16 @@ pub struct LaminarConfig {
     /// memory usage after every processing cycle. At 80% of the limit a warning
     /// is emitted; at 100% the query returns an error.
     pub max_state_bytes_per_operator: Option<usize>,
+
+    // Pipeline throughput tuning — see `PipelineConfig` for semantics.
+    /// Source → coordinator channel capacity (`None` = 64).
+    pub pipeline_channel_capacity: Option<usize>,
+    /// Micro-batch coalescing window (`None` = 5ms connectors / 0 embedded).
+    pub pipeline_batch_window: Option<std::time::Duration>,
+    /// Drain budget per cycle in nanoseconds (`None` = 1ms).
+    pub pipeline_drain_budget_ns: Option<u64>,
+    /// Per-query budget in nanoseconds (`None` = 8ms).
+    pub pipeline_query_budget_ns: Option<u64>,
 }
 
 impl Default for LaminarConfig {
@@ -104,6 +114,10 @@ impl Default for LaminarConfig {
             tiering: None,
             delivery_guarantee: DeliveryGuarantee::default(),
             max_state_bytes_per_operator: None,
+            pipeline_channel_capacity: None,
+            pipeline_batch_window: None,
+            pipeline_drain_budget_ns: None,
+            pipeline_query_budget_ns: None,
         }
     }
 }

@@ -513,7 +513,7 @@ pub struct KafkaSourceConfig {
     /// This is advisory — it keeps `kafka-consumer-groups` lag monitoring
     /// accurate. The authoritative offset state lives in `LaminarDB`'s
     /// checkpoint system. Set to `Duration::ZERO` to disable periodic
-    /// broker commits (default: 60s).
+    /// broker commits (default: 5s).
     pub broker_commit_interval: Duration,
 
     // -- Backpressure --
@@ -593,7 +593,7 @@ impl Default for KafkaSourceConfig {
             heartbeat_interval: Duration::from_secs(10),
             max_poll_interval: Duration::from_secs(600),
             queued_max_messages_kbytes: 16384,
-            broker_commit_interval: Duration::from_secs(60),
+            broker_commit_interval: Duration::from_secs(5),
             reader_channel_capacity: 1024,
             backpressure_high_watermark: 0.8,
             backpressure_low_watermark: 0.5,
@@ -772,7 +772,7 @@ impl KafkaSourceConfig {
 
         let broker_commit_interval_ms = config
             .get_parsed::<u64>("broker.commit.interval.ms")?
-            .unwrap_or(60_000);
+            .unwrap_or(5_000);
 
         let reader_channel_capacity = config
             .get_parsed::<usize>("reader.channel.capacity")?
@@ -1183,7 +1183,7 @@ mod tests {
         assert!(cfg.schema_registry_url.is_none());
         assert_eq!(cfg.security_protocol, SecurityProtocol::Plaintext);
         assert!(cfg.sasl_mechanism.is_none());
-        assert_eq!(cfg.broker_commit_interval, Duration::from_secs(60));
+        assert_eq!(cfg.broker_commit_interval, Duration::from_secs(5));
         assert_eq!(cfg.reader_channel_capacity, 1024);
     }
 

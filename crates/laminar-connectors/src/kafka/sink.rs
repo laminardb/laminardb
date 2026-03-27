@@ -406,6 +406,32 @@ impl KafkaSink {
         self.metrics.record_dlq();
         Ok(())
     }
+
+    /// Flush on the blocking pool — `Producer::flush()` is a synchronous
+    /// FFI call that would stall the sink task's async select loop.
+    async fn flush_producer_async(
+        producer: &FutureProducer,
+        timeout: Duration,
+    ) -> Result<(), rdkafka::error::KafkaError> {
+        let p = producer.clone();
+        tokio::task::spawn_blocking(move || p.flush(timeout))
+            .await
+            .expect("flush_producer_async: blocking task panicked")
+    }
+
+    /// Run a blocking producer operation on the thread pool. All
+    /// librdkafka transaction calls (`begin_transaction`,
+    /// `commit_transaction`, `abort_transaction`) are synchronous FFI.
+    async fn producer_blocking<F, R>(producer: &FutureProducer, op: F) -> R
+    where
+        F: FnOnce(&FutureProducer) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let p = producer.clone();
+        tokio::task::spawn_blocking(move || op(&p))
+            .await
+            .expect("producer_blocking: blocking task panicked")
+    }
 }
 
 #[async_trait]
@@ -599,8 +625,8 @@ impl SinkConnector for KafkaSink {
 
             // Intermediate flush to bound in-flight records and memory.
             if flush_threshold > 0 && (i + 1) % flush_threshold == 0 {
-                producer
-                    .flush(self.config.delivery_timeout)
+                Self::flush_producer_async(producer, self.config.delivery_timeout)
+                    .await
                     .map_err(|e| ConnectorError::WriteError(format!("flush failed: {e}")))?;
             }
         }
@@ -659,11 +685,26 @@ impl SinkConnector for KafkaSink {
                     actual: self.state.to_string(),
                 })?;
 
-            producer.begin_transaction().map_err(|e| {
-                ConnectorError::TransactionError(format!(
-                    "failed to begin transaction for epoch {epoch}: {e}"
-                ))
-            })?;
+            if self.transaction_active {
+                warn!(epoch, "aborting stale transaction before new epoch");
+                let txn_timeout = self.config.transaction_timeout;
+                Self::producer_blocking(producer, move |p| p.abort_transaction(txn_timeout))
+                    .await
+                    .map_err(|e| {
+                        ConnectorError::TransactionError(format!(
+                            "cannot begin epoch {epoch}: abort of stale transaction failed: {e}"
+                        ))
+                    })?;
+                self.transaction_active = false;
+            }
+
+            Self::producer_blocking(producer, |p| p.begin_transaction())
+                .await
+                .map_err(|e| {
+                    ConnectorError::TransactionError(format!(
+                        "failed to begin transaction for epoch {epoch}: {e}"
+                    ))
+                })?;
 
             self.transaction_active = true;
         }
@@ -683,11 +724,13 @@ impl SinkConnector for KafkaSink {
 
         // Flush all pending messages to Kafka brokers (phase 1).
         if let Some(ref producer) = self.producer {
-            producer.flush(self.config.delivery_timeout).map_err(|e| {
-                ConnectorError::TransactionError(format!(
-                    "failed to flush before pre-commit for epoch {epoch}: {e}"
-                ))
-            })?;
+            Self::flush_producer_async(producer, self.config.delivery_timeout)
+                .await
+                .map_err(|e| {
+                    ConnectorError::TransactionError(format!(
+                        "failed to flush before pre-commit for epoch {epoch}: {e}"
+                    ))
+                })?;
         }
 
         debug!(epoch, "pre-committed epoch (flushed)");
@@ -711,14 +754,15 @@ impl SinkConnector for KafkaSink {
                     actual: self.state.to_string(),
                 })?;
 
-            // Flush all pending messages.
-            producer.flush(self.config.delivery_timeout).map_err(|e| {
-                ConnectorError::TransactionError(format!("failed to flush before commit: {e}"))
-            })?;
+            Self::flush_producer_async(producer, self.config.delivery_timeout)
+                .await
+                .map_err(|e| {
+                    ConnectorError::TransactionError(format!("failed to flush before commit: {e}"))
+                })?;
 
-            // Commit the Kafka transaction.
-            producer
-                .commit_transaction(self.config.transaction_timeout)
+            let txn_timeout = self.config.transaction_timeout;
+            Self::producer_blocking(producer, move |p| p.commit_transaction(txn_timeout))
+                .await
                 .map_err(|e| {
                     ConnectorError::TransactionError(format!(
                         "failed to commit transaction for epoch {epoch}: {e}"
@@ -729,11 +773,13 @@ impl SinkConnector for KafkaSink {
         } else {
             // At-least-once: just flush pending messages.
             if let Some(ref producer) = self.producer {
-                producer.flush(self.config.delivery_timeout).map_err(|e| {
-                    ConnectorError::TransactionError(format!(
-                        "failed to flush for epoch {epoch}: {e}"
-                    ))
-                })?;
+                Self::flush_producer_async(producer, self.config.delivery_timeout)
+                    .await
+                    .map_err(|e| {
+                        ConnectorError::TransactionError(format!(
+                            "failed to flush for epoch {epoch}: {e}"
+                        ))
+                    })?;
             }
         }
 
@@ -755,8 +801,9 @@ impl SinkConnector for KafkaSink {
                     actual: self.state.to_string(),
                 })?;
 
-            producer
-                .abort_transaction(self.config.transaction_timeout)
+            let txn_timeout = self.config.transaction_timeout;
+            Self::producer_blocking(producer, move |p| p.abort_transaction(txn_timeout))
+                .await
                 .map_err(|e| {
                     ConnectorError::TransactionError(format!(
                         "failed to abort transaction for epoch {epoch}: {e}"
@@ -804,8 +851,8 @@ impl SinkConnector for KafkaSink {
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
         if let Some(ref producer) = self.producer {
-            producer
-                .flush(self.config.delivery_timeout)
+            Self::flush_producer_async(producer, self.config.delivery_timeout)
+                .await
                 .map_err(|e| ConnectorError::WriteError(format!("flush failed: {e}")))?;
         }
         Ok(())
@@ -821,10 +868,15 @@ impl SinkConnector for KafkaSink {
             }
         }
 
-        // Flush remaining messages.
         if let Some(ref producer) = self.producer {
-            if let Err(e) = producer.flush(Duration::from_secs(30)) {
+            if let Err(e) = Self::flush_producer_async(producer, Duration::from_secs(30)).await {
                 warn!(error = %e, "failed to flush on close");
+            }
+        }
+
+        if let Some(ref dlq) = self.dlq_producer {
+            if let Err(e) = Self::flush_producer_async(dlq, Duration::from_secs(10)).await {
+                warn!(error = %e, "failed to flush DLQ producer on close");
             }
         }
 
