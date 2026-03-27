@@ -83,6 +83,28 @@ pub fn register_postgres_cdc_source(registry: &ConnectorRegistry) {
             )))
         }),
     );
+
+    // Register standalone "postgres" table source for poll-based snapshot
+    // lookups (no replication slot / CDC required).
+    let pg_info = ConnectorInfo {
+        name: "postgres".to_string(),
+        display_name: "PostgreSQL Lookup Source".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        is_source: true,
+        is_sink: false,
+        config_keys: vec![],
+    };
+    registry.register_table_source(
+        "postgres",
+        pg_info,
+        Arc::new(|config| {
+            Ok(Box::new(
+                crate::lookup::postgres_reference::PostgresReferenceTableSource::new(
+                    config.clone(),
+                ),
+            ))
+        }),
+    );
 }
 
 fn postgres_cdc_config_keys() -> Vec<ConfigKeySpec> {

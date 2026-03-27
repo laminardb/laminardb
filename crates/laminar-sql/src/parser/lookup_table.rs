@@ -54,6 +54,8 @@ pub struct LookupTableProperties {
 /// Connector type for lookup tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectorType {
+    /// PostgreSQL standalone connector (poll-based snapshot, no CDC).
+    Postgres,
     /// PostgreSQL CDC connector.
     PostgresCdc,
     /// MySQL CDC connector.
@@ -83,6 +85,7 @@ impl ConnectorType {
             ));
         }
         Ok(match s.to_lowercase().as_str() {
+            "postgres" => Self::Postgres,
             "postgres-cdc" | "postgres_cdc" | "postgresql" => Self::PostgresCdc,
             "mysql-cdc" | "mysql_cdc" | "mysql" => Self::MysqlCdc,
             "redis" => Self::Redis,
@@ -114,9 +117,9 @@ impl LookupStrategy {
     /// Returns `ParseError` if the strategy is unknown.
     pub fn parse(s: &str) -> Result<Self, ParseError> {
         match s.to_lowercase().as_str() {
-            "replicated" | "full" => Ok(Self::Replicated),
+            "replicated" | "full" | "poll" | "snapshot" | "cdc" => Ok(Self::Replicated),
             "partitioned" | "sharded" => Ok(Self::Partitioned),
-            "on-demand" | "on_demand" | "lazy" => Ok(Self::OnDemand),
+            "on-demand" | "on_demand" | "lazy" | "manual" => Ok(Self::OnDemand),
             other => Err(ParseError::ValidationError(format!(
                 "unknown lookup strategy: '{other}' \
                  (expected: replicated, partitioned, on-demand)"

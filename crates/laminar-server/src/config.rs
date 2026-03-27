@@ -401,6 +401,10 @@ pub struct LookupConfig {
     #[serde(default)]
     pub properties: toml::Table,
 
+    /// Primary key column(s).
+    #[serde(default)]
+    pub primary_key: Vec<String>,
+
     /// Schema definition.
     #[serde(default)]
     pub schema: Vec<ColumnDef>,

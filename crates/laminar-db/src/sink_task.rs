@@ -98,6 +98,10 @@ impl SinkTaskHandle {
     }
 
     /// Spawns a new sink task with custom channel capacity and flush interval.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `channel_capacity` is 0.
     pub fn spawn_with_options(
         name: String,
         connector: Box<dyn SinkConnector>,
@@ -105,6 +109,7 @@ impl SinkTaskHandle {
         channel_capacity: usize,
         flush_interval: Duration,
     ) -> Self {
+        assert!(channel_capacity > 0, "sink channel_capacity must be > 0");
         let (tx, rx) = mpsc::channel(channel_capacity);
         let task_name = name.clone();
         let write_errors = Arc::new(AtomicU64::new(0));

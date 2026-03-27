@@ -99,6 +99,8 @@ pub struct PipelineCounters {
     pub sink_commit_duration_us: AtomicU64,
     /// Total sink write errors across all sinks (channel errors + timeouts).
     pub sink_write_errors: AtomicU64,
+    /// Cycles where the drain loop was skipped due to operator backpressure.
+    pub cycles_backpressured: AtomicU64,
 
     // ── Checkpoint size / lag ──
     /// Size of the last checkpoint in bytes (sidecar + manifest).
@@ -132,6 +134,7 @@ impl PipelineCounters {
             sink_precommit_duration_us: AtomicU64::new(0),
             sink_commit_duration_us: AtomicU64::new(0),
             sink_write_errors: AtomicU64::new(0),
+            cycles_backpressured: AtomicU64::new(0),
             last_checkpoint_size_bytes: AtomicU64::new(0),
             last_checkpoint_timestamp_ms: AtomicU64::new(0),
         }
@@ -160,6 +163,7 @@ impl PipelineCounters {
             sink_precommit_duration_us: self.sink_precommit_duration_us.load(Ordering::Relaxed),
             sink_commit_duration_us: self.sink_commit_duration_us.load(Ordering::Relaxed),
             sink_write_errors: self.sink_write_errors.load(Ordering::Relaxed),
+            cycles_backpressured: self.cycles_backpressured.load(Ordering::Relaxed),
             last_checkpoint_size_bytes: self.last_checkpoint_size_bytes.load(Ordering::Relaxed),
             last_checkpoint_timestamp_ms: self.last_checkpoint_timestamp_ms.load(Ordering::Relaxed),
         }
@@ -213,6 +217,8 @@ pub struct CounterSnapshot {
     pub sink_commit_duration_us: u64,
     /// Total sink write errors across all sinks.
     pub sink_write_errors: u64,
+    /// Cycles where drain was skipped due to operator backpressure.
+    pub cycles_backpressured: u64,
     /// Last checkpoint size in bytes.
     pub last_checkpoint_size_bytes: u64,
     /// Wall-clock timestamp (ms since epoch) of last successful checkpoint.

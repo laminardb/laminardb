@@ -264,6 +264,7 @@ fn scan_table_name(plan: &LogicalPlan) -> Option<String> {
 impl fmt::Display for crate::parser::lookup_table::ConnectorType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Postgres => write!(f, "postgres"),
             Self::PostgresCdc => write!(f, "postgres-cdc"),
             Self::MysqlCdc => write!(f, "mysql-cdc"),
             Self::Redis => write!(f, "redis"),

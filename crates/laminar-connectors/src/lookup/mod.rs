@@ -47,6 +47,10 @@ pub mod delta_lookup;
 #[cfg(feature = "postgres-cdc")]
 pub mod postgres_source;
 
+/// PostgreSQL poll-based reference table source (no CDC required).
+#[cfg(feature = "postgres-cdc")]
+pub mod postgres_reference;
+
 #[cfg(feature = "postgres-cdc")]
 pub use postgres_source::{PostgresLookupSource, PostgresLookupSourceConfig};
 

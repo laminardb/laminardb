@@ -14,7 +14,7 @@ exclude = [
 resolver = "2"
 
 [workspace.package]
-version = "0.18.13"
+version = "0.18.14"
 authors = ["LaminarDB Contributors"]
 edition = "2021"
 rust-version = "1.85"
