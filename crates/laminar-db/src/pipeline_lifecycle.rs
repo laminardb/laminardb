@@ -1024,9 +1024,21 @@ impl LaminarDB {
                             return;
                         }
                     };
-                    rt.block_on(async move {
-                        coordinator.run(callback).await;
-                    });
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        rt.block_on(async move {
+                            coordinator.run(callback).await;
+                        });
+                    }));
+                    if let Err(panic) = result {
+                        let msg = panic
+                            .downcast_ref::<String>()
+                            .map(String::as_str)
+                            .or_else(|| panic.downcast_ref::<&str>().copied())
+                            .unwrap_or("unknown");
+                        tracing::error!(panic = msg, "laminar-compute thread panicked");
+                        // done_tx dropped → done_rx returns Err → logged by watcher task
+                        return;
+                    }
                     let _ = done_tx.send(());
                 }) {
                 Ok(_) => {}
@@ -1049,7 +1061,9 @@ impl LaminarDB {
             }
 
             let handle = tokio::spawn(async move {
-                let _ = done_rx.await;
+                if done_rx.await.is_err() {
+                    tracing::error!("laminar-compute thread exited unexpectedly");
+                }
             });
 
             *self.runtime_handle.lock() = Some(handle);

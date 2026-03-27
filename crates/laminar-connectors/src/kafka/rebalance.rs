@@ -219,7 +219,7 @@ impl ConsumerContext for LaminarConsumerContext {
         match result {
             Ok(()) => {
                 tracing::debug!(
-                    partitions = offsets.count(),
+                    partition_count = offsets.count(),
                     "broker offset commit confirmed"
                 );
             }
@@ -227,7 +227,7 @@ impl ConsumerContext for LaminarConsumerContext {
                 self.commit_retry_needed.store(true, Ordering::Release);
                 warn!(
                     error = %e,
-                    partitions = offsets.count(),
+                    partition_count = offsets.count(),
                     "broker offset commit failed — scheduling sync retry"
                 );
             }
@@ -261,17 +261,18 @@ impl ConsumerContext for LaminarConsumerContext {
             };
 
             if seek_tpl.count() > 0 {
-                match base_consumer.seek_partitions(seek_tpl, std::time::Duration::ZERO) {
+                // Non-zero timeout: Duration::ZERO returns "In Progress" for every partition.
+                match base_consumer.seek_partitions(seek_tpl, std::time::Duration::from_secs(10)) {
                     Ok(result) => {
                         let errors: Vec<_> = result
                             .elements()
                             .iter()
                             .filter(|e| e.error().is_err())
-                            .map(|e| format!("{}-{}: {:?}", e.topic(), e.partition(), e.error()))
+                            .map(|e| format!("{}[{}]: {:?}", e.topic(), e.partition(), e.error()))
                             .collect();
                         if errors.is_empty() {
                             info!(
-                                partitions = result.count(),
+                                partition_count = result.count(),
                                 "seeked assigned partitions to tracked offsets"
                             );
                         } else {
@@ -291,7 +292,7 @@ impl ConsumerContext for LaminarConsumerContext {
                     warn!(error = %e, "failed to re-pause newly assigned partitions");
                 } else {
                     info!(
-                        partitions = tpl.count(),
+                        partition_count = tpl.count(),
                         "re-paused newly assigned partitions (reader backpressure active)"
                     );
                 }

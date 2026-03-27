@@ -404,7 +404,7 @@ impl KafkaSource {
                                     match c.commit(&tpl, CommitMode::Sync) {
                                         Ok(()) => {
                                             info!(
-                                                partitions = n,
+                                                partition_count = n,
                                                 "sync offset commit retry succeeded"
                                             );
                                         }
@@ -420,7 +420,7 @@ impl KafkaSource {
                             } else {
                                 match consumer.commit(&tpl, CommitMode::Async) {
                                     Ok(()) => info!(
-                                        partitions = tpl.count(),
+                                        partition_count = tpl.count(),
                                         "periodic broker offset commit (advisory)"
                                     ),
                                     Err(e) => warn!(
@@ -554,7 +554,7 @@ impl KafkaSource {
             if tpl.count() > 0 {
                 match consumer.commit(&tpl, CommitMode::Sync) {
                     Ok(()) => info!(
-                        partitions = tpl.count(),
+                        partition_count = tpl.count(),
                         "committed final offsets on shutdown"
                     ),
                     Err(e) => warn!(error = %e, "failed to commit final offsets on shutdown"),
@@ -707,7 +707,7 @@ impl SourceConnector for KafkaSource {
                         ))
                     })?;
                     info!(
-                        partitions = tpl.count(),
+                        partition_count = tpl.count(),
                         "assigned consumer to specific offsets"
                     );
                 }
@@ -753,7 +753,7 @@ impl SourceConnector for KafkaSource {
                             })?;
                             info!(
                                 timestamp_ms = ts_ms,
-                                partitions = resolved.count(),
+                                partition_count = resolved.count(),
                                 "assigned consumer to timestamp offsets"
                             );
                         }
@@ -1109,7 +1109,7 @@ impl SourceConnector for KafkaSource {
                 ConnectorError::CheckpointError(format!("failed to seek to offsets: {e}"))
             })?;
             info!(
-                partitions = self.offsets.partition_count(),
+                partition_count = self.offsets.partition_count(),
                 "restored consumer to checkpointed offsets"
             );
         }
