@@ -765,10 +765,9 @@ impl OperatorGraph {
                 continue;
             }
             let schema = batches[0].schema();
-            let concat = arrow::compute::concat_batches(&schema, batches)
-                .map_err(|e| DbError::query_pipeline_arrow(&**name, &e))?;
-            let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![concat]])
-                .map_err(|e| DbError::query_pipeline(&**name, &e))?;
+            let mem_table =
+                datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
+                    .map_err(|e| DbError::query_pipeline(&**name, &e))?;
             let _ = self.ctx.deregister_table(&**name);
             self.ctx
                 .register_table(&**name, Arc::new(mem_table))
@@ -907,10 +906,8 @@ impl OperatorGraph {
 
             if !self.nodes[node_id].output_routes.is_empty() {
                 let schema = batches[0].schema();
-                let concat = arrow::compute::concat_batches(&schema, &batches)
-                    .unwrap_or_else(|_| batches[0].clone());
                 if let Ok(mem_table) =
-                    datafusion::datasource::MemTable::try_new(schema, vec![vec![concat]])
+                    datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
                 {
                     let _ = self.ctx.deregister_table(&*node_name);
                     if let Err(e) = self.ctx.register_table(&*node_name, Arc::new(mem_table)) {
