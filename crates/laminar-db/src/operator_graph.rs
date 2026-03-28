@@ -474,6 +474,7 @@ impl OperatorGraph {
             stream_join_config.as_ref(),
             temporal_probe_config.as_ref(),
             projection_sql.as_deref(),
+            &table_refs,
         );
 
         // Determine input port count
@@ -585,6 +586,7 @@ impl OperatorGraph {
 
     /// Create the appropriate operator for a query based on detection results.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn create_operator(
         &self,
         name: &str,
@@ -596,6 +598,7 @@ impl OperatorGraph {
         stream_join_config: Option<&laminar_sql::translator::StreamJoinConfig>,
         temporal_probe_config: Option<&laminar_sql::translator::TemporalProbeConfig>,
         projection_sql: Option<&str>,
+        table_refs: &FxHashSet<String>,
     ) -> Box<dyn GraphOperator> {
         use crate::operator;
 
@@ -652,12 +655,21 @@ impl OperatorGraph {
             ));
         }
 
-        Box::new(operator::sql_query::SqlQueryOperator::new(
+        let mut op = operator::sql_query::SqlQueryOperator::new(
             name,
             sql,
             self.ctx.clone(),
             self.counters.clone(),
-        ))
+        );
+        // Find the stream source for this query (first table_ref that's in source_schemas).
+        // Used by CachedPlan to re-register the MemTable from accumulated inputs.
+        for tr in table_refs {
+            if self.source_schemas.contains_key(tr) {
+                op.set_source_table(tr);
+                break;
+            }
+        }
+        Box::new(op)
     }
 
     /// Remove a query by name using a tombstone.
@@ -833,31 +845,6 @@ impl OperatorGraph {
                 }
             })
             .collect();
-
-        // When budget-deferred, input_bufs accumulate across cycles but the
-        // source MemTable only has the latest cycle's data. Re-register
-        // stream sources (not reference/lookup ReferenceTableProviders).
-        for (port, port_batches) in inputs.iter().enumerate() {
-            if port_batches.is_empty() {
-                continue;
-            }
-            let upstream = self.input_sources[node_id][port];
-            if upstream < self.nodes.len()
-                && self.source_node_ids.contains(&upstream)
-                && self
-                    .source_schemas
-                    .contains_key(self.nodes[upstream].name.as_ref())
-            {
-                let upstream_name = &self.nodes[upstream].name;
-                let schema = port_batches[0].schema();
-                if let Ok(mem) =
-                    datafusion::datasource::MemTable::try_new(schema, vec![port_batches.clone()])
-                {
-                    let _ = self.ctx.deregister_table(&**upstream_name);
-                    let _ = self.ctx.register_table(&**upstream_name, Arc::new(mem));
-                }
-            }
-        }
 
         let output_result = self.nodes[node_id]
             .operator
