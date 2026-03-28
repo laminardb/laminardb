@@ -98,7 +98,6 @@ pub struct StreamingCoordinator {
     /// be included in the current checkpoint state. Bounded in practice by
     /// `channel_capacity` (max messages available per drain cycle).
     post_barrier_buf: Vec<SourceMsg>,
-    /// Batches whose watermarks should be extracted after all filtering is done.
     pending_watermark_batches: Vec<(Arc<str>, RecordBatch)>,
     /// Source indices that have delivered a barrier during the current drain
     /// cycle. Any subsequent batch from these sources goes to
@@ -451,17 +450,10 @@ impl StreamingCoordinator {
                 }
             }
 
-            // Extract watermarks AFTER all batches in this drain cycle have been
-            // filtered. This prevents batch N's watermark advance from causing
-            // batch N+1 to be filtered as "late."
             for (name, batch) in self.pending_watermark_batches.drain(..) {
                 callback.extract_watermark(&name, &batch);
             }
 
-            // Step: Execute SQL cycle. Also runs on idle wakeups when
-            // operators have deferred input from a prior budget-exceeded
-            // cycle — otherwise that data is stuck forever once the source
-            // goes idle.
             if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
                 let wm = callback.current_watermark();
                 match callback.execute_cycle(&self.source_batches_buf, wm).await {
@@ -605,6 +597,9 @@ impl StreamingCoordinator {
         drain_barriers.clear();
         while let Ok(msg) = self.rx.try_recv() {
             self.process_msg(msg, &mut callback, &mut drain_barriers, &mut drain_events);
+        }
+        for (name, batch) in self.pending_watermark_batches.drain(..) {
+            callback.extract_watermark(&name, &batch);
         }
         if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
             let wm = callback.current_watermark();

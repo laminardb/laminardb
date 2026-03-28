@@ -470,7 +470,7 @@ fn probe_index(
     results
 }
 
-/// Execute one cycle of an interval join (INNER only).
+/// Execute one cycle of an interval join.
 ///
 /// Bounds are inclusive: `|left_ts - right_ts| <= bound_ms`. NULL keys are
 /// skipped. New left rows probe all right; new right rows probe only old left
