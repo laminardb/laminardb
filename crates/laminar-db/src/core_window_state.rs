@@ -730,6 +730,7 @@ impl CoreWindowState {
                     batch,
                     indices,
                     &self.agg_specs,
+                    None,
                 )?;
             }
             return Ok(());
@@ -803,6 +804,7 @@ impl CoreWindowState {
                 batch,
                 indices,
                 &self.agg_specs,
+                None,
             )?;
         }
 

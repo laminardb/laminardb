@@ -315,6 +315,18 @@ pub(crate) struct AggStateCheckpoint {
     pub fingerprint: u64,
     /// Per-group checkpoint data.
     pub groups: Vec<GroupCheckpoint>,
+    /// Last emitted values per group (changelog mode only).
+    #[serde(default)]
+    pub last_emitted: Vec<EmittedCheckpoint>,
+}
+
+/// Serializable checkpoint for a single group's last emitted value.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct EmittedCheckpoint {
+    /// Serialized group key.
+    pub key: Vec<serde_json::Value>,
+    /// Last emitted aggregate values.
+    pub values: Vec<serde_json::Value>,
 }
 
 /// Serializable checkpoint for a single window's groups.
@@ -512,6 +524,62 @@ pub(crate) struct IncrementalAggState {
     having_sql: Option<String>,
     /// Maximum number of distinct groups before new groups are dropped.
     max_groups: usize,
+    /// When true, `emit()` produces Z-set delta records with a `__weight`
+    /// column (+1 insert, -1 retract). Only changed groups are emitted.
+    emit_changelog: bool,
+    /// Previous cycle's emitted values per group. Used to detect changes
+    /// and produce retraction pairs. Only populated when `emit_changelog`.
+    last_emitted: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
+    /// Idle group TTL in milliseconds. Only usable with `emit_changelog`
+    /// (eviction emits -1 retractions before removing groups).
+    pub(crate) idle_ttl_ms: Option<u64>,
+    /// Column index of `__weight` in the pre-agg batch when the upstream
+    /// source is a changelog stream. `None` for non-changelog sources.
+    weight_col_idx: Option<usize>,
+}
+
+/// Name of the Z-set weight column appended to changelog output.
+pub(crate) const WEIGHT_COLUMN: &str = "__weight";
+
+/// Build a weighted `RecordBatch` from collected keys, values, and weights.
+fn build_weighted_batch(
+    keys: &[arrow::row::OwnedRow],
+    vals: &[Vec<ScalarValue>],
+    weights: &[i64],
+    row_converter: &arrow::row::RowConverter,
+    num_group_cols: usize,
+    agg_specs: &[AggFuncSpec],
+    output_schema: &SchemaRef,
+) -> Result<RecordBatch, DbError> {
+    let group_arrays = if num_group_cols > 0 {
+        row_converter
+            .convert_rows(keys.iter().map(arrow::row::OwnedRow::row))
+            .map_err(|e| DbError::Pipeline(format!("group key array: {e}")))?
+    } else {
+        Vec::new()
+    };
+
+    let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(agg_specs.len());
+    for (agg_idx, spec) in agg_specs.iter().enumerate() {
+        let scalars: Vec<ScalarValue> = vals.iter().map(|v| v[agg_idx].clone()).collect();
+        let array = ScalarValue::iter_to_array(scalars)
+            .map_err(|e| DbError::Pipeline(format!("agg array: {e}")))?;
+        if array.data_type() == &spec.return_type {
+            agg_arrays.push(array);
+        } else {
+            let casted = arrow::compute::cast(&array, &spec.return_type).unwrap_or(array);
+            agg_arrays.push(casted);
+        }
+    }
+
+    let weight_array: ArrayRef = Arc::new(arrow::array::Int64Array::from(weights.to_vec()));
+
+    let mut all_arrays = group_arrays;
+    all_arrays.extend(agg_arrays);
+    all_arrays.push(weight_array);
+
+    RecordBatch::try_new(Arc::clone(output_schema), all_arrays)
+        .map_err(|e| DbError::Pipeline(format!("weighted batch: {e}")))
 }
 
 /// Per-group accumulator state with TTL metadata.
@@ -526,7 +594,11 @@ impl IncrementalAggState {
     /// plan of the given SQL query. Returns `None` if the query does not
     /// contain an `Aggregate` node (not an aggregation query).
     #[allow(clippy::too_many_lines)]
-    pub async fn try_from_sql(ctx: &SessionContext, sql: &str) -> Result<Option<Self>, DbError> {
+    pub async fn try_from_sql(
+        ctx: &SessionContext,
+        sql: &str,
+        emit_changelog: bool,
+    ) -> Result<Option<Self>, DbError> {
         let df = ctx
             .sql(sql)
             .await
@@ -810,6 +882,38 @@ impl IncrementalAggState {
         }
 
         let clauses = extract_clauses(sql);
+
+        // Detect __weight in upstream source for cascaded changelog aggregation.
+        // Check the registered table schema (not the pruned plan schema, which
+        // may have dropped unreferenced columns).
+        let source_has_weight = if let Ok(tp) = ctx
+            .table_provider(clauses.from_clause.trim_matches('"'))
+            .await
+        {
+            tp.schema().column_with_name(WEIGHT_COLUMN).is_some()
+        } else {
+            false
+        };
+
+        let weight_col_idx = if source_has_weight {
+            // Reject non-retractable aggregates over changelog streams.
+            for spec in &agg_specs {
+                let name = spec.udf.name().to_lowercase();
+                if matches!(name.as_str(), "min" | "max" | "first_value" | "last_value") {
+                    return Err(DbError::Pipeline(format!(
+                        "Cannot compute {}() over a changelog stream (EMIT CHANGES). \
+                         Use EMIT ON WINDOW CLOSE or a non-updating source.",
+                        spec.udf.name()
+                    )));
+                }
+            }
+            let idx = next_col_idx;
+            pre_agg_select_items.push(format!("\"{WEIGHT_COLUMN}\""));
+            Some(idx)
+        } else {
+            None
+        };
+
         let pre_agg_sql = format!(
             "SELECT {} FROM {}{}",
             pre_agg_select_items.join(", "),
@@ -855,6 +959,9 @@ impl IncrementalAggState {
                 spec.return_type.clone(),
                 true,
             ));
+        }
+        if emit_changelog {
+            output_fields.push(Field::new(WEIGHT_COLUMN, DataType::Int64, false));
         }
         let output_schema = Arc::new(Schema::new(output_fields));
 
@@ -905,12 +1012,67 @@ impl IncrementalAggState {
             having_filter,
             having_sql,
             max_groups: 1_000_000,
+            emit_changelog,
+            last_emitted: AHashMap::new(),
+            idle_ttl_ms: None,
+            weight_col_idx,
         }))
     }
 
-    /// Process a pre-aggregation batch. Watermark is recorded per-group
-    /// for future TTL eviction (Phase D+E — idle state retention with
-    /// retraction support).
+    /// Evict idle groups and return retraction records. Only produces output
+    /// when both `emit_changelog` and `idle_ttl_ms` are set.
+    pub fn evict_idle(&mut self, watermark: i64) -> Result<Vec<RecordBatch>, DbError> {
+        let Some(ttl) = self.idle_ttl_ms else {
+            return Ok(Vec::new());
+        };
+        if !self.emit_changelog {
+            return Ok(Vec::new());
+        }
+
+        #[allow(clippy::cast_possible_wrap)]
+        let cutoff = watermark.saturating_sub(ttl as i64);
+
+        let idle_keys: Vec<arrow::row::OwnedRow> = self
+            .groups
+            .iter()
+            .filter(|(_, e)| e.last_updated_ms < cutoff)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        if idle_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Collect retraction data from last_emitted before removing.
+        let mut retract_keys: Vec<arrow::row::OwnedRow> = Vec::new();
+        let mut retract_vals: Vec<Vec<ScalarValue>> = Vec::new();
+
+        for key in &idle_keys {
+            if let Some(old) = self.last_emitted.remove(key) {
+                retract_keys.push(key.clone());
+                retract_vals.push(old);
+            }
+            self.groups.remove(key);
+        }
+
+        if retract_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let weights = vec![-1i64; retract_keys.len()];
+        let batch = build_weighted_batch(
+            &retract_keys,
+            &retract_vals,
+            &weights,
+            &self.row_converter,
+            self.num_group_cols,
+            &self.agg_specs,
+            &self.output_schema,
+        )?;
+        Ok(vec![batch])
+    }
+
+    /// Process a pre-aggregation batch.
     pub fn process_batch(&mut self, batch: &RecordBatch, watermark_ms: i64) -> Result<(), DbError> {
         if batch.num_rows() == 0 {
             return Ok(());
@@ -966,7 +1128,13 @@ impl IncrementalAggState {
             let Some(entry) = self.groups.get_mut(row_key) else {
                 continue;
             };
-            Self::update_group_accumulators(&mut entry.accs, batch, indices, &self.agg_specs)?;
+            Self::update_group_accumulators(
+                &mut entry.accs,
+                batch,
+                indices,
+                &self.agg_specs,
+                self.weight_col_idx,
+            )?;
             entry.last_updated_ms = watermark_ms;
         }
 
@@ -997,7 +1165,13 @@ impl IncrementalAggState {
         entry.last_updated_ms = watermark_ms;
         #[allow(clippy::cast_possible_truncation)]
         let all_indices: Vec<u32> = (0..batch.num_rows() as u32).collect();
-        Self::update_group_accumulators(&mut entry.accs, batch, &all_indices, &self.agg_specs)
+        Self::update_group_accumulators(
+            &mut entry.accs,
+            batch,
+            &all_indices,
+            &self.agg_specs,
+            self.weight_col_idx,
+        )
     }
 
     /// Update accumulators for a single group given the row indices.
@@ -1010,8 +1184,18 @@ impl IncrementalAggState {
         batch: &RecordBatch,
         indices: &[u32],
         agg_specs: &[AggFuncSpec],
+        weight_col_idx: Option<usize>,
     ) -> Result<(), DbError> {
         let index_array = arrow::array::UInt32Array::from(indices.to_vec());
+
+        let weight_arr = if let Some(w_idx) = weight_col_idx {
+            Some(
+                compute::take(batch.column(w_idx), &index_array, None)
+                    .map_err(|e| DbError::Pipeline(format!("weight take: {e}")))?,
+            )
+        } else {
+            None
+        };
 
         for (i, spec) in agg_specs.iter().enumerate() {
             let mut input_arrays: Vec<ArrayRef> = Vec::with_capacity(spec.input_col_indices.len());
@@ -1039,6 +1223,17 @@ impl IncrementalAggState {
                 }
             }
 
+            // Z-set: multiply each input by __weight. SUM(x * w) is the
+            // weighted sum; COUNT(*) becomes SUM(w).
+            if let Some(ref w) = weight_arr {
+                for arr in &mut input_arrays {
+                    if arr.data_type().is_numeric() {
+                        *arr = arrow::compute::kernels::numeric::mul(arr, w)
+                            .map_err(|e| DbError::Pipeline(format!("weight mul: {e}")))?;
+                    }
+                }
+            }
+
             accs[i]
                 .update_batch(&input_arrays)
                 .map_err(|e| DbError::Pipeline(format!("accumulator update: {e}")))?;
@@ -1051,13 +1246,20 @@ impl IncrementalAggState {
     /// Does NOT reset the accumulators — they continue accumulating for the
     /// next cycle (running totals).
     pub fn emit(&mut self) -> Result<Vec<RecordBatch>, DbError> {
+        if self.emit_changelog {
+            return self.emit_changelog_delta();
+        }
+        self.emit_running_state()
+    }
+
+    /// Emit full running state (all groups, every cycle). No __weight column.
+    fn emit_running_state(&mut self) -> Result<Vec<RecordBatch>, DbError> {
         if self.groups.is_empty() {
             return Ok(Vec::new());
         }
 
         let num_rows = self.groups.len();
 
-        // Convert OwnedRow keys back to columnar arrays via RowConverter.
         let group_arrays = if self.num_group_cols > 0 {
             self.row_converter
                 .convert_rows(self.groups.keys().map(arrow::row::OwnedRow::row))
@@ -1066,7 +1268,6 @@ impl IncrementalAggState {
             Vec::new()
         };
 
-        // Evaluate accumulators into columnar arrays.
         let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(self.agg_specs.len());
         for (agg_idx, spec) in self.agg_specs.iter().enumerate() {
             let mut scalars: Vec<ScalarValue> = Vec::with_capacity(num_rows);
@@ -1092,6 +1293,84 @@ impl IncrementalAggState {
         let batch = RecordBatch::try_new(Arc::clone(&self.output_schema), all_arrays)
             .map_err(|e| DbError::Pipeline(format!("result batch build: {e}")))?;
 
+        Ok(vec![batch])
+    }
+
+    /// Emit Z-set delta: only changed/new/deleted groups with __weight column.
+    fn emit_changelog_delta(&mut self) -> Result<Vec<RecordBatch>, DbError> {
+        // Collect retractions and inserts.
+        let mut retract_keys: Vec<arrow::row::OwnedRow> = Vec::new();
+        let mut retract_vals: Vec<Vec<ScalarValue>> = Vec::new();
+        let mut insert_keys: Vec<arrow::row::OwnedRow> = Vec::new();
+        let mut insert_vals: Vec<Vec<ScalarValue>> = Vec::new();
+
+        for (key, entry) in &mut self.groups {
+            let current: Vec<ScalarValue> = entry
+                .accs
+                .iter_mut()
+                .map(|a| a.evaluate())
+                .collect::<Result<_, _>>()
+                .map_err(|e| DbError::Pipeline(format!("accumulator evaluate: {e}")))?;
+
+            if let Some(old) = self.last_emitted.get(key) {
+                if old != &current {
+                    retract_keys.push(key.clone());
+                    retract_vals.push(old.clone());
+                    insert_keys.push(key.clone());
+                    insert_vals.push(current.clone());
+                    self.last_emitted.insert(key.clone(), current);
+                }
+                // Unchanged: skip (true delta semantics).
+            } else {
+                insert_keys.push(key.clone());
+                insert_vals.push(current.clone());
+                self.last_emitted.insert(key.clone(), current);
+            }
+        }
+
+        // Detect deleted groups (in last_emitted but not in groups).
+        let deleted: Vec<arrow::row::OwnedRow> = self
+            .last_emitted
+            .keys()
+            .filter(|k| !self.groups.contains_key(*k))
+            .cloned()
+            .collect();
+        for key in &deleted {
+            let old = self.last_emitted.remove(key).unwrap();
+            retract_keys.push(key.clone());
+            retract_vals.push(old);
+        }
+
+        let total = retract_keys.len() + insert_keys.len();
+        if total == 0 {
+            return Ok(Vec::new());
+        }
+
+        // Build batch: retracts first (-1), then inserts (+1).
+        let mut all_keys = Vec::with_capacity(total);
+        let mut all_vals = Vec::with_capacity(total);
+        let mut weights = Vec::with_capacity(total);
+
+        for (k, v) in retract_keys.into_iter().zip(retract_vals) {
+            all_keys.push(k);
+            all_vals.push(v);
+            weights.push(-1i64);
+        }
+        for (k, v) in insert_keys.into_iter().zip(insert_vals) {
+            all_keys.push(k);
+            all_vals.push(v);
+            weights.push(1i64);
+        }
+
+        let batch = build_weighted_batch(
+            &all_keys,
+            &all_vals,
+            &weights,
+            &self.row_converter,
+            self.num_group_cols,
+            &self.agg_specs,
+            &self.output_schema,
+        )?;
         Ok(vec![batch])
     }
 
@@ -1167,9 +1446,23 @@ impl IncrementalAggState {
                 acc_states,
             });
         }
+        // Serialize last_emitted for changelog recovery.
+        let mut last_emitted_cp = Vec::new();
+        if self.emit_changelog {
+            for (row_key, vals) in &self.last_emitted {
+                let sv_key =
+                    row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
+                last_emitted_cp.push(EmittedCheckpoint {
+                    key: sv_key.iter().map(scalar_to_json).collect(),
+                    values: vals.iter().map(scalar_to_json).collect(),
+                });
+            }
+        }
+
         Ok(AggStateCheckpoint {
             fingerprint,
             groups,
+            last_emitted: last_emitted_cp,
         })
     }
 
@@ -1223,6 +1516,17 @@ impl IncrementalAggState {
                 },
             );
         }
+
+        // Restore last_emitted for changelog recovery.
+        self.last_emitted.clear();
+        for ec in &checkpoint.last_emitted {
+            let sv_key: Result<Vec<ScalarValue>, _> = ec.key.iter().map(json_to_scalar).collect();
+            let sv_key = sv_key?;
+            let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key)?;
+            let vals: Result<Vec<ScalarValue>, _> = ec.values.iter().map(json_to_scalar).collect();
+            self.last_emitted.insert(row_key, vals?);
+        }
+
         Ok(checkpoint.groups.len())
     }
 }
@@ -1812,6 +2116,7 @@ mod tests {
         let result = IncrementalAggState::try_from_sql(
             &ctx,
             "SELECT name, SUM(a) / SUM(b) AS ratio FROM events GROUP BY name",
+            false,
         )
         .await
         .unwrap();
@@ -1900,7 +2205,7 @@ mod tests {
             datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
         ctx.register_table("events", Arc::new(mem_table)).unwrap();
 
-        let result = IncrementalAggState::try_from_sql(&ctx, "SELECT * FROM events")
+        let result = IncrementalAggState::try_from_sql(&ctx, "SELECT * FROM events", false)
             .await
             .unwrap();
         assert!(result.is_none(), "Non-aggregate query should return None");
@@ -1928,6 +2233,7 @@ mod tests {
         let result = IncrementalAggState::try_from_sql(
             &ctx,
             "SELECT name, SUM(value) as total FROM events GROUP BY name",
+            false,
         )
         .await
         .unwrap();
@@ -1963,6 +2269,7 @@ mod tests {
         let mut state = IncrementalAggState::try_from_sql(
             &ctx,
             "SELECT name, SUM(value) as total FROM events GROUP BY name",
+            false,
         )
         .await
         .unwrap()
@@ -2055,7 +2362,7 @@ mod tests {
             datafusion::datasource::MemTable::try_new(Arc::clone(&schema), vec![vec![dummy]])
                 .unwrap();
         ctx.register_table("events", Arc::new(mem_table)).unwrap();
-        let state = IncrementalAggState::try_from_sql(&ctx, sql)
+        let state = IncrementalAggState::try_from_sql(&ctx, sql, false)
             .await
             .unwrap()
             .expect("expected aggregate state");
@@ -2085,6 +2392,7 @@ mod tests {
         let state = IncrementalAggState::try_from_sql(
             &ctx,
             "SELECT name, COUNT(DISTINCT value) as cnt FROM events GROUP BY name",
+            false,
         )
         .await
         .unwrap()
@@ -2187,6 +2495,7 @@ mod tests {
         let state = IncrementalAggState::try_from_sql(
             &ctx,
             "SELECT name, SUM(value) FILTER (WHERE value > 0) as pos_sum FROM events GROUP BY name",
+            false,
         )
         .await
         .unwrap()
@@ -2281,6 +2590,7 @@ mod tests {
         let state = IncrementalAggState::try_from_sql(
             &ctx,
             "SELECT name, SUM(value) as total FROM events GROUP BY name HAVING SUM(value) > 100",
+            false,
         )
         .await
         .unwrap()
@@ -2338,6 +2648,7 @@ mod tests {
         let state = IncrementalAggState::try_from_sql(
             &ctx,
             "SELECT name, SUM(amount) as total FROM orders GROUP BY name",
+            false,
         )
         .await
         .unwrap()
@@ -2375,6 +2686,7 @@ mod tests {
         let state = IncrementalAggState::try_from_sql(
             &ctx,
             "SELECT name, AVG(price) as avg_price FROM products GROUP BY name",
+            false,
         )
         .await
         .unwrap()
@@ -2412,6 +2724,7 @@ mod tests {
         let state = IncrementalAggState::try_from_sql(
             &ctx,
             "SELECT name, MIN(value) as min_val FROM events GROUP BY name",
+            false,
         )
         .await
         .unwrap()
@@ -2636,6 +2949,7 @@ mod tests {
         let state = IncrementalAggState::try_from_sql(
             &ctx,
             "SELECT upper(name), SUM(value) as total FROM events GROUP BY upper(name)",
+            false,
         )
         .await
         .unwrap()
@@ -3126,5 +3440,220 @@ mod tests {
         assert_eq!(js.left_batches, vec![vec![1, 2, 3]]);
         assert_eq!(js.right_batches, vec![vec![4, 5, 6]]);
         assert_eq!(js.last_evicted_watermark, 42);
+    }
+
+    #[tokio::test]
+    async fn test_changelog_delta_emit() {
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("price", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["X"])),
+                Arc::new(arrow::array::Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        ctx.register_table("t", Arc::new(mem)).unwrap();
+
+        let mut state = IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT symbol, SUM(price) AS total FROM t GROUP BY symbol",
+            true, // changelog mode
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // Output schema should include __weight.
+        assert_eq!(
+            state
+                .output_schema
+                .field(state.output_schema.fields().len() - 1)
+                .name(),
+            WEIGHT_COLUMN
+        );
+
+        // Cycle 1: new data → all groups are +1 inserts.
+        let b1 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("symbol", DataType::Utf8, true),
+                Field::new("price", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["AAPL", "GOOG"])),
+                Arc::new(arrow::array::Int64Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&b1, 1000).unwrap();
+        let r1 = state.emit().unwrap();
+        assert_eq!(r1.len(), 1);
+        let batch1 = &r1[0];
+        assert_eq!(batch1.num_rows(), 2); // AAPL +1, GOOG +1
+        let w1 = batch1
+            .column(batch1.num_columns() - 1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert!(w1.iter().all(|w| w == Some(1))); // all inserts
+
+        // Cycle 2: AAPL changes, GOOG unchanged → -1 old AAPL, +1 new AAPL, GOOG skipped.
+        let b2 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("symbol", DataType::Utf8, true),
+                Field::new("price", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["AAPL"])),
+                Arc::new(arrow::array::Int64Array::from(vec![50])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&b2, 2000).unwrap();
+        let r2 = state.emit().unwrap();
+        assert_eq!(r2.len(), 1);
+        let batch2 = &r2[0];
+        // Should be 2 rows: -1 (AAPL old), +1 (AAPL new). GOOG is unchanged → skipped.
+        assert_eq!(batch2.num_rows(), 2);
+        let w2 = batch2
+            .column(batch2.num_columns() - 1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(w2.value(0), -1); // retraction
+        assert_eq!(w2.value(1), 1); // insert
+
+        // Cycle 3: no new data, nothing changed → empty output.
+        let r3 = state.emit().unwrap();
+        assert!(r3.is_empty() || r3.iter().all(|b| b.num_rows() == 0));
+    }
+
+    #[tokio::test]
+    async fn test_cascaded_agg_retract_batch() {
+        // Simulate a downstream aggregate consuming upstream changelog output
+        // with a __weight column. Negative weights should trigger retract_batch.
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("total", DataType::Int64, false),
+            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["X"])),
+                Arc::new(arrow::array::Int64Array::from(vec![1])),
+                Arc::new(arrow::array::Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        ctx.register_table("upstream", Arc::new(mem)).unwrap();
+
+        let mut state = IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT symbol, SUM(total) AS grand_total FROM upstream GROUP BY symbol",
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        // weight_col_idx should be detected from upstream schema.
+        assert!(state.weight_col_idx.is_some());
+
+        // Cycle 1: insert AAPL=100 (+1), GOOG=200 (+1).
+        let b1 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("symbol", DataType::Utf8, true),
+                Field::new("total", DataType::Int64, true),
+                Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["AAPL", "GOOG"])),
+                Arc::new(arrow::array::Int64Array::from(vec![100, 200])),
+                Arc::new(arrow::array::Int64Array::from(vec![1, 1])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&b1, 1000).unwrap();
+        let r1 = state.emit().unwrap();
+        assert_eq!(r1[0].num_rows(), 2);
+
+        // Cycle 2: retract AAPL=100 (-1), insert AAPL=150 (+1). GOOG unchanged.
+        let b2 = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("symbol", DataType::Utf8, true),
+                Field::new("total", DataType::Int64, true),
+                Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["AAPL", "AAPL"])),
+                Arc::new(arrow::array::Int64Array::from(vec![100, 150])),
+                Arc::new(arrow::array::Int64Array::from(vec![-1, 1])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&b2, 2000).unwrap();
+        let r2 = state.emit().unwrap();
+        // AAPL: was 100, retracted 100, added 150 → SUM=150. GOOG: still 200.
+        assert_eq!(r2[0].num_rows(), 2);
+        let totals = r2[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        let symbols = r2[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        for i in 0..r2[0].num_rows() {
+            match symbols.value(i) {
+                "AAPL" => assert_eq!(totals.value(i), 150),
+                "GOOG" => assert_eq!(totals.value(i), 200),
+                other => panic!("unexpected symbol: {other}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_min_rejected_over_changelog_upstream() {
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("price", DataType::Int64, false),
+            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["X"])),
+                Arc::new(arrow::array::Int64Array::from(vec![1])),
+                Arc::new(arrow::array::Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        ctx.register_table("upstream", Arc::new(mem)).unwrap();
+
+        let result = IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT symbol, MIN(price) AS low FROM upstream GROUP BY symbol",
+            false,
+        )
+        .await;
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("Cannot compute"), "got: {msg}");
+            }
+            Ok(_) => panic!("expected error for MIN over changelog upstream"),
+        }
     }
 }

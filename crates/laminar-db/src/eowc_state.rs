@@ -630,6 +630,7 @@ impl IncrementalEowcState {
                     batch,
                     indices,
                     &self.agg_specs,
+                    None,
                 )?;
             }
             return Ok(());
@@ -691,6 +692,7 @@ impl IncrementalEowcState {
                 batch,
                 indices,
                 &self.agg_specs,
+                None,
             )?;
         }
 

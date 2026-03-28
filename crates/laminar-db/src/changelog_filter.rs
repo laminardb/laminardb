@@ -57,6 +57,41 @@ pub(crate) fn filter_positive_events(batch: &RecordBatch) -> Result<RecordBatch,
         .map_err(|e| DbError::Pipeline(format!("changelog filter: {e}")))
 }
 
+// ── Z-set __weight handling ───────────────────────────────────────────
+
+/// Prepare a batch for a sink. If the batch has a `__weight` column and
+/// the sink is NOT changelog-aware, filter to positive weights and strip
+/// the column. Changelog-aware sinks receive the batch unchanged.
+pub(crate) fn prepare_for_sink(batch: &RecordBatch, changelog_sink: bool) -> RecordBatch {
+    if changelog_sink {
+        return batch.clone();
+    }
+    let Ok(idx) = batch
+        .schema()
+        .index_of(crate::aggregate_state::WEIGHT_COLUMN)
+    else {
+        return batch.clone();
+    };
+    let Some(weights) = batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+    else {
+        return batch.clone();
+    };
+    // Keep only rows with positive weight.
+    let mask: BooleanArray = weights.iter().map(|w| Some(w.unwrap_or(0) > 0)).collect();
+    let Ok(filtered) = arrow::compute::filter_record_batch(batch, &mask) else {
+        return batch.clone();
+    };
+    // Strip the __weight column.
+    if filtered.num_columns() == 0 {
+        return filtered;
+    }
+    let indices: Vec<usize> = (0..filtered.num_columns()).filter(|&i| i != idx).collect();
+    filtered.project(&indices).unwrap_or(filtered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

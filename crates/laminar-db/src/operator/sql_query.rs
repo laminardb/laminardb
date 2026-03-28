@@ -45,6 +45,8 @@ pub(crate) struct SqlQueryOperator {
     pending_restore: Option<AggStateCheckpoint>,
     tier_logged: bool,
     cached_having_plan: Option<LogicalPlan>,
+    emit_changelog: bool,
+    idle_ttl_ms: Option<u64>,
 }
 
 impl SqlQueryOperator {
@@ -53,6 +55,8 @@ impl SqlQueryOperator {
         sql: &str,
         ctx: SessionContext,
         counters: Option<Arc<PipelineCounters>>,
+        emit_changelog: bool,
+        idle_ttl_ms: Option<u64>,
     ) -> Self {
         Self {
             op_name: Arc::from(name),
@@ -63,12 +67,14 @@ impl SqlQueryOperator {
             pending_restore: None,
             tier_logged: false,
             cached_having_plan: None,
+            emit_changelog,
+            idle_ttl_ms,
         }
     }
 
     async fn lazy_init(&mut self) -> Result<(), DbError> {
         // 1. Try aggregate path first
-        match IncrementalAggState::try_from_sql(&self.ctx, &self.sql).await {
+        match IncrementalAggState::try_from_sql(&self.ctx, &self.sql, self.emit_changelog).await {
             Ok(Some(mut agg_state)) => {
                 if let Some(ref cp) = self.pending_restore {
                     if let Err(e) = agg_state.restore_groups(cp) {
@@ -80,6 +86,9 @@ impl SqlQueryOperator {
                     }
                 }
                 self.pending_restore = None;
+                if let Some(ttl) = self.idle_ttl_ms {
+                    agg_state.idle_ttl_ms = Some(ttl);
+                }
                 self.log_tier(agg_state.compiled_projection().is_some());
                 self.state = QueryState::Agg(Box::new(agg_state));
                 return Ok(());
@@ -268,17 +277,44 @@ impl SqlQueryOperator {
             agg_state.process_batch(batch, watermark)?;
         }
 
-        // Step 3: Emit running aggregate totals + apply HAVING.
-        let having_filter = agg_state.having_filter().cloned();
-        let having_sql = agg_state.having_sql().map(String::from);
+        self.emit_agg_output(watermark).await
+    }
+
+    /// Shared emit path for aggregate queries: evict → emit → HAVING.
+    async fn emit_agg_output(&mut self, watermark: i64) -> Result<Vec<RecordBatch>, DbError> {
+        let QueryState::Agg(ref mut agg_state) = self.state else {
+            return Err(DbError::Pipeline(
+                "internal: emit_agg_output on non-agg".into(),
+            ));
+        };
+
+        let mut eviction = if self.emit_changelog {
+            agg_state.evict_idle(watermark)?
+        } else {
+            Vec::new()
+        };
+
         let mut batches = agg_state.emit()?;
-        if let Some(ref filter) = having_filter {
-            batches = apply_compiled_having(&batches, filter)?;
-        } else if let Some(ref having_sql) = having_sql {
-            batches = self.apply_having_sql(&batches, having_sql).await?;
+
+        // HAVING is skipped in changelog mode — retractions and HAVING interact
+        // incorrectly (a retraction that no longer satisfies HAVING would be
+        // silently dropped, leaving stale state downstream).
+        if !self.emit_changelog {
+            let having_filter = agg_state.having_filter().cloned();
+            let having_sql = agg_state.having_sql().map(String::from);
+            if let Some(ref filter) = having_filter {
+                batches = apply_compiled_having(&batches, filter)?;
+            } else if let Some(ref having_sql) = having_sql {
+                batches = self.apply_having_sql(&batches, having_sql).await?;
+            }
         }
 
-        Ok(batches)
+        if eviction.is_empty() {
+            Ok(batches)
+        } else {
+            eviction.extend(batches);
+            Ok(eviction)
+        }
     }
 
     /// Apply a HAVING predicate via SQL. Caches the `LogicalPlan` on first call
@@ -354,18 +390,8 @@ impl GraphOperator for SqlQueryOperator {
 
         if input_batches.is_empty() || input_batches.iter().all(|b| b.num_rows() == 0) {
             if matches!(self.state, QueryState::Agg(_)) {
-                let QueryState::Agg(ref mut agg_state) = self.state else {
-                    unreachable!();
-                };
-                let having_filter = agg_state.having_filter().cloned();
-                let having_sql = agg_state.having_sql().map(String::from);
-                let mut batches = agg_state.emit()?;
-                if let Some(ref filter) = having_filter {
-                    batches = apply_compiled_having(&batches, filter)?;
-                } else if let Some(ref having_sql) = having_sql {
-                    batches = self.apply_having_sql(&batches, having_sql).await?;
-                }
-                return Ok(batches);
+                // No new input — still emit running state (and evict if changelog).
+                return self.emit_agg_output(watermark).await;
             }
             return Ok(Vec::new());
         }
