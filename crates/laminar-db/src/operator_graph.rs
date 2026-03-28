@@ -20,6 +20,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
+use laminar_sql::datafusion::live_source::{LiveSourceHandle, LiveSourceProvider};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
@@ -150,8 +151,10 @@ pub(crate) struct OperatorGraph {
     temporal_configs: Vec<TemporalJoinTranslatorConfig>,
     depends_on_stream: FxHashSet<usize>,
     order_configs: FxHashMap<usize, OrderOperatorConfig>,
-    registered_sources: Vec<String>,
-    cycle_intermediates: Vec<String>,
+    /// Per-table `LiveSourceHandle` for batch swapping without catalog churn.
+    /// Covers both source tables (from `register_source_schema`) and
+    /// intermediate tables (created lazily on first operator output).
+    live_handles: FxHashMap<String, LiveSourceHandle>,
 }
 
 impl OperatorGraph {
@@ -178,8 +181,7 @@ impl OperatorGraph {
             temporal_configs: Vec::new(),
             depends_on_stream: FxHashSet::default(),
             order_configs: FxHashMap::default(),
-            registered_sources: Vec::new(),
-            cycle_intermediates: Vec::new(),
+            live_handles: FxHashMap::default(),
         }
     }
 
@@ -257,10 +259,36 @@ impl OperatorGraph {
         }
     }
 
-    /// Register a source schema so that empty placeholder tables can be
-    /// created for sources that have no data in a given cycle.
+    /// Register a source schema. Creates a [`LiveSourceProvider`] in the
+    /// `SessionContext` so that per-cycle batch delivery is a handle swap
+    /// instead of a catalog register/deregister pair.
     pub fn register_source_schema(&mut self, name: String, schema: SchemaRef) {
+        self.ensure_live_provider(&name, &schema);
         self.source_schemas.insert(name, schema);
+    }
+
+    /// Ensure a [`LiveSourceProvider`] is registered in the catalog for
+    /// `name`. Idempotent — skips if a handle already exists.
+    fn ensure_live_provider(&mut self, name: &str, schema: &SchemaRef) {
+        if self.live_handles.contains_key(name) {
+            return;
+        }
+        let provider = LiveSourceProvider::new(schema.clone());
+        let handle = provider.handle();
+        let _ = self.ctx.deregister_table(name);
+        if let Err(e) = self.ctx.register_table(name, Arc::new(provider)) {
+            // This is a programming error — the table was just deregistered,
+            // so registration should always succeed. Panic-worthy in debug,
+            // but in release just log an error. The handle won't be stored,
+            // so subsequent swap() calls will be no-ops for this table.
+            tracing::error!(
+                table = %name,
+                error = %e,
+                "BUG: Failed to register LiveSourceProvider after deregister"
+            );
+            return;
+        }
+        self.live_handles.insert(name.to_string(), handle);
     }
 
     /// Returns the temporal join configs for tables that appear as right-side
@@ -755,57 +783,29 @@ impl OperatorGraph {
         self.topo_dirty = false;
     }
 
-    /// Register source batches as temporary `MemTable` providers.
-    fn register_source_tables(
-        &mut self,
-        source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
-    ) -> Result<(), DbError> {
+    /// Swap source batches into their [`LiveSourceProvider`] handles.
+    fn register_source_tables(&mut self, source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
         for (name, batches) in source_batches {
             if batches.is_empty() {
                 continue;
             }
-            let schema = batches[0].schema();
-            let mem_table =
-                datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
-                    .map_err(|e| DbError::query_pipeline(&**name, &e))?;
-            let _ = self.ctx.deregister_table(&**name);
-            self.ctx
-                .register_table(&**name, Arc::new(mem_table))
-                .map_err(|e| DbError::query_pipeline(&**name, &e))?;
-            self.registered_sources.push(name.to_string());
-        }
-        // Register empty tables for known sources with no data this cycle
-        for (name, schema) in &self.source_schemas {
-            if source_batches.contains_key(name.as_str()) {
-                continue;
+            // Lazily create the provider if register_source_schema wasn't called
+            // (e.g., tests that skip the lifecycle).
+            if !self.live_handles.contains_key(name.as_ref()) {
+                let schema = batches[0].schema();
+                self.ensure_live_provider(name, &schema);
             }
-            let empty = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]])
-                .map_err(|e| DbError::query_pipeline(name, &e))?;
-            let _ = self.ctx.deregister_table(name);
-            self.ctx
-                .register_table(name, Arc::new(empty))
-                .map_err(|e| DbError::query_pipeline(name, &e))?;
-            self.registered_sources.push(name.clone());
-        }
-        Ok(())
-    }
-
-    /// Deregister source tables (cleanup after cycle).
-    fn cleanup_source_tables(&mut self) {
-        for name in self.registered_sources.drain(..) {
-            let _ = self.ctx.deregister_table(&name);
+            if let Some(handle) = self.live_handles.get(name.as_ref()) {
+                handle.swap(batches.clone());
+            }
         }
     }
 
-    /// Clean up all temporary state from a cycle: deregister source tables,
-    /// deregister intermediate tables, and stash the intermediates vec back
-    /// into `self.cycle_intermediates` for reuse.
-    fn finish_cycle(&mut self, intermediate_tables: Vec<String>) {
-        self.cleanup_source_tables();
-        for name in &intermediate_tables {
-            let _ = self.ctx.deregister_table(name);
+    /// Clear all live handles so stale data isn't visible next cycle.
+    fn finish_cycle(&mut self) {
+        for handle in self.live_handles.values() {
+            handle.clear();
         }
-        self.cycle_intermediates = intermediate_tables;
     }
 
     /// Execute a single operator node: take inputs, process, route outputs.
@@ -819,7 +819,6 @@ impl OperatorGraph {
         node_id: usize,
         current_watermark: i64,
         results: &mut FxHashMap<Arc<str>, Vec<RecordBatch>>,
-        intermediate_tables: &mut Vec<String>,
     ) -> Result<(), DbError> {
         let inputs = std::mem::take(&mut self.input_bufs[node_id]);
 
@@ -903,30 +902,27 @@ impl OperatorGraph {
 
         if !batches.is_empty() {
             let node_name = Arc::clone(&self.nodes[node_id].name);
+            let has_routes = !self.nodes[node_id].output_routes.is_empty();
+            let is_output = self.output_map.values().any(|&id| id == node_id);
 
-            if !self.nodes[node_id].output_routes.is_empty() {
-                let schema = batches[0].schema();
-                if let Ok(mem_table) =
-                    datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
-                {
-                    let _ = self.ctx.deregister_table(&*node_name);
-                    if let Err(e) = self.ctx.register_table(&*node_name, Arc::new(mem_table)) {
-                        tracing::warn!(
-                            query = %node_name,
-                            error = %e,
-                            "[LDB-3015] Failed to register intermediate table"
-                        );
-                    }
-                    intermediate_tables.push(node_name.to_string());
+            // Register intermediate for downstream SQL queries (catalog lookup).
+            if has_routes {
+                let name_str = node_name.to_string();
+                if !self.live_handles.contains_key(&name_str) {
+                    let schema = batches[0].schema();
+                    self.ensure_live_provider(&name_str, &schema);
+                }
+                if let Some(handle) = self.live_handles.get(name_str.as_str()) {
+                    handle.swap(batches.clone());
                 }
             }
 
-            if self.output_map.values().any(|&id| id == node_id) {
+            // Collect output for the caller.
+            if is_output {
                 results.insert(node_name, batches.clone());
             }
 
-            // Extend (not overwrite) so deferred operators retain
-            // batches accumulated from prior cycles.
+            // Route to downstream operator input buffers.
             let routes = self.nodes[node_id].output_routes.clone();
             if routes.len() == 1 {
                 let (target, port) = routes[0];
@@ -966,7 +962,7 @@ impl OperatorGraph {
             self.compute_topo_order();
         }
 
-        self.register_source_tables(source_batches)?;
+        self.register_source_tables(source_batches);
 
         for (name, &node_id) in &self.source_map {
             if let Some(batches) = source_batches.get(name) {
@@ -979,9 +975,6 @@ impl OperatorGraph {
         }
 
         let mut results = FxHashMap::default();
-        let mut intermediate_tables = std::mem::take(&mut self.cycle_intermediates);
-        intermediate_tables.clear();
-
         let cycle_start = std::time::Instant::now();
         let topo_len = self.topo_order.len();
 
@@ -1021,15 +1014,10 @@ impl OperatorGraph {
                             continue;
                         }
                         if let Err(e) = self
-                            .execute_single_operator(
-                                deferred_id,
-                                current_watermark,
-                                &mut results,
-                                &mut intermediate_tables,
-                            )
+                            .execute_single_operator(deferred_id, current_watermark, &mut results)
                             .await
                         {
-                            self.finish_cycle(intermediate_tables);
+                            self.finish_cycle();
                             return Err(e);
                         }
                         self.deferred_scan_offset = self.deferred_scan_offset.wrapping_add(1);
@@ -1041,20 +1029,15 @@ impl OperatorGraph {
             }
 
             if let Err(e) = self
-                .execute_single_operator(
-                    node_id,
-                    current_watermark,
-                    &mut results,
-                    &mut intermediate_tables,
-                )
+                .execute_single_operator(node_id, current_watermark, &mut results)
                 .await
             {
-                self.finish_cycle(intermediate_tables);
+                self.finish_cycle();
                 return Err(e);
             }
         }
 
-        self.finish_cycle(intermediate_tables);
+        self.finish_cycle();
         Ok(results)
     }
 
@@ -1494,7 +1477,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_og_cascading() {
-        // Query A feeds Query B through intermediate MemTable registration
+        // Query A feeds Query B through intermediate LiveSourceProvider
         let mut graph = test_graph();
         graph.add_query(
             "step1".to_string(),

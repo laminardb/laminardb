@@ -64,6 +64,44 @@ pub(crate) fn row_to_scalar_key_with_types(
     Ok(sv_key)
 }
 
+/// Sentinel `OwnedRow` for global aggregates (no GROUP BY).
+///
+/// Cached via `OnceLock` — allocated once, reused forever.
+pub(crate) fn global_aggregate_key() -> arrow::row::OwnedRow {
+    use std::sync::OnceLock;
+    static SENTINEL: OnceLock<arrow::row::OwnedRow> = OnceLock::new();
+    SENTINEL
+        .get_or_init(|| {
+            let conv =
+                arrow::row::RowConverter::new(vec![arrow::row::SortField::new(DataType::Boolean)])
+                    .unwrap();
+            let col: ArrayRef = Arc::new(arrow::array::BooleanArray::from(vec![false]));
+            conv.convert_columns(&[col]).unwrap().row(0).owned()
+        })
+        .clone()
+}
+
+/// Convert a `Vec<ScalarValue>` key to an `OwnedRow`.
+pub(crate) fn scalar_key_to_owned_row(
+    row_converter: &arrow::row::RowConverter,
+    sv_key: &[ScalarValue],
+) -> Result<arrow::row::OwnedRow, DbError> {
+    if sv_key.is_empty() {
+        return Ok(global_aggregate_key());
+    }
+    let arrays: Vec<ArrayRef> = sv_key
+        .iter()
+        .map(|sv| {
+            sv.to_array()
+                .map_err(|e| DbError::Pipeline(format!("scalar to array: {e}")))
+        })
+        .collect::<Result<_, _>>()?;
+    let rows = row_converter
+        .convert_columns(&arrays)
+        .map_err(|e| DbError::Pipeline(format!("key to row: {e}")))?;
+    Ok(rows.row(0).owned())
+}
+
 /// Emit a single window's accumulated state as a `RecordBatch`.
 ///
 /// Shared by `CoreWindowState` and `IncrementalEowcState`. Builds columns
@@ -71,8 +109,9 @@ pub(crate) fn row_to_scalar_key_with_types(
 pub(crate) fn emit_window_batch(
     window_start: i64,
     window_end: i64,
-    groups: ahash::AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>,
-    group_types: &[DataType],
+    groups: ahash::AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>,
+    row_converter: &arrow::row::RowConverter,
+    num_group_cols: usize,
     agg_specs: &[AggFuncSpec],
     output_schema: &SchemaRef,
 ) -> Result<Option<RecordBatch>, DbError> {
@@ -81,20 +120,14 @@ pub(crate) fn emit_window_batch(
         return Ok(None);
     }
 
-    // Single pass: drain the map, split keys into per-column scalar vecs
-    // and evaluate accumulators. This avoids cloning ScalarValue keys.
-    let num_group_cols = group_types.len();
-    let mut group_scalars: Vec<Vec<ScalarValue>> = (0..num_group_cols)
-        .map(|_| Vec::with_capacity(num_rows))
-        .collect();
+    // Collect keys and evaluate accumulators in a single drain pass.
+    let mut row_keys: Vec<arrow::row::OwnedRow> = Vec::with_capacity(num_rows);
     let mut agg_scalars: Vec<Vec<ScalarValue>> = (0..agg_specs.len())
         .map(|_| Vec::with_capacity(num_rows))
         .collect();
 
     for (key, mut accs) in groups {
-        for (i, sv) in key.into_iter().enumerate() {
-            group_scalars[i].push(sv);
-        }
+        row_keys.push(key);
         for (i, acc) in accs.iter_mut().enumerate() {
             let sv = acc
                 .evaluate()
@@ -108,18 +141,13 @@ pub(crate) fn emit_window_batch(
     let win_end_array: ArrayRef =
         Arc::new(arrow::array::Int64Array::from(vec![window_end; num_rows]));
 
-    let mut group_arrays: Vec<ArrayRef> = Vec::with_capacity(num_group_cols);
-    for (col_idx, scalars) in group_scalars.into_iter().enumerate() {
-        let dt = &group_types[col_idx];
-        let array = ScalarValue::iter_to_array(scalars)
-            .map_err(|e| DbError::Pipeline(format!("group key array: {e}")))?;
-        if array.data_type() == dt {
-            group_arrays.push(array);
-        } else {
-            let casted = arrow::compute::cast(&array, dt).unwrap_or(array);
-            group_arrays.push(casted);
-        }
-    }
+    let group_arrays = if num_group_cols == 0 {
+        Vec::new()
+    } else {
+        row_converter
+            .convert_rows(row_keys.iter().map(arrow::row::OwnedRow::row))
+            .map_err(|e| DbError::Pipeline(format!("group key array: {e}")))?
+    };
 
     let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(agg_specs.len());
     for (agg_idx, scalars) in agg_scalars.into_iter().enumerate() {
@@ -467,12 +495,10 @@ pub(crate) struct IncrementalAggState {
     group_types: Vec<DataType>,
     /// Aggregate function specifications.
     agg_specs: Vec<AggFuncSpec>,
-    /// Per-group accumulator state.
-    ///
-    /// `DataFusion` `Accumulator` is trait-object dispatched (~2ns vtable overhead).
-    /// Acceptable because each call processes a batch, not per-row. 50+
-    /// aggregate types preclude enum dispatch.
-    groups: AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>,
+    /// Per-group accumulator state keyed by binary-encoded group key.
+    groups: AHashMap<arrow::row::OwnedRow, GroupEntry>,
+    /// Persistent row converter for encoding/decoding group keys.
+    row_converter: arrow::row::RowConverter,
     /// Output schema (group columns + aggregate results).
     output_schema: SchemaRef,
     /// Compiled pre-agg projection (single-source queries only).
@@ -486,6 +512,13 @@ pub(crate) struct IncrementalAggState {
     having_sql: Option<String>,
     /// Maximum number of distinct groups before new groups are dropped.
     max_groups: usize,
+}
+
+/// Per-group accumulator state with TTL metadata.
+pub(crate) struct GroupEntry {
+    pub(crate) accs: Vec<Box<dyn datafusion_expr::Accumulator>>,
+    /// Watermark (ms) at which this group last received data.
+    pub(crate) last_updated_ms: i64,
 }
 
 impl IncrementalAggState {
@@ -851,6 +884,13 @@ impl IncrementalAggState {
             None
         };
 
+        let sort_fields: Vec<arrow::row::SortField> = group_types
+            .iter()
+            .map(|dt| arrow::row::SortField::new(dt.clone()))
+            .collect();
+        let row_converter = arrow::row::RowConverter::new(sort_fields)
+            .map_err(|e| DbError::Pipeline(format!("row converter init: {e}")))?;
+
         Ok(Some(Self {
             pre_agg_sql,
             num_group_cols,
@@ -858,6 +898,7 @@ impl IncrementalAggState {
             group_types,
             agg_specs,
             groups: AHashMap::new(),
+            row_converter,
             output_schema,
             compiled_projection,
             cached_pre_agg_plan,
@@ -867,40 +908,28 @@ impl IncrementalAggState {
         }))
     }
 
-    /// Process a pre-aggregation batch: partition by group key and update
-    /// accumulators.
-    ///
-    /// Uses Arrow's vectorized `RowConverter` to build binary-comparable
-    /// group keys in a single pass, avoiding per-row `Vec<ScalarValue>`
-    /// allocations.
-    pub fn process_batch(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
+    /// Process a pre-aggregation batch. Watermark is recorded per-group
+    /// for future TTL eviction (Phase D+E — idle state retention with
+    /// retraction support).
+    pub fn process_batch(&mut self, batch: &RecordBatch, watermark_ms: i64) -> Result<(), DbError> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
 
-        // Fast path for global aggregates (no GROUP BY): all rows go
-        // into a single group with an empty key, no row conversion needed.
         if self.num_group_cols == 0 {
-            return self.process_batch_no_groups(batch);
+            return self.process_batch_no_groups(batch, watermark_ms);
         }
 
-        // Vectorized group key extraction using Arrow row format.
         let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
             .map(|i| Arc::clone(batch.column(i)))
             .collect();
 
-        let sort_fields: Vec<arrow::row::SortField> = group_cols
-            .iter()
-            .map(|c| arrow::row::SortField::new(c.data_type().clone()))
-            .collect();
-
-        let converter = arrow::row::RowConverter::new(sort_fields)
-            .map_err(|e| DbError::Pipeline(format!("row converter: {e}")))?;
-
-        let rows = converter
+        let rows = self
+            .row_converter
             .convert_columns(&group_cols)
             .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
 
+        // Group row indices by key for batch accumulator updates.
         let estimated_groups = (batch.num_rows() / 4).max(16);
         let mut group_indices: FxHashMap<arrow::row::OwnedRow, Vec<u32>> =
             FxHashMap::with_capacity_and_hasher(estimated_groups, rustc_hash::FxBuildHasher);
@@ -913,9 +942,7 @@ impl IncrementalAggState {
         }
 
         for (row_key, indices) in &group_indices {
-            let sv_key = self.row_to_scalar_key(&converter, row_key)?;
-
-            if !self.groups.contains_key(&sv_key) {
+            if !self.groups.contains_key(row_key) {
                 if self.groups.len() >= self.max_groups {
                     tracing::warn!(
                         max_groups = self.max_groups,
@@ -928,41 +955,49 @@ impl IncrementalAggState {
                 for spec in &self.agg_specs {
                     accs.push(spec.create_accumulator()?);
                 }
-                self.groups.insert(sv_key.clone(), accs);
+                self.groups.insert(
+                    row_key.clone(),
+                    GroupEntry {
+                        accs,
+                        last_updated_ms: watermark_ms,
+                    },
+                );
             }
-            let Some(accs) = self.groups.get_mut(&sv_key) else {
+            let Some(entry) = self.groups.get_mut(row_key) else {
                 continue;
             };
-
-            Self::update_group_accumulators(accs, batch, indices, &self.agg_specs)?;
+            Self::update_group_accumulators(&mut entry.accs, batch, indices, &self.agg_specs)?;
+            entry.last_updated_ms = watermark_ms;
         }
 
         Ok(())
     }
 
     /// Fast path for global aggregates (COUNT(*), SUM(x), etc. with no GROUP BY).
-    fn process_batch_no_groups(&mut self, batch: &RecordBatch) -> Result<(), DbError> {
-        let empty_key: Vec<ScalarValue> = Vec::new();
+    fn process_batch_no_groups(
+        &mut self,
+        batch: &RecordBatch,
+        watermark_ms: i64,
+    ) -> Result<(), DbError> {
+        let empty_key = global_aggregate_key();
         if !self.groups.contains_key(&empty_key) {
             let mut accs = Vec::with_capacity(self.agg_specs.len());
             for spec in &self.agg_specs {
                 accs.push(spec.create_accumulator()?);
             }
-            self.groups.insert(empty_key.clone(), accs);
+            self.groups.insert(
+                empty_key.clone(),
+                GroupEntry {
+                    accs,
+                    last_updated_ms: watermark_ms,
+                },
+            );
         }
-        let accs = self.groups.get_mut(&empty_key).unwrap();
+        let entry = self.groups.get_mut(&empty_key).unwrap();
+        entry.last_updated_ms = watermark_ms;
         #[allow(clippy::cast_possible_truncation)]
         let all_indices: Vec<u32> = (0..batch.num_rows() as u32).collect();
-        Self::update_group_accumulators(accs, batch, &all_indices, &self.agg_specs)
-    }
-
-    /// Convert an `OwnedRow` back to a `Vec<ScalarValue>` group key.
-    fn row_to_scalar_key(
-        &self,
-        converter: &arrow::row::RowConverter,
-        row_key: &arrow::row::OwnedRow,
-    ) -> Result<Vec<ScalarValue>, DbError> {
-        row_to_scalar_key_with_types(converter, row_key, &self.group_types)
+        Self::update_group_accumulators(&mut entry.accs, batch, &all_indices, &self.agg_specs)
     }
 
     /// Update accumulators for a single group given the row indices.
@@ -1022,25 +1057,21 @@ impl IncrementalAggState {
 
         let num_rows = self.groups.len();
 
-        let mut group_arrays: Vec<ArrayRef> = Vec::with_capacity(self.num_group_cols);
-        for (col_idx, dt) in self.group_types.iter().enumerate() {
-            let scalars: Vec<ScalarValue> =
-                self.groups.keys().map(|key| key[col_idx].clone()).collect();
-            let array = ScalarValue::iter_to_array(scalars)
-                .map_err(|e| DbError::Pipeline(format!("group key array build: {e}")))?;
-            if array.data_type() == dt {
-                group_arrays.push(array);
-            } else {
-                let casted = arrow::compute::cast(&array, dt).unwrap_or(array);
-                group_arrays.push(casted);
-            }
-        }
+        // Convert OwnedRow keys back to columnar arrays via RowConverter.
+        let group_arrays = if self.num_group_cols > 0 {
+            self.row_converter
+                .convert_rows(self.groups.keys().map(arrow::row::OwnedRow::row))
+                .map_err(|e| DbError::Pipeline(format!("group key array build: {e}")))?
+        } else {
+            Vec::new()
+        };
 
+        // Evaluate accumulators into columnar arrays.
         let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(self.agg_specs.len());
         for (agg_idx, spec) in self.agg_specs.iter().enumerate() {
             let mut scalars: Vec<ScalarValue> = Vec::with_capacity(num_rows);
-            for accs in self.groups.values_mut() {
-                let sv = accs[agg_idx]
+            for entry in self.groups.values_mut() {
+                let sv = entry.accs[agg_idx]
                     .evaluate()
                     .map_err(|e| DbError::Pipeline(format!("accumulator evaluate: {e}")))?;
                 scalars.push(sv);
@@ -1099,16 +1130,11 @@ impl IncrementalAggState {
     }
 
     /// Estimated memory usage in bytes across all groups.
-    ///
-    /// Sums `ScalarValue::size()` for each group key element and
-    /// `Accumulator::size()` for each per-group accumulator.
     pub(crate) fn estimated_size_bytes(&self) -> usize {
         let mut total = 0;
-        for (key, accs) in &self.groups {
-            for sv in key {
-                total += sv.size();
-            }
-            for acc in accs {
+        for (key, entry) in &self.groups {
+            total += key.as_ref().len();
+            for acc in &entry.accs {
                 total += acc.size();
             }
         }
@@ -1125,10 +1151,12 @@ impl IncrementalAggState {
     pub(crate) fn checkpoint_groups(&mut self) -> Result<AggStateCheckpoint, DbError> {
         let fingerprint = self.query_fingerprint();
         let mut groups = Vec::with_capacity(self.groups.len());
-        for (key, accs) in &mut self.groups {
-            let key_json: Vec<serde_json::Value> = key.iter().map(scalar_to_json).collect();
-            let mut acc_states = Vec::with_capacity(accs.len());
-            for acc in accs {
+        for (row_key, entry) in &mut self.groups {
+            let sv_key =
+                row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
+            let key_json: Vec<serde_json::Value> = sv_key.iter().map(scalar_to_json).collect();
+            let mut acc_states = Vec::with_capacity(entry.accs.len());
+            for acc in &mut entry.accs {
                 let state = acc
                     .state()
                     .map_err(|e| DbError::Pipeline(format!("accumulator state: {e}")))?;
@@ -1163,8 +1191,11 @@ impl IncrementalAggState {
         }
         self.groups.clear();
         for gc in &checkpoint.groups {
-            let key: Result<Vec<ScalarValue>, _> = gc.key.iter().map(json_to_scalar).collect();
-            let key = key?;
+            // Decode JSON → ScalarValue → Array → OwnedRow.
+            let sv_key: Result<Vec<ScalarValue>, _> = gc.key.iter().map(json_to_scalar).collect();
+            let sv_key = sv_key?;
+            let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key)?;
+
             let mut accs = Vec::with_capacity(self.agg_specs.len());
             for (i, spec) in self.agg_specs.iter().enumerate() {
                 let mut acc = spec.create_accumulator()?;
@@ -1184,7 +1215,13 @@ impl IncrementalAggState {
                 }
                 accs.push(acc);
             }
-            self.groups.insert(key, accs);
+            self.groups.insert(
+                row_key,
+                GroupEntry {
+                    accs,
+                    last_updated_ms: i64::MIN,
+                },
+            );
         }
         Ok(checkpoint.groups.len())
     }
@@ -1944,7 +1981,7 @@ mod tests {
             ],
         )
         .unwrap();
-        state.process_batch(&batch1).unwrap();
+        state.process_batch(&batch1, i64::MIN).unwrap();
 
         let result1 = state.emit().unwrap();
         assert_eq!(result1.len(), 1);
@@ -1959,7 +1996,7 @@ mod tests {
             ],
         )
         .unwrap();
-        state.process_batch(&batch2).unwrap();
+        state.process_batch(&batch2, i64::MIN).unwrap();
 
         let result2 = state.emit().unwrap();
         assert_eq!(result2.len(), 1);
@@ -2078,7 +2115,7 @@ mod tests {
             ],
         )
         .unwrap();
-        state.process_batch(&batch).unwrap();
+        state.process_batch(&batch, i64::MIN).unwrap();
 
         let result = state.emit().unwrap();
         assert_eq!(result.len(), 1);
@@ -2111,7 +2148,7 @@ mod tests {
             ],
         )
         .unwrap();
-        state.process_batch(&batch).unwrap();
+        state.process_batch(&batch, i64::MIN).unwrap();
 
         let result = state.emit().unwrap();
         let total_col = result[0]
@@ -2205,7 +2242,7 @@ mod tests {
             ],
         )
         .unwrap();
-        state.process_batch(&batch).unwrap();
+        state.process_batch(&batch, i64::MIN).unwrap();
 
         let result = state.emit().unwrap();
         let total_col = result[0]
@@ -2273,7 +2310,7 @@ mod tests {
         )
         .unwrap();
         // This should succeed without panicking
-        assert!(state.process_batch(&batch).is_ok());
+        assert!(state.process_batch(&batch, i64::MIN).is_ok());
     }
 
     // ── Type inference tests ────────────────────────────────────────────
@@ -2657,7 +2694,7 @@ mod tests {
             ],
         )
         .unwrap();
-        state.process_batch(&batch).unwrap();
+        state.process_batch(&batch, i64::MIN).unwrap();
 
         let result = state.emit().unwrap();
         assert_eq!(result.len(), 1);
@@ -2689,7 +2726,7 @@ mod tests {
             ],
         )
         .unwrap();
-        state.process_batch(&batch1).unwrap();
+        state.process_batch(&batch1, i64::MIN).unwrap();
 
         // Batch 2: update existing groups + attempt new group "c"
         let batch2 = RecordBatch::try_new(
@@ -2700,7 +2737,7 @@ mod tests {
             ],
         )
         .unwrap();
-        state.process_batch(&batch2).unwrap();
+        state.process_batch(&batch2, i64::MIN).unwrap();
 
         let result = state.emit().unwrap();
         assert_eq!(result[0].num_rows(), 2, "still only 2 groups");
@@ -2921,7 +2958,7 @@ mod tests {
             ],
         )
         .unwrap();
-        state.process_batch(&batch).unwrap();
+        state.process_batch(&batch, i64::MIN).unwrap();
 
         // Checkpoint
         let cp = state.checkpoint_groups().unwrap();
@@ -2969,7 +3006,7 @@ mod tests {
             ],
         )
         .unwrap();
-        state.process_batch(&batch).unwrap();
+        state.process_batch(&batch, i64::MIN).unwrap();
 
         let cp = state.checkpoint_groups().unwrap();
         assert_eq!(cp.groups.len(), 3);
@@ -3021,7 +3058,7 @@ mod tests {
             ],
         )
         .unwrap();
-        state.process_batch(&batch).unwrap();
+        state.process_batch(&batch, i64::MIN).unwrap();
         let mut cp = state.checkpoint_groups().unwrap();
 
         // Tamper with fingerprint

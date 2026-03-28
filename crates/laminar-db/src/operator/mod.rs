@@ -9,8 +9,33 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion::prelude::SessionContext;
 
+use datafusion_expr::LogicalPlan;
+
 use crate::error::DbError;
 use crate::sql_analysis::{extract_projection_exprs, CompiledPostProjection};
+
+/// Execute a cached `LogicalPlan` through `DataFusion` physical planning.
+///
+/// The logical plan is cached (skips SQL parsing + logical optimization),
+/// but the physical plan is rebuilt per call because sub-query `MemTable`
+/// leaves have different data each time. Only the main query path
+/// (`SqlQueryOperator::CachedPlan`) caches the physical plan — its leaves
+/// are `LiveSourceExec` which reads fresh data at `execute()` time.
+pub(crate) async fn execute_logical_plan(
+    ctx: &SessionContext,
+    op_name: &str,
+    plan: &LogicalPlan,
+) -> Result<Vec<RecordBatch>, DbError> {
+    let physical = ctx
+        .state()
+        .create_physical_plan(plan)
+        .await
+        .map_err(|e| DbError::query_pipeline(op_name, &e))?;
+    let task_ctx = ctx.task_ctx();
+    datafusion::physical_plan::collect(physical, task_ctx)
+        .await
+        .map_err(|e| DbError::query_pipeline(op_name, &e))
+}
 
 pub(crate) mod asof_join;
 pub(crate) mod eowc_query;

@@ -90,6 +90,8 @@ pub mod json_types;
 pub mod json_udaf;
 /// PostgreSQL-compatible JSON scalar UDFs
 pub mod json_udf;
+/// Live source provider for streaming execution with plan caching
+pub mod live_source;
 /// Lookup join plan node for DataFusion.
 pub mod lookup_join;
 /// Physical execution plan and extension planner for lookup joins.
@@ -137,6 +139,7 @@ pub use json_udf::{
     JsonbExistsAll, JsonbExistsAny, JsonbGet, JsonbGetIdx, JsonbGetPath, JsonbGetPathText,
     JsonbGetText, JsonbGetTextIdx, ToJsonb,
 };
+pub use live_source::{LiveSourceHandle, LiveSourceProvider};
 pub use lookup_join_exec::{
     LookupJoinExec, LookupJoinExtensionPlanner, LookupSnapshot, LookupTableRegistry,
     PartialLookupJoinExec, PartialLookupState, RegisteredLookup, VersionedLookupJoinExec,
