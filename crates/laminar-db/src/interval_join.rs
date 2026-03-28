@@ -430,7 +430,6 @@ fn build_output_schema(
         })
         .collect();
 
-    // Semi/Anti: left columns only
     if matches!(
         config.join_type,
         StreamJoinType::LeftSemi | StreamJoinType::LeftAnti
@@ -488,8 +487,6 @@ pub(crate) fn execute_interval_join_cycle(
 ) -> Result<Vec<RecordBatch>, DbError> {
     let bound_ms = i64::try_from(config.time_bound.as_millis()).unwrap_or(i64::MAX);
 
-    // Separate positive (I/U+) and negative (D/U-) CDC events.
-    // Positive events are added to state; negative events remove from state.
     let left_pos: Vec<RecordBatch> = left_batches
         .iter()
         .map(crate::changelog_filter::filter_positive_events)
@@ -499,7 +496,6 @@ pub(crate) fn execute_interval_join_cycle(
         .map(crate::changelog_filter::filter_positive_events)
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Apply deletes: remove matching (key_hash, ts) from state
     for raw_batch in left_batches {
         if let Some(neg) = crate::changelog_filter::extract_negative_events(raw_batch)? {
             let keys = extract_key_column(&neg, &config.left_key)?;
@@ -680,7 +676,6 @@ pub(crate) fn execute_interval_join_cycle(
         let num_rows = match_pairs.len();
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
 
-        // Build left columns
         for col_idx in 0..left_schema.fields().len() {
             let mut builder = Vec::with_capacity(num_rows);
             for &(l_batch, l_row, _, _) in &match_pairs {
@@ -694,7 +689,6 @@ pub(crate) fn execute_interval_join_cycle(
             columns.push(concatenated);
         }
 
-        // Build right columns (skip for Semi/Anti)
         if !left_only {
             let right_schema = state
                 .right
@@ -823,7 +817,6 @@ fn emit_unmatched_left_rows(
     let num_rows = unmatched_left.len();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
 
-    // Left columns
     for col_idx in 0..left_schema.fields().len() {
         let mut builder = Vec::with_capacity(num_rows);
         for &(batch_idx, row_idx) in &unmatched_left {
@@ -836,7 +829,6 @@ fn emit_unmatched_left_rows(
         columns.push(concatenated);
     }
 
-    // Right columns: NULLs (skip for Anti)
     if !left_only {
         let right_schema = state
             .right
@@ -905,13 +897,11 @@ fn emit_unmatched_right_rows(
     let num_rows = unmatched_right.len();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
 
-    // Left columns: NULLs
     for col_idx in 0..left_schema.fields().len() {
         let dt = output_schema.field(col_idx).data_type();
         columns.push(arrow::array::new_null_array(dt, num_rows));
     }
 
-    // Right columns: actual data
     for col_idx in 0..right_schema.fields().len() {
         let mut builder = Vec::with_capacity(num_rows);
         for &(batch_idx, row_idx) in &unmatched_right {

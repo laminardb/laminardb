@@ -73,7 +73,6 @@ impl GraphOperator for AsofJoinOperator {
         let left_batches = inputs.first().map_or(&[][..], Vec::as_slice);
         let right_batches = inputs.get(1).map_or(&[][..], Vec::as_slice);
 
-        // Buffer right-side data across cycles
         self.right_buffer.ingest(
             right_batches,
             &self.config.key_column,

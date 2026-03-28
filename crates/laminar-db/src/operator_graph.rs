@@ -127,6 +127,8 @@ pub(crate) struct OperatorGraph {
     topo_order: Vec<usize>,
     topo_dirty: bool,
     source_map: FxHashMap<Arc<str>, usize>,
+    /// Cached set of source node IDs for O(1) lookup in `execute_single_operator`.
+    source_node_ids: FxHashSet<usize>,
     output_map: FxHashMap<Arc<str>, usize>,
     input_bufs: Vec<Vec<Vec<RecordBatch>>>,
     /// Per-node, per-input-port upstream node id. `input_sources[node][port] = upstream_node`.
@@ -160,6 +162,7 @@ impl OperatorGraph {
             topo_order: Vec::new(),
             topo_dirty: true,
             source_map: FxHashMap::default(),
+            source_node_ids: FxHashSet::default(),
             output_map: FxHashMap::default(),
             input_bufs: Vec::new(),
             input_sources: Vec::new(),
@@ -291,13 +294,13 @@ impl OperatorGraph {
         self.input_sources.push(vec![usize::MAX]); // source nodes: no upstream
         self.output_watermarks.push(i64::MIN);
         self.source_map.insert(name, node_id);
+        self.source_node_ids.insert(node_id);
         node_id
     }
 
     fn add_edge(&mut self, source: usize, target: usize, target_port: u8) {
         self.edges.push(GraphEdge { source, target });
         self.nodes[source].output_routes.push((target, target_port));
-        // Track reverse mapping: which upstream node feeds each input port
         let port = target_port as usize;
         if port < self.input_sources[target].len() {
             self.input_sources[target][port] = source;
@@ -819,7 +822,6 @@ impl OperatorGraph {
     ) -> Result<(), DbError> {
         let inputs = std::mem::take(&mut self.input_bufs[node_id]);
 
-        // Compute per-input watermarks from upstream output watermarks.
         let port_count = self.nodes[node_id].input_port_count;
         let watermarks: smallvec::SmallVec<[i64; 2]> = (0..port_count)
             .map(|port| {
@@ -843,7 +845,7 @@ impl OperatorGraph {
                 continue;
             }
             let upstream = self.input_sources[node_id][port];
-            if upstream < self.nodes.len() && self.source_map.values().any(|&id| id == upstream) {
+            if upstream < self.nodes.len() && self.source_node_ids.contains(&upstream) {
                 let upstream_name = &self.nodes[upstream].name;
                 let schema = port_batches[0].schema();
                 if let Ok(mem) =
@@ -862,8 +864,7 @@ impl OperatorGraph {
 
         // Source nodes (input_sources = [usize::MAX]) have output_watermarks
         // pre-seeded from per-source watermarks in execute_cycle. Don't overwrite.
-        let is_source = self.input_sources[node_id].iter().all(|&u| u == usize::MAX);
-        if !is_source {
+        if !self.source_node_ids.contains(&node_id) {
             self.output_watermarks[node_id] = watermarks
                 .iter()
                 .copied()
@@ -989,7 +990,6 @@ impl OperatorGraph {
 
         self.register_source_tables(source_batches)?;
 
-        // Inject source batches and set source watermarks every cycle.
         for (name, &node_id) in &self.source_map {
             if let Some(batches) = source_batches.get(name) {
                 self.input_bufs[node_id][0].clone_from(batches);
