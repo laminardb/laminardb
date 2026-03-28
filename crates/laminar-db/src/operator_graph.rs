@@ -844,20 +844,25 @@ impl OperatorGraph {
             .min()
             .unwrap_or(current_watermark);
 
-        let port_count = self.nodes[node_id].input_port_count;
-        self.input_bufs[node_id] = vec![Vec::new(); port_count];
-
         let batches = match output_result {
-            Ok(b) => b,
+            Ok(b) => {
+                let port_count = self.nodes[node_id].input_port_count;
+                self.input_bufs[node_id] = vec![Vec::new(); port_count];
+                b
+            }
             Err(e) => {
                 if self.depends_on_stream.contains(&node_id) {
+                    // Put batches back so they're retried next cycle.
+                    self.input_bufs[node_id] = inputs;
                     tracing::debug!(
                         query = %self.nodes[node_id].name,
                         error = %e,
-                        "Query skipped (upstream not ready)"
+                        "Query deferred (upstream not ready); batches preserved for retry"
                     );
                     return Ok(());
                 }
+                let port_count = self.nodes[node_id].input_port_count;
+                self.input_bufs[node_id] = vec![Vec::new(); port_count];
                 return Err(e);
             }
         };
