@@ -721,9 +721,16 @@ pub(crate) fn execute_asof_join_with_state(
 /// Serializable checkpoint for `AsofRightBuffer`.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub(crate) struct AsofBufferCheckpoint {
+    #[serde(default)]
     pub right_buffer_ipc: Vec<u8>,
+    #[serde(default)]
     pub index_entries: Vec<(u64, i64, Vec<usize>)>,
+    #[serde(default = "default_evicted_watermark")]
     pub last_evicted_watermark: i64,
+}
+
+fn default_evicted_watermark() -> i64 {
+    i64::MIN
 }
 
 impl AsofRightBuffer {

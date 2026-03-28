@@ -192,15 +192,34 @@ impl SideState {
         Ok(())
     }
 
-    /// Remove entries matching `(key_hash, timestamp)` from the index.
-    fn remove_by_key_ts(&mut self, key_hash: u64, ts: i64) {
-        if let Some(btree) = self.index.get_mut(&key_hash) {
-            if let Some(entries) = btree.remove(&ts) {
-                self.row_count = self.row_count.saturating_sub(entries.len());
-            }
-            if btree.is_empty() {
-                self.index.remove(&key_hash);
-            }
+    /// Remove entries matching `(key_hash, timestamp)` with verified key equality.
+    fn remove_by_key_ts(
+        &mut self,
+        key_hash: u64,
+        ts: i64,
+        delete_key: &KeyColumn<'_>,
+        delete_row: usize,
+        key_col_name: &str,
+    ) {
+        let Some(btree) = self.index.get_mut(&key_hash) else {
+            return;
+        };
+        let Some(entries) = btree.get_mut(&ts) else {
+            return;
+        };
+        let before = entries.len();
+        entries.retain(|&(batch_idx, row_idx)| {
+            extract_key_column(&self.batches[batch_idx], key_col_name).map_or(true, |stored_key| {
+                !delete_key.keys_equal(delete_row, &stored_key, row_idx)
+            })
+        });
+        let removed = before - entries.len();
+        self.row_count = self.row_count.saturating_sub(removed);
+        if entries.is_empty() {
+            btree.remove(&ts);
+        }
+        if btree.is_empty() {
+            self.index.remove(&key_hash);
         }
     }
 
@@ -502,7 +521,9 @@ pub(crate) fn execute_interval_join_cycle(
             let timestamps = extract_column_as_timestamps(&neg, &config.left_time_column)?;
             for (i, &ts) in timestamps.iter().enumerate() {
                 if let Some(kh) = keys.hash_at(i) {
-                    state.left.remove_by_key_ts(kh, ts);
+                    state
+                        .left
+                        .remove_by_key_ts(kh, ts, &keys, i, &config.left_key);
                 }
             }
         }
@@ -513,7 +534,9 @@ pub(crate) fn execute_interval_join_cycle(
             let timestamps = extract_column_as_timestamps(&neg, &config.right_time_column)?;
             for (i, &ts) in timestamps.iter().enumerate() {
                 if let Some(kh) = keys.hash_at(i) {
-                    state.right.remove_by_key_ts(kh, ts);
+                    state
+                        .right
+                        .remove_by_key_ts(kh, ts, &keys, i, &config.right_key);
                 }
             }
         }
