@@ -1,8 +1,7 @@
 //! ASOF join operator for the `OperatorGraph`.
 //!
-//! Wraps `crate::asof_batch::execute_asof_join_batch`, which matches each
-//! left row to the closest right row by timestamp within the same key
-//! partition. The operator is stateless (no cross-cycle state).
+//! Buffers right-side data across execution cycles so that left events can match
+//! against the full right-side history (up to watermark-driven eviction).
 
 use std::sync::Arc;
 
@@ -12,7 +11,7 @@ use datafusion::prelude::SessionContext;
 
 use laminar_sql::translator::AsofJoinTranslatorConfig;
 
-use crate::asof_batch::execute_asof_join_batch;
+use crate::asof_batch::{execute_asof_join_with_state, AsofBufferCheckpoint, AsofRightBuffer};
 use crate::error::DbError;
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
 use crate::sql_analysis::CompiledPostProjection;
@@ -24,6 +23,8 @@ pub(crate) struct AsofJoinOperator {
     ctx: SessionContext,
     compiled_post_proj: Option<CompiledPostProjection>,
     post_proj_compile_failed: bool,
+    right_buffer: AsofRightBuffer,
+    last_evicted_watermark: i64,
 }
 
 impl AsofJoinOperator {
@@ -40,6 +41,8 @@ impl AsofJoinOperator {
             ctx,
             compiled_post_proj: None,
             post_proj_compile_failed: false,
+            right_buffer: AsofRightBuffer::default(),
+            last_evicted_watermark: i64::MIN,
         }
     }
 
@@ -65,16 +68,37 @@ impl GraphOperator for AsofJoinOperator {
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
-        _watermark: i64,
+        watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
         let left_batches = inputs.first().map_or(&[][..], Vec::as_slice);
         let right_batches = inputs.get(1).map_or(&[][..], Vec::as_slice);
+
+        // Buffer right-side data across cycles
+        self.right_buffer.ingest(
+            right_batches,
+            &self.config.key_column,
+            &self.config.right_time_column,
+        )?;
+
+        // Right rows are needed until no future left event can match them.
+        // Future left events have ts >= left_wm, so right rows at
+        // ts < left_wm - tolerance are unreachable. Crossed logic:
+        // right eviction depends on LEFT watermark.
+        let max_lookback_ms = self.config.tolerance.map_or(i64::MAX, |d| {
+            i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+        });
+        let left_wm = watermarks.first().copied().unwrap_or(i64::MIN);
+        let cutoff = left_wm.saturating_sub(max_lookback_ms);
+        if cutoff > self.last_evicted_watermark {
+            self.right_buffer.evict_before(cutoff)?;
+            self.last_evicted_watermark = cutoff;
+        }
 
         if left_batches.is_empty() {
             return Ok(Vec::new());
         }
 
-        let joined = execute_asof_join_batch(left_batches, right_batches, &self.config)?;
+        let joined = execute_asof_join_with_state(left_batches, &self.right_buffer, &self.config)?;
 
         if joined.num_rows() == 0 {
             return Ok(Vec::new());
@@ -84,13 +108,36 @@ impl GraphOperator for AsofJoinOperator {
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
-        // Stateless — no checkpoint needed.
-        Ok(None)
+        let cp = self
+            .right_buffer
+            .snapshot_checkpoint(self.last_evicted_watermark)?;
+
+        let data = serde_json::to_vec(&cp).map_err(|e| {
+            DbError::Pipeline(format!(
+                "ASOF join [{}]: checkpoint serialization: {e}",
+                self.op_name
+            ))
+        })?;
+
+        Ok(Some(OperatorCheckpoint { data }))
     }
 
-    fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        // Stateless — nothing to restore.
+    fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+        let cp: AsofBufferCheckpoint = serde_json::from_slice(&checkpoint.data).map_err(|e| {
+            DbError::Pipeline(format!(
+                "ASOF join [{}]: checkpoint deserialization: {e}",
+                self.op_name
+            ))
+        })?;
+
+        let (buffer, last_wm) = AsofRightBuffer::from_checkpoint(&cp)?;
+        self.right_buffer = buffer;
+        self.last_evicted_watermark = last_wm;
         Ok(())
+    }
+
+    fn estimated_state_bytes(&self) -> usize {
+        self.right_buffer.estimated_size_bytes()
     }
 }
 
@@ -155,10 +202,98 @@ mod tests {
         let mut op = AsofJoinOperator::new("test_asof", test_config(), None, ctx);
 
         let result = op
-            .process(&[vec![trades_batch()], vec![quotes_batch()]], 0)
+            .process(&[vec![trades_batch()], vec![quotes_batch()]], &[0, 0])
             .await
             .unwrap();
 
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cross_cycle_match() {
+        let ctx = laminar_sql::create_session_context();
+        let mut op = AsofJoinOperator::new("test_asof", test_config(), None, ctx);
+
+        // Cycle 1: right data only
+        let result = op
+            .process(&[vec![], vec![quotes_batch()]], &[0, 0])
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+
+        // Cycle 2: left data arrives — should match against buffered right
+        let result = op
+            .process(&[vec![trades_batch()], vec![]], &[0, 0])
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_eviction_on_watermark_advance() {
+        let mut config = test_config();
+        config.tolerance = Some(std::time::Duration::from_millis(50));
+        let ctx = laminar_sql::create_session_context();
+        let mut op = AsofJoinOperator::new("test_asof", config, None, ctx);
+
+        // Buffer right data at ts=90 and ts=140
+        op.process(&[vec![], vec![quotes_batch()]], &[0, 0])
+            .await
+            .unwrap();
+
+        // Advance watermark to 200 → cutoff = 200 - 50 = 150
+        // quote@90 (< 150) evicted, quote@140 (< 150) evicted
+        op.process(&[vec![], vec![]], &[200, 200]).await.unwrap();
+
+        // Left at ts=100: backward match needs quote@90, but it's evicted
+        let result = op
+            .process(&[vec![trades_batch()], vec![]], &[200, 200])
+            .await
+            .unwrap();
+
+        // AAPL trade@100 can't match (quote@90 evicted), GOOG trade@150 can't match (quote@140 evicted)
+        // Left join: both emitted with null right columns
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 2);
+        // Right-side columns (quote_ts, bid) should all be null
+        let right_start = 3; // After symbol, trade_ts, price
+        for col_idx in right_start..result[0].num_columns() {
+            assert!(
+                result[0].column(col_idx).is_null(0),
+                "col {col_idx} row 0 should be null"
+            );
+            assert!(
+                result[0].column(col_idx).is_null(1),
+                "col {col_idx} row 1 should be null"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_roundtrip() {
+        let ctx = laminar_sql::create_session_context();
+        let mut op = AsofJoinOperator::new("test_asof", test_config(), None, ctx.clone());
+
+        // Buffer right data
+        op.process(&[vec![], vec![quotes_batch()]], &[0, 0])
+            .await
+            .unwrap();
+
+        // Checkpoint
+        let cp = op.checkpoint().unwrap().expect("should have state");
+        assert!(!cp.data.is_empty());
+
+        // Restore into new operator
+        let mut op2 = AsofJoinOperator::new("test_asof", test_config(), None, ctx);
+        op2.restore(cp).unwrap();
+
+        // Left data should match against restored right buffer
+        let result = op2
+            .process(&[vec![trades_batch()], vec![]], &[0, 0])
+            .await
+            .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 2);
     }
@@ -169,7 +304,7 @@ mod tests {
         let mut op = AsofJoinOperator::new("test_asof", test_config(), None, ctx);
 
         let result = op
-            .process(&[vec![], vec![quotes_batch()]], 0)
+            .process(&[vec![], vec![quotes_batch()]], &[0, 0])
             .await
             .unwrap();
         assert!(result.is_empty());
@@ -180,15 +315,8 @@ mod tests {
         let ctx = laminar_sql::create_session_context();
         let mut op = AsofJoinOperator::new("test_asof", test_config(), None, ctx);
 
-        let result = op.process(&[], 0).await.unwrap();
+        let result = op.process(&[], &[0]).await.unwrap();
         assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_checkpoint_returns_none() {
-        let ctx = laminar_sql::create_session_context();
-        let mut op = AsofJoinOperator::new("test_asof", test_config(), None, ctx);
-        assert!(op.checkpoint().unwrap().is_none());
     }
 
     #[test]
@@ -196,5 +324,12 @@ mod tests {
         let ctx = laminar_sql::create_session_context();
         let op = AsofJoinOperator::new("my_asof_query", test_config(), None, ctx);
         assert_eq!(&*op.op_name, "my_asof_query");
+    }
+
+    #[test]
+    fn test_estimated_state_bytes_starts_zero() {
+        let ctx = laminar_sql::create_session_context();
+        let op = AsofJoinOperator::new("test_asof", test_config(), None, ctx);
+        assert_eq!(op.estimated_state_bytes(), 0);
     }
 }

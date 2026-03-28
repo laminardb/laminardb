@@ -71,17 +71,20 @@ impl GraphOperator for IntervalJoinOperator {
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
-        watermark: i64,
+        watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
         let left_batches = inputs.first().map_or(&[][..], Vec::as_slice);
         let right_batches = inputs.get(1).map_or(&[][..], Vec::as_slice);
+        let left_wm = watermarks.first().copied().unwrap_or(i64::MIN);
+        let right_wm = watermarks.get(1).copied().unwrap_or(i64::MIN);
 
         let join_result = execute_interval_join_cycle(
             &mut self.state,
             left_batches,
             right_batches,
             &self.config,
-            watermark,
+            left_wm,
+            right_wm,
         )?;
 
         self.apply_projection(join_result).await
@@ -192,7 +195,10 @@ mod tests {
         let left = left_batch(&["A", "B"], &[100, 200], &[10.0, 20.0]);
         let right = right_batch(&["A", "B"], &[110, 250], &[1.0, 2.0]);
 
-        let result = op.process(&[vec![left], vec![right]], 0).await.unwrap();
+        let result = op
+            .process(&[vec![left], vec![right]], &[0, 0])
+            .await
+            .unwrap();
 
         // A: |100 - 110| = 10 <= 100 -> match
         // B: |200 - 250| = 50 <= 100 -> match
@@ -207,12 +213,12 @@ mod tests {
 
         // Cycle 1: only left data
         let left = left_batch(&["A"], &[100], &[10.0]);
-        let result = op.process(&[vec![left], vec![]], 0).await.unwrap();
+        let result = op.process(&[vec![left], vec![]], &[0, 0]).await.unwrap();
         assert!(result.is_empty());
 
         // Cycle 2: right data arrives, should match the buffered left
         let right = right_batch(&["A"], &[150], &[1.0]);
-        let result = op.process(&[vec![], vec![right]], 0).await.unwrap();
+        let result = op.process(&[vec![], vec![right]], &[0, 0]).await.unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 1);
     }
@@ -222,7 +228,7 @@ mod tests {
         let ctx = laminar_sql::create_session_context();
         let mut op = IntervalJoinOperator::new("test_interval", test_config(), None, ctx);
 
-        let result = op.process(&[], 0).await.unwrap();
+        let result = op.process(&[], &[0]).await.unwrap();
         assert!(result.is_empty());
     }
 
@@ -234,7 +240,10 @@ mod tests {
         // Buffer some data
         let left = left_batch(&["A"], &[100], &[10.0]);
         let right = right_batch(&["A"], &[110], &[1.0]);
-        let _ = op.process(&[vec![left], vec![right]], 50).await.unwrap();
+        let _ = op
+            .process(&[vec![left], vec![right]], &[50, 50])
+            .await
+            .unwrap();
 
         // Checkpoint
         let cp = op.checkpoint().unwrap().expect("should have state");
@@ -246,7 +255,10 @@ mod tests {
 
         // New right data should match the restored left
         let right2 = right_batch(&["A"], &[120], &[2.0]);
-        let result = op2.process(&[vec![], vec![right2]], 50).await.unwrap();
+        let result = op2
+            .process(&[vec![], vec![right2]], &[50, 50])
+            .await
+            .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 1);
     }

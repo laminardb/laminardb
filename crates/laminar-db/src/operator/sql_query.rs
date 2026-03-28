@@ -395,7 +395,7 @@ impl GraphOperator for SqlQueryOperator {
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
-        _watermark: i64,
+        _watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
         // Lazy initialization on first call.
         if matches!(self.state, QueryState::Uninit) {

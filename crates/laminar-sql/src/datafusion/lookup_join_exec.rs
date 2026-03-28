@@ -90,6 +90,8 @@ pub struct VersionedLookupState {
     pub version_column: String,
     /// Stream-side column name for event time (the AS OF column).
     pub stream_time_column: String,
+    /// Maximum versions to retain per key. `usize::MAX` = unbounded.
+    pub max_versions_per_key: usize,
 }
 
 /// State for a partial (on-demand) lookup table.
@@ -261,6 +263,7 @@ impl VersionedIndex {
         batch: &RecordBatch,
         key_indices: &[usize],
         version_col_idx: usize,
+        max_versions_per_key: usize,
     ) -> Result<Self> {
         if batch.num_rows() == 0 {
             return Ok(Self {
@@ -297,6 +300,15 @@ impl VersionedIndex {
                 .entry(*version_ts)
                 .or_default()
                 .push(i as u32);
+        }
+
+        // GC: keep only the N most recent versions per key.
+        if max_versions_per_key < usize::MAX {
+            for versions in map.values_mut() {
+                while versions.len() > max_versions_per_key {
+                    versions.pop_first();
+                }
+            }
         }
 
         Ok(Self { map })
@@ -1319,7 +1331,11 @@ async fn probe_partial_batch_with_fallback(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "source fallback failed, serving cache-only results");
+                    tracing::warn!(
+                        error = %e,
+                        missed_keys = miss_keys.len(),
+                        "partial lookup: source fallback failed, serving cache-only results"
+                    );
                 }
             }
         }
@@ -2441,7 +2457,7 @@ mod tests {
     #[test]
     fn test_versioned_index_build_and_probe() {
         let batch = versioned_table_batch();
-        let index = VersionedIndex::build(&batch, &[0], 1).unwrap();
+        let index = VersionedIndex::build(&batch, &[0], 1, usize::MAX).unwrap();
 
         // USD has versions at 100 and 200
         // Probe at 150 → should find version 100 (latest <= 150)
@@ -2464,7 +2480,7 @@ mod tests {
     #[test]
     fn test_versioned_index_no_version_before_ts() {
         let batch = versioned_table_batch();
-        let index = VersionedIndex::build(&batch, &[0], 1).unwrap();
+        let index = VersionedIndex::build(&batch, &[0], 1, usize::MAX).unwrap();
 
         let key_sf = vec![SortField::new(DataType::Utf8)];
         let converter = RowConverter::new(key_sf).unwrap();
@@ -2484,7 +2500,7 @@ mod tests {
         join_type: LookupJoinType,
     ) -> VersionedLookupJoinExec {
         let input = batch_exec(stream.clone());
-        let index = Arc::new(VersionedIndex::build(&table, &[0], 1).unwrap());
+        let index = Arc::new(VersionedIndex::build(&table, &[0], 1, usize::MAX).unwrap());
         let key_sort_fields = vec![SortField::new(DataType::Utf8)];
         let mut output_fields = stream.schema().fields().to_vec();
         output_fields.extend(table.schema().fields().iter().cloned());
@@ -2561,7 +2577,7 @@ mod tests {
             Field::new("v", DataType::Int64, false),
         ]));
         let batch = RecordBatch::new_empty(schema);
-        let index = VersionedIndex::build(&batch, &[0], 1).unwrap();
+        let index = VersionedIndex::build(&batch, &[0], 1, usize::MAX).unwrap();
         assert!(index.map.is_empty());
     }
 
@@ -2569,7 +2585,7 @@ mod tests {
     fn test_versioned_lookup_registry() {
         let registry = LookupTableRegistry::new();
         let table = versioned_table_batch();
-        let index = Arc::new(VersionedIndex::build(&table, &[0], 1).unwrap());
+        let index = Arc::new(VersionedIndex::build(&table, &[0], 1, usize::MAX).unwrap());
 
         registry.register_versioned(
             "rates",
@@ -2579,6 +2595,7 @@ mod tests {
                 key_columns: vec!["currency".to_string()],
                 version_column: "valid_from".to_string(),
                 stream_time_column: "event_ts".to_string(),
+                max_versions_per_key: usize::MAX,
             },
         );
 

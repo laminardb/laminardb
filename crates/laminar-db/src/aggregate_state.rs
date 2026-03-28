@@ -322,9 +322,12 @@ pub(crate) struct JoinStateCheckpoint {
     /// Serialized right-side batches (Arrow IPC).
     #[serde(default)]
     pub right_batches: Vec<Vec<u8>>,
-    /// Last watermark used for eviction.
+    /// Last cutoff used for left-side eviction.
     #[serde(default)]
     pub last_evicted_watermark: i64,
+    /// Last cutoff used for right-side eviction.
+    #[serde(default)]
+    pub last_evicted_watermark_right: i64,
 }
 
 /// Top-level checkpoint for the entire `StreamExecutor`.
@@ -3058,6 +3061,7 @@ mod tests {
                 left_batches: vec![vec![1, 2, 3]],
                 right_batches: vec![vec![4, 5, 6]],
                 last_evicted_watermark: 42,
+                last_evicted_watermark_right: 42,
             },
         );
 

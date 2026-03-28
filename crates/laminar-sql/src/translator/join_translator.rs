@@ -52,6 +52,10 @@ pub enum StreamJoinType {
     Right,
     /// Both sides always emitted
     Full,
+    /// At most one output per left row (first match)
+    LeftSemi,
+    /// Unmatched left rows only (emitted when deadline passes)
+    LeftAnti,
 }
 
 /// Lookup join types
@@ -76,7 +80,7 @@ pub struct TemporalJoinTranslatorConfig {
     pub table_key_column: String,
     /// Stream-side column for lookup timestamp (from `FOR SYSTEM_TIME AS OF`)
     pub stream_time_column: String,
-    /// Table-side version column (defaults to same as `stream_time_column`)
+    /// Table-side version column. Empty string = auto-detect from table schema at registration.
     pub table_version_column: String,
     /// Temporal semantics: "event_time" or "process_time"
     pub semantics: String,
@@ -136,6 +140,8 @@ impl std::fmt::Display for StreamJoinType {
             StreamJoinType::Left => write!(f, "LEFT"),
             StreamJoinType::Right => write!(f, "RIGHT"),
             StreamJoinType::Full => write!(f, "FULL"),
+            StreamJoinType::LeftSemi => write!(f, "LEFT SEMI"),
+            StreamJoinType::LeftAnti => write!(f, "LEFT ANTI"),
         }
     }
 }
@@ -215,11 +221,11 @@ impl std::fmt::Display for TemporalJoinTranslatorConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} TEMPORAL JOIN ON stream.{} = table.{} (version: {}, {})",
+            "{} TEMPORAL JOIN ON stream.{} = table.{} (AS OF: {}, {})",
             self.join_type.to_uppercase(),
             self.stream_key_column,
             self.table_key_column,
-            self.table_version_column,
+            self.stream_time_column,
             self.semantics,
         )
     }
@@ -246,14 +252,15 @@ impl JoinOperatorConfig {
                 JoinType::Left => "left",
                 _ => "inner",
             };
-            let version_col = analysis.temporal_version_column.clone().unwrap_or_default();
+            let stream_time_col = analysis.temporal_version_column.clone().unwrap_or_default();
+            // table_version_column left empty — resolved from table schema at registration.
             return JoinOperatorConfig::Temporal(TemporalJoinTranslatorConfig {
                 stream_table: analysis.left_table.clone(),
                 table_name: analysis.right_table.clone(),
                 stream_key_column: analysis.left_key_column.clone(),
                 table_key_column: analysis.right_key_column.clone(),
-                stream_time_column: version_col.clone(),
-                table_version_column: version_col,
+                stream_time_column: stream_time_col,
+                table_version_column: String::new(),
                 semantics: "event_time".to_string(),
                 join_type: join_type_str.to_string(),
             });
@@ -298,11 +305,13 @@ impl JoinOperatorConfig {
                 right_table: analysis.right_table.clone(),
                 time_bound: analysis.time_bound.unwrap_or(Duration::from_secs(3600)),
                 join_type: match analysis.join_type {
-                    JoinType::Inner
-                    | JoinType::LeftSemi
-                    | JoinType::LeftAnti
-                    | JoinType::RightSemi
-                    | JoinType::RightAnti => StreamJoinType::Inner,
+                    // RightSemi/RightAnti map to Inner here but are rejected
+                    // at detection time in sql_analysis.rs before reaching execution.
+                    JoinType::Inner | JoinType::RightSemi | JoinType::RightAnti => {
+                        StreamJoinType::Inner
+                    }
+                    JoinType::LeftSemi => StreamJoinType::LeftSemi,
+                    JoinType::LeftAnti => StreamJoinType::LeftAnti,
                     JoinType::Left | JoinType::AsOf => StreamJoinType::Left,
                     JoinType::Right => StreamJoinType::Right,
                     JoinType::Full => StreamJoinType::Full,
@@ -867,10 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_analysis_semi_anti_maps_to_inner() {
-        // Semi/anti join types map to Inner for stream-stream joins
-        // (semi/anti semantics require per-key state tracking which is
-        // architecturally different from interval joins)
+    fn test_from_analysis_semi_anti() {
         let semi = JoinAnalysis::stream_stream(
             "a".to_string(),
             "b".to_string(),
@@ -880,7 +886,7 @@ mod tests {
             JoinType::LeftSemi,
         );
         if let JoinOperatorConfig::StreamStream(config) = JoinOperatorConfig::from_analysis(&semi) {
-            assert_eq!(config.join_type, StreamJoinType::Inner);
+            assert_eq!(config.join_type, StreamJoinType::LeftSemi);
         } else {
             panic!("Expected StreamStream config");
         }
@@ -891,9 +897,26 @@ mod tests {
             "id".to_string(),
             "id".to_string(),
             Duration::from_secs(60),
-            JoinType::RightAnti,
+            JoinType::LeftAnti,
         );
         if let JoinOperatorConfig::StreamStream(config) = JoinOperatorConfig::from_analysis(&anti) {
+            assert_eq!(config.join_type, StreamJoinType::LeftAnti);
+        } else {
+            panic!("Expected StreamStream config");
+        }
+
+        // RightSemi/RightAnti still map to Inner (not yet implemented)
+        let right_anti = JoinAnalysis::stream_stream(
+            "a".to_string(),
+            "b".to_string(),
+            "id".to_string(),
+            "id".to_string(),
+            Duration::from_secs(60),
+            JoinType::RightAnti,
+        );
+        if let JoinOperatorConfig::StreamStream(config) =
+            JoinOperatorConfig::from_analysis(&right_anti)
+        {
             assert_eq!(config.join_type, StreamJoinType::Inner);
         } else {
             panic!("Expected StreamStream config");
@@ -920,7 +943,8 @@ mod tests {
         assert_eq!(config.right_key(), "id");
 
         if let JoinOperatorConfig::Temporal(tc) = config {
-            assert_eq!(tc.table_version_column, "order_time");
+            assert!(tc.table_version_column.is_empty());
+            assert_eq!(tc.stream_time_column, "order_time");
             assert_eq!(tc.semantics, "event_time");
             assert_eq!(tc.join_type, "inner");
         } else {

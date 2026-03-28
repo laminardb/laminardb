@@ -19,9 +19,9 @@ use arrow::array::{
 };
 use arrow::compute::concat_batches;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use laminar_sql::translator::StreamJoinConfig;
+use laminar_sql::translator::{StreamJoinConfig, StreamJoinType};
 
 use crate::aggregate_state::JoinStateCheckpoint;
 use crate::error::DbError;
@@ -192,6 +192,18 @@ impl SideState {
         Ok(())
     }
 
+    /// Remove entries matching `(key_hash, timestamp)` from the index.
+    fn remove_by_key_ts(&mut self, key_hash: u64, ts: i64) {
+        if let Some(btree) = self.index.get_mut(&key_hash) {
+            if let Some(entries) = btree.remove(&ts) {
+                self.row_count = self.row_count.saturating_sub(entries.len());
+            }
+            if btree.is_empty() {
+                self.index.remove(&key_hash);
+            }
+        }
+    }
+
     /// Evict all rows with `ts < cutoff`, then compact if batch count exceeds threshold.
     fn evict_before(&mut self, cutoff: i64, key_col: &str, time_col: &str) -> Result<(), DbError> {
         // Collect entries to remove from each btree
@@ -269,8 +281,10 @@ impl SideState {
 pub(crate) struct IntervalJoinState {
     left: SideState,
     right: SideState,
-    /// Last watermark used for eviction.
-    evicted_watermark: i64,
+    /// Last cutoff used for left-side eviction (derived from right watermark).
+    left_evicted_cutoff: i64,
+    /// Last cutoff used for right-side eviction (derived from left watermark).
+    right_evicted_cutoff: i64,
     /// Output schema (left cols + right cols).
     output_schema: Option<SchemaRef>,
 }
@@ -281,7 +295,8 @@ impl IntervalJoinState {
         Self {
             left: SideState::new(),
             right: SideState::new(),
-            evicted_watermark: i64::MIN,
+            left_evicted_cutoff: i64::MIN,
+            right_evicted_cutoff: i64::MIN,
             output_schema: None,
         }
     }
@@ -346,7 +361,8 @@ impl IntervalJoinState {
             right_buffer_rows: self.right.row_count as u64,
             left_batches: left_batches_ipc,
             right_batches: right_batches_ipc,
-            last_evicted_watermark: self.evicted_watermark,
+            last_evicted_watermark: self.left_evicted_cutoff,
+            last_evicted_watermark_right: self.right_evicted_cutoff,
         })
     }
 
@@ -360,7 +376,8 @@ impl IntervalJoinState {
         right_time_col: &str,
     ) -> Result<Self, DbError> {
         let mut state = Self::new();
-        state.evicted_watermark = cp.last_evicted_watermark;
+        state.left_evicted_cutoff = cp.last_evicted_watermark;
+        state.right_evicted_cutoff = cp.last_evicted_watermark_right;
 
         for ipc_bytes in &cp.left_batches {
             let batch =
@@ -387,23 +404,45 @@ impl IntervalJoinState {
 // ── Core join execution ────────────────────────────────────────────────────
 
 /// Build the merged output schema from left and right schemas.
-///
-/// All right-side columns are suffixed with `_{right_table}` to avoid
-/// ambiguity. Only INNER JOIN is supported (LEFT/RIGHT/FULL are rejected
-/// at detection time).
 fn build_output_schema(
     left_schema: &SchemaRef,
     right_schema: &SchemaRef,
     config: &StreamJoinConfig,
 ) -> SchemaRef {
+    let left_nullable = matches!(
+        config.join_type,
+        StreamJoinType::Right | StreamJoinType::Full
+    );
+    let right_nullable = matches!(
+        config.join_type,
+        StreamJoinType::Left | StreamJoinType::Full
+    );
+
     let mut fields: Vec<Field> = left_schema
         .fields()
         .iter()
-        .map(|f| f.as_ref().clone())
+        .map(|f| {
+            let mut field = f.as_ref().clone();
+            if left_nullable {
+                field = field.with_nullable(true);
+            }
+            field
+        })
         .collect();
 
+    // Semi/Anti: left columns only
+    if matches!(
+        config.join_type,
+        StreamJoinType::LeftSemi | StreamJoinType::LeftAnti
+    ) {
+        return Arc::new(Schema::new(fields));
+    }
+
     for field in right_schema.fields() {
-        let f = field.as_ref().clone();
+        let mut f = field.as_ref().clone();
+        if right_nullable {
+            f = f.with_nullable(true);
+        }
         let suffixed = format!("{}_{}", f.name(), config.right_table);
         fields.push(f.with_name(suffixed));
     }
@@ -444,9 +483,48 @@ pub(crate) fn execute_interval_join_cycle(
     left_batches: &[RecordBatch],
     right_batches: &[RecordBatch],
     config: &StreamJoinConfig,
-    watermark: i64,
+    left_watermark: i64,
+    right_watermark: i64,
 ) -> Result<Vec<RecordBatch>, DbError> {
     let bound_ms = i64::try_from(config.time_bound.as_millis()).unwrap_or(i64::MAX);
+
+    // Separate positive (I/U+) and negative (D/U-) CDC events.
+    // Positive events are added to state; negative events remove from state.
+    let left_pos: Vec<RecordBatch> = left_batches
+        .iter()
+        .map(crate::changelog_filter::filter_positive_events)
+        .collect::<Result<Vec<_>, _>>()?;
+    let right_pos: Vec<RecordBatch> = right_batches
+        .iter()
+        .map(crate::changelog_filter::filter_positive_events)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Apply deletes: remove matching (key_hash, ts) from state
+    for raw_batch in left_batches {
+        if let Some(neg) = crate::changelog_filter::extract_negative_events(raw_batch)? {
+            let keys = extract_key_column(&neg, &config.left_key)?;
+            let timestamps = extract_column_as_timestamps(&neg, &config.left_time_column)?;
+            for (i, &ts) in timestamps.iter().enumerate() {
+                if let Some(kh) = keys.hash_at(i) {
+                    state.left.remove_by_key_ts(kh, ts);
+                }
+            }
+        }
+    }
+    for raw_batch in right_batches {
+        if let Some(neg) = crate::changelog_filter::extract_negative_events(raw_batch)? {
+            let keys = extract_key_column(&neg, &config.right_key)?;
+            let timestamps = extract_column_as_timestamps(&neg, &config.right_time_column)?;
+            for (i, &ts) in timestamps.iter().enumerate() {
+                if let Some(kh) = keys.hash_at(i) {
+                    state.right.remove_by_key_ts(kh, ts);
+                }
+            }
+        }
+    }
+
+    let left_batches = &left_pos[..];
+    let right_batches = &right_pos[..];
 
     // Concat incoming batches for each side
     let new_left = if left_batches.is_empty() {
@@ -482,6 +560,9 @@ pub(crate) fn execute_interval_join_cycle(
 
     // Collect match pairs: (left_batch_idx, left_row_idx, right_batch_idx, right_row_idx)
     let mut match_pairs: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let is_semi = config.join_type == StreamJoinType::LeftSemi;
+    // For Semi: track which new left rows already matched (at most one per left row)
+    let mut semi_matched: FxHashSet<usize> = FxHashSet::default();
 
     // Step 2: Probe new left rows against all right (old + new)
     if let Some(ref lb) = new_left {
@@ -492,16 +573,25 @@ pub(crate) fn execute_interval_join_cycle(
         let new_left_batch_idx = left_old_count;
 
         for (row_idx, &left_ts) in left_timestamps.iter().enumerate() {
+            if is_semi && semi_matched.contains(&row_idx) {
+                continue;
+            }
             let Some(key_hash) = left_keys.hash_at(row_idx) else {
                 continue; // Skip null keys
             };
             let candidates = probe_index(&state.right.index, key_hash, left_ts, bound_ms);
 
             for (r_batch, r_row) in candidates {
+                if is_semi && semi_matched.contains(&row_idx) {
+                    break;
+                }
                 let r_key_col =
                     extract_key_column(&state.right.batches[r_batch], &config.right_key)?;
                 if left_keys.keys_equal(row_idx, &r_key_col, r_row) {
                     match_pairs.push((new_left_batch_idx, row_idx, r_batch, r_row));
+                    if is_semi {
+                        semi_matched.insert(row_idx);
+                    }
                 }
             }
         }
@@ -539,17 +629,39 @@ pub(crate) fn execute_interval_join_cycle(
             .add_batch(lb, &config.left_key, &config.left_time_column)?;
     }
 
-    // Determine or cache output schema (now both sides are buffered)
-    if state.output_schema.is_none() {
+    // Determine or update output schema. Rebuild when both sides become available
+    // to ensure right-column suffixing is correct.
+    {
         let left_schema = state.left.batches.first().map(RecordBatch::schema);
         let right_schema = state.right.batches.first().map(RecordBatch::schema);
-        if let (Some(ls), Some(rs)) = (left_schema, right_schema) {
-            state.output_schema = Some(build_output_schema(&ls, &rs, config));
+        match (left_schema, right_schema) {
+            (Some(ls), Some(rs)) => {
+                // Always set when both sides available (may upgrade a partial schema)
+                state.output_schema = Some(build_output_schema(&ls, &rs, config));
+            }
+            (Some(ls), None)
+                if state.output_schema.is_none() && config.join_type != StreamJoinType::Inner =>
+            {
+                state.output_schema =
+                    Some(build_output_schema(&ls, &Arc::new(Schema::empty()), config));
+            }
+            (None, Some(rs))
+                if state.output_schema.is_none() && config.join_type == StreamJoinType::Right =>
+            {
+                state.output_schema =
+                    Some(build_output_schema(&Arc::new(Schema::empty()), &rs, config));
+            }
+            _ => {}
         }
     }
 
-    // Step 5: Build output from match_pairs
-    let result = if match_pairs.is_empty() {
+    let left_only = matches!(
+        config.join_type,
+        StreamJoinType::LeftSemi | StreamJoinType::LeftAnti
+    );
+
+    // Step 5: Build output from match_pairs (Anti emits nothing here — only at eviction)
+    let mut result = if match_pairs.is_empty() || config.join_type == StreamJoinType::LeftAnti {
         Vec::new()
     } else {
         let output_schema = state.output_schema.as_ref().ok_or_else(|| {
@@ -560,17 +672,11 @@ pub(crate) fn execute_interval_join_cycle(
             .batches
             .first()
             .map_or_else(|| Arc::new(Schema::empty()), RecordBatch::schema);
-        let right_schema = state
-            .right
-            .batches
-            .first()
-            .map_or_else(|| Arc::new(Schema::empty()), RecordBatch::schema);
 
         let num_rows = match_pairs.len();
-        let mut columns: Vec<ArrayRef> =
-            Vec::with_capacity(left_schema.fields().len() + right_schema.fields().len());
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
 
-        // Build left columns by taking from the correct batches
+        // Build left columns
         for col_idx in 0..left_schema.fields().len() {
             let mut builder = Vec::with_capacity(num_rows);
             for &(l_batch, l_row, _, _) in &match_pairs {
@@ -584,18 +690,26 @@ pub(crate) fn execute_interval_join_cycle(
             columns.push(concatenated);
         }
 
-        // Build right columns
-        for col_idx in 0..right_schema.fields().len() {
-            let mut builder = Vec::with_capacity(num_rows);
-            for &(_, _, r_batch, r_row) in &match_pairs {
-                let array = state.right.batches[r_batch].column(col_idx);
-                let sliced = array.slice(r_row, 1);
-                builder.push(sliced);
+        // Build right columns (skip for Semi/Anti)
+        if !left_only {
+            let right_schema = state
+                .right
+                .batches
+                .first()
+                .map_or_else(|| Arc::new(Schema::empty()), RecordBatch::schema);
+            for col_idx in 0..right_schema.fields().len() {
+                let mut builder = Vec::with_capacity(num_rows);
+                for &(_, _, r_batch, r_row) in &match_pairs {
+                    let array = state.right.batches[r_batch].column(col_idx);
+                    let sliced = array.slice(r_row, 1);
+                    builder.push(sliced);
+                }
+                let refs: Vec<&dyn Array> = builder.iter().map(AsRef::as_ref).collect();
+                let concatenated = arrow::compute::concat(&refs).map_err(|e| {
+                    DbError::query_pipeline_arrow("interval join (right concat)", &e)
+                })?;
+                columns.push(concatenated);
             }
-            let refs: Vec<&dyn Array> = builder.iter().map(AsRef::as_ref).collect();
-            let concatenated = arrow::compute::concat(&refs)
-                .map_err(|e| DbError::query_pipeline_arrow("interval join (right concat)", &e))?;
-            columns.push(concatenated);
         }
 
         let batch = RecordBatch::try_new(output_schema.clone(), columns)
@@ -607,19 +721,197 @@ pub(crate) fn execute_interval_join_cycle(
         }
     };
 
-    // Step 6: Evict expired rows (and compact if batch count exceeds threshold)
-    let cutoff = watermark.saturating_sub(bound_ms);
-    if cutoff > state.evicted_watermark {
+    // Step 5.5: For LEFT/RIGHT/FULL/ANTI, emit unmatched rows about to be evicted.
+    // Probe the opposite side's state — runs BEFORE eviction so all matches are available.
+    if matches!(
+        config.join_type,
+        StreamJoinType::Left | StreamJoinType::Full | StreamJoinType::LeftAnti
+    ) {
+        let left_cutoff = right_watermark.saturating_sub(bound_ms);
+        if left_cutoff > state.left_evicted_cutoff && !state.left.batches.is_empty() {
+            let unmatched = emit_unmatched_left_rows(state, config, left_cutoff, bound_ms)?;
+            if let Some(batch) = unmatched {
+                result.push(batch);
+            }
+        }
+    }
+    if matches!(
+        config.join_type,
+        StreamJoinType::Right | StreamJoinType::Full
+    ) {
+        let right_cutoff = left_watermark.saturating_sub(bound_ms);
+        if right_cutoff > state.right_evicted_cutoff && !state.right.batches.is_empty() {
+            let unmatched = emit_unmatched_right_rows(state, config, right_cutoff, bound_ms)?;
+            if let Some(batch) = unmatched {
+                result.push(batch);
+            }
+        }
+    }
+
+    // Step 6: Evict expired rows independently per side.
+    // A left row at ts can match right rows with ts in [left_ts - bound, left_ts + bound].
+    // Once the right watermark passes left_ts + bound, no future right row can match.
+    // So: evict left rows where ts < right_watermark - bound (and vice versa).
+    let left_cutoff = right_watermark.saturating_sub(bound_ms);
+    if left_cutoff > state.left_evicted_cutoff {
         state
             .left
-            .evict_before(cutoff, &config.left_key, &config.left_time_column)?;
+            .evict_before(left_cutoff, &config.left_key, &config.left_time_column)?;
+        state.left_evicted_cutoff = left_cutoff;
+    }
+    let right_cutoff = left_watermark.saturating_sub(bound_ms);
+    if right_cutoff > state.right_evicted_cutoff {
         state
             .right
-            .evict_before(cutoff, &config.right_key, &config.right_time_column)?;
-        state.evicted_watermark = cutoff;
+            .evict_before(right_cutoff, &config.right_key, &config.right_time_column)?;
+        state.right_evicted_cutoff = right_cutoff;
     }
 
     Ok(result)
+}
+
+/// For LEFT/ANTI joins: emit left rows about to be evicted that have no match
+/// in the current right state. Called BEFORE right-side eviction.
+fn emit_unmatched_left_rows(
+    state: &IntervalJoinState,
+    config: &StreamJoinConfig,
+    left_cutoff: i64,
+    bound_ms: i64,
+) -> Result<Option<RecordBatch>, DbError> {
+    let Some(output_schema) = state.output_schema.as_ref() else {
+        return Ok(None);
+    };
+
+    let left_only = matches!(
+        config.join_type,
+        StreamJoinType::LeftSemi | StreamJoinType::LeftAnti
+    );
+
+    let mut unmatched_left: Vec<(usize, usize)> = Vec::new();
+
+    for (&key_hash, btree) in &state.left.index {
+        for (&ts, entries) in btree.range(..left_cutoff) {
+            for &(batch_idx, row_idx) in entries {
+                // Probe right state for any match
+                let has_match = !probe_index(&state.right.index, key_hash, ts, bound_ms).is_empty();
+                if !has_match {
+                    unmatched_left.push((batch_idx, row_idx));
+                }
+            }
+        }
+    }
+
+    if unmatched_left.is_empty() {
+        return Ok(None);
+    }
+
+    let left_schema = state
+        .left
+        .batches
+        .first()
+        .map_or_else(|| Arc::new(Schema::empty()), RecordBatch::schema);
+
+    let num_rows = unmatched_left.len();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
+
+    // Left columns
+    for col_idx in 0..left_schema.fields().len() {
+        let mut builder = Vec::with_capacity(num_rows);
+        for &(batch_idx, row_idx) in &unmatched_left {
+            let array = state.left.batches[batch_idx].column(col_idx);
+            builder.push(array.slice(row_idx, 1));
+        }
+        let refs: Vec<&dyn Array> = builder.iter().map(AsRef::as_ref).collect();
+        let concatenated = arrow::compute::concat(&refs)
+            .map_err(|e| DbError::query_pipeline_arrow("interval join (unmatched left)", &e))?;
+        columns.push(concatenated);
+    }
+
+    // Right columns: NULLs (skip for Anti)
+    if !left_only {
+        let right_schema = state
+            .right
+            .batches
+            .first()
+            .map_or_else(|| Arc::new(Schema::empty()), RecordBatch::schema);
+        for col_idx in 0..right_schema.fields().len() {
+            let dt = output_schema
+                .field(left_schema.fields().len() + col_idx)
+                .data_type();
+            columns.push(arrow::array::new_null_array(dt, num_rows));
+        }
+    }
+
+    RecordBatch::try_new(output_schema.clone(), columns)
+        .map(|b| if b.num_rows() > 0 { Some(b) } else { None })
+        .map_err(|e| DbError::query_pipeline_arrow("interval join (unmatched result)", &e))
+}
+
+/// For RIGHT/FULL joins: emit right rows about to be evicted that have no match
+/// in the current left state. Symmetric to `emit_unmatched_left_rows`.
+fn emit_unmatched_right_rows(
+    state: &IntervalJoinState,
+    _config: &StreamJoinConfig,
+    right_cutoff: i64,
+    bound_ms: i64,
+) -> Result<Option<RecordBatch>, DbError> {
+    let Some(output_schema) = state.output_schema.as_ref() else {
+        return Ok(None);
+    };
+
+    let mut unmatched_right: Vec<(usize, usize)> = Vec::new();
+
+    for (&key_hash, btree) in &state.right.index {
+        for (&ts, entries) in btree.range(..right_cutoff) {
+            for &(batch_idx, row_idx) in entries {
+                let has_match = !probe_index(&state.left.index, key_hash, ts, bound_ms).is_empty();
+                if !has_match {
+                    unmatched_right.push((batch_idx, row_idx));
+                }
+            }
+        }
+    }
+
+    if unmatched_right.is_empty() {
+        return Ok(None);
+    }
+
+    let left_schema = state
+        .left
+        .batches
+        .first()
+        .map_or_else(|| Arc::new(Schema::empty()), RecordBatch::schema);
+    let right_schema = state
+        .right
+        .batches
+        .first()
+        .map_or_else(|| Arc::new(Schema::empty()), RecordBatch::schema);
+
+    let num_rows = unmatched_right.len();
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
+
+    // Left columns: NULLs
+    for col_idx in 0..left_schema.fields().len() {
+        let dt = output_schema.field(col_idx).data_type();
+        columns.push(arrow::array::new_null_array(dt, num_rows));
+    }
+
+    // Right columns: actual data
+    for col_idx in 0..right_schema.fields().len() {
+        let mut builder = Vec::with_capacity(num_rows);
+        for &(batch_idx, row_idx) in &unmatched_right {
+            let array = state.right.batches[batch_idx].column(col_idx);
+            builder.push(array.slice(row_idx, 1));
+        }
+        let refs: Vec<&dyn Array> = builder.iter().map(AsRef::as_ref).collect();
+        let concatenated = arrow::compute::concat(&refs)
+            .map_err(|e| DbError::query_pipeline_arrow("interval join (unmatched right)", &e))?;
+        columns.push(concatenated);
+    }
+
+    RecordBatch::try_new(output_schema.clone(), columns)
+        .map(|b| if b.num_rows() > 0 { Some(b) } else { None })
+        .map_err(|e| DbError::query_pipeline_arrow("interval join (unmatched right result)", &e))
 }
 
 #[cfg(test)]
@@ -684,7 +976,7 @@ mod tests {
         let right = right_batch(&["A", "B"], &[110, 250], &[1.0, 2.0]);
 
         let result =
-            execute_interval_join_cycle(&mut state, &[left], &[right], &config, 0).unwrap();
+            execute_interval_join_cycle(&mut state, &[left], &[right], &config, 0, 0).unwrap();
 
         // A: |100 - 110| = 10 <= 100 → match
         // B: |200 - 250| = 50 <= 100 → match
@@ -700,12 +992,12 @@ mod tests {
 
         // Cycle 1: only left data
         let left = left_batch(&["A"], &[100], &[10.0]);
-        let result = execute_interval_join_cycle(&mut state, &[left], &[], &config, 0).unwrap();
+        let result = execute_interval_join_cycle(&mut state, &[left], &[], &config, 0, 0).unwrap();
         assert!(result.is_empty()); // No right data yet
 
         // Cycle 2: right data arrives, should match the buffered left
         let right = right_batch(&["A"], &[150], &[1.0]);
-        let result = execute_interval_join_cycle(&mut state, &[], &[right], &config, 0).unwrap();
+        let result = execute_interval_join_cycle(&mut state, &[], &[right], &config, 0, 0).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 1); // |100 - 150| = 50 <= 100
     }
@@ -719,7 +1011,7 @@ mod tests {
         let right = right_batch(&["A"], &[300], &[1.0]); // |100 - 300| = 200 > 100
 
         let result =
-            execute_interval_join_cycle(&mut state, &[left], &[right], &config, 0).unwrap();
+            execute_interval_join_cycle(&mut state, &[left], &[right], &config, 0, 0).unwrap();
         assert!(result.is_empty()); // Outside time bound
     }
 
@@ -730,12 +1022,12 @@ mod tests {
 
         // Cycle 1: buffer left row at ts=100
         let left = left_batch(&["A"], &[100], &[10.0]);
-        let _ = execute_interval_join_cycle(&mut state, &[left], &[], &config, 0).unwrap();
+        let _ = execute_interval_join_cycle(&mut state, &[left], &[], &config, 0, 0).unwrap();
         assert_eq!(state.left.row_count, 1);
 
         // Cycle 2: advance watermark to 300 → cutoff = 300 - 100 = 200
         // Row at ts=100 < 200, should be evicted
-        let _ = execute_interval_join_cycle(&mut state, &[], &[], &config, 300).unwrap();
+        let _ = execute_interval_join_cycle(&mut state, &[], &[], &config, 300, 300).unwrap();
         assert_eq!(state.left.row_count, 0);
     }
 
@@ -748,7 +1040,7 @@ mod tests {
         let right = right_batch(&["B", "A"], &[110, 110], &[1.0, 2.0]);
 
         let result =
-            execute_interval_join_cycle(&mut state, &[left], &[right], &config, 0).unwrap();
+            execute_interval_join_cycle(&mut state, &[left], &[right], &config, 0, 0).unwrap();
 
         // A@100 matches A@110 (|100-110|=10 <= 100) ✓
         // B@100 matches B@110 (|100-110|=10 <= 100) ✓
@@ -768,7 +1060,7 @@ mod tests {
         let right = right_batch(&["A"], &[110], &[1.0]);
 
         let result =
-            execute_interval_join_cycle(&mut state, &[left], &[right], &config, 0).unwrap();
+            execute_interval_join_cycle(&mut state, &[left], &[right], &config, 0, 0).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 1); // Exactly one match, not two
     }
@@ -778,7 +1070,7 @@ mod tests {
         let config = make_config();
         let mut state = IntervalJoinState::new();
 
-        let result = execute_interval_join_cycle(&mut state, &[], &[], &config, 0).unwrap();
+        let result = execute_interval_join_cycle(&mut state, &[], &[], &config, 0, 0).unwrap();
         assert!(result.is_empty());
     }
 
@@ -789,7 +1081,8 @@ mod tests {
 
         let left = left_batch(&["A"], &[100], &[10.0]);
         let right = right_batch(&["A"], &[110], &[1.0]);
-        let _ = execute_interval_join_cycle(&mut state, &[left], &[right], &config, 50).unwrap();
+        let _ =
+            execute_interval_join_cycle(&mut state, &[left], &[right], &config, 50, 50).unwrap();
 
         // Checkpoint (compacts before serializing)
         let cp = state
@@ -816,7 +1109,7 @@ mod tests {
         // New right data should still match the restored left
         let right2 = right_batch(&["A"], &[120], &[2.0]);
         let result =
-            execute_interval_join_cycle(&mut restored, &[], &[right2], &config, 50).unwrap();
+            execute_interval_join_cycle(&mut restored, &[], &[right2], &config, 50, 50).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 1); // Matches restored A@100
     }
@@ -873,7 +1166,7 @@ mod tests {
         let right = right_batch_nullable(&[Some("A"), None], &[110, 110], &[1.0, 2.0]);
 
         let result =
-            execute_interval_join_cycle(&mut state, &[left], &[right], &config, 0).unwrap();
+            execute_interval_join_cycle(&mut state, &[left], &[right], &config, 0, 0).unwrap();
 
         // Only A matches A — null keys never match (SQL three-valued logic)
         assert_eq!(result.len(), 1);
@@ -890,12 +1183,12 @@ mod tests {
             let ts = i * 10 + 1000;
             #[allow(clippy::cast_precision_loss)]
             let left = left_batch(&["A"], &[ts], &[i as f64]);
-            let _ = execute_interval_join_cycle(&mut state, &[left], &[], &config, 0).unwrap();
+            let _ = execute_interval_join_cycle(&mut state, &[left], &[], &config, 0, 0).unwrap();
         }
         assert!(state.left.batches.len() >= 40);
 
         // Evict the first half (ts < 1200). Watermark = 1300 → cutoff = 1300 - 100 = 1200
-        let _ = execute_interval_join_cycle(&mut state, &[], &[], &config, 1300).unwrap();
+        let _ = execute_interval_join_cycle(&mut state, &[], &[], &config, 1300, 1300).unwrap();
 
         // After compaction (triggered because batch count > COMPACTION_THRESHOLD),
         // should have exactly 1 batch with only live rows
@@ -904,8 +1197,171 @@ mod tests {
 
         // Verify live rows are still accessible by probing with a right-side match
         let right = right_batch(&["A"], &[1350], &[99.0]);
-        let result = execute_interval_join_cycle(&mut state, &[], &[right], &config, 1300).unwrap();
+        let result =
+            execute_interval_join_cycle(&mut state, &[], &[right], &config, 1300, 1300).unwrap();
         // Should match rows within [1250, 1450] — rows at ts=1300..1390 should be live
         assert!(!result.is_empty());
+    }
+
+    fn make_left_config() -> StreamJoinConfig {
+        StreamJoinConfig {
+            left_key: "id".to_string(),
+            right_key: "id".to_string(),
+            left_time_column: "ts".to_string(),
+            right_time_column: "ts".to_string(),
+            left_table: "left_stream".to_string(),
+            right_table: "right_stream".to_string(),
+            time_bound: Duration::from_millis(100),
+            join_type: StreamJoinType::Left,
+        }
+    }
+
+    #[test]
+    fn test_left_join_unmatched_emitted_with_nulls() {
+        let config = make_left_config();
+        let mut state = IntervalJoinState::new();
+
+        // Left at ts=100, right at ts=500 (outside bound, no match)
+        let left = left_batch(&["A"], &[100], &[10.0]);
+        let right = right_batch(&["B"], &[100], &[1.0]); // Different key, just to populate right schema
+        let result =
+            execute_interval_join_cycle(&mut state, &[left], &[right], &config, 0, 0).unwrap();
+        assert!(result.is_empty()); // No match (different keys)
+
+        // Advance right watermark to 300 → left cutoff = 300 - 100 = 200
+        // Left row at ts=100 < 200, deadline passed, no match → emit with NULLs
+        let result = execute_interval_join_cycle(&mut state, &[], &[], &config, 0, 300).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 1);
+        // Left columns present, right columns null
+        assert_eq!(result[0].num_columns(), 6); // 3 left + 3 right (suffixed)
+        assert!(result[0].column(3).is_null(0)); // right ts null
+    }
+
+    #[test]
+    fn test_left_join_matched_not_re_emitted() {
+        let config = make_left_config();
+        let mut state = IntervalJoinState::new();
+
+        let left = left_batch(&["A"], &[100], &[10.0]);
+        let right = right_batch(&["A"], &[110], &[1.0]);
+        let result =
+            execute_interval_join_cycle(&mut state, &[left], &[right], &config, 0, 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 1); // Matched
+
+        // Advance watermark past deadline
+        let result = execute_interval_join_cycle(&mut state, &[], &[], &config, 0, 300).unwrap();
+        // Should NOT re-emit as unmatched (probe finds match in right state)
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_right_join_unmatched_emitted() {
+        let mut config = make_config();
+        config.join_type = StreamJoinType::Right;
+        let mut state = IntervalJoinState::new();
+
+        // Right at ts=100 (unmatched key), left at ts=100 (different key, for schema)
+        let left = left_batch(&["B"], &[100], &[99.0]);
+        let right = right_batch(&["A"], &[100], &[1.0]);
+        let result =
+            execute_interval_join_cycle(&mut state, &[left], &[right], &config, 0, 0).unwrap();
+        assert!(result.is_empty()); // No match (different keys)
+
+        // Advance left watermark → right cutoff = 300 - 100 = 200
+        let result = execute_interval_join_cycle(&mut state, &[], &[], &config, 300, 0).unwrap();
+        // Right A@100 unmatched → emitted with NULL left columns
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert!(total_rows >= 1);
+        // First batch should have NULL left columns
+        assert!(result[0].column(0).is_null(0)); // left id null
+    }
+
+    #[test]
+    fn test_full_join_unmatched_both_sides() {
+        let mut config = make_config();
+        config.join_type = StreamJoinType::Full;
+        let mut state = IntervalJoinState::new();
+
+        // Left at ts=100, Right at ts=500 (outside bound, no match)
+        let left = left_batch(&["A"], &[100], &[10.0]);
+        let right = right_batch(&["A"], &[500], &[1.0]);
+        let _ = execute_interval_join_cycle(&mut state, &[left], &[right], &config, 0, 0).unwrap();
+
+        // Advance both watermarks past both deadlines
+        let result = execute_interval_join_cycle(&mut state, &[], &[], &config, 700, 700).unwrap();
+        // Both unmatched: one from left, one from right
+        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+    }
+
+    #[test]
+    fn test_semi_join_dedup() {
+        let mut config = make_config();
+        config.join_type = StreamJoinType::LeftSemi;
+        let mut state = IntervalJoinState::new();
+
+        // Left A@100, two right matches: A@110, A@120
+        let left = left_batch(&["A"], &[100], &[10.0]);
+        let right = right_batch(&["A", "A"], &[110, 120], &[1.0, 2.0]);
+        let result =
+            execute_interval_join_cycle(&mut state, &[left], &[right], &config, 0, 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 1); // Only one output per left row
+        assert_eq!(result[0].num_columns(), 3); // Left columns only
+    }
+
+    #[test]
+    fn test_anti_join_unmatched_only() {
+        let mut config = make_config();
+        config.join_type = StreamJoinType::LeftAnti;
+        let mut state = IntervalJoinState::new();
+
+        // A@100 has match, B@200 has no match
+        let left = left_batch(&["A", "B"], &[100, 200], &[10.0, 20.0]);
+        let right = right_batch(&["A"], &[110], &[1.0]);
+        let result =
+            execute_interval_join_cycle(&mut state, &[left], &[right], &config, 0, 0).unwrap();
+        // Anti emits nothing during matching — only at eviction
+        assert!(result.is_empty());
+
+        // Advance watermark past deadline for both
+        let result = execute_interval_join_cycle(&mut state, &[], &[], &config, 0, 400).unwrap();
+        // B@200 is unmatched → emitted. A@100 has match → not emitted.
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 1);
+        assert_eq!(result[0].num_columns(), 3); // Left columns only
+    }
+
+    #[test]
+    fn test_cdc_delete_removes_from_state() {
+        let config = make_config();
+        let mut state = IntervalJoinState::new();
+
+        // Insert left row
+        let left = left_batch(&["A"], &[100], &[10.0]);
+        let _ = execute_interval_join_cycle(&mut state, &[left], &[], &config, 0, 0).unwrap();
+        assert_eq!(state.left.row_count, 1);
+
+        // Send CDC delete for same key+ts
+        let del_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+            Field::new("_op", DataType::Utf8, false),
+        ]));
+        let del_batch = RecordBatch::try_new(
+            del_schema,
+            vec![
+                Arc::new(StringArray::from(vec!["A"])),
+                Arc::new(Int64Array::from(vec![100])),
+                Arc::new(Float64Array::from(vec![10.0])),
+                Arc::new(StringArray::from(vec!["D"])),
+            ],
+        )
+        .unwrap();
+        let _ = execute_interval_join_cycle(&mut state, &[del_batch], &[], &config, 0, 0).unwrap();
+        assert_eq!(state.left.row_count, 0); // Deleted
     }
 }
