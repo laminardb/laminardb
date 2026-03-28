@@ -44,6 +44,7 @@ pub(crate) struct SqlQueryOperator {
     pending_restore: Option<AggStateCheckpoint>,
     tier_logged: bool,
     cached_having_plan: Option<LogicalPlan>,
+    source_table: Option<Arc<str>>,
 }
 
 impl SqlQueryOperator {
@@ -62,7 +63,13 @@ impl SqlQueryOperator {
             pending_restore: None,
             tier_logged: false,
             cached_having_plan: None,
+            source_table: None,
         }
+    }
+
+    /// Set the stream source table name for `MemTable` re-registration.
+    pub fn set_source_table(&mut self, name: &str) {
+        self.source_table = Some(Arc::from(name));
     }
 
     /// Lazily initialize the query state on first `process()` call.
@@ -395,7 +402,7 @@ impl GraphOperator for SqlQueryOperator {
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
-        _watermark: i64,
+        _watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
         // Lazy initialization on first call.
         if matches!(self.state, QueryState::Uninit) {
@@ -458,7 +465,18 @@ impl GraphOperator for SqlQueryOperator {
                 }
             }
             QueryState::CachedPlan(_) => {
-                // MemTables are registered by the graph -- just execute the plan.
+                // Re-register the stream source MemTable from inputs so that
+                // budget-deferred accumulated batches are visible to the plan.
+                if let Some(ref src) = self.source_table {
+                    let schema = input_batches[0].schema();
+                    if let Ok(mem) = datafusion::datasource::MemTable::try_new(
+                        schema,
+                        vec![input_batches.to_vec()],
+                    ) {
+                        let _ = self.ctx.deregister_table(&**src);
+                        let _ = self.ctx.register_table(&**src, std::sync::Arc::new(mem));
+                    }
+                }
                 let QueryState::CachedPlan(ref plan) = self.state else {
                     unreachable!();
                 };

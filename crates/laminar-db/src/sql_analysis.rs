@@ -33,8 +33,8 @@ use sqlparser::parser::Parser;
 use laminar_sql::parser::join_parser::analyze_joins;
 use laminar_sql::parser::{EmitClause, EmitStrategy as SqlEmitStrategy};
 use laminar_sql::translator::{
-    AsofJoinTranslatorConfig, JoinOperatorConfig, StreamJoinConfig, StreamJoinType,
-    TemporalJoinTranslatorConfig, WindowOperatorConfig, WindowType,
+    AsofJoinTranslatorConfig, JoinOperatorConfig, StreamJoinConfig, TemporalJoinTranslatorConfig,
+    WindowOperatorConfig, WindowType,
 };
 
 // ---------------------------------------------------------------------------
@@ -601,15 +601,16 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> (Option<StreamJoinConfig>, 
         return (None, None);
     }
 
-    // Only INNER JOIN is supported by the interval join engine. LEFT/RIGHT/FULL
-    // would silently produce inner-join behavior (missing unmatched rows).
-    if !matches!(config.join_type, StreamJoinType::Inner) {
+    // RightSemi/RightAnti mapped to Inner by translator — reject to avoid wrong semantics.
+    if matches!(
+        stream_analysis.join_type,
+        laminar_sql::parser::join_parser::JoinType::RightSemi
+            | laminar_sql::parser::join_parser::JoinType::RightAnti
+    ) {
         tracing::warn!(
-            join_type = %config.join_type,
-            "Stream-stream interval join only supports INNER JOIN. \
-             {} JOIN would produce incorrect results. Query will use \
-             DataFusion batch join instead.",
-            config.join_type
+            join_type = ?stream_analysis.join_type,
+            "RightSemi/RightAnti not implemented for streaming interval joins; \
+             falling back to per-cycle batch join."
         );
         return (None, None);
     }

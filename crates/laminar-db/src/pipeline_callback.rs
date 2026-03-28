@@ -146,9 +146,26 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         watermark: i64,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
+        let source_wms: FxHashMap<Arc<str>, i64> = if let Some(ref tracker) = self.tracker {
+            self.source_ids
+                .iter()
+                .filter_map(|(name, &sid)| {
+                    tracker
+                        .source_watermark(sid)
+                        .map(|wm| (Arc::from(name.as_str()), wm))
+                })
+                .collect()
+        } else {
+            FxHashMap::default()
+        };
+        let swm_ref = if source_wms.is_empty() {
+            None
+        } else {
+            Some(&source_wms)
+        };
         let results = self
             .graph
-            .execute_cycle(source_batches, watermark)
+            .execute_cycle(source_batches, watermark, swm_ref)
             .await
             .map_err(|e| format!("{e}"))?;
 
@@ -768,6 +785,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                                 &combined,
                                 &key_indices,
                                 version_col_idx,
+                                versioned.max_versions_per_key,
                             ) {
                                 Ok(idx) => Arc::new(idx),
                                 Err(e) => {
@@ -786,6 +804,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                                 key_columns: versioned.key_columns.clone(),
                                 version_column: versioned.version_column.clone(),
                                 stream_time_column: versioned.stream_time_column.clone(),
+                                max_versions_per_key: versioned.max_versions_per_key,
                             },
                         );
                         let mut ts = self.table_store.write();

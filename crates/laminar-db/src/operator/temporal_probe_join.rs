@@ -71,10 +71,11 @@ impl GraphOperator for TemporalProbeJoinOperator {
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
-        watermark: i64,
+        watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
         let left_batches = inputs.first().map_or(&[][..], Vec::as_slice);
         let right_batches = inputs.get(1).map_or(&[][..], Vec::as_slice);
+        let watermark = watermarks.iter().copied().min().unwrap_or(i64::MIN);
 
         let join_result = execute_temporal_probe_cycle(
             &mut self.state,
@@ -179,7 +180,10 @@ mod tests {
         let mut op = TemporalProbeJoinOperator::new("test_probe", test_config(), None, ctx);
 
         let result = op
-            .process(&[vec![left_batch()], vec![right_batch()]], 110_000)
+            .process(
+                &[vec![left_batch()], vec![right_batch()]],
+                &[110_000, 110_000],
+            )
             .await
             .unwrap();
 
@@ -195,7 +199,10 @@ mod tests {
 
         // Process with low watermark: only offset=0 resolves
         let _ = op
-            .process(&[vec![left_batch()], vec![right_batch()]], 102_000)
+            .process(
+                &[vec![left_batch()], vec![right_batch()]],
+                &[102_000, 102_000],
+            )
             .await
             .unwrap();
 
@@ -208,7 +215,10 @@ mod tests {
         op2.restore(cp).unwrap();
 
         // Advance watermark to resolve remaining
-        let result = op2.process(&[vec![], vec![]], 110_000).await.unwrap();
+        let result = op2
+            .process(&[vec![], vec![]], &[110_000, 110_000])
+            .await
+            .unwrap();
         let total: usize = result.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total, 1); // offset=5000 resolves
     }
@@ -218,7 +228,7 @@ mod tests {
         let ctx = laminar_sql::create_session_context();
         let mut op = TemporalProbeJoinOperator::new("test_probe", test_config(), None, ctx);
 
-        let result = op.process(&[], 0).await.unwrap();
+        let result = op.process(&[], &[0]).await.unwrap();
         assert!(result.is_empty());
     }
 

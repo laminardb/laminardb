@@ -30,6 +30,7 @@ mod batch_filter;
 mod builder;
 mod catalog;
 mod catalog_connector;
+mod changelog_filter;
 /// Unified checkpoint coordination.
 pub mod checkpoint_coordinator;
 mod config;

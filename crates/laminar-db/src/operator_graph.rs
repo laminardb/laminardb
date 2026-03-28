@@ -36,10 +36,15 @@ use laminar_sql::translator::{
 
 #[async_trait]
 pub(crate) trait GraphOperator: Send {
+    /// Process one execution cycle.
+    ///
+    /// `watermarks[i]` is the watermark for `inputs[i]`, derived from
+    /// the upstream node's output watermark. Multi-input operators use
+    /// per-input watermarks for independent eviction.
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
-        watermark: i64,
+        watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError>;
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError>;
@@ -81,7 +86,7 @@ impl GraphOperator for SourcePassthrough {
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
-        _watermark: i64,
+        _watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
         Ok(inputs.first().cloned().unwrap_or_default())
     }
@@ -102,7 +107,7 @@ impl GraphOperator for TombstonedOperator {
     async fn process(
         &mut self,
         _inputs: &[Vec<RecordBatch>],
-        _watermark: i64,
+        _watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
         Ok(Vec::new())
     }
@@ -122,8 +127,14 @@ pub(crate) struct OperatorGraph {
     topo_order: Vec<usize>,
     topo_dirty: bool,
     source_map: FxHashMap<Arc<str>, usize>,
+    /// Cached set of source node IDs for O(1) lookup in `execute_single_operator`.
+    source_node_ids: FxHashSet<usize>,
     output_map: FxHashMap<Arc<str>, usize>,
     input_bufs: Vec<Vec<Vec<RecordBatch>>>,
+    /// Per-node, per-input-port upstream node id. `input_sources[node][port] = upstream_node`.
+    input_sources: Vec<Vec<usize>>,
+    /// Per-node output watermark, set during `execute_cycle`.
+    output_watermarks: Vec<i64>,
     /// Maximum batches per input port before shedding. Prevents unbounded
     /// fan-out growth within a single cycle. `0` means unlimited (default).
     max_input_buf_batches: usize,
@@ -151,8 +162,11 @@ impl OperatorGraph {
             topo_order: Vec::new(),
             topo_dirty: true,
             source_map: FxHashMap::default(),
+            source_node_ids: FxHashSet::default(),
             output_map: FxHashMap::default(),
             input_bufs: Vec::new(),
+            input_sources: Vec::new(),
+            output_watermarks: Vec::new(),
             max_input_buf_batches: 0,
             query_budget_ns: 8_000_000,
             deferred_scan_offset: 0,
@@ -277,13 +291,20 @@ impl OperatorGraph {
             removed: false,
         });
         self.input_bufs.push(vec![Vec::new()]);
+        self.input_sources.push(vec![usize::MAX]); // source nodes: no upstream
+        self.output_watermarks.push(i64::MIN);
         self.source_map.insert(name, node_id);
+        self.source_node_ids.insert(node_id);
         node_id
     }
 
     fn add_edge(&mut self, source: usize, target: usize, target_port: u8) {
         self.edges.push(GraphEdge { source, target });
         self.nodes[source].output_routes.push((target, target_port));
+        let port = target_port as usize;
+        if port < self.input_sources[target].len() {
+            self.input_sources[target][port] = source;
+        }
     }
 
     /// Ensure source/passthrough nodes exist for all upstream tables referenced
@@ -453,6 +474,7 @@ impl OperatorGraph {
             stream_join_config.as_ref(),
             temporal_probe_config.as_ref(),
             projection_sql.as_deref(),
+            &table_refs,
         );
 
         // Determine input port count
@@ -475,6 +497,7 @@ impl OperatorGraph {
             self.nodes[placeholder_id].operator = operator;
             self.nodes[placeholder_id].input_port_count = input_port_count;
             self.input_bufs[placeholder_id] = vec![Vec::new(); input_port_count];
+            self.input_sources[placeholder_id] = vec![usize::MAX; input_port_count];
             self.source_map.remove(name.as_str());
 
             let node_id = placeholder_id;
@@ -535,6 +558,8 @@ impl OperatorGraph {
             removed: false,
         });
         self.input_bufs.push(vec![Vec::new(); input_port_count]);
+        self.input_sources.push(vec![usize::MAX; input_port_count]);
+        self.output_watermarks.push(i64::MIN);
 
         // Create edges from table refs
         let depends = self.wire_query_edges(
@@ -561,6 +586,7 @@ impl OperatorGraph {
 
     /// Create the appropriate operator for a query based on detection results.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn create_operator(
         &self,
         name: &str,
@@ -572,6 +598,7 @@ impl OperatorGraph {
         stream_join_config: Option<&laminar_sql::translator::StreamJoinConfig>,
         temporal_probe_config: Option<&laminar_sql::translator::TemporalProbeConfig>,
         projection_sql: Option<&str>,
+        table_refs: &FxHashSet<String>,
     ) -> Box<dyn GraphOperator> {
         use crate::operator;
 
@@ -628,12 +655,21 @@ impl OperatorGraph {
             ));
         }
 
-        Box::new(operator::sql_query::SqlQueryOperator::new(
+        let mut op = operator::sql_query::SqlQueryOperator::new(
             name,
             sql,
             self.ctx.clone(),
             self.counters.clone(),
-        ))
+        );
+        // Find the stream source for this query (first table_ref that's in source_schemas).
+        // Used by CachedPlan to re-register the MemTable from accumulated inputs.
+        for tr in table_refs {
+            if self.source_schemas.contains_key(tr) {
+                op.set_source_table(tr);
+                break;
+            }
+        }
+        Box::new(op)
     }
 
     /// Remove a query by name using a tombstone.
@@ -788,6 +824,7 @@ impl OperatorGraph {
     /// Returns `Ok(())` on success or if the operator was skipped
     /// (depends-on-stream error). Returns `Err` on fatal errors — the caller
     /// must call `finish_cycle` before propagating.
+    #[allow(clippy::too_many_lines)]
     async fn execute_single_operator(
         &mut self,
         node_id: usize,
@@ -797,25 +834,52 @@ impl OperatorGraph {
     ) -> Result<(), DbError> {
         let inputs = std::mem::take(&mut self.input_bufs[node_id]);
 
+        let port_count = self.nodes[node_id].input_port_count;
+        let watermarks: smallvec::SmallVec<[i64; 2]> = (0..port_count)
+            .map(|port| {
+                let upstream = self.input_sources[node_id][port];
+                if upstream < self.output_watermarks.len() {
+                    self.output_watermarks[upstream]
+                } else {
+                    current_watermark
+                }
+            })
+            .collect();
+
         let output_result = self.nodes[node_id]
             .operator
-            .process(&inputs, current_watermark)
+            .process(&inputs, &watermarks)
             .await;
 
-        let port_count = self.nodes[node_id].input_port_count;
-        self.input_bufs[node_id] = vec![Vec::new(); port_count];
+        // Source nodes (input_sources = [usize::MAX]) have output_watermarks
+        // pre-seeded from per-source watermarks in execute_cycle. Don't overwrite.
+        if !self.source_node_ids.contains(&node_id) {
+            self.output_watermarks[node_id] = watermarks
+                .iter()
+                .copied()
+                .min()
+                .unwrap_or(current_watermark);
+        }
 
         let batches = match output_result {
-            Ok(b) => b,
+            Ok(b) => {
+                let port_count = self.nodes[node_id].input_port_count;
+                self.input_bufs[node_id] = vec![Vec::new(); port_count];
+                b
+            }
             Err(e) => {
                 if self.depends_on_stream.contains(&node_id) {
+                    // Put batches back so they're retried next cycle.
+                    self.input_bufs[node_id] = inputs;
                     tracing::debug!(
                         query = %self.nodes[node_id].name,
                         error = %e,
-                        "Query skipped (upstream not ready)"
+                        "Query deferred (upstream not ready); batches preserved for retry"
                     );
                     return Ok(());
                 }
+                let port_count = self.nodes[node_id].input_port_count;
+                self.input_bufs[node_id] = vec![Vec::new(); port_count];
                 return Err(e);
             }
         };
@@ -907,6 +971,7 @@ impl OperatorGraph {
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         current_watermark: i64,
+        source_watermarks: Option<&FxHashMap<Arc<str>, i64>>,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
         if self.topo_dirty {
             self.compute_topo_order();
@@ -914,11 +979,14 @@ impl OperatorGraph {
 
         self.register_source_tables(source_batches)?;
 
-        // Inject source batches into source node input buffers
-        for (name, batches) in source_batches {
-            if let Some(&node_id) = self.source_map.get(name) {
+        for (name, &node_id) in &self.source_map {
+            if let Some(batches) = source_batches.get(name) {
                 self.input_bufs[node_id][0].clone_from(batches);
             }
+            let wm = source_watermarks
+                .and_then(|m| m.get(name).copied())
+                .unwrap_or(current_watermark);
+            self.output_watermarks[node_id] = wm;
         }
 
         let mut results = FxHashMap::default();
@@ -1109,7 +1177,7 @@ mod tests {
         rt.block_on(async {
             let mut op = SourcePassthrough;
             let batch = test_batch();
-            let result = op.process(&[vec![batch.clone()]], 0).await.unwrap();
+            let result = op.process(&[vec![batch.clone()]], &[0]).await.unwrap();
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].num_rows(), 2);
         });
@@ -1239,7 +1307,7 @@ mod tests {
         source_batches.insert(Arc::from("trades"), vec![batch]);
 
         let results = graph
-            .execute_cycle(&source_batches, i64::MAX)
+            .execute_cycle(&source_batches, i64::MAX, None)
             .await
             .unwrap();
         assert!(results.contains_key("filtered"));
@@ -1268,7 +1336,7 @@ mod tests {
 
         let source_batches = FxHashMap::default();
         let results = graph
-            .execute_cycle(&source_batches, i64::MAX)
+            .execute_cycle(&source_batches, i64::MAX, None)
             .await
             .unwrap();
         // No source data → empty results (or no entry)
@@ -1304,7 +1372,7 @@ mod tests {
         source_batches.insert(Arc::from("trades"), vec![batch]);
 
         let results = graph
-            .execute_cycle(&source_batches, i64::MAX)
+            .execute_cycle(&source_batches, i64::MAX, None)
             .await
             .unwrap();
         assert!(results.contains_key("q1"));
@@ -1360,11 +1428,11 @@ mod tests {
         source.insert(Arc::from("trades"), vec![test_batch()]);
 
         // First cycle triggers lazy init
-        let r = graph.execute_cycle(&source, i64::MAX).await.unwrap();
+        let r = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
         assert_eq!(total_rows(&r, "projected"), 2); // Both rows projected
 
         // Second cycle reuses compiled path (no SQL overhead)
-        let r2 = graph.execute_cycle(&source, i64::MAX).await.unwrap();
+        let r2 = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
         assert_eq!(total_rows(&r2, "projected"), 2);
     }
 
@@ -1385,7 +1453,7 @@ mod tests {
         let mut source = FxHashMap::default();
         source.insert(Arc::from("trades"), vec![test_batch()]);
 
-        let r = graph.execute_cycle(&source, i64::MAX).await.unwrap();
+        let r = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
         assert_eq!(total_rows(&r, "filtered"), 1); // Only GOOG passes
     }
 
@@ -1405,11 +1473,11 @@ mod tests {
         source.insert(Arc::from("trades"), vec![test_batch()]);
 
         // Cycle 1
-        let r = graph.execute_cycle(&source, i64::MAX).await.unwrap();
+        let r = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
         assert_eq!(total_rows(&r, "agg"), 2); // AAPL + GOOG groups
 
         // Cycle 2: running totals accumulate
-        let r2 = graph.execute_cycle(&source, i64::MAX).await.unwrap();
+        let r2 = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
         let agg_batches = &r2[&Arc::from("agg") as &Arc<str>];
         assert_eq!(total_rows(&r2, "agg"), 2); // Still 2 groups
 
@@ -1457,7 +1525,7 @@ mod tests {
         let mut source = FxHashMap::default();
         source.insert(Arc::from("trades"), vec![test_batch()]);
 
-        let r = graph.execute_cycle(&source, i64::MAX).await.unwrap();
+        let r = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
         // step1: AAPL=300, GOOG=5600 (2 rows)
         assert_eq!(total_rows(&r, "step1"), 2);
         // step2: only GOOG=5600 passes WHERE doubled > 400
@@ -1495,7 +1563,7 @@ mod tests {
         let mut source = FxHashMap::default();
         source.insert(Arc::from("trades"), vec![test_batch()]);
 
-        let r = graph.execute_cycle(&source, i64::MAX).await.unwrap();
+        let r = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
         assert_eq!(total_rows(&r, "high"), 1); // GOOG
         assert_eq!(total_rows(&r, "low"), 1); // AAPL
                                               // combined: inner join on symbol — no shared symbols, so empty
@@ -1526,7 +1594,7 @@ mod tests {
         let mut source = FxHashMap::default();
         source.insert(Arc::from("trades"), vec![test_batch()]);
 
-        let r = graph.execute_cycle(&source, i64::MAX).await.unwrap();
+        let r = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
 
         // With 1ns budget, not all queries should produce output
         let produced = r.len();
@@ -1562,7 +1630,7 @@ mod tests {
         // deferred execution (1 main + 1 deferred per cycle = 5 cycles).
         let mut produced = FxHashSet::default();
         for _ in 0..5 {
-            let r = graph.execute_cycle(&source, i64::MAX).await.unwrap();
+            let r = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
             for key in r.keys() {
                 produced.insert(key.to_string());
             }
@@ -1592,7 +1660,7 @@ mod tests {
         let mut source = FxHashMap::default();
         source.insert(Arc::from("trades"), vec![test_batch()]);
 
-        let result = graph.execute_cycle(&source, i64::MAX).await;
+        let result = graph.execute_cycle(&source, i64::MAX, None).await;
         assert!(result.is_err(), "state size limit should be exceeded");
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -1617,7 +1685,7 @@ mod tests {
         source.insert(Arc::from("trades"), vec![test_batch()]);
 
         // Cycle 1: build up state
-        let _ = graph.execute_cycle(&source, i64::MAX).await.unwrap();
+        let _ = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
 
         // Snapshot
         let cp = graph
@@ -1637,13 +1705,13 @@ mod tests {
         );
 
         // Need one cycle to lazy-init state before restore will take effect
-        let _ = graph2.execute_cycle(&source, i64::MAX).await.unwrap();
+        let _ = graph2.execute_cycle(&source, i64::MAX, None).await.unwrap();
         let restored = graph2.restore_from_bytes(&bytes).unwrap();
         assert!(restored > 0, "should restore at least one operator");
 
         // Next cycle should show accumulated state from both the initial
         // cycle in graph2 plus the restored state from graph1
-        let r = graph2.execute_cycle(&source, i64::MAX).await.unwrap();
+        let r = graph2.execute_cycle(&source, i64::MAX, None).await.unwrap();
         assert_eq!(total_rows(&r, "agg"), 2);
     }
 
@@ -1664,12 +1732,15 @@ mod tests {
         source.insert(Arc::from("trades"), vec![test_batch()]);
 
         // First cycle with data
-        let r = graph.execute_cycle(&source, i64::MAX).await.unwrap();
+        let r = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
         assert_eq!(total_rows(&r, "agg"), 2);
 
         // Second cycle with no data — should still emit accumulated state
         let empty_source = FxHashMap::default();
-        let r2 = graph.execute_cycle(&empty_source, i64::MAX).await.unwrap();
+        let r2 = graph
+            .execute_cycle(&empty_source, i64::MAX, None)
+            .await
+            .unwrap();
         assert_eq!(total_rows(&r2, "agg"), 2);
     }
 
@@ -1706,7 +1777,7 @@ mod tests {
         let mut source = FxHashMap::default();
         source.insert(Arc::from("trades"), vec![test_batch()]);
 
-        let r = graph.execute_cycle(&source, i64::MAX).await.unwrap();
+        let r = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
         assert_eq!(total_rows(&r, "q1"), 2); // AAPL + GOOG
         assert_eq!(total_rows(&r, "q2"), 1); // Only GOOG (price=2800 > 200)
     }
@@ -1771,13 +1842,13 @@ mod tests {
         sources.insert(Arc::from("trades"), vec![trades]);
         sources.insert(Arc::from("market_data"), vec![market]);
 
-        let r1 = graph.execute_cycle(&sources, 102_000).await.unwrap();
+        let r1 = graph.execute_cycle(&sources, 102_000, None).await.unwrap();
         let rows1 = total_rows(&r1, "probed");
         assert_eq!(rows1, 1, "only offset=0 should resolve at watermark=102k");
 
         // Cycle 2: no new data, advance watermark past offset=5000 (probe_ts=105000)
         let empty = FxHashMap::default();
-        let r2 = graph.execute_cycle(&empty, 110_000).await.unwrap();
+        let r2 = graph.execute_cycle(&empty, 110_000, None).await.unwrap();
         let rows2 = total_rows(&r2, "probed");
         assert_eq!(rows2, 1, "offset=5000 should resolve at watermark=110k");
     }

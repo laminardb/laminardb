@@ -98,6 +98,7 @@ pub struct StreamingCoordinator {
     /// be included in the current checkpoint state. Bounded in practice by
     /// `channel_capacity` (max messages available per drain cycle).
     post_barrier_buf: Vec<SourceMsg>,
+    pending_watermark_batches: Vec<(Arc<str>, RecordBatch)>,
     /// Source indices that have delivered a barrier during the current drain
     /// cycle. Any subsequent batch from these sources goes to
     /// `post_barrier_buf`.
@@ -343,6 +344,7 @@ impl StreamingCoordinator {
             checkpoint_request_flags,
             source_batches_buf: FxHashMap::default(),
             post_barrier_buf: Vec::new(),
+            pending_watermark_batches: Vec::new(),
             barrier_seen: FxHashSet::default(),
             pending_offsets: vec![None; committed_offsets.len()],
             committed_offsets,
@@ -448,10 +450,10 @@ impl StreamingCoordinator {
                 }
             }
 
-            // Step: Execute SQL cycle. Also runs on idle wakeups when
-            // operators have deferred input from a prior budget-exceeded
-            // cycle — otherwise that data is stuck forever once the source
-            // goes idle.
+            for (name, batch) in self.pending_watermark_batches.drain(..) {
+                callback.extract_watermark(&name, &batch);
+            }
+
             if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
                 let wm = callback.current_watermark();
                 match callback.execute_cycle(&self.source_batches_buf, wm).await {
@@ -562,6 +564,9 @@ impl StreamingCoordinator {
             }
         }
 
+        for (name, batch) in self.pending_watermark_batches.drain(..) {
+            callback.extract_watermark(&name, &batch);
+        }
         if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
             let wm = callback.current_watermark();
             match callback.execute_cycle(&self.source_batches_buf, wm).await {
@@ -592,6 +597,9 @@ impl StreamingCoordinator {
         drain_barriers.clear();
         while let Ok(msg) = self.rx.try_recv() {
             self.process_msg(msg, &mut callback, &mut drain_barriers, &mut drain_events);
+        }
+        for (name, batch) in self.pending_watermark_batches.drain(..) {
+            callback.extract_watermark(&name, &batch);
         }
         if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
             let wm = callback.current_watermark();
@@ -669,16 +677,18 @@ impl StreamingCoordinator {
                     {
                         *cycle_events += batch.num_rows() as u64;
                     }
-                    // Filter BEFORE advancing the watermark — otherwise the
-                    // batch's own max timestamp advances the watermark and
-                    // then rows below that max are dropped from the same batch.
+                    // Filter with the PRE-DRAIN watermark. Watermark extraction
+                    // is deferred to after all batches in this drain cycle are
+                    // filtered — otherwise batch N's watermark advance causes
+                    // batch N+1's slightly-older rows to be dropped as "late."
                     if let Some(filtered) = callback.filter_late_rows(name, &batch) {
                         self.source_batches_buf
                             .entry(Arc::clone(name))
                             .or_default()
                             .push(filtered);
                     }
-                    callback.extract_watermark(name, &batch);
+                    self.pending_watermark_batches
+                        .push((Arc::clone(name), batch));
                 }
             }
             SourceMsg::Barrier {
@@ -919,6 +929,7 @@ mod tests {
             checkpoint_request_flags: Vec::new(),
             source_batches_buf: FxHashMap::default(),
             post_barrier_buf: Vec::new(),
+            pending_watermark_batches: Vec::new(),
             barrier_seen: FxHashSet::default(),
             committed_offsets: vec![None],
             pending_offsets: vec![None],
@@ -987,6 +998,7 @@ mod tests {
             checkpoint_request_flags: Vec::new(),
             source_batches_buf: FxHashMap::default(),
             post_barrier_buf: Vec::new(),
+            pending_watermark_batches: Vec::new(),
             barrier_seen: FxHashSet::default(),
             committed_offsets: vec![None],
             pending_offsets: vec![None],
@@ -1057,6 +1069,7 @@ mod tests {
             checkpoint_request_flags: Vec::new(),
             source_batches_buf: FxHashMap::default(),
             post_barrier_buf: Vec::new(),
+            pending_watermark_batches: Vec::new(),
             barrier_seen: FxHashSet::default(),
             committed_offsets: vec![None, None],
             pending_offsets: vec![None, None],
@@ -1321,6 +1334,7 @@ mod tests {
             checkpoint_request_flags: Vec::new(),
             source_batches_buf: FxHashMap::default(),
             post_barrier_buf: Vec::new(),
+            pending_watermark_batches: Vec::new(),
             barrier_seen: FxHashSet::default(),
             committed_offsets: vec![None],
             pending_offsets: vec![None],

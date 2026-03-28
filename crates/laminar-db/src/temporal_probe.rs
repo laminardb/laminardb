@@ -652,10 +652,10 @@ pub(crate) fn execute_temporal_probe_cycle(
 
             if state.carried_probes.len() > MAX_PENDING_PROBES {
                 let excess = state.carried_probes.len() - MAX_PENDING_PROBES;
-                tracing::warn!(
+                tracing::error!(
                     excess,
                     limit = MAX_PENDING_PROBES,
-                    "temporal probe: pending probes exceed limit, dropping oldest"
+                    "temporal probe: pending probes exceed limit, dropping oldest — DATA LOSS"
                 );
                 state.carried_probes.drain(..excess);
             }

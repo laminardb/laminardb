@@ -426,8 +426,9 @@ impl GraphOperator for EowcQueryOperator {
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
-        watermark: i64,
+        watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
+        let watermark = watermarks.first().copied().unwrap_or(i64::MIN);
         // Flatten inputs from port 0
         let input_batches: Vec<RecordBatch> = inputs.first().cloned().unwrap_or_default();
 
@@ -780,7 +781,7 @@ mod tests {
             None,
         );
 
-        let result = op.process(&[vec![]], 0).await.unwrap();
+        let result = op.process(&[vec![]], &[0]).await.unwrap();
         assert!(result.is_empty());
     }
 }
