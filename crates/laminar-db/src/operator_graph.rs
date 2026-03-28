@@ -837,12 +837,16 @@ impl OperatorGraph {
             .process(&inputs, &watermarks)
             .await;
 
-        // This node's output watermark = min(input watermarks)
-        self.output_watermarks[node_id] = watermarks
-            .iter()
-            .copied()
-            .min()
-            .unwrap_or(current_watermark);
+        // Source nodes (input_sources = [usize::MAX]) have output_watermarks
+        // pre-seeded from per-source watermarks in execute_cycle. Don't overwrite.
+        let is_source = self.input_sources[node_id].iter().all(|&u| u == usize::MAX);
+        if !is_source {
+            self.output_watermarks[node_id] = watermarks
+                .iter()
+                .copied()
+                .min()
+                .unwrap_or(current_watermark);
+        }
 
         let batches = match output_result {
             Ok(b) => {
@@ -962,15 +966,15 @@ impl OperatorGraph {
 
         self.register_source_tables(source_batches)?;
 
-        // Inject source batches into source node input buffers and set source watermarks
-        for (name, batches) in source_batches {
-            if let Some(&node_id) = self.source_map.get(name) {
+        // Inject source batches and set source watermarks every cycle.
+        for (name, &node_id) in &self.source_map {
+            if let Some(batches) = source_batches.get(name) {
                 self.input_bufs[node_id][0].clone_from(batches);
-                let wm = source_watermarks
-                    .and_then(|m| m.get(name).copied())
-                    .unwrap_or(current_watermark);
-                self.output_watermarks[node_id] = wm;
             }
+            let wm = source_watermarks
+                .and_then(|m| m.get(name).copied())
+                .unwrap_or(current_watermark);
+            self.output_watermarks[node_id] = wm;
         }
 
         let mut results = FxHashMap::default();

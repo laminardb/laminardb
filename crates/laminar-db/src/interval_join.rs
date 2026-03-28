@@ -640,7 +640,11 @@ pub(crate) fn execute_interval_join_cycle(
                 state.output_schema = Some(build_output_schema(&ls, &rs, config));
             }
             (Some(ls), None)
-                if state.output_schema.is_none() && config.join_type != StreamJoinType::Inner =>
+                if state.output_schema.is_none()
+                    && matches!(
+                        config.join_type,
+                        StreamJoinType::LeftSemi | StreamJoinType::LeftAnti
+                    ) =>
             {
                 state.output_schema =
                     Some(build_output_schema(&ls, &Arc::new(Schema::empty()), config));
@@ -792,8 +796,13 @@ fn emit_unmatched_left_rows(
     for (&key_hash, btree) in &state.left.index {
         for (&ts, entries) in btree.range(..left_cutoff) {
             for &(batch_idx, row_idx) in entries {
-                // Probe right state for any match
-                let has_match = !probe_index(&state.right.index, key_hash, ts, bound_ms).is_empty();
+                let candidates = probe_index(&state.right.index, key_hash, ts, bound_ms);
+                let left_key =
+                    extract_key_column(&state.left.batches[batch_idx], &config.left_key)?;
+                let has_match = candidates.iter().any(|&(rb, rr)| {
+                    extract_key_column(&state.right.batches[rb], &config.right_key)
+                        .is_ok_and(|rk| left_key.keys_equal(row_idx, &rk, rr))
+                });
                 if !has_match {
                     unmatched_left.push((batch_idx, row_idx));
                 }
@@ -851,7 +860,7 @@ fn emit_unmatched_left_rows(
 /// in the current left state. Symmetric to `emit_unmatched_left_rows`.
 fn emit_unmatched_right_rows(
     state: &IntervalJoinState,
-    _config: &StreamJoinConfig,
+    config: &StreamJoinConfig,
     right_cutoff: i64,
     bound_ms: i64,
 ) -> Result<Option<RecordBatch>, DbError> {
@@ -864,7 +873,13 @@ fn emit_unmatched_right_rows(
     for (&key_hash, btree) in &state.right.index {
         for (&ts, entries) in btree.range(..right_cutoff) {
             for &(batch_idx, row_idx) in entries {
-                let has_match = !probe_index(&state.left.index, key_hash, ts, bound_ms).is_empty();
+                let candidates = probe_index(&state.left.index, key_hash, ts, bound_ms);
+                let right_key =
+                    extract_key_column(&state.right.batches[batch_idx], &config.right_key)?;
+                let has_match = candidates.iter().any(|&(lb, lr)| {
+                    extract_key_column(&state.left.batches[lb], &config.left_key)
+                        .is_ok_and(|lk| right_key.keys_equal(row_idx, &lk, lr))
+                });
                 if !has_match {
                     unmatched_right.push((batch_idx, row_idx));
                 }
@@ -1272,7 +1287,7 @@ mod tests {
         // Advance left watermark → right cutoff = 300 - 100 = 200
         let result = execute_interval_join_cycle(&mut state, &[], &[], &config, 300, 0).unwrap();
         // Right A@100 unmatched → emitted with NULL left columns
-        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = result.iter().map(RecordBatch::num_rows).sum();
         assert!(total_rows >= 1);
         // First batch should have NULL left columns
         assert!(result[0].column(0).is_null(0)); // left id null
@@ -1292,7 +1307,7 @@ mod tests {
         // Advance both watermarks past both deadlines
         let result = execute_interval_join_cycle(&mut state, &[], &[], &config, 700, 700).unwrap();
         // Both unmatched: one from left, one from right
-        let total_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+        let total_rows: usize = result.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 2);
     }
 
