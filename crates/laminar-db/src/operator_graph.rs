@@ -832,6 +832,29 @@ impl OperatorGraph {
             })
             .collect();
 
+        // Re-register source-node MemTables from accumulated inputs.
+        // When a downstream operator is budget-deferred, its input_bufs
+        // accumulate batches across cycles but the source MemTable only has
+        // the latest cycle's data. Re-registering ensures the DataFusion
+        // plan reads all accumulated data.
+        // Only applies to source nodes (not intermediate query results).
+        for (port, port_batches) in inputs.iter().enumerate() {
+            if port_batches.is_empty() {
+                continue;
+            }
+            let upstream = self.input_sources[node_id][port];
+            if upstream < self.nodes.len() && self.source_map.values().any(|&id| id == upstream) {
+                let upstream_name = &self.nodes[upstream].name;
+                let schema = port_batches[0].schema();
+                if let Ok(mem) =
+                    datafusion::datasource::MemTable::try_new(schema, vec![port_batches.clone()])
+                {
+                    let _ = self.ctx.deregister_table(&**upstream_name);
+                    let _ = self.ctx.register_table(&**upstream_name, Arc::new(mem));
+                }
+            }
+        }
+
         let output_result = self.nodes[node_id]
             .operator
             .process(&inputs, &watermarks)
