@@ -474,7 +474,6 @@ impl OperatorGraph {
             stream_join_config.as_ref(),
             temporal_probe_config.as_ref(),
             projection_sql.as_deref(),
-            &table_refs,
         );
 
         // Determine input port count
@@ -598,7 +597,6 @@ impl OperatorGraph {
         stream_join_config: Option<&laminar_sql::translator::StreamJoinConfig>,
         temporal_probe_config: Option<&laminar_sql::translator::TemporalProbeConfig>,
         projection_sql: Option<&str>,
-        table_refs: &FxHashSet<String>,
     ) -> Box<dyn GraphOperator> {
         use crate::operator;
 
@@ -655,21 +653,12 @@ impl OperatorGraph {
             ));
         }
 
-        let mut op = operator::sql_query::SqlQueryOperator::new(
+        Box::new(operator::sql_query::SqlQueryOperator::new(
             name,
             sql,
             self.ctx.clone(),
             self.counters.clone(),
-        );
-        // Find the stream source for this query (first table_ref that's in source_schemas).
-        // Used by CachedPlan to re-register the MemTable from accumulated inputs.
-        for tr in table_refs {
-            if self.source_schemas.contains_key(tr) {
-                op.set_source_table(tr);
-                break;
-            }
-        }
-        Box::new(op)
+        ))
     }
 
     /// Remove a query by name using a tombstone.
@@ -776,9 +765,10 @@ impl OperatorGraph {
                 continue;
             }
             let schema = batches[0].schema();
-            let mem_table =
-                datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
-                    .map_err(|e| DbError::query_pipeline(&**name, &e))?;
+            let concat = arrow::compute::concat_batches(&schema, batches)
+                .map_err(|e| DbError::query_pipeline_arrow(&**name, &e))?;
+            let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![concat]])
+                .map_err(|e| DbError::query_pipeline(&**name, &e))?;
             let _ = self.ctx.deregister_table(&**name);
             self.ctx
                 .register_table(&**name, Arc::new(mem_table))
@@ -917,8 +907,10 @@ impl OperatorGraph {
 
             if !self.nodes[node_id].output_routes.is_empty() {
                 let schema = batches[0].schema();
+                let concat = arrow::compute::concat_batches(&schema, &batches)
+                    .unwrap_or_else(|_| batches[0].clone());
                 if let Ok(mem_table) =
-                    datafusion::datasource::MemTable::try_new(schema, vec![batches.clone()])
+                    datafusion::datasource::MemTable::try_new(schema, vec![vec![concat]])
                 {
                     let _ = self.ctx.deregister_table(&*node_name);
                     if let Err(e) = self.ctx.register_table(&*node_name, Arc::new(mem_table)) {

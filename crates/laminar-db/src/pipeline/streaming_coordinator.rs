@@ -454,6 +454,10 @@ impl StreamingCoordinator {
                 callback.extract_watermark(&name, &batch);
             }
 
+            // Step: Execute SQL cycle. Also runs on idle wakeups when
+            // operators have deferred input from a prior budget-exceeded
+            // cycle — otherwise that data is stuck forever once the source
+            // goes idle.
             if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
                 let wm = callback.current_watermark();
                 match callback.execute_cycle(&self.source_batches_buf, wm).await {
