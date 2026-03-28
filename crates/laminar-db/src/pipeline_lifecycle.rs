@@ -297,13 +297,35 @@ impl LaminarDB {
                     .iter()
                     .filter_map(|k| initial_batch.schema().index_of(k).ok())
                     .collect();
-                let Ok(version_col_idx) =
-                    initial_batch.schema().index_of(&tcfg.table_version_column)
+
+                // When table_version_column is empty (translator couldn't resolve it
+                // from the AS OF clause), pick the first timestamp/int column that
+                // isn't the join key.
+                let resolved_version_col = if tcfg.table_version_column.is_empty() {
+                    let schema = initial_batch.schema();
+                    schema
+                        .fields()
+                        .iter()
+                        .find(|f| {
+                            f.name() != &tcfg.table_key_column
+                                && matches!(
+                                    f.data_type(),
+                                    arrow::datatypes::DataType::Int64
+                                        | arrow::datatypes::DataType::Timestamp(_, _)
+                                )
+                        })
+                        .map(|f| f.name().clone())
+                        .unwrap_or_default()
+                } else {
+                    tcfg.table_version_column.clone()
+                };
+
+                let Ok(version_col_idx) = initial_batch.schema().index_of(&resolved_version_col)
                 else {
                     if !initial_batch.schema().fields().is_empty() {
                         tracing::warn!(
                             table=%tcfg.table_name,
-                            version_col=%tcfg.table_version_column,
+                            version_col=%resolved_version_col,
                             "Version column not found in temporal table schema; \
                              will resolve on first CDC batch"
                         );
@@ -318,8 +340,9 @@ impl LaminarDB {
                                 ),
                             ),
                             key_columns,
-                            version_column: tcfg.table_version_column.clone(),
+                            version_column: resolved_version_col,
                             stream_time_column: tcfg.stream_time_column.clone(),
+                            max_versions_per_key: usize::MAX,
                         },
                     );
                     continue;
@@ -329,6 +352,7 @@ impl LaminarDB {
                         &initial_batch,
                         &key_indices,
                         version_col_idx,
+                        usize::MAX,
                     )
                     .unwrap_or_default(),
                 );
@@ -338,8 +362,9 @@ impl LaminarDB {
                         batch: initial_batch,
                         index,
                         key_columns,
-                        version_column: tcfg.table_version_column.clone(),
+                        version_column: resolved_version_col,
                         stream_time_column: tcfg.stream_time_column.clone(),
+                        max_versions_per_key: usize::MAX,
                     },
                 );
             }

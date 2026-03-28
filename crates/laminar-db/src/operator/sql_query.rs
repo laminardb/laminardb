@@ -395,7 +395,7 @@ impl GraphOperator for SqlQueryOperator {
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
-        _watermark: i64,
+        _watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
         // Lazy initialization on first call.
         if matches!(self.state, QueryState::Uninit) {
@@ -458,12 +458,19 @@ impl GraphOperator for SqlQueryOperator {
                 }
             }
             QueryState::CachedPlan(_) => {
-                // MemTables are registered by the graph -- just execute the plan.
-                let QueryState::CachedPlan(ref plan) = self.state else {
-                    unreachable!();
-                };
-                let plan = plan.clone();
-                self.execute_cached_plan_with_invalidation(&plan).await
+                // Re-plan from SQL each cycle. The cached LogicalPlan was
+                // optimized with table statistics from lazy_init time (often
+                // 0-1 rows). Reusing it causes DataFusion to apply stale
+                // optimizations (e.g., row count limits) that drop rows when
+                // the MemTable grows.
+                let df = self
+                    .ctx
+                    .sql(&self.sql)
+                    .await
+                    .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
+                df.collect()
+                    .await
+                    .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))
             }
         }
     }

@@ -2546,11 +2546,13 @@ impl StreamExecutor {
             .get_mut(&idx)
             .expect("interval join state was just inserted");
 
+        // StreamExecutor uses the global watermark for both sides (conservative).
         let join_result = crate::interval_join::execute_interval_join_cycle(
             state,
             &left_batches,
             &right_batches,
             config,
+            current_watermark,
             current_watermark,
         )?;
 
@@ -4452,16 +4454,20 @@ mod tests {
     }
 
     #[test]
-    fn test_left_join_not_routed_to_interval() {
-        // LEFT JOIN with BETWEEN should NOT route to interval join engine
+    fn test_left_join_routed_to_interval() {
+        // LEFT JOIN with BETWEEN should route to interval join engine
         let (config, _) = detect_stream_join_query(
             "SELECT * FROM orders o \
              LEFT JOIN payments p ON o.order_id = p.order_id \
              AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR",
         );
         assert!(
-            config.is_none(),
-            "LEFT JOIN should not route to interval join engine"
+            config.is_some(),
+            "LEFT JOIN should route to interval join engine"
+        );
+        assert_eq!(
+            config.unwrap().join_type,
+            laminar_sql::translator::StreamJoinType::Left,
         );
     }
 

@@ -220,7 +220,7 @@ impl GraphOperator for TemporalJoinOperator {
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
-        _watermark: i64,
+        _watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
         let stream_batches = inputs.first().cloned().unwrap_or_default();
 
@@ -265,7 +265,7 @@ mod tests {
         let ctx = laminar_sql::create_session_context();
         let mut op = TemporalJoinOperator::new("test_temporal", test_config(), None, ctx, None);
 
-        let result = op.process(&[vec![]], 0).await.unwrap();
+        let result = op.process(&[vec![]], &[0]).await.unwrap();
         assert!(result.is_empty());
     }
 
@@ -289,7 +289,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = op.process(&[vec![batch]], 0).await;
+        let result = op.process(&[vec![batch]], &[0]).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
