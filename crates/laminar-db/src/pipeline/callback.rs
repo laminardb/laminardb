@@ -101,4 +101,9 @@ pub trait PipelineCallback: Send + 'static {
     fn is_backpressured(&self) -> bool {
         false
     }
+
+    /// Returns `true` when deferred operators have pending input to drain.
+    fn has_deferred_input(&self) -> bool {
+        false
+    }
 }

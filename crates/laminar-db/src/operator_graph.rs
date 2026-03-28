@@ -207,6 +207,15 @@ impl OperatorGraph {
         (max_len as f64 / cap as f64).min(1.0)
     }
 
+    /// Returns `true` if any non-source operator has pending input from
+    /// a prior cycle (deferred due to budget exhaustion).
+    pub fn has_pending_input(&self) -> bool {
+        self.input_bufs.iter().enumerate().any(|(id, ports)| {
+            ports.iter().any(|port| !port.is_empty())
+                && !self.source_map.values().any(|&src| src == id)
+        })
+    }
+
     pub fn set_lookup_registry(
         &mut self,
         registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,

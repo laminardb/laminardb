@@ -103,6 +103,14 @@ pub struct KafkaSource {
     /// Offset snapshot shared with the rebalance callback for seek-on-assign.
     /// Updated once per `poll_batch()` cycle (not per message).
     offset_snapshot: Arc<Mutex<OffsetTracker>>,
+
+    // Reusable poll_batch buffers — cleared each cycle, capacity retained.
+    poll_payload_buf: Vec<u8>,
+    poll_payload_offsets: Vec<(usize, usize)>,
+    poll_meta_partitions: Vec<i32>,
+    poll_meta_offsets: Vec<i64>,
+    poll_meta_timestamps: Vec<Option<i64>>,
+    poll_meta_headers: Vec<Option<String>>,
 }
 
 impl KafkaSource {
@@ -158,6 +166,12 @@ impl KafkaSource {
             reader_paused: Arc::new(AtomicBool::new(false)),
             commit_retry_needed: Arc::new(AtomicBool::new(false)),
             offset_snapshot: Arc::new(Mutex::new(OffsetTracker::new())),
+            poll_payload_buf: Vec::new(),
+            poll_payload_offsets: Vec::new(),
+            poll_meta_partitions: Vec::new(),
+            poll_meta_offsets: Vec::new(),
+            poll_meta_timestamps: Vec::new(),
+            poll_meta_headers: Vec::new(),
         }
     }
 
@@ -224,6 +238,12 @@ impl KafkaSource {
             reader_paused: Arc::new(AtomicBool::new(false)),
             commit_retry_needed: Arc::new(AtomicBool::new(false)),
             offset_snapshot: Arc::new(Mutex::new(OffsetTracker::new())),
+            poll_payload_buf: Vec::new(),
+            poll_payload_offsets: Vec::new(),
+            poll_meta_partitions: Vec::new(),
+            poll_meta_offsets: Vec::new(),
+            poll_meta_timestamps: Vec::new(),
+            poll_meta_headers: Vec::new(),
         }
     }
 
@@ -485,23 +505,20 @@ impl KafkaSource {
                             };
                             let headers_json = if capture_headers {
                                 use rdkafka::message::Headers;
-                                msg.headers().map(|hdrs| {
-                                    let mut json = String::from('{');
-                                    for i in 0..hdrs.count() {
-                                        let header = hdrs.get(i);
-                                        if i > 0 {
-                                            json.push(',');
-                                        }
-                                        json.push('"');
-                                        json.push_str(header.key);
-                                        json.push_str("\":\"");
-                                        if let Some(val) = header.value {
-                                            json.push_str(&String::from_utf8_lossy(val));
-                                        }
-                                        json.push('"');
-                                    }
-                                    json.push('}');
-                                    json
+                                msg.headers().and_then(|hdrs| {
+                                    let pairs: Vec<(String, serde_json::Value)> = (0..hdrs.count())
+                                        .map(|i| {
+                                            let h = hdrs.get(i);
+                                            let val = match h.value {
+                                                Some(v) => serde_json::Value::String(
+                                                    String::from_utf8_lossy(v).into_owned(),
+                                                ),
+                                                None => serde_json::Value::Null,
+                                            };
+                                            (h.key.to_string(), val)
+                                        })
+                                        .collect();
+                                    serde_json::to_string(&pairs).ok()
                                 })
                             } else {
                                 None
@@ -817,55 +834,39 @@ impl SourceConnector for KafkaSource {
 
         let limit = max_records.min(self.config.max_poll_records);
 
-        // Drain messages from the background reader task.
-        let mut payload_buf: Vec<u8> = Vec::with_capacity(limit * 256);
-        let mut payload_offsets: Vec<(usize, usize)> = Vec::with_capacity(limit);
+        // Reuse struct-level buffers — clear without freeing capacity.
+        self.poll_payload_buf.clear();
+        self.poll_payload_offsets.clear();
+        self.poll_meta_partitions.clear();
+        self.poll_meta_offsets.clear();
+        self.poll_meta_timestamps.clear();
+        self.poll_meta_headers.clear();
+
         let mut total_bytes: u64 = 0;
         let mut last_topic = String::new();
         let mut last_partition_id: i32 = 0;
         let mut last_offset: i64 = -1;
-        // Metadata columns (only collected when include_metadata is true).
         let include_metadata = self.config.include_metadata;
         let include_headers = self.config.include_headers;
-        let mut meta_partitions: Vec<i32> = if include_metadata {
-            Vec::with_capacity(limit)
-        } else {
-            Vec::new()
-        };
-        let mut meta_offsets: Vec<i64> = if include_metadata {
-            Vec::with_capacity(limit)
-        } else {
-            Vec::new()
-        };
-        let mut meta_timestamps: Vec<Option<i64>> = if include_metadata {
-            Vec::with_capacity(limit)
-        } else {
-            Vec::new()
-        };
-        let mut meta_headers: Vec<Option<String>> = if include_headers {
-            Vec::with_capacity(limit)
-        } else {
-            Vec::new()
-        };
 
-        while payload_offsets.len() < limit {
+        while self.poll_payload_offsets.len() < limit {
             match rx.try_recv() {
                 Ok(kp) => {
                     self.channel_len.fetch_sub(1, Ordering::Relaxed);
                     total_bytes += kp.data.len() as u64;
-                    let start = payload_buf.len();
-                    payload_buf.extend_from_slice(&kp.data);
-                    payload_offsets.push((start, kp.data.len()));
+                    let start = self.poll_payload_buf.len();
+                    self.poll_payload_buf.extend_from_slice(&kp.data);
+                    self.poll_payload_offsets.push((start, kp.data.len()));
 
                     self.offsets.update_arc(&kp.topic, kp.partition, kp.offset);
 
                     if include_metadata {
-                        meta_partitions.push(kp.partition);
-                        meta_offsets.push(kp.offset);
-                        meta_timestamps.push(kp.timestamp_ms);
+                        self.poll_meta_partitions.push(kp.partition);
+                        self.poll_meta_offsets.push(kp.offset);
+                        self.poll_meta_timestamps.push(kp.timestamp_ms);
                     }
                     if include_headers {
-                        meta_headers.push(kp.headers_json);
+                        self.poll_meta_headers.push(kp.headers_json);
                     }
 
                     // Update watermark tracker with event timestamp.
@@ -881,7 +882,13 @@ impl SourceConnector for KafkaSource {
                     }
                     last_offset = kp.offset;
                 }
-                Err(_) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    self.state = ConnectorState::Failed;
+                    return Err(ConnectorError::Internal(
+                        "Kafka reader task exited unexpectedly".into(),
+                    ));
+                }
             }
         }
 
@@ -920,7 +927,7 @@ impl SourceConnector for KafkaSource {
         // Publish current offsets to the reader task for periodic broker commits
         // and to the rebalance callback for seek-on-assign.
         // After retain_assigned, self.offsets only contains assigned partitions.
-        if had_revoke || !payload_offsets.is_empty() {
+        if had_revoke || !self.poll_payload_offsets.is_empty() {
             if let Some(ref tx) = self.offset_commit_tx {
                 let tpl = self.offsets.to_topic_partition_list();
                 if tx.send(tpl).is_err() {
@@ -933,7 +940,7 @@ impl SourceConnector for KafkaSource {
             }
         }
 
-        if payload_offsets.is_empty() {
+        if self.poll_payload_offsets.is_empty() {
             return Ok(None);
         }
 
@@ -955,10 +962,10 @@ impl SourceConnector for KafkaSource {
             .as_any_mut()
             .and_then(|any| any.downcast_mut::<AvroDeserializer>())
         {
-            for &(start, len) in &payload_offsets {
-                if let Some(schema_id) =
-                    AvroDeserializer::extract_confluent_id(&payload_buf[start..start + len])
-                {
+            for &(start, len) in &self.poll_payload_offsets {
+                if let Some(schema_id) = AvroDeserializer::extract_confluent_id(
+                    &self.poll_payload_buf[start..start + len],
+                ) {
                     avro_deser
                         .ensure_schema_registered(schema_id)
                         .await
@@ -967,9 +974,10 @@ impl SourceConnector for KafkaSource {
             }
         }
 
-        let refs: Vec<&[u8]> = payload_offsets
+        let refs: Vec<&[u8]> = self
+            .poll_payload_offsets
             .iter()
-            .map(|&(start, len)| &payload_buf[start..start + len])
+            .map(|&(start, len)| &self.poll_payload_buf[start..start + len])
             .collect();
 
         // Try batch deserialization first (fast path). If it fails, fall back
@@ -1011,25 +1019,34 @@ impl SourceConnector for KafkaSource {
         };
 
         // Append metadata columns if configured.
-        let batch = if include_metadata && !meta_partitions.is_empty() {
-            use arrow_array::{Int32Array, Int64Array};
+        let needs_meta = include_metadata && !self.poll_meta_partitions.is_empty();
+        let needs_headers = include_headers && !self.poll_meta_headers.is_empty();
+        let batch = if needs_meta || needs_headers {
             use arrow_schema::{DataType, Field};
 
             let mut fields = batch.schema().fields().to_vec();
             let mut columns: Vec<Arc<dyn arrow_array::Array>> = batch.columns().to_vec();
 
-            fields.push(Arc::new(Field::new("_partition", DataType::Int32, false)));
-            columns.push(Arc::new(Int32Array::from(meta_partitions)));
-
-            fields.push(Arc::new(Field::new("_offset", DataType::Int64, false)));
-            columns.push(Arc::new(Int64Array::from(meta_offsets)));
-
-            fields.push(Arc::new(Field::new("_timestamp", DataType::Int64, true)));
-            columns.push(Arc::new(Int64Array::from(meta_timestamps)));
-
-            if include_headers && !meta_headers.is_empty() {
+            if needs_meta {
+                use arrow_array::{Int32Array, Int64Array};
+                fields.push(Arc::new(Field::new("_partition", DataType::Int32, false)));
+                columns.push(Arc::new(Int32Array::from(std::mem::take(
+                    &mut self.poll_meta_partitions,
+                ))));
+                fields.push(Arc::new(Field::new("_offset", DataType::Int64, false)));
+                columns.push(Arc::new(Int64Array::from(std::mem::take(
+                    &mut self.poll_meta_offsets,
+                ))));
+                fields.push(Arc::new(Field::new("_timestamp", DataType::Int64, true)));
+                columns.push(Arc::new(Int64Array::from(std::mem::take(
+                    &mut self.poll_meta_timestamps,
+                ))));
+            }
+            if needs_headers {
                 fields.push(Arc::new(Field::new("_headers", DataType::Utf8, true)));
-                columns.push(Arc::new(arrow_array::StringArray::from(meta_headers)));
+                columns.push(Arc::new(arrow_array::StringArray::from(std::mem::take(
+                    &mut self.poll_meta_headers,
+                ))));
             }
 
             let meta_schema = Arc::new(arrow_schema::Schema::new(fields));
@@ -1063,8 +1080,6 @@ impl SourceConnector for KafkaSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        // Filter to only currently assigned partitions — prevents revoked
-        // partition offsets from leaking into checkpoints or broker commits.
         let assigned = match self.rebalance_state.lock() {
             Ok(state) => state.assigned_partitions().clone(),
             Err(poisoned) => poisoned.into_inner().assigned_partitions().clone(),
@@ -1166,7 +1181,6 @@ impl SourceConnector for KafkaSource {
     async fn close(&mut self) -> Result<(), ConnectorError> {
         info!("closing Kafka source connector");
 
-        // Filter to assigned partitions — same as checkpoint().
         let assigned = match self.rebalance_state.lock() {
             Ok(state) => state.assigned_partitions().clone(),
             Err(poisoned) => poisoned.into_inner().assigned_partitions().clone(),

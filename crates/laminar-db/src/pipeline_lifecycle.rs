@@ -853,25 +853,32 @@ impl LaminarDB {
         // minimal latency — data is processed as soon as it arrives.
         // Connector mode: 5ms batch window amortizes SQL overhead across
         // high-throughput external sources (Kafka, CDC).
+        let drain_budget_ns = self.config.pipeline_drain_budget_ns.unwrap_or(1_000_000);
+        let query_budget_ns = self.config.pipeline_query_budget_ns.unwrap_or(8_000_000);
         let pipeline_config = PipelineConfig {
             max_poll_records: max_poll,
-            channel_capacity: 64,
+            channel_capacity: self.config.pipeline_channel_capacity.unwrap_or(64),
             fallback_poll_interval: if has_external {
                 std::time::Duration::from_millis(10)
             } else {
                 std::time::Duration::from_millis(1)
             },
             checkpoint_interval,
-            batch_window: if has_external {
-                std::time::Duration::from_millis(5)
-            } else {
-                std::time::Duration::ZERO
-            },
+            batch_window: self
+                .config
+                .pipeline_batch_window
+                .unwrap_or(if has_external {
+                    std::time::Duration::from_millis(5)
+                } else {
+                    std::time::Duration::ZERO
+                }),
             barrier_alignment_timeout: std::time::Duration::from_secs(30),
             delivery_guarantee: self.config.delivery_guarantee,
-            cycle_budget_ns: 10_000_000,     // 10ms
-            drain_budget_ns: 1_000_000,      // 1ms
-            query_budget_ns: 8_000_000,      // 8ms
+            // cycle_budget is a soft cap for logging; ensure it's at least
+            // drain + query so sub-budgets can actually be used.
+            cycle_budget_ns: 10_000_000_u64.max(drain_budget_ns + query_budget_ns),
+            drain_budget_ns,
+            query_budget_ns,
             background_budget_ns: 5_000_000, // 5ms
             sink_write_timeout: std::time::Duration::from_secs(30),
             max_input_buf_batches: 256,

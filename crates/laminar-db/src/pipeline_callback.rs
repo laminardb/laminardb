@@ -672,7 +672,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn is_backpressured(&self) -> bool {
-        // Matches crate::metrics::BACKPRESSURE_THRESHOLD (0.8).
         let bp = self.graph.input_buf_pressure() > 0.8;
         if bp {
             self.counters
@@ -680,6 +679,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         bp
+    }
+
+    fn has_deferred_input(&self) -> bool {
+        self.graph.has_pending_input()
     }
 
     async fn poll_tables(&mut self) {
