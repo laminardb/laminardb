@@ -127,10 +127,12 @@ async fn test_produce_consume_roundtrip() {
 
     produce_messages(&brokers, topic, n).await;
 
-    let mut cfg = KafkaSourceConfig::default();
-    cfg.bootstrap_servers = brokers.clone();
-    cfg.group_id = "test-roundtrip-group".into();
-    cfg.subscription = TopicSubscription::Topics(vec![topic.into()]);
+    let cfg = KafkaSourceConfig {
+        bootstrap_servers: brokers.clone(),
+        group_id: "test-roundtrip-group".into(),
+        subscription: TopicSubscription::Topics(vec![topic.into()]),
+        ..KafkaSourceConfig::default()
+    };
 
     let mut source = KafkaSource::new(test_schema(), cfg);
     let connector_cfg = ConnectorConfig::new("kafka");
@@ -173,10 +175,12 @@ async fn test_checkpoint_restore() {
     produce_messages(&brokers, topic, n).await;
 
     // Phase 1: consume all, checkpoint.
-    let mut cfg = KafkaSourceConfig::default();
-    cfg.bootstrap_servers = brokers.clone();
-    cfg.group_id = "test-checkpoint-group".into();
-    cfg.subscription = TopicSubscription::Topics(vec![topic.into()]);
+    let cfg = KafkaSourceConfig {
+        bootstrap_servers: brokers.clone(),
+        group_id: "test-checkpoint-group".into(),
+        subscription: TopicSubscription::Topics(vec![topic.into()]),
+        ..KafkaSourceConfig::default()
+    };
 
     let mut source = KafkaSource::new(test_schema(), cfg.clone());
     let connector_cfg = ConnectorConfig::new("kafka");
@@ -214,7 +218,7 @@ async fn test_poison_pill_isolation() {
         .create()
         .expect("producer creation");
 
-    let payloads = vec![
+    let payloads = [
         r#"{"id": 1, "name": "good-1"}"#,
         "NOT VALID JSON {{{",
         r#"{"id": 3, "name": "good-3"}"#,
@@ -231,11 +235,13 @@ async fn test_poison_pill_isolation() {
             .expect("send failed");
     }
 
-    let mut cfg = KafkaSourceConfig::default();
-    cfg.bootstrap_servers = brokers;
-    cfg.group_id = "test-poison-group".into();
-    cfg.subscription = TopicSubscription::Topics(vec![topic.into()]);
-    cfg.max_deser_error_rate = 0.5; // tolerate up to 50% errors
+    let cfg = KafkaSourceConfig {
+        bootstrap_servers: brokers,
+        group_id: "test-poison-group".into(),
+        subscription: TopicSubscription::Topics(vec![topic.into()]),
+        max_deser_error_rate: 0.5,
+        ..KafkaSourceConfig::default()
+    };
 
     let mut source = KafkaSource::new(test_schema(), cfg);
     let connector_cfg = ConnectorConfig::new("kafka");
