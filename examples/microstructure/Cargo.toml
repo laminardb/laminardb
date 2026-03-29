@@ -2,7 +2,7 @@
 
 [package]
 name = "microstructure"
-version = "0.18.15"
+version = "0.19.0"
 edition = "2021"
 publish = false
 description = "Market Microstructure Intelligence: 12 WebSocket streams, 36 SQL stages, sub-us latency"
