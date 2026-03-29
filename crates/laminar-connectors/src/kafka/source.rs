@@ -318,15 +318,27 @@ impl KafkaSource {
                             let c = Arc::clone(&commit_consumer);
                             let flag = Arc::clone(&commit_retry);
                             let n = tpl.count();
-                            tokio::task::spawn_blocking(move || {
-                                match c.commit(&tpl, CommitMode::Sync) {
-                                    Ok(()) => info!(partition_count = n, "sync offset commit retry succeeded"),
-                                    Err(e) => {
-                                        flag.store(true, Ordering::Release);
-                                        warn!(error = %e, "sync offset commit retry failed");
-                                    }
+                            // Await the blocking commit so it completes before
+                            // close() drops the consumer Arc.
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                tokio::task::spawn_blocking(move || {
+                                    c.commit(&tpl, CommitMode::Sync)
+                                }),
+                            )
+                            .await
+                            {
+                                Ok(Ok(Ok(()))) => info!(partition_count = n, "sync offset commit retry succeeded"),
+                                Ok(Ok(Err(e))) => {
+                                    flag.store(true, Ordering::Release);
+                                    warn!(error = %e, "sync offset commit retry failed");
                                 }
-                            });
+                                Ok(Err(e)) => warn!(error = %e, "sync commit blocking task panicked"),
+                                Err(_) => {
+                                    flag.store(true, Ordering::Release);
+                                    warn!("sync offset commit retry timed out");
+                                }
+                            }
                         } else {
                             match commit_consumer.commit(&tpl, CommitMode::Async) {
                                 Ok(()) => info!(partition_count = tpl.count(), "periodic broker offset commit (advisory)"),
@@ -1000,19 +1012,25 @@ impl SourceConnector for KafkaSource {
 
         // Try batch deserialization first (fast path). If it fails, fall back
         // to per-record deserialization to isolate poison pills.
-        let batch = match self.deserializer.deserialize_batch(&refs, &self.schema) {
-            Ok(batch) => batch,
+        let (batch, good_indices) = match self.deserializer.deserialize_batch(&refs, &self.schema) {
+            Ok(batch) => (batch, None),
             Err(batch_err) => {
                 // Per-record fallback: deserialize one at a time, collect
                 // successful batches directly (avoids double-deserialization).
+                // Track indices of successful records so metadata vectors can
+                // be filtered to match the reduced row count.
                 let mut good_batches = Vec::with_capacity(refs.len());
+                let mut good_idx = Vec::with_capacity(refs.len());
                 let mut error_count = 0u64;
-                for r in &refs {
+                for (i, r) in refs.iter().enumerate() {
                     match self
                         .deserializer
                         .deserialize_batch(std::slice::from_ref(r), &self.schema)
                     {
-                        Ok(batch) => good_batches.push(batch),
+                        Ok(batch) => {
+                            good_batches.push(batch);
+                            good_idx.push(i);
+                        }
                         Err(e) => {
                             error_count += 1;
                             self.metrics.record_error();
@@ -1037,11 +1055,31 @@ impl SourceConnector for KafkaSource {
                         "deserialized batch with poison pill isolation"
                     );
                 }
-                arrow_select::concat::concat_batches(&self.schema, &good_batches).map_err(|e| {
-                    ConnectorError::Internal(format!("failed to concat batches: {e}"))
-                })?
+                let batch = arrow_select::concat::concat_batches(&self.schema, &good_batches)
+                    .map_err(|e| {
+                        ConnectorError::Internal(format!("failed to concat batches: {e}"))
+                    })?;
+                (batch, Some(good_idx))
             }
         };
+
+        // If poison pill fallback filtered records, also filter metadata
+        // vectors so their lengths match the deserialized batch row count.
+        if let Some(ref idx) = good_indices {
+            if include_metadata {
+                self.poll_meta_partitions =
+                    idx.iter().map(|&i| self.poll_meta_partitions[i]).collect();
+                self.poll_meta_offsets = idx.iter().map(|&i| self.poll_meta_offsets[i]).collect();
+                self.poll_meta_timestamps =
+                    idx.iter().map(|&i| self.poll_meta_timestamps[i]).collect();
+            }
+            if include_headers {
+                self.poll_meta_headers = idx
+                    .iter()
+                    .map(|&i| std::mem::take(&mut self.poll_meta_headers[i]))
+                    .collect();
+            }
+        }
 
         // Append metadata columns if configured.
         let needs_meta = include_metadata && !self.poll_meta_partitions.is_empty();

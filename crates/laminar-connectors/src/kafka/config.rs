@@ -395,7 +395,7 @@ impl std::fmt::Display for SchemaEvolutionStrategy {
 }
 
 /// Maps the Kafka-level [`CompatibilityLevel`] to the schema module's
-/// [`CompatibilityMode`] for evolution evaluation.
+/// `CompatibilityMode` for evolution evaluation.
 impl From<CompatibilityLevel> for crate::schema::traits::CompatibilityMode {
     fn from(level: CompatibilityLevel) -> Self {
         use crate::schema::traits::CompatibilityMode;
@@ -1100,6 +1100,7 @@ fn is_blocked_passthrough_key(key: &str) -> bool {
                 | "enable.auto.commit"
                 | "enable.auto.offset.store"
                 | "enable.idempotence"
+                | "auto.offset.reset"
                 | "session.timeout.ms"
                 | "heartbeat.interval.ms"
                 | "max.poll.interval.ms"
