@@ -367,7 +367,10 @@ impl KafkaSink {
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .unwrap_or_else(|_| {
+                tracing::warn!("system clock before Unix epoch — using 0 for DLQ timestamp");
+                std::time::Duration::ZERO
+            })
             .as_millis()
             .to_string();
         let epoch_str = self.current_epoch.to_string();
@@ -651,7 +654,13 @@ impl SinkConnector for KafkaSink {
                     if self.dlq_producer.is_some() {
                         let key: Option<&[u8]> =
                             keys.as_ref().map(|kb| kb.key(i)).filter(|k| !k.is_empty());
-                        self.route_to_dlq(&payloads[i], key, &err_msg).await?;
+                        if let Err(dlq_err) = self.route_to_dlq(&payloads[i], key, &err_msg).await {
+                            warn!(
+                                original_error = %err_msg,
+                                dlq_error = %dlq_err,
+                                "failed to route record to DLQ — record lost"
+                            );
+                        }
                     } else {
                         return Err(ConnectorError::WriteError(format!(
                             "Kafka produce failed: {err_msg}"
@@ -933,10 +942,8 @@ fn select_serializer(
             schema_id,
             registry,
         )),
-        other => serde::create_serializer(other).unwrap_or_else(|_| {
-            tracing::warn!(format = %other, "unsupported serializer format, falling back to JSON");
-            Box::new(serde::json::JsonSerializer::new())
-        }),
+        other => serde::create_serializer(other)
+            .expect("serializer creation failed for validated format"),
     }
 }
 
