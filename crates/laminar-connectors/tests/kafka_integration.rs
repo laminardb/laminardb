@@ -32,18 +32,20 @@ fn test_schema() -> SchemaRef {
     ]))
 }
 
+/// Fixed host port for Redpanda. Using a fixed port with `with_mapped_port`
+/// so the advertised Kafka address matches the address clients connect to.
+const REDPANDA_HOST_PORT: u16 = 19092;
+
 /// Starts a Redpanda container and returns the broker address.
 async fn start_redpanda() -> (testcontainers::ContainerAsync<GenericImage>, String) {
-    // Redpanda listens on 9092 inside the container. We omit
-    // --advertise-kafka-addr so Redpanda advertises its listen address.
-    // rdkafka caches the bootstrap broker from the initial connection,
-    // so metadata-redirect to the internal address is not an issue for
-    // short-lived integration tests.
+    use testcontainers::core::IntoContainerPort;
+
     let container = GenericImage::new("redpandadata/redpanda", "v24.3.1")
         .with_exposed_port(9092.into())
         .with_wait_for(testcontainers::core::WaitFor::message_on_stderr(
             "Successfully started Redpanda",
         ))
+        .with_mapped_port(REDPANDA_HOST_PORT, 9092.tcp())
         .with_cmd([
             "redpanda",
             "start",
@@ -54,6 +56,8 @@ async fn start_redpanda() -> (testcontainers::ContainerAsync<GenericImage>, Stri
             "--overprovisioned",
             "--kafka-addr",
             "PLAINTEXT://0.0.0.0:9092",
+            "--advertise-kafka-addr",
+            "PLAINTEXT://127.0.0.1:19092",
             "--node-id",
             "0",
         ])
@@ -61,8 +65,7 @@ async fn start_redpanda() -> (testcontainers::ContainerAsync<GenericImage>, Stri
         .await
         .expect("failed to start Redpanda container");
 
-    let port = container.get_host_port_ipv4(9092).await.expect("get port");
-    let brokers = format!("127.0.0.1:{port}");
+    let brokers = format!("127.0.0.1:{REDPANDA_HOST_PORT}");
 
     // Brief wait for broker to accept connections.
     sleep(Duration::from_secs(2)).await;
