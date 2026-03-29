@@ -118,6 +118,10 @@ pub mod websocket;
 #[cfg(feature = "mongodb-cdc")]
 pub mod mongodb;
 
+/// OpenTelemetry OTLP/gRPC source connector.
+#[cfg(feature = "otel")]
+pub mod otel;
+
 /// AutoLoader-style file source and sink connectors.
 #[cfg(feature = "files")]
 #[allow(

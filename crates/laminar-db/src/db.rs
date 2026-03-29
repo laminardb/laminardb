@@ -310,6 +310,10 @@ impl LaminarDB {
             laminar_connectors::files::register_file_source(registry);
             laminar_connectors::files::register_file_sink(registry);
         }
+        #[cfg(feature = "otel")]
+        {
+            laminar_connectors::otel::register_otel_source(registry);
+        }
     }
 
     /// Handle `CREATE LOOKUP TABLE` by registering the table in the
@@ -2302,6 +2306,10 @@ mod tests {
         {
             expected_sources += 1; // file source
             expected_sinks += 1; // file sink
+        }
+        #[cfg(feature = "otel")]
+        {
+            expected_sources += 1; // otel source
         }
 
         assert_eq!(registry.list_sources().len(), expected_sources);
