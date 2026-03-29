@@ -75,6 +75,53 @@ pub(crate) fn emit_clause_to_core(
 }
 
 // ---------------------------------------------------------------------------
+// String literal / comment stripping
+// ---------------------------------------------------------------------------
+
+/// Replace single-quoted string literals and `--` line comments with spaces.
+///
+/// Preserves byte offsets so that positions found in the stripped string
+/// can be used on the original SQL. Used before keyword searches to avoid
+/// false positives from keywords inside strings or comments.
+fn strip_literals_and_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            // Single-quoted string: replace content with spaces
+            out.push(' ');
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        // Escaped quote (''): skip both
+                        out.push_str("  ");
+                        i += 2;
+                        continue;
+                    }
+                    out.push(' ');
+                    i += 1;
+                    break;
+                }
+                out.push(' ');
+                i += 1;
+            }
+        } else if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            // Line comment: replace until newline
+            while i < bytes.len() && bytes[i] != b'\n' {
+                out.push(' ');
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Table reference extraction
 // ---------------------------------------------------------------------------
 
@@ -631,7 +678,10 @@ pub(crate) fn detect_temporal_probe_query(
     Option<laminar_sql::translator::TemporalProbeConfig>,
     Option<String>,
 ) {
-    let upper = sql.to_uppercase();
+    // Strip string literals and single-line comments before keyword search
+    // to avoid false positives from SQL like WHERE msg = 'TEMPORAL PROBE JOIN'.
+    let stripped = strip_literals_and_comments(sql);
+    let upper = stripped.to_uppercase();
     let Some(tpj_pos) = upper.find("TEMPORAL PROBE JOIN") else {
         return (None, None);
     };
@@ -715,7 +765,14 @@ pub(crate) fn detect_temporal_probe_query(
         let step_pos = range_upper.find(" STEP ");
 
         let start_str = range_text[from_pos..to_pos].trim();
-        let start_ms = laminar_sql::translator::parse_interval_to_ms(start_str).unwrap_or(0);
+        let start_ms = if let Some(v) = laminar_sql::translator::parse_interval_to_ms(start_str) {
+            v
+        } else {
+            tracing::warn!(
+                "TEMPORAL PROBE JOIN: invalid RANGE start '{start_str}', defaulting to 0"
+            );
+            0
+        };
 
         let (end_str, step_str) = if let Some(sp) = step_pos {
             let to_end = &range_text[to_pos + 4..sp];
@@ -728,8 +785,20 @@ pub(crate) fn detect_temporal_probe_query(
             (range_text[to_pos + 4..end_pos].trim(), "1s")
         };
 
-        let end_ms = laminar_sql::translator::parse_interval_to_ms(end_str).unwrap_or(0);
-        let step_ms = laminar_sql::translator::parse_interval_to_ms(step_str).unwrap_or(1000);
+        let end_ms = if let Some(v) = laminar_sql::translator::parse_interval_to_ms(end_str) {
+            v
+        } else {
+            tracing::warn!("TEMPORAL PROBE JOIN: invalid RANGE end '{end_str}', defaulting to 0");
+            0
+        };
+        let step_ms = if let Some(v) = laminar_sql::translator::parse_interval_to_ms(step_str) {
+            v
+        } else {
+            tracing::warn!(
+                "TEMPORAL PROBE JOIN: invalid RANGE step '{step_str}', defaulting to 1s"
+            );
+            1000
+        };
 
         (
             laminar_sql::translator::ProbeOffsetSpec::Range {
