@@ -148,6 +148,11 @@ pub struct KafkaSink {
 
 impl KafkaSink {
     /// Creates a new Kafka sink connector with explicit schema.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.format` is not a supported serialization format.
+    /// Call [`KafkaSinkConfig::validate`] first to catch this at config time.
     #[must_use]
     pub fn new(schema: SchemaRef, config: KafkaSinkConfig) -> Self {
         let avro_schema_id = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -175,6 +180,11 @@ impl KafkaSink {
     }
 
     /// Creates a new Kafka sink with Schema Registry integration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.format` is not a supported serialization format.
+    /// Call [`KafkaSinkConfig::validate`] first to catch this at config time.
     #[must_use]
     pub fn with_schema_registry(
         schema: SchemaRef,
