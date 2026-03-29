@@ -40,7 +40,6 @@
 
 // Source modules
 pub mod avro;
-pub mod backpressure;
 pub mod config;
 pub mod metrics;
 pub mod offsets;
@@ -66,15 +65,13 @@ pub mod discovery;
 pub use avro::AvroDeserializer;
 pub use config::{
     AssignmentStrategy, CompatibilityLevel, IsolationLevel, KafkaSourceConfig, OffsetReset,
-    SaslMechanism, SecurityProtocol, SrAuth, StartupMode, TopicSubscription,
+    SaslMechanism, SchemaEvolutionStrategy, SecurityProtocol, SrAuth, StartupMode,
+    TopicSubscription,
 };
 pub use metrics::KafkaSourceMetrics;
 pub use offsets::OffsetTracker;
 pub use source::KafkaSource;
-pub use watermarks::{
-    AlignmentCheckResult, KafkaAlignmentConfig, KafkaAlignmentMode, KafkaWatermarkTracker,
-    WatermarkMetrics, WatermarkMetricsSnapshot,
-};
+pub use watermarks::{KafkaWatermarkTracker, WatermarkMetrics};
 
 // Sink re-exports
 pub use avro_serializer::AvroSerializer;
@@ -218,7 +215,6 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
             "read_committed",
         ),
         ConfigKeySpec::optional("max.poll.records", "Max records per poll", "1000"),
-        ConfigKeySpec::optional("poll.timeout.ms", "Poll timeout in milliseconds", "100"),
         ConfigKeySpec::optional(
             "partition.assignment.strategy",
             "Partition assignment (range/roundrobin/cooperative-sticky)",
@@ -281,21 +277,6 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
             "Enable per-partition watermark tracking",
             "false",
         ),
-        ConfigKeySpec::optional(
-            "alignment.group.id",
-            "Alignment group ID for multi-source coordination",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "alignment.max.drift.ms",
-            "Maximum allowed drift between sources in alignment group",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "alignment.mode",
-            "Alignment enforcement mode (pause/warn-only/drop-excess)",
-            "pause",
-        ),
         // Backpressure
         ConfigKeySpec::optional(
             "backpressure.high.watermark",
@@ -305,6 +286,12 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
         ConfigKeySpec::optional(
             "backpressure.low.watermark",
             "Channel fill ratio to resume",
+            "0.5",
+        ),
+        // Error handling
+        ConfigKeySpec::optional(
+            "max.deser.error.rate",
+            "Max tolerated deserialization error rate per batch (0.0-1.0)",
             "0.5",
         ),
         // Schema Registry
@@ -334,6 +321,11 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
             "schema.compatibility",
             "Schema compatibility level override",
             "",
+        ),
+        ConfigKeySpec::optional(
+            "schema.evolution.strategy",
+            "Runtime schema evolution handling (log/reject/ignore)",
+            "log",
         ),
     ]
 }

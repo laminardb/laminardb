@@ -33,9 +33,12 @@ impl RebalanceState {
 
     /// Handles a partition assignment event.
     ///
-    /// Replaces the current assignment set and increments the rebalance counter.
+    /// Additive: inserts new partitions without clearing existing ones.
+    /// This is correct for both eager and cooperative rebalance protocols:
+    /// - Eager: the preceding `on_revoke(all)` already clears the set.
+    /// - Cooperative: `Assign` only contains newly assigned partitions,
+    ///   so clearing would lose existing assignments.
     pub fn on_assign(&mut self, partitions: &[(String, i32)]) {
-        self.assigned.clear();
         for (topic, partition) in partitions {
             self.assigned.insert((topic.clone(), *partition));
         }
@@ -141,6 +144,22 @@ impl LaminarConsumerContext {
     pub fn revoke_generation(&self) -> &Arc<AtomicU64> {
         &self.revoke_generation
     }
+
+    /// Locks the rebalance state, recovering from poison.
+    fn lock_rebalance_state(&self) -> std::sync::MutexGuard<'_, RebalanceState> {
+        self.rebalance_state.lock().unwrap_or_else(|poisoned| {
+            warn!("rebalance_state mutex poisoned, recovering");
+            poisoned.into_inner()
+        })
+    }
+
+    /// Locks the offset snapshot, recovering from poison.
+    fn lock_offset_snapshot(&self) -> std::sync::MutexGuard<'_, super::offsets::OffsetTracker> {
+        self.offset_snapshot.lock().unwrap_or_else(|poisoned| {
+            warn!("offset_snapshot mutex poisoned, recovering");
+            poisoned.into_inner()
+        })
+    }
 }
 
 impl ClientContext for LaminarConsumerContext {}
@@ -166,15 +185,9 @@ impl ConsumerContext for LaminarConsumerContext {
                     .iter()
                     .map(|e| (e.topic().to_string(), e.partition()))
                     .collect();
-                match self.rebalance_state.lock() {
-                    Ok(mut state) => state.on_revoke(&partitions),
-                    Err(poisoned) => {
-                        warn!("rebalance_state mutex poisoned, recovering");
-                        poisoned.into_inner().on_revoke(&partitions);
-                    }
-                }
+                self.lock_rebalance_state().on_revoke(&partitions);
                 self.revoke_generation
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
                 self.rebalance_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.rebalance_metric
@@ -193,13 +206,7 @@ impl ConsumerContext for LaminarConsumerContext {
                     .iter()
                     .map(|e| (e.topic().to_string(), e.partition()))
                     .collect();
-                match self.rebalance_state.lock() {
-                    Ok(mut state) => state.on_assign(&partitions),
-                    Err(poisoned) => {
-                        warn!("rebalance_state mutex poisoned, recovering");
-                        poisoned.into_inner().on_assign(&partitions);
-                    }
-                }
+                self.lock_rebalance_state().on_assign(&partitions);
                 self.rebalance_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.rebalance_metric
@@ -255,10 +262,7 @@ impl ConsumerContext for LaminarConsumerContext {
                 .map(|e| (e.topic().to_string(), e.partition()))
                 .collect();
 
-            let seek_tpl = match self.offset_snapshot.lock() {
-                Ok(tracker) => tracker.to_seek_tpl(&assigned),
-                Err(poisoned) => poisoned.into_inner().to_seek_tpl(&assigned),
-            };
+            let seek_tpl = self.lock_offset_snapshot().to_seek_tpl(&assigned);
 
             if seek_tpl.count() > 0 {
                 // Non-zero timeout: Duration::ZERO returns "In Progress" for every partition.
@@ -287,7 +291,7 @@ impl ConsumerContext for LaminarConsumerContext {
             }
 
             // Re-pause newly assigned partitions if backpressure is active.
-            if self.reader_paused.load(Ordering::Relaxed) {
+            if self.reader_paused.load(Ordering::Acquire) {
                 if let Err(e) = base_consumer.pause(tpl) {
                     warn!(error = %e, "failed to re-pause newly assigned partitions");
                 } else {
@@ -334,16 +338,31 @@ mod tests {
     }
 
     #[test]
-    fn test_reassign() {
+    fn test_eager_reassign() {
         let mut state = RebalanceState::new();
         state.on_assign(&[("events".into(), 0), ("events".into(), 1)]);
-        // New assignment replaces old
+        // Eager rebalance: revoke all first, then assign new set
+        state.on_revoke(&[("events".into(), 0), ("events".into(), 1)]);
         state.on_assign(&[("events".into(), 2), ("events".into(), 3)]);
 
         assert_eq!(state.assigned_partitions().len(), 2);
         assert!(!state.is_assigned("events", 0));
         assert!(state.is_assigned("events", 2));
         assert_eq!(state.rebalance_count(), 2);
+    }
+
+    #[test]
+    fn test_cooperative_assign() {
+        let mut state = RebalanceState::new();
+        state.on_assign(&[("events".into(), 0), ("events".into(), 1)]);
+        // Cooperative: only revoke subset, assign new subset
+        state.on_revoke(&[("events".into(), 1)]);
+        state.on_assign(&[("events".into(), 2)]);
+
+        assert_eq!(state.assigned_partitions().len(), 2);
+        assert!(state.is_assigned("events", 0)); // retained
+        assert!(!state.is_assigned("events", 1)); // revoked
+        assert!(state.is_assigned("events", 2)); // newly assigned
     }
 
     #[test]
