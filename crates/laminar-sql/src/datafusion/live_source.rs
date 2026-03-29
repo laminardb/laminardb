@@ -3,7 +3,7 @@
 //!
 //! Register a [`LiveSourceProvider`] once at pipeline startup. Each cycle,
 //! swap batches via [`LiveSourceHandle`], then execute the cached physical
-//! plan. [`LiveSourceExec`] reads from the shared slot at `execute()` time,
+//! plan. The internal `LiveSourceExec` reads from the shared slot at `execute()` time,
 //! so the cached plan always sees fresh data.
 
 use std::any::Any;
@@ -28,8 +28,8 @@ use datafusion_expr::TableType;
 
 /// Swappable `TableProvider` for streaming micro-batch execution.
 ///
-/// `scan()` returns a [`LiveSourceExec`] that reads from the shared batch
-/// slot at `execute()` time — enabling physical plan caching.
+/// `scan()` returns an internal execution plan that reads from the shared
+/// batch slot at `execute()` time — enabling physical plan caching.
 pub struct LiveSourceProvider {
     current: Arc<Mutex<Vec<RecordBatch>>>,
     schema: SchemaRef,
