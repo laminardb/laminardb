@@ -125,12 +125,14 @@ fn extract_quoted(s: &str) -> Option<&str> {
     } else if let Some(rest) = s.strip_prefix('"') {
         rest.find('"').map(|end| &rest[..end])
     } else {
-        // Bare word — up to whitespace or punctuation
+        // Bare word — up to whitespace or punctuation, then strip
+        // sentence-ending period (DataFusion 52.x: "No field named col.")
         let end = s.find(|c: char| c.is_whitespace() || c == ',' || c == ')');
         let word = match end {
             Some(i) => &s[..i],
             None => s,
         };
+        let word = word.strip_suffix('.').unwrap_or(word);
         if word.is_empty() {
             None
         } else {
@@ -442,6 +444,35 @@ mod tests {
         let t = translate_datafusion_error("Schema error: No field named 'baz'");
         assert_eq!(t.code, codes::COLUMN_NOT_FOUND);
         assert!(t.message.contains("baz"));
+    }
+
+    #[test]
+    fn test_column_not_found_bare_word_with_trailing_period() {
+        let t = translate_datafusion_error("No field named ref_price.");
+        assert_eq!(t.code, codes::COLUMN_NOT_FOUND);
+        assert!(
+            t.message.contains("'ref_price'"),
+            "should strip trailing period: {}",
+            t.message
+        );
+        assert!(
+            !t.message.contains("ref_price."),
+            "should not include trailing period: {}",
+            t.message
+        );
+    }
+
+    #[test]
+    fn test_column_not_found_bare_word_with_valid_fields() {
+        let t = translate_datafusion_error(
+            "Schema error: No field named ref_price. Valid fields: symbol, event_time",
+        );
+        assert_eq!(t.code, codes::COLUMN_NOT_FOUND);
+        assert!(
+            t.message.contains("'ref_price'"),
+            "should extract clean column name: {}",
+            t.message
+        );
     }
 
     #[test]
