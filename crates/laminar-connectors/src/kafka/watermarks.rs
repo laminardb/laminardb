@@ -122,7 +122,7 @@ impl KafkaWatermarkTracker {
             combined_watermark: i64::MIN,
             idle_timeout,
             max_out_of_orderness: Duration::from_secs(5),
-            metrics: WatermarkMetrics::new(),
+            metrics: WatermarkMetrics::default(),
         }
     }
 

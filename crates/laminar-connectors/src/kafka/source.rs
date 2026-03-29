@@ -1033,7 +1033,7 @@ impl SourceConnector for KafkaSource {
                     warn!(
                         skipped = error_count,
                         total = refs.len(),
-                        error_rate = format!("{error_rate:.1%}"),
+                        error_rate = %format_args!("{error_rate:.1}"),
                         "deserialized batch with poison pill isolation"
                     );
                 }
