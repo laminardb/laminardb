@@ -41,6 +41,9 @@ async fn start_redpanda() -> (testcontainers::ContainerAsync<GenericImage>, Stri
     // short-lived integration tests.
     let container = GenericImage::new("redpandadata/redpanda", "v24.3.1")
         .with_exposed_port(9092.into())
+        .with_wait_for(testcontainers::core::WaitFor::message_on_stderr(
+            "Successfully started Redpanda",
+        ))
         .with_cmd([
             "redpanda",
             "start",
@@ -54,9 +57,6 @@ async fn start_redpanda() -> (testcontainers::ContainerAsync<GenericImage>, Stri
             "--node-id",
             "0",
         ])
-        .with_wait_for(testcontainers::core::WaitFor::message_on_stderr(
-            "Successfully started Redpanda",
-        ))
         .start()
         .await
         .expect("failed to start Redpanda container");
