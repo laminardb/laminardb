@@ -1926,4 +1926,79 @@ mod tests {
         let graph = test_graph();
         assert!((graph.input_buf_pressure() - 0.0).abs() < f64::EPSILON);
     }
+
+    /// Regression test: LEFT JOIN between a streaming source and a
+    /// `ReferenceTableProvider` (lookup table) must work across multiple
+    /// cycles without panicking. Before the fix, `RepartitionExec` in the
+    /// cached physical plan had consumed internal channels on the first
+    /// cycle, causing `"partition not used yet"` on the second.
+    #[tokio::test]
+    async fn test_lookup_left_join_multi_cycle() {
+        use crate::table_store::TableStore;
+
+        let ctx = laminar_sql::create_session_context();
+        laminar_sql::register_streaming_functions(&ctx);
+
+        // Register a lookup table via ReferenceTableProvider
+        let lookup_schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("company_name", DataType::Utf8, true),
+        ]));
+        let ts = Arc::new(parking_lot::RwLock::new(TableStore::new()));
+        {
+            let mut store = ts.write();
+            store
+                .create_table("instruments", lookup_schema.clone(), "symbol")
+                .unwrap();
+            let batch = RecordBatch::try_new(
+                lookup_schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(vec!["AAPL", "GOOG"])),
+                    Arc::new(StringArray::from(vec!["Apple Inc.", "Alphabet"])),
+                ],
+            )
+            .unwrap();
+            store.upsert("instruments", &batch).unwrap();
+        }
+        let provider = crate::table_provider::ReferenceTableProvider::new(
+            "instruments".to_string(),
+            lookup_schema,
+            ts,
+        );
+        ctx.register_table("instruments", Arc::new(provider))
+            .unwrap();
+
+        let mut graph = OperatorGraph::new(ctx);
+        graph.register_source_schema("trades".to_string(), test_schema());
+
+        graph.add_query(
+            "enriched".to_string(),
+            "SELECT t.symbol, t.price, i.company_name \
+             FROM trades t LEFT JOIN instruments i ON t.symbol = i.symbol"
+                .to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let batch = test_batch(); // AAPL + GOOG
+        let mut source = FxHashMap::default();
+        source.insert(Arc::from("trades"), vec![batch.clone()]);
+
+        // Cycle 1
+        let r1 = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
+        let rows1: usize = r1
+            .get("enriched")
+            .map_or(0, |bs| bs.iter().map(|b| b.num_rows()).sum());
+        assert_eq!(rows1, 2, "cycle 1 should produce 2 joined rows");
+
+        // Cycle 2 — this panicked before the fix
+        source.insert(Arc::from("trades"), vec![batch]);
+        let r2 = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
+        let rows2: usize = r2
+            .get("enriched")
+            .map_or(0, |bs| bs.iter().map(|b| b.num_rows()).sum());
+        assert_eq!(rows2, 2, "cycle 2 should also produce 2 joined rows");
+    }
 }

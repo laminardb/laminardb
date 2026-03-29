@@ -31,9 +31,13 @@ enum QueryState {
     Agg(Box<IncrementalAggState>),
     /// Non-aggregate single-source -- compiled `PhysicalExpr` evaluation.
     Compiled(CompiledProjection),
-    /// Non-aggregate complex -- cached physical plan. `LiveSourceExec` leaf
-    /// nodes read fresh data from swapped handles on each `execute()`.
+    /// Single-source non-compilable -- cached physical plan. `LiveSourceExec`
+    /// reads fresh data from swapped handles on each `execute()`.
     CachedPlan(Arc<dyn datafusion::physical_plan::ExecutionPlan>),
+    /// Multi-source (JOIN) -- cached logical plan, physical rebuilt per cycle.
+    /// `HashJoinExec::OnceAsync` freezes the build-side hash table on first
+    /// execution, so reusing the physical plan returns stale lookup data.
+    CachedLogical(Box<LogicalPlan>),
 }
 
 pub(crate) struct SqlQueryOperator {
@@ -121,17 +125,21 @@ impl SqlQueryOperator {
                 self.state = QueryState::Compiled(proj);
                 return Ok(());
             }
+            // Single-source, non-compilable: cache physical plan.
+            // LiveSourceExec reads fresh data per execute(), so reuse is safe.
+            let physical = self
+                .ctx
+                .state()
+                .create_physical_plan(&plan)
+                .await
+                .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
+            self.log_tier(false);
+            self.state = QueryState::CachedPlan(physical);
+        } else {
+            // Multi-source (JOIN): cache logical plan, rebuild physical per cycle.
+            self.log_tier(false);
+            self.state = QueryState::CachedLogical(Box::new(plan));
         }
-
-        // Cache the physical plan. LiveSourceExec leaves read fresh data per execute().
-        let physical = self
-            .ctx
-            .state()
-            .create_physical_plan(&plan)
-            .await
-            .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
-        self.log_tier(false);
-        self.state = QueryState::CachedPlan(physical);
         Ok(())
     }
 
@@ -433,6 +441,9 @@ impl GraphOperator for SqlQueryOperator {
                     }
                 }
             },
+            QueryState::CachedLogical(ref plan) => {
+                execute_logical_plan(&self.ctx, &self.op_name, plan).await
+            }
         }
     }
 
@@ -479,7 +490,7 @@ impl GraphOperator for SqlQueryOperator {
             QueryState::Uninit => {
                 self.pending_restore = Some(cp);
             }
-            QueryState::Compiled(_) | QueryState::CachedPlan(_) => {
+            QueryState::Compiled(_) | QueryState::CachedPlan(_) | QueryState::CachedLogical(_) => {
                 tracing::warn!(
                     query = %self.op_name,
                     "Ignoring aggregate checkpoint for non-aggregate query (schema evolution?)"
