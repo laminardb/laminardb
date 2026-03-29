@@ -790,10 +790,6 @@ impl IncrementalEowcState {
         self.cached_pre_agg_plan.as_ref()
     }
 
-    /// Create an empty row key (for global aggregates with 0 group columns).
-
-    /// Convert a `Vec<ScalarValue>` key back to an `OwnedRow` (for checkpoint restore).
-
     /// Return the number of open windows.
     #[cfg(test)]
     pub fn open_window_count(&self) -> usize {
@@ -853,6 +849,7 @@ impl IncrementalEowcState {
                 group_checkpoints.push(GroupCheckpoint {
                     key: key_json,
                     acc_states,
+                    last_updated_ms: i64::MIN,
                 });
             }
             windows.push(WindowCheckpoint {
@@ -888,8 +885,11 @@ impl IncrementalEowcState {
                 let sv_key: Result<Vec<ScalarValue>, _> =
                     gc.key.iter().map(json_to_scalar).collect();
                 let sv_key = sv_key?;
-                let row_key =
-                    crate::aggregate_state::scalar_key_to_owned_row(&self.row_converter, &sv_key)?;
+                let row_key = crate::aggregate_state::scalar_key_to_owned_row(
+                    &self.row_converter,
+                    &sv_key,
+                    &self.group_types,
+                )?;
                 let mut accs = Vec::with_capacity(self.agg_specs.len());
                 for (i, spec) in self.agg_specs.iter().enumerate() {
                     let mut acc = spec.create_accumulator()?;

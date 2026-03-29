@@ -81,19 +81,29 @@ pub(crate) fn global_aggregate_key() -> arrow::row::OwnedRow {
         .clone()
 }
 
-/// Convert a `Vec<ScalarValue>` key to an `OwnedRow`.
+/// Convert a `Vec<ScalarValue>` key to an `OwnedRow`, casting to
+/// `target_types` when `json_to_scalar` has widened the types.
 pub(crate) fn scalar_key_to_owned_row(
     row_converter: &arrow::row::RowConverter,
     sv_key: &[ScalarValue],
+    target_types: &[DataType],
 ) -> Result<arrow::row::OwnedRow, DbError> {
     if sv_key.is_empty() {
         return Ok(global_aggregate_key());
     }
     let arrays: Vec<ArrayRef> = sv_key
         .iter()
-        .map(|sv| {
-            sv.to_array()
-                .map_err(|e| DbError::Pipeline(format!("scalar to array: {e}")))
+        .enumerate()
+        .map(|(i, sv)| {
+            let arr = sv
+                .to_array()
+                .map_err(|e| DbError::Pipeline(format!("scalar to array: {e}")))?;
+            if i < target_types.len() && arr.data_type() != &target_types[i] {
+                arrow::compute::cast(&arr, &target_types[i])
+                    .map_err(|e| DbError::Pipeline(format!("key type cast: {e}")))
+            } else {
+                Ok(arr)
+            }
         })
         .collect::<Result<_, _>>()?;
     let rows = row_converter
@@ -306,6 +316,13 @@ pub(crate) struct GroupCheckpoint {
     pub key: Vec<serde_json::Value>,
     /// Per-accumulator state vectors.
     pub acc_states: Vec<Vec<serde_json::Value>>,
+    /// Watermark at which this group was last updated (for TTL).
+    #[serde(default = "default_last_updated")]
+    pub last_updated_ms: i64,
+}
+
+fn default_last_updated() -> i64 {
+    i64::MIN
 }
 
 /// Serializable checkpoint for all groups in an agg state.
@@ -896,12 +913,16 @@ impl IncrementalAggState {
         };
 
         let weight_col_idx = if source_has_weight {
-            // Reject non-retractable aggregates over changelog streams.
+            // Only SUM is mathematically correct with Z-set weight
+            // multiplication (SUM(x * w)). COUNT ignores weights,
+            // AVG's internal count doesn't account for weights, and
+            // MIN/MAX can't retract without full state.
             for spec in &agg_specs {
                 let name = spec.udf.name().to_lowercase();
-                if matches!(name.as_str(), "min" | "max" | "first_value" | "last_value") {
+                if !matches!(name.as_str(), "sum") {
                     return Err(DbError::Pipeline(format!(
-                        "Cannot compute {}() over a changelog stream (EMIT CHANGES). \
+                        "Cannot compute {}() over a changelog stream. \
+                         Only SUM is supported for cascaded changelog aggregation. \
                          Use EMIT ON WINDOW CLOSE or a non-updating source.",
                         spec.udf.name()
                     )));
@@ -922,7 +943,10 @@ impl IncrementalAggState {
         );
 
         // Build compiled projection for single-source queries.
-        let compiled_projection = if compile_ok {
+        // Skip compilation when upstream has __weight — the compiled path
+        // doesn't include the weight column, so process_batch would read
+        // the wrong index. The cached plan path handles it via pre_agg_sql.
+        let compiled_projection = if compile_ok && weight_col_idx.is_none() {
             let source_table = compile_source.unwrap();
             // Compile WHERE predicate
             let filter = if let Some(where_pred) = &agg_info.where_predicate {
@@ -1444,6 +1468,7 @@ impl IncrementalAggState {
             groups.push(GroupCheckpoint {
                 key: key_json,
                 acc_states,
+                last_updated_ms: entry.last_updated_ms,
             });
         }
         // Serialize last_emitted for changelog recovery.
@@ -1487,7 +1512,7 @@ impl IncrementalAggState {
             // Decode JSON → ScalarValue → Array → OwnedRow.
             let sv_key: Result<Vec<ScalarValue>, _> = gc.key.iter().map(json_to_scalar).collect();
             let sv_key = sv_key?;
-            let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key)?;
+            let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key, &self.group_types)?;
 
             let mut accs = Vec::with_capacity(self.agg_specs.len());
             for (i, spec) in self.agg_specs.iter().enumerate() {
@@ -1512,7 +1537,7 @@ impl IncrementalAggState {
                 row_key,
                 GroupEntry {
                     accs,
-                    last_updated_ms: i64::MIN,
+                    last_updated_ms: gc.last_updated_ms,
                 },
             );
         }
@@ -1522,7 +1547,7 @@ impl IncrementalAggState {
         for ec in &checkpoint.last_emitted {
             let sv_key: Result<Vec<ScalarValue>, _> = ec.key.iter().map(json_to_scalar).collect();
             let sv_key = sv_key?;
-            let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key)?;
+            let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key, &self.group_types)?;
             let vals: Result<Vec<ScalarValue>, _> = ec.values.iter().map(json_to_scalar).collect();
             self.last_emitted.insert(row_key, vals?);
         }

@@ -1389,6 +1389,7 @@ impl CoreWindowState {
                         group_checkpoints.push(GroupCheckpoint {
                             key: key_json,
                             acc_states,
+                            last_updated_ms: i64::MIN,
                         });
                     }
                     windows.push(WindowCheckpoint {
@@ -1478,8 +1479,11 @@ impl CoreWindowState {
                 let sv_key: Result<Vec<ScalarValue>, _> =
                     gc.key.iter().map(json_to_scalar).collect();
                 let sv_key = sv_key?;
-                let row_key =
-                    crate::aggregate_state::scalar_key_to_owned_row(&self.row_converter, &sv_key)?;
+                let row_key = crate::aggregate_state::scalar_key_to_owned_row(
+                    &self.row_converter,
+                    &sv_key,
+                    &self.group_types,
+                )?;
                 let mut accs = Vec::with_capacity(self.agg_specs.len());
                 for (i, spec) in self.agg_specs.iter().enumerate() {
                     let mut acc = spec.create_accumulator()?;
@@ -1519,8 +1523,11 @@ impl CoreWindowState {
         for sgc in &checkpoint.session_state {
             let sv_key: Result<Vec<ScalarValue>, _> = sgc.key.iter().map(json_to_scalar).collect();
             let sv_key = sv_key?;
-            let row_key =
-                crate::aggregate_state::scalar_key_to_owned_row(&self.row_converter, &sv_key)?;
+            let row_key = crate::aggregate_state::scalar_key_to_owned_row(
+                &self.row_converter,
+                &sv_key,
+                &self.group_types,
+            )?;
             let mut sessions = BTreeMap::new();
             for sc in &sgc.sessions {
                 let mut accs = Vec::with_capacity(self.agg_specs.len());
