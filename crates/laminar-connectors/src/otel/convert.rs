@@ -118,9 +118,21 @@ fn write_json_string(buf: &mut String, s: &str) {
     buf.push('"');
 }
 
-/// Write an `AnyValue` as JSON.
+/// Maximum nesting depth for `AnyValue` JSON serialization.
+/// Protects against stack overflow from malicious OTLP payloads.
+const MAX_JSON_DEPTH: usize = 32;
+
+/// Write an `AnyValue` as JSON with bounded recursion depth.
 fn write_any_value_json(buf: &mut String, v: &AnyValue) {
+    write_any_value_json_depth(buf, v, 0);
+}
+
+fn write_any_value_json_depth(buf: &mut String, v: &AnyValue, depth: usize) {
     use opentelemetry_proto::tonic::common::v1::any_value::Value;
+    if depth >= MAX_JSON_DEPTH {
+        buf.push_str("null");
+        return;
+    }
     match &v.value {
         Some(Value::StringValue(s)) => write_json_string(buf, s),
         Some(Value::BoolValue(b)) => buf.push_str(if *b { "true" } else { "false" }),
@@ -142,7 +154,7 @@ fn write_any_value_json(buf: &mut String, v: &AnyValue) {
                 if i > 0 {
                     buf.push(',');
                 }
-                write_any_value_json(buf, val);
+                write_any_value_json_depth(buf, val, depth + 1);
             }
             buf.push(']');
         }
@@ -155,7 +167,7 @@ fn write_any_value_json(buf: &mut String, v: &AnyValue) {
                 write_json_string(buf, &kv.key);
                 buf.push(':');
                 if let Some(val) = &kv.value {
-                    write_any_value_json(buf, val);
+                    write_any_value_json_depth(buf, val, depth + 1);
                 } else {
                     buf.push_str("null");
                 }

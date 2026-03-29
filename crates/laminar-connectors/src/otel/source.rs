@@ -144,6 +144,7 @@ impl SourceConnector for OtelSource {
 
         let mut total_rows = 0usize;
         let mut batches: Vec<RecordBatch> = Vec::new();
+        let mut disconnected = false;
 
         loop {
             match rx.try_recv() {
@@ -157,13 +158,18 @@ impl SourceConnector for OtelSource {
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     self.state = ConnectorState::Closed;
-                    return Err(ConnectorError::Closed);
+                    disconnected = true;
+                    break;
                 }
             }
         }
 
         if batches.is_empty() {
-            return Ok(None);
+            return if disconnected {
+                Err(ConnectorError::Closed)
+            } else {
+                Ok(None)
+            };
         }
 
         self.checkpoint_seq += 1;
