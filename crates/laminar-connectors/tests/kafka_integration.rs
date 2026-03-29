@@ -1,7 +1,8 @@
 //! Integration tests for Kafka source connector.
 //!
-//! Requires Docker. Uses a single shared Redpanda container for all tests
-//! (each test uses a unique topic to avoid interference).
+//! Requires Docker. Uses a single Redpanda container with a fixed host port.
+//! All test scenarios run sequentially within one `#[tokio::test]` to avoid
+//! port conflicts from parallel container starts.
 //!
 //! Run with: `cargo test --test kafka_integration --features kafka`
 
@@ -19,7 +20,6 @@ use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::GenericImage;
 use testcontainers::ImageExt;
-use tokio::sync::OnceCell;
 use tokio::time::sleep;
 
 use laminar_connectors::config::ConnectorConfig;
@@ -33,52 +33,8 @@ fn test_schema() -> SchemaRef {
     ]))
 }
 
-/// Fixed host port for Redpanda. Using a fixed port with `with_mapped_port`
-/// so the advertised Kafka address matches the address clients connect to.
 const REDPANDA_HOST_PORT: u16 = 19092;
 
-/// Shared Redpanda container — started once, reused by all tests.
-/// Each test uses a unique topic name to avoid interference.
-static REDPANDA: OnceCell<(testcontainers::ContainerAsync<GenericImage>, String)> =
-    OnceCell::const_new();
-
-async fn get_brokers() -> &'static str {
-    let (_, brokers) = REDPANDA
-        .get_or_init(|| async {
-            let container = GenericImage::new("redpandadata/redpanda", "v24.3.1")
-                .with_exposed_port(9092.into())
-                .with_wait_for(testcontainers::core::WaitFor::message_on_stderr(
-                    "Successfully started Redpanda",
-                ))
-                .with_mapped_port(REDPANDA_HOST_PORT, 9092.tcp())
-                .with_cmd([
-                    "redpanda",
-                    "start",
-                    "--smp",
-                    "1",
-                    "--memory",
-                    "256M",
-                    "--overprovisioned",
-                    "--kafka-addr",
-                    "PLAINTEXT://0.0.0.0:9092",
-                    "--advertise-kafka-addr",
-                    "PLAINTEXT://127.0.0.1:19092",
-                    "--node-id",
-                    "0",
-                ])
-                .start()
-                .await
-                .expect("failed to start Redpanda container");
-
-            let brokers = format!("127.0.0.1:{REDPANDA_HOST_PORT}");
-            sleep(Duration::from_secs(2)).await;
-            (container, brokers)
-        })
-        .await;
-    brokers
-}
-
-/// Produces N JSON messages to the given topic.
 async fn produce_messages(brokers: &str, topic: &str, count: usize) {
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", brokers)
@@ -100,7 +56,6 @@ async fn produce_messages(brokers: &str, topic: &str, count: usize) {
     }
 }
 
-/// Polls the source until `expected` records are collected or timeout.
 async fn poll_all(
     source: &mut KafkaSource,
     expected: usize,
@@ -124,28 +79,65 @@ async fn poll_all(
     batches
 }
 
+fn make_config(brokers: &str, group_id: &str, topic: &str) -> KafkaSourceConfig {
+    KafkaSourceConfig {
+        bootstrap_servers: brokers.to_string(),
+        group_id: group_id.into(),
+        subscription: TopicSubscription::Topics(vec![topic.into()]),
+        ..KafkaSourceConfig::default()
+    }
+}
+
+/// Single test entry point — starts one Redpanda container and runs all
+/// scenarios sequentially to avoid fixed-port conflicts.
 #[tokio::test]
-async fn test_produce_consume_roundtrip() {
-    let brokers = get_brokers().await;
+async fn kafka_source_integration() {
+    let _container = GenericImage::new("redpandadata/redpanda", "v24.3.1")
+        .with_exposed_port(9092.into())
+        .with_wait_for(testcontainers::core::WaitFor::message_on_stderr(
+            "Successfully started Redpanda",
+        ))
+        .with_mapped_port(REDPANDA_HOST_PORT, 9092.tcp())
+        .with_cmd([
+            "redpanda",
+            "start",
+            "--smp",
+            "1",
+            "--memory",
+            "256M",
+            "--overprovisioned",
+            "--kafka-addr",
+            "PLAINTEXT://0.0.0.0:9092",
+            "--advertise-kafka-addr",
+            "PLAINTEXT://127.0.0.1:19092",
+            "--node-id",
+            "0",
+        ])
+        .start()
+        .await
+        .expect("failed to start Redpanda container");
+
+    let brokers = format!("127.0.0.1:{REDPANDA_HOST_PORT}");
+    sleep(Duration::from_secs(2)).await;
+
+    roundtrip(&brokers).await;
+    checkpoint_restore(&brokers).await;
+    poison_pill(&brokers).await;
+}
+
+async fn roundtrip(brokers: &str) {
     let topic = "test-roundtrip";
     let n = 50;
 
     produce_messages(brokers, topic, n).await;
 
-    let cfg = KafkaSourceConfig {
-        bootstrap_servers: brokers.to_string(),
-        group_id: "test-roundtrip-group".into(),
-        subscription: TopicSubscription::Topics(vec![topic.into()]),
-        ..KafkaSourceConfig::default()
-    };
-
+    let cfg = make_config(brokers, "test-roundtrip-group", topic);
     let mut source = KafkaSource::new(test_schema(), cfg);
     let connector_cfg = ConnectorConfig::new("kafka");
     source.open(&connector_cfg).await.unwrap();
 
     let batches = poll_all(&mut source, n, Duration::from_secs(30)).await;
 
-    // Verify content.
     let mut seen_ids: Vec<i64> = Vec::new();
     for batch in &batches {
         let ids = batch
@@ -171,35 +163,25 @@ async fn test_produce_consume_roundtrip() {
     source.close().await.unwrap();
 }
 
-#[tokio::test]
-async fn test_checkpoint_restore() {
-    let brokers = get_brokers().await;
+async fn checkpoint_restore(brokers: &str) {
     let topic = "test-checkpoint";
     let n = 20;
 
     produce_messages(brokers, topic, n).await;
 
-    // Phase 1: consume all, checkpoint.
-    let cfg = KafkaSourceConfig {
-        bootstrap_servers: brokers.to_string(),
-        group_id: "test-checkpoint-group".into(),
-        subscription: TopicSubscription::Topics(vec![topic.into()]),
-        ..KafkaSourceConfig::default()
-    };
+    let cfg = make_config(brokers, "test-checkpoint-group", topic);
+    let connector_cfg = ConnectorConfig::new("kafka");
 
     let mut source = KafkaSource::new(test_schema(), cfg.clone());
-    let connector_cfg = ConnectorConfig::new("kafka");
     source.open(&connector_cfg).await.unwrap();
 
     poll_all(&mut source, n, Duration::from_secs(30)).await;
     let checkpoint = source.checkpoint();
     source.close().await.unwrap();
 
-    // Produce more messages after checkpoint.
     let extra = 10;
     produce_messages(brokers, topic, extra).await;
 
-    // Phase 2: restore from checkpoint, should only get the extra messages.
     let mut source2 = KafkaSource::new(test_schema(), cfg);
     source2.open(&connector_cfg).await.unwrap();
     source2.restore(&checkpoint).await.unwrap();
@@ -211,12 +193,9 @@ async fn test_checkpoint_restore() {
     source2.close().await.unwrap();
 }
 
-#[tokio::test]
-async fn test_poison_pill_isolation() {
-    let brokers = get_brokers().await;
+async fn poison_pill(brokers: &str) {
     let topic = "test-poison";
 
-    // Produce a mix of valid JSON and garbage.
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", brokers)
         .set("message.timeout.ms", "5000")
@@ -241,23 +220,18 @@ async fn test_poison_pill_isolation() {
     }
 
     let cfg = KafkaSourceConfig {
-        bootstrap_servers: brokers.to_string(),
-        group_id: "test-poison-group".into(),
-        subscription: TopicSubscription::Topics(vec![topic.into()]),
         max_deser_error_rate: 0.5,
-        ..KafkaSourceConfig::default()
+        ..make_config(brokers, "test-poison-group", topic)
     };
 
     let mut source = KafkaSource::new(test_schema(), cfg);
     let connector_cfg = ConnectorConfig::new("kafka");
     source.open(&connector_cfg).await.unwrap();
 
-    // Should get the 2 good records; the poison pill is skipped.
     let batches = poll_all(&mut source, 2, Duration::from_secs(30)).await;
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 2);
 
-    // Verify the good records came through.
     let mut ids: Vec<i64> = Vec::new();
     for batch in &batches {
         let col = batch
