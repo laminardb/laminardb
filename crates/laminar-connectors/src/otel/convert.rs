@@ -1015,6 +1015,7 @@ mod tests {
                         make_kv("host.name", "test-host"),
                     ],
                     dropped_attributes_count: 0,
+                    entity_refs: vec![],
                 }),
                 scope_spans: vec![ScopeSpans {
                     scope: Some(InstrumentationScope {
@@ -1252,6 +1253,7 @@ mod tests {
                 resource: Some(ProtoResource {
                     attributes: vec![make_kv("service.name", "metrics-svc")],
                     dropped_attributes_count: 0,
+                    entity_refs: vec![],
                 }),
                 scope_metrics: vec![ScopeMetrics {
                     scope: Some(InstrumentationScope {
@@ -1478,6 +1480,7 @@ mod tests {
             flags: 0,
             trace_id: vec![],
             span_id: vec![],
+            event_name: String::new(),
         }
     }
 
@@ -1487,6 +1490,7 @@ mod tests {
                 resource: Some(ProtoResource {
                     attributes: vec![make_kv("service.name", "log-svc")],
                     dropped_attributes_count: 0,
+                    entity_refs: vec![],
                 }),
                 scope_logs: vec![ScopeLogs {
                     scope: Some(InstrumentationScope {

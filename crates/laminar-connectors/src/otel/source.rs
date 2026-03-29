@@ -91,9 +91,7 @@ impl SourceConnector for OtelSource {
         let listener = TcpListener::bind(&addr)
             .await
             .map_err(|e| ConnectorError::ConnectionFailed(format!("failed to bind {addr}: {e}")))?;
-        let incoming = TcpIncoming::from_listener(listener, true, None).map_err(|e| {
-            ConnectorError::ConnectionFailed(format!("failed to create listener stream: {e}"))
-        })?;
+        let incoming = TcpIncoming::from(listener).with_nodelay(Some(true));
 
         let send_timeout = Duration::from_secs(5);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -288,12 +286,13 @@ fn spawn_grpc_server<S>(
 ) -> JoinHandle<()>
 where
     S: tonic::codegen::Service<
-            tonic::codegen::http::Request<tonic::body::BoxBody>,
-            Response = tonic::codegen::http::Response<tonic::body::BoxBody>,
+            tonic::codegen::http::Request<tonic::body::Body>,
+            Response = tonic::codegen::http::Response<tonic::body::Body>,
             Error = std::convert::Infallible,
         > + tonic::server::NamedService
         + Clone
         + Send
+        + Sync
         + 'static,
     S::Future: Send + 'static,
 {
