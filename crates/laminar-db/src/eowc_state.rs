@@ -429,6 +429,7 @@ impl IncrementalEowcState {
                     output_name,
                     return_type,
                     distinct: is_distinct,
+                    is_count_star: agg_func.params.args.is_empty(),
                     filter_col_index,
                 });
             } else {
@@ -1146,6 +1147,7 @@ mod tests {
             output_name: "total".to_string(),
             return_type: DataType::Int64,
             distinct: false,
+            is_count_star: false,
             filter_col_index: None,
         }];
 
