@@ -11,8 +11,10 @@ use std::time::Duration;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::task::JoinHandle;
+use tonic::transport::server::TcpIncoming;
 
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsServiceServer;
 use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
@@ -82,43 +84,41 @@ impl SourceConnector for OtelSource {
         let (batch_tx, batch_rx) = mpsc::channel(self.config.channel_capacity);
         self.batch_rx = Some(batch_rx);
 
-        let addr = self.config.socket_addr().parse().map_err(|e| {
-            ConnectorError::ConfigurationError(format!(
-                "invalid bind address '{}': {e}",
-                self.config.socket_addr()
-            ))
+        let addr = self.config.socket_addr();
+
+        // Bind the TCP listener here so port conflicts fail open(),
+        // not silently inside the background task.
+        let listener = TcpListener::bind(&addr)
+            .await
+            .map_err(|e| ConnectorError::ConnectionFailed(format!("failed to bind {addr}: {e}")))?;
+        let incoming = TcpIncoming::from_listener(listener, true, None).map_err(|e| {
+            ConnectorError::ConnectionFailed(format!("failed to create listener stream: {e}"))
         })?;
 
         let send_timeout = Duration::from_secs(5);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         self.shutdown_tx = Some(shutdown_tx);
 
-        let schema = Arc::clone(&self.schema);
-        let data_ready = Arc::clone(&self.data_ready);
-        let records_received = Arc::clone(&self.records_received);
-        let requests_received = Arc::clone(&self.requests_received);
-        let batch_size = self.config.batch_size;
-
         let receiver = OtelReceiver::new(
             batch_tx,
-            schema,
-            data_ready,
-            records_received,
-            requests_received,
+            Arc::clone(&self.schema),
+            Arc::clone(&self.data_ready),
+            Arc::clone(&self.records_received),
+            Arc::clone(&self.requests_received),
             send_timeout,
-            batch_size,
+            self.config.batch_size,
         );
 
-        // Spawn signal-specific gRPC server
+        // Spawn signal-specific gRPC server on the already-bound listener
         let server_handle = match self.config.signals {
             OtelSignal::Traces => {
-                spawn_grpc_server(TraceServiceServer::new(receiver), addr, shutdown_rx)
+                spawn_grpc_server(TraceServiceServer::new(receiver), incoming, shutdown_rx)
             }
             OtelSignal::Metrics => {
-                spawn_grpc_server(MetricsServiceServer::new(receiver), addr, shutdown_rx)
+                spawn_grpc_server(MetricsServiceServer::new(receiver), incoming, shutdown_rx)
             }
             OtelSignal::Logs => {
-                spawn_grpc_server(LogsServiceServer::new(receiver), addr, shutdown_rx)
+                spawn_grpc_server(LogsServiceServer::new(receiver), incoming, shutdown_rx)
             }
         };
 
@@ -126,7 +126,7 @@ impl SourceConnector for OtelSource {
         self.state = ConnectorState::Running;
 
         tracing::info!(
-            addr = %self.config.socket_addr(),
+            %addr,
             signals = ?self.config.signals,
             batch_size = self.config.batch_size,
             "OTel source connector started"
@@ -280,10 +280,10 @@ impl SourceConnector for OtelSource {
     }
 }
 
-/// Spawn a tonic gRPC server with graceful shutdown for any service type.
+/// Spawn a tonic gRPC server on a pre-bound listener with graceful shutdown.
 fn spawn_grpc_server<S>(
     svc: S,
-    addr: std::net::SocketAddr,
+    incoming: TcpIncoming,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> JoinHandle<()>
 where
@@ -298,10 +298,9 @@ where
     S::Future: Send + 'static,
 {
     tokio::spawn(async move {
-        tracing::info!(%addr, "OTel gRPC server starting");
         if let Err(e) = tonic::transport::Server::builder()
             .add_service(svc)
-            .serve_with_shutdown(addr, async move {
+            .serve_with_incoming_shutdown(incoming, async move {
                 let _ = shutdown_rx.wait_for(|&v| v).await;
             })
             .await
