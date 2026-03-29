@@ -66,6 +66,7 @@ mod pipeline_lifecycle;
 pub mod profile;
 /// Unified recovery manager.
 pub mod recovery_manager;
+mod retractable_accumulator;
 mod show_commands;
 mod sink_task;
 mod sql_analysis;
