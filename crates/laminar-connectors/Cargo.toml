@@ -82,6 +82,12 @@ tokio-tungstenite = { version = "0.28", features = ["native-tls"], optional = tr
 tungstenite = { version = "0.28", optional = true }
 futures-util = { version = "0.3", features = ["sink"], optional = true }
 
+# OpenTelemetry OTLP/gRPC receiver
+opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "trace", "metrics", "logs"], optional = true }
+tonic = { version = "0.14", optional = true }
+prost = { version = "0.14", optional = true }
+base64 = { workspace = true, optional = true }
+
 # File source/sink
 globset = { workspace = true, optional = true }
 notify = { workspace = true, optional = true }
@@ -115,6 +121,8 @@ kafka-discovery = ["kafka", "laminar-core/delta", "dep:tokio-util"]
 websocket = ["dep:tokio-tungstenite", "dep:tungstenite", "dep:futures-util", "dep:url"]
 # File source and sink (AutoLoader-style)
 files = ["dep:notify", "dep:globset", "dep:object_store", "dep:parquet", "dep:libc", "dep:tokio-stream", "dep:xorf"]
+# OpenTelemetry OTLP/gRPC source
+otel = ["dep:opentelemetry-proto", "dep:tonic", "dep:prost", "dep:base64"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
