@@ -266,6 +266,7 @@ impl KafkaSource {
     /// - **HWM**: periodic high watermark queries for lag monitoring
     ///
     /// Deferred to allow `restore()` to access the consumer directly after `open()`.
+    #[allow(clippy::too_many_lines)]
     fn ensure_reader_started(&mut self) {
         if self.reader_handle.is_some() || self.consumer.is_none() {
             return;
@@ -955,8 +956,7 @@ impl SourceConnector for KafkaSource {
                     let compat = self
                         .config
                         .schema_compatibility
-                        .map(CompatibilityMode::from)
-                        .unwrap_or(CompatibilityMode::Backward);
+                        .map_or(CompatibilityMode::Backward, CompatibilityMode::from);
                     let evolver = SchemaEvolution::new(compat);
 
                     for id in new_schema_ids {
