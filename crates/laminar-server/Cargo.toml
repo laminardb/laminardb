@@ -92,6 +92,7 @@ default = [
     "mongodb-cdc",
     "files",
     "parquet-lookup",
+    "otel",
 ]
 jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
