@@ -152,7 +152,8 @@ impl KafkaSink {
     pub fn new(schema: SchemaRef, config: KafkaSinkConfig) -> Self {
         let avro_schema_id = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let serializer =
-            select_serializer(config.format, &schema, Arc::clone(&avro_schema_id), None);
+            select_serializer(config.format, &schema, Arc::clone(&avro_schema_id), None)
+                .expect("format validated in KafkaSinkConfig::validate()");
         let partitioner = select_partitioner(config.partitioner);
 
         Self {
@@ -187,7 +188,8 @@ impl KafkaSink {
             &schema,
             Arc::clone(&avro_schema_id),
             Some(Arc::clone(&sr)),
-        );
+        )
+        .expect("format validated in KafkaSinkConfig::validate()");
         let partitioner = select_partitioner(config.partitioner);
 
         Self {
@@ -285,7 +287,7 @@ impl KafkaSink {
                 &self.schema,
                 Arc::clone(&self.avro_schema_id),
                 self.schema_registry.clone(),
-            );
+            )?;
         }
 
         Ok(())
@@ -456,7 +458,7 @@ impl SinkConnector for KafkaSink {
                 &self.schema,
                 Arc::clone(&self.avro_schema_id),
                 self.schema_registry.clone(),
-            );
+            )?;
             self.partitioner = select_partitioner(self.config.partitioner);
         }
 
@@ -935,15 +937,16 @@ fn select_serializer(
     schema: &SchemaRef,
     schema_id: Arc<std::sync::atomic::AtomicU32>,
     registry: Option<Arc<SchemaRegistryClient>>,
-) -> Box<dyn RecordSerializer> {
+) -> Result<Box<dyn RecordSerializer>, ConnectorError> {
     match format {
-        Format::Avro => Box::new(AvroSerializer::with_shared_schema_id(
+        Format::Avro => Ok(Box::new(AvroSerializer::with_shared_schema_id(
             schema.clone(),
             schema_id,
             registry,
-        )),
-        other => serde::create_serializer(other)
-            .expect("serializer creation failed for validated format"),
+        ))),
+        other => serde::create_serializer(other).map_err(|e| {
+            ConnectorError::ConfigurationError(format!("unsupported sink format '{other}': {e}"))
+        }),
     }
 }
 
