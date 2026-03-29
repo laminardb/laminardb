@@ -46,6 +46,7 @@ pub(crate) struct ConnectorPipelineCallback {
         crate::sink_task::SinkTaskHandle,
         Option<String>,
         String, // input stream name (FROM clause target)
+        bool,   // changelog-capable sink
     )>,
     pub(crate) watermark_states: FxHashMap<String, SourceWatermarkState>,
     pub(crate) source_entries_for_wm: FxHashMap<String, Arc<crate::catalog::SourceEntry>>,
@@ -115,7 +116,7 @@ impl ConnectorPipelineCallback {
             self.compiled_sink_filters.push(None);
         }
 
-        for (i, (_, _, filter_sql, sink_input)) in self.sinks.iter().enumerate() {
+        for (i, (_, _, filter_sql, sink_input, _)) in self.sinks.iter().enumerate() {
             // Skip if no filter or already compiled.
             if filter_sql.is_none() || self.compiled_sink_filters[i].is_some() {
                 continue;
@@ -212,7 +213,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .sinks
             .iter()
             .enumerate()
-            .filter_map(|(sink_idx, (sink_name, handle, filter_expr, sink_input))| {
+            .filter_map(|(sink_idx, (sink_name, handle, filter_expr, sink_input, changelog_capable))| {
                 // Route by FROM clause: only send matching results.
                 let batches = results.get(sink_input.as_str())?;
                 if batches.is_empty() {
@@ -263,6 +264,9 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         } else {
                             batch.clone()
                         };
+
+                        let filtered =
+                            crate::changelog_filter::prepare_for_sink(&filtered, *changelog_capable);
 
                         if filtered.num_rows() > 0 {
                             match tokio::time::timeout(write_timeout, handle.write_batch(filtered))
@@ -674,8 +678,14 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 window_config,
                 order_config,
             } => {
-                self.graph
-                    .add_query(name.clone(), sql, emit_clause, window_config, order_config);
+                self.graph.add_query(
+                    name.clone(),
+                    sql,
+                    emit_clause,
+                    window_config,
+                    order_config,
+                    None,
+                );
                 tracing::info!(stream = %name, "Stream added via control channel");
             }
             crate::pipeline::ControlMsg::DropStream { name } => {

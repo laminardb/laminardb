@@ -4,7 +4,7 @@
 //! introspects the SQL via `DataFusion` to determine the execution path:
 //! - Aggregate (GROUP BY) -> incremental accumulators
 //! - Simple single-source -> compiled `PhysicalExpr` projection
-//! - Complex non-aggregate -> cached `LogicalPlan` (physical planning per cycle)
+//! - Complex non-aggregate -> cached physical plan (`LiveSourceExec` reads fresh data)
 
 use std::sync::Arc;
 
@@ -21,6 +21,8 @@ use crate::metrics::PipelineCounters;
 use crate::operator_graph::{try_evaluate_compiled, GraphOperator, OperatorCheckpoint};
 use crate::sql_analysis::{extract_projection_filter, single_source_table};
 
+use super::execute_logical_plan;
+
 /// Internal state for the query operator (lazy initialization).
 enum QueryState {
     /// Not yet initialized -- need to introspect SQL on first call.
@@ -28,11 +30,10 @@ enum QueryState {
     /// Aggregate query -- incremental accumulator path.
     Agg(Box<IncrementalAggState>),
     /// Non-aggregate single-source -- compiled `PhysicalExpr` evaluation.
-    /// Carries a fallback `LogicalPlan` for runtime errors (e.g., type mismatches
-    /// not caught during compilation).
-    Compiled(CompiledProjection, Box<LogicalPlan>),
-    /// Non-aggregate complex -- cached `LogicalPlan` (physical planning per cycle).
-    CachedPlan(Box<LogicalPlan>),
+    Compiled(CompiledProjection),
+    /// Non-aggregate complex -- cached physical plan. `LiveSourceExec` leaf
+    /// nodes read fresh data from swapped handles on each `execute()`.
+    CachedPlan(Arc<dyn datafusion::physical_plan::ExecutionPlan>),
 }
 
 pub(crate) struct SqlQueryOperator {
@@ -44,6 +45,8 @@ pub(crate) struct SqlQueryOperator {
     pending_restore: Option<AggStateCheckpoint>,
     tier_logged: bool,
     cached_having_plan: Option<LogicalPlan>,
+    emit_changelog: bool,
+    idle_ttl_ms: Option<u64>,
 }
 
 impl SqlQueryOperator {
@@ -52,6 +55,8 @@ impl SqlQueryOperator {
         sql: &str,
         ctx: SessionContext,
         counters: Option<Arc<PipelineCounters>>,
+        emit_changelog: bool,
+        idle_ttl_ms: Option<u64>,
     ) -> Self {
         Self {
             op_name: Arc::from(name),
@@ -62,19 +67,15 @@ impl SqlQueryOperator {
             pending_restore: None,
             tier_logged: false,
             cached_having_plan: None,
+            emit_changelog,
+            idle_ttl_ms,
         }
     }
 
-    /// Lazily initialize the query state on first `process()` call.
-    ///
-    /// Introspects the SQL via `DataFusion` to determine whether this is an
-    /// aggregate query (GROUP BY) or a non-aggregate query, then selects
-    /// the appropriate execution path.
     async fn lazy_init(&mut self) -> Result<(), DbError> {
         // 1. Try aggregate path first
-        match IncrementalAggState::try_from_sql(&self.ctx, &self.sql).await {
+        match IncrementalAggState::try_from_sql(&self.ctx, &self.sql, self.emit_changelog).await {
             Ok(Some(mut agg_state)) => {
-                // Apply any pending checkpoint before switching state.
                 if let Some(ref cp) = self.pending_restore {
                     if let Err(e) = agg_state.restore_groups(cp) {
                         tracing::warn!(
@@ -85,14 +86,14 @@ impl SqlQueryOperator {
                     }
                 }
                 self.pending_restore = None;
-
+                if let Some(ttl) = self.idle_ttl_ms {
+                    agg_state.idle_ttl_ms = Some(ttl);
+                }
                 self.log_tier(agg_state.compiled_projection().is_some());
                 self.state = QueryState::Agg(Box::new(agg_state));
                 return Ok(());
             }
-            Ok(None) => {
-                // Not an aggregate query -- fall through to non-agg paths.
-            }
+            Ok(None) => {}
             Err(e) => {
                 tracing::debug!(
                     query = %self.op_name,
@@ -102,18 +103,14 @@ impl SqlQueryOperator {
             }
         }
 
-        // 2. Non-aggregate: try compiled projection for single-source queries,
-        //    otherwise cache the logical plan.
+        // 2. Non-aggregate: try compiled projection, otherwise cache physical plan.
         let df = self
             .ctx
             .sql(&self.sql)
             .await
             .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
-
         let plan = df.logical_plan().clone();
 
-        // Only attempt compiled projection for single-source queries
-        // (rejects self-joins, multi-source, etc.)
         if single_source_table(&self.sql).is_some() {
             if let Some(proj) = self.try_build_compiled_projection(&plan) {
                 tracing::debug!(
@@ -121,23 +118,28 @@ impl SqlQueryOperator {
                     "Non-aggregate single-source query compiled to PhysicalExpr"
                 );
                 self.log_tier(true);
-                self.state = QueryState::Compiled(proj, Box::new(plan));
+                self.state = QueryState::Compiled(proj);
                 return Ok(());
             }
         }
 
+        // Cache the physical plan. LiveSourceExec leaves read fresh data per execute().
+        let physical = self
+            .ctx
+            .state()
+            .create_physical_plan(&plan)
+            .await
+            .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
         self.log_tier(false);
-        self.state = QueryState::CachedPlan(Box::new(plan));
+        self.state = QueryState::CachedPlan(physical);
         Ok(())
     }
 
-    /// Log the execution tier (compiled vs. cached plan) once per query.
     fn log_tier(&mut self, compiled: bool) {
         if self.tier_logged {
             return;
         }
         self.tier_logged = true;
-
         if let Some(ref c) = self.counters {
             if compiled {
                 c.queries_compiled
@@ -149,10 +151,6 @@ impl SqlQueryOperator {
         }
     }
 
-    /// Try to build a `CompiledProjection` from a logical plan.
-    ///
-    /// Returns `Some` if the plan is a simple Projection + Filter over a single
-    /// `TableScan` and all expressions compile to `PhysicalExpr`.
     fn try_build_compiled_projection(
         &self,
         plan: &datafusion_expr::LogicalPlan,
@@ -195,19 +193,51 @@ impl SqlQueryOperator {
         })
     }
 
+    /// Build a physical plan from `self.sql` and store it as `CachedPlan`.
+    async fn build_and_cache_physical_plan(&mut self) -> Result<(), DbError> {
+        let df = self
+            .ctx
+            .sql(&self.sql)
+            .await
+            .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
+        let plan = df.logical_plan().clone();
+        let physical = self
+            .ctx
+            .state()
+            .create_physical_plan(&plan)
+            .await
+            .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
+        self.state = QueryState::CachedPlan(physical);
+        Ok(())
+    }
+
+    /// Execute the cached physical plan. Assumes state is `CachedPlan`.
+    async fn execute_cached_plan(&self) -> Result<Vec<RecordBatch>, DbError> {
+        let QueryState::CachedPlan(ref plan) = self.state else {
+            return Err(DbError::Pipeline(
+                "internal: execute_cached_plan called on non-CachedPlan state".into(),
+            ));
+        };
+        let task_ctx = self.ctx.task_ctx();
+        datafusion::physical_plan::collect(plan.clone(), task_ctx)
+            .await
+            .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))
+    }
+
     /// Execute the aggregate path: pre-agg -> `process_batch` -> emit -> HAVING.
-    async fn execute_agg(&mut self, inputs: &[RecordBatch]) -> Result<Vec<RecordBatch>, DbError> {
+    async fn execute_agg(
+        &mut self,
+        inputs: &[RecordBatch],
+        watermark: i64,
+    ) -> Result<Vec<RecordBatch>, DbError> {
         let QueryState::Agg(ref mut agg_state) = self.state else {
             return Err(DbError::Pipeline(
                 "internal: execute_agg called on non-agg state".into(),
             ));
         };
 
-        // Step 1: Pre-aggregation -- project input batches to group-keys + agg-inputs.
+        // Step 1: Pre-aggregation
         let pre_agg_batches = if let Some(proj) = agg_state.compiled_projection() {
-            // Compiled path: direct PhysicalExpr evaluation, no MemTable.
-            // Use try_evaluate_compiled to detect errors — silently dropping
-            // failing batches would corrupt aggregate totals.
             match try_evaluate_compiled(proj, inputs) {
                 Ok(result) => result,
                 Err(e) => {
@@ -218,7 +248,7 @@ impl SqlQueryOperator {
                     );
                     if let Some(plan) = agg_state.cached_pre_agg_plan() {
                         let plan = plan.clone();
-                        Self::execute_plan(&self.ctx, &self.op_name, &plan).await?
+                        execute_logical_plan(&self.ctx, &self.op_name, &plan).await?
                     } else {
                         return Err(DbError::Pipeline(format!(
                             "[LDB-8051] query '{}': compiled pre-agg failed and no cached plan: {e}",
@@ -228,9 +258,8 @@ impl SqlQueryOperator {
                 }
             }
         } else if let Some(plan) = agg_state.cached_pre_agg_plan() {
-            // Cached plan path: MemTable already registered by the graph.
             let plan = plan.clone();
-            Self::execute_plan(&self.ctx, &self.op_name, &plan).await?
+            execute_logical_plan(&self.ctx, &self.op_name, &plan).await?
         } else {
             return Err(DbError::Pipeline(format!(
                 "[LDB-8050] query '{}': no compiled projection or cached plan",
@@ -245,98 +274,52 @@ impl SqlQueryOperator {
 
         // Step 2: Feed pre-agg batches to incremental accumulators.
         for batch in &pre_agg_batches {
-            agg_state.process_batch(batch)?;
+            agg_state.process_batch(batch, watermark)?;
         }
 
-        // Step 3: Emit running aggregate totals.
-        let having_filter = agg_state.having_filter().cloned();
-        let having_sql = agg_state.having_sql().map(String::from);
+        self.emit_agg_output(watermark).await
+    }
+
+    /// Shared emit path for aggregate queries: evict → emit → HAVING.
+    async fn emit_agg_output(&mut self, watermark: i64) -> Result<Vec<RecordBatch>, DbError> {
+        let QueryState::Agg(ref mut agg_state) = self.state else {
+            return Err(DbError::Pipeline(
+                "internal: emit_agg_output on non-agg".into(),
+            ));
+        };
+
+        let mut eviction = if self.emit_changelog {
+            agg_state.evict_idle(watermark)?
+        } else {
+            Vec::new()
+        };
+
         let mut batches = agg_state.emit()?;
 
-        // Step 4: Apply HAVING filter.
-        if let Some(ref filter) = having_filter {
-            batches = apply_compiled_having(&batches, filter)?;
-        } else if let Some(ref having_sql) = having_sql {
-            batches = self.apply_having_sql(&batches, having_sql).await?;
+        // HAVING is skipped in changelog mode — retractions and HAVING interact
+        // incorrectly (a retraction that no longer satisfies HAVING would be
+        // silently dropped, leaving stale state downstream).
+        if !self.emit_changelog {
+            let having_filter = agg_state.having_filter().cloned();
+            let having_sql = agg_state.having_sql().map(String::from);
+            if let Some(ref filter) = having_filter {
+                batches = apply_compiled_having(&batches, filter)?;
+            } else if let Some(ref having_sql) = having_sql {
+                batches = self.apply_having_sql(&batches, having_sql).await?;
+            }
         }
 
-        Ok(batches)
-    }
-
-    /// Execute a `LogicalPlan` through `DataFusion` physical planning (no re-plan).
-    ///
-    /// Used for sub-queries (pre-agg, HAVING) where the plan is always valid.
-    async fn execute_plan(
-        ctx: &SessionContext,
-        op_name: &str,
-        plan: &LogicalPlan,
-    ) -> Result<Vec<RecordBatch>, DbError> {
-        let physical = ctx
-            .state()
-            .create_physical_plan(plan)
-            .await
-            .map_err(|e| DbError::query_pipeline(op_name, &e))?;
-
-        let task_ctx = ctx.task_ctx();
-        datafusion::physical_plan::collect(physical, task_ctx)
-            .await
-            .map_err(|e| DbError::query_pipeline(op_name, &e))
-    }
-
-    /// Execute a cached `LogicalPlan` through `DataFusion` physical planning.
-    ///
-    /// `MemTables` are already registered in the `SessionContext` by the graph,
-    /// so only physical planning and execution runs per cycle.
-    ///
-    /// If physical planning fails with a schema error (source schema changed),
-    /// re-plans from SQL and updates the cached plan.
-    async fn execute_cached_plan_with_invalidation(
-        &mut self,
-        plan: &LogicalPlan,
-    ) -> Result<Vec<RecordBatch>, DbError> {
-        let plan_result = self.ctx.state().create_physical_plan(plan).await;
-
-        match plan_result {
-            Ok(physical) => {
-                let task_ctx = self.ctx.task_ctx();
-                datafusion::physical_plan::collect(physical, task_ctx)
-                    .await
-                    .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))
-            }
-            Err(e) => {
-                // Schema error: re-plan from SQL and update cached plan
-                let err_str = e.to_string();
-                if err_str.contains("Schema error")
-                    || err_str.contains("schema mismatch")
-                    || err_str.contains("table") && err_str.contains("not found")
-                {
-                    tracing::debug!(
-                        query = %self.op_name,
-                        error = %e,
-                        "Cached plan invalidated (schema change), re-planning from SQL"
-                    );
-                    let df = self
-                        .ctx
-                        .sql(&self.sql)
-                        .await
-                        .map_err(|e2| DbError::query_pipeline(&*self.op_name, &e2))?;
-                    let new_plan = df.logical_plan().clone();
-                    self.state = QueryState::CachedPlan(Box::new(new_plan));
-                    df.collect()
-                        .await
-                        .map_err(|e2| DbError::query_pipeline(&*self.op_name, &e2))
-                } else {
-                    Err(DbError::query_pipeline(&*self.op_name, &e))
-                }
-            }
+        if eviction.is_empty() {
+            Ok(batches)
+        } else {
+            eviction.extend(batches);
+            Ok(eviction)
         }
     }
 
-    /// Apply a HAVING predicate via SQL when the compiled `PhysicalExpr` is not
-    /// available.
-    ///
-    /// Registers emitted batches as a temporary `MemTable` and runs the HAVING
-    /// SQL against it. Caches the `LogicalPlan` on first call.
+    /// Apply a HAVING predicate via SQL. Caches the `LogicalPlan` on first call
+    /// (saves SQL parsing + logical optimization), but physical plan is rebuilt
+    /// per call because the `MemTable` leaf has different data each time.
     async fn apply_having_sql(
         &mut self,
         batches: &[RecordBatch],
@@ -358,7 +341,7 @@ impl SqlQueryOperator {
             .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
 
         let result = if let Some(ref plan) = self.cached_having_plan {
-            Self::execute_plan(&self.ctx, &self.op_name, plan).await
+            execute_logical_plan(&self.ctx, &self.op_name, plan).await
         } else {
             let col_list: Vec<String> = schema
                 .fields()
@@ -395,89 +378,65 @@ impl GraphOperator for SqlQueryOperator {
     async fn process(
         &mut self,
         inputs: &[Vec<RecordBatch>],
-        _watermarks: &[i64],
+        watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
-        // Lazy initialization on first call.
         if matches!(self.state, QueryState::Uninit) {
             self.lazy_init().await?;
         }
 
+        let watermark = watermarks.first().copied().unwrap_or(i64::MIN);
+
         let input_batches = inputs.first().map_or(&[] as &[RecordBatch], Vec::as_slice);
 
-        // Skip if no input data.
         if input_batches.is_empty() || input_batches.iter().all(|b| b.num_rows() == 0) {
-            // Aggregate queries still emit running state even with no new input.
             if matches!(self.state, QueryState::Agg(_)) {
-                let QueryState::Agg(ref mut agg_state) = self.state else {
-                    unreachable!();
-                };
-                let having_filter = agg_state.having_filter().cloned();
-                let having_sql = agg_state.having_sql().map(String::from);
-                let mut batches = agg_state.emit()?;
-                if let Some(ref filter) = having_filter {
-                    batches = apply_compiled_having(&batches, filter)?;
-                } else if let Some(ref having_sql) = having_sql {
-                    batches = self.apply_having_sql(&batches, having_sql).await?;
-                }
-                return Ok(batches);
+                // No new input — still emit running state (and evict if changelog).
+                return self.emit_agg_output(watermark).await;
             }
             return Ok(Vec::new());
         }
 
         match &self.state {
             QueryState::Uninit => unreachable!("lazy_init already called"),
-            QueryState::Agg(_) => self.execute_agg(input_batches).await,
-            QueryState::Compiled(_, _) => {
-                // Direct PhysicalExpr evaluation on input batches.
-                // Use try_evaluate_compiled to distinguish errors from empty results.
-                let QueryState::Compiled(ref proj, _) = self.state else {
+            QueryState::Agg(_) => self.execute_agg(input_batches, watermark).await,
+            QueryState::Compiled(_) => {
+                let QueryState::Compiled(ref proj) = self.state else {
                     unreachable!();
                 };
                 match try_evaluate_compiled(proj, input_batches) {
                     Ok(result) => Ok(result),
                     Err(e) => {
-                        // Compiled evaluation failed (e.g., type mismatch).
-                        // Fall back to CachedPlan permanently.
                         tracing::debug!(
                             query = %self.op_name,
                             error = %e,
                             "Compiled projection failed, falling back to cached plan"
                         );
-                        let QueryState::Compiled(_, fallback) =
-                            std::mem::replace(&mut self.state, QueryState::Uninit)
-                        else {
-                            unreachable!();
-                        };
-                        self.state = QueryState::CachedPlan(fallback);
-                        let QueryState::CachedPlan(ref plan) = self.state else {
-                            unreachable!();
-                        };
-                        let plan = plan.clone();
-                        self.execute_cached_plan_with_invalidation(&plan).await
+                        self.build_and_cache_physical_plan().await?;
+                        self.execute_cached_plan().await
                     }
                 }
             }
-            QueryState::CachedPlan(_) => {
-                // Re-plan from SQL each cycle. The cached LogicalPlan was
-                // optimized with table statistics from lazy_init time (often
-                // 0-1 rows). Reusing it causes DataFusion to apply stale
-                // optimizations (e.g., row count limits) that drop rows when
-                // the MemTable grows.
-                let df = self
-                    .ctx
-                    .sql(&self.sql)
-                    .await
-                    .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
-                df.collect()
-                    .await
-                    .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))
-            }
+            QueryState::CachedPlan(_) => match self.execute_cached_plan().await {
+                Ok(batches) => Ok(batches),
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("Schema error") || err_str.contains("schema mismatch") {
+                        tracing::debug!(
+                            query = %self.op_name,
+                            error = %e,
+                            "Cached physical plan invalidated, re-planning"
+                        );
+                        self.build_and_cache_physical_plan().await?;
+                        self.execute_cached_plan().await
+                    } else {
+                        Err(e)
+                    }
+                }
+            },
         }
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
-        // If we have a pending restore (Uninit, not yet processed), preserve it
-        // so a restore->checkpoint cycle before first process() doesn't lose data.
         if matches!(self.state, QueryState::Uninit) {
             if let Some(ref cp) = self.pending_restore {
                 let data = serde_json::to_vec(cp).map_err(|e| {
@@ -492,7 +451,6 @@ impl GraphOperator for SqlQueryOperator {
         }
 
         let QueryState::Agg(ref mut agg_state) = self.state else {
-            // Non-aggregate queries are stateless.
             return Ok(None);
         };
 
@@ -503,7 +461,6 @@ impl GraphOperator for SqlQueryOperator {
                 self.op_name
             ))
         })?;
-
         Ok(Some(OperatorCheckpoint { data }))
     }
 
@@ -517,23 +474,18 @@ impl GraphOperator for SqlQueryOperator {
 
         match self.state {
             QueryState::Agg(ref mut agg_state) => {
-                // Already initialized -- restore directly.
                 agg_state.restore_groups(&cp)?;
             }
             QueryState::Uninit => {
-                // Not yet initialized -- defer restoration until lazy_init.
                 self.pending_restore = Some(cp);
             }
-            QueryState::Compiled(_, _) | QueryState::CachedPlan(_) => {
-                // Non-aggregate state received an aggregate checkpoint.
-                // This can happen during schema evolution. Log and ignore.
+            QueryState::Compiled(_) | QueryState::CachedPlan(_) => {
                 tracing::warn!(
                     query = %self.op_name,
                     "Ignoring aggregate checkpoint for non-aggregate query (schema evolution?)"
                 );
             }
         }
-
         Ok(())
     }
 

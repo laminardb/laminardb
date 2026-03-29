@@ -271,6 +271,7 @@ impl LaminarDB {
                 reg.emit_clause.clone(),
                 reg.window_config.clone(),
                 reg.order_config.clone(),
+                None,
             );
         }
 
@@ -488,6 +489,7 @@ impl LaminarDB {
             crate::sink_task::SinkTaskHandle,
             Option<String>,
             String, // input stream name (FROM clause target)
+            bool,   // changelog-capable
         )> = Vec::new();
         for (name, reg) in &sink_regs {
             if reg.connector_type.is_none() {
@@ -505,13 +507,15 @@ impl LaminarDB {
             sink.open(&config)
                 .await
                 .map_err(|e| DbError::Connector(format!("Failed to open sink '{name}': {e}")))?;
-            let exactly_once = sink.capabilities().exactly_once;
-            let handle = crate::sink_task::SinkTaskHandle::spawn(name.clone(), sink, exactly_once);
+            let caps = sink.capabilities();
+            let handle =
+                crate::sink_task::SinkTaskHandle::spawn(name.clone(), sink, caps.exactly_once);
             sinks.push((
                 name.clone(),
                 handle,
                 reg.filter_expr.clone(),
                 reg.input.clone(),
+                caps.changelog,
             ));
         }
 
@@ -539,7 +543,7 @@ impl LaminarDB {
         {
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
-                for (name, handle, _, _) in &sinks {
+                for (name, handle, _, _, _) in &sinks {
                     let exactly_once = handle.exactly_once();
                     coord.register_sink(name.clone(), handle.clone(), exactly_once);
                 }
@@ -923,7 +927,7 @@ impl LaminarDB {
                         )));
                     }
                 }
-                for (name, handle, _, _) in &sinks {
+                for (name, handle, _, _, _) in &sinks {
                     if !handle.exactly_once() {
                         return Err(DbError::Config(format!(
                             "[LDB-5031] exactly-once requires all sinks to support \
@@ -941,7 +945,7 @@ impl LaminarDB {
                 }
             } else if pipeline_config.delivery_guarantee == DeliveryGuarantee::AtLeastOnce {
                 let has_non_replayable = sources.iter().any(|s| !s.supports_replay);
-                let has_eo_sink = sinks.iter().any(|(_, h, _, _)| h.exactly_once());
+                let has_eo_sink = sinks.iter().any(|(_, h, _, _, _)| h.exactly_once());
                 if has_non_replayable && has_eo_sink {
                     tracing::warn!(
                         "[LDB-5033] pipeline has exactly-once sinks but some sources \

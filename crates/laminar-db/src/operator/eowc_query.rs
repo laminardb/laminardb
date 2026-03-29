@@ -219,8 +219,6 @@ impl EowcQueryOperator {
         op_name: &str,
         ctx: &SessionContext,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        // Pre-aggregation — use try_evaluate_compiled to detect errors instead
-        // of silently dropping failing batches, which would corrupt window aggregates.
         let pre_agg_batches = if let Some(proj) = cw.compiled_projection() {
             match try_evaluate_compiled(proj, inputs) {
                 Ok(result) => result,
@@ -231,7 +229,7 @@ impl EowcQueryOperator {
                         "EOWC compiled pre-agg failed, falling back to cached plan"
                     );
                     if let Some(plan) = cw.cached_pre_agg_plan() {
-                        execute_cached_plan(ctx, op_name, plan).await?
+                        super::execute_logical_plan(ctx, op_name, plan).await?
                     } else {
                         return Err(DbError::Pipeline(format!(
                             "[LDB-8051] EOWC query '{op_name}': compiled pre-agg failed and no cached plan: {e}"
@@ -240,7 +238,7 @@ impl EowcQueryOperator {
                 }
             }
         } else if let Some(plan) = cw.cached_pre_agg_plan() {
-            execute_cached_plan(ctx, op_name, plan).await?
+            super::execute_logical_plan(ctx, op_name, plan).await?
         } else {
             return Err(DbError::Pipeline(format!(
                 "[LDB-8050] EOWC query '{op_name}': no compiled projection or cached plan"
@@ -274,7 +272,6 @@ impl EowcQueryOperator {
         op_name: &str,
         ctx: &SessionContext,
     ) -> Result<Vec<RecordBatch>, DbError> {
-        // Pre-aggregation — same try+fallback pattern as CoreWindow path.
         let pre_agg_batches = if let Some(proj) = eowc.compiled_projection() {
             match try_evaluate_compiled(proj, inputs) {
                 Ok(result) => result,
@@ -285,7 +282,7 @@ impl EowcQueryOperator {
                         "EOWC-agg compiled pre-agg failed, falling back to cached plan"
                     );
                     if let Some(plan) = eowc.cached_pre_agg_plan() {
-                        execute_cached_plan(ctx, op_name, plan).await?
+                        super::execute_logical_plan(ctx, op_name, plan).await?
                     } else {
                         return Err(DbError::Pipeline(format!(
                             "[LDB-8051] EOWC query '{op_name}': compiled pre-agg failed and no cached plan: {e}"
@@ -294,7 +291,7 @@ impl EowcQueryOperator {
                 }
             }
         } else if let Some(plan) = eowc.cached_pre_agg_plan() {
-            execute_cached_plan(ctx, op_name, plan).await?
+            super::execute_logical_plan(ctx, op_name, plan).await?
         } else {
             return Err(DbError::Pipeline(format!(
                 "[LDB-8050] EOWC query '{op_name}': no compiled projection or cached plan"
@@ -438,13 +435,10 @@ impl GraphOperator for EowcQueryOperator {
         }
 
         match &mut self.state {
-            EowcInnerState::Uninit => {
-                // Should not happen after initialization
-                Err(DbError::Pipeline(format!(
-                    "EOWC query '{}': state not initialized",
-                    self.op_name
-                )))
-            }
+            EowcInnerState::Uninit => Err(DbError::Pipeline(format!(
+                "EOWC query '{}': state not initialized",
+                self.op_name
+            ))),
             EowcInnerState::CoreWindow(ref mut cw) => {
                 Self::process_core_window(cw, &input_batches, watermark, &self.op_name, &self.ctx)
                     .await
@@ -561,24 +555,6 @@ impl GraphOperator for EowcQueryOperator {
             }
         }
     }
-}
-
-/// Execute a cached logical plan via `DataFusion`.
-async fn execute_cached_plan(
-    ctx: &SessionContext,
-    query_name: &str,
-    plan: &datafusion_expr::LogicalPlan,
-) -> Result<Vec<RecordBatch>, DbError> {
-    let physical = ctx
-        .state()
-        .create_physical_plan(plan)
-        .await
-        .map_err(|e| DbError::query_pipeline(query_name, &e))?;
-
-    let task_ctx = ctx.task_ctx();
-    datafusion::physical_plan::collect(physical, task_ctx)
-        .await
-        .map_err(|e| DbError::query_pipeline(query_name, &e))
 }
 
 /// Apply a HAVING filter expressed as SQL by running it against a temporary

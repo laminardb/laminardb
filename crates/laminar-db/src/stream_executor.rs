@@ -947,7 +947,7 @@ impl StreamExecutor {
         // First call: try to initialize IncrementalAggState
         let query_name = self.queries[idx].name.clone();
         let query_sql = self.queries[idx].sql.clone();
-        match IncrementalAggState::try_from_sql(&self.ctx, &query_sql).await {
+        match IncrementalAggState::try_from_sql(&self.ctx, &query_sql, false).await {
             Ok(Some(state)) => {
                 self.agg_states.insert(idx, state);
                 self.try_restore_pending_agg(idx);
@@ -1215,7 +1215,7 @@ impl StreamExecutor {
             DbError::Pipeline(format!("internal: missing agg_state for query index {idx}"))
         })?;
         for batch in &pre_agg_batches {
-            agg_state.process_batch(batch)?;
+            agg_state.process_batch(batch, i64::MIN)?;
         }
 
         let having_filter = agg_state.having_filter().cloned();
