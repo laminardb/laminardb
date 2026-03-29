@@ -171,6 +171,10 @@ use crate::planner::streaming_optimizer::{StreamingPhysicalValidator, StreamingV
 pub fn base_session_config() -> SessionConfig {
     let mut config = SessionConfig::new();
     config.options_mut().sql_parser.enable_ident_normalization = false;
+    // Single partition for streaming micro-batch execution. Multi-partition
+    // plans contain stateful operators (RepartitionExec) that cannot be
+    // reused across cycles, causing panics on cached physical plans.
+    config = config.with_target_partitions(1);
     config
 }
 
@@ -218,9 +222,7 @@ pub fn create_streaming_context() -> SessionContext {
 /// (no plan-time validation).
 #[must_use]
 pub fn create_streaming_context_with_validator(mode: StreamingValidatorMode) -> SessionContext {
-    let config = base_session_config()
-        .with_batch_size(8192)
-        .with_target_partitions(1); // Single partition for streaming
+    let config = base_session_config().with_batch_size(8192);
 
     let ctx = if matches!(mode, StreamingValidatorMode::Off) {
         SessionContext::new_with_config(config)
