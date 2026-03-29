@@ -93,9 +93,11 @@ impl AvroDeserializer {
     /// # Errors
     ///
     /// Returns `SerdeError` if the schema cannot be fetched or registered.
-    pub async fn ensure_schema_registered(&mut self, schema_id: i32) -> Result<(), SerdeError> {
+    /// Returns `Ok(true)` if this was a newly registered schema ID,
+    /// `Ok(false)` if already known.
+    pub async fn ensure_schema_registered(&mut self, schema_id: i32) -> Result<bool, SerdeError> {
         if self.known_ids.contains(&schema_id) {
-            return Ok(());
+            return Ok(false);
         }
 
         let registry = self
@@ -109,7 +111,7 @@ impl AvroDeserializer {
             .map_err(|_| SerdeError::SchemaNotFound { schema_id })?;
 
         self.register_schema(schema_id, &cached.schema_str)?;
-        Ok(())
+        Ok(true)
     }
 
     /// Extracts the Confluent schema ID from a wire-format message.

@@ -18,6 +18,18 @@ use tracing::{debug, info, warn};
 
 use super::rebalance::LaminarConsumerContext;
 
+/// Locks a mutex, recovering from poison if a prior holder panicked.
+///
+/// Used for state shared with rdkafka's rebalance callback thread.
+/// Poison indicates a panic in the callback — the data may be stale
+/// but is structurally sound, so we recover rather than propagate.
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("mutex poisoned, recovering");
+        poisoned.into_inner()
+    })
+}
+
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{PartitionInfo, SourceBatch, SourceConnector};
@@ -27,13 +39,15 @@ use crate::metrics::ConnectorMetrics;
 use crate::serde::{self, Format, RecordDeserializer};
 
 use super::avro::AvroDeserializer;
-use super::backpressure::KafkaBackpressureController;
-use super::config::{KafkaSourceConfig, StartupMode, TopicSubscription};
+use super::config::{KafkaSourceConfig, SchemaEvolutionStrategy, StartupMode, TopicSubscription};
 use super::metrics::KafkaSourceMetrics;
 use super::offsets::OffsetTracker;
 use super::rebalance::RebalanceState;
 use super::schema_registry::SchemaRegistryClient;
 use super::watermarks::KafkaWatermarkTracker;
+
+use crate::schema::evolution::SchemaEvolution;
+use crate::schema::traits::{CompatibilityMode, EvolutionVerdict};
 
 /// Payload sent from the background Kafka reader task to [`KafkaSource::poll_batch`].
 struct KafkaPayload {
@@ -67,7 +81,6 @@ pub struct KafkaSource {
     state: ConnectorState,
     metrics: KafkaSourceMetrics,
     schema: SchemaRef,
-    backpressure: KafkaBackpressureController,
     channel_len: Arc<AtomicUsize>,
     rebalance_state: Arc<Mutex<RebalanceState>>,
     /// Shared rebalance counter bridging `LaminarConsumerContext` → `KafkaSourceMetrics`.
@@ -86,6 +99,8 @@ pub struct KafkaSource {
     checkpoint_request: Arc<AtomicBool>,
     msg_rx: Option<tokio::sync::mpsc::Receiver<KafkaPayload>>,
     reader_handle: Option<tokio::task::JoinHandle<()>>,
+    commit_handle: Option<tokio::task::JoinHandle<()>>,
+    hwm_handle: Option<tokio::task::JoinHandle<()>>,
     reader_shutdown: Option<tokio::sync::watch::Sender<bool>>,
     offset_commit_tx: Option<tokio::sync::watch::Sender<TopicPartitionList>>,
     watermark_tracker: Option<KafkaWatermarkTracker>,
@@ -115,73 +130,12 @@ pub struct KafkaSource {
 
 impl KafkaSource {
     /// Creates a new Kafka source connector with explicit schema.
-    ///
-    /// # Arguments
-    ///
-    /// * `schema` - Arrow schema for output batches
-    /// * `config` - Parsed Kafka source configuration
     #[must_use]
     pub fn new(schema: SchemaRef, config: KafkaSourceConfig) -> Self {
-        let deserializer = select_deserializer(config.format);
-        let channel_len = Arc::new(AtomicUsize::new(0));
-        let backpressure = KafkaBackpressureController::new(
-            config.backpressure_high_watermark,
-            config.backpressure_low_watermark,
-            config.reader_channel_capacity,
-            Arc::clone(&channel_len),
-        );
-
-        let watermark_tracker = if config.enable_watermark_tracking {
-            Some(
-                KafkaWatermarkTracker::new(0, config.idle_timeout)
-                    .with_max_out_of_orderness(config.max_out_of_orderness),
-            )
-        } else {
-            None
-        };
-
-        Self {
-            consumer: None,
-            config,
-            deserializer,
-            offsets: OffsetTracker::new(),
-            state: ConnectorState::Created,
-            metrics: KafkaSourceMetrics::new(),
-            schema,
-            backpressure,
-            channel_len,
-            rebalance_state: Arc::new(Mutex::new(RebalanceState::new())),
-            rebalance_counter: Arc::new(AtomicU64::new(0)),
-            revoke_generation: Arc::new(AtomicU64::new(0)),
-            last_seen_revoke_gen: 0,
-            schema_registry: None,
-            data_ready: Arc::new(Notify::new()),
-            checkpoint_request: Arc::new(AtomicBool::new(false)),
-            msg_rx: None,
-            reader_handle: None,
-            reader_shutdown: None,
-            offset_commit_tx: None,
-            watermark_tracker,
-            high_watermarks_rx: None,
-            reader_paused: Arc::new(AtomicBool::new(false)),
-            commit_retry_needed: Arc::new(AtomicBool::new(false)),
-            offset_snapshot: Arc::new(Mutex::new(OffsetTracker::new())),
-            poll_payload_buf: Vec::new(),
-            poll_payload_offsets: Vec::new(),
-            poll_meta_partitions: Vec::new(),
-            poll_meta_offsets: Vec::new(),
-            poll_meta_timestamps: Vec::new(),
-            poll_meta_headers: Vec::new(),
-        }
+        Self::build_base(schema, config, select_deserializer, None)
     }
 
     /// Creates a new Kafka source connector with Schema Registry.
-    ///
-    /// # Arguments
-    ///
-    /// * `schema` - Arrow schema for output batches
-    /// * `config` - Parsed Kafka source configuration
-    /// * `sr_client` - Schema Registry client
     #[must_use]
     pub fn with_schema_registry(
         schema: SchemaRef,
@@ -189,19 +143,25 @@ impl KafkaSource {
         sr_client: SchemaRegistryClient,
     ) -> Self {
         let sr = Arc::new(sr_client);
-        let deserializer: Box<dyn RecordDeserializer> = if config.format == Format::Avro {
-            Box::new(AvroDeserializer::with_schema_registry(Arc::clone(&sr)))
-        } else {
-            select_deserializer(config.format)
+        let sr_clone = Arc::clone(&sr);
+        let deser_factory = move |format: Format| -> Box<dyn RecordDeserializer> {
+            if format == Format::Avro {
+                Box::new(AvroDeserializer::with_schema_registry(sr_clone))
+            } else {
+                select_deserializer(format)
+            }
         };
+        Self::build_base(schema, config, deser_factory, Some(sr))
+    }
 
+    fn build_base(
+        schema: SchemaRef,
+        config: KafkaSourceConfig,
+        deser_factory: impl FnOnce(Format) -> Box<dyn RecordDeserializer>,
+        schema_registry: Option<Arc<SchemaRegistryClient>>,
+    ) -> Self {
+        let deserializer = deser_factory(config.format);
         let channel_len = Arc::new(AtomicUsize::new(0));
-        let backpressure = KafkaBackpressureController::new(
-            config.backpressure_high_watermark,
-            config.backpressure_low_watermark,
-            config.reader_channel_capacity,
-            Arc::clone(&channel_len),
-        );
 
         let watermark_tracker = if config.enable_watermark_tracking {
             Some(
@@ -220,17 +180,18 @@ impl KafkaSource {
             state: ConnectorState::Created,
             metrics: KafkaSourceMetrics::new(),
             schema,
-            backpressure,
             channel_len,
             rebalance_state: Arc::new(Mutex::new(RebalanceState::new())),
             rebalance_counter: Arc::new(AtomicU64::new(0)),
             revoke_generation: Arc::new(AtomicU64::new(0)),
             last_seen_revoke_gen: 0,
-            schema_registry: Some(sr),
+            schema_registry,
             data_ready: Arc::new(Notify::new()),
             checkpoint_request: Arc::new(AtomicBool::new(false)),
             msg_rx: None,
             reader_handle: None,
+            commit_handle: None,
+            hwm_handle: None,
             reader_shutdown: None,
             offset_commit_tx: None,
             watermark_tracker,
@@ -297,7 +258,12 @@ impl KafkaSource {
         self.config.event_time_column.as_deref()
     }
 
-    /// Spawns the background reader task on first `poll_batch()` call.
+    /// Spawns background tasks on first `poll_batch()` call.
+    ///
+    /// Three tasks handle separate concerns:
+    /// - **Reader**: consumes messages, manages backpressure, detects revokes
+    /// - **Commit**: periodic advisory broker offset commits
+    /// - **HWM**: periodic high watermark queries for lag monitoring
     ///
     /// Deferred to allow `restore()` to access the consumer directly after `open()`.
     #[allow(clippy::too_many_lines)]
@@ -306,13 +272,14 @@ impl KafkaSource {
             return;
         }
 
-        // Wrap in Arc so the blocking watermark task can share the consumer
-        // with the async reader loop. librdkafka handles are thread-safe.
         let consumer = Arc::new(self.consumer.take().unwrap());
         let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(self.config.reader_channel_capacity);
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (offset_tx, offset_rx) = tokio::sync::watch::channel(TopicPartitionList::new());
+        let reader_offset_rx = offset_rx.clone(); // reader reads final offsets on shutdown
         let (hwm_tx, hwm_rx) = tokio::sync::watch::channel(Vec::new());
+        // Channel for the reader to publish seen partitions to the HWM task.
+        let (seen_tx, seen_rx) = tokio::sync::watch::channel(Vec::<(Arc<str>, i32)>::new());
         let data_ready = Arc::clone(&self.data_ready);
         let channel_len = Arc::clone(&self.channel_len);
         let capture_headers = self.config.include_headers;
@@ -325,76 +292,145 @@ impl KafkaSource {
         let pause_threshold = self.config.backpressure_high_watermark;
         let resume_threshold = self.config.backpressure_low_watermark;
 
-        // The reader task owns the consumer. On shutdown it commits the latest
-        // offsets received via the offset_rx watch channel, then unsubscribes.
+        // -- Commit task: periodic advisory broker offset commits --
+        let commit_consumer = Arc::clone(&consumer);
+        let commit_retry = Arc::clone(&commit_retry_needed);
+        let mut commit_shutdown = shutdown_rx.clone();
+        let commit_handle = tokio::spawn(async move {
+            if broker_commit_interval.is_zero() {
+                // Disabled — wait for shutdown.
+                let _ = commit_shutdown.changed().await;
+                return;
+            }
+            let mut timer = tokio::time::interval(broker_commit_interval);
+            timer.tick().await; // skip first
+
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = commit_shutdown.changed() => break,
+                    _ = timer.tick() => {
+                        let tpl = offset_rx.borrow().clone();
+                        if tpl.count() == 0 { continue; }
+                        if commit_retry
+                            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+                            .is_ok()
+                        {
+                            let c = Arc::clone(&commit_consumer);
+                            let flag = Arc::clone(&commit_retry);
+                            let n = tpl.count();
+                            // Await the blocking commit so it completes before
+                            // close() drops the consumer Arc.
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                tokio::task::spawn_blocking(move || {
+                                    c.commit(&tpl, CommitMode::Sync)
+                                }),
+                            )
+                            .await
+                            {
+                                Ok(Ok(Ok(()))) => info!(partition_count = n, "sync offset commit retry succeeded"),
+                                Ok(Ok(Err(e))) => {
+                                    flag.store(true, Ordering::Release);
+                                    warn!(error = %e, "sync offset commit retry failed");
+                                }
+                                Ok(Err(e)) => warn!(error = %e, "sync commit blocking task panicked"),
+                                Err(_) => {
+                                    flag.store(true, Ordering::Release);
+                                    warn!("sync offset commit retry timed out");
+                                }
+                            }
+                        } else {
+                            match commit_consumer.commit(&tpl, CommitMode::Async) {
+                                Ok(()) => info!(partition_count = tpl.count(), "periodic broker offset commit (advisory)"),
+                                Err(e) => warn!(error = %e, "periodic broker offset commit failed"),
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // -- HWM task: periodic high watermark queries for lag monitoring --
+        let hwm_consumer = Arc::clone(&consumer);
+        let mut hwm_shutdown = shutdown_rx.clone();
+        let hwm_handle = tokio::spawn(async move {
+            let mut timer = tokio::time::interval(std::time::Duration::from_secs(30));
+            timer.tick().await; // skip first
+
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = hwm_shutdown.changed() => break,
+                    _ = timer.tick() => {
+                        let partitions: Vec<_> = seen_rx.borrow().clone();
+                        if partitions.is_empty() { continue; }
+                        let c = Arc::clone(&hwm_consumer);
+                        let watermarks = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            tokio::task::spawn_blocking(move || {
+                                let mut results = Vec::with_capacity(partitions.len());
+                                for (topic, partition) in &partitions {
+                                    match c.fetch_watermarks(topic, *partition, std::time::Duration::from_secs(1)) {
+                                        Ok((_low, high)) => results.push((Arc::clone(topic), *partition, high)),
+                                        Err(e) => debug!(%topic, partition, error = %e, "HWM fetch failed"),
+                                    }
+                                }
+                                results
+                            }),
+                        )
+                        .await
+                        .unwrap_or(Ok(Vec::new()))
+                        .unwrap_or_default();
+                        if !watermarks.is_empty() {
+                            let _ = hwm_tx.send(watermarks);
+                        }
+                    }
+                }
+            }
+        });
+
+        // -- Reader task: message consumption, backpressure, revoke pruning --
+        let mut reader_shutdown = shutdown_rx;
         let reader_handle = tokio::spawn(async move {
             let mut cached_topic: Arc<str> = Arc::from("");
-
-            // Track seen topic-partitions for high watermark queries.
             let mut seen_partitions: std::collections::HashSet<(Arc<str>, i32)> =
                 std::collections::HashSet::new();
-
-            // Periodic broker commit timer. Advisory — keeps kafka-consumer-groups
-            // lag monitoring accurate. Zero interval disables periodic commits.
-            let commit_enabled = !broker_commit_interval.is_zero();
-            let mut commit_timer = tokio::time::interval(if commit_enabled {
-                broker_commit_interval
-            } else {
-                // tokio::time::interval panics on Duration::ZERO; use a
-                // large interval that will never fire before shutdown.
-                std::time::Duration::from_secs(86400)
-            });
-            // Skip the first tick (fires immediately).
-            commit_timer.tick().await;
-
-            // Periodic high watermark query timer (30s).
-            let mut hwm_timer = tokio::time::interval(std::time::Duration::from_secs(30));
-            hwm_timer.tick().await; // Skip the first tick.
-
             let mut is_paused = false;
             let mut last_revoke_gen: u64 = 0;
 
             loop {
-                // Prune seen_partitions when a revoke event has occurred, so
-                // the HWM timer stops querying watermarks for revoked partitions.
-                // Reads rebalance_state (updated in pre_rebalance) rather than
-                // consumer.assignment() which may lag the callback.
-                let current_gen = revoke_generation.load(Ordering::Relaxed);
+                // Prune seen_partitions on revoke so HWM task stops querying them.
+                let current_gen = revoke_generation.load(Ordering::Acquire);
                 if current_gen != last_revoke_gen {
                     last_revoke_gen = current_gen;
-                    let assigned = match rebalance_state.lock() {
-                        Ok(state) => state.assigned_partitions().clone(),
-                        Err(poisoned) => poisoned.into_inner().assigned_partitions().clone(),
-                    };
+                    let assigned = lock_or_recover(&rebalance_state)
+                        .assigned_partitions()
+                        .clone();
                     seen_partitions.retain(|(t, p)| assigned.contains(&(t.to_string(), *p)));
+                    let _ = seen_tx.send(seen_partitions.iter().cloned().collect());
                 }
 
-                // Check channel fill ratio for pause/resume of Kafka partitions.
-                // This keeps consumer.recv() calling rd_kafka_consumer_poll()
-                // even when paused, preventing max.poll.interval.ms violations.
+                // Backpressure: pause/resume Kafka partitions based on channel fill.
                 #[allow(clippy::cast_precision_loss)]
                 let fill = if reader_channel_capacity > 0 {
-                    channel_len.load(Ordering::Relaxed) as f64 / reader_channel_capacity as f64
+                    channel_len.load(Ordering::Acquire) as f64 / reader_channel_capacity as f64
                 } else {
                     0.0
                 };
                 if fill >= pause_threshold && !is_paused {
                     if let Ok(assignment) = consumer.assignment() {
-                        if let Err(e) = consumer.pause(&assignment) {
-                            warn!(error = %e, "failed to pause Kafka partitions");
-                        } else {
+                        if consumer.pause(&assignment).is_ok() {
                             is_paused = true;
-                            reader_paused.store(true, Ordering::Relaxed);
+                            reader_paused.store(true, Ordering::Release);
                             debug!("reader: paused Kafka partitions (fill={fill:.2})");
                         }
                     }
                 } else if fill <= resume_threshold && is_paused {
                     if let Ok(assignment) = consumer.assignment() {
-                        if let Err(e) = consumer.resume(&assignment) {
-                            warn!(error = %e, "failed to resume Kafka partitions");
-                        } else {
+                        if consumer.resume(&assignment).is_ok() {
                             is_paused = false;
-                            reader_paused.store(false, Ordering::Relaxed);
+                            reader_paused.store(false, Ordering::Release);
                             debug!("reader: resumed Kafka partitions (fill={fill:.2})");
                         }
                     }
@@ -402,85 +438,7 @@ impl KafkaSource {
 
                 let msg_result = tokio::select! {
                     biased;
-                    _ = shutdown_rx.changed() => break,
-                    _ = commit_timer.tick(), if commit_enabled => {
-                        let tpl = offset_rx.borrow().clone();
-                        if tpl.count() > 0 {
-                            if commit_retry_needed
-                                .compare_exchange(
-                                    true,
-                                    false,
-                                    Ordering::AcqRel,
-                                    Ordering::Relaxed,
-                                )
-                                .is_ok()
-                            {
-                                // Escalate to sync commit on the blocking pool
-                                // so we don't stall the reader or block shutdown.
-                                let c = Arc::clone(&consumer);
-                                let flag = Arc::clone(&commit_retry_needed);
-                                let n = tpl.count();
-                                tokio::task::spawn_blocking(move || {
-                                    match c.commit(&tpl, CommitMode::Sync) {
-                                        Ok(()) => {
-                                            info!(
-                                                partition_count = n,
-                                                "sync offset commit retry succeeded"
-                                            );
-                                        }
-                                        Err(e) => {
-                                            flag.store(true, Ordering::Release);
-                                            warn!(
-                                                error = %e,
-                                                "sync offset commit retry failed"
-                                            );
-                                        }
-                                    }
-                                });
-                            } else {
-                                match consumer.commit(&tpl, CommitMode::Async) {
-                                    Ok(()) => info!(
-                                        partition_count = tpl.count(),
-                                        "periodic broker offset commit (advisory)"
-                                    ),
-                                    Err(e) => warn!(
-                                        error = %e,
-                                        "periodic broker offset commit failed"
-                                    ),
-                                }
-                            }
-                        }
-                        continue;
-                    },
-                    _ = hwm_timer.tick() => {
-                        // fetch_watermarks is a blocking FFI call — run on the
-                        // blocking pool to avoid stalling the async reader.
-                        if !seen_partitions.is_empty() {
-                            let partitions: Vec<_> = seen_partitions.iter().cloned().collect();
-                            let c = Arc::clone(&consumer);
-                            let watermarks = tokio::task::spawn_blocking(move || {
-                                let mut results = Vec::with_capacity(partitions.len());
-                                for (topic, partition) in &partitions {
-                                    if let Ok((_low, high)) = c.fetch_watermarks(
-                                        topic,
-                                        *partition,
-                                        std::time::Duration::from_secs(5),
-                                    ) {
-                                        results.push((Arc::clone(topic), *partition, high));
-                                    }
-                                }
-                                results
-                            })
-                            .await
-                            .unwrap_or_default();
-                            if !watermarks.is_empty() {
-                                let _ = hwm_tx.send(watermarks);
-                            }
-                        }
-                        continue;
-                    },
-                    // Timeout ensures we re-check backpressure and timers even
-                    // when paused partitions yield no messages.
+                    _ = reader_shutdown.changed() => break,
                     msg = tokio::time::timeout(
                         std::time::Duration::from_millis(200),
                         consumer.recv(),
@@ -496,8 +454,10 @@ impl KafkaSource {
                             if &*cached_topic != topic {
                                 cached_topic = Arc::from(topic);
                             }
-                            // Track partition for watermark queries.
-                            seen_partitions.insert((Arc::clone(&cached_topic), msg.partition()));
+                            if seen_partitions.insert((Arc::clone(&cached_topic), msg.partition()))
+                            {
+                                let _ = seen_tx.send(seen_partitions.iter().cloned().collect());
+                            }
                             let timestamp_ms = match msg.timestamp() {
                                 rdkafka::Timestamp::CreateTime(ts)
                                 | rdkafka::Timestamp::LogAppendTime(ts) => Some(ts),
@@ -536,19 +496,22 @@ impl KafkaSource {
                                     channel_len.fetch_add(1, Ordering::Relaxed);
                                 }
                                 Err(tokio::sync::mpsc::error::TrySendError::Full(kp)) => {
-                                    // Pause partitions BEFORE blocking so rdkafka
-                                    // stops prefetching while we wait for drain.
                                     if !is_paused {
                                         if let Ok(assignment) = consumer.assignment() {
                                             if consumer.pause(&assignment).is_ok() {
                                                 is_paused = true;
-                                                reader_paused.store(true, Ordering::Relaxed);
+                                                reader_paused.store(true, Ordering::Release);
                                                 debug!("reader: paused partitions (channel full)");
                                             }
                                         }
                                     }
                                     channel_len.fetch_add(1, Ordering::Relaxed);
-                                    if msg_tx.send(kp).await.is_err() {
+                                    let send_ok = tokio::select! {
+                                        biased;
+                                        _ = reader_shutdown.changed() => false,
+                                        result = msg_tx.send(kp) => result.is_ok(),
+                                    };
+                                    if !send_ok {
                                         channel_len.fetch_sub(1, Ordering::Relaxed);
                                         break;
                                     }
@@ -564,10 +527,11 @@ impl KafkaSource {
                 }
             }
 
-            // Commit final offsets before unsubscribing. The close() method
-            // sends the latest TPL via offset_tx before signaling shutdown,
-            // so offset_rx.borrow() contains the most recent offsets.
-            let tpl = offset_rx.borrow().clone();
+            // Final commit + unsubscribe (reader owns the consumer Arc).
+            // The close() method sends latest offsets via offset_tx before
+            // signaling shutdown, so the commit task may have already
+            // committed them — this is a best-effort final flush.
+            let tpl = reader_offset_rx.borrow().clone();
             if tpl.count() > 0 {
                 match consumer.commit(&tpl, CommitMode::Sync) {
                     Ok(()) => info!(
@@ -577,12 +541,13 @@ impl KafkaSource {
                     Err(e) => warn!(error = %e, "failed to commit final offsets on shutdown"),
                 }
             }
-
             consumer.unsubscribe();
         });
 
         self.msg_rx = Some(msg_rx);
         self.reader_handle = Some(reader_handle);
+        self.commit_handle = Some(commit_handle);
+        self.hwm_handle = Some(hwm_handle);
         self.reader_shutdown = Some(shutdown_tx);
         self.offset_commit_tx = Some(offset_tx);
         self.high_watermarks_rx = Some(hwm_rx);
@@ -812,15 +777,6 @@ impl SourceConnector for KafkaSource {
             });
         }
 
-        // Update backpressure state — never skip the drain below (deadlocks).
-        if self.backpressure.should_pause() {
-            self.backpressure.set_paused(true);
-            debug!("backpressure: pausing consumption");
-        } else if self.backpressure.should_resume() {
-            self.backpressure.set_paused(false);
-            debug!("backpressure: resuming consumption");
-        }
-
         // Lazily spawn the background reader task on first poll.
         self.ensure_reader_started();
 
@@ -852,7 +808,7 @@ impl SourceConnector for KafkaSource {
         while self.poll_payload_offsets.len() < limit {
             match rx.try_recv() {
                 Ok(kp) => {
-                    self.channel_len.fetch_sub(1, Ordering::Relaxed);
+                    self.channel_len.fetch_sub(1, Ordering::Release);
                     total_bytes += kp.data.len() as u64;
                     let start = self.poll_payload_buf.len();
                     self.poll_payload_buf.extend_from_slice(&kp.data);
@@ -905,14 +861,14 @@ impl SourceConnector for KafkaSource {
 
         // Lock-free revoke detection: check if a rebalance revoke happened
         // since the last poll cycle. If so, purge offsets for revoked partitions.
-        let current_revoke_gen = self.revoke_generation.load(Ordering::Relaxed);
+        let current_revoke_gen = self.revoke_generation.load(Ordering::Acquire);
         let had_revoke = current_revoke_gen != self.last_seen_revoke_gen;
         if had_revoke {
             self.last_seen_revoke_gen = current_revoke_gen;
-            let assigned = match self.rebalance_state.lock() {
-                Ok(state) => state.assigned_partitions().clone(),
-                Err(poisoned) => poisoned.into_inner().assigned_partitions().clone(),
-            };
+            // Clone is intentional: only runs on rebalance events (rare), not per-poll.
+            let assigned = lock_or_recover(&self.rebalance_state)
+                .assigned_partitions()
+                .clone();
             let before = self.offsets.partition_count();
             self.offsets.retain_assigned(&assigned);
             let after = self.offsets.partition_count();
@@ -934,10 +890,24 @@ impl SourceConnector for KafkaSource {
                     debug!("offset_commit_tx closed, reader task shutting down");
                 }
             }
-            match self.offset_snapshot.lock() {
-                Ok(mut snapshot) => snapshot.clone_from(&self.offsets),
-                Err(poisoned) => poisoned.into_inner().clone_from(&self.offsets),
+            lock_or_recover(&self.offset_snapshot).clone_from(&self.offsets);
+        }
+
+        // Compute consumer lag from high watermarks (moved from metrics()
+        // to avoid side-effects in a &self getter).
+        if let Some(ref hwm_rx) = self.high_watermarks_rx {
+            let watermarks = hwm_rx.borrow();
+            let mut total_lag: u64 = 0;
+            for (topic, partition, high_watermark) in watermarks.iter() {
+                if let Some(current_offset) = self.offsets.get(topic, *partition) {
+                    let lag = high_watermark.saturating_sub(current_offset + 1);
+                    #[allow(clippy::cast_sign_loss)]
+                    if lag > 0 {
+                        total_lag += lag as u64;
+                    }
+                }
             }
+            self.metrics.set_lag(total_lag);
         }
 
         if self.poll_payload_offsets.is_empty() {
@@ -957,19 +927,79 @@ impl SourceConnector for KafkaSource {
         };
 
         // Resolve Avro schemas from Schema Registry before deserialization.
+        // Also detect schema evolution when new schema IDs appear.
         if let Some(avro_deser) = self
             .deserializer
             .as_any_mut()
             .and_then(|any| any.downcast_mut::<AvroDeserializer>())
         {
+            let mut new_schema_ids = Vec::new();
             for &(start, len) in &self.poll_payload_offsets {
                 if let Some(schema_id) = AvroDeserializer::extract_confluent_id(
                     &self.poll_payload_buf[start..start + len],
                 ) {
-                    avro_deser
+                    let is_new = avro_deser
                         .ensure_schema_registered(schema_id)
                         .await
                         .map_err(ConnectorError::Serde)?;
+                    if is_new {
+                        new_schema_ids.push(schema_id);
+                    }
+                }
+            }
+
+            // Schema evolution detection for newly seen Avro schema IDs.
+            if !new_schema_ids.is_empty()
+                && self.config.schema_evolution_strategy != SchemaEvolutionStrategy::Ignore
+            {
+                if let Some(ref sr) = self.schema_registry {
+                    let compat = self
+                        .config
+                        .schema_compatibility
+                        .map_or(CompatibilityMode::Backward, CompatibilityMode::from);
+                    let evolver = SchemaEvolution::new(compat);
+
+                    for id in new_schema_ids {
+                        let cached = sr.resolve_confluent_id(id).await.map_err(|e| {
+                            ConnectorError::SchemaMismatch(format!(
+                                "failed to resolve schema {id}: {e}"
+                            ))
+                        })?;
+                        let changes = evolver.diff_schemas(&self.schema, &cached.arrow_schema);
+                        if changes.is_empty() {
+                            info!(
+                                schema_id = id,
+                                "new Avro schema ID registered, no field changes"
+                            );
+                            continue;
+                        }
+                        let verdict = evolver.evaluate_evolution(&changes);
+                        match &verdict {
+                            EvolutionVerdict::Compatible => {
+                                info!(schema_id = id, ?changes, "schema evolved (compatible)");
+                            }
+                            EvolutionVerdict::RequiresMigration => {
+                                warn!(
+                                    schema_id = id,
+                                    ?changes,
+                                    "schema evolved (requires migration)"
+                                );
+                            }
+                            EvolutionVerdict::Incompatible(reason) => {
+                                if self.config.schema_evolution_strategy
+                                    == SchemaEvolutionStrategy::Reject
+                                {
+                                    return Err(ConnectorError::SchemaMismatch(format!(
+                                        "incompatible schema evolution for ID {id}: {reason}"
+                                    )));
+                                }
+                                warn!(
+                                    schema_id = id, %reason, ?changes,
+                                    "incompatible schema evolution detected"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -982,18 +1012,25 @@ impl SourceConnector for KafkaSource {
 
         // Try batch deserialization first (fast path). If it fails, fall back
         // to per-record deserialization to isolate poison pills.
-        let batch = match self.deserializer.deserialize_batch(&refs, &self.schema) {
-            Ok(batch) => batch,
+        let (batch, good_indices) = match self.deserializer.deserialize_batch(&refs, &self.schema) {
+            Ok(batch) => (batch, None),
             Err(batch_err) => {
-                // Per-record fallback: deserialize one at a time, skip failures.
-                let mut good_refs = Vec::with_capacity(refs.len());
+                // Per-record fallback: deserialize one at a time, collect
+                // successful batches directly (avoids double-deserialization).
+                // Track indices of successful records so metadata vectors can
+                // be filtered to match the reduced row count.
+                let mut good_batches = Vec::with_capacity(refs.len());
+                let mut good_idx = Vec::with_capacity(refs.len());
                 let mut error_count = 0u64;
-                for r in &refs {
+                for (i, r) in refs.iter().enumerate() {
                     match self
                         .deserializer
                         .deserialize_batch(std::slice::from_ref(r), &self.schema)
                     {
-                        Ok(_) => good_refs.push(*r),
+                        Ok(batch) => {
+                            good_batches.push(batch);
+                            good_idx.push(i);
+                        }
                         Err(e) => {
                             error_count += 1;
                             self.metrics.record_error();
@@ -1001,22 +1038,48 @@ impl SourceConnector for KafkaSource {
                         }
                     }
                 }
-                if good_refs.is_empty() {
-                    // All records failed — propagate the original batch error.
+                if good_batches.is_empty() {
                     return Err(ConnectorError::Serde(batch_err));
                 }
+                // Escalate if the error rate exceeds the configured threshold.
+                #[allow(clippy::cast_precision_loss)]
                 if error_count > 0 {
+                    let error_rate = error_count as f64 / refs.len() as f64;
+                    if error_rate > self.config.max_deser_error_rate {
+                        return Err(ConnectorError::Serde(batch_err));
+                    }
                     warn!(
                         skipped = error_count,
                         total = refs.len(),
+                        error_rate = %format_args!("{error_rate:.1}"),
                         "deserialized batch with poison pill isolation"
                     );
                 }
-                self.deserializer
-                    .deserialize_batch(&good_refs, &self.schema)
-                    .map_err(ConnectorError::Serde)?
+                let batch = arrow_select::concat::concat_batches(&self.schema, &good_batches)
+                    .map_err(|e| {
+                        ConnectorError::Internal(format!("failed to concat batches: {e}"))
+                    })?;
+                (batch, Some(good_idx))
             }
         };
+
+        // If poison pill fallback filtered records, also filter metadata
+        // vectors so their lengths match the deserialized batch row count.
+        if let Some(ref idx) = good_indices {
+            if include_metadata {
+                self.poll_meta_partitions =
+                    idx.iter().map(|&i| self.poll_meta_partitions[i]).collect();
+                self.poll_meta_offsets = idx.iter().map(|&i| self.poll_meta_offsets[i]).collect();
+                self.poll_meta_timestamps =
+                    idx.iter().map(|&i| self.poll_meta_timestamps[i]).collect();
+            }
+            if include_headers {
+                self.poll_meta_headers = idx
+                    .iter()
+                    .map(|&i| std::mem::take(&mut self.poll_meta_headers[i]))
+                    .collect();
+            }
+        }
 
         // Append metadata columns if configured.
         let needs_meta = include_metadata && !self.poll_meta_partitions.is_empty();
@@ -1080,10 +1143,9 @@ impl SourceConnector for KafkaSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
-        let assigned = match self.rebalance_state.lock() {
-            Ok(state) => state.assigned_partitions().clone(),
-            Err(poisoned) => poisoned.into_inner().assigned_partitions().clone(),
-        };
+        let assigned = lock_or_recover(&self.rebalance_state)
+            .assigned_partitions()
+            .clone();
 
         // Push filtered offsets to the reader task so it can commit them
         // on shutdown even if close() is called without a subsequent checkpoint.
@@ -1135,7 +1197,7 @@ impl SourceConnector for KafkaSource {
     fn health_check(&self) -> HealthStatus {
         match self.state {
             ConnectorState::Running => {
-                if self.backpressure.is_paused() {
+                if self.reader_paused.load(Ordering::Acquire) {
                     HealthStatus::Degraded("backpressure: consumption paused".into())
                 } else {
                     HealthStatus::Healthy
@@ -1150,23 +1212,6 @@ impl SourceConnector for KafkaSource {
     }
 
     fn metrics(&self) -> ConnectorMetrics {
-        // Compute consumer lag from high watermarks, filtered to currently
-        // assigned partitions so revoked partitions don't contribute stale lag.
-        if let Some(ref hwm_rx) = self.high_watermarks_rx {
-            let watermarks = hwm_rx.borrow();
-            let mut total_lag: u64 = 0;
-            for (topic, partition, high_watermark) in watermarks.iter() {
-                // Only count partitions we still track offsets for (assigned).
-                if let Some(current_offset) = self.offsets.get(topic, *partition) {
-                    let lag = high_watermark.saturating_sub(current_offset + 1);
-                    #[allow(clippy::cast_sign_loss)]
-                    if lag > 0 {
-                        total_lag += lag as u64;
-                    }
-                }
-            }
-            self.metrics.set_lag(total_lag);
-        }
         self.metrics.to_connector_metrics()
     }
 
@@ -1181,10 +1226,9 @@ impl SourceConnector for KafkaSource {
     async fn close(&mut self) -> Result<(), ConnectorError> {
         info!("closing Kafka source connector");
 
-        let assigned = match self.rebalance_state.lock() {
-            Ok(state) => state.assigned_partitions().clone(),
-            Err(poisoned) => poisoned.into_inner().assigned_partitions().clone(),
-        };
+        let assigned = lock_or_recover(&self.rebalance_state)
+            .assigned_partitions()
+            .clone();
 
         // Send final filtered offsets to the reader task before signaling shutdown.
         if let Some(ref tx) = self.offset_commit_tx {
@@ -1194,12 +1238,19 @@ impl SourceConnector for KafkaSource {
             }
         }
 
-        // Signal shutdown and wait for the reader task to commit and exit.
+        // Signal shutdown and wait for all background tasks to exit.
         if let Some(tx) = self.reader_shutdown.take() {
             let _ = tx.send(true);
         }
+        let timeout = std::time::Duration::from_secs(5);
         if let Some(handle) = self.reader_handle.take() {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+            let _ = tokio::time::timeout(timeout, handle).await;
+        }
+        if let Some(handle) = self.commit_handle.take() {
+            let _ = tokio::time::timeout(timeout, handle).await;
+        }
+        if let Some(handle) = self.hwm_handle.take() {
+            let _ = tokio::time::timeout(timeout, handle).await;
         }
         self.msg_rx = None;
         self.offset_commit_tx = None;

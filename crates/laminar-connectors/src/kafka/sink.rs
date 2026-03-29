@@ -148,11 +148,17 @@ pub struct KafkaSink {
 
 impl KafkaSink {
     /// Creates a new Kafka sink connector with explicit schema.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.format` is not a supported serialization format.
+    /// Call [`KafkaSinkConfig::validate`] first to catch this at config time.
     #[must_use]
     pub fn new(schema: SchemaRef, config: KafkaSinkConfig) -> Self {
         let avro_schema_id = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let serializer =
-            select_serializer(config.format, &schema, Arc::clone(&avro_schema_id), None);
+            select_serializer(config.format, &schema, Arc::clone(&avro_schema_id), None)
+                .expect("format validated in KafkaSinkConfig::validate()");
         let partitioner = select_partitioner(config.partitioner);
 
         Self {
@@ -174,6 +180,11 @@ impl KafkaSink {
     }
 
     /// Creates a new Kafka sink with Schema Registry integration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.format` is not a supported serialization format.
+    /// Call [`KafkaSinkConfig::validate`] first to catch this at config time.
     #[must_use]
     pub fn with_schema_registry(
         schema: SchemaRef,
@@ -187,7 +198,8 @@ impl KafkaSink {
             &schema,
             Arc::clone(&avro_schema_id),
             Some(Arc::clone(&sr)),
-        );
+        )
+        .expect("format validated in KafkaSinkConfig::validate()");
         let partitioner = select_partitioner(config.partitioner);
 
         Self {
@@ -285,7 +297,7 @@ impl KafkaSink {
                 &self.schema,
                 Arc::clone(&self.avro_schema_id),
                 self.schema_registry.clone(),
-            );
+            )?;
         }
 
         Ok(())
@@ -367,7 +379,10 @@ impl KafkaSink {
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .unwrap_or_else(|_| {
+                tracing::warn!("system clock before Unix epoch — using 0 for DLQ timestamp");
+                std::time::Duration::ZERO
+            })
             .as_millis()
             .to_string();
         let epoch_str = self.current_epoch.to_string();
@@ -453,7 +468,7 @@ impl SinkConnector for KafkaSink {
                 &self.schema,
                 Arc::clone(&self.avro_schema_id),
                 self.schema_registry.clone(),
-            );
+            )?;
             self.partitioner = select_partitioner(self.config.partitioner);
         }
 
@@ -651,7 +666,13 @@ impl SinkConnector for KafkaSink {
                     if self.dlq_producer.is_some() {
                         let key: Option<&[u8]> =
                             keys.as_ref().map(|kb| kb.key(i)).filter(|k| !k.is_empty());
-                        self.route_to_dlq(&payloads[i], key, &err_msg).await?;
+                        if let Err(dlq_err) = self.route_to_dlq(&payloads[i], key, &err_msg).await {
+                            warn!(
+                                original_error = %err_msg,
+                                dlq_error = %dlq_err,
+                                "failed to route record to DLQ — record lost"
+                            );
+                        }
                     } else {
                         return Err(ConnectorError::WriteError(format!(
                             "Kafka produce failed: {err_msg}"
@@ -926,16 +947,15 @@ fn select_serializer(
     schema: &SchemaRef,
     schema_id: Arc<std::sync::atomic::AtomicU32>,
     registry: Option<Arc<SchemaRegistryClient>>,
-) -> Box<dyn RecordSerializer> {
+) -> Result<Box<dyn RecordSerializer>, ConnectorError> {
     match format {
-        Format::Avro => Box::new(AvroSerializer::with_shared_schema_id(
+        Format::Avro => Ok(Box::new(AvroSerializer::with_shared_schema_id(
             schema.clone(),
             schema_id,
             registry,
-        )),
-        other => serde::create_serializer(other).unwrap_or_else(|_| {
-            tracing::warn!(format = %other, "unsupported serializer format, falling back to JSON");
-            Box::new(serde::json::JsonSerializer::new())
+        ))),
+        other => serde::create_serializer(other).map_err(|e| {
+            ConnectorError::ConfigurationError(format!("unsupported sink format '{other}': {e}"))
         }),
     }
 }
