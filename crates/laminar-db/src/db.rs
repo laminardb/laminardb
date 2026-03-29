@@ -310,6 +310,10 @@ impl LaminarDB {
             laminar_connectors::files::register_file_source(registry);
             laminar_connectors::files::register_file_sink(registry);
         }
+        #[cfg(feature = "otel")]
+        {
+            laminar_connectors::otel::register_otel_source(registry);
+        }
     }
 
     /// Handle `CREATE LOOKUP TABLE` by registering the table in the
