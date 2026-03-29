@@ -1,8 +1,7 @@
 //! Integration tests for Kafka source connector.
 //!
-//! Requires Docker. Uses Redpanda as a lightweight Kafka-compatible broker.
-//! Validates produce → consume roundtrip, checkpoint/restore, and poison
-//! pill isolation.
+//! Requires Docker. Uses a single shared Redpanda container for all tests
+//! (each test uses a unique topic to avoid interference).
 //!
 //! Run with: `cargo test --test kafka_integration --features kafka`
 
@@ -16,9 +15,11 @@ use arrow_array::{Int64Array, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
+use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::GenericImage;
 use testcontainers::ImageExt;
+use tokio::sync::OnceCell;
 use tokio::time::sleep;
 
 use laminar_connectors::config::ConnectorConfig;
@@ -36,41 +37,45 @@ fn test_schema() -> SchemaRef {
 /// so the advertised Kafka address matches the address clients connect to.
 const REDPANDA_HOST_PORT: u16 = 19092;
 
-/// Starts a Redpanda container and returns the broker address.
-async fn start_redpanda() -> (testcontainers::ContainerAsync<GenericImage>, String) {
-    use testcontainers::core::IntoContainerPort;
+/// Shared Redpanda container — started once, reused by all tests.
+/// Each test uses a unique topic name to avoid interference.
+static REDPANDA: OnceCell<(testcontainers::ContainerAsync<GenericImage>, String)> =
+    OnceCell::const_new();
 
-    let container = GenericImage::new("redpandadata/redpanda", "v24.3.1")
-        .with_exposed_port(9092.into())
-        .with_wait_for(testcontainers::core::WaitFor::message_on_stderr(
-            "Successfully started Redpanda",
-        ))
-        .with_mapped_port(REDPANDA_HOST_PORT, 9092.tcp())
-        .with_cmd([
-            "redpanda",
-            "start",
-            "--smp",
-            "1",
-            "--memory",
-            "256M",
-            "--overprovisioned",
-            "--kafka-addr",
-            "PLAINTEXT://0.0.0.0:9092",
-            "--advertise-kafka-addr",
-            "PLAINTEXT://127.0.0.1:19092",
-            "--node-id",
-            "0",
-        ])
-        .start()
-        .await
-        .expect("failed to start Redpanda container");
+async fn get_brokers() -> &'static str {
+    let (_, brokers) = REDPANDA
+        .get_or_init(|| async {
+            let container = GenericImage::new("redpandadata/redpanda", "v24.3.1")
+                .with_exposed_port(9092.into())
+                .with_wait_for(testcontainers::core::WaitFor::message_on_stderr(
+                    "Successfully started Redpanda",
+                ))
+                .with_mapped_port(REDPANDA_HOST_PORT, 9092.tcp())
+                .with_cmd([
+                    "redpanda",
+                    "start",
+                    "--smp",
+                    "1",
+                    "--memory",
+                    "256M",
+                    "--overprovisioned",
+                    "--kafka-addr",
+                    "PLAINTEXT://0.0.0.0:9092",
+                    "--advertise-kafka-addr",
+                    "PLAINTEXT://127.0.0.1:19092",
+                    "--node-id",
+                    "0",
+                ])
+                .start()
+                .await
+                .expect("failed to start Redpanda container");
 
-    let brokers = format!("127.0.0.1:{REDPANDA_HOST_PORT}");
-
-    // Brief wait for broker to accept connections.
-    sleep(Duration::from_secs(2)).await;
-
-    (container, brokers)
+            let brokers = format!("127.0.0.1:{REDPANDA_HOST_PORT}");
+            sleep(Duration::from_secs(2)).await;
+            (container, brokers)
+        })
+        .await;
+    brokers
 }
 
 /// Produces N JSON messages to the given topic.
@@ -121,14 +126,14 @@ async fn poll_all(
 
 #[tokio::test]
 async fn test_produce_consume_roundtrip() {
-    let (_container, brokers) = start_redpanda().await;
+    let brokers = get_brokers().await;
     let topic = "test-roundtrip";
     let n = 50;
 
-    produce_messages(&brokers, topic, n).await;
+    produce_messages(brokers, topic, n).await;
 
     let cfg = KafkaSourceConfig {
-        bootstrap_servers: brokers.clone(),
+        bootstrap_servers: brokers.to_string(),
         group_id: "test-roundtrip-group".into(),
         subscription: TopicSubscription::Topics(vec![topic.into()]),
         ..KafkaSourceConfig::default()
@@ -168,15 +173,15 @@ async fn test_produce_consume_roundtrip() {
 
 #[tokio::test]
 async fn test_checkpoint_restore() {
-    let (_container, brokers) = start_redpanda().await;
+    let brokers = get_brokers().await;
     let topic = "test-checkpoint";
     let n = 20;
 
-    produce_messages(&brokers, topic, n).await;
+    produce_messages(brokers, topic, n).await;
 
     // Phase 1: consume all, checkpoint.
     let cfg = KafkaSourceConfig {
-        bootstrap_servers: brokers.clone(),
+        bootstrap_servers: brokers.to_string(),
         group_id: "test-checkpoint-group".into(),
         subscription: TopicSubscription::Topics(vec![topic.into()]),
         ..KafkaSourceConfig::default()
@@ -192,7 +197,7 @@ async fn test_checkpoint_restore() {
 
     // Produce more messages after checkpoint.
     let extra = 10;
-    produce_messages(&brokers, topic, extra).await;
+    produce_messages(brokers, topic, extra).await;
 
     // Phase 2: restore from checkpoint, should only get the extra messages.
     let mut source2 = KafkaSource::new(test_schema(), cfg);
@@ -208,12 +213,12 @@ async fn test_checkpoint_restore() {
 
 #[tokio::test]
 async fn test_poison_pill_isolation() {
-    let (_container, brokers) = start_redpanda().await;
+    let brokers = get_brokers().await;
     let topic = "test-poison";
 
     // Produce a mix of valid JSON and garbage.
     let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", &brokers)
+        .set("bootstrap.servers", brokers)
         .set("message.timeout.ms", "5000")
         .create()
         .expect("producer creation");
@@ -236,7 +241,7 @@ async fn test_poison_pill_isolation() {
     }
 
     let cfg = KafkaSourceConfig {
-        bootstrap_servers: brokers,
+        bootstrap_servers: brokers.to_string(),
         group_id: "test-poison-group".into(),
         subscription: TopicSubscription::Topics(vec![topic.into()]),
         max_deser_error_rate: 0.5,
