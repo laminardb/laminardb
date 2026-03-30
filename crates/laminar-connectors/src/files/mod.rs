@@ -10,6 +10,7 @@
 //! - JSON Lines (via [`JsonDecoder`](crate::schema::JsonDecoder))
 //! - Plain text (via [`TextLineDecoder`](crate::files::text_decoder::TextLineDecoder))
 //! - Apache Parquet (via [`ParquetDecoder`](crate::schema::parquet::ParquetDecoder))
+//! - Arrow IPC (via [`ArrowIpcDecoder`](crate::files::arrow_ipc_codec::ArrowIpcDecoder))
 //!
 //! # Example DDL
 //!
@@ -27,6 +28,7 @@ use std::sync::Arc;
 use crate::config::ConnectorInfo;
 use crate::registry::ConnectorRegistry;
 
+pub mod arrow_ipc_codec;
 pub mod config;
 pub mod discovery;
 pub mod manifest;

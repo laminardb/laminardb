@@ -5,11 +5,12 @@
 
 use std::sync::Arc;
 
-use arrow_array::builder::{BinaryBuilder, StringBuilder};
+use arrow_array::builder::BinaryBuilder;
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::error::ConnectorError;
+use crate::schema::csv::{CsvDecoder, CsvDecoderConfig};
 use crate::schema::json::decoder::{JsonDecoder, JsonDecoderConfig};
 use crate::schema::traits::FormatDecoder;
 use crate::schema::types::RawRecord;
@@ -24,6 +25,8 @@ pub struct MessageParser {
     format: MessageFormat,
     /// Type-aware JSON decoder (set for JSON/JsonLines formats).
     json_decoder: Option<JsonDecoder>,
+    /// Type-aware CSV decoder (set for CSV format).
+    csv_decoder: Option<CsvDecoder>,
 }
 
 impl MessageParser {
@@ -40,10 +43,26 @@ impl MessageParser {
             }
             _ => None,
         };
+        let csv_decoder = match &format {
+            MessageFormat::Csv {
+                delimiter,
+                has_header,
+            } => {
+                #[allow(clippy::cast_possible_truncation)]
+                let csv_config = CsvDecoderConfig {
+                    delimiter: *delimiter as u8,
+                    has_header: *has_header,
+                    ..CsvDecoderConfig::default()
+                };
+                Some(CsvDecoder::with_config(schema.clone(), csv_config))
+            }
+            _ => None,
+        };
         Self {
             schema,
             format,
             json_decoder,
+            csv_decoder,
         }
     }
 
@@ -66,7 +85,7 @@ impl MessageParser {
         match &self.format {
             MessageFormat::Json | MessageFormat::JsonLines => self.parse_json_batch(messages),
             MessageFormat::Binary => self.parse_binary_batch(messages),
-            MessageFormat::Csv { delimiter, .. } => self.parse_csv_batch(messages, *delimiter),
+            MessageFormat::Csv { .. } => self.parse_csv_batch(messages),
         }
     }
 
@@ -111,54 +130,16 @@ impl MessageParser {
 
     /// Parses CSV text messages into a `RecordBatch`.
     ///
-    /// Each message is treated as one or more CSV rows.
-    fn parse_csv_batch(
-        &self,
-        messages: &[&[u8]],
-        delimiter: char,
-    ) -> Result<RecordBatch, ConnectorError> {
-        let mut builders: Vec<StringBuilder> = self
-            .schema
-            .fields()
+    /// Delegates to [`CsvDecoder`] for schema-directed type coercion.
+    fn parse_csv_batch(&self, messages: &[&[u8]]) -> Result<RecordBatch, ConnectorError> {
+        let decoder = self.csv_decoder.as_ref().ok_or_else(|| {
+            ConnectorError::Internal("csv_decoder not initialized for CSV format".into())
+        })?;
+        let records: Vec<RawRecord> = messages
             .iter()
-            .map(|_| StringBuilder::with_capacity(messages.len(), messages.len() * 32))
+            .map(|m| RawRecord::new(m.to_vec()))
             .collect();
-
-        let num_fields = self.schema.fields().len();
-
-        for msg in messages {
-            let text = std::str::from_utf8(msg).map_err(|e| {
-                ConnectorError::Serde(crate::error::SerdeError::MalformedInput(format!(
-                    "invalid UTF-8 in CSV message: {e}"
-                )))
-            })?;
-
-            for line in text.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-
-                let fields: Vec<&str> = line.split(delimiter).collect();
-                for (i, builder) in builders.iter_mut().enumerate().take(num_fields) {
-                    if i < fields.len() {
-                        builder.append_value(fields[i].trim());
-                    } else {
-                        builder.append_null();
-                    }
-                }
-            }
-        }
-
-        let arrays: Vec<Arc<dyn arrow_array::Array>> = builders
-            .into_iter()
-            .map(|mut b| Arc::new(b.finish()) as _)
-            .collect();
-
-        RecordBatch::try_new(self.schema.clone(), arrays).map_err(|e| {
-            ConnectorError::Serde(crate::error::SerdeError::Csv(format!(
-                "failed to build CSV RecordBatch: {e}"
-            )))
-        })
+        decoder.decode_batch(&records).map_err(ConnectorError::from)
     }
 }
 

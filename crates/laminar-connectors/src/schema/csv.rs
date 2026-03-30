@@ -20,7 +20,7 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, SchemaRef, TimeUnit};
 
 use crate::schema::error::{SchemaError, SchemaResult};
-use crate::schema::traits::FormatDecoder;
+use crate::schema::traits::{FormatDecoder, FormatEncoder};
 use crate::schema::types::RawRecord;
 
 /// Strategy for rows with incorrect field count.
@@ -513,9 +513,85 @@ fn append_coerced(
     }
 }
 
+/// Configuration for [`CsvEncoder`].
+#[derive(Debug, Clone)]
+pub struct CsvEncoderConfig {
+    /// Field delimiter. Default: `','`.
+    pub delimiter: u8,
+    /// Whether to include a header row. Default: `false`.
+    pub has_header: bool,
+}
+
+impl Default for CsvEncoderConfig {
+    fn default() -> Self {
+        Self {
+            delimiter: b',',
+            has_header: false,
+        }
+    }
+}
+
+/// Encodes Arrow `RecordBatch`es into CSV byte records via `arrow_csv::writer`.
+#[derive(Debug)]
+pub struct CsvEncoder {
+    schema: SchemaRef,
+    config: CsvEncoderConfig,
+}
+
+impl CsvEncoder {
+    /// Creates a new CSV encoder for the given schema with default config.
+    #[must_use]
+    pub fn new(schema: SchemaRef) -> Self {
+        Self::with_config(schema, CsvEncoderConfig::default())
+    }
+
+    /// Creates a new CSV encoder with custom configuration.
+    #[must_use]
+    pub fn with_config(schema: SchemaRef, config: CsvEncoderConfig) -> Self {
+        Self { schema, config }
+    }
+}
+
+impl FormatEncoder for CsvEncoder {
+    fn input_schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn encode_batch(&self, batch: &RecordBatch) -> SchemaResult<Vec<Vec<u8>>> {
+        if batch.num_rows() == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut buf = Vec::new();
+        {
+            let writer = arrow_csv::writer::WriterBuilder::new()
+                .with_header(self.config.has_header)
+                .with_delimiter(self.config.delimiter);
+            let mut csv_writer = writer.build(&mut buf);
+            csv_writer
+                .write(batch)
+                .map_err(|e| SchemaError::DecodeError(format!("CSV encode error: {e}")))?;
+        }
+
+        let output: Vec<Vec<u8>> = buf
+            .split(|&b| b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect();
+
+        Ok(output)
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn format_name(&self) -> &str {
+        "csv"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::traits::FormatEncoder;
     use arrow_array::cast::AsArray;
     use arrow_schema::{Field, Schema};
 
@@ -1182,5 +1258,119 @@ mod tests {
             batch.column(0).as_string::<i32>().value(0),
             "hello \"world\""
         );
+    }
+
+    // ── CsvEncoder tests ──────────────────────────────────────
+
+    #[test]
+    fn test_csv_encode_basic() {
+        let schema = make_schema(vec![
+            ("id", DataType::Int64, false),
+            ("name", DataType::Utf8, false),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1, 2])),
+                Arc::new(arrow_array::StringArray::from(vec!["Alice", "Bob"])),
+            ],
+        )
+        .unwrap();
+
+        let encoder = CsvEncoder::new(schema);
+        let records = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(std::str::from_utf8(&records[0]).unwrap(), "1,Alice");
+        assert_eq!(std::str::from_utf8(&records[1]).unwrap(), "2,Bob");
+    }
+
+    #[test]
+    fn test_csv_encode_with_header() {
+        let schema = make_schema(vec![
+            ("id", DataType::Int64, false),
+            ("name", DataType::Utf8, false),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1])),
+                Arc::new(arrow_array::StringArray::from(vec!["Alice"])),
+            ],
+        )
+        .unwrap();
+
+        let config = CsvEncoderConfig {
+            has_header: true,
+            ..Default::default()
+        };
+        let encoder = CsvEncoder::with_config(schema, config);
+        let records = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(records.len(), 2); // header + 1 data row
+        assert_eq!(std::str::from_utf8(&records[0]).unwrap(), "id,name");
+        assert_eq!(std::str::from_utf8(&records[1]).unwrap(), "1,Alice");
+    }
+
+    #[test]
+    fn test_csv_encode_tab_delimiter() {
+        let schema = make_schema(vec![
+            ("a", DataType::Int64, false),
+            ("b", DataType::Utf8, false),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![42])),
+                Arc::new(arrow_array::StringArray::from(vec!["hello"])),
+            ],
+        )
+        .unwrap();
+
+        let config = CsvEncoderConfig {
+            delimiter: b'\t',
+            ..Default::default()
+        };
+        let encoder = CsvEncoder::with_config(schema, config);
+        let records = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(std::str::from_utf8(&records[0]).unwrap(), "42\thello");
+    }
+
+    #[test]
+    fn test_csv_encode_empty_batch() {
+        let schema = make_schema(vec![("x", DataType::Int64, false)]);
+        let batch = RecordBatch::new_empty(schema.clone());
+        let encoder = CsvEncoder::new(schema);
+        let records = encoder.encode_batch(&batch).unwrap();
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn test_csv_encode_nulls() {
+        let schema = make_schema(vec![
+            ("id", DataType::Int64, false),
+            ("value", DataType::Int64, true),
+        ]);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1, 2])),
+                Arc::new(arrow_array::Int64Array::from(vec![Some(10), None])),
+            ],
+        )
+        .unwrap();
+
+        let encoder = CsvEncoder::new(schema);
+        let records = encoder.encode_batch(&batch).unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(std::str::from_utf8(&records[0]).unwrap(), "1,10");
+        assert_eq!(std::str::from_utf8(&records[1]).unwrap(), "2,");
     }
 }

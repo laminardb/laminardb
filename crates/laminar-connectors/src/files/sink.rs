@@ -418,10 +418,15 @@ fn build_encoder(
     config: &FileSinkConfig,
 ) -> Result<Box<dyn FormatEncoder>, ConnectorError> {
     match format {
-        FileFormat::Csv | FileFormat::Json | FileFormat::Text => {
-            // JSON encoder produces one JSON object per row — suitable for
-            // JSON Lines output. CSV and text also use this as a baseline;
-            // a dedicated CSV encoder can be added later via the serde module.
+        FileFormat::Csv => {
+            let csv_config = crate::schema::CsvEncoderConfig {
+                delimiter: b',',
+                has_header: false,
+            };
+            let encoder = crate::schema::CsvEncoder::with_config(schema.clone(), csv_config);
+            Ok(Box::new(encoder))
+        }
+        FileFormat::Json | FileFormat::Text => {
             let encoder = crate::schema::JsonEncoder::new(schema.clone());
             Ok(Box::new(encoder))
         }
@@ -443,6 +448,10 @@ fn build_encoder(
                 .with_compression(compression);
             let encoder =
                 crate::schema::parquet::ParquetEncoder::with_config(schema.clone(), parquet_config);
+            Ok(Box::new(encoder))
+        }
+        FileFormat::ArrowIpc => {
+            let encoder = super::arrow_ipc_codec::ArrowIpcEncoder::new(schema.clone());
             Ok(Box::new(encoder))
         }
     }

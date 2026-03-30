@@ -1,20 +1,21 @@
 //! JSON format encoder implementing [`FormatEncoder`].
-//!
-//! Converts Arrow `RecordBatch`es into JSON byte payloads (one JSON
-//! object per row).
 
+use std::io::Write as _;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::RecordBatch;
-use arrow_schema::{DataType, SchemaRef, TimeUnit};
+use arrow_array::{Array, RecordBatch};
+use arrow_json::writer::{
+    Encoder, EncoderFactory, EncoderOptions, LineDelimited, NullableEncoder, WriterBuilder,
+};
+use arrow_schema::{ArrowError, DataType, FieldRef, SchemaRef};
 
 use crate::schema::error::{SchemaError, SchemaResult};
 use crate::schema::traits::FormatEncoder;
 
-/// Encodes Arrow `RecordBatch`es into JSON byte records.
-///
-/// Each row becomes one JSON object serialized as UTF-8 bytes.
+/// Encodes Arrow `RecordBatch`es into one JSON object per row via
+/// `arrow_json::writer`. `LargeBinary` columns are inlined as JSON
+/// when valid (JSONB passthrough), matching `CollectExtra` semantics.
 #[derive(Debug)]
 pub struct JsonEncoder {
     schema: SchemaRef,
@@ -34,26 +35,29 @@ impl FormatEncoder for JsonEncoder {
     }
 
     fn encode_batch(&self, batch: &RecordBatch) -> SchemaResult<Vec<Vec<u8>>> {
-        let num_rows = batch.num_rows();
-        let mut output = Vec::with_capacity(num_rows);
-
-        for row in 0..num_rows {
-            let mut obj = serde_json::Map::with_capacity(batch.num_columns());
-
-            for (col_idx, field) in self.schema.fields().iter().enumerate() {
-                let col = batch.column(col_idx);
-                let value = if col.is_null(row) {
-                    serde_json::Value::Null
-                } else {
-                    column_value_to_json(col, row, field.data_type())?
-                };
-                obj.insert(field.name().clone(), value);
-            }
-
-            let bytes = serde_json::to_vec(&serde_json::Value::Object(obj))
-                .map_err(|e| SchemaError::DecodeError(format!("JSON encode error: {e}")))?;
-            output.push(bytes);
+        if batch.num_rows() == 0 {
+            return Ok(Vec::new());
         }
+
+        let mut buf = Vec::new();
+        {
+            let mut writer = WriterBuilder::new()
+                .with_explicit_nulls(true)
+                .with_encoder_factory(Arc::new(JsonbPassthroughFactory))
+                .build::<_, LineDelimited>(&mut buf);
+            writer
+                .write(batch)
+                .map_err(|e| SchemaError::DecodeError(format!("JSON encode error: {e}")))?;
+            writer
+                .finish()
+                .map_err(|e| SchemaError::DecodeError(format!("JSON finish error: {e}")))?;
+        }
+
+        let output: Vec<Vec<u8>> = buf
+            .split(|&b| b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect();
 
         Ok(output)
     }
@@ -63,83 +67,49 @@ impl FormatEncoder for JsonEncoder {
     }
 }
 
-fn column_value_to_json(
-    col: &Arc<dyn arrow_array::Array>,
-    row: usize,
-    data_type: &DataType,
-) -> SchemaResult<serde_json::Value> {
-    Ok(match data_type {
-        DataType::Boolean => serde_json::Value::Bool(col.as_boolean().value(row)),
-        DataType::Int32 => serde_json::Value::Number(
-            col.as_primitive::<arrow_array::types::Int32Type>()
-                .value(row)
-                .into(),
-        ),
-        DataType::Int64 => serde_json::Value::Number(
-            col.as_primitive::<arrow_array::types::Int64Type>()
-                .value(row)
-                .into(),
-        ),
-        DataType::Float32 => {
-            let f = f64::from(
-                col.as_primitive::<arrow_array::types::Float32Type>()
-                    .value(row),
-            );
-            serde_json::Number::from_f64(f)
-                .map_or(serde_json::Value::Null, serde_json::Value::Number)
+/// Inlines `LargeBinary` as raw JSON when valid; falls through otherwise.
+#[derive(Debug)]
+struct JsonbPassthroughFactory;
+
+impl EncoderFactory for JsonbPassthroughFactory {
+    fn make_default_encoder<'a>(
+        &self,
+        _field: &'a FieldRef,
+        array: &'a dyn Array,
+        _options: &'a EncoderOptions,
+    ) -> Result<Option<NullableEncoder<'a>>, ArrowError> {
+        if *array.data_type() != DataType::LargeBinary {
+            return Ok(None);
         }
-        DataType::Float64 => {
-            let f = col
-                .as_primitive::<arrow_array::types::Float64Type>()
-                .value(row);
-            serde_json::Number::from_f64(f)
-                .map_or(serde_json::Value::Null, serde_json::Value::Number)
+        let binary_array = array.as_binary::<i64>();
+        let nulls = binary_array.nulls().cloned();
+        let encoder = LargeBinaryJsonbEncoder {
+            array: binary_array,
+        };
+        Ok(Some(NullableEncoder::new(Box::new(encoder), nulls)))
+    }
+}
+
+struct LargeBinaryJsonbEncoder<'a> {
+    array: &'a arrow_array::LargeBinaryArray,
+}
+
+impl Encoder for LargeBinaryJsonbEncoder<'_> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        let bytes = self.array.value(idx);
+        if serde_json::from_slice::<serde_json::Value>(bytes).is_ok() {
+            out.extend_from_slice(bytes);
+        } else {
+            write!(out, "\"<binary:{} bytes>\"", bytes.len()).unwrap();
         }
-        DataType::Utf8 => serde_json::Value::String(col.as_string::<i32>().value(row).to_string()),
-        DataType::LargeUtf8 => {
-            serde_json::Value::String(col.as_string::<i64>().value(row).to_string())
-        }
-        DataType::LargeBinary => {
-            // Attempt to parse as JSON; fallback to opaque binary string.
-            let bytes = col.as_binary::<i64>().value(row);
-            match serde_json::from_slice::<serde_json::Value>(bytes) {
-                Ok(v) => v,
-                Err(_) => serde_json::Value::String(format!("<binary:{} bytes>", bytes.len())),
-            }
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            let nanos = col
-                .as_primitive::<arrow_array::types::TimestampNanosecondType>()
-                .value(row);
-            // Convert nanos to RFC 3339 string.
-            // `rem_euclid` guarantees a non-negative remainder in [0, 1_000_000_000),
-            // which always fits in u32.
-            let secs = nanos.div_euclid(1_000_000_000);
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let nsec = nanos.rem_euclid(1_000_000_000) as u32;
-            if let Some(dt) = chrono::DateTime::from_timestamp(secs, nsec) {
-                serde_json::Value::String(dt.to_rfc3339())
-            } else {
-                serde_json::Value::Number(nanos.into())
-            }
-        }
-        // Fallback: use Arrow's string representation.
-        _ => {
-            let arr_str = arrow_cast::display::ArrayFormatter::try_new(
-                col.as_ref(),
-                &arrow_cast::display::FormatOptions::default(),
-            )
-            .map_err(|e| SchemaError::DecodeError(format!("format error: {e}")))?;
-            serde_json::Value::String(arr_str.value(row).to_string())
-        }
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow_array::*;
-    use arrow_schema::{Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
     fn make_schema(fields: Vec<(&str, DataType, bool)>) -> SchemaRef {
         Arc::new(Schema::new(
@@ -181,23 +151,93 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_nulls() {
-        let schema = make_schema(vec![("value", DataType::Int64, true)]);
+    fn test_encode_nulls_explicit() {
+        let schema = make_schema(vec![
+            ("a", DataType::Int64, true),
+            ("b", DataType::Utf8, true),
+        ]);
 
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(Int64Array::from(vec![Some(1), None]))],
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), None])),
+                Arc::new(StringArray::from(vec![None, Some("x")])),
+            ],
         )
         .unwrap();
 
         let encoder = JsonEncoder::new(schema);
         let records = encoder.encode_batch(&batch).unwrap();
 
+        // Row 0: a=1, b=null — null key must be present.
         let v0: serde_json::Value = serde_json::from_slice(&records[0]).unwrap();
-        assert_eq!(v0["value"], 1);
+        assert_eq!(v0["a"], 1);
+        assert!(
+            v0.get("b").unwrap().is_null(),
+            "null key 'b' must be present"
+        );
 
+        // Row 1: a=null, b="x" — null key must be present.
         let v1: serde_json::Value = serde_json::from_slice(&records[1]).unwrap();
-        assert!(v1["value"].is_null());
+        assert!(
+            v1.get("a").unwrap().is_null(),
+            "null key 'a' must be present"
+        );
+        assert_eq!(v1["b"], "x");
+    }
+
+    #[test]
+    fn test_encode_large_binary_jsonb() {
+        let schema = make_schema(vec![
+            ("name", DataType::Utf8, false),
+            ("extra", DataType::LargeBinary, true),
+        ]);
+
+        let json_bytes = br#"{"nested":"value","count":42}"#;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["Alice", "Bob"])),
+                Arc::new(LargeBinaryArray::from(vec![
+                    Some(json_bytes.as_ref()),
+                    None,
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let encoder = JsonEncoder::new(schema);
+        let records = encoder.encode_batch(&batch).unwrap();
+
+        // Row 0: extra must be inlined as a JSON object, not hex-encoded.
+        let v0: serde_json::Value = serde_json::from_slice(&records[0]).unwrap();
+        assert_eq!(v0["name"], "Alice");
+        assert!(v0["extra"].is_object(), "JSONB must be inlined as object");
+        assert_eq!(v0["extra"]["nested"], "value");
+        assert_eq!(v0["extra"]["count"], 42);
+
+        // Row 1: null extra.
+        let v1: serde_json::Value = serde_json::from_slice(&records[1]).unwrap();
+        assert!(v1["extra"].is_null());
+    }
+
+    #[test]
+    fn test_encode_large_binary_non_json() {
+        let schema = make_schema(vec![("data", DataType::LargeBinary, false)]);
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(LargeBinaryArray::from(vec![
+                b"\x00\x01\x02".as_ref()
+            ]))],
+        )
+        .unwrap();
+
+        let encoder = JsonEncoder::new(schema);
+        let records = encoder.encode_batch(&batch).unwrap();
+
+        let v: serde_json::Value = serde_json::from_slice(&records[0]).unwrap();
+        assert_eq!(v["data"], "<binary:3 bytes>");
     }
 
     #[test]
@@ -237,5 +277,30 @@ mod tests {
         let encoder = JsonEncoder::new(schema);
         let records = encoder.encode_batch(&batch).unwrap();
         assert!(records.is_empty());
+    }
+
+    #[test]
+    fn test_encode_timestamp() {
+        let schema = make_schema(vec![(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+            false,
+        )]);
+
+        let nanos = 1_736_936_600_000_000_000_i64;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(
+                TimestampNanosecondArray::from(vec![nanos]).with_timezone("+00:00"),
+            )],
+        )
+        .unwrap();
+
+        let encoder = JsonEncoder::new(schema);
+        let records = encoder.encode_batch(&batch).unwrap();
+        assert_eq!(records.len(), 1);
+
+        let v: serde_json::Value = serde_json::from_slice(&records[0]).unwrap();
+        assert!(v["ts"].is_string());
     }
 }

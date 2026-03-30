@@ -353,6 +353,16 @@ fn build_decoder_and_schema(
             let decoder = crate::schema::parquet::ParquetDecoder::new(schema.clone());
             Ok((Box::new(decoder), schema))
         }
+        FileFormat::ArrowIpc => {
+            // Arrow IPC files embed their schema in the header — use it as
+            // authoritative. The DDL schema is used as placeholder until
+            // the first file is read.
+            let schema = connector_config.arrow_schema().unwrap_or_else(|| {
+                Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]))
+            });
+            let decoder = super::arrow_ipc_codec::ArrowIpcDecoder::new(schema.clone());
+            Ok((Box::new(decoder), schema))
+        }
     }
 }
 
