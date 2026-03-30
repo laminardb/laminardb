@@ -927,9 +927,13 @@ pub fn arrow_to_avro_schema(schema: &SchemaRef, record_name: &str) -> Result<Str
         }));
     }
 
+    // Avro record names must match [A-Za-z_][A-Za-z0-9_]*; topic names
+    // commonly contain hyphens (e.g. "my-events") which are invalid.
+    let safe_name = record_name.replace('-', "_");
+
     let schema = serde_json::json!({
         "type": "record",
-        "name": record_name,
+        "name": safe_name,
         "fields": fields,
     });
 
@@ -1173,6 +1177,15 @@ mod tests {
         assert_eq!(fields[0]["type"], "long");
         assert_eq!(fields[1]["name"], "name");
         assert_eq!(fields[1]["type"], "string");
+    }
+
+    #[test]
+    fn test_arrow_to_avro_schema_sanitizes_hyphens() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        let avro_str = arrow_to_avro_schema(&schema, "trades-avro-output").unwrap();
+        let avro: serde_json::Value = serde_json::from_str(&avro_str).unwrap();
+        assert_eq!(avro["name"], "trades_avro_output");
     }
 
     #[test]

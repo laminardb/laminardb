@@ -119,6 +119,10 @@ pub struct KafkaSource {
     /// Updated once per `poll_batch()` cycle (not per message).
     offset_snapshot: Arc<Mutex<OffsetTracker>>,
 
+    /// Last Avro writer schema from the schema registry, used to diff
+    /// successive versions for evolution detection.
+    last_avro_schema: Option<SchemaRef>,
+
     // Reusable poll_batch buffers — cleared each cycle, capacity retained.
     poll_payload_buf: Vec<u8>,
     poll_payload_offsets: Vec<(usize, usize)>,
@@ -199,6 +203,7 @@ impl KafkaSource {
             reader_paused: Arc::new(AtomicBool::new(false)),
             commit_retry_needed: Arc::new(AtomicBool::new(false)),
             offset_snapshot: Arc::new(Mutex::new(OffsetTracker::new())),
+            last_avro_schema: None,
             poll_payload_buf: Vec::new(),
             poll_payload_offsets: Vec::new(),
             poll_meta_partitions: Vec::new(),
@@ -602,6 +607,9 @@ impl SourceConnector for KafkaSource {
             self.deserializer = select_deserializer(kafka_config.format);
         }
 
+        // New deserializer has empty known_ids; reset evolution baseline to match.
+        self.last_avro_schema = None;
+
         // Override schema from SQL DDL if provided.
         if let Some(schema) = config.arrow_schema() {
             info!(
@@ -948,7 +956,7 @@ impl SourceConnector for KafkaSource {
                 }
             }
 
-            // Schema evolution detection for newly seen Avro schema IDs.
+            // Detect schema evolution by diffing successive writer schemas.
             if !new_schema_ids.is_empty()
                 && self.config.schema_evolution_strategy != SchemaEvolutionStrategy::Ignore
             {
@@ -965,7 +973,17 @@ impl SourceConnector for KafkaSource {
                                 "failed to resolve schema {id}: {e}"
                             ))
                         })?;
-                        let changes = evolver.diff_schemas(&self.schema, &cached.arrow_schema);
+
+                        let Some(ref prev) = self.last_avro_schema else {
+                            // First schema — establish baseline, nothing to diff.
+                            info!(schema_id = id, "initial Avro schema registered");
+                            self.last_avro_schema = Some(Arc::clone(&cached.arrow_schema));
+                            continue;
+                        };
+
+                        let changes = evolver.diff_schemas(prev, &cached.arrow_schema);
+                        self.last_avro_schema = Some(Arc::clone(&cached.arrow_schema));
+
                         if changes.is_empty() {
                             info!(
                                 schema_id = id,
