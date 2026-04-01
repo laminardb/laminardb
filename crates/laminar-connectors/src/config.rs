@@ -11,9 +11,41 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
+use arrow_schema::{Schema, SchemaRef};
 
 use crate::error::ConnectorError;
+
+/// Encode an Arrow schema as a hex-encoded IPC flatbuffer string.
+#[must_use]
+pub fn encode_arrow_schema_ipc(schema: &Schema) -> String {
+    let mut dt = DictionaryTracker::new(false);
+    let enc = IpcDataGenerator::default().schema_to_bytes_with_dictionary_tracker(
+        schema,
+        &mut dt,
+        &IpcWriteOptions::default(),
+    );
+    let bytes = &enc.ipc_message;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
+/// Decode a hex-encoded IPC flatbuffer string to an Arrow schema.
+#[must_use]
+pub fn decode_arrow_schema_ipc(hex: &str) -> Option<Schema> {
+    let bytes: Option<Vec<u8>> = (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            hex.get(i..i + 2)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        })
+        .collect();
+    arrow_ipc::convert::try_schema_from_flatbuffer_bytes(&bytes?).ok()
+}
 
 /// Configuration for a connector instance.
 ///
@@ -128,66 +160,11 @@ impl ConnectorConfig {
             .collect()
     }
 
-    /// Returns the SQL-defined Arrow schema passed via `_arrow_schema`,
-    /// or `None` if absent or unparseable.
-    ///
-    /// The compact format is `"col1:Type1,col2:Type2,..."` as produced by
-    /// `encode_arrow_schema` in `laminar-db`.
-    ///
-    /// **Note:** This method re-parses the schema string on each call.
-    /// Cache the result if you need it in a hot loop.
+    /// Decodes the `_arrow_schema` IPC flatbuffer, or `None` if absent.
     #[must_use]
     pub fn arrow_schema(&self) -> Option<SchemaRef> {
         let s = self.get("_arrow_schema")?;
-        let fields: Vec<Field> = s
-            .split(',')
-            .filter(|part| !part.is_empty())
-            .filter_map(|part| {
-                let (name, type_str) = part.split_once(':')?;
-                let dt = match type_str {
-                    "Utf8" => DataType::Utf8,
-                    "LargeUtf8" => DataType::LargeUtf8,
-                    "Float64" => DataType::Float64,
-                    "Float32" => DataType::Float32,
-                    "Int64" => DataType::Int64,
-                    "Int32" => DataType::Int32,
-                    "Int16" => DataType::Int16,
-                    "Int8" => DataType::Int8,
-                    "UInt64" => DataType::UInt64,
-                    "UInt32" => DataType::UInt32,
-                    "Boolean" => DataType::Boolean,
-                    "Date32" => DataType::Date32,
-                    "Date64" => DataType::Date64,
-                    "Timestamp(Millisecond)" => {
-                        DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None)
-                    }
-                    "Timestamp(Microsecond)" => {
-                        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
-                    }
-                    "Timestamp(Nanosecond)" => {
-                        DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
-                    }
-                    "Timestamp(Second)" => {
-                        DataType::Timestamp(arrow_schema::TimeUnit::Second, None)
-                    }
-                    other => {
-                        tracing::warn!(
-                            type_str = other,
-                            field = name,
-                            "unknown Arrow type in _arrow_schema — column skipped"
-                        );
-                        return None;
-                    }
-                };
-                Some(Field::new(name, dt, true))
-            })
-            .collect();
-
-        if fields.is_empty() {
-            None
-        } else {
-            Some(Arc::new(Schema::new(fields)))
-        }
+        decode_arrow_schema_ipc(s).map(Arc::new)
     }
 
     /// Formats all properties for display with secrets redacted.
@@ -357,6 +334,7 @@ impl fmt::Display for ConnectorState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::Schema;
 
     #[test]
     fn test_config_basic_operations() {
@@ -477,9 +455,19 @@ mod tests {
     }
 
     #[test]
-    fn test_arrow_schema_parses_compact_encoding() {
+    fn test_arrow_schema_ipc_round_trip() {
+        use arrow_schema::{DataType, Field};
+
+        let original = Schema::new(vec![
+            Field::new("s", DataType::Utf8, true),
+            Field::new("p", DataType::Float64, true),
+            Field::new("q", DataType::Float64, true),
+            Field::new("T", DataType::Int64, true),
+        ]);
+        let hex = encode_arrow_schema_ipc(&original);
+
         let mut config = ConnectorConfig::new("websocket");
-        config.set("_arrow_schema", "s:Utf8,p:Float64,q:Float64,T:Int64");
+        config.set("_arrow_schema", hex);
 
         let schema = config.arrow_schema().expect("should parse");
         assert_eq!(schema.fields().len(), 4);
@@ -489,7 +477,33 @@ mod tests {
         assert_eq!(schema.field(1).data_type(), &DataType::Float64);
         assert_eq!(schema.field(3).name(), "T");
         assert_eq!(schema.field(3).data_type(), &DataType::Int64);
-        assert!(schema.field(0).is_nullable());
+    }
+
+    #[test]
+    fn test_arrow_schema_ipc_handles_map_type() {
+        use arrow_schema::{DataType, Field, Fields};
+
+        let map_field = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Float64, true),
+            ])),
+            false,
+        );
+        let original = Schema::new(vec![
+            Field::new("sensor_id", DataType::Utf8, true),
+            Field::new("data", DataType::Map(Arc::new(map_field), false), true),
+        ]);
+        let hex = encode_arrow_schema_ipc(&original);
+
+        let mut config = ConnectorConfig::new("kafka");
+        config.set("_arrow_schema", hex);
+
+        let schema = config.arrow_schema().expect("should parse Map type");
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "sensor_id");
+        assert!(matches!(schema.field(1).data_type(), DataType::Map(_, _)));
     }
 
     #[test]

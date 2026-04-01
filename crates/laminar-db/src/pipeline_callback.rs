@@ -943,17 +943,9 @@ fn update_partial_cache_from_batch(
     }
 }
 
-/// Encode an Arrow schema as a compact string for passing through `ConnectorConfig`.
-///
-/// Format: `name:type,name:type,...` where type is the Arrow `DataType` debug name.
-/// Example: `symbol:Utf8,price:Float64,volume:Int64`
+/// Encode an Arrow schema as a hex-encoded IPC flatbuffer for `ConnectorConfig`.
 pub(crate) fn encode_arrow_schema(schema: &arrow_schema::Schema) -> String {
-    schema
-        .fields()
-        .iter()
-        .map(|f| format!("{}:{:?}", f.name(), f.data_type()))
-        .collect::<Vec<_>>()
-        .join(",")
+    laminar_connectors::config::encode_arrow_schema_ipc(schema)
 }
 
 /// Apply a SQL WHERE filter to a `RecordBatch` using a cached `SessionContext`.
