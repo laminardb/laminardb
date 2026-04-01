@@ -217,6 +217,25 @@ mod tests {
     /// and `AvroDeserializer` (wire decode path).
     #[test]
     fn test_nullable_map_nullable_double_full_path() {
+        fn zigzag(val: i64) -> Vec<u8> {
+            let mut z = ((val << 1) ^ (val >> 63)) as u64;
+            let mut buf = Vec::new();
+            loop {
+                if z & !0x7F == 0 {
+                    buf.push(z as u8);
+                    break;
+                }
+                buf.push((z as u8 & 0x7F) | 0x80);
+                z >>= 7;
+            }
+            buf
+        }
+        fn avro_string(s: &str) -> Vec<u8> {
+            let mut b = zigzag(s.len() as i64);
+            b.extend_from_slice(s.as_bytes());
+            b
+        }
+
         let avro_json = r#"{
             "type": "record",
             "name": "Metrics",
@@ -239,25 +258,6 @@ mod tests {
 
         // Encode { sensor_id: "s1", data: {"temp": 23.5} } in Avro binary.
         // Union branches are prefixed with a zigzag-encoded index.
-        fn zigzag(val: i64) -> Vec<u8> {
-            let mut z = ((val << 1) ^ (val >> 63)) as u64;
-            let mut buf = Vec::new();
-            loop {
-                if z & !0x7F == 0 {
-                    buf.push(z as u8);
-                    break;
-                }
-                buf.push((z as u8 & 0x7F) | 0x80);
-                z >>= 7;
-            }
-            buf
-        }
-        fn avro_string(s: &str) -> Vec<u8> {
-            let mut b = zigzag(s.len() as i64);
-            b.extend_from_slice(s.as_bytes());
-            b
-        }
-
         let mut payload = Vec::new();
         payload.extend_from_slice(&avro_string("s1"));
         payload.extend_from_slice(&zigzag(1)); // data: branch 1 (map, not null)
