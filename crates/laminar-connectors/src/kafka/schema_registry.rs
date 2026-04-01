@@ -809,9 +809,9 @@ fn parse_avro_type(avro_type: &serde_json::Value) -> Result<(DataType, bool), Co
                     let items = obj.get("items").ok_or_else(|| {
                         ConnectorError::SchemaMismatch("Avro array type missing 'items'".into())
                     })?;
-                    let (item_type, _) = parse_avro_type(items)?;
+                    let (item_type, item_nullable) = parse_avro_type(items)?;
                     Ok((
-                        DataType::List(Arc::new(Field::new("item", item_type, true))),
+                        DataType::List(Arc::new(Field::new("item", item_type, item_nullable))),
                         false,
                     ))
                 }
@@ -819,14 +819,14 @@ fn parse_avro_type(avro_type: &serde_json::Value) -> Result<(DataType, bool), Co
                     let values = obj.get("values").ok_or_else(|| {
                         ConnectorError::SchemaMismatch("Avro map type missing 'values'".into())
                     })?;
-                    let (value_type, _) = parse_avro_type(values)?;
+                    let (value_type, value_nullable) = parse_avro_type(values)?;
                     Ok((
                         DataType::Map(
                             Arc::new(Field::new(
                                 "entries",
                                 DataType::Struct(Fields::from(vec![
                                     Field::new("key", DataType::Utf8, false),
-                                    Field::new("value", value_type, true),
+                                    Field::new("value", value_type, value_nullable),
                                 ])),
                                 false,
                             )),

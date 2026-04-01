@@ -39,7 +39,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
 use sqlparser::ast::{ColumnDef, DataType as SqlDataType};
 
 use laminar_core::streaming::config::{
@@ -390,6 +390,40 @@ pub fn sql_type_to_arrow(sql_type: &SqlDataType) -> Result<DataType, ParseError>
         SqlDataType::Interval { .. } => Ok(DataType::Interval(
             arrow::datatypes::IntervalUnit::MonthDayNano,
         )),
+
+        // Array type: ARRAY<T>, T[], Array(T)
+        SqlDataType::Array(elem_def) => {
+            let item_type = match elem_def {
+                sqlparser::ast::ArrayElemTypeDef::AngleBracket(t)
+                | sqlparser::ast::ArrayElemTypeDef::SquareBracket(t, _)
+                | sqlparser::ast::ArrayElemTypeDef::Parenthesis(t) => sql_type_to_arrow(t)?,
+                sqlparser::ast::ArrayElemTypeDef::None => {
+                    return Err(ParseError::ValidationError(
+                        "ARRAY type requires element type, e.g. ARRAY<INT>".into(),
+                    ));
+                }
+            };
+            Ok(DataType::List(Arc::new(Field::new(
+                "item", item_type, true,
+            ))))
+        }
+
+        // Map type: MAP(K, V)
+        SqlDataType::Map(key_type, value_type) => {
+            let key_dt = sql_type_to_arrow(key_type)?;
+            let value_dt = sql_type_to_arrow(value_type)?;
+            Ok(DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("key", key_dt, false),
+                        Field::new("value", value_dt, true),
+                    ])),
+                    false,
+                )),
+                false,
+            ))
+        }
 
         // Unsupported types
         _ => Err(ParseError::ValidationError(format!(

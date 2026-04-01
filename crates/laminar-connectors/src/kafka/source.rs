@@ -1073,7 +1073,8 @@ impl SourceConnector for KafkaSource {
                         "deserialized batch with poison pill isolation"
                     );
                 }
-                let batch = arrow_select::concat::concat_batches(&self.schema, &good_batches)
+                let concat_schema = good_batches[0].schema();
+                let batch = arrow_select::concat::concat_batches(&concat_schema, &good_batches)
                     .map_err(|e| {
                         ConnectorError::Internal(format!("failed to concat batches: {e}"))
                     })?;

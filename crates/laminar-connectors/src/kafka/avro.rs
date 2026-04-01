@@ -212,6 +212,81 @@ mod tests {
         ]))
     }
 
+    /// Avro `union<null, map<string, union<null, double>>>` must produce
+    /// identical Arrow schemas from both `avro_to_arrow_schema` (SR path)
+    /// and `AvroDeserializer` (wire decode path).
+    #[test]
+    fn test_nullable_map_nullable_double_full_path() {
+        fn zigzag(val: i64) -> Vec<u8> {
+            let mut z = ((val << 1) ^ (val >> 63)) as u64;
+            let mut buf = Vec::new();
+            loop {
+                if z & !0x7F == 0 {
+                    buf.push(z as u8);
+                    break;
+                }
+                buf.push((z as u8 & 0x7F) | 0x80);
+                z >>= 7;
+            }
+            buf
+        }
+        fn avro_string(s: &str) -> Vec<u8> {
+            let mut b = zigzag(s.len() as i64);
+            b.extend_from_slice(s.as_bytes());
+            b
+        }
+
+        let avro_json = r#"{
+            "type": "record",
+            "name": "Metrics",
+            "fields": [
+                {"name": "sensor_id", "type": "string"},
+                {
+                    "name": "data",
+                    "type": ["null", {"type": "map", "values": ["null", "double"]}]
+                }
+            ]
+        }"#;
+
+        // Path 1: what the schema registry infers
+        let sr_schema = crate::kafka::schema_registry::avro_to_arrow_schema(avro_json)
+            .expect("avro_to_arrow_schema should handle nullable map");
+
+        // Path 2: what the decoder actually produces from wire bytes
+        let mut deser = AvroDeserializer::new();
+        deser.register_schema(42, avro_json).unwrap();
+
+        // Encode { sensor_id: "s1", data: {"temp": 23.5} } in Avro binary.
+        // Union branches are prefixed with a zigzag-encoded index.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&avro_string("s1"));
+        payload.extend_from_slice(&zigzag(1)); // data: branch 1 (map, not null)
+        payload.extend_from_slice(&zigzag(1)); // map block: 1 entry
+        payload.extend_from_slice(&avro_string("temp"));
+        payload.extend_from_slice(&zigzag(1)); // value: branch 1 (double, not null)
+        payload.extend_from_slice(&23.5_f64.to_le_bytes());
+        payload.extend_from_slice(&zigzag(0)); // end of map
+
+        // Confluent wire frame: magic + schema_id + payload
+        let mut msg = vec![0x00u8];
+        msg.extend_from_slice(&42i32.to_be_bytes());
+        msg.extend_from_slice(&payload);
+
+        let batch = deser
+            .deserialize_batch(&[msg.as_slice()], &sr_schema)
+            .expect("decode should succeed");
+        assert_eq!(batch.num_rows(), 1);
+
+        let sr_data = sr_schema.field_with_name("data").unwrap();
+        let decoded_schema = batch.schema();
+        let dec_data = decoded_schema.field_with_name("data").unwrap();
+        assert_eq!(
+            sr_data.data_type(),
+            dec_data.data_type(),
+            "schema registry and arrow-avro must produce identical Map types"
+        );
+    }
+
     #[test]
     fn test_extract_confluent_id() {
         // Valid: 0x00 + 4-byte BE schema ID
