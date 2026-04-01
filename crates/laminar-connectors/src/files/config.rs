@@ -222,6 +222,8 @@ pub enum FileFormat {
     Text,
     /// Apache Parquet.
     Parquet,
+    /// Arrow IPC file format (random-access `.arrow` files).
+    ArrowIpc,
 }
 
 impl FileFormat {
@@ -236,8 +238,9 @@ impl FileFormat {
             "json" | "jsonl" | "ndjson" | "json_lines" => Ok(Self::Json),
             "text" | "txt" | "plain" => Ok(Self::Text),
             "parquet" | "parq" => Ok(Self::Parquet),
+            "arrow" | "ipc" | "arrow_ipc" => Ok(Self::ArrowIpc),
             other => Err(ConnectorError::ConfigurationError(format!(
-                "unknown file format: '{other}' (expected csv, json, text, or parquet)"
+                "unknown file format: '{other}' (expected csv, json, text, parquet, or arrow)"
             ))),
         }
     }
@@ -250,6 +253,7 @@ impl FileFormat {
             "json" | "jsonl" | "ndjson" => Some(Self::Json),
             "txt" | "log" => Some(Self::Text),
             "parquet" | "parq" => Some(Self::Parquet),
+            "arrow" | "ipc" => Some(Self::ArrowIpc),
             _ => None,
         }
     }
@@ -262,13 +266,14 @@ impl FileFormat {
             Self::Json => "jsonl",
             Self::Text => "txt",
             Self::Parquet => "parquet",
+            Self::ArrowIpc => "arrow",
         }
     }
 
     /// Whether this is a columnar/bulk format (cannot be truncated mid-file).
     #[must_use]
     pub fn is_bulk_format(&self) -> bool {
-        matches!(self, Self::Parquet)
+        matches!(self, Self::Parquet | Self::ArrowIpc)
     }
 }
 
@@ -365,6 +370,12 @@ mod tests {
         assert_eq!(FileFormat::parse("text").unwrap(), FileFormat::Text);
         assert_eq!(FileFormat::parse("parquet").unwrap(), FileFormat::Parquet);
         assert_eq!(FileFormat::parse("parq").unwrap(), FileFormat::Parquet);
+        assert_eq!(FileFormat::parse("arrow").unwrap(), FileFormat::ArrowIpc);
+        assert_eq!(FileFormat::parse("ipc").unwrap(), FileFormat::ArrowIpc);
+        assert_eq!(
+            FileFormat::parse("arrow_ipc").unwrap(),
+            FileFormat::ArrowIpc
+        );
         assert!(FileFormat::parse("xml").is_err());
     }
 
@@ -386,6 +397,14 @@ mod tests {
             FileFormat::from_extension("log.txt"),
             Some(FileFormat::Text)
         );
+        assert_eq!(
+            FileFormat::from_extension("data.arrow"),
+            Some(FileFormat::ArrowIpc)
+        );
+        assert_eq!(
+            FileFormat::from_extension("stream.ipc"),
+            Some(FileFormat::ArrowIpc)
+        );
         assert_eq!(FileFormat::from_extension("file.bin"), None);
     }
 
@@ -395,6 +414,7 @@ mod tests {
         assert_eq!(FileFormat::Json.extension(), "jsonl");
         assert_eq!(FileFormat::Text.extension(), "txt");
         assert_eq!(FileFormat::Parquet.extension(), "parquet");
+        assert_eq!(FileFormat::ArrowIpc.extension(), "arrow");
     }
 
     #[test]
@@ -402,6 +422,7 @@ mod tests {
         assert!(!FileFormat::Csv.is_bulk_format());
         assert!(!FileFormat::Json.is_bulk_format());
         assert!(!FileFormat::Text.is_bulk_format());
+        assert!(FileFormat::ArrowIpc.is_bulk_format());
         assert!(FileFormat::Parquet.is_bulk_format());
     }
 

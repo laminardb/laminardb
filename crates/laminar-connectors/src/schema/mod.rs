@@ -9,10 +9,6 @@
 //!   determining a source's Arrow schema
 //! - **Format inference** (`inference`) — registry of format-specific
 //!   schema inferencers with built-in JSON, CSV, and raw support
-//! - **Bridge adapters** (`bridge`) — adapters between legacy
-//!   [`RecordDeserializer`](crate::serde::RecordDeserializer) /
-//!   [`RecordSerializer`](crate::serde::RecordSerializer) and the new
-//!   `FormatDecoder` / `FormatEncoder` traits
 //! - **JSON format** (`json`) — JSON decoder, encoder, and JSONB binary
 //!   format (F-SCHEMA-004)
 //! - **CSV format** ([`csv`]) — CSV decoder with DuckDB-style type coercion
@@ -35,7 +31,6 @@
 //!   5. Error
 //! ```
 
-pub mod bridge;
 pub mod csv;
 pub mod error;
 pub mod evolution;
@@ -49,7 +44,9 @@ pub mod types;
 pub mod parquet;
 
 // ── Re-exports for convenience ─────────────────────────────────────
-pub use csv::{CsvDecoder, CsvDecoderConfig, FieldCountMismatchStrategy};
+pub use csv::{
+    CsvDecoder, CsvDecoderConfig, CsvEncoder, CsvEncoderConfig, FieldCountMismatchStrategy,
+};
 pub use error::{SchemaError, SchemaResult};
 pub use evolution::{
     diff_schemas_by_name, is_safe_widening, EvolutionResult, EvolutionTrigger, SchemaEvolution,
