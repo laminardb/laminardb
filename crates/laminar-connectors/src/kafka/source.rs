@@ -796,8 +796,7 @@ impl SourceConnector for KafkaSource {
                                     warn!(%subject, error = %e, "SR schema register failed");
                                 } else {
                                     info!(%subject, schema_id = cached.id, "SR schema fetched at open()");
-                                    self.last_avro_schema =
-                                        Some(Arc::clone(&cached.arrow_schema));
+                                    self.last_avro_schema = Some(Arc::clone(&cached.arrow_schema));
                                     self.schema = cached.arrow_schema;
                                 }
                             }
