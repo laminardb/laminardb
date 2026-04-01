@@ -60,9 +60,9 @@ rustc-hash = { workspace = true }
 # Arrow for RecordBatch
 arrow-array = { workspace = true }
 arrow-cast = { workspace = true }
+arrow-ipc = { workspace = true }
 arrow-row = { version = "57.2", optional = true }
 arrow-csv = { workspace = true }
-arrow-ipc = { workspace = true }
 arrow-json = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }

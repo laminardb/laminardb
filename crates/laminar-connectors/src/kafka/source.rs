@@ -769,6 +769,40 @@ impl SourceConnector for KafkaSource {
         // ensures the first `poll_batch()` fires promptly even without
         // a `data_ready_notify()` signal.
 
+        // Eagerly fetch the SR schema so the Arrow schema is available at
+        // plan time (before the first poll_batch).
+        if let Some(ref sr) = self.schema_registry {
+            if let TopicSubscription::Topics(topics) = &kafka_config.subscription {
+                if topics.len() > 1 {
+                    warn!("multiple topics with schema registry — using first topic's schema");
+                }
+                if let Some(topic) = topics.first() {
+                    let subject = format!("{topic}-value");
+                    match sr.get_latest_schema(&subject).await {
+                        Ok(cached) => {
+                            if let Some(avro_deser) = self
+                                .deserializer
+                                .as_any_mut()
+                                .and_then(|any| any.downcast_mut::<AvroDeserializer>())
+                            {
+                                if let Err(e) =
+                                    avro_deser.register_schema(cached.id, &cached.schema_str)
+                                {
+                                    warn!(%subject, error = %e, "SR schema register failed");
+                                } else {
+                                    info!(%subject, schema_id = cached.id, "SR schema fetched at open()");
+                                    self.schema = cached.arrow_schema;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(%subject, error = %e, "SR unavailable at open(), will resolve lazily");
+                        }
+                    }
+                }
+            }
+        }
+
         info!("Kafka source connector opened successfully");
         Ok(())
     }

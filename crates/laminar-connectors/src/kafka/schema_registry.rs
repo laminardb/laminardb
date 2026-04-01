@@ -4,12 +4,11 @@
 //! the Confluent Schema Registry API, with in-memory caching, arrow
 //! schema conversion, and compatibility checking.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use foyer::{Cache, CacheBuilder};
 
-use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
+use arrow_schema::{DataType, SchemaRef};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -734,171 +733,29 @@ impl std::fmt::Debug for SchemaRegistryClient {
     }
 }
 
-/// Converts an Avro JSON schema string to an Arrow [`SchemaRef`].
-///
-/// Supports Avro record schemas with primitive field types.
+/// Converts an Avro JSON schema string to an Arrow [`SchemaRef`] via `arrow-avro`'s Decoder.
 ///
 /// # Errors
 ///
-/// Returns `ConnectorError::SchemaMismatch` if the schema JSON is invalid
-/// or contains unsupported types.
+/// Returns `ConnectorError::SchemaMismatch` if the JSON is invalid or conversion fails.
 pub fn avro_to_arrow_schema(avro_schema_str: &str) -> Result<SchemaRef, ConnectorError> {
-    let avro: serde_json::Value = serde_json::from_str(avro_schema_str)
-        .map_err(|e| ConnectorError::SchemaMismatch(format!("invalid Avro schema JSON: {e}")))?;
+    use arrow_avro::reader::ReaderBuilder;
+    use arrow_avro::schema::{AvroSchema, Fingerprint, FingerprintAlgorithm, SchemaStore};
 
-    let fields_val = avro.get("fields").ok_or_else(|| {
-        ConnectorError::SchemaMismatch("Avro schema missing 'fields' array".into())
-    })?;
+    let mut store = SchemaStore::new_with_type(FingerprintAlgorithm::Id);
+    let avro_schema = AvroSchema::new(avro_schema_str.to_string());
+    let fp = Fingerprint::Id(0);
+    store
+        .set(fp, avro_schema)
+        .map_err(|e| ConnectorError::SchemaMismatch(format!("invalid Avro schema: {e}")))?;
 
-    let fields_arr = fields_val.as_array().ok_or_else(|| {
-        ConnectorError::SchemaMismatch("Avro schema 'fields' is not an array".into())
-    })?;
+    let decoder = ReaderBuilder::new()
+        .with_writer_schema_store(store)
+        .with_active_fingerprint(fp)
+        .build_decoder()
+        .map_err(|e| ConnectorError::SchemaMismatch(format!("Avro→Arrow conversion: {e}")))?;
 
-    let mut arrow_fields = Vec::with_capacity(fields_arr.len());
-    for field in fields_arr {
-        let name = field
-            .get("name")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ConnectorError::SchemaMismatch("Avro field missing 'name'".into()))?;
-
-        let (data_type, nullable) = parse_avro_type(field.get("type").ok_or_else(|| {
-            ConnectorError::SchemaMismatch(format!("Avro field '{name}' missing 'type'"))
-        })?)?;
-
-        arrow_fields.push(Field::new(name, data_type, nullable));
-    }
-
-    Ok(Arc::new(Schema::new(arrow_fields)))
-}
-
-/// Parses an Avro type definition to an Arrow `DataType` and nullable flag.
-#[allow(clippy::too_many_lines)]
-fn parse_avro_type(avro_type: &serde_json::Value) -> Result<(DataType, bool), ConnectorError> {
-    match avro_type {
-        serde_json::Value::String(s) => Ok((avro_primitive_to_arrow(s)?, false)),
-        serde_json::Value::Array(union) => {
-            // Union type — check for ["null", T] pattern
-            let non_null: Vec<_> = union
-                .iter()
-                .filter(|v| v.as_str() != Some("null"))
-                .collect();
-            let nullable = union.iter().any(|v| v.as_str() == Some("null"));
-
-            if non_null.len() == 1 {
-                let (dt, _) = parse_avro_type(non_null[0])?;
-                Ok((dt, nullable))
-            } else {
-                // Multi-type union — fall back to string
-                Ok((DataType::Utf8, nullable))
-            }
-        }
-        serde_json::Value::Object(obj) => {
-            // Check logical type first.
-            if let Some(logical) = obj.get("logicalType").and_then(|v| v.as_str()) {
-                return match logical {
-                    "timestamp-millis" | "timestamp-micros" => Ok((DataType::Int64, false)),
-                    "date" => Ok((DataType::Int32, false)),
-                    "decimal" => Ok((DataType::Float64, false)),
-                    _ => Ok((DataType::Utf8, false)),
-                };
-            }
-
-            let type_str = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
-            match type_str {
-                "array" => {
-                    let items = obj.get("items").ok_or_else(|| {
-                        ConnectorError::SchemaMismatch("Avro array type missing 'items'".into())
-                    })?;
-                    let (item_type, item_nullable) = parse_avro_type(items)?;
-                    Ok((
-                        DataType::List(Arc::new(Field::new("item", item_type, item_nullable))),
-                        false,
-                    ))
-                }
-                "map" => {
-                    let values = obj.get("values").ok_or_else(|| {
-                        ConnectorError::SchemaMismatch("Avro map type missing 'values'".into())
-                    })?;
-                    let (value_type, value_nullable) = parse_avro_type(values)?;
-                    Ok((
-                        DataType::Map(
-                            Arc::new(Field::new(
-                                "entries",
-                                DataType::Struct(Fields::from(vec![
-                                    Field::new("key", DataType::Utf8, false),
-                                    Field::new("value", value_type, value_nullable),
-                                ])),
-                                false,
-                            )),
-                            false,
-                        ),
-                        false,
-                    ))
-                }
-                "record" => {
-                    let fields_val = obj.get("fields").ok_or_else(|| {
-                        ConnectorError::SchemaMismatch("Avro nested record missing 'fields'".into())
-                    })?;
-                    let fields_arr = fields_val.as_array().ok_or_else(|| {
-                        ConnectorError::SchemaMismatch(
-                            "Avro nested record 'fields' is not an array".into(),
-                        )
-                    })?;
-                    let mut arrow_fields = Vec::with_capacity(fields_arr.len());
-                    for f in fields_arr {
-                        let name = f.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-                            ConnectorError::SchemaMismatch(
-                                "Avro nested record field missing 'name'".into(),
-                            )
-                        })?;
-                        let f_type = f.get("type").ok_or_else(|| {
-                            ConnectorError::SchemaMismatch(format!(
-                                "Avro nested field '{name}' missing 'type'"
-                            ))
-                        })?;
-                        let (dt, nullable) = parse_avro_type(f_type)?;
-                        arrow_fields.push(Field::new(name, dt, nullable));
-                    }
-                    Ok((DataType::Struct(Fields::from(arrow_fields)), false))
-                }
-                "enum" => Ok((
-                    DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-                    false,
-                )),
-                "fixed" => {
-                    let size = obj
-                        .get("size")
-                        .and_then(serde_json::Value::as_u64)
-                        .ok_or_else(|| {
-                            ConnectorError::SchemaMismatch("Avro fixed type missing 'size'".into())
-                        })?;
-                    #[allow(clippy::cast_possible_truncation)]
-                    Ok((DataType::FixedSizeBinary(size as i32), false))
-                }
-                _ => Ok((DataType::Utf8, false)),
-            }
-        }
-        _ => Err(ConnectorError::SchemaMismatch(format!(
-            "unsupported Avro type: {avro_type}"
-        ))),
-    }
-}
-
-/// Maps an Avro primitive type name to Arrow `DataType`.
-fn avro_primitive_to_arrow(avro_type: &str) -> Result<DataType, ConnectorError> {
-    match avro_type {
-        "null" => Ok(DataType::Null),
-        "boolean" => Ok(DataType::Boolean),
-        "int" => Ok(DataType::Int32),
-        "long" => Ok(DataType::Int64),
-        "float" => Ok(DataType::Float32),
-        "double" => Ok(DataType::Float64),
-        "bytes" => Ok(DataType::Binary),
-        "string" => Ok(DataType::Utf8),
-        other => Err(ConnectorError::SchemaMismatch(format!(
-            "unsupported Avro primitive type: '{other}'"
-        ))),
-    }
+    Ok(decoder.schema())
 }
 
 /// Converts an Arrow [`SchemaRef`] to an Avro JSON schema string.
@@ -1036,7 +893,10 @@ fn arrow_to_avro_type(data_type: &DataType) -> Result<serde_json::Value, SerdeEr
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use arrow_schema::{Field, Fields, Schema};
 
     #[test]
     fn test_avro_to_arrow_simple_record() {
