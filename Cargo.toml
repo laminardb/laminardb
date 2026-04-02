@@ -48,7 +48,7 @@ mimalloc = { version = "0.1", default-features = false }  # mimalloc for Windows
 rustc-hash = "2.1"  # Faster than std HashMap (replaces unmaintained fxhash)
 parking_lot = "0.12"  # Faster Mutex/RwLock
 memmap2 = "0.9"  # Memory-mapped files
-uuid = { version = "1.22", features = ["v4", "v7", "serde"] }  # Unique IDs
+uuid = { version = "1.23", features = ["v4", "v7", "serde"] }  # Unique IDs
 gethostname = "0.5"  # Pure Rust hostname lookup
 ahash = "0.8"  # Fast hashing for state stores
 foyer = { version = "0.22", features = ["serde"] }  # High-performance cache (S3-FIFO eviction, serde for HybridCache)
@@ -110,7 +110,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Testing
 criterion = { version = "0.8", features = ["html_reports"] }
-proptest = "1.10"
+proptest = "1.11"
 tempfile = "3.27"
 
 [profile.release]
