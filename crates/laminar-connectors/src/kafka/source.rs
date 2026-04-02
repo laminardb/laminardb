@@ -778,8 +778,13 @@ impl SourceConnector for KafkaSource {
                 }
                 if let Some(topic) = topics.first() {
                     let subject = format!("{topic}-value");
-                    match sr.get_latest_schema(&subject).await {
-                        Ok(cached) => {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        sr.get_latest_schema(&subject),
+                    )
+                    .await
+                    {
+                        Ok(Ok(cached)) => {
                             if let Some(avro_deser) = self
                                 .deserializer
                                 .as_any_mut()
@@ -791,12 +796,16 @@ impl SourceConnector for KafkaSource {
                                     warn!(%subject, error = %e, "SR schema register failed");
                                 } else {
                                     info!(%subject, schema_id = cached.id, "SR schema fetched at open()");
+                                    self.last_avro_schema = Some(Arc::clone(&cached.arrow_schema));
                                     self.schema = cached.arrow_schema;
                                 }
                             }
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             warn!(%subject, error = %e, "SR unavailable at open(), will resolve lazily");
+                        }
+                        Err(_elapsed) => {
+                            warn!(%subject, "SR prefetch timed out at open(), will resolve lazily");
                         }
                     }
                 }
