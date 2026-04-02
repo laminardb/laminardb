@@ -533,9 +533,6 @@ pub(crate) struct IncrementalAggState {
     pre_agg_sql: String,
     /// Number of group-by columns in the pre-agg output (first N columns).
     num_group_cols: usize,
-    /// Group-by column names in the output schema.
-    #[allow(dead_code)]
-    group_col_names: Vec<String>,
     /// Group-by column data types.
     group_types: Vec<DataType>,
     /// Aggregate function specifications.
@@ -1047,7 +1044,6 @@ impl IncrementalAggState {
         Ok(Some(Self {
             pre_agg_sql,
             num_group_cols,
-            group_col_names,
             group_types,
             agg_specs,
             groups: AHashMap::new(),
@@ -2309,7 +2305,6 @@ mod tests {
         let state = result.unwrap();
         assert_eq!(state.num_group_cols, 1);
         assert_eq!(state.agg_specs.len(), 1);
-        assert_eq!(state.group_col_names, vec!["name"]);
     }
 
     #[tokio::test]

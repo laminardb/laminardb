@@ -349,9 +349,15 @@ impl DagExecutor {
                         key: reg.key.unwrap_or_default(),
                         timestamp: reg.timestamp,
                     };
+                    #[allow(clippy::cast_possible_truncation)]
+                    // µs since epoch fits i64 for ~292K years
+                    let processing_time = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as i64;
                     let mut ctx = OperatorContext {
                         event_time: reg.timestamp,
-                        processing_time: current_time,
+                        processing_time,
                         timers: &mut rt.timer_service,
                         state: rt.state_store.as_mut(),
                         watermark_generator: rt.watermark_generator.as_mut(),
@@ -586,9 +592,15 @@ impl DagExecutor {
 
             let outputs = if let Some(op) = &mut operator {
                 if let Some(rt) = &mut runtime {
+                    #[allow(clippy::cast_possible_truncation)]
+                    // µs since epoch fits i64 for ~292K years
+                    let processing_time = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as i64;
                     let mut ctx = OperatorContext {
                         event_time: event.timestamp,
-                        processing_time: 0,
+                        processing_time,
                         timers: &mut rt.timer_service,
                         state: rt.state_store.as_mut(),
                         watermark_generator: rt.watermark_generator.as_mut(),

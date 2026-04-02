@@ -109,11 +109,11 @@ impl ChangelogRef {
         Self::new(batch_offset, row_index, 1, CdcOperation::UpdateAfter)
     }
 
-    /// Returns the CDC operation type.
+    /// Returns the CDC operation type, or `Insert` if the stored byte is invalid.
     #[inline]
     #[must_use]
     pub fn operation(&self) -> CdcOperation {
-        CdcOperation::from_u8(self.operation_raw)
+        CdcOperation::from_u8(self.operation_raw).unwrap_or(CdcOperation::Insert)
     }
 
     /// Returns true if this is an insert-type operation.
@@ -1040,8 +1040,7 @@ impl<T: Serialize> CdcEnvelope<T> {
 ///
 /// # Ring Architecture
 ///
-/// This is a Ring 1 structure (allocates). Ring 0 uses the non-retractable
-/// [`super::window::FirstValueAccumulator`] via the static dispatch path.
+/// This is a Ring 1 structure (allocates, uses `BTreeMap` for retraction support).
 ///
 /// Uses `BTreeMap<i64, Vec<i64>>` (timestamp → values) for O(log n) insert/remove
 /// and O(1) first-value access via `first_key_value()`.
@@ -1820,14 +1819,14 @@ mod tests {
         ] {
             let u8_val = op.to_u8();
             let restored = CdcOperation::from_u8(u8_val);
-            assert_eq!(op, restored);
+            assert_eq!(Some(op), restored);
         }
     }
 
     #[test]
     fn test_cdc_operation_unknown_u8() {
-        // Unknown values default to Insert
-        assert_eq!(CdcOperation::from_u8(255), CdcOperation::Insert);
+        assert_eq!(CdcOperation::from_u8(255), None);
+        assert_eq!(CdcOperation::from_u8(4), None);
     }
 
     // ════════════════════════════════════════════════════════════════════════

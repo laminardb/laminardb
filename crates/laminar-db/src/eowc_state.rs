@@ -139,9 +139,6 @@ pub(crate) struct IncrementalEowcState {
     agg_specs: Vec<AggFuncSpec>,
     /// Number of group-by columns in pre-agg output.
     num_group_cols: usize,
-    /// Group-by column names in output schema.
-    #[allow(dead_code)]
-    group_col_names: Vec<String>,
     /// Group-by column data types.
     group_types: Vec<DataType>,
     /// Pre-aggregation SQL for expression evaluation (kept for fallback + fingerprint).
@@ -548,7 +545,6 @@ impl IncrementalEowcState {
             row_converter,
             agg_specs,
             num_group_cols,
-            group_col_names,
             group_types,
             pre_agg_sql,
             output_schema,
@@ -1163,7 +1159,6 @@ mod tests {
             windows: BTreeMap::new(),
             agg_specs,
             num_group_cols: 1,
-            group_col_names: vec!["symbol".to_string()],
             group_types: vec![DataType::Utf8],
             row_converter: arrow::row::RowConverter::new(vec![arrow::row::SortField::new(
                 DataType::Utf8,

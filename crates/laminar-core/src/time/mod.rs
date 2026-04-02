@@ -325,6 +325,15 @@ impl PartialOrd for TimerRegistration {
 /// assert_eq!(fired.len(), 1);
 /// assert_eq!(fired[0].id, id2); // Timer at t=50 fires first
 /// ```
+// Threshold at which the timer service logs a warning about accumulated timers.
+// This typically indicates a stalled watermark preventing timer firing.
+const TIMER_WARN_THRESHOLD: usize = 100_000;
+
+/// Timer service for scheduling and managing timers.
+///
+/// The timer service maintains a priority queue of timer registrations,
+/// ordered by timestamp. Operators can register timers to be fired at
+/// specific event times.
 pub struct TimerService {
     timers: BinaryHeap<TimerRegistration>,
     next_timer_id: u64,
@@ -336,6 +345,15 @@ impl TimerService {
     pub fn new() -> Self {
         Self {
             timers: BinaryHeap::new(),
+            next_timer_id: 0,
+        }
+    }
+
+    /// Creates a new timer service with pre-allocated capacity.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            timers: BinaryHeap::with_capacity(capacity),
             next_timer_id: 0,
         }
     }
@@ -364,6 +382,14 @@ impl TimerService {
             key,
             operator_index,
         });
+
+        if self.timers.len() == TIMER_WARN_THRESHOLD {
+            tracing::warn!(
+                pending = self.timers.len(),
+                "Timer heap reached {} pending timers — watermark may be stalled",
+                TIMER_WARN_THRESHOLD,
+            );
+        }
 
         id
     }
