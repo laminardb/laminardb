@@ -189,15 +189,16 @@ impl CdcOperation {
         }
     }
 
-    /// Decode from u8 (unknown values default to Insert).
+    /// Decode from u8. Returns `None` for out-of-range values.
     #[inline]
     #[must_use]
-    pub fn from_u8(value: u8) -> Self {
+    pub fn from_u8(value: u8) -> Option<Self> {
         match value {
-            1 => Self::Delete,
-            2 => Self::UpdateBefore,
-            3 => Self::UpdateAfter,
-            _ => Self::Insert,
+            0 => Some(Self::Insert),
+            1 => Some(Self::Delete),
+            2 => Some(Self::UpdateBefore),
+            3 => Some(Self::UpdateAfter),
+            _ => None,
         }
     }
 }

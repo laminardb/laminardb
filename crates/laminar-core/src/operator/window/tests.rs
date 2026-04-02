@@ -77,7 +77,8 @@ fn test_cdc_operation_u8_roundtrip() {
         CdcOperation::UpdateBefore,
         CdcOperation::UpdateAfter,
     ] {
-        assert_eq!(CdcOperation::from_u8(op.to_u8()), op);
+        assert_eq!(CdcOperation::from_u8(op.to_u8()), Some(op));
     }
-    assert_eq!(CdcOperation::from_u8(255), CdcOperation::Insert);
+    assert_eq!(CdcOperation::from_u8(4), None);
+    assert_eq!(CdcOperation::from_u8(255), None);
 }

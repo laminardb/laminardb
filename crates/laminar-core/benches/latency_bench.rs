@@ -5,8 +5,9 @@
 //!
 //! Run with: cargo bench --bench latency_bench
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use laminar_core::operator::window::TumblingWindowAssigner;
+use std::hint::black_box;
 
 fn bench_assign_latency(c: &mut Criterion) {
     let mut group = c.benchmark_group("assign_latency");

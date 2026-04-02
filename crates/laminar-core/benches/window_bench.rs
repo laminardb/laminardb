@@ -2,8 +2,9 @@
 //!
 //! Run with: cargo bench --bench window_bench
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use laminar_core::operator::window::{TumblingWindowAssigner, WindowId};
+use std::hint::black_box;
 
 fn bench_window_assign(c: &mut Criterion) {
     let mut group = c.benchmark_group("window_assign");
