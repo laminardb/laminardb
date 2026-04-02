@@ -588,7 +588,7 @@ impl DagExecutor {
                 if let Some(rt) = &mut runtime {
                     let mut ctx = OperatorContext {
                         event_time: event.timestamp,
-                        processing_time: 0,
+                        processing_time: event.timestamp,
                         timers: &mut rt.timer_service,
                         state: rt.state_store.as_mut(),
                         watermark_generator: rt.watermark_generator.as_mut(),

@@ -61,12 +61,6 @@
 //! let df = ctx.sql("SELECT * FROM events WHERE value > 100").await?;
 //! ```
 
-/// DataFusion aggregate bridge for streaming aggregation.
-///
-/// Bridges DataFusion's `Accumulator` trait with `laminar-core`'s
-/// `DynAccumulator` / `DynAggregatorFactory` traits. This avoids
-/// duplicating aggregation logic.
-pub mod aggregate_bridge;
 mod bridge;
 mod channel_source;
 /// Lambda higher-order functions for arrays and maps (F-SCHEMA-015 Tier 3)
@@ -107,10 +101,6 @@ pub mod watermark_udf;
 /// Window function UDFs (TUMBLE, HOP, SESSION, CUMULATE)
 pub mod window_udf;
 
-pub use aggregate_bridge::{
-    create_aggregate_factory, lookup_aggregate_udf, result_to_scalar_value, scalar_value_to_result,
-    DataFusionAccumulatorAdapter, DataFusionAggregateFactory,
-};
 pub use bridge::{BridgeSendError, BridgeSender, BridgeStream, BridgeTrySendError, StreamBridge};
 pub use channel_source::ChannelStreamSource;
 pub use complex_type_lambda::{

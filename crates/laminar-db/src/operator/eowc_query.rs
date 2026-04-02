@@ -49,8 +49,8 @@ enum EowcCheckpointEnvelope {
 /// `process()` call by probing the SQL plan.
 enum EowcInnerState {
     Uninit,
-    CoreWindow(CoreWindowState),
-    EowcAgg(IncrementalEowcState),
+    CoreWindow(Box<CoreWindowState>),
+    EowcAgg(Box<IncrementalEowcState>),
     /// Non-aggregate EOWC: accumulate batches and replay via SQL when
     /// windows close.
     Raw {
@@ -104,7 +104,7 @@ impl EowcQueryOperator {
                         window_type = ?cfg.window_type,
                         "EOWC operator: routed to core window pipeline"
                     );
-                    self.state = EowcInnerState::CoreWindow(cw);
+                    self.state = EowcInnerState::CoreWindow(Box::new(cw));
                     self.apply_pending_restore();
                     return Ok(());
                 }
@@ -136,7 +136,7 @@ impl EowcQueryOperator {
                             query = %self.op_name,
                             "EOWC operator: using incremental per-window accumulators"
                         );
-                        self.state = EowcInnerState::EowcAgg(eowc);
+                        self.state = EowcInnerState::EowcAgg(Box::new(eowc));
                         self.apply_pending_restore();
                         return Ok(());
                     }

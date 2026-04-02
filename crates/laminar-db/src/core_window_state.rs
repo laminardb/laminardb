@@ -114,8 +114,6 @@ pub(crate) struct CoreWindowState {
     row_converter: arrow::row::RowConverter,
     agg_specs: Vec<AggFuncSpec>,
     num_group_cols: usize,
-    #[allow(dead_code)]
-    group_col_names: Vec<String>,
     group_types: Vec<DataType>,
     pre_agg_sql: String,
     time_col_index: usize,
@@ -130,6 +128,11 @@ pub(crate) struct CoreWindowState {
     /// arriving within this window are included instead of dropped.
     allowed_lateness_ms: i64,
     post_projection: Option<PostProjection>,
+    /// Reusable scratch map for no-group window assignment (avoids per-batch allocation).
+    scratch_nogroup: AHashMap<i64, Vec<u32>>,
+    /// Reusable scratch map for grouped window assignment (avoids per-batch allocation).
+    #[allow(clippy::type_complexity)]
+    scratch_grouped: AHashMap<(i64, arrow::row::OwnedRow), Vec<u32>>,
 }
 
 impl CoreWindowState {
@@ -627,7 +630,6 @@ impl CoreWindowState {
             row_converter,
             agg_specs,
             num_group_cols,
-            group_col_names,
             group_types,
             pre_agg_sql,
             output_schema,
@@ -640,6 +642,8 @@ impl CoreWindowState {
             allowed_lateness_ms: i64::try_from(window_config.allowed_lateness.as_millis())
                 .unwrap_or(0),
             post_projection,
+            scratch_nogroup: AHashMap::new(),
+            scratch_grouped: AHashMap::new(),
         }))
     }
 
@@ -688,7 +692,8 @@ impl CoreWindowState {
         // For no-group case, just group by window_start
         if !has_groups {
             let empty_key = crate::aggregate_state::global_aggregate_key();
-            let mut grouped: AHashMap<i64, Vec<u32>> = AHashMap::new();
+            let mut grouped = std::mem::take(&mut self.scratch_nogroup);
+            grouped.clear();
             for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
                 if ts_ms == NULL_TIMESTAMP {
                     continue; // skip rows with null timestamps
@@ -734,12 +739,14 @@ impl CoreWindowState {
                     None,
                 )?;
             }
+            self.scratch_nogroup = grouped;
             return Ok(());
         }
 
         // Grouped path: OwnedRow as key (one owned() per row, ~8-32 bytes each)
         let rows_ref = rows.as_ref().expect("rows set when has_groups");
-        let mut grouped: AHashMap<(i64, arrow::row::OwnedRow), Vec<u32>> = AHashMap::new();
+        let mut grouped = std::mem::take(&mut self.scratch_grouped);
+        grouped.clear();
 
         for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
             if ts_ms == NULL_TIMESTAMP {
@@ -809,6 +816,7 @@ impl CoreWindowState {
             )?;
         }
 
+        self.scratch_grouped = grouped;
         Ok(())
     }
 
@@ -825,8 +833,10 @@ impl CoreWindowState {
             if ts_ms == NULL_TIMESTAMP {
                 continue; // skip rows with null timestamps
             }
-            let key = self.extract_group_key_row(batch, row)?;
-            self.update_session_window(ts_ms, gap_ms, &key, batch, row)?;
+            #[allow(clippy::cast_possible_truncation)]
+            let index_array = arrow::array::UInt32Array::from_value(row as u32, 1);
+            let key = self.extract_group_key_row(batch, &index_array)?;
+            self.update_session_window(ts_ms, gap_ms, &key, batch, &index_array)?;
         }
         Ok(())
     }
@@ -835,18 +845,14 @@ impl CoreWindowState {
     fn extract_group_key_row(
         &self,
         batch: &RecordBatch,
-        row: usize,
+        index_array: &arrow::array::UInt32Array,
     ) -> Result<arrow::row::OwnedRow, DbError> {
         if self.num_group_cols == 0 {
             return Ok(crate::aggregate_state::global_aggregate_key());
         }
-        let index_array = arrow::array::UInt32Array::from(vec![
-            #[allow(clippy::cast_possible_truncation)]
-            (row as u32),
-        ]);
         let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
             .map(|i| {
-                compute::take(batch.column(i), &index_array, None)
+                compute::take(batch.column(i), index_array, None)
                     .map_err(|e| DbError::Pipeline(format!("group key take: {e}")))
             })
             .collect::<Result<_, _>>()?;
@@ -865,7 +871,7 @@ impl CoreWindowState {
         gap_ms: i64,
         key: &arrow::row::OwnedRow,
         batch: &RecordBatch,
-        row: usize,
+        index_array: &arrow::array::UInt32Array,
     ) -> Result<(), DbError> {
         let new_start = ts_ms;
         let new_end = ts_ms.saturating_add(gap_ms);
@@ -886,7 +892,7 @@ impl CoreWindowState {
         match overlapping.len() {
             0 => {
                 let mut accs = self.create_fresh_accumulators()?;
-                Self::update_accumulators(&mut accs, &self.agg_specs, batch, row)?;
+                Self::update_accumulators(&mut accs, &self.agg_specs, batch, index_array)?;
                 let group =
                     self.session_groups
                         .entry(key.clone())
@@ -910,7 +916,7 @@ impl CoreWindowState {
                 let merged_end = sess.end.max(new_end);
                 sess.start = merged_start;
                 sess.end = merged_end;
-                Self::update_accumulators(&mut sess.accs, &self.agg_specs, batch, row)?;
+                Self::update_accumulators(&mut sess.accs, &self.agg_specs, batch, index_array)?;
                 if merged_start != sess_key {
                     let sess = group.sessions.remove(&sess_key).unwrap();
                     group.sessions.insert(merged_start, sess);
@@ -950,7 +956,7 @@ impl CoreWindowState {
                 }
 
                 let mut accs = survivor_accs.unwrap();
-                Self::update_accumulators(&mut accs, &self.agg_specs, batch, row)?;
+                Self::update_accumulators(&mut accs, &self.agg_specs, batch, index_array)?;
                 group.sessions.insert(
                     merged_start,
                     SessionAccState {
@@ -981,22 +987,18 @@ impl CoreWindowState {
         accs: &mut [Box<dyn datafusion_expr::Accumulator>],
         agg_specs: &[AggFuncSpec],
         batch: &RecordBatch,
-        row: usize,
+        index_array: &arrow::array::UInt32Array,
     ) -> Result<(), DbError> {
-        let index_array = arrow::array::UInt32Array::from(vec![
-            #[allow(clippy::cast_possible_truncation)]
-            (row as u32),
-        ]);
         for (i, spec) in agg_specs.iter().enumerate() {
             let mut input_arrays: Vec<ArrayRef> = Vec::with_capacity(spec.input_col_indices.len());
             for &col_idx in &spec.input_col_indices {
-                let arr = compute::take(batch.column(col_idx), &index_array, None)
+                let arr = compute::take(batch.column(col_idx), index_array, None)
                     .map_err(|e| DbError::Pipeline(format!("array take: {e}")))?;
                 input_arrays.push(arr);
             }
 
             if let Some(filter_idx) = spec.filter_col_index {
-                let filter_arr = compute::take(batch.column(filter_idx), &index_array, None)
+                let filter_arr = compute::take(batch.column(filter_idx), index_array, None)
                     .map_err(|e| DbError::Pipeline(format!("filter take: {e}")))?;
                 if let Some(mask) = filter_arr
                     .as_any()
@@ -1632,7 +1634,6 @@ mod tests {
             session_groups: AHashMap::new(),
             agg_specs,
             num_group_cols: 1,
-            group_col_names: vec!["symbol".to_string()],
             group_types: vec![DataType::Utf8],
             row_converter: arrow::row::RowConverter::new(vec![arrow::row::SortField::new(
                 DataType::Utf8,
@@ -1648,6 +1649,8 @@ mod tests {
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
             post_projection: None,
+            scratch_nogroup: AHashMap::new(),
+            scratch_grouped: AHashMap::new(),
         }
     }
 
@@ -1694,7 +1697,6 @@ mod tests {
             session_groups: AHashMap::new(),
             agg_specs,
             num_group_cols: 1,
-            group_col_names: vec!["symbol".to_string()],
             group_types: vec![DataType::Utf8],
             row_converter: arrow::row::RowConverter::new(vec![arrow::row::SortField::new(
                 DataType::Utf8,
@@ -1710,6 +1712,8 @@ mod tests {
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
             post_projection: None,
+            scratch_nogroup: AHashMap::new(),
+            scratch_grouped: AHashMap::new(),
         }
     }
 
@@ -1744,7 +1748,6 @@ mod tests {
             session_groups: AHashMap::new(),
             agg_specs,
             num_group_cols: 1,
-            group_col_names: vec!["symbol".to_string()],
             group_types: vec![DataType::Utf8],
             row_converter: arrow::row::RowConverter::new(vec![arrow::row::SortField::new(
                 DataType::Utf8,
@@ -1760,6 +1763,8 @@ mod tests {
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
             post_projection: None,
+            scratch_nogroup: AHashMap::new(),
+            scratch_grouped: AHashMap::new(),
         }
     }
 
@@ -1792,7 +1797,6 @@ mod tests {
             session_groups: AHashMap::new(),
             agg_specs,
             num_group_cols: 1,
-            group_col_names: vec!["symbol".to_string()],
             group_types: vec![DataType::Utf8],
             row_converter: arrow::row::RowConverter::new(vec![arrow::row::SortField::new(
                 DataType::Utf8,
@@ -1808,6 +1812,8 @@ mod tests {
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
             post_projection: None,
+            scratch_nogroup: AHashMap::new(),
+            scratch_grouped: AHashMap::new(),
         }
     }
 

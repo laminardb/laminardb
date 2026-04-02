@@ -209,7 +209,6 @@ impl From<arrow_schema::ArrowError> for OperatorError {
 pub mod changelog;
 pub mod lag_lead;
 pub mod partitioned_topk;
-pub mod session_window;
 pub mod sliding_window;
 pub mod table_cache;
 pub mod topk;
