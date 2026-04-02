@@ -1040,8 +1040,7 @@ impl<T: Serialize> CdcEnvelope<T> {
 ///
 /// # Ring Architecture
 ///
-/// This is a Ring 1 structure (allocates). Ring 0 uses the non-retractable
-/// [`super::window::FirstValueAccumulator`] via the static dispatch path.
+/// This is a Ring 1 structure (allocates, uses `BTreeMap` for retraction support).
 ///
 /// Uses `BTreeMap<i64, Vec<i64>>` (timestamp → values) for O(log n) insert/remove
 /// and O(1) first-value access via `first_key_value()`.
