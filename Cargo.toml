@@ -53,7 +53,7 @@ gethostname = "0.5"  # Pure Rust hostname lookup
 ahash = "0.8"  # Fast hashing for state stores
 foyer = { version = "0.22", features = ["serde"] }  # High-performance cache (S3-FIFO eviction, serde for HybridCache)
 sha2 = "0.10"  # SHA-256 for checkpoint integrity
-lz4_flex = "0.12"  # Pure Rust LZ4 compression (fastest decompression for recovery)
+lz4_flex = "0.13"  # Pure Rust LZ4 compression (fastest decompression for recovery)
 zstd = "0.13"  # Zstd compression for archival storage tiers (warm/cold)
 backoff = { version = "0.4", features = ["tokio"] }  # Exponential backoff retry
 regex = "1.12"
