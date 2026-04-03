@@ -25,7 +25,8 @@ use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use datafusion_expr::LogicalPlan;
 use sqlparser::ast::{
-    Expr, SelectItem, SetExpr, Statement, TableFactor, WildcardAdditionalOptions,
+    Expr, FunctionArg, FunctionArgExpr, SelectItem, SetExpr, Statement, TableFactor,
+    WildcardAdditionalOptions,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -196,9 +197,8 @@ fn collect_tables_from_set_expr(set_expr: &SetExpr, tables: &mut FxHashSet<Strin
 /// Collect table names from a single `TableFactor`.
 fn collect_tables_from_factor(factor: &TableFactor, tables: &mut FxHashSet<String>) {
     match factor {
-        TableFactor::Table { name, .. } => {
-            // Use last component of potentially qualified name (e.g., "schema.table")
-            tables.insert(name.to_string());
+        TableFactor::Table { name, args, .. } => {
+            tables.insert(resolve_tvf_source(name, args));
         }
         TableFactor::Derived { subquery, .. } => {
             collect_tables_from_set_expr(subquery.body.as_ref(), tables);
@@ -240,8 +240,8 @@ fn collect_tables_counting(set_expr: &SetExpr, tables: &mut Vec<String>) {
 /// Collect a single table occurrence from a `TableFactor`.
 fn collect_factor_counting(factor: &TableFactor, tables: &mut Vec<String>) {
     match factor {
-        TableFactor::Table { name, .. } => {
-            tables.push(name.to_string());
+        TableFactor::Table { name, args, .. } => {
+            tables.push(resolve_tvf_source(name, args));
         }
         TableFactor::Derived { subquery, .. } => {
             collect_tables_counting(subquery.body.as_ref(), tables);
@@ -255,6 +255,54 @@ fn collect_factor_counting(factor: &TableFactor, tables: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+/// Resolve the source table name from a `TableFactor::Table`.
+///
+/// sqlparser parses `FROM TUMBLE(events, ts, ...)` as `TableFactor::Table`
+/// with `name = "TUMBLE"` and `args = Some([events, ts, ...])`. For window
+/// TVFs the first argument is the actual source table — return that instead
+/// of the function name.
+fn resolve_tvf_source(
+    name: &sqlparser::ast::ObjectName,
+    args: &Option<sqlparser::ast::TableFunctionArgs>,
+) -> String {
+    let name_str = name.to_string();
+    if let Some(ref tfa) = args {
+        if is_window_tvf(&name_str) {
+            if let Some(source) = first_ident_arg(&tfa.args) {
+                return source;
+            }
+        }
+    }
+    name_str
+}
+
+fn is_window_tvf(name: &str) -> bool {
+    name.eq_ignore_ascii_case("TUMBLE")
+        || name.eq_ignore_ascii_case("HOP")
+        || name.eq_ignore_ascii_case("SESSION")
+        || name.eq_ignore_ascii_case("SLIDE")
+}
+
+/// Extract the first bare identifier from a function arg list.
+fn first_ident_arg(args: &[FunctionArg]) -> Option<String> {
+    match args.first()? {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(id))) => {
+            Some(id.value.clone())
+        }
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts))) => {
+            let mut buf = String::new();
+            for (i, part) in parts.iter().enumerate() {
+                if i > 0 {
+                    buf.push('.');
+                }
+                buf.push_str(&part.value);
+            }
+            Some(buf)
+        }
+        _ => None,
     }
 }
 
@@ -1524,5 +1572,54 @@ fn rewrite_probe_expr(
             format!("{e} IS NOT NULL")
         }
         _ => expr.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_table_refs_plain() {
+        let refs = extract_table_references("SELECT * FROM events WHERE id > 1");
+        assert_eq!(refs.len(), 1);
+        assert!(refs.contains("events"));
+    }
+
+    #[test]
+    fn extract_table_refs_tumble_in_from() {
+        let refs = extract_table_references(
+            "SELECT COUNT(*) FROM TUMBLE(events, ts, INTERVAL '10' SECOND) \
+             GROUP BY window_start",
+        );
+        assert_eq!(refs.len(), 1);
+        assert!(refs.contains("events"), "got {:?}", refs);
+    }
+
+    #[test]
+    fn extract_table_refs_tumble_join() {
+        let refs = extract_table_references(
+            "SELECT * FROM TUMBLE(events, ts, INTERVAL '1' MINUTE) e \
+             JOIN dim ON e.key = dim.key",
+        );
+        assert!(refs.contains("events"), "got {:?}", refs);
+        assert!(refs.contains("dim"), "got {:?}", refs);
+    }
+
+    #[test]
+    fn single_source_tumble() {
+        let name = single_source_table(
+            "SELECT COUNT(*) FROM TUMBLE(trades, ts, INTERVAL '5' SECOND)",
+        );
+        assert_eq!(name.as_deref(), Some("trades"));
+    }
+
+    #[test]
+    fn is_window_tvf_case_insensitive() {
+        assert!(is_window_tvf("TUMBLE"));
+        assert!(is_window_tvf("tumble"));
+        assert!(is_window_tvf("Hop"));
+        assert!(is_window_tvf("SESSION"));
+        assert!(!is_window_tvf("my_func"));
     }
 }
