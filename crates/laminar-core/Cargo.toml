@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://laminardb.io/api/laminar_core"
-description = "Core streaming engine for LaminarDB - reactor, operators, and state management"
+description = "Core streaming engine for LaminarDB - operators, checkpoint barriers, and streaming primitives"
 
 [features]
 default = []
@@ -22,13 +22,11 @@ delta = [
 [dependencies]
 # Performance critical - no allocations on hot path
 rustc-hash = { workspace = true }
-ahash = { workspace = true }
 xorf = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
 foyer = { workspace = true }
 equivalent = "1"
-memmap2 = { workspace = true }
 uuid = { workspace = true }
 smallvec = { workspace = true }
 arrayvec = { workspace = true }
@@ -79,14 +77,8 @@ libc = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
-proptest = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
-tempfile = { workspace = true }
-
-[[bench]]
-name = "state_bench"
-harness = false
 
 [[bench]]
 name = "window_bench"
@@ -101,23 +93,11 @@ name = "streaming_bench"
 harness = false
 
 [[bench]]
-name = "dag_bench"
-harness = false
-
-[[bench]]
-name = "dag_stress"
-harness = false
-
-[[bench]]
 name = "subscription_bench"
 harness = false
 
 [[bench]]
 name = "cache_bench"
-harness = false
-
-[[bench]]
-name = "checkpoint_bench"
 harness = false
 
 [[bench]]

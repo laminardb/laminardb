@@ -33,8 +33,8 @@ use crate::parser::{
     StreamingStatement, WindowFunction, WindowRewriter,
 };
 use crate::translator::{
-    AnalyticWindowConfig, DagExplainOutput, HavingFilterConfig, JoinOperatorConfig,
-    OrderOperatorConfig, WindowFrameConfig, WindowOperatorConfig,
+    AnalyticWindowConfig, HavingFilterConfig, JoinOperatorConfig, OrderOperatorConfig,
+    WindowFrameConfig, WindowOperatorConfig,
 };
 
 /// Information about a registered lookup table.
@@ -101,9 +101,6 @@ pub enum StreamingPlan {
 
     /// Standard SQL statement (pass-through to DataFusion)
     Standard(Box<Statement>),
-
-    /// DAG topology explanation (from EXPLAIN DAG)
-    DagExplain(DagExplainOutput),
 
     /// Lookup table registration (DDL)
     RegisterLookupTable(LookupTableInfo),

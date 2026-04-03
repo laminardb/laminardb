@@ -74,7 +74,7 @@ This crate sits at the top of the dependency graph, integrating all other Lamina
 laminar-db
   |-- laminar-core        (Ring 0 engine)
   |-- laminar-sql         (SQL parsing + DataFusion)
-  |-- laminar-storage     (WAL + checkpointing)
+  |-- laminar-storage     (checkpoint persistence)
   |-- laminar-connectors  (external connectors)
 ```
 
@@ -108,6 +108,6 @@ The `eowc_state` module provides incremental per-window accumulators that mainta
 
 - [`laminar-core`](../laminar-core) -- Ring 0 engine (operators, state, streaming)
 - [`laminar-sql`](../laminar-sql) -- SQL parser and DataFusion integration
-- [`laminar-storage`](../laminar-storage) -- WAL and checkpointing
+- [`laminar-storage`](../laminar-storage) -- Checkpoint persistence
 - [`laminar-connectors`](../laminar-connectors) -- External system connectors
 - [`laminar-derive`](../laminar-derive) -- Derive macros for typed data handling

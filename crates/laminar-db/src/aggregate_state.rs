@@ -3485,7 +3485,7 @@ mod tests {
 
         let cp = StreamExecutorCheckpoint {
             version: 2,
-            vnode_count: laminar_core::state::VNODE_COUNT,
+            vnode_count: laminar_storage::checkpoint_manifest::VNODE_COUNT,
             agg_states: FxHashMap::default(),
             eowc_states: FxHashMap::default(),
             core_window_states: FxHashMap::default(),

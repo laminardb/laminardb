@@ -7,44 +7,23 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://laminardb.io/api/laminar_storage"
-description = "Storage layer for LaminarDB - WAL, checkpointing, and lakehouse integration"
+description = "Storage layer for LaminarDB - checkpoint persistence and object store integration"
 
 [dependencies]
-# Core dependency
-laminar-core = { path = "../laminar-core", version = "0.19.12" }
-
 # Storage
 object_store = "0.13"  # For cloud storage
 parquet = "57.2"  # For lakehouse formats
 
-
-# Serialization (rkyv for zero-copy performance)
-rkyv = { workspace = true }
+# Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
 
-# CRC32 for WAL integrity
-crc32c = "0.6"
-
 # Base64 encoding for operator state in checkpoint manifests
 base64 = { workspace = true }
 
-# Fast hash for changelog entries
-rustc-hash = { workspace = true }
-
-# LZ4 compression for checkpoint batching
-lz4_flex = { workspace = true }
-
-# Zstd compression for archival storage tiers
-zstd = { workspace = true }
-
-# Identifiers
-uuid = { workspace = true }
-
 # Checkpoint integrity
 sha2 = { workspace = true }
-backoff = { workspace = true }
 
 # Async
 tokio = { workspace = true }
@@ -60,15 +39,9 @@ tracing = { workspace = true }
 [features]
 default = []
 
-io-uring = ["laminar-core/io-uring"]
 aws = ["object_store/aws"]
 gcs = ["object_store/gcp"]
 azure = ["object_store/azure"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
-criterion = { workspace = true }
-
-[[bench]]
-name = "wal_bench"
-harness = false
