@@ -1,16 +1,13 @@
 //! Arrow schemas for OTel signal types.
 //!
-//! Each signal type (traces, metrics, logs) has a fixed Arrow schema
-//! that the protobuf data is flattened into.
+//! Each schema flattens the nested OTLP protobuf hierarchy
+//! (Resource → Scope → Span/DataPoint/LogRecord) into flat columns.
 
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
-/// Arrow schema for trace spans.
-///
-/// Flattens the nested `ResourceSpans -> ScopeSpans -> Span` protobuf
-/// hierarchy into a flat columnar layout suitable for streaming SQL.
+/// Trace span schema.
 #[must_use]
 pub fn traces_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -37,7 +34,7 @@ pub fn traces_schema() -> SchemaRef {
     ]))
 }
 
-/// Arrow schema for metric data points.
+/// Metric data point schema.
 #[must_use]
 pub fn metrics_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -58,7 +55,7 @@ pub fn metrics_schema() -> SchemaRef {
     ]))
 }
 
-/// Arrow schema for log records.
+/// Log record schema.
 #[must_use]
 pub fn logs_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![

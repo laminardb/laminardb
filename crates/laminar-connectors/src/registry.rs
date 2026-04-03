@@ -99,17 +99,42 @@ impl ConnectorRegistry {
         self.sinks.write().insert(name.into(), (info, factory));
     }
 
+    /// Returns the default schema for a source connector as `(name, sql_type, nullable)` tuples.
+    /// Passes `properties` so the connector can pick the right schema variant.
+    #[must_use]
+    pub fn default_source_columns(
+        &self,
+        connector_type: &str,
+        properties: &std::collections::HashMap<String, String>,
+    ) -> Option<Vec<(String, String, bool)>> {
+        let sources = self.sources.read();
+        let (_, factory) = sources.get(connector_type)?;
+        let mut instance = factory();
+        instance.discover_schema(properties);
+        let schema = instance.schema();
+        Some(
+            schema
+                .fields()
+                .iter()
+                .map(|f| {
+                    (
+                        f.name().clone(),
+                        arrow_type_to_sql_str(f.data_type()),
+                        f.is_nullable(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
     /// Creates a new source connector instance.
-    ///
-    /// The connector type is determined by `config.connector_type()`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConnectorError::ConfigurationError` if the connector type
-    /// is not registered.
     ///
     /// The factory creates a default-configured connector. The caller must
     /// subsequently call `open(config)` to forward WITH clause properties.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::ConfigurationError` if not registered.
     pub fn create_source(
         &self,
         config: &ConnectorConfig,
@@ -272,6 +297,25 @@ impl std::fmt::Debug for ConnectorRegistry {
             .field("table_sources", &self.list_table_sources())
             .finish()
     }
+}
+
+fn arrow_type_to_sql_str(dt: &arrow_schema::DataType) -> String {
+    use arrow_schema::DataType;
+    match dt {
+        DataType::Boolean => "BOOLEAN",
+        DataType::Int8 | DataType::UInt8 => "TINYINT",
+        DataType::Int16 | DataType::UInt16 => "SMALLINT",
+        DataType::Int32 | DataType::UInt32 => "INT",
+        DataType::Int64 | DataType::UInt64 => "BIGINT",
+        DataType::Float16 | DataType::Float32 => "FLOAT",
+        DataType::Float64 => "DOUBLE",
+        DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR",
+        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => "BINARY",
+        DataType::Timestamp(_, _) => "TIMESTAMP",
+        DataType::Date32 | DataType::Date64 => "DATE",
+        _ => "VARCHAR",
+    }
+    .into()
 }
 
 #[cfg(test)]

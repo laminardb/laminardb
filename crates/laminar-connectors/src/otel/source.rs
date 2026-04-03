@@ -187,6 +187,18 @@ impl SourceConnector for OtelSource {
         Ok(Some(SourceBatch::new(combined)))
     }
 
+    fn discover_schema(&mut self, properties: &std::collections::HashMap<String, String>) {
+        if let Some(sig) = properties.get("signals") {
+            if let Ok(signal) = OtelSignal::parse(sig) {
+                self.schema = match signal {
+                    OtelSignal::Traces => traces_schema(),
+                    OtelSignal::Metrics => metrics_schema(),
+                    OtelSignal::Logs => logs_schema(),
+                };
+            }
+        }
+    }
+
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

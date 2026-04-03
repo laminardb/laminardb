@@ -30,14 +30,14 @@ use super::convert::{logs_request_to_batch, metrics_request_to_batch, trace_requ
 
 // ── Shared helpers ──
 
-/// Current wall-clock time as nanoseconds since Unix epoch.
-fn now_nanos() -> i64 {
+/// Current wall-clock time as milliseconds since Unix epoch.
+fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| {
             #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-            let ns = d.as_nanos() as i64;
-            ns
+            let ms = d.as_millis() as i64;
+            ms
         })
 }
 
@@ -150,7 +150,7 @@ impl TraceService for OtelReceiver {
         request: Request<ExportTraceServiceRequest>,
     ) -> Result<Response<ExportTraceServiceResponse>, Status> {
         self.requests_received.fetch_add(1, Ordering::Relaxed);
-        let batch = trace_request_to_batch(&request.into_inner(), &self.schema, now_nanos())
+        let batch = trace_request_to_batch(&request.into_inner(), &self.schema, now_millis())
             .map_err(|e| Status::internal(format!("batch conversion failed: {e}")))?;
         self.handle_batch(batch).await?;
         Ok(Response::new(ExportTraceServiceResponse {
@@ -166,7 +166,7 @@ impl MetricsService for OtelReceiver {
         request: Request<ExportMetricsServiceRequest>,
     ) -> Result<Response<ExportMetricsServiceResponse>, Status> {
         self.requests_received.fetch_add(1, Ordering::Relaxed);
-        let batch = metrics_request_to_batch(&request.into_inner(), &self.schema, now_nanos())
+        let batch = metrics_request_to_batch(&request.into_inner(), &self.schema, now_millis())
             .map_err(|e| Status::internal(format!("batch conversion failed: {e}")))?;
         self.handle_batch(batch).await?;
         Ok(Response::new(ExportMetricsServiceResponse {
@@ -182,7 +182,7 @@ impl LogsService for OtelReceiver {
         request: Request<ExportLogsServiceRequest>,
     ) -> Result<Response<ExportLogsServiceResponse>, Status> {
         self.requests_received.fetch_add(1, Ordering::Relaxed);
-        let batch = logs_request_to_batch(&request.into_inner(), &self.schema, now_nanos())
+        let batch = logs_request_to_batch(&request.into_inner(), &self.schema, now_millis())
             .map_err(|e| Status::internal(format!("batch conversion failed: {e}")))?;
         self.handle_batch(batch).await?;
         Ok(Response::new(ExportLogsServiceResponse {
