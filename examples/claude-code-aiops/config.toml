@@ -21,7 +21,7 @@ bind = "127.0.0.1:8080"
 backend = "memory"
 
 [checkpoint]
-interval = "5m"
+interval = "30s"
 
 # ---------------------------------------------------------------------------
 # OTel gRPC source — receives Claude Code telemetry events

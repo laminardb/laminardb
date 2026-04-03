@@ -496,7 +496,7 @@ fn default_state_path() -> String {
 }
 fn default_checkpoint_url() -> String {
     let base = std::env::temp_dir();
-    let path = base.join("laminardb").join("checkpoints");
+    let path = base.join("laminardb");
     // file:// URLs need forward slashes on all platforms.
     let path_str = path.to_string_lossy().replace('\\', "/");
     format!("file:///{path_str}")

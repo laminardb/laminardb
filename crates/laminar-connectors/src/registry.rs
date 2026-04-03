@@ -309,11 +309,10 @@ fn arrow_type_to_sql_str(dt: &arrow_schema::DataType) -> String {
         DataType::Int64 | DataType::UInt64 => "BIGINT",
         DataType::Float16 | DataType::Float32 => "FLOAT",
         DataType::Float64 => "DOUBLE",
-        DataType::Utf8 | DataType::LargeUtf8 => "VARCHAR",
         DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => "BINARY",
         DataType::Timestamp(_, _) => "TIMESTAMP",
         DataType::Date32 | DataType::Date64 => "DATE",
-        _ => "VARCHAR",
+        _ => "VARCHAR", // Utf8, LargeUtf8, and anything else
     }
     .into()
 }

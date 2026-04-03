@@ -21,6 +21,10 @@ pub enum OtelSignal {
 
 impl OtelSignal {
     /// Parse from a string value (case-insensitive).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::ConfigurationError` for unknown signal types.
     pub fn parse(s: &str) -> Result<Self, ConnectorError> {
         match s.to_lowercase().as_str() {
             "traces" | "trace" => Ok(Self::Traces),

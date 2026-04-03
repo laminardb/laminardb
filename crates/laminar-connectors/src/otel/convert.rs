@@ -524,6 +524,7 @@ impl MetricBuilders {
 /// # Errors
 ///
 /// Returns `ArrowError` if column construction fails.
+#[allow(clippy::too_many_lines)] // 5 metric types × dispatch loop; builders already extracted
 pub fn metrics_request_to_batch(
     req: &ExportMetricsServiceRequest,
     schema: &SchemaRef,
