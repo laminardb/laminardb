@@ -289,9 +289,7 @@ fn is_window_tvf(name: &str) -> bool {
 /// Extract the first bare identifier from a function arg list.
 fn first_ident_arg(args: &[FunctionArg]) -> Option<String> {
     match args.first()? {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(id))) => {
-            Some(id.value.clone())
-        }
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(id))) => Some(id.value.clone()),
         FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts))) => {
             let mut buf = String::new();
             for (i, part) in parts.iter().enumerate() {
@@ -1608,9 +1606,8 @@ mod tests {
 
     #[test]
     fn single_source_tumble() {
-        let name = single_source_table(
-            "SELECT COUNT(*) FROM TUMBLE(trades, ts, INTERVAL '5' SECOND)",
-        );
+        let name =
+            single_source_table("SELECT COUNT(*) FROM TUMBLE(trades, ts, INTERVAL '5' SECOND)");
         assert_eq!(name.as_deref(), Some("trades"));
     }
 
