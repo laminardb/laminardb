@@ -499,7 +499,11 @@ fn default_checkpoint_url() -> String {
     let path = base.join("laminardb");
     // file:// URLs need forward slashes on all platforms.
     let path_str = path.to_string_lossy().replace('\\', "/");
-    format!("file:///{path_str}")
+    if path_str.starts_with('/') {
+        format!("file://{path_str}")
+    } else {
+        format!("file:///{path_str}")
+    }
 }
 fn default_max_retained() -> usize {
     10

@@ -188,13 +188,21 @@ impl SourceConnector for OtelSource {
     }
 
     fn discover_schema(&mut self, properties: &std::collections::HashMap<String, String>) {
-        if let Some(sig) = properties.get("signals") {
-            if let Ok(signal) = OtelSignal::parse(sig) {
-                self.schema = match signal {
-                    OtelSignal::Traces => traces_schema(),
-                    OtelSignal::Metrics => metrics_schema(),
-                    OtelSignal::Logs => logs_schema(),
-                };
+        let sig = properties
+            .get("signals")
+            .or_else(|| properties.get("signal"));
+        if let Some(sig) = sig {
+            match OtelSignal::parse(sig) {
+                Ok(signal) => {
+                    self.schema = match signal {
+                        OtelSignal::Traces => traces_schema(),
+                        OtelSignal::Metrics => metrics_schema(),
+                        OtelSignal::Logs => logs_schema(),
+                    };
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "invalid OTel signal type, using default traces schema");
+                }
             }
         }
     }

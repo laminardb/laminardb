@@ -198,7 +198,7 @@ fn collect_tables_from_set_expr(set_expr: &SetExpr, tables: &mut FxHashSet<Strin
 fn collect_tables_from_factor(factor: &TableFactor, tables: &mut FxHashSet<String>) {
     match factor {
         TableFactor::Table { name, args, .. } => {
-            tables.insert(resolve_tvf_source(name, args));
+            tables.insert(resolve_tvf_source(name, args.as_ref()));
         }
         TableFactor::Derived { subquery, .. } => {
             collect_tables_from_set_expr(subquery.body.as_ref(), tables);
@@ -241,7 +241,7 @@ fn collect_tables_counting(set_expr: &SetExpr, tables: &mut Vec<String>) {
 fn collect_factor_counting(factor: &TableFactor, tables: &mut Vec<String>) {
     match factor {
         TableFactor::Table { name, args, .. } => {
-            tables.push(resolve_tvf_source(name, args));
+            tables.push(resolve_tvf_source(name, args.as_ref()));
         }
         TableFactor::Derived { subquery, .. } => {
             collect_tables_counting(subquery.body.as_ref(), tables);
@@ -266,11 +266,13 @@ fn collect_factor_counting(factor: &TableFactor, tables: &mut Vec<String>) {
 /// of the function name.
 fn resolve_tvf_source(
     name: &sqlparser::ast::ObjectName,
-    args: &Option<sqlparser::ast::TableFunctionArgs>,
+    args: Option<&sqlparser::ast::TableFunctionArgs>,
 ) -> String {
     let name_str = name.to_string();
-    if let Some(ref tfa) = args {
-        if is_window_tvf(&name_str) {
+    // Handle schema-qualified names like "schema.TUMBLE"
+    let base_name = name_str.rsplit('.').next().unwrap_or(&name_str);
+    if let Some(tfa) = args {
+        if is_window_tvf(base_name) {
             if let Some(source) = first_ident_arg(&tfa.args) {
                 return source;
             }

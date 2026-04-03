@@ -41,8 +41,8 @@ cargo run --release -p laminar-server --no-default-features \
 
 ```bash
 # From the repo root:
-python -m http.server 8080 -d examples/claude-code-aiops
-# Open http://localhost:8080/dashboard.html
+python -m http.server 8000 -d examples/claude-code-aiops
+# Open http://localhost:8000/dashboard.html
 ```
 
 ### 3. Point Claude Code at it

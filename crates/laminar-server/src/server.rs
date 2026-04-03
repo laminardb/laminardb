@@ -161,7 +161,7 @@ pub async fn run_server(
     let checkpoint_cfg = StreamCheckpointConfig {
         interval_ms: Some(config.checkpoint.interval.as_millis() as u64),
         data_dir: file_url_to_path(checkpoint_url),
-        max_retained: Some(config.checkpoint.max_retained.try_into().unwrap_or(10)),
+        max_retained: Some(config.checkpoint.max_retained),
         ..StreamCheckpointConfig::default()
     };
     builder = builder.checkpoint(checkpoint_cfg);

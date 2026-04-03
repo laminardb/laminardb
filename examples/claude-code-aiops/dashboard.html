@@ -575,6 +575,12 @@ function fmtTokens(n) {
 
 function fmtMs(n) { return n < 1000 ? n.toFixed(0) + 'ms' : (n / 1000).toFixed(1) + 's'; }
 
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
 function fmtTime(d) {
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
@@ -676,30 +682,46 @@ function handleTools(rows) {
 
 function handlePrompts(rows) {
   for (const r of rows) {
+    const id = r.prompt_id || '';
     const model = r.model || '';
     const shortModel = model.replace('claude-', '').replace(/-\d{8}$/, '');
     const inp = +r.total_input_tokens || 0;
     const cacheR = +r.total_cache_read_tokens || 0;
     const cachePct = (cacheR + inp) > 0 ? ((cacheR / (cacheR + inp)) * 100).toFixed(0) : '--';
 
-    S.prompts.unshift({
-      num: S.prompts.length + 1,
-      cost: +r.prompt_cost_usd || 0,
-      model: shortModel,
-      length: +r.prompt_length || 0,
-      inp: inp,
-      out: +r.total_output_tokens || 0,
-      cacheR: cacheR,
-      cachePct: cachePct,
-      duration: +r.total_duration_ms || 0,
-      tools: +r.tools_invoked || 0,
-      failures: +r.tool_failures || 0,
-      calls: +r.api_calls || 0,
-    });
-    addEvent('prompt', `${shortModel} ${fmtCost(+r.prompt_cost_usd || 0)} ${+r.tools_invoked || 0} tools`);
+    const existing = id && S.prompts.find(p => p.id === id);
+    if (existing) {
+      existing.cost += +r.prompt_cost_usd || 0;
+      existing.inp += inp;
+      existing.out += +r.total_output_tokens || 0;
+      existing.cacheR += cacheR;
+      existing.cachePct = (existing.cacheR + existing.inp) > 0
+        ? ((existing.cacheR / (existing.cacheR + existing.inp)) * 100).toFixed(0) : '--';
+      existing.duration += +r.total_duration_ms || 0;
+      existing.tools += +r.tools_invoked || 0;
+      existing.failures += +r.tool_failures || 0;
+      existing.calls += +r.api_calls || 0;
+      if (!existing.model && shortModel) existing.model = shortModel;
+    } else {
+      S.prompts.unshift({
+        id: id,
+        num: S.prompts.length + 1,
+        cost: +r.prompt_cost_usd || 0,
+        model: shortModel,
+        length: +r.prompt_length || 0,
+        inp: inp,
+        out: +r.total_output_tokens || 0,
+        cacheR: cacheR,
+        cachePct: cachePct,
+        duration: +r.total_duration_ms || 0,
+        tools: +r.tools_invoked || 0,
+        failures: +r.tool_failures || 0,
+        calls: +r.api_calls || 0,
+      });
+      addEvent('prompt', `${shortModel} ${fmtCost(+r.prompt_cost_usd || 0)} ${+r.tools_invoked || 0} tools`);
+    }
   }
   if (S.prompts.length > 50) S.prompts.length = 50;
-  // Re-number
   S.prompts.forEach((p, i) => p.num = S.prompts.length - i);
   renderAll();
 }
@@ -865,7 +887,7 @@ function renderModels() {
 
     return `<div class="model-entry">
       <div class="model-header">
-        <span class="model-name">${short}</span>
+        <span class="model-name">${esc(short)}</span>
         <span class="model-cost">${fmtCost(d.cost)}</span>
       </div>
       <div class="model-bar-track">
@@ -893,7 +915,7 @@ function renderTools() {
     const rate = d.cnt > 0 ? (d.succ / d.cnt * 100) : 0;
     const rc = rate >= 95 ? 'rate-good' : rate >= 80 ? 'rate-warn' : 'rate-bad';
     html += `<tr>
-      <td style="font-weight:600">${name}</td>
+      <td style="font-weight:600">${esc(name)}</td>
       <td>${d.cnt}</td>
       <td><span class="rate-pill ${rc}">${rate.toFixed(0)}%</span></td>
       <td>${fmtMs(d.avg)}</td>
@@ -917,7 +939,7 @@ function renderPrompts() {
     return `<div class="prompt-entry">
       <span class="prompt-num">${p.num}</span>
       <span class="prompt-cost">${fmtCost(p.cost)}</span>
-      <span class="prompt-model">${p.model || '—'}</span>
+      <span class="prompt-model">${esc(p.model || '—')}</span>
       <span class="prompt-tokens">${fmtTokens(p.inp)}</span>
       <span class="prompt-tokens-out">${fmtTokens(p.out)}</span>
       <span class="prompt-tools">${toolsHtml}</span>
@@ -932,8 +954,8 @@ function renderEvents() {
   el.innerHTML = S.events.slice(0, 30).map(e =>
     `<div class="log-line">
       <span class="ts">${fmtTime(e.time)}</span>
-      <span class="ev"> ${e.type}</span>
-      <span class="detail"> ${e.detail}</span>
+      <span class="ev"> ${esc(e.type)}</span>
+      <span class="detail"> ${esc(e.detail)}</span>
     </div>`
   ).join('');
 }
@@ -951,7 +973,7 @@ function renderDecisions() {
     const autoPct = total > 0 ? ((d.auto / total) * 100).toFixed(0) : 0;
     const rejectColor = d.reject > 0 ? 'var(--red)' : 'var(--text-dim)';
     html += `<tr>
-      <td style="font-weight:600">${name}</td>
+      <td style="font-weight:600">${esc(name)}</td>
       <td style="color:var(--green)">${d.accept}</td>
       <td style="color:${rejectColor}">${d.reject}</td>
       <td>${autoPct}%</td>
@@ -1024,8 +1046,7 @@ function renderActivity() {
 }
 
 // Connect
-ws(9000, 'd-cost', function(rows) {
-  // Heartbeat — flash the indicator on every 5s window
+ws(9000, 'hb', function() {
   const hb = document.getElementById('hb');
   hb.classList.add('pulse');
   setTimeout(() => hb.classList.remove('pulse'), 1500);
