@@ -1593,7 +1593,7 @@ mod tests {
              GROUP BY window_start",
         );
         assert_eq!(refs.len(), 1);
-        assert!(refs.contains("events"), "got {:?}", refs);
+        assert!(refs.contains("events"), "got {refs:?}");
     }
 
     #[test]
@@ -1602,8 +1602,8 @@ mod tests {
             "SELECT * FROM TUMBLE(events, ts, INTERVAL '1' MINUTE) e \
              JOIN dim ON e.key = dim.key",
         );
-        assert!(refs.contains("events"), "got {:?}", refs);
-        assert!(refs.contains("dim"), "got {:?}", refs);
+        assert!(refs.contains("events"), "got {refs:?}");
+        assert!(refs.contains("dim"), "got {refs:?}");
     }
 
     #[test]
