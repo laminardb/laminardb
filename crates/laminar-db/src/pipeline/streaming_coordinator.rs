@@ -148,9 +148,6 @@ impl PendingBarrier {
 /// Fallback timeout for idle wake.
 const IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// Barrier alignment timeout.
-const BARRIER_TIMEOUT: Duration = Duration::from_secs(60);
-
 impl StreamingCoordinator {
     /// Create a new streaming coordinator.
     ///
@@ -526,7 +523,7 @@ impl StreamingCoordinator {
 
             // Step: Barrier timeout check.
             if self.pending_barrier.active
-                && self.pending_barrier.started_at.elapsed() > BARRIER_TIMEOUT
+                && self.pending_barrier.started_at.elapsed() > self.config.barrier_alignment_timeout
             {
                 tracing::warn!(
                     checkpoint_id = self.pending_barrier.checkpoint_id,
@@ -915,7 +912,7 @@ mod tests {
                 fallback_poll_interval: Duration::from_millis(10),
                 checkpoint_interval: None,
                 delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
-                barrier_alignment_timeout: BARRIER_TIMEOUT,
+                barrier_alignment_timeout: Duration::from_secs(30),
                 cycle_budget_ns: 10_000_000,
                 drain_budget_ns: 1_000_000,
                 query_budget_ns: 8_000_000,
@@ -984,7 +981,7 @@ mod tests {
                 fallback_poll_interval: Duration::from_millis(10),
                 checkpoint_interval: Some(Duration::from_secs(60)),
                 delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
-                barrier_alignment_timeout: BARRIER_TIMEOUT,
+                barrier_alignment_timeout: Duration::from_secs(30),
                 cycle_budget_ns: 10_000_000,
                 drain_budget_ns: 1_000_000,
                 query_budget_ns: 8_000_000,
@@ -1055,7 +1052,7 @@ mod tests {
                 fallback_poll_interval: Duration::from_millis(10),
                 checkpoint_interval: None,
                 delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
-                barrier_alignment_timeout: BARRIER_TIMEOUT,
+                barrier_alignment_timeout: Duration::from_secs(30),
                 cycle_budget_ns: 10_000_000,
                 drain_budget_ns: 1_000_000,
                 query_budget_ns: 8_000_000,
@@ -1320,7 +1317,7 @@ mod tests {
                 fallback_poll_interval: Duration::from_millis(10),
                 checkpoint_interval: None,
                 delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
-                barrier_alignment_timeout: BARRIER_TIMEOUT,
+                barrier_alignment_timeout: Duration::from_secs(30),
                 cycle_budget_ns: 10_000_000,
                 drain_budget_ns: 1_000_000,
                 query_budget_ns: 8_000_000,

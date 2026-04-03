@@ -2311,7 +2311,7 @@ impl StreamExecutor {
 
         Ok(Some(StreamExecutorCheckpoint {
             version: 2,
-            vnode_count: laminar_core::state::VNODE_COUNT,
+            vnode_count: laminar_storage::checkpoint_manifest::VNODE_COUNT,
             agg_states: agg_checkpoints,
             eowc_states: eowc_checkpoints,
             core_window_states: cw_checkpoints,

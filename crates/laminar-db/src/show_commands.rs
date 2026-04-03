@@ -20,20 +20,18 @@ impl LaminarDB {
         };
 
         // Build single-row result with checkpoint metadata.
-        let (cp_id, epoch, ts_ms, sources, sinks, is_inc, total_checkpoints) =
-            if let Some(ref m) = latest {
-                (
-                    m.checkpoint_id,
-                    m.epoch,
-                    m.timestamp_ms,
-                    m.source_names.join(", "),
-                    m.sink_names.join(", "),
-                    m.is_incremental,
-                    list.len() as u64,
-                )
-            } else {
-                (0, 0, 0, String::new(), String::new(), false, 0)
-            };
+        let (cp_id, epoch, ts_ms, sources, sinks, total_checkpoints) = if let Some(ref m) = latest {
+            (
+                m.checkpoint_id,
+                m.epoch,
+                m.timestamp_ms,
+                m.source_names.join(", "),
+                m.sink_names.join(", "),
+                list.len() as u64,
+            )
+        } else {
+            (0, 0, 0, String::new(), String::new(), 0)
+        };
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("checkpoint_id", DataType::UInt64, false),
@@ -41,7 +39,6 @@ impl LaminarDB {
             Field::new("timestamp_ms", DataType::UInt64, false),
             Field::new("sources", DataType::Utf8, false),
             Field::new("sinks", DataType::Utf8, false),
-            Field::new("is_incremental", DataType::Boolean, false),
             Field::new("total_checkpoints", DataType::UInt64, false),
         ]));
 
@@ -53,7 +50,6 @@ impl LaminarDB {
                 Arc::new(UInt64Array::from(vec![ts_ms])),
                 Arc::new(StringArray::from(vec![sources.as_str()])),
                 Arc::new(StringArray::from(vec![sinks.as_str()])),
-                Arc::new(BooleanArray::from(vec![is_inc])),
                 Arc::new(UInt64Array::from(vec![total_checkpoints])),
             ],
         )

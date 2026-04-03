@@ -901,6 +901,9 @@ impl LaminarDB {
                 } else {
                     std::time::Duration::ZERO
                 }),
+            // Tracks CheckpointConfig::default().alignment_timeout.
+            // TODO: expose alignment_timeout_ms in LaminarDbConfig.checkpoint
+            // so users can configure this.
             barrier_alignment_timeout: std::time::Duration::from_secs(30),
             delivery_guarantee: self.config.delivery_guarantee,
             // cycle_budget is a soft cap for logging; ensure it's at least
@@ -1018,6 +1021,7 @@ impl LaminarDB {
             pipeline_hash,
             delivery_guarantee: pipeline_config.delivery_guarantee,
             sink_write_timeout: pipeline_config.sink_write_timeout,
+            serialization_timeout: std::time::Duration::from_secs(120),
             sink_timed_out: false,
             cycle_histogram: std::cell::RefCell::new(
                 crate::checkpoint_coordinator::DurationHistogram::new(),

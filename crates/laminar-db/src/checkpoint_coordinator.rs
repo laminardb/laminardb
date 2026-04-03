@@ -1,9 +1,6 @@
 //! Unified checkpoint coordinator.
 //!
-//! Single orchestrator that replaces `StreamCheckpointManager`,
-//! `PipelineCheckpointManager`, and the persistence side of `DagCheckpointResult`.
-//! Lives in Ring 2 (control plane). Reuses the existing
-//! `DagCheckpointCoordinator` for barrier logic.
+//! Single orchestrator for checkpoint lifecycle. Lives in Ring 2 (control plane).
 //!
 //! The checkpoint manifest is the source of truth for source offsets.
 //! Kafka broker commits are advisory (for monitoring tools). On recovery,
@@ -11,8 +8,8 @@
 //!
 //! ## Checkpoint Cycle
 //!
-//! 1. Barrier propagation — `dag_coordinator.trigger_checkpoint()`
-//! 2. Operator snapshot — `dag_coordinator.finalize_checkpoint()` → operator states
+//! 1. Barrier injection — `CheckpointBarrierInjector.trigger()`
+//! 2. Operator snapshot — `OperatorGraph.snapshot_state()` → operator states
 //! 3. Source snapshot — `source.checkpoint()` for each source
 //! 4. Sink pre-commit — `sink.pre_commit(epoch)` for each exactly-once sink
 //! 5. Manifest persist — `store.save(&manifest)` (atomic write)
@@ -28,7 +25,6 @@ use std::sync::atomic::Ordering;
 
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::SourceConnector;
-use laminar_storage::changelog_drainer::ChangelogDrainer;
 use laminar_storage::checkpoint_manifest::{
     CheckpointManifest, ConnectorCheckpoint, SinkCommitStatus,
 };
@@ -61,8 +57,6 @@ pub struct CheckpointConfig {
     ///
     /// Defaults to 60 seconds.
     pub commit_timeout: Duration,
-    /// Whether to use incremental checkpoints.
-    pub incremental: bool,
     /// Maximum operator state size (bytes) to inline in the JSON manifest.
     ///
     /// States larger than this threshold are written to a `state.bin` sidecar
@@ -71,6 +65,8 @@ pub struct CheckpointConfig {
     ///
     /// Default: 1 MB (`1_048_576`). Set to `usize::MAX` to inline everything.
     pub state_inline_threshold: usize,
+    /// Maximum time for operator state serialization. Defaults to 120 seconds.
+    pub serialization_timeout: Duration,
     /// Maximum total checkpoint size in bytes (manifest + sidecar).
     ///
     /// If the packed operator state exceeds this limit, the checkpoint is
@@ -79,27 +75,12 @@ pub struct CheckpointConfig {
     ///
     /// `None` means no limit (default). A warning is logged at 80% of the cap.
     pub max_checkpoint_bytes: Option<usize>,
-    /// Maximum pending changelog entries per drainer before forced clear.
-    ///
-    /// On checkpoint failure, `clear_pending()` is normally skipped. If
-    /// failures repeat, pending entries grow unboundedly → OOM. This cap
-    /// is a safety valve: if any drainer exceeds it after a failure, all
-    /// drainers are cleared and an `[LDB-6010]` warning is logged.
-    ///
-    /// Default: 10,000,000 entries.
-    pub max_pending_changelog_entries: usize,
     /// Adaptive checkpoint interval configuration.
     ///
     /// When `Some`, the coordinator dynamically adjusts the checkpoint interval
     /// based on observed checkpoint durations using an exponential moving average.
     /// When `None` (default), the static `interval` is used unchanged.
     pub adaptive: Option<AdaptiveCheckpointConfig>,
-    /// Unaligned checkpoint configuration.
-    ///
-    /// When `Some`, the coordinator can fall back to unaligned checkpoints
-    /// when barrier alignment takes too long under backpressure.
-    /// When `None` (default), only aligned checkpoints are used.
-    pub unaligned: Option<UnalignedCheckpointConfig>,
 }
 
 /// Configuration for adaptive checkpoint intervals.
@@ -138,9 +119,6 @@ impl Default for AdaptiveCheckpointConfig {
     }
 }
 
-/// Re-export from `laminar_core::checkpoint::unaligned`.
-pub use laminar_core::checkpoint::UnalignedCheckpointConfig;
-
 impl Default for CheckpointConfig {
     fn default() -> Self {
         Self {
@@ -150,32 +128,15 @@ impl Default for CheckpointConfig {
             pre_commit_timeout: Duration::from_secs(30),
             persist_timeout: Duration::from_secs(120),
             commit_timeout: Duration::from_secs(60),
-            incremental: false,
+            serialization_timeout: Duration::from_secs(120),
             state_inline_threshold: 1_048_576,
             max_checkpoint_bytes: None,
-            max_pending_changelog_entries: 10_000_000,
             adaptive: None,
-            unaligned: None,
         }
     }
 }
 
 /// Parameters for a checkpoint operation.
-///
-/// Groups the many `HashMap` parameters that the checkpoint methods require,
-/// improving API ergonomics and readability. Use `Default::default()` or
-/// struct update syntax to fill in only the fields you need.
-///
-/// # Example
-///
-/// ```
-/// # use laminar_db::checkpoint_coordinator::CheckpointRequest;
-/// let req = CheckpointRequest {
-///     watermark: Some(5000),
-///     pipeline_hash: Some(0xDEAD_BEEF),
-///     ..CheckpointRequest::default()
-/// };
-/// ```
 #[derive(Debug, Clone, Default)]
 pub struct CheckpointRequest {
     /// Serialized operator states.
@@ -199,8 +160,6 @@ pub struct CheckpointRequest {
 pub enum CheckpointPhase {
     /// No checkpoint in progress.
     Idle,
-    /// Barrier injected, waiting for operator snapshots.
-    BarrierInFlight,
     /// Operators snapshotted, collecting source positions.
     Snapshotting,
     /// Sinks pre-committing (phase 1).
@@ -215,7 +174,6 @@ impl std::fmt::Display for CheckpointPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Idle => write!(f, "Idle"),
-            Self::BarrierInFlight => write!(f, "BarrierInFlight"),
             Self::Snapshotting => write!(f, "Snapshotting"),
             Self::PreCommitting => write!(f, "PreCommitting"),
             Self::Persisting => write!(f, "Persisting"),
@@ -279,16 +237,12 @@ pub struct CheckpointCoordinator {
     last_checkpoint_duration: Option<Duration>,
     /// Rolling histogram of checkpoint durations for percentile tracking.
     duration_histogram: DurationHistogram,
-    /// Changelog drainers to flush before checkpointing.
-    changelog_drainers: Vec<ChangelogDrainer>,
     /// Shared counters for observability.
     counters: Option<Arc<PipelineCounters>>,
     /// Exponential moving average of checkpoint durations (milliseconds).
     smoothed_duration_ms: f64,
     /// Cumulative bytes written across all checkpoints (manifest + sidecar).
     total_bytes_written: u64,
-    /// Number of checkpoints completed in unaligned mode.
-    unaligned_checkpoint_count: u64,
 }
 
 impl CheckpointCoordinator {
@@ -313,11 +267,9 @@ impl CheckpointCoordinator {
             checkpoints_failed: 0,
             last_checkpoint_duration: None,
             duration_histogram: DurationHistogram::new(),
-            changelog_drainers: Vec::new(),
             counters: None,
             smoothed_duration_ms: 0.0,
             total_bytes_written: 0,
-            unaligned_checkpoint_count: 0,
         }
     }
 
@@ -363,7 +315,10 @@ impl CheckpointCoordinator {
                     Err(e) => {
                         // Roll back sinks that already started.
                         for s in &started {
-                            s.handle.rollback_epoch(epoch).await;
+                            if let Err(re) = s.handle.rollback_epoch(epoch).await {
+                                error!(sink = %s.name, epoch, error = %re,
+                                    "[LDB-6016] sink rollback failed during begin_epoch recovery");
+                            }
                         }
                         return Err(DbError::Checkpoint(format!(
                             "sink '{}' failed to begin epoch {epoch}: {e}",
@@ -401,65 +356,6 @@ impl CheckpointCoordinator {
                 .last_checkpoint_duration_ms
                 .store(duration.as_millis() as u64, Ordering::Relaxed);
             counters.checkpoint_epoch.store(epoch, Ordering::Relaxed);
-        }
-    }
-
-    // ── Changelog drainers ──
-
-    /// Registers a changelog drainer to flush before checkpointing.
-    pub fn register_changelog_drainer(&mut self, drainer: ChangelogDrainer) {
-        self.changelog_drainers.push(drainer);
-    }
-
-    /// Flushes all registered changelog drainers.
-    fn flush_changelog_drainers(&mut self) {
-        for drainer in &mut self.changelog_drainers {
-            let count = drainer.drain();
-            debug!(
-                drained = count,
-                pending = drainer.pending_count(),
-                "changelog drainer flushed"
-            );
-        }
-    }
-
-    /// Returns a slice of registered changelog drainers.
-    #[must_use]
-    pub fn changelog_drainers(&self) -> &[ChangelogDrainer] {
-        &self.changelog_drainers
-    }
-
-    /// Returns a mutable slice of registered changelog drainers.
-    pub fn changelog_drainers_mut(&mut self) -> &mut [ChangelogDrainer] {
-        &mut self.changelog_drainers
-    }
-
-    /// Safety valve: clears changelog drainer buffers if any exceeds the cap.
-    ///
-    /// Called on checkpoint failure to prevent unbounded memory growth when
-    /// checkpoints fail repeatedly. Under normal operation, `clear_pending()`
-    /// is called on the success path in `checkpoint_inner()`.
-    fn maybe_cap_drainers(&mut self) {
-        let cap = self.config.max_pending_changelog_entries;
-        let needs_clear = self
-            .changelog_drainers
-            .iter()
-            .any(|d| d.pending_count() > cap);
-        if needs_clear {
-            let total: usize = self
-                .changelog_drainers
-                .iter()
-                .map(ChangelogDrainer::pending_count)
-                .sum();
-            warn!(
-                total_pending = total,
-                cap,
-                "[LDB-6010] changelog drainer exceeded cap after checkpoint failure — \
-                 clearing to prevent OOM"
-            );
-            for drainer in &mut self.changelog_drainers {
-                drainer.clear_pending();
-            }
         }
     }
 
@@ -694,14 +590,28 @@ impl CheckpointCoordinator {
         }
     }
 
-    /// Rolls back all exactly-once sinks.
+    /// Rolls back all exactly-once sinks. Collects per-sink errors.
     async fn rollback_sinks(&self, epoch: u64) -> Result<(), DbError> {
+        let mut errors = Vec::new();
         for sink in &self.sinks {
             if sink.exactly_once {
-                sink.handle.rollback_epoch(epoch).await;
+                if let Err(e) = sink.handle.rollback_epoch(epoch).await {
+                    error!(
+                        sink = %sink.name, epoch, error = %e,
+                        "[LDB-6016] sink rollback failed"
+                    );
+                    errors.push(format!("sink '{}': {e}", sink.name));
+                }
             }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(DbError::Checkpoint(format!(
+                "rollback failed: {}",
+                errors.join("; ")
+            )))
+        }
     }
 
     /// Collects the last committed epoch from each sink.
@@ -804,12 +714,6 @@ impl CheckpointCoordinator {
         self.smoothed_duration_ms
     }
 
-    /// Returns the number of unaligned checkpoints completed.
-    #[must_use]
-    pub fn unaligned_checkpoint_count(&self) -> u64 {
-        self.unaligned_checkpoint_count
-    }
-
     /// Returns checkpoint statistics.
     #[must_use]
     pub fn stats(&self) -> CheckpointStats {
@@ -825,7 +729,6 @@ impl CheckpointCoordinator {
             total_bytes_written: self.total_bytes_written,
             current_phase: self.phase,
             current_epoch: self.epoch,
-            unaligned_checkpoint_count: self.unaligned_checkpoint_count,
         }
     }
 
@@ -833,24 +736,6 @@ impl CheckpointCoordinator {
     #[must_use]
     pub fn store(&self) -> &dyn CheckpointStore {
         &*self.store
-    }
-
-    /// Performs a full checkpoint cycle with additional table offsets.
-    ///
-    /// Identical to [`checkpoint()`](Self::checkpoint) but provided as a
-    /// convenience for callers that build a [`CheckpointRequest`] with
-    /// `extra_table_offsets` populated. This is useful for
-    /// `ReferenceTableSource` instances that are not registered as
-    /// `SourceConnector` but still need their offsets persisted.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DbError::Checkpoint` if any phase fails.
-    pub async fn checkpoint_with_extra_tables(
-        &mut self,
-        request: CheckpointRequest,
-    ) -> Result<CheckpointResult, DbError> {
-        self.checkpoint_inner(request).await
     }
 
     /// Performs a full checkpoint with pre-captured source offsets.
@@ -872,11 +757,6 @@ impl CheckpointCoordinator {
     }
 
     /// Shared checkpoint implementation for all checkpoint entry points.
-    ///
-    /// WAL preparation is performed internally to guarantee atomicity:
-    /// changelog drain + epoch barrier + WAL sync happen after operator
-    /// states are received, so the WAL positions in the manifest always
-    /// reflect the state after the operator snapshot.
     ///
     /// When [`CheckpointRequest::source_offset_overrides`] is non-empty,
     /// those sources use the provided offsets instead of calling
@@ -902,8 +782,6 @@ impl CheckpointCoordinator {
 
         info!(checkpoint_id, epoch, "starting checkpoint");
 
-        self.flush_changelog_drainers();
-
         // ── Step 3: Source offsets ──
         // Source offsets are provided by the caller (pre-captured at barrier
         // alignment or pre-spawn). Table offsets come from extra_table_offsets.
@@ -916,7 +794,6 @@ impl CheckpointCoordinator {
         if let Err(e) = self.pre_commit_sinks(epoch).await {
             self.phase = CheckpointPhase::Idle;
             self.checkpoints_failed += 1;
-            self.maybe_cap_drainers();
             let duration = start.elapsed();
             self.emit_checkpoint_metrics(false, epoch, duration);
             error!(checkpoint_id, epoch, error = %e, "pre-commit failed");
@@ -943,7 +820,6 @@ impl CheckpointCoordinator {
         // global watermark, as that loses granularity on recovery.
         manifest.source_watermarks = source_watermarks;
         manifest.table_store_checkpoint_path = table_store_checkpoint_path;
-        manifest.is_incremental = self.config.incremental;
         manifest.source_names = {
             let mut names: Vec<String> = manifest.source_offsets.keys().cloned().collect();
             names.sort();
@@ -970,7 +846,6 @@ impl CheckpointCoordinator {
             if sidecar_bytes > cap {
                 self.phase = CheckpointPhase::Idle;
                 self.checkpoints_failed += 1;
-                self.maybe_cap_drainers();
                 let duration = start.elapsed();
                 self.emit_checkpoint_metrics(false, epoch, duration);
                 let msg = format!(
@@ -994,19 +869,13 @@ impl CheckpointCoordinator {
                 );
             }
         }
-        // Track cumulative bytes written (manifest + sidecar).
-        // Serialize the manifest once to measure its size. This happens on the
-        // checkpoint path (not hot), and the actual persist re-serializes inside
-        // save_manifest via spawn_blocking.
-        let manifest_bytes = serde_json::to_string(&manifest).map_or(0, |s| s.len());
-        let checkpoint_bytes = (manifest_bytes + sidecar_bytes) as u64;
+        let checkpoint_bytes = sidecar_bytes as u64;
 
         // ── Step 5: Persist manifest (decision record — sinks are Pending) ──
         self.phase = CheckpointPhase::Persisting;
         if let Err(e) = self.save_manifest(manifest.clone(), state_data).await {
             self.phase = CheckpointPhase::Idle;
             self.checkpoints_failed += 1;
-            self.maybe_cap_drainers();
             let duration = start.elapsed();
             self.emit_checkpoint_metrics(false, epoch, duration);
             if let Err(rollback_err) = self.rollback_sinks(epoch).await {
@@ -1064,14 +933,6 @@ impl CheckpointCoordinator {
                 duration,
                 error: Some("partial sink commit failure".into()),
             });
-        }
-
-        // ── Step 7: Clear changelog drainer pending buffers ──
-        // Entries are metadata-only (key_hash + mmap_offset) used for SPSC
-        // backpressure relief. The checkpoint captured full state, so the
-        // metadata is no longer needed. Clearing prevents unbounded growth.
-        for drainer in &mut self.changelog_drainers {
-            drainer.clear_pending();
         }
 
         // ── Success ──
@@ -1189,7 +1050,6 @@ impl std::fmt::Debug for CheckpointCoordinator {
             .field("next_checkpoint_id", &self.next_checkpoint_id)
             .field("phase", &self.phase)
             .field("sinks", &self.sinks.len())
-            .field("changelog_drainers", &self.changelog_drainers.len())
             .field("completed", &self.checkpoints_completed)
             .field("failed", &self.checkpoints_failed)
             .finish_non_exhaustive()
@@ -1278,14 +1138,25 @@ impl DurationHistogram {
         sorted[idx]
     }
 
-    /// Returns (p50, p95, p99) in microseconds.
+    /// Returns (p50, p95, p99) in microseconds. Sorts once.
     #[must_use]
     pub fn percentiles(&self) -> (u64, u64, u64) {
-        (
-            self.percentile(0.50),
-            self.percentile(0.95),
-            self.percentile(0.99),
-        )
+        let n = self.len();
+        if n == 0 {
+            return (0, 0, 0);
+        }
+        let mut sorted: Vec<u64> = self.samples[..n].to_vec();
+        sorted.sort_unstable();
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let at = |p: f64| -> u64 {
+            let idx = ((p * (n as f64 - 1.0)).ceil() as usize).min(n - 1);
+            sorted[idx]
+        };
+        (at(0.50), at(0.95), at(0.99))
     }
 }
 
@@ -1324,8 +1195,6 @@ pub struct CheckpointStats {
     pub current_phase: CheckpointPhase,
     /// Current epoch number.
     pub current_epoch: u64,
-    /// Number of checkpoints completed in unaligned mode.
-    pub unaligned_checkpoint_count: u64,
 }
 
 // ── Conversion helpers ──
@@ -1388,10 +1257,6 @@ mod tests {
     #[test]
     fn test_checkpoint_phase_display() {
         assert_eq!(CheckpointPhase::Idle.to_string(), "Idle");
-        assert_eq!(
-            CheckpointPhase::BarrierInFlight.to_string(),
-            "BarrierInFlight"
-        );
         assert_eq!(CheckpointPhase::Snapshotting.to_string(), "Snapshotting");
         assert_eq!(CheckpointPhase::PreCommitting.to_string(), "PreCommitting");
         assert_eq!(CheckpointPhase::Persisting.to_string(), "Persisting");
@@ -1542,38 +1407,6 @@ mod tests {
         let debug = format!("{coord:?}");
         assert!(debug.contains("CheckpointCoordinator"));
         assert!(debug.contains("epoch: 1"));
-    }
-
-    // ── Changelog drainer tests ──
-
-    #[tokio::test]
-    async fn test_checkpoint_flushes_changelog_drainers() {
-        use laminar_storage::incremental::StateChangelogBuffer;
-        use laminar_storage::incremental::StateChangelogEntry;
-        use std::sync::Arc;
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
-
-        let buf = Arc::new(StateChangelogBuffer::with_capacity(64));
-        buf.push(StateChangelogEntry::put(1, 100, 0, 10));
-        let drainer = ChangelogDrainer::new(buf, 100);
-        coord.register_changelog_drainer(drainer);
-
-        let result = coord
-            .checkpoint(CheckpointRequest {
-                watermark: Some(5000),
-                ..CheckpointRequest::default()
-            })
-            .await
-            .unwrap();
-
-        assert!(result.success);
-        assert_eq!(
-            coord.changelog_drainers()[0].pending_count(),
-            0,
-            "pending entries should be cleared after checkpoint"
-        );
     }
 
     // ── Checkpoint observability tests ──

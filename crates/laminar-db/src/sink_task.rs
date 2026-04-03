@@ -53,7 +53,10 @@ pub(crate) enum SinkCommand {
         ack: oneshot::Sender<Result<(), ConnectorError>>,
     },
     /// Abort a failed epoch.
-    RollbackEpoch { epoch: u64 },
+    RollbackEpoch {
+        epoch: u64,
+        ack: oneshot::Sender<Result<(), ConnectorError>>,
+    },
     /// Flush + close the connector and exit the task (test-only).
     #[cfg(test)]
     Close,
@@ -234,9 +237,24 @@ impl SinkTaskHandle {
         })?
     }
 
-    /// Abort a failed epoch (fire-and-forget).
-    pub async fn rollback_epoch(&self, epoch: u64) {
-        let _ = self.tx.send(SinkCommand::RollbackEpoch { epoch }).await;
+    /// Abort a failed epoch.
+    pub async fn rollback_epoch(&self, epoch: u64) -> Result<(), ConnectorError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.tx
+            .send(SinkCommand::RollbackEpoch { epoch, ack: ack_tx })
+            .await
+            .map_err(|_| {
+                ConnectorError::ConnectionFailed(format!(
+                    "sink task '{}' closed unexpectedly",
+                    self.name
+                ))
+            })?;
+        ack_rx.await.map_err(|_| {
+            ConnectorError::ConnectionFailed(format!(
+                "sink task '{}' dropped rollback acknowledgment",
+                self.name
+            ))
+        })?
     }
 
     /// Signals the sink task to close and waits for it to finish (30s timeout).
@@ -335,8 +353,9 @@ async fn run_sink_task(
                         };
                         let _ = ack.send(result);
                     }
-                    SinkCommand::RollbackEpoch { epoch } => {
-                        if let Err(e) = sink.rollback_epoch(epoch).await {
+                    SinkCommand::RollbackEpoch { epoch, ack } => {
+                        let result = sink.rollback_epoch(epoch).await;
+                        if let Err(ref e) = result {
                             tracing::warn!(
                                 sink = %name,
                                 epoch,
@@ -344,6 +363,7 @@ async fn run_sink_task(
                                 "[LDB-6004] Sink rollback failed"
                             );
                         }
+                        let _ = ack.send(result);
                     }
                     #[cfg(test)]
                     SinkCommand::Close => {

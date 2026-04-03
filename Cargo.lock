@@ -991,20 +991,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "backoff"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b62ddb9cb1ec0a098ad4bbf9344d0713fa193ae1a80af55febcff2627b6a00c1"
-dependencies = [
- "futures-core",
- "getrandom 0.2.17",
- "instant",
- "pin-project-lite",
- "rand 0.8.5",
- "tokio",
-]
-
-[[package]]
 name = "backon"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4616,7 +4602,6 @@ dependencies = [
 name = "laminar-core"
 version = "0.19.12"
 dependencies = [
- "ahash",
  "arrayvec",
  "arrow",
  "arrow-array",
@@ -4633,9 +4618,7 @@ dependencies = [
  "hwlocality",
  "io-uring",
  "libc",
- "memmap2",
  "parking_lot 0.12.5",
- "proptest",
  "rand 0.10.0",
  "rkyv",
  "rustc-hash",
@@ -4643,7 +4626,6 @@ dependencies = [
  "serde_json",
  "smallvec",
  "sqlparser",
- "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -4768,18 +4750,11 @@ name = "laminar-storage"
 version = "0.19.12"
 dependencies = [
  "anyhow",
- "backoff",
  "base64 0.22.1",
  "bytes",
- "crc32c",
- "criterion",
  "futures",
- "laminar-core",
- "lz4_flex",
  "object_store 0.13.1",
  "parquet",
- "rkyv",
- "rustc-hash",
  "serde",
  "serde_json",
  "sha2",
@@ -4787,8 +4762,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "uuid",
- "zstd",
 ]
 
 [[package]]
@@ -5109,15 +5082,6 @@ name = "memchr"
 version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
-
-[[package]]
-name = "memmap2"
-version = "0.9.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "memoffset"

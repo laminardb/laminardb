@@ -1,21 +1,8 @@
-//! Checkpoint barrier protocol for distributed snapshots.
+//! Checkpoint barrier protocol.
 //!
-//! This module implements the Chandy-Lamport style barrier protocol for
-//! consistent distributed checkpoints. Barriers flow through the dataflow
-//! graph alongside events, triggering state snapshots at each operator.
-//!
-//! ## Protocol Overview
-//!
-//! 1. The coordinator injects a [`CheckpointBarrier`] into all sources
-//! 2. Barriers propagate through operators via [`StreamMessage::Barrier`]
-//! 3. Operators with multiple inputs align barriers before snapshotting
-//! 4. Once all sinks acknowledge, the checkpoint is complete
-//!
-//! ## Fast Path
-//!
-//! The [`CheckpointBarrierInjector`] uses a packed `AtomicU64` command
-//! word for cross-thread signaling. The poll fast path (no pending barrier)
-//! is a single atomic load — typically < 10ns.
+//! The coordinator injects barriers into sources via [`CheckpointBarrierInjector`].
+//! Sources deliver barriers alongside events. The fast path (no pending barrier)
+//! is a single `AtomicU64` load (~10ns).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -30,12 +17,6 @@ pub mod flags {
     pub const DRAIN: u64 = 1 << 1;
     /// Cancel any in-progress checkpoint with this ID.
     pub const CANCEL: u64 = 1 << 2;
-    /// This barrier was part of an unaligned checkpoint.
-    ///
-    /// Unaligned checkpoints capture in-flight channel data instead of
-    /// blocking on barrier alignment, trading larger checkpoint size for
-    /// faster completion under backpressure.
-    pub const UNALIGNED: u64 = 1 << 3;
 }
 
 /// A checkpoint barrier that flows through the dataflow graph.
@@ -103,12 +84,6 @@ impl CheckpointBarrier {
     pub const fn is_cancel(&self) -> bool {
         self.flags & flags::CANCEL != 0
     }
-
-    /// Check whether this barrier is from an unaligned checkpoint.
-    #[must_use]
-    pub const fn is_unaligned(&self) -> bool {
-        self.flags & flags::UNALIGNED != 0
-    }
 }
 
 /// A message that flows through streaming channels.
@@ -160,18 +135,7 @@ impl<T> StreamMessage<T> {
     }
 }
 
-/// Packed barrier command for cross-thread signaling.
-///
-/// Encodes a `checkpoint_id` (upper 32 bits) and flags (lower 32 bits)
-/// into a single `u64` that can be atomically stored. A value of 0
-/// means "no pending barrier".
-///
-/// ## Encoding
-///
-/// ```text
-/// [  checkpoint_id (32)  |  flags (32)  ]
-///       bits 63..32          bits 31..0
-/// ```
+/// Pack `checkpoint_id` (upper 32) | flags (lower 32) into one `AtomicU64` word. 0 = no barrier.
 #[inline]
 const fn pack_barrier_cmd(checkpoint_id: u32, flags: u32) -> u64 {
     ((checkpoint_id as u64) << 32) | (flags as u64)

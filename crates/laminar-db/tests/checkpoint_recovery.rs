@@ -237,31 +237,6 @@ async fn test_coordinator_resumes_epoch_after_recovery() {
     assert_eq!(coord2.next_checkpoint_id(), 3);
 }
 
-// ── Scenario 9: Incremental checkpoint flag ──
-
-#[tokio::test]
-async fn test_incremental_checkpoint_flag() {
-    let dir = tempfile::tempdir().unwrap();
-
-    let config = CheckpointConfig {
-        incremental: true,
-        ..CheckpointConfig::default()
-    };
-    let store = Box::new(make_store(dir.path()));
-    let mut coord = CheckpointCoordinator::new(config, store);
-
-    let result = coord
-        .checkpoint(CheckpointRequest::default())
-        .await
-        .unwrap();
-
-    assert!(result.success);
-
-    let store = make_store(dir.path());
-    let loaded = store.load_latest().unwrap().unwrap();
-    assert!(loaded.is_incremental);
-}
-
 // ── Scenario 10: Table offsets round-trip ──
 
 #[test]
@@ -321,8 +296,6 @@ fn test_checkpoint_store_prune_keeps_latest() {
 fn test_manifest_full_round_trip() {
     let mut manifest = CheckpointManifest::new(42, 100);
     manifest.watermark = Some(999_999);
-    manifest.is_incremental = true;
-    manifest.parent_id = Some(41);
     manifest.table_store_checkpoint_path = Some("/tmp/cp".into());
 
     manifest.source_offsets.insert(
@@ -348,8 +321,6 @@ fn test_manifest_full_round_trip() {
     assert_eq!(restored.checkpoint_id, 42);
     assert_eq!(restored.epoch, 100);
     assert_eq!(restored.watermark, Some(999_999));
-    assert!(restored.is_incremental);
-    assert_eq!(restored.parent_id, Some(41));
     assert_eq!(
         restored.table_store_checkpoint_path.as_deref(),
         Some("/tmp/cp")
