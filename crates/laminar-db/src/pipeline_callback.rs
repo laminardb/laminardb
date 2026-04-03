@@ -74,6 +74,8 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) pipeline_hash: Option<u64>,
     pub(crate) delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee,
     pub(crate) sink_write_timeout: Duration,
+    /// Maximum time to wait for operator state serialization.
+    pub(crate) serialization_timeout: Duration,
     /// Set when a sink write times out in this cycle. Suppresses the next
     /// periodic checkpoint to avoid advancing offsets past dropped batches.
     pub(crate) sink_timed_out: bool,
@@ -96,10 +98,15 @@ impl ConnectorPipelineCallback {
             Err(e) => return Err(format!("snapshot failed: {e}")),
         };
         // Offload CPU-bound serialization to blocking thread pool.
-        let bytes = tokio::task::spawn_blocking(move || {
-            crate::operator_graph::OperatorGraph::serialize_checkpoint(&cp)
-        })
+        let timeout = self.serialization_timeout;
+        let bytes = tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || {
+                crate::operator_graph::OperatorGraph::serialize_checkpoint(&cp)
+            }),
+        )
         .await
+        .map_err(|_| format!("[LDB-6017] operator state serialization timed out ({timeout:?})"))?
         .map_err(|e| format!("serialize join error: {e}"))?
         .map_err(|e| format!("serialize error: {e}"))?;
         operator_states.insert("operator_graph".to_string(), bytes);

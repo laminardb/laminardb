@@ -108,9 +108,6 @@ pub async fn execute_streaming_sql(
     let plan = planner.plan(statement)?;
 
     match plan {
-        StreamingPlan::RegisterSource(_) | StreamingPlan::RegisterSink(_) => {
-            Ok(StreamingSqlResult::Ddl(DdlResult { plan }))
-        }
         StreamingPlan::Query(mut query_plan) => {
             // Rewrite INTERVAL arithmetic for BIGINT timestamp columns
             rewrite_interval_arithmetic(&mut query_plan.statement);
@@ -135,7 +132,8 @@ pub async fn execute_streaming_sql(
                 query_plan: None,
             }))
         }
-        StreamingPlan::DagExplain(_)
+        StreamingPlan::RegisterSource(_)
+        | StreamingPlan::RegisterSink(_)
         | StreamingPlan::RegisterLookupTable(_)
         | StreamingPlan::DropLookupTable { .. } => Ok(StreamingSqlResult::Ddl(DdlResult { plan })),
     }

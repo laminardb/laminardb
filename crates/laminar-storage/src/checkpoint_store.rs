@@ -475,12 +475,19 @@ impl CheckpointStore for FileSystemCheckpointStore {
         let manifest_path = self.manifest_path(manifest.checkpoint_id);
         let json = serde_json::to_string_pretty(manifest)?;
 
-        // Write to a temp file, fsync, then rename for atomic durability
+        // Write to a temp file, fsync, then rename for atomic durability.
         let tmp_path = manifest_path.with_extension("json.tmp");
-        std::fs::write(&tmp_path, &json)?;
-        sync_file(&tmp_path)?;
-        std::fs::rename(&tmp_path, &manifest_path)?;
-        sync_dir(&cp_dir)?;
+        let atomic_write = || -> Result<(), std::io::Error> {
+            std::fs::write(&tmp_path, &json)?;
+            sync_file(&tmp_path)?;
+            std::fs::rename(&tmp_path, &manifest_path)?;
+            sync_dir(&cp_dir)
+        };
+        if let Err(e) = atomic_write() {
+            // Clean up temp file to avoid orphans on disk-full.
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e.into());
+        }
 
         // Update latest.txt pointer — only after manifest is durable
         let latest = self.latest_path();

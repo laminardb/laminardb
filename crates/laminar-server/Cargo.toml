@@ -121,7 +121,7 @@ gcs = ["laminar-db/gcs"]
 azure = ["laminar-db/azure"]
 # Performance features
 # Linux-only performance features (cannot be default — crates won't compile on Windows/macOS)
-io-uring = ["laminar-storage/io-uring"]     # Linux 5.10+: async I/O for WAL/checkpoints
+io-uring = ["laminar-core/io-uring"]        # Linux 5.10+: async I/O
 hwloc = ["laminar-core/hwloc"]              # Linux/macOS: NUMA topology discovery
 # Meta-feature: enable all Linux-specific performance optimizations.
 # Recommended for production Linux deployments:

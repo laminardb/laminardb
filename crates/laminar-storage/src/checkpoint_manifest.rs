@@ -1,21 +1,7 @@
-//! Unified checkpoint manifest types.
+//! Checkpoint manifest types.
 //!
-//! The [`CheckpointManifest`] is the single source of truth for checkpoint state,
-//! replacing the previously separate `PipelineCheckpoint`, `DagCheckpointResult`,
-//! and `CheckpointMetadata` types. One manifest captures ALL state at a point in
-//! time: source offsets, sink epochs, operator state, and watermarks.
-//!
-//! ## Manifest Format
-//!
-//! Manifests are serialized as JSON for human readability and debuggability.
-//! Large operator state (binary blobs) is stored in a separate `state.bin` file
-//! referenced by the manifest.
-//!
-//! ## Connector Checkpoint
-//!
-//! The [`ConnectorCheckpoint`] type provides a connector-agnostic offset container
-//! that supports all connector types (Kafka partitions, PostgreSQL LSNs, MySQL GTIDs)
-//! through string key-value pairs.
+//! Manifests are JSON for debuggability. Large operator state goes into a
+//! separate `state.bin` sidecar referenced by offset/length in the manifest.
 
 #[allow(clippy::disallowed_types)] // cold path: manifest serialization
 use std::collections::HashMap;
@@ -36,13 +22,10 @@ pub enum SinkCommitStatus {
     Failed(String),
 }
 
+/// Virtual partition count for state key distribution.
+pub const VNODE_COUNT: u16 = 256;
+
 /// A point-in-time snapshot of all pipeline state.
-///
-/// This is the single source of truth for checkpoint persistence, replacing
-/// the three previously disconnected checkpoint systems:
-/// - `PipelineCheckpoint` (source offsets + sink epochs)
-/// - `DagCheckpointResult` (operator state — in-memory only)
-/// - `CheckpointMetadata` (watermark)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct CheckpointManifest {
     /// Manifest format version (for future evolution).
@@ -112,49 +95,10 @@ pub struct CheckpointManifest {
     #[serde(default)]
     pub pipeline_hash: Option<u64>,
 
-    // ── In-flight Data (unaligned checkpoints) ──
-    /// In-flight channel data captured during unaligned checkpoints.
-    ///
-    /// Key: operator name. Value: list of in-flight records from input channels.
-    /// Empty for aligned checkpoints. During recovery, these events are replayed
-    /// before resuming normal processing.
-    #[serde(default)]
-    pub inflight_data: HashMap<String, Vec<InFlightRecord>>,
-
-    // ── Vnode Assignment ──
-    /// Vnode assignment version at checkpoint start.
-    ///
-    /// Monotonically increasing counter incremented on each vnode reassignment.
-    /// Recovery compares this against the current assignment version to detect
-    /// ownership changes since the checkpoint. Required for safe cross-node
-    /// vnode recovery during rebalancing.
-    #[serde(default)]
-    pub assignment_version: u64,
-    /// Vnode-to-node mapping at checkpoint time (`vnode_id` → `node_id`).
-    ///
-    /// Records which node owned which vnode when the checkpoint was taken.
-    /// On recovery after a rebalance, new owners fetch vnode state from
-    /// object storage using this map to identify the original writer.
-    /// Empty for single-node deployments.
-    #[serde(default)]
-    pub vnode_map: HashMap<u16, u64>,
-
     // ── Metadata ──
-    /// Virtual partition count used for state key distribution.
-    ///
-    /// Immutable after the first checkpoint. All future checkpoints must
-    /// use the same value. Enables per-vnode restore in distributed mode.
+    /// Virtual partition count for state key distribution.
     #[serde(default)]
     pub vnode_count: u16,
-    /// Total size of all checkpoint data in bytes (manifest + state.bin).
-    #[serde(default)]
-    pub size_bytes: u64,
-    /// Whether this is an incremental checkpoint (only deltas since parent).
-    #[serde(default)]
-    pub is_incremental: bool,
-    /// Parent checkpoint ID for incremental checkpoints.
-    #[serde(default)]
-    pub parent_id: Option<u64>,
 
     // ── Integrity ──
     /// SHA-256 hex digest of the sidecar `state.bin` file (if any).
@@ -234,40 +178,15 @@ impl CheckpointManifest {
             }
         }
 
-        // Incremental checkpoints must have a parent
-        if self.is_incremental && self.parent_id.is_none() {
-            errors.push(ManifestValidationError {
-                message: "incremental checkpoint has no parent_id".into(),
-            });
-        }
-
-        // vnode_map entries must reference valid vnode IDs (< vnode_count).
-        if self.vnode_count > 0 && !self.vnode_map.is_empty() {
-            for &vnode_id in self.vnode_map.keys() {
-                if vnode_id >= self.vnode_count {
-                    errors.push(ManifestValidationError {
-                        message: format!(
-                            "vnode_map contains vnode_id {vnode_id} >= vnode_count {}",
-                            self.vnode_count
-                        ),
-                    });
-                }
-            }
-        }
-
-        // vnode_count must be set (non-zero) and match the runtime constant.
-        // A mismatch means the checkpoint was created with a different partition
-        // scheme and cannot be safely restored.
         if self.vnode_count == 0 {
             errors.push(ManifestValidationError {
                 message: "vnode_count is 0 (missing or legacy checkpoint)".into(),
             });
-        } else if self.vnode_count != laminar_core::state::VNODE_COUNT {
+        } else if self.vnode_count != VNODE_COUNT {
             errors.push(ManifestValidationError {
                 message: format!(
-                    "vnode_count mismatch: checkpoint has {}, runtime expects {}",
+                    "vnode_count mismatch: checkpoint has {}, runtime expects {VNODE_COUNT}",
                     self.vnode_count,
-                    laminar_core::state::VNODE_COUNT
                 ),
             });
         }
@@ -300,13 +219,7 @@ impl CheckpointManifest {
             source_names: Vec::new(),
             sink_names: Vec::new(),
             pipeline_hash: None,
-            inflight_data: HashMap::new(),
-            assignment_version: 0,
-            vnode_map: HashMap::new(),
-            vnode_count: laminar_core::state::VNODE_COUNT,
-            size_bytes: 0,
-            is_incremental: false,
-            parent_id: None,
+            vnode_count: VNODE_COUNT,
             state_checksum: None,
         }
     }
@@ -350,18 +263,6 @@ impl ConnectorCheckpoint {
             metadata: HashMap::new(),
         }
     }
-}
-
-/// In-flight data record from an unaligned checkpoint.
-///
-/// Each record represents serialized events buffered in a single input
-/// channel at the time of the unaligned snapshot.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct InFlightRecord {
-    /// Input channel index.
-    pub input_id: usize,
-    /// Base64-encoded serialized event data.
-    pub data_b64: String,
 }
 
 /// Serialized operator state stored in the manifest.
@@ -495,8 +396,6 @@ mod tests {
         assert!(m.source_offsets.is_empty());
         assert!(m.sink_epochs.is_empty());
         assert!(m.operator_states.is_empty());
-        assert!(!m.is_incremental);
-        assert!(m.parent_id.is_none());
     }
 
     #[test]
@@ -547,7 +446,6 @@ mod tests {
         assert!(m.sink_epochs.is_empty());
         assert!(m.operator_states.is_empty());
         assert!(m.watermark.is_none());
-        assert!(!m.is_incremental);
     }
 
     #[test]
@@ -587,19 +485,6 @@ mod tests {
     fn test_operator_checkpoint_empty_inline() {
         let op = OperatorCheckpoint::inline(b"");
         assert_eq!(op.decode_inline().unwrap(), b"");
-    }
-
-    #[test]
-    fn test_manifest_with_incremental() {
-        let mut m = CheckpointManifest::new(5, 5);
-        m.is_incremental = true;
-        m.parent_id = Some(4);
-
-        let json = serde_json::to_string(&m).unwrap();
-        let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
-
-        assert!(restored.is_incremental);
-        assert_eq!(restored.parent_id, Some(4));
     }
 
     #[test]
@@ -717,44 +602,6 @@ mod tests {
         assert!(!op.external);
         assert!(sidecar.is_none());
         assert_eq!(op.decode_inline().unwrap(), b"");
-    }
-
-    #[test]
-    fn test_manifest_inflight_round_trip() {
-        use base64::Engine;
-
-        let mut m = CheckpointManifest::new(1, 1);
-        let record = InFlightRecord {
-            input_id: 2,
-            data_b64: base64::engine::general_purpose::STANDARD.encode(b"buffered-event"),
-        };
-        m.inflight_data.insert("join-op".into(), vec![record]);
-
-        let json = serde_json::to_string_pretty(&m).unwrap();
-        let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(restored.inflight_data.len(), 1);
-        let records = restored.inflight_data.get("join-op").unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].input_id, 2);
-
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&records[0].data_b64)
-            .unwrap();
-        assert_eq!(decoded, b"buffered-event");
-    }
-
-    #[test]
-    fn test_manifest_inflight_backward_compat() {
-        // Older manifests without inflight_data should deserialize fine.
-        let json = r#"{
-            "version": 1,
-            "checkpoint_id": 1,
-            "epoch": 1,
-            "timestamp_ms": 1000
-        }"#;
-        let m: CheckpointManifest = serde_json::from_str(json).unwrap();
-        assert!(m.inflight_data.is_empty());
     }
 
     #[test]
