@@ -461,6 +461,7 @@ impl StreamingCoordinator {
                     Ok(results) => {
                         self.commit_pending_offsets();
                         callback.push_to_streams(&results);
+                        callback.update_mv_stores(&results);
                         callback.write_to_sinks(&results).await;
                     }
                     Err(e) => {
@@ -574,6 +575,7 @@ impl StreamingCoordinator {
                 Ok(results) => {
                     self.commit_pending_offsets();
                     callback.push_to_streams(&results);
+                    callback.update_mv_stores(&results);
                     callback.write_to_sinks(&results).await;
                 }
                 Err(e) => {
@@ -608,6 +610,7 @@ impl StreamingCoordinator {
                 Ok(results) => {
                     self.commit_pending_offsets();
                     callback.push_to_streams(&results);
+                    callback.update_mv_stores(&results);
                     callback.write_to_sinks(&results).await;
                 }
                 Err(e) => {

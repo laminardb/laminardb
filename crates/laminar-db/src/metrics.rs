@@ -107,6 +107,12 @@ pub struct PipelineCounters {
     pub last_checkpoint_size_bytes: AtomicU64,
     /// Wall-clock timestamp (ms since epoch) of the last successful checkpoint.
     pub last_checkpoint_timestamp_ms: AtomicU64,
+
+    // ── Materialized view counters ──
+    /// Total MV update operations (one per batch written to any MV).
+    pub mv_updates: AtomicU64,
+    /// Current approximate bytes stored across all MVs.
+    pub mv_bytes_stored: AtomicU64,
 }
 
 impl PipelineCounters {
@@ -137,6 +143,8 @@ impl PipelineCounters {
             cycles_backpressured: AtomicU64::new(0),
             last_checkpoint_size_bytes: AtomicU64::new(0),
             last_checkpoint_timestamp_ms: AtomicU64::new(0),
+            mv_updates: AtomicU64::new(0),
+            mv_bytes_stored: AtomicU64::new(0),
         }
     }
 
@@ -166,6 +174,8 @@ impl PipelineCounters {
             cycles_backpressured: self.cycles_backpressured.load(Ordering::Relaxed),
             last_checkpoint_size_bytes: self.last_checkpoint_size_bytes.load(Ordering::Relaxed),
             last_checkpoint_timestamp_ms: self.last_checkpoint_timestamp_ms.load(Ordering::Relaxed),
+            mv_updates: self.mv_updates.load(Ordering::Relaxed),
+            mv_bytes_stored: self.mv_bytes_stored.load(Ordering::Relaxed),
         }
     }
 }
@@ -223,6 +233,10 @@ pub struct CounterSnapshot {
     pub last_checkpoint_size_bytes: u64,
     /// Wall-clock timestamp (ms since epoch) of last successful checkpoint.
     pub last_checkpoint_timestamp_ms: u64,
+    /// Total MV update operations.
+    pub mv_updates: u64,
+    /// Current approximate bytes stored across all MVs.
+    pub mv_bytes_stored: u64,
 }
 
 /// Pipeline-wide metrics snapshot.
@@ -252,6 +266,10 @@ pub struct PipelineMetrics {
     pub sink_count: usize,
     /// Global pipeline watermark (minimum across all source watermarks).
     pub pipeline_watermark: i64,
+    /// Total materialized view update operations.
+    pub mv_updates: u64,
+    /// Current approximate bytes stored across all MVs.
+    pub mv_bytes_stored: u64,
 }
 
 /// Metrics for a single registered source.
@@ -423,6 +441,8 @@ mod tests {
             stream_count: 1,
             sink_count: 1,
             pipeline_watermark: i64::MIN,
+            mv_updates: 0,
+            mv_bytes_stored: 0,
         };
         let m2 = m.clone();
         assert_eq!(m2.total_events_ingested, 100);

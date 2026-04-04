@@ -621,6 +621,27 @@ impl LaminarDB {
                                  skipping restore (clean break). Starting fresh."
                             );
                         }
+
+                        // Restore materialized view results (keyed "mv:{name}").
+                        {
+                            let prefix = crate::mv_store::CHECKPOINT_KEY_PREFIX;
+                            let mut store = self.mv_store.write();
+                            let mut restored = 0usize;
+                            for (key, op) in &recovered.manifest.operator_states {
+                                if let Some(name) = key.strip_prefix(prefix) {
+                                    if let Some(bytes) = op.decode_inline() {
+                                        if let Err(e) = store.restore_from_ipc(name, &bytes) {
+                                            tracing::warn!(mv = name, error = %e, "MV restore failed");
+                                        } else {
+                                            restored += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            if restored > 0 {
+                                tracing::info!(mvs = restored, "Restored MV state from checkpoint");
+                            }
+                        }
                         tracing::info!(
                             epoch = recovered.epoch(),
                             sources_restored = recovered.sources_restored,
@@ -1008,6 +1029,7 @@ impl LaminarDB {
             coordinator,
             table_sources,
             table_store: table_store_for_loop,
+            mv_store: self.mv_store.clone(),
             lookup_registry: Arc::clone(&self.lookup_registry),
             filter_ctx: laminar_sql::create_session_context(),
             compiled_sink_filters: Vec::new(),

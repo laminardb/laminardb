@@ -791,6 +791,7 @@ impl LaminarDB {
     /// Registers the view in the MV registry with dependency tracking,
     /// then executes the backing query through `DataFusion` to obtain the
     /// output schema.
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn handle_create_materialized_view(
         &self,
         sql: &str,
@@ -853,7 +854,8 @@ impl LaminarDB {
 
         // Register in the MV registry
         {
-            let mv = laminar_core::mv::MaterializedView::new(&name_str, sql, sources, schema);
+            let mv =
+                laminar_core::mv::MaterializedView::new(&name_str, sql, sources, schema.clone());
 
             let mut registry = self.mv_registry.lock();
 
@@ -894,6 +896,51 @@ impl LaminarDB {
             mgr.register_stream(crate::connector_manager::StreamRegistration {
                 name: name_str.clone(),
                 query_sql: query_sql.clone(),
+                emit_clause: plan_emit.clone(),
+                window_config: plan_window.clone(),
+                order_config: plan_order.clone(),
+            });
+        }
+
+        // Register MV result store + DataFusion table provider.
+        {
+            use crate::mv_store::MvStorageMode;
+
+            // Non-windowed aggregates (IncrementalAggState) emit ALL groups
+            // every cycle → replace-all is correct.
+            // Windowed aggregates (CoreWindowState) only emit closing windows
+            // → must append to keep previous windows' results.
+            let has_aggregate = self.ctx.sql(&query_sql).await.ok().is_some_and(|df| {
+                crate::aggregate_state::find_aggregate(df.logical_plan()).is_some()
+            });
+            let mode = if has_aggregate && plan_window.is_none() {
+                MvStorageMode::Aggregate
+            } else {
+                MvStorageMode::append_default()
+            };
+
+            self.mv_store
+                .write()
+                .create_mv(&name_str, schema.clone(), mode);
+
+            let provider = crate::table_provider::MvTableProvider::new(
+                name_str.clone(),
+                schema,
+                self.mv_store.clone(),
+            );
+            let _ = self.ctx.deregister_table(&name_str);
+            self.ctx
+                .register_table(&name_str, Arc::new(provider))
+                .map_err(|e| {
+                    DbError::MaterializedView(format!("Failed to register MV table provider: {e}"))
+                })?;
+        }
+
+        // If the pipeline is already running, hot-add the query.
+        if let Some(ref tx) = *self.control_tx.lock() {
+            let _ = tx.try_send(crate::pipeline::ControlMsg::AddStream {
+                name: name_str.clone(),
+                sql: query_sql,
                 emit_clause: plan_emit,
                 window_config: plan_window,
                 order_config: plan_order,
@@ -940,11 +987,23 @@ impl LaminarDB {
             }
         }
 
-        // Remove stream registrations for dropped MVs
+        // Remove stream registrations and MV result stores for dropped MVs
         {
             let mut mgr = self.connector_manager.lock();
+            let mut mv_store = self.mv_store.write();
             for dropped in &dropped_names {
                 mgr.unregister_stream(dropped);
+                mv_store.drop_mv(dropped);
+                let _ = self.ctx.deregister_table(dropped);
+            }
+        }
+
+        // Notify running coordinator to remove the queries.
+        if let Some(ref tx) = *self.control_tx.lock() {
+            for dropped in &dropped_names {
+                let _ = tx.try_send(crate::pipeline::ControlMsg::DropStream {
+                    name: dropped.clone(),
+                });
             }
         }
 
