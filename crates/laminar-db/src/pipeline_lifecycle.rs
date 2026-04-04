@@ -593,7 +593,7 @@ impl LaminarDB {
                                 src.restore_checkpoint = Some(restored);
                             }
                         }
-                        // Restore operator graph state (new format)
+                        let mut graph_restore_failed = false;
                         if let Some(op) = recovered.manifest.operator_states.get("operator_graph") {
                             if let Some(bytes) = op.decode_inline() {
                                 match graph.restore_from_bytes(&bytes) {
@@ -604,6 +604,7 @@ impl LaminarDB {
                                         );
                                     }
                                     Err(e) => {
+                                        graph_restore_failed = true;
                                         tracing::warn!(
                                             error = %e,
                                             "Operator graph state restore failed, starting fresh"
@@ -616,14 +617,17 @@ impl LaminarDB {
                             .operator_states
                             .contains_key("stream_executor")
                         {
+                            graph_restore_failed = true;
                             tracing::warn!(
                                 "Found old stream_executor checkpoint format; \
                                  skipping restore (clean break). Starting fresh."
                             );
                         }
 
-                        // Restore materialized view results (keyed "mv:{name}").
-                        {
+                        // Skip MV restore when operator state failed to load —
+                        // stale MV data with fresh operators is inconsistent.
+                        // No operator state at all (stateless pipeline) is fine.
+                        if !graph_restore_failed {
                             let prefix = crate::mv_store::CHECKPOINT_KEY_PREFIX;
                             let mut store = self.mv_store.write();
                             let mut restored = 0usize;

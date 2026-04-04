@@ -4923,7 +4923,7 @@ mod tests {
         loop {
             let df = db.ctx.sql(&format!("SELECT * FROM {mv}")).await.unwrap();
             let batches = df.collect().await.unwrap();
-            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
             if rows >= min_rows || std::time::Instant::now() > deadline {
                 return rows;
             }
@@ -5040,7 +5040,7 @@ mod tests {
         let df = db.ctx.sql("SELECT * FROM ev_mv").await.unwrap();
         let schema = df.schema().clone();
         let batches = df.collect().await.unwrap();
-        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(rows, 0);
 
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
@@ -5075,8 +5075,14 @@ mod tests {
         .await
         .unwrap();
 
-        // Let the coordinator process the AddStream control message.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Wait for the coordinator to process the AddStream control message.
+        // Poll observable state instead of a fixed sleep.
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while db.metrics().total_cycles == 0 && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
 
         let handle = db.source_untyped("trades").unwrap();
         let schema = handle.schema().clone();

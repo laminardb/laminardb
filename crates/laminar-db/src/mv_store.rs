@@ -64,7 +64,9 @@ impl MvEntry {
             MvStorageMode::Append { max_batches } => {
                 self.approx_bytes += batch.get_array_memory_size();
                 self.batches.push_back(batch.clone());
-                while self.batches.len() > *max_batches || self.approx_bytes > DEFAULT_MAX_BYTES {
+                while self.batches.len() > 1
+                    && (self.batches.len() > *max_batches || self.approx_bytes > DEFAULT_MAX_BYTES)
+                {
                     if let Some(evicted) = self.batches.pop_front() {
                         self.approx_bytes = self
                             .approx_bytes
