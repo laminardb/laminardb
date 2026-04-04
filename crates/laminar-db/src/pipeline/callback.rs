@@ -47,6 +47,11 @@ pub trait PipelineCallback: Send + 'static {
     /// Called with results to push to stream subscriptions.
     fn push_to_streams(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>);
 
+    /// Update materialized view stores with cycle results.
+    fn update_mv_stores(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
+        let _ = results;
+    }
+
     /// Called with results to write to sinks.
     async fn write_to_sinks(&mut self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>);
 

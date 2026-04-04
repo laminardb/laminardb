@@ -593,7 +593,7 @@ impl LaminarDB {
                                 src.restore_checkpoint = Some(restored);
                             }
                         }
-                        // Restore operator graph state (new format)
+                        let mut graph_restore_failed = false;
                         if let Some(op) = recovered.manifest.operator_states.get("operator_graph") {
                             if let Some(bytes) = op.decode_inline() {
                                 match graph.restore_from_bytes(&bytes) {
@@ -604,6 +604,7 @@ impl LaminarDB {
                                         );
                                     }
                                     Err(e) => {
+                                        graph_restore_failed = true;
                                         tracing::warn!(
                                             error = %e,
                                             "Operator graph state restore failed, starting fresh"
@@ -616,10 +617,36 @@ impl LaminarDB {
                             .operator_states
                             .contains_key("stream_executor")
                         {
+                            graph_restore_failed = true;
                             tracing::warn!(
                                 "Found old stream_executor checkpoint format; \
                                  skipping restore (clean break). Starting fresh."
                             );
+                        }
+
+                        // Skip MV restore when operator state failed to load —
+                        // stale MV data with fresh operators is inconsistent.
+                        // No operator state at all (stateless pipeline) is fine.
+                        if !graph_restore_failed {
+                            let prefix = crate::mv_store::CHECKPOINT_KEY_PREFIX;
+                            let mut store = self.mv_store.write();
+                            let mut restored = 0usize;
+                            for (key, op) in &recovered.manifest.operator_states {
+                                if let Some(name) = key.strip_prefix(prefix) {
+                                    if let Some(bytes) = op.decode_inline() {
+                                        match store.restore_from_ipc(name, &bytes) {
+                                            Ok(true) => restored += 1,
+                                            Ok(false) => {} // MV no longer registered
+                                            Err(e) => {
+                                                tracing::warn!(mv = name, error = %e, "MV restore failed");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if restored > 0 {
+                                tracing::info!(mvs = restored, "Restored MV state from checkpoint");
+                            }
                         }
                         tracing::info!(
                             epoch = recovered.epoch(),
@@ -1008,6 +1035,7 @@ impl LaminarDB {
             coordinator,
             table_sources,
             table_store: table_store_for_loop,
+            mv_store: self.mv_store.clone(),
             lookup_registry: Arc::clone(&self.lookup_registry),
             filter_ctx: laminar_sql::create_session_context(),
             compiled_sink_filters: Vec::new(),

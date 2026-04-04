@@ -103,6 +103,8 @@ pub struct LaminarDB {
     /// `None` before `start()` or after `shutdown()`.
     pub(crate) control_tx:
         parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<crate::pipeline::ControlMsg>>>,
+    /// Materialized view result store (shared with compute thread and query threads).
+    pub(crate) mv_store: Arc<parking_lot::RwLock<crate::mv_store::MvStore>>,
 }
 
 /// Per-source watermark tracking state for the pipeline loop.
@@ -256,6 +258,7 @@ impl LaminarDB {
             pipeline_watermark: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
             lookup_registry,
             control_tx: parking_lot::Mutex::new(None),
+            mv_store: Arc::new(parking_lot::RwLock::new(crate::mv_store::MvStore::new())),
         })
     }
 
@@ -4912,5 +4915,189 @@ mod tests {
             m2.total_events_ingested >= m.total_events_ingested,
             "pipeline should continue after connector-less source push"
         );
+    }
+
+    /// Poll an MV until it has at least `min_rows` rows, or timeout.
+    async fn poll_mv(db: &LaminarDB, mv: &str, min_rows: usize) -> usize {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let df = db.ctx.sql(&format!("SELECT * FROM {mv}")).await.unwrap();
+            let batches = df.collect().await.unwrap();
+            let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            if rows >= min_rows || std::time::Instant::now() > deadline {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mv_aggregate_queryable_with_pipeline() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts BIGINT, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+
+        db.execute(
+            "CREATE MATERIALIZED VIEW trade_counts AS \
+             SELECT symbol, COUNT(*) as cnt FROM trades GROUP BY symbol",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(poll_mv(&db, "trade_counts", 0).await, 0);
+
+        db.start().await.unwrap();
+
+        let handle = db.source_untyped("trades").unwrap();
+        let schema = handle.schema().clone();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["AAPL", "GOOG"])),
+                Arc::new(arrow::array::Float64Array::from(vec![150.0, 2800.0])),
+                Arc::new(arrow::array::Int64Array::from(vec![1000, 2000])),
+            ],
+        )
+        .unwrap();
+        handle.push_arrow(batch).unwrap();
+
+        let rows = poll_mv(&db, "trade_counts", 1).await;
+        assert!(rows > 0, "MV should have data after pipeline processes");
+    }
+
+    #[tokio::test]
+    async fn test_mv_append_mode_queryable() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE events (id INT, value DOUBLE, ts BIGINT, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+
+        db.execute(
+            "CREATE MATERIALIZED VIEW filtered AS \
+             SELECT id, value FROM events WHERE value > 10.0",
+        )
+        .await
+        .unwrap();
+
+        db.start().await.unwrap();
+
+        let handle = db.source_untyped("events").unwrap();
+        let schema = handle.schema().clone();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3])),
+                Arc::new(arrow::array::Float64Array::from(vec![5.0, 15.0, 25.0])),
+                Arc::new(arrow::array::Int64Array::from(vec![1000, 2000, 3000])),
+            ],
+        )
+        .unwrap();
+        handle.push_arrow(batch).unwrap();
+
+        let rows = poll_mv(&db, "filtered", 2).await;
+        assert_eq!(rows, 2, "filter MV should have 2 matching rows");
+    }
+
+    #[tokio::test]
+    async fn test_mv_drop_cleans_up_table() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT, value DOUBLE)")
+            .await
+            .unwrap();
+        db.execute("CREATE MATERIALIZED VIEW ev_mv AS SELECT * FROM events")
+            .await
+            .unwrap();
+
+        assert!(db.ctx.sql("SELECT * FROM ev_mv").await.is_ok());
+        assert!(db.mv_store.read().has_mv("ev_mv"));
+
+        db.execute("DROP MATERIALIZED VIEW ev_mv").await.unwrap();
+
+        assert!(!db.mv_store.read().has_mv("ev_mv"));
+        assert!(
+            db.ctx.sql("SELECT * FROM ev_mv").await.is_err(),
+            "table should be deregistered after DROP"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mv_empty_returns_correct_schema() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT, value DOUBLE)")
+            .await
+            .unwrap();
+        db.execute("CREATE MATERIALIZED VIEW ev_mv AS SELECT id, value FROM events")
+            .await
+            .unwrap();
+
+        let df = db.ctx.sql("SELECT * FROM ev_mv").await.unwrap();
+        let schema = df.schema().clone();
+        let batches = df.collect().await.unwrap();
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 0);
+
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert!(
+            names.contains(&"id") && names.contains(&"value"),
+            "schema should contain projected columns, got: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mv_hot_add_while_pipeline_running() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts BIGINT, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+
+        // Need at least one stream before start() for the pipeline to launch.
+        db.execute("CREATE STREAM noop AS SELECT * FROM trades")
+            .await
+            .unwrap();
+
+        db.start().await.unwrap();
+
+        // Create MV AFTER pipeline is running (hot-add via ControlMsg).
+        db.execute(
+            "CREATE MATERIALIZED VIEW trade_counts AS \
+             SELECT symbol, COUNT(*) as cnt FROM trades GROUP BY symbol",
+        )
+        .await
+        .unwrap();
+
+        // Wait for the coordinator to process the AddStream control message.
+        // Poll observable state instead of a fixed sleep.
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while db.metrics().total_cycles == 0 && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        let handle = db.source_untyped("trades").unwrap();
+        let schema = handle.schema().clone();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["AAPL"])),
+                Arc::new(arrow::array::Float64Array::from(vec![150.0])),
+                Arc::new(arrow::array::Int64Array::from(vec![1000])),
+            ],
+        )
+        .unwrap();
+        handle.push_arrow(batch).unwrap();
+
+        let rows = poll_mv(&db, "trade_counts", 1).await;
+        assert!(rows > 0, "hot-added MV should receive pipeline data");
     }
 }

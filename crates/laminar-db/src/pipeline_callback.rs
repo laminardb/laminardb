@@ -63,6 +63,7 @@ pub(crate) struct ConnectorPipelineCallback {
         laminar_connectors::reference::RefreshMode,
     )>,
     pub(crate) table_store: Arc<parking_lot::RwLock<crate::table_store::TableStore>>,
+    pub(crate) mv_store: Arc<parking_lot::RwLock<crate::mv_store::MvStore>>,
     pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
     /// Cached `SessionContext` for sink WHERE filters (avoids per-batch allocation).
     pub(crate) filter_ctx: SessionContext,
@@ -110,6 +111,15 @@ impl ConnectorPipelineCallback {
         .map_err(|e| format!("serialize join error: {e}"))?
         .map_err(|e| format!("serialize error: {e}"))?;
         operator_states.insert("operator_graph".to_string(), bytes);
+
+        // Serialize MV result store — each MV gets its own entry keyed "mv:{name}".
+        let mv_states = self
+            .mv_store
+            .read()
+            .checkpoint_states()
+            .map_err(|e| format!("MV checkpoint failed: {e}"))?;
+        operator_states.extend(mv_states);
+
         Ok(operator_states)
     }
 
@@ -200,6 +210,34 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                     }
                 }
             }
+        }
+    }
+
+    fn update_mv_stores(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
+        if results.is_empty() {
+            return;
+        }
+        let mut store = self.mv_store.write();
+        let mut updates = 0u64;
+        for (stream_name, batches) in results {
+            if store.has_mv(stream_name) {
+                for batch in batches {
+                    if batch.num_rows() > 0 {
+                        store.update(stream_name, batch);
+                        updates += 1;
+                    }
+                }
+            }
+        }
+        if updates > 0 {
+            self.counters
+                .mv_updates
+                .fetch_add(updates, std::sync::atomic::Ordering::Relaxed);
+            #[allow(clippy::cast_possible_truncation)]
+            self.counters.mv_bytes_stored.store(
+                store.total_bytes() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 
