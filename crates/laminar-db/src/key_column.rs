@@ -106,6 +106,11 @@ pub(crate) struct CompositeKey<'a> {
 impl<'a> CompositeKey<'a> {
     /// Extract composite key columns from a batch.
     pub fn extract(batch: &'a RecordBatch, col_names: &[String]) -> Result<Self, DbError> {
+        if col_names.is_empty() {
+            return Err(DbError::Pipeline(
+                "Composite key requires at least one column".to_string(),
+            ));
+        }
         let mut columns = Vec::with_capacity(col_names.len());
         for name in col_names {
             columns.push(extract_key_column(batch, name)?);
