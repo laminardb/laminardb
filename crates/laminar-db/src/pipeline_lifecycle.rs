@@ -634,10 +634,12 @@ impl LaminarDB {
                             for (key, op) in &recovered.manifest.operator_states {
                                 if let Some(name) = key.strip_prefix(prefix) {
                                     if let Some(bytes) = op.decode_inline() {
-                                        if let Err(e) = store.restore_from_ipc(name, &bytes) {
-                                            tracing::warn!(mv = name, error = %e, "MV restore failed");
-                                        } else {
-                                            restored += 1;
+                                        match store.restore_from_ipc(name, &bytes) {
+                                            Ok(true) => restored += 1,
+                                            Ok(false) => {} // MV no longer registered
+                                            Err(e) => {
+                                                tracing::warn!(mv = name, error = %e, "MV restore failed");
+                                            }
                                         }
                                     }
                                 }

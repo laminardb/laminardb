@@ -146,9 +146,10 @@ impl MvStore {
     }
 
     /// Restore a single MV from checkpoint IPC bytes.
-    pub fn restore_from_ipc(&mut self, name: &str, bytes: &[u8]) -> Result<(), DbError> {
+    /// Returns `Ok(true)` if restored, `Ok(false)` if the MV is no longer registered.
+    pub fn restore_from_ipc(&mut self, name: &str, bytes: &[u8]) -> Result<bool, DbError> {
         let Some(entry) = self.entries.get_mut(name) else {
-            return Ok(()); // MV no longer registered, skip
+            return Ok(false);
         };
         let batches = ipc_to_batches(bytes)
             .map_err(|e| DbError::Storage(format!("MV restore '{name}': {e}")))?;
@@ -166,7 +167,7 @@ impl MvStore {
         entry.batches.clear();
         entry.approx_bytes = batches.iter().map(RecordBatch::get_array_memory_size).sum();
         entry.batches.extend(batches);
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -298,7 +299,7 @@ mod tests {
         store2.create_mv("agg", test_schema(), MvStorageMode::Aggregate);
         for (key, bytes) in &states {
             let name = key.strip_prefix(CHECKPOINT_KEY_PREFIX).unwrap();
-            store2.restore_from_ipc(name, bytes).unwrap();
+            assert!(store2.restore_from_ipc(name, bytes).unwrap());
         }
         assert_eq!(store2.to_record_batch("agg").unwrap().num_rows(), 2);
     }
