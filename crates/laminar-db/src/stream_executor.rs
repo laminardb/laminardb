@@ -312,7 +312,11 @@ impl StreamExecutor {
     ) {
         let (asof_config, mut projection_sql) = detect_asof_query(&sql);
         let (temporal_config, temporal_projection_sql) = detect_temporal_query(&sql);
-        let (stream_join_config, stream_join_projection_sql) = detect_stream_join_query(&sql);
+        let stream_join_detection = detect_stream_join_query(&sql);
+        let stream_join_config = stream_join_detection.as_ref().map(|d| d.config.clone());
+        let stream_join_projection_sql = stream_join_detection
+            .as_ref()
+            .map(|d| d.projection_sql.clone());
         if projection_sql.is_none() {
             projection_sql = temporal_projection_sql;
         }
@@ -4441,17 +4445,17 @@ mod tests {
     #[test]
     fn test_left_join_routed_to_interval() {
         // LEFT JOIN with BETWEEN should route to interval join engine
-        let (config, _) = detect_stream_join_query(
+        let detection = detect_stream_join_query(
             "SELECT * FROM orders o \
              LEFT JOIN payments p ON o.order_id = p.order_id \
              AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR",
         );
         assert!(
-            config.is_some(),
+            detection.is_some(),
             "LEFT JOIN should route to interval join engine"
         );
         assert_eq!(
-            config.unwrap().join_type,
+            detection.unwrap().config.join_type,
             laminar_sql::translator::StreamJoinType::Left,
         );
     }
