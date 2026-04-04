@@ -534,7 +534,6 @@ impl StreamingCoordinator {
             }
         }
 
-        // ── Shutdown ──
         // Signal source tasks to stop.
         for handle in &self.source_handles {
             handle.shutdown.notify_one();
@@ -1217,8 +1216,6 @@ mod tests {
         // Barriers should have both sources.
         assert_eq!(barriers.len(), 2, "should have barriers from both sources");
     }
-
-    // ── Backpressure drain-skip test ─────────────────────────────
 
     #[allow(clippy::disallowed_types)] // test-only: std::sync::Mutex is fine here
     struct BackpressuredCallback {

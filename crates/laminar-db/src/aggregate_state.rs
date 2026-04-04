@@ -34,8 +34,6 @@ use serde_json::json;
 
 use crate::error::DbError;
 
-// ── Shared group-key helpers ─────────────────────────────────────────
-
 /// Convert an `OwnedRow` back to a `Vec<ScalarValue>` group key,
 /// casting types to match `group_types` when needed.
 ///
@@ -181,8 +179,6 @@ pub(crate) fn emit_window_batch(
 
     Ok(Some(batch))
 }
-
-// ── ScalarValue JSON encoding ────────────────────────────────────────
 
 /// Encode a `ScalarValue` to a JSON value for checkpoint serialization.
 ///
@@ -1595,8 +1591,6 @@ impl IncrementalAggState {
     }
 }
 
-// ── Plan introspection helpers ─────────────────────────────────────────
-
 /// Result of finding an aggregate node in a logical plan.
 pub(crate) struct AggregateInfo {
     pub(crate) group_exprs: Vec<datafusion_expr::Expr>,
@@ -1864,24 +1858,15 @@ pub(crate) fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
 /// Replaces the `ctx.sql(pre_agg_sql).await.collect().await` hot-path call
 /// with direct `PhysicalExpr::evaluate()` on the source batch, eliminating
 /// SQL parsing, logical planning, physical planning, and `MemTable` overhead.
-#[allow(dead_code)] // source_table used by legacy evaluate_compiled_projection path
 pub(crate) struct CompiledProjection {
-    /// Source table name (for looking up raw batches instead of querying `MemTable`).
+    #[cfg_attr(not(test), allow(dead_code))] // read only by stream_executor tests
     pub(crate) source_table: String,
-    /// One `PhysicalExpr` per column in the output (group keys, agg inputs, filter bools).
     pub(crate) exprs: Vec<Arc<dyn PhysicalExpr>>,
-    /// WHERE predicate (applied before projection), if any.
     pub(crate) filter: Option<Arc<dyn PhysicalExpr>>,
-    /// Output schema matching what `process_batch` / `update_batch` expects.
     pub(crate) output_schema: SchemaRef,
 }
 
 impl CompiledProjection {
-    /// Source table name.
-    pub(crate) fn source_table(&self) -> &str {
-        &self.source_table
-    }
-
     /// Evaluate the projection against a source batch.
     ///
     /// Applies the WHERE filter (if any), then evaluates each expression
@@ -2686,8 +2671,6 @@ mod tests {
         assert!(state.process_batch(&batch, i64::MIN).is_ok());
     }
 
-    // ── Type inference tests ────────────────────────────────────────────
-
     #[tokio::test]
     async fn test_type_inference_preserves_source_int32() {
         let ctx = laminar_sql::create_session_context();
@@ -2797,8 +2780,6 @@ mod tests {
         assert_eq!(state.agg_specs[0].input_types[0], DataType::Int64,);
     }
 
-    // ── AST extraction tests ────────────────────────────────────────────
-
     #[test]
     fn test_extract_clauses_subquery_in_where() {
         // Subquery with its own WHERE — AST handles nesting
@@ -2812,8 +2793,6 @@ mod tests {
             c.where_clause
         );
     }
-
-    // ── expr_to_sql coverage ────────────────────────────────────────
 
     #[test]
     fn test_expr_to_sql_column() {
@@ -2987,8 +2966,6 @@ mod tests {
         assert!(sql.contains("DISTINCT"), "should contain DISTINCT: {sql}");
     }
 
-    // ── GROUP BY expression tests ───────────────────────────────────
-
     #[tokio::test]
     async fn test_group_by_expression_scalar_function() {
         let ctx = laminar_sql::create_session_context();
@@ -3043,8 +3020,6 @@ mod tests {
             state.pre_agg_sql
         );
     }
-
-    // ── Group cardinality limit ────────────────────────────────────
 
     #[tokio::test]
     async fn test_group_cardinality_limit_enforced() {
@@ -3167,8 +3142,6 @@ mod tests {
             c.where_clause
         );
     }
-
-    // ── Checkpoint/restore tests ─────────────────────────────────────
 
     #[test]
     #[allow(clippy::too_many_lines)]

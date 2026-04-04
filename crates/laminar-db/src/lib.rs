@@ -72,6 +72,7 @@ mod show_commands;
 mod sink_task;
 mod sql_analysis;
 mod sql_utils;
+#[cfg(test)]
 mod stream_executor;
 mod table_backend;
 mod table_cache_mode;

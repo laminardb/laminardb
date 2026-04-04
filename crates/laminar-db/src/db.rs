@@ -462,10 +462,6 @@ impl LaminarDB {
             }
         }
 
-        let table_cache_mode = info.properties.cache_memory.map(|mem| {
-            let max_entries = cache_entries_from_memory(mem);
-            crate::table_cache_mode::TableCacheMode::Partial { max_entries }
-        });
         let cache_max = info.properties.cache_memory.map(cache_entries_from_memory);
 
         self.connector_manager
@@ -478,9 +474,7 @@ impl LaminarDB {
                 format: info.raw_options.get("format").cloned(),
                 format_options,
                 refresh,
-                cache_mode: table_cache_mode,
                 cache_max_entries: cache_max,
-                storage: None,
             });
 
         Ok(())
@@ -1855,8 +1849,6 @@ mod tests {
         assert_eq!(db.source_count(), 1);
     }
 
-    // ── Multi-statement execution tests ─────────────────
-
     #[tokio::test]
     async fn test_multi_statement_execution() {
         let db = LaminarDB::open().unwrap();
@@ -1886,8 +1878,6 @@ mod tests {
         assert_eq!(db.source_count(), 1);
     }
 
-    // ── Config variable substitution tests ──────────────
-
     #[tokio::test]
     async fn test_config_var_substitution() {
         let db = LaminarDB::builder()
@@ -1900,8 +1890,6 @@ mod tests {
         db.execute("CREATE SOURCE events (id INT)").await.unwrap();
         assert_eq!(db.source_count(), 1);
     }
-
-    // ── CREATE STREAM tests ─────────────────────────────
 
     #[tokio::test]
     async fn test_create_stream() {
@@ -2099,8 +2087,6 @@ mod tests {
             _ => panic!("Expected RowsAffected"),
         }
     }
-
-    // ── Connector registry / DDL validation tests ──
 
     #[tokio::test]
     async fn test_create_source_unknown_connector() {
@@ -2335,8 +2321,6 @@ mod tests {
         assert!(registry.list_sources().contains(&"test-source".to_string()));
     }
 
-    // ── Materialized View Catalog tests ──
-
     #[tokio::test]
     async fn test_create_materialized_view() {
         let db = LaminarDB::open().unwrap();
@@ -2546,8 +2530,6 @@ mod tests {
         );
     }
 
-    // ── Pipeline Topology Introspection tests ──
-
     #[tokio::test]
     async fn test_pipeline_topology_empty() {
         let db = LaminarDB::open().unwrap();
@@ -2700,8 +2682,6 @@ mod tests {
         assert_eq!(find("st").node_type, PipelineNodeType::Stream);
         assert_eq!(find("sk").node_type, PipelineNodeType::Sink);
     }
-
-    // ── Reference Table tests ──
 
     #[tokio::test]
     async fn test_create_table_with_primary_key() {
@@ -2856,8 +2836,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ── HAVING clause tests ─────────────────────────────
-
     #[tokio::test]
     async fn test_having_filters_grouped_results() {
         let db = LaminarDB::open().unwrap();
@@ -2970,8 +2948,6 @@ mod tests {
         // C: cnt=2>=2 AND total=30>25 ✓
         assert_eq!(total_rows, 2);
     }
-
-    // ── Multi-way JOIN tests ─────────────────────────────
 
     #[tokio::test]
     async fn test_multi_join_two_way_lookup() {
@@ -3136,8 +3112,6 @@ mod tests {
         assert_eq!(total_rows, 2);
     }
 
-    // ── Window Frame tests ────────────────────────────────
-
     #[tokio::test]
     async fn test_frame_moving_average() {
         let db = LaminarDB::open().unwrap();
@@ -3281,8 +3255,6 @@ mod tests {
         assert_eq!(cnt_col.value(1), 2);
         assert_eq!(cnt_col.value(2), 2);
     }
-
-    // ── Connector-Backed Table Population ──
 
     /// Helper: create a test `RecordBatch` for table population tests.
     fn table_test_batch(ids: &[i32], symbols: &[&str]) -> RecordBatch {
@@ -3492,8 +3464,6 @@ mod tests {
         // The change batch id=2/GOOG should NOT be present
         assert!(ts.lookup("instruments", "2").is_none());
     }
-
-    // ── PARTIAL Cache Mode DDL tests ──
 
     #[tokio::test]
     async fn test_create_table_partial_cache_mode() {
@@ -3719,8 +3689,6 @@ mod tests {
         let db = LaminarDB::open().unwrap();
         assert!(db.stream_metrics("nonexistent").is_none());
     }
-
-    // ── Watermark Source Tracker tests ──────────────────────────────────
 
     /// Helper: push a batch with `Timestamp(µs)` column to a source.
     ///
@@ -4527,8 +4495,6 @@ mod tests {
             Some("1000".to_string())
         );
     }
-
-    // ── extract_connector_from_with_options tests ──
 
     #[test]
     fn test_extract_connector_from_with_options_basic() {

@@ -331,8 +331,6 @@ impl CheckpointCoordinator {
         Ok(())
     }
 
-    // ── Observability ──
-
     /// Sets the shared pipeline counters for checkpoint metrics emission.
     ///
     /// When set, checkpoint completion and failure will update the counters
@@ -782,14 +780,12 @@ impl CheckpointCoordinator {
 
         info!(checkpoint_id, epoch, "starting checkpoint");
 
-        // ── Step 3: Source offsets ──
         // Source offsets are provided by the caller (pre-captured at barrier
         // alignment or pre-spawn). Table offsets come from extra_table_offsets.
         self.phase = CheckpointPhase::Snapshotting;
         let source_offsets = source_offset_overrides;
         let table_offsets = extra_table_offsets;
 
-        // ── Step 4: Sink pre-commit ──
         self.phase = CheckpointPhase::PreCommitting;
         if let Err(e) = self.pre_commit_sinks(epoch).await {
             self.phase = CheckpointPhase::Idle;
@@ -806,7 +802,6 @@ impl CheckpointCoordinator {
             });
         }
 
-        // ── Build manifest ──
         let mut manifest = CheckpointManifest::new(checkpoint_id, epoch);
         manifest.source_offsets = source_offsets;
         manifest.table_offsets = table_offsets;
@@ -841,7 +836,6 @@ impl CheckpointCoordinator {
             );
         }
 
-        // ── Step 4b: Checkpoint size check ──
         if let Some(cap) = self.config.max_checkpoint_bytes {
             if sidecar_bytes > cap {
                 self.phase = CheckpointPhase::Idle;
@@ -871,7 +865,6 @@ impl CheckpointCoordinator {
         }
         let checkpoint_bytes = sidecar_bytes as u64;
 
-        // ── Step 5: Persist manifest (decision record — sinks are Pending) ──
         self.phase = CheckpointPhase::Persisting;
         if let Err(e) = self.save_manifest(manifest.clone(), state_data).await {
             self.phase = CheckpointPhase::Idle;
@@ -897,14 +890,12 @@ impl CheckpointCoordinator {
             });
         }
 
-        // ── Step 6: Sink commit (per-sink tracking) ──
         self.phase = CheckpointPhase::Committing;
         let sink_statuses = self.commit_sinks_tracked(epoch).await;
         let has_failures = sink_statuses
             .values()
             .any(|s| matches!(s, SinkCommitStatus::Failed(_)));
 
-        // ── Step 6b: Overwrite manifest with final sink commit statuses ──
         if !sink_statuses.is_empty() {
             manifest.sink_commit_statuses = sink_statuses;
             if let Err(e) = self.update_manifest_only(&manifest).await {
@@ -935,7 +926,6 @@ impl CheckpointCoordinator {
             });
         }
 
-        // ── Success ──
         self.phase = CheckpointPhase::Idle;
         self.next_checkpoint_id += 1;
         self.epoch += 1;
@@ -963,7 +953,6 @@ impl CheckpointCoordinator {
 
         self.adjust_interval();
 
-        // ── Step 8: Begin next epoch on exactly-once sinks ──
         let next_epoch = self.epoch;
         let begin_epoch_error = match self.begin_epoch_for_sinks(next_epoch).await {
             Ok(()) => None,
@@ -1197,8 +1186,6 @@ pub struct CheckpointStats {
     pub current_epoch: u64,
 }
 
-// ── Conversion helpers ──
-
 /// Converts a `SourceCheckpoint` to a `ConnectorCheckpoint`.
 #[must_use]
 pub fn source_to_connector_checkpoint(cp: &SourceCheckpoint) -> ConnectorCheckpoint {
@@ -1409,8 +1396,6 @@ mod tests {
         assert!(debug.contains("epoch: 1"));
     }
 
-    // ── Checkpoint observability tests ──
-
     #[tokio::test]
     async fn test_checkpoint_emits_metrics_on_success() {
         use crate::metrics::PipelineCounters;
@@ -1464,8 +1449,6 @@ mod tests {
         assert!(result.success);
         // No panics — metrics emission is a no-op
     }
-
-    // ── DurationHistogram tests ──
 
     #[test]
     fn test_histogram_empty() {
@@ -1531,8 +1514,6 @@ mod tests {
         assert!((99_000..=101_000).contains(&p50), "p50={p50}");
     }
 
-    // ── Sidecar threshold tests ──
-
     #[tokio::test]
     async fn test_sidecar_round_trip() {
         let dir = tempfile::tempdir().unwrap();
@@ -1595,8 +1576,6 @@ mod tests {
         // No sidecar file
         assert!(coord.store().load_state_data(1).unwrap().is_none());
     }
-
-    // ── Adaptive interval tests ──
 
     #[test]
     fn test_adaptive_disabled_by_default() {

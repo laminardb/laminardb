@@ -669,7 +669,6 @@ impl StreamExecutor {
                 }
             };
 
-            // ── State size bounds check ──
             if let Some(limit) = self.max_state_bytes {
                 // Check incremental aggregate state
                 if let Some(state) = self.agg_states.get(&idx) {
@@ -847,8 +846,8 @@ pub(crate) fn evaluate_compiled_projection(
     results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
 ) -> Vec<RecordBatch> {
     let batches = source_batches
-        .get(proj.source_table())
-        .or_else(|| results.get(proj.source_table()));
+        .get(proj.source_table.as_str())
+        .or_else(|| results.get(proj.source_table.as_str()));
     let Some(batches) = batches else {
         return Vec::new();
     };
@@ -859,7 +858,7 @@ pub(crate) fn evaluate_compiled_projection(
             Ok(_) => {}
             Err(e) => {
                 tracing::trace!(
-                    source = proj.source_table(),
+                    source = proj.source_table.as_str(),
                     error = %e,
                     "Compiled projection failed, skipping batch"
                 );
@@ -1427,7 +1426,6 @@ impl StreamExecutor {
         // window config (non-ASOF only — ASOF joins use a custom execution path).
         if asof_config.is_none() {
             if let Some(cfg) = window_config {
-                // ── core window fast path: already routed ──
                 if self.core_window_states.contains_key(&idx) {
                     return self
                         .execute_core_window_query(
@@ -1440,7 +1438,6 @@ impl StreamExecutor {
                         .await;
                 }
 
-                // ── core window detection (first call only) ──
                 if !self.non_core_window_queries.contains(&idx)
                     && !self.eowc_agg_states.contains_key(&idx)
                     && !self.non_eowc_agg_queries.contains(&idx)
@@ -1484,7 +1481,6 @@ impl StreamExecutor {
                     }
                 }
 
-                // ── IncrementalEowcState fast path: already have state ──
                 if self.eowc_agg_states.contains_key(&idx) {
                     return self
                         .execute_incremental_eowc(
@@ -1497,7 +1493,6 @@ impl StreamExecutor {
                         .await;
                 }
 
-                // ── IncrementalEowcState detection (first call only) ──
                 // Guard: session windows MUST route through CoreWindowState.
                 // The EOWC session fallback (one "window" per timestamp) is
                 // incorrect. If CoreWindowState rejected this query, skip
@@ -3435,8 +3430,6 @@ mod tests {
         assert_eq!(total_rows, 3);
     }
 
-    // ── EOWC (Emit On Window Close) tests ──
-
     fn eowc_test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("symbol", DataType::Utf8, false),
@@ -3808,8 +3801,6 @@ mod tests {
         assert_eq!(compute_closed_boundary(2200, &config), 700);
     }
 
-    // ── Pre-computed table refs tests ──
-
     #[test]
     fn test_precomputed_table_refs() {
         let ctx = create_session_context();
@@ -3894,8 +3885,6 @@ mod tests {
         assert!(results.contains_key("downstream"));
     }
 
-    // ── EmitStrategy conversion tests ──
-
     #[test]
     fn test_sql_emit_to_core_all_variants() {
         use laminar_core::operator::window::EmitStrategy as CoreEmit;
@@ -3944,8 +3933,6 @@ mod tests {
             CoreEmit::OnUpdate
         );
     }
-
-    // ── Top-K post-filter tests ──
 
     #[test]
     fn test_apply_topk_filter_limits_rows() {
@@ -4296,8 +4283,6 @@ mod tests {
         let result = executor.execute_cycle(&source, i64::MIN).await;
         assert!(result.is_ok(), "should succeed without limit");
     }
-
-    // ── Interval Join Integration Tests ───────────────────────────────────
 
     fn orders_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![

@@ -395,9 +395,7 @@ impl LaminarDB {
                     format,
                     format_options,
                     refresh: refresh_mode,
-                    cache_mode: cache_mode.clone(),
                     cache_max_entries,
-                    storage: storage.clone(),
                 });
             }
         }

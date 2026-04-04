@@ -29,8 +29,6 @@ use datafusion_expr::Accumulator;
 
 use crate::error::DbError;
 
-// ── Helpers ─────────────────────────────────────────────────────────
-
 /// Extract `i64` weights from the last array in the inputs slice.
 fn weight_array(values: &[ArrayRef]) -> &arrow::array::Int64Array {
     values
@@ -139,8 +137,6 @@ fn f64_to_scalar(v: f64, dt: &DataType) -> ScalarValue {
         _ => ScalarValue::Float64(Some(v)),
     }
 }
-
-// ── Factory ─────────────────────────────────────────────────────────
 
 /// Create a retractable accumulator for the given aggregate function name.
 ///
@@ -543,8 +539,6 @@ mod tests {
         Arc::new(Int64Array::from(vals.to_vec()))
     }
 
-    // ── SUM ─────────────────────────────────────────────────────
-
     #[test]
     fn sum_basic_insert_retract() {
         let mut acc = RetractableSumAccum::new(DataType::Int64);
@@ -579,8 +573,6 @@ mod tests {
         assert!(result.is_null());
     }
 
-    // ── COUNT(*) ────────────────────────────────────────────────
-
     #[test]
     fn count_star_basic() {
         let mut acc = RetractableCountStarAccum::default();
@@ -607,8 +599,6 @@ mod tests {
         assert_eq!(restored.evaluate().unwrap(), ScalarValue::Int64(Some(2)));
     }
 
-    // ── COUNT(col) ──────────────────────────────────────────────
-
     #[test]
     fn count_col_skips_nulls() {
         let mut acc = RetractableCountAccum::default();
@@ -632,8 +622,6 @@ mod tests {
         acc.update_batch(&[i64_arr(&[10]), i64_arr(&[-1])]).unwrap();
         assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int64(Some(2)));
     }
-
-    // ── AVG ─────────────────────────────────────────────────────
 
     #[test]
     fn avg_basic() {
@@ -675,8 +663,6 @@ mod tests {
             ScalarValue::Float64(Some(20.0))
         );
     }
-
-    // ── MIN ─────────────────────────────────────────────────────
 
     #[test]
     fn min_basic() {
@@ -738,8 +724,6 @@ mod tests {
         assert_eq!(restored.evaluate().unwrap(), ScalarValue::Int64(Some(10)));
     }
 
-    // ── MAX ─────────────────────────────────────────────────────
-
     #[test]
     fn max_basic() {
         let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Max);
@@ -763,8 +747,6 @@ mod tests {
         assert!(acc.evaluate().unwrap().is_null());
     }
 
-    // ── Float support ───────────────────────────────────────────
-
     #[test]
     fn min_max_float64() {
         let mut min_acc = RetractableExtremumAccum::new(DataType::Float64, Extremum::Min);
@@ -785,8 +767,6 @@ mod tests {
             ScalarValue::Float64(Some(3.25))
         );
     }
-
-    // ── Sortable encoding ───────────────────────────────────────
 
     #[test]
     fn sortable_encoding_roundtrip() {
@@ -813,8 +793,6 @@ mod tests {
             );
         }
     }
-
-    // ── Mixed aggregates (factory) ──────────────────────────────
 
     #[test]
     fn factory_supported_functions() {

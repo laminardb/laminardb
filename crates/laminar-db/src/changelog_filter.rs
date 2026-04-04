@@ -57,8 +57,6 @@ pub(crate) fn filter_positive_events(batch: &RecordBatch) -> Result<RecordBatch,
         .map_err(|e| DbError::Pipeline(format!("changelog filter: {e}")))
 }
 
-// ── Z-set __weight handling ───────────────────────────────────────────
-
 /// Prepare a batch for a sink. If the batch has a `__weight` column and
 /// the sink is NOT changelog-aware, filter to positive weights and strip
 /// the column. Changelog-aware sinks receive the batch unchanged.
