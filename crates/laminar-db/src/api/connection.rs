@@ -303,8 +303,6 @@ impl Connection {
         self.inner.is_checkpoint_enabled()
     }
 
-    // ── Catalog info ──
-
     /// List source info with schemas and watermark columns.
     #[must_use]
     pub fn source_info(&self) -> Vec<crate::SourceInfo> {
@@ -328,8 +326,6 @@ impl Connection {
     pub fn query_info(&self) -> Vec<crate::QueryInfo> {
         self.inner.queries()
     }
-
-    // ── Pipeline topology & state ──
 
     /// Get the pipeline topology graph.
     #[must_use]
@@ -373,8 +369,6 @@ impl Connection {
         self.inner.active_query_count()
     }
 
-    // ── Metrics ──
-
     /// Get pipeline-wide metrics snapshot.
     #[must_use]
     pub fn metrics(&self) -> crate::PipelineMetrics {
@@ -405,8 +399,6 @@ impl Connection {
         self.inner.all_stream_metrics()
     }
 
-    // ── Query control ──
-
     /// Cancel a running query by ID.
     ///
     /// # Errors
@@ -415,8 +407,6 @@ impl Connection {
     pub fn cancel_query(&self, query_id: u64) -> Result<(), ApiError> {
         self.inner.cancel_query(query_id).map_err(ApiError::from)
     }
-
-    // ── Shutdown ──
 
     /// Gracefully shut down the streaming pipeline.
     ///
@@ -448,8 +438,6 @@ impl Connection {
         };
         result.map_err(ApiError::from)
     }
-
-    // ── Subscription ──
 
     /// Subscribe to a named stream, returning an `ArrowSubscription`.
     ///

@@ -26,8 +26,6 @@ use laminar_sql::translator::{StreamJoinConfig, StreamJoinType};
 use crate::aggregate_state::JoinStateCheckpoint;
 use crate::error::DbError;
 
-// ── Key helpers (same pattern as asof_batch.rs) ────────────────────────────
-
 /// A borrowed reference to a key column, avoiding per-row String allocations.
 enum KeyColumn<'a> {
     Utf8(&'a StringArray),
@@ -132,8 +130,6 @@ fn extract_column_as_timestamps(batch: &RecordBatch, col_name: &str) -> Result<V
         ))),
     }
 }
-
-// ── Per-side state ─────────────────────────────────────────────────────────
 
 /// Compact when accumulated batch count exceeds this threshold.
 const COMPACTION_THRESHOLD: usize = 32;
@@ -294,8 +290,6 @@ impl SideState {
     }
 }
 
-// ── Complete join state ────────────────────────────────────────────────────
-
 /// Complete interval join state for one query.
 pub(crate) struct IntervalJoinState {
     left: SideState,
@@ -419,8 +413,6 @@ impl IntervalJoinState {
         Ok(state)
     }
 }
-
-// ── Core join execution ────────────────────────────────────────────────────
 
 /// Build the merged output schema from left and right schemas.
 fn build_output_schema(

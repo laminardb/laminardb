@@ -1861,8 +1861,6 @@ mod tests {
         assert_eq!(rows2, 1, "offset=5000 should resolve at watermark=110k");
     }
 
-    // ── input_buf_pressure tests ─────────────────────────────────
-
     #[test]
     fn test_pressure_zero_when_cap_disabled() {
         let mut graph = test_graph();

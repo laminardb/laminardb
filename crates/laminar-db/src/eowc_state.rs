@@ -1026,8 +1026,6 @@ mod tests {
     use super::*;
     use arrow::array::Int64Array;
 
-    // ── Window assignment tests ──────────────────────────────────────
-
     #[test]
     fn test_tumbling_window_assignment_aligns_to_boundary() {
         let wt = EowcWindowType::Tumbling { size_ms: 1000 };
@@ -1069,8 +1067,6 @@ mod tests {
         assert_eq!(assign_windows(500, &wt), vec![0]);
     }
 
-    // ── Timestamp extraction tests ───────────────────────────────────
-
     #[test]
     fn test_extract_i64_timestamps_from_int64() {
         let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
@@ -1100,8 +1096,6 @@ mod tests {
         let ts = extract_i64_timestamps(&batch, 0).unwrap();
         assert_eq!(ts, vec![100, 200, 300]);
     }
-
-    // ── Incremental state tests ──────────────────────────────────────
 
     fn make_pre_agg_batch(
         groups: Vec<&str>,
@@ -1315,8 +1309,6 @@ mod tests {
         assert_eq!(schema.field(3).name(), "total");
         assert_eq!(schema.fields().len(), 4);
     }
-
-    // ── Checkpoint/restore tests ─────────────────────────────────────
 
     #[test]
     fn test_eowc_checkpoint_roundtrip_tumbling() {
