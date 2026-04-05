@@ -223,8 +223,8 @@ name = "prompt_tools"
 sql = """
 SELECT
     p.prompt_id,
-    t.tool_name,
-    t.tool_success,
+    t.tool_name AS tool_name,
+    t.tool_success AS tool_success,
     CAST(t.duration_ms AS BIGINT) AS tool_duration_ms,
     t.ts_ms - p.ts_ms AS prompt_to_tool_ms
 FROM enriched_events p

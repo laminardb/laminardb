@@ -744,18 +744,20 @@ function handleLifecycle(rows) {
   for (const r of rows) {
     const id = r.prompt_id || '';
     const model = (r.model || '').replace('claude-', '').replace(/-\d{8}$/, '');
+    const inp = +(r.input_tokens) || 0;
+    const out = +(r.output_tokens) || 0;
+    const cost = +(r.cost_usd) || 0;
     const existing = id && S.lifecycle.find(e => e.id === id);
     if (existing) {
-      // Merge additional api_request matches for same prompt
-      existing.tokens += (+r.input_tokens || 0) + (+r.output_tokens || 0);
-      existing.cost += +r.cost_usd || 0;
+      existing.tokens += inp + out;
+      existing.cost += cost;
     } else {
       S.lifecycle.unshift({
         id: id,
         time: new Date(),
         model: model,
-        tokens: (+r.input_tokens || 0) + (+r.output_tokens || 0),
-        cost: +r.cost_usd || 0,
+        tokens: inp + out,
+        cost: cost,
         latency: +r.time_to_response_ms || +r.api_duration_ms || 0,
         tools: [],
       });
@@ -772,7 +774,7 @@ function handleToolJoins(rows) {
     if (!id) continue;
     const tool = {
       name: r.tool_name || '?',
-      success: r.tool_success === 'true',
+      success: r.tool_success === 'true' || r.tool_success === true,
       ms: +r.tool_duration_ms || 0,
     };
     // Attach to lifecycle entry if exists
