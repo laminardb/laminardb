@@ -513,18 +513,30 @@ async fn ws_stream(
     sub: laminar_core::streaming::Subscription<laminar_db::ArrowRecord>,
     name: String,
 ) {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<arrow_array::RecordBatch>(32);
+    use std::sync::atomic::{AtomicI64, Ordering};
 
-    // Producer: blocking recv on a dedicated thread
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<arrow_array::RecordBatch>(32);
+    let watermark = Arc::new(AtomicI64::new(i64::MIN));
+    let wm_producer = Arc::clone(&watermark);
+
+    // Producer: poll for batches and watermarks on a dedicated thread
     tokio::task::spawn_blocking(move || loop {
-        match sub.recv_timeout(std::time::Duration::from_millis(500)) {
-            Ok(batch) => {
+        match sub.poll_message() {
+            Some(laminar_core::streaming::SubscriptionMessage::Batch(batch)) => {
                 if tx.blocking_send(batch).is_err() {
                     break;
                 }
             }
-            Err(laminar_core::streaming::RecvError::Timeout) => continue,
-            Err(_) => break,
+            Some(laminar_core::streaming::SubscriptionMessage::Watermark(wm)) => {
+                wm_producer.store(wm, Ordering::Relaxed);
+            }
+            Some(laminar_core::streaming::SubscriptionMessage::Record(_)) => {}
+            None => {
+                if sub.is_disconnected() {
+                    break;
+                }
+                std::thread::park_timeout(std::time::Duration::from_millis(50));
+            }
         }
     });
 
@@ -534,13 +546,20 @@ async fn ws_stream(
         tokio::select! {
             batch = rx.recv() => {
                 let Some(batch) = batch else { break };
-                let json = batch_to_json(&batch);
+                let json = match batch_to_json(&batch) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(stream = %name, error = %e, "failed to serialize batch");
+                        continue;
+                    }
+                };
+                let wm = watermark.load(Ordering::Relaxed);
                 let msg = serde_json::json!({
                     "type": "data",
                     "subscription_id": &name,
                     "data": json,
                     "sequence": seq,
-                    "watermark": null,
+                    "watermark": if wm == i64::MIN { serde_json::Value::Null } else { serde_json::json!(wm) },
                 });
                 seq += 1;
                 if socket.send(Message::Text(msg.to_string().into())).await.is_err() {
@@ -557,14 +576,12 @@ async fn ws_stream(
     }
 }
 
-fn batch_to_json(batch: &arrow_array::RecordBatch) -> serde_json::Value {
+fn batch_to_json(batch: &arrow_array::RecordBatch) -> Result<serde_json::Value, String> {
     let mut buf = Vec::new();
-    {
-        let mut writer = arrow_json::ArrayWriter::new(&mut buf);
-        let _ = writer.write(batch);
-        let _ = writer.finish();
-    }
-    serde_json::from_slice(&buf).unwrap_or(serde_json::Value::Array(vec![]))
+    let mut writer = arrow_json::ArrayWriter::new(&mut buf);
+    writer.write(batch).map_err(|e| e.to_string())?;
+    writer.finish().map_err(|e| e.to_string())?;
+    Ok(serde_json::from_slice(&buf).unwrap_or(serde_json::Value::Array(vec![])))
 }
 
 #[cfg(test)]
