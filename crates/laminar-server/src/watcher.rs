@@ -1,8 +1,4 @@
 //! File system watcher for automatic config hot-reload.
-//!
-//! Watches the config file's parent directory using the `notify` crate and
-//! triggers a reload when the target file is modified. Handles atomic editor
-//! saves (write-temp + rename) by watching the directory rather than the file.
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -25,10 +21,7 @@ use crate::config;
 use crate::http::AppState;
 use crate::reload;
 
-/// Watch the config file and trigger reload on changes.
-///
-/// Runs forever until the task is aborted. Errors are logged but never
-/// cause the watcher to exit (resilience against transient failures).
+/// Watch the config file and trigger reload on changes. Runs until aborted.
 pub async fn watch_config(config_path: PathBuf, state: Arc<AppState>, debounce: Duration) {
     let (tx, mut rx) = mpsc::channel::<()>(16);
 
