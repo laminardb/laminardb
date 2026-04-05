@@ -469,7 +469,6 @@ backend = "memory"
 [checkpoint]
 url = "file:///tmp/checkpoints"
 interval = "10s"
-mode = "aligned"
 
 [[source]]
 name = "trades"
@@ -528,12 +527,10 @@ workers = 8
 [state]
 backend = "mmap"
 path = "/data/state"
-max_size_bytes = 10737418240
 
 [checkpoint]
 url = "s3://bucket/checkpoints"
 interval = "30s"
-snapshot_strategy = "fork_cow"
 
 [discovery]
 strategy = "static"
