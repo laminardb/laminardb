@@ -387,60 +387,6 @@ fn default_evicted_watermark() -> i64 {
     i64::MIN
 }
 
-/// Top-level checkpoint for the entire `StreamExecutor`.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct StreamExecutorCheckpoint {
-    /// Checkpoint format version.
-    pub version: u32,
-    /// Virtual partition count at checkpoint time.
-    #[serde(default)]
-    pub vnode_count: u16,
-    /// Non-EOWC aggregate states, keyed by query name.
-    #[serde(default)]
-    pub agg_states: FxHashMap<String, AggStateCheckpoint>,
-    /// EOWC aggregate states, keyed by query name.
-    #[serde(default)]
-    pub eowc_states: FxHashMap<String, EowcStateCheckpoint>,
-    /// Core window pipeline states, keyed by query name.
-    #[serde(default)]
-    pub core_window_states: FxHashMap<String, crate::core_window_state::CoreWindowCheckpoint>,
-    /// Join states, keyed by query name.
-    ///
-    /// Currently empty for ASOF/temporal joins (stateless per-cycle).
-    /// Populated by future stateful joins (interval joins, etc.).
-    #[serde(default)]
-    pub join_states: FxHashMap<String, JoinStateCheckpoint>,
-    /// Raw-batch EOWC states, keyed by query name.
-    ///
-    /// These are non-aggregate EOWC queries that accumulate raw
-    /// `RecordBatch` data until the watermark closes their windows.
-    /// Each batch is serialized as Arrow IPC bytes.
-    #[serde(default)]
-    pub raw_eowc_states: FxHashMap<String, RawEowcCheckpoint>,
-}
-
-// Compile-time assertion: StreamExecutorCheckpoint must be Send
-// so it can be offloaded to spawn_blocking for serialization.
-const _: () = {
-    const fn assert_send<T: Send>() {}
-    assert_send::<StreamExecutorCheckpoint>();
-};
-
-/// Checkpoint for raw-batch EOWC state (non-aggregate EOWC queries).
-///
-/// Stores accumulated `RecordBatch` data as Arrow IPC bytes plus
-/// the watermark boundary used for window-close tracking.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct RawEowcCheckpoint {
-    /// The last closed-window boundary that was emitted.
-    pub last_closed_boundary: i64,
-    /// Total accumulated rows (for diagnostics).
-    pub accumulated_rows: usize,
-    /// Accumulated source batches, keyed by source table name.
-    /// Each inner `Vec<u8>` is a single `RecordBatch` serialized as Arrow IPC.
-    pub sources: FxHashMap<String, Vec<Vec<u8>>>,
-}
-
 /// Specification for one aggregate function in a streaming query.
 pub(crate) struct AggFuncSpec {
     /// The `DataFusion` aggregate UDF.
@@ -1859,7 +1805,7 @@ pub(crate) fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
 /// with direct `PhysicalExpr::evaluate()` on the source batch, eliminating
 /// SQL parsing, logical planning, physical planning, and `MemTable` overhead.
 pub(crate) struct CompiledProjection {
-    #[cfg_attr(not(test), allow(dead_code))] // read only by stream_executor tests
+    #[allow(dead_code)] // set during construction, used for diagnostics
     pub(crate) source_table: String,
     pub(crate) exprs: Vec<Arc<dyn PhysicalExpr>>,
     pub(crate) filter: Option<Arc<dyn PhysicalExpr>>,
@@ -3371,26 +3317,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_checkpoint_empty_state_returns_none() {
-        use crate::stream_executor::StreamExecutor;
-        let ctx = laminar_sql::create_session_context();
-        laminar_sql::register_streaming_functions(&ctx);
-        let mut executor = StreamExecutor::new(ctx);
-        // No queries registered = no state
-        let result = executor.snapshot_state().unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_restore_corrupt_bytes_returns_error() {
-        use crate::stream_executor::StreamExecutor;
-        let ctx = laminar_sql::create_session_context();
-        let mut executor = StreamExecutor::new(ctx);
-        let result = executor.restore_state(b"not valid json");
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn test_restore_fingerprint_mismatch_errors() {
         let (_, mut state) =
             setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
@@ -3424,58 +3350,6 @@ mod tests {
             err.contains("fingerprint mismatch"),
             "Error should mention fingerprint: {err}"
         );
-    }
-
-    #[test]
-    fn test_checkpoint_backward_compat_without_join_states() {
-        // Verify that checkpoints serialized before join_states was added
-        // still deserialize correctly (serde(default) handles it).
-        let json = r#"{
-            "version": 1,
-            "agg_states": {},
-            "eowc_states": {},
-            "core_window_states": {}
-        }"#;
-        let cp: StreamExecutorCheckpoint = serde_json::from_str(json).unwrap();
-        assert_eq!(cp.version, 1);
-        assert!(cp.join_states.is_empty());
-    }
-
-    #[test]
-    fn test_checkpoint_with_join_states_round_trip() {
-        let mut join_states = FxHashMap::default();
-        join_states.insert(
-            "enriched".to_string(),
-            JoinStateCheckpoint {
-                left_buffer_rows: 100,
-                right_buffer_rows: 50,
-                left_batches: vec![vec![1, 2, 3]],
-                right_batches: vec![vec![4, 5, 6]],
-                last_evicted_watermark: 42,
-                last_evicted_watermark_right: 42,
-            },
-        );
-
-        let cp = StreamExecutorCheckpoint {
-            version: 2,
-            vnode_count: laminar_storage::checkpoint_manifest::VNODE_COUNT,
-            agg_states: FxHashMap::default(),
-            eowc_states: FxHashMap::default(),
-            core_window_states: FxHashMap::default(),
-            join_states,
-            raw_eowc_states: FxHashMap::default(),
-        };
-
-        let bytes = serde_json::to_vec(&cp).unwrap();
-        let restored: StreamExecutorCheckpoint = serde_json::from_slice(&bytes).unwrap();
-
-        assert_eq!(restored.join_states.len(), 1);
-        let js = restored.join_states.get("enriched").unwrap();
-        assert_eq!(js.left_buffer_rows, 100);
-        assert_eq!(js.right_buffer_rows, 50);
-        assert_eq!(js.left_batches, vec![vec![1, 2, 3]]);
-        assert_eq!(js.right_batches, vec![vec![4, 5, 6]]);
-        assert_eq!(js.last_evicted_watermark, 42);
     }
 
     #[tokio::test]

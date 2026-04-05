@@ -30,7 +30,7 @@ use laminar_sql::translator::WindowOperatorConfig;
 
 /// Maximum rows an EOWC raw-batch accumulator may hold before coalescing.
 /// Prevents unbounded memory growth when windows fail to close or late
-/// data keeps arriving. Matches `StreamExecutor::MAX_EOWC_ACCUMULATED_ROWS`.
+/// data keeps arriving.
 const MAX_EOWC_ACCUMULATED_ROWS: usize = 1_000_000;
 
 /// Wrapper for checkpoint data that discriminates between state variants.

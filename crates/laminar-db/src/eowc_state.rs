@@ -111,7 +111,7 @@ fn assign_windows(ts_ms: i64, window_type: &EowcWindowType) -> Vec<i64> {
         EowcWindowType::Session { .. } => {
             // Session windows MUST be routed through CoreWindowState (Ring 0
             // operators) which implements proper gap-based merge.  The guard
-            // at stream_executor.rs:973-980 prevents session queries from
+            // in EowcQueryOperator::initialize() prevents session queries from
             // reaching IncrementalEowcState.  If we get here, the routing
             // logic has a bug — crash rather than produce wrong results.
             unreachable!(

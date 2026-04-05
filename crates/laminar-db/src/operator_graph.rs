@@ -1,8 +1,8 @@
 //! Operator graph for streaming SQL execution.
 //!
-//! Replaces the monolithic `StreamExecutor` with a graph of independent operator
-//! nodes connected by typed edges. Each operator owns its state, checkpoint/restore,
-//! and execution logic.
+//! Graph of independent operator nodes connected by typed edges for streaming SQL
+//! execution. Each operator owns its state, checkpoint/restore, and execution
+//! logic.
 //!
 //! # Architecture
 //!
@@ -553,7 +553,7 @@ impl OperatorGraph {
 
     /// Register a stream query for execution.
     ///
-    /// Detection runs at registration time (same as `StreamExecutor::add_query`):
+    /// Detection runs at registration time:
     /// ASOF, temporal, and interval joins are detected from SQL text. Standard
     /// and EOWC queries use lazy initialization on first execution.
     #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
@@ -566,7 +566,7 @@ impl OperatorGraph {
         order_config: Option<OrderOperatorConfig>,
         idle_ttl_ms: Option<u64>,
     ) {
-        // Detection (same as StreamExecutor::add_query)
+        // Detection: ASOF, temporal, temporal probe, interval joins
         let (temporal_probe_config, temporal_probe_projection_sql) =
             detect_temporal_probe_query(&sql);
         let (asof_config, projection_sql) = if temporal_probe_config.is_none() {
@@ -2201,6 +2201,84 @@ mod tests {
         assert!(
             total_rows <= 4,
             "at most 4 matches (2A × 2B), got {total_rows}"
+        );
+    }
+
+    /// Regression test for <https://github.com/laminardb/laminardb/issues/324>.
+    ///
+    /// A pass-through query (SELECT + WHERE, no window, no aggregate) must
+    /// emit results every cycle and make them available to downstream queries.
+    /// This verifies that such queries use `SqlQueryOperator` (not EOWC
+    /// accumulation) and that output is routed to downstream consumers in the
+    /// same cycle.
+    #[tokio::test]
+    async fn test_passthrough_emits_every_cycle() {
+        let mut graph = test_graph();
+
+        // Pass-through: project + filter, no window, no aggregate, no EMIT clause.
+        graph.add_query(
+            "enriched".to_string(),
+            "SELECT symbol, price FROM trades WHERE price > 100".to_string(),
+            None, // no emit clause
+            None, // no window config
+            None, // no order config
+            None, // no idle TTL
+        );
+
+        // Downstream consumer reads from enriched.
+        graph.add_query(
+            "downstream".to_string(),
+            "SELECT symbol FROM enriched WHERE price > 1000".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let mut source = FxHashMap::default();
+        source.insert(Arc::from("trades"), vec![test_batch()]);
+
+        // Cycle 1: both should emit.
+        let r1 = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
+        assert_eq!(
+            total_rows(&r1, "enriched"),
+            2,
+            "pass-through must emit all matching rows on cycle 1"
+        );
+        assert_eq!(
+            total_rows(&r1, "downstream"),
+            1,
+            "downstream must receive pass-through output on cycle 1 (only GOOG > 1000)"
+        );
+
+        // Cycle 2: fresh source data → both emit again (no accumulation).
+        let r2 = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
+        assert_eq!(
+            total_rows(&r2, "enriched"),
+            2,
+            "pass-through must emit again on cycle 2 (not accumulating)"
+        );
+        assert_eq!(
+            total_rows(&r2, "downstream"),
+            1,
+            "downstream must receive pass-through output on cycle 2"
+        );
+
+        // Cycle 3: no source data → no output (not replaying stale data).
+        let empty_source: FxHashMap<Arc<str>, Vec<RecordBatch>> = FxHashMap::default();
+        let r3 = graph
+            .execute_cycle(&empty_source, i64::MAX, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            total_rows(&r3, "enriched"),
+            0,
+            "pass-through must not emit when source is empty"
+        );
+        assert_eq!(
+            total_rows(&r3, "downstream"),
+            0,
+            "downstream must not emit when upstream is empty"
         );
     }
 }
