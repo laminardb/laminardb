@@ -1,6 +1,4 @@
 //! Pipeline lifecycle management: start, close, shutdown.
-//!
-//! Reopened `impl LaminarDB` — split from `db.rs`.
 #![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::HashMap;
@@ -16,10 +14,6 @@ use crate::db::{
 };
 use crate::error::DbError;
 
-/// Extract a checkpoint path prefix from an object store URL.
-///
-/// For `s3://bucket/prefix/path` → `"prefix/path/"`.
-/// For `file:///some/path` → `""` (local FS uses the path directly).
 pub(crate) fn url_to_checkpoint_prefix(url: &str) -> String {
     // Strip scheme
     let after_scheme = url.find("://").map_or(url, |i| &url[i + 3..]);
@@ -51,14 +45,11 @@ impl LaminarDB {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Check if the database is shut down.
+    /// Returns `true` if the database has been shut down.
     pub fn is_closed(&self) -> bool {
         self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Check if the streaming pipeline is active (starting, running, or
-    /// shutting down). DDL that requires connector instantiation or task
-    /// cancellation is unsafe in all three states.
     pub(crate) fn is_pipeline_running(&self) -> bool {
         let s = self.state.load(std::sync::atomic::Ordering::Acquire);
         s == STATE_RUNNING || s == STATE_STARTING || s == STATE_SHUTTING_DOWN
