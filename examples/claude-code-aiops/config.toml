@@ -1,17 +1,8 @@
-# =============================================================================
-# LaminarDB AI Ops Demo Configuration
-# =============================================================================
-# Real-time cost attribution for Claude Code via streaming SQL over OTel events.
+# LaminarDB AI Ops Demo — see README.md for details.
 #
-# Verified against Claude Code v2.1.90 telemetry output (2026-04-02).
-# Event types: user_prompt, api_request, tool_decision, tool_result
-# All attributes are flat keys in the `attributes` JSON column.
-#
-# Usage:
-#   cargo run --release -p laminar-server --no-default-features \
-#       --features mimalloc,otel,websocket,files -- \
-#       --config examples/claude-code-aiops/config.toml
-# =============================================================================
+# cargo run --release -p laminar-server --no-default-features \
+#     --features mimalloc,otel,websocket,files -- \
+#     --config examples/claude-code-aiops/config.toml
 
 [server]
 mode = "embedded"
@@ -23,9 +14,7 @@ backend = "memory"
 [checkpoint]
 interval = "30s"
 
-# ---------------------------------------------------------------------------
-# OTel gRPC source — receives Claude Code telemetry events
-# ---------------------------------------------------------------------------
+# OTel gRPC source
 
 [[source]]
 name = "otel_events"
@@ -44,11 +33,9 @@ batch_size = "256"
 column = "_laminar_received_at"
 max_out_of_orderness = "10s"
 
-# ---------------------------------------------------------------------------
-# Streaming SQL pipelines (see README.md for telemetry attribute reference)
-# ---------------------------------------------------------------------------
+# Pipelines
 
-# Heartbeat — 5s window, proves the pipeline is alive
+# Heartbeat (5s)
 [[pipeline]]
 name = "event_count"
 sql = """
@@ -59,7 +46,7 @@ GROUP BY TUMBLE(_laminar_received_at, INTERVAL '5' SECOND)
 EMIT ON WINDOW CLOSE
 """
 
-# Pipeline 1: Cost per model (15s windows for near-real-time)
+# Cost per model (15s)
 [[pipeline]]
 name = "cost_by_model"
 sql = """
@@ -84,7 +71,7 @@ GROUP BY
 EMIT ON WINDOW CLOSE
 """
 
-# Pipeline 2: Tool effectiveness (15s windows)
+# Tool effectiveness (15s)
 [[pipeline]]
 name = "tool_stats"
 sql = """
@@ -105,8 +92,7 @@ GROUP BY
 EMIT ON WINDOW CLOSE
 """
 
-# Pipeline 3: Per-prompt breakdown (30s windows)
-# Correlates user_prompt, api_request, and tool_result events by prompt.id.
+# Per-prompt breakdown (30s)
 [[pipeline]]
 name = "prompt_analysis"
 sql = """
@@ -147,8 +133,7 @@ GROUP BY
 EMIT ON WINDOW CLOSE
 """
 
-# Pipeline 4: Tool permission decisions (15s windows)
-# Tracks auto-accept vs manual approval and rejection patterns.
+# Tool permission decisions (15s)
 [[pipeline]]
 name = "tool_decisions"
 sql = """
@@ -167,8 +152,7 @@ GROUP BY
 EMIT ON WINDOW CLOSE
 """
 
-# Pipeline 5: Session activity + cost velocity (15s windows)
-# Tracks events per window, cost rate, and speed mode usage.
+# Session activity (15s)
 [[pipeline]]
 name = "session_activity"
 sql = """
@@ -192,13 +176,9 @@ GROUP BY
 EMIT ON WINDOW CLOSE
 """
 
-# ---------------------------------------------------------------------------
-# Stream-to-stream temporal joins
-# ---------------------------------------------------------------------------
-# The join parser requires simple column refs for ON keys (not function exprs).
-# Pre-extract flat columns from the JSON attributes, then join on those.
+# Stream joins — pre-extract flat columns, then join on simple refs
 
-# Pipeline 6: Pre-extract flat columns for join keys
+# Enriched events (pass-through)
 [[pipeline]]
 name = "enriched_events"
 sql = """
@@ -219,7 +199,7 @@ FROM otel_events
 WHERE jsonb_get_text(from_json(attributes), 'prompt.id') IS NOT NULL
 """
 
-# Pipeline 7: Prompt lifecycle — correlate user_prompt → api_request
+# Prompt → API call join (2min window)
 [[pipeline]]
 name = "prompt_lifecycle"
 sql = """
@@ -241,7 +221,7 @@ WHERE p.event_name = 'user_prompt'
     AND a.event_name = 'api_request'
 """
 
-# Pipeline 8: Prompt-to-tool — correlate user_prompt → tool_result
+# Prompt → tool result join (5min window)
 [[pipeline]]
 name = "prompt_tools"
 sql = """
@@ -260,9 +240,7 @@ WHERE p.event_name = 'user_prompt'
     AND t.event_name = 'tool_result'
 """
 
-# ---------------------------------------------------------------------------
-# WebSocket sinks — real-time dashboard
-# ---------------------------------------------------------------------------
+# WebSocket sinks
 
 [[sink]]
 name = "heartbeat_ws"
@@ -328,9 +306,7 @@ connector = "websocket"
 [sink.properties]
 "bind.address" = "0.0.0.0:9007"
 
-# ---------------------------------------------------------------------------
-# File sinks — Parquet persistence (survives server restarts)
-# ---------------------------------------------------------------------------
+# Parquet file sinks
 
 [[sink]]
 name = "cost_archive"

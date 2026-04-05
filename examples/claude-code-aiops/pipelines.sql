@@ -1,24 +1,7 @@
--- =============================================================================
--- LaminarDB AI Ops Demo: Streaming SQL Pipelines
--- =============================================================================
--- Verified against Claude Code v2.1.90 telemetry (2026-04-02).
---
--- Event types (event.name attribute):
---   user_prompt  — prompt.id, prompt_length
---   api_request  — model, input_tokens, output_tokens, cache_read_tokens,
---                  cache_creation_tokens, cost_usd, duration_ms, speed
---   tool_decision — tool_name, decision, source
---   tool_result   — tool_name, success, duration_ms, tool_result_size_bytes
---
--- All attributes are flat keys in the `attributes` JSON column.
--- Extract via: jsonb_get_text(from_json(attributes), 'key')
---
--- Use GROUP BY TUMBLE(col, interval) syntax — the planner only extracts
--- window config from the GROUP BY form.
--- =============================================================================
+-- LaminarDB AI Ops Demo — standalone SQL reference (see README.md for details).
+-- Use GROUP BY TUMBLE(col, interval) syntax for windowed aggregation.
 
--- Pipeline 1: Cost per model (1-minute windows)
--- Uses pre-calculated cost_usd from Claude Code (no pricing lookup needed).
+-- Cost per model
 CREATE STREAM cost_by_model AS
 SELECT
     jsonb_get_text(from_json(attributes), 'model') AS model,
@@ -40,8 +23,7 @@ GROUP BY
     jsonb_get_text(from_json(attributes), 'user.account_uuid')
 EMIT ON WINDOW CLOSE;
 
--- Pipeline 2: Tool effectiveness (1-minute windows)
--- Uses tool_result events (tool_decision has no duration/success data).
+-- Tool effectiveness
 CREATE STREAM tool_stats AS
 SELECT
     jsonb_get_text(from_json(attributes), 'tool_name') AS tool_name,
@@ -59,8 +41,7 @@ GROUP BY
     jsonb_get_text(from_json(attributes), 'tool_name')
 EMIT ON WINDOW CLOSE;
 
--- Pipeline 3: Per-prompt breakdown (30s windows)
--- Correlates user_prompt, api_request, and tool_result events by prompt.id.
+-- Per-prompt breakdown
 CREATE STREAM prompt_analysis AS
 SELECT
     jsonb_get_text(from_json(attributes), 'prompt.id') AS prompt_id,
@@ -98,13 +79,9 @@ GROUP BY
     jsonb_get_text(from_json(attributes), 'prompt.id')
 EMIT ON WINDOW CLOSE;
 
--- =============================================================================
--- Stream-to-stream temporal joins
--- =============================================================================
--- The join parser requires simple column refs for ON keys. Pre-extract flat
--- columns from JSON attributes, then join on those.
+-- Stream joins — pre-extract flat columns, then join on simple refs
 
--- Pipeline 6: Pre-extract flat columns for join keys
+-- Enriched events (pass-through)
 CREATE STREAM enriched_events AS
 SELECT
     _laminar_received_at,
@@ -122,7 +99,7 @@ SELECT
 FROM otel_events
 WHERE jsonb_get_text(from_json(attributes), 'prompt.id') IS NOT NULL;
 
--- Pipeline 7: Prompt lifecycle — correlate user_prompt → api_request
+-- Prompt → API call join (2min window)
 CREATE STREAM prompt_lifecycle AS
 SELECT
     p.prompt_id,
@@ -141,7 +118,7 @@ JOIN enriched_events a
 WHERE p.event_name = 'user_prompt'
     AND a.event_name = 'api_request';
 
--- Pipeline 8: Prompt-to-tool — correlate user_prompt → tool_result
+-- Prompt → tool result join (5min window)
 CREATE STREAM prompt_tools AS
 SELECT
     p.prompt_id,
