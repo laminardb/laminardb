@@ -140,14 +140,14 @@ pub async fn open_or_create_table(
         return Ok(table);
     }
 
-    // Table doesn't exist - create it if we have a schema.
-    let schema = schema.ok_or_else(|| {
-        ConnectorError::ConfigurationError(
-            "cannot create Delta Lake table without schema - \
-             write at least one batch first"
-                .into(),
-        )
-    })?;
+    // Table doesn't exist — create if we have a schema, otherwise defer to first write_batch().
+    let Some(schema) = schema else {
+        info!(
+            table_path,
+            "table does not exist yet; will create on first write"
+        );
+        return Ok(table);
+    };
 
     info!(table_path, "creating new Delta Lake table");
 
