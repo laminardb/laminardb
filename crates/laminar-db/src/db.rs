@@ -844,6 +844,10 @@ impl LaminarDB {
     }
 
     /// Subscribe to a named stream's output.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DbError::StreamNotFound` if the stream doesn't exist.
     #[cfg(feature = "api")]
     pub fn subscribe_raw(
         &self,
