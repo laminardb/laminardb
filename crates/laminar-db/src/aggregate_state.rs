@@ -1,19 +1,4 @@
-//! Incremental aggregate state for streaming GROUP BY queries.
-//!
-//! Maintains per-group accumulator state across micro-batch cycles so that
-//! streaming aggregations (SUM, COUNT, AVG, etc.) produce correct running
-//! totals instead of per-batch results.
-//!
-//! # Architecture
-//!
-//! ```text
-//! Source batch → group-by partition → per-group accumulators → emit RecordBatch
-//!                                          ↕ (persists across cycles)
-//! ```
-//!
-//! Uses `DataFusion`'s `Accumulator` trait directly for correct semantics
-//! across all 50+ built-in aggregates (including AVG, STDDEV, etc. that
-//! require multi-field state).
+//! Incremental aggregation state for streaming GROUP BY queries.
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -34,12 +19,6 @@ use serde_json::json;
 
 use crate::error::DbError;
 
-/// Convert an `OwnedRow` back to a `Vec<ScalarValue>` group key,
-/// casting types to match `group_types` when needed.
-///
-/// Used by `IncrementalAggState`, `CoreWindowState`, and `IncrementalEowcState`
-/// to convert from the compact row format back to the `Vec<ScalarValue>` keys
-/// used in the per-group accumulator maps.
 pub(crate) fn row_to_scalar_key_with_types(
     converter: &arrow::row::RowConverter,
     row_key: &arrow::row::OwnedRow,
@@ -62,9 +41,6 @@ pub(crate) fn row_to_scalar_key_with_types(
     Ok(sv_key)
 }
 
-/// Sentinel `OwnedRow` for global aggregates (no GROUP BY).
-///
-/// Cached via `OnceLock` — allocated once, reused forever.
 pub(crate) fn global_aggregate_key() -> arrow::row::OwnedRow {
     use std::sync::OnceLock;
     static SENTINEL: OnceLock<arrow::row::OwnedRow> = OnceLock::new();
@@ -79,8 +55,6 @@ pub(crate) fn global_aggregate_key() -> arrow::row::OwnedRow {
         .clone()
 }
 
-/// Convert a `Vec<ScalarValue>` key to an `OwnedRow`, casting to
-/// `target_types` when `json_to_scalar` has widened the types.
 pub(crate) fn scalar_key_to_owned_row(
     row_converter: &arrow::row::RowConverter,
     sv_key: &[ScalarValue],
@@ -110,10 +84,6 @@ pub(crate) fn scalar_key_to_owned_row(
     Ok(rows.row(0).owned())
 }
 
-/// Emit a single window's accumulated state as a `RecordBatch`.
-///
-/// Shared by `CoreWindowState` and `IncrementalEowcState`. Builds columns
-/// for `window_start`, `window_end`, group keys, and aggregate results.
 pub(crate) fn emit_window_batch(
     window_start: i64,
     window_end: i64,
@@ -180,11 +150,6 @@ pub(crate) fn emit_window_batch(
     Ok(Some(batch))
 }
 
-/// Encode a `ScalarValue` to a JSON value for checkpoint serialization.
-///
-/// Supports the common types returned by `Accumulator::state()`:
-/// Null, Boolean, Int8–64, UInt8–64, Float32/64, Utf8, and List.
-/// Integer types are widened to i64/u64 for compact encoding.
 pub(crate) fn scalar_to_json(sv: &ScalarValue) -> serde_json::Value {
     match sv {
         ScalarValue::Null => json!({"t": "N"}),
@@ -239,7 +204,6 @@ pub(crate) fn scalar_to_json(sv: &ScalarValue) -> serde_json::Value {
     }
 }
 
-/// Decode a JSON value back to a `ScalarValue`.
 pub(crate) fn json_to_scalar(v: &serde_json::Value) -> Result<ScalarValue, DbError> {
     let t = v
         .get("t")
@@ -292,9 +256,6 @@ pub(crate) fn json_to_scalar(v: &serde_json::Value) -> Result<ScalarValue, DbErr
     }
 }
 
-/// Compute a u64 fingerprint for a query based on its SQL and output schema.
-///
-/// Used to detect schema evolution between checkpoint save and restore.
 pub(crate) fn query_fingerprint(pre_agg_sql: &str, output_schema: &Schema) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     pre_agg_sql.hash(&mut hasher);
@@ -305,14 +266,10 @@ pub(crate) fn query_fingerprint(pre_agg_sql: &str, output_schema: &Schema) -> u6
     hasher.finish()
 }
 
-/// Serializable checkpoint for a single group's state.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GroupCheckpoint {
-    /// Serialized group key.
     pub key: Vec<serde_json::Value>,
-    /// Per-accumulator state vectors.
     pub acc_states: Vec<Vec<serde_json::Value>>,
-    /// Watermark at which this group was last updated (for TTL).
     #[serde(default = "default_last_updated")]
     pub last_updated_ms: i64,
 }
@@ -321,64 +278,44 @@ fn default_last_updated() -> i64 {
     i64::MIN
 }
 
-/// Serializable checkpoint for all groups in an agg state.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct AggStateCheckpoint {
-    /// Query fingerprint for schema validation.
     pub fingerprint: u64,
-    /// Per-group checkpoint data.
     pub groups: Vec<GroupCheckpoint>,
-    /// Last emitted values per group (changelog mode only).
     #[serde(default)]
     pub last_emitted: Vec<EmittedCheckpoint>,
 }
 
-/// Serializable checkpoint for a single group's last emitted value.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct EmittedCheckpoint {
-    /// Serialized group key.
     pub key: Vec<serde_json::Value>,
-    /// Last emitted aggregate values.
     pub values: Vec<serde_json::Value>,
 }
 
-/// Serializable checkpoint for a single window's groups.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct WindowCheckpoint {
-    /// Window start timestamp (ms since epoch).
     pub window_start: i64,
-    /// Groups within this window.
     pub groups: Vec<GroupCheckpoint>,
 }
 
-/// Serializable checkpoint for all windows in an EOWC state.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct EowcStateCheckpoint {
-    /// Query fingerprint for schema validation.
     pub fingerprint: u64,
-    /// Per-window checkpoint data.
     pub windows: Vec<WindowCheckpoint>,
 }
 
-/// Serializable checkpoint for join state (interval joins).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct JoinStateCheckpoint {
-    /// Number of buffered left-side rows.
     #[serde(default)]
     pub left_buffer_rows: u64,
-    /// Number of buffered right-side rows.
     #[serde(default)]
     pub right_buffer_rows: u64,
-    /// Serialized left-side batches (Arrow IPC).
     #[serde(default)]
     pub left_batches: Vec<Vec<u8>>,
-    /// Serialized right-side batches (Arrow IPC).
     #[serde(default)]
     pub right_batches: Vec<Vec<u8>>,
-    /// Last cutoff used for left-side eviction.
     #[serde(default = "default_evicted_watermark")]
     pub last_evicted_watermark: i64,
-    /// Last cutoff used for right-side eviction.
     #[serde(default = "default_evicted_watermark")]
     pub last_evicted_watermark_right: i64,
 }
@@ -387,83 +324,18 @@ fn default_evicted_watermark() -> i64 {
     i64::MIN
 }
 
-/// Top-level checkpoint for the entire `StreamExecutor`.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct StreamExecutorCheckpoint {
-    /// Checkpoint format version.
-    pub version: u32,
-    /// Virtual partition count at checkpoint time.
-    #[serde(default)]
-    pub vnode_count: u16,
-    /// Non-EOWC aggregate states, keyed by query name.
-    #[serde(default)]
-    pub agg_states: FxHashMap<String, AggStateCheckpoint>,
-    /// EOWC aggregate states, keyed by query name.
-    #[serde(default)]
-    pub eowc_states: FxHashMap<String, EowcStateCheckpoint>,
-    /// Core window pipeline states, keyed by query name.
-    #[serde(default)]
-    pub core_window_states: FxHashMap<String, crate::core_window_state::CoreWindowCheckpoint>,
-    /// Join states, keyed by query name.
-    ///
-    /// Currently empty for ASOF/temporal joins (stateless per-cycle).
-    /// Populated by future stateful joins (interval joins, etc.).
-    #[serde(default)]
-    pub join_states: FxHashMap<String, JoinStateCheckpoint>,
-    /// Raw-batch EOWC states, keyed by query name.
-    ///
-    /// These are non-aggregate EOWC queries that accumulate raw
-    /// `RecordBatch` data until the watermark closes their windows.
-    /// Each batch is serialized as Arrow IPC bytes.
-    #[serde(default)]
-    pub raw_eowc_states: FxHashMap<String, RawEowcCheckpoint>,
-}
-
-// Compile-time assertion: StreamExecutorCheckpoint must be Send
-// so it can be offloaded to spawn_blocking for serialization.
-const _: () = {
-    const fn assert_send<T: Send>() {}
-    assert_send::<StreamExecutorCheckpoint>();
-};
-
-/// Checkpoint for raw-batch EOWC state (non-aggregate EOWC queries).
-///
-/// Stores accumulated `RecordBatch` data as Arrow IPC bytes plus
-/// the watermark boundary used for window-close tracking.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct RawEowcCheckpoint {
-    /// The last closed-window boundary that was emitted.
-    pub last_closed_boundary: i64,
-    /// Total accumulated rows (for diagnostics).
-    pub accumulated_rows: usize,
-    /// Accumulated source batches, keyed by source table name.
-    /// Each inner `Vec<u8>` is a single `RecordBatch` serialized as Arrow IPC.
-    pub sources: FxHashMap<String, Vec<Vec<u8>>>,
-}
-
-/// Specification for one aggregate function in a streaming query.
 pub(crate) struct AggFuncSpec {
-    /// The `DataFusion` aggregate UDF.
     pub(crate) udf: Arc<AggregateUDF>,
-    /// Input data types for this aggregate.
     pub(crate) input_types: Vec<DataType>,
-    /// Column indices in the pre-aggregation output that feed this aggregate.
-    /// These index into the pre-agg schema (group cols first, then agg inputs).
     pub(crate) input_col_indices: Vec<usize>,
-    /// Output column name (alias from the query).
     pub(crate) output_name: String,
-    /// Output data type.
     pub(crate) return_type: DataType,
-    /// Whether this is a DISTINCT aggregate (e.g., `COUNT(DISTINCT x)`).
     pub(crate) distinct: bool,
-    /// Whether this is COUNT(*) — uses a dummy boolean input, no real column.
     pub(crate) is_count_star: bool,
-    /// Column index of the FILTER boolean column in pre-agg output, if any.
     pub(crate) filter_col_index: Option<usize>,
 }
 
 impl AggFuncSpec {
-    /// Create a fresh `DataFusion` accumulator for this function.
     pub(crate) fn create_accumulator(
         &self,
     ) -> Result<Box<dyn datafusion_expr::Accumulator>, DbError> {
@@ -519,48 +391,22 @@ impl AggFuncSpec {
     }
 }
 
-/// Incremental aggregation state for a streaming GROUP BY query.
-///
-/// Persists per-group accumulator state across micro-batch cycles so that
-/// running aggregations produce correct results.
 pub(crate) struct IncrementalAggState {
-    /// SQL that computes pre-aggregation expressions (group keys + agg inputs).
-    /// Kept for `query_fingerprint()` and as fallback for multi-source queries.
     pre_agg_sql: String,
-    /// Number of group-by columns in the pre-agg output (first N columns).
     num_group_cols: usize,
-    /// Group-by column data types.
     group_types: Vec<DataType>,
-    /// Aggregate function specifications.
     agg_specs: Vec<AggFuncSpec>,
-    /// Per-group accumulator state keyed by binary-encoded group key.
     groups: AHashMap<arrow::row::OwnedRow, GroupEntry>,
-    /// Persistent row converter for encoding/decoding group keys.
     row_converter: arrow::row::RowConverter,
-    /// Output schema (group columns + aggregate results).
     output_schema: SchemaRef,
-    /// Compiled pre-agg projection (single-source queries only).
     compiled_projection: Option<CompiledProjection>,
-    /// Cached optimized logical plan for the pre-agg SQL (multi-source queries).
-    /// Skips SQL parsing and logical optimization on subsequent cycles.
     cached_pre_agg_plan: Option<LogicalPlan>,
-    /// Compiled HAVING predicate.
     having_filter: Option<Arc<dyn PhysicalExpr>>,
-    /// HAVING predicate SQL fallback (when compiled filter is not available).
     having_sql: Option<String>,
-    /// Maximum number of distinct groups before new groups are dropped.
     max_groups: usize,
-    /// When true, `emit()` produces Z-set delta records with a `__weight`
-    /// column (+1 insert, -1 retract). Only changed groups are emitted.
     emit_changelog: bool,
-    /// Previous cycle's emitted values per group. Used to detect changes
-    /// and produce retraction pairs. Only populated when `emit_changelog`.
     last_emitted: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
-    /// Idle group TTL in milliseconds. Only usable with `emit_changelog`
-    /// (eviction emits -1 retractions before removing groups).
     pub(crate) idle_ttl_ms: Option<u64>,
-    /// Column index of `__weight` in the pre-agg batch when the upstream
-    /// source is a changelog stream. `None` for non-changelog sources.
     weight_col_idx: Option<usize>,
 }
 
@@ -608,10 +454,8 @@ fn build_weighted_batch(
         .map_err(|e| DbError::Pipeline(format!("weighted batch: {e}")))
 }
 
-/// Per-group accumulator state with TTL metadata.
 pub(crate) struct GroupEntry {
     pub(crate) accs: Vec<Box<dyn datafusion_expr::Accumulator>>,
-    /// Watermark (ms) at which this group last received data.
     pub(crate) last_updated_ms: i64,
 }
 
@@ -1110,7 +954,6 @@ impl IncrementalAggState {
         Ok(vec![batch])
     }
 
-    /// Process a pre-aggregation batch.
     pub fn process_batch(&mut self, batch: &RecordBatch, watermark_ms: i64) -> Result<(), DbError> {
         if batch.num_rows() == 0 {
             return Ok(());
@@ -1296,8 +1139,6 @@ impl IncrementalAggState {
         Ok(())
     }
 
-    /// Emit the current aggregate state as a `RecordBatch`.
-    ///
     /// Does NOT reset the accumulators — they continue accumulating for the
     /// next cycle (running totals).
     pub fn emit(&mut self) -> Result<Vec<RecordBatch>, DbError> {
@@ -1351,7 +1192,6 @@ impl IncrementalAggState {
         Ok(vec![batch])
     }
 
-    /// Emit Z-set delta: only changed/new/deleted groups with __weight column.
     fn emit_changelog_delta(&mut self) -> Result<Vec<RecordBatch>, DbError> {
         // Collect retractions and inserts.
         let mut retract_keys: Vec<arrow::row::OwnedRow> = Vec::new();
@@ -1429,41 +1269,26 @@ impl IncrementalAggState {
         Ok(vec![batch])
     }
 
-    /// Pre-aggregation SQL.
-    #[allow(dead_code)] // Accessed in tests and available for diagnostics.
-    pub fn pre_agg_sql(&self) -> &str {
-        &self.pre_agg_sql
-    }
-
-    /// Compiled HAVING filter, if any.
     pub fn having_filter(&self) -> Option<&Arc<dyn PhysicalExpr>> {
         self.having_filter.as_ref()
     }
 
-    /// HAVING predicate SQL fallback (when compiled filter is not available).
     pub fn having_sql(&self) -> Option<&str> {
         self.having_sql.as_deref()
     }
 
-    /// Compiled pre-agg projection (single-source queries only).
     pub fn compiled_projection(&self) -> Option<&CompiledProjection> {
         self.compiled_projection.as_ref()
     }
 
-    /// Cached optimized logical plan for the pre-agg SQL.
-    ///
-    /// Present only for multi-source queries (where `compiled_projection` is
-    /// `None`). Allows skipping SQL parsing and logical optimization per cycle.
     pub fn cached_pre_agg_plan(&self) -> Option<&LogicalPlan> {
         self.cached_pre_agg_plan.as_ref()
     }
 
-    /// Compute a fingerprint for this query (SQL + schema).
     pub(crate) fn query_fingerprint(&self) -> u64 {
         query_fingerprint(&self.pre_agg_sql, &self.output_schema)
     }
 
-    /// Estimated memory usage in bytes across all groups.
     pub(crate) fn estimated_size_bytes(&self) -> usize {
         let mut total = 0;
         for (key, entry) in &self.groups {
@@ -1475,13 +1300,6 @@ impl IncrementalAggState {
         total
     }
 
-    /// Number of distinct groups currently tracked.
-    #[allow(dead_code)]
-    pub(crate) fn group_count(&self) -> usize {
-        self.groups.len()
-    }
-
-    /// Checkpoint all group states into a serializable struct.
     pub(crate) fn checkpoint_groups(&mut self) -> Result<AggStateCheckpoint, DbError> {
         let fingerprint = self.query_fingerprint();
         let mut groups = Vec::with_capacity(self.groups.len());
@@ -1522,11 +1340,6 @@ impl IncrementalAggState {
         })
     }
 
-    /// Restore group states from a checkpoint.
-    ///
-    /// Creates fresh accumulators and restores their state via
-    /// `merge_batch()` with single-element arrays derived from the
-    /// checkpointed `ScalarValue`s.
     pub(crate) fn restore_groups(
         &mut self,
         checkpoint: &AggStateCheckpoint,
@@ -1606,7 +1419,6 @@ pub(crate) struct AggregateInfo {
     pub(crate) where_predicate: Option<datafusion_expr::Expr>,
 }
 
-/// Walk a `DataFusion` `LogicalPlan` tree to find the first `Aggregate` node.
 pub(crate) fn find_aggregate(plan: &LogicalPlan) -> Option<AggregateInfo> {
     find_aggregate_inner(plan, None)
 }
@@ -1655,11 +1467,6 @@ fn find_aggregate_inner(
     }
 }
 
-/// Extract the WHERE predicate from a plan tree below the Aggregate.
-///
-/// Walks through common unary wrapper nodes (Projection, Sort, Limit,
-/// `SubqueryAlias`) to find a `Filter` that the optimizer may have placed
-/// below intermediate nodes.
 fn extract_where_predicate(plan: &LogicalPlan) -> Option<datafusion_expr::Expr> {
     match plan {
         LogicalPlan::Filter(f) => Some(f.predicate.clone()),
@@ -1671,7 +1478,6 @@ fn extract_where_predicate(plan: &LogicalPlan) -> Option<datafusion_expr::Expr> 
     }
 }
 
-/// Convert a `ScalarValue` to a SQL-safe literal string.
 fn scalar_value_to_sql(sv: &ScalarValue) -> String {
     match sv {
         ScalarValue::Utf8(Some(s))
@@ -1742,7 +1548,6 @@ fn scalar_value_to_sql(sv: &ScalarValue) -> String {
     }
 }
 
-/// Convert a `DataFusion` CASE expression to SQL.
 fn case_to_sql(case: &datafusion_expr::expr::Case) -> String {
     use std::fmt::Write;
     let mut sql = String::from("CASE");
@@ -1764,8 +1569,6 @@ fn case_to_sql(case: &datafusion_expr::expr::Case) -> String {
     sql
 }
 
-/// Convert a `DataFusion` `Expr` to a SQL string for use in pre-aggregation
-/// queries.
 pub(crate) fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
     use datafusion_expr::Expr;
     match expr {
@@ -1859,7 +1662,7 @@ pub(crate) fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
 /// with direct `PhysicalExpr::evaluate()` on the source batch, eliminating
 /// SQL parsing, logical planning, physical planning, and `MemTable` overhead.
 pub(crate) struct CompiledProjection {
-    #[cfg_attr(not(test), allow(dead_code))] // read only by stream_executor tests
+    #[allow(dead_code)]
     pub(crate) source_table: String,
     pub(crate) exprs: Vec<Arc<dyn PhysicalExpr>>,
     pub(crate) filter: Option<Arc<dyn PhysicalExpr>>,
@@ -1915,9 +1718,6 @@ impl CompiledProjection {
     }
 }
 
-/// Apply a compiled HAVING filter to emitted aggregate batches.
-///
-/// Evaluates the `PhysicalExpr` predicate against each batch and filters rows.
 pub(crate) fn apply_compiled_having(
     batches: &[RecordBatch],
     having_filter: &Arc<dyn PhysicalExpr>,
@@ -1946,9 +1746,6 @@ pub(crate) fn apply_compiled_having(
     Ok(result)
 }
 
-/// Compile a HAVING predicate to a `PhysicalExpr`.
-///
-/// Returns `None` if compilation fails (caller should fall back to SQL).
 pub(crate) fn compile_having_filter(
     ctx: &SessionContext,
     having_predicate: Option<&datafusion_expr::Expr>,
@@ -1961,16 +1758,11 @@ pub(crate) fn compile_having_filter(
     create_physical_expr(having_pred, &df_schema, props).ok()
 }
 
-/// Extracted FROM and WHERE clauses from a SQL query.
 pub(crate) struct SqlClauses {
-    /// The FROM clause (table references, joins, etc.)
     pub(crate) from_clause: String,
-    /// The WHERE clause including the `WHERE` keyword, or empty string.
     pub(crate) where_clause: String,
 }
 
-/// Extract FROM and WHERE clauses from a SQL string using the `sqlparser`
-/// AST. Falls back to heuristic string extraction if parsing fails.
 pub(crate) fn extract_clauses(sql: &str) -> SqlClauses {
     if let Ok(clauses) = extract_clauses_ast(sql) {
         return clauses;
@@ -1982,7 +1774,6 @@ pub(crate) fn extract_clauses(sql: &str) -> SqlClauses {
     }
 }
 
-/// AST-based clause extraction using `sqlparser`.
 fn extract_clauses_ast(sql: &str) -> Result<SqlClauses, DbError> {
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
@@ -2023,7 +1814,6 @@ fn extract_clauses_ast(sql: &str) -> Result<SqlClauses, DbError> {
     })
 }
 
-/// Heuristic FROM clause extraction (fallback).
 fn extract_from_clause_heuristic(sql: &str) -> String {
     let upper = sql.to_uppercase();
     let from_pos = upper.find(" FROM ").map(|p| p + 6);
@@ -2040,7 +1830,6 @@ fn extract_from_clause_heuristic(sql: &str) -> String {
     rest[..end].trim().to_string()
 }
 
-/// Heuristic WHERE clause extraction (fallback).
 fn extract_where_clause_heuristic(sql: &str) -> String {
     let upper = sql.to_uppercase();
     let where_pos = upper.find(" WHERE ");
@@ -2057,9 +1846,6 @@ fn extract_where_clause_heuristic(sql: &str) -> String {
     format!(" {}", rest[..end].trim())
 }
 
-/// Resolve the data type of a `DataFusion` expression against the
-/// aggregate node's input schema. This gives the true pre-widening
-/// type (e.g., `Int32` for a column that SUM widens to `Int64`).
 pub(crate) fn resolve_expr_type(
     expr: &datafusion_expr::Expr,
     input_schema: &Schema,
@@ -3371,26 +3157,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_checkpoint_empty_state_returns_none() {
-        use crate::stream_executor::StreamExecutor;
-        let ctx = laminar_sql::create_session_context();
-        laminar_sql::register_streaming_functions(&ctx);
-        let mut executor = StreamExecutor::new(ctx);
-        // No queries registered = no state
-        let result = executor.snapshot_state().unwrap();
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_restore_corrupt_bytes_returns_error() {
-        use crate::stream_executor::StreamExecutor;
-        let ctx = laminar_sql::create_session_context();
-        let mut executor = StreamExecutor::new(ctx);
-        let result = executor.restore_state(b"not valid json");
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn test_restore_fingerprint_mismatch_errors() {
         let (_, mut state) =
             setup_agg_state("SELECT name, SUM(value) as total FROM events GROUP BY name").await;
@@ -3424,58 +3190,6 @@ mod tests {
             err.contains("fingerprint mismatch"),
             "Error should mention fingerprint: {err}"
         );
-    }
-
-    #[test]
-    fn test_checkpoint_backward_compat_without_join_states() {
-        // Verify that checkpoints serialized before join_states was added
-        // still deserialize correctly (serde(default) handles it).
-        let json = r#"{
-            "version": 1,
-            "agg_states": {},
-            "eowc_states": {},
-            "core_window_states": {}
-        }"#;
-        let cp: StreamExecutorCheckpoint = serde_json::from_str(json).unwrap();
-        assert_eq!(cp.version, 1);
-        assert!(cp.join_states.is_empty());
-    }
-
-    #[test]
-    fn test_checkpoint_with_join_states_round_trip() {
-        let mut join_states = FxHashMap::default();
-        join_states.insert(
-            "enriched".to_string(),
-            JoinStateCheckpoint {
-                left_buffer_rows: 100,
-                right_buffer_rows: 50,
-                left_batches: vec![vec![1, 2, 3]],
-                right_batches: vec![vec![4, 5, 6]],
-                last_evicted_watermark: 42,
-                last_evicted_watermark_right: 42,
-            },
-        );
-
-        let cp = StreamExecutorCheckpoint {
-            version: 2,
-            vnode_count: laminar_storage::checkpoint_manifest::VNODE_COUNT,
-            agg_states: FxHashMap::default(),
-            eowc_states: FxHashMap::default(),
-            core_window_states: FxHashMap::default(),
-            join_states,
-            raw_eowc_states: FxHashMap::default(),
-        };
-
-        let bytes = serde_json::to_vec(&cp).unwrap();
-        let restored: StreamExecutorCheckpoint = serde_json::from_slice(&bytes).unwrap();
-
-        assert_eq!(restored.join_states.len(), 1);
-        let js = restored.join_states.get("enriched").unwrap();
-        assert_eq!(js.left_buffer_rows, 100);
-        assert_eq!(js.right_buffer_rows, 50);
-        assert_eq!(js.left_batches, vec![vec![1, 2, 3]]);
-        assert_eq!(js.right_batches, vec![vec![4, 5, 6]]);
-        assert_eq!(js.last_evicted_watermark, 42);
     }
 
     #[tokio::test]

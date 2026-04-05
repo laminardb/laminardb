@@ -9,127 +9,19 @@
 //!
 //! The join state is checkpointed via Arrow IPC serialization.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
-};
+use arrow::array::{Array, ArrayRef, RecordBatch};
 use arrow::compute::concat_batches;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{Field, Schema, SchemaRef};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use laminar_sql::translator::{StreamJoinConfig, StreamJoinType};
 
 use crate::aggregate_state::JoinStateCheckpoint;
 use crate::error::DbError;
-
-/// A borrowed reference to a key column, avoiding per-row String allocations.
-enum KeyColumn<'a> {
-    Utf8(&'a StringArray),
-    Int64(&'a Int64Array),
-}
-
-impl KeyColumn<'_> {
-    fn is_null(&self, i: usize) -> bool {
-        match self {
-            KeyColumn::Utf8(a) => a.is_null(i),
-            KeyColumn::Int64(a) => a.is_null(i),
-        }
-    }
-
-    fn hash_at(&self, i: usize) -> Option<u64> {
-        if self.is_null(i) {
-            return None;
-        }
-        let mut hasher = DefaultHasher::new();
-        match self {
-            KeyColumn::Utf8(a) => a.value(i).hash(&mut hasher),
-            KeyColumn::Int64(a) => a.value(i).hash(&mut hasher),
-        }
-        Some(hasher.finish())
-    }
-
-    fn keys_equal(&self, i: usize, other: &KeyColumn<'_>, j: usize) -> bool {
-        if self.is_null(i) || other.is_null(j) {
-            return false;
-        }
-        match (self, other) {
-            (KeyColumn::Utf8(a), KeyColumn::Utf8(b)) => a.value(i) == b.value(j),
-            (KeyColumn::Int64(a), KeyColumn::Int64(b)) => a.value(i) == b.value(j),
-            _ => false,
-        }
-    }
-}
-
-fn extract_key_column<'a>(
-    batch: &'a RecordBatch,
-    col_name: &str,
-) -> Result<KeyColumn<'a>, DbError> {
-    let col_idx = batch
-        .schema()
-        .index_of(col_name)
-        .map_err(|_| DbError::Pipeline(format!("Column '{col_name}' not found")))?;
-    let array = batch.column(col_idx);
-    match array.data_type() {
-        DataType::Utf8 => {
-            let a = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Utf8")))?;
-            Ok(KeyColumn::Utf8(a))
-        }
-        DataType::Int64 => {
-            let a = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Int64")))?;
-            Ok(KeyColumn::Int64(a))
-        }
-        other => Err(DbError::Pipeline(format!(
-            "Unsupported key column type: {other}"
-        ))),
-    }
-}
-
-fn extract_column_as_timestamps(batch: &RecordBatch, col_name: &str) -> Result<Vec<i64>, DbError> {
-    let col_idx = batch
-        .schema()
-        .index_of(col_name)
-        .map_err(|_| DbError::Pipeline(format!("Timestamp column '{col_name}' not found")))?;
-    let array = batch.column(col_idx);
-    match array.data_type() {
-        DataType::Int64 => {
-            let a = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Int64")))?;
-            Ok(a.values().to_vec())
-        }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let a = array
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .ok_or_else(|| {
-                    DbError::Pipeline(format!("Column '{col_name}' is not TimestampMillisecond"))
-                })?;
-            Ok(a.values().to_vec())
-        }
-        DataType::Float64 => {
-            let a = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Float64")))?;
-            #[allow(clippy::cast_possible_truncation)]
-            Ok(a.values().iter().map(|v| *v as i64).collect())
-        }
-        other => Err(DbError::Pipeline(format!(
-            "Unsupported timestamp column type for '{col_name}': {other}"
-        ))),
-    }
-}
+use crate::key_column::{extract_column_as_timestamps, extract_key_column, KeyColumn};
 
 /// Compact when accumulated batch count exceeds this threshold.
 const COMPACTION_THRESHOLD: usize = 32;
@@ -937,6 +829,8 @@ fn emit_unmatched_right_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Float64Array, Int64Array, StringArray};
+    use arrow::datatypes::DataType;
     use laminar_sql::translator::StreamJoinType;
     use std::time::Duration;
 

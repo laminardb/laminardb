@@ -1,17 +1,4 @@
 //! Operator graph for streaming SQL execution.
-//!
-//! Replaces the monolithic `StreamExecutor` with a graph of independent operator
-//! nodes connected by typed edges. Each operator owns its state, checkpoint/restore,
-//! and execution logic.
-//!
-//! # Architecture
-//!
-//! ```text
-//! SourcePassthrough ──edge──▶ SqlQueryOperator ──edge──▶ (downstream)
-//!        ▲ inject batches             │ process + emit
-//!        │                            ▼
-//!     source_map              output_map → results
-//! ```
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -37,8 +24,6 @@ use laminar_sql::translator::{
 
 #[async_trait]
 pub(crate) trait GraphOperator: Send {
-    /// Process one execution cycle.
-    ///
     /// `watermarks[i]` is the watermark for `inputs[i]`, derived from
     /// the upstream node's output watermark. Multi-input operators use
     /// per-input watermarks for independent eviction.
@@ -79,7 +64,6 @@ struct GraphEdge {
     target: usize,
 }
 
-/// Passes input batches through unchanged. Used for source injection nodes.
 struct SourcePassthrough;
 
 #[async_trait]
@@ -122,7 +106,6 @@ impl GraphOperator for TombstonedOperator {
     }
 }
 
-/// Pre-filters self-join input batches via `SELECT * FROM tmp WHERE <filter_sql>`.
 struct SqlFilterOperator {
     filter_sql: String,
     ctx: SessionContext,
@@ -256,9 +239,6 @@ impl OperatorGraph {
         self.max_state_bytes = limit;
     }
 
-    /// Set maximum batches per operator input port. When fan-out would
-    /// exceed this limit, the oldest batches are shed and a warning is
-    /// logged. `0` means unlimited.
     pub fn set_max_input_buf_batches(&mut self, cap: usize) {
         self.max_input_buf_batches = cap;
     }
@@ -271,9 +251,6 @@ impl OperatorGraph {
         self.counters = Some(c);
     }
 
-    /// Returns the fill ratio (0.0–1.0) of the most-full input buffer
-    /// relative to `max_input_buf_batches`. Returns 0.0 when the cap is
-    /// disabled (`max_input_buf_batches == 0`) or no buffers exist.
     #[allow(clippy::cast_precision_loss)]
     pub fn input_buf_pressure(&self) -> f64 {
         let cap = self.max_input_buf_batches;
@@ -290,8 +267,6 @@ impl OperatorGraph {
         (max_len as f64 / cap as f64).min(1.0)
     }
 
-    /// Returns `true` if any non-source operator has pending input from
-    /// a prior cycle (deferred due to budget exhaustion).
     pub fn has_pending_input(&self) -> bool {
         self.input_bufs.iter().enumerate().any(|(id, ports)| {
             ports.iter().any(|port| !port.is_empty())
@@ -306,7 +281,6 @@ impl OperatorGraph {
         self.lookup_registry = Some(registry);
     }
 
-    /// Shed oldest batches from an input buffer when it exceeds the cap.
     fn enforce_input_buf_cap(&mut self, node: usize, port: usize) {
         let cap = self.max_input_buf_batches;
         if cap == 0 {
@@ -326,16 +300,11 @@ impl OperatorGraph {
         }
     }
 
-    /// Register a source schema. Creates a [`LiveSourceProvider`] in the
-    /// `SessionContext` so that per-cycle batch delivery is a handle swap
-    /// instead of a catalog register/deregister pair.
     pub fn register_source_schema(&mut self, name: String, schema: SchemaRef) {
         self.ensure_live_provider(&name, &schema);
         self.source_schemas.insert(name, schema);
     }
 
-    /// Ensure a [`LiveSourceProvider`] is registered in the catalog for
-    /// `name`. Idempotent — skips if a handle already exists.
     fn ensure_live_provider(&mut self, name: &str, schema: &SchemaRef) {
         if self.live_handles.contains_key(name) {
             return;
@@ -358,8 +327,6 @@ impl OperatorGraph {
         self.live_handles.insert(name.to_string(), handle);
     }
 
-    /// Returns the temporal join configs for tables that appear as right-side
-    /// in temporal joins.
     pub fn temporal_join_configs(&self) -> Vec<TemporalJoinTranslatorConfig> {
         self.temporal_configs.clone()
     }
@@ -370,8 +337,6 @@ impl OperatorGraph {
             .position(|n| &*n.name == name && !n.removed)
     }
 
-    /// Ensure a source passthrough node exists for the given table name.
-    /// Returns the node ID.
     fn ensure_source_node(&mut self, table_name: &str) -> usize {
         if let Some(&id) = self.source_map.get(table_name) {
             return id;
@@ -419,8 +384,6 @@ impl OperatorGraph {
         }
     }
 
-    /// Ensure source/passthrough nodes exist for all upstream tables referenced
-    /// by a query's join configs or plain table references.
     fn ensure_query_source_nodes(
         &mut self,
         temporal_probe_config: Option<&laminar_sql::translator::TemporalProbeConfig>,
@@ -457,12 +420,6 @@ impl OperatorGraph {
         }
     }
 
-    /// Wire inbound edges from upstream source nodes to the given query node.
-    ///
-    /// For two-input joins (temporal probe, ASOF, stream join), wires the left
-    /// table to port 0 and the right table to port 1. For single-input queries,
-    /// wires all table references to port 0 (avoiding duplicates).
-    ///
     /// Returns `true` if the query depends on another query (not just raw sources).
     #[allow(clippy::too_many_arguments)]
     fn wire_query_edges(
@@ -551,11 +508,6 @@ impl OperatorGraph {
         }
     }
 
-    /// Register a stream query for execution.
-    ///
-    /// Detection runs at registration time (same as `StreamExecutor::add_query`):
-    /// ASOF, temporal, and interval joins are detected from SQL text. Standard
-    /// and EOWC queries use lazy initialization on first execution.
     #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
     pub fn add_query(
         &mut self,
@@ -736,8 +688,6 @@ impl OperatorGraph {
         self.topo_dirty = true;
     }
 
-    /// Create the appropriate operator for a query based on detection results.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn create_operator(
         &self,
@@ -819,7 +769,6 @@ impl OperatorGraph {
         ))
     }
 
-    /// Remove a query by name using a tombstone.
     pub fn remove_query(&mut self, name: &str) {
         let Some(node_id) = self.find_node(name) else {
             return;
@@ -859,8 +808,8 @@ impl OperatorGraph {
         self.topo_dirty = true;
     }
 
-    /// Recompute topological order using Kahn's algorithm.
     fn compute_topo_order(&mut self) {
+        // Kahn's algorithm
         let n = self.nodes.len();
         let mut in_degree = vec![0usize; n];
         let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -924,7 +873,6 @@ impl OperatorGraph {
         self.topo_dirty = false;
     }
 
-    /// Swap source batches into their [`LiveSourceProvider`] handles.
     fn register_source_tables(&mut self, source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
         for (name, batches) in source_batches {
             if batches.is_empty() {
@@ -942,18 +890,12 @@ impl OperatorGraph {
         }
     }
 
-    /// Clear all live handles so stale data isn't visible next cycle.
     fn finish_cycle(&mut self) {
         for handle in self.live_handles.values() {
             handle.clear();
         }
     }
 
-    /// Execute a single operator node: take inputs, process, route outputs.
-    ///
-    /// Returns `Ok(())` on success or if the operator was skipped
-    /// (depends-on-stream error). Returns `Err` on fatal errors — the caller
-    /// must call `finish_cycle` before propagating.
     #[allow(clippy::too_many_lines)]
     async fn execute_single_operator(
         &mut self,
@@ -1085,14 +1027,6 @@ impl OperatorGraph {
         Ok(())
     }
 
-    /// Execute one processing cycle.
-    ///
-    /// Registers `source_batches` as temporary tables, runs all operators in
-    /// topological order, and returns a map from stream name to result batches.
-    ///
-    /// When the per-query time budget is exceeded, one deferred operator with
-    /// non-empty input is executed to guarantee forward progress and prevent
-    /// tail-operator starvation.
     pub async fn execute_cycle(
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
@@ -1182,9 +1116,7 @@ impl OperatorGraph {
         Ok(results)
     }
 
-    /// Snapshot all operator state into a `GraphCheckpoint`.
-    ///
-    /// Requires `&mut self` because some accumulators need `&mut` for `state()`.
+    // &mut self: some accumulators need &mut for state()
     pub fn snapshot_state(&mut self) -> Result<Option<GraphCheckpoint>, DbError> {
         let mut operators = FxHashMap::default();
         for node in &mut self.nodes {
@@ -1204,7 +1136,6 @@ impl OperatorGraph {
         }))
     }
 
-    /// Restore operator state from a `GraphCheckpoint`.
     pub fn restore_state(&mut self, checkpoint: &GraphCheckpoint) -> Result<usize, DbError> {
         let mut restored = 0;
         for node in &mut self.nodes {
@@ -1221,13 +1152,11 @@ impl OperatorGraph {
         Ok(restored)
     }
 
-    /// Serialize a `GraphCheckpoint` to JSON bytes.
     pub fn serialize_checkpoint(cp: &GraphCheckpoint) -> Result<Vec<u8>, DbError> {
         serde_json::to_vec(cp)
             .map_err(|e| DbError::Pipeline(format!("operator graph checkpoint serialization: {e}")))
     }
 
-    /// Restore operator state from serialized bytes.
     pub fn restore_from_bytes(&mut self, bytes: &[u8]) -> Result<usize, DbError> {
         let checkpoint: GraphCheckpoint = serde_json::from_slice(bytes).map_err(|e| {
             DbError::Pipeline(format!("operator graph checkpoint deserialization: {e}"))
@@ -1236,11 +1165,6 @@ impl OperatorGraph {
     }
 }
 
-/// Evaluate a `CompiledProjection` on input batches, propagating the first error.
-///
-/// Distinguishes between "evaluation error" (returns `Err`) and "legitimate empty
-/// result after filtering" (returns `Ok(empty vec)`). Used by operators to decide
-/// whether to fall back to `CachedPlan`.
 pub(crate) fn try_evaluate_compiled(
     proj: &crate::aggregate_state::CompiledProjection,
     batches: &[RecordBatch],

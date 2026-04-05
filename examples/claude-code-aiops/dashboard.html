@@ -418,12 +418,24 @@
     <span><span class="dot" id="d-prompts"></span>prompts</span>
     <span><span class="dot" id="d-decisions"></span>perms</span>
     <span><span class="dot" id="d-activity"></span>activity</span>
+    <span><span class="dot" id="d-lifecycle"></span>joins</span>
     <span id="uptime" style="color:var(--text-dim)"></span>
     <button class="reconnect-btn" onclick="reconnectAll()">reconnect</button>
   </div>
 </div>
 
 <div class="grid">
+  <!-- Row 0: HERO — Prompt Lifecycle (stream-to-stream join) -->
+  <div class="panel span3">
+    <div class="panel-title">Prompt Lifecycle <span style="color:var(--accent);font-size:9px;margin-left:8px">STREAM JOIN on prompt.id</span></div>
+    <div style="overflow-x:auto">
+      <table class="tool-tbl" id="lifecycle-table">
+        <tr><th>Time</th><th>Model</th><th>Tokens</th><th>Cost</th><th>Latency</th><th>Tools</th></tr>
+      </table>
+    </div>
+    <div class="empty" id="lifecycle-empty">Waiting for stream join results (prompt → api_request correlation)...</div>
+  </div>
+
   <!-- Row 1: Cost hero + stats -->
   <div class="panel span2">
     <div class="panel-title">Session Cost</div>
@@ -539,6 +551,8 @@
 <script>
 // State
 const S = {
+  lifecycle: [],      // joined prompt→api rows
+  toolJoins: {},      // prompt_id → [{tool_name, success, duration_ms}]
   totalCost: 0,
   totalRequests: 0,
   totalInputTokens: 0,
@@ -726,6 +740,54 @@ function handlePrompts(rows) {
   renderAll();
 }
 
+function handleLifecycle(rows) {
+  for (const r of rows) {
+    const id = r.prompt_id || '';
+    const model = (r.model || '').replace('claude-', '').replace(/-\d{8}$/, '');
+    const existing = id && S.lifecycle.find(e => e.id === id);
+    if (existing) {
+      // Merge additional api_request matches for same prompt
+      existing.tokens += (+r.input_tokens || 0) + (+r.output_tokens || 0);
+      existing.cost += +r.cost_usd || 0;
+    } else {
+      S.lifecycle.unshift({
+        id: id,
+        time: new Date(),
+        model: model,
+        tokens: (+r.input_tokens || 0) + (+r.output_tokens || 0),
+        cost: +r.cost_usd || 0,
+        latency: +r.time_to_response_ms || +r.api_duration_ms || 0,
+        tools: [],
+      });
+    }
+    addEvent('join', `${model} ${fmtCost(+r.cost_usd || 0)} prompt→api`);
+  }
+  if (S.lifecycle.length > 50) S.lifecycle.length = 50;
+  renderAll();
+}
+
+function handleToolJoins(rows) {
+  for (const r of rows) {
+    const id = r.prompt_id || '';
+    if (!id) continue;
+    const tool = {
+      name: r.tool_name || '?',
+      success: r.tool_success === 'true',
+      ms: +r.tool_duration_ms || 0,
+    };
+    // Attach to lifecycle entry if exists
+    const entry = S.lifecycle.find(e => e.id === id);
+    if (entry) {
+      entry.tools.push(tool);
+    }
+    // Also store separately for late arrivals
+    if (!S.toolJoins[id]) S.toolJoins[id] = [];
+    S.toolJoins[id].push(tool);
+    addEvent('join', `${esc(tool.name)} ${tool.success ? '✓' : '✗'} prompt→tool`);
+  }
+  renderAll();
+}
+
 function handleDecisions(rows) {
   for (const r of rows) {
     const name = r.tool_name || 'unknown';
@@ -814,6 +876,7 @@ function renderAll() {
   renderSparkline();
   renderModels();
   renderTools();
+  renderLifecycle();
   renderDecisions();
   renderActivity();
   renderPrompts();
@@ -960,6 +1023,37 @@ function renderEvents() {
   ).join('');
 }
 
+function renderLifecycle() {
+  const tbl = document.getElementById('lifecycle-table');
+  const empty = document.getElementById('lifecycle-empty');
+  if (!S.lifecycle.length) return;
+  empty.style.display = 'none';
+
+  // Attach any late tool joins
+  for (const entry of S.lifecycle) {
+    if (S.toolJoins[entry.id] && entry.tools.length < S.toolJoins[entry.id].length) {
+      entry.tools = S.toolJoins[entry.id];
+    }
+  }
+
+  let html = '<tr><th>Time</th><th>Model</th><th>Tokens</th><th>Cost</th><th>Latency</th><th>Tools</th></tr>';
+  for (const e of S.lifecycle.slice(0, 30)) {
+    const toolsHtml = e.tools.length
+      ? e.tools.map(t => `<span style="color:${t.success ? 'var(--green)' : 'var(--red)'}">${esc(t.name)}</span>`).join(' ')
+      : '<span style="color:var(--text-dim)">--</span>';
+    const costColor = e.cost > 0.5 ? 'var(--amber)' : 'var(--green)';
+    html += `<tr>
+      <td>${fmtTime(e.time)}</td>
+      <td style="color:var(--accent)">${esc(e.model)}</td>
+      <td>${fmtTokens(e.tokens)}</td>
+      <td style="color:${costColor};font-weight:600">${fmtCost(e.cost)}</td>
+      <td>${fmtMs(e.latency)}</td>
+      <td>${toolsHtml}</td>
+    </tr>`;
+  }
+  tbl.innerHTML = html;
+}
+
 function renderDecisions() {
   const el = document.getElementById('decisions-panel');
   const entries = Object.entries(S.decisions).sort((a, b) => (b[1].accept + b[1].reject) - (a[1].accept + a[1].reject));
@@ -1056,6 +1150,8 @@ ws(9002, 'd-tools', handleTools);
 ws(9003, 'd-prompts', handlePrompts);
 ws(9004, 'd-decisions', handleDecisions);
 ws(9005, 'd-activity', handleActivity);
+ws(9006, 'd-lifecycle', handleLifecycle);
+ws(9007, 'd-lifecycle', handleToolJoins);
 
 // Uptime ticker
 setInterval(() => {

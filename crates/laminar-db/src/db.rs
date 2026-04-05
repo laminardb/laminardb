@@ -30,14 +30,10 @@ pub(crate) const STATE_RUNNING: u8 = 2;
 pub(crate) const STATE_SHUTTING_DOWN: u8 = 3;
 pub(crate) const STATE_STOPPED: u8 = 4;
 
-/// Estimate the number of cache entries from a memory budget.
-///
-/// Assumes ~256 bytes per cache entry and enforces a minimum of 1024 entries.
 fn cache_entries_from_memory(mem: laminar_sql::parser::lookup_table::ByteSize) -> usize {
     (mem.as_bytes() / 256).max(1024) as usize
 }
 
-/// Extract SQL text from a `StreamingStatement` for storage in the connector manager.
 pub(crate) fn streaming_statement_to_sql(stmt: &StreamingStatement) -> String {
     match stmt {
         StreamingStatement::Standard(sql_stmt) => sql_stmt.to_string(),
@@ -53,23 +49,6 @@ pub(crate) fn streaming_statement_to_sql(stmt: &StreamingStatement) -> String {
 /// Provides a unified interface for SQL execution, data ingestion,
 /// and result consumption. All streaming infrastructure (sources, sinks,
 /// channels, subscriptions) is managed internally.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use laminar_db::LaminarDB;
-///
-/// let db = LaminarDB::open()?;
-///
-/// db.execute("CREATE SOURCE trades (
-///     symbol VARCHAR, price DOUBLE, ts BIGINT,
-///     WATERMARK FOR ts AS ts - INTERVAL '1' SECOND
-/// )").await?;
-///
-/// let query = db.execute("SELECT symbol, AVG(price) FROM trades
-///     GROUP BY symbol, TUMBLE(ts, INTERVAL '1' MINUTE)
-/// ").await?;
-/// ```
 pub struct LaminarDB {
     pub(crate) catalog: Arc<SourceCatalog>,
     pub(crate) planner: parking_lot::Mutex<StreamingPlanner>,
@@ -107,20 +86,13 @@ pub struct LaminarDB {
     pub(crate) mv_store: Arc<parking_lot::RwLock<crate::mv_store::MvStore>>,
 }
 
-/// Per-source watermark tracking state for the pipeline loop.
-///
-/// Combines an `EventTimeExtractor` (to find the max timestamp in each batch)
-/// with a watermark generator (to compute the watermark with delay).
 pub(crate) struct SourceWatermarkState {
     pub(crate) extractor: laminar_core::time::EventTimeExtractor,
     pub(crate) generator: Box<dyn laminar_core::time::WatermarkGenerator>,
-    /// Watermark column name for late-row filtering.
     pub(crate) column: String,
-    /// Timestamp format for late-row filtering.
     pub(crate) format: laminar_core::time::TimestampFormat,
 }
 
-/// Infer the `TimestampFormat` from a schema column's `DataType`.
 pub(crate) fn infer_timestamp_format(
     schema: &arrow::datatypes::SchemaRef,
     column: &str,
@@ -135,11 +107,6 @@ pub(crate) fn infer_timestamp_format(
     }
 }
 
-/// Filters rows from a `RecordBatch` whose timestamp is behind the watermark.
-///
-/// Returns `None` if all rows are late (i.e., filtered result is empty).
-/// For sources without a watermark column, callers should skip this function
-/// and pass the batch through unfiltered.
 pub(crate) fn filter_late_rows(
     batch: &RecordBatch,
     column: &str,
@@ -155,7 +122,6 @@ pub(crate) fn filter_late_rows(
     )
 }
 
-/// Parse a human-readable duration string (e.g., "5s", "1m", "500ms", "30s").
 pub(crate) fn parse_duration_str(s: &str) -> Option<std::time::Duration> {
     let s = s.trim();
     if s.ends_with("ms") {

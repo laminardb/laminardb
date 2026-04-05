@@ -1,6 +1,4 @@
-//! `PipelineCallback` implementation bridging the event-driven pipeline
-//! coordinator to the stream executor, sinks, watermarks, checkpoints,
-//! and table sources.
+//! Production `PipelineCallback` bridging coordinator to sinks, checkpoints, and watermarks.
 #![allow(clippy::disallowed_types)] // cold path
 
 use std::sync::Arc;
@@ -86,9 +84,6 @@ pub(crate) struct ConnectorPipelineCallback {
 }
 
 impl ConnectorPipelineCallback {
-    /// Snapshot operator state inline, then offload `serde_json::to_vec()`
-    /// to `spawn_blocking` so the coordinator's I/O reactor is not blocked.
-    /// The coordinator still awaits the result (no concurrent event processing).
     async fn capture_and_serialize_operator_state(
         &mut self,
     ) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
@@ -123,7 +118,6 @@ impl ConnectorPipelineCallback {
         Ok(operator_states)
     }
 
-    /// Try to compile sink filter SQL to `PhysicalExpr` for sinks that haven't been compiled yet.
     async fn compile_pending_sink_filters(
         &mut self,
         results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,

@@ -68,36 +68,54 @@ Use Claude Code normally. The dashboard updates in real time.
 | **Tool Usage** | 15s | Per-tool call counts, success rates, latency |
 | **Tool Permissions** | 15s | Accept/reject decisions, auto-approval % |
 | **Activity Timeline** | 15s | API and tool call volume over time |
+| **Prompt Lifecycle** | streaming | Stream join: prompt → api_request correlated by prompt.id |
 | **Per-Prompt Breakdown** | 30s | Cost, model, tokens, tools, cache %, duration per prompt |
 | **Stat Cards** | 15s | API reqs, tool calls, avg latency, cost/req, fast mode %, $/hr |
 | **Event Log** | live | Scrolling feed of all pipeline output |
 
 ## How It Works
 
-Claude Code emits [OpenTelemetry log events](https://opentelemetry.io/docs/specs/otel/logs/)
-for every prompt, API call, tool decision, and tool result. These events contain
-token counts, costs, latencies, and tool metadata.
+Claude Code emits separate OTel events for prompts, API calls, and tool results —
+correlated by `prompt.id` but arriving as independent log records. LaminarDB
+receives these via OTLP/gRPC, runs **stream-to-stream temporal joins** to
+correlate prompt → api_request → tool_result in real-time, plus windowed
+aggregations for cost and tool metrics. Results push to the dashboard over
+WebSocket. All output is persisted to Parquet files for historical analysis.
 
-LaminarDB receives these events via OTLP/gRPC, runs 5 streaming SQL pipelines
-with tumbling windows, and pushes aggregated results to the dashboard over
-WebSocket. All pipeline output is also persisted to local JSON files in
-`./data/aiops/` for historical analysis.
+### Hero Feature: Stream-to-Stream Temporal Join
+
+```sql
+SELECT p.prompt_id, a.model, a.cost_usd, a.duration_ms
+FROM otel_events p
+JOIN otel_events a
+    ON p.prompt_id = a.prompt_id
+    AND a.ts BETWEEN p.ts AND p.ts + INTERVAL '2' MINUTE
+WHERE p.event_name = 'user_prompt'
+    AND a.event_name = 'api_request'
+```
+
+This reconstructs "what happened when the developer submitted this prompt?" by
+joining the prompt event with its API response — as events flow in real-time.
+Prometheus cannot do this. Grafana cannot do this. No AI observability platform
+offers streaming SQL joins over raw telemetry.
 
 ### Pipelines
 
-| Pipeline | Window | What It Computes |
-|----------|--------|------------------|
-| `event_count` | 5s | Heartbeat (event count) |
-| `cost_by_model` | 15s | Cost, tokens, latency grouped by model |
-| `tool_stats` | 15s | Tool invocations, success rate, latency |
-| `tool_decisions` | 15s | Permission accept/reject by tool and source |
-| `session_activity` | 15s | Event counts, cost velocity, speed mode |
-| `prompt_analysis` | 30s | Per-prompt cost, model, tokens, tools, cache |
+| Pipeline | Type | What It Computes |
+|----------|------|------------------|
+| `prompt_lifecycle` | **stream join** | Prompt → API call correlation (model, cost, latency) |
+| `prompt_tools` | **stream join** | Prompt → tool execution correlation (tool, success, duration) |
+| `event_count` | window | Heartbeat (5s event count) |
+| `cost_by_model` | window | Cost, tokens, latency grouped by model (15s) |
+| `tool_stats` | window | Tool invocations, success rate, latency (15s) |
+| `tool_decisions` | window | Permission accept/reject by tool (15s) |
+| `session_activity` | window | Event counts, cost velocity, speed mode (15s) |
+| `prompt_analysis` | window | Per-prompt cost, model, tokens, tools, cache (30s) |
 
 ### Persistence
 
-All pipeline output is written to `./data/aiops/` as append-mode JSON files.
-These survive server restarts — you get historical data without any database.
+All pipeline output is written to `./data/aiops/` as Parquet files with zstd
+compression. These survive server restarts — query with DuckDB or pandas.
 
 ## Claude Code Telemetry Reference
 

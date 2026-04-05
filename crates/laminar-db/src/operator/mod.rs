@@ -14,13 +14,8 @@ use datafusion_expr::LogicalPlan;
 use crate::error::DbError;
 use crate::sql_analysis::{extract_projection_exprs, CompiledPostProjection};
 
-/// Execute a cached `LogicalPlan` through `DataFusion` physical planning.
-///
-/// The logical plan is cached (skips SQL parsing + logical optimization),
-/// but the physical plan is rebuilt per call because sub-query `MemTable`
-/// leaves have different data each time. Only the main query path
-/// (`SqlQueryOperator::CachedPlan`) caches the physical plan — its leaves
-/// are `LiveSourceExec` which reads fresh data at `execute()` time.
+/// Physical plan is rebuilt per call because sub-query `MemTable` leaves
+/// have different data each time.
 pub(crate) async fn execute_logical_plan(
     ctx: &SessionContext,
     op_name: &str,
@@ -44,10 +39,6 @@ pub(crate) mod sql_query;
 pub(crate) mod temporal_join;
 pub(crate) mod temporal_probe_join;
 
-/// Try to compile a post-join projection SQL to physical expressions.
-///
-/// On success, returns a `CompiledPostProjection` that evaluates the
-/// projection directly on a `RecordBatch` without SQL overhead.
 pub(crate) async fn try_compile_post_projection(
     ctx: &SessionContext,
     proj_sql: &str,
@@ -70,7 +61,6 @@ pub(crate) async fn try_compile_post_projection(
     })
 }
 
-/// Apply a compiled post-projection to a single batch.
 fn apply_compiled_post_projection(
     proj: &CompiledPostProjection,
     batch: &RecordBatch,
@@ -91,9 +81,6 @@ fn apply_compiled_post_projection(
         .map_err(|e| DbError::Pipeline(format!("post-projection batch: {e}")))
 }
 
-/// Apply optional post-join projection, preferring compiled `PhysicalExpr` over SQL.
-///
-/// Shared by ASOF, temporal, and interval join operators.
 pub(crate) async fn apply_post_projection(
     ctx: &SessionContext,
     op_name: &str,

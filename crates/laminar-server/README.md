@@ -123,8 +123,6 @@ format = "json"
 | POST | `/api/v1/sql` | Execute ad-hoc SQL (`{"sql": "..."}`) |
 | POST | `/api/v1/reload` | Hot-reload configuration |
 | GET | `/api/v1/cluster` | Cluster status (delta mode only) |
-| POST | `/api/v1/pause` | Pause pipeline (stub — returns 501) |
-| POST | `/api/v1/resume` | Resume pipeline (stub — returns 501) |
 
 ## Hot Reload
 
@@ -144,4 +142,4 @@ See [deploy/README.md](../../deploy/README.md) for binary downloads, Docker, and
 - [`laminar-db`](../laminar-db) -- Database facade
 - [`laminar-connectors`](../laminar-connectors) -- External system connectors
 - [`laminar-core`](../laminar-core) -- Streaming engine
-- [`laminar-storage`](../laminar-storage) -- WAL and checkpoint storage
+- [`laminar-storage`](../laminar-storage) -- Checkpoint storage

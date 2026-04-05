@@ -1,13 +1,6 @@
 #![deny(clippy::disallowed_types)]
 
-//! Core window state for EOWC queries routed through core operators.
-//!
-//! Routes qualifying SQL EOWC queries through the core engine's canonical
-//! window assigners (`TumblingWindowAssigner`, `SlidingWindowAssigner`, or
-//! session-gap logic) for window assignment while using `DataFusion`
-//! `Accumulator`s for aggregation. This eliminates the duplicated window
-//! assignment logic in `IncrementalEowcState`.
-//!
+//! Core window state for tumbling/hopping/session aggregate queries.
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -42,28 +35,21 @@ enum CoreWindowAssigner {
 
 /// Pre-compiled post-aggregate projection (e.g., `SUM(a)/SUM(b) AS ratio`).
 struct PostProjection {
-    /// One `PhysicalExpr` per column in `final_schema`, evaluated against
-    /// an intermediate batch with the `Aggregate` node's output schema.
     exprs: Vec<Arc<dyn PhysicalExpr>>,
-    /// Output schema after projection: `[window_start, window_end, projected...]`.
     final_schema: SchemaRef,
-    /// Schema matching the `Aggregate` output: `[group_cols..., agg_results...]`.
     intermediate_schema: SchemaRef,
 }
 
-/// Accumulator state for a single session window instance.
 struct SessionAccState {
     start: i64,
     end: i64,
     accs: Vec<Box<dyn datafusion_expr::Accumulator>>,
 }
 
-/// Per-group session state: active sessions keyed by start timestamp.
 struct SessionGroupState {
     sessions: BTreeMap<i64, SessionAccState>,
 }
 
-/// Serializable checkpoint for a single session.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SessionCheckpoint {
     pub start: i64,
@@ -71,17 +57,14 @@ pub(crate) struct SessionCheckpoint {
     pub acc_states: Vec<Vec<serde_json::Value>>,
 }
 
-/// Serializable checkpoint for one group's sessions.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SessionGroupCheckpoint {
     pub key: Vec<serde_json::Value>,
     pub sessions: Vec<SessionCheckpoint>,
 }
 
-/// Serializable checkpoint for a core window pipeline state.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CoreWindowCheckpoint {
-    /// Query fingerprint for schema validation.
     pub fingerprint: u64,
     /// Per-window checkpoint data (reuses EOWC format) — used by
     /// tumbling and hopping assigners.
@@ -1278,33 +1261,27 @@ impl CoreWindowState {
         Ok(result)
     }
 
-    /// Pre-aggregation SQL.
-    #[allow(dead_code)] // Accessed in tests and available for diagnostics.
+    #[cfg(test)]
     pub fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql
     }
 
-    /// HAVING predicate SQL, if any.
     pub fn having_sql(&self) -> Option<&str> {
         self.having_sql.as_deref()
     }
 
-    /// Compiled HAVING filter, if available.
     pub fn having_filter(&self) -> Option<&Arc<dyn PhysicalExpr>> {
         self.having_filter.as_ref()
     }
 
-    /// Compiled pre-aggregation projection, if available.
     pub fn compiled_projection(&self) -> Option<&CompiledProjection> {
         self.compiled_projection.as_ref()
     }
 
-    /// Cached optimized logical plan for the pre-agg SQL.
     pub fn cached_pre_agg_plan(&self) -> Option<&datafusion_expr::LogicalPlan> {
         self.cached_pre_agg_plan.as_ref()
     }
 
-    /// Compute a fingerprint for this query (SQL + schema).
     pub(crate) fn query_fingerprint(&self) -> u64 {
         query_fingerprint(&self.pre_agg_sql, &self.output_schema)
     }
@@ -1347,17 +1324,6 @@ impl CoreWindowState {
             }
         }
         total
-    }
-
-    /// Total number of distinct groups across all windows.
-    ///
-    /// For tumbling/hopping: sums group counts across all open windows.
-    /// For session: counts groups in `session_groups`.
-    #[allow(dead_code)]
-    pub(crate) fn group_count(&self) -> usize {
-        let windowed: usize = self.windows.values().map(|g| g.len()).sum();
-        let session = self.session_groups.len();
-        windowed + session
     }
 
     /// Checkpoint all per-window group states into a serializable struct.

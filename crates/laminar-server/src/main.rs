@@ -1,10 +1,4 @@
 //! LaminarDB standalone server binary.
-//!
-//! Reads a TOML config file and runs streaming SQL pipelines.
-//!
-//! ```bash
-//! laminardb --config laminardb.toml
-//! ```
 
 #![allow(clippy::disallowed_types)] // cold path: server startup and config only
 
@@ -36,26 +30,16 @@ use clap::Parser;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// LaminarDB - High-performance embedded streaming database
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about = "LaminarDB streaming database server")]
 struct Args {
-    /// Configuration file path
     #[arg(short, long, default_value = "laminardb.toml")]
     config: String,
-
-    /// Log level
     #[arg(long, default_value = "info")]
     log_level: String,
-
-    /// Bind address for admin API (overrides config file)
     #[arg(long)]
     admin_bind: Option<String>,
-
     /// Validate checkpoints and exit without starting the server.
-    ///
-    /// Walks all checkpoints, verifies manifest integrity and state
-    /// checksums, and reports which are valid for recovery.
     #[arg(long)]
     validate_checkpoints: bool,
 }
@@ -99,7 +83,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Validate all checkpoints and exit with a report.
 async fn validate_checkpoints_and_exit(config: &config::ServerConfig) -> Result<()> {
     let store = build_checkpoint_store(config);
     let Some(store) = store else {
@@ -136,7 +119,6 @@ async fn validate_checkpoints_and_exit(config: &config::ServerConfig) -> Result<
     Ok(())
 }
 
-/// Build a checkpoint store from server config (shared between validate and run).
 fn build_checkpoint_store(
     config: &config::ServerConfig,
 ) -> Option<Box<dyn laminar_storage::checkpoint_store::CheckpointStore>> {

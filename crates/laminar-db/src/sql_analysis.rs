@@ -1,19 +1,4 @@
-//! SQL analysis and detection utilities.
-//!
-//! Extracted from `stream_executor.rs` — these functions are used by
-//! `OperatorGraph`, DDL processing, and operator implementations to inspect
-//! SQL queries without running them.
-//!
-//! # Contents
-//!
-//! - **Table reference extraction**: [`extract_table_references`], [`single_source_table`]
-//! - **Join detection**: [`detect_asof_query`], [`detect_temporal_query`],
-//!   [`detect_stream_join_query`], [`detect_temporal_probe_query`]
-//! - **Projection helpers**: [`extract_projection_exprs`], [`extract_projection_filter`],
-//!   [`CompiledPostProjection`], [`ProjectionFilterInfo`]
-//! - **Window helpers**: [`compute_closed_boundary`], [`infer_ts_format_from_batch`]
-//! - **Emit conversion**: [`sql_emit_to_core`], [`emit_clause_to_core`]
-//! - **Post-filter**: [`apply_topk_filter`]
+//! SQL analysis and join detection utilities.
 
 use std::sync::Arc;
 
@@ -32,6 +17,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 
 use laminar_sql::parser::join_parser::analyze_joins;
+#[cfg(test)]
 use laminar_sql::parser::{EmitClause, EmitStrategy as SqlEmitStrategy};
 use laminar_sql::translator::{
     AsofJoinTranslatorConfig, JoinOperatorConfig, StreamJoinConfig, StreamJoinType,
@@ -42,13 +28,7 @@ use laminar_sql::translator::{
 // Emit conversion
 // ---------------------------------------------------------------------------
 
-/// Convert a SQL-layer `EmitStrategy` to a core-layer `EmitStrategy`.
-///
-/// The SQL parser produces `EmitStrategy::FinalOnly`, while core operators
-/// expect `EmitStrategy::Final`. This function maps all variants correctly.
-///
-/// Cannot use a `From` impl due to the orphan rule (neither type is local).
-#[allow(dead_code)] // Used in tests (core_window_state).
+#[cfg(test)]
 pub(crate) fn sql_emit_to_core(
     s: &SqlEmitStrategy,
 ) -> laminar_core::operator::window::EmitStrategy {
@@ -63,11 +43,7 @@ pub(crate) fn sql_emit_to_core(
     }
 }
 
-/// Convert an `EmitClause` (SQL AST) to a core `EmitStrategy`.
-///
-/// Calls `EmitClause::to_emit_strategy()` to resolve the clause to a
-/// runtime strategy, then converts via [`sql_emit_to_core`].
-#[allow(dead_code)] // Used in tests (core_window_state).
+#[cfg(test)]
 pub(crate) fn emit_clause_to_core(
     clause: &EmitClause,
 ) -> Result<laminar_core::operator::window::EmitStrategy, laminar_sql::parser::ParseError> {
@@ -79,11 +55,6 @@ pub(crate) fn emit_clause_to_core(
 // String literal / comment stripping
 // ---------------------------------------------------------------------------
 
-/// Replace single-quoted string literals and `--` line comments with spaces.
-///
-/// Preserves byte offsets so that positions found in the stripped string
-/// can be used on the original SQL. Used before keyword searches to avoid
-/// false positives from keywords inside strings or comments.
 fn strip_literals_and_comments(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     let bytes = sql.as_bytes();
@@ -126,12 +97,8 @@ fn strip_literals_and_comments(sql: &str) -> String {
 // Table reference extraction
 // ---------------------------------------------------------------------------
 
-/// Extract all table names referenced in FROM/JOIN clauses of a SQL query.
-///
-/// Parses the SQL and walks the AST to find `TableFactor::Table` references,
-/// recursing into subqueries, nested joins, and set operations (UNION, etc.).
-///
-/// Returns a **deduplicated** set. For self-join detection use
+/// Returns a deduplicated set of table names from FROM/JOIN clauses.
+/// Not deduplicated by occurrence count -- for self-join detection use
 /// [`single_source_table`] instead.
 pub(crate) fn extract_table_references(sql: &str) -> FxHashSet<String> {
     let mut tables = FxHashSet::default();
@@ -147,15 +114,10 @@ pub(crate) fn extract_table_references(sql: &str) -> FxHashSet<String> {
     tables
 }
 
-/// Check whether `sql` references exactly one logical table occurrence.
-///
 /// Unlike [`extract_table_references`] (which deduplicates), this counts every
 /// FROM/JOIN table occurrence. A self-join like `events e1 JOIN events e2`
-/// returns `false` because there are two occurrences even though the base table
+/// returns `None` because there are two occurrences even though the base table
 /// name is the same.
-///
-/// Returns `Some(table_name)` when there is exactly one occurrence, `None`
-/// otherwise.
 pub(crate) fn single_source_table(sql: &str) -> Option<String> {
     let dialect = GenericDialect {};
     let statements = Parser::parse_sql(&dialect, sql).ok()?;
@@ -172,7 +134,6 @@ pub(crate) fn single_source_table(sql: &str) -> Option<String> {
     }
 }
 
-/// Recursively collect table names from a `SetExpr`.
 fn collect_tables_from_set_expr(set_expr: &SetExpr, tables: &mut FxHashSet<String>) {
     match set_expr {
         SetExpr::Select(select) => {
@@ -194,7 +155,6 @@ fn collect_tables_from_set_expr(set_expr: &SetExpr, tables: &mut FxHashSet<Strin
     }
 }
 
-/// Collect table names from a single `TableFactor`.
 fn collect_tables_from_factor(factor: &TableFactor, tables: &mut FxHashSet<String>) {
     match factor {
         TableFactor::Table { name, args, .. } => {
@@ -215,7 +175,7 @@ fn collect_tables_from_factor(factor: &TableFactor, tables: &mut FxHashSet<Strin
     }
 }
 
-/// Like [`collect_tables_from_set_expr`] but collects every occurrence (not deduplicated).
+/// Not deduplicated -- collects every occurrence for counting.
 fn collect_tables_counting(set_expr: &SetExpr, tables: &mut Vec<String>) {
     match set_expr {
         SetExpr::Select(select) => {
@@ -237,7 +197,6 @@ fn collect_tables_counting(set_expr: &SetExpr, tables: &mut Vec<String>) {
     }
 }
 
-/// Collect a single table occurrence from a `TableFactor`.
 fn collect_factor_counting(factor: &TableFactor, tables: &mut Vec<String>) {
     match factor {
         TableFactor::Table { name, args, .. } => {
@@ -315,9 +274,7 @@ fn first_ident_arg(args: &[FunctionArg]) -> Option<String> {
 /// Compiled from the projection SQL (e.g., `SELECT a, b AS alias FROM __asof_tmp`)
 /// on first execution when the join output schema is known.
 pub(crate) struct CompiledPostProjection {
-    /// Physical expressions to evaluate per output column.
     pub(crate) exprs: Vec<Arc<dyn PhysicalExpr>>,
-    /// Output schema.
     pub(crate) output_schema: SchemaRef,
 }
 
@@ -333,26 +290,15 @@ impl std::fmt::Debug for CompiledPostProjection {
 // Projection / filter extraction
 // ---------------------------------------------------------------------------
 
-/// Information extracted from a simple Projection + Filter logical plan.
 pub(crate) struct ProjectionFilterInfo {
-    /// Projection expressions from the top-level Projection node.
     pub(crate) proj_exprs: Vec<datafusion_expr::Expr>,
-    /// Optional WHERE predicate from a Filter node below the Projection.
     pub(crate) filter_predicate: Option<datafusion_expr::Expr>,
-    /// `DFSchema` of the scan input (for compiling expressions).
     pub(crate) input_df_schema: Arc<datafusion_common::DFSchema>,
-    /// Source table name from the `TableScan`.
     pub(crate) source_table: String,
 }
 
-/// Walk an optimized `LogicalPlan` to extract a simple Projection + Filter shape.
-///
-/// Returns `Some` only for plans of the shape:
-///   `Projection? -> Filter? -> TableScan`
-/// (with optional `SubqueryAlias` wrappers).
-///
-/// Returns `None` if the plan has Sort, Limit, Distinct, Join, Aggregate,
-/// or any other node that `CompiledProjection` cannot handle.
+/// Returns `Some` only for plans of the shape
+/// `Projection? -> Filter? -> TableScan` (with optional `SubqueryAlias` wrappers).
 pub(crate) fn extract_projection_filter(plan: &LogicalPlan) -> Option<ProjectionFilterInfo> {
     match plan {
         LogicalPlan::Projection(proj) => {
@@ -391,8 +337,6 @@ pub(crate) fn extract_projection_filter(plan: &LogicalPlan) -> Option<Projection
     }
 }
 
-/// Extract optional `Filter` predicate + `TableScan` from the inner plan.
-/// Returns `(optional_predicate, input_df_schema, table_name)`.
 fn extract_filter_or_scan(
     plan: &LogicalPlan,
 ) -> Option<(
@@ -428,10 +372,6 @@ fn extract_filter_or_scan(
     }
 }
 
-/// Extract projection expressions from a logical plan for post-join compilation.
-///
-/// Walks the plan to find the Projection node, compiles each expression to a
-/// `PhysicalExpr`, and returns the expressions with the output schema.
 pub(crate) fn extract_projection_exprs(
     plan: &LogicalPlan,
     input_schema: &SchemaRef,
@@ -553,7 +493,6 @@ pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperator
     }
 }
 
-/// Infer the `TimestampFormat` from a `RecordBatch` column's `DataType`.
 pub(crate) fn infer_ts_format_from_batch(
     batch: &RecordBatch,
     column: &str,
@@ -572,9 +511,6 @@ pub(crate) fn infer_ts_format_from_batch(
 // Join detection
 // ---------------------------------------------------------------------------
 
-/// Detect an ASOF join in raw SQL text.
-///
-/// Returns `(config, projection_sql)` or `(None, None)` if not detected.
 pub(crate) fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>, Option<String>) {
     // Parse using the streaming parser which understands ASOF syntax
     let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
@@ -614,9 +550,6 @@ pub(crate) fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>,
     (Some(config), Some(projection_sql))
 }
 
-/// Detect a temporal join in raw SQL text.
-///
-/// Returns `(config, projection_sql)` or `(None, None)` if not detected.
 pub(crate) fn detect_temporal_query(
     sql: &str,
 ) -> (Option<TemporalJoinTranslatorConfig>, Option<String>) {
@@ -680,7 +613,6 @@ fn split_conjunction_sqlparser(expr: &Expr) -> Vec<Expr> {
     }
 }
 
-/// Does this expression reference `alias` via any `CompoundIdentifier`?
 fn expr_mentions_alias(expr: &Expr, alias: &str) -> bool {
     match expr {
         Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
@@ -1015,10 +947,7 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection>
     })
 }
 
-/// Detect a `TEMPORAL PROBE JOIN` in raw SQL text.
-///
 /// Not recognized by sqlparser, so detection works on the raw SQL string.
-/// Returns `(config, projection_sql)` or `(None, None)` if not detected.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn detect_temporal_probe_query(
     sql: &str,

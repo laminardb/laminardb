@@ -97,3 +97,62 @@ GROUP BY
     TUMBLE(_laminar_received_at, INTERVAL '30' SECOND),
     jsonb_get_text(from_json(attributes), 'prompt.id')
 EMIT ON WINDOW CLOSE;
+
+-- =============================================================================
+-- Stream-to-stream temporal joins
+-- =============================================================================
+-- The join parser requires simple column refs for ON keys. Pre-extract flat
+-- columns from JSON attributes, then join on those.
+
+-- Pipeline 6: Pre-extract flat columns for join keys
+CREATE STREAM enriched_events AS
+SELECT
+    _laminar_received_at,
+    attributes,
+    jsonb_get_text(from_json(attributes), 'prompt.id') AS prompt_id,
+    jsonb_get_text(from_json(attributes), 'event.name') AS event_name,
+    jsonb_get_text(from_json(attributes), 'model') AS model,
+    jsonb_get_text(from_json(attributes), 'prompt_length') AS prompt_length,
+    jsonb_get_text(from_json(attributes), 'input_tokens') AS input_tokens,
+    jsonb_get_text(from_json(attributes), 'output_tokens') AS output_tokens,
+    jsonb_get_text(from_json(attributes), 'cost_usd') AS cost_usd,
+    jsonb_get_text(from_json(attributes), 'duration_ms') AS duration_ms,
+    jsonb_get_text(from_json(attributes), 'tool_name') AS tool_name,
+    jsonb_get_text(from_json(attributes), 'success') AS tool_success
+FROM otel_events
+WHERE jsonb_get_text(from_json(attributes), 'prompt.id') IS NOT NULL;
+
+-- Pipeline 7: Prompt lifecycle — correlate user_prompt → api_request
+CREATE STREAM prompt_lifecycle AS
+SELECT
+    p.prompt_id,
+    CAST(p.prompt_length AS BIGINT) AS prompt_length,
+    a.model,
+    CAST(a.input_tokens AS BIGINT) AS input_tokens,
+    CAST(a.output_tokens AS BIGINT) AS output_tokens,
+    CAST(a.cost_usd AS DOUBLE) AS cost_usd,
+    CAST(a.duration_ms AS BIGINT) AS api_duration_ms,
+    (a._laminar_received_at - p._laminar_received_at) / 1000000 AS time_to_response_ms
+FROM enriched_events p
+JOIN enriched_events a
+    ON p.prompt_id = a.prompt_id
+    AND a._laminar_received_at BETWEEN p._laminar_received_at
+        AND p._laminar_received_at + 120000000000
+WHERE p.event_name = 'user_prompt'
+    AND a.event_name = 'api_request';
+
+-- Pipeline 8: Prompt-to-tool — correlate user_prompt → tool_result
+CREATE STREAM prompt_tools AS
+SELECT
+    p.prompt_id,
+    t.tool_name,
+    t.tool_success,
+    CAST(t.duration_ms AS BIGINT) AS tool_duration_ms,
+    (t._laminar_received_at - p._laminar_received_at) / 1000000 AS prompt_to_tool_ms
+FROM enriched_events p
+JOIN enriched_events t
+    ON p.prompt_id = t.prompt_id
+    AND t._laminar_received_at BETWEEN p._laminar_received_at
+        AND p._laminar_received_at + 300000000000
+WHERE p.event_name = 'user_prompt'
+    AND t.event_name = 'tool_result';
