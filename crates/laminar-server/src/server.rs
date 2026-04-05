@@ -15,7 +15,7 @@ use laminar_core::streaming::checkpoint::StreamCheckpointConfig;
 use laminar_db::{DbError, LaminarDB, Profile};
 
 use crate::config::{
-    ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
+    ColumnDef, ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
 };
 #[cfg(feature = "delta-experimental")]
 use crate::delta_config::{DeltaConfig, DeltaConfigError};
@@ -160,16 +160,8 @@ pub async fn run_server(
     let checkpoint_url = &config.checkpoint.url;
     let checkpoint_cfg = StreamCheckpointConfig {
         interval_ms: Some(config.checkpoint.interval.as_millis() as u64),
-        data_dir: if checkpoint_url.starts_with("file:///") {
-            Some(PathBuf::from(
-                checkpoint_url
-                    .strip_prefix("file://")
-                    .unwrap_or(checkpoint_url),
-            ))
-        } else {
-            None
-        },
-        max_retained: Some(10),
+        data_dir: file_url_to_path(checkpoint_url),
+        max_retained: Some(config.checkpoint.max_retained),
         ..StreamCheckpointConfig::default()
     };
     builder = builder.checkpoint(checkpoint_cfg);
@@ -200,7 +192,36 @@ pub async fn run_server(
     let db = Arc::new(db);
 
     // 2. Execute DDL for each TOML section (order matters: sources → lookups → pipelines → sinks)
-    for source in &config.sources {
+    //    Auto-populate schema from connector registry when not declared in config.
+    let registry = db.connector_registry();
+    let mut auto_sources = Vec::new();
+    for s in &config.sources {
+        if s.schema.is_empty() {
+            let props: std::collections::HashMap<String, String> = s
+                .properties
+                .iter()
+                .map(|(k, v)| (k.clone(), toml_value_to_sql(v)))
+                .collect();
+            if let Some(cols) = registry.default_source_columns(&s.connector, &props) {
+                let mut s = s.clone();
+                s.schema = cols
+                    .into_iter()
+                    .map(|(name, data_type, nullable)| ColumnDef {
+                        name,
+                        data_type,
+                        nullable,
+                    })
+                    .collect();
+                info!(source = %s.name, columns = s.schema.len(),
+                    "Auto-populated schema from connector");
+                auto_sources.push(s);
+                continue;
+            }
+        }
+        auto_sources.push(s.clone());
+    }
+
+    for source in &auto_sources {
         let ddl = source_to_ddl(source);
         db.execute(&ddl).await.map_err(|e| ServerError::Ddl {
             section: "source".to_string(),
@@ -311,8 +332,25 @@ pub async fn run_server(
 // DDL generation
 // ---------------------------------------------------------------------------
 
-/// Generate `CREATE SOURCE` DDL from a TOML source config.
-///
+/// Extract a local filesystem path from a `file://` URL, or `None` for cloud URLs.
+fn file_url_to_path(url: &str) -> Option<PathBuf> {
+    if !url.starts_with("file:///") {
+        return None;
+    }
+    let raw = url.strip_prefix("file://").unwrap_or(url);
+    // On Windows, file:///C:/path yields "/C:/path" — strip the leading slash.
+    #[cfg(windows)]
+    let raw = {
+        let b = raw.as_bytes();
+        if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+            &raw[1..]
+        } else {
+            raw
+        }
+    };
+    Some(PathBuf::from(raw))
+}
+
 /// Uses the connector-first syntax:
 /// ```sql
 /// CREATE SOURCE name (col1 TYPE, col2 TYPE, WATERMARK FOR col AS col - INTERVAL 'n' SECOND)
@@ -598,7 +636,6 @@ mod tests {
         let pipeline = PipelineConfig {
             name: "vwap".to_string(),
             sql: "SELECT symbol, SUM(price) FROM trades GROUP BY symbol".to_string(),
-            parallelism: None,
         };
         let ddl = pipeline_to_ddl(&pipeline);
         assert_eq!(
@@ -652,7 +689,6 @@ mod tests {
             name: "instruments".to_string(),
             connector: "postgres".to_string(),
             strategy: "poll".to_string(),
-            pushdown: true,
             cache: LookupCacheConfig::default(),
             properties: {
                 let mut t = toml::Table::new();
@@ -684,7 +720,6 @@ mod tests {
             name: "t".to_string(),
             connector: "postgres".to_string(),
             strategy: "poll".to_string(),
-            pushdown: false,
             cache: LookupCacheConfig::default(),
             properties: toml::Table::new(),
             primary_key: vec![],
@@ -704,7 +739,6 @@ mod tests {
             name: "bad".to_string(),
             connector: "postgres".to_string(),
             strategy: "poll".to_string(),
-            pushdown: false,
             cache: LookupCacheConfig::default(),
             properties: toml::Table::new(),
             primary_key: vec![],

@@ -529,7 +529,6 @@ mod tests {
         PipelineConfig {
             name: name.to_string(),
             sql: sql.to_string(),
-            parallelism: None,
         }
     }
 
@@ -548,7 +547,6 @@ mod tests {
             name: name.to_string(),
             connector: "postgres".to_string(),
             strategy: "poll".to_string(),
-            pushdown: true,
             cache: LookupCacheConfig::default(),
             properties: toml::Table::new(),
             primary_key: vec![],

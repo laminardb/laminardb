@@ -330,6 +330,11 @@ pub trait SourceConnector: Send {
         max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError>;
 
+    /// Adjust schema based on connector properties, before `open()`.
+    /// Used by schema auto-discovery when config omits column definitions.
+    /// Default: no-op. Override if schema depends on properties (e.g., signal type).
+    fn discover_schema(&mut self, _properties: &std::collections::HashMap<String, String>) {}
+
     /// Returns the schema of records produced by this source.
     fn schema(&self) -> SchemaRef;
 

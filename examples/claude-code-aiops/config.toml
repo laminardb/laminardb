@@ -1,0 +1,293 @@
+# =============================================================================
+# LaminarDB AI Ops Demo Configuration
+# =============================================================================
+# Real-time cost attribution for Claude Code via streaming SQL over OTel events.
+#
+# Verified against Claude Code v2.1.90 telemetry output (2026-04-02).
+# Event types: user_prompt, api_request, tool_decision, tool_result
+# All attributes are flat keys in the `attributes` JSON column.
+#
+# Usage:
+#   cargo run --release -p laminar-server --no-default-features \
+#       --features mimalloc,otel,websocket,files -- \
+#       --config examples/claude-code-aiops/config.toml
+# =============================================================================
+
+[server]
+mode = "embedded"
+bind = "127.0.0.1:8080"
+
+[state]
+backend = "memory"
+
+[checkpoint]
+interval = "30s"
+
+# ---------------------------------------------------------------------------
+# OTel gRPC source — receives Claude Code telemetry events
+# ---------------------------------------------------------------------------
+
+[[source]]
+name = "otel_events"
+connector = "otel"
+format = "json"
+
+# Schema auto-discovered from connector — no [[source.schema]] needed.
+
+[source.properties]
+port = "4317"
+"bind.address" = "0.0.0.0"
+signals = "logs"
+batch_size = "256"
+
+[source.watermark]
+column = "_laminar_received_at"
+max_out_of_orderness = "10s"
+
+# ---------------------------------------------------------------------------
+# Streaming SQL pipelines (see README.md for telemetry attribute reference)
+# ---------------------------------------------------------------------------
+
+# Heartbeat — 5s window, proves the pipeline is alive
+[[pipeline]]
+name = "event_count"
+sql = """
+SELECT
+    COUNT(*) AS cnt
+FROM otel_events
+GROUP BY TUMBLE(_laminar_received_at, INTERVAL '5' SECOND)
+EMIT ON WINDOW CLOSE
+"""
+
+# Pipeline 1: Cost per model (15s windows for near-real-time)
+[[pipeline]]
+name = "cost_by_model"
+sql = """
+SELECT
+    jsonb_get_text(from_json(attributes), 'model') AS model,
+    jsonb_get_text(from_json(attributes), 'user.account_uuid') AS account_uuid,
+    COUNT(*) AS request_count,
+    SUM(CAST(jsonb_get_text(from_json(attributes), 'input_tokens') AS BIGINT)) AS total_input_tokens,
+    SUM(CAST(jsonb_get_text(from_json(attributes), 'output_tokens') AS BIGINT)) AS total_output_tokens,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'cache_read_tokens') IS NOT NULL
+        THEN CAST(jsonb_get_text(from_json(attributes), 'cache_read_tokens') AS BIGINT) ELSE 0 END) AS total_cache_read_tokens,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'cache_creation_tokens') IS NOT NULL
+        THEN CAST(jsonb_get_text(from_json(attributes), 'cache_creation_tokens') AS BIGINT) ELSE 0 END) AS total_cache_creation_tokens,
+    SUM(CAST(jsonb_get_text(from_json(attributes), 'cost_usd') AS DOUBLE)) AS total_cost_usd,
+    AVG(CAST(jsonb_get_text(from_json(attributes), 'duration_ms') AS DOUBLE)) AS avg_duration_ms
+FROM otel_events
+WHERE jsonb_get_text(from_json(attributes), 'event.name') = 'api_request'
+GROUP BY
+    TUMBLE(_laminar_received_at, INTERVAL '15' SECOND),
+    jsonb_get_text(from_json(attributes), 'model'),
+    jsonb_get_text(from_json(attributes), 'user.account_uuid')
+EMIT ON WINDOW CLOSE
+"""
+
+# Pipeline 2: Tool effectiveness (15s windows)
+[[pipeline]]
+name = "tool_stats"
+sql = """
+SELECT
+    jsonb_get_text(from_json(attributes), 'tool_name') AS tool_name,
+    COUNT(*) AS invocation_count,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'success') = 'true' THEN 1 ELSE 0 END) AS success_count,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'success') = 'false' THEN 1 ELSE 0 END) AS failure_count,
+    AVG(CAST(jsonb_get_text(from_json(attributes), 'duration_ms') AS DOUBLE)) AS avg_duration_ms,
+    MAX(CAST(jsonb_get_text(from_json(attributes), 'duration_ms') AS DOUBLE)) AS max_duration_ms,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'tool_result_size_bytes') IS NOT NULL
+        THEN CAST(jsonb_get_text(from_json(attributes), 'tool_result_size_bytes') AS BIGINT) ELSE 0 END) AS total_result_bytes
+FROM otel_events
+WHERE jsonb_get_text(from_json(attributes), 'event.name') = 'tool_result'
+GROUP BY
+    TUMBLE(_laminar_received_at, INTERVAL '15' SECOND),
+    jsonb_get_text(from_json(attributes), 'tool_name')
+EMIT ON WINDOW CLOSE
+"""
+
+# Pipeline 3: Per-prompt breakdown (30s windows)
+# Correlates user_prompt, api_request, and tool_result events by prompt.id.
+[[pipeline]]
+name = "prompt_analysis"
+sql = """
+SELECT
+    jsonb_get_text(from_json(attributes), 'prompt.id') AS prompt_id,
+    MAX(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'user_prompt'
+        THEN CAST(jsonb_get_text(from_json(attributes), 'prompt_length') AS BIGINT) END) AS prompt_length,
+    MAX(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'api_request'
+        THEN jsonb_get_text(from_json(attributes), 'model') END) AS model,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'api_request'
+        THEN CAST(jsonb_get_text(from_json(attributes), 'cost_usd') AS DOUBLE)
+        ELSE 0.0 END) AS prompt_cost_usd,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'api_request'
+        THEN CAST(jsonb_get_text(from_json(attributes), 'input_tokens') AS BIGINT)
+        ELSE 0 END) AS total_input_tokens,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'api_request'
+        THEN CAST(jsonb_get_text(from_json(attributes), 'output_tokens') AS BIGINT)
+        ELSE 0 END) AS total_output_tokens,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'api_request'
+        THEN CASE WHEN jsonb_get_text(from_json(attributes), 'cache_read_tokens') IS NOT NULL
+            THEN CAST(jsonb_get_text(from_json(attributes), 'cache_read_tokens') AS BIGINT) ELSE 0 END
+        ELSE 0 END) AS total_cache_read_tokens,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'api_request'
+        THEN CAST(jsonb_get_text(from_json(attributes), 'duration_ms') AS BIGINT)
+        ELSE 0 END) AS total_duration_ms,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'tool_result'
+        THEN 1 ELSE 0 END) AS tools_invoked,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'tool_result'
+        AND jsonb_get_text(from_json(attributes), 'success') = 'false'
+        THEN 1 ELSE 0 END) AS tool_failures,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'api_request'
+        THEN 1 ELSE 0 END) AS api_calls
+FROM otel_events
+WHERE jsonb_get_text(from_json(attributes), 'prompt.id') IS NOT NULL
+GROUP BY
+    TUMBLE(_laminar_received_at, INTERVAL '30' SECOND),
+    jsonb_get_text(from_json(attributes), 'prompt.id')
+EMIT ON WINDOW CLOSE
+"""
+
+# Pipeline 4: Tool permission decisions (15s windows)
+# Tracks auto-accept vs manual approval and rejection patterns.
+[[pipeline]]
+name = "tool_decisions"
+sql = """
+SELECT
+    jsonb_get_text(from_json(attributes), 'tool_name') AS tool_name,
+    jsonb_get_text(from_json(attributes), 'decision') AS decision,
+    jsonb_get_text(from_json(attributes), 'source') AS source,
+    COUNT(*) AS decision_count
+FROM otel_events
+WHERE jsonb_get_text(from_json(attributes), 'event.name') = 'tool_decision'
+GROUP BY
+    TUMBLE(_laminar_received_at, INTERVAL '15' SECOND),
+    jsonb_get_text(from_json(attributes), 'tool_name'),
+    jsonb_get_text(from_json(attributes), 'decision'),
+    jsonb_get_text(from_json(attributes), 'source')
+EMIT ON WINDOW CLOSE
+"""
+
+# Pipeline 5: Session activity + cost velocity (15s windows)
+# Tracks events per window, cost rate, and speed mode usage.
+[[pipeline]]
+name = "session_activity"
+sql = """
+SELECT
+    COUNT(*) AS total_events,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'user_prompt' THEN 1 ELSE 0 END) AS prompts,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'api_request' THEN 1 ELSE 0 END) AS api_calls,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'tool_result' THEN 1 ELSE 0 END) AS tool_calls,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'api_request'
+        THEN CAST(jsonb_get_text(from_json(attributes), 'cost_usd') AS DOUBLE)
+        ELSE 0.0 END) AS window_cost_usd,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'api_request'
+        AND jsonb_get_text(from_json(attributes), 'speed') = 'fast'
+        THEN 1 ELSE 0 END) AS fast_mode_calls,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'api_request'
+        AND jsonb_get_text(from_json(attributes), 'speed') = 'normal'
+        THEN 1 ELSE 0 END) AS normal_mode_calls
+FROM otel_events
+GROUP BY
+    TUMBLE(_laminar_received_at, INTERVAL '15' SECOND)
+EMIT ON WINDOW CLOSE
+"""
+
+# ---------------------------------------------------------------------------
+# WebSocket sinks — real-time dashboard
+# ---------------------------------------------------------------------------
+
+[[sink]]
+name = "heartbeat_ws"
+pipeline = "event_count"
+connector = "websocket"
+
+[sink.properties]
+"bind.address" = "0.0.0.0:9000"
+
+[[sink]]
+name = "cost_ws"
+pipeline = "cost_by_model"
+connector = "websocket"
+
+[sink.properties]
+"bind.address" = "0.0.0.0:9001"
+
+[[sink]]
+name = "tools_ws"
+pipeline = "tool_stats"
+connector = "websocket"
+
+[sink.properties]
+"bind.address" = "0.0.0.0:9002"
+
+[[sink]]
+name = "prompts_ws"
+pipeline = "prompt_analysis"
+connector = "websocket"
+
+[sink.properties]
+"bind.address" = "0.0.0.0:9003"
+
+[[sink]]
+name = "decisions_ws"
+pipeline = "tool_decisions"
+connector = "websocket"
+
+[sink.properties]
+"bind.address" = "0.0.0.0:9004"
+
+[[sink]]
+name = "activity_ws"
+pipeline = "session_activity"
+connector = "websocket"
+
+[sink.properties]
+"bind.address" = "0.0.0.0:9005"
+
+# ---------------------------------------------------------------------------
+# File sinks — Parquet persistence (survives server restarts)
+# ---------------------------------------------------------------------------
+
+[[sink]]
+name = "cost_archive"
+pipeline = "cost_by_model"
+connector = "files"
+
+[sink.properties]
+path = "./data/aiops/cost"
+format = "parquet"
+mode = "rolling"
+compression = "zstd"
+
+[[sink]]
+name = "tools_archive"
+pipeline = "tool_stats"
+connector = "files"
+
+[sink.properties]
+path = "./data/aiops/tools"
+format = "parquet"
+mode = "rolling"
+compression = "zstd"
+
+[[sink]]
+name = "prompts_archive"
+pipeline = "prompt_analysis"
+connector = "files"
+
+[sink.properties]
+path = "./data/aiops/prompts"
+format = "parquet"
+mode = "rolling"
+compression = "zstd"
+
+[[sink]]
+name = "activity_archive"
+pipeline = "session_activity"
+connector = "files"
+
+[sink.properties]
+path = "./data/aiops/activity"
+format = "parquet"
+mode = "rolling"
+compression = "zstd"

@@ -153,72 +153,53 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
 // Data structures
 // ---------------------------------------------------------------------------
 
-/// Top-level server configuration.
-///
-/// Deserialized from `laminardb.toml`. All sections except `[server]`
-/// are optional (an empty config starts a server with no pipelines).
+/// Top-level server configuration, deserialized from TOML.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ServerConfig {
-    /// Server-level settings.
     #[serde(default)]
     pub server: ServerSection,
 
-    /// State store configuration.
     #[serde(default)]
     pub state: StateSection,
 
-    /// Checkpoint configuration.
     #[serde(default)]
     pub checkpoint: CheckpointSection,
 
-    /// Streaming sources (Kafka, CDC, etc.).
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
 
-    /// Lookup tables for enrichment joins.
     #[serde(default, rename = "lookup")]
     pub lookups: Vec<LookupConfig>,
 
-    /// SQL pipelines to compile and execute.
     #[serde(default, rename = "pipeline")]
     pub pipelines: Vec<PipelineConfig>,
 
-    /// Output sinks (Kafka, Postgres, Delta Lake, etc.).
     #[serde(default, rename = "sink")]
     pub sinks: Vec<SinkConfig>,
 
-    /// Raw SQL DDL executed before `start()`, as an alternative to structured
-    /// `[[source]]`/`[[pipeline]]`/`[[sink]]` sections. Supports `${VAR}` env substitution.
+    /// Raw SQL DDL executed before `start()`, as alternative to structured sections.
     #[serde(default)]
     pub sql: Option<String>,
 
-    /// Delta mode discovery settings (optional; absent = embedded mode).
     pub discovery: Option<DiscoverySection>,
-
-    /// Coordination settings (optional; absent = embedded mode).
     pub coordination: Option<CoordinationSection>,
-
-    /// Node identity for delta mode.
     pub node_id: Option<String>,
 }
 
-/// `[server]` section: server-level settings.
+/// `[server]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct ServerSection {
-    /// Operating mode: "embedded" (single-node) or "delta" (multi-node).
+    /// "embedded" (single-node) or "delta" (multi-node).
     #[serde(default = "default_mode")]
     pub mode: String,
 
-    /// Bind address for HTTP API.
     #[serde(default = "default_bind")]
     pub bind: String,
 
-    /// Number of worker threads (0 = auto-detect CPU count).
+    /// 0 = auto-detect CPU count.
     #[serde(default)]
     pub workers: usize,
 
-    /// Log level: trace, debug, info, warn, error.
     #[serde(default = "default_log_level")]
     pub log_level: String,
 }
@@ -234,15 +215,13 @@ impl Default for ServerSection {
     }
 }
 
-/// `[state]` section: state store backend configuration.
+/// `[state]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct StateSection {
-    /// Backend type: "memory", "mmap", or "disaggregated".
+    /// "memory", "mmap", or "disaggregated".
     #[serde(default = "default_state_backend")]
     pub backend: String,
 
-    /// Path for persistent state (mmap backend).
     #[serde(default = "default_state_path")]
     pub path: String,
 }
@@ -256,27 +235,24 @@ impl Default for StateSection {
     }
 }
 
-/// `[checkpoint]` section: checkpointing configuration.
+/// `[checkpoint]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct CheckpointSection {
-    /// Storage URL for checkpoint data.
-    /// Supports: file:///path, s3://bucket/prefix, gs://bucket/prefix.
+    /// Supports: `file:///path`, `s3://bucket/prefix`, `gs://bucket/prefix`.
     #[serde(default = "default_checkpoint_url")]
     pub url: String,
 
-    /// Checkpoint interval (e.g., "10s", "1m", "30s").
     #[serde(default = "default_checkpoint_interval", with = "humantime_serde")]
     pub interval: Duration,
 
-    /// Explicit cloud storage credentials/config overrides.
-    ///
-    /// Keys are backend-specific (e.g., `aws_access_key_id`, `aws_region`).
-    /// These supplement environment-variable-based credential resolution.
+    /// Number of recent checkpoints to retain before pruning.
+    #[serde(default = "default_max_retained")]
+    pub max_retained: usize,
+
+    /// Cloud storage credentials (e.g., `aws_access_key_id`, `aws_region`).
     #[serde(default)]
     pub storage: std::collections::HashMap<String, String>,
 
-    /// S3 storage class tiering configuration.
     #[serde(default)]
     pub tiering: Option<TieringSection>,
 }
@@ -286,6 +262,7 @@ impl Default for CheckpointSection {
         Self {
             url: default_checkpoint_url(),
             interval: default_checkpoint_interval(),
+            max_retained: default_max_retained(),
             storage: std::collections::HashMap::new(),
             tiering: None,
         }
@@ -298,133 +275,102 @@ impl Default for CheckpointSection {
 /// for cost optimization. Active checkpoints use the hot tier,
 /// older checkpoints are moved to warm/cold tiers via S3 Lifecycle rules.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct TieringSection {
-    /// Storage class for active checkpoints (e.g., `"EXPRESS_ONE_ZONE"`, `"STANDARD"`).
+    /// e.g., `"EXPRESS_ONE_ZONE"`, `"STANDARD"`.
     #[serde(default = "default_hot_class")]
     pub hot_class: String,
 
-    /// Storage class for older checkpoints (e.g., `"STANDARD"`).
     #[serde(default = "default_warm_class")]
     pub warm_class: String,
 
-    /// Storage class for archive checkpoints (e.g., `"GLACIER_IR"`). Empty = no cold tier.
+    /// Empty = no cold tier.
     #[serde(default)]
     pub cold_class: String,
 
-    /// Time before moving objects from hot to warm tier (e.g., `"24h"`).
     #[serde(default = "default_hot_retention", with = "humantime_serde")]
     pub hot_retention: Duration,
 
-    /// Time before moving objects from warm to cold tier (e.g., `"7d"`). 0 = no cold tier.
+    /// 0 = no cold tier.
     #[serde(default = "default_warm_retention", with = "humantime_serde")]
     pub warm_retention: Duration,
 }
 
-/// `[[source]]` section: streaming source definition.
+/// `[[source]]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct SourceConfig {
-    /// Unique name for this source (referenced by SQL and sinks).
     pub name: String,
 
-    /// Connector type: "kafka", "postgres_cdc", "mysql_cdc", "generator".
+    /// "kafka", "postgres_cdc", "mysql_cdc", "otel", etc.
     pub connector: String,
 
-    /// Data format: "json", "avro", "protobuf", "csv".
+    /// "json", "avro", "protobuf", "csv".
     #[serde(default = "default_format")]
     pub format: String,
 
-    /// Connector-specific properties (e.g., broker, topic, table).
     #[serde(default)]
     pub properties: toml::Table,
 
-    /// Schema definition (column names and types).
     #[serde(default)]
     pub schema: Vec<ColumnDef>,
 
-    /// Watermark configuration.
     pub watermark: Option<WatermarkConfig>,
 }
 
 /// Column definition within a source or lookup schema.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct ColumnDef {
-    /// Column name.
     pub name: String,
 
     /// SQL type: "INT", "BIGINT", "VARCHAR", "TIMESTAMP", "DOUBLE", "BOOLEAN".
     #[serde(rename = "type")]
     pub data_type: String,
 
-    /// Whether this column is nullable.
     #[serde(default = "default_true")]
     pub nullable: bool,
 }
 
 /// Watermark configuration for a source.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct WatermarkConfig {
-    /// Column containing event timestamps.
     pub column: String,
 
-    /// Maximum allowed out-of-orderness (e.g., "5s", "1m").
     #[serde(default = "default_max_ooo", with = "humantime_serde")]
     pub max_out_of_orderness: Duration,
 }
 
-/// `[[lookup]]` section: lookup table for enrichment joins.
+/// `[[lookup]]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct LookupConfig {
-    /// Unique name for this lookup table.
     pub name: String,
 
-    /// Connector type: "postgres", "mysql", "redis", "csv".
+    /// "postgres", "mysql", "redis", "csv".
     pub connector: String,
 
-    /// Refresh strategy: "poll", "cdc", "manual".
+    /// "poll", "cdc", "manual".
     #[serde(default = "default_lookup_strategy")]
     pub strategy: String,
 
-    /// Whether to push down predicates to the source.
-    #[serde(default = "default_true")]
-    pub pushdown: bool,
-
-    /// Cache configuration.
     #[serde(default)]
     pub cache: LookupCacheConfig,
 
-    /// Connector-specific properties.
     #[serde(default)]
     pub properties: toml::Table,
 
-    /// Primary key column(s).
     #[serde(default)]
     pub primary_key: Vec<String>,
 
-    /// Schema definition.
     #[serde(default)]
     pub schema: Vec<ColumnDef>,
 }
 
 /// Cache configuration for lookup tables.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct LookupCacheConfig {
-    /// Cache size in bytes.
     #[serde(default = "default_cache_size")]
     pub size_bytes: u64,
 
-    /// TTL for cached entries (e.g., "5m", "1h").
     #[serde(default = "default_cache_ttl", with = "humantime_serde")]
     pub ttl: Duration,
-
-    /// Enable hybrid (memory + disk) caching via foyer.
-    #[serde(default)]
-    pub hybrid: bool,
 }
 
 impl Default for LookupCacheConfig {
@@ -432,80 +378,59 @@ impl Default for LookupCacheConfig {
         Self {
             size_bytes: default_cache_size(),
             ttl: default_cache_ttl(),
-            hybrid: false,
         }
     }
 }
 
-/// `[[pipeline]]` section: SQL pipeline definition.
+/// `[[pipeline]]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct PipelineConfig {
-    /// Unique name for this pipeline.
     pub name: String,
-
-    /// SQL query defining the pipeline logic.
     pub sql: String,
-
-    /// Optional parallelism override (default: server worker count).
-    pub parallelism: Option<usize>,
 }
 
-/// `[[sink]]` section: output sink definition.
+/// `[[sink]]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct SinkConfig {
-    /// Unique name for this sink.
     pub name: String,
-
-    /// Pipeline this sink reads from.
     pub pipeline: String,
 
-    /// Connector type: "kafka", "postgres", "delta-lake", "iceberg", "stdout".
+    /// "kafka", "postgres", "delta-lake", "iceberg", "files", "websocket", "stdout".
     pub connector: String,
 
-    /// Delivery guarantee: "at_least_once", "exactly_once".
+    /// "at_least_once" or "exactly_once".
     #[serde(default = "default_delivery")]
     pub delivery: String,
 
-    /// Connector-specific properties.
     #[serde(default)]
     pub properties: toml::Table,
 }
 
-/// `[discovery]` section: delta node discovery.
+/// `[discovery]` section (delta mode).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct DiscoverySection {
-    /// Discovery strategy: "static", "dns", "gossip".
+    /// "static", "dns", "gossip".
     pub strategy: String,
 
-    /// Seed node addresses for initial cluster bootstrap.
     #[serde(default)]
     pub seeds: Vec<String>,
 
-    /// Port for gossip protocol communication.
     #[serde(default = "default_gossip_port")]
     pub gossip_port: u16,
 }
 
-/// `[coordination]` section: delta coordination.
+/// `[coordination]` section (delta mode).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct CoordinationSection {
-    /// Coordination strategy: "raft".
     #[serde(default = "default_coordination_strategy")]
     pub strategy: String,
 
-    /// Port for Raft RPC communication.
     #[serde(default = "default_raft_port")]
     pub raft_port: u16,
 
-    /// Raft election timeout range.
     #[serde(default = "default_election_timeout", with = "humantime_serde")]
     pub election_timeout: Duration,
 
-    /// Raft heartbeat interval.
     #[serde(default = "default_heartbeat_interval", with = "humantime_serde")]
     pub heartbeat_interval: Duration,
 }
@@ -570,7 +495,18 @@ fn default_state_path() -> String {
     "./data/state".to_string()
 }
 fn default_checkpoint_url() -> String {
-    "file:///tmp/laminardb/checkpoints".to_string()
+    let base = std::env::temp_dir();
+    let path = base.join("laminardb");
+    // file:// URLs need forward slashes on all platforms.
+    let path_str = path.to_string_lossy().replace('\\', "/");
+    if path_str.starts_with('/') {
+        format!("file://{path_str}")
+    } else {
+        format!("file:///{path_str}")
+    }
+}
+fn default_max_retained() -> usize {
+    10
 }
 fn default_checkpoint_interval() -> Duration {
     Duration::from_secs(10)
@@ -955,7 +891,6 @@ max_out_of_orderness = "10s"
         let cache = LookupCacheConfig::default();
         assert_eq!(cache.size_bytes, 100 * 1024 * 1024);
         assert_eq!(cache.ttl, Duration::from_secs(300));
-        assert!(!cache.hybrid);
     }
 
     #[test]

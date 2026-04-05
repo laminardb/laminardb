@@ -46,9 +46,6 @@ pub fn register_otel_source(registry: &ConnectorRegistry) {
     registry.register_source(
         "otel",
         info,
-        Arc::new(|| {
-            let default_schema = traces_schema();
-            Box::new(OtelSource::new(default_schema))
-        }),
+        Arc::new(|| Box::new(OtelSource::new(traces_schema()))),
     );
 }

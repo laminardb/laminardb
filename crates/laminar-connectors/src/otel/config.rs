@@ -21,7 +21,11 @@ pub enum OtelSignal {
 
 impl OtelSignal {
     /// Parse from a string value (case-insensitive).
-    fn parse(s: &str) -> Result<Self, ConnectorError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::ConfigurationError` for unknown signal types.
+    pub fn parse(s: &str) -> Result<Self, ConnectorError> {
         match s.to_lowercase().as_str() {
             "traces" | "trace" => Ok(Self::Traces),
             "metrics" | "metric" => Ok(Self::Metrics),
@@ -34,18 +38,18 @@ impl OtelSignal {
     }
 }
 
-/// Configuration for the OTel source connector.
+/// OTel source connector configuration.
 #[derive(Debug, Clone)]
 pub struct OtelSourceConfig {
-    /// Address to bind the gRPC server to.
+    /// gRPC bind address.
     pub bind_address: String,
-    /// Port for the gRPC server.
+    /// gRPC listen port.
     pub port: u16,
-    /// Which signal types to receive.
+    /// Which signal type to receive (one per source).
     pub signals: OtelSignal,
-    /// Maximum rows per `RecordBatch`.
+    /// Max rows per batch.
     pub batch_size: usize,
-    /// Bounded channel capacity (number of batches).
+    /// Bounded channel capacity.
     pub channel_capacity: usize,
 }
 
