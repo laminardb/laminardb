@@ -237,44 +237,48 @@ WHERE p.event_name = 'user_prompt'
 
 # All pipelines available via ws://localhost:8080/ws/{pipeline_name}
 
-# Delta Lake sinks (local filesystem, ACID, queryable with DuckDB)
+# Parquet file sinks
 
 [[sink]]
 name = "cost_archive"
 pipeline = "cost_by_model"
-connector = "delta-lake"
+connector = "files"
 
 [sink.properties]
-"table.path" = "./data/aiops/cost"
-"write.mode" = "append"
+path = "./data/aiops/cost"
+format = "parquet"
+mode = "rolling"
 compression = "zstd"
 
 [[sink]]
 name = "tools_archive"
 pipeline = "tool_stats"
-connector = "delta-lake"
+connector = "files"
 
 [sink.properties]
-"table.path" = "./data/aiops/tools"
-"write.mode" = "append"
+path = "./data/aiops/tools"
+format = "parquet"
+mode = "rolling"
 compression = "zstd"
 
 [[sink]]
 name = "prompts_archive"
 pipeline = "prompt_analysis"
-connector = "delta-lake"
+connector = "files"
 
 [sink.properties]
-"table.path" = "./data/aiops/prompts"
-"write.mode" = "append"
+path = "./data/aiops/prompts"
+format = "parquet"
+mode = "rolling"
 compression = "zstd"
 
 [[sink]]
 name = "activity_archive"
 pipeline = "session_activity"
-connector = "delta-lake"
+connector = "files"
 
 [sink.properties]
-"table.path" = "./data/aiops/activity"
-"write.mode" = "append"
+path = "./data/aiops/activity"
+format = "parquet"
+mode = "rolling"
 compression = "zstd"
