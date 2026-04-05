@@ -460,6 +460,7 @@ impl StreamingCoordinator {
                 match callback.execute_cycle(&self.source_batches_buf, wm).await {
                     Ok(results) => {
                         self.commit_pending_offsets();
+                        callback.update_mv_stores(&results);
                         callback.push_to_streams(&results);
                         callback.write_to_sinks(&results).await;
                     }
@@ -533,7 +534,6 @@ impl StreamingCoordinator {
             }
         }
 
-        // ── Shutdown ──
         // Signal source tasks to stop.
         for handle in &self.source_handles {
             handle.shutdown.notify_one();
@@ -573,6 +573,7 @@ impl StreamingCoordinator {
             match callback.execute_cycle(&self.source_batches_buf, wm).await {
                 Ok(results) => {
                     self.commit_pending_offsets();
+                    callback.update_mv_stores(&results);
                     callback.push_to_streams(&results);
                     callback.write_to_sinks(&results).await;
                 }
@@ -607,6 +608,7 @@ impl StreamingCoordinator {
             match callback.execute_cycle(&self.source_batches_buf, wm).await {
                 Ok(results) => {
                     self.commit_pending_offsets();
+                    callback.update_mv_stores(&results);
                     callback.push_to_streams(&results);
                     callback.write_to_sinks(&results).await;
                 }
@@ -1214,8 +1216,6 @@ mod tests {
         // Barriers should have both sources.
         assert_eq!(barriers.len(), 2, "should have barriers from both sources");
     }
-
-    // ── Backpressure drain-skip test ─────────────────────────────
 
     #[allow(clippy::disallowed_types)] // test-only: std::sync::Mutex is fine here
     struct BackpressuredCallback {

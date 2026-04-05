@@ -320,8 +320,6 @@ pub fn sql_values_to_record_batch(
 mod tests {
     use super::*;
 
-    // ── split_statements tests ──────────────────────────────────────
-
     #[test]
     fn test_single_statement() {
         let stmts = split_statements("SELECT 1");
@@ -394,8 +392,6 @@ mod tests {
         let stmts = split_statements("/* just a block comment */");
         assert!(stmts.is_empty());
     }
-
-    // ── resolve_config_vars tests ───────────────────────────────────
 
     #[test]
     fn test_basic_substitution() {

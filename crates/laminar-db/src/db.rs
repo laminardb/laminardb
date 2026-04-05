@@ -103,6 +103,8 @@ pub struct LaminarDB {
     /// `None` before `start()` or after `shutdown()`.
     pub(crate) control_tx:
         parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<crate::pipeline::ControlMsg>>>,
+    /// Materialized view result store (shared with compute thread and query threads).
+    pub(crate) mv_store: Arc<parking_lot::RwLock<crate::mv_store::MvStore>>,
 }
 
 /// Per-source watermark tracking state for the pipeline loop.
@@ -256,6 +258,7 @@ impl LaminarDB {
             pipeline_watermark: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
             lookup_registry,
             control_tx: parking_lot::Mutex::new(None),
+            mv_store: Arc::new(parking_lot::RwLock::new(crate::mv_store::MvStore::new())),
         })
     }
 
@@ -459,10 +462,6 @@ impl LaminarDB {
             }
         }
 
-        let table_cache_mode = info.properties.cache_memory.map(|mem| {
-            let max_entries = cache_entries_from_memory(mem);
-            crate::table_cache_mode::TableCacheMode::Partial { max_entries }
-        });
         let cache_max = info.properties.cache_memory.map(cache_entries_from_memory);
 
         self.connector_manager
@@ -475,9 +474,7 @@ impl LaminarDB {
                 format: info.raw_options.get("format").cloned(),
                 format_options,
                 refresh,
-                cache_mode: table_cache_mode,
                 cache_max_entries: cache_max,
-                storage: None,
             });
 
         Ok(())
@@ -1852,8 +1849,6 @@ mod tests {
         assert_eq!(db.source_count(), 1);
     }
 
-    // ── Multi-statement execution tests ─────────────────
-
     #[tokio::test]
     async fn test_multi_statement_execution() {
         let db = LaminarDB::open().unwrap();
@@ -1883,8 +1878,6 @@ mod tests {
         assert_eq!(db.source_count(), 1);
     }
 
-    // ── Config variable substitution tests ──────────────
-
     #[tokio::test]
     async fn test_config_var_substitution() {
         let db = LaminarDB::builder()
@@ -1897,8 +1890,6 @@ mod tests {
         db.execute("CREATE SOURCE events (id INT)").await.unwrap();
         assert_eq!(db.source_count(), 1);
     }
-
-    // ── CREATE STREAM tests ─────────────────────────────
 
     #[tokio::test]
     async fn test_create_stream() {
@@ -2096,8 +2087,6 @@ mod tests {
             _ => panic!("Expected RowsAffected"),
         }
     }
-
-    // ── Connector registry / DDL validation tests ──
 
     #[tokio::test]
     async fn test_create_source_unknown_connector() {
@@ -2332,8 +2321,6 @@ mod tests {
         assert!(registry.list_sources().contains(&"test-source".to_string()));
     }
 
-    // ── Materialized View Catalog tests ──
-
     #[tokio::test]
     async fn test_create_materialized_view() {
         let db = LaminarDB::open().unwrap();
@@ -2543,8 +2530,6 @@ mod tests {
         );
     }
 
-    // ── Pipeline Topology Introspection tests ──
-
     #[tokio::test]
     async fn test_pipeline_topology_empty() {
         let db = LaminarDB::open().unwrap();
@@ -2697,8 +2682,6 @@ mod tests {
         assert_eq!(find("st").node_type, PipelineNodeType::Stream);
         assert_eq!(find("sk").node_type, PipelineNodeType::Sink);
     }
-
-    // ── Reference Table tests ──
 
     #[tokio::test]
     async fn test_create_table_with_primary_key() {
@@ -2853,8 +2836,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ── HAVING clause tests ─────────────────────────────
-
     #[tokio::test]
     async fn test_having_filters_grouped_results() {
         let db = LaminarDB::open().unwrap();
@@ -2967,8 +2948,6 @@ mod tests {
         // C: cnt=2>=2 AND total=30>25 ✓
         assert_eq!(total_rows, 2);
     }
-
-    // ── Multi-way JOIN tests ─────────────────────────────
 
     #[tokio::test]
     async fn test_multi_join_two_way_lookup() {
@@ -3133,8 +3112,6 @@ mod tests {
         assert_eq!(total_rows, 2);
     }
 
-    // ── Window Frame tests ────────────────────────────────
-
     #[tokio::test]
     async fn test_frame_moving_average() {
         let db = LaminarDB::open().unwrap();
@@ -3278,8 +3255,6 @@ mod tests {
         assert_eq!(cnt_col.value(1), 2);
         assert_eq!(cnt_col.value(2), 2);
     }
-
-    // ── Connector-Backed Table Population ──
 
     /// Helper: create a test `RecordBatch` for table population tests.
     fn table_test_batch(ids: &[i32], symbols: &[&str]) -> RecordBatch {
@@ -3489,8 +3464,6 @@ mod tests {
         // The change batch id=2/GOOG should NOT be present
         assert!(ts.lookup("instruments", "2").is_none());
     }
-
-    // ── PARTIAL Cache Mode DDL tests ──
 
     #[tokio::test]
     async fn test_create_table_partial_cache_mode() {
@@ -3716,8 +3689,6 @@ mod tests {
         let db = LaminarDB::open().unwrap();
         assert!(db.stream_metrics("nonexistent").is_none());
     }
-
-    // ── Watermark Source Tracker tests ──────────────────────────────────
 
     /// Helper: push a batch with `Timestamp(µs)` column to a source.
     ///
@@ -4525,8 +4496,6 @@ mod tests {
         );
     }
 
-    // ── extract_connector_from_with_options tests ──
-
     #[test]
     fn test_extract_connector_from_with_options_basic() {
         let mut opts = HashMap::new();
@@ -4912,5 +4881,189 @@ mod tests {
             m2.total_events_ingested >= m.total_events_ingested,
             "pipeline should continue after connector-less source push"
         );
+    }
+
+    /// Poll an MV until it has at least `min_rows` rows, or timeout.
+    async fn poll_mv(db: &LaminarDB, mv: &str, min_rows: usize) -> usize {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let df = db.ctx.sql(&format!("SELECT * FROM {mv}")).await.unwrap();
+            let batches = df.collect().await.unwrap();
+            let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            if rows >= min_rows || std::time::Instant::now() > deadline {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mv_aggregate_queryable_with_pipeline() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts BIGINT, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+
+        db.execute(
+            "CREATE MATERIALIZED VIEW trade_counts AS \
+             SELECT symbol, COUNT(*) as cnt FROM trades GROUP BY symbol",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(poll_mv(&db, "trade_counts", 0).await, 0);
+
+        db.start().await.unwrap();
+
+        let handle = db.source_untyped("trades").unwrap();
+        let schema = handle.schema().clone();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["AAPL", "GOOG"])),
+                Arc::new(arrow::array::Float64Array::from(vec![150.0, 2800.0])),
+                Arc::new(arrow::array::Int64Array::from(vec![1000, 2000])),
+            ],
+        )
+        .unwrap();
+        handle.push_arrow(batch).unwrap();
+
+        let rows = poll_mv(&db, "trade_counts", 1).await;
+        assert!(rows > 0, "MV should have data after pipeline processes");
+    }
+
+    #[tokio::test]
+    async fn test_mv_append_mode_queryable() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE events (id INT, value DOUBLE, ts BIGINT, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+
+        db.execute(
+            "CREATE MATERIALIZED VIEW filtered AS \
+             SELECT id, value FROM events WHERE value > 10.0",
+        )
+        .await
+        .unwrap();
+
+        db.start().await.unwrap();
+
+        let handle = db.source_untyped("events").unwrap();
+        let schema = handle.schema().clone();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3])),
+                Arc::new(arrow::array::Float64Array::from(vec![5.0, 15.0, 25.0])),
+                Arc::new(arrow::array::Int64Array::from(vec![1000, 2000, 3000])),
+            ],
+        )
+        .unwrap();
+        handle.push_arrow(batch).unwrap();
+
+        let rows = poll_mv(&db, "filtered", 2).await;
+        assert_eq!(rows, 2, "filter MV should have 2 matching rows");
+    }
+
+    #[tokio::test]
+    async fn test_mv_drop_cleans_up_table() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT, value DOUBLE)")
+            .await
+            .unwrap();
+        db.execute("CREATE MATERIALIZED VIEW ev_mv AS SELECT * FROM events")
+            .await
+            .unwrap();
+
+        assert!(db.ctx.sql("SELECT * FROM ev_mv").await.is_ok());
+        assert!(db.mv_store.read().has_mv("ev_mv"));
+
+        db.execute("DROP MATERIALIZED VIEW ev_mv").await.unwrap();
+
+        assert!(!db.mv_store.read().has_mv("ev_mv"));
+        assert!(
+            db.ctx.sql("SELECT * FROM ev_mv").await.is_err(),
+            "table should be deregistered after DROP"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mv_empty_returns_correct_schema() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT, value DOUBLE)")
+            .await
+            .unwrap();
+        db.execute("CREATE MATERIALIZED VIEW ev_mv AS SELECT id, value FROM events")
+            .await
+            .unwrap();
+
+        let df = db.ctx.sql("SELECT * FROM ev_mv").await.unwrap();
+        let schema = df.schema().clone();
+        let batches = df.collect().await.unwrap();
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 0);
+
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert!(
+            names.contains(&"id") && names.contains(&"value"),
+            "schema should contain projected columns, got: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mv_hot_add_while_pipeline_running() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts BIGINT, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+
+        // Need at least one stream before start() for the pipeline to launch.
+        db.execute("CREATE STREAM noop AS SELECT * FROM trades")
+            .await
+            .unwrap();
+
+        db.start().await.unwrap();
+
+        // Create MV AFTER pipeline is running (hot-add via ControlMsg).
+        db.execute(
+            "CREATE MATERIALIZED VIEW trade_counts AS \
+             SELECT symbol, COUNT(*) as cnt FROM trades GROUP BY symbol",
+        )
+        .await
+        .unwrap();
+
+        // Wait for the coordinator to process the AddStream control message.
+        // Poll observable state instead of a fixed sleep.
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while db.metrics().total_cycles == 0 && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        let handle = db.source_untyped("trades").unwrap();
+        let schema = handle.schema().clone();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["AAPL"])),
+                Arc::new(arrow::array::Float64Array::from(vec![150.0])),
+                Arc::new(arrow::array::Int64Array::from(vec![1000])),
+            ],
+        )
+        .unwrap();
+        handle.push_arrow(batch).unwrap();
+
+        let rows = poll_mv(&db, "trade_counts", 1).await;
+        assert!(rows > 0, "hot-added MV should receive pipeline data");
     }
 }

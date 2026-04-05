@@ -312,7 +312,11 @@ impl StreamExecutor {
     ) {
         let (asof_config, mut projection_sql) = detect_asof_query(&sql);
         let (temporal_config, temporal_projection_sql) = detect_temporal_query(&sql);
-        let (stream_join_config, stream_join_projection_sql) = detect_stream_join_query(&sql);
+        let stream_join_detection = detect_stream_join_query(&sql);
+        let stream_join_config = stream_join_detection.as_ref().map(|d| d.config.clone());
+        let stream_join_projection_sql = stream_join_detection
+            .as_ref()
+            .map(|d| d.projection_sql.clone());
         if projection_sql.is_none() {
             projection_sql = temporal_projection_sql;
         }
@@ -669,7 +673,6 @@ impl StreamExecutor {
                 }
             };
 
-            // ── State size bounds check ──
             if let Some(limit) = self.max_state_bytes {
                 // Check incremental aggregate state
                 if let Some(state) = self.agg_states.get(&idx) {
@@ -847,8 +850,8 @@ pub(crate) fn evaluate_compiled_projection(
     results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
 ) -> Vec<RecordBatch> {
     let batches = source_batches
-        .get(proj.source_table())
-        .or_else(|| results.get(proj.source_table()));
+        .get(proj.source_table.as_str())
+        .or_else(|| results.get(proj.source_table.as_str()));
     let Some(batches) = batches else {
         return Vec::new();
     };
@@ -859,7 +862,7 @@ pub(crate) fn evaluate_compiled_projection(
             Ok(_) => {}
             Err(e) => {
                 tracing::trace!(
-                    source = proj.source_table(),
+                    source = proj.source_table.as_str(),
                     error = %e,
                     "Compiled projection failed, skipping batch"
                 );
@@ -1427,7 +1430,6 @@ impl StreamExecutor {
         // window config (non-ASOF only — ASOF joins use a custom execution path).
         if asof_config.is_none() {
             if let Some(cfg) = window_config {
-                // ── core window fast path: already routed ──
                 if self.core_window_states.contains_key(&idx) {
                     return self
                         .execute_core_window_query(
@@ -1440,7 +1442,6 @@ impl StreamExecutor {
                         .await;
                 }
 
-                // ── core window detection (first call only) ──
                 if !self.non_core_window_queries.contains(&idx)
                     && !self.eowc_agg_states.contains_key(&idx)
                     && !self.non_eowc_agg_queries.contains(&idx)
@@ -1484,7 +1485,6 @@ impl StreamExecutor {
                     }
                 }
 
-                // ── IncrementalEowcState fast path: already have state ──
                 if self.eowc_agg_states.contains_key(&idx) {
                     return self
                         .execute_incremental_eowc(
@@ -1497,7 +1497,6 @@ impl StreamExecutor {
                         .await;
                 }
 
-                // ── IncrementalEowcState detection (first call only) ──
                 // Guard: session windows MUST route through CoreWindowState.
                 // The EOWC session fallback (one "window" per timestamp) is
                 // incorrect. If CoreWindowState rejected this query, skip
@@ -3435,8 +3434,6 @@ mod tests {
         assert_eq!(total_rows, 3);
     }
 
-    // ── EOWC (Emit On Window Close) tests ──
-
     fn eowc_test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("symbol", DataType::Utf8, false),
@@ -3808,8 +3805,6 @@ mod tests {
         assert_eq!(compute_closed_boundary(2200, &config), 700);
     }
 
-    // ── Pre-computed table refs tests ──
-
     #[test]
     fn test_precomputed_table_refs() {
         let ctx = create_session_context();
@@ -3894,8 +3889,6 @@ mod tests {
         assert!(results.contains_key("downstream"));
     }
 
-    // ── EmitStrategy conversion tests ──
-
     #[test]
     fn test_sql_emit_to_core_all_variants() {
         use laminar_core::operator::window::EmitStrategy as CoreEmit;
@@ -3944,8 +3937,6 @@ mod tests {
             CoreEmit::OnUpdate
         );
     }
-
-    // ── Top-K post-filter tests ──
 
     #[test]
     fn test_apply_topk_filter_limits_rows() {
@@ -4297,8 +4288,6 @@ mod tests {
         assert!(result.is_ok(), "should succeed without limit");
     }
 
-    // ── Interval Join Integration Tests ───────────────────────────────────
-
     fn orders_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("order_id", DataType::Utf8, false),
@@ -4456,17 +4445,17 @@ mod tests {
     #[test]
     fn test_left_join_routed_to_interval() {
         // LEFT JOIN with BETWEEN should route to interval join engine
-        let (config, _) = detect_stream_join_query(
+        let detection = detect_stream_join_query(
             "SELECT * FROM orders o \
              LEFT JOIN payments p ON o.order_id = p.order_id \
              AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR",
         );
         assert!(
-            config.is_some(),
+            detection.is_some(),
             "LEFT JOIN should route to interval join engine"
         );
         assert_eq!(
-            config.unwrap().join_type,
+            detection.unwrap().config.join_type,
             laminar_sql::translator::StreamJoinType::Left,
         );
     }

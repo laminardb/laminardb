@@ -1,7 +1,4 @@
-//! Pipeline observability metrics types.
-//!
-//! Provides atomic counters for pipeline-loop aggregates and snapshot types
-//! for querying source, stream, and pipeline-wide metrics from user code.
+//! Pipeline observability metrics.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -9,15 +6,15 @@ use std::time::Duration;
 /// The state of a streaming pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineState {
-    /// Pipeline has been created but not started.
+    /// Created but not started.
     Created,
-    /// Pipeline is in the process of starting.
+    /// Starting.
     Starting,
-    /// Pipeline is actively processing events.
+    /// Processing events.
     Running,
-    /// Pipeline is gracefully shutting down.
+    /// Gracefully shutting down.
     ShuttingDown,
-    /// Pipeline has stopped.
+    /// Stopped.
     Stopped,
 }
 
@@ -33,84 +30,76 @@ impl std::fmt::Display for PipelineState {
     }
 }
 
-/// Cache line size (bytes) for padding between hot/cold counter groups.
 const CACHE_LINE_SIZE: usize = 64;
 
-/// Shared atomic counters incremented by the pipeline processing loop.
+/// Shared atomic counters for the pipeline processing loop.
 ///
-/// Counters are separated into two groups on different cache lines to
-/// prevent false sharing between Ring 0 (hot path) and Ring 2 (checkpoint):
-///
-/// - **Ring 0 group** (`events_ingested` … `total_batches`): incremented on
-///   every processing cycle from the reactor thread.
-/// - **Ring 2 group** (`checkpoints_completed` … `checkpoint_epoch`): updated
-///   from the async checkpoint coordinator.
-///
-/// All reads and writes use `Ordering::Relaxed` — metrics are advisory,
-/// not transactional.
+/// Ring 0 fields (hot path) and Ring 2 fields (checkpoint) are on separate
+/// cache lines to prevent false sharing. All use `Ordering::Relaxed`.
 #[repr(C)]
 pub struct PipelineCounters {
-    // ── Ring 0 counters (hot path, tight loop) ──
-    /// Total events ingested from sources.
+    // Ring 0 (reactor thread, every cycle)
+    /// Events ingested.
     pub events_ingested: AtomicU64,
-    /// Total events emitted to streams/sinks.
+    /// Events emitted.
     pub events_emitted: AtomicU64,
-    /// Total events dropped (e.g. backpressure).
+    /// Events dropped.
     pub events_dropped: AtomicU64,
-    /// Total processing cycles completed.
+    /// Processing cycles.
     pub cycles: AtomicU64,
-    /// Duration of the last processing cycle in nanoseconds.
+    /// Last cycle duration (ns).
     pub last_cycle_duration_ns: AtomicU64,
-    /// Total batches processed.
+    /// Batches processed.
     pub total_batches: AtomicU64,
-
-    /// Queries using compiled `PhysicalExpr` (zero-overhead per cycle).
+    /// Queries using compiled `PhysicalExpr`.
     pub queries_compiled: AtomicU64,
-    /// Queries using cached logical plan (physical planning per cycle).
+    /// Queries using cached logical plan.
     pub queries_cached_plan: AtomicU64,
 
-    // ── Cache line padding ──
-    // Ring 0 group is 8 × 8 = 64 bytes. Pad to a full cache line boundary
-    // so Ring 2 counters start on a separate cache line.
+    // Pad to cache line boundary so Ring 2 starts on a new line.
     _pad: [u8; CACHE_LINE_SIZE - (8 * std::mem::size_of::<AtomicU64>()) % CACHE_LINE_SIZE],
 
-    // ── Ring 2 counters (checkpoint coordinator, async) ──
-    /// Total checkpoints completed successfully.
+    // Ring 2 (checkpoint coordinator, async)
+    /// Checkpoints completed.
     pub checkpoints_completed: AtomicU64,
-    /// Total checkpoints that failed.
+    /// Checkpoints failed.
     pub checkpoints_failed: AtomicU64,
-    /// Duration of the last checkpoint in milliseconds.
+    /// Last checkpoint duration (ms).
     pub last_checkpoint_duration_ms: AtomicU64,
-    /// Current checkpoint epoch.
+    /// Checkpoint epoch.
     pub checkpoint_epoch: AtomicU64,
-    /// Maximum configured state bytes per operator (0 = unlimited).
+    /// Max state bytes per operator (0 = unlimited).
     pub max_state_bytes: AtomicU64,
-    /// Cycle duration p50 in nanoseconds (updated periodically).
+    /// Cycle p50 (ns).
     pub cycle_p50_ns: AtomicU64,
-    /// Cycle duration p95 in nanoseconds (updated periodically).
+    /// Cycle p95 (ns).
     pub cycle_p95_ns: AtomicU64,
-    /// Cycle duration p99 in nanoseconds (updated periodically).
+    /// Cycle p99 (ns).
     pub cycle_p99_ns: AtomicU64,
 
-    // ── Sink 2PC timing (checkpoint coordinator, async) ──
-    /// Duration of the last sink pre-commit phase in microseconds.
+    // Sink 2PC timing
+    /// Last sink pre-commit (us).
     pub sink_precommit_duration_us: AtomicU64,
-    /// Duration of the last sink commit phase in microseconds.
+    /// Last sink commit (us).
     pub sink_commit_duration_us: AtomicU64,
-    /// Total sink write errors across all sinks (channel errors + timeouts).
+    /// Sink write errors (channel errors + timeouts).
     pub sink_write_errors: AtomicU64,
-    /// Cycles where the drain loop was skipped due to operator backpressure.
+    /// Cycles skipped due to backpressure.
     pub cycles_backpressured: AtomicU64,
 
-    // ── Checkpoint size / lag ──
-    /// Size of the last checkpoint in bytes (sidecar + manifest).
+    /// Last checkpoint size (bytes).
     pub last_checkpoint_size_bytes: AtomicU64,
-    /// Wall-clock timestamp (ms since epoch) of the last successful checkpoint.
+    /// Last checkpoint wall-clock timestamp (ms since epoch).
     pub last_checkpoint_timestamp_ms: AtomicU64,
+
+    /// MV update operations.
+    pub mv_updates: AtomicU64,
+    /// Approximate MV bytes stored.
+    pub mv_bytes_stored: AtomicU64,
 }
 
 impl PipelineCounters {
-    /// Create zeroed counters.
+    /// Zeroed counters.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -137,10 +126,12 @@ impl PipelineCounters {
             cycles_backpressured: AtomicU64::new(0),
             last_checkpoint_size_bytes: AtomicU64::new(0),
             last_checkpoint_timestamp_ms: AtomicU64::new(0),
+            mv_updates: AtomicU64::new(0),
+            mv_bytes_stored: AtomicU64::new(0),
         }
     }
 
-    /// Take a snapshot of all counters.
+    /// Relaxed-load snapshot of all counters.
     #[must_use]
     pub fn snapshot(&self) -> CounterSnapshot {
         CounterSnapshot {
@@ -166,6 +157,8 @@ impl PipelineCounters {
             cycles_backpressured: self.cycles_backpressured.load(Ordering::Relaxed),
             last_checkpoint_size_bytes: self.last_checkpoint_size_bytes.load(Ordering::Relaxed),
             last_checkpoint_timestamp_ms: self.last_checkpoint_timestamp_ms.load(Ordering::Relaxed),
+            mv_updates: self.mv_updates.load(Ordering::Relaxed),
+            mv_bytes_stored: self.mv_bytes_stored.load(Ordering::Relaxed),
         }
     }
 }
@@ -176,134 +169,138 @@ impl Default for PipelineCounters {
     }
 }
 
-/// A point-in-time snapshot of [`PipelineCounters`].
+/// Point-in-time snapshot of [`PipelineCounters`]. Fields mirror the atomic originals.
 #[derive(Debug, Clone, Copy)]
 pub struct CounterSnapshot {
-    /// Total events ingested.
+    /// Events ingested.
     pub events_ingested: u64,
-    /// Total events emitted.
+    /// Events emitted.
     pub events_emitted: u64,
-    /// Total events dropped.
+    /// Events dropped.
     pub events_dropped: u64,
-    /// Total processing cycles.
+    /// Processing cycles.
     pub cycles: u64,
-    /// Last cycle duration in nanoseconds.
+    /// Last cycle (ns).
     pub last_cycle_duration_ns: u64,
-    /// Total batches processed.
+    /// Batches processed.
     pub total_batches: u64,
-    /// Queries using compiled `PhysicalExpr` (zero-overhead per cycle).
+    /// Compiled-expr queries.
     pub queries_compiled: u64,
-    /// Queries using cached logical plan (physical planning per cycle).
+    /// Cached-plan queries.
     pub queries_cached_plan: u64,
-    /// Total checkpoints completed.
+    /// Checkpoints completed.
     pub checkpoints_completed: u64,
-    /// Total checkpoints failed.
+    /// Checkpoints failed.
     pub checkpoints_failed: u64,
-    /// Last checkpoint duration in milliseconds.
+    /// Last checkpoint (ms).
     pub last_checkpoint_duration_ms: u64,
-    /// Current checkpoint epoch.
+    /// Checkpoint epoch.
     pub checkpoint_epoch: u64,
-    /// Maximum configured state bytes per operator (0 = unlimited).
+    /// Max state bytes (0 = unlimited).
     pub max_state_bytes: u64,
-    /// Cycle duration p50 in nanoseconds.
+    /// Cycle p50 (ns).
     pub cycle_p50_ns: u64,
-    /// Cycle duration p95 in nanoseconds.
+    /// Cycle p95 (ns).
     pub cycle_p95_ns: u64,
-    /// Cycle duration p99 in nanoseconds.
+    /// Cycle p99 (ns).
     pub cycle_p99_ns: u64,
-    /// Last sink pre-commit duration in microseconds.
+    /// Last pre-commit (us).
     pub sink_precommit_duration_us: u64,
-    /// Last sink commit duration in microseconds.
+    /// Last commit (us).
     pub sink_commit_duration_us: u64,
-    /// Total sink write errors across all sinks.
+    /// Sink write errors.
     pub sink_write_errors: u64,
-    /// Cycles where drain was skipped due to operator backpressure.
+    /// Backpressure-skipped cycles.
     pub cycles_backpressured: u64,
-    /// Last checkpoint size in bytes.
+    /// Last checkpoint size (bytes).
     pub last_checkpoint_size_bytes: u64,
-    /// Wall-clock timestamp (ms since epoch) of last successful checkpoint.
+    /// Last checkpoint timestamp (ms since epoch).
     pub last_checkpoint_timestamp_ms: u64,
+    /// MV updates.
+    pub mv_updates: u64,
+    /// Approximate MV bytes.
+    pub mv_bytes_stored: u64,
 }
 
 /// Pipeline-wide metrics snapshot.
 #[derive(Debug, Clone)]
 pub struct PipelineMetrics {
-    /// Total events ingested across all sources.
+    /// Events ingested.
     pub total_events_ingested: u64,
-    /// Total events emitted to streams/sinks.
+    /// Events emitted.
     pub total_events_emitted: u64,
-    /// Total events dropped.
+    /// Events dropped.
     pub total_events_dropped: u64,
-    /// Total processing cycles completed.
+    /// Cycles.
     pub total_cycles: u64,
-    /// Total batches processed.
+    /// Batches.
     pub total_batches: u64,
-    /// Time since the pipeline was created.
+    /// Uptime.
     pub uptime: Duration,
-    /// Current pipeline state.
+    /// State.
     pub state: PipelineState,
-    /// Duration of the last processing cycle in nanoseconds.
+    /// Last cycle (ns).
     pub last_cycle_duration_ns: u64,
-    /// Number of registered sources.
+    /// Sources.
     pub source_count: usize,
-    /// Number of registered streams.
+    /// Streams.
     pub stream_count: usize,
-    /// Number of registered sinks.
+    /// Sinks.
     pub sink_count: usize,
-    /// Global pipeline watermark (minimum across all source watermarks).
+    /// Min watermark across all sources.
     pub pipeline_watermark: i64,
+    /// MV updates.
+    pub mv_updates: u64,
+    /// Approximate MV bytes.
+    pub mv_bytes_stored: u64,
 }
 
 /// Metrics for a single registered source.
 #[derive(Debug, Clone)]
 pub struct SourceMetrics {
-    /// Source name.
+    /// Name.
     pub name: String,
-    /// Total events pushed to this source (sequence number).
+    /// Total events (sequence number).
     pub total_events: u64,
-    /// Number of events currently buffered.
+    /// Buffered events.
     pub pending: usize,
-    /// Buffer capacity.
+    /// Capacity.
     pub capacity: usize,
-    /// Whether the source is experiencing backpressure (>80% full).
+    /// >80% full.
     pub is_backpressured: bool,
-    /// Current watermark value.
+    /// Watermark.
     pub watermark: i64,
-    /// Buffer utilization ratio (0.0 to 1.0).
+    /// 0.0..1.0.
     pub utilization: f64,
 }
 
 /// Metrics for a single registered stream.
 #[derive(Debug, Clone)]
 pub struct StreamMetrics {
-    /// Stream name.
+    /// Name.
     pub name: String,
-    /// Total events pushed to this stream.
+    /// Total events.
     pub total_events: u64,
-    /// Number of events currently buffered.
+    /// Buffered events.
     pub pending: usize,
-    /// Buffer capacity.
+    /// Capacity.
     pub capacity: usize,
-    /// Whether the stream is experiencing backpressure (>80% full).
+    /// >80% full.
     pub is_backpressured: bool,
-    /// Current watermark value.
+    /// Watermark.
     pub watermark: i64,
-    /// SQL query that defines this stream, if any.
+    /// Defining SQL query.
     pub sql: Option<String>,
 }
 
-/// Backpressure threshold: a buffer is considered backpressured when
-/// its utilization exceeds this fraction.
 const BACKPRESSURE_THRESHOLD: f64 = 0.8;
 
-/// Compute whether a buffer is backpressured given pending and capacity.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn is_backpressured(pending: usize, capacity: usize) -> bool {
     capacity > 0 && (pending as f64 / capacity as f64) > BACKPRESSURE_THRESHOLD
 }
 
-/// Compute buffer utilization as a ratio (0.0 to 1.0).
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 pub(crate) fn utilization(pending: usize, capacity: usize) -> f64 {
@@ -423,6 +420,8 @@ mod tests {
             stream_count: 1,
             sink_count: 1,
             pipeline_watermark: i64::MIN,
+            mv_updates: 0,
+            mv_bytes_stored: 0,
         };
         let m2 = m.clone();
         assert_eq!(m2.total_events_ingested, 100);

@@ -10,8 +10,6 @@ use arrow::datatypes::SchemaRef;
 
 use crate::error::DbError;
 
-// ── TableBackend enum ──
-
 /// Backend storage for a single reference table.
 #[allow(dead_code)]
 pub(crate) enum TableBackend {
@@ -139,8 +137,6 @@ mod tests {
         )
         .unwrap()
     }
-
-    // ── InMemory backend tests ──
 
     #[test]
     fn test_in_memory_crud() {

@@ -56,6 +56,7 @@ mod handle;
 mod interval_join;
 mod metrics;
 mod metrics_api;
+mod mv_store;
 mod operator;
 mod operator_graph;
 /// Thread-per-core connector pipeline.
@@ -71,6 +72,7 @@ mod show_commands;
 mod sink_task;
 mod sql_analysis;
 mod sql_utils;
+#[cfg(test)]
 mod stream_executor;
 mod table_backend;
 mod table_cache_mode;

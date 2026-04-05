@@ -42,6 +42,8 @@ impl LaminarDB {
             stream_count: self.catalog.list_streams().len(),
             sink_count: self.catalog.list_sinks().len(),
             pipeline_watermark: self.pipeline_watermark(),
+            mv_updates: snap.mv_updates,
+            mv_bytes_stored: snap.mv_bytes_stored,
         }
     }
 

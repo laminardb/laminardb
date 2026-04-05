@@ -669,8 +669,6 @@ impl CoreWindowState {
             return self.update_batch_session(batch, &ts_array);
         }
 
-        // ── Vectorized path for tumbling/hopping ────────────────────────
-
         // Batch-level group key extraction via persistent RowConverter
         let rows = if self.num_group_cols > 0 {
             let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
@@ -1817,8 +1815,6 @@ mod tests {
         }
     }
 
-    // ── Detection tests ─────────────────────────────────────────────
-
     #[tokio::test]
     async fn test_detect_tumbling_aggregate_returns_core_window() {
         use laminar_sql::{create_session_context, register_streaming_functions};
@@ -1930,8 +1926,6 @@ mod tests {
         assert!(result.is_none(), "Projection-only should return None");
     }
 
-    // ── Pipeline tests ──────────────────────────────────────────────
-
     #[test]
     fn test_core_window_tumbling_sum() {
         let mut state = make_core_window_state(1000);
@@ -2040,8 +2034,6 @@ mod tests {
         assert!(batches.is_empty());
     }
 
-    // ── Emit clause bridge test ─────────────────────────────────────
-
     #[test]
     fn test_emit_clause_to_core_all_variants() {
         use crate::sql_analysis::{emit_clause_to_core, sql_emit_to_core};
@@ -2073,8 +2065,6 @@ mod tests {
             CoreEmit::Final
         );
     }
-
-    // ── Checkpoint/Restore tests ────────────────────────────────────
 
     #[test]
     fn test_core_window_checkpoint_roundtrip() {
@@ -2135,8 +2125,6 @@ mod tests {
         let result = state2.restore_windows(&cp);
         assert!(result.is_err(), "Should fail on fingerprint mismatch");
     }
-
-    // ── New detection tests (hopping/session) ──────────────────────
 
     #[tokio::test]
     async fn test_detect_sliding_aggregate_returns_core_window() {
@@ -2243,8 +2231,6 @@ mod tests {
         assert!(result.is_none(), "Session with gap=0 should return None");
     }
 
-    // ── Hopping pipeline tests ─────────────────────────────────────
-
     #[test]
     fn test_hopping_basic_sum() {
         // 4s window, 2s slide → each event in 2 windows
@@ -2340,8 +2326,6 @@ mod tests {
         let batches = state.close_windows(5000).unwrap();
         assert!(batches.is_empty());
     }
-
-    // ── Session pipeline tests ─────────────────────────────────────
 
     #[test]
     fn test_session_basic_sum() {
@@ -2508,8 +2492,6 @@ mod tests {
         assert_eq!(results[1], ("B".to_string(), 2000, 300));
     }
 
-    // ── Hopping checkpoint tests ───────────────────────────────────
-
     #[test]
     fn test_hopping_checkpoint_roundtrip() {
         let mut state = make_hopping_core_window_state(4000, 2000);
@@ -2573,8 +2555,6 @@ mod tests {
             "SUM should be 10+20+30=60 after restore"
         );
     }
-
-    // ── Post-aggregate projection tests ──────────────────────────────
 
     #[tokio::test]
     async fn test_post_aggregate_projection_detection() {

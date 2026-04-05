@@ -34,8 +34,8 @@ use sqlparser::parser::Parser;
 use laminar_sql::parser::join_parser::analyze_joins;
 use laminar_sql::parser::{EmitClause, EmitStrategy as SqlEmitStrategy};
 use laminar_sql::translator::{
-    AsofJoinTranslatorConfig, JoinOperatorConfig, StreamJoinConfig, TemporalJoinTranslatorConfig,
-    WindowOperatorConfig, WindowType,
+    AsofJoinTranslatorConfig, JoinOperatorConfig, StreamJoinConfig, StreamJoinType,
+    TemporalJoinTranslatorConfig, WindowOperatorConfig, WindowType,
 };
 
 // ---------------------------------------------------------------------------
@@ -654,46 +654,314 @@ pub(crate) fn detect_temporal_query(
     (Some(config), Some(projection_sql))
 }
 
-/// Detect a stream-stream interval join in raw SQL text.
-///
-/// Returns `(config, projection_sql)` or `(None, None)` if not detected.
-pub(crate) fn detect_stream_join_query(sql: &str) -> (Option<StreamJoinConfig>, Option<String>) {
-    let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
-        return (None, None);
+fn split_conjunction_sqlparser(expr: &Expr) -> Vec<Expr> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: sqlparser::ast::BinaryOperator::And,
+            right,
+        } => {
+            let mut parts = split_conjunction_sqlparser(left);
+            parts.extend(split_conjunction_sqlparser(right));
+            parts
+        }
+        Expr::Nested(inner)
+            if matches!(
+                inner.as_ref(),
+                Expr::BinaryOp {
+                    op: sqlparser::ast::BinaryOperator::And,
+                    ..
+                }
+            ) =>
+        {
+            split_conjunction_sqlparser(inner)
+        }
+        other => vec![other.clone()],
+    }
+}
+
+/// Does this expression reference `alias` via any `CompoundIdentifier`?
+fn expr_mentions_alias(expr: &Expr, alias: &str) -> bool {
+    match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+            parts[0].value.eq_ignore_ascii_case(alias)
+        }
+        Expr::Value(_) | Expr::Identifier(_) => false,
+        Expr::BinaryOp { left, right, .. } => {
+            expr_mentions_alias(left, alias) || expr_mentions_alias(right, alias)
+        }
+        Expr::UnaryOp { expr: e, .. }
+        | Expr::Cast { expr: e, .. }
+        | Expr::Nested(e)
+        | Expr::IsNull(e)
+        | Expr::IsNotNull(e) => expr_mentions_alias(e, alias),
+        Expr::Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(al) = &f.args {
+                al.args.iter().any(|a| match a {
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(e),
+                    )
+                    | sqlparser::ast::FunctionArg::Named {
+                        arg: sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ..
+                    } => expr_mentions_alias(e, alias),
+                    _ => false,
+                })
+            } else {
+                false
+            }
+        }
+        Expr::InList { expr, list, .. } => {
+            expr_mentions_alias(expr, alias) || list.iter().any(|i| expr_mentions_alias(i, alias))
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_mentions_alias(expr, alias)
+                || expr_mentions_alias(low, alias)
+                || expr_mentions_alias(high, alias)
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|o| expr_mentions_alias(o, alias))
+                || conditions.iter().any(|cw| {
+                    expr_mentions_alias(&cw.condition, alias)
+                        || expr_mentions_alias(&cw.result, alias)
+                })
+                || else_result
+                    .as_ref()
+                    .is_some_and(|e| expr_mentions_alias(e, alias))
+        }
+        // Unknown expr variant — conservatively assume it references the alias
+        _ => true,
+    }
+}
+
+/// False for the non-preserved side of an outer join (removing its
+/// WHERE predicate would let NULL-extended rows through).
+fn can_remove_from_post_where(join_type: StreamJoinType, is_left_side: bool) -> bool {
+    !matches!(
+        (join_type, is_left_side),
+        (StreamJoinType::Left | StreamJoinType::LeftAnti, false)
+            | (StreamJoinType::Right, true)
+            | (StreamJoinType::Full, _)
+    )
+}
+
+/// `p.col` → `col`, literals and other nodes pass through via `to_string()`.
+fn expr_to_sql_strip_alias(expr: &Expr, alias: &str) -> String {
+    match expr {
+        Expr::CompoundIdentifier(parts)
+            if parts.len() >= 2 && parts[0].value.eq_ignore_ascii_case(alias) =>
+        {
+            parts[1..]
+                .iter()
+                .map(|p| p.value.as_str())
+                .collect::<Vec<_>>()
+                .join(".")
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let l = expr_to_sql_strip_alias(left, alias);
+            let r = expr_to_sql_strip_alias(right, alias);
+            format!("{l} {op} {r}")
+        }
+        Expr::UnaryOp { op, expr: inner } => {
+            format!("{op} {}", expr_to_sql_strip_alias(inner, alias))
+        }
+        Expr::Nested(inner) => format!("({})", expr_to_sql_strip_alias(inner, alias)),
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => format!(
+            "CAST({} AS {data_type})",
+            expr_to_sql_strip_alias(inner, alias)
+        ),
+        Expr::IsNull(inner) => format!("{} IS NULL", expr_to_sql_strip_alias(inner, alias)),
+        Expr::IsNotNull(inner) => {
+            format!("{} IS NOT NULL", expr_to_sql_strip_alias(inner, alias))
+        }
+        Expr::Between {
+            expr: inner,
+            negated,
+            low,
+            high,
+        } => {
+            let e = expr_to_sql_strip_alias(inner, alias);
+            let l = expr_to_sql_strip_alias(low, alias);
+            let h = expr_to_sql_strip_alias(high, alias);
+            if *negated {
+                format!("{e} NOT BETWEEN {l} AND {h}")
+            } else {
+                format!("{e} BETWEEN {l} AND {h}")
+            }
+        }
+        Expr::InList {
+            expr: inner,
+            list,
+            negated,
+        } => {
+            let e = expr_to_sql_strip_alias(inner, alias);
+            let items: Vec<String> = list
+                .iter()
+                .map(|i| expr_to_sql_strip_alias(i, alias))
+                .collect();
+            if *negated {
+                format!("{e} NOT IN ({})", items.join(", "))
+            } else {
+                format!("{e} IN ({})", items.join(", "))
+            }
+        }
+        Expr::Function(func) => {
+            let name = &func.name;
+            let args = match &func.args {
+                sqlparser::ast::FunctionArguments::List(al) => al
+                    .args
+                    .iter()
+                    .map(|a| match a {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ) => expr_to_sql_strip_alias(e, alias),
+                        other => other.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                other => other.to_string(),
+            };
+            format!("{name}({args})")
+        }
+        other => other.to_string(),
+    }
+}
+
+fn conjoin_predicates(preds: &[Expr]) -> Option<Expr> {
+    preds.iter().cloned().reduce(|acc, pred| Expr::BinaryOp {
+        left: Box::new(acc),
+        op: sqlparser::ast::BinaryOperator::And,
+        right: Box::new(pred),
+    })
+}
+
+struct SelfJoinPreFilters {
+    left_sql: Option<String>,
+    right_sql: Option<String>,
+    post_join_where: Option<String>,
+}
+
+fn extract_self_join_pre_filters(
+    select: &sqlparser::ast::Select,
+    analysis: &laminar_sql::parser::join_parser::JoinAnalysis,
+    config: &StreamJoinConfig,
+) -> Option<SelfJoinPreFilters> {
+    let where_expr = select.selection.as_ref()?;
+    let left_alias = analysis.left_alias.as_deref().unwrap_or(&config.left_table);
+    let right_alias = analysis
+        .right_alias
+        .as_deref()
+        .unwrap_or(&config.right_table);
+
+    let preds = split_conjunction_sqlparser(where_expr);
+
+    let mut left_strs = Vec::new();
+    let mut right_strs = Vec::new();
+    let mut post_join_preds = Vec::new();
+
+    for pred in &preds {
+        let refs_left = expr_mentions_alias(pred, left_alias);
+        let refs_right = expr_mentions_alias(pred, right_alias);
+
+        match (refs_left, refs_right) {
+            (true, false) => {
+                left_strs.push(expr_to_sql_strip_alias(pred, left_alias));
+                if !can_remove_from_post_where(config.join_type, true) {
+                    post_join_preds.push(pred.clone());
+                }
+            }
+            (false, true) => {
+                right_strs.push(expr_to_sql_strip_alias(pred, right_alias));
+                if !can_remove_from_post_where(config.join_type, false) {
+                    post_join_preds.push(pred.clone());
+                }
+            }
+            _ => post_join_preds.push(pred.clone()),
+        }
+    }
+
+    if left_strs.is_empty() && right_strs.is_empty() {
+        return None;
+    }
+
+    let left_sql = if left_strs.is_empty() {
+        None
+    } else {
+        Some(left_strs.join(" AND "))
+    };
+    let right_sql = if right_strs.is_empty() {
+        None
+    } else {
+        Some(right_strs.join(" AND "))
     };
 
-    let Some(laminar_sql::parser::StreamingStatement::Standard(stmt)) = statements.first() else {
-        return (None, None);
+    let post_join_where = conjoin_predicates(&post_join_preds).map(|e| {
+        rewrite_stream_join_expr(
+            &e,
+            analysis.left_alias.as_deref(),
+            analysis.right_alias.as_deref(),
+            config,
+        )
+    });
+
+    Some(SelfJoinPreFilters {
+        left_sql,
+        right_sql,
+        post_join_where,
+    })
+}
+
+pub(crate) struct StreamJoinDetection {
+    pub config: StreamJoinConfig,
+    pub projection_sql: String,
+    pub left_pre_filter: Option<String>,
+    pub right_pre_filter: Option<String>,
+}
+
+pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection> {
+    let statements = laminar_sql::parse_streaming_sql(sql).ok()?;
+
+    let laminar_sql::parser::StreamingStatement::Standard(stmt) = statements.first()? else {
+        return None;
     };
 
     let Statement::Query(query) = stmt.as_ref() else {
-        return (None, None);
+        return None;
     };
 
     let SetExpr::Select(select) = query.body.as_ref() else {
-        return (None, None);
+        return None;
     };
 
-    let Ok(Some(multi)) = analyze_joins(select) else {
-        return (None, None);
-    };
+    let multi = analyze_joins(select).ok()??;
 
     // Find the first stream-stream join step (has time_bound, not ASOF/temporal/lookup)
-    let Some(stream_analysis) = multi.joins.iter().find(|j| {
+    let stream_analysis = multi.joins.iter().find(|j| {
         j.time_bound.is_some() && !j.is_asof_join && !j.is_temporal_join && !j.is_lookup_join
-    }) else {
-        return (None, None);
-    };
+    })?;
 
     let JoinOperatorConfig::StreamStream(config) =
         JoinOperatorConfig::from_analysis(stream_analysis)
     else {
-        return (None, None);
+        return None;
     };
 
     // Only route to interval join if we have time columns
     if config.left_time_column.is_empty() || config.right_time_column.is_empty() {
-        return (None, None);
+        return None;
     }
 
     // RightSemi/RightAnti mapped to Inner by translator — reject to avoid wrong semantics.
@@ -707,12 +975,44 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> (Option<StreamJoinConfig>, 
             "RightSemi/RightAnti not implemented for streaming interval joins; \
              falling back to per-cycle batch join."
         );
-        return (None, None);
+        return None;
     }
 
-    let projection_sql = build_stream_join_projection_sql(select, stream_analysis, &config);
+    let pre_filters = if config.left_table == config.right_table {
+        extract_self_join_pre_filters(select, stream_analysis, &config)
+    } else {
+        None
+    };
 
-    (Some(config), Some(projection_sql))
+    let where_clause = match &pre_filters {
+        Some(f) => f
+            .post_join_where
+            .as_ref()
+            .map(|w| format!(" WHERE {w}"))
+            .unwrap_or_default(),
+        None => select
+            .selection
+            .as_ref()
+            .map(|expr| {
+                let rewritten = rewrite_stream_join_expr(
+                    expr,
+                    stream_analysis.left_alias.as_deref(),
+                    stream_analysis.right_alias.as_deref(),
+                    &config,
+                );
+                format!(" WHERE {rewritten}")
+            })
+            .unwrap_or_default(),
+    };
+    let projection_sql =
+        build_stream_join_projection_sql(select, stream_analysis, &config, &where_clause);
+
+    Some(StreamJoinDetection {
+        config,
+        projection_sql,
+        left_pre_filter: pre_filters.as_ref().and_then(|f| f.left_sql.clone()),
+        right_pre_filter: pre_filters.as_ref().and_then(|f| f.right_sql.clone()),
+    })
 }
 
 /// Detect a `TEMPORAL PROBE JOIN` in raw SQL text.
@@ -1232,12 +1532,11 @@ fn rewrite_temporal_expr(
 // Private: Stream-stream join projection rewriting
 // ---------------------------------------------------------------------------
 
-/// Build a `SELECT ... FROM __interval_tmp` projection query from the original
-/// SELECT items, rewriting table-qualified references to plain column names.
 fn build_stream_join_projection_sql(
     select: &sqlparser::ast::Select,
     analysis: &laminar_sql::parser::join_parser::JoinAnalysis,
     config: &StreamJoinConfig,
+    where_clause: &str,
 ) -> String {
     let left_alias = analysis.left_alias.as_deref();
     let right_alias = analysis.right_alias.as_deref();
@@ -1268,15 +1567,6 @@ fn build_stream_join_projection_sql(
             }
         })
         .collect();
-
-    let where_clause = select
-        .selection
-        .as_ref()
-        .map(|expr| {
-            let rewritten = rewrite_stream_join_expr(expr, left_alias, right_alias, config);
-            format!(" WHERE {rewritten}")
-        })
-        .unwrap_or_default();
 
     format!(
         "SELECT {} FROM __interval_tmp{where_clause}",
@@ -1620,5 +1910,187 @@ mod tests {
         assert!(is_window_tvf("Hop"));
         assert!(is_window_tvf("SESSION"));
         assert!(!is_window_tvf("my_func"));
+    }
+}
+
+#[cfg(test)]
+mod self_join_filter_tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_self_join_simple_predicates() {
+        let d = detect_stream_join_query(
+            "SELECT l.key, r.key FROM events l \
+             JOIN events r ON l.key = r.key \
+             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '10' SECOND \
+             WHERE l.type = 'A' AND r.type = 'B'",
+        )
+        .expect("should detect self-join");
+
+        assert_eq!(d.left_pre_filter.as_deref(), Some("type = 'A'"));
+        assert_eq!(d.right_pre_filter.as_deref(), Some("type = 'B'"));
+        assert!(
+            !d.projection_sql.contains("WHERE"),
+            "inner join should have no post-join WHERE, got: {}",
+            d.projection_sql
+        );
+    }
+
+    #[test]
+    fn test_cross_alias_predicate_stays_post_join() {
+        let d = detect_stream_join_query(
+            "SELECT p.key FROM events p \
+             JOIN events a ON p.key = a.key \
+             AND a.ts BETWEEN p.ts AND p.ts + INTERVAL '10' SECOND \
+             WHERE p.type = 'A' AND a.type = 'B' AND p.cost > a.cost",
+        )
+        .expect("should detect self-join");
+
+        assert_eq!(d.left_pre_filter.as_deref(), Some("type = 'A'"));
+        assert_eq!(d.right_pre_filter.as_deref(), Some("type = 'B'"));
+        assert!(
+            d.projection_sql.contains("WHERE"),
+            "cross-alias p.cost > a.cost should stay post-join: {}",
+            d.projection_sql
+        );
+    }
+
+    #[test]
+    fn test_unqualified_column_stays_post_join() {
+        let d = detect_stream_join_query(
+            "SELECT p.key FROM events p \
+             JOIN events a ON p.key = a.key \
+             AND a.ts BETWEEN p.ts AND p.ts + INTERVAL '10' SECOND \
+             WHERE p.type = 'A' AND status = 'active'",
+        )
+        .expect("should detect self-join");
+
+        assert_eq!(d.left_pre_filter.as_deref(), Some("type = 'A'"));
+        assert!(d.right_pre_filter.is_none());
+        assert!(
+            d.projection_sql.contains("WHERE"),
+            "unqualified 'status' should stay post-join: {}",
+            d.projection_sql
+        );
+    }
+
+    #[test]
+    fn test_non_self_join_no_pre_filters() {
+        let d = detect_stream_join_query(
+            "SELECT o.order_id FROM orders o \
+             JOIN payments p ON o.order_id = p.order_id \
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR \
+             WHERE o.amount > 100",
+        )
+        .expect("should detect interval join");
+
+        assert!(d.left_pre_filter.is_none());
+        assert!(d.right_pre_filter.is_none());
+        assert!(d.projection_sql.contains("WHERE"));
+    }
+
+    #[test]
+    fn test_left_join_keeps_right_predicate_in_post_where() {
+        let d = detect_stream_join_query(
+            "SELECT p.key FROM events p \
+             LEFT JOIN events a ON p.key = a.key \
+             AND a.ts BETWEEN p.ts AND p.ts + INTERVAL '10' SECOND \
+             WHERE p.type = 'A' AND a.type = 'B'",
+        )
+        .expect("should detect self-join");
+
+        assert_eq!(d.left_pre_filter.as_deref(), Some("type = 'A'"));
+        assert_eq!(d.right_pre_filter.as_deref(), Some("type = 'B'"));
+        assert!(
+            d.projection_sql.contains("WHERE"),
+            "LEFT JOIN must keep right predicate in WHERE: {}",
+            d.projection_sql
+        );
+    }
+
+    #[test]
+    fn test_self_join_no_where_clause() {
+        let d = detect_stream_join_query(
+            "SELECT l.key, r.key FROM events l \
+             JOIN events r ON l.key = r.key \
+             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '10' SECOND",
+        )
+        .expect("should detect self-join");
+
+        assert!(d.left_pre_filter.is_none());
+        assert!(d.right_pre_filter.is_none());
+    }
+
+    #[test]
+    fn test_nested_function_predicate() {
+        let d = detect_stream_join_query(
+            "SELECT p.key FROM events p \
+             JOIN events a ON p.key = a.key \
+             AND a.ts BETWEEN p.ts AND p.ts + INTERVAL '10' SECOND \
+             WHERE jsonb_get_text(from_json(p.attrs), 'name') = 'prompt' \
+             AND jsonb_get_text(from_json(a.attrs), 'name') = 'api'",
+        )
+        .expect("should detect self-join");
+
+        assert!(d.left_pre_filter.is_some());
+        assert!(d.right_pre_filter.is_some());
+        let left = d.left_pre_filter.unwrap();
+        assert!(!left.contains("p."), "alias should be stripped: {left}");
+        assert!(left.contains("attrs"), "column name should survive: {left}");
+    }
+
+    #[test]
+    fn test_cast_predicate_classified_correctly() {
+        let d = detect_stream_join_query(
+            "SELECT l.key FROM events l \
+             JOIN events r ON l.key = r.key \
+             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '10' SECOND \
+             WHERE CAST(l.duration AS DOUBLE) > 1000",
+        )
+        .expect("should detect self-join");
+
+        assert!(d.left_pre_filter.is_some());
+        assert!(d.right_pre_filter.is_none());
+        let left = d.left_pre_filter.unwrap();
+        assert!(!left.contains("l."), "alias should be stripped: {left}");
+    }
+
+    #[test]
+    fn test_is_not_null_predicate() {
+        let d = detect_stream_join_query(
+            "SELECT l.key FROM events l \
+             JOIN events r ON l.key = r.key \
+             AND r.ts BETWEEN l.ts AND l.ts + INTERVAL '10' SECOND \
+             WHERE l.name IS NOT NULL AND r.name IS NOT NULL",
+        )
+        .expect("should detect self-join");
+
+        assert!(d.left_pre_filter.is_some());
+        assert!(d.right_pre_filter.is_some());
+        let left = d.left_pre_filter.unwrap();
+        assert!(
+            left.contains("IS NOT NULL"),
+            "should preserve IS NOT NULL: {left}"
+        );
+        assert!(!left.contains("l."), "alias should be stripped: {left}");
+    }
+
+    #[test]
+    fn test_string_literal_containing_alias_not_corrupted() {
+        let d = detect_stream_join_query(
+            "SELECT p.key FROM events p \
+             JOIN events a ON p.key = a.key \
+             AND a.ts BETWEEN p.ts AND p.ts + INTERVAL '10' SECOND \
+             WHERE a.type = 'p.internal'",
+        )
+        .expect("should detect self-join");
+
+        assert!(d.left_pre_filter.is_none());
+        assert!(d.right_pre_filter.is_some());
+        let right = d.right_pre_filter.unwrap();
+        assert!(
+            right.contains("'p.internal'"),
+            "string literal must not be corrupted: {right}"
+        );
     }
 }

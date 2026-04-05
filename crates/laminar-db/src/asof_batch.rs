@@ -466,8 +466,6 @@ fn take_with_nulls(
         .map_err(|e| DbError::query_pipeline_arrow("ASOF join (right take)", &e))
 }
 
-// ── Stateful right-side buffer for streaming ASOF joins ──────────────────
-
 const ASOF_COMPACTION_THRESHOLD: u32 = 32;
 
 /// Right-side index: `key_hash → BTreeMap<timestamp, Vec<row_index>>`.
@@ -715,8 +713,6 @@ pub(crate) fn execute_asof_join_with_state(
         config,
     )
 }
-
-// ── Checkpoint types for AsofRightBuffer ─────────────────────────────────
 
 /// Serializable checkpoint for `AsofRightBuffer`.
 #[derive(serde::Serialize, serde::Deserialize)]
