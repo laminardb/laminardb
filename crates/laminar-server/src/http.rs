@@ -519,9 +519,6 @@ async fn ws_stream(
     let watermark = Arc::new(AtomicI64::new(i64::MIN));
     let wm_producer = Arc::clone(&watermark);
 
-    // Producer: blocking poll on dedicated thread. Exits when tx is dropped
-    // (consumer loop breaks on client disconnect, dropping rx, which causes
-    // tx.blocking_send to fail).
     tokio::task::spawn_blocking(move || loop {
         match sub.poll_message() {
             Some(laminar_core::streaming::SubscriptionMessage::Batch(batch)) => {
