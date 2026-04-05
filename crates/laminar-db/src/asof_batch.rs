@@ -5,97 +5,22 @@
 //! Implements the ASOF join algorithm for batch data, matching each left row
 //! to the closest right row by timestamp within the same key partition.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use arrow::array::{
-    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
-};
+use arrow::array::{ArrayRef, RecordBatch};
 use arrow::compute::concat_batches;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{Field, Schema, SchemaRef};
 
 use laminar_sql::parser::join_parser::AsofSqlDirection;
 use laminar_sql::translator::{AsofJoinTranslatorConfig, AsofSqlJoinType};
 
 use crate::error::DbError;
-
-/// A borrowed reference to a key column, avoiding per-row String allocations.
-enum KeyColumn<'a> {
-    Utf8(&'a StringArray),
-    Int64(&'a Int64Array),
-}
-
-impl KeyColumn<'_> {
-    /// Returns true if the key at row `i` is null.
-    fn is_null(&self, i: usize) -> bool {
-        match self {
-            KeyColumn::Utf8(a) => a.is_null(i),
-            KeyColumn::Int64(a) => a.is_null(i),
-        }
-    }
-
-    /// Computes a hash for the key at row `i`. Returns `None` for null keys.
-    fn hash_at(&self, i: usize) -> Option<u64> {
-        if self.is_null(i) {
-            return None;
-        }
-        let mut hasher = DefaultHasher::new();
-        match self {
-            KeyColumn::Utf8(a) => a.value(i).hash(&mut hasher),
-            KeyColumn::Int64(a) => a.value(i).hash(&mut hasher),
-        }
-        Some(hasher.finish())
-    }
-
-    /// Returns true if the keys at the given indices in two `KeyColumn`s are equal.
-    /// Returns false if either key is null (SQL three-valued logic).
-    fn keys_equal(&self, i: usize, other: &KeyColumn<'_>, j: usize) -> bool {
-        if self.is_null(i) || other.is_null(j) {
-            return false;
-        }
-        match (self, other) {
-            (KeyColumn::Utf8(a), KeyColumn::Utf8(b)) => a.value(i) == b.value(j),
-            (KeyColumn::Int64(a), KeyColumn::Int64(b)) => a.value(i) == b.value(j),
-            _ => false,
-        }
-    }
-}
-
-/// Extracts a key column from a `RecordBatch` without per-row allocation.
-fn extract_key_column<'a>(
-    batch: &'a RecordBatch,
-    col_name: &str,
-) -> Result<KeyColumn<'a>, DbError> {
-    let col_idx = batch
-        .schema()
-        .index_of(col_name)
-        .map_err(|_| DbError::Pipeline(format!("Column '{col_name}' not found")))?;
-    let array = batch.column(col_idx);
-
-    match array.data_type() {
-        DataType::Utf8 => {
-            let string_array = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Utf8")))?;
-            Ok(KeyColumn::Utf8(string_array))
-        }
-        DataType::Int64 => {
-            let int_array = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Int64")))?;
-            Ok(KeyColumn::Int64(int_array))
-        }
-        other => Err(DbError::Pipeline(format!(
-            "Unsupported key column type: {other}"
-        ))),
-    }
-}
+use crate::key_column::{
+    extract_column_as_timestamps, extract_key_column, take_with_nulls, KeyColumn,
+};
 
 /// Execute an ASOF join on two sets of `RecordBatch`es.
 ///
@@ -319,46 +244,6 @@ fn find_verified_match(
     }
 }
 
-/// Extract a column's values as `i64` timestamps (epoch millis).
-fn extract_column_as_timestamps(batch: &RecordBatch, col_name: &str) -> Result<Vec<i64>, DbError> {
-    let col_idx = batch
-        .schema()
-        .index_of(col_name)
-        .map_err(|_| DbError::Pipeline(format!("Timestamp column '{col_name}' not found")))?;
-    let array = batch.column(col_idx);
-
-    match array.data_type() {
-        DataType::Int64 => {
-            let int_array = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Int64")))?;
-            Ok(int_array.values().to_vec())
-        }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let ts_array = array
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .ok_or_else(|| {
-                    DbError::Pipeline(format!("Column '{col_name}' is not TimestampMillisecond"))
-                })?;
-            Ok(ts_array.values().to_vec())
-        }
-        DataType::Float64 => {
-            // Support float timestamps (cast to i64 millis)
-            let f_array = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Float64")))?;
-            #[allow(clippy::cast_possible_truncation)]
-            Ok(f_array.values().iter().map(|v| *v as i64).collect())
-        }
-        other => Err(DbError::Pipeline(format!(
-            "Unsupported timestamp column type for '{col_name}': {other}"
-        ))),
-    }
-}
-
 /// Build the merged output schema from left and right schemas.
 ///
 /// Right-side columns are made nullable for Left joins. Duplicate column
@@ -440,30 +325,6 @@ fn build_output_batch(
 
     RecordBatch::try_new(output_schema.clone(), columns)
         .map_err(|e| DbError::query_pipeline_arrow("ASOF join (result)", &e))
-}
-
-/// Take rows from an array using optional indices (None = null).
-fn take_with_nulls(
-    array: &dyn Array,
-    indices: &[Option<usize>],
-    num_rows: usize,
-) -> Result<ArrayRef, DbError> {
-    if array.is_empty() {
-        // Right side is empty — produce typed all-null array matching the source dtype
-        return Ok(arrow::array::new_null_array(array.data_type(), num_rows));
-    }
-
-    // Build a UInt32Array with null entries for unmatched rows
-    #[allow(clippy::cast_possible_truncation)]
-    let index_array = arrow::array::UInt32Array::from(
-        indices
-            .iter()
-            .map(|opt| opt.map(|i| i as u32))
-            .collect::<Vec<Option<u32>>>(),
-    );
-
-    arrow::compute::take(array, &index_array, None)
-        .map_err(|e| DbError::query_pipeline_arrow("ASOF join (right take)", &e))
 }
 
 const ASOF_COMPACTION_THRESHOLD: u32 = 32;
@@ -798,6 +659,8 @@ impl AsofRightBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Float64Array, Int64Array, StringArray};
+    use arrow::datatypes::DataType;
     use std::time::Duration;
 
     fn trades_batch() -> RecordBatch {

@@ -54,6 +54,7 @@ mod ddl;
 mod error;
 mod handle;
 mod interval_join;
+mod key_column;
 mod metrics;
 mod metrics_api;
 mod mv_store;

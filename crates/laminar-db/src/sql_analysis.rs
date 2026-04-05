@@ -969,8 +969,10 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection>
 
 /// Detect a `TEMPORAL PROBE JOIN` in raw SQL text.
 ///
-/// Not recognized by sqlparser, so detection works on the raw SQL string.
-/// Returns `(config, projection_sql)` or `(None, None)` if not detected.
+/// sqlparser does not recognize this syntax, so we find the probe clause,
+/// extract probe-specific parts (TIMESTAMPS, RANGE/LIST, AS alias), rewrite
+/// to a standard JOIN, then use `analyze_joins()` for table/key/alias
+/// extraction.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn detect_temporal_probe_query(
     sql: &str,
@@ -978,52 +980,28 @@ pub(crate) fn detect_temporal_probe_query(
     Option<laminar_sql::translator::TemporalProbeConfig>,
     Option<String>,
 ) {
-    // Strip string literals and single-line comments before keyword search
-    // to avoid false positives from SQL like WHERE msg = 'TEMPORAL PROBE JOIN'.
+    use laminar_sql::translator::TemporalProbeConfig;
+    // Quick bail-out: strip literals/comments to avoid false positives.
     let stripped = strip_literals_and_comments(sql);
     let upper = stripped.to_uppercase();
     let Some(tpj_pos) = upper.find("TEMPORAL PROBE JOIN") else {
         return (None, None);
     };
 
-    let from_pos = upper[..tpj_pos].rfind("FROM").unwrap_or(0);
-    let between_from_and_tpj = sql[from_pos + 4..tpj_pos].trim();
-
-    let left_parts: Vec<&str> = between_from_and_tpj.split_whitespace().collect();
-    if left_parts.is_empty() {
-        return (None, None);
-    }
-    let left_table = left_parts[0].to_string();
-    let left_alias = if left_parts.len() >= 3 && left_parts[1].eq_ignore_ascii_case("AS") {
-        Some(left_parts[2].to_string())
-    } else {
-        left_parts.get(1).map(ToString::to_string)
-    };
-
+    // --- Step 1: Extract probe-specific clauses from the raw text ---
     let after_tpj = &sql[tpj_pos + "TEMPORAL PROBE JOIN".len()..];
-    let after_tpj_trimmed = after_tpj.trim_start();
+    let after_tpj_upper = upper[tpj_pos + "TEMPORAL PROBE JOIN".len()..].to_string();
 
-    let after_upper = after_tpj_trimmed.to_uppercase();
-    let Some(on_pos) = after_upper.find(" ON ") else {
+    let Some(on_pos) = after_tpj_upper.find(" ON ") else {
         return (None, None);
     };
+    let after_on = after_tpj[on_pos + 4..].trim_start();
+    let after_on_upper = after_on.to_uppercase();
 
-    let right_part = after_tpj_trimmed[..on_pos].trim();
-    let right_parts: Vec<&str> = right_part.split_whitespace().collect();
-    if right_parts.is_empty() {
-        return (None, None);
-    }
-    let right_table = right_parts[0].to_string();
-    let right_alias = if right_parts.len() >= 3 && right_parts[1].eq_ignore_ascii_case("AS") {
-        Some(right_parts[2].to_string())
-    } else {
-        right_parts.get(1).map(ToString::to_string)
-    };
-
-    let after_on = after_tpj_trimmed[on_pos + 4..].trim_start();
+    // Parse key columns from ON clause (needed for rewrite and config).
     let key_columns: Vec<String> = if let Some(rest) = after_on.strip_prefix('(') {
-        let end_paren = rest.find(')').unwrap_or(rest.len());
-        rest[..end_paren]
+        let end = rest.find(')').unwrap_or(rest.len());
+        rest[..end]
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -1032,14 +1010,13 @@ pub(crate) fn detect_temporal_probe_query(
         vec![after_on.split_whitespace().next().unwrap_or("").to_string()]
     };
 
-    // Parse optional TIMESTAMPS (left_col, right_col) clause
-    let after_on_upper = after_on.to_uppercase();
+    // TIMESTAMPS (left_col, right_col) — optional, defaults to "ts".
     let (left_time_column, right_time_column) =
         if let Some(ts_pos) = after_on_upper.find("TIMESTAMPS") {
-            let ts_text = &after_on[ts_pos + "TIMESTAMPS".len()..].trim_start();
+            let ts_text = after_on[ts_pos + "TIMESTAMPS".len()..].trim_start();
             if let Some(rest) = ts_text.strip_prefix('(') {
-                let end_paren = rest.find(')').unwrap_or(rest.len());
-                let cols: Vec<&str> = rest[..end_paren].split(',').map(str::trim).collect();
+                let end = rest.find(')').unwrap_or(rest.len());
+                let cols: Vec<&str> = rest[..end].split(',').map(str::trim).collect();
                 (
                     cols.first().unwrap_or(&"ts").to_string(),
                     cols.get(1).unwrap_or(&"ts").to_string(),
@@ -1048,108 +1025,75 @@ pub(crate) fn detect_temporal_probe_query(
                 ("ts".into(), "ts".into())
             }
         } else {
-            tracing::warn!(
-                %left_table,
-                %right_table,
-                "temporal probe join: no TIMESTAMPS clause, defaulting to 'ts'. \
-                 Use TIMESTAMPS (left_col, right_col) to specify."
-            );
             ("ts".into(), "ts".into())
         };
 
-    let (offsets, alias_search_start) = if let Some(range_pos) = after_on_upper.find("RANGE ") {
-        let range_text = &after_on[range_pos + 6..];
-        let range_upper = range_text.to_uppercase();
-        let from_pos = range_upper.find("FROM ").map_or(0, |p| p + 5);
-        let to_pos = range_upper.find(" TO ").unwrap_or(range_text.len());
-        let step_pos = range_upper.find(" STEP ");
-
-        let start_str = range_text[from_pos..to_pos].trim();
-        let start_ms = if let Some(v) = laminar_sql::translator::parse_interval_to_ms(start_str) {
-            v
-        } else {
-            tracing::warn!(
-                "TEMPORAL PROBE JOIN: invalid RANGE start '{start_str}', defaulting to 0"
-            );
-            0
-        };
-
-        let (end_str, step_str) = if let Some(sp) = step_pos {
-            let to_end = &range_text[to_pos + 4..sp];
-            let as_pos = range_upper[sp + 6..].find(" AS ");
-            let step_end = as_pos.map_or(range_text.len(), |p| sp + 6 + p);
-            (to_end.trim(), range_text[sp + 6..step_end].trim())
-        } else {
-            let as_pos = range_upper[to_pos + 4..].find(" AS ");
-            let end_pos = as_pos.map_or(range_text.len(), |p| to_pos + 4 + p);
-            (range_text[to_pos + 4..end_pos].trim(), "1s")
-        };
-
-        let end_ms = if let Some(v) = laminar_sql::translator::parse_interval_to_ms(end_str) {
-            v
-        } else {
-            tracing::warn!("TEMPORAL PROBE JOIN: invalid RANGE end '{end_str}', defaulting to 0");
-            0
-        };
-        let step_ms = if let Some(v) = laminar_sql::translator::parse_interval_to_ms(step_str) {
-            v
-        } else {
-            tracing::warn!(
-                "TEMPORAL PROBE JOIN: invalid RANGE step '{step_str}', defaulting to 1s"
-            );
-            1000
-        };
-
-        (
-            laminar_sql::translator::ProbeOffsetSpec::Range {
-                start_ms,
-                end_ms,
-                step_ms,
-            },
-            range_pos,
-        )
+    // RANGE or LIST offsets.
+    let offsets = if let Some(range_pos) = after_on_upper.find("RANGE ") {
+        parse_probe_range_clause(&after_on[range_pos + 6..])
     } else if let Some(list_pos) = after_on_upper.find("LIST ") {
-        let list_text = &after_on[list_pos + 5..];
-        let Some(open_paren) = list_text.find('(') else {
-            return (None, None);
-        };
-        let Some(close_paren) = list_text.find(')') else {
-            return (None, None);
-        };
-        let items_str = &list_text[open_paren + 1..close_paren];
-        let offsets_ms: Vec<i64> = items_str
-            .split(',')
-            .filter_map(|s| laminar_sql::translator::parse_interval_to_ms(s.trim()))
-            .collect();
-        if offsets_ms.is_empty() {
-            return (None, None);
-        }
-        (
-            laminar_sql::translator::ProbeOffsetSpec::List(offsets_ms),
-            list_pos,
-        )
+        parse_probe_list_clause(&after_on[list_pos + 5..])
     } else {
         return (None, None);
     };
 
-    let remaining = &after_on[alias_search_start..];
-    let remaining_upper = remaining.to_uppercase();
-    let Some(as_pos) = remaining_upper.rfind(" AS ") else {
+    // Terminal AS <alias>.
+    let Some(as_pos) = after_on_upper.rfind(" AS ") else {
         return (None, None);
     };
-
-    let after_as = remaining[as_pos + 4..].trim();
-    let probe_alias = after_as
+    let probe_alias = after_on[as_pos + 4..]
+        .trim()
         .split(|c: char| c.is_whitespace() || c == ';' || c == ')')
         .next()
         .unwrap_or("p")
         .to_string();
 
-    let config = laminar_sql::translator::TemporalProbeConfig::new(
-        left_table.clone(),
-        right_table.clone(),
-        left_alias.clone(),
-        right_alias.clone(),
+    // --- Step 2: Rewrite to standard JOIN, parse with sqlparser ---
+    let probe_in_upper = &upper[tpj_pos..];
+    let as_needle = format!(" AS {}", probe_alias.to_uppercase());
+    let Some(as_off) = probe_in_upper.rfind(&as_needle) else {
+        return (None, None);
+    };
+    let probe_clause_end = tpj_pos + as_off + as_needle.len();
+
+    let right_text = after_tpj[..on_pos].trim();
+    let on_equalities = key_columns
+        .iter()
+        .map(|k| format!("__left__.{k} = __right__.{k}"))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let rewritten = format!(
+        "{}JOIN {right_text} ON {on_equalities}{}",
+        &sql[..tpj_pos],
+        &sql[probe_clause_end..]
+    );
+
+    let Ok(stmts) = laminar_sql::parse_streaming_sql(&rewritten) else {
+        return (None, None);
+    };
+    let Some(laminar_sql::parser::StreamingStatement::Standard(stmt)) = stmts.first() else {
+        return (None, None);
+    };
+    let Statement::Query(query) = stmt.as_ref() else {
+        return (None, None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return (None, None);
+    };
+
+    // --- Step 3: Use analyze_joins() for table/alias extraction ---
+    let Ok(Some(multi)) = analyze_joins(select) else {
+        return (None, None);
+    };
+    let Some(join_analysis) = multi.joins.first() else {
+        return (None, None);
+    };
+
+    let config = TemporalProbeConfig::new(
+        join_analysis.left_table.clone(),
+        join_analysis.right_table.clone(),
+        join_analysis.left_alias.clone(),
+        join_analysis.right_alias.clone(),
         key_columns,
         left_time_column,
         right_time_column,
@@ -1157,17 +1101,66 @@ pub(crate) fn detect_temporal_probe_query(
         probe_alias,
     );
 
-    // Build projection SQL by pre-processing the original SQL into a form
-    // sqlparser can parse, then walking the AST for safe rewriting.
     let projection_sql = build_probe_projection_via_ast(
         sql,
         tpj_pos,
         &config,
-        left_alias.as_deref(),
-        right_alias.as_deref(),
+        join_analysis.left_alias.as_deref(),
+        join_analysis.right_alias.as_deref(),
     );
 
     (Some(config), projection_sql)
+}
+
+/// Parse `RANGE FROM <start> TO <end> [STEP <step>]` into a `ProbeOffsetSpec`.
+fn parse_probe_range_clause(text: &str) -> laminar_sql::translator::ProbeOffsetSpec {
+    let upper = text.to_uppercase();
+    let from_pos = upper.find("FROM ").map_or(0, |p| p + 5);
+    let to_pos = upper.find(" TO ").unwrap_or(text.len());
+    let step_pos = upper.find(" STEP ");
+
+    let start_str = text[from_pos..to_pos].trim();
+    let start_ms = laminar_sql::translator::parse_interval_to_ms(start_str).unwrap_or_else(|| {
+        tracing::warn!("temporal probe: invalid RANGE start '{start_str}', defaulting to 0");
+        0
+    });
+
+    let (end_str, step_str) = if let Some(sp) = step_pos {
+        let to_end = text[to_pos + 4..sp].trim();
+        let as_pos = upper[sp + 6..].find(" AS ");
+        let step_end = as_pos.map_or(text.len(), |p| sp + 6 + p);
+        (to_end, text[sp + 6..step_end].trim())
+    } else {
+        let as_pos = upper[to_pos + 4..].find(" AS ");
+        let end_pos = as_pos.map_or(text.len(), |p| to_pos + 4 + p);
+        (text[to_pos + 4..end_pos].trim(), "1s")
+    };
+
+    let end_ms = laminar_sql::translator::parse_interval_to_ms(end_str).unwrap_or_else(|| {
+        tracing::warn!("temporal probe: invalid RANGE end '{end_str}', defaulting to 0");
+        0
+    });
+    let step_ms = laminar_sql::translator::parse_interval_to_ms(step_str).unwrap_or_else(|| {
+        tracing::warn!("temporal probe: invalid RANGE step '{step_str}', defaulting to 1s");
+        1000
+    });
+
+    laminar_sql::translator::ProbeOffsetSpec::Range {
+        start_ms,
+        end_ms,
+        step_ms,
+    }
+}
+
+/// Parse `LIST (<interval>, ...)` into a `ProbeOffsetSpec`.
+fn parse_probe_list_clause(text: &str) -> laminar_sql::translator::ProbeOffsetSpec {
+    let open = text.find('(').unwrap_or(0);
+    let close = text.find(')').unwrap_or(text.len());
+    let items: Vec<i64> = text[open + 1..close]
+        .split(',')
+        .filter_map(|s| laminar_sql::translator::parse_interval_to_ms(s.trim()))
+        .collect();
+    laminar_sql::translator::ProbeOffsetSpec::List(items)
 }
 
 // ---------------------------------------------------------------------------
