@@ -1,7 +1,7 @@
 # LaminarDB AI Ops Demo — see README.md for details.
 #
 # cargo run --release -p laminar-server --no-default-features \
-#     --features mimalloc,otel,websocket,files -- \
+#     --features mimalloc,otel,websocket,delta-lake -- \
 #     --config examples/claude-code-aiops/config.toml
 
 [server]
@@ -235,114 +235,46 @@ WHERE p.event_name = 'user_prompt'
     AND t.event_name = 'tool_result'
 """
 
-# WebSocket sinks
+# All pipelines available via ws://localhost:8080/ws/{pipeline_name}
 
-[[sink]]
-name = "heartbeat_ws"
-pipeline = "event_count"
-connector = "websocket"
-
-[sink.properties]
-"bind.address" = "0.0.0.0:9000"
-
-[[sink]]
-name = "cost_ws"
-pipeline = "cost_by_model"
-connector = "websocket"
-
-[sink.properties]
-"bind.address" = "0.0.0.0:9001"
-
-[[sink]]
-name = "tools_ws"
-pipeline = "tool_stats"
-connector = "websocket"
-
-[sink.properties]
-"bind.address" = "0.0.0.0:9002"
-
-[[sink]]
-name = "prompts_ws"
-pipeline = "prompt_analysis"
-connector = "websocket"
-
-[sink.properties]
-"bind.address" = "0.0.0.0:9003"
-
-[[sink]]
-name = "decisions_ws"
-pipeline = "tool_decisions"
-connector = "websocket"
-
-[sink.properties]
-"bind.address" = "0.0.0.0:9004"
-
-[[sink]]
-name = "activity_ws"
-pipeline = "session_activity"
-connector = "websocket"
-
-[sink.properties]
-"bind.address" = "0.0.0.0:9005"
-
-[[sink]]
-name = "lifecycle_ws"
-pipeline = "prompt_lifecycle"
-connector = "websocket"
-
-[sink.properties]
-"bind.address" = "0.0.0.0:9006"
-
-[[sink]]
-name = "prompt_tools_ws"
-pipeline = "prompt_tools"
-connector = "websocket"
-
-[sink.properties]
-"bind.address" = "0.0.0.0:9007"
-
-# Parquet file sinks
+# Delta Lake sinks (local filesystem, ACID, queryable with DuckDB)
 
 [[sink]]
 name = "cost_archive"
 pipeline = "cost_by_model"
-connector = "files"
+connector = "delta-lake"
 
 [sink.properties]
-path = "./data/aiops/cost"
-format = "parquet"
-mode = "rolling"
+"table.path" = "./data/aiops/cost"
+"write.mode" = "append"
 compression = "zstd"
 
 [[sink]]
 name = "tools_archive"
 pipeline = "tool_stats"
-connector = "files"
+connector = "delta-lake"
 
 [sink.properties]
-path = "./data/aiops/tools"
-format = "parquet"
-mode = "rolling"
+"table.path" = "./data/aiops/tools"
+"write.mode" = "append"
 compression = "zstd"
 
 [[sink]]
 name = "prompts_archive"
 pipeline = "prompt_analysis"
-connector = "files"
+connector = "delta-lake"
 
 [sink.properties]
-path = "./data/aiops/prompts"
-format = "parquet"
-mode = "rolling"
+"table.path" = "./data/aiops/prompts"
+"write.mode" = "append"
 compression = "zstd"
 
 [[sink]]
 name = "activity_archive"
 pipeline = "session_activity"
-connector = "files"
+connector = "delta-lake"
 
 [sink.properties]
-path = "./data/aiops/activity"
-format = "parquet"
-mode = "rolling"
+"table.path" = "./data/aiops/activity"
+"write.mode" = "append"
 compression = "zstd"

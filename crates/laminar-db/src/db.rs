@@ -843,12 +843,13 @@ impl LaminarDB {
         Ok(crate::handle::TypedSubscription::from_raw(sub))
     }
 
-    /// Get a raw Arrow subscription for a named stream (crate-internal).
+    /// Get a raw Arrow subscription for a named stream.
     ///
-    /// Used by `api::Connection::subscribe` to create an `ArrowSubscription`
-    /// without requiring the `FromBatch` trait bound.
+    /// Returns a channel-based subscription that delivers `RecordBatch`es
+    /// as they are produced by the streaming pipeline. The subscription
+    /// has blocking `recv()` and non-blocking `poll()` methods.
     #[cfg(feature = "api")]
-    pub(crate) fn subscribe_raw(
+    pub fn subscribe_raw(
         &self,
         name: &str,
     ) -> Result<laminar_core::streaming::Subscription<crate::catalog::ArrowRecord>, DbError> {

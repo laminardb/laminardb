@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -45,6 +46,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/checkpoint", post(trigger_checkpoint))
         .route("/api/v1/sql", post(execute_sql))
         .route("/api/v1/reload", post(handle_reload))
+        // WebSocket stream subscriptions
+        .route("/ws/{name}", get(ws_upgrade))
         // Cluster (delta mode)
         .route("/api/v1/cluster", get(cluster_status))
         .layer(CorsLayer::permissive())
@@ -485,6 +488,83 @@ async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
         pipeline_state,
     })
     .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket stream subscriptions
+// ---------------------------------------------------------------------------
+
+async fn ws_upgrade(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    match state.db.subscribe_raw(&name) {
+        Ok(sub) => ws
+            .on_upgrade(move |socket| ws_stream(socket, sub, name))
+            .into_response(),
+        Err(_) => error_response(StatusCode::NOT_FOUND, format!("stream '{name}' not found"))
+            .into_response(),
+    }
+}
+
+async fn ws_stream(
+    mut socket: WebSocket,
+    sub: laminar_core::streaming::Subscription<laminar_db::ArrowRecord>,
+    name: String,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<arrow_array::RecordBatch>(32);
+
+    // Producer: blocking recv on a dedicated thread
+    tokio::task::spawn_blocking(move || loop {
+        match sub.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(batch) => {
+                if tx.blocking_send(batch).is_err() {
+                    break;
+                }
+            }
+            Err(laminar_core::streaming::RecvError::Timeout) => continue,
+            Err(_) => break,
+        }
+    });
+
+    let mut seq = 0u64;
+
+    loop {
+        tokio::select! {
+            batch = rx.recv() => {
+                let Some(batch) = batch else { break };
+                let json = batch_to_json(&batch);
+                let msg = serde_json::json!({
+                    "type": "data",
+                    "subscription_id": &name,
+                    "data": json,
+                    "sequence": seq,
+                    "watermark": null,
+                });
+                seq += 1;
+                if socket.send(Message::Text(msg.to_string().into())).await.is_err() {
+                    break;
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn batch_to_json(batch: &arrow_array::RecordBatch) -> serde_json::Value {
+    let mut buf = Vec::new();
+    {
+        let mut writer = arrow_json::ArrayWriter::new(&mut buf);
+        let _ = writer.write(batch);
+        let _ = writer.finish();
+    }
+    serde_json::from_slice(&buf).unwrap_or(serde_json::Value::Array(vec![]))
 }
 
 #[cfg(test)]

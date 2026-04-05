@@ -20,7 +20,11 @@ laminar-core = { path = "../laminar-core", version = "0.19.12" }
 laminar-sql = { path = "../laminar-sql", version = "0.19.12" }
 laminar-storage = { path = "../laminar-storage", version = "0.19.12" }
 laminar-connectors = { path = "../laminar-connectors", version = "0.19.12" }
-laminar-db = { path = "../laminar-db", version = "0.19.12" }
+laminar-db = { path = "../laminar-db", version = "0.19.12", features = ["api"] }
+
+# Arrow (for WS JSON serialization)
+arrow-array = { workspace = true }
+arrow-json = { workspace = true }
 
 # CLI and configuration
 clap = { version = "4.6", features = ["derive", "env"] }
@@ -42,7 +46,7 @@ serde_json = { workspace = true }
 toml = "1.0"
 
 # Web framework
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 

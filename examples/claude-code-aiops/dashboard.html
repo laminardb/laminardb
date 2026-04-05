@@ -602,13 +602,15 @@ function fmtTime(d) {
 // WebSocket with reconnect
 const sockets = [];
 
-function ws(port, dotId, onMsg) {
+const WS_BASE = 'ws://localhost:8080/ws';
+
+function ws(stream, dotId, onMsg) {
   const dot = document.getElementById(dotId);
   let backoff = 1000;
   let current = null;
 
   function go() {
-    current = new WebSocket(`ws://localhost:${port}`);
+    current = new WebSocket(`${WS_BASE}/${stream}`);
     current.onopen = () => { dot.classList.add('on'); backoff = 1000; };
     current.onmessage = e => {
       try {
@@ -621,7 +623,7 @@ function ws(port, dotId, onMsg) {
   }
 
   go();
-  sockets.push({ reconnect() { if (current) current.close(); backoff = 100; }, port, dotId });
+  sockets.push({ reconnect() { if (current) current.close(); backoff = 100; }, stream, dotId });
 }
 
 function reconnectAll() {
@@ -1142,18 +1144,18 @@ function renderActivity() {
 }
 
 // Connect
-ws(9000, 'hb', function() {
+ws('event_count', 'hb', function() {
   const hb = document.getElementById('hb');
   hb.classList.add('pulse');
   setTimeout(() => hb.classList.remove('pulse'), 1500);
 });
-ws(9001, 'd-cost', handleCost);
-ws(9002, 'd-tools', handleTools);
-ws(9003, 'd-prompts', handlePrompts);
-ws(9004, 'd-decisions', handleDecisions);
-ws(9005, 'd-activity', handleActivity);
-ws(9006, 'd-lifecycle', handleLifecycle);
-ws(9007, 'd-lifecycle', handleToolJoins);
+ws('cost_by_model', 'd-cost', handleCost);
+ws('tool_stats', 'd-tools', handleTools);
+ws('prompt_analysis', 'd-prompts', handlePrompts);
+ws('tool_decisions', 'd-decisions', handleDecisions);
+ws('session_activity', 'd-activity', handleActivity);
+ws('prompt_lifecycle', 'd-lifecycle', handleLifecycle);
+ws('prompt_tools', 'd-lifecycle', handleToolJoins);
 
 // Uptime ticker
 setInterval(() => {
