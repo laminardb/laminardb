@@ -28,7 +28,7 @@ use crate::error::DbError;
 use crate::metrics::PipelineCounters;
 use crate::sql_analysis::{
     apply_topk_filter, detect_asof_query, detect_stream_join_query, detect_temporal_probe_query,
-    detect_temporal_query, extract_table_references,
+    detect_temporal_query, extract_table_references, StreamJoinDetection,
 };
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{
@@ -111,6 +111,73 @@ impl GraphOperator for TombstonedOperator {
         _watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
         Ok(Vec::new())
+    }
+
+    fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+        Ok(None)
+    }
+
+    fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+        Ok(())
+    }
+}
+
+/// Pre-filters self-join input batches via `SELECT * FROM tmp WHERE <filter_sql>`.
+struct SqlFilterOperator {
+    filter_sql: String,
+    ctx: SessionContext,
+    tmp_table: String,
+}
+
+impl SqlFilterOperator {
+    fn new(filter_sql: String, ctx: SessionContext, node_name: &str) -> Self {
+        let tmp_table = format!(
+            "__prefilter_{}",
+            node_name.replace(|c: char| !c.is_alphanumeric(), "_")
+        );
+        Self {
+            filter_sql,
+            ctx,
+            tmp_table,
+        }
+    }
+}
+
+#[async_trait]
+impl GraphOperator for SqlFilterOperator {
+    async fn process(
+        &mut self,
+        inputs: &[Vec<RecordBatch>],
+        _watermarks: &[i64],
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let batches = inputs.first().cloned().unwrap_or_default();
+        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+            return Ok(Vec::new());
+        }
+
+        let schema = batches[0].schema();
+        let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![batches])
+            .map_err(|e| DbError::Pipeline(format!("pre-filter: {e}")))?;
+
+        let _ = self.ctx.deregister_table(&self.tmp_table);
+        self.ctx
+            .register_table(&self.tmp_table, Arc::new(mem_table))
+            .map_err(|e| DbError::Pipeline(format!("pre-filter: {e}")))?;
+
+        let sql = format!("SELECT * FROM {} WHERE {}", self.tmp_table, self.filter_sql);
+        let result = async {
+            self.ctx
+                .sql(&sql)
+                .await
+                .map_err(|e| DbError::Pipeline(format!("pre-filter: {e}")))?
+                .collect()
+                .await
+                .map_err(|e| DbError::Pipeline(format!("pre-filter: {e}")))
+        }
+        .await;
+
+        let _ = self.ctx.deregister_table(&self.tmp_table);
+        result
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
@@ -326,6 +393,23 @@ impl OperatorGraph {
         node_id
     }
 
+    fn insert_filter_node(&mut self, name: &str, filter_sql: String, source_id: usize) -> usize {
+        let node_id = self.nodes.len();
+        self.nodes.push(GraphNode {
+            name: Arc::from(name),
+            operator: Box::new(SqlFilterOperator::new(filter_sql, self.ctx.clone(), name)),
+            input_port_count: 1,
+            output_routes: Vec::new(),
+            removed: false,
+        });
+        self.input_bufs.push(vec![Vec::new()]);
+        self.input_sources.push(vec![usize::MAX]);
+        self.output_watermarks.push(i64::MIN);
+        self.add_edge(source_id, node_id, 0);
+        self.topo_dirty = true;
+        node_id
+    }
+
     fn add_edge(&mut self, source: usize, target: usize, target_port: u8) {
         self.edges.push(GraphEdge { source, target });
         self.nodes[source].output_routes.push((target, target_port));
@@ -380,12 +464,14 @@ impl OperatorGraph {
     /// wires all table references to port 0 (avoiding duplicates).
     ///
     /// Returns `true` if the query depends on another query (not just raw sources).
+    #[allow(clippy::too_many_arguments)]
     fn wire_query_edges(
         &mut self,
         node_id: usize,
         temporal_probe_config: Option<&laminar_sql::translator::TemporalProbeConfig>,
         asof_config: Option<&laminar_sql::translator::AsofJoinTranslatorConfig>,
         stream_join_config: Option<&laminar_sql::translator::StreamJoinConfig>,
+        stream_join_detection: Option<&StreamJoinDetection>,
         temporal_config: Option<&TemporalJoinTranslatorConfig>,
         table_refs: &FxHashSet<String>,
     ) -> bool {
@@ -406,10 +492,41 @@ impl OperatorGraph {
             self.add_edge(right_id, node_id, 1);
             false
         } else if let Some(sjc) = stream_join_config {
-            let left_id = self.find_node(&sjc.left_table).expect("source ensured");
-            let right_id = self.find_node(&sjc.right_table).expect("source ensured");
-            self.add_edge(left_id, node_id, 0);
-            self.add_edge(right_id, node_id, 1);
+            let source_id = self.find_node(&sjc.left_table).expect("source ensured");
+
+            let has_pre_filters = stream_join_detection
+                .is_some_and(|d| d.left_pre_filter.is_some() || d.right_pre_filter.is_some());
+
+            if sjc.left_table == sjc.right_table && has_pre_filters {
+                let det = stream_join_detection.unwrap();
+
+                let left_input = if let Some(ref filter_sql) = det.left_pre_filter {
+                    self.insert_filter_node(
+                        &format!("{}::left_prefilter", self.nodes[node_id].name),
+                        filter_sql.clone(),
+                        source_id,
+                    )
+                } else {
+                    source_id
+                };
+
+                let right_input = if let Some(ref filter_sql) = det.right_pre_filter {
+                    self.insert_filter_node(
+                        &format!("{}::right_prefilter", self.nodes[node_id].name),
+                        filter_sql.clone(),
+                        source_id,
+                    )
+                } else {
+                    source_id
+                };
+
+                self.add_edge(left_input, node_id, 0);
+                self.add_edge(right_input, node_id, 1);
+            } else {
+                let right_id = self.find_node(&sjc.right_table).expect("source ensured");
+                self.add_edge(source_id, node_id, 0);
+                self.add_edge(right_id, node_id, 1);
+            }
             false
         } else if let Some(tc) = temporal_config {
             let stream_id = self.find_node(&tc.stream_table).expect("source ensured");
@@ -462,11 +579,15 @@ impl OperatorGraph {
         } else {
             (None, None)
         };
-        let (stream_join_config, stream_join_projection_sql) = if temporal_probe_config.is_none() {
+        let stream_join_detection = if temporal_probe_config.is_none() {
             detect_stream_join_query(&sql)
         } else {
-            (None, None)
+            None
         };
+        let stream_join_config = stream_join_detection.as_ref().map(|d| d.config.clone());
+        let stream_join_projection_sql = stream_join_detection
+            .as_ref()
+            .map(|d| d.projection_sql.clone());
         let projection_sql = projection_sql
             .or(temporal_probe_projection_sql)
             .or(temporal_projection_sql)
@@ -546,6 +667,7 @@ impl OperatorGraph {
                 temporal_probe_config.as_ref(),
                 asof_config.as_ref(),
                 stream_join_config.as_ref(),
+                stream_join_detection.as_ref(),
                 None,
                 &table_refs,
             );
@@ -596,6 +718,7 @@ impl OperatorGraph {
             temporal_probe_config.as_ref(),
             asof_config.as_ref(),
             stream_join_config.as_ref(),
+            stream_join_detection.as_ref(),
             temporal_config.as_ref(),
             &table_refs,
         );
@@ -702,26 +825,37 @@ impl OperatorGraph {
             return;
         };
 
-        // Tombstone the node and release its input buffers.
-        self.nodes[node_id].removed = true;
-        self.nodes[node_id].operator = Box::new(TombstonedOperator);
-        for port_buf in &mut self.input_bufs[node_id] {
-            port_buf.clear();
+        // Collect IDs of this node + any child prefilter nodes (name prefix match).
+        let prefix = format!("{name}::");
+        let ids_to_remove: smallvec::SmallVec<[usize; 3]> = std::iter::once(node_id)
+            .chain(
+                self.nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| !n.removed && n.name.starts_with(&prefix))
+                    .map(|(i, _)| i),
+            )
+            .collect();
+
+        for &id in &ids_to_remove {
+            self.nodes[id].removed = true;
+            self.nodes[id].operator = Box::new(TombstonedOperator);
+            self.nodes[id].output_routes.clear();
+            for port_buf in &mut self.input_bufs[id] {
+                port_buf.clear();
+            }
+            self.order_configs.remove(&id);
+            self.depends_on_stream.remove(&id);
+            self.edges.retain(|e| e.source != id && e.target != id);
         }
 
-        // Remove from output map
-        self.output_map.remove(name);
-        self.order_configs.remove(&node_id);
-        self.depends_on_stream.remove(&node_id);
-
-        // Remove edges TO this node and FROM this node
-        self.edges
-            .retain(|e| e.source != node_id && e.target != node_id);
-        self.nodes[node_id].output_routes.clear();
+        // Clean dangling output routes pointing to any removed node
         for node in &mut self.nodes {
-            node.output_routes.retain(|&(t, _)| t != node_id);
+            node.output_routes
+                .retain(|&(t, _)| !ids_to_remove.contains(&t));
         }
 
+        self.output_map.remove(name);
         self.topo_dirty = true;
     }
 
@@ -1998,5 +2132,75 @@ mod tests {
             .get("enriched")
             .map_or(0, |bs| bs.iter().map(|b| b.num_rows()).sum());
         assert_eq!(rows2, 2, "cycle 2 should also produce 2 joined rows");
+    }
+
+    #[tokio::test]
+    async fn test_self_join_prefilter_end_to_end() {
+        use arrow::array::TimestampMillisecondArray;
+        use arrow::datatypes::TimeUnit;
+
+        let ctx = laminar_sql::create_session_context();
+        laminar_sql::register_streaming_functions(&ctx);
+        let mut graph = OperatorGraph::new(ctx);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("type", DataType::Utf8, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+        ]));
+        graph.register_source_schema("events".to_string(), Arc::clone(&schema));
+
+        graph.add_query(
+            "joined".to_string(),
+            "SELECT p.key, p.type, a.type \
+             FROM events p \
+             JOIN events a ON p.key = a.key \
+             AND a.ts BETWEEN p.ts AND p.ts + INTERVAL '10' SECOND \
+             WHERE p.type = 'A' AND a.type = 'B'"
+                .to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        // source + 2 filter nodes + join operator = 4
+        assert!(
+            graph.nodes.len() >= 4,
+            "expected 4+ nodes, got {}",
+            graph.nodes.len()
+        );
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["k1", "k1", "k1", "k1"])),
+                Arc::new(StringArray::from(vec!["A", "B", "A", "B"])),
+                Arc::new(TimestampMillisecondArray::from(vec![
+                    1000, 2000, 3000, 4000,
+                ])),
+            ],
+        )
+        .unwrap();
+
+        let mut source = FxHashMap::default();
+        source.insert(Arc::from("events"), vec![batch]);
+
+        let results = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
+        let joined = results
+            .get("joined")
+            .expect("joined query should produce output");
+        let total_rows: usize = joined.iter().map(|b| b.num_rows()).sum();
+
+        // 2A × 2B within time window = up to 4 matches
+        assert!(total_rows > 0, "should produce matches");
+        assert!(
+            total_rows <= 4,
+            "at most 4 matches (2A × 2B), got {total_rows}"
+        );
     }
 }
