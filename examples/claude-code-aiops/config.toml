@@ -21,8 +21,6 @@ name = "otel_events"
 connector = "otel"
 format = "json"
 
-# Schema auto-discovered from connector — no [[source.schema]] needed.
-
 [source.properties]
 port = "4317"
 "bind.address" = "0.0.0.0"
