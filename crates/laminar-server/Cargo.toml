@@ -39,7 +39,7 @@ thiserror = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = "1.0"
+toml = "1.1"
 
 # Web framework
 axum = "0.8"
