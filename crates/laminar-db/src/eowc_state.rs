@@ -1,17 +1,4 @@
-//! Incremental per-window accumulator state for EOWC queries.
-//!
-//! Replaces the raw-batch accumulation pattern (`EowcState.accumulated_sources`)
-//! with per-window-per-group incremental `Accumulator` state. This reduces
-//! memory from O(events) to O(windows * groups) and window-close latency
-//! from O(N) to O(groups).
-//!
-//! # Architecture
-//!
-//! ```text
-//! Source batch → pre-agg SQL → assign windows → per-window accumulators
-//!                                                    ↕ (persists across cycles)
-//! Watermark advance → close windows → evaluate() → emit RecordBatch
-//! ```
+//! Incremental EOWC (Emit On Window Close) aggregation state.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -33,19 +20,14 @@ use crate::aggregate_state::{
 };
 use crate::error::DbError;
 
-/// Window type with parameters for window assignment.
 #[derive(Debug, Clone)]
 pub(crate) enum EowcWindowType {
-    /// Tumbling: non-overlapping, fixed-size windows.
     Tumbling { size_ms: i64 },
-    /// Hopping: overlapping windows with fixed size and slide.
     Hopping { size_ms: i64, slide_ms: i64 },
-    /// Session: gap-based windows (simplified, non-merging).
     Session { gap_ms: i64 },
 }
 
 impl EowcWindowType {
-    /// Convert from a `WindowOperatorConfig`.
     fn from_config(config: &WindowOperatorConfig) -> Self {
         match config.window_type {
             WindowType::Tumbling | WindowType::Cumulate => {
@@ -68,7 +50,6 @@ impl EowcWindowType {
         }
     }
 
-    /// Window size in milliseconds (for close boundary computation).
     fn size_ms(&self) -> i64 {
         match self {
             EowcWindowType::Tumbling { size_ms } | EowcWindowType::Hopping { size_ms, .. } => {
@@ -79,7 +60,6 @@ impl EowcWindowType {
     }
 }
 
-/// Assign a timestamp to one or more window start boundaries.
 fn assign_windows(ts_ms: i64, window_type: &EowcWindowType) -> Vec<i64> {
     match window_type {
         EowcWindowType::Tumbling { size_ms } => {
@@ -127,35 +107,21 @@ fn assign_windows(ts_ms: i64, window_type: &EowcWindowType) -> Vec<i64> {
 /// Keyed by window start timestamp (ms since epoch). Each window contains
 /// per-group accumulators that are updated incrementally as batches arrive.
 pub(crate) struct IncrementalEowcState {
-    /// Window type determines assignment logic.
     window_type: EowcWindowType,
-    /// Per-window aggregate state: `window_start` -> per-group accumulators.
     #[allow(clippy::type_complexity)]
     windows:
         BTreeMap<i64, AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>>,
-    /// Persistent row converter for group key encoding/decoding.
     row_converter: arrow::row::RowConverter,
-    /// Aggregate function specs (extracted once from the query plan).
     agg_specs: Vec<AggFuncSpec>,
-    /// Number of group-by columns in pre-agg output.
     num_group_cols: usize,
-    /// Group-by column data types.
     group_types: Vec<DataType>,
-    /// Pre-aggregation SQL for expression evaluation (kept for fallback + fingerprint).
     pre_agg_sql: String,
-    /// Output schema for emitted batches (`window_start` + `window_end` + group cols + agg results).
     output_schema: SchemaRef,
-    /// Index of the time column in the pre-agg output.
     time_col_index: usize,
-    /// Compiled pre-agg projection (single-source queries only).
     compiled_projection: Option<CompiledProjection>,
-    /// Cached optimized logical plan for the pre-agg SQL (multi-source queries).
     cached_pre_agg_plan: Option<datafusion_expr::LogicalPlan>,
-    /// Compiled HAVING predicate.
     having_filter: Option<Arc<dyn PhysicalExpr>>,
-    /// HAVING predicate SQL fallback.
     having_sql: Option<String>,
-    /// Maximum groups per window before new groups are dropped.
     max_groups_per_window: usize,
     /// Grace period (ms) after window end before closing. Late events
     /// arriving within this window are included instead of dropped.
@@ -743,7 +709,6 @@ impl IncrementalEowcState {
         Ok(result_batches)
     }
 
-    /// Emit a single window's accumulated state as a `RecordBatch`.
     fn emit_window(
         &self,
         window_start: i64,
@@ -761,39 +726,27 @@ impl IncrementalEowcState {
         )
     }
 
-    /// Pre-aggregation SQL.
-    #[allow(dead_code)] // Available for diagnostics.
-    pub fn pre_agg_sql(&self) -> &str {
-        &self.pre_agg_sql
-    }
-
-    /// HAVING predicate SQL, if any.
     pub fn having_sql(&self) -> Option<&str> {
         self.having_sql.as_deref()
     }
 
-    /// Compiled HAVING predicate, if available.
     pub fn having_filter(&self) -> Option<&Arc<dyn PhysicalExpr>> {
         self.having_filter.as_ref()
     }
 
-    /// Compiled pre-agg projection, if available.
     pub fn compiled_projection(&self) -> Option<&CompiledProjection> {
         self.compiled_projection.as_ref()
     }
 
-    /// Cached optimized logical plan for the pre-agg SQL.
     pub fn cached_pre_agg_plan(&self) -> Option<&datafusion_expr::LogicalPlan> {
         self.cached_pre_agg_plan.as_ref()
     }
 
-    /// Return the number of open windows.
     #[cfg(test)]
     pub fn open_window_count(&self) -> usize {
         self.windows.len()
     }
 
-    /// Compute a fingerprint for this query (SQL + schema).
     pub(crate) fn query_fingerprint(&self) -> u64 {
         crate::aggregate_state::query_fingerprint(&self.pre_agg_sql, &self.output_schema)
     }
@@ -813,12 +766,6 @@ impl IncrementalEowcState {
             }
         }
         total
-    }
-
-    /// Total number of distinct groups across all open windows.
-    #[allow(dead_code)]
-    pub(crate) fn group_count(&self) -> usize {
-        self.windows.values().map(|g| g.len()).sum()
     }
 
     /// Checkpoint all per-window group states into a serializable struct.
