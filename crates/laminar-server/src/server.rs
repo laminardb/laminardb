@@ -1,8 +1,4 @@
-//! Engine construction and lifecycle management for LaminarDB server.
-//!
-//! Translates TOML configuration into SQL DDL statements and executes them
-//! against `LaminarDB`, then manages the pipeline lifecycle (start, run,
-//! shutdown).
+//! Engine construction and lifecycle for LaminarDB server.
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -22,32 +18,19 @@ use crate::delta_config::{DeltaConfig, DeltaConfigError};
 use crate::http;
 use crate::reload::ReloadGuard;
 
-/// Handle to a running LaminarDB server (embedded or delta mode).
-///
-/// Call [`wait_for_shutdown`](ServerHandle::wait_for_shutdown) to block until
-/// the server receives a shutdown signal (Ctrl-C).
+/// Handle to a running LaminarDB server. Call `wait_for_shutdown` to block until Ctrl-C.
 pub enum ServerHandle {
-    /// Embedded (single-node) mode.
     Embedded {
-        /// LaminarDB engine.
         db: Arc<LaminarDB>,
-        /// HTTP API task.
         api_handle: tokio::task::JoinHandle<()>,
-        /// Config file watcher task.
         watcher_handle: Option<tokio::task::JoinHandle<()>>,
     },
-    /// Delta (multi-node) mode.
-    ///
-    /// Only available when the `delta-experimental` feature is enabled.
-    /// This mode is not yet production-ready.
     #[cfg(feature = "delta-experimental")]
     Delta(Box<crate::delta::DeltaHandle>),
 }
 
 impl ServerHandle {
-    /// Block until a shutdown signal is received, then gracefully shut down.
-    ///
-    /// Handles SIGINT (Ctrl-C) on all platforms and SIGTERM on Unix.
+    /// Block until SIGINT/SIGTERM, then gracefully shut down.
     pub async fn wait_for_shutdown(self) -> Result<(), ServerError> {
         match self {
             Self::Embedded {
@@ -79,7 +62,6 @@ impl ServerHandle {
     }
 }
 
-/// Wait for SIGINT or SIGTERM (Unix) / SIGINT (Windows).
 async fn wait_for_termination_signal() -> Result<(), ServerError> {
     #[cfg(unix)]
     {
@@ -104,15 +86,6 @@ async fn wait_for_termination_signal() -> Result<(), ServerError> {
 }
 
 /// Build and start a LaminarDB server from the given configuration.
-///
-/// 1. Constructs a `LaminarDB` instance via the builder API
-/// 2. Executes DDL for all TOML-defined sources, lookups, pipelines, and sinks
-/// 3. Starts the streaming pipeline
-/// 4. Spawns the HTTP API server
-///
-/// # Errors
-///
-/// Returns `ServerError` if any phase fails.
 pub async fn run_server(
     config: ServerConfig,
     config_path: PathBuf,
@@ -138,16 +111,14 @@ pub async fn run_server(
         ));
     }
 
-    // 1. Build LaminarDB via builder API
+    // Build LaminarDB via builder API
     let mut builder = LaminarDB::builder();
 
-    // Map state backend → storage_dir (must happen before profile selection)
     let has_storage = config.state.backend != "memory";
     if has_storage {
         builder = builder.storage_dir(&config.state.path);
     }
 
-    // Map mode → profile (Embedded requires storage_dir; fall back to BareMetal)
     let profile = match config.server.mode.as_str() {
         "embedded" if has_storage => Profile::Embedded,
         "embedded" => Profile::BareMetal,
@@ -155,11 +126,44 @@ pub async fn run_server(
         _ => Profile::BareMetal,
     };
     builder = builder.profile(profile);
+    builder = apply_checkpoint_config(builder, &config.checkpoint.url, &config.checkpoint);
 
-    // Map checkpoint config
-    let checkpoint_url = &config.checkpoint.url;
-    let checkpoint_cfg = StreamCheckpointConfig {
-        interval_ms: Some(config.checkpoint.interval.as_millis() as u64),
+    let db = builder
+        .build()
+        .await
+        .map_err(|e| ServerError::Build(e.to_string()))?;
+    let db = Arc::new(db);
+
+    execute_config_ddl(&db, &config).await?;
+
+    db.start()
+        .await
+        .map_err(|e| ServerError::Start(e.to_string()))?;
+    info!("Pipeline started");
+
+    let (app_state, api_handle) =
+        start_http_api(Arc::clone(&db), config_path.clone(), config).await?;
+    let watcher_handle = spawn_config_watcher(&app_state, config_path);
+
+    Ok(ServerHandle::Embedded {
+        db,
+        api_handle,
+        watcher_handle,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers (used by both embedded and delta startup)
+// ---------------------------------------------------------------------------
+
+/// Apply checkpoint settings to a `LaminarDB` builder.
+pub(crate) fn apply_checkpoint_config(
+    mut builder: laminar_db::LaminarDbBuilder,
+    checkpoint_url: &str,
+    checkpoint: &crate::config::CheckpointSection,
+) -> laminar_db::LaminarDbBuilder {
+    let cfg = StreamCheckpointConfig {
+        interval_ms: Some(checkpoint.interval.as_millis() as u64),
         data_dir: if checkpoint_url.starts_with("file:///") {
             Some(PathBuf::from(
                 checkpoint_url
@@ -172,18 +176,16 @@ pub async fn run_server(
         max_retained: Some(10),
         ..StreamCheckpointConfig::default()
     };
-    builder = builder.checkpoint(checkpoint_cfg);
+    builder = builder.checkpoint(cfg);
 
-    // Object store URL for non-file checkpoint URLs
     if !checkpoint_url.starts_with("file:///") && !checkpoint_url.is_empty() {
-        builder = builder.object_store_url(checkpoint_url.clone());
-        if !config.checkpoint.storage.is_empty() {
-            builder = builder.object_store_options(config.checkpoint.storage.clone());
+        builder = builder.object_store_url(checkpoint_url.to_string());
+        if !checkpoint.storage.is_empty() {
+            builder = builder.object_store_options(checkpoint.storage.clone());
         }
     }
 
-    // Wire tiering config if present
-    if let Some(tiering) = &config.checkpoint.tiering {
+    if let Some(tiering) = &checkpoint.tiering {
         builder = builder.tiering(laminar_db::TieringConfig {
             hot_class: tiering.hot_class.clone(),
             warm_class: tiering.warm_class.clone(),
@@ -193,13 +195,14 @@ pub async fn run_server(
         });
     }
 
-    let db = builder
-        .build()
-        .await
-        .map_err(|e| ServerError::Build(e.to_string()))?;
-    let db = Arc::new(db);
+    builder
+}
 
-    // 2. Execute DDL for each TOML section (order matters: sources → lookups → pipelines → sinks)
+/// Execute DDL for all config sections (sources, lookups, pipelines, sinks, raw SQL).
+pub(crate) async fn execute_config_ddl(
+    db: &LaminarDB,
+    config: &ServerConfig,
+) -> Result<(), ServerError> {
     for source in &config.sources {
         let ddl = source_to_ddl(source);
         db.execute(&ddl).await.map_err(|e| ServerError::Ddl {
@@ -240,13 +243,10 @@ pub async fn run_server(
         info!("Created sink: {}", sink.name);
     }
 
-    // 2b. Execute raw SQL pipeline if present (after structured DDL so
-    //     SQL can reference TOML-defined sources/lookups if needed).
     if let Some(ref sql) = config.sql {
         let trimmed = sql.trim();
         if !trimmed.is_empty() {
             db.execute(trimmed).await.map_err(|e| {
-                // Truncate for log readability; full SQL is in the TOML file.
                 let snippet: String = trimmed.chars().take(80).collect();
                 ServerError::Ddl {
                     section: "sql".to_string(),
@@ -258,17 +258,19 @@ pub async fn run_server(
         }
     }
 
-    // 3. Start pipeline
-    db.start()
-        .await
-        .map_err(|e| ServerError::Start(e.to_string()))?;
-    info!("Pipeline started");
+    Ok(())
+}
 
-    // 4. Start HTTP API
+/// Start HTTP API server and return (shared state, join handle).
+pub(crate) async fn start_http_api(
+    db: Arc<LaminarDB>,
+    config_path: PathBuf,
+    config: ServerConfig,
+) -> Result<(Arc<http::AppState>, tokio::task::JoinHandle<()>), ServerError> {
     let bind = config.server.bind.clone();
     let app_state = Arc::new(http::AppState {
-        db: Arc::clone(&db),
-        config_path: config_path.clone(),
+        db,
+        config_path,
         started_at: chrono::Utc::now(),
         current_config: tokio::sync::RwLock::new(config),
         reload_guard: ReloadGuard::new(),
@@ -278,46 +280,37 @@ pub async fn run_server(
     let router = http::build_router(Arc::clone(&app_state));
     let api_handle = http::serve(router, &bind).await?;
     info!("HTTP API listening on {bind}");
+    Ok((app_state, api_handle))
+}
 
-    // 5. Spawn config file watcher (disabled via LAMINAR_DISABLE_FILE_WATCH=1)
-    let watcher_disabled =
+/// Spawn config file watcher unless disabled via `LAMINAR_DISABLE_FILE_WATCH=1`.
+pub(crate) fn spawn_config_watcher(
+    app_state: &Arc<http::AppState>,
+    config_path: PathBuf,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let disabled =
         std::env::var("LAMINAR_DISABLE_FILE_WATCH").is_ok_and(|v| v == "1" || v == "true");
-    let watcher_handle = if watcher_disabled {
+    if disabled {
         info!("Config file watcher disabled via LAMINAR_DISABLE_FILE_WATCH");
-        None
-    } else {
-        let watcher_state = Arc::clone(&app_state);
-        let watcher_path = config_path;
-        let handle = tokio::spawn(async move {
-            crate::watcher::watch_config(
-                watcher_path,
-                watcher_state,
-                std::time::Duration::from_millis(500),
-            )
-            .await;
-        });
-        info!("Config file watcher started");
-        Some(handle)
-    };
-
-    Ok(ServerHandle::Embedded {
-        db,
-        api_handle,
-        watcher_handle,
-    })
+        return None;
+    }
+    let watcher_state = Arc::clone(app_state);
+    let handle = tokio::spawn(async move {
+        crate::watcher::watch_config(
+            config_path,
+            watcher_state,
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+    });
+    info!("Config file watcher started");
+    Some(handle)
 }
 
 // ---------------------------------------------------------------------------
 // DDL generation
 // ---------------------------------------------------------------------------
 
-/// Generate `CREATE SOURCE` DDL from a TOML source config.
-///
-/// Uses the connector-first syntax:
-/// ```sql
-/// CREATE SOURCE name (col1 TYPE, col2 TYPE, WATERMARK FOR col AS col - INTERVAL 'n' SECOND)
-/// FROM CONNECTOR (key = 'value', ...);
-/// ```
 pub fn source_to_ddl(source: &SourceConfig) -> String {
     let mut parts = Vec::new();
     parts.push(format!("CREATE SOURCE {}", source.name));
@@ -363,17 +356,10 @@ pub fn source_to_ddl(source: &SourceConfig) -> String {
     parts.join(" ")
 }
 
-/// Generate `CREATE STREAM ... AS ...` DDL from a TOML pipeline config.
 pub fn pipeline_to_ddl(pipeline: &PipelineConfig) -> String {
     format!("CREATE STREAM {} AS {}", pipeline.name, pipeline.sql.trim())
 }
 
-/// Generate `CREATE SINK` DDL from a TOML sink config.
-///
-/// Uses the `INTO CONNECTOR (...)` syntax:
-/// ```sql
-/// CREATE SINK name FROM pipeline INTO KAFKA (key = 'value', ...)
-/// ```
 pub fn sink_to_ddl(sink: &SinkConfig) -> String {
     let connector_keyword = sink.connector.replace('-', "_").to_uppercase();
     let mut opts: Vec<String> = sink
@@ -407,11 +393,6 @@ pub fn sink_to_ddl(sink: &SinkConfig) -> String {
     }
 }
 
-/// Generate `CREATE LOOKUP TABLE` DDL from a TOML lookup config.
-///
-/// # Errors
-///
-/// Returns `ServerError::Ddl` if the lookup has no schema columns.
 #[allow(clippy::result_large_err)]
 pub fn lookup_to_ddl(lookup: &LookupConfig) -> Result<String, ServerError> {
     if lookup.schema.is_empty() {
@@ -462,9 +443,10 @@ pub fn lookup_to_ddl(lookup: &LookupConfig) -> Result<String, ServerError> {
 }
 
 /// Convert a TOML value to a SQL string literal value.
+/// Escapes single quotes (SQL standard: ' → '').
 fn toml_value_to_sql(value: &toml::Value) -> String {
     match value {
-        toml::Value::String(s) => s.clone(),
+        toml::Value::String(s) => s.replace('\'', "''"),
         toml::Value::Integer(i) => i.to_string(),
         toml::Value::Float(f) => f.to_string(),
         toml::Value::Boolean(b) => b.to_string(),
@@ -476,57 +458,30 @@ fn toml_value_to_sql(value: &toml::Value) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
-
-/// Server runtime errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
-    /// LaminarDB builder failure.
     #[error("failed to build LaminarDB: {0}")]
     Build(String),
-
-    /// DDL execution failure.
     #[error("failed to execute DDL for {section} '{name}': {source}")]
     Ddl {
-        /// Section type (source, pipeline, sink, lookup).
         section: String,
-        /// Object name.
         name: String,
-        /// Underlying database error.
         source: DbError,
     },
-
-    /// Pipeline start failure.
     #[error("failed to start pipeline: {0}")]
     Start(String),
-
-    /// HTTP bind failure.
     #[error("HTTP server error: {0}")]
     Http(String),
-
-    /// Graceful shutdown failure.
     #[error("shutdown error: {0}")]
     Shutdown(String),
-
-    /// Configuration error.
     #[error(transparent)]
     Config(#[from] ConfigError),
-
-    /// Delta mode error.
     #[error("delta mode error: {0}")]
     Delta(String),
-
-    /// Delta configuration error.
     #[cfg(feature = "delta-experimental")]
     #[error(transparent)]
     DeltaConfig(#[from] DeltaConfigError),
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -598,7 +553,6 @@ mod tests {
         let pipeline = PipelineConfig {
             name: "vwap".to_string(),
             sql: "SELECT symbol, SUM(price) FROM trades GROUP BY symbol".to_string(),
-            parallelism: None,
         };
         let ddl = pipeline_to_ddl(&pipeline);
         assert_eq!(
@@ -652,7 +606,6 @@ mod tests {
             name: "instruments".to_string(),
             connector: "postgres".to_string(),
             strategy: "poll".to_string(),
-            pushdown: true,
             cache: LookupCacheConfig::default(),
             properties: {
                 let mut t = toml::Table::new();
@@ -684,7 +637,6 @@ mod tests {
             name: "t".to_string(),
             connector: "postgres".to_string(),
             strategy: "poll".to_string(),
-            pushdown: false,
             cache: LookupCacheConfig::default(),
             properties: toml::Table::new(),
             primary_key: vec![],
@@ -704,7 +656,6 @@ mod tests {
             name: "bad".to_string(),
             connector: "postgres".to_string(),
             strategy: "poll".to_string(),
-            pushdown: false,
             cache: LookupCacheConfig::default(),
             properties: toml::Table::new(),
             primary_key: vec![],
@@ -722,5 +673,17 @@ mod tests {
         assert_eq!(toml_value_to_sql(&toml::Value::Integer(42)), "42");
         assert_eq!(toml_value_to_sql(&toml::Value::Boolean(true)), "true");
         assert_eq!(toml_value_to_sql(&toml::Value::Float(3.25)), "3.25");
+    }
+
+    #[test]
+    fn test_toml_value_to_sql_escapes_single_quotes() {
+        assert_eq!(
+            toml_value_to_sql(&toml::Value::String("it's a test".to_string())),
+            "it''s a test"
+        );
+        assert_eq!(
+            toml_value_to_sql(&toml::Value::String("a''b".to_string())),
+            "a''''b"
+        );
     }
 }

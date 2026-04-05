@@ -24,8 +24,6 @@ laminar-db = { path = "../laminar-db", version = "0.19.12" }
 
 # CLI and configuration
 clap = { version = "4.6", features = ["derive", "env"] }
-config = { version = "0.15", default-features = false, features = ["toml"] }
-directories = "6.0"
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }

@@ -1,8 +1,6 @@
 //! TOML configuration parsing for LaminarDB server.
 //!
-//! Loads, validates, and applies defaults to `laminardb.toml` configuration
-//! files. Supports environment variable substitution (`${VAR}` syntax) and
-//! both embedded (single-node) and delta (multi-node) operating modes.
+//! Supports `${VAR}` and `${VAR:-default}` environment variable substitution.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -18,18 +16,6 @@ static ENV_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Load, parse, and validate a LaminarDB configuration file.
-///
-/// Performs the following steps:
-/// 1. Read the file from disk
-/// 2. Substitute environment variables (`${VAR}` syntax)
-/// 3. Parse TOML into `ServerConfig`
-/// 4. Apply defaults for missing optional fields
-/// 5. Validate referential integrity
-///
-/// # Errors
-///
-/// Returns `ConfigError` if the file cannot be read, environment
-/// variables are missing, TOML is malformed, or validation fails.
 pub fn load_config(path: &Path) -> Result<ServerConfig, ConfigError> {
     let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::FileRead {
         path: path.to_path_buf(),
@@ -47,10 +33,7 @@ pub fn load_config(path: &Path) -> Result<ServerConfig, ConfigError> {
     Ok(config)
 }
 
-/// Substitute `${VAR_NAME}` patterns with environment variable values.
-///
-/// Supports optional default values: `${VAR_NAME:-default_value}`.
-/// Unresolved variables without defaults produce an error.
+/// Substitute `${VAR}` and `${VAR:-default}` patterns with environment values.
 fn substitute_env_vars(input: &str) -> Result<String, ConfigError> {
     let mut errors = Vec::new();
     let result = ENV_VAR_RE.replace_all(input, |caps: &regex::Captures| {
@@ -75,7 +58,6 @@ fn substitute_env_vars(input: &str) -> Result<String, ConfigError> {
     Ok(result.into_owned())
 }
 
-/// Validate referential integrity and semantic constraints.
 fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     let mut errors = Vec::new();
 
@@ -149,78 +131,41 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Data structures
-// ---------------------------------------------------------------------------
-
-/// Top-level server configuration.
-///
-/// Deserialized from `laminardb.toml`. All sections except `[server]`
-/// are optional (an empty config starts a server with no pipelines).
+/// Top-level server configuration deserialized from `laminardb.toml`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ServerConfig {
-    /// Server-level settings.
     #[serde(default)]
     pub server: ServerSection,
-
-    /// State store configuration.
     #[serde(default)]
     pub state: StateSection,
-
-    /// Checkpoint configuration.
     #[serde(default)]
     pub checkpoint: CheckpointSection,
-
-    /// Streaming sources (Kafka, CDC, etc.).
     #[serde(default, rename = "source")]
     pub sources: Vec<SourceConfig>,
-
-    /// Lookup tables for enrichment joins.
     #[serde(default, rename = "lookup")]
     pub lookups: Vec<LookupConfig>,
-
-    /// SQL pipelines to compile and execute.
     #[serde(default, rename = "pipeline")]
     pub pipelines: Vec<PipelineConfig>,
-
-    /// Output sinks (Kafka, Postgres, Delta Lake, etc.).
     #[serde(default, rename = "sink")]
     pub sinks: Vec<SinkConfig>,
-
-    /// Raw SQL DDL executed before `start()`, as an alternative to structured
-    /// `[[source]]`/`[[pipeline]]`/`[[sink]]` sections. Supports `${VAR}` env substitution.
+    /// Raw SQL DDL executed before `start()`, as an alternative to structured sections.
     #[serde(default)]
     pub sql: Option<String>,
-
-    /// Delta mode discovery settings (optional; absent = embedded mode).
     pub discovery: Option<DiscoverySection>,
-
-    /// Coordination settings (optional; absent = embedded mode).
     pub coordination: Option<CoordinationSection>,
-
-    /// Node identity for delta mode.
     pub node_id: Option<String>,
 }
 
-/// `[server]` section: server-level settings.
+/// `[server]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct ServerSection {
-    /// Operating mode: "embedded" (single-node) or "delta" (multi-node).
     #[serde(default = "default_mode")]
     pub mode: String,
-
-    /// Bind address for HTTP API.
     #[serde(default = "default_bind")]
     pub bind: String,
-
-    /// Number of worker threads (0 = auto-detect CPU count).
+    /// Number of worker threads (0 = auto-detect). Used in delta mode.
     #[serde(default)]
     pub workers: usize,
-
-    /// Log level: trace, debug, info, warn, error.
-    #[serde(default = "default_log_level")]
-    pub log_level: String,
 }
 
 impl Default for ServerSection {
@@ -229,20 +174,16 @@ impl Default for ServerSection {
             mode: default_mode(),
             bind: default_bind(),
             workers: 0,
-            log_level: default_log_level(),
         }
     }
 }
 
-/// `[state]` section: state store backend configuration.
+/// `[state]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct StateSection {
-    /// Backend type: "memory", "mmap", or "disaggregated".
+    /// Backend type: "memory" or "mmap".
     #[serde(default = "default_state_backend")]
     pub backend: String,
-
-    /// Path for persistent state (mmap backend).
     #[serde(default = "default_state_path")]
     pub path: String,
 }
@@ -256,27 +197,17 @@ impl Default for StateSection {
     }
 }
 
-/// `[checkpoint]` section: checkpointing configuration.
+/// `[checkpoint]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct CheckpointSection {
-    /// Storage URL for checkpoint data.
-    /// Supports: file:///path, s3://bucket/prefix, gs://bucket/prefix.
+    /// Storage URL: file:///path, s3://bucket/prefix, gs://bucket/prefix.
     #[serde(default = "default_checkpoint_url")]
     pub url: String,
-
-    /// Checkpoint interval (e.g., "10s", "1m", "30s").
     #[serde(default = "default_checkpoint_interval", with = "humantime_serde")]
     pub interval: Duration,
-
-    /// Explicit cloud storage credentials/config overrides.
-    ///
-    /// Keys are backend-specific (e.g., `aws_access_key_id`, `aws_region`).
-    /// These supplement environment-variable-based credential resolution.
+    /// Cloud storage credentials/config (e.g., `aws_access_key_id`).
     #[serde(default)]
     pub storage: std::collections::HashMap<String, String>,
-
-    /// S3 storage class tiering configuration.
     #[serde(default)]
     pub tiering: Option<TieringSection>,
 }
@@ -292,139 +223,80 @@ impl Default for CheckpointSection {
     }
 }
 
-/// `[checkpoint.tiering]` section: S3 storage class tiering.
-///
-/// Controls how checkpoint objects are assigned to S3 storage classes
-/// for cost optimization. Active checkpoints use the hot tier,
-/// older checkpoints are moved to warm/cold tiers via S3 Lifecycle rules.
+/// `[checkpoint.tiering]` section: S3 storage class tiering for cost optimization.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct TieringSection {
-    /// Storage class for active checkpoints (e.g., `"EXPRESS_ONE_ZONE"`, `"STANDARD"`).
     #[serde(default = "default_hot_class")]
     pub hot_class: String,
-
-    /// Storage class for older checkpoints (e.g., `"STANDARD"`).
     #[serde(default = "default_warm_class")]
     pub warm_class: String,
-
-    /// Storage class for archive checkpoints (e.g., `"GLACIER_IR"`). Empty = no cold tier.
+    /// Empty = no cold tier.
     #[serde(default)]
     pub cold_class: String,
-
-    /// Time before moving objects from hot to warm tier (e.g., `"24h"`).
     #[serde(default = "default_hot_retention", with = "humantime_serde")]
     pub hot_retention: Duration,
-
-    /// Time before moving objects from warm to cold tier (e.g., `"7d"`). 0 = no cold tier.
     #[serde(default = "default_warm_retention", with = "humantime_serde")]
     pub warm_retention: Duration,
 }
 
-/// `[[source]]` section: streaming source definition.
+/// `[[source]]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct SourceConfig {
-    /// Unique name for this source (referenced by SQL and sinks).
     pub name: String,
-
     /// Connector type: "kafka", "postgres_cdc", "mysql_cdc", "generator".
     pub connector: String,
-
-    /// Data format: "json", "avro", "protobuf", "csv".
     #[serde(default = "default_format")]
     pub format: String,
-
-    /// Connector-specific properties (e.g., broker, topic, table).
     #[serde(default)]
     pub properties: toml::Table,
-
-    /// Schema definition (column names and types).
     #[serde(default)]
     pub schema: Vec<ColumnDef>,
-
-    /// Watermark configuration.
     pub watermark: Option<WatermarkConfig>,
 }
 
 /// Column definition within a source or lookup schema.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct ColumnDef {
-    /// Column name.
     pub name: String,
-
-    /// SQL type: "INT", "BIGINT", "VARCHAR", "TIMESTAMP", "DOUBLE", "BOOLEAN".
     #[serde(rename = "type")]
     pub data_type: String,
-
-    /// Whether this column is nullable.
     #[serde(default = "default_true")]
     pub nullable: bool,
 }
 
 /// Watermark configuration for a source.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct WatermarkConfig {
-    /// Column containing event timestamps.
     pub column: String,
-
-    /// Maximum allowed out-of-orderness (e.g., "5s", "1m").
     #[serde(default = "default_max_ooo", with = "humantime_serde")]
     pub max_out_of_orderness: Duration,
 }
 
 /// `[[lookup]]` section: lookup table for enrichment joins.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct LookupConfig {
-    /// Unique name for this lookup table.
     pub name: String,
-
     /// Connector type: "postgres", "mysql", "redis", "csv".
     pub connector: String,
-
-    /// Refresh strategy: "poll", "cdc", "manual".
     #[serde(default = "default_lookup_strategy")]
     pub strategy: String,
-
-    /// Whether to push down predicates to the source.
-    #[serde(default = "default_true")]
-    pub pushdown: bool,
-
-    /// Cache configuration.
     #[serde(default)]
     pub cache: LookupCacheConfig,
-
-    /// Connector-specific properties.
     #[serde(default)]
     pub properties: toml::Table,
-
-    /// Primary key column(s).
     #[serde(default)]
     pub primary_key: Vec<String>,
-
-    /// Schema definition.
     #[serde(default)]
     pub schema: Vec<ColumnDef>,
 }
 
 /// Cache configuration for lookup tables.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct LookupCacheConfig {
-    /// Cache size in bytes.
     #[serde(default = "default_cache_size")]
     pub size_bytes: u64,
-
-    /// TTL for cached entries (e.g., "5m", "1h").
     #[serde(default = "default_cache_ttl", with = "humantime_serde")]
     pub ttl: Duration,
-
-    /// Enable hybrid (memory + disk) caching via foyer.
-    #[serde(default)]
-    pub hybrid: bool,
 }
 
 impl Default for LookupCacheConfig {
@@ -432,136 +304,76 @@ impl Default for LookupCacheConfig {
         Self {
             size_bytes: default_cache_size(),
             ttl: default_cache_ttl(),
-            hybrid: false,
         }
     }
 }
 
-/// `[[pipeline]]` section: SQL pipeline definition.
+/// `[[pipeline]]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct PipelineConfig {
-    /// Unique name for this pipeline.
     pub name: String,
-
-    /// SQL query defining the pipeline logic.
     pub sql: String,
-
-    /// Optional parallelism override (default: server worker count).
-    pub parallelism: Option<usize>,
 }
 
-/// `[[sink]]` section: output sink definition.
+/// `[[sink]]` section.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct SinkConfig {
-    /// Unique name for this sink.
     pub name: String,
-
-    /// Pipeline this sink reads from.
     pub pipeline: String,
-
     /// Connector type: "kafka", "postgres", "delta-lake", "iceberg", "stdout".
     pub connector: String,
-
-    /// Delivery guarantee: "at_least_once", "exactly_once".
     #[serde(default = "default_delivery")]
     pub delivery: String,
-
-    /// Connector-specific properties.
     #[serde(default)]
     pub properties: toml::Table,
 }
 
 /// `[discovery]` section: delta node discovery.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct DiscoverySection {
-    /// Discovery strategy: "static", "dns", "gossip".
     pub strategy: String,
-
-    /// Seed node addresses for initial cluster bootstrap.
     #[serde(default)]
     pub seeds: Vec<String>,
-
-    /// Port for gossip protocol communication.
     #[serde(default = "default_gossip_port")]
     pub gossip_port: u16,
 }
 
 /// `[coordination]` section: delta coordination.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[allow(dead_code)]
 pub struct CoordinationSection {
-    /// Coordination strategy: "raft".
     #[serde(default = "default_coordination_strategy")]
     pub strategy: String,
-
-    /// Port for Raft RPC communication.
     #[serde(default = "default_raft_port")]
     pub raft_port: u16,
-
-    /// Raft election timeout range.
     #[serde(default = "default_election_timeout", with = "humantime_serde")]
     pub election_timeout: Duration,
-
-    /// Raft heartbeat interval.
     #[serde(default = "default_heartbeat_interval", with = "humantime_serde")]
     pub heartbeat_interval: Duration,
 }
 
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
-
-/// Configuration errors with structured context.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// Failed to read the configuration file.
     #[error("failed to read config file '{}': {source}", path.display())]
     FileRead {
-        /// Path that failed to read.
         path: std::path::PathBuf,
-        /// Underlying I/O error.
         source: std::io::Error,
     },
-
-    /// TOML parse error.
     #[error("failed to parse config file '{}': {source}", path.display())]
     ParseError {
-        /// Path that failed to parse.
         path: std::path::PathBuf,
-        /// Underlying TOML error.
         source: toml::de::Error,
     },
-
-    /// Missing required environment variables.
     #[error("missing environment variables: {}", vars.join(", "))]
-    MissingEnvVars {
-        /// Names of missing variables.
-        vars: Vec<String>,
-    },
-
-    /// Referential integrity or semantic validation failures.
+    MissingEnvVars { vars: Vec<String> },
     #[error("configuration validation errors:\n  - {}", errors.join("\n  - "))]
-    ValidationErrors {
-        /// List of validation error messages.
-        errors: Vec<String>,
-    },
+    ValidationErrors { errors: Vec<String> },
 }
-
-// ---------------------------------------------------------------------------
-// Default value functions
-// ---------------------------------------------------------------------------
 
 fn default_mode() -> String {
     "embedded".to_string()
 }
 fn default_bind() -> String {
     "127.0.0.1:8080".to_string()
-}
-fn default_log_level() -> String {
-    "info".to_string()
 }
 fn default_state_backend() -> String {
     "memory".to_string()
@@ -905,7 +717,6 @@ bind = "not-a-socket-addr"
         assert_eq!(config.server.mode, "embedded");
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert_eq!(config.server.workers, 0);
-        assert_eq!(config.server.log_level, "info");
         assert_eq!(config.state.backend, "memory");
         assert_eq!(config.checkpoint.interval, Duration::from_secs(10));
     }
@@ -955,7 +766,6 @@ max_out_of_orderness = "10s"
         let cache = LookupCacheConfig::default();
         assert_eq!(cache.size_bytes, 100 * 1024 * 1024);
         assert_eq!(cache.ttl, Duration::from_secs(300));
-        assert!(!cache.hybrid);
     }
 
     #[test]

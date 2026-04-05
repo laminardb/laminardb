@@ -1,21 +1,4 @@
 //! HTTP API for LaminarDB server.
-//!
-//! Provides health checks, metrics, pipeline introspection, checkpoint
-//! control, and ad-hoc SQL execution via a REST API.
-//!
-//! # Endpoints
-//!
-//! | Method | Path | Description |
-//! |--------|------|-------------|
-//! | `GET` | `/health` | Liveness probe |
-//! | `GET` | `/ready` | Readiness probe |
-//! | `GET` | `/metrics` | Prometheus text metrics |
-//! | `GET` | `/api/v1/sources` | List sources |
-//! | `GET` | `/api/v1/sinks` | List sinks |
-//! | `GET` | `/api/v1/streams` | List streams |
-//! | `GET` | `/api/v1/streams/{name}` | Stream detail |
-//! | `POST` | `/api/v1/checkpoint` | Trigger checkpoint |
-//! | `POST` | `/api/v1/sql` | Execute ad-hoc SQL |
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,22 +20,13 @@ use crate::config::ServerConfig;
 use crate::reload::{self, ReloadGuard};
 use crate::server::ServerError;
 
-/// Shared application state for all HTTP handlers.
-#[allow(dead_code)]
 pub struct AppState {
-    /// Reference to the running LaminarDB instance.
     pub db: Arc<LaminarDB>,
-    /// Path to the configuration file used to start this server.
     pub config_path: PathBuf,
-    /// Server start time (UTC).
     pub started_at: chrono::DateTime<chrono::Utc>,
-    /// Current active configuration (updated on reload).
     pub current_config: tokio::sync::RwLock<ServerConfig>,
-    /// Guard preventing concurrent reloads.
     pub reload_guard: ReloadGuard,
-    /// Total number of successful + failed reloads.
     pub reload_total: AtomicU64,
-    /// Unix timestamp (seconds) of last reload attempt.
     pub reload_last_ts: AtomicU64,
 }
 
@@ -73,17 +47,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/reload", post(handle_reload))
         // Cluster (delta mode)
         .route("/api/v1/cluster", get(cluster_status))
-        // Stubs (501 Not Implemented)
-        .route("/api/v1/pause", post(not_implemented))
-        .route("/api/v1/resume", post(not_implemented))
         .layer(CorsLayer::permissive())
         .layer(axum::middleware::from_fn(request_logging))
         .with_state(state)
 }
 
-/// Bind the router to a TCP address and spawn the server task.
-///
-/// Returns a `JoinHandle` that can be aborted for shutdown.
 pub async fn serve(router: Router, bind: &str) -> Result<tokio::task::JoinHandle<()>, ServerError> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -98,10 +66,6 @@ pub async fn serve(router: Router, bind: &str) -> Result<tokio::task::JoinHandle
     Ok(handle)
 }
 
-// ---------------------------------------------------------------------------
-// Response types
-// ---------------------------------------------------------------------------
-
 /// Health check response.
 #[derive(Debug, Serialize)]
 struct HealthResponse {
@@ -110,7 +74,6 @@ struct HealthResponse {
     pipeline_state: &'static str,
 }
 
-/// Source listing response.
 #[derive(Debug, Serialize)]
 struct SourceResponse {
     name: String,
@@ -118,7 +81,6 @@ struct SourceResponse {
     watermark_column: Option<String>,
 }
 
-/// Stream listing response.
 #[derive(Debug, Serialize)]
 struct StreamResponse {
     name: String,
@@ -126,13 +88,11 @@ struct StreamResponse {
     sql: Option<String>,
 }
 
-/// Sink listing response.
 #[derive(Debug, Serialize)]
 struct SinkResponse {
     name: String,
 }
 
-/// Checkpoint trigger response.
 #[derive(Debug, Serialize)]
 struct CheckpointResponse {
     success: bool,
@@ -143,13 +103,11 @@ struct CheckpointResponse {
     error: Option<String>,
 }
 
-/// SQL execution request.
 #[derive(Debug, Deserialize)]
 struct SqlRequest {
     sql: String,
 }
 
-/// SQL execution response.
 #[derive(Debug, Serialize)]
 struct SqlResponse {
     result_type: String,
@@ -159,7 +117,6 @@ struct SqlResponse {
     rows_affected: Option<u64>,
 }
 
-/// Error response body.
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
@@ -168,10 +125,6 @@ struct ErrorBody {
 fn error_response(status: StatusCode, msg: impl Into<String>) -> impl IntoResponse {
     (status, Json(ErrorBody { error: msg.into() }))
 }
-
-// ---------------------------------------------------------------------------
-// Middleware
-// ---------------------------------------------------------------------------
 
 async fn request_logging(
     req: axum::http::Request<axum::body::Body>,
@@ -190,11 +143,6 @@ async fn request_logging(
     response
 }
 
-// ---------------------------------------------------------------------------
-// Handlers
-// ---------------------------------------------------------------------------
-
-/// `GET /health` — liveness probe.
 async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let pipeline_state = state.db.pipeline_state();
     let status = if pipeline_state == "Stopped" {
@@ -217,7 +165,6 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     )
 }
 
-/// `GET /ready` — readiness probe (200 only when Running).
 async fn readiness_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let pipeline_state = state.db.pipeline_state();
     if pipeline_state == "Running" {
@@ -239,7 +186,6 @@ async fn readiness_check(State(state): State<Arc<AppState>>) -> impl IntoRespons
     }
 }
 
-/// `GET /metrics` — Prometheus text format metrics.
 async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let metrics = state.db.metrics();
     let source_metrics = state.db.all_source_metrics();
@@ -331,7 +277,6 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
     )
 }
 
-/// `GET /api/v1/sources` — list all registered sources.
 async fn list_sources(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let sources: Vec<SourceResponse> = state
         .db
@@ -345,7 +290,6 @@ async fn list_sources(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(sources)
 }
 
-/// `GET /api/v1/sinks` — list all registered sinks.
 async fn list_sinks(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let sinks: Vec<SinkResponse> = state
         .db
@@ -356,7 +300,6 @@ async fn list_sinks(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(sinks)
 }
 
-/// `GET /api/v1/streams` — list all registered streams.
 async fn list_streams(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let streams: Vec<StreamResponse> = state
         .db
@@ -370,7 +313,6 @@ async fn list_streams(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(streams)
 }
 
-/// `GET /api/v1/streams/{name}` — get a stream by name.
 async fn get_stream(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -387,7 +329,6 @@ async fn get_stream(
     }
 }
 
-/// `POST /api/v1/checkpoint` — trigger a manual checkpoint.
 async fn trigger_checkpoint(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.db.checkpoint().await {
         Ok(result) => {
@@ -414,7 +355,6 @@ async fn trigger_checkpoint(State(state): State<Arc<AppState>>) -> impl IntoResp
     }
 }
 
-/// `POST /api/v1/sql` — execute ad-hoc SQL.
 async fn execute_sql(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SqlRequest>,
@@ -450,7 +390,6 @@ async fn execute_sql(
     }
 }
 
-/// `POST /api/v1/reload` — trigger a configuration reload.
 async fn handle_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Acquire concurrency guard
     let _guard = match state.reload_guard.try_acquire() {
@@ -519,7 +458,6 @@ async fn handle_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     (status, Json(result)).into_response()
 }
 
-/// `GET /api/v1/cluster` — cluster status (delta mode only).
 async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let config = state.current_config.read().await;
     if config.server.mode != "delta" {
@@ -548,18 +486,6 @@ async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
     })
     .into_response()
 }
-
-/// Stub handler for unimplemented endpoints.
-async fn not_implemented() -> impl IntoResponse {
-    error_response(
-        StatusCode::NOT_IMPLEMENTED,
-        "this endpoint is not yet implemented",
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -703,20 +629,6 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn test_not_implemented_stubs() {
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/api/v1/pause")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]
