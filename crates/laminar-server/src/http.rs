@@ -513,61 +513,46 @@ async fn ws_stream(
     sub: laminar_core::streaming::Subscription<laminar_db::ArrowRecord>,
     name: String,
 ) {
-    use std::sync::atomic::{AtomicI64, Ordering};
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<arrow_array::RecordBatch>(32);
-    let watermark = Arc::new(AtomicI64::new(i64::MIN));
-    let wm_producer = Arc::clone(&watermark);
-
-    tokio::task::spawn_blocking(move || loop {
-        match sub.poll_message() {
-            Some(laminar_core::streaming::SubscriptionMessage::Batch(batch)) => {
-                if tx.blocking_send(batch).is_err() {
-                    break;
-                }
-            }
-            Some(laminar_core::streaming::SubscriptionMessage::Watermark(wm)) => {
-                wm_producer.store(wm, Ordering::Relaxed);
-            }
-            Some(laminar_core::streaming::SubscriptionMessage::Record(_)) => {}
-            None => {
-                if sub.is_disconnected() {
-                    break;
-                }
-                std::thread::park_timeout(std::time::Duration::from_millis(50));
-            }
-        }
-    });
-
     let mut seq = 0u64;
+    let mut watermark = i64::MIN;
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
-            batch = rx.recv() => {
-                let Some(batch) = batch else { break };
-                let json = match batch_to_json(&batch) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(stream = %name, error = %e, "failed to serialize batch");
-                        continue;
+            _ = interval.tick() => {
+                while let Some(msg) = sub.poll_message() {
+                    use laminar_core::streaming::SubscriptionMessage;
+                    match msg {
+                        SubscriptionMessage::Batch(batch) => {
+                            let json = match batch_to_json(&batch) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warn!(stream = %name, error = %e, "failed to serialize batch");
+                                    continue;
+                                }
+                            };
+                            let wm = if watermark == i64::MIN { serde_json::Value::Null } else { serde_json::json!(watermark) };
+                            let out = serde_json::json!({
+                                "type": "data",
+                                "subscription_id": &name,
+                                "data": json,
+                                "sequence": seq,
+                                "watermark": wm,
+                            });
+                            seq += 1;
+                            if socket.send(Message::Text(out.to_string().into())).await.is_err() {
+                                return;
+                            }
+                        }
+                        SubscriptionMessage::Watermark(wm) => { watermark = wm; }
+                        SubscriptionMessage::Record(_) => {}
                     }
-                };
-                let wm = watermark.load(Ordering::Relaxed);
-                let msg = serde_json::json!({
-                    "type": "data",
-                    "subscription_id": &name,
-                    "data": json,
-                    "sequence": seq,
-                    "watermark": if wm == i64::MIN { serde_json::Value::Null } else { serde_json::json!(wm) },
-                });
-                seq += 1;
-                if socket.send(Message::Text(msg.to_string().into())).await.is_err() {
-                    break;
                 }
             }
             msg = socket.recv() => {
                 match msg {
-                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Close(_))) | None => return,
                     _ => {}
                 }
             }
