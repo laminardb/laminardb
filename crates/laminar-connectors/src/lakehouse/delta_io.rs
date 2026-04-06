@@ -1332,18 +1332,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_open_nonexistent_without_schema_fails() {
+    async fn test_open_nonexistent_without_schema_defers() {
         let temp_dir = TempDir::new().unwrap();
-        // Create the directory so the path exists, but it's not a Delta table.
         let nonexistent_table = temp_dir.path().join("nonexistent");
         std::fs::create_dir_all(&nonexistent_table).unwrap();
         let table_path = nonexistent_table.to_str().unwrap();
 
-        // Open without schema when table doesn't exist should fail.
+        // Open without schema returns an uninitialized table (deferred creation).
         let result = open_or_create_table(table_path, HashMap::new(), None).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("schema"), "error should mention schema: {err}");
+        assert!(result.is_ok());
+        let table = result.unwrap();
+        assert!(table.version().is_none(), "table should be uninitialized");
     }
 
     #[tokio::test]
