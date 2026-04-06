@@ -1296,7 +1296,11 @@ mod tests {
     }
 
     fn test_config() -> DeltaLakeSinkConfig {
-        DeltaLakeSinkConfig::new("/tmp/delta_test")
+        #[cfg(unix)]
+        let path = "/tmp/delta_test_nonexistent_8f3a";
+        #[cfg(windows)]
+        let path = "C:\\delta_test_nonexistent_8f3a";
+        DeltaLakeSinkConfig::new(path)
     }
 
     fn upsert_config() -> DeltaLakeSinkConfig {
@@ -1938,6 +1942,6 @@ mod tests {
         let sink = DeltaLakeSink::new(test_config());
         let debug = format!("{sink:?}");
         assert!(debug.contains("DeltaLakeSink"));
-        assert!(debug.contains("/tmp/delta_test"));
+        assert!(debug.contains("delta_test_nonexistent_8f3a"));
     }
 }

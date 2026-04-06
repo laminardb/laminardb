@@ -63,6 +63,12 @@ pub(crate) struct SinkInner<T: Record> {
     subscriber_count: AtomicUsize,
 }
 
+impl<T: Record> SinkInner<T> {
+    pub(crate) fn release_subscriber(&self) {
+        self.subscriber_count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// A streaming data sink.
 ///
 /// Sinks receive records from a Source and distribute them to subscribers.

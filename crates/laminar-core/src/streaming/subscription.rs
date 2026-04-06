@@ -282,6 +282,16 @@ impl<T: Record> Subscription<T> {
         Arc::clone(&self.schema)
     }
 
+    /// Returns a watch receiver that resolves on `changed().await` when new data
+    /// may be available. Drain with [`poll_message`](Self::poll_message) after.
+    #[must_use]
+    pub fn async_watch(&self) -> tokio::sync::watch::Receiver<()> {
+        match &self.inner {
+            SubscriptionInner::Direct(sink) => sink.consumer().async_watch(),
+            SubscriptionInner::Broadcast(consumer) => consumer.async_watch(),
+        }
+    }
+
     fn message_to_batch(msg: SourceMessage<T>) -> Option<RecordBatch> {
         match msg {
             SourceMessage::Record(record) => Some(record.to_record_batch()),
@@ -348,6 +358,14 @@ impl<T: Record> SubscriptionMessage<T> {
         match self {
             Self::Watermark(ts) => Some(*ts),
             _ => None,
+        }
+    }
+}
+
+impl<T: Record> Drop for Subscription<T> {
+    fn drop(&mut self) {
+        if let SubscriptionInner::Direct(ref sink) = self.inner {
+            sink.release_subscriber();
         }
     }
 }
@@ -593,5 +611,30 @@ mod tests {
         let debug = format!("{sub:?}");
         assert!(debug.contains("Subscription"));
         assert!(debug.contains("Direct"));
+    }
+
+    #[tokio::test]
+    async fn test_watch_drain_pattern() {
+        let (source, sink) = create::<TestEvent>(64);
+        let sub = Arc::new(sink.subscribe());
+        let sub_clone = Arc::clone(&sub);
+
+        let handle = tokio::spawn(async move {
+            let mut rx = sub_clone.async_watch();
+            let _ = rx.changed().await;
+            let mut count = 0;
+            while sub_clone.poll_message().is_some() {
+                count += 1;
+            }
+            count
+        });
+        tokio::task::yield_now().await;
+
+        for i in 0..5 {
+            source.push(TestEvent { id: i, value: 1.0 }).unwrap();
+        }
+
+        let count = handle.await.unwrap();
+        assert_eq!(count, 5);
     }
 }

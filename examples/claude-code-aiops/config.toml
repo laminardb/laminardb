@@ -235,6 +235,32 @@ WHERE p.event_name = 'user_prompt'
     AND t.event_name = 'tool_result'
 """
 
+# Rolling 5-hour token usage (slides every 1 min, matches Claude Code rate limit window)
+[[pipeline]]
+name = "usage_5h"
+sql = """
+SELECT
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'api_request'
+        THEN CAST(jsonb_get_text(from_json(attributes), 'input_tokens') AS BIGINT) ELSE 0 END)
+        AS input_tokens,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'api_request'
+        THEN CAST(jsonb_get_text(from_json(attributes), 'output_tokens') AS BIGINT) ELSE 0 END)
+        AS output_tokens,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'api_request'
+        AND jsonb_get_text(from_json(attributes), 'cache_read_tokens') IS NOT NULL
+        THEN CAST(jsonb_get_text(from_json(attributes), 'cache_read_tokens') AS BIGINT) ELSE 0 END)
+        AS cache_read_tokens,
+    SUM(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'api_request'
+        THEN CAST(jsonb_get_text(from_json(attributes), 'cost_usd') AS DOUBLE) ELSE 0.0 END)
+        AS window_cost_usd,
+    COUNT(CASE WHEN jsonb_get_text(from_json(attributes), 'event.name') = 'api_request'
+        THEN 1 END)
+        AS request_count
+FROM otel_events
+GROUP BY HOP(_laminar_received_at, INTERVAL '1' MINUTE, INTERVAL '5' HOUR)
+EMIT ON WINDOW CLOSE
+"""
+
 # All pipelines available via ws://localhost:8080/ws/{pipeline_name}
 
 # Delta Lake sinks (ACID, local filesystem, queryable with DuckDB)
