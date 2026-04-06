@@ -586,11 +586,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             return false;
         }
 
-        // A sink timeout in this cycle means some data was dropped.
-        // Committing offsets would skip that data on recovery.
-        // Do NOT clear the flag here — maybe_checkpoint is the sole consumer,
-        // ensuring both paths are suppressed in the same coordinator cycle.
+        // Clear after one suppression — the timer-based path that also
+        // clears this flag is unreachable when barrier checkpointing is active.
         if self.sink_timed_out {
+            self.sink_timed_out = false;
             tracing::warn!(
                 "skipping barrier checkpoint after sink timeout to preserve replay window"
             );
