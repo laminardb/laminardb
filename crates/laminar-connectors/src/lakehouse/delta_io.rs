@@ -140,14 +140,14 @@ pub async fn open_or_create_table(
         return Ok(table);
     }
 
-    // Table doesn't exist - create it if we have a schema.
-    let schema = schema.ok_or_else(|| {
-        ConnectorError::ConfigurationError(
-            "cannot create Delta Lake table without schema - \
-             write at least one batch first"
-                .into(),
-        )
-    })?;
+    // Table doesn't exist — create if we have a schema, otherwise defer to first write_batch().
+    let Some(schema) = schema else {
+        info!(
+            table_path,
+            "table does not exist yet; will create on first write"
+        );
+        return Ok(table);
+    };
 
     info!(table_path, "creating new Delta Lake table");
 
@@ -1332,18 +1332,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_open_nonexistent_without_schema_fails() {
+    async fn test_open_nonexistent_without_schema_defers() {
         let temp_dir = TempDir::new().unwrap();
-        // Create the directory so the path exists, but it's not a Delta table.
         let nonexistent_table = temp_dir.path().join("nonexistent");
         std::fs::create_dir_all(&nonexistent_table).unwrap();
         let table_path = nonexistent_table.to_str().unwrap();
 
-        // Open without schema when table doesn't exist should fail.
+        // Open without schema returns an uninitialized table (deferred creation).
         let result = open_or_create_table(table_path, HashMap::new(), None).await;
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("schema"), "error should mention schema: {err}");
+        assert!(result.is_ok());
+        let table = result.unwrap();
+        assert!(table.version().is_none(), "table should be uninitialized");
     }
 
     #[tokio::test]

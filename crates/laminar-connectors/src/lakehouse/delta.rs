@@ -887,12 +887,19 @@ impl SinkConnector for DeltaLakeSink {
                      available — deferring Delta table init to first begin_epoch"
                 );
                 self.needs_deferred_delta_init = true;
-                // Stay in Initializing until init completes in begin_epoch().
                 self.state = ConnectorState::Initializing;
                 return Ok(());
             }
 
             self.init_delta_table().await?;
+
+            // If table still has no version after init (new table, no schema yet),
+            // defer full creation to the first write_batch() when schema is available.
+            if self.table.as_ref().is_some_and(|t| t.version().is_none()) && self.schema.is_none() {
+                self.needs_deferred_delta_init = true;
+                self.state = ConnectorState::Initializing;
+                return Ok(());
+            }
         }
 
         #[cfg(not(feature = "delta-lake"))]

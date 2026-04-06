@@ -35,9 +35,11 @@ fn now_nanos() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| {
+            // Nanos from epoch fits in i64 until ~2262.
             #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-            let ns = d.as_nanos() as i64;
-            ns
+            {
+                d.as_nanos() as i64
+            }
         })
 }
 

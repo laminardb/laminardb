@@ -196,17 +196,12 @@ fn any_value_to_string(v: Option<&AnyValue>) -> Option<String> {
     })
 }
 
-/// Convert an `ExportTraceServiceRequest` into an Arrow `RecordBatch`.
-///
-/// Flattens the nested protobuf hierarchy:
-/// `ResourceSpans` -> `ScopeSpans` -> `Span` into flat rows.
-///
-/// Returns `Ok(None)` if the request contains zero spans.
+/// Convert an `ExportTraceServiceRequest` into a `RecordBatch`, or `None` if empty.
 ///
 /// # Errors
 ///
-/// Returns `ArrowError` if column construction fails (e.g., type mismatch).
-#[allow(clippy::too_many_lines)]
+/// Returns `ArrowError` if column construction fails.
+#[allow(clippy::too_many_lines)] // 20 columns = inherently long
 pub fn trace_request_to_batch(
     req: &ExportTraceServiceRequest,
     schema: &SchemaRef,
@@ -387,21 +382,154 @@ fn any_value_to_body_string(v: Option<&AnyValue>) -> Option<String> {
 
 // ── Metrics conversion ──
 
+struct MetricBuilders {
+    names: StringBuilder,
+    descs: StringBuilder,
+    units: StringBuilder,
+    types: Int32Builder,
+    timestamps: Int64Builder,
+    value_doubles: Float64Builder,
+    value_ints: Int64Builder,
+    hist_counts: UInt64Builder,
+    hist_sums: Float64Builder,
+    res_svc_names: StringBuilder,
+    res_attrs: StringBuilder,
+    scope_names: StringBuilder,
+    attrs: StringBuilder,
+    received_at: Int64Builder,
+}
+
+struct MetricContext<'a> {
+    name: &'a str,
+    desc: &'a str,
+    unit: &'a str,
+    metric_type: i32,
+    svc_name: Option<&'a str>,
+    res_json: Option<&'a str>,
+    scope_name: Option<&'a str>,
+    received_at_nanos: i64,
+}
+
+impl MetricBuilders {
+    fn with_capacity(n: usize) -> Self {
+        Self {
+            names: StringBuilder::with_capacity(n, n * 32),
+            descs: StringBuilder::with_capacity(n, n * 32),
+            units: StringBuilder::with_capacity(n, n * 8),
+            types: Int32Builder::with_capacity(n),
+            timestamps: Int64Builder::with_capacity(n),
+            value_doubles: Float64Builder::with_capacity(n),
+            value_ints: Int64Builder::with_capacity(n),
+            hist_counts: UInt64Builder::with_capacity(n),
+            hist_sums: Float64Builder::with_capacity(n),
+            res_svc_names: StringBuilder::with_capacity(n, n * 16),
+            res_attrs: StringBuilder::with_capacity(n, n * 64),
+            scope_names: StringBuilder::with_capacity(n, n * 16),
+            attrs: StringBuilder::with_capacity(n, n * 64),
+            received_at: Int64Builder::with_capacity(n),
+        }
+    }
+
+    fn append_common(&mut self, ctx: &MetricContext, time_unix_nano: u64, dp_attrs: &[KeyValue]) {
+        self.names.append_value(ctx.name);
+        append_nullable_str(&mut self.descs, ctx.desc);
+        append_nullable_str(&mut self.units, ctx.unit);
+        self.types.append_value(ctx.metric_type);
+        #[allow(clippy::cast_possible_wrap)]
+        self.timestamps.append_value(time_unix_nano as i64);
+
+        append_context_fields(
+            ctx.svc_name,
+            ctx.res_json,
+            ctx.scope_name,
+            dp_attrs,
+            ctx.received_at_nanos,
+            &mut self.res_svc_names,
+            &mut self.res_attrs,
+            &mut self.scope_names,
+            &mut self.attrs,
+            &mut self.received_at,
+        );
+    }
+
+    fn append_number_dp(
+        &mut self,
+        ctx: &MetricContext,
+        time_unix_nano: u64,
+        value: Option<&number_data_point::Value>,
+        dp_attrs: &[KeyValue],
+    ) {
+        self.append_common(ctx, time_unix_nano, dp_attrs);
+        match value {
+            Some(number_data_point::Value::AsDouble(d)) => {
+                self.value_doubles.append_value(*d);
+                self.value_ints.append_null();
+            }
+            Some(number_data_point::Value::AsInt(i)) => {
+                self.value_doubles.append_null();
+                self.value_ints.append_value(*i);
+            }
+            None => {
+                self.value_doubles.append_null();
+                self.value_ints.append_null();
+            }
+        }
+        self.hist_counts.append_null();
+        self.hist_sums.append_null();
+    }
+
+    fn append_histogram_dp(
+        &mut self,
+        ctx: &MetricContext,
+        time_unix_nano: u64,
+        count: u64,
+        sum: Option<f64>,
+        dp_attrs: &[KeyValue],
+    ) {
+        self.append_common(ctx, time_unix_nano, dp_attrs);
+        self.value_doubles.append_null();
+        self.value_ints.append_null();
+        self.hist_counts.append_value(count);
+        match sum {
+            Some(s) => self.hist_sums.append_value(s),
+            None => self.hist_sums.append_null(),
+        }
+    }
+
+    fn finish(mut self, schema: &SchemaRef) -> Result<RecordBatch, arrow_schema::ArrowError> {
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(self.names.finish()),
+                Arc::new(self.descs.finish()),
+                Arc::new(self.units.finish()),
+                Arc::new(self.types.finish()),
+                Arc::new(self.timestamps.finish()),
+                Arc::new(self.value_doubles.finish()),
+                Arc::new(self.value_ints.finish()),
+                Arc::new(self.hist_counts.finish()),
+                Arc::new(self.hist_sums.finish()),
+                Arc::new(self.res_svc_names.finish()),
+                Arc::new(self.res_attrs.finish()),
+                Arc::new(self.scope_names.finish()),
+                Arc::new(self.attrs.finish()),
+                Arc::new(self.received_at.finish()),
+            ],
+        )
+    }
+}
+
 /// Convert an `ExportMetricsServiceRequest` into an Arrow `RecordBatch`.
-///
-/// Flattens `ResourceMetrics` -> `ScopeMetrics` -> `Metric` -> data points.
-/// Each data point becomes one row.
 ///
 /// # Errors
 ///
 /// Returns `ArrowError` if column construction fails.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)] // 5 metric types × dispatch loop; builders already extracted
 pub fn metrics_request_to_batch(
     req: &ExportMetricsServiceRequest,
     schema: &SchemaRef,
     received_at_nanos: i64,
 ) -> Result<Option<RecordBatch>, arrow_schema::ArrowError> {
-    // Count total data points for capacity hints
     let total_points: usize = req
         .resource_metrics
         .iter()
@@ -414,20 +542,7 @@ pub fn metrics_request_to_batch(
         return Ok(None);
     }
 
-    let mut metric_names = StringBuilder::with_capacity(total_points, total_points * 32);
-    let mut metric_descs = StringBuilder::with_capacity(total_points, total_points * 32);
-    let mut metric_units = StringBuilder::with_capacity(total_points, total_points * 8);
-    let mut metric_types = Int32Builder::with_capacity(total_points);
-    let mut timestamps = Int64Builder::with_capacity(total_points);
-    let mut value_doubles = Float64Builder::with_capacity(total_points);
-    let mut value_ints = Int64Builder::with_capacity(total_points);
-    let mut hist_counts = UInt64Builder::with_capacity(total_points);
-    let mut hist_sums = Float64Builder::with_capacity(total_points);
-    let mut res_svc_names = StringBuilder::with_capacity(total_points, total_points * 16);
-    let mut res_attrs = StringBuilder::with_capacity(total_points, total_points * 64);
-    let mut scope_names_col = StringBuilder::with_capacity(total_points, total_points * 16);
-    let mut attrs_col = StringBuilder::with_capacity(total_points, total_points * 64);
-    let mut received_at = Int64Builder::with_capacity(total_points);
+    let mut b = MetricBuilders::with_capacity(total_points);
 
     for rm in &req.resource_metrics {
         let resource = rm.resource.as_ref();
@@ -438,170 +553,85 @@ pub fn metrics_request_to_batch(
             let scope_name = sm.scope.as_ref().map(|s| s.name.as_str());
 
             for metric in &sm.metrics {
-                let name = &metric.name;
-                let desc = &metric.description;
-                let unit = &metric.unit;
-
-                let Some(data) = &metric.data else {
-                    continue;
+                let Some(data) = &metric.data else { continue };
+                let base = MetricContext {
+                    name: &metric.name,
+                    desc: &metric.description,
+                    unit: &metric.unit,
+                    metric_type: 0,
+                    svc_name: svc_name.as_deref(),
+                    res_json: res_json.as_deref(),
+                    scope_name,
+                    received_at_nanos,
                 };
 
                 match data {
                     metric::Data::Gauge(g) => {
                         for dp in &g.data_points {
-                            append_metric_row(
-                                name,
-                                desc,
-                                unit,
-                                0,
+                            b.append_number_dp(
+                                &base,
                                 dp.time_unix_nano,
                                 dp.value.as_ref(),
                                 &dp.attributes,
-                                svc_name.as_deref(),
-                                res_json.as_deref(),
-                                scope_name,
-                                received_at_nanos,
-                                &mut metric_names,
-                                &mut metric_descs,
-                                &mut metric_units,
-                                &mut metric_types,
-                                &mut timestamps,
-                                &mut value_doubles,
-                                &mut value_ints,
-                                &mut hist_counts,
-                                &mut hist_sums,
-                                &mut res_svc_names,
-                                &mut res_attrs,
-                                &mut scope_names_col,
-                                &mut attrs_col,
-                                &mut received_at,
                             );
                         }
                     }
                     metric::Data::Sum(s) => {
                         for dp in &s.data_points {
-                            append_metric_row(
-                                name,
-                                desc,
-                                unit,
-                                1,
+                            let ctx = MetricContext {
+                                metric_type: 1,
+                                ..base
+                            };
+                            b.append_number_dp(
+                                &ctx,
                                 dp.time_unix_nano,
                                 dp.value.as_ref(),
                                 &dp.attributes,
-                                svc_name.as_deref(),
-                                res_json.as_deref(),
-                                scope_name,
-                                received_at_nanos,
-                                &mut metric_names,
-                                &mut metric_descs,
-                                &mut metric_units,
-                                &mut metric_types,
-                                &mut timestamps,
-                                &mut value_doubles,
-                                &mut value_ints,
-                                &mut hist_counts,
-                                &mut hist_sums,
-                                &mut res_svc_names,
-                                &mut res_attrs,
-                                &mut scope_names_col,
-                                &mut attrs_col,
-                                &mut received_at,
                             );
                         }
                     }
                     metric::Data::Histogram(h) => {
                         for dp in &h.data_points {
-                            append_histogram_row(
-                                name,
-                                desc,
-                                unit,
-                                2,
+                            let ctx = MetricContext {
+                                metric_type: 2,
+                                ..base
+                            };
+                            b.append_histogram_dp(
+                                &ctx,
                                 dp.time_unix_nano,
                                 dp.count,
                                 dp.sum,
                                 &dp.attributes,
-                                svc_name.as_deref(),
-                                res_json.as_deref(),
-                                scope_name,
-                                received_at_nanos,
-                                &mut metric_names,
-                                &mut metric_descs,
-                                &mut metric_units,
-                                &mut metric_types,
-                                &mut timestamps,
-                                &mut value_doubles,
-                                &mut value_ints,
-                                &mut hist_counts,
-                                &mut hist_sums,
-                                &mut res_svc_names,
-                                &mut res_attrs,
-                                &mut scope_names_col,
-                                &mut attrs_col,
-                                &mut received_at,
                             );
                         }
                     }
                     metric::Data::ExponentialHistogram(eh) => {
                         for dp in &eh.data_points {
-                            append_histogram_row(
-                                name,
-                                desc,
-                                unit,
-                                3,
+                            let ctx = MetricContext {
+                                metric_type: 3,
+                                ..base
+                            };
+                            b.append_histogram_dp(
+                                &ctx,
                                 dp.time_unix_nano,
                                 dp.count,
                                 dp.sum,
                                 &dp.attributes,
-                                svc_name.as_deref(),
-                                res_json.as_deref(),
-                                scope_name,
-                                received_at_nanos,
-                                &mut metric_names,
-                                &mut metric_descs,
-                                &mut metric_units,
-                                &mut metric_types,
-                                &mut timestamps,
-                                &mut value_doubles,
-                                &mut value_ints,
-                                &mut hist_counts,
-                                &mut hist_sums,
-                                &mut res_svc_names,
-                                &mut res_attrs,
-                                &mut scope_names_col,
-                                &mut attrs_col,
-                                &mut received_at,
                             );
                         }
                     }
                     metric::Data::Summary(s) => {
                         for dp in &s.data_points {
-                            append_histogram_row(
-                                name,
-                                desc,
-                                unit,
-                                4,
+                            let ctx = MetricContext {
+                                metric_type: 4,
+                                ..base
+                            };
+                            b.append_histogram_dp(
+                                &ctx,
                                 dp.time_unix_nano,
                                 dp.count,
                                 Some(dp.sum),
                                 &dp.attributes,
-                                svc_name.as_deref(),
-                                res_json.as_deref(),
-                                scope_name,
-                                received_at_nanos,
-                                &mut metric_names,
-                                &mut metric_descs,
-                                &mut metric_units,
-                                &mut metric_types,
-                                &mut timestamps,
-                                &mut value_doubles,
-                                &mut value_ints,
-                                &mut hist_counts,
-                                &mut hist_sums,
-                                &mut res_svc_names,
-                                &mut res_attrs,
-                                &mut scope_names_col,
-                                &mut attrs_col,
-                                &mut received_at,
                             );
                         }
                     }
@@ -610,30 +640,9 @@ pub fn metrics_request_to_batch(
         }
     }
 
-    let batch = RecordBatch::try_new(
-        Arc::clone(schema),
-        vec![
-            Arc::new(metric_names.finish()),
-            Arc::new(metric_descs.finish()),
-            Arc::new(metric_units.finish()),
-            Arc::new(metric_types.finish()),
-            Arc::new(timestamps.finish()),
-            Arc::new(value_doubles.finish()),
-            Arc::new(value_ints.finish()),
-            Arc::new(hist_counts.finish()),
-            Arc::new(hist_sums.finish()),
-            Arc::new(res_svc_names.finish()),
-            Arc::new(res_attrs.finish()),
-            Arc::new(scope_names_col.finish()),
-            Arc::new(attrs_col.finish()),
-            Arc::new(received_at.finish()),
-        ],
-    )?;
-
-    Ok(Some(batch))
+    Ok(Some(b.finish(schema)?))
 }
 
-/// Count data points in a metric across all data variants.
 fn count_metric_points(m: &opentelemetry_proto::tonic::metrics::v1::Metric) -> usize {
     match &m.data {
         Some(metric::Data::Gauge(g)) => g.data_points.len(),
@@ -643,132 +652,6 @@ fn count_metric_points(m: &opentelemetry_proto::tonic::metrics::v1::Metric) -> u
         Some(metric::Data::Summary(s)) => s.data_points.len(),
         None => 0,
     }
-}
-
-/// Append one row for a Gauge/Sum `NumberDataPoint`.
-#[allow(clippy::too_many_arguments)]
-fn append_metric_row(
-    name: &str,
-    desc: &str,
-    unit: &str,
-    metric_type: i32,
-    time_unix_nano: u64,
-    value: Option<&number_data_point::Value>,
-    dp_attrs: &[KeyValue],
-    svc_name: Option<&str>,
-    res_json: Option<&str>,
-    scope_name: Option<&str>,
-    received_at_nanos: i64,
-    metric_names: &mut StringBuilder,
-    metric_descs: &mut StringBuilder,
-    metric_units: &mut StringBuilder,
-    metric_types: &mut Int32Builder,
-    timestamps: &mut Int64Builder,
-    value_doubles: &mut Float64Builder,
-    value_ints: &mut Int64Builder,
-    hist_counts: &mut UInt64Builder,
-    hist_sums: &mut Float64Builder,
-    res_svc_names: &mut StringBuilder,
-    res_attrs: &mut StringBuilder,
-    scope_names_col: &mut StringBuilder,
-    attrs_col: &mut StringBuilder,
-    received_at: &mut Int64Builder,
-) {
-    metric_names.append_value(name);
-    append_nullable_str(metric_descs, desc);
-    append_nullable_str(metric_units, unit);
-    metric_types.append_value(metric_type);
-    #[allow(clippy::cast_possible_wrap)]
-    timestamps.append_value(time_unix_nano as i64);
-
-    match value {
-        Some(number_data_point::Value::AsDouble(d)) => {
-            value_doubles.append_value(*d);
-            value_ints.append_null();
-        }
-        Some(number_data_point::Value::AsInt(i)) => {
-            value_doubles.append_null();
-            value_ints.append_value(*i);
-        }
-        None => {
-            value_doubles.append_null();
-            value_ints.append_null();
-        }
-    }
-    hist_counts.append_null();
-    hist_sums.append_null();
-
-    append_context_fields(
-        svc_name,
-        res_json,
-        scope_name,
-        dp_attrs,
-        received_at_nanos,
-        res_svc_names,
-        res_attrs,
-        scope_names_col,
-        attrs_col,
-        received_at,
-    );
-}
-
-/// Append one row for a Histogram/`ExponentialHistogram`/Summary data point.
-#[allow(clippy::too_many_arguments)]
-fn append_histogram_row(
-    name: &str,
-    desc: &str,
-    unit: &str,
-    metric_type: i32,
-    time_unix_nano: u64,
-    count: u64,
-    sum: Option<f64>,
-    dp_attrs: &[KeyValue],
-    svc_name: Option<&str>,
-    res_json: Option<&str>,
-    scope_name: Option<&str>,
-    received_at_nanos: i64,
-    metric_names: &mut StringBuilder,
-    metric_descs: &mut StringBuilder,
-    metric_units: &mut StringBuilder,
-    metric_types: &mut Int32Builder,
-    timestamps: &mut Int64Builder,
-    value_doubles: &mut Float64Builder,
-    value_ints: &mut Int64Builder,
-    hist_counts: &mut UInt64Builder,
-    hist_sums: &mut Float64Builder,
-    res_svc_names: &mut StringBuilder,
-    res_attrs: &mut StringBuilder,
-    scope_names_col: &mut StringBuilder,
-    attrs_col: &mut StringBuilder,
-    received_at: &mut Int64Builder,
-) {
-    metric_names.append_value(name);
-    append_nullable_str(metric_descs, desc);
-    append_nullable_str(metric_units, unit);
-    metric_types.append_value(metric_type);
-    #[allow(clippy::cast_possible_wrap)]
-    timestamps.append_value(time_unix_nano as i64);
-
-    value_doubles.append_null();
-    value_ints.append_null();
-    hist_counts.append_value(count);
-    match sum {
-        Some(s) => hist_sums.append_value(s),
-        None => hist_sums.append_null(),
-    }
-
-    append_context_fields(
-        svc_name,
-        res_json,
-        scope_name,
-        dp_attrs,
-        received_at_nanos,
-        res_svc_names,
-        res_attrs,
-        scope_names_col,
-        attrs_col,
-        received_at,
-    );
 }
 
 /// Append resource/scope/attribute/`received_at` fields (shared across all metric types).
@@ -825,12 +708,9 @@ fn append_nullable_opt(builder: &mut StringBuilder, s: Option<&str>) {
 
 /// Convert an `ExportLogsServiceRequest` into an Arrow `RecordBatch`.
 ///
-/// Flattens `ResourceLogs` -> `ScopeLogs` -> `LogRecord`. Each record = one row.
-///
 /// # Errors
 ///
 /// Returns `ArrowError` if column construction fails.
-#[allow(clippy::too_many_lines)]
 pub fn logs_request_to_batch(
     req: &ExportLogsServiceRequest,
     schema: &SchemaRef,
@@ -908,25 +788,18 @@ pub fn logs_request_to_batch(
                     span_ids.append_value(&sid)?;
                 }
 
-                // Resource/scope/attributes
-                match &svc_name {
-                    Some(s) => res_svc_names.append_value(s),
-                    None => res_svc_names.append_null(),
-                }
-                match &res_json {
-                    Some(s) => res_attrs.append_value(s),
-                    None => res_attrs.append_null(),
-                }
-                match scope_name {
-                    Some(s) if !s.is_empty() => scope_names_col.append_value(s),
-                    _ => scope_names_col.append_null(),
-                }
-                match kv_to_json(&log.attributes) {
-                    Some(s) => attrs_col.append_value(&s),
-                    None => attrs_col.append_null(),
-                }
-
-                received_at.append_value(received_at_nanos);
+                append_context_fields(
+                    svc_name.as_deref(),
+                    res_json.as_deref(),
+                    scope_name,
+                    &log.attributes,
+                    received_at_nanos,
+                    &mut res_svc_names,
+                    &mut res_attrs,
+                    &mut scope_names_col,
+                    &mut attrs_col,
+                    &mut received_at,
+                );
             }
         }
     }

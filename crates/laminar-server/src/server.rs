@@ -11,7 +11,7 @@ use laminar_core::streaming::checkpoint::StreamCheckpointConfig;
 use laminar_db::{DbError, LaminarDB, Profile};
 
 use crate::config::{
-    ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
+    ColumnDef, ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
 };
 #[cfg(feature = "delta-experimental")]
 use crate::delta_config::{DeltaConfig, DeltaConfigError};
@@ -164,16 +164,8 @@ pub(crate) fn apply_checkpoint_config(
 ) -> laminar_db::LaminarDbBuilder {
     let cfg = StreamCheckpointConfig {
         interval_ms: Some(checkpoint.interval.as_millis() as u64),
-        data_dir: if checkpoint_url.starts_with("file:///") {
-            Some(PathBuf::from(
-                checkpoint_url
-                    .strip_prefix("file://")
-                    .unwrap_or(checkpoint_url),
-            ))
-        } else {
-            None
-        },
-        max_retained: Some(10),
+        data_dir: file_url_to_path(checkpoint_url),
+        max_retained: Some(checkpoint.max_retained),
         ..StreamCheckpointConfig::default()
     };
     builder = builder.checkpoint(cfg);
@@ -203,7 +195,36 @@ pub(crate) async fn execute_config_ddl(
     db: &LaminarDB,
     config: &ServerConfig,
 ) -> Result<(), ServerError> {
-    for source in &config.sources {
+    // Auto-populate schema from connector registry when not declared in config.
+    let registry = db.connector_registry();
+    let mut sources = Vec::new();
+    for s in &config.sources {
+        if s.schema.is_empty() {
+            let props: std::collections::HashMap<String, String> = s
+                .properties
+                .iter()
+                .map(|(k, v)| (k.clone(), toml_value_to_sql(v)))
+                .collect();
+            if let Some(cols) = registry.default_source_columns(&s.connector, &props) {
+                let mut s = s.clone();
+                s.schema = cols
+                    .into_iter()
+                    .map(|(name, data_type, nullable)| ColumnDef {
+                        name,
+                        data_type,
+                        nullable,
+                    })
+                    .collect();
+                info!(source = %s.name, columns = s.schema.len(),
+                    "Auto-populated schema from connector");
+                sources.push(s);
+                continue;
+            }
+        }
+        sources.push(s.clone());
+    }
+
+    for source in &sources {
         let ddl = source_to_ddl(source);
         db.execute(&ddl).await.map_err(|e| ServerError::Ddl {
             section: "source".to_string(),
@@ -305,6 +326,28 @@ pub(crate) fn spawn_config_watcher(
     });
     info!("Config file watcher started");
     Some(handle)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Extract a local filesystem path from a `file://` URL, or `None` for cloud URLs.
+fn file_url_to_path(url: &str) -> Option<PathBuf> {
+    if !url.starts_with("file:///") {
+        return None;
+    }
+    let raw = url.strip_prefix("file://").unwrap_or(url);
+    #[cfg(windows)]
+    let raw = {
+        let b = raw.as_bytes();
+        if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+            &raw[1..]
+        } else {
+            raw
+        }
+    };
+    Some(PathBuf::from(raw))
 }
 
 // ---------------------------------------------------------------------------

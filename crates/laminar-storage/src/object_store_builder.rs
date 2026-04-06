@@ -99,6 +99,11 @@ fn build_local_file_system(url: &str) -> Result<Arc<dyn ObjectStore>, ObjectStor
     // it so `LocalFileSystem::new_with_prefix` receives "C:/path".
     let path = strip_windows_leading_slash(path);
 
+    // Ensure the directory exists — LocalFileSystem doesn't create it.
+    std::fs::create_dir_all(path).map_err(|e| {
+        ObjectStoreBuilderError::InvalidUrl(format!("failed to create directory '{path}': {e}"))
+    })?;
+
     let fs = LocalFileSystem::new_with_prefix(path)?;
     Ok(Arc::new(fs))
 }

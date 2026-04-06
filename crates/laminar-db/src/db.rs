@@ -843,12 +843,13 @@ impl LaminarDB {
         Ok(crate::handle::TypedSubscription::from_raw(sub))
     }
 
-    /// Get a raw Arrow subscription for a named stream (crate-internal).
+    /// Subscribe to a named stream's output.
     ///
-    /// Used by `api::Connection::subscribe` to create an `ArrowSubscription`
-    /// without requiring the `FromBatch` trait bound.
+    /// # Errors
+    ///
+    /// Returns `DbError::StreamNotFound` if the stream doesn't exist.
     #[cfg(feature = "api")]
-    pub(crate) fn subscribe_raw(
+    pub fn subscribe_raw(
         &self,
         name: &str,
     ) -> Result<laminar_core::streaming::Subscription<crate::catalog::ArrowRecord>, DbError> {

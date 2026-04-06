@@ -92,7 +92,7 @@ mod temporal_probe;
 pub mod ffi;
 
 pub use builder::LaminarDbBuilder;
-pub use catalog::{SourceCatalog, SourceEntry};
+pub use catalog::{ArrowRecord, SourceCatalog, SourceEntry};
 pub use checkpoint_coordinator::{
     CheckpointConfig, CheckpointCoordinator, CheckpointPhase, CheckpointRequest, CheckpointResult,
     CheckpointStats,

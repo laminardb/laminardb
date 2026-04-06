@@ -205,6 +205,9 @@ pub struct CheckpointSection {
     pub url: String,
     #[serde(default = "default_checkpoint_interval", with = "humantime_serde")]
     pub interval: Duration,
+    /// Number of recent checkpoints to retain before pruning.
+    #[serde(default = "default_max_retained")]
+    pub max_retained: usize,
     /// Cloud storage credentials/config (e.g., `aws_access_key_id`).
     #[serde(default)]
     pub storage: std::collections::HashMap<String, String>,
@@ -217,6 +220,7 @@ impl Default for CheckpointSection {
         Self {
             url: default_checkpoint_url(),
             interval: default_checkpoint_interval(),
+            max_retained: default_max_retained(),
             storage: std::collections::HashMap::new(),
             tiering: None,
         }
@@ -382,7 +386,17 @@ fn default_state_path() -> String {
     "./data/state".to_string()
 }
 fn default_checkpoint_url() -> String {
-    "file:///tmp/laminardb/checkpoints".to_string()
+    let base = std::env::temp_dir();
+    let path = base.join("laminardb");
+    let path_str = path.to_string_lossy().replace('\\', "/");
+    if path_str.starts_with('/') {
+        format!("file://{path_str}")
+    } else {
+        format!("file:///{path_str}")
+    }
+}
+fn default_max_retained() -> usize {
+    10
 }
 fn default_checkpoint_interval() -> Duration {
     Duration::from_secs(10)

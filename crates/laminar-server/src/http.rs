@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -45,6 +46,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/checkpoint", post(trigger_checkpoint))
         .route("/api/v1/sql", post(execute_sql))
         .route("/api/v1/reload", post(handle_reload))
+        // WebSocket stream subscriptions
+        .route("/ws/{name}", get(ws_upgrade))
         // Cluster (delta mode)
         .route("/api/v1/cluster", get(cluster_status))
         .layer(CorsLayer::permissive())
@@ -485,6 +488,84 @@ async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
         pipeline_state,
     })
     .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket stream subscriptions
+// ---------------------------------------------------------------------------
+
+async fn ws_upgrade(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    match state.db.subscribe_raw(&name) {
+        Ok(sub) => ws
+            .on_upgrade(move |socket| ws_stream(socket, sub, name))
+            .into_response(),
+        Err(_) => error_response(StatusCode::NOT_FOUND, format!("stream '{name}' not found"))
+            .into_response(),
+    }
+}
+
+async fn ws_stream(
+    mut socket: WebSocket,
+    sub: laminar_core::streaming::Subscription<laminar_db::ArrowRecord>,
+    name: String,
+) {
+    let mut seq = 0u64;
+    let mut watermark = i64::MIN;
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                while let Some(msg) = sub.poll_message() {
+                    use laminar_core::streaming::SubscriptionMessage;
+                    match msg {
+                        SubscriptionMessage::Batch(batch) => {
+                            let json = match batch_to_json(&batch) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warn!(stream = %name, error = %e, "failed to serialize batch");
+                                    continue;
+                                }
+                            };
+                            let wm = if watermark == i64::MIN { serde_json::Value::Null } else { serde_json::json!(watermark) };
+                            let out = serde_json::json!({
+                                "type": "data",
+                                "subscription_id": &name,
+                                "data": json,
+                                "sequence": seq,
+                                "watermark": wm,
+                            });
+                            seq += 1;
+                            if socket.send(Message::Text(out.to_string().into())).await.is_err() {
+                                return;
+                            }
+                        }
+                        SubscriptionMessage::Watermark(wm) => { watermark = wm; }
+                        SubscriptionMessage::Record(_) => {}
+                    }
+                }
+            }
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Close(_))) | None => return,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn batch_to_json(batch: &arrow_array::RecordBatch) -> Result<serde_json::Value, String> {
+    let mut buf = Vec::new();
+    let mut writer = arrow_json::ArrayWriter::new(&mut buf);
+    writer.write(batch).map_err(|e| e.to_string())?;
+    writer.finish().map_err(|e| e.to_string())?;
+    Ok(serde_json::from_slice(&buf).unwrap_or(serde_json::Value::Array(vec![])))
 }
 
 #[cfg(test)]

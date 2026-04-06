@@ -13,8 +13,9 @@ use tokio::sync::Notify;
 
 use laminar_core::streaming::{self, BackpressureStrategy, SourceConfig, WaitStrategy};
 
+/// Record type for Arrow-based streaming subscriptions.
 #[derive(Clone, Debug)]
-pub(crate) struct ArrowRecord {
+pub struct ArrowRecord {
     pub(crate) batch: RecordBatch,
 }
 

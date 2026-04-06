@@ -1,0 +1,1174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Code Cost Monitor - Zero Infra AI Ops</title>
+<style>
+  :root {
+    --bg: #0a0a12;
+    --surface: #12121f;
+    --surface2: #1a1a2e;
+    --border: #252545;
+    --text: #e0e0f0;
+    --text-dim: #6b6b8d;
+    --accent: #6c5ce7;
+    --green: #00b894;
+    --amber: #fdcb6e;
+    --red: #e17055;
+    --purple: #a29bfe;
+    --blue: #74b9ff;
+    --cyan: #00cec9;
+    --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    min-height: 100vh;
+    padding: 20px;
+  }
+
+  /* Header */
+  .header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0 0 16px 0;
+    margin-bottom: 20px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .header h1 {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-dim);
+    letter-spacing: 0.5px;
+  }
+
+  .header h1 span { color: var(--accent); }
+
+  .conn-status {
+    display: flex;
+    gap: 14px;
+    font-size: 11px;
+    font-family: var(--mono);
+    color: var(--text-dim);
+    align-items: center;
+  }
+
+  .reconnect-btn {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 10px;
+    padding: 3px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  .reconnect-btn:hover { border-color: var(--accent); color: var(--accent); }
+
+  .heartbeat {
+    display: inline-block;
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--border);
+    margin-right: 4px;
+    transition: background 0.2s;
+  }
+
+  .heartbeat.pulse {
+    background: var(--green);
+    box-shadow: 0 0 8px var(--green);
+  }
+
+  .dot {
+    display: inline-block;
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    margin-right: 4px;
+    background: var(--red);
+  }
+
+  .dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
+
+  /* Grid layout */
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr 1fr;
+    gap: 12px;
+  }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .span2 { grid-column: span 2; }
+  .span3 { grid-column: span 3; }
+  .span4 { grid-column: 1 / -1; }
+
+  .panel-title {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    color: var(--text-dim);
+    margin-bottom: 14px;
+    font-weight: 700;
+  }
+
+  /* Big cost number */
+  .cost-hero {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+  }
+
+  .big-cost {
+    font-family: var(--mono);
+    font-size: 52px;
+    font-weight: 800;
+    line-height: 1;
+    background: linear-gradient(135deg, var(--green), var(--cyan));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  .cost-sub {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    line-height: 1.8;
+  }
+
+  .cost-sub .highlight {
+    color: var(--text);
+    font-weight: 600;
+  }
+
+  .sparkline-wrap {
+    width: 100%;
+    height: 50px;
+    margin-top: 12px;
+  }
+
+  .sparkline-wrap canvas { width: 100%; height: 100%; }
+
+  /* Stat cards row */
+  .stat-row {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 12px;
+  }
+
+  .stat-card {
+    background: var(--surface2);
+    border-radius: 6px;
+    padding: 14px;
+    text-align: center;
+  }
+
+  .stat-val {
+    font-family: var(--mono);
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--text);
+  }
+
+  .stat-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--text-dim);
+    margin-top: 4px;
+  }
+
+  /* Model bars */
+  .model-entry { margin-bottom: 12px; }
+  .model-entry:last-child { margin-bottom: 0; }
+
+  .model-header {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 4px;
+  }
+
+  .model-name {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .model-cost {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--green);
+    font-weight: 600;
+  }
+
+  .model-bar-track {
+    height: 6px;
+    background: var(--surface2);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+
+  .model-bar-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.4s ease;
+  }
+
+  .bar-opus { background: linear-gradient(90deg, #6c5ce7, #a29bfe); }
+  .bar-sonnet { background: linear-gradient(90deg, #0984e3, #74b9ff); }
+  .bar-haiku { background: linear-gradient(90deg, #00b894, #55efc4); }
+  .bar-default { background: linear-gradient(90deg, #636e72, #b2bec3); }
+
+  .model-detail {
+    display: flex;
+    gap: 12px;
+    margin-top: 4px;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--text-dim);
+  }
+
+  /* Token breakdown */
+  .token-breakdown {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+
+  .token-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 10px;
+    background: var(--surface2);
+    border-radius: 5px;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+
+  .token-label { color: var(--text-dim); }
+  .token-val { font-weight: 600; }
+  .token-val.input { color: var(--blue); }
+  .token-val.output { color: var(--purple); }
+  .token-val.cache-read { color: var(--green); }
+  .token-val.cache-create { color: var(--amber); }
+
+  .cache-rate {
+    grid-column: 1 / -1;
+    text-align: center;
+    padding: 10px;
+    background: var(--surface2);
+    border-radius: 5px;
+  }
+
+  .cache-pct {
+    font-family: var(--mono);
+    font-size: 28px;
+    font-weight: 700;
+    color: var(--green);
+  }
+
+  .cache-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--text-dim);
+    margin-top: 2px;
+  }
+
+  /* Tool table */
+  .tool-tbl {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+
+  .tool-tbl th {
+    text-align: left;
+    font-weight: 700;
+    color: var(--text-dim);
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .tool-tbl td {
+    padding: 7px 8px;
+    border-bottom: 1px solid rgba(37, 37, 69, 0.5);
+  }
+
+  .tool-tbl tr:last-child td { border-bottom: none; }
+  .tool-tbl tr:hover td { background: rgba(108, 92, 231, 0.05); }
+
+  .rate-pill {
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 700;
+  }
+
+  .rate-good { color: var(--green); }
+  .rate-warn { color: var(--amber); }
+  .rate-bad { color: var(--red); }
+
+  /* Prompt feed */
+  .prompt-feed {
+    max-height: 260px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+
+  .prompt-entry {
+    display: grid;
+    grid-template-columns: 30px 70px 100px 70px 70px 60px 55px 60px;
+    gap: 6px;
+    padding: 7px 6px;
+    border-bottom: 1px solid rgba(37, 37, 69, 0.4);
+    font-family: var(--mono);
+    font-size: 11px;
+    align-items: center;
+  }
+
+  .prompt-entry:last-child { border-bottom: none; }
+  .prompt-entry:hover { background: rgba(108, 92, 231, 0.05); }
+
+  .prompt-num { color: var(--text-dim); font-weight: 600; }
+  .prompt-cost { font-weight: 700; color: var(--green); }
+  .prompt-model { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .prompt-tokens { color: var(--blue); }
+  .prompt-tokens-out { color: var(--purple); }
+  .prompt-tools { color: var(--cyan); }
+  .prompt-cache { color: var(--green); font-size: 10px; }
+  .prompt-duration { color: var(--text-dim); }
+
+  .prompt-header {
+    display: grid;
+    grid-template-columns: 30px 70px 100px 70px 70px 60px 55px 60px;
+    gap: 6px;
+    padding: 4px 6px 8px 6px;
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-dim);
+    font-weight: 700;
+    border-bottom: 1px solid var(--border);
+  }
+
+  /* Event log */
+  .event-log {
+    max-height: 200px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+
+  .log-line {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 3px 0;
+    color: var(--text-dim);
+    border-bottom: 1px solid rgba(37, 37, 69, 0.3);
+  }
+
+  .log-line .ts { color: var(--text-dim); }
+  .log-line .ev { color: var(--accent); font-weight: 600; }
+  .log-line .detail { color: var(--text); }
+
+  .empty {
+    color: var(--text-dim);
+    font-size: 12px;
+    text-align: center;
+    padding: 20px;
+    font-style: italic;
+  }
+
+  /* Responsive */
+  @media (max-width: 1200px) {
+    .grid { grid-template-columns: 1fr 1fr; }
+    .span2, .span3, .span4 { grid-column: 1 / -1; }
+    .stat-row { grid-template-columns: repeat(3, 1fr); }
+  }
+  @media (max-width: 700px) {
+    .grid { grid-template-columns: 1fr; }
+    .span2, .span3, .span4 { grid-column: span 1; }
+    .stat-row { grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1><span>Claude Code</span> Cost Monitor <span style="color:var(--text-dim);font-size:11px;margin-left:8px">zero infra &middot; real time &middot; powered by LaminarDB</span></h1>
+  <div class="conn-status">
+    <span><span class="heartbeat" id="hb"></span>live</span>
+    <span><span class="dot" id="d-cost"></span>cost</span>
+    <span><span class="dot" id="d-tools"></span>tools</span>
+    <span><span class="dot" id="d-prompts"></span>prompts</span>
+    <span><span class="dot" id="d-decisions"></span>perms</span>
+    <span><span class="dot" id="d-activity"></span>activity</span>
+    <span><span class="dot" id="d-lifecycle"></span>joins</span>
+    <span id="uptime" style="color:var(--text-dim)"></span>
+    <button class="reconnect-btn" onclick="reconnectAll()">reconnect</button>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Row 1: Cost + Stat cards -->
+  <div class="panel">
+    <div class="panel-title" title="Running total with cost-per-minute burn rate">Session Cost</div>
+    <div class="cost-hero">
+      <div class="big-cost" id="total-cost">$0.00</div>
+      <div class="cost-sub">
+        <div><span class="highlight" id="req-count">0</span> API calls</div>
+        <div><span class="highlight" id="token-count">0</span> tokens</div>
+        <div><span id="rate-info" style="color:var(--amber)"></span></div>
+      </div>
+    </div>
+    <div class="sparkline-wrap"><canvas id="sparkline"></canvas></div>
+  </div>
+
+  <div class="panel span3" style="padding:10px 14px">
+    <div class="stat-row">
+      <div class="stat-card">
+        <div class="stat-val" id="s-requests">0</div>
+        <div class="stat-label">API Requests</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-val" id="s-tools">0</div>
+        <div class="stat-label">Tool Calls</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-val" id="s-avg-latency">--</div>
+        <div class="stat-label">Avg Latency</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-val" id="s-cost-per-req">--</div>
+        <div class="stat-label">Cost / Request</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-val" id="s-fast-pct">--</div>
+        <div class="stat-label">Fast Mode %</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-val" id="s-cost-rate">--</div>
+        <div class="stat-label">Cost / Hour</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Row 2: Prompt Lifecycle hero -->
+  <div class="panel span4">
+    <div class="panel-title" title="Stream-to-stream temporal join: user_prompt → api_request → tool_result by prompt.id">Prompt Lifecycle <span style="color:var(--accent);font-size:9px;margin-left:8px">STREAM JOIN</span></div>
+    <div style="overflow-x:auto;max-height:150px;overflow-y:auto">
+      <table class="tool-tbl" id="lifecycle-table">
+        <tr><th>Time</th><th>Model</th><th>Tokens</th><th>Cost</th><th>Latency</th><th>Tools</th></tr>
+      </table>
+    </div>
+    <div class="empty" id="lifecycle-empty">Waiting for stream join results...</div>
+  </div>
+
+  <!-- Row 3: Model + Tokens + Tools -->
+  <div class="panel">
+    <div class="panel-title" title="Cost per model — which model drives spend">Cost by Model</div>
+    <div id="model-bars"><div class="empty">Waiting for data...</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title" title="Input/output/cache tokens + cache hit rate">Token Breakdown</div>
+    <div class="token-breakdown">
+      <div class="token-item">
+        <span class="token-label">Input</span>
+        <span class="token-val input" id="t-input">0</span>
+      </div>
+      <div class="token-item">
+        <span class="token-label">Output</span>
+        <span class="token-val output" id="t-output">0</span>
+      </div>
+      <div class="token-item">
+        <span class="token-label">Cache Read</span>
+        <span class="token-val cache-read" id="t-cache-read">0</span>
+      </div>
+      <div class="token-item">
+        <span class="token-label">Cache Create</span>
+        <span class="token-val cache-create" id="t-cache-create">0</span>
+      </div>
+      <div class="cache-rate">
+        <div class="cache-pct" id="cache-pct">--</div>
+        <div class="cache-label">Cache Hit Rate</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel span2">
+    <div class="panel-title" title="Per-tool calls, success rate, avg/max latency, data volume">Tool Usage</div>
+    <div id="tool-panel"><div class="empty">Waiting for data...</div></div>
+  </div>
+
+  <!-- Row 4: Permissions + Per-Prompt + Event Log -->
+  <div class="panel">
+    <div class="panel-title" title="Accept/reject per tool, auto-approval %">Tool Permissions</div>
+    <div id="decisions-panel"><div class="empty">Waiting for data...</div></div>
+  </div>
+
+  <div class="panel span2">
+    <div class="panel-title" title="Cost, tokens, tools, cache per prompt (30s window)">Per-Prompt Breakdown</div>
+    <div class="prompt-header">
+      <span>#</span><span>Cost</span><span>Model</span><span>In</span><span>Out</span><span>Tools</span><span>Cache</span><span>Time</span>
+    </div>
+    <div class="prompt-feed" id="prompt-feed">
+      <div class="empty">Waiting for prompt data...</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title" title="Raw feed of pipeline events as they arrive">Event Log</div>
+    <div class="event-log" id="event-log">
+      <div class="empty">Waiting for events...</div>
+    </div>
+  </div>
+</div>
+
+<!-- Activity Timeline (hidden, data still collected) -->
+<div style="display:none">
+  <canvas id="activity-chart"></canvas>
+  <div id="activity-legend"></div>
+</div>
+
+<script>
+// State
+const S = {
+  lifecycle: [],      // joined prompt→api rows
+  toolJoins: {},      // prompt_id → [{tool_name, success, duration_ms}]
+  totalCost: 0,
+  totalRequests: 0,
+  totalInputTokens: 0,
+  totalOutputTokens: 0,
+  totalCacheRead: 0,
+  totalCacheCreate: 0,
+  totalToolCalls: 0,
+  totalAvgLatency: 0,
+  totalFastCalls: 0,
+  totalNormalCalls: 0,
+  costHistory: [],
+  activityHistory: [],  // {prompts, api, tools, cost}
+  models: {},
+  tools: {},
+  decisions: {},  // tool_name -> {accept: n, reject: n, auto: n, manual: n}
+  prompts: [],
+  events: [],
+  startTime: Date.now(),
+};
+
+// Formatting
+function fmtCost(n) {
+  if (n >= 100) return '$' + n.toFixed(0);
+  if (n >= 1) return '$' + n.toFixed(2);
+  if (n >= 0.01) return '$' + n.toFixed(3);
+  return '$' + n.toFixed(4);
+}
+
+function fmtTokens(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(n);
+}
+
+function fmtMs(n) { return n < 1000 ? n.toFixed(0) + 'ms' : (n / 1000).toFixed(1) + 's'; }
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function fmtTime(d) {
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+// WebSocket with reconnect
+const sockets = [];
+
+const WS_BASE = 'ws://localhost:8080/ws';
+
+function ws(stream, dotId, onMsg) {
+  const dot = document.getElementById(dotId);
+  let backoff = 1000;
+  let current = null;
+
+  function go() {
+    current = new WebSocket(`${WS_BASE}/${stream}`);
+    current.onopen = () => { dot.classList.add('on'); backoff = 1000; };
+    current.onmessage = e => {
+      try {
+        const m = JSON.parse(e.data);
+        if (m.type === 'data' && m.data) onMsg(Array.isArray(m.data) ? m.data : [m.data]);
+      } catch(_) {}
+    };
+    current.onclose = () => { dot.classList.remove('on'); setTimeout(go, Math.min(backoff *= 1.5, 10000)); };
+    current.onerror = () => current.close();
+  }
+
+  go();
+  sockets.push({ reconnect() { if (current) current.close(); backoff = 100; }, stream, dotId });
+}
+
+function reconnectAll() {
+  sockets.forEach(s => s.reconnect());
+}
+
+// Data handlers
+function handleCost(rows) {
+  let windowCost = 0;
+  for (const r of rows) {
+    const model = r.model || 'unknown';
+    const cost = +r.total_cost_usd || 0;
+    const reqs = +r.request_count || 0;
+    const inp = +r.total_input_tokens || 0;
+    const out = +r.total_output_tokens || 0;
+    const cacheR = +r.total_cache_read_tokens || 0;
+    const cacheC = +r.total_cache_creation_tokens || 0;
+    const avgMs = +r.avg_duration_ms || 0;
+
+    S.totalCost += cost;
+    S.totalRequests += reqs;
+    S.totalInputTokens += inp;
+    S.totalOutputTokens += out;
+    S.totalCacheRead += cacheR;
+    S.totalCacheCreate += cacheC;
+    windowCost += cost;
+
+    // weighted avg latency
+    const prev = S.totalRequests - reqs;
+    S.totalAvgLatency = prev > 0
+      ? (S.totalAvgLatency * prev + avgMs * reqs) / S.totalRequests
+      : avgMs;
+
+    if (!S.models[model]) S.models[model] = { cost: 0, reqs: 0, inp: 0, out: 0, cacheR: 0, cacheC: 0 };
+    const m = S.models[model];
+    m.cost += cost; m.reqs += reqs; m.inp += inp; m.out += out; m.cacheR += cacheR; m.cacheC += cacheC;
+
+    addEvent('api_request', `${model} ${reqs} reqs ${fmtCost(cost)}`);
+  }
+
+  S.costHistory.push(windowCost);
+  if (S.costHistory.length > 60) S.costHistory.shift();
+
+  renderAll();
+}
+
+function handleTools(rows) {
+  for (const r of rows) {
+    const name = r.tool_name || 'unknown';
+    const cnt = +r.invocation_count || 0;
+    const succ = +r.success_count || 0;
+    const fail = +r.failure_count || 0;
+    const avg = +r.avg_duration_ms || 0;
+    const max = +r.max_duration_ms || 0;
+    const bytes = +r.total_result_bytes || 0;
+
+    if (!S.tools[name]) S.tools[name] = { cnt: 0, succ: 0, fail: 0, avg: 0, max: 0, bytes: 0 };
+    const t = S.tools[name];
+    const prevCnt = t.cnt;
+    t.cnt += cnt;
+    t.succ += succ;
+    t.fail += fail;
+    t.avg = prevCnt > 0 ? (t.avg * prevCnt + avg * cnt) / t.cnt : avg;
+    t.max = Math.max(t.max, max);
+    t.bytes += bytes;
+    S.totalToolCalls += cnt;
+
+    addEvent('tool_result', `${name} x${cnt} ${avg.toFixed(0)}ms`);
+  }
+  renderAll();
+}
+
+function handlePrompts(rows) {
+  for (const r of rows) {
+    const id = r.prompt_id || '';
+    const model = r.model || '';
+    const shortModel = model.replace('claude-', '').replace(/-\d{8}$/, '');
+    const inp = +r.total_input_tokens || 0;
+    const cacheR = +r.total_cache_read_tokens || 0;
+    const cachePct = (cacheR + inp) > 0 ? ((cacheR / (cacheR + inp)) * 100).toFixed(0) : '--';
+
+    const existing = id && S.prompts.find(p => p.id === id);
+    if (existing) {
+      existing.cost += +r.prompt_cost_usd || 0;
+      existing.inp += inp;
+      existing.out += +r.total_output_tokens || 0;
+      existing.cacheR += cacheR;
+      existing.cachePct = (existing.cacheR + existing.inp) > 0
+        ? ((existing.cacheR / (existing.cacheR + existing.inp)) * 100).toFixed(0) : '--';
+      existing.duration += +r.total_duration_ms || 0;
+      existing.tools += +r.tools_invoked || 0;
+      existing.failures += +r.tool_failures || 0;
+      existing.calls += +r.api_calls || 0;
+      if (!existing.model && shortModel) existing.model = shortModel;
+    } else {
+      S.prompts.unshift({
+        id: id,
+        num: S.prompts.length + 1,
+        cost: +r.prompt_cost_usd || 0,
+        model: shortModel,
+        length: +r.prompt_length || 0,
+        inp: inp,
+        out: +r.total_output_tokens || 0,
+        cacheR: cacheR,
+        cachePct: cachePct,
+        duration: +r.total_duration_ms || 0,
+        tools: +r.tools_invoked || 0,
+        failures: +r.tool_failures || 0,
+        calls: +r.api_calls || 0,
+      });
+      addEvent('prompt', `${shortModel} ${fmtCost(+r.prompt_cost_usd || 0)} ${+r.tools_invoked || 0} tools`);
+    }
+  }
+  if (S.prompts.length > 50) S.prompts.length = 50;
+  S.prompts.forEach((p, i) => p.num = S.prompts.length - i);
+  renderAll();
+}
+
+function handleLifecycle(rows) {
+  for (const r of rows) {
+    const id = r.prompt_id || '';
+    const model = (r.model || '').replace('claude-', '').replace(/-\d{8}$/, '');
+    const inp = +(r.input_tokens) || 0;
+    const out = +(r.output_tokens) || 0;
+    const cost = +(r.cost_usd) || 0;
+    const existing = id && S.lifecycle.find(e => e.id === id);
+    if (existing) {
+      existing.tokens += inp + out;
+      existing.cost += cost;
+    } else {
+      S.lifecycle.unshift({
+        id: id,
+        time: new Date(),
+        model: model,
+        tokens: inp + out,
+        cost: cost,
+        latency: +r.time_to_response_ms || +r.api_duration_ms || 0,
+        tools: [],
+      });
+    }
+    addEvent('join', `${model} ${fmtCost(+r.cost_usd || 0)} prompt→api`);
+  }
+  if (S.lifecycle.length > 50) S.lifecycle.length = 50;
+  renderAll();
+}
+
+function handleToolJoins(rows) {
+  for (const r of rows) {
+    const id = r.prompt_id || '';
+    if (!id) continue;
+    const tool = {
+      name: r.tool_name || '?',
+      success: r.tool_success === 'true' || r.tool_success === true,
+      ms: +r.tool_duration_ms || 0,
+    };
+    // Attach to lifecycle entry if exists
+    const entry = S.lifecycle.find(e => e.id === id);
+    if (entry) {
+      entry.tools.push(tool);
+    }
+    // Also store separately for late arrivals
+    if (!S.toolJoins[id]) S.toolJoins[id] = [];
+    S.toolJoins[id].push(tool);
+    addEvent('join', `${esc(tool.name)} ${tool.success ? '✓' : '✗'} prompt→tool`);
+  }
+  renderAll();
+}
+
+function handleDecisions(rows) {
+  for (const r of rows) {
+    const name = r.tool_name || 'unknown';
+    const decision = r.decision || 'unknown';
+    const source = r.source || 'unknown';
+    const cnt = +r.decision_count || 0;
+
+    if (!S.decisions[name]) S.decisions[name] = { accept: 0, reject: 0, auto: 0, manual: 0 };
+    const d = S.decisions[name];
+    if (decision === 'accept') d.accept += cnt;
+    else if (decision === 'reject') d.reject += cnt;
+    if (source.includes('permanent') || source === 'auto') d.auto += cnt;
+    else d.manual += cnt;
+
+    addEvent('decision', `${name} ${decision} (${source}) x${cnt}`);
+  }
+  renderAll();
+}
+
+function handleActivity(rows) {
+  for (const r of rows) {
+    S.activityHistory.push({
+      prompts: +r.prompts || 0,
+      api: +r.api_calls || 0,
+      tools: +r.tool_calls || 0,
+      cost: +r.window_cost_usd || 0,
+    });
+    S.totalFastCalls += (+r.fast_mode_calls || 0);
+    S.totalNormalCalls += (+r.normal_mode_calls || 0);
+    addEvent('activity', `${r.total_events} events, ${fmtCost(+r.window_cost_usd || 0)}`);
+  }
+  if (S.activityHistory.length > 60) S.activityHistory = S.activityHistory.slice(-60);
+  renderAll();
+}
+
+function addEvent(type, detail) {
+  S.events.unshift({ time: new Date(), type, detail });
+  if (S.events.length > 100) S.events.length = 100;
+}
+
+// Rendering
+function renderAll() {
+  const totalTokens = S.totalInputTokens + S.totalOutputTokens;
+
+  // Hero cost
+  document.getElementById('total-cost').textContent = fmtCost(S.totalCost);
+  document.getElementById('req-count').textContent = S.totalRequests;
+  document.getElementById('token-count').textContent = fmtTokens(totalTokens);
+
+  // Cost rate
+  const mins = (Date.now() - S.startTime) / 60000;
+  if (mins > 0.5 && S.totalCost > 0) {
+    const rate = S.totalCost / mins;
+    document.getElementById('rate-info').textContent = `${fmtCost(rate)}/min`;
+    document.getElementById('s-cost-rate').textContent = fmtCost(rate * 60);
+  }
+
+  // Fast mode %
+  const totalModes = S.totalFastCalls + S.totalNormalCalls;
+  document.getElementById('s-fast-pct').textContent =
+    totalModes > 0 ? ((S.totalFastCalls / totalModes * 100).toFixed(0) + '%') : '--';
+
+  // Token breakdown
+  document.getElementById('t-input').textContent = fmtTokens(S.totalInputTokens);
+  document.getElementById('t-output').textContent = fmtTokens(S.totalOutputTokens);
+  document.getElementById('t-cache-read').textContent = fmtTokens(S.totalCacheRead);
+  document.getElementById('t-cache-create').textContent = fmtTokens(S.totalCacheCreate);
+
+  // Cache hit rate = cache_read / (cache_read + input)
+  const cacheTotal = S.totalCacheRead + S.totalInputTokens;
+  if (cacheTotal > 0) {
+    const pct = (S.totalCacheRead / cacheTotal * 100).toFixed(1);
+    document.getElementById('cache-pct').textContent = pct + '%';
+    document.getElementById('cache-pct').style.color =
+      pct >= 50 ? 'var(--green)' : pct >= 20 ? 'var(--amber)' : 'var(--red)';
+  }
+
+  // Stat cards
+  document.getElementById('s-requests').textContent = S.totalRequests;
+  document.getElementById('s-tools').textContent = S.totalToolCalls;
+  document.getElementById('s-avg-latency').textContent =
+    S.totalAvgLatency > 0 ? fmtMs(S.totalAvgLatency) : '--';
+  document.getElementById('s-cost-per-req').textContent =
+    S.totalRequests > 0 ? fmtCost(S.totalCost / S.totalRequests) : '--';
+
+  renderSparkline();
+  renderModels();
+  renderTools();
+  renderLifecycle();
+  renderDecisions();
+  renderActivity();
+  renderPrompts();
+  renderEvents();
+}
+
+function renderSparkline() {
+  const canvas = document.getElementById('sparkline');
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  ctx.scale(dpr, dpr);
+
+  const w = rect.width, h = rect.height;
+  const data = S.costHistory;
+  if (data.length < 2) return;
+
+  const max = Math.max(...data, 0.001);
+  const step = w / (data.length - 1);
+
+  ctx.clearRect(0, 0, w, h);
+
+  // Fill
+  const grad = ctx.createLinearGradient(0, 0, 0, h);
+  grad.addColorStop(0, 'rgba(0, 184, 148, 0.25)');
+  grad.addColorStop(1, 'rgba(0, 184, 148, 0)');
+  ctx.beginPath();
+  ctx.moveTo(0, h);
+  data.forEach((v, i) => ctx.lineTo(i * step, h - (v / max) * (h - 4)));
+  ctx.lineTo((data.length - 1) * step, h);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Line
+  ctx.beginPath();
+  data.forEach((v, i) => {
+    const x = i * step, y = h - (v / max) * (h - 4);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = 'var(--green)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Dot
+  const lx = (data.length - 1) * step, ly = h - (data[data.length - 1] / max) * (h - 4);
+  ctx.beginPath();
+  ctx.arc(lx, ly, 3, 0, Math.PI * 2);
+  ctx.fillStyle = '#00b894';
+  ctx.fill();
+}
+
+function renderModels() {
+  const el = document.getElementById('model-bars');
+  const entries = Object.entries(S.models).sort((a, b) => b[1].cost - a[1].cost);
+  if (!entries.length) return;
+
+  const maxCost = Math.max(...entries.map(e => e[1].cost), 0.001);
+
+  el.innerHTML = entries.map(([model, d]) => {
+    const pct = (d.cost / maxCost * 100).toFixed(0);
+    const barClass = model.includes('opus') ? 'bar-opus'
+      : model.includes('haiku') ? 'bar-haiku'
+      : model.includes('sonnet') ? 'bar-sonnet' : 'bar-default';
+    const short = model.replace('claude-', '').replace(/-\d{8}$/, '');
+    const cacheRate = (d.cacheR + d.inp) > 0
+      ? ((d.cacheR / (d.cacheR + d.inp)) * 100).toFixed(0) + '% cache'
+      : '';
+
+    return `<div class="model-entry">
+      <div class="model-header">
+        <span class="model-name">${esc(short)}</span>
+        <span class="model-cost">${fmtCost(d.cost)}</span>
+      </div>
+      <div class="model-bar-track">
+        <div class="model-bar-fill ${barClass}" style="width:${Math.max(pct, 3)}%"></div>
+      </div>
+      <div class="model-detail">
+        <span>${d.reqs} reqs</span>
+        <span>${fmtTokens(d.inp)} in</span>
+        <span>${fmtTokens(d.out)} out</span>
+        <span>${cacheRate}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function renderTools() {
+  const el = document.getElementById('tool-panel');
+  const entries = Object.entries(S.tools).sort((a, b) => b[1].cnt - a[1].cnt);
+  if (!entries.length) return;
+
+  let html = `<table class="tool-tbl">
+    <tr><th>Tool</th><th>Calls</th><th>Rate</th><th>Avg</th><th>Max</th><th>Data</th></tr>`;
+
+  for (const [name, d] of entries) {
+    const rate = d.cnt > 0 ? (d.succ / d.cnt * 100) : 0;
+    const rc = rate >= 95 ? 'rate-good' : rate >= 80 ? 'rate-warn' : 'rate-bad';
+    html += `<tr>
+      <td style="font-weight:600">${esc(name)}</td>
+      <td>${d.cnt}</td>
+      <td><span class="rate-pill ${rc}">${rate.toFixed(0)}%</span></td>
+      <td>${fmtMs(d.avg)}</td>
+      <td>${fmtMs(d.max)}</td>
+      <td>${fmtTokens(d.bytes)}B</td>
+    </tr>`;
+  }
+
+  el.innerHTML = html + '</table>';
+}
+
+function renderPrompts() {
+  const el = document.getElementById('prompt-feed');
+  if (!S.prompts.length) return;
+
+  el.innerHTML = S.prompts.map(p => {
+    const toolsHtml = p.failures > 0
+      ? `${p.tools} <span style="color:var(--red)">${p.failures}F</span>`
+      : `${p.tools}`;
+
+    return `<div class="prompt-entry">
+      <span class="prompt-num">${p.num}</span>
+      <span class="prompt-cost">${fmtCost(p.cost)}</span>
+      <span class="prompt-model">${esc(p.model || '—')}</span>
+      <span class="prompt-tokens">${fmtTokens(p.inp)}</span>
+      <span class="prompt-tokens-out">${fmtTokens(p.out)}</span>
+      <span class="prompt-tools">${toolsHtml}</span>
+      <span class="prompt-cache">${p.cachePct}%</span>
+      <span class="prompt-duration">${fmtMs(p.duration)}</span>
+    </div>`;
+  }).join('');
+}
+
+function renderEvents() {
+  const el = document.getElementById('event-log');
+  el.innerHTML = S.events.slice(0, 30).map(e =>
+    `<div class="log-line">
+      <span class="ts">${fmtTime(e.time)}</span>
+      <span class="ev"> ${esc(e.type)}</span>
+      <span class="detail"> ${esc(e.detail)}</span>
+    </div>`
+  ).join('');
+}
+
+function renderLifecycle() {
+  const tbl = document.getElementById('lifecycle-table');
+  const empty = document.getElementById('lifecycle-empty');
+  if (!S.lifecycle.length) return;
+  empty.style.display = 'none';
+
+  // Attach any late tool joins
+  for (const entry of S.lifecycle) {
+    if (S.toolJoins[entry.id] && entry.tools.length < S.toolJoins[entry.id].length) {
+      entry.tools = S.toolJoins[entry.id];
+    }
+  }
+
+  let html = '<tr><th>Time</th><th>Model</th><th>Tokens</th><th>Cost</th><th>Latency</th><th>Tools</th></tr>';
+  for (const e of S.lifecycle.slice(0, 30)) {
+    const toolsHtml = e.tools.length
+      ? e.tools.map(t => `<span style="color:${t.success ? 'var(--green)' : 'var(--red)'}">${esc(t.name)}</span>`).join(' ')
+      : '<span style="color:var(--text-dim)">--</span>';
+    const costColor = e.cost > 0.5 ? 'var(--amber)' : 'var(--green)';
+    html += `<tr>
+      <td>${fmtTime(e.time)}</td>
+      <td style="color:var(--accent)">${esc(e.model)}</td>
+      <td>${fmtTokens(e.tokens)}</td>
+      <td style="color:${costColor};font-weight:600">${fmtCost(e.cost)}</td>
+      <td>${fmtMs(e.latency)}</td>
+      <td>${toolsHtml}</td>
+    </tr>`;
+  }
+  tbl.innerHTML = html;
+}
+
+function renderDecisions() {
+  const el = document.getElementById('decisions-panel');
+  const entries = Object.entries(S.decisions).sort((a, b) => (b[1].accept + b[1].reject) - (a[1].accept + a[1].reject));
+  if (!entries.length) return;
+
+  let html = `<table class="tool-tbl">
+    <tr><th>Tool</th><th>Accept</th><th>Reject</th><th>Auto</th></tr>`;
+
+  for (const [name, d] of entries) {
+    const total = d.accept + d.reject;
+    const autoPct = total > 0 ? ((d.auto / total) * 100).toFixed(0) : 0;
+    const rejectColor = d.reject > 0 ? 'var(--red)' : 'var(--text-dim)';
+    html += `<tr>
+      <td style="font-weight:600">${esc(name)}</td>
+      <td style="color:var(--green)">${d.accept}</td>
+      <td style="color:${rejectColor}">${d.reject}</td>
+      <td>${autoPct}%</td>
+    </tr>`;
+  }
+
+  el.innerHTML = html + '</table>';
+}
+
+function renderActivity() {
+  const canvas = document.getElementById('activity-chart');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  canvas.style.width = rect.width + 'px';
+  canvas.style.height = rect.height + 'px';
+  ctx.scale(dpr, dpr);
+
+  const w = rect.width, h = rect.height;
+  const data = S.activityHistory;
+  if (data.length < 2) return;
+
+  const maxVal = Math.max(...data.map(d => d.api + d.tools), 1);
+  const step = w / (data.length - 1);
+
+  ctx.clearRect(0, 0, w, h);
+
+  // Tool calls (cyan, filled)
+  ctx.beginPath();
+  ctx.moveTo(0, h);
+  data.forEach((d, i) => ctx.lineTo(i * step, h - ((d.tools + d.api) / maxVal) * (h - 4)));
+  ctx.lineTo((data.length - 1) * step, h);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(0, 206, 201, 0.2)';
+  ctx.fill();
+
+  // API calls (blue line)
+  ctx.beginPath();
+  data.forEach((d, i) => {
+    const x = i * step, y = h - (d.api / maxVal) * (h - 4);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = '#74b9ff';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Tool calls (cyan line)
+  ctx.beginPath();
+  data.forEach((d, i) => {
+    const x = i * step, y = h - (d.tools / maxVal) * (h - 4);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = '#00cec9';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // Legend
+  const leg = document.getElementById('activity-legend');
+  if (leg && data.length > 0) {
+    const last = data[data.length - 1];
+    leg.innerHTML = `
+      <span style="color:#74b9ff">API: ${last.api}</span>
+      <span style="color:#00cec9">Tools: ${last.tools}</span>
+      <span style="color:var(--amber)">Cost: ${fmtCost(last.cost)}</span>
+    `;
+  }
+}
+
+// Connect
+ws('event_count', 'hb', function() {
+  const hb = document.getElementById('hb');
+  hb.classList.add('pulse');
+  setTimeout(() => hb.classList.remove('pulse'), 1500);
+});
+ws('cost_by_model', 'd-cost', handleCost);
+ws('tool_stats', 'd-tools', handleTools);
+ws('prompt_analysis', 'd-prompts', handlePrompts);
+ws('tool_decisions', 'd-decisions', handleDecisions);
+ws('session_activity', 'd-activity', handleActivity);
+ws('prompt_lifecycle', 'd-lifecycle', handleLifecycle);
+ws('prompt_tools', 'd-lifecycle', handleToolJoins);
+
+// Uptime ticker
+setInterval(() => {
+  const s = Math.floor((Date.now() - S.startTime) / 1000);
+  const m = Math.floor(s / 60), sec = s % 60;
+  document.getElementById('uptime').textContent = `${m}:${String(sec).padStart(2,'0')}`;
+}, 1000);
+
+window.addEventListener('resize', renderSparkline);
+</script>
+</body>
+</html>
