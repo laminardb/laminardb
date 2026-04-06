@@ -249,7 +249,7 @@ connector = "delta-lake"
 "write.mode" = "append"
 compression = "zstd"
 "compaction.enabled" = "true"
-"compaction.check-interval.ms" = "120000"
+"compaction.check-interval.ms" = "600000"
 
 [[sink]]
 name = "tools_archive"
@@ -261,7 +261,7 @@ connector = "delta-lake"
 "write.mode" = "append"
 compression = "zstd"
 "compaction.enabled" = "true"
-"compaction.check-interval.ms" = "120000"
+"compaction.check-interval.ms" = "600000"
 
 [[sink]]
 name = "prompts_archive"
@@ -273,7 +273,7 @@ connector = "delta-lake"
 "write.mode" = "append"
 compression = "zstd"
 "compaction.enabled" = "true"
-"compaction.check-interval.ms" = "120000"
+"compaction.check-interval.ms" = "600000"
 
 [[sink]]
 name = "activity_archive"
@@ -285,4 +285,4 @@ connector = "delta-lake"
 "write.mode" = "append"
 compression = "zstd"
 "compaction.enabled" = "true"
-"compaction.check-interval.ms" = "120000"
+"compaction.check-interval.ms" = "600000"
