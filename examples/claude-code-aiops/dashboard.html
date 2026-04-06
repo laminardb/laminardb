@@ -427,7 +427,8 @@
 <div class="grid">
   <!-- Row 0: HERO — Prompt Lifecycle (stream-to-stream join) -->
   <div class="panel span3">
-    <div class="panel-title">Prompt Lifecycle <span style="color:var(--accent);font-size:9px;margin-left:8px">STREAM JOIN on prompt.id</span></div>
+    <div class="panel-title" title="Stream-to-stream temporal join correlating user_prompt → api_request → tool_result by prompt.id within a 2-minute window">Prompt Lifecycle <span style="color:var(--accent);font-size:9px;margin-left:8px">STREAM JOIN on prompt.id</span></div>
+    <div style="font-size:10px;color:var(--text-dim);margin-bottom:8px">Each row = one prompt correlated with its API response and tool executions in real-time</div>
     <div style="overflow-x:auto">
       <table class="tool-tbl" id="lifecycle-table">
         <tr><th>Time</th><th>Model</th><th>Tokens</th><th>Cost</th><th>Latency</th><th>Tools</th></tr>
@@ -438,7 +439,7 @@
 
   <!-- Row 1: Cost hero + stats -->
   <div class="panel span2">
-    <div class="panel-title">Session Cost</div>
+    <div class="panel-title" title="Running total of all API costs this session, with cost-per-minute burn rate">Session Cost</div>
     <div class="cost-hero">
       <div class="big-cost" id="total-cost">$0.00</div>
       <div class="cost-sub">
@@ -451,7 +452,7 @@
   </div>
 
   <div class="panel">
-    <div class="panel-title">Token Breakdown</div>
+    <div class="panel-title" title="Input tokens sent to the model, output tokens generated, cache reads (reused context), and cache creates (new context cached)">Token Breakdown</div>
     <div class="token-breakdown">
       <div class="token-item">
         <span class="token-label">Input</span>
@@ -508,40 +509,40 @@
 
   <!-- Row 3: Model breakdown + Tools -->
   <div class="panel">
-    <div class="panel-title">Cost by Model</div>
+    <div class="panel-title" title="Cost breakdown per model (Opus, Sonnet, Haiku) — shows which model is driving spend">Cost by Model</div>
     <div id="model-bars"><div class="empty">Waiting for api_request events...</div></div>
   </div>
 
   <div class="panel span2">
-    <div class="panel-title">Tool Usage</div>
+    <div class="panel-title" title="Per-tool invocation count, success rate, average/max latency, and data volume">Tool Usage</div>
     <div id="tool-panel"><div class="empty">Waiting for tool_result events...</div></div>
   </div>
 
   <!-- Row 4: Tool Permissions + Activity Timeline -->
   <div class="panel">
-    <div class="panel-title">Tool Permissions</div>
+    <div class="panel-title" title="How often each tool is auto-approved vs manually approved/rejected">Tool Permissions</div>
     <div id="decisions-panel"><div class="empty">Waiting for tool_decision events...</div></div>
   </div>
 
   <div class="panel span2">
-    <div class="panel-title">Activity Timeline (15s windows)</div>
+    <div class="panel-title" title="API calls and tool executions over time — shows busy vs idle periods">Activity Timeline</div>
     <div style="height:80px"><canvas id="activity-chart"></canvas></div>
     <div id="activity-legend" style="display:flex;gap:14px;margin-top:8px;font-family:var(--mono);font-size:10px;color:var(--text-dim)"></div>
   </div>
 
   <!-- Row 5: Per-prompt breakdown + Event log -->
   <div class="panel span2">
-    <div class="panel-title">Per-Prompt Breakdown</div>
+    <div class="panel-title" title="Aggregated cost, tokens, tools, and cache hit rate per prompt (30s window)">Per-Prompt Breakdown</div>
     <div class="prompt-header">
       <span>#</span><span>Cost</span><span>Model</span><span>In</span><span>Out</span><span>Tools</span><span>Cache</span><span>Time</span>
     </div>
     <div class="prompt-feed" id="prompt-feed">
-      <div class="empty">Waiting for prompt windows (5m)...</div>
+      <div class="empty">Waiting for prompt data (30s windows)...</div>
     </div>
   </div>
 
   <div class="panel">
-    <div class="panel-title">Event Log</div>
+    <div class="panel-title" title="Raw feed of all pipeline output events as they arrive">Event Log</div>
     <div class="event-log" id="event-log">
       <div class="empty">Waiting for events...</div>
     </div>
