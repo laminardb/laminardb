@@ -100,21 +100,22 @@
   /* Grid layout */
   .grid {
     display: grid;
-    grid-template-columns: 1fr 1fr 1fr;
-    grid-template-rows: auto auto auto;
-    gap: 16px;
+    grid-template-columns: 1fr 1fr 1fr 1fr;
+    gap: 12px;
   }
 
   .panel {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 8px;
-    padding: 18px;
+    padding: 14px;
     min-height: 0;
+    overflow: hidden;
   }
 
   .span2 { grid-column: span 2; }
-  .span3 { grid-column: 1 / -1; }
+  .span3 { grid-column: span 3; }
+  .span4 { grid-column: 1 / -1; }
 
   .panel-title {
     font-size: 10px;
@@ -400,9 +401,14 @@
   }
 
   /* Responsive */
-  @media (max-width: 900px) {
+  @media (max-width: 1200px) {
+    .grid { grid-template-columns: 1fr 1fr; }
+    .span2, .span3, .span4 { grid-column: 1 / -1; }
+    .stat-row { grid-template-columns: repeat(3, 1fr); }
+  }
+  @media (max-width: 700px) {
     .grid { grid-template-columns: 1fr; }
-    .span2, .span3 { grid-column: span 1; }
+    .span2, .span3, .span4 { grid-column: span 1; }
     .stat-row { grid-template-columns: repeat(2, 1fr); }
   }
 </style>
@@ -425,21 +431,9 @@
 </div>
 
 <div class="grid">
-  <!-- Row 0: HERO — Prompt Lifecycle (stream-to-stream join) -->
-  <div class="panel span3">
-    <div class="panel-title" title="Stream-to-stream temporal join correlating user_prompt → api_request → tool_result by prompt.id within a 2-minute window">Prompt Lifecycle <span style="color:var(--accent);font-size:9px;margin-left:8px">STREAM JOIN on prompt.id</span></div>
-    <div style="font-size:10px;color:var(--text-dim);margin-bottom:8px">Each row = one prompt correlated with its API response and tool executions in real-time</div>
-    <div style="overflow-x:auto">
-      <table class="tool-tbl" id="lifecycle-table">
-        <tr><th>Time</th><th>Model</th><th>Tokens</th><th>Cost</th><th>Latency</th><th>Tools</th></tr>
-      </table>
-    </div>
-    <div class="empty" id="lifecycle-empty">Waiting for stream join results (prompt → api_request correlation)...</div>
-  </div>
-
-  <!-- Row 1: Cost hero + stats -->
-  <div class="panel span2">
-    <div class="panel-title" title="Running total of all API costs this session, with cost-per-minute burn rate">Session Cost</div>
+  <!-- Row 1: Cost + Stat cards -->
+  <div class="panel">
+    <div class="panel-title" title="Running total with cost-per-minute burn rate">Session Cost</div>
     <div class="cost-hero">
       <div class="big-cost" id="total-cost">$0.00</div>
       <div class="cost-sub">
@@ -451,34 +445,7 @@
     <div class="sparkline-wrap"><canvas id="sparkline"></canvas></div>
   </div>
 
-  <div class="panel">
-    <div class="panel-title" title="Input tokens sent to the model, output tokens generated, cache reads (reused context), and cache creates (new context cached)">Token Breakdown</div>
-    <div class="token-breakdown">
-      <div class="token-item">
-        <span class="token-label">Input</span>
-        <span class="token-val input" id="t-input">0</span>
-      </div>
-      <div class="token-item">
-        <span class="token-label">Output</span>
-        <span class="token-val output" id="t-output">0</span>
-      </div>
-      <div class="token-item">
-        <span class="token-label">Cache Read</span>
-        <span class="token-val cache-read" id="t-cache-read">0</span>
-      </div>
-      <div class="token-item">
-        <span class="token-label">Cache Create</span>
-        <span class="token-val cache-create" id="t-cache-create">0</span>
-      </div>
-      <div class="cache-rate">
-        <div class="cache-pct" id="cache-pct">--</div>
-        <div class="cache-label">Cache Hit Rate</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Row 2: Stat cards (full width) -->
-  <div class="panel span3" style="padding:12px 18px">
+  <div class="panel span3" style="padding:10px 14px">
     <div class="stat-row">
       <div class="stat-card">
         <div class="stat-val" id="s-requests">0</div>
@@ -507,46 +474,82 @@
     </div>
   </div>
 
-  <!-- Row 3: Model breakdown + Tools -->
+  <!-- Row 2: Prompt Lifecycle hero -->
+  <div class="panel span4">
+    <div class="panel-title" title="Stream-to-stream temporal join: user_prompt → api_request → tool_result by prompt.id">Prompt Lifecycle <span style="color:var(--accent);font-size:9px;margin-left:8px">STREAM JOIN</span></div>
+    <div style="overflow-x:auto;max-height:150px;overflow-y:auto">
+      <table class="tool-tbl" id="lifecycle-table">
+        <tr><th>Time</th><th>Model</th><th>Tokens</th><th>Cost</th><th>Latency</th><th>Tools</th></tr>
+      </table>
+    </div>
+    <div class="empty" id="lifecycle-empty">Waiting for stream join results...</div>
+  </div>
+
+  <!-- Row 3: Model + Tokens + Tools -->
   <div class="panel">
-    <div class="panel-title" title="Cost breakdown per model (Opus, Sonnet, Haiku) — shows which model is driving spend">Cost by Model</div>
-    <div id="model-bars"><div class="empty">Waiting for api_request events...</div></div>
+    <div class="panel-title" title="Cost per model — which model drives spend">Cost by Model</div>
+    <div id="model-bars"><div class="empty">Waiting for data...</div></div>
   </div>
 
-  <div class="panel span2">
-    <div class="panel-title" title="Per-tool invocation count, success rate, average/max latency, and data volume">Tool Usage</div>
-    <div id="tool-panel"><div class="empty">Waiting for tool_result events...</div></div>
-  </div>
-
-  <!-- Row 4: Tool Permissions + Activity Timeline -->
   <div class="panel">
-    <div class="panel-title" title="How often each tool is auto-approved vs manually approved/rejected">Tool Permissions</div>
-    <div id="decisions-panel"><div class="empty">Waiting for tool_decision events...</div></div>
+    <div class="panel-title" title="Input/output/cache tokens + cache hit rate">Token Breakdown</div>
+    <div class="token-breakdown">
+      <div class="token-item">
+        <span class="token-label">Input</span>
+        <span class="token-val input" id="t-input">0</span>
+      </div>
+      <div class="token-item">
+        <span class="token-label">Output</span>
+        <span class="token-val output" id="t-output">0</span>
+      </div>
+      <div class="token-item">
+        <span class="token-label">Cache Read</span>
+        <span class="token-val cache-read" id="t-cache-read">0</span>
+      </div>
+      <div class="token-item">
+        <span class="token-label">Cache Create</span>
+        <span class="token-val cache-create" id="t-cache-create">0</span>
+      </div>
+      <div class="cache-rate">
+        <div class="cache-pct" id="cache-pct">--</div>
+        <div class="cache-label">Cache Hit Rate</div>
+      </div>
+    </div>
   </div>
 
   <div class="panel span2">
-    <div class="panel-title" title="API calls and tool executions over time — shows busy vs idle periods">Activity Timeline</div>
-    <div style="height:80px"><canvas id="activity-chart"></canvas></div>
-    <div id="activity-legend" style="display:flex;gap:14px;margin-top:8px;font-family:var(--mono);font-size:10px;color:var(--text-dim)"></div>
+    <div class="panel-title" title="Per-tool calls, success rate, avg/max latency, data volume">Tool Usage</div>
+    <div id="tool-panel"><div class="empty">Waiting for data...</div></div>
   </div>
 
-  <!-- Row 5: Per-prompt breakdown + Event log -->
+  <!-- Row 4: Permissions + Per-Prompt + Event Log -->
+  <div class="panel">
+    <div class="panel-title" title="Accept/reject per tool, auto-approval %">Tool Permissions</div>
+    <div id="decisions-panel"><div class="empty">Waiting for data...</div></div>
+  </div>
+
   <div class="panel span2">
-    <div class="panel-title" title="Aggregated cost, tokens, tools, and cache hit rate per prompt (30s window)">Per-Prompt Breakdown</div>
+    <div class="panel-title" title="Cost, tokens, tools, cache per prompt (30s window)">Per-Prompt Breakdown</div>
     <div class="prompt-header">
       <span>#</span><span>Cost</span><span>Model</span><span>In</span><span>Out</span><span>Tools</span><span>Cache</span><span>Time</span>
     </div>
     <div class="prompt-feed" id="prompt-feed">
-      <div class="empty">Waiting for prompt data (30s windows)...</div>
+      <div class="empty">Waiting for prompt data...</div>
     </div>
   </div>
 
   <div class="panel">
-    <div class="panel-title" title="Raw feed of all pipeline output events as they arrive">Event Log</div>
+    <div class="panel-title" title="Raw feed of pipeline events as they arrive">Event Log</div>
     <div class="event-log" id="event-log">
       <div class="empty">Waiting for events...</div>
     </div>
   </div>
+</div>
+
+<!-- Activity Timeline (hidden, data still collected) -->
+<div style="display:none">
+  <canvas id="activity-chart"></canvas>
+  <div id="activity-legend"></div>
 </div>
 
 <script>
