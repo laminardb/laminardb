@@ -3951,8 +3951,8 @@ mod tests {
             ScalarValue::Int64(Some(-42)),
         );
         assert_eq!(
-            round_trip(&ScalarValue::Float64(Some(3.14))),
-            ScalarValue::Float64(Some(3.14)),
+            round_trip(&ScalarValue::Float64(Some(2.72))),
+            ScalarValue::Float64(Some(2.72)),
         );
         assert_eq!(
             round_trip(&ScalarValue::Utf8(Some("hello".into()))),
