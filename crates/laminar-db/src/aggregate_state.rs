@@ -182,6 +182,20 @@ pub(crate) fn scalar_to_json(sv: &ScalarValue) -> serde_json::Value {
         ScalarValue::Utf8(Some(s))
         | ScalarValue::LargeUtf8(Some(s))
         | ScalarValue::Utf8View(Some(s)) => json!({"t": "S", "v": s}),
+        ScalarValue::TimestampNanosecond(v, tz) => {
+            json!({"t": "TSns", "v": v, "tz": tz.as_ref().map(ToString::to_string)})
+        }
+        ScalarValue::TimestampMicrosecond(v, tz) => {
+            json!({"t": "TSus", "v": v, "tz": tz.as_ref().map(ToString::to_string)})
+        }
+        ScalarValue::TimestampMillisecond(v, tz) => {
+            json!({"t": "TSms", "v": v, "tz": tz.as_ref().map(ToString::to_string)})
+        }
+        ScalarValue::TimestampSecond(v, tz) => {
+            json!({"t": "TSs", "v": v, "tz": tz.as_ref().map(ToString::to_string)})
+        }
+        ScalarValue::Date32(v) => json!({"t": "D32", "v": v}),
+        ScalarValue::Date64(v) => json!({"t": "D64", "v": v}),
         ScalarValue::List(arr) => {
             use arrow::array::Array;
             let list_arr: Option<&arrow::array::ListArray> = arr.as_any().downcast_ref();
@@ -232,6 +246,25 @@ pub(crate) fn json_to_scalar(v: &serde_json::Value) -> Result<ScalarValue, DbErr
             Some(s) => Ok(ScalarValue::Utf8(Some(s.to_string()))),
             None => Ok(ScalarValue::Utf8(None)),
         },
+        "TSns" | "TSus" | "TSms" | "TSs" => {
+            let ts = val.and_then(serde_json::Value::as_i64);
+            let tz: Option<Arc<str>> = v.get("tz").and_then(|v| v.as_str()).map(Arc::from);
+            match t {
+                "TSns" => Ok(ScalarValue::TimestampNanosecond(ts, tz)),
+                "TSus" => Ok(ScalarValue::TimestampMicrosecond(ts, tz)),
+                "TSms" => Ok(ScalarValue::TimestampMillisecond(ts, tz)),
+                _ => Ok(ScalarValue::TimestampSecond(ts, tz)),
+            }
+        }
+        "D32" => {
+            #[allow(clippy::cast_possible_truncation)]
+            let d = val.and_then(serde_json::Value::as_i64).map(|n| n as i32);
+            Ok(ScalarValue::Date32(d))
+        }
+        "D64" => {
+            let d = val.and_then(serde_json::Value::as_i64);
+            Ok(ScalarValue::Date64(d))
+        }
         "L" => {
             let items = val
                 .and_then(|v| v.as_array())
@@ -250,6 +283,10 @@ pub(crate) fn json_to_scalar(v: &serde_json::Value) -> Result<ScalarValue, DbErr
                 Ok(ScalarValue::List(arr))
             }
         }
+        "STR" => match val.and_then(|v| v.as_str()) {
+            Some(s) => Ok(ScalarValue::Utf8(Some(s.to_string()))),
+            None => Ok(ScalarValue::Utf8(None)),
+        },
         other => Err(DbError::Pipeline(format!(
             "unsupported scalar type tag in checkpoint: {other}"
         ))),
@@ -3895,5 +3932,60 @@ mod tests {
         assert!((avg_col.value(0) - 30.0).abs() < 0.001, "AVG should be 30");
         assert_eq!(min_col.value(0), 20, "MIN should be 20");
         assert_eq!(max_col.value(0), 40, "MAX should be 40");
+    }
+
+    fn round_trip(sv: &ScalarValue) -> ScalarValue {
+        let json = scalar_to_json(sv);
+        json_to_scalar(&json).unwrap()
+    }
+
+    #[test]
+    fn scalar_json_round_trip() {
+        assert_eq!(round_trip(&ScalarValue::Null), ScalarValue::Null);
+        assert_eq!(
+            round_trip(&ScalarValue::Boolean(Some(true))),
+            ScalarValue::Boolean(Some(true)),
+        );
+        assert_eq!(
+            round_trip(&ScalarValue::Int64(Some(-42))),
+            ScalarValue::Int64(Some(-42)),
+        );
+        assert_eq!(
+            round_trip(&ScalarValue::Float64(Some(2.72))),
+            ScalarValue::Float64(Some(2.72)),
+        );
+        assert_eq!(
+            round_trip(&ScalarValue::Utf8(Some("hello".into()))),
+            ScalarValue::Utf8(Some("hello".into())),
+        );
+        let tz: Option<Arc<str>> = Some(Arc::from("UTC"));
+        assert_eq!(
+            round_trip(&ScalarValue::TimestampNanosecond(
+                Some(1_000_000),
+                tz.clone()
+            )),
+            ScalarValue::TimestampNanosecond(Some(1_000_000), tz),
+        );
+        assert_eq!(
+            round_trip(&ScalarValue::TimestampMillisecond(None, None)),
+            ScalarValue::TimestampMillisecond(None, None),
+        );
+        assert_eq!(
+            round_trip(&ScalarValue::Date32(Some(19000))),
+            ScalarValue::Date32(Some(19000)),
+        );
+        assert_eq!(
+            round_trip(&ScalarValue::Date64(Some(1_700_000_000_000))),
+            ScalarValue::Date64(Some(1_700_000_000_000)),
+        );
+    }
+
+    #[test]
+    fn str_fallback_restores_as_utf8() {
+        let sv = ScalarValue::Binary(Some(vec![1, 2, 3]));
+        let json = scalar_to_json(&sv);
+        assert_eq!(json["t"], "STR");
+        let restored = json_to_scalar(&json).unwrap();
+        assert!(matches!(restored, ScalarValue::Utf8(Some(_))));
     }
 }

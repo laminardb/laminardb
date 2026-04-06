@@ -750,19 +750,14 @@ impl StreamingCoordinator {
         if self.pending_barrier.sources_aligned.len() >= self.pending_barrier.sources_total {
             let checkpoints = std::mem::take(&mut self.pending_barrier.source_checkpoints);
             let ok = callback.checkpoint_with_barrier(checkpoints).await;
-            if ok {
-                self.pending_barrier.active = false;
-                self.last_checkpoint = Instant::now();
-            } else {
+            if !ok {
                 tracing::warn!(
                     checkpoint_id = self.pending_barrier.checkpoint_id,
                     "barrier checkpoint failed, will retry on next interval"
                 );
-                // Keep active=true so next periodic trigger retries.
-                // Source checkpoints were consumed; sources will re-checkpoint
-                // on the next barrier injection.
-                self.pending_barrier.active = false;
             }
+            self.pending_barrier.active = false;
+            self.last_checkpoint = Instant::now();
         }
     }
 
