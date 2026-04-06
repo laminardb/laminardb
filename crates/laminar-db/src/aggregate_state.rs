@@ -3960,7 +3960,10 @@ mod tests {
         );
         let tz: Option<Arc<str>> = Some(Arc::from("UTC"));
         assert_eq!(
-            round_trip(&ScalarValue::TimestampNanosecond(Some(1_000_000), tz.clone())),
+            round_trip(&ScalarValue::TimestampNanosecond(
+                Some(1_000_000),
+                tz.clone()
+            )),
             ScalarValue::TimestampNanosecond(Some(1_000_000), tz),
         );
         assert_eq!(
