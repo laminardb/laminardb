@@ -47,12 +47,14 @@ cargo run --release -p laminar-server --no-default-features \
 
 ### 2. Open the dashboard
 
-Open `examples/claude-code-aiops/dashboard.html` directly in your browser, or serve it:
+**Hosted (no download needed):**
 
-```bash
-python -m http.server 8000 -d examples/claude-code-aiops
-# Open http://localhost:8000/dashboard.html
-```
+Open [laminardb.io/examples/aiops](https://laminardb.io/examples/aiops/) in your browser.
+The dashboard connects to `ws://localhost:8080` — your data never leaves your machine.
+
+**Or local:**
+
+Open `examples/claude-code-aiops/dashboard.html` directly in your browser.
 
 ### 3. Start Claude Code with telemetry
 
@@ -83,7 +85,7 @@ claude
 | Panel | Updates | What It Shows |
 |-------|---------|---------------|
 | **Prompt Lifecycle** | streaming | Stream join: prompt → api_request → tools correlated by prompt.id |
-| **Session Cost** | 15s | Running total with sparkline and $/min burn rate |
+| **Session Cost + 5h Usage** | 15s / 1m | Running total, burn rate, and rolling 5-hour token gauge |
 | **Token Breakdown** | 15s | Input/output/cache-read/cache-create + cache hit rate |
 | **Cost by Model** | 15s | Per-model cost bars (Opus vs Sonnet vs Haiku) |
 | **Tool Usage** | 15s | Per-tool call counts, success rates, latency |
@@ -122,6 +124,7 @@ their SDK (no arbitrary SQL joins across event types).
 | `tool_decisions` | window (15s) | Permission accept/reject by tool |
 | `session_activity` | window (15s) | Event counts, cost velocity, speed mode |
 | `prompt_analysis` | window (30s) | Per-prompt cost, model, tokens, tools, cache |
+| `usage_5h` | **hop (5h/1m)** | Rolling 5-hour token + cost gauge (rate limit window) |
 | `event_count` | window (5s) | Heartbeat |
 
 ## Persistence

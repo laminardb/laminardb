@@ -1,7 +1,8 @@
 //! HTTP API for LaminarDB server.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,6 +22,11 @@ use crate::config::ServerConfig;
 use crate::reload::{self, ReloadGuard};
 use crate::server::ServerError;
 
+pub struct StreamBroadcast {
+    tx: tokio::sync::broadcast::Sender<Arc<str>>,
+    bridge_started: AtomicBool,
+}
+
 pub struct AppState {
     pub db: Arc<LaminarDB>,
     pub config_path: PathBuf,
@@ -29,27 +35,24 @@ pub struct AppState {
     pub reload_guard: ReloadGuard,
     pub reload_total: AtomicU64,
     pub reload_last_ts: AtomicU64,
+    pub ws_connections: AtomicU64,
+    pub stream_broadcasts: parking_lot::RwLock<HashMap<String, Arc<StreamBroadcast>>>,
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
-        // Health and observability
         .route("/health", get(health_check))
         .route("/ready", get(readiness_check))
         .route("/metrics", get(prometheus_metrics))
-        // Pipeline introspection
         .route("/api/v1/sources", get(list_sources))
         .route("/api/v1/sinks", get(list_sinks))
         .route("/api/v1/streams", get(list_streams))
         .route("/api/v1/streams/{name}", get(get_stream))
-        // Actions
         .route("/api/v1/checkpoint", post(trigger_checkpoint))
         .route("/api/v1/sql", post(execute_sql))
         .route("/api/v1/reload", post(handle_reload))
-        // WebSocket stream subscriptions
-        .route("/ws/{name}", get(ws_upgrade))
-        // Cluster (delta mode)
         .route("/api/v1/cluster", get(cluster_status))
+        .route("/ws/{name}", get(ws_upgrade))
         .layer(CorsLayer::permissive())
         .layer(axum::middleware::from_fn(request_logging))
         .with_state(state)
@@ -491,68 +494,164 @@ async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket stream subscriptions
+// WebSocket stream subscriptions (tokio::sync::broadcast fan-out)
 // ---------------------------------------------------------------------------
+
+const MAX_WS_CONNECTIONS: u64 = 10_000;
+const WS_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+const BROADCAST_CAPACITY: usize = 256;
+
+fn get_or_create_broadcast(state: &AppState, name: &str) -> Arc<StreamBroadcast> {
+    if let Some(b) = state.stream_broadcasts.read().get(name) {
+        return Arc::clone(b);
+    }
+    let mut map = state.stream_broadcasts.write();
+    if let Some(b) = map.get(name) {
+        return Arc::clone(b);
+    }
+    let (tx, _) = tokio::sync::broadcast::channel(BROADCAST_CAPACITY);
+    let sb = Arc::new(StreamBroadcast {
+        tx,
+        bridge_started: AtomicBool::new(false),
+    });
+    map.insert(name.to_string(), Arc::clone(&sb));
+    sb
+}
+
+fn ensure_bridge(state: &Arc<AppState>, name: &str, sb: &Arc<StreamBroadcast>) {
+    if sb
+        .bridge_started
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let sub = match state.db.subscribe_raw(name) {
+        Ok(s) => s,
+        Err(_) => {
+            sb.bridge_started.store(false, Ordering::Release);
+            return;
+        }
+    };
+    let tx = sb.tx.clone();
+    let stream_name = name.to_string();
+    let flag = Arc::clone(sb);
+    tokio::spawn(async move {
+        stream_bridge(sub, tx, stream_name).await;
+        flag.bridge_started.store(false, Ordering::Release);
+    });
+}
+
+async fn stream_bridge(
+    sub: laminar_core::streaming::Subscription<laminar_db::ArrowRecord>,
+    tx: tokio::sync::broadcast::Sender<Arc<str>>,
+    name: String,
+) {
+    use laminar_core::streaming::SubscriptionMessage;
+
+    let mut watch = sub.async_watch();
+    let mut seq: u64 = 0;
+
+    loop {
+        if watch.changed().await.is_err() {
+            break;
+        }
+
+        let mut all_rows: Vec<serde_json::Value> = Vec::new();
+        while let Some(msg) = sub.poll_message() {
+            if let SubscriptionMessage::Batch(batch) = msg {
+                match batch_to_json(&batch) {
+                    Ok(serde_json::Value::Array(rows)) => all_rows.extend(rows),
+                    Ok(v) => all_rows.push(v),
+                    Err(e) => warn!(stream = %name, error = %e, "serialize error"),
+                }
+            }
+        }
+
+        if all_rows.is_empty() {
+            continue;
+        }
+
+        let out = serde_json::json!({
+            "type": "data",
+            "subscription_id": &name,
+            "data": all_rows,
+            "sequence": seq,
+        });
+        seq += 1;
+
+        if tx.send(Arc::from(out.to_string())).is_err() {
+            break; // no receivers — exit, bridge_started resets on return
+        }
+    }
+}
 
 async fn ws_upgrade(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    match state.db.subscribe_raw(&name) {
-        Ok(sub) => ws
-            .on_upgrade(move |socket| ws_stream(socket, sub, name))
-            .into_response(),
-        Err(_) => error_response(StatusCode::NOT_FOUND, format!("stream '{name}' not found"))
-            .into_response(),
+    if state.ws_connections.load(Ordering::Relaxed) >= MAX_WS_CONNECTIONS {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many WebSocket connections".to_string(),
+        )
+        .into_response();
     }
+
+    if !state.db.streams().iter().any(|s| s.name == name) {
+        return error_response(StatusCode::NOT_FOUND, format!("stream '{name}' not found"))
+            .into_response();
+    }
+
+    let sb = get_or_create_broadcast(&state, &name);
+    ensure_bridge(&state, &name, &sb);
+    let rx = sb.tx.subscribe();
+
+    let st = Arc::clone(&state);
+    ws.on_upgrade(move |socket| async move {
+        st.ws_connections.fetch_add(1, Ordering::Relaxed);
+        ws_client(socket, rx).await;
+        st.ws_connections.fetch_sub(1, Ordering::Relaxed);
+    })
+    .into_response()
 }
 
-async fn ws_stream(
-    mut socket: WebSocket,
-    sub: laminar_core::streaming::Subscription<laminar_db::ArrowRecord>,
-    name: String,
-) {
-    let mut seq = 0u64;
-    let mut watermark = i64::MIN;
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+async fn ws_client(mut socket: WebSocket, mut rx: tokio::sync::broadcast::Receiver<Arc<str>>) {
+    let mut heartbeat = tokio::time::interval(WS_HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
-            _ = interval.tick() => {
-                while let Some(msg) = sub.poll_message() {
-                    use laminar_core::streaming::SubscriptionMessage;
-                    match msg {
-                        SubscriptionMessage::Batch(batch) => {
-                            let json = match batch_to_json(&batch) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    warn!(stream = %name, error = %e, "failed to serialize batch");
-                                    continue;
-                                }
-                            };
-                            let wm = if watermark == i64::MIN { serde_json::Value::Null } else { serde_json::json!(watermark) };
-                            let out = serde_json::json!({
-                                "type": "data",
-                                "subscription_id": &name,
-                                "data": json,
-                                "sequence": seq,
-                                "watermark": wm,
-                            });
-                            seq += 1;
-                            if socket.send(Message::Text(out.to_string().into())).await.is_err() {
-                                return;
-                            }
+            biased;
+            result = rx.recv() => {
+                match result {
+                    Ok(msg) => {
+                        if socket.send(Message::Text((*msg).into())).await.is_err() {
+                            break;
                         }
-                        SubscriptionMessage::Watermark(wm) => { watermark = wm; }
-                        SubscriptionMessage::Record(_) => {}
                     }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(lagged = n, "ws client lagged, skipping");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            _ = heartbeat.tick() => {
+                let hb = serde_json::json!({
+                    "type": "heartbeat",
+                    "server_time": chrono::Utc::now().timestamp_millis(),
+                });
+                if socket.send(Message::Text(hb.to_string().into())).await.is_err() {
+                    break;
                 }
             }
             msg = socket.recv() => {
                 match msg {
-                    Some(Ok(Message::Close(_))) | None => return,
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Ping(data))) => {
+                        if socket.send(Message::Pong(data)).await.is_err() { break; }
+                    }
                     _ => {}
                 }
             }
@@ -596,6 +695,8 @@ mod tests {
             reload_guard: ReloadGuard::new(),
             reload_total: AtomicU64::new(0),
             reload_last_ts: AtomicU64::new(0),
+            ws_connections: AtomicU64::new(0),
+            stream_broadcasts: parking_lot::RwLock::new(HashMap::new()),
         })
     }
 
@@ -818,6 +919,8 @@ mod tests {
             reload_guard: ReloadGuard::new(),
             reload_total: AtomicU64::new(0),
             reload_last_ts: AtomicU64::new(0),
+            ws_connections: AtomicU64::new(0),
+            stream_broadcasts: parking_lot::RwLock::new(HashMap::new()),
         });
 
         let app = build_router(state.clone());

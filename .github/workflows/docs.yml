@@ -8,6 +8,7 @@ on:
       - 'crates/**/*.rs'
       - 'Cargo.toml'
       - 'site/**'
+      - 'examples/**'
       - '.github/workflows/docs.yml'
   release:
     types: [published]

@@ -73,6 +73,9 @@ struct ChannelInner<T> {
     /// In MPSC mode, producers acquire this lock to push.
     /// Value: 0 = unlocked, 1 = locked
     mpsc_lock: AtomicU8,
+
+    /// Signals async consumers on each push via `watch::changed()`.
+    async_signal: tokio::sync::watch::Sender<()>,
 }
 
 /// Internal statistics counters.
@@ -123,6 +126,7 @@ impl<T> ChannelInner<T> {
             config,
             stats: ChannelStatsInner::new(),
             mpsc_lock: AtomicU8::new(0),
+            async_signal: tokio::sync::watch::channel(()).0,
         }
     }
 
@@ -373,6 +377,7 @@ impl<T> Producer<T> {
         match self.inner.buffer.push(item) {
             Ok(()) => {
                 self.inner.track_push();
+                let _ = self.inner.async_signal.send(());
                 Ok(())
             }
             Err(item) => Err(TryPushError::full(item)),
@@ -387,6 +392,7 @@ impl<T> Producer<T> {
         let result = match self.inner.buffer.push(item) {
             Ok(()) => {
                 self.inner.track_push();
+                let _ = self.inner.async_signal.send(());
                 Ok(())
             }
             Err(item) => Err(TryPushError::full(item)),
@@ -445,6 +451,7 @@ impl<T> Drop for Producer<T> {
         if prev == 1 {
             // Last producer dropped - close the channel
             self.inner.closed.store(true, Ordering::Release);
+            let _ = self.inner.async_signal.send(());
         }
     }
 }
@@ -523,6 +530,13 @@ impl<T> Consumer<T> {
 
             self.wait_for_item_timeout(deadline);
         }
+    }
+
+    /// Returns a watch receiver for use in `tokio::select!` loops.
+    /// Call `rx.changed().await` then drain with [`poll`](Self::poll).
+    #[must_use]
+    pub fn async_watch(&self) -> tokio::sync::watch::Receiver<()> {
+        self.inner.async_signal.subscribe()
     }
 
     /// Pops multiple items from the buffer.
@@ -1088,5 +1102,30 @@ mod tests {
 
         let consumer_debug = format!("{consumer:?}");
         assert!(consumer_debug.contains("Consumer"));
+    }
+
+    #[tokio::test]
+    async fn test_watch_coalescing() {
+        let (producer, consumer) = channel::<i32>(64);
+        let consumer = Arc::new(consumer);
+        let consumer_clone = Arc::clone(&consumer);
+
+        let handle = tokio::spawn(async move {
+            let mut rx = consumer_clone.async_watch();
+            let _ = rx.changed().await;
+            let mut drained = Vec::new();
+            while let Some(item) = consumer_clone.poll() {
+                drained.push(item);
+            }
+            drained
+        });
+        tokio::task::yield_now().await;
+
+        for i in 0..10 {
+            producer.try_push(i).unwrap();
+        }
+
+        let drained = handle.await.unwrap();
+        assert_eq!(drained, (0..10).collect::<Vec<_>>());
     }
 }

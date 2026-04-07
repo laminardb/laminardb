@@ -4685,6 +4685,7 @@ dependencies = [
  "mimalloc",
  "notify",
  "openssl",
+ "parking_lot 0.12.5",
  "regex",
  "serde",
  "serde_json",
