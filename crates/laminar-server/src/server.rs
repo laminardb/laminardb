@@ -297,7 +297,6 @@ pub(crate) async fn start_http_api(
         reload_total: AtomicU64::new(0),
         reload_last_ts: AtomicU64::new(0),
         ws_connections: AtomicU64::new(0),
-        stream_broadcasts: parking_lot::RwLock::new(std::collections::HashMap::new()),
     });
     let router = http::build_router(Arc::clone(&app_state));
     let api_handle = http::serve(router, &bind).await?;

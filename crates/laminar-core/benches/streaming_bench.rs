@@ -144,7 +144,7 @@ fn bench_source_push(c: &mut Criterion) {
 
     let config = SourceConfig::with_buffer_size(65536);
     let (source, sink) = streaming::create_with_config::<BenchEvent>(config);
-    let sub = sink.subscribe();
+    let mut sub = sink.subscribe();
 
     let mut id = 0i64;
     group.bench_function("single_record", |b| {
@@ -170,7 +170,7 @@ fn bench_source_push_arrow(c: &mut Criterion) {
             &batch_size,
             |b, &size| {
                 let (source, sink) = streaming::create::<BenchEvent>(65536);
-                let sub = sink.subscribe();
+                let mut sub = sink.subscribe();
                 let batch = make_batch(size);
                 b.iter(|| {
                     let _ = sub.poll();
@@ -195,7 +195,7 @@ fn bench_source_push_batch_drain(c: &mut Criterion) {
             &batch_size,
             |b, &size| {
                 let (source, sink) = streaming::create::<BenchEvent>(65536);
-                let sub = sink.subscribe();
+                let mut sub = sink.subscribe();
                 b.iter(|| {
                     sub.poll_each(size, |_| true);
                     let events: Vec<BenchEvent> = (0..size as i64).map(make_event).collect();
@@ -216,7 +216,7 @@ fn bench_end_to_end(c: &mut Criterion) {
     group.throughput(Throughput::Elements(1));
 
     let (source, sink) = streaming::create::<BenchEvent>(65536);
-    let sub = sink.subscribe();
+    let mut sub = sink.subscribe();
 
     let mut id = 0i64;
     group.bench_function("push_poll", |b| {
@@ -241,7 +241,7 @@ fn bench_end_to_end_throughput(c: &mut Criterion) {
             &batch_size,
             |b, &size| {
                 let (source, sink) = streaming::create::<BenchEvent>(65536);
-                let sub = sink.subscribe();
+                let mut sub = sink.subscribe();
                 b.iter(|| {
                     for i in 0..size as i64 {
                         let _ = source.try_push(make_event(i));

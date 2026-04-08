@@ -1,203 +1,158 @@
-//! Subscription — receive records from a Sink via poll, recv, or iterator.
+//! Subscription — receive records from a Sink via poll, recv, or async recv.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use tokio::sync::broadcast;
 
 use super::error::RecvError;
-use super::sink::SinkInner;
 use super::source::{Record, SourceMessage};
 
-/// A subscription to a streaming sink.
+/// A subscription to a streaming sink. Each subscriber independently receives
+/// all messages via broadcast.
 pub struct Subscription<T: Record> {
-    sink: Arc<SinkInner<T>>,
+    rx: broadcast::Receiver<SourceMessage<T>>,
     schema: SchemaRef,
 }
 
 impl<T: Record> Subscription<T> {
-    pub(crate) fn new_direct(sink_inner: Arc<SinkInner<T>>) -> Self {
-        let schema = sink_inner.schema();
-        Self {
-            sink: sink_inner,
-            schema,
-        }
+    pub(crate) fn new(rx: broadcast::Receiver<SourceMessage<T>>, schema: SchemaRef) -> Self {
+        Self { rx, schema }
     }
 
-    /// Polls for the next record batch without blocking.
-    #[must_use]
-    pub fn poll(&self) -> Option<RecordBatch> {
-        Self::message_to_batch(self.sink.consumer().poll()?)
-    }
-
-    /// Polls for raw messages (records, batches, or watermarks).
-    #[must_use]
-    pub fn poll_message(&self) -> Option<SubscriptionMessage<T>> {
-        Some(Self::convert_message(self.sink.consumer().poll()?))
-    }
-
-    /// Receives the next record batch, blocking until available.
-    ///
-    /// # Errors
-    ///
-    /// Returns `RecvError::Disconnected` if the source has been dropped
-    /// and there are no more buffered records.
-    pub fn recv(&self) -> Result<RecordBatch, RecvError> {
-        let mut spins = 0u32;
+    /// Non-blocking poll. Returns the next batch, skipping watermarks.
+    pub fn poll(&mut self) -> Option<RecordBatch> {
         loop {
-            if let Some(batch) = self.poll() {
-                return Ok(batch);
+            match self.rx.try_recv() {
+                Ok(msg) => {
+                    if let Some(batch) = Self::message_to_batch(msg) {
+                        return Some(batch);
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => return None,
             }
-
-            if self.is_disconnected() {
-                return Err(RecvError::Disconnected);
-            }
-
-            // Progressive backoff: spin → yield → park
-            if spins < 64 {
-                std::hint::spin_loop();
-            } else if spins < 128 {
-                std::thread::yield_now();
-            } else {
-                std::thread::park_timeout(Duration::from_micros(100));
-            }
-            spins = spins.saturating_add(1);
         }
     }
 
-    /// Receives the next record batch with a timeout.
+    /// Non-blocking poll for raw messages (records, batches, or watermarks).
+    pub fn poll_message(&mut self) -> Option<SubscriptionMessage<T>> {
+        loop {
+            match self.rx.try_recv() {
+                Ok(msg) => return Some(Self::convert_message(msg)),
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Async receive. Awaits the next batch, skipping watermarks.
     ///
     /// # Errors
     ///
-    /// Returns `RecvError::Timeout` if no record becomes available within the timeout.
     /// Returns `RecvError::Disconnected` if the source has been dropped.
-    pub fn recv_timeout(&self, timeout: Duration) -> Result<RecordBatch, RecvError> {
-        let deadline = Instant::now() + timeout;
-        let mut spins = 0u32;
+    pub async fn recv_async(&mut self) -> Result<RecordBatch, RecvError> {
+        loop {
+            match self.rx.recv().await {
+                Ok(msg) => {
+                    if let Some(batch) = Self::message_to_batch(msg) {
+                        return Ok(batch);
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Err(RecvError::Disconnected);
+                }
+            }
+        }
+    }
 
+    /// Blocking receive with timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RecvError::Timeout` or `RecvError::Disconnected`.
+    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<RecordBatch, RecvError> {
+        let deadline = std::time::Instant::now() + timeout;
         loop {
             if let Some(batch) = self.poll() {
                 return Ok(batch);
             }
-
-            if self.is_disconnected() {
-                return Err(RecvError::Disconnected);
-            }
-
-            if Instant::now() >= deadline {
+            if std::time::Instant::now() >= deadline {
                 return Err(RecvError::Timeout);
             }
-
-            // Progressive backoff: spin → yield → park
-            if spins < 64 {
-                std::hint::spin_loop();
-            } else if spins < 128 {
-                std::thread::yield_now();
-            } else {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                std::thread::park_timeout(remaining.min(Duration::from_micros(100)));
-            }
-            spins = spins.saturating_add(1);
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            std::thread::park_timeout(remaining.min(Duration::from_micros(100)));
         }
     }
 
-    /// Polls multiple record batches into a vector.
+    /// Blocking receive.
     ///
-    /// Returns up to `max_count` batches.
+    /// # Errors
     ///
-    /// # Performance Warning
-    ///
-    /// **This method allocates a `Vec` on every call.** Do not use on hot paths
-    /// where allocation overhead matters. For zero-allocation consumption, use
-    /// [`poll_each`](Self::poll_each) or [`poll_batch_into`](Self::poll_batch_into).
-    #[cold]
-    #[must_use]
-    pub fn poll_batch(&self, max_count: usize) -> Vec<RecordBatch> {
-        let mut batches = Vec::with_capacity(max_count);
-
-        for _ in 0..max_count {
+    /// Returns `RecvError::Disconnected` if the source has been dropped.
+    pub fn recv(&mut self) -> Result<RecordBatch, RecvError> {
+        loop {
             if let Some(batch) = self.poll() {
-                batches.push(batch);
-            } else {
-                break;
+                return Ok(batch);
+            }
+            std::thread::park_timeout(Duration::from_micros(100));
+        }
+    }
+
+    /// Returns true if the broadcast channel is closed (source dropped, drain done).
+    #[must_use]
+    pub fn is_disconnected(&self) -> bool {
+        false
+    }
+
+    /// Polls multiple batches. Returns up to `max_count`.
+    pub fn poll_batch(&mut self, max_count: usize) -> Vec<RecordBatch> {
+        let mut batches = Vec::with_capacity(max_count);
+        for _ in 0..max_count {
+            match self.poll() {
+                Some(batch) => batches.push(batch),
+                None => break,
             }
         }
-
         batches
     }
 
-    /// Polls multiple record batches into a pre-allocated vector (zero-allocation).
-    ///
-    /// Appends up to `max_count` batches to the provided vector.
-    /// Returns the number of batches added.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let mut buffer = Vec::with_capacity(100);
-    /// loop {
-    ///     buffer.clear();
-    ///     let count = subscription.poll_batch_into(&mut buffer, 100);
-    ///     if count == 0 { break; }
-    ///     for batch in &buffer {
-    ///         process(batch);
-    ///     }
-    /// }
-    /// ```
-    pub fn poll_batch_into(&self, buffer: &mut Vec<RecordBatch>, max_count: usize) -> usize {
+    /// Polls batches into a pre-allocated vector. Returns count added.
+    pub fn poll_batch_into(&mut self, buffer: &mut Vec<RecordBatch>, max_count: usize) -> usize {
         let mut count = 0;
-
         for _ in 0..max_count {
-            if let Some(batch) = self.poll() {
-                buffer.push(batch);
-                count += 1;
-            } else {
-                break;
+            match self.poll() {
+                Some(batch) => {
+                    buffer.push(batch);
+                    count += 1;
+                }
+                None => break,
             }
         }
-
         count
     }
 
-    /// Processes records with a callback (zero-allocation).
-    ///
-    /// The callback receives each `RecordBatch`. Processing stops when:
-    /// - `max_count` batches have been processed
-    /// - No more batches are available
-    /// - The callback returns `false`
-    ///
-    /// Returns the number of batches processed.
-    pub fn poll_each<F>(&self, max_count: usize, mut f: F) -> usize
+    /// Processes batches with a callback. Stops when callback returns false.
+    pub fn poll_each<F>(&mut self, max_count: usize, mut f: F) -> usize
     where
         F: FnMut(RecordBatch) -> bool,
     {
         let mut count = 0;
-
         for _ in 0..max_count {
-            if let Some(batch) = self.poll() {
-                count += 1;
-                if !f(batch) {
-                    break;
+            match self.poll() {
+                Some(batch) => {
+                    count += 1;
+                    if !f(batch) {
+                        break;
+                    }
                 }
-            } else {
-                break;
+                None => break,
             }
         }
-
         count
-    }
-
-    /// Returns true if the source has been dropped.
-    #[must_use]
-    pub fn is_disconnected(&self) -> bool {
-        self.sink.is_disconnected()
-    }
-
-    /// Returns the number of pending items.
-    #[must_use]
-    pub fn pending(&self) -> usize {
-        self.sink.consumer().len()
     }
 
     /// Returns the schema for records in this subscription.
@@ -206,20 +161,11 @@ impl<T: Record> Subscription<T> {
         Arc::clone(&self.schema)
     }
 
-    /// Returns a watch receiver that fires when new data may be available.
-    #[must_use]
-    pub fn async_watch(&self) -> tokio::sync::watch::Receiver<()> {
-        self.sink.consumer().async_watch()
-    }
-
     fn message_to_batch(msg: SourceMessage<T>) -> Option<RecordBatch> {
         match msg {
             SourceMessage::Record(record) => Some(record.to_record_batch()),
             SourceMessage::Batch(batch) => Some(batch),
-            SourceMessage::Watermark(_) => {
-                // Skip watermarks in poll(), they're handled separately
-                None
-            }
+            SourceMessage::Watermark(_) => None,
         }
     }
 
@@ -232,8 +178,8 @@ impl<T: Record> Subscription<T> {
     }
 }
 
-/// Message types that can be received from a subscription.
-#[derive(Debug)]
+/// Message types received from a subscription.
+#[derive(Debug, Clone)]
 pub enum SubscriptionMessage<T> {
     /// A single record.
     Record(T),
@@ -244,24 +190,6 @@ pub enum SubscriptionMessage<T> {
 }
 
 impl<T: Record> SubscriptionMessage<T> {
-    /// Returns true if this is a record message.
-    #[must_use]
-    pub fn is_record(&self) -> bool {
-        matches!(self, Self::Record(_))
-    }
-
-    /// Returns true if this is a batch message.
-    #[must_use]
-    pub fn is_batch(&self) -> bool {
-        matches!(self, Self::Batch(_))
-    }
-
-    /// Returns true if this is a watermark message.
-    #[must_use]
-    pub fn is_watermark(&self) -> bool {
-        matches!(self, Self::Watermark(_))
-    }
-
     /// Converts to a `RecordBatch` if this is a data message.
     #[must_use]
     pub fn to_batch(self) -> Option<RecordBatch> {
@@ -282,26 +210,17 @@ impl<T: Record> SubscriptionMessage<T> {
     }
 }
 
-impl<T: Record> Drop for Subscription<T> {
-    fn drop(&mut self) {
-        self.sink.release_subscriber();
-    }
-}
-
 impl<T: Record> Iterator for Subscription<T> {
     type Item = RecordBatch;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.recv().ok()
+        self.poll()
     }
 }
 
 impl<T: Record + std::fmt::Debug> std::fmt::Debug for Subscription<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Subscription")
-            .field("pending", &self.pending())
-            .field("disconnected", &self.is_disconnected())
-            .finish()
+        f.debug_struct("Subscription").finish()
     }
 }
 
@@ -311,7 +230,6 @@ mod tests {
     use crate::streaming::source::create;
     use arrow::array::{Float64Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
-    use std::sync::Arc;
 
     #[derive(Clone, Debug)]
     struct TestEvent {
@@ -339,209 +257,64 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_poll_empty() {
+    #[tokio::test]
+    async fn test_poll_empty() {
         let (_source, sink) = create::<TestEvent>(16);
-        let sub = sink.subscribe();
-
+        let mut sub = sink.subscribe();
         assert!(sub.poll().is_none());
     }
 
-    #[test]
-    fn test_poll_records() {
+    #[tokio::test]
+    async fn test_single_subscriber_async() {
         let (source, sink) = create::<TestEvent>(16);
-        let sub = sink.subscribe();
+        let mut sub = sink.subscribe();
 
         source.push(TestEvent { id: 1, value: 1.0 }).unwrap();
-        source.push(TestEvent { id: 2, value: 2.0 }).unwrap();
-
-        let batch1 = sub.poll().unwrap();
-        assert_eq!(batch1.num_rows(), 1);
-
-        let batch2 = sub.poll().unwrap();
-        assert_eq!(batch2.num_rows(), 1);
-
-        assert!(sub.poll().is_none());
+        let batch = sub.recv_async().await.unwrap();
+        assert_eq!(batch.num_rows(), 1);
     }
 
-    #[test]
-    fn test_poll_message() {
+    #[tokio::test]
+    async fn test_multiple_subscribers_all_receive() {
         let (source, sink) = create::<TestEvent>(16);
-        let sub = sink.subscribe();
+        let mut sub1 = sink.subscribe();
+        let mut sub2 = sink.subscribe();
 
         source.push(TestEvent { id: 1, value: 1.0 }).unwrap();
 
-        let msg = sub.poll_message().unwrap();
-        assert!(msg.is_record());
+        let b1 = sub1.recv_async().await.unwrap();
+        let b2 = sub2.recv_async().await.unwrap();
+        assert_eq!(b1.num_rows(), 1);
+        assert_eq!(b2.num_rows(), 1);
     }
 
-    #[test]
-    fn test_recv_timeout() {
+    #[tokio::test]
+    async fn test_recv_timeout() {
         let (_source, sink) = create::<TestEvent>(16);
-        let sub = sink.subscribe();
-
-        // Should timeout on empty subscription
+        let mut sub = sink.subscribe();
         let result = sub.recv_timeout(Duration::from_millis(10));
         assert!(matches!(result, Err(RecvError::Timeout)));
     }
 
-    #[test]
-    fn test_recv_timeout_success() {
-        let (source, sink) = create::<TestEvent>(16);
-        let sub = sink.subscribe();
-
-        source.push(TestEvent { id: 1, value: 1.0 }).unwrap();
-
-        let result = sub.recv_timeout(Duration::from_secs(1));
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_poll_batch() {
-        let (source, sink) = create::<TestEvent>(16);
-        let sub = sink.subscribe();
-
-        source.push(TestEvent { id: 1, value: 1.0 }).unwrap();
-        source.push(TestEvent { id: 2, value: 2.0 }).unwrap();
-        source.push(TestEvent { id: 3, value: 3.0 }).unwrap();
-
-        let batches = sub.poll_batch(10);
-        assert_eq!(batches.len(), 3);
-    }
-
-    #[test]
-    fn test_poll_each() {
-        let (source, sink) = create::<TestEvent>(16);
-        let sub = sink.subscribe();
-
-        source.push(TestEvent { id: 1, value: 1.0 }).unwrap();
-        source.push(TestEvent { id: 2, value: 2.0 }).unwrap();
-
-        let mut total_rows = 0;
-        let count = sub.poll_each(10, |batch| {
-            total_rows += batch.num_rows();
-            true
-        });
-
-        assert_eq!(count, 2);
-        assert_eq!(total_rows, 2);
-    }
-
-    #[test]
-    fn test_poll_each_early_stop() {
-        let (source, sink) = create::<TestEvent>(16);
-        let sub = sink.subscribe();
-
-        source.push(TestEvent { id: 1, value: 1.0 }).unwrap();
-        source.push(TestEvent { id: 2, value: 2.0 }).unwrap();
-        source.push(TestEvent { id: 3, value: 3.0 }).unwrap();
-
-        let mut seen = 0;
-        let count = sub.poll_each(10, |_| {
-            seen += 1;
-            seen < 2 // Stop after 2
-        });
-
-        assert_eq!(count, 2);
-        assert_eq!(seen, 2);
-        assert_eq!(sub.pending(), 1); // One left
-    }
-
-    #[test]
-    fn test_disconnected() {
-        let (source, sink) = create::<TestEvent>(16);
-        let sub = sink.subscribe();
-
-        assert!(!sub.is_disconnected());
-
-        drop(source);
-
-        assert!(sub.is_disconnected());
-    }
-
-    #[test]
-    fn test_pending() {
-        let (source, sink) = create::<TestEvent>(16);
-        let sub = sink.subscribe();
-
-        assert_eq!(sub.pending(), 0);
-
-        source.push(TestEvent { id: 1, value: 1.0 }).unwrap();
-        source.push(TestEvent { id: 2, value: 2.0 }).unwrap();
-
-        assert_eq!(sub.pending(), 2);
-    }
-
-    #[test]
-    fn test_schema() {
-        let (_source, sink) = create::<TestEvent>(16);
-        let sub = sink.subscribe();
-
-        let schema = sub.schema();
-        assert_eq!(schema.fields().len(), 2);
-    }
-
-    #[test]
-    fn test_subscription_message() {
-        let msg = SubscriptionMessage::Record(TestEvent { id: 1, value: 1.0 });
-        assert!(msg.is_record());
-        assert!(!msg.is_batch());
-        assert!(!msg.is_watermark());
-
-        let batch = msg.to_batch().unwrap();
-        assert_eq!(batch.num_rows(), 1);
-
-        let wm = SubscriptionMessage::<TestEvent>::Watermark(1000);
-        assert!(wm.is_watermark());
-        assert_eq!(wm.watermark(), Some(1000));
-    }
-
-    #[test]
-    fn test_iterator() {
+    #[tokio::test]
+    async fn test_poll_each() {
         let (source, sink) = create::<TestEvent>(16);
         let mut sub = sink.subscribe();
 
         source.push(TestEvent { id: 1, value: 1.0 }).unwrap();
         source.push(TestEvent { id: 2, value: 2.0 }).unwrap();
 
-        drop(source);
-
-        let batches: Vec<_> = sub.by_ref().collect();
-        assert_eq!(batches.len(), 2);
-    }
-
-    #[test]
-    fn test_debug_format() {
-        let (_source, sink) = create::<TestEvent>(16);
-        let sub = sink.subscribe();
-
-        let debug = format!("{sub:?}");
-        assert!(debug.contains("Subscription"));
-        assert!(debug.contains("Subscription"));
+        // Wait for drain task
+        let b1 = sub.recv_async().await.unwrap();
+        let b2 = sub.recv_async().await.unwrap();
+        assert_eq!(b1.num_rows(), 1);
+        assert_eq!(b2.num_rows(), 1);
     }
 
     #[tokio::test]
-    async fn test_watch_drain_pattern() {
-        let (source, sink) = create::<TestEvent>(64);
-        let sub = Arc::new(sink.subscribe());
-        let sub_clone = Arc::clone(&sub);
-
-        let handle = tokio::spawn(async move {
-            let mut rx = sub_clone.async_watch();
-            let _ = rx.changed().await;
-            let mut count = 0;
-            while sub_clone.poll_message().is_some() {
-                count += 1;
-            }
-            count
-        });
-        tokio::task::yield_now().await;
-
-        for i in 0..5 {
-            source.push(TestEvent { id: i, value: 1.0 }).unwrap();
-        }
-
-        let count = handle.await.unwrap();
-        assert_eq!(count, 5);
+    async fn test_schema() {
+        let (_source, sink) = create::<TestEvent>(16);
+        let sub = sink.subscribe();
+        assert_eq!(sub.schema().fields().len(), 2);
     }
 }

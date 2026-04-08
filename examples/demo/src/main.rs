@@ -274,7 +274,7 @@ async fn run_embedded_mode() -> Result<(), Box<dyn std::error::Error>> {
     let tick_source = db.source::<MarketTick>("market_ticks")?;
     let order_source = db.source::<OrderEvent>("order_events")?;
     let book_source = db.source::<OrderBookUpdate>("book_updates")?;
-    let subs = Subscriptions::from_db(&db)?;
+    let mut subs = Subscriptions::from_db(&db)?;
 
     let mut generator = MarketGenerator::new();
     let mut app = App::new();
@@ -301,7 +301,7 @@ async fn run_embedded_mode() -> Result<(), Box<dyn std::error::Error>> {
         book_source,
     };
 
-    let result = run_with_tui(&mut app, &mut data_source, &subs, &db).await;
+    let result = run_with_tui(&mut app, &mut data_source, &mut subs, &db).await;
 
     // -- Shutdown --
     db.shutdown().await?;
@@ -372,7 +372,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // -- Subscribe and setup app state --
-    let subs = Subscriptions::from_db(&db)?;
+    let mut subs = Subscriptions::from_db(&db)?;
 
     let mut app = App::new();
     app.set_topology(db.pipeline_topology());
@@ -394,7 +394,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
         producer,
     };
 
-    let result = run_with_tui(&mut app, &mut data_source, &subs, &db).await;
+    let result = run_with_tui(&mut app, &mut data_source, &mut subs, &db).await;
 
     // -- Shutdown --
     db.shutdown().await?;
@@ -407,7 +407,7 @@ async fn run_kafka_mode() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_with_tui<D: PipelineDataSource>(
     app: &mut App,
     data_source: &mut D,
-    subs: &Subscriptions,
+    subs: &mut Subscriptions,
     db: &LaminarDB,
 ) -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
@@ -449,7 +449,7 @@ async fn run_tui_loop<D: PipelineDataSource>(
     app: &mut App,
     stats_collector: &mut StatsCollector,
     data_source: &mut D,
-    subs: &Subscriptions,
+    subs: &mut Subscriptions,
     db: &LaminarDB,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
@@ -505,7 +505,7 @@ async fn run_tui_loop<D: PipelineDataSource>(
 }
 
 /// Poll all subscription channels and merge results into app state.
-fn drain_subscriptions(app: &mut App, subs: &Subscriptions) {
+fn drain_subscriptions(app: &mut App, subs: &mut Subscriptions) {
     for _ in 0..64 {
         match subs.ohlc.poll() {
             Some(rows) => app.ingest_ohlc(rows),

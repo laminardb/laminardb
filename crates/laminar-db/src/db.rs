@@ -3932,7 +3932,7 @@ mod tests {
             .await
             .unwrap();
 
-        let sub = db.catalog.get_stream_subscription("out").unwrap();
+        let mut sub = db.catalog.get_stream_subscription("out").unwrap();
         db.start().await.unwrap();
 
         let handle = db.source_untyped("events").unwrap();
@@ -4088,7 +4088,7 @@ mod tests {
             .await
             .unwrap();
 
-        let sub = db.catalog.get_stream_subscription("out").unwrap();
+        let mut sub = db.catalog.get_stream_subscription("out").unwrap();
 
         let handle = db.source_untyped("events").unwrap();
         handle.set_event_time_column("ts");
@@ -4143,7 +4143,7 @@ mod tests {
             .await
             .unwrap();
 
-        let sub = db.catalog.get_stream_subscription("out").unwrap();
+        let mut sub = db.catalog.get_stream_subscription("out").unwrap();
         db.start().await.unwrap();
 
         let handle = db.source_untyped("events").unwrap();
@@ -4193,7 +4193,7 @@ mod tests {
             .await
             .unwrap();
 
-        let sub = db.catalog.get_stream_subscription("out").unwrap();
+        let mut sub = db.catalog.get_stream_subscription("out").unwrap();
         db.start().await.unwrap();
 
         let handle = db.source_untyped("events").unwrap();
@@ -4238,7 +4238,8 @@ mod tests {
             ExecuteResult::Query(mut q) => {
                 // The bridge_query_stream spawns a tokio task; yield to let it run.
                 tokio::task::yield_now().await;
-                let sub = q.subscribe_raw().unwrap();
+                let mut sub = q.subscribe_raw().unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 let mut total_rows = 0;
                 for _ in 0..256 {
                     match sub.poll() {
@@ -4285,8 +4286,8 @@ mod tests {
         let result = db.execute("SELECT * FROM sensors").await.unwrap();
         match result {
             ExecuteResult::Query(mut q) => {
-                tokio::task::yield_now().await;
-                let sub = q.subscribe_raw().unwrap();
+                let mut sub = q.subscribe_raw().unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 let mut total_rows = 0;
                 for _ in 0..256 {
                     match sub.poll() {
