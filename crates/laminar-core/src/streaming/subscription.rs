@@ -1,33 +1,4 @@
-//! Streaming Subscription API.
-//!
-//! A Subscription provides access to records from a Sink. It supports:
-//!
-//! - Non-blocking poll
-//! - Blocking receive with optional timeout
-//! - Iterator interface
-//! - Zero-allocation batch operations
-//!
-//! ## Usage
-//!
-//! ```rust,ignore
-//! let subscription = sink.subscribe();
-//!
-//! // Non-blocking poll
-//! while let Some(batch) = subscription.poll() {
-//!     process(batch);
-//! }
-//!
-//! // Blocking receive
-//! let batch = subscription.recv()?;
-//!
-//! // With timeout
-//! let batch = subscription.recv_timeout(Duration::from_secs(1))?;
-//!
-//! // As iterator
-//! for batch in subscription {
-//!     process(batch);
-//! }
-//! ```
+//! Subscription — receive records from a Sink via poll, recv, or iterator.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,76 +6,35 @@ use std::time::{Duration, Instant};
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 
-use super::channel::Consumer;
 use super::error::RecvError;
 use super::sink::SinkInner;
 use super::source::{Record, SourceMessage};
 
 /// A subscription to a streaming sink.
-///
-/// Subscriptions receive records from a Sink and provide them via
-/// polling, blocking receive, or iterator interfaces.
-///
-/// ## Modes
-///
-/// - **Direct**: First subscriber, reads directly from source channel
-/// - **Broadcast**: Additional subscribers, reads from dedicated channel
 pub struct Subscription<T: Record> {
-    inner: SubscriptionInner<T>,
+    sink: Arc<SinkInner<T>>,
     schema: SchemaRef,
 }
 
-enum SubscriptionInner<T: Record> {
-    /// Direct subscription to sink's consumer.
-    Direct(Arc<SinkInner<T>>),
-    /// Broadcast subscription with dedicated channel.
-    Broadcast(Consumer<SourceMessage<T>>),
-}
-
 impl<T: Record> Subscription<T> {
-    /// Creates a direct subscription (first subscriber).
     pub(crate) fn new_direct(sink_inner: Arc<SinkInner<T>>) -> Self {
         let schema = sink_inner.schema();
         Self {
-            inner: SubscriptionInner::Direct(sink_inner),
-            schema,
-        }
-    }
-
-    /// Creates a broadcast subscription (additional subscribers).
-    pub(crate) fn new_broadcast(consumer: Consumer<SourceMessage<T>>, schema: SchemaRef) -> Self {
-        Self {
-            inner: SubscriptionInner::Broadcast(consumer),
+            sink: sink_inner,
             schema,
         }
     }
 
     /// Polls for the next record batch without blocking.
-    ///
-    /// Returns `Some(RecordBatch)` if data is available, `None` if empty.
-    ///
-    /// Records are automatically converted to Arrow `RecordBatch` format.
     #[must_use]
     pub fn poll(&self) -> Option<RecordBatch> {
-        let msg = match &self.inner {
-            SubscriptionInner::Direct(sink) => sink.consumer().poll(),
-            SubscriptionInner::Broadcast(consumer) => consumer.poll(),
-        }?;
-
-        Self::message_to_batch(msg)
+        Self::message_to_batch(self.sink.consumer().poll()?)
     }
 
-    /// Polls for raw messages (without conversion to `RecordBatch`).
-    ///
-    /// This is useful when you need to handle watermarks separately.
+    /// Polls for raw messages (records, batches, or watermarks).
     #[must_use]
     pub fn poll_message(&self) -> Option<SubscriptionMessage<T>> {
-        let msg = match &self.inner {
-            SubscriptionInner::Direct(sink) => sink.consumer().poll(),
-            SubscriptionInner::Broadcast(consumer) => consumer.poll(),
-        }?;
-
-        Some(Self::convert_message(msg))
+        Some(Self::convert_message(self.sink.consumer().poll()?))
     }
 
     /// Receives the next record batch, blocking until available.
@@ -258,22 +188,16 @@ impl<T: Record> Subscription<T> {
         count
     }
 
-    /// Returns true if the source has been dropped and buffer is empty.
+    /// Returns true if the source has been dropped.
     #[must_use]
     pub fn is_disconnected(&self) -> bool {
-        match &self.inner {
-            SubscriptionInner::Direct(sink) => sink.is_disconnected(),
-            SubscriptionInner::Broadcast(consumer) => consumer.is_disconnected(),
-        }
+        self.sink.is_disconnected()
     }
 
     /// Returns the number of pending items.
     #[must_use]
     pub fn pending(&self) -> usize {
-        match &self.inner {
-            SubscriptionInner::Direct(sink) => sink.consumer().len(),
-            SubscriptionInner::Broadcast(consumer) => consumer.len(),
-        }
+        self.sink.consumer().len()
     }
 
     /// Returns the schema for records in this subscription.
@@ -282,14 +206,10 @@ impl<T: Record> Subscription<T> {
         Arc::clone(&self.schema)
     }
 
-    /// Returns a watch receiver that resolves on `changed().await` when new data
-    /// may be available. Drain with [`poll_message`](Self::poll_message) after.
+    /// Returns a watch receiver that fires when new data may be available.
     #[must_use]
     pub fn async_watch(&self) -> tokio::sync::watch::Receiver<()> {
-        match &self.inner {
-            SubscriptionInner::Direct(sink) => sink.consumer().async_watch(),
-            SubscriptionInner::Broadcast(consumer) => consumer.async_watch(),
-        }
+        self.sink.consumer().async_watch()
     }
 
     fn message_to_batch(msg: SourceMessage<T>) -> Option<RecordBatch> {
@@ -364,16 +284,10 @@ impl<T: Record> SubscriptionMessage<T> {
 
 impl<T: Record> Drop for Subscription<T> {
     fn drop(&mut self) {
-        if let SubscriptionInner::Direct(ref sink) = self.inner {
-            sink.release_subscriber();
-        }
+        self.sink.release_subscriber();
     }
 }
 
-/// Iterator implementation for Subscription.
-///
-/// Iterates over record batches, blocking on each call to `next()`.
-/// Iteration stops when the source is disconnected.
 impl<T: Record> Iterator for Subscription<T> {
     type Item = RecordBatch;
 
@@ -384,16 +298,9 @@ impl<T: Record> Iterator for Subscription<T> {
 
 impl<T: Record + std::fmt::Debug> std::fmt::Debug for Subscription<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mode = match &self.inner {
-            SubscriptionInner::Direct(_) => "Direct",
-            SubscriptionInner::Broadcast(_) => "Broadcast",
-        };
-
         f.debug_struct("Subscription")
-            .field("mode", &mode)
             .field("pending", &self.pending())
-            .field("is_disconnected", &self.is_disconnected())
-            .field("schema", &self.schema)
+            .field("disconnected", &self.is_disconnected())
             .finish()
     }
 }
@@ -610,7 +517,7 @@ mod tests {
 
         let debug = format!("{sub:?}");
         assert!(debug.contains("Subscription"));
-        assert!(debug.contains("Direct"));
+        assert!(debug.contains("Subscription"));
     }
 
     #[tokio::test]

@@ -1,34 +1,11 @@
-//! Streaming Sink API.
-//!
-//! A Sink is the consumption endpoint of a streaming pipeline.
-//! It receives records from a Source and provides them to subscribers.
-//!
-//! ## Modes
-//!
-//! - **Single subscriber (SPSC)**: Optimal performance, subscriber gets all records
-//! - **Broadcast**: Multiple subscribers, each gets a copy of all records
-//!
-//! ## Usage
-//!
-//! ```rust,ignore
-//! use laminar_core::streaming;
-//!
-//! let (source, sink) = streaming::create::<MyEvent>(1024);
-//!
-//! // Single subscriber
-//! let subscription = sink.subscribe();
-//!
-//! // Or broadcast to multiple subscribers
-//! let sub1 = sink.subscribe();
-//! let sub2 = sink.subscribe();
-//! ```
+//! Sink — consumption endpoint with subscribe-based fan-out.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 
-use super::channel::{channel_with_config, Consumer, Producer};
+use super::channel::Consumer;
 use super::config::ChannelConfig;
 use super::source::{Record, SourceMessage};
 use super::subscription::Subscription;
@@ -42,12 +19,6 @@ pub enum SinkMode {
     Broadcast,
 }
 
-/// Internal subscriber state.
-struct SubscriberInner<T: Record> {
-    /// Producer for this subscriber's channel.
-    producer: Producer<SourceMessage<T>>,
-}
-
 /// Shared state for a Sink.
 pub(crate) struct SinkInner<T: Record> {
     /// Consumer for receiving from source.
@@ -57,6 +28,7 @@ pub(crate) struct SinkInner<T: Record> {
     schema: SchemaRef,
 
     /// Configuration for subscriber channels.
+    #[allow(dead_code)]
     channel_config: ChannelConfig,
 
     /// Number of active subscribers.
@@ -69,43 +41,9 @@ impl<T: Record> SinkInner<T> {
     }
 }
 
-/// A streaming data sink.
-///
-/// Sinks receive records from a Source and distribute them to subscribers.
-/// The sink supports both single-subscriber and broadcast modes.
-///
-/// ## Subscription Model
-///
-/// When you call `subscribe()`, you get a `Subscription` that receives
-/// records from this sink. If you subscribe multiple times, the sink
-/// automatically enters broadcast mode where each subscriber gets a
-/// copy of every record.
-///
-/// ## Performance Notes
-///
-/// - Single subscriber mode: Zero overhead, direct channel access
-/// - Broadcast mode: Uses `RwLock` for subscriber list (read-heavy optimization)
-/// - `poll_and_distribute()`: Takes a read lock (fast, non-blocking with other readers)
-/// - `subscribe()`: Takes a write lock (rare, happens at setup time)
-///
-/// ## Example
-///
-/// ```rust,ignore
-/// let (source, sink) = streaming::create::<MyEvent>(1024);
-///
-/// // Subscribe to receive records
-/// let subscription = sink.subscribe();
-///
-/// // Process records
-/// while let Some(batch) = subscription.poll() {
-///     process(batch);
-/// }
-/// ```
+/// A streaming data sink. Supports single-subscriber and broadcast modes.
 pub struct Sink<T: Record> {
     inner: Arc<SinkInner<T>>,
-    /// Subscribers (only used in broadcast mode).
-    /// Uses `RwLock` for fast read access on hot path.
-    subscribers: Arc<parking_lot::RwLock<Vec<SubscriberInner<T>>>>,
 }
 
 impl<T: Record> Sink<T> {
@@ -122,47 +60,14 @@ impl<T: Record> Sink<T> {
                 channel_config,
                 subscriber_count: AtomicUsize::new(0),
             }),
-            subscribers: Arc::new(parking_lot::RwLock::new(Vec::new())),
         }
     }
 
     /// Creates a subscription to receive records from this sink.
-    ///
-    /// The first subscriber receives records directly from the source channel.
-    /// Additional subscribers trigger broadcast mode where records are copied.
-    ///
-    /// # Returns
-    ///
-    /// A `Subscription` that can be used to poll or receive records.
-    ///
-    /// # Performance
-    ///
-    /// This method takes a write lock and should only be called during setup,
-    /// not on the hot path. Subscription setup is O(1).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal lock is poisoned (should not happen in normal use).
     #[must_use]
     pub fn subscribe(&self) -> Subscription<T> {
-        let count = self.inner.subscriber_count.fetch_add(1, Ordering::AcqRel);
-
-        if count == 0 {
-            // First subscriber - direct connection to source
-            Subscription::new_direct(Arc::clone(&self.inner))
-        } else {
-            // Additional subscriber - create broadcast channel
-            let (producer, consumer) =
-                channel_with_config::<SourceMessage<T>>(self.inner.channel_config.clone());
-
-            // Store producer for broadcasting (write lock, not hot path)
-            {
-                let mut subs = self.subscribers.write();
-                subs.push(SubscriberInner { producer });
-            }
-
-            Subscription::new_broadcast(consumer, Arc::clone(&self.inner.schema))
-        }
+        self.inner.subscriber_count.fetch_add(1, Ordering::AcqRel);
+        Subscription::new_direct(Arc::clone(&self.inner))
     }
 
     /// Returns the number of active subscribers.
@@ -197,56 +102,6 @@ impl<T: Record> Sink<T> {
     #[must_use]
     pub fn pending(&self) -> usize {
         self.inner.consumer.len()
-    }
-
-    /// Polls for records and distributes them to subscribers.
-    ///
-    /// In single-subscriber mode, this is a no-op (direct channel).
-    /// In broadcast mode, this copies records to all subscriber channels.
-    ///
-    /// Returns the number of records distributed.
-    ///
-    /// # Performance
-    ///
-    /// Snapshots subscriber producers under the read lock (cheap Arc bumps),
-    /// then releases the lock before the poll loop to avoid holding it during I/O.
-    #[must_use]
-    pub fn poll_and_distribute(&self) -> usize
-    where
-        T: Clone,
-    {
-        // Only needed in broadcast mode
-        if self.mode() != SinkMode::Broadcast {
-            return 0;
-        }
-
-        // Snapshot producers under read lock, then release immediately
-        let producers: smallvec::SmallVec<[Producer<SourceMessage<T>>; 4]> = {
-            let subscribers = self.subscribers.read();
-            if subscribers.is_empty() {
-                return 0;
-            }
-            subscribers.iter().map(|s| s.producer.clone()).collect()
-        };
-        // RwLock released — iterate producers without holding lock
-
-        let mut count = 0;
-
-        // Poll records from source and broadcast
-        while let Some(msg) = self.inner.consumer.poll() {
-            for producer in &producers {
-                // Clone and send to each subscriber
-                let msg_clone = match &msg {
-                    SourceMessage::Record(r) => SourceMessage::Record(r.clone()),
-                    SourceMessage::Batch(b) => SourceMessage::Batch(b.clone()),
-                    SourceMessage::Watermark(ts) => SourceMessage::Watermark(*ts),
-                };
-                let _ = producer.try_push(msg_clone);
-            }
-            count += 1;
-        }
-
-        count
     }
 }
 
@@ -330,17 +185,6 @@ mod tests {
     }
 
     #[test]
-    fn test_broadcast_mode() {
-        let (_source, sink) = create::<TestEvent>(16);
-
-        let _sub1 = sink.subscribe();
-        let _sub2 = sink.subscribe();
-
-        assert_eq!(sink.subscriber_count(), 2);
-        assert_eq!(sink.mode(), SinkMode::Broadcast);
-    }
-
-    #[test]
     fn test_schema() {
         let (_source, sink) = create::<TestEvent>(16);
 
@@ -358,8 +202,6 @@ mod tests {
 
         drop(source);
 
-        // The sink consumer should detect disconnection
-        // (may need to poll to see it)
         assert!(sink.is_disconnected());
     }
 

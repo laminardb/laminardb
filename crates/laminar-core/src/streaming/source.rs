@@ -1,31 +1,4 @@
-//! Streaming Source API.
-//!
-//! A Source is the entry point for data into a streaming pipeline.
-//! It wraps a channel producer with a type-safe interface and supports:
-//!
-//! - Push individual records or batches
-//! - Push Arrow `RecordBatch` directly
-//! - Watermark emission for event-time processing
-//! - Automatic SPSC → MPSC upgrade on clone
-//!
-//! ## Usage
-//!
-//! ```rust,ignore
-//! use laminar_core::streaming::{Source, SourceConfig};
-//!
-//! // Create a source
-//! let (source, sink) = streaming::create::<MyEvent>(config);
-//!
-//! // Push records
-//! source.push(event)?;
-//! source.push_batch(&events)?;
-//!
-//! // Emit watermark
-//! source.watermark(timestamp);
-//!
-//! // Clone for multi-producer (triggers MPSC upgrade)
-//! let source2 = source.clone();
-//! ```
+//! Source — entry point for data into a streaming pipeline.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -33,50 +6,12 @@ use std::sync::{Arc, OnceLock};
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 
-use super::channel::{channel_with_config, ChannelMode, Producer};
+use super::channel::{channel_with_config, Producer};
 use super::config::SourceConfig;
 use super::error::{StreamingError, TryPushError};
 use super::sink::Sink;
 
 /// Trait for types that can be streamed through a Source.
-///
-/// Implementations must provide:
-/// - Conversion to/from Arrow `RecordBatch`
-/// - Schema definition
-/// - Optional event time extraction
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use laminar_core::streaming::Record;
-/// use arrow::array::RecordBatch;
-/// use arrow::datatypes::{Schema, SchemaRef, Field, DataType};
-///
-/// #[derive(Clone)]
-/// struct TradeEvent {
-///     symbol: String,
-///     price: f64,
-///     timestamp: i64,
-/// }
-///
-/// impl Record for TradeEvent {
-///     fn schema() -> SchemaRef {
-///         Arc::new(Schema::new(vec![
-///             Field::new("symbol", DataType::Utf8, false),
-///             Field::new("price", DataType::Float64, false),
-///             Field::new("timestamp", DataType::Int64, false),
-///         ]))
-///     }
-///
-///     fn to_record_batch(&self) -> RecordBatch {
-///         // Convert to RecordBatch...
-///     }
-///
-///     fn event_time(&self) -> Option<i64> {
-///         Some(self.timestamp)
-///     }
-/// }
-/// ```
 pub trait Record: Send + Sized + 'static {
     /// Returns the Arrow schema for this record type.
     fn schema() -> SchemaRef;
@@ -190,31 +125,7 @@ struct SourceInner<T: Record> {
     event_time_column: OnceLock<String>,
 }
 
-/// A streaming data source.
-///
-/// Sources are the entry point for data into a streaming pipeline.
-/// They provide a type-safe interface for pushing records and control
-/// signals (watermarks).
-///
-/// ## Thread Safety
-///
-/// Sources can be cloned to create multiple producers. The first clone
-/// triggers an automatic upgrade from SPSC to MPSC mode.
-///
-/// ## Example
-///
-/// ```rust,ignore
-/// let (source, sink) = streaming::create::<MyEvent>(config);
-///
-/// // Single producer (SPSC mode)
-/// source.push(event1)?;
-///
-/// // Clone for multiple producers (MPSC mode)
-/// let source2 = source.clone();
-/// std::thread::spawn(move || {
-///     source2.push(event2)?;
-/// });
-/// ```
+/// A streaming data source. Cloneable for multi-producer use.
 pub struct Source<T: Record> {
     inner: Arc<SourceInner<T>>,
 }
@@ -223,7 +134,7 @@ impl<T: Record> Source<T> {
     /// Creates a new Source/Sink pair.
     pub(crate) fn new(config: SourceConfig) -> (Self, Sink<T>) {
         let channel_config = config.channel;
-        let (producer, consumer) = channel_with_config::<SourceMessage<T>>(channel_config.clone());
+        let (producer, consumer) = channel_with_config::<SourceMessage<T>>(&channel_config);
 
         let schema = T::schema();
 
@@ -242,14 +153,12 @@ impl<T: Record> Source<T> {
         (source, sink)
     }
 
-    /// Pushes a record to the source, blocking if necessary.
+    /// Pushes a record. Non-blocking — returns `ChannelFull` if the buffer is full.
     ///
     /// # Errors
     ///
-    /// Returns `StreamingError::ChannelClosed` if the sink has been dropped.
-    /// Returns `StreamingError::ChannelFull` if backpressure strategy is `Reject`.
+    /// Returns `StreamingError::ChannelFull` if the buffer is full or the sink was dropped.
     pub fn push(&self, record: T) -> Result<(), StreamingError> {
-        // Update watermark if record has event time
         if let Some(event_time) = record.event_time() {
             self.inner.watermark.update(event_time);
         }
@@ -263,87 +172,50 @@ impl<T: Record> Source<T> {
         Ok(())
     }
 
-    /// Tries to push a record without blocking.
+    /// Pushes a record, returning it on failure.
     ///
     /// # Errors
     ///
-    /// Returns `TryPushError` containing the record if the push failed.
+    /// Returns `TryPushError` containing the record if the channel is full.
     pub fn try_push(&self, record: T) -> Result<(), TryPushError<T>> {
-        // Update watermark if record has event time
         if let Some(event_time) = record.event_time() {
             self.inner.watermark.update(event_time);
         }
 
         self.inner
             .producer
-            .try_push(SourceMessage::Record(record))
-            .map_err(|e| match e.into_inner() {
+            .push(SourceMessage::Record(record))
+            .map_err(|msg| match msg {
                 SourceMessage::Record(r) => TryPushError {
                     value: r,
                     error: StreamingError::ChannelFull,
                 },
-                _ => unreachable!("pushed a record, got something else back"),
+                _ => unreachable!(),
             })?;
 
         self.inner.sequence.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Pushes multiple records, returning the number successfully pushed.
-    ///
-    /// Stops at the first failure. Requires `Clone` because records are cloned
-    /// before being sent.
-    ///
-    /// # Performance Warning
-    ///
-    /// **This method clones each record.** For zero-clone batch insertion,
-    /// use [`push_batch_drain`](Self::push_batch_drain) which takes ownership
-    /// via an iterator.
+    /// Pushes multiple records (cloned). Stops at the first failure.
     pub fn push_batch(&self, records: &[T]) -> usize
     where
         T: Clone,
     {
-        let mut count = 0;
-        for record in records {
-            if self.try_push(record.clone()).is_err() {
-                break;
-            }
-            count += 1;
-        }
-        count
+        self.push_batch_drain(records.iter().cloned())
     }
 
     /// Pushes records from an iterator, consuming them (zero-clone).
-    ///
-    /// Returns the number of records successfully pushed. Stops at the first
-    /// failure (channel full or closed).
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let events = vec![event1, event2, event3];
-    /// let pushed = source.push_batch_drain(events.into_iter());
-    /// ```
+    /// Stops at the first failure. Returns the number pushed.
     pub fn push_batch_drain<I>(&self, records: I) -> usize
     where
         I: IntoIterator<Item = T>,
     {
         let mut count = 0;
         for record in records {
-            // Update watermark if record has event time
-            if let Some(event_time) = record.event_time() {
-                self.inner.watermark.update(event_time);
-            }
-
-            if self
-                .inner
-                .producer
-                .try_push(SourceMessage::Record(record))
-                .is_err()
-            {
+            if self.push(record).is_err() {
                 break;
             }
-            self.inner.sequence.fetch_add(1, Ordering::Relaxed);
             count += 1;
         }
         count
@@ -424,18 +296,6 @@ impl<T: Record> Source<T> {
         self.inner.name.as_deref()
     }
 
-    /// Returns true if the source is in MPSC mode.
-    #[must_use]
-    pub fn is_mpsc(&self) -> bool {
-        self.inner.producer.is_mpsc()
-    }
-
-    /// Returns the channel mode.
-    #[must_use]
-    pub fn mode(&self) -> ChannelMode {
-        self.inner.producer.mode()
-    }
-
     /// Returns true if the sink has been dropped.
     #[must_use]
     pub fn is_closed(&self) -> bool {
@@ -490,23 +350,8 @@ impl<T: Record> Source<T> {
 }
 
 impl<T: Record> Clone for Source<T> {
-    /// Clones the source, triggering automatic SPSC → MPSC upgrade.
-    ///
-    /// # Performance Warning
-    ///
-    /// **This method allocates a new `Arc<SourceInner>`.** The first clone also
-    /// triggers an upgrade from SPSC to MPSC mode, which adds synchronization
-    /// overhead to all subsequent `push` operations.
-    ///
-    /// For maximum performance with a single producer, avoid cloning the source.
-    /// Use clones only when you genuinely need multiple producer threads.
     fn clone(&self) -> Self {
-        // Clone the producer (triggers MPSC upgrade)
         let producer = self.inner.producer.clone();
-
-        // Create new inner with cloned producer.
-        // Sequence and watermark are shared across clones so the checkpoint
-        // manager sees a single, consistent counter per logical source.
         let event_time_col = self.inner.event_time_column.get().cloned();
         let event_time_column = OnceLock::new();
         if let Some(col) = event_time_col {
@@ -529,7 +374,6 @@ impl<T: Record + std::fmt::Debug> std::fmt::Debug for Source<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Source")
             .field("name", &self.inner.name)
-            .field("mode", &self.mode())
             .field("pending", &self.pending())
             .field("capacity", &self.capacity())
             .field("watermark", &self.current_watermark())
@@ -537,26 +381,7 @@ impl<T: Record + std::fmt::Debug> std::fmt::Debug for Source<T> {
     }
 }
 
-/// Creates a new Source/Sink pair with default configuration.
-///
-/// This is the primary entry point for creating streaming pipelines.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use laminar_core::streaming;
-///
-/// let (source, sink) = streaming::create::<MyEvent>(1024);
-///
-/// // Push data
-/// source.push(event)?;
-///
-/// // Consume data
-/// let subscription = sink.subscribe();
-/// while let Some(batch) = subscription.poll() {
-///     // Process batch
-/// }
-/// ```
+/// Creates a new Source/Sink pair with the given buffer size.
 #[must_use]
 pub fn create<T: Record>(buffer_size: usize) -> (Source<T>, Sink<T>) {
     Source::new(SourceConfig::with_buffer_size(buffer_size))
@@ -613,7 +438,6 @@ mod tests {
     fn test_create_source_sink() {
         let (source, _sink) = create::<TestEvent>(1024);
 
-        assert!(!source.is_mpsc());
         assert!(!source.is_closed());
         assert_eq!(source.pending(), 0);
     }
@@ -744,16 +568,28 @@ mod tests {
     }
 
     #[test]
-    fn test_clone_upgrades_to_mpsc() {
-        let (source, _sink) = create::<TestEvent>(16);
-
-        assert!(!source.is_mpsc());
-        assert_eq!(source.mode(), ChannelMode::Spsc);
-
+    fn test_clone_multi_producer() {
+        let (source, sink) = create::<TestEvent>(16);
         let source2 = source.clone();
 
-        assert!(source.is_mpsc());
-        assert!(source2.is_mpsc());
+        source
+            .push(TestEvent {
+                id: 1,
+                value: 1.0,
+                timestamp: 1000,
+            })
+            .unwrap();
+        source2
+            .push(TestEvent {
+                id: 2,
+                value: 2.0,
+                timestamp: 2000,
+            })
+            .unwrap();
+
+        let sub = sink.subscribe();
+        assert!(sub.poll().is_some());
+        assert!(sub.poll().is_some());
     }
 
     #[test]
@@ -792,7 +628,6 @@ mod tests {
 
         let debug = format!("{source:?}");
         assert!(debug.contains("Source"));
-        assert!(debug.contains("Spsc"));
     }
 
     #[test]

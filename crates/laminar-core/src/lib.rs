@@ -1,19 +1,4 @@
-//! # `LaminarDB` Core
-//!
-//! The core streaming engine for `LaminarDB`.
-//!
-//! This crate provides:
-//! - **Operators**: Window assigners, table cache, changelog types
-//! - **Checkpoint**: Barrier protocol for consistent snapshots
-//! - **Time**: Event time processing, watermarks, and timers
-//! - **Streaming**: SPSC/MPSC channels, sources, sinks, subscriptions
-//!
-//! ## Design Principles
-//!
-//! 1. **Zero allocations on hot path** - Uses arena allocators
-//! 2. **No locks on hot path** - SPSC queues, lock-free structures
-//! 3. **Predictable latency** - < 1μs event processing
-//! 4. **CPU cache friendly** - Data structures optimized for cache locality
+//! Core streaming engine for `LaminarDB`.
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
@@ -33,7 +18,6 @@ pub mod operator;
 /// Shared Arrow IPC serialization for `RecordBatch` ↔ bytes.
 pub mod serialization;
 pub mod streaming;
-pub mod subscription;
 pub mod time;
 
 /// Distributed delta mode (multi-node coordination).

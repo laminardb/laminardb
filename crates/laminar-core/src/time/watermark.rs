@@ -1,44 +1,4 @@
-//! # Watermark Generation and Tracking
-//!
-//! Watermarks indicate event-time progress through a streaming system. They are assertions
-//! that no events with timestamps earlier than the watermark are expected to arrive.
-//!
-//! ## Watermark Generation Strategies
-//!
-//! - [`BoundedOutOfOrdernessGenerator`]: Allows events to be late by a fixed duration
-//! - [`AscendingTimestampsGenerator`]: Assumes strictly increasing timestamps (no lateness)
-//! - [`PeriodicGenerator`]: Emits watermarks at fixed wall-clock intervals
-//! - [`PunctuatedGenerator`]: Emits watermarks based on special marker events
-//!
-//! ## Multi-Source Alignment
-//!
-//! When processing multiple input streams (e.g., joins), use [`WatermarkTracker`] to
-//! track the minimum watermark across all sources.
-//!
-//! ## Idle Source Handling
-//!
-//! Sources that stop producing events can block watermark progress. The
-//! [`IdleSourceDetector`] marks sources as idle after a configurable timeout.
-//!
-//! # Example
-//!
-//! ```rust
-//! use laminar_core::time::{
-//!     WatermarkGenerator, BoundedOutOfOrdernessGenerator,
-//!     WatermarkTracker, Watermark,
-//! };
-//!
-//! // Single source with bounded out-of-orderness
-//! let mut generator = BoundedOutOfOrdernessGenerator::new(1000); // 1 second
-//! let wm = generator.on_event(5000);
-//! assert_eq!(wm, Some(Watermark::new(4000)));
-//!
-//! // Multi-source tracking
-//! let mut tracker = WatermarkTracker::new(2);
-//! tracker.update_source(0, 5000);
-//! tracker.update_source(1, 3000);
-//! assert_eq!(tracker.current_watermark(), Some(Watermark::new(3000)));
-//! ```
+//! Watermark generators and multi-source tracking.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 

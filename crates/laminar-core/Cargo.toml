@@ -66,6 +66,7 @@ tracing = { workspace = true }
 
 # NUMA topology (optional, enhanced detection)
 hwlocality = { version = "1.0.0-alpha.8", optional = true }
+crossfire = "3"
 
 # Platform-specific dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -90,10 +91,6 @@ harness = false
 
 [[bench]]
 name = "streaming_bench"
-harness = false
-
-[[bench]]
-name = "subscription_bench"
 harness = false
 
 [[bench]]

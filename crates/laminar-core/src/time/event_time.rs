@@ -1,17 +1,4 @@
-//! Event Time Extraction
-//!
-//! This module provides `EventTimeExtractor` for extracting timestamps from Arrow `RecordBatch`
-//! columns. It supports multiple timestamp formats and extraction modes for correct event-time
-//! processing in streaming windows.
-//!
-//! # Example
-//!
-//! ```ignore
-//! use laminar_core::time::{EventTimeExtractor, TimestampFormat};
-//!
-//! let mut extractor = EventTimeExtractor::from_column("event_time", TimestampFormat::UnixMillis);
-//! let timestamp = extractor.extract(&batch)?;
-//! ```
+//! Event time extraction from Arrow `RecordBatch` columns.
 
 use std::fmt;
 use std::sync::Arc;
