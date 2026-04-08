@@ -1,43 +1,4 @@
-//! `PostgreSQL` sink connector.
-//!
-//! Writes Arrow `RecordBatch` to `PostgreSQL` tables using two strategies:
-//! - **Append mode**: COPY BINARY for maximum throughput (>500K rows/sec)
-//! - **Upsert mode**: `INSERT ... ON CONFLICT DO UPDATE` with UNNEST arrays
-//!
-//! Exactly-once semantics use co-transactional offset storage — data and
-//! epoch markers committed in the same `PostgreSQL` transaction.
-//!
-//! # Architecture
-//!
-//! ```text
-//! Ring 0 (Hot Path):  SPSC push only (~5ns, zero sink code)
-//! Ring 1 (Background): Batch buffering → COPY/INSERT → transaction mgmt
-//! Ring 2 (Control):    Connection pool, table creation, epoch recovery
-//! ```
-//!
-//! # Module Structure
-//!
-//! - `sink_config` - Configuration and enums
-//! - `sink` - `PostgresSink` implementing `SinkConnector`
-//! - `sink_metrics` - Lock-free atomic metrics
-//! - `types` - Arrow → `PostgreSQL` type mapping
-//!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use laminar_connectors::postgres::{PostgresSink, PostgresSinkConfig, WriteMode};
-//!
-//! let config = PostgresSinkConfig {
-//!     hostname: "localhost".to_string(),
-//!     database: "mydb".to_string(),
-//!     table_name: "events".to_string(),
-//!     write_mode: WriteMode::Upsert,
-//!     primary_key_columns: vec!["id".to_string()],
-//!     ..Default::default()
-//! };
-//!
-//! let sink = PostgresSink::new(schema, config);
-//! ```
+//! PostgreSQL sink connector.
 
 pub mod sink;
 pub mod sink_config;

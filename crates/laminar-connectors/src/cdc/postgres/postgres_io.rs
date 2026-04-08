@@ -1,27 +1,4 @@
-//! `PostgreSQL` logical replication I/O functions.
-//!
-//! Provides low-level functions for connecting to `PostgreSQL`, managing
-//! replication slots, and parsing/encoding replication wire messages.
-//!
-//! # Architecture
-//!
-//! - **Control-plane connection** (`connect`, `ensure_replication_slot`):
-//!   Feature-gated behind `postgres-cdc`, uses `tokio-postgres` for slot
-//!   management and metadata queries.
-//! - **Replication streaming**: WAL streaming uses `pgwire-replication` which
-//!   implements the `CopyBoth` sub-protocol natively. See
-//!   `build_replication_config()` for config conversion.
-//! - **Wire format** (`parse_replication_message`, `encode_standby_status`,
-//!   `build_start_replication_query`): Always available, retained as test
-//!   utilities and protocol documentation.
-//!
-//! # Wire Format
-//!
-//! Replication messages inside `CopyData` frames:
-//!
-//! - `XLogData` (tag `w`): 25-byte header + WAL payload
-//! - `PrimaryKeepalive` (tag `k`): 18 bytes with WAL position and reply flag
-//! - `StandbyStatusUpdate` (tag `r`): 34 bytes sent from client to server
+//! PostgreSQL logical replication I/O.
 
 use super::lsn::Lsn;
 use crate::error::ConnectorError;

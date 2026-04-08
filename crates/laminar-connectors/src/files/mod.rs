@@ -1,27 +1,4 @@
-//! AutoLoader-style file source and sink connectors.
-//!
-//! Watches local directories or cloud storage for new files, infers and
-//! evolves schemas automatically, and checkpoints exactly which files have
-//! been processed.
-//!
-//! # Formats
-//!
-//! - CSV (via [`CsvDecoder`](crate::schema::CsvDecoder))
-//! - JSON Lines (via [`JsonDecoder`](crate::schema::JsonDecoder))
-//! - Plain text (via [`TextLineDecoder`](crate::files::text_decoder::TextLineDecoder))
-//! - Apache Parquet (via [`ParquetDecoder`](crate::schema::parquet::ParquetDecoder))
-//! - Arrow IPC (via [`ArrowIpcDecoder`](crate::files::arrow_ipc_codec::ArrowIpcDecoder))
-//!
-//! # Example DDL
-//!
-//! ```sql
-//! CREATE SOURCE logs (ts BIGINT, level VARCHAR, message VARCHAR)
-//! WITH (
-//!     connector = 'files',
-//!     path = '/data/logs/*.csv',
-//!     format = 'csv'
-//! );
-//! ```
+//! File source and sink connectors.
 
 use std::sync::Arc;
 

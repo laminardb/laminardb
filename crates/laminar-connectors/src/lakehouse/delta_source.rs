@@ -1,36 +1,4 @@
-//! Delta Lake source connector implementation.
-//!
-//! [`DeltaSource`] implements [`SourceConnector`], reading Arrow `RecordBatch`
-//! data from Delta Lake tables by polling for new versions.
-//!
-//! # Read Modes
-//!
-//! - **Incremental** (default): Walks versions one-by-one from `current_version + 1`
-//!   to latest, reading only the files added in each version. Correct for streaming.
-//! - **Snapshot**: Jumps to the latest version and reads the full table state.
-//!   Useful for batch-style materialization of small tables.
-//!
-//! # Polling Strategy
-//!
-//! The source maintains a `current_version` cursor. On each `poll_batch()`:
-//! 1. Drain any buffered batches from the previous load first
-//! 2. Throttle: skip version check if less than `poll_interval` since last check
-//! 3. Check if the table has a newer version than `current_version`
-//! 4. **Incremental**: read one version at a time (`current_version + 1`)
-//!    **Snapshot**: jump directly to the latest version
-//! 5. Buffer results; `current_version` only advances after the buffer is
-//!    fully drained, so checkpoint always reflects fully-consumed state
-//!
-//! # Schema Evolution Detection
-//!
-//! When a new version is loaded, the source compares the table schema against
-//! the previously known schema. On mismatch, the action is controlled by
-//! `schema.evolution.action`: `warn` (log and continue) or `error` (stop).
-//!
-//! # Checkpoint / Recovery
-//!
-//! The checkpoint stores `current_version` and `read_mode` so that on recovery
-//! the source resumes from the correct Delta Lake version.
+//! Delta Lake source connector.
 
 use std::collections::VecDeque;
 use std::sync::Arc;

@@ -1,30 +1,4 @@
-//! MySQL CDC binlog I/O integration module.
-//!
-//! This module provides the actual I/O operations for MySQL binlog replication
-//! via the `mysql_async` crate. All functions are feature-gated behind `mysql-cdc`.
-//!
-//! # Architecture
-//!
-//! The I/O module is separate from the business logic in `source.rs`
-//! to allow:
-//! - Testing business logic without a running MySQL server
-//! - Clean separation of concerns (connection management vs. event decoding)
-//! - Easy mocking for unit tests
-//!
-//! # Usage
-//!
-//! ```ignore
-//! use laminar_connectors::cdc::mysql::mysql_io;
-//!
-//! let conn = mysql_io::connect(&config).await?;
-//! let stream = mysql_io::start_binlog_stream(conn, &config, None, None).await?;
-//! let events = mysql_io::read_events(&mut stream, 100, Duration::from_secs(1)).await?;
-//! for event in events {
-//!     if let Some(msg) = mysql_io::decode_binlog_event(&event, &stream)? {
-//!         // Process BinlogMessage...
-//!     }
-//! }
-//! ```
+//! MySQL CDC binlog I/O.
 
 #[cfg(feature = "mysql-cdc")]
 use std::time::Duration;

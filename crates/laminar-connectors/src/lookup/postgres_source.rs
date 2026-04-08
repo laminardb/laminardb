@@ -1,41 +1,4 @@
-//! `PostgreSQL` lookup source implementation.
-//!
-//! Provides a `LookupSource` backed by `PostgreSQL` with connection pooling
-//! via `deadpool-postgres` and predicate pushdown support.
-//!
-//! ## Features
-//!
-//! - **Connection pooling**: Efficient connection reuse via `deadpool-postgres`
-//! - **Predicate pushdown**: Translates `Predicate` variants to SQL WHERE
-//!   clauses (except `NotEq`, which is always evaluated locally)
-//! - **Projection pushdown**: SELECT only requested columns
-//! - **Batch lookups**: `WHERE pk = ANY($1)` for single-column primary keys,
-//!   `WHERE (pk1, pk2) IN (...)` for composite keys
-//!
-//! ## Example
-//!
-//! ```rust,no_run
-//! use std::sync::Arc;
-//! use arrow_schema::{DataType, Field, Schema};
-//! use laminar_connectors::lookup::postgres_source::{
-//!     PostgresLookupSource, PostgresLookupSourceConfig,
-//! };
-//!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = PostgresLookupSourceConfig {
-//!     connection_string: "host=localhost dbname=mydb user=app".into(),
-//!     table_name: "customers".into(),
-//!     primary_key_columns: vec!["id".into()],
-//!     ..Default::default()
-//! };
-//! let schema = Arc::new(Schema::new(vec![
-//!     Field::new("id", DataType::Int64, false),
-//!     Field::new("name", DataType::Utf8, true),
-//! ]));
-//! let source = PostgresLookupSource::new(config, schema)?;
-//! # Ok(())
-//! # }
-//! ```
+//! PostgreSQL lookup source with predicate pushdown.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

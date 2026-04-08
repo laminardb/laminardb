@@ -1,37 +1,4 @@
-//! SQL DDL to Streaming API translation.
-//!
-//! This module translates parsed SQL CREATE SOURCE/SINK statements into
-//! typed streaming definitions that can be used to configure the runtime.
-//!
-//! ## Supported Syntax
-//!
-//! ```sql
-//! -- In-memory streaming source
-//! CREATE SOURCE trades (
-//!     symbol VARCHAR NOT NULL,
-//!     price DOUBLE NOT NULL,
-//!     quantity BIGINT NOT NULL,
-//!     ts TIMESTAMP NOT NULL,
-//!     WATERMARK FOR ts AS ts - INTERVAL '100' MILLISECONDS
-//! ) WITH (
-//!     buffer_size = 131072,
-//!     backpressure = 'block'
-//! );
-//!
-//! -- In-memory streaming sink
-//! CREATE SINK trade_aggregates AS
-//!     SELECT * FROM trade_stats
-//! WITH (
-//!     buffer_size = 65536
-//! );
-//! ```
-//!
-//! ## Validation
-//!
-//! - Rejects `channel = ...` option (channel type is auto-derived)
-//! - Validates buffer_size is within bounds
-//! - Validates backpressure strategy names
-//! - Validates wait_strategy names
+//! SQL DDL to streaming API translation.
 
 #[allow(clippy::disallowed_types)] // cold path: SQL translation
 use std::collections::HashMap;

@@ -1,34 +1,4 @@
 //! Channel type derivation from query plan analysis.
-//!
-//! This module analyzes query plans to automatically determine whether sources
-//! need SPSC (single consumer) or broadcast (multiple consumer) channels.
-//!
-//! # Key Principle
-//!
-//! **Users never specify broadcast mode.** The planner analyzes MVs and sources
-//! to derive the correct channel type automatically:
-//!
-//! - If a source is consumed by exactly 1 MV → SPSC (optimal)
-//! - If a source is consumed by 2+ MVs → Broadcast
-//!
-//! # Example
-//!
-//! ```sql
-//! CREATE SOURCE trades (...);
-//!
-//! CREATE MATERIALIZED VIEW vwap AS
-//!   SELECT symbol, SUM(price * volume) / SUM(volume) AS vwap
-//!   FROM trades
-//!   GROUP BY symbol, TUMBLE(ts, INTERVAL '1' MINUTE);
-//!
-//! CREATE MATERIALIZED VIEW max_price AS
-//!   SELECT symbol, MAX(price)
-//!   FROM trades
-//!   GROUP BY symbol, TUMBLE(ts, INTERVAL '1' MINUTE);
-//! ```
-//!
-//! In this example, `trades` source has 2 consumers (`vwap` and `max_price`),
-//! so the planner derives `Broadcast { consumer_count: 2 }` for `trades`.
 
 #[allow(clippy::disallowed_types)] // cold path: query planning
 use std::collections::HashMap;

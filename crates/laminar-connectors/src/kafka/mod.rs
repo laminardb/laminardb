@@ -1,42 +1,4 @@
-//! Kafka source and sink connectors for LaminarDB.
-//!
-//! Provides a `KafkaSource` that consumes from Kafka topics and
-//! produces Arrow `RecordBatch` data through the [`SourceConnector`]
-//! trait, and a `KafkaSink` that writes Arrow `RecordBatch` data
-//! to Kafka topics through the [`SinkConnector`] trait.
-//!
-//! Both connectors support JSON, CSV, Raw, Debezium, and Avro
-//! formats, with full Confluent Schema Registry integration for Avro.
-//!
-//! # Features
-//!
-//! - Per-partition offset tracking with checkpoint/restore (source)
-//! - At-least-once and exactly-once delivery (sink)
-//! - Confluent Schema Registry with caching and compatibility checking
-//! - Avro serialization/deserialization via `arrow-avro` (Confluent wire format)
-//! - Configurable partitioning: key-hash, round-robin, sticky (sink)
-//! - Backpressure control with high/low watermark hysteresis (source)
-//! - Consumer group rebalance tracking (source)
-//! - Dead letter queue for failed records (sink)
-//! - Atomic metrics counters
-//!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use laminar_connectors::kafka::{KafkaSource, KafkaSourceConfig};
-//! use laminar_connectors::kafka::{KafkaSink, KafkaSinkConfig};
-//!
-//! // Source
-//! let config = KafkaSourceConfig::from_config(&connector_config)?;
-//! let source = KafkaSource::new(schema, config);
-//!
-//! // Sink
-//! let config = KafkaSinkConfig::from_config(&connector_config)?;
-//! let sink = KafkaSink::new(schema, config);
-//! ```
-//!
-//! [`SourceConnector`]: crate::connector::SourceConnector
-//! [`SinkConnector`]: crate::connector::SinkConnector
+//! Kafka source and sink connectors.
 
 // Source modules
 pub mod avro;
@@ -56,10 +18,6 @@ pub mod sink_metrics;
 
 // Shared modules
 pub mod schema_registry;
-
-// Discovery module (requires delta feature from laminar-core)
-#[cfg(feature = "kafka-discovery")]
-pub mod discovery;
 
 // Source re-exports
 pub use avro::AvroDeserializer;
