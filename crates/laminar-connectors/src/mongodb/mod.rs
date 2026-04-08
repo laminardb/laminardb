@@ -1,4 +1,4 @@
-//! MongoDB CDC source and sink connectors.
+//! `MongoDB` CDC source and sink connectors.
 
 pub mod change_event;
 pub mod config;

@@ -1,4 +1,4 @@
-//! PostgreSQL lookup source with predicate pushdown.
+//! `PostgreSQL` lookup source with predicate pushdown.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

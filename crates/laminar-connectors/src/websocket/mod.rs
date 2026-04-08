@@ -1,4 +1,4 @@
-//! WebSocket source and sink connectors for LaminarDB.
+//! `WebSocket` source and sink connectors for `LaminarDB`.
 //!
 //! Provides four connector modes:
 //! - **Source client**: Connects to an external WebSocket server (e.g., exchange feeds)
@@ -8,7 +8,7 @@
 //!
 //! # Delivery Guarantees
 //!
-//! WebSocket is a **non-replayable** transport. Source connectors provide
+//! `WebSocket` is a **non-replayable** transport. Source connectors provide
 //! **at-most-once** or **best-effort** delivery — there are no offsets to
 //! seek to on recovery. Sink connectors optionally support a replay buffer
 //! for client-side resume, but this is bounded and best-effort.

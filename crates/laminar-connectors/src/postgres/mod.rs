@@ -1,4 +1,4 @@
-//! PostgreSQL sink connector.
+//! `PostgreSQL` sink connector.
 
 pub mod sink;
 pub mod sink_config;

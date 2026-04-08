@@ -1,4 +1,4 @@
-//! PostgreSQL logical replication I/O.
+//! `PostgreSQL` logical replication I/O.
 
 use super::lsn::Lsn;
 use crate::error::ConnectorError;

@@ -1,4 +1,4 @@
-//! PostgreSQL CDC source connector.
+//! `PostgreSQL` CDC source connector.
 
 pub mod changelog;
 pub mod config;

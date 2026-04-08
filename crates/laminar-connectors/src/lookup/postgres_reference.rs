@@ -1,4 +1,4 @@
-//! PostgreSQL poll-based reference table source.
+//! `PostgreSQL` poll-based reference table source.
 //!
 //! Implements [`ReferenceTableSource`](crate::reference::ReferenceTableSource) via a simple `SELECT * FROM table`
 //! query. No replication slot or CDC configuration required — suitable for
