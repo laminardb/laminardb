@@ -10,6 +10,12 @@ use tokio::sync::broadcast;
 use super::error::RecvError;
 use super::source::{Record, SourceMessage};
 
+enum PollResult {
+    Batch(RecordBatch),
+    Empty,
+    Closed,
+}
+
 /// A subscription to a streaming sink. Each subscriber independently receives
 /// all messages via broadcast.
 pub struct Subscription<T: Record> {
@@ -77,8 +83,10 @@ impl<T: Record> Subscription<T> {
     pub fn recv_timeout(&mut self, timeout: Duration) -> Result<RecordBatch, RecvError> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if let Some(batch) = self.poll() {
-                return Ok(batch);
+            match self.poll_or_closed() {
+                PollResult::Batch(batch) => return Ok(batch),
+                PollResult::Closed => return Err(RecvError::Disconnected),
+                PollResult::Empty => {}
             }
             if std::time::Instant::now() >= deadline {
                 return Err(RecvError::Timeout);
@@ -95,17 +103,36 @@ impl<T: Record> Subscription<T> {
     /// Returns `RecvError::Disconnected` if the source has been dropped.
     pub fn recv(&mut self) -> Result<RecordBatch, RecvError> {
         loop {
-            if let Some(batch) = self.poll() {
-                return Ok(batch);
+            match self.poll_or_closed() {
+                PollResult::Batch(batch) => return Ok(batch),
+                PollResult::Closed => return Err(RecvError::Disconnected),
+                PollResult::Empty => {}
             }
             std::thread::park_timeout(Duration::from_micros(100));
         }
     }
 
-    /// Returns true if the broadcast channel is closed (source dropped, drain done).
+    /// Internal: distinguishes empty from closed.
+    fn poll_or_closed(&mut self) -> PollResult {
+        loop {
+            match self.rx.try_recv() {
+                Ok(msg) => {
+                    if let Some(batch) = Self::message_to_batch(msg) {
+                        return PollResult::Batch(batch);
+                    }
+                    // watermark — skip, try again
+                }
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(broadcast::error::TryRecvError::Empty) => return PollResult::Empty,
+                Err(broadcast::error::TryRecvError::Closed) => return PollResult::Closed,
+            }
+        }
+    }
+
+    /// Returns true if the broadcast channel is closed.
     #[must_use]
-    pub fn is_disconnected(&self) -> bool {
-        false
+    pub fn is_disconnected(&mut self) -> bool {
+        matches!(self.poll_or_closed(), PollResult::Closed)
     }
 
     /// Polls multiple batches. Returns up to `max_count`.
