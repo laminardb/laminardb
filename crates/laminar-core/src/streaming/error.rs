@@ -69,6 +69,15 @@ impl<T> TryPushError<T> {
         }
     }
 
+    /// Creates a new error indicating the receiver was dropped.
+    #[must_use]
+    pub fn disconnected(value: T) -> Self {
+        Self {
+            value,
+            error: StreamingError::Disconnected,
+        }
+    }
+
     /// Consumes the error and returns the value that could not be pushed.
     #[must_use]
     pub fn into_inner(self) -> T {

@@ -55,9 +55,10 @@ impl<T: Send + 'static> Producer<T> {
     ///
     /// Returns `TryPushError` containing the item if the channel is full.
     pub fn try_push(&self, item: T) -> Result<(), TryPushError<T>> {
-        self.tx
-            .try_send(item)
-            .map_err(|e| TryPushError::full(e.into_inner()))
+        self.tx.try_send(item).map_err(|e| match e {
+            crossfire::TrySendError::Full(v) => TryPushError::full(v),
+            crossfire::TrySendError::Disconnected(v) => TryPushError::disconnected(v),
+        })
     }
 
     /// Returns `true` if the receiver has been dropped.
