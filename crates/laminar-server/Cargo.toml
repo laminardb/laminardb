@@ -80,8 +80,7 @@ mimalloc = { workspace = true, optional = true }
 tempfile = { workspace = true }
 
 [features]
-# Cross-platform defaults. On Linux, add `--features linux-perf` for
-# io_uring, NUMA topology, and XDP/eBPF optimizations.
+# Cross-platform defaults.
 default = [
     "jemalloc",
     "mimalloc",
@@ -122,14 +121,6 @@ parquet-lookup = ["laminar-db/parquet-lookup"]
 aws = ["laminar-db/aws"]
 gcs = ["laminar-db/gcs"]
 azure = ["laminar-db/azure"]
-# Performance features
-# Linux-only performance features (cannot be default — crates won't compile on Windows/macOS)
-io-uring = ["laminar-core/io-uring"]        # Linux 5.10+: async I/O
-hwloc = ["laminar-core/hwloc"]              # Linux/macOS: NUMA topology discovery
-# Meta-feature: enable all Linux-specific performance optimizations.
-# Recommended for production Linux deployments:
-#   cargo build --release --features linux-perf
-linux-perf = ["io-uring", "hwloc"]
 # Compile OpenSSL from source — required for musl cross-compilation where
 # system libssl-dev is not available for the target triple.
 # Delta/cluster mode: experimental multi-node support. This mode is NOT

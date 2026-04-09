@@ -3909,34 +3909,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hwlocality"
-version = "1.0.0-alpha.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f50d4312588681f6d07e6009728bf5c777e1f674d43a3ad91d15f6795a0db965"
-dependencies = [
- "arrayvec",
- "bitflags 2.10.0",
- "derive_more",
- "errno",
- "hwlocality-sys",
- "libc",
- "strum",
- "thiserror 2.0.18",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "hwlocality-sys"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d55ff554bde432473a6d17dc219a2d7fedc1be12d1e150418526f666dc9d096"
-dependencies = [
- "libc",
- "pkg-config",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "hyper"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4610,9 +4582,6 @@ dependencies = [
  "crossfire",
  "equivalent",
  "foyer",
- "hwlocality",
- "io-uring",
- "libc",
  "parking_lot 0.12.5",
  "rand 0.10.0",
  "rkyv",

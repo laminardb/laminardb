@@ -61,7 +61,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
       - name: Clippy (all features)
         run: cargo clippy --workspace --all-features --all-targets -- -D warnings
         env:
@@ -100,7 +100,7 @@ jobs:
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
 
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
@@ -115,7 +115,7 @@ jobs:
         env:
           RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
-      # Windows: explicit features (skip hwloc, io-uring)
+      # Windows: explicit features (default set, with vendored OpenSSL)
       - name: Run tests (Windows)
         if: runner.os == 'Windows'
         run: cargo nextest run --workspace --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,files,parquet-lookup"
@@ -149,7 +149,7 @@ jobs:
         with:
           key: release
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
       - name: Build release
         run: cargo build --workspace --release --all-features
         env:
@@ -172,7 +172,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
 
       - name: Check no default features
         run: cargo check --workspace --no-default-features
@@ -186,8 +186,6 @@ jobs:
         run: |
           # Core features
           cargo check -p laminar-core --no-default-features
-          cargo check -p laminar-core --features io-uring
-          cargo check -p laminar-core --features hwloc
           cargo check -p laminar-core --features delta
 
           # DB features
@@ -244,7 +242,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev mold protobuf-compiler
       - name: Build docs
         run: cargo doc --workspace --no-deps --all-features
         env:
@@ -294,9 +292,7 @@ jobs:
         run: cargo +nightly miri setup
       - name: Run Miri on core
         run: |
-          cargo +nightly miri test -p laminar-core --lib -- \
-            --skip test_tpc \
-            --skip test_io_uring
+          cargo +nightly miri test -p laminar-core --lib
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation"
         continue-on-error: true
