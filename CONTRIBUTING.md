@@ -25,9 +25,6 @@ Some feature-gated connectors need extra libs. You only need these if you're wor
 ```bash
 # Kafka (rdkafka)
 sudo apt-get install cmake pkg-config libsasl2-dev
-
-# NUMA topology (hwloc)
-sudo apt-get install libhwloc-dev
 ```
 
 ## How the project is organized
@@ -36,11 +33,11 @@ LaminarDB is a Rust workspace with 7 crates. Here's what each one does:
 
 | Crate | What it does |
 |-------|-------------|
-| **laminar-core** | The engine. Reactor, operators, state stores, DAG executor, streaming channels, checkpoint barriers. This is the hot path. |
-| **laminar-sql** | SQL parser with streaming extensions (EMIT, watermarks, windows), query planner, DataFusion integration. |
-| **laminar-storage** | WAL, incremental checkpointing, checkpoint manifests, per-core WAL segments. |
-| **laminar-connectors** | All external connectors: Kafka, PostgreSQL CDC, MySQL CDC, MongoDB CDC, Delta Lake, Iceberg, WebSocket, Parquet, files. Also the schema framework and serde layer. |
-| **laminar-db** | The main entry point. Ties everything together -- checkpoint coordination, recovery, streaming executor, FFI API. |
+| **laminar-core** | The engine. Operators, window assigners, streaming channels (crossfire), checkpoint barrier protocol, lookup tables, time/watermarks, structured error codes. |
+| **laminar-sql** | SQL parser with streaming extensions (EMIT, watermarks, windows, ASOF), query planner, DataFusion integration, custom UDFs, streaming physical optimizer, watermark filter pushdown. |
+| **laminar-storage** | Checkpoint manifests, filesystem/object-store checkpoint persistence, object-store builder. |
+| **laminar-connectors** | All external connectors: Kafka, PostgreSQL CDC, MySQL CDC, MongoDB CDC, Delta Lake, Iceberg, WebSocket, OpenTelemetry (OTLP/gRPC), files, Postgres/Parquet lookup. Also the schema framework and serde layer. |
+| **laminar-db** | The main entry point. Ties everything together -- `StreamingCoordinator` pipeline, checkpoint coordination, recovery, FFI API. |
 | **laminar-derive** | Proc macros: `Record`, `FromRecordBatch`, `FromRow`, `ConnectorConfig`. |
 | **laminar-server** | Standalone server binary with TOML config, Axum HTTP API, hot reload, Prometheus metrics. |
 
@@ -51,11 +48,15 @@ For the full architecture, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 A few common starting points:
 
 - **Connector traits**: `crates/laminar-connectors/src/connector.rs` -- `SourceConnector` and `SinkConnector`
+- **Connector registry**: `crates/laminar-connectors/src/registry.rs`
 - **Schema decoders**: `crates/laminar-connectors/src/schema/` -- JSON, CSV, Avro, Parquet
 - **SQL parser**: `crates/laminar-sql/src/parser/` -- streaming SQL extensions
-- **State stores**: `crates/laminar-core/src/state/` -- AHashMap, Mmap backends
-- **DAG operators**: `crates/laminar-core/src/dag/operators/` -- joins, windows, aggregations
-- **Checkpoint system**: `crates/laminar-core/src/checkpoint/` -- barriers, alignment
+- **Operators & window assigners**: `crates/laminar-core/src/operator/` -- windows, changelog, table cache
+- **Streaming channels**: `crates/laminar-core/src/streaming/` -- source/sink/subscription API (crossfire MPSC)
+- **Checkpoint barrier protocol**: `crates/laminar-core/src/checkpoint/`
+- **Streaming coordinator**: `crates/laminar-db/src/pipeline/streaming_coordinator.rs`
+- **Checkpoint coordinator**: `crates/laminar-db/src/checkpoint_coordinator.rs`
+- **Recovery manager**: `crates/laminar-db/src/recovery_manager.rs`
 - **Server HTTP API**: `crates/laminar-server/src/http.rs` -- REST endpoints
 - **FFI layer**: `crates/laminar-db/src/ffi/` -- C bindings for language interop
 - **Feature tracking**: `docs/features/INDEX.md` -- what's done, what's not
@@ -76,6 +77,7 @@ Most connectors are behind feature flags so the default build stays fast. Here a
 | `websocket` | WebSocket source and sink |
 | `files` | File source and sink (AutoLoader-style) |
 | `parquet-lookup` | Parquet file lookup table source |
+| `otel` | OpenTelemetry OTLP/gRPC source (traces, metrics, logs) |
 | `ffi` | C FFI layer and Arrow C Data Interface |
 | `delta` | Distributed delta mode (Raft, gossip, gRPC) |
 
@@ -88,24 +90,23 @@ cargo test --all --features postgres-cdc,postgres-sink
 
 ## The hot path rules
 
-If you're touching code in `laminar-core` that runs on the event processing path (Ring 0), there are some strict rules:
+If you're touching operator code in `laminar-core` (the event-processing path executed each pipeline cycle), there are some strict rules:
 
-- **No heap allocations.** Use pre-allocated buffers, SmallVec, arena allocators.
-- **No locks.** SPSC queues for inter-ring communication. No Mutex, no RwLock.
-- **No system calls.** No println!, no file I/O, no network calls on the hot path.
+- **Minimize heap allocations.** Use pre-allocated buffers, SmallVec, and shared state maps. Per-event allocation destroys throughput.
+- **No locks on the cycle path.** State is owned by the coordinator task; use lock-free or atomic types if cross-thread sharing is required.
+- **No blocking system calls.** No `println!`, no file I/O, no network calls inside an execute cycle. Push I/O to the source/sink tokio tasks or to background checkpoint threads.
 - **`// SAFETY:` comments** on every `unsafe` block. No exceptions.
 
-If you're not sure whether your code is on the hot path, it probably isn't. The hot path is the reactor loop in `laminar-core` -- most contributions (connectors, SQL, storage) run in Ring 1 where these rules don't apply.
+If you're not sure whether your code is on the hot path, it probably isn't. The hot path is the `StreamingCoordinator` → `PipelineCallback::execute_cycle()` path running on the dedicated `laminar-compute` thread. Most contributions (connectors, SQL planning, storage) run on the main tokio runtime where these rules don't apply.
 
 Run benchmarks before and after if you're touching performance-sensitive code:
 
 ```bash
-cargo bench --bench state_bench       # State store lookups (<500ns target)
 cargo bench --bench latency_bench     # End-to-end event latency (<10us target)
 cargo bench --bench streaming_bench   # Throughput per core (500K events/sec target)
 ```
 
-There are 13 benchmark suites across the workspace -- see `crates/*/benches/` for the full list.
+Benchmark suites live under `crates/*/benches/` -- see each crate for the full list.
 
 ## Running tests
 
@@ -126,7 +127,7 @@ cargo test --all --features kafka,postgres-cdc,mysql-cdc
 cargo bench --bench dag_bench
 ```
 
-We have ~4,400 tests across the workspace. If you're adding new functionality, please add tests. If you're fixing a bug, a regression test is always welcome.
+We have ~2,700 tests across the workspace. If you're adding new functionality, please add tests. If you're fixing a bug, a regression test is always welcome.
 
 ## Code style
 

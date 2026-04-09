@@ -53,7 +53,7 @@ See the [Configuration Reference](https://laminardb.io/docs/) for every field, o
 
 ```toml
 [server]
-mode = "embedded"           # "embedded" (single-node) or "delta" (multi-node, planned)
+mode = "embedded"           # "embedded" (single-node) or "delta" (multi-node scaffolding, not production-hardened)
 bind = "0.0.0.0:8080"       # HTTP API bind address
 workers = 0                 # 0 = auto-detect CPU count
 log_level = "info"
@@ -123,6 +123,7 @@ format = "json"
 | POST | `/api/v1/sql` | Execute ad-hoc SQL (`{"sql": "..."}`) |
 | POST | `/api/v1/reload` | Hot-reload configuration |
 | GET | `/api/v1/cluster` | Cluster status (delta mode only) |
+| GET | `/ws/{name}` | WebSocket upgrade for push-based subscriptions to a stream |
 
 ## Hot Reload
 

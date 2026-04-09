@@ -1,0 +1,39 @@
+# LaminarDB
+
+> LaminarDB is an open-source streaming SQL engine written in Rust. It runs continuous SQL queries over event streams using Apache Arrow and DataFusion. It can be embedded in Rust or Python applications or run as a standalone server. Licensed Apache 2.0. Current version: 0.20.0.
+
+LaminarDB evaluates SQL queries continuously as events arrive. It supports tumbling, sliding, hopping, and session windows; ASOF, temporal, temporal probe, interval, and lookup joins; EMIT clauses (ON WATERMARK, ON WINDOW CLOSE, PERIODICALLY, CHANGES, FINAL); watermarks with ALLOW LATENESS; and late data routing via LATE DATA TO.
+
+The engine runs on a dedicated single-threaded tokio runtime called the StreamingCoordinator, fed by crossfire MPSC channels from source tasks. The data path avoids allocations, locks, and syscalls. Exactly-once sinks use barrier checkpoints with two-phase commit. State and offsets are persisted to object stores (file, S3, Azure, GCS).
+
+LaminarDB is pre-1.0. Single-node embedded and standalone server deployments are stable. Multi-node cluster mode is on the roadmap but not yet functional.
+
+## Documentation
+
+- [README](https://raw.githubusercontent.com/laminardb/laminardb/main/README.md): Project overview, install, and quick start
+- [Architecture](https://raw.githubusercontent.com/laminardb/laminardb/main/docs/ARCHITECTURE.md): System design and execution model
+- [SQL Reference](https://raw.githubusercontent.com/laminardb/laminardb/main/docs/SQL_REFERENCE.md): Streaming SQL syntax reference
+- [Roadmap](https://raw.githubusercontent.com/laminardb/laminardb/main/docs/ROADMAP.md): Phase timeline and feature status
+- [Benchmarks](https://raw.githubusercontent.com/laminardb/laminardb/main/docs/BENCHMARKS.md): Criterion benchmark results
+- [Contributing](https://raw.githubusercontent.com/laminardb/laminardb/main/CONTRIBUTING.md): Contribution guide and hot-path constraints
+- [Changelog](https://raw.githubusercontent.com/laminardb/laminardb/main/CHANGELOG.md): Release history
+
+## Connectors
+
+- [Connectors overview](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-connectors/README.md): Kafka, CDC (PostgreSQL, MySQL, MongoDB), Delta Lake, Iceberg, OpenTelemetry, WebSocket, files, lookups
+
+## Crates
+
+- [laminar-core](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-core/README.md): Operators, windows, streaming channels, checkpoint barriers
+- [laminar-sql](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-sql/README.md): SQL parser, planner, DataFusion integration, temporal probe translator
+- [laminar-storage](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-storage/README.md): Checkpoint manifest and store, object store builder
+- [laminar-db](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-db/README.md): Unified facade, StreamingCoordinator, recovery, checkpoint coordinator
+- [laminar-server](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-server/README.md): HTTP and WebSocket server binary
+- [laminar-derive](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-derive/README.md): Procedural macros for typed records
+
+## Optional
+
+- [GitHub repository](https://github.com/laminardb/laminardb): Source code
+- [Crates.io: laminar-db](https://crates.io/crates/laminar-db): Rust crate
+- [Website](https://laminardb.io): Landing page
+- [Configuration reference](https://laminardb.io/docs/): Server and connector configuration

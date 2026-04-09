@@ -19,7 +19,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     pkg-config \
     libssl-dev \
-    libhwloc-dev \
     libelf-dev \
     zlib1g-dev \
     libcurl4-openssl-dev \

@@ -12,7 +12,7 @@ Streaming SQL extensions on top of sqlparser-rs: tumbling windows, session windo
 |--------|---------|
 | `parser` | Streaming SQL parser: windows, emit, late data, joins, aggregation, analytics, ranking, DDL (CREATE SOURCE/STREAM/SINK/LOOKUP TABLE) |
 | `planner` | `StreamingPlanner` converts parsed SQL into `StreamingPlan` / `QueryPlan` |
-| `translator` | Operator config builders: window, join, analytic, order, having, DDL, ASOF join |
+| `translator` | Operator config builders: window, join, analytic, order, having, DDL, ASOF join, temporal probe join |
 | `datafusion` | DataFusion integration: custom UDFs (tumble, hop, session, slide, first_value, last_value), aggregate bridge, `execute_streaming_sql`, watermark filter pushdown, PROCTIME() UDF, JSON functions, complex type functions |
 | `error` | User-friendly DataFusion error translation with `LDB-NNNN` codes |
 
@@ -46,7 +46,8 @@ SELECT ... FROM orders ASOF JOIN trades ON o.symbol = t.symbol AND o.ts >= t.ts
 CREATE LOOKUP TABLE instruments FROM POSTGRES (...)
 
 -- Late data handling
-SELECT ... ALLOWED_LATENESS INTERVAL '10' SECOND
+SELECT ... ALLOW LATENESS INTERVAL '10' SECOND
+SELECT ... LATE DATA TO <side_output_sink>
 
 -- Window functions
 SELECT ..., LAG(price, 1) OVER (PARTITION BY symbol ORDER BY ts) FROM trades
@@ -87,7 +88,7 @@ The `StreamingPhysicalValidator` rule catches invalid physical plans (e.g., Sort
 
 ## Watermark Filter Pushdown
 
-The `WatermarkDynamicFilter` pushes `ts >= watermark` predicates down to `StreamingScanExec` so late rows are dropped before expression evaluation. Uses shared `Arc<AtomicI64>` for zero-copy watermark updates from Ring 0.
+The `WatermarkDynamicFilter` pushes `ts >= watermark` predicates down to `StreamingScanExec` so late rows are dropped before expression evaluation. Uses shared `Arc<AtomicI64>` for zero-copy watermark updates from the coordinator.
 
 ## Public API
 
