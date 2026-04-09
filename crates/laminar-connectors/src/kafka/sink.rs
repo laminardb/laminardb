@@ -1,30 +1,4 @@
-//! Kafka sink connector implementation.
-//!
-//! [`KafkaSink`] implements the [`SinkConnector`] trait, writing Arrow
-//! `RecordBatch` data to Kafka topics via rdkafka's `FutureProducer`.
-//! Supports at-least-once (idempotent) and exactly-once (transactional)
-//! delivery, configurable partitioning, and dead-letter queue routing.
-//!
-//! # Exactly-once architecture
-//!
-//! Recovery uses the checkpoint **manifest** as the authoritative source of
-//! committed offsets — NOT broker consumer group state. Broker-committed
-//! offsets are advisory only (for monitoring via `kafka-consumer-groups`).
-//!
-//! `send_offsets_to_transaction()` is intentionally NOT wired. It would add
-//! cross-connector plumbing complexity for zero correctness benefit: the
-//! manifest is what recovery reads, not the broker consumer group.
-//!
-//! The 2PC protocol is:
-//! 1. `pre_commit()` / `flush()` — ensure all records are delivered to brokers
-//! 2. Manifest persist — checkpoint coordinator writes the epoch to storage
-//! 3. `commit_transaction()` — atomically commit the Kafka transaction
-//!
-//! **Known window**: a crash between `commit_transaction()` success and the
-//! manifest status update to `Committed` will cause the next recovery to
-//! replay the epoch (at-least-once for that window). This is the classic
-//! 2PC coordinator crash problem; `send_offsets_to_transaction` does not
-//! fix it.
+//! Kafka sink connector.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

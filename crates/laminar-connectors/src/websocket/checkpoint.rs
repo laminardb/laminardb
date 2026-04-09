@@ -1,6 +1,6 @@
-//! WebSocket source checkpoint types.
+//! `WebSocket` source checkpoint types.
 //!
-//! WebSocket is non-replayable -- checkpoints capture state for best-effort recovery.
+//! `WebSocket` is non-replayable -- checkpoints capture state for best-effort recovery.
 //! On recovery, data gaps should be expected and logged.
 
 use serde::{Deserialize, Serialize};

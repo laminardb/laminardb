@@ -88,8 +88,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        drain_subs(&vwap_subs, &mut state.vwap, |r| r.symbol.clone());
-        drain_subs(&signal_subs, &mut state.signals, |r| r.symbol.clone());
+        drain_subs(&mut vwap_subs, &mut state.vwap, |r| r.symbol.clone());
+        drain_subs(&mut signal_subs, &mut state.signals, |r| r.symbol.clone());
 
         let m = db.metrics();
         state.total_events = m.total_events_ingested;
@@ -114,11 +114,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn drain_subs<T: Clone + FromBatch>(
-    subs: &[TypedSubscription<T>],
+    subs: &mut [TypedSubscription<T>],
     map: &mut HashMap<String, T>,
     key_fn: fn(&T) -> String,
 ) {
-    for sub in subs {
+    for sub in subs.iter_mut() {
         for _ in 0..64 {
             match sub.poll() {
                 Some(rows) => {

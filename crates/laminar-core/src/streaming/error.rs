@@ -1,7 +1,4 @@
-//! Streaming API error types.
-//!
-//! This module defines error types for the streaming API including
-//! source, sink, and channel operations.
+//! Streaming error types.
 
 use std::fmt;
 
@@ -72,25 +69,13 @@ impl<T> TryPushError<T> {
         }
     }
 
-    /// Creates a new error indicating the channel is closed.
+    /// Creates a new error indicating the receiver was dropped.
     #[must_use]
-    pub fn closed(value: T) -> Self {
+    pub fn disconnected(value: T) -> Self {
         Self {
             value,
-            error: StreamingError::ChannelClosed,
+            error: StreamingError::Disconnected,
         }
-    }
-
-    /// Returns true if the error is due to a full channel.
-    #[must_use]
-    pub fn is_full(&self) -> bool {
-        matches!(self.error, StreamingError::ChannelFull)
-    }
-
-    /// Returns true if the error is due to a closed channel.
-    #[must_use]
-    pub fn is_closed(&self) -> bool {
-        matches!(self.error, StreamingError::ChannelClosed)
     }
 
     /// Consumes the error and returns the value that could not be pushed.
@@ -154,14 +139,7 @@ mod tests {
     #[test]
     fn test_try_push_error() {
         let err = TryPushError::full(42);
-        assert!(err.is_full());
-        assert!(!err.is_closed());
         assert_eq!(err.into_inner(), 42);
-
-        let err = TryPushError::closed("test");
-        assert!(!err.is_full());
-        assert!(err.is_closed());
-        assert_eq!(err.into_inner(), "test");
     }
 
     #[test]

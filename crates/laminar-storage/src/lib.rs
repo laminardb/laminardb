@@ -1,15 +1,4 @@
-//! # `LaminarDB` Storage
-//!
-//! Checkpoint persistence and object store integration for `LaminarDB`.
-//!
-//! ## Module Overview
-//!
-//! - [`checkpoint_manifest`]: Unified checkpoint manifest types
-//! - [`checkpoint_store`]: Checkpoint persistence trait and implementations
-//! - [`object_store_builder`]: Factory for cloud/local object store backends
-//!
-//! **Note:** Lakehouse sinks (Delta Lake, Iceberg) are in `laminar-connectors` crate,
-//! not here. This crate handles `LaminarDB`'s internal durability, not external storage formats.
+//! Checkpoint persistence and object store integration.
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]

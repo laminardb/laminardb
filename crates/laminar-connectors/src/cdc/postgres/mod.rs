@@ -1,36 +1,4 @@
-//! PostgreSQL CDC source connector.
-//!
-//! Streams row-level changes from PostgreSQL using logical replication
-//! (pgoutput plugin). Supports INSERT, UPDATE, DELETE operations with
-//! Z-set changelog integration.
-//!
-//! # Architecture
-//!
-//! ```text
-//! Ring 0 (Hot Path):  SPSC pop only (~5ns, zero CDC code)
-//! Ring 1 (Background): WAL consumption → pgoutput decode → Arrow conversion
-//! Ring 2 (Control):    Slot management, schema discovery, health checks
-//! ```
-//!
-//! # Module Structure
-//!
-//! - `config` - Connection and replication configuration
-//! - `lsn` - Log Sequence Number type
-//! - `types` - PostgreSQL OID to Arrow type mapping
-//! - `decoder` - pgoutput binary protocol parser
-//! - `schema` - Relation (table) schema cache
-//! - `changelog` - Z-set change event conversion
-//! - `metrics` - Lock-free atomic CDC metrics
-//! - `source` - `PostgresCdcSource` implementing `SourceConnector`
-//!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use laminar_connectors::cdc::postgres::{PostgresCdcSource, PostgresCdcConfig};
-//!
-//! let config = PostgresCdcConfig::new("localhost", "mydb", "laminar_slot", "laminar_pub");
-//! let mut source = PostgresCdcSource::new(config);
-//! ```
+//! `PostgreSQL` CDC source connector.
 
 pub mod changelog;
 pub mod config;

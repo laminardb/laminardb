@@ -1,44 +1,4 @@
 //! Async FFI callbacks for push-based notifications.
-//!
-//! Provides callback-based APIs for subscriptions where the database notifies
-//! the caller when new data arrives, rather than requiring polling.
-//!
-//! # Thread Safety
-//!
-//! - Callbacks are invoked from a background thread
-//! - Callbacks for a single subscription are serialized (never concurrent)
-//! - After `laminar_subscription_cancel()` returns, no more callbacks will fire
-//!
-//! # Example
-//!
-//! ```c
-//! #include "laminar.h"
-//!
-//! void on_data(void* ctx, LaminarRecordBatch* batch, int32_t event_type) {
-//!     // Process the batch...
-//!     laminar_batch_free(batch);  // Must free
-//! }
-//!
-//! void on_error(void* ctx, int32_t code, const char* msg) {
-//!     fprintf(stderr, "Error %d: %s\n", code, msg);
-//! }
-//!
-//! int main() {
-//!     LaminarConnection* conn;
-//!     laminar_open(&conn);
-//!
-//!     LaminarSubscriptionHandle* sub;
-//!     laminar_subscribe_callback(conn, "SELECT * FROM trades",
-//!                                on_data, on_error, NULL, &sub);
-//!
-//!     // Callbacks fire in background...
-//!     sleep(60);
-//!
-//!     laminar_subscription_cancel(sub);
-//!     laminar_subscription_free(sub);
-//!     laminar_close(conn);
-//! }
-//! ```
 
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::atomic::{AtomicBool, Ordering};

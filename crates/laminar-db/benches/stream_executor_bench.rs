@@ -71,7 +71,7 @@ impl laminar_db::FromBatch for RowCount {
 
 /// Wait for at least one output batch on the given stream (with timeout).
 fn wait_for_output(db: &LaminarDB, stream: &str, timeout: Duration) {
-    let sub = db.subscribe::<RowCount>(stream).unwrap();
+    let mut sub = db.subscribe::<RowCount>(stream).unwrap();
     let _ = sub.recv_timeout(timeout);
 }
 

@@ -1,20 +1,4 @@
-//! # Sliding (Hopping) Window Assigner
-//!
-//! Fixed-size, overlapping windows with a configurable slide interval.
-//!
-//! ## Example
-//!
-//! ```rust
-//! use laminar_core::operator::sliding_window::SlidingWindowAssigner;
-//! use std::time::Duration;
-//!
-//! // 10-second windows sliding every 5 seconds
-//! let assigner = SlidingWindowAssigner::new(
-//!     Duration::from_secs(10),
-//!     Duration::from_secs(5),
-//! );
-//! assert_eq!(assigner.windows_per_event(), 2);
-//! ```
+//! Sliding (hopping) window assigner.
 
 use super::window::{WindowAssigner, WindowId, WindowIdVec};
 use std::time::Duration;

@@ -132,8 +132,7 @@ impl<T: FromBatch> TypedSubscription<T> {
     }
 
     /// Non-blocking poll for the next batch.
-    #[must_use]
-    pub fn poll(&self) -> Option<Vec<T>> {
+    pub fn poll(&mut self) -> Option<Vec<T>> {
         self.inner.poll().map(|batch| T::from_batch_all(&batch))
     }
 
@@ -141,7 +140,7 @@ impl<T: FromBatch> TypedSubscription<T> {
     ///
     /// # Errors
     /// Returns `RecvError` if the channel is closed.
-    pub fn recv(&self) -> Result<Vec<T>, laminar_core::streaming::RecvError> {
+    pub fn recv(&mut self) -> Result<Vec<T>, laminar_core::streaming::RecvError> {
         self.inner.recv().map(|batch| T::from_batch_all(&batch))
     }
 
@@ -150,7 +149,7 @@ impl<T: FromBatch> TypedSubscription<T> {
     /// # Errors
     /// Returns `RecvError` on timeout or closed channel.
     pub fn recv_timeout(
-        &self,
+        &mut self,
         timeout: Duration,
     ) -> Result<Vec<T>, laminar_core::streaming::RecvError> {
         self.inner
@@ -159,7 +158,7 @@ impl<T: FromBatch> TypedSubscription<T> {
     }
 
     /// Callback-based drain. Return `false` from `f` to stop.
-    pub fn poll_each<F: FnMut(T) -> bool>(&self, max_batches: usize, mut f: F) -> usize {
+    pub fn poll_each<F: FnMut(T) -> bool>(&mut self, max_batches: usize, mut f: F) -> usize {
         let mut count = 0;
         for _ in 0..max_batches {
             match self.inner.poll() {

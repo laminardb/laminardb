@@ -1806,6 +1806,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
+name = "crossfire"
+version = "3.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0042e53977a94d5d10de04ce7eb6016aa212c08e83ea202f7a9f102ff104303"
+dependencies = [
+ "crossbeam-utils",
+ "futures-core",
+ "parking_lot 0.12.5",
+ "smallvec",
+]
+
+[[package]]
 name = "crossterm"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4517,7 +4529,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-connectors"
-version = "0.19.12"
+version = "0.20.0"
 dependencies = [
  "arrow-array",
  "arrow-avro",
@@ -4582,7 +4594,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-core"
-version = "0.19.12"
+version = "0.20.0"
 dependencies = [
  "arrayvec",
  "arrow",
@@ -4595,6 +4607,7 @@ dependencies = [
  "chitchat",
  "chrono",
  "criterion",
+ "crossfire",
  "equivalent",
  "foyer",
  "hwlocality",
@@ -4620,7 +4633,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-db"
-version = "0.19.12"
+version = "0.20.0"
 dependencies = [
  "ahash",
  "arrow",
@@ -4653,7 +4666,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-derive"
-version = "0.19.12"
+version = "0.20.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4667,7 +4680,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-server"
-version = "0.19.12"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -4704,7 +4717,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-sql"
-version = "0.19.12"
+version = "0.20.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4730,7 +4743,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-storage"
-version = "0.19.12"
+version = "0.20.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

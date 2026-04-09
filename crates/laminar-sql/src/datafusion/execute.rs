@@ -1,26 +1,4 @@
-//! End-to-end streaming SQL execution
-//!
-//! Provides [`execute_streaming_sql`] for parsing, planning, and executing
-//! streaming SQL statements through the `DataFusion` engine.
-//!
-//! # Architecture
-//!
-//! ```text
-//! SQL string
-//!     │
-//!     ▼
-//! parse_streaming_sql()  →  StreamingStatement
-//!     │
-//!     ▼
-//! StreamingPlanner::plan()  →  StreamingPlan
-//!     │
-//!     ├─ DDL (CREATE SOURCE/SINK)  →  DdlResult
-//!     │
-//!     ├─ Query (windows/joins)     →  LogicalPlan → DataFrame → stream
-//!     │                                + QueryPlan metadata
-//!     │
-//!     └─ Standard SQL              →  DataFusion ctx.sql() → stream
-//! ```
+//! Streaming SQL execution via DataFusion.
 
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;

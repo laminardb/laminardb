@@ -98,7 +98,7 @@ pub struct SourceEntry {
 }
 
 impl SourceEntry {
-    /// Push a batch to both the SPSC channel and the snapshot ring.
+    /// Push a batch to both the channel and the snapshot ring.
     pub(crate) fn push_and_buffer(
         &self,
         batch: RecordBatch,
@@ -178,9 +178,11 @@ impl SourceCatalog {
         let buf_size = buffer_size.unwrap_or(self.default_buffer_size);
         let bp = backpressure.unwrap_or(self.default_backpressure);
 
+        // Channel buffer is at least 1024 to avoid blocking on small snapshot rings.
+        let channel_buf = buf_size.max(1024);
         let config = SourceConfig {
             channel: streaming::ChannelConfig {
-                buffer_size: buf_size,
+                buffer_size: channel_buf,
                 backpressure: bp,
                 wait_strategy: WaitStrategy::SpinYield,
                 track_stats: false,
@@ -382,16 +384,16 @@ mod tests {
         ]))
     }
 
-    #[test]
-    fn test_register_source() {
+    #[tokio::test]
+    async fn test_register_source() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         let result = catalog.register_source("test", test_schema(), None, None, None, None);
         assert!(result.is_ok());
         assert!(catalog.get_source("test").is_some());
     }
 
-    #[test]
-    fn test_register_duplicate_source() {
+    #[tokio::test]
+    async fn test_register_duplicate_source() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         catalog
             .register_source("test", test_schema(), None, None, None, None)
@@ -403,8 +405,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_drop_source() {
+    #[tokio::test]
+    async fn test_drop_source() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         catalog
             .register_source("test", test_schema(), None, None, None, None)
@@ -413,8 +415,8 @@ mod tests {
         assert!(catalog.get_source("test").is_none());
     }
 
-    #[test]
-    fn test_list_sources() {
+    #[tokio::test]
+    async fn test_list_sources() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         catalog
             .register_source("a", test_schema(), None, None, None, None)
@@ -427,15 +429,15 @@ mod tests {
         assert_eq!(names, vec!["a", "b"]);
     }
 
-    #[test]
-    fn test_register_sink() {
+    #[tokio::test]
+    async fn test_register_sink() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         assert!(catalog.register_sink("output", "events").is_ok());
         assert_eq!(catalog.list_sinks(), vec!["output"]);
     }
 
-    #[test]
-    fn test_register_query() {
+    #[tokio::test]
+    async fn test_register_query() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         let id = catalog.register_query("SELECT * FROM events");
         assert_eq!(id, 1);
@@ -444,8 +446,8 @@ mod tests {
         assert!(queries[0].2); // active
     }
 
-    #[test]
-    fn test_deactivate_query() {
+    #[tokio::test]
+    async fn test_deactivate_query() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         let id = catalog.register_query("SELECT * FROM events");
         catalog.deactivate_query(id);
@@ -453,8 +455,8 @@ mod tests {
         assert!(!queries[0].2); // inactive
     }
 
-    #[test]
-    fn test_describe_source() {
+    #[tokio::test]
+    async fn test_describe_source() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         let schema = test_schema();
         catalog
@@ -465,8 +467,8 @@ mod tests {
         assert_eq!(result.unwrap().fields().len(), 2);
     }
 
-    #[test]
-    fn test_or_replace() {
+    #[tokio::test]
+    async fn test_or_replace() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         catalog
             .register_source("test", test_schema(), None, None, None, None)
@@ -482,8 +484,8 @@ mod tests {
         assert_eq!(entry.watermark_column, Some("ts".to_string()));
     }
 
-    #[test]
-    fn test_push_and_buffer_snapshot() {
+    #[tokio::test]
+    async fn test_push_and_buffer_snapshot() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         let schema = test_schema();
         let entry = catalog
@@ -505,9 +507,9 @@ mod tests {
         assert_eq!(snap[0].num_rows(), 1);
     }
 
-    #[test]
-    fn test_buffer_capacity_drops_oldest() {
-        // Use a small buffer size so we can test overflow
+    #[tokio::test]
+    async fn test_buffer_capacity_drops_oldest() {
+        // SnapshotRing capacity=2; channel gets a larger buffer so pushes don't block.
         let catalog = SourceCatalog::new(2, BackpressureStrategy::DropOldest);
         let schema = test_schema();
         let entry = catalog
@@ -528,7 +530,7 @@ mod tests {
         }
 
         let snap = entry.snapshot();
-        // buffer_capacity=2, so only the last 2 batches should remain
+        // SnapshotRing capacity=2, so only the last 2 batches remain
         assert_eq!(snap.len(), 2);
         let col = snap[0]
             .column(0)
