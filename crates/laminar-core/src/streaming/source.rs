@@ -56,7 +56,7 @@ pub(crate) enum SourceMessage<T> {
     Batch(RecordBatch),
 
     /// A watermark timestamp.
-    Watermark(i64),
+    Watermark(#[allow(dead_code)] i64),
 }
 
 /// Shared state for watermark tracking.

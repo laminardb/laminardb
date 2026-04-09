@@ -14,4 +14,4 @@ pub use config::{BackpressureStrategy, ChannelConfig, SourceConfig, WaitStrategy
 pub use error::{RecvError, StreamingError, TryPushError};
 pub use sink::Sink;
 pub use source::{create, create_with_config, Record, Source};
-pub use subscription::{Subscription, SubscriptionMessage};
+pub use subscription::Subscription;

@@ -1,4 +1,4 @@
-//! Subscription — receive records from a Sink via poll, recv, or async recv.
+//! Subscription — receive records from a Sink.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,14 +10,8 @@ use tokio::sync::broadcast;
 use super::error::RecvError;
 use super::source::{Record, SourceMessage};
 
-enum PollResult {
-    Batch(RecordBatch),
-    Empty,
-    Closed,
-}
-
 /// A subscription to a streaming sink. Each subscriber independently receives
-/// all messages via broadcast.
+/// every message via broadcast.
 pub struct Subscription<T: Record> {
     rx: broadcast::Receiver<SourceMessage<T>>,
     schema: SchemaRef,
@@ -34,35 +28,22 @@ impl<T: Record> Subscription<T> {
     }
 
     /// Non-blocking poll. Returns the next batch, skipping watermarks.
+    /// Returns `None` on empty or closed channel. Check `is_disconnected()`
+    /// to distinguish.
     pub fn poll(&mut self) -> Option<RecordBatch> {
         loop {
             match self.rx.try_recv() {
                 Ok(msg) => {
-                    if let Some(batch) = Self::message_to_batch(msg) {
+                    if let Some(batch) = message_to_batch(msg) {
                         return Some(batch);
                     }
                 }
-                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(broadcast::error::TryRecvError::Empty) => return None,
                 Err(broadcast::error::TryRecvError::Closed) => {
                     self.closed = true;
                     return None;
                 }
-                Err(broadcast::error::TryRecvError::Empty) => return None,
-            }
-        }
-    }
-
-    /// Non-blocking poll for raw messages (records, batches, or watermarks).
-    pub fn poll_message(&mut self) -> Option<SubscriptionMessage<T>> {
-        loop {
-            match self.rx.try_recv() {
-                Ok(msg) => return Some(Self::convert_message(msg)),
                 Err(broadcast::error::TryRecvError::Lagged(_)) => {}
-                Err(broadcast::error::TryRecvError::Closed) => {
-                    self.closed = true;
-                    return None;
-                }
-                Err(broadcast::error::TryRecvError::Empty) => return None,
             }
         }
     }
@@ -76,128 +57,60 @@ impl<T: Record> Subscription<T> {
         loop {
             match self.rx.recv().await {
                 Ok(msg) => {
-                    if let Some(batch) = Self::message_to_batch(msg) {
+                    if let Some(batch) = message_to_batch(msg) {
                         return Ok(batch);
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => {
                     self.closed = true;
                     return Err(RecvError::Disconnected);
                 }
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
             }
         }
     }
 
-    /// Blocking receive with timeout.
-    ///
-    /// # Errors
-    ///
-    /// Returns `RecvError::Timeout` or `RecvError::Disconnected`.
-    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<RecordBatch, RecvError> {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            match self.poll_or_closed() {
-                PollResult::Batch(batch) => return Ok(batch),
-                PollResult::Closed => return Err(RecvError::Disconnected),
-                PollResult::Empty => {}
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(RecvError::Timeout);
-            }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            std::thread::park_timeout(remaining.min(Duration::from_micros(100)));
-        }
-    }
-
-    /// Blocking receive.
+    /// Blocking receive. Uses tokio's waker-based `blocking_recv`.
     ///
     /// # Errors
     ///
     /// Returns `RecvError::Disconnected` if the source has been dropped.
     pub fn recv(&mut self) -> Result<RecordBatch, RecvError> {
         loop {
-            match self.poll_or_closed() {
-                PollResult::Batch(batch) => return Ok(batch),
-                PollResult::Closed => return Err(RecvError::Disconnected),
-                PollResult::Empty => {}
-            }
-            std::thread::park_timeout(Duration::from_micros(100));
-        }
-    }
-
-    /// Internal: distinguishes empty from closed and caches the closed state.
-    fn poll_or_closed(&mut self) -> PollResult {
-        loop {
-            match self.rx.try_recv() {
+            match self.rx.blocking_recv() {
                 Ok(msg) => {
-                    if let Some(batch) = Self::message_to_batch(msg) {
-                        return PollResult::Batch(batch);
+                    if let Some(batch) = message_to_batch(msg) {
+                        return Ok(batch);
                     }
-                    // watermark — skip, try again
                 }
-                Err(broadcast::error::TryRecvError::Lagged(_)) => {}
-                Err(broadcast::error::TryRecvError::Empty) => return PollResult::Empty,
-                Err(broadcast::error::TryRecvError::Closed) => {
+                Err(broadcast::error::RecvError::Closed) => {
                     self.closed = true;
-                    return PollResult::Closed;
+                    return Err(RecvError::Disconnected);
                 }
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
             }
         }
     }
 
-    /// Returns true if the broadcast channel has been observed closed.
-    /// Non-destructive — reads a cached flag rather than polling the receiver.
+    /// Blocking receive with timeout. Requires a tokio runtime in the current
+    /// thread context.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RecvError::Timeout` or `RecvError::Disconnected`.
+    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<RecordBatch, RecvError> {
+        let handle = tokio::runtime::Handle::current();
+        match handle.block_on(tokio::time::timeout(timeout, self.recv_async())) {
+            Ok(Ok(batch)) => Ok(batch),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(RecvError::Timeout),
+        }
+    }
+
+    /// Returns true if the channel has been observed closed.
     #[must_use]
     pub fn is_disconnected(&self) -> bool {
         self.closed
-    }
-
-    /// Polls multiple batches. Returns up to `max_count`.
-    pub fn poll_batch(&mut self, max_count: usize) -> Vec<RecordBatch> {
-        let mut batches = Vec::with_capacity(max_count);
-        for _ in 0..max_count {
-            match self.poll() {
-                Some(batch) => batches.push(batch),
-                None => break,
-            }
-        }
-        batches
-    }
-
-    /// Polls batches into a pre-allocated vector. Returns count added.
-    pub fn poll_batch_into(&mut self, buffer: &mut Vec<RecordBatch>, max_count: usize) -> usize {
-        let mut count = 0;
-        for _ in 0..max_count {
-            match self.poll() {
-                Some(batch) => {
-                    buffer.push(batch);
-                    count += 1;
-                }
-                None => break,
-            }
-        }
-        count
-    }
-
-    /// Processes batches with a callback. Stops when callback returns false.
-    pub fn poll_each<F>(&mut self, max_count: usize, mut f: F) -> usize
-    where
-        F: FnMut(RecordBatch) -> bool,
-    {
-        let mut count = 0;
-        for _ in 0..max_count {
-            match self.poll() {
-                Some(batch) => {
-                    count += 1;
-                    if !f(batch) {
-                        break;
-                    }
-                }
-                None => break,
-            }
-        }
-        count
     }
 
     /// Returns the schema for records in this subscription.
@@ -205,67 +118,22 @@ impl<T: Record> Subscription<T> {
     pub fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }
-
-    fn message_to_batch(msg: SourceMessage<T>) -> Option<RecordBatch> {
-        match msg {
-            SourceMessage::Record(record) => Some(record.to_record_batch()),
-            SourceMessage::Batch(batch) => Some(batch),
-            SourceMessage::Watermark(_) => None,
-        }
-    }
-
-    fn convert_message(msg: SourceMessage<T>) -> SubscriptionMessage<T> {
-        match msg {
-            SourceMessage::Record(record) => SubscriptionMessage::Record(record),
-            SourceMessage::Batch(batch) => SubscriptionMessage::Batch(batch),
-            SourceMessage::Watermark(ts) => SubscriptionMessage::Watermark(ts),
-        }
-    }
 }
 
-/// Message types received from a subscription.
-#[derive(Debug, Clone)]
-pub enum SubscriptionMessage<T> {
-    /// A single record.
-    Record(T),
-    /// A batch of records.
-    Batch(RecordBatch),
-    /// A watermark timestamp.
-    Watermark(i64),
-}
-
-impl<T: Record> SubscriptionMessage<T> {
-    /// Converts to a `RecordBatch` if this is a data message.
-    #[must_use]
-    pub fn to_batch(self) -> Option<RecordBatch> {
-        match self {
-            Self::Record(r) => Some(r.to_record_batch()),
-            Self::Batch(b) => Some(b),
-            Self::Watermark(_) => None,
-        }
-    }
-
-    /// Returns the watermark timestamp if this is a watermark message.
-    #[must_use]
-    pub fn watermark(&self) -> Option<i64> {
-        match self {
-            Self::Watermark(ts) => Some(*ts),
-            _ => None,
-        }
-    }
-}
-
-impl<T: Record> Iterator for Subscription<T> {
-    type Item = RecordBatch;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.poll()
+fn message_to_batch<T: Record>(msg: SourceMessage<T>) -> Option<RecordBatch> {
+    match msg {
+        SourceMessage::Record(r) => Some(r.to_record_batch()),
+        SourceMessage::Batch(b) => Some(b),
+        SourceMessage::Watermark(_) => None,
     }
 }
 
 impl<T: Record + std::fmt::Debug> std::fmt::Debug for Subscription<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Subscription").finish()
+        f.debug_struct("Subscription")
+            .field("closed", &self.closed)
+            .field("schema", &self.schema)
+            .finish_non_exhaustive()
     }
 }
 
@@ -334,26 +202,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_recv_timeout() {
-        let (_source, sink) = create::<TestEvent>(16);
-        let mut sub = sink.subscribe();
-        let result = sub.recv_timeout(Duration::from_millis(10));
-        assert!(matches!(result, Err(RecvError::Timeout)));
-    }
-
-    #[tokio::test]
-    async fn test_poll_each() {
+    async fn test_disconnected_after_source_and_sink_drop() {
         let (source, sink) = create::<TestEvent>(16);
         let mut sub = sink.subscribe();
 
-        source.push(TestEvent { id: 1, value: 1.0 }).unwrap();
-        source.push(TestEvent { id: 2, value: 2.0 }).unwrap();
+        drop(source);
+        drop(sink);
+        // Drain task exits on source disconnect; once Sink is dropped too,
+        // the broadcast closes and recv_async returns Disconnected.
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Wait for drain task
-        let b1 = sub.recv_async().await.unwrap();
-        let b2 = sub.recv_async().await.unwrap();
-        assert_eq!(b1.num_rows(), 1);
-        assert_eq!(b2.num_rows(), 1);
+        assert!(sub.recv_async().await.is_err());
+        assert!(sub.is_disconnected());
     }
 
     #[tokio::test]

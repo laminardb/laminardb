@@ -129,7 +129,7 @@ fn bench_source_push_batch_drain(c: &mut Criterion) {
                 let (source, sink) = streaming::create::<BenchEvent>(65536);
                 let mut sub = sink.subscribe();
                 b.iter(|| {
-                    sub.poll_each(size, |_| true);
+                    while sub.poll().is_some() {}
                     let events: Vec<BenchEvent> = (0..size as i64).map(make_event).collect();
                     let pushed = source.push_batch_drain(black_box(events.into_iter()));
                     black_box(pushed)
@@ -178,10 +178,12 @@ fn bench_end_to_end_throughput(c: &mut Criterion) {
                     for i in 0..size as i64 {
                         let _ = source.try_push(make_event(i));
                     }
-                    black_box(sub.poll_each(size, |batch| {
+                    let mut count = 0;
+                    while let Some(batch) = sub.poll() {
                         black_box(batch);
-                        true
-                    }))
+                        count += 1;
+                    }
+                    black_box(count)
                 })
             },
         );
