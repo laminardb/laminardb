@@ -9,7 +9,7 @@
 | Phase 1: Core Engine | 12 | 0 | 0 | 0 | 12 | 0 |
 | Phase 1.5: SQL Parser | 1 | 0 | 0 | 0 | 1 | 0 |
 | Phase 2: Production Hardening | 38 | 0 | 0 | 0 | 38 | 0 |
-| Phase 2.5: JIT Compiler | 12 | 0 | 0 | 0 | 12 | 0 |
+| Phase 2.5: JIT Compiler (removed) | 12 | 0 | 0 | 0 | 0 | 12 |
 | Phase 3: Connectors | 100 | 5 | 0 | 0 | 95 | 0 |
 | Phase 4: Enterprise Security | 11 | 11 | 0 | 0 | 0 | 0 |
 | Phase 5: Admin & Observability | 10 | 6 | 0 | 0 | 4 | 0 |
@@ -17,9 +17,9 @@
 | Phase 6b: Delta Foundation | 14 | 0 | 0 | 0 | 14 | 0 |
 | Phase 6c: Delta Hardening | 10 | 1 | 0 | 0 | 8 | 1 |
 | Perf Optimization | 12 | 10 | 0 | 0 | 2 | 0 |
-| **Total** | **249** | **34** | **0** | **0** | **213** | **2** |
+| **Total** | **249** | **34** | **0** | **0** | **201** | **14** |
 
-**Completion: 213/249 features (86%).** Phases 1, 1.5, 2, 2.5, and 6b are fully complete. Phase 3 is 95% complete (5 remaining). Phase 6c server infrastructure is complete (8/10). Phases 4 and Perf Optimization are planned.
+**Completion: 201/249 active features (81%).** Phases 1, 1.5, 2, and 6b are fully complete; Phase 2.5 (Cranelift JIT) shipped then was removed and superseded by compiled `PhysicalExpr` projections. Phase 3 is 95% complete (5 remaining). Phase 6c server infrastructure is 80% complete (8/10). Phases 4 and Perf Optimization are mostly planned.
 
 ## Status Legend
 
@@ -114,7 +114,11 @@
 
 ## Phase 2.5: Plan Compiler & SQL Compiler Integration
 
-> **Status**: 12/12 features complete (100%) ✅. Compiles DataFusion logical plans into zero-allocation JIT functions for Ring 0, with end-to-end SQL query execution integration.
+> **Status**: Removed. The Cranelift JIT and plan compiler were implemented
+> (all 12 features shipped) but were later replaced by compiled `PhysicalExpr`
+> projections and cached logical plans in `StreamExecutor`, which achieve the
+> same per-cycle overhead reduction without the 12K LOC JIT dependency. The
+> feature list below is retained for historical tracking.
 
 See [Plan Compiler Index](plan-compiler/INDEX.md) for architecture details and [research](../research/plan-compiler-research-2026.md) for background.
 

@@ -7,7 +7,7 @@ Core streaming engine for LaminarDB — operators, checkpoint barriers, and stre
 | Module | Purpose |
 |--------|---------|
 | `operator` | Window assigners, table cache, changelog/Z-set types |
-| `time` | Event time extraction, watermark generators, timer service |
+| `time` | Event time extraction, watermark generators |
 | `streaming` | Source/Sink/Subscription API backed by crossfire channels |
 | `checkpoint` | Barrier protocol for consistent snapshots |
 | `lookup` | Lookup table trait, predicate pushdown, foyer cache |
@@ -22,7 +22,7 @@ Core streaming engine for LaminarDB — operators, checkpoint barriers, and stre
 ```bash
 cargo bench -p laminar-core --bench streaming_bench    # Channel and source throughput
 cargo bench -p laminar-core --bench window_bench       # Window operations
-cargo bench -p laminar-core --bench lookup_join_bench   # Lookup join throughput
-cargo bench -p laminar-core --bench cache_bench         # foyer cache hit/miss
-cargo bench -p laminar-core --bench latency_bench       # p99 latency
+cargo bench -p laminar-core --bench lookup_join_bench  # Lookup join throughput
+cargo bench -p laminar-core --bench cache_bench        # foyer cache hit/miss
+cargo bench -p laminar-core --bench latency_bench      # End-to-end event latency
 ```

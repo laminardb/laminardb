@@ -5,9 +5,93 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>LaminarDB Docs — Configuration Reference</title>
   <meta name="description" content="Complete configuration reference for LaminarDB server, connectors, checkpoints, and deployment. Every field verified against source code.">
-  <meta name="robots" content="index, follow">
+  <meta name="robots" content="index, follow, max-image-preview:large">
   <meta name="theme-color" content="#0a0a0a">
   <link rel="canonical" href="https://laminardb.io/docs/">
+  <link rel="alternate" type="text/plain" title="LLM-friendly site overview" href="/llms.txt">
+
+  <meta property="og:title" content="LaminarDB Docs — Configuration Reference">
+  <meta property="og:description" content="Complete configuration reference for LaminarDB server, connectors, checkpoints, and deployment. Every field verified against source code.">
+  <meta property="og:url" content="https://laminardb.io/docs/">
+  <meta property="og:type" content="article">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="LaminarDB Docs — Configuration Reference">
+  <meta name="twitter:description" content="Complete configuration reference for LaminarDB server, connectors, checkpoints, and deployment.">
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "TechArticle",
+        "@id": "https://laminardb.io/docs/#article",
+        "headline": "LaminarDB Configuration Reference",
+        "description": "Complete configuration reference for the LaminarDB standalone server: TOML fields, REST API endpoints, connector properties, checkpoint configuration, hot reload, Prometheus metrics, and join semantics. Every field verified against the source code.",
+        "url": "https://laminardb.io/docs/",
+        "inLanguage": "en",
+        "dateModified": "2026-04-09",
+        "isPartOf": { "@id": "https://laminardb.io/#website" },
+        "about": { "@id": "https://laminardb.io/#software" },
+        "author": { "@id": "https://laminardb.io/#org" },
+        "publisher": { "@id": "https://laminardb.io/#org" },
+        "proficiencyLevel": "Expert",
+        "articleSection": [
+          "Server Configuration",
+          "State Configuration",
+          "Checkpoint Configuration",
+          "REST API",
+          "Hot Reload",
+          "Prometheus Metrics",
+          "Source Connectors",
+          "Sink Connectors",
+          "Lookup Sources",
+          "Join Semantics"
+        ],
+        "keywords": "streaming SQL, LaminarDB configuration, Kafka connector, CDC, Delta Lake, Iceberg, OpenTelemetry, ASOF join, temporal probe join, exactly-once, barrier checkpoint"
+      },
+      {
+        "@type": "BreadcrumbList",
+        "itemListElement": [
+          {
+            "@type": "ListItem",
+            "position": 1,
+            "name": "Home",
+            "item": "https://laminardb.io"
+          },
+          {
+            "@type": "ListItem",
+            "position": 2,
+            "name": "Docs",
+            "item": "https://laminardb.io/docs/"
+          }
+        ]
+      },
+      {
+        "@type": "WebSite",
+        "@id": "https://laminardb.io/#website",
+        "url": "https://laminardb.io",
+        "name": "LaminarDB"
+      },
+      {
+        "@type": "SoftwareApplication",
+        "@id": "https://laminardb.io/#software",
+        "name": "LaminarDB",
+        "url": "https://laminardb.io",
+        "applicationCategory": "DatabaseApplication"
+      },
+      {
+        "@type": "Organization",
+        "@id": "https://laminardb.io/#org",
+        "name": "LaminarDB Contributors",
+        "url": "https://laminardb.io",
+        "sameAs": [
+          "https://github.com/laminardb",
+          "https://github.com/laminardb/laminardb"
+        ]
+      }
+    ]
+  }
+  </script>
 
   <link rel="icon" type="image/svg+xml" href="../favicon.svg">
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -344,7 +428,7 @@
           <path d="M4 32 C12 32,14 30,22 30 C30 30,32 34,36 34" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
         </svg>
         <span>LaminarDB</span>
-        <span class="version-badge" data-version="tag">v0.18.12</span>
+        <span class="version-badge" data-version="tag">v0.20.0</span>
       </a>
 
       <nav class="nav-links" aria-label="Main navigation">
@@ -395,6 +479,7 @@
       <h4>Joins</h4>
       <a href="#join-interval">Interval Join</a>
       <a href="#join-asof">ASOF Join</a>
+      <a href="#join-temporal-probe">Temporal Probe Join</a>
       <a href="#join-temporal">Temporal Join</a>
       <a href="#join-lookup">Lookup Join</a>
 
@@ -406,19 +491,27 @@
 
     <!-- Content -->
     <main class="docs-content">
+      <article>
+
+      <nav aria-label="Breadcrumb" style="font-size: 0.75rem; color: var(--text-dim); margin-bottom: 0.75rem;">
+        <a href="../" style="color: var(--text-dim);">Home</a>
+        <span style="margin: 0 6px;">&rsaquo;</span>
+        <span style="color: var(--text-secondary);">Docs</span>
+      </nav>
 
       <h1 style="font-size: 1.75rem; margin-bottom: 0.5rem;">Standalone Server &amp; Configuration Reference</h1>
       <p style="color: var(--text-dim); margin-bottom: 1rem;">
         The <code>laminardb</code> binary reads a TOML configuration file, constructs streaming pipelines, and serves a REST API with Prometheus metrics.
         Every field on this page is verified against
         <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs</a>.
+        Last updated: 9 April 2026.
       </p>
 
       <h3>Install</h3>
       <div class="toml-block">
         <div class="toml-header">Install &amp; run</div>
         <pre><code class="language-bash"># Pre-built binary (Linux x86_64)
-curl -LO "https://github.com/laminardb/laminardb/releases/latest/download/laminardb-server-x86_64-unknown-linux-gnu-v0.18.12.tar.gz"
+curl -LO "https://github.com/laminardb/laminardb/releases/latest/download/laminardb-server-x86_64-unknown-linux-gnu-v0.20.0.tar.gz"
 tar xzf laminardb-server-*.tar.gz
 
 # Or build from source
@@ -621,12 +714,12 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
         <div class="endpoint-row">
           <span class="endpoint-method method-post">POST</span>
           <span class="endpoint-path">/api/v1/pause</span>
-          <span class="endpoint-desc">Pause pipeline (not yet implemented &mdash; returns 501)</span>
+          <span class="endpoint-desc">Pause pipeline (not yet implemented, returns 501)</span>
         </div>
         <div class="endpoint-row">
           <span class="endpoint-method method-post">POST</span>
           <span class="endpoint-path">/api/v1/resume</span>
-          <span class="endpoint-desc">Resume pipeline (not yet implemented &mdash; returns 501)</span>
+          <span class="endpoint-desc">Resume pipeline (not yet implemented, returns 501)</span>
         </div>
       </div>
 
@@ -699,7 +792,7 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
             <td class="field-name">connector</td>
             <td class="field-type">String</td>
             <td><span class="field-required">required</span></td>
-            <td>"kafka", "postgres_cdc", "mysql_cdc", "mongodb-cdc", "websocket", "files", "delta-lake"</td>
+            <td>"kafka", "postgres_cdc", "mysql_cdc", "mongodb-cdc", "websocket", "files", "delta-lake", "iceberg", "otel", "parquet-lookup", "postgres-lookup"</td>
           </tr>
           <tr>
             <td class="field-name">format</td>
@@ -807,7 +900,7 @@ max_out_of_orderness = "5s"</code></pre>
             <td class="field-name">connector</td>
             <td class="field-type">String</td>
             <td><span class="field-required">required</span></td>
-            <td>"kafka", "postgres", "delta-lake", "websocket", "files", "stdout"</td>
+            <td>"kafka", "postgres", "mongodb", "delta-lake", "iceberg", "websocket", "files", "stdout"</td>
           </tr>
           <tr>
             <td class="field-name">delivery</td>
@@ -886,8 +979,11 @@ max_out_of_orderness = "5s"</code></pre>
         <div class="connector-card"><a href="#kafka-source"><h4>Kafka</h4></a><div class="direction">Source + Sink</div><div class="feature">kafka</div></div>
         <div class="connector-card"><a href="#postgres-cdc"><h4>PostgreSQL CDC</h4></a><div class="direction">Source</div><div class="feature">postgres-cdc</div></div>
         <div class="connector-card"><a href="#mysql-cdc"><h4>MySQL CDC</h4></a><div class="direction">Source</div><div class="feature">mysql-cdc</div></div>
+        <div class="connector-card"><a href="#mongodb-cdc"><h4>MongoDB CDC</h4></a><div class="direction">Source + Sink</div><div class="feature">mongodb-cdc</div></div>
         <div class="connector-card"><a href="#postgres-sink"><h4>PostgreSQL Sink</h4></a><div class="direction">Sink</div><div class="feature">postgres-sink</div></div>
         <div class="connector-card"><a href="#delta-source"><h4>Delta Lake</h4></a><div class="direction">Source + Sink</div><div class="feature">delta-lake</div></div>
+        <div class="connector-card"><h4>Apache Iceberg</h4><div class="direction">Source + Sink</div><div class="feature">iceberg</div></div>
+        <div class="connector-card"><h4>OpenTelemetry</h4><div class="direction">Source (OTLP/gRPC)</div><div class="feature">otel</div></div>
         <div class="connector-card"><a href="#websocket-source"><h4>WebSocket</h4></a><div class="direction">Source + Sink</div><div class="feature">websocket</div></div>
         <div class="connector-card"><a href="#file-source"><h4>File Auto-Loader</h4></a><div class="direction">Source + Sink</div><div class="feature">files</div></div>
       </div>
@@ -1053,10 +1149,10 @@ max_out_of_orderness = "5s"</code></pre>
 
       <p style="font-size: 0.8rem; color: var(--text-dim);">
         <strong>Full document modes:</strong>
-        <code>delta</code> — update description only (default).
-        <code>update_lookup</code> — fetches current document on updates.
-        <code>required</code> — requires <code>changeStreamPreAndPostImages</code> enabled on collection.
-        <code>when_available</code> — returns post-image when available, null otherwise.
+        <code>delta</code> sends the update description only (default).
+        <code>update_lookup</code> fetches the current document on updates.
+        <code>required</code> needs <code>changeStreamPreAndPostImages</code> enabled on the collection.
+        <code>when_available</code> returns the post-image when present, otherwise null.
       </p>
 
       <p style="font-size: 0.8rem; color: var(--text-dim);">
@@ -1089,11 +1185,11 @@ max_out_of_orderness = "5s"</code></pre>
 
       <p style="font-size: 0.8rem; color: var(--text-dim);">
         <strong>Write modes:</strong>
-        <code>insert</code> — append-only.
-        <code>upsert</code> — replace by key fields (set via <code>upsert.key.fields</code>).
-        <code>replace</code> — full document replacement.
-        <code>cdc_replay</code> — routes by <code>_op</code> column (I→insert, U→update, R→replace, D→delete).
-        Time series collections only support <code>insert</code> mode.
+        <code>insert</code> is append-only.
+        <code>upsert</code> replaces documents by the fields listed in <code>upsert.key.fields</code>.
+        <code>replace</code> rewrites the full document.
+        <code>cdc_replay</code> routes by the <code>_op</code> column (I→insert, U→update, R→replace, D→delete).
+        Time series collections only support <code>insert</code>.
       </p>
 
       <!-- DELTA LAKE SOURCE -->
@@ -1217,7 +1313,7 @@ max_out_of_orderness = "5s"</code></pre>
 
       <h2 id="joins" style="font-size: 1.5rem;">Join Semantics</h2>
       <p>
-        LaminarDB supports four join types. All are stateful and operate on
+        LaminarDB supports five join types. All are stateful and operate on
         streaming data. Join types are detected from SQL syntax automatically.
       </p>
 
@@ -1233,8 +1329,14 @@ max_out_of_orderness = "5s"</code></pre>
           <tr>
             <td class="field-name" style="color: var(--text);">ASOF</td>
             <td>Optional tolerance</td>
-            <td>One closest per key</td>
+            <td>One closest per key (backward / forward / nearest)</td>
             <td>Trade/quote enrichment</td>
+          </tr>
+          <tr>
+            <td class="field-name" style="color: var(--text);">Temporal Probe</td>
+            <td>Explicit offsets</td>
+            <td>N rows per left event at fixed offsets</td>
+            <td>Impact curves, lagged feature lookups</td>
           </tr>
           <tr>
             <td class="field-name" style="color: var(--text);">Temporal</td>
@@ -1358,9 +1460,41 @@ ASOF JOIN calibrations c
         Key columns support <code>VARCHAR</code> and <code>BIGINT</code> types.
       </p>
 
+      <!-- TEMPORAL PROBE JOIN -->
+      <h3 id="join-temporal-probe">Temporal Probe Join</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-sql/src/translator/temporal_probe.rs" target="_blank" rel="noopener">translator/temporal_probe.rs</a>, <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-db/src/operator/temporal_probe_join.rs" target="_blank" rel="noopener">operator/temporal_probe_join.rs</a></div>
+
+      <p>
+        For each left event, produces N output rows by probing the right stream at
+        a fixed list of time offsets. Each probe returns the ASOF-matched right
+        value at <code>left.event_time + offset</code>. Useful for lagged feature
+        lookups and impact curves.
+      </p>
+
+      <h4>Offset specification</h4>
+      <table class="config-table">
+        <thead><tr><th>Syntax</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="field-name">RANGE FROM &lt;start&gt; TO &lt;end&gt; STEP &lt;step&gt;</td>
+            <td>Uniform range (all in milliseconds)</td>
+          </tr>
+          <tr>
+            <td class="field-name">LIST (&lt;ms&gt;, &lt;ms&gt;, ...)</td>
+            <td>Explicit list of offsets in milliseconds</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p style="font-size: 0.82rem;">
+        <strong>Directions:</strong> <code>Backward</code>, <code>Forward</code>,
+        and <code>Nearest</code>. Each probed offset is resolved using the same
+        semantics as a standalone ASOF join in that direction.
+      </p>
+
       <!-- TEMPORAL JOIN -->
       <h3 id="join-temporal">Temporal Join (FOR SYSTEM_TIME AS OF)</h3>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-db/src/stream_executor.rs" target="_blank" rel="noopener">stream_executor.rs</a></div>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-db/src/operator/temporal_join.rs" target="_blank" rel="noopener">operator/temporal_join.rs</a>, <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-sql/src/parser/join_parser.rs" target="_blank" rel="noopener">parser/join_parser.rs</a></div>
 
       <p>
         Point-in-time lookup against a versioned table. For each stream event,
@@ -1391,7 +1525,7 @@ JOIN currency_rates FOR SYSTEM_TIME AS OF o.order_time AS r
 
       <p>
         Enriches stream events against a static or slowly-changing reference table.
-        No time bound &mdash; matches by key equality only. Results are cached with
+        Matches by key equality with no time bound. Results are cached with a
         configurable TTL.
       </p>
 
@@ -1595,6 +1729,7 @@ partition.columns = "exchange"
 writer.id = "vwap-writer"</code></pre>
       </div>
 
+      </article>
     </main>
   </div>
 
@@ -1605,7 +1740,7 @@ writer.id = "vwap-writer"</code></pre>
         <div class="footer-left">
           LaminarDB &middot;
           <a href="https://github.com/laminardb/laminardb/blob/main/LICENSE" target="_blank" rel="noopener">Apache 2.0</a> &middot;
-          <span data-version="tag">v0.18.12</span>
+          <span data-version="tag">v0.20.0</span>
         </div>
         <div class="footer-links">
           <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>

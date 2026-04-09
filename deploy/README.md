@@ -20,7 +20,7 @@ Available platforms:
 
 ```bash
 # Download and extract (Linux x86_64 example)
-curl -LO https://github.com/laminardb/laminardb/releases/latest/download/laminardb-server-x86_64-unknown-linux-gnu-v0.18.12.tar.gz
+curl -LO https://github.com/laminardb/laminardb/releases/latest/download/laminardb-server-x86_64-unknown-linux-gnu-v0.20.0.tar.gz
 tar xzf laminardb-server-x86_64-unknown-linux-gnu-v*.tar.gz
 
 # Verify checksums
@@ -56,8 +56,8 @@ curl http://localhost:8080/health
 
 Available tags:
 - `latest` - latest build from `main`
-- `0.18.12` - specific version
-- `0.18` - latest patch for minor version
+- `0.20.0` - specific version
+- `0.20` - latest patch for minor version
 - `sha-abc1234` - specific commit
 
 Multi-arch support: `linux/amd64` and `linux/arm64`.
@@ -78,7 +78,7 @@ See the root `docker-compose.yml` for a full example with Kafka and PostgreSQL.
 
 ```bash
 helm install my-laminardb oci://ghcr.io/laminardb/charts/laminardb \
-  --set image.tag=0.18.12
+  --set image.tag=0.20.0
 ```
 
 ### Quick start (standalone embedded mode)

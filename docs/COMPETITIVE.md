@@ -1,21 +1,21 @@
 # Competitive Landscape Analysis
 
-> Last Updated: February 2026
+> Last Updated: April 2026
 
 ## Executive Summary
 
-The closest alternatives are either distributed-only (Flink, RisingWave, Materialize) or lack SQL (Kafka Streams). LaminarDB is embedded, thread-per-core, sub-microsecond, and SQL-native.
+The closest alternatives are either distributed-only (Flink, RisingWave, Materialize) or lack SQL (Kafka Streams). LaminarDB is embedded, Rust-native (no GC pauses), sub-microsecond per compiled operator cycle, and SQL-native.
 
 ## Competitive Matrix
 
 | Feature | LaminarDB | Apache Flink | Apache Kafka Streams | RisingWave | Materialize | ksqlDB |
 |---------|-----------|--------------|---------------------|------------|-------------|--------|
-| **Deployment** | Embedded | Distributed | Embedded | Distributed | Distributed | Distributed |
-| **Latency** | < 1μs | ~10ms | ~1ms | ~10ms | ~10ms | ~100ms |
-| **SQL Support** | Full | Limited | None | Full | Full | Full |
-| **Exactly-Once** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Lakehouse** | ✅ | Limited | ❌ | ✅ | ❌ | ❌ |
-| **Thread-per-Core** | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Deployment** | Embedded or single binary | Distributed | Embedded | Distributed | Distributed | Distributed |
+| **Per-event latency (microbench, mean)** | Sub-microsecond for compiled projections | ~10ms | ~1ms | ~10ms | ~10ms | ~100ms |
+| **SQL Support** | Full (DataFusion) | Flink SQL | None (DSL only) | Full (Postgres-compatible) | Full | Full |
+| **Exactly-Once** | ✅ (checkpoint + 2PC) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Lakehouse** | Delta Lake, Iceberg | Limited | ❌ | Parquet/Iceberg | ❌ | ❌ |
+| **No GC pauses (native)** | ✅ (Rust) | ❌ | ❌ | ✅ (Rust) | ❌ | ❌ |
 | **License** | Apache 2.0 | Apache 2.0 | Apache 2.0 | Apache 2.0 | BSL | Confluent |
 
 ## Detailed Comparison
@@ -35,7 +35,7 @@ The closest alternatives are either distributed-only (Flink, RisingWave, Materia
 - Resource intensive
 
 **LaminarDB Advantage:**
-- 1000x lower latency
+- Dramatically lower per-event latency for compiled queries (microsecond-scale vs. millisecond-scale)
 - No cluster required
 - No GC pauses (Rust)
 - Embedded deployment option
@@ -76,9 +76,8 @@ The closest alternatives are either distributed-only (Flink, RisingWave, Materia
 
 **LaminarDB Advantage:**
 - Embedded deployment option
-- Sub-microsecond latency
-- Simpler operations
-- Thread-per-core performance
+- Sub-microsecond latency for compiled projections
+- Simpler operations (single binary or library)
 
 ### Materialize
 

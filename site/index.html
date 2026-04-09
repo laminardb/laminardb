@@ -4,21 +4,25 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>LaminarDB — Streaming SQL Engine</title>
-  <meta name="description" content="The streaming engine that starts embedded. Sub-microsecond SQL over event streams. Embed in Rust or Python, run standalone, or scale to a cluster. Arrow, DataFusion. Apache 2.0.">
-  <meta name="keywords" content="streaming database, embedded database, stream processing, Rust, SQL, Apache Arrow, DataFusion, Kafka, CDC, Delta Lake, sub-microsecond, ASOF join, tumbling window, session window">
-  <meta name="robots" content="index, follow">
+  <meta name="description" content="LaminarDB is an open-source streaming SQL engine written in Rust. It runs continuous SQL queries over event streams using Apache Arrow and DataFusion. Embed it in Rust or Python, or run as a standalone server. Sub-microsecond state lookups. Apache 2.0.">
+  <meta name="keywords" content="streaming database, embedded database, stream processing, Rust, SQL, Apache Arrow, DataFusion, Kafka, CDC, Delta Lake, Apache Iceberg, OpenTelemetry, sub-microsecond, ASOF join, temporal probe join, tumbling window, session window, exactly-once, barrier checkpoint">
+  <meta name="author" content="LaminarDB Contributors">
+  <meta name="robots" content="index, follow, max-image-preview:large">
   <meta name="theme-color" content="#0a0a0a">
   <link rel="canonical" href="https://laminardb.io">
+  <link rel="alternate" type="text/plain" title="LLM-friendly site overview" href="/llms.txt">
 
   <meta property="og:title" content="LaminarDB — Streaming SQL Engine">
-  <meta property="og:description" content="The streaming engine that starts embedded. Sub-microsecond SQL over event streams. Embed in Rust or Python, run standalone, or scale to a cluster.">
+  <meta property="og:description" content="Open-source streaming SQL engine in Rust. Runs continuous SQL over event streams using Apache Arrow and DataFusion. Embed in Rust or Python, or run as a standalone server.">
   <meta property="og:image" content="https://laminardb.io/img/logo.jpg">
   <meta property="og:url" content="https://laminardb.io">
   <meta property="og:type" content="website">
+  <meta property="og:site_name" content="LaminarDB">
+  <meta property="og:locale" content="en_US">
 
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="LaminarDB — Streaming SQL Engine">
-  <meta name="twitter:description" content="The streaming engine that starts embedded. Sub-microsecond SQL. Embed in Rust or Python, run standalone, or scale to a cluster.">
+  <meta name="twitter:description" content="Open-source streaming SQL engine in Rust. Continuous SQL over event streams. Embed in Rust or Python, or run as a standalone server.">
   <meta name="twitter:image" content="https://laminardb.io/img/logo.jpg">
 
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
@@ -30,24 +34,206 @@
   <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet">
   <link rel="stylesheet" href="css/style.css">
 
+  <style>
+    /* FAQ section */
+    #faq .faq-list { display: flex; flex-direction: column; border-top: 1px solid var(--border); max-width: 820px; }
+    #faq details { border-bottom: 1px solid var(--border); }
+    #faq summary {
+      list-style: none;
+      cursor: pointer;
+      padding: 1.1rem 0;
+      font-size: 0.98rem;
+      font-weight: 500;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      user-select: none;
+      transition: color 0.12s;
+    }
+    #faq summary::-webkit-details-marker { display: none; }
+    #faq summary::after {
+      content: "+";
+      font-family: var(--font-mono);
+      color: var(--text-dim);
+      font-size: 1.15rem;
+      font-weight: 300;
+      flex-shrink: 0;
+    }
+    #faq details[open] summary { color: var(--accent-bright); }
+    #faq details[open] summary::after { content: "−"; color: var(--accent-bright); }
+    #faq summary:hover { color: var(--accent-bright); }
+    #faq details p {
+      margin: 0 0 1.1rem 0;
+      font-size: 0.88rem;
+      line-height: 1.65;
+      color: var(--text-secondary);
+      max-width: 720px;
+    }
+  </style>
+
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
-    "@type": "SoftwareApplication",
-    "name": "LaminarDB",
-    "description": "Streaming SQL engine with sub-microsecond state lookups. Process event streams using SQL, Rust, Apache Arrow, and DataFusion.",
-    "applicationCategory": "Database",
-    "operatingSystem": "Linux, macOS, Windows",
-    "license": "https://opensource.org/licenses/Apache-2.0",
-    "url": "https://laminardb.io",
-    "codeRepository": "https://github.com/laminardb/laminardb",
-    "programmingLanguage": ["Rust", "Python", "SQL"],
-    "softwareVersion": "0.18.12",
-    "author": {
-      "@type": "Organization",
-      "name": "LaminarDB Contributors",
-      "url": "https://github.com/laminardb"
-    }
+    "@graph": [
+      {
+        "@type": "SoftwareApplication",
+        "@id": "https://laminardb.io/#software",
+        "name": "LaminarDB",
+        "alternateName": "laminar-db",
+        "description": "LaminarDB is an open-source streaming SQL engine written in Rust. It runs continuous SQL queries over event streams using Apache Arrow and DataFusion, with sub-microsecond state lookups. Embed it in Rust or Python applications or run it as a standalone server.",
+        "applicationCategory": "DatabaseApplication",
+        "applicationSubCategory": "Streaming SQL Engine",
+        "operatingSystem": "Linux, macOS, Windows",
+        "license": "https://opensource.org/licenses/Apache-2.0",
+        "url": "https://laminardb.io",
+        "codeRepository": "https://github.com/laminardb/laminardb",
+        "programmingLanguage": ["Rust", "Python", "SQL"],
+        "softwareVersion": "0.20.0",
+        "softwareRequirements": "Rust 1.85 or newer (for embedded use)",
+        "dateModified": "2026-04-09",
+        "author": { "@id": "https://laminardb.io/#org" },
+        "publisher": { "@id": "https://laminardb.io/#org" },
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "USD"
+        },
+        "featureList": [
+          "Continuous SQL queries over event streams",
+          "Tumbling, sliding, hopping, and session windows",
+          "ASOF, temporal, temporal probe, interval, and lookup joins",
+          "Exactly-once sinks via two-phase commit barrier checkpoints",
+          "Kafka, PostgreSQL/MySQL/MongoDB CDC, Delta Lake, Iceberg, and OpenTelemetry connectors",
+          "Embed in Rust or Python, or run as a standalone server",
+          "Sub-microsecond state lookup target"
+        ]
+      },
+      {
+        "@type": "Organization",
+        "@id": "https://laminardb.io/#org",
+        "name": "LaminarDB Contributors",
+        "url": "https://laminardb.io",
+        "logo": "https://laminardb.io/img/logo.jpg",
+        "sameAs": [
+          "https://github.com/laminardb",
+          "https://github.com/laminardb/laminardb",
+          "https://crates.io/crates/laminar-db"
+        ]
+      },
+      {
+        "@type": "WebSite",
+        "@id": "https://laminardb.io/#website",
+        "url": "https://laminardb.io",
+        "name": "LaminarDB",
+        "description": "The streaming engine that starts embedded",
+        "publisher": { "@id": "https://laminardb.io/#org" },
+        "inLanguage": "en"
+      },
+      {
+        "@type": "FAQPage",
+        "@id": "https://laminardb.io/#faq",
+        "mainEntity": [
+          {
+            "@type": "Question",
+            "name": "What is LaminarDB?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "LaminarDB is an open-source streaming SQL engine written in Rust. It runs continuous SQL queries over event streams using Apache Arrow and DataFusion. It can be embedded in Rust or Python applications or run as a standalone server."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "How fast is LaminarDB?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "LaminarDB targets sub-microsecond state lookups (under 500 nanoseconds) and processes over 500,000 events per core per second. Criterion benchmarks on an AMD Ryzen AI 7 350 laptop measured state lookups in 10 to 16 nanoseconds and throughput of 1.1 to 1.46 million events per second per core."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "What connectors does LaminarDB support?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "LaminarDB ships with sources and sinks for Apache Kafka, PostgreSQL CDC, MySQL CDC, MongoDB CDC, Delta Lake, Apache Iceberg, OpenTelemetry OTLP, WebSocket, and rolling file formats (CSV, JSON, Parquet). All connectors are feature-gated so you only compile what you use."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Is LaminarDB production-ready?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "LaminarDB is pre-1.0, currently at version 0.20.0. Single-node embedded and standalone server deployments are stable, including exactly-once sinks via barrier checkpoints. Multi-node cluster mode is on the roadmap but not yet functional."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "How does LaminarDB compare to Apache Flink?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "LaminarDB targets low-latency single-node workloads with an embedded or lightweight server deployment. Apache Flink scales horizontally across clusters and has a mature connector ecosystem, but carries a JVM runtime and significant operational overhead. Choose Flink for cluster-scale throughput; choose LaminarDB for sub-microsecond latency and embedded use."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Can I use LaminarDB from Python?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Yes. Install the Python package with pip install laminardb. It exposes the same streaming SQL engine as the Rust crate, with a Python-native API for pushing events and subscribing to results."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "What SQL features does LaminarDB support?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "LaminarDB supports standard SQL through DataFusion plus streaming extensions: tumbling, sliding, hopping, and session windows; ASOF, temporal, temporal probe, interval, and lookup joins; EMIT clauses (ON WATERMARK, ON WINDOW CLOSE, PERIODICALLY, CHANGES, FINAL); watermarks with ALLOW LATENESS; and late data routing via LATE DATA TO."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "How does LaminarDB handle exactly-once delivery?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "LaminarDB uses Chandy-Lamport style barrier checkpoints with two-phase commit. Source offsets and sink commit status are stored in a checkpoint manifest. On recovery, the engine restores operator state and rewinds sources to the last committed checkpoint."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "What is an ASOF join in LaminarDB?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "An ASOF join matches each row in the left stream to the single closest row in the right stream by timestamp within the same key partition. LaminarDB supports three directions: Backward (most recent prior event), Forward (next event), and Nearest (minimum absolute time difference)."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "What is a temporal probe join?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "A temporal probe join produces multiple output rows for each left event by probing the right stream at a list of fixed time offsets. Offsets are specified with RANGE FROM x TO y STEP z or LIST of explicit millisecond values. It is designed for impact-curve analysis and lagged feature lookups."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Does LaminarDB require a JVM?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "No. LaminarDB is written in Rust and ships as a native binary. It has no JVM or other runtime dependencies beyond the operating system."
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "Is LaminarDB open source?",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "Yes. LaminarDB is licensed under Apache 2.0 and the source is hosted at github.com/laminardb/laminardb."
+            }
+          }
+        ]
+      }
+    ]
   }
   </script>
 </head>
@@ -66,7 +252,7 @@
           <path d="M4 32 C12 32,14 30,22 30 C30 30,32 34,36 34" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
         </svg>
         <span>LaminarDB</span>
-        <span class="version-badge" data-version="tag">v0.18.12</span>
+        <span class="version-badge" data-version="tag">v0.20.0</span>
       </a>
 
       <nav class="nav-links" aria-label="Main navigation">
@@ -74,6 +260,7 @@
         <a href="#connectors">Connectors</a>
         <a href="#comparison">Comparison</a>
         <a href="#status">Status</a>
+        <a href="#faq">FAQ</a>
         <a href="docs/">Docs</a>
         <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API</a>
         <a href="https://github.com/laminardb/laminardb" class="github-link" target="_blank" rel="noopener">
@@ -91,6 +278,7 @@
         <a href="#connectors">Connectors</a>
         <a href="#comparison">Comparison</a>
         <a href="#status">Status</a>
+        <a href="#faq">FAQ</a>
         <a href="docs/">Docs</a>
         <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API</a>
         <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
@@ -106,8 +294,7 @@
         <h1 class="hero-tagline">The streaming engine that starts embedded</h1>
         <p class="hero-desc">
           Sub-microsecond SQL over event streams.
-          Embed in Rust or Python, run as a standalone server,
-          or scale to a cluster. No JVM.
+          Embed it in Rust or Python, or run the standalone server. No JVM.
         </p>
 
         <div class="hero-install-group">
@@ -166,8 +353,8 @@ db.start().await?;</code></pre>
         <div class="hero-metrics">
           <div class="hero-metric">
             <div class="hero-metric-value">&lt;500<span class="unit">ns</span></div>
-            <div class="hero-metric-label">state lookup</div>
-            <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/state_bench.rs" target="_blank" rel="noopener">state_bench.rs</a></div>
+            <div class="hero-metric-label">state lookup target</div>
+            <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/blob/main/docs/BENCHMARKS.md" target="_blank" rel="noopener">BENCHMARKS.md</a></div>
           </div>
           <div class="hero-metric">
             <div class="hero-metric-value">1M+<span class="unit">/s</span></div>
@@ -189,58 +376,58 @@ db.start().await?;</code></pre>
         <h2>What it is</h2>
         <div class="text-block">
           <p>
-            LaminarDB is a streaming SQL engine.
-            Write SQL queries over event streams &mdash; windows, joins, aggregations &mdash;
-            and the engine evaluates them continuously as events arrive.
+            LaminarDB runs SQL queries over event streams. Windows, joins, aggregations:
+            the engine evaluates them continuously as events arrive.
             Built on <a href="https://arrow.apache.org/" target="_blank" rel="noopener">Apache Arrow 57</a>
             and <a href="https://datafusion.apache.org/" target="_blank" rel="noopener">DataFusion 52</a>.
           </p>
           <p>
-            <strong>Three deployment modes.</strong>
-            Embed it in your application &mdash; Rust (<code>cargo add laminar-db</code>) or Python (<code>pip install laminardb</code>).
-            Run it as a standalone server (<code>laminardb</code> binary) with Kafka, CDC, and Delta Lake connectors.
-            Or deploy as a cluster &mdash; distributed mode is coming soon.
+            <strong>Deployment.</strong>
+            Embed it in Rust (<code>cargo add laminar-db</code>) or Python (<code>pip install laminardb</code>).
+            Or run the standalone <code>laminardb</code> binary with Kafka, CDC, and Delta Lake connectors.
+            Cluster mode is on the roadmap but not yet functional.
           </p>
           <p>
-            It is not a message broker (it consumes from Kafka, doesn't replace it)
-            and it is not a general-purpose OLTP/OLAP database &mdash; it processes streams.
+            It is not a message broker and it is not a general-purpose database.
+            It processes streams.
           </p>
         </div>
 
         <div class="arch-rings">
           <div class="ring ring-0">
             <div class="ring-header">
-              <span class="ring-name">Ring 0 &mdash; Hot Path</span>
-              <span class="ring-constraint">&lt;500ns &middot; zero alloc &middot; no locks</span>
+              <span class="ring-name">Compute Thread</span>
+              <span class="ring-constraint">dedicated tokio runtime &middot; zero alloc on data path</span>
             </div>
             <div class="ring-chips">
-              <span class="ring-chip">Reactor</span>
+              <span class="ring-chip">StreamingCoordinator</span>
               <span class="ring-chip">Operators</span>
               <span class="ring-chip">State Store</span>
-              <span class="ring-chip">SPSC Queues</span>
+              <span class="ring-chip">DataFusion Exec</span>
             </div>
           </div>
-          <div class="ring-divider">SPSC queues</div>
+          <div class="ring-divider">crossfire MPSC channels</div>
           <div class="ring ring-1">
             <div class="ring-header">
-              <span class="ring-name">Ring 1 &mdash; Background I/O</span>
-              <span class="ring-constraint">async &middot; bounded latency impact</span>
+              <span class="ring-name">I/O Runtime</span>
+              <span class="ring-constraint">main tokio runtime &middot; async</span>
             </div>
             <div class="ring-chips">
-              <span class="ring-chip">WAL</span>
-              <span class="ring-chip">Checkpoints</span>
-              <span class="ring-chip">Connectors</span>
+              <span class="ring-chip">Source Tasks</span>
+              <span class="ring-chip">Sink Tasks</span>
+              <span class="ring-chip">Checkpoint Coordinator</span>
               <span class="ring-chip">Recovery</span>
             </div>
           </div>
           <div class="ring-divider">Bounded channels</div>
           <div class="ring ring-2">
             <div class="ring-header">
-              <span class="ring-name">Ring 2 &mdash; Control Plane</span>
+              <span class="ring-name">Control Plane</span>
               <span class="ring-constraint">no latency requirements</span>
             </div>
             <div class="ring-chips">
               <span class="ring-chip">REST API</span>
+              <span class="ring-chip">WebSocket</span>
               <span class="ring-chip">Metrics</span>
               <span class="ring-chip">Config</span>
             </div>
@@ -270,7 +457,7 @@ db.start().await?;</code></pre>
           </div>
           <div class="code-body">
             <div class="tab-panel active" id="qs-rust">
-              <pre><code class="language-rust">// Cargo.toml: laminar-db = "0.18", tokio = { version = "1", features = ["full"] }
+              <pre><code class="language-rust">// Cargo.toml: laminar-db = "0.20", tokio = { version = "1", features = ["full"] }
 
 use laminar_db::LaminarDB;
 
@@ -484,6 +671,20 @@ CREATE SINK lake INTO DELTA_LAKE (
                 <td>S3, Azure, GCS, Unity, Glue catalogs. Exactly-once epoch tracking.</td>
               </tr>
               <tr>
+                <td>Apache Iceberg</td>
+                <td>Source + Sink</td>
+                <td><span class="status-impl">Implemented</span></td>
+                <td><code class="feature-flag">iceberg</code></td>
+                <td>REST catalog. Incremental reads via snapshot manifests.</td>
+              </tr>
+              <tr>
+                <td>OpenTelemetry</td>
+                <td>Source</td>
+                <td><span class="status-impl">Implemented</span></td>
+                <td><code class="feature-flag">otel</code></td>
+                <td>OTLP/gRPC receiver. Traces, metrics, logs with schema auto-discovery.</td>
+              </tr>
+              <tr>
                 <td>WebSocket</td>
                 <td>Source + Sink</td>
                 <td><span class="status-impl">Implemented</span></td>
@@ -528,9 +729,9 @@ CREATE SINK lake INTO DELTA_LAKE (
             <p>
               Rust: <code>cargo add laminar-db</code>.
               Python: <code>pip install laminardb</code>.
-              The engine runs in your process &mdash; push events, subscribe to results.
+              The engine runs in your process. Push events, subscribe to results.
             </p>
-            <p>Good fit for edge processing, embedded analytics, and latency-sensitive apps.</p>
+            <p>Suited to edge processing, embedded analytics, and latency-sensitive apps.</p>
           </div>
           <div class="deploy-card">
             <h3>Standalone Server</h3>
@@ -541,16 +742,17 @@ CREATE SINK lake INTO DELTA_LAKE (
             </p>
             <p>
               TOML configuration with <code>${ENV_VAR}</code> substitution.
-              REST API, Prometheus metrics, ad-hoc SQL, and hot-reload (edit config &rarr; automatic apply).
+              REST API, Prometheus metrics, ad-hoc SQL, and hot-reload of source, sink, and pipeline sections.
             </p>
-            <p>Use for: CDC pipelines, stream-to-lakehouse, event routing.</p>
+            <p>Typical uses: CDC pipelines, stream-to-lakehouse, event routing.</p>
           </div>
           <div class="deploy-card">
             <h3>Cluster</h3>
-            <span class="label-planned">Coming Soon</span>
+            <span class="label-planned">Planned</span>
             <p>
-              Multi-node deployment using Raft consensus and gossip discovery.
-              Core primitives are in the workspace &mdash; cluster mode is being wired into the server.
+              Multi-node deployment is on the roadmap and not yet functional.
+              The server has scaffolding for cluster mode; inter-node coordination
+              and state replication are still being designed.
             </p>
             <p><a href="https://github.com/laminardb/laminardb/blob/main/docs/ROADMAP.md" target="_blank" rel="noopener">Track progress on the roadmap</a></p>
           </div>
@@ -563,8 +765,7 @@ CREATE SINK lake INTO DELTA_LAKE (
       <div class="container">
         <h2>How it compares</h2>
         <p class="section-desc">
-          Different tools for different problems.
-          LaminarDB targets low-latency, single-node workloads today &mdash; cluster mode is coming.
+          LaminarDB targets low-latency, single-node workloads. Cluster mode is on the roadmap.
         </p>
 
         <div class="comparison-wrapper">
@@ -606,7 +807,7 @@ CREATE SINK lake INTO DELTA_LAKE (
               </tr>
               <tr>
                 <td>Deployment</td>
-                <td class="hl">Embedded, server, cluster (soon)</td>
+                <td class="hl">Embedded, server, cluster (planned)</td>
                 <td class="win">Cluster (YARN/K8s)</td>
                 <td>In-app (JVM)</td>
                 <td class="win">Kubernetes</td>
@@ -638,7 +839,7 @@ CREATE SINK lake INTO DELTA_LAKE (
               </tr>
               <tr>
                 <td>Connectors</td>
-                <td class="hl">10</td>
+                <td class="hl">Kafka, CDC, Delta, Iceberg, OTel, WS, Files</td>
                 <td class="win">100+</td>
                 <td>Kafka only</td>
                 <td class="win">15+</td>
@@ -662,7 +863,7 @@ CREATE SINK lake INTO DELTA_LAKE (
               </tr>
               <tr>
                 <td>Maturity</td>
-                <td class="hl">Pre-1.0 (<span data-version="tag">v0.18.12</span>)</td>
+                <td class="hl">Pre-1.0 (<span data-version="tag">v0.20.0</span>)</td>
                 <td class="win">Production (10+ yrs)</td>
                 <td class="win">Production (8+ yrs)</td>
                 <td class="win">Production (~2 yrs)</td>
@@ -673,28 +874,28 @@ CREATE SINK lake INTO DELTA_LAKE (
         </div>
 
         <p class="comparison-note">
-          Bold cells show where a competitor has a clear advantage.
-          LaminarDB wins on latency and deployment flexibility.
-          It loses on maturity, horizontal scale, and ecosystem breadth.
+          Bold cells mark a clear competitor advantage.
+          LaminarDB leads on latency and deployment flexibility, and trails on maturity,
+          horizontal scale, and ecosystem breadth.
         </p>
 
         <h3 style="margin-bottom: 1rem;">When to choose something else</h3>
         <div class="alternatives">
           <div class="alt-card">
             <h4>Apache Flink</h4>
-            <p>Need to scale across a cluster? Flink handles 100+ connectors and complex event processing. Trade-off: heavyweight JVM footprint and operational overhead.</p>
+            <p>Pick Flink when you need cluster-scale throughput, a mature connector ecosystem, or complex event processing. The trade-off is a heavyweight JVM footprint and significant operational overhead.</p>
           </div>
           <div class="alt-card">
             <h4>Kafka Streams</h4>
-            <p>Strictly Kafka in/out and already running JVM services? Streams is the simplest fit. No SQL though.</p>
+            <p>Pick Kafka Streams for strict Kafka-in / Kafka-out workloads inside an existing JVM service. It is the simplest fit in that niche, though it has no SQL layer.</p>
           </div>
           <div class="alt-card">
             <h4>Arroyo</h4>
-            <p>Distributed streaming in Rust with a web UI. Runs on Kubernetes. Shares the DataFusion SQL foundation with LaminarDB.</p>
+            <p>Distributed streaming in Rust with a web UI, built on Kubernetes. Shares the DataFusion SQL foundation with LaminarDB and solves the cluster-scale side of the problem.</p>
           </div>
           <div class="alt-card">
             <h4>kdb+</h4>
-            <p>Finance teams with q/k expertise and sub-microsecond timeseries analytics. 30+ years of production track record. Licensing is steep.</p>
+            <p>Finance teams with q/k expertise get sub-microsecond timeseries analytics and thirty years of production track record. Licensing is the main barrier.</p>
           </div>
         </div>
       </div>
@@ -705,8 +906,8 @@ CREATE SINK lake INTO DELTA_LAKE (
       <div class="container">
         <h2>Benchmarks</h2>
         <p class="section-desc">
-          Criterion benchmarks run on an AMD Ryzen AI 7 350 laptop.
-          These are not server numbers. Dedicated hardware with isolated cores will perform better.
+          Criterion numbers from an AMD Ryzen AI 7 350 laptop. Not server-grade hardware:
+          dedicated boxes with isolated cores will do better.
           <a href="https://github.com/laminardb/laminardb/blob/main/docs/BENCHMARKS.md" target="_blank" rel="noopener">Full results</a>.
         </p>
 
@@ -716,7 +917,7 @@ CREATE SINK lake INTO DELTA_LAKE (
               <tr>
                 <th>Metric</th>
                 <th>Target</th>
-                <th>Measured</th>
+                <th>Measured (2026-02-28 snapshot)</th>
                 <th>Benchmark File</th>
               </tr>
             </thead>
@@ -725,7 +926,7 @@ CREATE SINK lake INTO DELTA_LAKE (
                 <td>State lookup (AHash get_ref)</td>
                 <td>&lt;500ns</td>
                 <td>10&ndash;16ns (zero-copy)</td>
-                <td><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/state_bench.rs" target="_blank" rel="noopener">state_bench.rs</a></td>
+                <td><a href="https://github.com/laminardb/laminardb/blob/main/docs/BENCHMARKS.md" target="_blank" rel="noopener">BENCHMARKS.md</a></td>
               </tr>
               <tr>
                 <td>Throughput / core</td>
@@ -743,23 +944,16 @@ CREATE SINK lake INTO DELTA_LAKE (
                 <td>Checkpoint recovery</td>
                 <td>&lt;10s</td>
                 <td>1.39ms</td>
-                <td><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/checkpoint_bench.rs" target="_blank" rel="noopener">checkpoint_bench.rs</a></td>
-              </tr>
-              <tr>
-                <td>WAL append</td>
-                <td>&lt;1&micro;s</td>
-                <td>541ns</td>
-                <td><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-storage/benches/wal_bench.rs" target="_blank" rel="noopener">wal_bench.rs</a></td>
+                <td><a href="https://github.com/laminardb/laminardb/blob/main/docs/BENCHMARKS.md" target="_blank" rel="noopener">BENCHMARKS.md</a></td>
               </tr>
             </tbody>
           </table>
         </div>
 
         <p style="margin-top: 1rem; font-size: 0.85rem; color: var(--text-dim);">
-          Reproduce: <code>cargo bench --bench state_bench</code>,
-          <code>cargo bench --bench streaming_bench</code>,
+          Reproduce with <code>cargo bench --bench streaming_bench</code> or
           <code>cargo bench --bench latency_bench</code>.
-          All benchmarks use <a href="https://github.com/bheisler/criterion.rs" target="_blank" rel="noopener">Criterion</a> for statistical analysis.
+          All benches are driven by <a href="https://github.com/bheisler/criterion.rs" target="_blank" rel="noopener">Criterion</a>.
         </p>
       </div>
     </section>
@@ -769,7 +963,7 @@ CREATE SINK lake INTO DELTA_LAKE (
       <div class="container">
         <h2>Status</h2>
         <p class="section-desc">
-          Current version: <strong data-version="bare">0.18.12</strong> (pre-1.0).
+          Current version: <strong data-version="bare">0.20.0</strong> (pre-1.0).
           <a href="https://github.com/laminardb/laminardb/releases" target="_blank" rel="noopener">Releases</a> &middot;
           <a href="https://github.com/laminardb/laminardb/blob/main/docs/ROADMAP.md" target="_blank" rel="noopener">Roadmap</a>
         </p>
@@ -778,31 +972,87 @@ CREATE SINK lake INTO DELTA_LAKE (
           <div class="status-col stable">
             <h3>Stable</h3>
             <ul>
-              <li>Core engine (reactor, state stores, DAG executor)</li>
-              <li>Window functions (tumbling, sliding, hopping, session)</li>
-              <li>Joins (interval, ASOF, temporal, lookup, semi/anti)</li>
-              <li>All 10 connectors (Kafka, CDC, MongoDB, Delta, WS, files)</li>
+              <li>Streaming engine (StreamingCoordinator, operator graph, state stores)</li>
+              <li>Window functions (tumbling, sliding/hopping, session)</li>
+              <li>Joins (interval, ASOF, temporal, temporal probe, lookup, semi/anti)</li>
+              <li>Connectors: Kafka, PG/MySQL/MongoDB CDC, Delta Lake, Iceberg, OTel, WebSocket, Files</li>
               <li>Barrier-based checkpointing with 2PC exactly-once</li>
-              <li>Per-core WAL for durability</li>
+              <li>Object store checkpoints (file, S3, Azure, GCS)</li>
               <li>Standalone server with REST API, Prometheus metrics, hot-reload</li>
+              <li>Push-based WebSocket stream subscriptions</li>
               <li>Docker (multi-arch) and Helm chart deployment</li>
             </ul>
           </div>
           <div class="status-col experimental">
             <h3>Experimental</h3>
             <ul>
-              <li>io_uring storage (Linux only, feature-gated)</li>
-              <li>Incremental checkpoints</li>
+              <li>Materialized view result storage and queryability</li>
             </ul>
           </div>
           <div class="status-col unimplemented">
             <h3>Not yet implemented</h3>
             <ul>
-              <li>Cluster / multi-node deployment (coming soon)</li>
+              <li>Cluster / multi-node deployment (planned)</li>
               <li>PostgreSQL wire protocol (planned)</li>
-              <li>Redis connector</li>
             </ul>
           </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- FAQ -->
+    <section id="faq">
+      <div class="container">
+        <h2>Frequently asked questions</h2>
+        <div class="faq-list">
+          <details open>
+            <summary>What is LaminarDB?</summary>
+            <p>LaminarDB is an open-source streaming SQL engine written in Rust. It runs continuous SQL queries over event streams using Apache Arrow and DataFusion. It can be embedded in Rust or Python applications or run as a standalone server.</p>
+          </details>
+          <details>
+            <summary>How fast is LaminarDB?</summary>
+            <p>LaminarDB targets sub-microsecond state lookups (under 500 nanoseconds) and processes over 500,000 events per core per second. Criterion benchmarks on an AMD Ryzen AI 7 350 laptop measured state lookups in 10 to 16 nanoseconds and throughput of 1.1 to 1.46 million events per second per core.</p>
+          </details>
+          <details>
+            <summary>What connectors does LaminarDB support?</summary>
+            <p>LaminarDB ships with sources and sinks for Apache Kafka, PostgreSQL CDC, MySQL CDC, MongoDB CDC, Delta Lake, Apache Iceberg, OpenTelemetry OTLP, WebSocket, and rolling file formats (CSV, JSON, Parquet). All connectors are feature-gated so you only compile what you use.</p>
+          </details>
+          <details>
+            <summary>Is LaminarDB production-ready?</summary>
+            <p>LaminarDB is pre-1.0, currently at version 0.20.0. Single-node embedded and standalone server deployments are stable, including exactly-once sinks via barrier checkpoints. Multi-node cluster mode is on the roadmap but not yet functional.</p>
+          </details>
+          <details>
+            <summary>How does LaminarDB compare to Apache Flink?</summary>
+            <p>LaminarDB targets low-latency single-node workloads with an embedded or lightweight server deployment. Apache Flink scales horizontally across clusters and has a mature connector ecosystem, but carries a JVM runtime and significant operational overhead. Choose Flink for cluster-scale throughput; choose LaminarDB for sub-microsecond latency and embedded use.</p>
+          </details>
+          <details>
+            <summary>Can I use LaminarDB from Python?</summary>
+            <p>Yes. Install the Python package with <code>pip install laminardb</code>. It exposes the same streaming SQL engine as the Rust crate, with a Python-native API for pushing events and subscribing to results.</p>
+          </details>
+          <details>
+            <summary>What SQL features does LaminarDB support?</summary>
+            <p>LaminarDB supports standard SQL through DataFusion plus streaming extensions: tumbling, sliding, hopping, and session windows; ASOF, temporal, temporal probe, interval, and lookup joins; EMIT clauses (<code>ON WATERMARK</code>, <code>ON WINDOW CLOSE</code>, <code>PERIODICALLY</code>, <code>CHANGES</code>, <code>FINAL</code>); watermarks with <code>ALLOW LATENESS</code>; and late data routing via <code>LATE DATA TO</code>.</p>
+          </details>
+          <details>
+            <summary>How does LaminarDB handle exactly-once delivery?</summary>
+            <p>LaminarDB uses Chandy-Lamport style barrier checkpoints with two-phase commit. Source offsets and sink commit status are stored in a checkpoint manifest. On recovery, the engine restores operator state and rewinds sources to the last committed checkpoint.</p>
+          </details>
+          <details>
+            <summary>What is an ASOF join in LaminarDB?</summary>
+            <p>An ASOF join matches each row in the left stream to the single closest row in the right stream by timestamp within the same key partition. LaminarDB supports three directions: <strong>Backward</strong> (most recent prior event), <strong>Forward</strong> (next event), and <strong>Nearest</strong> (minimum absolute time difference).</p>
+          </details>
+          <details>
+            <summary>What is a temporal probe join?</summary>
+            <p>A temporal probe join produces multiple output rows for each left event by probing the right stream at a list of fixed time offsets. Offsets are specified with <code>RANGE FROM x TO y STEP z</code> or <code>LIST</code> of explicit millisecond values. It is designed for impact-curve analysis and lagged feature lookups.</p>
+          </details>
+          <details>
+            <summary>Does LaminarDB require a JVM?</summary>
+            <p>No. LaminarDB is written in Rust and ships as a native binary. It has no JVM or other runtime dependencies beyond the operating system.</p>
+          </details>
+          <details>
+            <summary>Is LaminarDB open source?</summary>
+            <p>Yes. LaminarDB is licensed under Apache 2.0 and the source is hosted at <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">github.com/laminardb/laminardb</a>.</p>
+          </details>
         </div>
       </div>
     </section>
@@ -812,9 +1062,9 @@ CREATE SINK lake INTO DELTA_LAKE (
       <div class="container">
         <h2>Contributing</h2>
         <p style="max-width: 600px; margin-bottom: 1.5rem;">
-          LaminarDB is Apache 2.0 licensed. Contributions welcome.
-          Rust 1.85+ required. See the contribution guide for Ring 0 constraints
-          (no allocations, no locks, no syscalls on the hot path).
+          LaminarDB is Apache 2.0 licensed and contributions are welcome.
+          You will need Rust 1.85 or newer. Read the contribution guide before starting:
+          the data path has strict constraints on allocations, locks, and syscalls.
         </p>
         <div class="contrib-links">
           <a href="https://github.com/laminardb/laminardb/blob/main/CONTRIBUTING.md" class="btn btn-secondary" target="_blank" rel="noopener">Contribution Guide</a>
@@ -833,7 +1083,7 @@ CREATE SINK lake INTO DELTA_LAKE (
         <div class="footer-left">
           LaminarDB &middot;
           <a href="https://github.com/laminardb/laminardb/blob/main/LICENSE" target="_blank" rel="noopener">Apache 2.0</a> &middot;
-          <span data-version="tag">v0.18.12</span>
+          <span data-version="tag">v0.20.0</span>
         </div>
         <div class="footer-links">
           <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
