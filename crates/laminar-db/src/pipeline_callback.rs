@@ -326,6 +326,20 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .collect();
         futures::future::join_all(sink_futures).await;
 
+        // Barrier: wait for every sink task to finish processing the
+        // commands we just enqueued, so the drain below catches any
+        // failures before maybe_checkpoint can advance source offsets.
+        let sync_futures = self.sinks.iter().map(|(name, handle, _, _, _)| {
+            let name = name.clone();
+            let handle = handle.clone();
+            async move {
+                if let Err(e) = handle.sync().await {
+                    tracing::warn!(sink = %name, error = %e, "sink sync barrier failed");
+                }
+            }
+        });
+        futures::future::join_all(sync_futures).await;
+
         // Drain SinkEvents emitted by sink tasks during this cycle.
         while let Ok(event) = self.sink_event_rx.try_recv() {
             tracing::debug!(?event, "sink event");

@@ -88,6 +88,10 @@ pub(crate) enum SinkCommand {
         epoch: u64,
         ack: oneshot::Sender<Result<(), ConnectorError>>,
     },
+    /// No-op barrier: acks once every prior command has been processed.
+    /// Used by the pipeline to make sure write results have surfaced as
+    /// `SinkEvent`s before checkpoint suppression decisions.
+    Sync { ack: oneshot::Sender<()> },
     /// Flush + close the connector and exit the task (test-only).
     #[cfg(test)]
     Close,
@@ -169,6 +173,27 @@ impl SinkTaskHandle {
                     self.name
                 ))
             })
+    }
+
+    /// Sends a no-op `Sync` barrier and waits for the sink task to ack.
+    /// When it returns, every previously queued command has been processed.
+    pub async fn sync(&self) -> Result<(), ConnectorError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.tx
+            .send(SinkCommand::Sync { ack: ack_tx })
+            .await
+            .map_err(|_| {
+                ConnectorError::ConnectionFailed(format!(
+                    "sink task '{}' closed unexpectedly",
+                    self.name
+                ))
+            })?;
+        ack_rx.await.map_err(|_| {
+            ConnectorError::ConnectionFailed(format!(
+                "sink task '{}' dropped sync acknowledgment",
+                self.name
+            ))
+        })
     }
 
     /// Begins a new epoch (starts a Kafka transaction for exactly-once sinks).
@@ -420,6 +445,9 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
                             );
                         }
                         let _ = ack.send(result);
+                    }
+                    SinkCommand::Sync { ack } => {
+                        let _ = ack.send(());
                     }
                     #[cfg(test)]
                     SinkCommand::Close => {

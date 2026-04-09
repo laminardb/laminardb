@@ -515,6 +515,13 @@ impl LaminarDB {
                     Some(ms) => std::time::Duration::from_millis(ms),
                     None => caps.suggested_write_timeout,
                 };
+            if write_timeout.is_zero() {
+                return Err(DbError::Connector(format!(
+                    "sink '{name}': write_timeout must be > 0 \
+                     (check 'sink.write.timeout.ms' or the sink's \
+                     suggested_write_timeout)"
+                )));
+            }
             let sink_id: std::sync::Arc<str> = std::sync::Arc::from(name.as_str());
             let handle =
                 crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {

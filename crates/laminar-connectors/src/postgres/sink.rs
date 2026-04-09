@@ -944,7 +944,9 @@ impl SinkConnector for PostgresSink {
     }
 
     fn capabilities(&self) -> SinkConnectorCapabilities {
-        let mut caps = SinkConnectorCapabilities::new(Duration::from_secs(30)).with_idempotent();
+        // statement_timeout + small margin for pool checkout / setup.
+        let write_timeout = self.config.statement_timeout + Duration::from_secs(5);
+        let mut caps = SinkConnectorCapabilities::new(write_timeout).with_idempotent();
 
         if self.config.write_mode == WriteMode::Upsert {
             caps = caps.with_upsert();
@@ -1042,7 +1044,8 @@ impl SinkConnector for PostgresSink {
     }
 
     fn capabilities(&self) -> SinkConnectorCapabilities {
-        let mut caps = SinkConnectorCapabilities::new(Duration::from_secs(30)).with_idempotent();
+        let write_timeout = self.config.statement_timeout + Duration::from_secs(5);
+        let mut caps = SinkConnectorCapabilities::new(write_timeout).with_idempotent();
         if self.config.write_mode == WriteMode::Upsert {
             caps = caps.with_upsert();
         }
