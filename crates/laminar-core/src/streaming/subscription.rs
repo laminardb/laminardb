@@ -21,11 +21,16 @@ enum PollResult {
 pub struct Subscription<T: Record> {
     rx: broadcast::Receiver<SourceMessage<T>>,
     schema: SchemaRef,
+    closed: bool,
 }
 
 impl<T: Record> Subscription<T> {
     pub(crate) fn new(rx: broadcast::Receiver<SourceMessage<T>>, schema: SchemaRef) -> Self {
-        Self { rx, schema }
+        Self {
+            rx,
+            schema,
+            closed: false,
+        }
     }
 
     /// Non-blocking poll. Returns the next batch, skipping watermarks.
@@ -38,7 +43,11 @@ impl<T: Record> Subscription<T> {
                     }
                 }
                 Err(broadcast::error::TryRecvError::Lagged(_)) => {}
-                Err(_) => return None,
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    self.closed = true;
+                    return None;
+                }
+                Err(broadcast::error::TryRecvError::Empty) => return None,
             }
         }
     }
@@ -49,7 +58,11 @@ impl<T: Record> Subscription<T> {
             match self.rx.try_recv() {
                 Ok(msg) => return Some(Self::convert_message(msg)),
                 Err(broadcast::error::TryRecvError::Lagged(_)) => {}
-                Err(_) => return None,
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    self.closed = true;
+                    return None;
+                }
+                Err(broadcast::error::TryRecvError::Empty) => return None,
             }
         }
     }
@@ -69,6 +82,7 @@ impl<T: Record> Subscription<T> {
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => {
+                    self.closed = true;
                     return Err(RecvError::Disconnected);
                 }
             }
@@ -112,7 +126,7 @@ impl<T: Record> Subscription<T> {
         }
     }
 
-    /// Internal: distinguishes empty from closed.
+    /// Internal: distinguishes empty from closed and caches the closed state.
     fn poll_or_closed(&mut self) -> PollResult {
         loop {
             match self.rx.try_recv() {
@@ -124,15 +138,19 @@ impl<T: Record> Subscription<T> {
                 }
                 Err(broadcast::error::TryRecvError::Lagged(_)) => {}
                 Err(broadcast::error::TryRecvError::Empty) => return PollResult::Empty,
-                Err(broadcast::error::TryRecvError::Closed) => return PollResult::Closed,
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    self.closed = true;
+                    return PollResult::Closed;
+                }
             }
         }
     }
 
-    /// Returns true if the broadcast channel is closed.
+    /// Returns true if the broadcast channel has been observed closed.
+    /// Non-destructive — reads a cached flag rather than polling the receiver.
     #[must_use]
-    pub fn is_disconnected(&mut self) -> bool {
-        matches!(self.poll_or_closed(), PollResult::Closed)
+    pub fn is_disconnected(&self) -> bool {
+        self.closed
     }
 
     /// Polls multiple batches. Returns up to `max_count`.

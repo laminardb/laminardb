@@ -776,7 +776,7 @@ mod tests {
         assert!(source.pending_batches.is_empty());
     }
 
-    /// D020: Source open() must error without delta-lake feature.
+    /// D020: Source `open()` must error without delta-lake feature.
     #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
     async fn test_open_requires_feature() {

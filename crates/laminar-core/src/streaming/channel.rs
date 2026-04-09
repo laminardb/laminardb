@@ -178,7 +178,7 @@ mod tests {
         let a = rt.block_on(rx.recv()).unwrap();
         let b = rt.block_on(rx.recv()).unwrap();
         let mut items = vec![a, b];
-        items.sort();
+        items.sort_unstable();
         assert_eq!(items, vec![1, 2]);
     }
 

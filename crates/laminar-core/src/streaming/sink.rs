@@ -138,13 +138,13 @@ mod tests {
         let (_source, sink) = create::<TestEvent>(16);
         assert_eq!(sink.subscriber_count(), 0);
 
-        let _sub1 = sink.subscribe();
+        let sub1 = sink.subscribe();
         assert_eq!(sink.subscriber_count(), 1);
 
         let _sub2 = sink.subscribe();
         assert_eq!(sink.subscriber_count(), 2);
 
-        drop(_sub1);
+        drop(sub1);
         assert_eq!(sink.subscriber_count(), 1);
     }
 }

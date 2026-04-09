@@ -68,74 +68,6 @@ fn make_batch(size: usize) -> RecordBatch {
 
 // Channel Benchmarks
 
-fn bench_channel_push(c: &mut Criterion) {
-    let mut group = c.benchmark_group("channel_push");
-    group.throughput(Throughput::Elements(1));
-
-    for capacity in [1024, 4096, 65536] {
-        group.bench_with_input(
-            BenchmarkId::new("try_push", capacity),
-            &capacity,
-            |b, &cap| {
-                let (producer, consumer) = streaming::channel::<u64>(cap);
-                let mut val = 0u64;
-                b.iter(|| {
-                    let _ = consumer.poll();
-                    let result = producer.try_push(black_box(val));
-                    val = val.wrapping_add(1);
-                    black_box(result)
-                })
-            },
-        );
-    }
-
-    group.finish();
-}
-
-fn bench_channel_pop(c: &mut Criterion) {
-    let mut group = c.benchmark_group("channel_pop");
-    group.throughput(Throughput::Elements(1));
-
-    let (producer, consumer) = streaming::channel::<u64>(65536);
-    for i in 0..32768u64 {
-        let _ = producer.try_push(i);
-    }
-
-    let mut refill = 32768u64;
-    group.bench_function("poll", |b| {
-        b.iter(|| {
-            let result = consumer.poll();
-            if result.is_none() {
-                let _ = producer.try_push(refill);
-                refill = refill.wrapping_add(1);
-            }
-            black_box(result)
-        })
-    });
-
-    group.finish();
-}
-
-fn bench_mpsc_push(c: &mut Criterion) {
-    let mut group = c.benchmark_group("mpsc_push");
-    group.throughput(Throughput::Elements(1));
-
-    let (producer, consumer) = streaming::channel::<u64>(65536);
-    let _producer2 = producer.clone();
-
-    let mut val = 0u64;
-    group.bench_function("single_writer", |b| {
-        b.iter(|| {
-            let _ = consumer.poll();
-            let result = producer.try_push(black_box(val));
-            val = val.wrapping_add(1);
-            black_box(result)
-        })
-    });
-
-    group.finish();
-}
-
 // Source Benchmarks
 
 fn bench_source_push(c: &mut Criterion) {
@@ -275,13 +207,6 @@ fn bench_watermark(c: &mut Criterion) {
 }
 
 criterion_group!(
-    channel_benches,
-    bench_channel_push,
-    bench_channel_pop,
-    bench_mpsc_push,
-);
-
-criterion_group!(
     source_benches,
     bench_source_push,
     bench_source_push_arrow,
@@ -295,4 +220,4 @@ criterion_group!(
     bench_watermark,
 );
 
-criterion_main!(channel_benches, source_benches, end_to_end_benches);
+criterion_main!(source_benches, end_to_end_benches);

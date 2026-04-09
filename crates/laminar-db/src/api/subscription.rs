@@ -110,7 +110,7 @@ impl ArrowSubscription {
 
     /// Check if subscription is still active.
     #[must_use]
-    pub fn is_active(&mut self) -> bool {
+    pub fn is_active(&self) -> bool {
         self.active && !self.inner.is_disconnected()
     }
 
