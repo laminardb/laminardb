@@ -5,6 +5,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -266,7 +267,7 @@ impl SinkConnector for MockSinkConnector {
     }
 
     fn capabilities(&self) -> SinkConnectorCapabilities {
-        SinkConnectorCapabilities::default()
+        SinkConnectorCapabilities::new(Duration::from_secs(60))
             .with_exactly_once()
             .with_idempotent()
             .with_two_phase_commit()

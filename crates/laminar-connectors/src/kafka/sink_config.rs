@@ -54,6 +54,9 @@ pub struct KafkaSinkConfig {
     /// Delivery guarantee level.
     pub delivery_guarantee: DeliveryGuarantee,
     /// Transactional ID prefix for exactly-once.
+    ///
+    // TODO(distributed): embed the lease epoch here so a new lease holder
+    // fences the previous one via Kafka's producer epoch.
     pub transactional_id: Option<String>,
     /// Transaction timeout.
     pub transaction_timeout: Duration,

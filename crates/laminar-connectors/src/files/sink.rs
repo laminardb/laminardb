@@ -10,6 +10,7 @@
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -391,7 +392,7 @@ impl SinkConnector for FileSink {
     }
 
     fn capabilities(&self) -> SinkConnectorCapabilities {
-        SinkConnectorCapabilities::default()
+        SinkConnectorCapabilities::new(Duration::from_secs(30))
             .with_exactly_once()
             .with_two_phase_commit()
     }

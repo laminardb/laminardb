@@ -9,6 +9,8 @@
 //! `Transaction::fast_append()`. `rollback_epoch()` discards staged data
 //! without side effects.
 
+use std::time::Duration;
+
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -503,7 +505,8 @@ impl SinkConnector for IcebergSink {
     }
 
     fn capabilities(&self) -> SinkConnectorCapabilities {
-        SinkConnectorCapabilities::default()
+        // Iceberg catalog writes can be slow under contention.
+        SinkConnectorCapabilities::new(Duration::from_secs(300))
             .with_exactly_once()
             .with_two_phase_commit()
     }

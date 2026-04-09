@@ -470,10 +470,13 @@ impl LaminarDB {
             }
         }
 
-        // Build sinks via registry (generic — no connector-specific code).
-        // Each sink runs in its own tokio task with a bounded command channel,
-        // eliminating Arc<Mutex> contention between pipeline writes and
-        // checkpoint operations.
+        // Build sinks. Each runs in its own tokio task with a bounded
+        // command channel and shares one event channel back to the
+        // pipeline callback.
+        let (sink_event_tx, sink_event_rx) =
+            laminar_core::streaming::channel::channel::<crate::sink_task::SinkEvent>(
+                crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY,
+            );
         #[allow(clippy::type_complexity)]
         let mut sinks: Vec<(
             String,
@@ -499,8 +502,31 @@ impl LaminarDB {
                 .await
                 .map_err(|e| DbError::Connector(format!("Failed to open sink '{name}': {e}")))?;
             let caps = sink.capabilities();
+            // Resolve per-sink write timeout: user override (property)
+            // takes precedence over the sink's declared suggestion.
+            let write_timeout =
+                match config
+                    .get_parsed::<u64>("sink.write.timeout.ms")
+                    .map_err(|e| {
+                        DbError::Connector(format!(
+                            "Invalid 'sink.write.timeout.ms' for sink '{name}': {e}"
+                        ))
+                    })? {
+                    Some(ms) => std::time::Duration::from_millis(ms),
+                    None => caps.suggested_write_timeout,
+                };
+            let sink_id: std::sync::Arc<str> = std::sync::Arc::from(name.as_str());
             let handle =
-                crate::sink_task::SinkTaskHandle::spawn(name.clone(), sink, caps.exactly_once);
+                crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+                    name: name.clone(),
+                    sink_id,
+                    connector: sink,
+                    exactly_once: caps.exactly_once,
+                    channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+                    flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+                    write_timeout,
+                    event_tx: sink_event_tx.clone(),
+                });
             sinks.push((
                 name.clone(),
                 handle,
@@ -509,6 +535,9 @@ impl LaminarDB {
                 caps.changelog,
             ));
         }
+        // Drop the local sender so the channel disconnects when all
+        // sink tasks exit.
+        drop(sink_event_tx);
 
         // Build table sources from registrations
         let mut table_sources: Vec<(String, Box<dyn ReferenceTableSource>, RefreshMode)> =
@@ -930,7 +959,6 @@ impl LaminarDB {
             drain_budget_ns,
             query_budget_ns,
             background_budget_ns: 5_000_000, // 5ms
-            sink_write_timeout: std::time::Duration::from_secs(30),
             max_input_buf_batches: 256,
         };
 
@@ -1039,8 +1067,8 @@ impl LaminarDB {
                 .map(std::time::Duration::from_millis),
             pipeline_hash,
             delivery_guarantee: pipeline_config.delivery_guarantee,
-            sink_write_timeout: pipeline_config.sink_write_timeout,
             serialization_timeout: std::time::Duration::from_secs(120),
+            sink_event_rx,
             sink_timed_out: false,
             cycle_histogram: std::cell::RefCell::new(
                 crate::checkpoint_coordinator::DurationHistogram::new(),

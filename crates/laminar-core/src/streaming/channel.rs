@@ -111,6 +111,18 @@ impl<T: Send + 'static> AsyncConsumer<T> {
         self.rx.recv().await
     }
 
+    /// Non-blocking receive. Returns `Err` immediately if the channel is
+    /// empty or the senders have all disconnected.
+    ///
+    /// # Errors
+    ///
+    /// Returns `crossfire::TryRecvError::Empty` when no items are buffered,
+    /// `crossfire::TryRecvError::Disconnected` after all senders are dropped
+    /// and the buffer is drained.
+    pub fn try_recv(&self) -> Result<T, crossfire::TryRecvError> {
+        self.rx.try_recv()
+    }
+
     /// Returns `true` if the sender has been dropped.
     #[must_use]
     pub fn is_disconnected(&self) -> bool {

@@ -790,6 +790,17 @@ impl CheckpointCoordinator {
         if let Err(e) = self.pre_commit_sinks(epoch).await {
             self.phase = CheckpointPhase::Idle;
             self.checkpoints_failed += 1;
+            // Roll back unconditionally — `rollback_epoch` is idempotent.
+            // Without this, a poisoned epoch leaves Kafka transactions
+            // open until the broker-side transaction.timeout.ms fires.
+            if let Err(rollback_err) = self.rollback_sinks(epoch).await {
+                error!(
+                    checkpoint_id,
+                    epoch,
+                    error = %rollback_err,
+                    "[LDB-6004] sink rollback failed after pre-commit failure"
+                );
+            }
             let duration = start.elapsed();
             self.emit_checkpoint_metrics(false, epoch, duration);
             error!(checkpoint_id, epoch, error = %e, "pre-commit failed");
@@ -1708,5 +1719,114 @@ mod tests {
         // After 3 fast checkpoints, percentiles should be > 0
         // (they're real durations, not zero).
         assert!(stats.last_duration.is_some());
+    }
+
+    /// Sink whose `pre_commit` always fails; counts `rollback_epoch` calls.
+    struct FailingPreCommitSink {
+        rollback_count: Arc<std::sync::atomic::AtomicU64>,
+        schema: arrow::datatypes::SchemaRef,
+    }
+
+    #[async_trait::async_trait]
+    impl laminar_connectors::connector::SinkConnector for FailingPreCommitSink {
+        async fn open(
+            &mut self,
+            _config: &laminar_connectors::config::ConnectorConfig,
+        ) -> Result<(), laminar_connectors::error::ConnectorError> {
+            Ok(())
+        }
+
+        async fn write_batch(
+            &mut self,
+            _batch: &arrow::array::RecordBatch,
+        ) -> Result<
+            laminar_connectors::connector::WriteResult,
+            laminar_connectors::error::ConnectorError,
+        > {
+            Ok(laminar_connectors::connector::WriteResult::new(0, 0))
+        }
+
+        async fn pre_commit(
+            &mut self,
+            epoch: u64,
+        ) -> Result<(), laminar_connectors::error::ConnectorError> {
+            Err(laminar_connectors::error::ConnectorError::TransactionError(
+                format!("synthetic pre_commit failure at epoch {epoch}"),
+            ))
+        }
+
+        async fn rollback_epoch(
+            &mut self,
+            _epoch: u64,
+        ) -> Result<(), laminar_connectors::error::ConnectorError> {
+            self.rollback_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+
+        async fn close(&mut self) -> Result<(), laminar_connectors::error::ConnectorError> {
+            Ok(())
+        }
+
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn capabilities(&self) -> laminar_connectors::connector::SinkConnectorCapabilities {
+            laminar_connectors::connector::SinkConnectorCapabilities::new(Duration::from_secs(5))
+                .with_exactly_once()
+                .with_two_phase_commit()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pre_commit_failure_triggers_rollback() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path());
+
+        let rollback_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let sink = FailingPreCommitSink {
+            rollback_count: Arc::clone(&rollback_count),
+            schema,
+        };
+        let (event_tx, _event_rx) = laminar_core::streaming::channel::channel::<
+            crate::sink_task::SinkEvent,
+        >(crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY);
+        let handle = crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+            name: "failing-sink".into(),
+            sink_id: Arc::from("failing-sink"),
+            connector: Box::new(sink),
+            exactly_once: true,
+            channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+            flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+            write_timeout: Duration::from_secs(5),
+            event_tx,
+        });
+        coord.register_sink("failing-sink", handle, true);
+
+        coord.begin_initial_epoch().await.unwrap();
+
+        let result = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("pre-commit failed")),
+            "error should mention pre-commit: got {:?}",
+            result.error
+        );
+        assert_eq!(
+            rollback_count.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "rollback_epoch should have been called once"
+        );
     }
 }

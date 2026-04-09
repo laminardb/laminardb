@@ -82,8 +82,12 @@ pub struct PipelineCounters {
     pub sink_precommit_duration_us: AtomicU64,
     /// Last sink commit (us).
     pub sink_commit_duration_us: AtomicU64,
-    /// Sink write errors (channel errors + timeouts).
-    pub sink_write_errors: AtomicU64,
+    /// `write_batch` returned `Err` (broker, serialization, etc.).
+    pub sink_write_failures: AtomicU64,
+    /// `write_batch` exceeded its per-call I/O timeout.
+    pub sink_write_timeouts: AtomicU64,
+    /// Sink command channel was closed (sink task died).
+    pub sink_task_channel_closed: AtomicU64,
     /// Cycles skipped due to backpressure.
     pub cycles_backpressured: AtomicU64,
 
@@ -122,7 +126,9 @@ impl PipelineCounters {
             cycle_p99_ns: AtomicU64::new(0),
             sink_precommit_duration_us: AtomicU64::new(0),
             sink_commit_duration_us: AtomicU64::new(0),
-            sink_write_errors: AtomicU64::new(0),
+            sink_write_failures: AtomicU64::new(0),
+            sink_write_timeouts: AtomicU64::new(0),
+            sink_task_channel_closed: AtomicU64::new(0),
             cycles_backpressured: AtomicU64::new(0),
             last_checkpoint_size_bytes: AtomicU64::new(0),
             last_checkpoint_timestamp_ms: AtomicU64::new(0),
@@ -153,7 +159,9 @@ impl PipelineCounters {
             cycle_p99_ns: self.cycle_p99_ns.load(Ordering::Relaxed),
             sink_precommit_duration_us: self.sink_precommit_duration_us.load(Ordering::Relaxed),
             sink_commit_duration_us: self.sink_commit_duration_us.load(Ordering::Relaxed),
-            sink_write_errors: self.sink_write_errors.load(Ordering::Relaxed),
+            sink_write_failures: self.sink_write_failures.load(Ordering::Relaxed),
+            sink_write_timeouts: self.sink_write_timeouts.load(Ordering::Relaxed),
+            sink_task_channel_closed: self.sink_task_channel_closed.load(Ordering::Relaxed),
             cycles_backpressured: self.cycles_backpressured.load(Ordering::Relaxed),
             last_checkpoint_size_bytes: self.last_checkpoint_size_bytes.load(Ordering::Relaxed),
             last_checkpoint_timestamp_ms: self.last_checkpoint_timestamp_ms.load(Ordering::Relaxed),
@@ -208,8 +216,12 @@ pub struct CounterSnapshot {
     pub sink_precommit_duration_us: u64,
     /// Last commit (us).
     pub sink_commit_duration_us: u64,
-    /// Sink write errors.
-    pub sink_write_errors: u64,
+    /// `write_batch` returned `Err`.
+    pub sink_write_failures: u64,
+    /// `write_batch` exceeded its per-call I/O timeout.
+    pub sink_write_timeouts: u64,
+    /// Sink command channel closed (task died).
+    pub sink_task_channel_closed: u64,
     /// Backpressure-skipped cycles.
     pub cycles_backpressured: u64,
     /// Last checkpoint size (bytes).

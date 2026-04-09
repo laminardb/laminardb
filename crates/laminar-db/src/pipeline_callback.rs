@@ -72,11 +72,12 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) checkpoint_interval: Option<std::time::Duration>,
     pub(crate) pipeline_hash: Option<u64>,
     pub(crate) delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee,
-    pub(crate) sink_write_timeout: Duration,
     /// Maximum time to wait for operator state serialization.
     pub(crate) serialization_timeout: Duration,
+    /// Drained once per cycle by `write_to_sinks` to update sink metrics.
+    pub(crate) sink_event_rx: laminar_core::streaming::AsyncConsumer<crate::sink_task::SinkEvent>,
     /// Set when a sink write times out in this cycle. Suppresses the next
-    /// periodic checkpoint to avoid advancing offsets past dropped batches.
+    /// checkpoint to preserve the replay window.
     pub(crate) sink_timed_out: bool,
     /// Cycle duration histogram for percentile tracking (single-threaded access).
     pub(crate) cycle_histogram:
@@ -239,119 +240,108 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         // Lazy-compile any pending sink filters.
         self.compile_pending_sink_filters(results).await;
 
-        // Shared flag — set by any sink future on timeout, read after join_all.
-        let had_timeout = std::sync::atomic::AtomicBool::new(false);
-        let is_exactly_once = self.delivery_guarantee
-            == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce;
-        let write_timeout = self.sink_write_timeout;
-        let counters = Arc::clone(&self.counters);
-
         // Route results to sinks concurrently, filtered by FROM clause.
+        // The per-call I/O timeout is enforced inside the sink task; the
+        // bounded command channel backpressures us naturally. Failures
+        // and timeouts are reported out of band via SinkEvents drained
+        // below after join_all.
         let filter_ctx = self.filter_ctx.clone(); // Arc bump — cheap
         let sink_futures: Vec<_> = self
             .sinks
             .iter()
             .enumerate()
-            .filter_map(|(sink_idx, (sink_name, handle, filter_expr, sink_input, changelog_capable))| {
-                // Route by FROM clause: only send matching results.
-                let batches = results.get(sink_input.as_str())?;
-                if batches.is_empty() {
-                    return None;
-                }
-                let sink_name = sink_name.clone();
-                let handle = handle.clone();
-                let compiled_filter = self
-                    .compiled_sink_filters
-                    .get(sink_idx)
-                    .and_then(Clone::clone);
-                let filter_expr = filter_expr.clone();
-                let batches = batches.clone();
-                let ctx = filter_ctx.clone();
-                let had_timeout = &had_timeout;
-                let counters = &counters;
-                Some(async move {
-                    for batch in &batches {
-                        let filtered = if let Some(ref phys) = compiled_filter {
-                            // Use compiled PhysicalExpr — no SQL overhead
-                            match apply_compiled_sink_filter(batch, phys) {
-                                Ok(Some(fb)) => fb,
-                                Ok(None) => continue,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        sink = %sink_name,
-                                        error = %e,
-                                        "Compiled sink filter error"
-                                    );
-                                    continue;
-                                }
-                            }
-                        } else if let Some(ref filter_sql) = filter_expr {
-                            // Fallback to SQL-based filter
-                            match apply_filter(&ctx, batch, filter_sql).await {
-                                Ok(Some(fb)) => fb,
-                                Ok(None) => continue,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        sink = %sink_name,
-                                        filter = %filter_sql,
-                                        error = %e,
-                                        "Sink filter error"
-                                    );
-                                    continue;
-                                }
-                            }
-                        } else {
-                            batch.clone()
-                        };
-
-                        let filtered =
-                            crate::changelog_filter::prepare_for_sink(&filtered, *changelog_capable);
-
-                        if filtered.num_rows() > 0 {
-                            match tokio::time::timeout(write_timeout, handle.write_batch(filtered))
-                                .await
-                            {
-                                Ok(Err(e)) => {
-                                    counters.sink_write_errors.fetch_add(1, Ordering::Relaxed);
-                                    tracing::warn!(
-                                        sink = %sink_name,
-                                        error = %e,
-                                        "[LDB-5030] Sink write error — \
-                                         skipping remaining batches for this sink"
-                                    );
-                                    break;
-                                }
-                                Err(_elapsed) => {
-                                    counters.sink_write_errors.fetch_add(1, Ordering::Relaxed);
-                                    had_timeout.store(true, Ordering::Relaxed);
-                                    if is_exactly_once {
-                                        tracing::error!(
-                                            sink = %sink_name,
-                                            timeout_secs = write_timeout.as_secs(),
-                                            "[LDB-5040] Sink write timed out, batch dropped \
-                                             (EXACTLY-ONCE VIOLATION — next checkpoint suppressed)"
-                                        );
-                                    } else {
+            .filter_map(
+                |(sink_idx, (sink_name, handle, filter_expr, sink_input, changelog_capable))| {
+                    // Route by FROM clause: only send matching results.
+                    let batches = results.get(sink_input.as_str())?;
+                    if batches.is_empty() {
+                        return None;
+                    }
+                    let sink_name = sink_name.clone();
+                    let handle = handle.clone();
+                    let compiled_filter = self
+                        .compiled_sink_filters
+                        .get(sink_idx)
+                        .and_then(Clone::clone);
+                    let filter_expr = filter_expr.clone();
+                    let batches = batches.clone();
+                    let ctx = filter_ctx.clone();
+                    Some(async move {
+                        for batch in &batches {
+                            let filtered = if let Some(ref phys) = compiled_filter {
+                                // Use compiled PhysicalExpr — no SQL overhead
+                                match apply_compiled_sink_filter(batch, phys) {
+                                    Ok(Some(fb)) => fb,
+                                    Ok(None) => continue,
+                                    Err(e) => {
                                         tracing::warn!(
                                             sink = %sink_name,
-                                            timeout_secs = write_timeout.as_secs(),
-                                            "[LDB-5040] Sink write timed out, batch dropped \
-                                             (next checkpoint suppressed to allow replay)"
+                                            error = %e,
+                                            "Compiled sink filter error"
                                         );
+                                        continue;
                                     }
+                                }
+                            } else if let Some(ref filter_sql) = filter_expr {
+                                // Fallback to SQL-based filter
+                                match apply_filter(&ctx, batch, filter_sql).await {
+                                    Ok(Some(fb)) => fb,
+                                    Ok(None) => continue,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            sink = %sink_name,
+                                            filter = %filter_sql,
+                                            error = %e,
+                                            "Sink filter error"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                batch.clone()
+                            };
+
+                            let filtered = crate::changelog_filter::prepare_for_sink(
+                                &filtered,
+                                *changelog_capable,
+                            );
+
+                            if filtered.num_rows() > 0 {
+                                if let Err(e) = handle.write_batch(filtered).await {
+                                    // ChannelClosed metric is incremented when
+                                    // we drain the event channel below; here
+                                    // we just log and stop sending to this sink.
+                                    tracing::warn!(
+                                        sink = %sink_name,
+                                        error = %e,
+                                        "Sink command channel closed"
+                                    );
                                     break;
                                 }
-                                Ok(Ok(())) => {}
                             }
                         }
-                    }
-                })
-            })
+                    })
+                },
+            )
             .collect();
         futures::future::join_all(sink_futures).await;
 
-        if had_timeout.load(Ordering::Relaxed) {
-            self.sink_timed_out = true;
+        // Drain SinkEvents emitted by sink tasks during this cycle.
+        while let Ok(event) = self.sink_event_rx.try_recv() {
+            tracing::debug!(?event, "sink event");
+            let counter = match &event {
+                crate::sink_task::SinkEvent::WriteError { .. } => {
+                    &self.counters.sink_write_failures
+                }
+                crate::sink_task::SinkEvent::WriteTimeout { .. } => {
+                    self.sink_timed_out = true;
+                    &self.counters.sink_write_timeouts
+                }
+                crate::sink_task::SinkEvent::ChannelClosed { .. } => {
+                    &self.counters.sink_task_channel_closed
+                }
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
         }
     }
 

@@ -1,32 +1,63 @@
-//! Per-sink task that owns a [`SinkConnector`] and processes commands via a
-//! bounded channel.
-//!
-//! This decouples the pipeline loop from individual sink I/O, eliminating
-//! `Arc<Mutex>` contention between pipeline writes and checkpoint operations.
-//!
-//! Each sink runs in its own tokio task and processes commands sequentially:
-//! - `WriteBatch` — write a `RecordBatch` to the sink
-//! - `Flush` — explicitly flush buffered data
-//! - `PreCommit` — checkpoint 2PC phase 1
-//! - `CommitEpoch` — checkpoint 2PC phase 2
-//! - `RollbackEpoch` — abort a failed epoch
-//! - `Close` — flush + close the connector
+//! Per-sink task that owns a [`SinkConnector`] and processes commands
+//! sequentially. Failures and timeouts are reported out of band via the
+//! [`SinkEvent`] channel.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use laminar_connectors::connector::SinkConnector;
 use laminar_connectors::error::ConnectorError;
+use laminar_core::streaming::Producer;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 /// Default capacity for the sink command channel.
-const DEFAULT_CHANNEL_CAPACITY: usize = 128;
+pub(crate) const DEFAULT_CHANNEL_CAPACITY: usize = 128;
 
 /// Default periodic flush interval for sink tasks.
-const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+pub(crate) const DEFAULT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Capacity of the sink event channel. Events are exception-path; a
+/// generous bound is fine and avoids unbounded growth on stuck drains.
+pub(crate) const SINK_EVENT_CHANNEL_CAPACITY: usize = 1024;
+
+/// Out-of-band events emitted by a sink task. Drained once per cycle by
+/// the pipeline callback to update metrics and suppress checkpoints.
+/// Fields are read via `Debug` when the drain loop logs them.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) enum SinkEvent {
+    WriteError {
+        sink_id: Arc<str>,
+        epoch: u64,
+        rows: usize,
+        error: String,
+    },
+    WriteTimeout {
+        sink_id: Arc<str>,
+        epoch: u64,
+        rows: usize,
+        timeout: Duration,
+    },
+    ChannelClosed {
+        sink_id: Arc<str>,
+    },
+}
+
+/// Configuration for spawning a sink task.
+pub(crate) struct SinkTaskConfig {
+    pub name: String,
+    /// Stable identifier carried in [`SinkEvent`]s.
+    pub sink_id: Arc<str>,
+    pub connector: Box<dyn SinkConnector>,
+    pub exactly_once: bool,
+    pub channel_capacity: usize,
+    pub flush_interval: Duration,
+    pub write_timeout: Duration,
+    pub event_tx: Producer<SinkEvent>,
+}
 
 /// Commands sent to a sink's dedicated task.
 pub(crate) enum SinkCommand {
@@ -63,86 +94,76 @@ pub(crate) enum SinkCommand {
 }
 
 /// Handle for sending commands to a sink's dedicated task.
-///
-/// The handle is cheaply cloneable (wraps `mpsc::Sender` + `Arc` metadata).
-/// Both the pipeline loop and the checkpoint coordinator can hold handles
-/// to the same sink task without contending on a mutex.
 #[derive(Clone)]
 pub(crate) struct SinkTaskHandle {
-    /// Sink name (for logging).
     name: Arc<str>,
-    /// Command channel sender.
+    sink_id: Arc<str>,
     tx: mpsc::Sender<SinkCommand>,
-    /// Whether this sink supports exactly-once semantics.
     exactly_once: bool,
-    /// Background task join handle. Used by `close()` for explicit shutdown.
-    /// Implicit shutdown (channel drop) works without awaiting the handle.
-    #[allow(dead_code)] // used by close(); implicit channel-drop handles normal shutdown
+    /// Held so `close()` can join the task; implicit shutdown happens
+    /// when the command channel drops.
+    #[allow(dead_code)]
     task: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
-    /// Shared with the task loop — kept alive so the task can increment it.
-    #[allow(dead_code)]
-    write_errors: Arc<AtomicU64>,
-    /// Shared with the task loop for epoch poisoning. The struct holds the
-    /// Arc to keep it alive; the task loop reads/writes it directly.
-    #[allow(dead_code)]
-    epoch_poisoned: Arc<AtomicBool>,
+    /// Used by `write_batch` to emit `ChannelClosed` if the task is gone.
+    event_tx: Producer<SinkEvent>,
 }
 
 impl SinkTaskHandle {
-    /// Spawns a new sink task and returns a handle.
-    pub fn spawn(name: String, connector: Box<dyn SinkConnector>, exactly_once: bool) -> Self {
-        Self::spawn_with_options(
-            name,
-            connector,
-            exactly_once,
-            DEFAULT_CHANNEL_CAPACITY,
-            DEFAULT_FLUSH_INTERVAL,
-        )
-    }
-
-    /// Spawns a new sink task with custom channel capacity and flush interval.
+    /// Spawns a sink task and returns a handle.
     ///
     /// # Panics
     ///
-    /// Panics if `channel_capacity` is 0.
-    pub fn spawn_with_options(
-        name: String,
-        connector: Box<dyn SinkConnector>,
-        exactly_once: bool,
-        channel_capacity: usize,
-        flush_interval: Duration,
-    ) -> Self {
-        assert!(channel_capacity > 0, "sink channel_capacity must be > 0");
-        let (tx, rx) = mpsc::channel(channel_capacity);
-        let task_name = name.clone();
-        let write_errors = Arc::new(AtomicU64::new(0));
-        let epoch_poisoned = Arc::new(AtomicBool::new(false));
-        let handle = tokio::spawn(run_sink_task(
-            task_name,
+    /// Panics if `config.channel_capacity` is 0.
+    pub fn spawn(config: SinkTaskConfig) -> Self {
+        assert!(
+            config.channel_capacity > 0,
+            "sink channel_capacity must be > 0"
+        );
+        let SinkTaskConfig {
+            name,
+            sink_id,
             connector,
+            exactly_once,
+            channel_capacity,
+            flush_interval,
+            write_timeout,
+            event_tx,
+        } = config;
+        let (tx, rx) = mpsc::channel(channel_capacity);
+        let task_sink_id = Arc::clone(&sink_id);
+        let task_event_tx = event_tx.clone();
+        let task_name = name.clone();
+        let handle = tokio::spawn(run_sink_task(SinkTaskInner {
+            name: task_name,
+            sink_id: task_sink_id,
+            sink: connector,
             rx,
             flush_interval,
-            Arc::clone(&write_errors),
-            Arc::clone(&epoch_poisoned),
-        ));
+            write_timeout,
+            event_tx: task_event_tx,
+        }));
 
         Self {
             name: Arc::from(name),
+            sink_id,
             tx,
             exactly_once,
             task: Arc::new(tokio::sync::Mutex::new(Some(handle))),
-            write_errors,
-            epoch_poisoned,
+            event_tx,
         }
     }
 
-    /// Sends a batch to be written. Non-blocking unless the channel is full,
-    /// in which case backpressure is applied via the bounded channel.
+    /// Sends a batch to be written. Backpressures via the bounded channel
+    /// when the sink task is behind. On channel-closed, emits
+    /// `SinkEvent::ChannelClosed` and returns an error.
     pub async fn write_batch(&self, batch: RecordBatch) -> Result<(), ConnectorError> {
         self.tx
             .send(SinkCommand::WriteBatch { batch })
             .await
             .map_err(|_| {
+                let _ = self.event_tx.try_push(SinkEvent::ChannelClosed {
+                    sink_id: Arc::clone(&self.sink_id),
+                });
                 ConnectorError::ConnectionFailed(format!(
                     "sink task '{}' closed unexpectedly",
                     self.name
@@ -277,60 +298,97 @@ impl SinkTaskHandle {
     }
 }
 
-/// Main loop for a sink task.
-///
-/// Owns the `SinkConnector` exclusively — no external locking needed.
-#[allow(clippy::too_many_lines)]
-async fn run_sink_task(
+/// Owned state for a single sink task. Constructed by `spawn`.
+struct SinkTaskInner {
     name: String,
-    mut sink: Box<dyn SinkConnector>,
-    mut rx: mpsc::Receiver<SinkCommand>,
+    sink_id: Arc<str>,
+    sink: Box<dyn SinkConnector>,
+    rx: mpsc::Receiver<SinkCommand>,
     flush_interval: Duration,
-    write_errors: Arc<AtomicU64>,
-    epoch_poisoned: Arc<AtomicBool>,
-) {
-    let mut flush_timer = tokio::time::interval(flush_interval);
+    write_timeout: Duration,
+    event_tx: Producer<SinkEvent>,
+}
+
+/// Main loop for a sink task. Owns the `SinkConnector` exclusively.
+/// `epoch_poisoned` is local: `pre_commit`/`commit_epoch` reject poisoned
+/// epochs, which the coordinator surfaces and turns into `rollback_sinks`.
+#[allow(clippy::too_many_lines)]
+async fn run_sink_task(mut inner: SinkTaskInner) {
+    let mut flush_timer = tokio::time::interval(inner.flush_interval);
     flush_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Skip the first immediate tick
+    // Skip the first immediate tick.
     flush_timer.tick().await;
+
+    let mut current_epoch: u64 = 0;
+    let epoch_poisoned = AtomicBool::new(false);
 
     loop {
         tokio::select! {
-            cmd = rx.recv() => {
+            cmd = inner.rx.recv() => {
                 let Some(cmd) = cmd else {
-                    // Channel closed — shut down gracefully
-                    tracing::debug!(sink = %name, "Sink command channel closed");
-                    if let Err(e) = sink.flush().await {
-                        tracing::warn!(sink = %name, error = %e, "Sink flush failed on channel close");
+                    // Channel closed — shut down gracefully.
+                    tracing::debug!(sink = %inner.name, "Sink command channel closed");
+                    if let Err(e) = inner.sink.flush().await {
+                        tracing::warn!(sink = %inner.name, error = %e,
+                            "Sink flush failed on channel close");
                     }
-                    if let Err(e) = sink.close().await {
-                        tracing::warn!(sink = %name, error = %e, "Sink close failed on channel close");
+                    if let Err(e) = inner.sink.close().await {
+                        tracing::warn!(sink = %inner.name, error = %e,
+                            "Sink close failed on channel close");
                     }
                     break;
                 };
                 match cmd {
                     SinkCommand::WriteBatch { batch } => {
-                        if let Err(e) = sink.write_batch(&batch).await {
-                            write_errors.fetch_add(1, Ordering::Relaxed);
-                            epoch_poisoned.store(true, Ordering::Release);
-                            tracing::warn!(
-                                sink = %name,
-                                error = %e,
-                                write_errors = write_errors.load(Ordering::Relaxed),
-                                "Sink write error — epoch poisoned"
-                            );
+                        let rows = batch.num_rows();
+                        match tokio::time::timeout(
+                            inner.write_timeout,
+                            inner.sink.write_batch(&batch),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(e)) => {
+                                epoch_poisoned.store(true, Ordering::Release);
+                                tracing::warn!(
+                                    sink = %inner.name, error = %e, rows,
+                                    "Sink write error — epoch poisoned"
+                                );
+                                let _ = inner.event_tx.try_push(SinkEvent::WriteError {
+                                    sink_id: Arc::clone(&inner.sink_id),
+                                    epoch: current_epoch,
+                                    rows,
+                                    error: e.to_string(),
+                                });
+                            }
+                            Err(_elapsed) => {
+                                epoch_poisoned.store(true, Ordering::Release);
+                                tracing::error!(
+                                    sink = %inner.name,
+                                    timeout_secs = inner.write_timeout.as_secs(),
+                                    rows,
+                                    "Sink write I/O timed out — epoch poisoned"
+                                );
+                                let _ = inner.event_tx.try_push(SinkEvent::WriteTimeout {
+                                    sink_id: Arc::clone(&inner.sink_id),
+                                    epoch: current_epoch,
+                                    rows,
+                                    timeout: inner.write_timeout,
+                                });
+                            }
                         }
                     }
                     SinkCommand::BeginEpoch { epoch, ack } => {
-                        let result = sink.begin_epoch(epoch).await;
+                        let result = inner.sink.begin_epoch(epoch).await;
                         if result.is_ok() {
+                            current_epoch = epoch;
                             epoch_poisoned.store(false, Ordering::Release);
                         }
                         let _ = ack.send(result);
                     }
                     #[cfg(test)]
                     SinkCommand::Flush { ack } => {
-                        let result = sink.flush().await;
+                        let result = inner.sink.flush().await;
                         let _ = ack.send(result);
                     }
                     SinkCommand::PreCommit { epoch, ack } => {
@@ -339,7 +397,7 @@ async fn run_sink_task(
                                 "epoch poisoned by prior write failure".into(),
                             ))
                         } else {
-                            sink.pre_commit(epoch).await
+                            inner.sink.pre_commit(epoch).await
                         };
                         let _ = ack.send(result);
                     }
@@ -349,17 +407,15 @@ async fn run_sink_task(
                                 "epoch poisoned by prior write failure".into(),
                             ))
                         } else {
-                            sink.commit_epoch(epoch).await
+                            inner.sink.commit_epoch(epoch).await
                         };
                         let _ = ack.send(result);
                     }
                     SinkCommand::RollbackEpoch { epoch, ack } => {
-                        let result = sink.rollback_epoch(epoch).await;
+                        let result = inner.sink.rollback_epoch(epoch).await;
                         if let Err(ref e) = result {
                             tracing::warn!(
-                                sink = %name,
-                                epoch,
-                                error = %e,
+                                sink = %inner.name, epoch, error = %e,
                                 "[LDB-6004] Sink rollback failed"
                             );
                         }
@@ -367,39 +423,28 @@ async fn run_sink_task(
                     }
                     #[cfg(test)]
                     SinkCommand::Close => {
-                        if let Err(e) = sink.flush().await {
-                            tracing::warn!(
-                                sink = %name,
-                                error = %e,
-                                "Sink flush failed during close"
-                            );
+                        if let Err(e) = inner.sink.flush().await {
+                            tracing::warn!(sink = %inner.name, error = %e,
+                                "Sink flush failed during close");
                         }
-                        if let Err(e) = sink.close().await {
-                            tracing::warn!(
-                                sink = %name,
-                                error = %e,
-                                "Sink close failed"
-                            );
+                        if let Err(e) = inner.sink.close().await {
+                            tracing::warn!(sink = %inner.name, error = %e,
+                                "Sink close failed");
                         }
-                        tracing::debug!(sink = %name, "Sink task closed");
+                        tracing::debug!(sink = %inner.name, "Sink task closed");
                         break;
                     }
                 }
             }
             _ = flush_timer.tick() => {
-                match tokio::time::timeout(flush_interval, sink.flush()).await {
+                match tokio::time::timeout(inner.flush_interval, inner.sink.flush()).await {
                     Ok(Err(e)) => {
-                        tracing::warn!(
-                            sink = %name,
-                            error = %e,
-                            "Periodic sink flush error"
-                        );
+                        tracing::warn!(sink = %inner.name, error = %e,
+                            "Periodic sink flush error");
                     }
                     Err(_elapsed) => {
-                        tracing::warn!(
-                            sink = %name,
-                            "periodic flush timed out — sink may be stuck"
-                        );
+                        tracing::warn!(sink = %inner.name,
+                            "periodic flush timed out — sink may be stuck");
                     }
                     Ok(Ok(())) => {}
                 }
@@ -416,6 +461,7 @@ mod tests {
     use laminar_connectors::connector::WriteResult;
     use laminar_connectors::health::HealthStatus;
     use laminar_connectors::metrics::ConnectorMetrics;
+    use laminar_core::streaming::AsyncConsumer;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// Minimal mock sink for testing the task infrastructure.
@@ -482,6 +528,10 @@ mod tests {
         fn metrics(&self) -> ConnectorMetrics {
             ConnectorMetrics::default()
         }
+
+        fn capabilities(&self) -> laminar_connectors::connector::SinkConnectorCapabilities {
+            laminar_connectors::connector::SinkConnectorCapabilities::new(Duration::from_secs(5))
+        }
     }
 
     fn test_batch() -> RecordBatch {
@@ -489,10 +539,30 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap()
     }
 
+    fn spawn_with_defaults(
+        name: &str,
+        connector: Box<dyn SinkConnector>,
+        write_timeout: Duration,
+    ) -> (SinkTaskHandle, AsyncConsumer<SinkEvent>) {
+        let (event_tx, event_rx) =
+            laminar_core::streaming::channel::channel::<SinkEvent>(SINK_EVENT_CHANNEL_CAPACITY);
+        let handle = SinkTaskHandle::spawn(SinkTaskConfig {
+            name: name.into(),
+            sink_id: Arc::from(name),
+            connector,
+            exactly_once: false,
+            channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            flush_interval: DEFAULT_FLUSH_INTERVAL,
+            write_timeout,
+            event_tx,
+        });
+        (handle, event_rx)
+    }
+
     #[tokio::test]
     async fn test_sink_task_write_and_close() {
         let (sink, writes, _flushes) = CountingSink::new();
-        let handle = SinkTaskHandle::spawn("test".into(), Box::new(sink), false);
+        let (handle, _events) = spawn_with_defaults("test", Box::new(sink), Duration::from_secs(5));
 
         handle.write_batch(test_batch()).await.unwrap();
         handle.write_batch(test_batch()).await.unwrap();
@@ -504,7 +574,7 @@ mod tests {
     #[tokio::test]
     async fn test_sink_task_flush() {
         let (sink, _writes, flushes) = CountingSink::new();
-        let handle = SinkTaskHandle::spawn("test".into(), Box::new(sink), false);
+        let (handle, _events) = spawn_with_defaults("test", Box::new(sink), Duration::from_secs(5));
 
         handle.flush().await.unwrap();
         handle.close().await;
@@ -516,7 +586,8 @@ mod tests {
     #[tokio::test]
     async fn test_sink_task_handle_clone() {
         let (sink, writes, _flushes) = CountingSink::new();
-        let handle1 = SinkTaskHandle::spawn("test".into(), Box::new(sink), false);
+        let (handle1, _events) =
+            spawn_with_defaults("test", Box::new(sink), Duration::from_secs(5));
         let handle2 = handle1.clone();
 
         handle1.write_batch(test_batch()).await.unwrap();
@@ -524,5 +595,95 @@ mod tests {
         handle1.close().await;
 
         assert_eq!(writes.load(Ordering::Relaxed), 2);
+    }
+
+    /// Sink whose `write_batch` sleeps longer than the configured timeout.
+    struct SlowSink {
+        schema: arrow::datatypes::SchemaRef,
+        sleep: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl SinkConnector for SlowSink {
+        async fn open(
+            &mut self,
+            _config: &laminar_connectors::config::ConnectorConfig,
+        ) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        async fn write_batch(
+            &mut self,
+            _batch: &RecordBatch,
+        ) -> Result<WriteResult, ConnectorError> {
+            tokio::time::sleep(self.sleep).await;
+            Ok(WriteResult::new(1, 0))
+        }
+
+        async fn close(&mut self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            Arc::clone(&self.schema)
+        }
+
+        fn capabilities(&self) -> laminar_connectors::connector::SinkConnectorCapabilities {
+            laminar_connectors::connector::SinkConnectorCapabilities::new(Duration::from_secs(5))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_sink_task_write_timeout_emits_event() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let sink = SlowSink {
+            schema,
+            sleep: Duration::from_secs(60),
+        };
+        let (handle, events) =
+            spawn_with_defaults("slow", Box::new(sink), Duration::from_millis(50));
+
+        handle.write_batch(test_batch()).await.unwrap();
+        // With paused time, sleep auto-advances when all tasks are
+        // blocked on time, firing the sink task's 50ms timeout first.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let event = events
+            .try_recv()
+            .expect("expected a SinkEvent::WriteTimeout");
+        match event {
+            SinkEvent::WriteTimeout {
+                sink_id,
+                rows,
+                timeout,
+                ..
+            } => {
+                assert_eq!(&*sink_id, "slow");
+                assert_eq!(rows, 3);
+                assert_eq!(timeout, Duration::from_millis(50));
+            }
+            other => panic!("expected WriteTimeout, got {other:?}"),
+        }
+    }
+
+    /// Verifies channel-closed errors emit a `SinkEvent::ChannelClosed`.
+    #[tokio::test]
+    async fn test_sink_task_channel_closed_emits_event() {
+        let (sink, _writes, _flushes) = CountingSink::new();
+        let (handle, events) = spawn_with_defaults("dead", Box::new(sink), Duration::from_secs(5));
+
+        // Force the task to drop by closing the handle, which sends Close
+        // and then awaits the join handle. After this, the command channel
+        // is closed.
+        handle.close().await;
+
+        // The next write_batch should fail and emit ChannelClosed.
+        let err = handle.write_batch(test_batch()).await.unwrap_err();
+        assert!(matches!(err, ConnectorError::ConnectionFailed(_)));
+
+        let event = events
+            .try_recv()
+            .expect("expected SinkEvent::ChannelClosed");
+        assert!(matches!(event, SinkEvent::ChannelClosed { sink_id } if &*sink_id == "dead"));
     }
 }

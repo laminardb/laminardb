@@ -624,7 +624,10 @@ impl SinkConnector for KafkaSink {
             }
         }
 
-        // Phase 2: Collect delivery reports.
+        // Phase 2: drain every delivery future so counts and DLQ routing
+        // stay accurate even when some records fail.
+        let mut failed: usize = 0;
+        let mut first_error: Option<String> = None;
         for (i, (send_time, future)) in delivery_futures.into_iter().enumerate() {
             match future.await {
                 Ok(_delivery) => {
@@ -636,6 +639,10 @@ impl SinkConnector for KafkaSink {
                 Err((err, _msg)) => {
                     self.metrics.record_error();
                     let err_msg = err.to_string();
+                    failed += 1;
+                    if first_error.is_none() {
+                        first_error = Some(err_msg.clone());
+                    }
 
                     if self.dlq_producer.is_some() {
                         let key: Option<&[u8]> =
@@ -647,10 +654,6 @@ impl SinkConnector for KafkaSink {
                                 "failed to route record to DLQ — record lost"
                             );
                         }
-                    } else {
-                        return Err(ConnectorError::WriteError(format!(
-                            "Kafka produce failed: {err_msg}"
-                        )));
                     }
                 }
             }
@@ -662,8 +665,19 @@ impl SinkConnector for KafkaSink {
         debug!(
             records = records_written,
             bytes = bytes_written,
+            failed,
             "wrote batch to Kafka"
         );
+
+        // With DLQ, failures are already routed — report success. Without,
+        // surface the aggregate so the sink task can poison the epoch.
+        if failed > 0 && self.dlq_producer.is_none() {
+            return Err(ConnectorError::WriteError(format!(
+                "Kafka produce: {failed}/{} records failed, first error: {}",
+                payloads.len(),
+                first_error.unwrap_or_else(|| "unknown".into())
+            )));
+        }
 
         Ok(WriteResult::new(records_written, bytes_written))
     }
@@ -833,7 +847,9 @@ impl SinkConnector for KafkaSink {
     }
 
     fn capabilities(&self) -> SinkConnectorCapabilities {
-        let mut caps = SinkConnectorCapabilities::default()
+        // Catch stuck-broker scenarios faster than librdkafka's
+        // delivery.timeout.ms (default 5min).
+        let mut caps = SinkConnectorCapabilities::new(Duration::from_secs(10))
             .with_idempotent()
             .with_partitioned();
 
