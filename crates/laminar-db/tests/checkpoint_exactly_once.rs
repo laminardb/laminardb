@@ -148,7 +148,8 @@ async fn test_barrier_aligned_checkpoint_fires() {
         ..PipelineConfig::default()
     };
 
-    let (_control_tx, control_rx) = tokio::sync::mpsc::channel(64);
+    let (_control_tx, control_rx) =
+        crossfire::mpsc::bounded_async::<laminar_db::pipeline::ControlMsg>(64);
     let coordinator = StreamingCoordinator::new(sources, config, shutdown, control_rx)
         .await
         .unwrap();
@@ -297,7 +298,8 @@ async fn test_single_source_barrier_checkpoint() {
         ..PipelineConfig::default()
     };
 
-    let (_control_tx, control_rx) = tokio::sync::mpsc::channel(64);
+    let (_control_tx, control_rx) =
+        crossfire::mpsc::bounded_async::<laminar_db::pipeline::ControlMsg>(64);
     let coordinator = StreamingCoordinator::new(sources, config, shutdown, control_rx)
         .await
         .unwrap();
@@ -357,7 +359,8 @@ async fn test_exhausted_sources_with_shutdown() {
         ..PipelineConfig::default()
     };
 
-    let (_control_tx, control_rx) = tokio::sync::mpsc::channel(64);
+    let (_control_tx, control_rx) =
+        crossfire::mpsc::bounded_async::<laminar_db::pipeline::ControlMsg>(64);
     let coordinator = StreamingCoordinator::new(sources, config, shutdown, control_rx)
         .await
         .unwrap();

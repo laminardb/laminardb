@@ -7,11 +7,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
+use crossfire::{mpsc, oneshot, AsyncRx, MAsyncTx};
 use laminar_connectors::connector::SinkConnector;
 use laminar_connectors::error::ConnectorError;
 use laminar_core::streaming::Producer;
-use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+
+/// Cloneable async sender for the sink command channel.
+type SinkCommandTx = MAsyncTx<mpsc::Array<SinkCommand>>;
+/// Single-consumer async receiver for the sink command channel.
+type SinkCommandRx = AsyncRx<mpsc::Array<SinkCommand>>;
 
 /// Default capacity for the sink command channel.
 pub(crate) const DEFAULT_CHANNEL_CAPACITY: usize = 128;
@@ -66,32 +71,32 @@ pub(crate) enum SinkCommand {
     /// Begin a new epoch (starts Kafka transaction for exactly-once sinks).
     BeginEpoch {
         epoch: u64,
-        ack: oneshot::Sender<Result<(), ConnectorError>>,
+        ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
     /// Explicitly flush buffered data (test-only).
     #[cfg(test)]
     Flush {
-        ack: oneshot::Sender<Result<(), ConnectorError>>,
+        ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
     /// Checkpoint 2PC phase 1: flush and prepare.
     PreCommit {
         epoch: u64,
-        ack: oneshot::Sender<Result<(), ConnectorError>>,
+        ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
     /// Checkpoint 2PC phase 2: finalize transaction.
     CommitEpoch {
         epoch: u64,
-        ack: oneshot::Sender<Result<(), ConnectorError>>,
+        ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
     /// Abort a failed epoch.
     RollbackEpoch {
         epoch: u64,
-        ack: oneshot::Sender<Result<(), ConnectorError>>,
+        ack: oneshot::TxOneshot<Result<(), ConnectorError>>,
     },
     /// No-op barrier: acks once every prior command has been processed.
     /// Used by the pipeline to make sure write results have surfaced as
     /// `SinkEvent`s before checkpoint suppression decisions.
-    Sync { ack: oneshot::Sender<()> },
+    Sync { ack: oneshot::TxOneshot<()> },
     /// Flush + close the connector and exit the task (test-only).
     #[cfg(test)]
     Close,
@@ -102,7 +107,7 @@ pub(crate) enum SinkCommand {
 pub(crate) struct SinkTaskHandle {
     name: Arc<str>,
     sink_id: Arc<str>,
-    tx: mpsc::Sender<SinkCommand>,
+    tx: SinkCommandTx,
     exactly_once: bool,
     /// Held so `close()` can join the task; implicit shutdown happens
     /// when the command channel drops.
@@ -133,7 +138,7 @@ impl SinkTaskHandle {
             write_timeout,
             event_tx,
         } = config;
-        let (tx, rx) = mpsc::channel(channel_capacity);
+        let (tx, rx) = mpsc::bounded_async::<SinkCommand>(channel_capacity);
         let task_sink_id = Arc::clone(&sink_id);
         let task_event_tx = event_tx.clone();
         let task_name = name.clone();
@@ -157,6 +162,21 @@ impl SinkTaskHandle {
         }
     }
 
+    /// Builds the error returned when the command channel is closed —
+    /// i.e. the sink task has exited and our `send()` failed.
+    fn closed_err(&self) -> ConnectorError {
+        ConnectorError::ConnectionFailed(format!("sink task '{}' closed unexpectedly", self.name))
+    }
+
+    /// Builds the error returned when the sink task drops its ack sender
+    /// before responding to `op` — usually because the task panicked mid-op.
+    fn ack_dropped_err(&self, op: &'static str) -> ConnectorError {
+        ConnectorError::ConnectionFailed(format!(
+            "sink task '{}' dropped {op} acknowledgment",
+            self.name
+        ))
+    }
+
     /// Sends a batch to be written. Backpressures via the bounded channel
     /// when the sink task is behind. On channel-closed, emits
     /// `SinkEvent::ChannelClosed` and returns an error.
@@ -168,32 +188,19 @@ impl SinkTaskHandle {
                 let _ = self.event_tx.try_push(SinkEvent::ChannelClosed {
                     sink_id: Arc::clone(&self.sink_id),
                 });
-                ConnectorError::ConnectionFailed(format!(
-                    "sink task '{}' closed unexpectedly",
-                    self.name
-                ))
+                self.closed_err()
             })
     }
 
     /// Sends a no-op `Sync` barrier and waits for the sink task to ack.
     /// When it returns, every previously queued command has been processed.
     pub async fn sync(&self) -> Result<(), ConnectorError> {
-        let (ack_tx, ack_rx) = oneshot::channel();
+        let (ack_tx, ack_rx) = oneshot::oneshot();
         self.tx
             .send(SinkCommand::Sync { ack: ack_tx })
             .await
-            .map_err(|_| {
-                ConnectorError::ConnectionFailed(format!(
-                    "sink task '{}' closed unexpectedly",
-                    self.name
-                ))
-            })?;
-        ack_rx.await.map_err(|_| {
-            ConnectorError::ConnectionFailed(format!(
-                "sink task '{}' dropped sync acknowledgment",
-                self.name
-            ))
-        })
+            .map_err(|_| self.closed_err())?;
+        ack_rx.await.map_err(|_| self.ack_dropped_err("sync"))
     }
 
     /// Begins a new epoch (starts a Kafka transaction for exactly-once sinks).
@@ -201,22 +208,12 @@ impl SinkTaskHandle {
     /// Must be called before `write_batch()` for each epoch when using
     /// exactly-once delivery. For at-least-once sinks this is a no-op.
     pub async fn begin_epoch(&self, epoch: u64) -> Result<(), ConnectorError> {
-        let (ack_tx, ack_rx) = oneshot::channel();
+        let (ack_tx, ack_rx) = oneshot::oneshot();
         self.tx
             .send(SinkCommand::BeginEpoch { epoch, ack: ack_tx })
             .await
-            .map_err(|_| {
-                ConnectorError::ConnectionFailed(format!(
-                    "sink task '{}' closed unexpectedly",
-                    self.name
-                ))
-            })?;
-        ack_rx.await.map_err(|_| {
-            ConnectorError::ConnectionFailed(format!(
-                "sink task '{}' dropped begin-epoch acknowledgment",
-                self.name
-            ))
-        })?
+            .map_err(|_| self.closed_err())?;
+        ack_rx.await.map_err(|_| self.ack_dropped_err("begin-epoch"))?
     }
 
     /// Requests an explicit flush and waits for acknowledgment.
@@ -225,82 +222,42 @@ impl SinkTaskHandle {
     /// flush implicitly in `run_sink_task`). Available for manual use.
     #[cfg(test)]
     pub async fn flush(&self) -> Result<(), ConnectorError> {
-        let (ack_tx, ack_rx) = oneshot::channel();
+        let (ack_tx, ack_rx) = oneshot::oneshot();
         self.tx
             .send(SinkCommand::Flush { ack: ack_tx })
             .await
-            .map_err(|_| {
-                ConnectorError::ConnectionFailed(format!(
-                    "sink task '{}' closed unexpectedly",
-                    self.name
-                ))
-            })?;
-        ack_rx.await.map_err(|_| {
-            ConnectorError::ConnectionFailed(format!(
-                "sink task '{}' dropped flush acknowledgment",
-                self.name
-            ))
-        })?
+            .map_err(|_| self.closed_err())?;
+        ack_rx.await.map_err(|_| self.ack_dropped_err("flush"))?
     }
 
     /// Checkpoint 2PC phase 1: pre-commit.
     pub async fn pre_commit(&self, epoch: u64) -> Result<(), ConnectorError> {
-        let (ack_tx, ack_rx) = oneshot::channel();
+        let (ack_tx, ack_rx) = oneshot::oneshot();
         self.tx
             .send(SinkCommand::PreCommit { epoch, ack: ack_tx })
             .await
-            .map_err(|_| {
-                ConnectorError::ConnectionFailed(format!(
-                    "sink task '{}' closed unexpectedly",
-                    self.name
-                ))
-            })?;
-        ack_rx.await.map_err(|_| {
-            ConnectorError::ConnectionFailed(format!(
-                "sink task '{}' dropped pre-commit acknowledgment",
-                self.name
-            ))
-        })?
+            .map_err(|_| self.closed_err())?;
+        ack_rx.await.map_err(|_| self.ack_dropped_err("pre-commit"))?
     }
 
     /// Checkpoint 2PC phase 2: commit epoch.
     pub async fn commit_epoch(&self, epoch: u64) -> Result<(), ConnectorError> {
-        let (ack_tx, ack_rx) = oneshot::channel();
+        let (ack_tx, ack_rx) = oneshot::oneshot();
         self.tx
             .send(SinkCommand::CommitEpoch { epoch, ack: ack_tx })
             .await
-            .map_err(|_| {
-                ConnectorError::ConnectionFailed(format!(
-                    "sink task '{}' closed unexpectedly",
-                    self.name
-                ))
-            })?;
-        ack_rx.await.map_err(|_| {
-            ConnectorError::ConnectionFailed(format!(
-                "sink task '{}' dropped commit acknowledgment",
-                self.name
-            ))
-        })?
+            .map_err(|_| self.closed_err())?;
+        ack_rx.await.map_err(|_| self.ack_dropped_err("commit"))?
     }
 
     /// Abort a failed epoch.
     pub async fn rollback_epoch(&self, epoch: u64) -> Result<(), ConnectorError> {
-        let (ack_tx, ack_rx) = oneshot::channel();
+        let (ack_tx, ack_rx) = oneshot::oneshot();
         self.tx
             .send(SinkCommand::RollbackEpoch { epoch, ack: ack_tx })
             .await
-            .map_err(|_| {
-                ConnectorError::ConnectionFailed(format!(
-                    "sink task '{}' closed unexpectedly",
-                    self.name
-                ))
-            })?;
-        ack_rx.await.map_err(|_| {
-            ConnectorError::ConnectionFailed(format!(
-                "sink task '{}' dropped rollback acknowledgment",
-                self.name
-            ))
-        })?
+            .map_err(|_| self.closed_err())?;
+        ack_rx.await.map_err(|_| self.ack_dropped_err("rollback"))?
     }
 
     /// Signals the sink task to close and waits for it to finish (30s timeout).
@@ -328,7 +285,7 @@ struct SinkTaskInner {
     name: String,
     sink_id: Arc<str>,
     sink: Box<dyn SinkConnector>,
-    rx: mpsc::Receiver<SinkCommand>,
+    rx: SinkCommandRx,
     flush_interval: Duration,
     write_timeout: Duration,
     event_tx: Producer<SinkEvent>,
@@ -350,8 +307,8 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
     loop {
         tokio::select! {
             cmd = inner.rx.recv() => {
-                let Some(cmd) = cmd else {
-                    // Channel closed — shut down gracefully.
+                let Ok(cmd) = cmd else {
+                    // All senders dropped — shut down gracefully.
                     tracing::debug!(sink = %inner.name, "Sink command channel closed");
                     if let Err(e) = inner.sink.flush().await {
                         tracing::warn!(sink = %inner.name, error = %e,
@@ -409,12 +366,12 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
                             current_epoch = epoch;
                             epoch_poisoned.store(false, Ordering::Release);
                         }
-                        let _ = ack.send(result);
+                        ack.send(result);
                     }
                     #[cfg(test)]
                     SinkCommand::Flush { ack } => {
                         let result = inner.sink.flush().await;
-                        let _ = ack.send(result);
+                        ack.send(result);
                     }
                     SinkCommand::PreCommit { epoch, ack } => {
                         let result = if epoch_poisoned.load(Ordering::Acquire) {
@@ -424,7 +381,7 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
                         } else {
                             inner.sink.pre_commit(epoch).await
                         };
-                        let _ = ack.send(result);
+                        ack.send(result);
                     }
                     SinkCommand::CommitEpoch { epoch, ack } => {
                         let result = if epoch_poisoned.load(Ordering::Acquire) {
@@ -434,7 +391,7 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
                         } else {
                             inner.sink.commit_epoch(epoch).await
                         };
-                        let _ = ack.send(result);
+                        ack.send(result);
                     }
                     SinkCommand::RollbackEpoch { epoch, ack } => {
                         let result = inner.sink.rollback_epoch(epoch).await;
@@ -444,10 +401,10 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
                                 "[LDB-6004] Sink rollback failed"
                             );
                         }
-                        let _ = ack.send(result);
+                        ack.send(result);
                     }
                     SinkCommand::Sync { ack } => {
-                        let _ = ack.send(());
+                        ack.send(());
                     }
                     #[cfg(test)]
                     SinkCommand::Close => {

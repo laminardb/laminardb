@@ -11,8 +11,9 @@ use std::time::Duration;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use crossfire::{mpsc, AsyncRx, TryRecvError};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch, Notify};
+use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
 use tonic::transport::server::TcpIncoming;
 
@@ -40,7 +41,7 @@ pub struct OtelSource {
     config: OtelSourceConfig,
     schema: SchemaRef,
     state: ConnectorState,
-    batch_rx: Option<mpsc::Receiver<RecordBatch>>,
+    batch_rx: Option<AsyncRx<mpsc::Array<RecordBatch>>>,
     data_ready: Arc<Notify>,
     server_handle: Option<JoinHandle<()>>,
     shutdown_tx: Option<watch::Sender<bool>>,
@@ -81,7 +82,7 @@ impl SourceConnector for OtelSource {
             OtelSignal::Logs => logs_schema(),
         };
 
-        let (batch_tx, batch_rx) = mpsc::channel(self.config.channel_capacity);
+        let (batch_tx, batch_rx) = mpsc::bounded_async::<RecordBatch>(self.config.channel_capacity);
         self.batch_rx = Some(batch_rx);
 
         let addr = self.config.socket_addr();
@@ -137,7 +138,7 @@ impl SourceConnector for OtelSource {
         &mut self,
         max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError> {
-        let rx = self.batch_rx.as_mut().ok_or(ConnectorError::InvalidState {
+        let rx = self.batch_rx.as_ref().ok_or(ConnectorError::InvalidState {
             expected: "Running".into(),
             actual: format!("{}", self.state),
         })?;
@@ -155,8 +156,8 @@ impl SourceConnector for OtelSource {
                         break;
                     }
                 }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
                     self.state = ConnectorState::Closed;
                     disconnected = true;
                     break;

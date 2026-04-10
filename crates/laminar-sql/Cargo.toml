@@ -35,6 +35,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+crossfire = { workspace = true }
 
 # Concurrency
 parking_lot = { workspace = true }

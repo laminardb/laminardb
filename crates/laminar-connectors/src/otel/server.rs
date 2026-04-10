@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use tokio::sync::{mpsc, Notify};
+use crossfire::{mpsc, MAsyncTx};
+use tokio::sync::Notify;
 use tonic::{Request, Response, Status};
 
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsService;
@@ -48,7 +49,7 @@ fn now_nanos() -> i64 {
 async fn split_and_send(
     batch: RecordBatch,
     batch_size: usize,
-    tx: &mpsc::Sender<RecordBatch>,
+    tx: &MAsyncTx<mpsc::Array<RecordBatch>>,
     notify: &Notify,
     timeout: Duration,
 ) -> Result<usize, Status> {
@@ -93,7 +94,7 @@ async fn split_and_send(
 /// One instance is created per signal type; the tonic service trait
 /// (`TraceService`, `MetricsService`, `LogsService`) is impl'd below.
 pub struct OtelReceiver {
-    batch_tx: mpsc::Sender<RecordBatch>,
+    batch_tx: MAsyncTx<mpsc::Array<RecordBatch>>,
     schema: SchemaRef,
     data_ready: Arc<Notify>,
     records_received: Arc<AtomicU64>,
@@ -105,7 +106,7 @@ pub struct OtelReceiver {
 impl OtelReceiver {
     /// Create a new receiver.
     pub fn new(
-        batch_tx: mpsc::Sender<RecordBatch>,
+        batch_tx: MAsyncTx<mpsc::Array<RecordBatch>>,
         schema: SchemaRef,
         data_ready: Arc<Notify>,
         records_received: Arc<AtomicU64>,

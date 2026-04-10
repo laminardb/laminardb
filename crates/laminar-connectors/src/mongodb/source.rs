@@ -115,7 +115,7 @@ pub struct MongoDbCdcSource {
 
     /// Channel receiver for change events from the background task.
     #[cfg(feature = "mongodb-cdc")]
-    event_rx: Option<tokio::sync::mpsc::Receiver<ChangeStreamPayload>>,
+    event_rx: Option<ChangeStreamRx>,
 
     /// Shutdown signal for the background reader task.
     #[cfg(feature = "mongodb-cdc")]
@@ -130,6 +130,13 @@ enum ChangeStreamPayload {
     /// Fatal error from the reader task.
     Error(String),
 }
+
+/// Cloneable async sender for the change stream reader → `poll_batch` queue.
+#[cfg(feature = "mongodb-cdc")]
+type ChangeStreamTx = crossfire::MAsyncTx<crossfire::mpsc::Array<ChangeStreamPayload>>;
+/// Single-consumer async receiver for the change stream reader → `poll_batch` queue.
+#[cfg(feature = "mongodb-cdc")]
+type ChangeStreamRx = crossfire::AsyncRx<crossfire::mpsc::Array<ChangeStreamPayload>>;
 
 impl MongoDbCdcSource {
     /// Creates a new `MongoDB` CDC source with the given configuration.
@@ -455,7 +462,8 @@ impl MongoDbCdcSource {
             preflight_timeseries_guard(&db, &self.config.database, &self.config.collection).await?;
         }
 
-        let (tx, rx) = tokio::sync::mpsc::channel(self.config.max_buffered_events);
+        let (tx, rx) =
+            crossfire::mpsc::bounded_async::<ChangeStreamPayload>(self.config.max_buffered_events);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let config = self.config.clone();
@@ -556,7 +564,7 @@ async fn run_change_stream_reader(
     db: mongodb::Database,
     config: MongoDbSourceConfig,
     resume_token: Option<ResumeToken>,
-    tx: tokio::sync::mpsc::Sender<ChangeStreamPayload>,
+    tx: ChangeStreamTx,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     data_ready: Arc<Notify>,
     metrics: Arc<MongoDbCdcMetrics>,

@@ -60,7 +60,7 @@ xxhash-rust = { workspace = true, optional = true }
 # Observability
 tracing = { workspace = true }
 
-crossfire = "3"
+crossfire = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

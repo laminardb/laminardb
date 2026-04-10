@@ -49,6 +49,7 @@ foyer = { workspace = true }
 
 # Common
 tokio = { workspace = true }
+crossfire = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

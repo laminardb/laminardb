@@ -13,8 +13,9 @@ use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use crossfire::{mpsc, AsyncRx, MAsyncTx, TryRecvError, TrySendError};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use crate::checkpoint::SourceCheckpoint;
@@ -62,7 +63,7 @@ pub struct WebSocketSource {
     /// Checkpoint state.
     checkpoint_state: WebSocketSourceCheckpoint,
     /// Bounded channel receiver for messages from the WS reader task.
-    rx: Option<mpsc::Receiver<WsMessage>>,
+    rx: Option<AsyncRx<mpsc::Array<WsMessage>>>,
     /// Shutdown signal sender.
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     /// Handle to the spawned reader task.
@@ -126,7 +127,7 @@ impl WebSocketSource {
         reconnect: ReconnectConfig,
         max_message_size: usize,
         on_backpressure: WsBackpressure,
-        tx: mpsc::Sender<WsMessage>,
+        tx: MAsyncTx<mpsc::Array<WsMessage>>,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
         data_ready: Arc<Notify>,
     ) -> tokio::task::JoinHandle<()> {
@@ -271,7 +272,7 @@ impl WebSocketSource {
 ///
 /// Returns `Err(())` if the channel is closed (shutdown).
 async fn send_with_backpressure(
-    tx: &mpsc::Sender<WsMessage>,
+    tx: &MAsyncTx<mpsc::Array<WsMessage>>,
     msg: WsMessage,
     strategy: &WsBackpressure,
     data_ready: &Notify,
@@ -279,15 +280,15 @@ async fn send_with_backpressure(
     let result = match strategy {
         WsBackpressure::Block => tx.send(msg).await.map_err(|_| ()),
         WsBackpressure::DropNewest => match tx.try_send(msg) {
-            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(()),
+            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+            Err(TrySendError::Disconnected(_)) => Err(()),
         },
         // TODO(F006): implement DropOldest, Buffer, Sample properly.
         WsBackpressure::DropOldest
         | WsBackpressure::Buffer { .. }
         | WsBackpressure::Sample { .. } => match tx.try_send(msg) {
-            Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(()),
+            Ok(()) | Err(TrySendError::Full(_)) => Ok(()),
+            Err(TrySendError::Disconnected(_)) => Err(()),
         },
     };
     if result.is_ok() {
@@ -376,7 +377,7 @@ impl SourceConnector for WebSocketSource {
 
         // Create bounded channel between reader task and poll_batch().
         let channel_capacity = 10_000;
-        let (tx, rx) = mpsc::channel(channel_capacity);
+        let (tx, rx) = mpsc::bounded_async::<WsMessage>(channel_capacity);
 
         // Create shutdown signal.
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -437,8 +438,8 @@ impl SourceConnector for WebSocketSource {
                     warn!(reason = %reason, "WebSocket disconnected");
                     break;
                 }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
                     // Channel closed — reader task ended.
                     if self.message_buffer.is_empty() {
                         self.state = ConnectorState::Failed;

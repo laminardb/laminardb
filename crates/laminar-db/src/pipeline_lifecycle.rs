@@ -1085,11 +1085,11 @@ impl LaminarDB {
         // Start the streaming coordinator on a dedicated compute thread.
         // Source tasks were already spawned on the main tokio runtime in
         // StreamingCoordinator::new(). The coordinator communicates with
-        // them via tokio::sync::mpsc which works across runtimes.
+        // them via crossfire mpsc which works across runtimes.
         {
             // Control channel for live DDL (add/drop stream).
             let (control_tx, control_rx) =
-                tokio::sync::mpsc::channel::<crate::pipeline::ControlMsg>(64);
+                crossfire::mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
             *self.control_tx.lock() = Some(control_tx);
 
             let coordinator = crate::pipeline::StreamingCoordinator::new(
@@ -1100,8 +1100,8 @@ impl LaminarDB {
             )
             .await?;
 
-            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
-            let (startup_tx, startup_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+            let (done_tx, done_rx) = crossfire::oneshot::oneshot::<()>();
+            let (startup_tx, startup_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();
             match std::thread::Builder::new()
                 .name("laminar-compute".into())
                 .spawn(move || {
@@ -1110,11 +1110,11 @@ impl LaminarDB {
                         .build()
                     {
                         Ok(rt) => {
-                            let _ = startup_tx.send(Ok(()));
+                            startup_tx.send(Ok(()));
                             rt
                         }
                         Err(e) => {
-                            let _ = startup_tx.send(Err(format!("compute runtime: {e}")));
+                            startup_tx.send(Err(format!("compute runtime: {e}")));
                             return;
                         }
                     };
@@ -1133,7 +1133,7 @@ impl LaminarDB {
                         // done_tx dropped → done_rx returns Err → logged by watcher task
                         return;
                     }
-                    let _ = done_tx.send(());
+                    done_tx.send(());
                 }) {
                 Ok(_) => {}
                 Err(e) => {

@@ -61,6 +61,9 @@ struct KafkaPayload {
     headers_json: Option<String>,
 }
 
+/// Single-consumer async receiver for the reader → `poll_batch` queue.
+type KafkaPayloadRx = crossfire::AsyncRx<crossfire::mpsc::Array<KafkaPayload>>;
+
 /// Kafka source connector that consumes messages and produces Arrow batches.
 ///
 /// Operates in Ring 1 (background) and pushes deserialized `RecordBatch`
@@ -97,7 +100,7 @@ pub struct KafkaSource {
     schema_registry: Option<Arc<SchemaRegistryClient>>,
     data_ready: Arc<Notify>,
     checkpoint_request: Arc<AtomicBool>,
-    msg_rx: Option<tokio::sync::mpsc::Receiver<KafkaPayload>>,
+    msg_rx: Option<KafkaPayloadRx>,
     reader_handle: Option<tokio::task::JoinHandle<()>>,
     commit_handle: Option<tokio::task::JoinHandle<()>>,
     hwm_handle: Option<tokio::task::JoinHandle<()>>,
@@ -278,7 +281,8 @@ impl KafkaSource {
         }
 
         let consumer = Arc::new(self.consumer.take().unwrap());
-        let (msg_tx, msg_rx) = tokio::sync::mpsc::channel(self.config.reader_channel_capacity);
+        let (msg_tx, msg_rx) =
+            crossfire::mpsc::bounded_async::<KafkaPayload>(self.config.reader_channel_capacity);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (offset_tx, offset_rx) = tokio::sync::watch::channel(TopicPartitionList::new());
         let reader_offset_rx = offset_rx.clone(); // reader reads final offsets on shutdown
@@ -500,7 +504,7 @@ impl KafkaSource {
                                 Ok(()) => {
                                     channel_len.fetch_add(1, Ordering::Relaxed);
                                 }
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(kp)) => {
+                                Err(crossfire::TrySendError::Full(kp)) => {
                                     if !is_paused {
                                         if let Ok(assignment) = consumer.assignment() {
                                             if consumer.pause(&assignment).is_ok() {
@@ -521,7 +525,7 @@ impl KafkaSource {
                                         break;
                                     }
                                 }
-                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                                Err(crossfire::TrySendError::Disconnected(_)) => break,
                             }
                             data_ready.notify_one();
                         }
@@ -889,8 +893,8 @@ impl SourceConnector for KafkaSource {
                     }
                     last_offset = kp.offset;
                 }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                Err(crossfire::TryRecvError::Empty) => break,
+                Err(crossfire::TryRecvError::Disconnected) => {
                     self.state = ConnectorState::Failed;
                     return Err(ConnectorError::Internal(
                         "Kafka reader task exited unexpectedly".into(),

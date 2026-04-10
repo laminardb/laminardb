@@ -1,6 +1,6 @@
 //! Simplified pipeline coordinator.
 //!
-//! Sources push directly to the coordinator via `tokio::sync::mpsc`.
+//! Sources push directly to the coordinator via `crossfire::mpsc`.
 //! The coordinator runs on a dedicated single-threaded tokio runtime
 //! (`laminar-compute` thread), isolating CPU-bound event processing
 //! from IO tasks (Kafka poll, S3 checkpoint writes, HTTP) on the main
@@ -12,11 +12,11 @@
 //! Source task (main tokio runtime)
 //!   │  connector.poll_batch().await
 //!   │
-//!   └──── mpsc::Sender ────► StreamingCoordinator (dedicated compute thread)
-//!                                 │  callback.execute_cycle()
-//!                                 │  callback.write_to_sinks()
-//!                                 ▼
-//!                               Sinks
+//!   └──── MAsyncTx ────► StreamingCoordinator (dedicated compute thread)
+//!                              │  callback.execute_cycle()
+//!                              │  callback.write_to_sinks()
+//!                              ▼
+//!                            Sinks
 //! ```
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,16 +24,21 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
+use crossfire::{mpsc, AsyncRx};
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::DeliveryGuarantee;
 use laminar_core::alloc::{PriorityClass, PriorityGuard};
 use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
 use rustc_hash::{FxHashMap, FxHashSet};
-use tokio::sync::mpsc;
 
 use super::callback::{PipelineCallback, SourceRegistration};
 use super::config::PipelineConfig;
 use crate::error::DbError;
+
+/// Single-consumer async receiver for source → coordinator batches.
+type SourceMsgRx = AsyncRx<mpsc::Array<SourceMsg>>;
+/// Single-consumer async receiver for live DDL control messages.
+type ControlMsgRx = AsyncRx<mpsc::Array<super::ControlMsg>>;
 
 /// Message sent from a source task to the coordinator.
 ///
@@ -76,7 +81,7 @@ struct SourceHandle {
 pub struct StreamingCoordinator {
     config: PipelineConfig,
     /// Receives all source messages (batches + barriers).
-    rx: mpsc::Receiver<SourceMsg>,
+    rx: SourceMsgRx,
     /// Handles to source tasks (for shutdown + checkpoint queries).
     source_handles: Vec<SourceHandle>,
     /// Source name cache indexed by `source_idx`.
@@ -110,7 +115,7 @@ pub struct StreamingCoordinator {
     /// after a successful `execute_cycle`, discarded on failure.
     pending_offsets: Vec<Option<SourceCheckpoint>>,
     /// Control channel for live DDL (add/drop stream) from `LaminarDB`.
-    control_rx: mpsc::Receiver<super::ControlMsg>,
+    control_rx: ControlMsgRx,
 }
 
 /// Tracks in-flight checkpoint barrier alignment.
@@ -163,7 +168,7 @@ impl StreamingCoordinator {
         sources: Vec<SourceRegistration>,
         config: PipelineConfig,
         shutdown: Arc<tokio::sync::Notify>,
-        control_rx: mpsc::Receiver<super::ControlMsg>,
+        control_rx: ControlMsgRx,
     ) -> Result<Self, DbError> {
         // Validate delivery guarantee constraints.
         if config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
@@ -189,7 +194,7 @@ impl StreamingCoordinator {
         }
 
         // Channel for all source messages.
-        let (tx, rx) = mpsc::channel(config.channel_capacity);
+        let (tx, rx) = mpsc::bounded_async::<SourceMsg>(config.channel_capacity);
 
         let mut source_handles = Vec::with_capacity(sources.len());
         let mut source_names = Vec::with_capacity(sources.len());
@@ -377,7 +382,7 @@ impl StreamingCoordinator {
                 () = self.shutdown.notified() => break,
                 msg = self.rx.recv() => {
                     match msg {
-                        Some(m) => {
+                        Ok(m) => {
                             // If batch_window > 0, coalesce: sleep briefly
                             // to let more data accumulate.
                             if !batch_window.is_zero() {
@@ -385,7 +390,7 @@ impl StreamingCoordinator {
                             }
                             Some(m)
                         }
-                        None => break, // All senders dropped
+                        Err(_) => break, // All senders dropped
                     }
                 }
                 () = tokio::time::sleep(IDLE_TIMEOUT) => None,
@@ -897,10 +902,10 @@ mod tests {
     #[tokio::test]
     async fn test_coordinator_direct_channel() {
         let shutdown = Arc::new(tokio::sync::Notify::new());
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
 
         // Create coordinator directly (bypassing source spawning).
-        let (_control_tx, control_rx) = mpsc::channel(64);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
         let coordinator = StreamingCoordinator {
             config: PipelineConfig {
                 batch_window: Duration::ZERO,
@@ -966,8 +971,8 @@ mod tests {
     #[tokio::test]
     async fn test_final_checkpoint_on_shutdown() {
         let shutdown = Arc::new(tokio::sync::Notify::new());
-        let (tx, rx) = mpsc::channel(64);
-        let (_control_tx, control_rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
 
         let coordinator = StreamingCoordinator {
             config: PipelineConfig {
@@ -1038,7 +1043,7 @@ mod tests {
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
 
-        let (_control_tx2, control_rx2) = mpsc::channel(64);
+        let (_control_tx2, control_rx2) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
         let mut coordinator = StreamingCoordinator {
             config: PipelineConfig {
                 batch_window: Duration::ZERO,
@@ -1054,7 +1059,7 @@ mod tests {
                 background_budget_ns: 5_000_000,
                 max_input_buf_batches: 256,
             },
-            rx: mpsc::channel(64).1, // dummy, not used
+            rx: mpsc::bounded_async::<SourceMsg>(64).1, // dummy, not used
             source_handles: Vec::new(),
             source_names: vec![Arc::from("s0"), Arc::from("s1")],
             shutdown: Arc::clone(&shutdown),
@@ -1298,8 +1303,8 @@ mod tests {
     #[tokio::test]
     async fn test_drain_skip_under_backpressure() {
         let shutdown = Arc::new(tokio::sync::Notify::new());
-        let (tx, rx) = mpsc::channel(64);
-        let (_control_tx, control_rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
 
         let coordinator = StreamingCoordinator {
             config: PipelineConfig {
