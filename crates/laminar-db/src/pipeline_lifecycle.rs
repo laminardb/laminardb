@@ -9,8 +9,8 @@ use laminar_core::streaming;
 use rustc_hash::FxHashMap;
 
 use crate::db::{
-    infer_timestamp_format, LaminarDB, SourceWatermarkState, STATE_RUNNING, STATE_SHUTTING_DOWN,
-    STATE_STARTING, STATE_STOPPED,
+    infer_timestamp_format, LaminarDB, SourceWatermarkState, STATE_CREATED, STATE_RUNNING,
+    STATE_SHUTTING_DOWN, STATE_STARTING, STATE_STOPPED,
 };
 use crate::error::DbError;
 
@@ -69,8 +69,9 @@ impl LaminarDB {
     ///
     /// # Errors
     ///
-    /// Returns an error if the pipeline cannot be started.
-    #[allow(clippy::too_many_lines)]
+    /// Returns an error if the pipeline cannot be started. On failure, the
+    /// instance is unwound back to `STATE_CREATED` so the caller can retry
+    /// after fixing the offending config.
     pub async fn start(&self) -> Result<(), DbError> {
         let current = self.state.load(std::sync::atomic::Ordering::Acquire);
         if current == STATE_RUNNING || current == STATE_STARTING {
@@ -85,6 +86,28 @@ impl LaminarDB {
         self.state
             .store(STATE_STARTING, std::sync::atomic::Ordering::Release);
 
+        match self.start_inner().await {
+            Ok(()) => {
+                self.state
+                    .store(STATE_RUNNING, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+            Err(e) => {
+                // Any failure between STATE_STARTING and STATE_RUNNING must
+                // unwind — otherwise the instance is wedged and a retry from
+                // the caller silently succeeds without actually starting.
+                self.state
+                    .store(STATE_CREATED, std::sync::atomic::Ordering::Release);
+                Err(e)
+            }
+        }
+    }
+
+    /// Runs the actual startup sequence. Called exclusively by
+    /// [`LaminarDB::start`], which handles the `STATE_STARTING` ↔
+    /// `STATE_RUNNING` / `STATE_CREATED` transitions around it.
+    #[allow(clippy::too_many_lines)]
+    async fn start_inner(&self) -> Result<(), DbError> {
         // Snapshot connector registrations under the lock
         let (source_regs, sink_regs, stream_regs, table_regs, has_external) = {
             let mgr = self.connector_manager.lock();
@@ -179,8 +202,6 @@ impl LaminarDB {
             );
         }
 
-        self.state
-            .store(STATE_RUNNING, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -470,10 +491,13 @@ impl LaminarDB {
             }
         }
 
-        // Build sinks via registry (generic — no connector-specific code).
-        // Each sink runs in its own tokio task with a bounded command channel,
-        // eliminating Arc<Mutex> contention between pipeline writes and
-        // checkpoint operations.
+        // Build sinks. Each runs in its own tokio task with a bounded
+        // command channel and shares one event channel back to the
+        // pipeline callback.
+        let (sink_event_tx, sink_event_rx) =
+            laminar_core::streaming::channel::channel::<crate::sink_task::SinkEvent>(
+                crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY,
+            );
         #[allow(clippy::type_complexity)]
         let mut sinks: Vec<(
             String,
@@ -499,8 +523,38 @@ impl LaminarDB {
                 .await
                 .map_err(|e| DbError::Connector(format!("Failed to open sink '{name}': {e}")))?;
             let caps = sink.capabilities();
+            // Resolve per-sink write timeout: user override (property)
+            // takes precedence over the sink's declared suggestion.
+            let write_timeout =
+                match config
+                    .get_parsed::<u64>("sink.write.timeout.ms")
+                    .map_err(|e| {
+                        DbError::Connector(format!(
+                            "Invalid 'sink.write.timeout.ms' for sink '{name}': {e}"
+                        ))
+                    })? {
+                    Some(ms) => std::time::Duration::from_millis(ms),
+                    None => caps.suggested_write_timeout,
+                };
+            if write_timeout.is_zero() {
+                return Err(DbError::Connector(format!(
+                    "sink '{name}': write_timeout must be > 0 \
+                     (check 'sink.write.timeout.ms' or the sink's \
+                     suggested_write_timeout)"
+                )));
+            }
+            let sink_id: std::sync::Arc<str> = std::sync::Arc::from(name.as_str());
             let handle =
-                crate::sink_task::SinkTaskHandle::spawn(name.clone(), sink, caps.exactly_once);
+                crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+                    name: name.clone(),
+                    sink_id,
+                    connector: sink,
+                    exactly_once: caps.exactly_once,
+                    channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+                    flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+                    write_timeout,
+                    event_tx: sink_event_tx.clone(),
+                });
             sinks.push((
                 name.clone(),
                 handle,
@@ -509,6 +563,9 @@ impl LaminarDB {
                 caps.changelog,
             ));
         }
+        // Drop the local sender so the channel disconnects when all
+        // sink tasks exit.
+        drop(sink_event_tx);
 
         // Build table sources from registrations
         let mut table_sources: Vec<(String, Box<dyn ReferenceTableSource>, RefreshMode)> =
@@ -930,7 +987,6 @@ impl LaminarDB {
             drain_budget_ns,
             query_budget_ns,
             background_budget_ns: 5_000_000, // 5ms
-            sink_write_timeout: std::time::Duration::from_secs(30),
             max_input_buf_batches: 256,
         };
 
@@ -1039,8 +1095,8 @@ impl LaminarDB {
                 .map(std::time::Duration::from_millis),
             pipeline_hash,
             delivery_guarantee: pipeline_config.delivery_guarantee,
-            sink_write_timeout: pipeline_config.sink_write_timeout,
             serialization_timeout: std::time::Duration::from_secs(120),
+            sink_event_rx,
             sink_timed_out: false,
             cycle_histogram: std::cell::RefCell::new(
                 crate::checkpoint_coordinator::DurationHistogram::new(),
@@ -1050,11 +1106,11 @@ impl LaminarDB {
         // Start the streaming coordinator on a dedicated compute thread.
         // Source tasks were already spawned on the main tokio runtime in
         // StreamingCoordinator::new(). The coordinator communicates with
-        // them via tokio::sync::mpsc which works across runtimes.
+        // them via crossfire mpsc which works across runtimes.
         {
             // Control channel for live DDL (add/drop stream).
             let (control_tx, control_rx) =
-                tokio::sync::mpsc::channel::<crate::pipeline::ControlMsg>(64);
+                crossfire::mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
             *self.control_tx.lock() = Some(control_tx);
 
             let coordinator = crate::pipeline::StreamingCoordinator::new(
@@ -1065,8 +1121,8 @@ impl LaminarDB {
             )
             .await?;
 
-            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
-            let (startup_tx, startup_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+            let (done_tx, done_rx) = crossfire::oneshot::oneshot::<()>();
+            let (startup_tx, startup_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();
             match std::thread::Builder::new()
                 .name("laminar-compute".into())
                 .spawn(move || {
@@ -1075,11 +1131,11 @@ impl LaminarDB {
                         .build()
                     {
                         Ok(rt) => {
-                            let _ = startup_tx.send(Ok(()));
+                            startup_tx.send(Ok(()));
                             rt
                         }
                         Err(e) => {
-                            let _ = startup_tx.send(Err(format!("compute runtime: {e}")));
+                            startup_tx.send(Err(format!("compute runtime: {e}")));
                             return;
                         }
                     };
@@ -1098,7 +1154,7 @@ impl LaminarDB {
                         // done_tx dropped → done_rx returns Err → logged by watcher task
                         return;
                     }
-                    let _ = done_tx.send(());
+                    done_tx.send(());
                 }) {
                 Ok(_) => {}
                 Err(e) => {

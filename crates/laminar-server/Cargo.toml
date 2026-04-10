@@ -32,6 +32,7 @@ clap = { version = "4.6", features = ["derive", "env"] }
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
+crossfire = { workspace = true }
 
 # Logging
 tracing = { workspace = true }

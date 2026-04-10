@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::mpsc;
+use crossfire::{mpsc, AsyncRx, MAsyncTx, MTx};
 use tracing::{debug, error, info, warn};
 
 use super::manifest::FileIngestionManifest;
@@ -44,7 +44,7 @@ pub struct DiscoveryConfig {
 /// Handle to a running discovery engine. Dropping this stops the engine.
 pub struct FileDiscoveryEngine {
     /// Channel receiver for discovered files.
-    rx: mpsc::Receiver<DiscoveredFile>,
+    rx: AsyncRx<mpsc::Array<DiscoveredFile>>,
     /// Abort handle for the background task.
     _abort: tokio::task::JoinHandle<()>,
 }
@@ -54,7 +54,7 @@ impl FileDiscoveryEngine {
     ///
     /// Files already present in `known_files` are skipped.
     pub fn start(config: DiscoveryConfig, known_files: Arc<FileIngestionManifest>) -> Self {
-        let (tx, rx) = mpsc::channel(256);
+        let (tx, rx) = mpsc::bounded_async::<DiscoveredFile>(256);
 
         let abort = if is_cloud_path(&config.path) {
             tokio::spawn(cloud_poll_loop(config, tx, known_files))
@@ -97,7 +97,7 @@ fn is_cloud_path(path: &str) -> bool {
 
 async fn cloud_poll_loop(
     config: DiscoveryConfig,
-    tx: mpsc::Sender<DiscoveredFile>,
+    tx: MAsyncTx<mpsc::Array<DiscoveredFile>>,
     known: Arc<FileIngestionManifest>,
 ) {
     let (store, prefix) = match build_cloud_store(&config.path) {
@@ -208,7 +208,7 @@ fn build_cloud_store(
 
 async fn local_discovery_loop(
     config: DiscoveryConfig,
-    tx: mpsc::Sender<DiscoveredFile>,
+    tx: MAsyncTx<mpsc::Array<DiscoveredFile>>,
     known: Arc<FileIngestionManifest>,
 ) -> Result<(), ConnectorError> {
     use notify::{RecursiveMode, Watcher};
@@ -234,7 +234,7 @@ async fn local_discovery_loop(
     }
 
     // Channel from notify watcher → our async loop.
-    let (notify_tx, mut notify_rx) = mpsc::channel::<String>(512);
+    let (notify_tx, notify_rx) = mpsc::bounded_async::<String>(512);
 
     // Start the appropriate watcher.
     // Both RecommendedWatcher and PollWatcher are Send, but `dyn Watcher` is not.
@@ -246,14 +246,14 @@ async fn local_discovery_loop(
     }
 
     let _watcher: WatcherHolder = if use_poll {
-        let notify_tx_clone = notify_tx.clone();
+        let notify_tx_clone: MTx<_> = notify_tx.clone().into_blocking();
         let poll_config = notify::Config::default().with_poll_interval(config.poll_interval);
         let mut watcher = notify::PollWatcher::new(
             move |result: Result<notify::Event, notify::Error>| {
                 if let Ok(event) = result {
                     for path in event.paths {
                         if let Some(s) = path.to_str() {
-                            let _ = notify_tx_clone.blocking_send(s.to_string());
+                            let _ = notify_tx_clone.send(s.to_string());
                         }
                     }
                 }
@@ -270,7 +270,7 @@ async fn local_discovery_loop(
             })?;
         WatcherHolder::Poll(watcher)
     } else {
-        let notify_tx_clone = notify_tx.clone();
+        let notify_tx_clone: MTx<_> = notify_tx.clone().into_blocking();
         let mut watcher =
             notify::recommended_watcher(move |result: Result<notify::Event, notify::Error>| {
                 if let Ok(event) = result {
@@ -280,7 +280,7 @@ async fn local_discovery_loop(
                         EventKind::Create(_) | EventKind::Modify(_) => {
                             for path in event.paths {
                                 if let Some(s) = path.to_str() {
-                                    let _ = notify_tx_clone.blocking_send(s.to_string());
+                                    let _ = notify_tx_clone.send(s.to_string());
                                 }
                             }
                         }

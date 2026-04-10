@@ -58,7 +58,7 @@ async fn test_checkpoint_non_blocking() {
 
     // Spawn a background task that measures tick intervals
     // If the runtime is blocked, these intervals will spike
-    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    let (tx, rx) = crossfire::mpsc::bounded_async::<Duration>(100);
 
     let ticker = tokio::spawn(async move {
         let mut last_tick = Instant::now();

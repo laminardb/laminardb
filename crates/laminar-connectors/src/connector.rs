@@ -193,9 +193,7 @@ impl WriteResult {
 }
 
 /// Capabilities declared by a sink connector.
-///
-/// Describes the capabilities of an external sink connector implementation.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct SinkConnectorCapabilities {
     /// Whether the sink supports exactly-once semantics via epochs.
@@ -218,9 +216,29 @@ pub struct SinkConnectorCapabilities {
 
     /// Whether the sink supports partitioned writes.
     pub partitioned: bool,
+
+    /// Default per-call `write_batch` I/O timeout. Users can override via
+    /// the `sink.write.timeout.ms` connector property.
+    pub suggested_write_timeout: std::time::Duration,
 }
 
 impl SinkConnectorCapabilities {
+    /// Constructs capabilities with the required `suggested_write_timeout`.
+    /// All booleans default to `false`; enable via `with_*` builders.
+    #[must_use]
+    pub fn new(suggested_write_timeout: std::time::Duration) -> Self {
+        Self {
+            exactly_once: false,
+            idempotent: false,
+            upsert: false,
+            changelog: false,
+            two_phase_commit: false,
+            schema_evolution: false,
+            partitioned: false,
+            suggested_write_timeout,
+        }
+    }
+
     /// Creates capabilities with exactly-once support.
     #[must_use]
     pub fn with_exactly_once(mut self) -> Self {
@@ -451,6 +469,11 @@ pub trait SinkConnector: Send {
 
     /// Writes a batch of records to the external system.
     ///
+    /// Implementations must be cancellation-safe: the runtime wraps this
+    /// call in `tokio::time::timeout`. Don't split a `&mut self` mutation
+    /// across an `.await`. In-flight transactional state may remain open
+    /// after cancellation; the caller will [`Self::rollback_epoch`] it.
+    ///
     /// # Errors
     ///
     /// Returns `ConnectorError` on write failure.
@@ -507,8 +530,9 @@ pub trait SinkConnector: Send {
 
     /// Rolls back the current epoch.
     ///
-    /// Called by the runtime when a checkpoint fails.
-    /// Default implementation does nothing.
+    /// Must be idempotent: the runtime calls this on every exactly-once
+    /// sink after a `pre_commit` failure, including sinks that never
+    /// successfully `pre_commit`ed.
     ///
     /// # Errors
     ///
@@ -529,10 +553,9 @@ pub trait SinkConnector: Send {
         ConnectorMetrics::default()
     }
 
-    /// Returns the capabilities of this sink connector.
-    fn capabilities(&self) -> SinkConnectorCapabilities {
-        SinkConnectorCapabilities::default()
-    }
+    /// Returns the capabilities of this sink connector. Required (no
+    /// default) so every implementation declares `suggested_write_timeout`.
+    fn capabilities(&self) -> SinkConnectorCapabilities;
 
     /// Flushes any buffered data to the external system.
     ///
@@ -605,7 +628,7 @@ mod tests {
 
     #[test]
     fn test_sink_capabilities_builder() {
-        let caps = SinkConnectorCapabilities::default()
+        let caps = SinkConnectorCapabilities::new(std::time::Duration::from_secs(5))
             .with_exactly_once()
             .with_changelog()
             .with_partitioned();
@@ -616,5 +639,9 @@ mod tests {
         assert!(caps.changelog);
         assert!(!caps.schema_evolution);
         assert!(caps.partitioned);
+        assert_eq!(
+            caps.suggested_write_timeout,
+            std::time::Duration::from_secs(5)
+        );
     }
 }

@@ -90,7 +90,7 @@ pub struct PostgresCdcSource {
 
     /// Channel receiver for WAL events from the background reader task.
     #[cfg(feature = "postgres-cdc")]
-    wal_rx: Option<tokio::sync::mpsc::Receiver<WalPayload>>,
+    wal_rx: Option<WalPayloadRx>,
 
     /// Background WAL reader task handle.
     #[cfg(feature = "postgres-cdc")]
@@ -117,6 +117,10 @@ struct TransactionState {
     /// Change events accumulated in this transaction.
     events: Vec<ChangeEvent>,
 }
+
+/// Single-consumer async receiver for the WAL reader → `poll_batch` queue.
+#[cfg(feature = "postgres-cdc")]
+type WalPayloadRx = crossfire::AsyncRx<crossfire::mpsc::Array<WalPayload>>;
 
 /// WAL event payload sent from the background reader task to [`PostgresCdcSource::poll_batch`].
 #[allow(dead_code)] // constructed + consumed only with feature = "postgres-cdc"
@@ -558,7 +562,7 @@ impl SourceConnector for PostgresCdcSource {
                 })?;
 
             // Spawn background reader task for event-driven wake-up.
-            let (wal_tx, wal_rx) = tokio::sync::mpsc::channel(4096);
+            let (wal_tx, wal_rx) = crossfire::mpsc::bounded_async::<WalPayload>(4096);
             let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
             let (confirmed_lsn_tx, mut confirmed_lsn_rx) =
                 tokio::sync::watch::channel(self.confirmed_flush_lsn.as_u64());
@@ -735,8 +739,8 @@ impl SourceConnector for PostgresCdcSource {
                     {
                         match rx.try_recv() {
                             Ok(payload) => payloads.push(payload),
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            Err(crossfire::TryRecvError::Empty) => break,
+                            Err(crossfire::TryRecvError::Disconnected) => {
                                 reader_closed = true;
                                 break;
                             }

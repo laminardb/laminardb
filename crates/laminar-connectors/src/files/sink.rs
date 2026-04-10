@@ -10,6 +10,7 @@
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -108,13 +109,19 @@ impl FileSink {
         Ok(())
     }
 
-    /// Closes the current writer (flushes `BufWriter`).
-    fn close_writer(&mut self) -> Result<(), ConnectorError> {
-        if let Some(mut w) = self.writer.take() {
+    /// Closes the current writer (flushes `BufWriter`) on the blocking
+    /// thread pool so the async runtime is not stalled.
+    async fn close_writer_async(&mut self) -> Result<(), ConnectorError> {
+        let Some(writer) = self.writer.take() else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || -> Result<(), ConnectorError> {
+            let mut w = writer;
             w.flush()
-                .map_err(|e| ConnectorError::WriteError(format!("flush error: {e}")))?;
-        }
-        Ok(())
+                .map_err(|e| ConnectorError::WriteError(format!("flush error: {e}")))
+        })
+        .await
+        .map_err(|e| ConnectorError::WriteError(format!("spawn_blocking failed: {e}")))?
     }
 }
 
@@ -202,42 +209,45 @@ impl SinkConnector for FileSink {
             return Ok(WriteResult::new(rows, 0));
         }
 
-        // Row format: encode and write immediately via buffered writer.
-        let encoder = self
+        // Row format: encode in-memory, then run the blocking write
+        // loop on the blocking pool so it can't stall the runtime.
+        let encoded = self
             .encoder
             .as_ref()
             .ok_or_else(|| ConnectorError::InvalidState {
                 expected: "encoder ready".into(),
                 actual: "no encoder".into(),
-            })?;
-
-        let encoded = encoder
+            })?
             .encode_batch(batch)
             .map_err(|e| ConnectorError::WriteError(format!("encode error: {e}")))?;
 
         self.ensure_writer()?;
-        let writer = self.writer.as_mut().unwrap();
-
-        let mut bytes_written: u64 = 0;
-        for record_bytes in &encoded {
-            writer
-                .write_all(record_bytes)
-                .map_err(|e| ConnectorError::WriteError(format!("write error: {e}")))?;
-            writer
-                .write_all(b"\n")
-                .map_err(|e| ConnectorError::WriteError(format!("write error: {e}")))?;
-            bytes_written += record_bytes.len() as u64 + 1;
-        }
-
+        let mut writer = self.writer.take().expect("ensure_writer just ran");
+        let (writer, bytes_written) =
+            tokio::task::spawn_blocking(move || -> Result<_, ConnectorError> {
+                let mut total: u64 = 0;
+                for record_bytes in &encoded {
+                    writer
+                        .write_all(record_bytes)
+                        .map_err(|e| ConnectorError::WriteError(format!("write error: {e}")))?;
+                    writer
+                        .write_all(b"\n")
+                        .map_err(|e| ConnectorError::WriteError(format!("write error: {e}")))?;
+                    total += record_bytes.len() as u64 + 1;
+                }
+                Ok((writer, total))
+            })
+            .await
+            .map_err(|e| ConnectorError::WriteError(format!("spawn_blocking failed: {e}")))??;
+        self.writer = Some(writer);
         self.segment_bytes += bytes_written;
 
-        // Mid-epoch rotation for row formats (if max_file_size exceeded).
+        // Mid-epoch rotation for row formats.
         if let Some(max_size) = max_file_size {
             if self.segment_bytes >= max_size as u64 {
                 debug!("file sink: rotating at {} bytes", self.segment_bytes);
-                self.close_writer()?;
+                self.close_writer_async().await?;
                 self.current_segment += 1;
-                // Next write_batch will open a new segment via ensure_writer().
             }
         }
 
@@ -253,7 +263,7 @@ impl SinkConnector for FileSink {
         self.epoch_batches.clear();
         self.current_segment = 0;
         self.segment_bytes = 0;
-        self.close_writer()?;
+        self.close_writer_async().await?;
         self.active_tmp_files.clear();
         Ok(())
     }
@@ -285,19 +295,26 @@ impl SinkConnector for FileSink {
                 .encode_batch(&combined)
                 .map_err(|e| ConnectorError::WriteError(format!("Parquet encode error: {e}")))?;
 
-            // Parquet encoder returns exactly one file blob.
-            if let Some(file_bytes) = encoded.first() {
+            // Parquet encoder returns exactly one file blob. Run the
+            // file write on the blocking pool.
+            if let Some(file_bytes) = encoded.into_iter().next() {
                 self.open_segment()?;
-                let writer = self.writer.as_mut().unwrap();
-                writer
-                    .write_all(file_bytes)
-                    .map_err(|e| ConnectorError::WriteError(format!("write error: {e}")))?;
+                let writer = self.writer.take().expect("open_segment just ran");
+                let writer = tokio::task::spawn_blocking(move || -> Result<_, ConnectorError> {
+                    let mut w = writer;
+                    w.write_all(&file_bytes)
+                        .map_err(|e| ConnectorError::WriteError(format!("write error: {e}")))?;
+                    Ok(w)
+                })
+                .await
+                .map_err(|e| ConnectorError::WriteError(format!("spawn_blocking failed: {e}")))??;
+                self.writer = Some(writer);
             }
             self.epoch_batches.clear();
         }
 
-        // Flush and close the buffered writer.
-        self.close_writer()?;
+        // Flush and close the buffered writer (on the blocking pool).
+        self.close_writer_async().await?;
 
         // Fsync all tmp files. Propagate errors — fsync failure means data
         // is not durable and we must not let the checkpoint proceed.
@@ -370,7 +387,7 @@ impl SinkConnector for FileSink {
     }
 
     async fn rollback_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
-        self.close_writer()?;
+        self.close_writer_async().await?;
         for tmp_path in &self.active_tmp_files {
             if tmp_path.exists() {
                 let _ = std::fs::remove_file(tmp_path);
@@ -391,13 +408,13 @@ impl SinkConnector for FileSink {
     }
 
     fn capabilities(&self) -> SinkConnectorCapabilities {
-        SinkConnectorCapabilities::default()
+        SinkConnectorCapabilities::new(Duration::from_secs(30))
             .with_exactly_once()
             .with_two_phase_commit()
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
-        self.close_writer()?;
+        self.close_writer_async().await?;
         for tmp_path in &self.active_tmp_files {
             if tmp_path.exists() {
                 let _ = std::fs::remove_file(tmp_path);

@@ -21,7 +21,7 @@
 //! and CDC replay modes issue individual operations per document.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, SchemaRef};
@@ -332,7 +332,7 @@ impl SinkConnector for MongoDbSink {
     }
 
     fn capabilities(&self) -> SinkConnectorCapabilities {
-        let mut caps = SinkConnectorCapabilities::default().with_idempotent();
+        let mut caps = SinkConnectorCapabilities::new(Duration::from_secs(30)).with_idempotent();
 
         if matches!(self.config.write_mode, WriteMode::Upsert { .. }) {
             caps = caps.with_upsert();

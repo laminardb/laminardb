@@ -21,7 +21,7 @@
 //! - **Ring 2**: Schema management, configuration, health checks.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::SchemaRef;
@@ -1132,7 +1132,8 @@ impl SinkConnector for DeltaLakeSink {
     }
 
     fn capabilities(&self) -> SinkConnectorCapabilities {
-        let mut caps = SinkConnectorCapabilities::default().with_idempotent();
+        // Delta commits can run long under compaction or contention.
+        let mut caps = SinkConnectorCapabilities::new(Duration::from_secs(180)).with_idempotent();
 
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             caps = caps.with_exactly_once().with_two_phase_commit();

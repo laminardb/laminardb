@@ -238,8 +238,16 @@ async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResp
         snap.checkpoint_epoch
     ));
     lines.push(format!(
-        "laminardb_sink_write_errors_total {}",
-        snap.sink_write_errors
+        "laminardb_sink_write_failures_total {}",
+        snap.sink_write_failures
+    ));
+    lines.push(format!(
+        "laminardb_sink_write_timeouts_total {}",
+        snap.sink_write_timeouts
+    ));
+    lines.push(format!(
+        "laminardb_sink_task_channel_closed_total {}",
+        snap.sink_task_channel_closed
     ));
     if snap.last_checkpoint_duration_ms > 0 {
         lines.push(format!(

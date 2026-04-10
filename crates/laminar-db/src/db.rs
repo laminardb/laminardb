@@ -21,8 +21,12 @@ use crate::handle::{
     DdlInfo, ExecuteResult, QueryHandle, QueryInfo, SinkInfo, SourceHandle, SourceInfo,
     UntypedSourceHandle,
 };
+use crate::pipeline::ControlMsg;
 use crate::pipeline_lifecycle::url_to_checkpoint_prefix;
 use crate::sql_utils;
+
+/// Cloneable async sender for the live-DDL control channel.
+pub(crate) type ControlMsgTx = crossfire::MAsyncTx<crossfire::mpsc::Array<ControlMsg>>;
 
 pub(crate) const STATE_CREATED: u8 = 0;
 pub(crate) const STATE_STARTING: u8 = 1;
@@ -80,8 +84,7 @@ pub struct LaminarDB {
     pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
     /// Control channel sender for live DDL to the running coordinator.
     /// `None` before `start()` or after `shutdown()`.
-    pub(crate) control_tx:
-        parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<crate::pipeline::ControlMsg>>>,
+    pub(crate) control_tx: parking_lot::Mutex<Option<ControlMsgTx>>,
     /// Materialized view result store (shared with compute thread and query threads).
     pub(crate) mv_store: Arc<parking_lot::RwLock<crate::mv_store::MvStore>>,
 }
@@ -169,6 +172,11 @@ impl LaminarDB {
         config: LaminarConfig,
         config_vars: HashMap<String, String>,
     ) -> Result<Self, DbError> {
+        // One-time crossfire backoff tuning. No-op on multi-core; on single-core
+        // VMs this swaps spin-loops for yields (~2x channel throughput).
+        // Idempotent via an internal atomic — safe to call on every instance.
+        crossfire::detect_backoff_cfg();
+
         let lookup_registry = Arc::new(laminar_sql::datafusion::LookupTableRegistry::new());
 
         // Build a SessionContext with the LookupJoinExtensionPlanner wired

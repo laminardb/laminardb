@@ -5,8 +5,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crossfire::{mpsc, MTx};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 fn file_content_hash(path: &std::path::Path) -> Option<u64> {
@@ -23,7 +23,8 @@ use crate::reload;
 
 /// Watch the config file and trigger reload on changes. Runs until aborted.
 pub async fn watch_config(config_path: PathBuf, state: Arc<AppState>, debounce: Duration) {
-    let (tx, mut rx) = mpsc::channel::<()>(16);
+    let (tx, rx) = mpsc::bounded_async::<()>(16);
+    let blocking_tx: MTx<_> = tx.clone().into_blocking();
 
     // Canonicalize the config path for reliable comparison
     let canonical = match config_path.canonicalize() {
@@ -56,7 +57,7 @@ pub async fn watch_config(config_path: PathBuf, state: Arc<AppState>, debounce: 
                         p.canonicalize().ok().as_ref() == Some(&target)
                     });
                     if dominated {
-                        let _ = tx.blocking_send(());
+                        let _ = blocking_tx.send(());
                     }
                 }
                 Err(e) => {
@@ -87,7 +88,7 @@ pub async fn watch_config(config_path: PathBuf, state: Arc<AppState>, debounce: 
     // Keep the watcher alive and process debounced events
     loop {
         // Wait for first notification
-        if rx.recv().await.is_none() {
+        if rx.recv().await.is_err() {
             debug!("Watcher channel closed, exiting");
             return;
         }

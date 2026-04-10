@@ -572,18 +572,11 @@ impl StreamingPlanner {
         self.lookup_tables.clone()
     }
 
-    /// Creates a `DataFusion` logical plan from a query plan.
-    ///
-    /// Converts the query plan's SQL statement into a `DataFusion`
-    /// `LogicalPlan` using the session context's state. Window UDFs
-    /// (TUMBLE, HOP, SESSION) must be registered on the context via
+    /// Converts a query plan's SQL statement into a `DataFusion`
+    /// `LogicalPlan`. Window UDFs (TUMBLE, HOP, SESSION) must be registered
+    /// on `ctx` via
     /// [`register_streaming_functions`](crate::datafusion::register_streaming_functions)
     /// for windowed queries to resolve correctly.
-    ///
-    /// # Arguments
-    ///
-    /// * `plan` - The streaming query plan containing the SQL statement
-    /// * `ctx` - `DataFusion` session context with registered UDFs
     ///
     /// # Errors
     ///

@@ -6,6 +6,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -410,8 +411,8 @@ impl SinkConnector for WebSocketSinkServer {
     }
 
     fn capabilities(&self) -> SinkConnectorCapabilities {
-        SinkConnectorCapabilities::default()
-        // WebSocket sink: no exactly-once, no upsert, no changelog
+        // In-memory fanout — timeout is effectively unreachable.
+        SinkConnectorCapabilities::new(Duration::from_secs(10))
     }
 
     async fn begin_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {
