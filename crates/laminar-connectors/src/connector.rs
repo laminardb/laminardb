@@ -563,6 +563,11 @@ pub trait SinkConnector: Send {
 
     /// Flushes any buffered data to the external system.
     ///
+    /// Implementations must be internally bounded — the sink task's
+    /// periodic timer calls this on every tick and wraps it only in a
+    /// generous backstop. Thorough drains belong in `pre_commit` /
+    /// `commit_epoch` / `close`, not here.
+    ///
     /// # Errors
     ///
     /// Returns `ConnectorError` if the flush fails.
