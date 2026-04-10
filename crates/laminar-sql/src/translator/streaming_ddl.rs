@@ -6,7 +6,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use sqlparser::ast::{ColumnDef, DataType as SqlDataType};
 
 use laminar_core::streaming::config::{
@@ -375,27 +375,10 @@ pub fn sql_type_to_arrow(sql_type: &SqlDataType) -> Result<DataType, ParseError>
             ))))
         }
 
-        // Map type: MAP(K, V)
-        SqlDataType::Map(key_type, value_type) => {
-            let key_dt = sql_type_to_arrow(key_type)?;
-            let value_dt = sql_type_to_arrow(value_type)?;
-            Ok(DataType::Map(
-                Arc::new(Field::new(
-                    "entries",
-                    DataType::Struct(Fields::from(vec![
-                        Field::new("key", key_dt, false),
-                        Field::new("value", value_dt, true),
-                    ])),
-                    false,
-                )),
-                false,
-            ))
-        }
-
-        // Unsupported types
+        // Complex types (MAP, STRUCT, nested records) — use auto-discovery instead.
         _ => Err(ParseError::ValidationError(format!(
-            "unsupported data type: {:?}",
-            sql_type
+            "unsupported data type in hand-declared column: {sql_type:?} \
+             — use auto-discovery with an Avro source for complex types"
         ))),
     }
 }
@@ -876,5 +859,32 @@ mod tests {
 
         let wm = def.watermark.unwrap();
         assert!(!wm.is_processing_time);
+    }
+
+    #[test]
+    fn array_of_int_parses() {
+        let def = parse_and_translate("CREATE SOURCE events (tags ARRAY<INT>)").unwrap();
+        match &def.columns[0].data_type {
+            DataType::List(field) => assert_eq!(field.data_type(), &DataType::Int32),
+            other => panic!("expected DataType::List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal_with_precision_parses() {
+        let def = parse_and_translate("CREATE SOURCE events (amount DECIMAL(10, 2))").unwrap();
+        assert_eq!(def.columns[0].data_type, DataType::Decimal128(10, 2));
+    }
+
+    /// Hand-declared MAP columns point users at auto-discovery.
+    #[test]
+    fn hand_declared_map_column_errors_actionably() {
+        let err =
+            parse_and_translate("CREATE SOURCE events (data MAP(VARCHAR, VARCHAR))").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("use auto-discovery") || msg.contains("unsupported"),
+            "expected actionable error for hand-declared MAP, got: {msg}"
+        );
     }
 }

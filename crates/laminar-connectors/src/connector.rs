@@ -348,8 +348,12 @@ pub trait SourceConnector: Send {
         max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError>;
 
-    /// Adjust schema based on properties before `open()`. Default: no-op.
-    fn discover_schema(&mut self, _properties: &std::collections::HashMap<String, String>) {}
+    /// Resolve the source schema from the `WITH (...)` properties before
+    /// DDL reaches the planner. Implementations that hit the network
+    /// (e.g. Kafka fetching an Avro schema from a Schema Registry) must
+    /// bound their I/O with a timeout and leave the schema empty on
+    /// failure rather than hang.
+    async fn discover_schema(&mut self, _properties: &std::collections::HashMap<String, String>) {}
 
     /// Returns the schema of records produced by this source.
     fn schema(&self) -> SchemaRef;

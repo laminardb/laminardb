@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use laminar_sql::parser::StreamingStatement;
-use laminar_sql::translator::streaming_ddl;
+use laminar_sql::translator::streaming_ddl::{self, ColumnDefinition};
 
 use crate::connector_manager::normalize_connector_type;
 use crate::db::{parse_duration_str, streaming_statement_to_sql, LaminarDB};
@@ -18,7 +18,7 @@ use crate::handle::{DdlInfo, ExecuteResult};
 impl LaminarDB {
     /// Handle CREATE SOURCE statement.
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn handle_create_source(
+    pub(crate) async fn handle_create_source(
         &self,
         create: &laminar_sql::parser::CreateSourceStatement,
     ) -> Result<ExecuteResult, DbError> {
@@ -34,8 +34,51 @@ impl LaminarDB {
             )));
         }
 
-        let source_def = streaming_ddl::translate_create_source(create.clone())
+        let mut source_def = streaming_ddl::translate_create_source(create.clone())
             .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))?;
+
+        // No columns + connector = auto-discover (e.g. Kafka Avro via Schema Registry).
+        if source_def.columns.is_empty() && has_connector {
+            let resolved = resolve_connector_info(
+                create.connector_type.as_ref(),
+                &create.connector_options,
+                create.format.as_ref(),
+                &create.with_options,
+            );
+            if let Some(ct) = &resolved.connector_type {
+                let normalized = normalize_connector_type(ct);
+
+                let mut props = resolved.connector_options;
+                if let Some(fmt) = resolved.format {
+                    props.insert("format".into(), fmt);
+                }
+                props.extend(resolved.format_options);
+
+                let discovered = self
+                    .connector_registry
+                    .default_source_schema(&normalized, &props)
+                    .await
+                    .ok_or_else(|| {
+                        DbError::Config(format!(
+                            "source '{}': no columns declared and connector '{normalized}' \
+                             could not auto-discover a schema (check Schema Registry \
+                             connectivity or declare columns explicitly)",
+                            source_def.name
+                        ))
+                    })?;
+
+                source_def.columns = discovered
+                    .fields()
+                    .iter()
+                    .map(|f| ColumnDefinition {
+                        name: f.name().clone(),
+                        data_type: f.data_type().clone(),
+                        nullable: f.is_nullable(),
+                    })
+                    .collect();
+                source_def.schema = discovered;
+            }
+        }
 
         let name = &source_def.name;
         let schema = source_def.schema.clone();

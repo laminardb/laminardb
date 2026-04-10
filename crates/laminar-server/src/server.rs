@@ -11,7 +11,7 @@ use laminar_core::streaming::checkpoint::StreamCheckpointConfig;
 use laminar_db::{DbError, LaminarDB, Profile};
 
 use crate::config::{
-    ColumnDef, ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
+    ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
 };
 #[cfg(feature = "delta-experimental")]
 use crate::delta_config::{DeltaConfig, DeltaConfigError};
@@ -194,36 +194,10 @@ pub(crate) async fn execute_config_ddl(
     db: &LaminarDB,
     config: &ServerConfig,
 ) -> Result<(), ServerError> {
-    // Auto-populate schema from connector registry when not declared in config.
-    let registry = db.connector_registry();
-    let mut sources = Vec::new();
-    for s in &config.sources {
-        if s.schema.is_empty() {
-            let props: std::collections::HashMap<String, String> = s
-                .properties
-                .iter()
-                .map(|(k, v)| (k.clone(), toml_value_to_sql(v)))
-                .collect();
-            if let Some(cols) = registry.default_source_columns(&s.connector, &props) {
-                let mut s = s.clone();
-                s.schema = cols
-                    .into_iter()
-                    .map(|(name, data_type, nullable)| ColumnDef {
-                        name,
-                        data_type,
-                        nullable,
-                    })
-                    .collect();
-                info!(source = %s.name, columns = s.schema.len(),
-                    "Auto-populated schema from connector");
-                sources.push(s);
-                continue;
-            }
-        }
-        sources.push(s.clone());
-    }
-
-    for source in &sources {
+    // When a source has no schema in TOML, we emit a columnless
+    // `CREATE SOURCE foo FROM KAFKA (opts)`. The SQL DDL path in
+    // `handle_create_source` picks that up and runs discovery.
+    for source in &config.sources {
         let ddl = source_to_ddl(source);
         db.execute(&ddl).await.map_err(|e| ServerError::Ddl {
             section: "source".to_string(),

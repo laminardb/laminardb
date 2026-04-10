@@ -346,7 +346,7 @@ impl SchemaRegistryClient {
         let resp: SchemaByIdResponse = self.get_json(&url).await?;
 
         let schema_type: SchemaType = resp.schema_type.parse()?;
-        let arrow_schema = avro_to_arrow_schema(&resp.schema)?;
+        let arrow_schema = schema_to_arrow(schema_type, &resp.schema)?;
 
         let cached = CachedSchema {
             id,
@@ -370,7 +370,7 @@ impl SchemaRegistryClient {
         let resp: SchemaVersionResponse = self.get_json(&url).await?;
 
         let schema_type: SchemaType = resp.schema_type.parse()?;
-        let arrow_schema = avro_to_arrow_schema(&resp.schema)?;
+        let arrow_schema = schema_to_arrow(schema_type, &resp.schema)?;
 
         let cached = CachedSchema {
             id: resp.id,
@@ -404,7 +404,7 @@ impl SchemaRegistryClient {
         let resp: SchemaVersionResponse = self.get_json(&url).await?;
 
         let schema_type: SchemaType = resp.schema_type.parse()?;
-        let arrow_schema = avro_to_arrow_schema(&resp.schema)?;
+        let arrow_schema = schema_to_arrow(schema_type, &resp.schema)?;
 
         let cached = CachedSchema {
             id: resp.id,
@@ -733,6 +733,21 @@ impl std::fmt::Debug for SchemaRegistryClient {
     }
 }
 
+/// Dispatch a Schema Registry payload to the right Arrow converter.
+/// Only Avro is wired today; JSON Schema and Protobuf return an
+/// actionable error until a maintained conversion library lands.
+fn schema_to_arrow(schema_type: SchemaType, schema_str: &str) -> Result<SchemaRef, ConnectorError> {
+    let name = match schema_type {
+        SchemaType::Avro => return avro_to_arrow_schema(schema_str),
+        SchemaType::Json => "JSON Schema Registry",
+        SchemaType::Protobuf => "Protobuf Schema Registry",
+    };
+    Err(ConnectorError::SchemaMismatch(format!(
+        "{name} subjects are not yet supported for auto-discovery \
+         — declare columns explicitly or use an Avro subject"
+    )))
+}
+
 /// Converts an Avro JSON schema string to an Arrow [`SchemaRef`] via `arrow-avro`'s Decoder.
 ///
 /// # Errors
@@ -974,6 +989,31 @@ mod tests {
     fn test_avro_to_arrow_missing_fields() {
         let avro = r#"{"type": "record", "name": "test"}"#;
         assert!(avro_to_arrow_schema(avro).is_err());
+    }
+
+    #[test]
+    fn schema_to_arrow_avro_works() {
+        let avro = r#"{"type":"record","name":"t","fields":[{"name":"x","type":"long"}]}"#;
+        let schema = schema_to_arrow(SchemaType::Avro, avro).unwrap();
+        assert_eq!(schema.field(0).name(), "x");
+    }
+
+    #[test]
+    fn schema_to_arrow_json_returns_actionable_error() {
+        let err = schema_to_arrow(SchemaType::Json, "{}").unwrap_err();
+        assert!(
+            err.to_string().contains("JSON Schema Registry"),
+            "error should name the subject type, got: {err}"
+        );
+    }
+
+    #[test]
+    fn schema_to_arrow_protobuf_returns_actionable_error() {
+        let err = schema_to_arrow(SchemaType::Protobuf, "").unwrap_err();
+        assert!(
+            err.to_string().contains("Protobuf"),
+            "error should name the subject type, got: {err}"
+        );
     }
 
     #[test]
