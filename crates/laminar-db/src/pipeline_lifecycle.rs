@@ -9,8 +9,8 @@ use laminar_core::streaming;
 use rustc_hash::FxHashMap;
 
 use crate::db::{
-    infer_timestamp_format, LaminarDB, SourceWatermarkState, STATE_RUNNING, STATE_SHUTTING_DOWN,
-    STATE_STARTING, STATE_STOPPED,
+    infer_timestamp_format, LaminarDB, SourceWatermarkState, STATE_CREATED, STATE_RUNNING,
+    STATE_SHUTTING_DOWN, STATE_STARTING, STATE_STOPPED,
 };
 use crate::error::DbError;
 
@@ -69,8 +69,9 @@ impl LaminarDB {
     ///
     /// # Errors
     ///
-    /// Returns an error if the pipeline cannot be started.
-    #[allow(clippy::too_many_lines)]
+    /// Returns an error if the pipeline cannot be started. On failure, the
+    /// instance is unwound back to `STATE_CREATED` so the caller can retry
+    /// after fixing the offending config.
     pub async fn start(&self) -> Result<(), DbError> {
         let current = self.state.load(std::sync::atomic::Ordering::Acquire);
         if current == STATE_RUNNING || current == STATE_STARTING {
@@ -85,6 +86,28 @@ impl LaminarDB {
         self.state
             .store(STATE_STARTING, std::sync::atomic::Ordering::Release);
 
+        match self.start_inner().await {
+            Ok(()) => {
+                self.state
+                    .store(STATE_RUNNING, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+            Err(e) => {
+                // Any failure between STATE_STARTING and STATE_RUNNING must
+                // unwind — otherwise the instance is wedged and a retry from
+                // the caller silently succeeds without actually starting.
+                self.state
+                    .store(STATE_CREATED, std::sync::atomic::Ordering::Release);
+                Err(e)
+            }
+        }
+    }
+
+    /// Runs the actual startup sequence. Called exclusively by
+    /// [`LaminarDB::start`], which handles the `STATE_STARTING` ↔
+    /// `STATE_RUNNING` / `STATE_CREATED` transitions around it.
+    #[allow(clippy::too_many_lines)]
+    async fn start_inner(&self) -> Result<(), DbError> {
         // Snapshot connector registrations under the lock
         let (source_regs, sink_regs, stream_regs, table_regs, has_external) = {
             let mgr = self.connector_manager.lock();
@@ -179,8 +202,6 @@ impl LaminarDB {
             );
         }
 
-        self.state
-            .store(STATE_RUNNING, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
