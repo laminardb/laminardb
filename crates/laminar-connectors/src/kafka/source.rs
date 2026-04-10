@@ -812,17 +812,12 @@ impl SourceConnector for KafkaSource {
                                 {
                                     warn!(%subject, error = %e, "SR schema register failed");
                                 } else {
-                                    // Compare the live SR schema against
-                                    // whatever was baked into the catalog
-                                    // at CREATE SOURCE time, so drift
-                                    // between DDL and SR shows up as a
-                                    // log line rather than as a confusing
-                                    // "column not found" at query time.
+                                    // Keep the catalog schema pinned — planner
+                                    // plans are already built against it.
                                     log_schema_drift(&self.schema, &cached.arrow_schema, &subject);
                                     info!(%subject, schema_id = cached.id,
                                         "SR schema fetched at open()");
-                                    self.last_avro_schema = Some(Arc::clone(&cached.arrow_schema));
-                                    self.schema = cached.arrow_schema;
+                                    self.last_avro_schema = Some(cached.arrow_schema);
                                 }
                             }
                         }
@@ -1831,9 +1826,8 @@ mod tests {
     }
 
     /// Drift detection: catalog has a stale 2-field schema, live SR
-    /// has evolved to 3 fields. Verifies the source comes up and
-    /// self.schema tracks the live SR shape. (The warning itself is
-    /// observable in logs, not asserted here.)
+    /// has evolved to 3 fields. Catalog stays pinned; only
+    /// `last_avro_schema` tracks the live SR shape.
     #[tokio::test]
     async fn open_logs_drift_when_sr_evolved_since_ddl() {
         use wiremock::matchers::{method, path};
@@ -1898,8 +1892,13 @@ mod tests {
 
         assert_eq!(
             source.schema().fields().len(),
-            3,
-            "SR prefetch should have replaced the stale catalog schema"
+            2,
+            "catalog schema must stay pinned even after SR drift"
+        );
+        assert_eq!(
+            source.last_avro_schema.as_ref().map(|s| s.fields().len()),
+            Some(3),
+            "last_avro_schema should reflect the evolved SR shape"
         );
     }
 }

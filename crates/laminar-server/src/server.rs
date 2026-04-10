@@ -194,10 +194,23 @@ pub(crate) async fn execute_config_ddl(
     db: &LaminarDB,
     config: &ServerConfig,
 ) -> Result<(), ServerError> {
-    // When a source has no schema in TOML, we emit a columnless
-    // `CREATE SOURCE foo FROM KAFKA (opts)`. The SQL DDL path in
-    // `handle_create_source` picks that up and runs discovery.
+    // WATERMARK FOR can't compose with auto-discovery: the watermark column
+    // is validated against declared columns before discovery runs.
     for source in &config.sources {
+        if source.schema.is_empty() && source.watermark.is_some() {
+            return Err(ServerError::Ddl {
+                section: "source".to_string(),
+                name: source.name.clone(),
+                source: DbError::Config(
+                    "schema is empty and a watermark is configured — \
+                     WATERMARK FOR does not compose with auto-discovery. \
+                     Declare columns explicitly in TOML, or configure \
+                     watermarks via the connector's 'event.time.column' \
+                     property instead."
+                        .to_string(),
+                ),
+            });
+        }
         let ddl = source_to_ddl(source);
         db.execute(&ddl).await.map_err(|e| ServerError::Ddl {
             section: "source".to_string(),
@@ -536,6 +549,37 @@ mod tests {
         assert!(ddl.contains("name VARCHAR"));
         assert!(ddl.contains("FROM KAFKA"));
         assert!(ddl.contains("format = 'json'"));
+    }
+
+    #[tokio::test]
+    async fn execute_config_ddl_rejects_columnless_source_with_watermark() {
+        let mut source = make_source("events", "kafka");
+        source.schema.clear();
+        source.watermark = Some(WatermarkConfig {
+            column: "ts".to_string(),
+            max_out_of_orderness: std::time::Duration::from_secs(5),
+        });
+
+        let db = laminar_db::LaminarDB::open().unwrap();
+        let config = ServerConfig {
+            server: ServerSection::default(),
+            state: StateSection::default(),
+            checkpoint: CheckpointSection::default(),
+            sources: vec![source],
+            lookups: vec![],
+            pipelines: vec![],
+            sinks: vec![],
+            sql: None,
+            discovery: None,
+            coordination: None,
+            node_id: None,
+        };
+        let err = execute_config_ddl(&db, &config).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("WATERMARK FOR does not compose with auto-discovery"),
+            "expected actionable error, got: {msg}"
+        );
     }
 
     #[test]

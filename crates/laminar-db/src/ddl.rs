@@ -37,6 +37,14 @@ impl LaminarDB {
         let mut source_def = streaming_ddl::translate_create_source(create.clone())
             .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))?;
 
+        // IF NOT EXISTS: short-circuit before discovery runs any network I/O.
+        if create.if_not_exists && self.catalog.get_source(&source_def.name).is_some() {
+            return Ok(ExecuteResult::Ddl(DdlInfo {
+                statement_type: "CREATE SOURCE".to_string(),
+                object_name: source_def.name.clone(),
+            }));
+        }
+
         // No columns + connector = auto-discover (e.g. Kafka Avro via Schema Registry).
         if source_def.columns.is_empty() && has_connector {
             let resolved = resolve_connector_info(
