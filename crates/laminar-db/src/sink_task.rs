@@ -213,7 +213,9 @@ impl SinkTaskHandle {
             .send(SinkCommand::BeginEpoch { epoch, ack: ack_tx })
             .await
             .map_err(|_| self.closed_err())?;
-        ack_rx.await.map_err(|_| self.ack_dropped_err("begin-epoch"))?
+        ack_rx
+            .await
+            .map_err(|_| self.ack_dropped_err("begin-epoch"))?
     }
 
     /// Requests an explicit flush and waits for acknowledgment.
@@ -237,7 +239,9 @@ impl SinkTaskHandle {
             .send(SinkCommand::PreCommit { epoch, ack: ack_tx })
             .await
             .map_err(|_| self.closed_err())?;
-        ack_rx.await.map_err(|_| self.ack_dropped_err("pre-commit"))?
+        ack_rx
+            .await
+            .map_err(|_| self.ack_dropped_err("pre-commit"))?
     }
 
     /// Checkpoint 2PC phase 2: commit epoch.
