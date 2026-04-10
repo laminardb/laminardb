@@ -78,11 +78,6 @@ pub struct WebSocketSource {
 
 impl WebSocketSource {
     /// Creates a new WebSocket source connector in client mode.
-    ///
-    /// # Arguments
-    ///
-    /// * `schema` - Arrow schema for output batches.
-    /// * `config` - WebSocket source configuration.
     #[must_use]
     pub fn new(schema: SchemaRef, config: WebSocketSourceConfig) -> Self {
         let parser = MessageParser::new(

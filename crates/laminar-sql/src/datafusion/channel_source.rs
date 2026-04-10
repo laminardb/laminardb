@@ -73,21 +73,12 @@ pub struct ChannelStreamSource {
 
 impl ChannelStreamSource {
     /// Creates a new channel stream source with default capacity.
-    ///
-    /// # Arguments
-    ///
-    /// * `schema` - Schema of the `RecordBatch` instances that will be pushed
     #[must_use]
     pub fn new(schema: SchemaRef) -> Self {
         Self::with_capacity(schema, DEFAULT_CHANNEL_CAPACITY)
     }
 
-    /// Creates a new channel stream source with specified capacity.
-    ///
-    /// # Arguments
-    ///
-    /// * `schema` - Schema of the `RecordBatch` instances that will be pushed
-    /// * `capacity` - Maximum number of batches that can be buffered
+    /// Creates a new channel stream source with the given channel capacity.
     #[must_use]
     pub fn with_capacity(schema: SchemaRef, capacity: usize) -> Self {
         let bridge = StreamBridge::new(Arc::clone(&schema), capacity);
@@ -102,13 +93,8 @@ impl ChannelStreamSource {
     }
 
     /// Declares that this source produces data in the given sort order.
-    ///
     /// When set, `DataFusion` can elide `SortExec` for ORDER BY queries
     /// that match the declared ordering.
-    ///
-    /// # Arguments
-    ///
-    /// * `ordering` - The columns that the output is sorted by
     #[must_use]
     pub fn with_ordering(mut self, ordering: Vec<SortColumn>) -> Self {
         self.ordering = Some(ordering);

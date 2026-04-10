@@ -29,32 +29,9 @@ use super::schema::{cdc_envelope_schema, TableCache, TableInfo};
 #[cfg(feature = "mysql-cdc")]
 type BinlogMessageRx = crossfire::AsyncRx<crossfire::mpsc::Array<BinlogMessage>>;
 
-/// MySQL binlog CDC source connector.
-///
-/// Reads change events from MySQL binary log using replication protocol.
-/// Supports both GTID-based and file/position-based replication.
-///
-/// # Example
-///
-/// ```ignore
-/// use laminar_connectors::cdc::mysql::{MySqlCdcSource, MySqlCdcConfig};
-///
-/// let config = MySqlCdcConfig {
-///     host: "localhost".to_string(),
-///     port: 3306,
-///     username: "replicator".to_string(),
-///     password: "secret".to_string(),
-///     server_id: 12345,
-///     ..Default::default()
-/// };
-///
-/// let mut source = MySqlCdcSource::new(config);
-/// source.open(&ConnectorConfig::default()).await?;
-///
-/// while let Some(batch) = source.poll_batch(1000).await? {
-///     println!("Received {} rows", batch.num_rows());
-/// }
-/// ```
+/// MySQL binlog CDC source connector. Reads change events from the MySQL
+/// binary log via replication protocol; supports GTID-based and
+/// file/position-based replication.
 pub struct MySqlCdcSource {
     /// Configuration for the MySQL CDC connection.
     config: MySqlCdcConfig,
