@@ -1,7 +1,7 @@
 //! MySQL binlog replication CDC source connector. Reads row-level changes from
-//! a MySQL server's binlog (GTID or file/position based), decodes them via
-//! [`decoder`], resolves column types against the [`schema::TableCache`], and
-//! emits Z-set [`changelog::ChangeEvent`]s that `MySqlCdcSource` converts into
+//! a MySQL server's binlog (GTID or file/position based), decodes them via the
+//! `decoder` submodule, resolves column types against `schema::TableCache`, and
+//! emits Z-set `changelog::ChangeEvent`s that `MySqlCdcSource` converts into
 //! Arrow `RecordBatch`es on `poll_batch`.
 #![allow(dead_code)] // reader path is feature-gated; helpers are used conditionally
 #![allow(clippy::doc_markdown)] // MySQL terminology dominates — backtick-warning noise

@@ -1,7 +1,8 @@
 //! Streaming connector pipeline. Each source connector runs as a tokio task
-//! pushing batches via crossfire mpsc to the [`StreamingCoordinator`], which
+//! pushing batches via crossfire mpsc to the `StreamingCoordinator`, which
 //! drives SQL execution cycles, routes results to sinks, and manages
-//! checkpoint barriers. See [`streaming_coordinator`] for the runtime topology.
+//! checkpoint barriers. See the `streaming_coordinator` submodule for the
+//! runtime topology.
 
 pub mod callback;
 pub mod config;
