@@ -879,14 +879,20 @@ impl SourceConnector for PostgresCdcSource {
         #[cfg(feature = "postgres-cdc")]
         if let Some(handle) = self.connection_handle.take() {
             let abort = handle.abort_handle();
-            if tokio::time::timeout(std::time::Duration::from_secs(2), handle)
-                .await
-                .is_err()
-            {
-                tracing::warn!(
-                    "[postgres-cdc] control-plane task did not exit within 2s; aborting"
-                );
-                abort.abort();
+            match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(join_err)) => {
+                    tracing::warn!(
+                        error = %join_err,
+                        "[postgres-cdc] control-plane task exited with error"
+                    );
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        "[postgres-cdc] control-plane task did not exit within 2s; aborting"
+                    );
+                    abort.abort();
+                }
             }
         }
 
