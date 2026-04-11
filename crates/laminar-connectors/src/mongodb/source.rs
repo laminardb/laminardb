@@ -18,7 +18,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use arrow_array::builder::{Int64Builder, StringBuilder, UInt32Builder};
+use arrow_array::builder::{StringBuilder, UInt32Builder};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -57,7 +57,11 @@ pub fn mongodb_cdc_envelope_schema() -> SchemaRef {
         Field::new("_document_key", DataType::Utf8, false),
         Field::new("_cluster_time_s", DataType::UInt32, false),
         Field::new("_cluster_time_i", DataType::UInt32, false),
-        Field::new("_wall_time_ms", DataType::Int64, false),
+        Field::new(
+            "_wall_time_ms",
+            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+            false,
+        ),
         Field::new("_full_document", DataType::Utf8, true),
         Field::new("_update_desc", DataType::Utf8, true),
         Field::new("_resume_token", DataType::Utf8, false),
@@ -253,7 +257,7 @@ fn events_to_record_batch(
     let mut dk_builder = StringBuilder::with_capacity(len, len * 64);
     let mut cts_builder = UInt32Builder::with_capacity(len);
     let mut ct_inc_builder = UInt32Builder::with_capacity(len);
-    let mut wt_builder = Int64Builder::with_capacity(len);
+    let mut wt_builder = arrow_array::builder::TimestampMillisecondBuilder::with_capacity(len);
     let mut fd_builder = StringBuilder::with_capacity(len, len * 128);
     let mut ud_builder = StringBuilder::with_capacity(len, len * 64);
     let mut rt_builder = StringBuilder::with_capacity(len, len * 64);

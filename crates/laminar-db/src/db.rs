@@ -93,35 +93,18 @@ pub(crate) struct SourceWatermarkState {
     pub(crate) extractor: laminar_core::time::EventTimeExtractor,
     pub(crate) generator: Box<dyn laminar_core::time::WatermarkGenerator>,
     pub(crate) column: String,
-    pub(crate) format: laminar_core::time::TimestampFormat,
-}
-
-pub(crate) fn infer_timestamp_format(
-    schema: &arrow::datatypes::SchemaRef,
-    column: &str,
-) -> laminar_core::time::TimestampFormat {
-    if let Ok(idx) = schema.index_of(column) {
-        match schema.field(idx).data_type() {
-            DataType::Timestamp(_, _) => laminar_core::time::TimestampFormat::ArrowNative,
-            _ => laminar_core::time::TimestampFormat::UnixMillis,
-        }
-    } else {
-        laminar_core::time::TimestampFormat::UnixMillis
-    }
 }
 
 pub(crate) fn filter_late_rows(
     batch: &RecordBatch,
     column: &str,
     watermark: i64,
-    format: laminar_core::time::TimestampFormat,
 ) -> Option<RecordBatch> {
-    crate::batch_filter::filter_batch_by_timestamp(
+    laminar_core::time::filter_batch_by_timestamp(
         batch,
         column,
         watermark,
-        format,
-        crate::batch_filter::ThresholdOp::GreaterEq,
+        laminar_core::time::ThresholdOp::GreaterEq,
     )
 }
 
@@ -4153,33 +4136,29 @@ mod tests {
 
     #[test]
     fn test_filter_late_rows_filters_correctly() {
-        use arrow::array::Int64Array;
+        use arrow::array::{Int64Array, TimestampMillisecondArray};
 
-        // Int64 / UnixMillis format
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
-            Field::new("ts", DataType::Int64, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                false,
+            ),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
-                Arc::new(Int64Array::from(vec![100, 500, 200, 800])),
+                Arc::new(TimestampMillisecondArray::from(vec![100, 500, 200, 800])),
             ],
         )
         .unwrap();
 
-        // Watermark at 300: rows with ts >= 300 survive (ts=500, ts=800)
-        let filtered = filter_late_rows(
-            &batch,
-            "ts",
-            300,
-            laminar_core::time::TimestampFormat::UnixMillis,
-        );
-        let filtered = filtered.expect("should have some on-time rows");
+        // Watermark at 300: rows with ts >= 300 survive (ts=500, ts=800).
+        let filtered = filter_late_rows(&batch, "ts", 300).expect("should have some on-time rows");
         assert_eq!(filtered.num_rows(), 2);
 
-        // Check values
         let ids = filtered
             .column(0)
             .as_any()
@@ -4191,28 +4170,26 @@ mod tests {
 
     #[test]
     fn test_filter_late_rows_all_late() {
-        use arrow::array::Int64Array;
+        use arrow::array::{Int64Array, TimestampMillisecondArray};
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
-            Field::new("ts", DataType::Int64, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                false,
+            ),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int64Array::from(vec![1, 2])),
-                Arc::new(Int64Array::from(vec![100, 200])),
+                Arc::new(TimestampMillisecondArray::from(vec![100, 200])),
             ],
         )
         .unwrap();
 
-        // Watermark at 1000: all rows are late
-        let result = filter_late_rows(
-            &batch,
-            "ts",
-            1000,
-            laminar_core::time::TimestampFormat::UnixMillis,
-        );
+        let result = filter_late_rows(&batch, "ts", 1000);
         assert!(result.is_none(), "all-late batch should return None");
     }
 
@@ -4224,41 +4201,19 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
 
-        // Column not found — batch passes through unfiltered
-        let result = filter_late_rows(
-            &batch,
-            "ts",
-            1000,
-            laminar_core::time::TimestampFormat::UnixMillis,
-        );
-        let result = result.expect("should pass through when column not found");
+        // Column not found — batch passes through unfiltered.
+        let result = filter_late_rows(&batch, "ts", 1000)
+            .expect("should pass through when column not found");
         assert_eq!(result.num_rows(), 2);
     }
 
     /// Helper: creates a `RecordBatch` with (id: BIGINT, ts: BIGINT).
-    fn make_bigint_ts_batch(
-        schema: &arrow::datatypes::SchemaRef,
-        timestamps: &[i64],
-    ) -> RecordBatch {
-        RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(arrow::array::Int64Array::from(
-                    (1..=i64::try_from(timestamps.len()).expect("len fits i64"))
-                        .collect::<Vec<_>>(),
-                )),
-                Arc::new(arrow::array::Int64Array::from(timestamps.to_vec())),
-            ],
-        )
-        .unwrap()
-    }
-
     #[tokio::test]
     async fn test_programmatic_watermark_filters_late_rows() {
         // Source with set_event_time_column("ts"), no SQL WATERMARK clause.
         // Push data, advance watermark, push late data, verify late data filtered.
         let db = LaminarDB::open().unwrap();
-        db.execute("CREATE SOURCE events (id BIGINT, ts BIGINT)")
+        db.execute("CREATE SOURCE events (id BIGINT, ts TIMESTAMP)")
             .await
             .unwrap();
         db.execute("CREATE STREAM out AS SELECT id, ts FROM events")
@@ -4275,7 +4230,7 @@ mod tests {
         let schema = handle.schema().clone();
 
         // Step 1: Push on-time data
-        let batch1 = make_bigint_ts_batch(&schema, &[1000, 2000, 3000]);
+        let batch1 = make_ts_batch(&schema, &[1000, 2000, 3000]);
         handle.push_arrow(batch1).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -4294,7 +4249,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         // Step 3: Push late data (all timestamps < 200_000)
-        let late_batch = make_bigint_ts_batch(&schema, &[100, 200, 300]);
+        let late_batch = make_ts_batch(&schema, &[100, 200, 300]);
         handle.push_arrow(late_batch).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -4313,7 +4268,7 @@ mod tests {
     async fn test_sql_watermark_for_col_filters_late_rows() {
         // Source with WATERMARK FOR ts (no AS expr), should use zero delay.
         let db = LaminarDB::open().unwrap();
-        db.execute("CREATE SOURCE events (id BIGINT, ts BIGINT, WATERMARK FOR ts)")
+        db.execute("CREATE SOURCE events (id BIGINT, ts TIMESTAMP, WATERMARK FOR ts)")
             .await
             .unwrap();
         db.execute("CREATE STREAM out AS SELECT id, ts FROM events")
@@ -4327,7 +4282,7 @@ mod tests {
         let schema = handle.schema().clone();
 
         // Push on-time data
-        let batch1 = make_bigint_ts_batch(&schema, &[1000, 2000, 3000]);
+        let batch1 = make_ts_batch(&schema, &[1000, 2000, 3000]);
         handle.push_arrow(batch1).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -4345,7 +4300,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         // Push late data
-        let late_batch = make_bigint_ts_batch(&schema, &[100, 200, 300]);
+        let late_batch = make_ts_batch(&schema, &[100, 200, 300]);
         handle.push_arrow(late_batch).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -4363,7 +4318,7 @@ mod tests {
     async fn test_no_watermark_passes_all_data() {
         // Source without any watermark config — all data should pass through.
         let db = LaminarDB::open().unwrap();
-        db.execute("CREATE SOURCE events (id BIGINT, ts BIGINT)")
+        db.execute("CREATE SOURCE events (id BIGINT, ts TIMESTAMP)")
             .await
             .unwrap();
         db.execute("CREATE STREAM out AS SELECT id, ts FROM events")
@@ -4377,12 +4332,12 @@ mod tests {
         let schema = handle.schema().clone();
 
         // Push two batches — no watermark filtering should happen
-        let batch1 = make_bigint_ts_batch(&schema, &[1000, 2000, 3000]);
+        let batch1 = make_ts_batch(&schema, &[1000, 2000, 3000]);
         handle.push_arrow(batch1).unwrap();
         handle.watermark(200_000); // watermark without event_time_column is a no-op for filtering
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        let batch2 = make_bigint_ts_batch(&schema, &[100, 200, 300]);
+        let batch2 = make_ts_batch(&schema, &[100, 200, 300]);
         handle.push_arrow(batch2).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -4971,7 +4926,7 @@ mod tests {
 
         // A real source with a watermark that the pipeline will process.
         db.execute(
-            "CREATE SOURCE trades (id BIGINT, price DOUBLE, ts BIGINT, \
+            "CREATE SOURCE trades (id BIGINT, price DOUBLE, ts TIMESTAMP, \
              WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
         )
         .await
@@ -4983,7 +4938,8 @@ mod tests {
 
         db.start().await.unwrap();
 
-        // Push data into the real source.
+        // Push data into the real source. `ts TIMESTAMP` maps to
+        // Timestamp(Microsecond), so values here are in µs.
         let handle = db.source_untyped("trades").unwrap();
         let schema = handle.schema().clone();
         let batch = RecordBatch::try_new(
@@ -4991,7 +4947,9 @@ mod tests {
             vec![
                 Arc::new(arrow::array::Int64Array::from(vec![1, 2])),
                 Arc::new(arrow::array::Float64Array::from(vec![100.0, 200.0])),
-                Arc::new(arrow::array::Int64Array::from(vec![1000, 2000])),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                    1_000_000, 2_000_000,
+                ])),
             ],
         )
         .unwrap();
@@ -5046,7 +5004,7 @@ mod tests {
     async fn test_mv_aggregate_queryable_with_pipeline() {
         let db = LaminarDB::open().unwrap();
         db.execute(
-            "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts BIGINT, \
+            "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts TIMESTAMP, \
              WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
         )
         .await
@@ -5070,7 +5028,9 @@ mod tests {
             vec![
                 Arc::new(arrow::array::StringArray::from(vec!["AAPL", "GOOG"])),
                 Arc::new(arrow::array::Float64Array::from(vec![150.0, 2800.0])),
-                Arc::new(arrow::array::Int64Array::from(vec![1000, 2000])),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                    1_000_000, 2_000_000,
+                ])),
             ],
         )
         .unwrap();
@@ -5084,7 +5044,7 @@ mod tests {
     async fn test_mv_append_mode_queryable() {
         let db = LaminarDB::open().unwrap();
         db.execute(
-            "CREATE SOURCE events (id INT, value DOUBLE, ts BIGINT, \
+            "CREATE SOURCE events (id INT, value DOUBLE, ts TIMESTAMP, \
              WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
         )
         .await
@@ -5106,7 +5066,9 @@ mod tests {
             vec![
                 Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3])),
                 Arc::new(arrow::array::Float64Array::from(vec![5.0, 15.0, 25.0])),
-                Arc::new(arrow::array::Int64Array::from(vec![1000, 2000, 3000])),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                    1_000_000, 2_000_000, 3_000_000,
+                ])),
             ],
         )
         .unwrap();
@@ -5165,7 +5127,7 @@ mod tests {
     async fn test_mv_hot_add_while_pipeline_running() {
         let db = LaminarDB::open().unwrap();
         db.execute(
-            "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts BIGINT, \
+            "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts TIMESTAMP, \
              WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
         )
         .await
@@ -5202,7 +5164,9 @@ mod tests {
             vec![
                 Arc::new(arrow::array::StringArray::from(vec!["AAPL"])),
                 Arc::new(arrow::array::Float64Array::from(vec![150.0])),
-                Arc::new(arrow::array::Int64Array::from(vec![1000])),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                    1_000_000,
+                ])),
             ],
         )
         .unwrap();

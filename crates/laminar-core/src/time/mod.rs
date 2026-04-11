@@ -1,10 +1,13 @@
 //! Event time, watermarks, and timer management.
+mod cast;
 mod event_time;
+mod filter;
 mod watermark;
 
-pub use event_time::{
-    EventTimeError, EventTimeExtractor, ExtractionMode, TimestampField, TimestampFormat,
-};
+pub use cast::{cast_to_millis_array, CastError};
+pub use event_time::{EventTimeError, EventTimeExtractor, ExtractionMode, TimestampField};
+
+pub use filter::{filter_batch_by_timestamp, ThresholdOp};
 
 pub use watermark::{
     AscendingTimestampsGenerator, BoundedOutOfOrdernessGenerator, MeteredGenerator,

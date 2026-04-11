@@ -145,6 +145,8 @@ impl TableCache {
 /// - `_after`: After image (for inserts/updates)
 #[must_use]
 pub fn cdc_envelope_schema(table_schema: &Schema) -> Schema {
+    use arrow_schema::TimeUnit;
+
     let before_fields = table_schema
         .fields()
         .iter()
@@ -160,7 +162,11 @@ pub fn cdc_envelope_schema(table_schema: &Schema) -> Schema {
     Schema::new(vec![
         Field::new("_table", DataType::Utf8, false),
         Field::new("_op", DataType::Utf8, false),
-        Field::new("_ts_ms", DataType::Int64, false),
+        Field::new(
+            "_ts_ms",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
         Field::new("_binlog_file", DataType::Utf8, true),
         Field::new("_binlog_pos", DataType::UInt64, true),
         Field::new("_gtid", DataType::Utf8, true),

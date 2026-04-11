@@ -599,31 +599,23 @@ fn split_by_timestamp(
     time_column: &str,
     boundary: i64,
 ) -> (Vec<RecordBatch>, Vec<RecordBatch>) {
-    let format = batches
-        .first()
-        .map_or(laminar_core::time::TimestampFormat::UnixMillis, |b| {
-            crate::sql_analysis::infer_ts_format_from_batch(b, time_column)
-        });
-
     let mut closed_batches = Vec::new();
     let mut retained_batches = Vec::new();
 
     for batch in batches {
-        if let Some(closed) = crate::batch_filter::filter_batch_by_timestamp(
+        if let Some(closed) = laminar_core::time::filter_batch_by_timestamp(
             batch,
             time_column,
             boundary,
-            format,
-            crate::batch_filter::ThresholdOp::Less,
+            laminar_core::time::ThresholdOp::Less,
         ) {
             closed_batches.push(closed);
         }
-        if let Some(retained) = crate::batch_filter::filter_batch_by_timestamp(
+        if let Some(retained) = laminar_core::time::filter_batch_by_timestamp(
             batch,
             time_column,
             boundary,
-            format,
-            crate::batch_filter::ThresholdOp::GreaterEq,
+            laminar_core::time::ThresholdOp::GreaterEq,
         ) {
             retained_batches.push(retained);
         }

@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{Float64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use laminar_core::streaming::StreamCheckpointConfig;
 use laminar_db::{LaminarConfig, LaminarDB};
 
@@ -21,11 +21,14 @@ fn config_for(dir: &std::path::Path) -> LaminarConfig {
     }
 }
 
-fn make_batch(symbols: &[&str], prices: &[f64], timestamps: &[i64]) -> RecordBatch {
+/// `ts TIMESTAMP` in DDL is `Timestamp(Microsecond)`; callers pass
+/// millisecond values and this helper scales to µs.
+fn make_batch(symbols: &[&str], prices: &[f64], timestamps_ms: &[i64]) -> RecordBatch {
+    let us: Vec<i64> = timestamps_ms.iter().map(|ms| ms * 1000).collect();
     RecordBatch::try_from_iter(vec![
         ("symbol", Arc::new(StringArray::from(symbols.to_vec())) as _),
         ("price", Arc::new(Float64Array::from(prices.to_vec())) as _),
-        ("ts", Arc::new(Int64Array::from(timestamps.to_vec())) as _),
+        ("ts", Arc::new(TimestampMicrosecondArray::from(us)) as _),
     ])
     .unwrap()
 }
@@ -40,7 +43,7 @@ async fn test_checkpoint_kill_restart_recovery() {
     let dir = tempfile::tempdir().unwrap();
     let storage = dir.path().to_path_buf();
 
-    let ddl_source = "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts BIGINT, \
+    let ddl_source = "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts TIMESTAMP, \
                        WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)";
     let ddl_stream = "CREATE STREAM trade_summary AS \
                       SELECT symbol, SUM(price) AS total_price, COUNT(*) AS cnt \
@@ -119,7 +122,7 @@ async fn test_no_event_loss_during_checkpoint() {
     let db = LaminarDB::open_with_config(config_for(&storage)).unwrap();
 
     db.execute(
-        "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts BIGINT, \
+        "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts TIMESTAMP, \
          WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
     )
     .await

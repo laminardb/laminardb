@@ -5,7 +5,7 @@ use std::sync::Arc;
 use rustc_hash::FxHashSet;
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::{DataType, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use datafusion_expr::LogicalPlan;
@@ -490,20 +490,6 @@ pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperator
             };
             floored + offset
         }
-    }
-}
-
-pub(crate) fn infer_ts_format_from_batch(
-    batch: &RecordBatch,
-    column: &str,
-) -> laminar_core::time::TimestampFormat {
-    if let Ok(idx) = batch.schema().index_of(column) {
-        match batch.schema().field(idx).data_type() {
-            DataType::Timestamp(_, _) => laminar_core::time::TimestampFormat::ArrowNative,
-            _ => laminar_core::time::TimestampFormat::UnixMillis,
-        }
-    } else {
-        laminar_core::time::TimestampFormat::UnixMillis
     }
 }
 

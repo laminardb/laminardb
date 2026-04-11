@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use arrow_array::builder::{
     FixedSizeBinaryBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
-    UInt64Builder,
+    TimestampNanosecondBuilder, UInt64Builder,
 };
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -239,7 +239,7 @@ pub fn trace_request_to_batch(
     let mut span_attrs = StringBuilder::with_capacity(total_spans, total_spans * 64);
     let mut events_counts = Int32Builder::with_capacity(total_spans);
     let mut links_counts = Int32Builder::with_capacity(total_spans);
-    let mut received_at = Int64Builder::with_capacity(total_spans);
+    let mut received_at = TimestampNanosecondBuilder::with_capacity(total_spans);
 
     for resource_spans in &req.resource_spans {
         let resource = resource_spans.resource.as_ref();
@@ -396,7 +396,7 @@ struct MetricBuilders {
     res_attrs: StringBuilder,
     scope_names: StringBuilder,
     attrs: StringBuilder,
-    received_at: Int64Builder,
+    received_at: TimestampNanosecondBuilder,
 }
 
 struct MetricContext<'a> {
@@ -426,7 +426,7 @@ impl MetricBuilders {
             res_attrs: StringBuilder::with_capacity(n, n * 64),
             scope_names: StringBuilder::with_capacity(n, n * 16),
             attrs: StringBuilder::with_capacity(n, n * 64),
-            received_at: Int64Builder::with_capacity(n),
+            received_at: TimestampNanosecondBuilder::with_capacity(n),
         }
     }
 
@@ -666,7 +666,7 @@ fn append_context_fields(
     res_attrs: &mut StringBuilder,
     scope_names_col: &mut StringBuilder,
     attrs_col: &mut StringBuilder,
-    received_at: &mut Int64Builder,
+    received_at: &mut TimestampNanosecondBuilder,
 ) {
     match svc_name {
         Some(s) => res_svc_names.append_value(s),
@@ -738,7 +738,7 @@ pub fn logs_request_to_batch(
     let mut res_attrs = StringBuilder::with_capacity(total_records, total_records * 64);
     let mut scope_names_col = StringBuilder::with_capacity(total_records, total_records * 16);
     let mut attrs_col = StringBuilder::with_capacity(total_records, total_records * 64);
-    let mut received_at = Int64Builder::with_capacity(total_records);
+    let mut received_at = TimestampNanosecondBuilder::with_capacity(total_records);
 
     for rl in &req.resource_logs {
         let resource = rl.resource.as_ref();
@@ -1080,7 +1080,7 @@ mod tests {
         let col = batch
             .column(19)
             .as_any()
-            .downcast_ref::<arrow_array::Int64Array>()
+            .downcast_ref::<arrow_array::TimestampNanosecondArray>()
             .unwrap();
         for i in 0..3 {
             assert_eq!(col.value(i), 42);

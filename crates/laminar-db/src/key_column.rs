@@ -6,10 +6,9 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use arrow::array::{
-    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
-};
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow::datatypes::DataType;
+use laminar_core::time::cast_to_millis_array;
 
 use crate::error::DbError;
 
@@ -88,8 +87,11 @@ pub(crate) fn extract_key_column<'a>(
     }
 }
 
-/// Extracts a timestamp column as `Vec<i64>` (millis).
-/// Supports Int64, Timestamp(Millisecond), and Float64.
+/// Extracts a timestamp column as `Vec<i64>` (epoch millis).
+///
+/// Accepts any Arrow `Timestamp(_)` (the cast kernel rescales). Also
+/// accepts legacy `Int64` (treated as epoch millis) and `Float64`
+/// (truncated).
 pub(crate) fn extract_column_as_timestamps(
     batch: &RecordBatch,
     col_name: &str,
@@ -101,27 +103,21 @@ pub(crate) fn extract_column_as_timestamps(
     let array = batch.column(col_idx);
 
     match array.data_type() {
+        DataType::Timestamp(_, _) => cast_to_millis_array(array.as_ref())
+            .map(|a| a.values().to_vec())
+            .map_err(|e| DbError::Pipeline(format!("column '{col_name}': {e}"))),
         DataType::Int64 => {
             let a = array
                 .as_any()
                 .downcast_ref::<Int64Array>()
-                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Int64")))?;
-            Ok(a.values().to_vec())
-        }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let a = array
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .ok_or_else(|| {
-                    DbError::Pipeline(format!("Column '{col_name}' is not TimestampMillisecond"))
-                })?;
+                .expect("Int64 downcast");
             Ok(a.values().to_vec())
         }
         DataType::Float64 => {
             let a = array
                 .as_any()
                 .downcast_ref::<Float64Array>()
-                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Float64")))?;
+                .expect("Float64 downcast");
             #[allow(clippy::cast_possible_truncation)]
             Ok(a.values().iter().map(|v| *v as i64).collect())
         }
@@ -193,5 +189,46 @@ impl<'a> CompositeKey<'a> {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{TimestampMicrosecondArray, TimestampNanosecondArray};
+    use arrow::datatypes::{Field, Schema, TimeUnit};
+    use std::sync::Arc;
+
+    /// Regression: interval-join operators hit this path, and until the
+    /// `Timestamp(_)` migration it only accepted `Timestamp(Millisecond)`.
+    /// The OTel example's `_laminar_received_at` is `Timestamp(Nanosecond)`;
+    /// the cast kernel rescales it to millis.
+    #[test]
+    fn extract_timestamps_handles_nanos() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        // 1s, 2s in ns.
+        let arr = TimestampNanosecondArray::from(vec![1_000_000_000, 2_000_000_000]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+
+        let result = extract_column_as_timestamps(&batch, "ts").unwrap();
+        assert_eq!(result, vec![1_000, 2_000]);
+    }
+
+    #[test]
+    fn extract_timestamps_handles_micros() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]));
+        let arr = TimestampMicrosecondArray::from(vec![1_500_000]); // 1.5s in µs
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap();
+
+        let result = extract_column_as_timestamps(&batch, "ts").unwrap();
+        assert_eq!(result, vec![1_500]);
     }
 }

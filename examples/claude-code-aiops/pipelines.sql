@@ -81,10 +81,11 @@ EMIT ON WINDOW CLOSE;
 
 -- Stream joins — pre-extract flat columns, then join on simple refs
 
--- Enriched events — extract flat columns + convert nanos→millis for join bounds
+-- Enriched events — flatten JSON attributes; `ts` is the native
+-- Timestamp(Nanosecond) column used by the join predicates below.
 CREATE STREAM enriched_events AS
 SELECT
-    _laminar_received_at / 1000000 AS ts_ms,
+    _laminar_received_at AS ts,
     jsonb_get_text(from_json(attributes), 'prompt.id') AS prompt_id,
     jsonb_get_text(from_json(attributes), 'event.name') AS event_name,
     jsonb_get_text(from_json(attributes), 'model') AS model,
@@ -98,7 +99,7 @@ SELECT
 FROM otel_events
 WHERE jsonb_get_text(from_json(attributes), 'prompt.id') IS NOT NULL;
 
--- Prompt → API call join (2min window, ts_ms is milliseconds)
+-- Prompt → API call join (2-minute window).
 CREATE STREAM prompt_lifecycle AS
 SELECT
     p.prompt_id,
@@ -108,25 +109,25 @@ SELECT
     CAST(a.output_tokens AS BIGINT) AS output_tokens,
     CAST(a.cost_usd AS DOUBLE) AS cost_usd,
     CAST(a.duration_ms AS BIGINT) AS api_duration_ms,
-    a.ts_ms - p.ts_ms AS time_to_response_ms
+    CAST(a.ts - p.ts AS BIGINT) / 1000000 AS time_to_response_ms
 FROM enriched_events p
 JOIN enriched_events a
     ON p.prompt_id = a.prompt_id
-    AND a.ts_ms BETWEEN p.ts_ms AND p.ts_ms + INTERVAL '2' MINUTE
+    AND a.ts BETWEEN p.ts AND p.ts + INTERVAL '2' MINUTE
 WHERE p.event_name = 'user_prompt'
     AND a.event_name = 'api_request';
 
--- Prompt → tool result join (5min window)
+-- Prompt → tool result join (5-minute window).
 CREATE STREAM prompt_tools AS
 SELECT
     p.prompt_id,
     t.tool_name AS tool_name,
     t.tool_success AS tool_success,
     CAST(t.duration_ms AS BIGINT) AS tool_duration_ms,
-    t.ts_ms - p.ts_ms AS prompt_to_tool_ms
+    CAST(t.ts - p.ts AS BIGINT) / 1000000 AS prompt_to_tool_ms
 FROM enriched_events p
 JOIN enriched_events t
     ON p.prompt_id = t.prompt_id
-    AND t.ts_ms BETWEEN p.ts_ms AND p.ts_ms + INTERVAL '5' MINUTE
+    AND t.ts BETWEEN p.ts AND p.ts + INTERVAL '5' MINUTE
 WHERE p.event_name = 'user_prompt'
     AND t.event_name = 'tool_result';

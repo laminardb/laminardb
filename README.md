@@ -398,7 +398,7 @@ Historical mean latencies measured on an AMD Ryzen AI 7 350 development laptop (
 
 ## Project Status
 
-**Version 0.20.0** — active development, pre-1.0. APIs may change between minor versions.
+**Version 0.20.1** — active development, pre-1.0. APIs may change between minor versions.
 
 | Phase | Description | Progress |
 |-------|-------------|----------|

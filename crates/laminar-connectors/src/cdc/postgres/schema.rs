@@ -119,11 +119,16 @@ impl RelationCache {
 /// columns, making it compatible with any table structure.
 #[must_use]
 pub fn cdc_envelope_schema() -> SchemaRef {
+    use arrow_schema::TimeUnit;
     Arc::new(Schema::new(vec![
         Field::new("_table", DataType::Utf8, false),
         Field::new("_op", DataType::Utf8, false),
         Field::new("_lsn", DataType::UInt64, false),
-        Field::new("_ts_ms", DataType::Int64, false),
+        Field::new(
+            "_ts_ms",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
         Field::new("_before", DataType::Utf8, true),
         Field::new("_after", DataType::Utf8, true),
     ]))
