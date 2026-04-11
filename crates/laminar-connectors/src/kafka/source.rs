@@ -794,9 +794,13 @@ impl SourceConnector for KafkaSource {
                     warn!("multiple topics with schema registry — using first topic's schema");
                 }
                 if let Some(topic) = topics.first() {
-                    let subject = format!("{topic}-value");
+                    let subject = resolve_value_subject(
+                        kafka_config.schema_registry_subject_strategy,
+                        kafka_config.schema_registry_record_name.as_deref(),
+                        topic,
+                    );
                     match tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
+                        kafka_config.schema_registry_discovery_timeout,
                         sr.get_latest_schema(&subject),
                     )
                     .await
