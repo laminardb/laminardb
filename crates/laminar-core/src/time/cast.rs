@@ -1,10 +1,4 @@
-//! Shared helper for casting a `Timestamp(_)` array to
-//! `TimestampMillisecondArray`.
-//!
-//! Used by the window UDFs, the event-time extractor, the interval-join
-//! key helper, and the WebSocket parser — anywhere we need a uniform
-//! millisecond representation regardless of the column's declared
-//! precision.
+//! Cast any `Timestamp(_)` array to `TimestampMillisecondArray`.
 
 use std::fmt;
 
@@ -24,14 +18,11 @@ impl fmt::Display for CastError {
 
 impl std::error::Error for CastError {}
 
-/// Cast any `Timestamp(_)` array to `TimestampMillisecond`. The
-/// already-millis case is zero-copy; other precisions go through
-/// `arrow::compute::cast`.
+/// Cast any `Timestamp(_)` array to `TimestampMillisecondArray`.
 ///
 /// # Errors
 ///
-/// Returns [`CastError`] if the column isn't `Timestamp(_)` or if
-/// Arrow's cast kernel fails.
+/// [`CastError`] if `array` isn't a `Timestamp(_)` or the cast fails.
 pub fn cast_to_millis_array(array: &dyn Array) -> Result<TimestampMillisecondArray, CastError> {
     if !matches!(array.data_type(), DataType::Timestamp(_, _)) {
         return Err(CastError(format!(

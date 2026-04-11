@@ -143,18 +143,27 @@ impl MessageParser {
     }
 }
 
-/// Extracts the maximum event time (as epoch milliseconds) from a named column.
+/// Max event time (epoch ms) from a named `Timestamp(_)` column.
+/// `Ok(None)` when every row is null.
 ///
-/// Returns the maximum event time (epoch millis) from a column,
-/// or `None` if the column is missing, not a `Timestamp(_)`, or empty.
-#[must_use]
-pub fn extract_max_event_time(batch: &RecordBatch, field: &str) -> Option<i64> {
-    let col_idx = batch.schema().index_of(field).ok()?;
-    let arr = laminar_core::time::cast_to_millis_array(batch.column(col_idx).as_ref()).ok()?;
-    (0..arr.len())
+/// # Errors
+///
+/// `SchemaMismatch` if `field` is missing or isn't a `Timestamp(_)`.
+pub fn extract_max_event_time(
+    batch: &RecordBatch,
+    field: &str,
+) -> Result<Option<i64>, ConnectorError> {
+    let col_idx = batch.schema().index_of(field).map_err(|_| {
+        ConnectorError::SchemaMismatch(format!(
+            "event-time column '{field}' not found in batch schema"
+        ))
+    })?;
+    let arr = laminar_core::time::cast_to_millis_array(batch.column(col_idx).as_ref())
+        .map_err(|e| ConnectorError::SchemaMismatch(format!("event-time column '{field}': {e}")))?;
+    Ok((0..arr.len())
         .filter(|&i| !arr.is_null(i))
         .map(|i| arr.value(i))
-        .max()
+        .max())
 }
 
 /// Creates a default schema for JSON messages when no explicit schema is provided.
@@ -415,7 +424,7 @@ mod tests {
         let ts = arrow_array::TimestampMillisecondArray::from(vec![1000, 3000, 2000]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(ts)]).unwrap();
 
-        assert_eq!(extract_max_event_time(&batch, "ts"), Some(3000));
+        assert_eq!(extract_max_event_time(&batch, "ts").unwrap(), Some(3000));
     }
 
     #[test]
@@ -432,16 +441,25 @@ mod tests {
         ]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(ts)]).unwrap();
 
-        assert_eq!(extract_max_event_time(&batch, "ts"), Some(3_000));
+        assert_eq!(extract_max_event_time(&batch, "ts").unwrap(), Some(3_000));
     }
 
     #[test]
-    fn test_extract_max_event_time_missing_column() {
+    fn test_extract_max_event_time_missing_column_errors() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ids = arrow_array::Int64Array::from(vec![1, 2, 3]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(ids)]).unwrap();
 
-        assert_eq!(extract_max_event_time(&batch, "ts"), None);
+        assert!(extract_max_event_time(&batch, "ts").is_err());
+    }
+
+    #[test]
+    fn test_extract_max_event_time_non_timestamp_column_errors() {
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
+        let ts = arrow_array::Int64Array::from(vec![1, 2, 3]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ts)]).unwrap();
+
+        assert!(extract_max_event_time(&batch, "ts").is_err());
     }
 
     #[test]
@@ -455,6 +473,6 @@ mod tests {
             arrow_array::TimestampMillisecondArray::from(vec![Some(1000), None, Some(3000), None]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(ts)]).unwrap();
 
-        assert_eq!(extract_max_event_time(&batch, "ts"), Some(3000));
+        assert_eq!(extract_max_event_time(&batch, "ts").unwrap(), Some(3000));
     }
 }

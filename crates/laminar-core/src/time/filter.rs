@@ -59,9 +59,6 @@ pub fn filter_batch_by_timestamp(
         });
     }
 
-    // cast_to_millis_array is zero-copy for already-millis columns and
-    // uses Arrow's SIMD cast kernel for other precisions. The mask compare
-    // below then runs on one representation no matter the source unit.
     let ms = cast_to_millis_array(col.as_ref()).map_err(|e| FilterError::IncompatibleType {
         column: column.to_string(),
         found: e.to_string(),

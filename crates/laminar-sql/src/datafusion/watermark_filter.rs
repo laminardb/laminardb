@@ -95,16 +95,14 @@ impl WatermarkDynamicFilter {
         self.watermark_ms.load(Ordering::Acquire)
     }
 
-    /// Filters a record batch, keeping only rows where `time_column >= watermark`.
-    ///
-    /// Returns `Ok(None)` when all rows are filtered out. When the
-    /// watermark is still uninitialized (< 0) the batch passes through
-    /// untouched. Delegates the row-level comparison to
-    /// [`filter_batch_by_timestamp`].
+    /// Keep only rows where `time_column >= watermark`. Returns
+    /// `Ok(None)` when nothing survives; passes through untouched
+    /// while the watermark is uninitialised (< 0).
     ///
     /// # Errors
     ///
-    /// Returns an error if `time_column` is missing from the schema.
+    /// `DataFusionError::Plan` when `time_column` is missing or isn't
+    /// a `Timestamp(_)` (propagated from [`filter_batch_by_timestamp`]).
     pub fn filter_batch(
         &self,
         batch: &RecordBatch,

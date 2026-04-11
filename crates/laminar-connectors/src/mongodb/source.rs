@@ -45,7 +45,7 @@ use super::resume_token::{InMemoryResumeTokenStore, ResumeToken, ResumeTokenStor
 /// | `_document_key`     | Utf8   | no       | Document key JSON                  |
 /// | `_cluster_time_s`   | UInt32 | no       | Cluster time seconds               |
 /// | `_cluster_time_i`   | UInt32 | no       | Cluster time increment             |
-/// | `_wall_time_ms`     | Int64  | no       | Wall clock timestamp (Unix ms)     |
+/// | `_wall_time_ms`     | Timestamp(ms) | no | Wall clock timestamp             |
 /// | `_full_document`    | Utf8   | yes      | Full document JSON                 |
 /// | `_update_desc`      | Utf8   | yes      | Update description JSON            |
 /// | `_resume_token`     | Utf8   | no       | Opaque resume token JSON           |
