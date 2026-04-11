@@ -25,6 +25,12 @@ pub struct KafkaSourceMetrics {
     pub rebalances: AtomicU64,
     /// Consumer lag (sum across all partitions of `high_watermark - current_offset`).
     pub lag: AtomicU64,
+    /// Count of successful Schema Registry discoveries at DDL time.
+    pub sr_discovery_successes: AtomicU64,
+    /// Count of Schema Registry discovery failures (HTTP error, parse error).
+    pub sr_discovery_failures: AtomicU64,
+    /// Count of Schema Registry discovery timeouts.
+    pub sr_discovery_timeouts: AtomicU64,
 }
 
 impl KafkaSourceMetrics {
@@ -39,6 +45,9 @@ impl KafkaSourceMetrics {
             commits: AtomicU64::new(0),
             rebalances: AtomicU64::new(0),
             lag: AtomicU64::new(0),
+            sr_discovery_successes: AtomicU64::new(0),
+            sr_discovery_failures: AtomicU64::new(0),
+            sr_discovery_timeouts: AtomicU64::new(0),
         }
     }
 
@@ -69,6 +78,21 @@ impl KafkaSourceMetrics {
         self.lag.store(lag, Ordering::Relaxed);
     }
 
+    /// Records a successful Schema Registry discovery at DDL time.
+    pub fn record_sr_discovery_success(&self) {
+        self.sr_discovery_successes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a Schema Registry discovery failure.
+    pub fn record_sr_discovery_failure(&self) {
+        self.sr_discovery_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a Schema Registry discovery timeout.
+    pub fn record_sr_discovery_timeout(&self) {
+        self.sr_discovery_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Converts to the SDK's [`ConnectorMetrics`].
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
@@ -88,6 +112,18 @@ impl KafkaSourceMetrics {
         m.add_custom(
             "kafka.rebalances",
             self.rebalances.load(Ordering::Relaxed) as f64,
+        );
+        m.add_custom(
+            "kafka.sr_discovery_successes",
+            self.sr_discovery_successes.load(Ordering::Relaxed) as f64,
+        );
+        m.add_custom(
+            "kafka.sr_discovery_failures",
+            self.sr_discovery_failures.load(Ordering::Relaxed) as f64,
+        );
+        m.add_custom(
+            "kafka.sr_discovery_timeouts",
+            self.sr_discovery_timeouts.load(Ordering::Relaxed) as f64,
         );
         m
     }
@@ -132,8 +168,8 @@ mod tests {
 
         let cm = m.to_connector_metrics();
         assert_eq!(cm.errors_total, 2);
-        assert_eq!(cm.custom.len(), 3);
-        // Check custom metrics
+        // 3 base (batches_polled, commits, rebalances) + 3 SR-discovery counters.
+        assert_eq!(cm.custom.len(), 6);
         let commits = cm.custom.iter().find(|(k, _)| k == "kafka.commits");
         assert_eq!(commits.unwrap().1, 1.0);
     }
@@ -159,6 +195,35 @@ mod tests {
 
         m.set_lag(100);
         assert_eq!(m.to_connector_metrics().lag, 100);
+    }
+
+    #[test]
+    fn test_sr_discovery_counters() {
+        let m = KafkaSourceMetrics::new();
+        m.record_sr_discovery_success();
+        m.record_sr_discovery_success();
+        m.record_sr_discovery_failure();
+        m.record_sr_discovery_timeout();
+
+        let cm = m.to_connector_metrics();
+        let successes = cm
+            .custom
+            .iter()
+            .find(|(k, _)| k == "kafka.sr_discovery_successes")
+            .unwrap();
+        let failures = cm
+            .custom
+            .iter()
+            .find(|(k, _)| k == "kafka.sr_discovery_failures")
+            .unwrap();
+        let timeouts = cm
+            .custom
+            .iter()
+            .find(|(k, _)| k == "kafka.sr_discovery_timeouts")
+            .unwrap();
+        assert_eq!(successes.1, 2.0);
+        assert_eq!(failures.1, 1.0);
+        assert_eq!(timeouts.1, 1.0);
     }
 
     #[test]

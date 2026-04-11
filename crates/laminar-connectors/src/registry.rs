@@ -7,6 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use arrow_schema::SchemaRef;
 use parking_lot::RwLock;
 
 use crate::config::{ConnectorConfig, ConnectorInfo};
@@ -99,32 +100,30 @@ impl ConnectorRegistry {
         self.sinks.write().insert(name.into(), (info, factory));
     }
 
-    /// Returns the default schema for a source connector as `(name, sql_type, nullable)` tuples.
-    /// Passes `properties` so the connector can pick the right schema variant.
-    #[must_use]
-    pub fn default_source_columns(
+    /// Run a connector's `discover_schema` against the given
+    /// properties and return the resulting Arrow schema. `None` means
+    /// the connector type is unknown or discovery produced no fields.
+    pub async fn default_source_schema(
         &self,
         connector_type: &str,
         properties: &std::collections::HashMap<String, String>,
-    ) -> Option<Vec<(String, String, bool)>> {
-        let sources = self.sources.read();
-        let (_, factory) = sources.get(connector_type)?;
+    ) -> Option<SchemaRef> {
+        // Release the read lock before awaiting — `discover_schema` may
+        // do network I/O.
+        let factory = {
+            let sources = self.sources.read();
+            let (_, factory) = sources.get(connector_type)?;
+            factory.clone()
+        };
+
         let mut instance = factory();
-        instance.discover_schema(properties);
+        instance.discover_schema(properties).await;
         let schema = instance.schema();
-        Some(
-            schema
-                .fields()
-                .iter()
-                .map(|f| {
-                    (
-                        f.name().clone(),
-                        arrow_type_to_sql_str(f.data_type()),
-                        f.is_nullable(),
-                    )
-                })
-                .collect(),
-        )
+        if schema.fields().is_empty() {
+            None
+        } else {
+            Some(schema)
+        }
     }
 
     /// Creates a new source connector instance.
@@ -299,24 +298,6 @@ impl std::fmt::Debug for ConnectorRegistry {
     }
 }
 
-fn arrow_type_to_sql_str(dt: &arrow_schema::DataType) -> String {
-    use arrow_schema::DataType;
-    match dt {
-        DataType::Boolean => "BOOLEAN",
-        DataType::Int8 | DataType::UInt8 => "TINYINT",
-        DataType::Int16 | DataType::UInt16 => "SMALLINT",
-        DataType::Int32 | DataType::UInt32 => "INT",
-        DataType::Int64 | DataType::UInt64 => "BIGINT",
-        DataType::Float16 | DataType::Float32 => "FLOAT",
-        DataType::Float64 => "DOUBLE",
-        DataType::Binary | DataType::LargeBinary | DataType::FixedSizeBinary(_) => "BINARY",
-        DataType::Timestamp(_, _) => "TIMESTAMP",
-        DataType::Date32 | DataType::Date64 => "DATE",
-        _ => "VARCHAR", // Utf8, LargeUtf8, and anything else
-    }
-    .into()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +397,29 @@ mod tests {
         assert!(registry.create_deserializer("json").is_ok());
         assert!(registry.create_serializer("csv").is_ok());
         assert!(registry.create_deserializer("unknown").is_err());
+    }
+
+    #[tokio::test]
+    async fn default_source_schema_some_when_discovered() {
+        let registry = ConnectorRegistry::new();
+        registry.register_source(
+            "mock",
+            mock_info("mock", true, false),
+            Arc::new(|| Box::new(MockSourceConnector::new())),
+        );
+        let schema = registry
+            .default_source_schema("mock", &std::collections::HashMap::new())
+            .await;
+        assert!(schema.is_some_and(|s| !s.fields().is_empty()));
+    }
+
+    #[tokio::test]
+    async fn default_source_schema_none_for_unknown_connector() {
+        let registry = ConnectorRegistry::new();
+        assert!(registry
+            .default_source_schema("nope", &std::collections::HashMap::new())
+            .await
+            .is_none());
     }
 
     // ── Table source factory tests ──

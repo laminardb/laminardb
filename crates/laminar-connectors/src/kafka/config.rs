@@ -394,6 +394,51 @@ impl std::fmt::Display for SchemaEvolutionStrategy {
     }
 }
 
+/// Confluent subject-name strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubjectNameStrategy {
+    /// `{topic}-value` (Confluent default).
+    #[default]
+    TopicName,
+    /// `{record_name}-value`. Requires `schema.registry.record.name`.
+    RecordName,
+    /// `{topic}-{record_name}-value`. Requires `schema.registry.record.name`.
+    TopicRecordName,
+}
+
+str_enum!(fromstr SubjectNameStrategy, lowercase_nodash, ConnectorError,
+    "invalid schema.registry.subject.name.strategy",
+    TopicName => "topic-name", "topicname", "topicnamestrategy";
+    RecordName => "record-name", "recordname", "recordnamestrategy";
+    TopicRecordName => "topic-record-name", "topicrecordname", "topicrecordnamestrategy"
+);
+
+impl std::fmt::Display for SubjectNameStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubjectNameStrategy::TopicName => write!(f, "topic-name"),
+            SubjectNameStrategy::RecordName => write!(f, "record-name"),
+            SubjectNameStrategy::TopicRecordName => write!(f, "topic-record-name"),
+        }
+    }
+}
+
+/// Build the SR `-value` subject for a topic. `from_config` validates
+/// that `record_name` is present for the record-based strategies, so
+/// the `expect`s are unreachable in practice.
+pub(crate) fn resolve_value_subject(
+    strategy: SubjectNameStrategy,
+    record_name: Option<&str>,
+    topic: &str,
+) -> String {
+    let name = || record_name.expect("from_config validates record.name");
+    match strategy {
+        SubjectNameStrategy::TopicName => format!("{topic}-value"),
+        SubjectNameStrategy::RecordName => format!("{}-value", name()),
+        SubjectNameStrategy::TopicRecordName => format!("{topic}-{}-value", name()),
+    }
+}
+
 /// Maps the Kafka-level [`CompatibilityLevel`] to the schema module's
 /// `CompatibilityMode` for evolution evaluation.
 impl From<CompatibilityLevel> for crate::schema::traits::CompatibilityMode {
@@ -434,6 +479,7 @@ impl std::fmt::Debug for SrAuth {
 /// Uses a custom `Debug` impl that redacts `sasl_password` and
 /// `ssl_key_password` to prevent credential leakage in logs.
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)] // Config struct — each bool is an independent user-facing knob.
 pub struct KafkaSourceConfig {
     // -- Required --
     /// Comma-separated list of broker addresses.
@@ -478,6 +524,13 @@ pub struct KafkaSourceConfig {
     pub schema_registry_ssl_certificate_location: Option<String>,
     /// Schema Registry SSL client key path.
     pub schema_registry_ssl_key_location: Option<String>,
+    /// Confluent subject-name strategy. Default: `TopicName`.
+    pub schema_registry_subject_strategy: SubjectNameStrategy,
+    /// Record name for `record-name` / `topic-record-name` strategies.
+    pub schema_registry_record_name: Option<String>,
+    /// Deadline for Schema Registry lookups performed during schema
+    /// auto-discovery at DDL time. Default: 10s.
+    pub schema_registry_discovery_timeout: Duration,
     /// Column name containing the event timestamp.
     pub event_time_column: Option<String>,
     /// Whether to include Kafka metadata columns (_partition, _offset, _timestamp).
@@ -604,6 +657,9 @@ impl Default for KafkaSourceConfig {
             schema_registry_ssl_ca_location: None,
             schema_registry_ssl_certificate_location: None,
             schema_registry_ssl_key_location: None,
+            schema_registry_subject_strategy: SubjectNameStrategy::default(),
+            schema_registry_record_name: None,
+            schema_registry_discovery_timeout: Duration::from_secs(10),
             event_time_column: None,
             include_metadata: false,
             include_headers: false,
@@ -717,6 +773,30 @@ impl KafkaSourceConfig {
         let schema_registry_ssl_key_location = config
             .get("schema.registry.ssl.key.location")
             .map(String::from);
+
+        let schema_registry_subject_strategy =
+            match config.get("schema.registry.subject.name.strategy") {
+                Some(s) => s.parse::<SubjectNameStrategy>()?,
+                None => SubjectNameStrategy::default(),
+            };
+
+        let schema_registry_record_name =
+            config.get("schema.registry.record.name").map(String::from);
+
+        if matches!(
+            schema_registry_subject_strategy,
+            SubjectNameStrategy::RecordName | SubjectNameStrategy::TopicRecordName
+        ) && schema_registry_record_name.is_none()
+        {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "schema.registry.subject.name.strategy={schema_registry_subject_strategy} \
+                 requires schema.registry.record.name"
+            )));
+        }
+
+        let schema_registry_discovery_timeout = config
+            .get_parsed::<u64>("schema.registry.discovery.timeout.ms")?
+            .map_or(Duration::from_secs(10), Duration::from_millis);
 
         let event_time_column = config.get("event.time.column").map(String::from);
 
@@ -844,6 +924,9 @@ impl KafkaSourceConfig {
             schema_registry_ssl_ca_location,
             schema_registry_ssl_certificate_location,
             schema_registry_ssl_key_location,
+            schema_registry_subject_strategy,
+            schema_registry_record_name,
+            schema_registry_discovery_timeout,
             event_time_column,
             include_metadata,
             include_headers,
@@ -1926,5 +2009,91 @@ mod tests {
                 .unwrap();
         let rdkafka = cfg.to_rdkafka_config();
         assert_eq!(rdkafka.get("queued.max.messages.kbytes"), Some("8192"));
+    }
+
+    // ── Schema Registry subject-name strategy ──
+
+    #[test]
+    fn resolve_subject_topic_name() {
+        assert_eq!(
+            resolve_value_subject(SubjectNameStrategy::TopicName, None, "orders"),
+            "orders-value"
+        );
+    }
+
+    #[test]
+    fn resolve_subject_record_name() {
+        assert_eq!(
+            resolve_value_subject(
+                SubjectNameStrategy::RecordName,
+                Some("com.acme.Order"),
+                "orders"
+            ),
+            "com.acme.Order-value"
+        );
+    }
+
+    #[test]
+    fn resolve_subject_topic_record_name() {
+        assert_eq!(
+            resolve_value_subject(
+                SubjectNameStrategy::TopicRecordName,
+                Some("com.acme.Order"),
+                "orders"
+            ),
+            "orders-com.acme.Order-value"
+        );
+    }
+
+    #[test]
+    fn parse_subject_strategy_from_config() {
+        let cfg = KafkaSourceConfig::from_config(&make_config(&[
+            ("schema.registry.url", "http://sr:8081"),
+            ("schema.registry.subject.name.strategy", "record-name"),
+            ("schema.registry.record.name", "com.acme.Order"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            cfg.schema_registry_subject_strategy,
+            SubjectNameStrategy::RecordName
+        );
+        assert_eq!(
+            cfg.schema_registry_record_name.as_deref(),
+            Some("com.acme.Order")
+        );
+    }
+
+    #[test]
+    fn parse_subject_strategy_rejects_missing_record_name() {
+        let err = KafkaSourceConfig::from_config(&make_config(&[
+            ("schema.registry.url", "http://sr:8081"),
+            ("schema.registry.subject.name.strategy", "record-name"),
+        ]))
+        .unwrap_err();
+        assert!(matches!(err, ConnectorError::ConfigurationError(_)));
+    }
+
+    #[test]
+    fn parse_discovery_timeout_default_ten_seconds() {
+        let cfg =
+            KafkaSourceConfig::from_config(&make_config(&[("schema.registry.url", "http://sr")]))
+                .unwrap();
+        assert_eq!(
+            cfg.schema_registry_discovery_timeout,
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn parse_discovery_timeout_override() {
+        let cfg = KafkaSourceConfig::from_config(&make_config(&[
+            ("schema.registry.url", "http://sr"),
+            ("schema.registry.discovery.timeout.ms", "25000"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            cfg.schema_registry_discovery_timeout,
+            Duration::from_millis(25000)
+        );
     }
 }

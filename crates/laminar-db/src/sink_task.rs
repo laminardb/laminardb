@@ -426,16 +426,18 @@ async fn run_sink_task(mut inner: SinkTaskInner) {
                 }
             }
             _ = flush_timer.tick() => {
-                match tokio::time::timeout(inner.flush_interval, inner.sink.flush()).await {
-                    Ok(Err(e)) => {
-                        tracing::warn!(sink = %inner.name, error = %e,
-                            "Periodic sink flush error");
-                    }
-                    Err(_elapsed) => {
-                        tracing::warn!(sink = %inner.name,
-                            "periodic flush timed out — sink may be stuck");
-                    }
+                // Backstop only — `SinkConnector::flush` must be internally
+                // bounded (see trait doc). Wider than any reasonable inner
+                // deadline so we can't fire first and orphan a spawn_blocking.
+                match tokio::time::timeout(inner.flush_interval * 2, inner.sink.flush()).await {
                     Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!(
+                        sink = %inner.name, error = %e, "Periodic sink flush error"
+                    ),
+                    Err(_) => tracing::warn!(
+                        sink = %inner.name,
+                        "Periodic flush exceeded backstop — connector has unbounded flush"
+                    ),
                 }
             }
         }

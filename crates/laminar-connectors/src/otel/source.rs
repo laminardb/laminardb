@@ -188,7 +188,7 @@ impl SourceConnector for OtelSource {
         Ok(Some(SourceBatch::new(combined)))
     }
 
-    fn discover_schema(&mut self, properties: &std::collections::HashMap<String, String>) {
+    async fn discover_schema(&mut self, properties: &std::collections::HashMap<String, String>) {
         let sig = properties
             .get("signals")
             .or_else(|| properties.get("signal"));

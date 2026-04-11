@@ -615,7 +615,7 @@ impl LaminarDB {
 
         match statement {
             StreamingStatement::CreateSource(create) => {
-                let result = self.handle_create_source(create)?;
+                let result = self.handle_create_source(create).await?;
                 if let ExecuteResult::Ddl(ref info) = result {
                     self.connector_manager
                         .lock()
@@ -2294,6 +2294,175 @@ mod tests {
             .unwrap();
         let registry = db.connector_registry();
         assert!(registry.list_sources().contains(&"test-source".to_string()));
+    }
+
+    /// SQL DDL auto-discovery must land a `Map` column in the catalog
+    /// verbatim from the connector — no SQL string round-trip.
+    #[tokio::test]
+    async fn test_sql_create_source_auto_discovers_map_column() {
+        use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema};
+
+        let map_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "data",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(Fields::from(vec![
+                            Field::new("key", DataType::Utf8, false),
+                            Field::new("value", DataType::Utf8, true),
+                        ])),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+        ]));
+
+        let (db, _) = fake_source_db("fake-avro", Some(Arc::clone(&map_schema))).await;
+        db.execute(
+            "CREATE SOURCE events WITH ('connector' = 'fake-avro', \
+             'schema.registry.url' = 'http://irrelevant', 'topic' = 'events')",
+        )
+        .await
+        .unwrap();
+
+        let entry = db.catalog.get_source("events").expect("source in catalog");
+        assert_eq!(entry.schema.fields().len(), 2);
+        assert_eq!(entry.schema.field(0).data_type(), &DataType::Int64);
+        assert!(
+            matches!(entry.schema.field(1).data_type(), DataType::Map(_, _)),
+            "auto-discovered `data` must arrive as Map, got {:?}",
+            entry.schema.field(1).data_type()
+        );
+    }
+
+    /// CREATE SOURCE IF NOT EXISTS must skip auto-discovery when the
+    /// source already exists — no wasted Schema Registry round trip.
+    #[tokio::test]
+    async fn test_sql_create_source_if_not_exists_skips_discovery() {
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+
+        let discovered = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let (db, counter) = fake_source_db("counting-fake", Some(discovered)).await;
+
+        db.execute("CREATE SOURCE events WITH ('connector' = 'counting-fake')")
+            .await
+            .unwrap();
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        db.execute("CREATE SOURCE IF NOT EXISTS events WITH ('connector' = 'counting-fake')")
+            .await
+            .unwrap();
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "IF NOT EXISTS should short-circuit before discovery"
+        );
+    }
+
+    /// CREATE SOURCE without columns must fail loudly when discovery
+    /// yields an empty schema, not register a zero-column table.
+    #[tokio::test]
+    async fn test_sql_create_source_errors_when_discovery_yields_empty() {
+        let (db, _) = fake_source_db("empty-fake", None).await;
+        let err = db
+            .execute("CREATE SOURCE events WITH ('connector' = 'empty-fake')")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("could not auto-discover a schema"),
+            "expected actionable discovery-failure error, got: {err}"
+        );
+    }
+
+    /// Build a `LaminarDB` with one fake source plus a shared counter
+    /// that ticks on every `discover_schema` call.
+    async fn fake_source_db(
+        name: &'static str,
+        discovered: Option<Arc<arrow::datatypes::Schema>>,
+    ) -> (LaminarDB, Arc<std::sync::atomic::AtomicUsize>) {
+        use arrow::datatypes::Schema as ArrowSchema;
+        use async_trait::async_trait;
+        use laminar_connectors::checkpoint::SourceCheckpoint;
+        use laminar_connectors::config::{ConnectorConfig, ConnectorInfo};
+        use laminar_connectors::connector::{SourceBatch, SourceConnector};
+        use laminar_connectors::error::ConnectorError;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FakeSource {
+            schema: Arc<ArrowSchema>,
+            on_discover: Option<Arc<ArrowSchema>>,
+            counter: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl SourceConnector for FakeSource {
+            async fn open(&mut self, _: &ConnectorConfig) -> Result<(), ConnectorError> {
+                Ok(())
+            }
+            async fn poll_batch(
+                &mut self,
+                _: usize,
+            ) -> Result<Option<SourceBatch>, ConnectorError> {
+                Ok(None)
+            }
+            async fn discover_schema(&mut self, _: &std::collections::HashMap<String, String>) {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+                if let Some(s) = &self.on_discover {
+                    self.schema = Arc::clone(s);
+                }
+            }
+            fn schema(&self) -> Arc<ArrowSchema> {
+                Arc::clone(&self.schema)
+            }
+            fn checkpoint(&self) -> SourceCheckpoint {
+                SourceCheckpoint::new(0)
+            }
+            async fn restore(&mut self, _: &SourceCheckpoint) -> Result<(), ConnectorError> {
+                Ok(())
+            }
+            async fn close(&mut self) -> Result<(), ConnectorError> {
+                Ok(())
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+
+        let db = LaminarDB::builder()
+            .register_connector(move |registry| {
+                let discovered = discovered.clone();
+                let counter = Arc::clone(&counter_clone);
+                registry.register_source(
+                    name,
+                    ConnectorInfo {
+                        name: name.into(),
+                        display_name: name.into(),
+                        version: "0.1.0".into(),
+                        is_source: true,
+                        is_sink: false,
+                        config_keys: vec![],
+                    },
+                    Arc::new(move || {
+                        Box::new(FakeSource {
+                            schema: Arc::new(ArrowSchema::empty()),
+                            on_discover: discovered.clone(),
+                            counter: Arc::clone(&counter),
+                        })
+                    }),
+                );
+            })
+            .build()
+            .await
+            .unwrap();
+        (db, counter)
     }
 
     #[tokio::test]

@@ -134,6 +134,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 criterion = { workspace = true }
+wiremock = "0.6"
 
 [[bench]]
 name = "mongodb_throughput"

@@ -11,6 +11,7 @@ use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::ClientConfig;
 use rdkafka::TopicPartitionList;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -39,7 +40,10 @@ use crate::metrics::ConnectorMetrics;
 use crate::serde::{self, Format, RecordDeserializer};
 
 use super::avro::AvroDeserializer;
-use super::config::{KafkaSourceConfig, SchemaEvolutionStrategy, StartupMode, TopicSubscription};
+use super::config::{
+    resolve_value_subject, KafkaSourceConfig, SchemaEvolutionStrategy, StartupMode,
+    TopicSubscription,
+};
 use super::metrics::KafkaSourceMetrics;
 use super::offsets::OffsetTracker;
 use super::rebalance::RebalanceState;
@@ -159,6 +163,28 @@ impl KafkaSource {
             }
         };
         Self::build_base(schema, config, deser_factory, Some(sr))
+    }
+
+    /// Build a Schema Registry client from the parsed config, or
+    /// `Ok(None)` when `schema.registry.url` is not set.
+    fn build_sr_client(
+        config: &KafkaSourceConfig,
+    ) -> Result<Option<SchemaRegistryClient>, ConnectorError> {
+        let Some(sr_url) = config.schema_registry_url.as_ref() else {
+            return Ok(None);
+        };
+        let client = if let Some(ca) = config.schema_registry_ssl_ca_location.as_deref() {
+            SchemaRegistryClient::with_tls_mtls(
+                sr_url.clone(),
+                config.schema_registry_auth.clone(),
+                ca,
+                config.schema_registry_ssl_certificate_location.as_deref(),
+                config.schema_registry_ssl_key_location.as_deref(),
+            )?
+        } else {
+            SchemaRegistryClient::new(sr_url.clone(), config.schema_registry_auth.clone())
+        };
+        Ok(Some(client))
     }
 
     fn build_base(
@@ -579,20 +605,7 @@ impl SourceConnector for KafkaSource {
         };
 
         // Re-select deserializer (factory defaults to JSON).
-        if let Some(ref sr_url) = kafka_config.schema_registry_url {
-            let sr_client = if let Some(ref ca) = kafka_config.schema_registry_ssl_ca_location {
-                SchemaRegistryClient::with_tls_mtls(
-                    sr_url.clone(),
-                    kafka_config.schema_registry_auth.clone(),
-                    ca,
-                    kafka_config
-                        .schema_registry_ssl_certificate_location
-                        .as_deref(),
-                    kafka_config.schema_registry_ssl_key_location.as_deref(),
-                )?
-            } else {
-                SchemaRegistryClient::new(sr_url.clone(), kafka_config.schema_registry_auth.clone())
-            };
+        if let Some(sr_client) = Self::build_sr_client(&kafka_config)? {
             let sr = Arc::new(sr_client);
             self.schema_registry = Some(Arc::clone(&sr));
             self.deserializer = if kafka_config.format == Format::Avro {
@@ -781,9 +794,13 @@ impl SourceConnector for KafkaSource {
                     warn!("multiple topics with schema registry — using first topic's schema");
                 }
                 if let Some(topic) = topics.first() {
-                    let subject = format!("{topic}-value");
+                    let subject = resolve_value_subject(
+                        kafka_config.schema_registry_subject_strategy,
+                        kafka_config.schema_registry_record_name.as_deref(),
+                        topic,
+                    );
                     match tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
+                        kafka_config.schema_registry_discovery_timeout,
                         sr.get_latest_schema(&subject),
                     )
                     .await
@@ -799,9 +816,12 @@ impl SourceConnector for KafkaSource {
                                 {
                                     warn!(%subject, error = %e, "SR schema register failed");
                                 } else {
-                                    info!(%subject, schema_id = cached.id, "SR schema fetched at open()");
-                                    self.last_avro_schema = Some(Arc::clone(&cached.arrow_schema));
-                                    self.schema = cached.arrow_schema;
+                                    // Keep the catalog schema pinned — planner
+                                    // plans are already built against it.
+                                    log_schema_drift(&self.schema, &cached.arrow_schema, &subject);
+                                    info!(%subject, schema_id = cached.id,
+                                        "SR schema fetched at open()");
+                                    self.last_avro_schema = Some(cached.arrow_schema);
                                 }
                             }
                         }
@@ -818,6 +838,69 @@ impl SourceConnector for KafkaSource {
 
         info!("Kafka source connector opened successfully");
         Ok(())
+    }
+
+    async fn discover_schema(&mut self, properties: &std::collections::HashMap<String, String>) {
+        let cfg = crate::config::ConnectorConfig::with_properties("kafka", properties.clone());
+        let Ok(kafka_config) = KafkaSourceConfig::from_config(&cfg) else {
+            return;
+        };
+        if kafka_config.format != Format::Avro {
+            return;
+        }
+
+        let topic = match &kafka_config.subscription {
+            TopicSubscription::Topics(topics) => match topics.first() {
+                Some(t) => {
+                    if topics.len() > 1 {
+                        warn!(topics = ?topics, chosen = %t,
+                            "multi-topic source: using first topic's SR schema");
+                    }
+                    t.clone()
+                }
+                None => return,
+            },
+            TopicSubscription::Pattern(pattern) => {
+                warn!(%pattern,
+                    "topic.pattern cannot auto-discover a schema — declare columns explicitly");
+                return;
+            }
+        };
+
+        let sr_client = match Self::build_sr_client(&kafka_config) {
+            Ok(Some(c)) => c,
+            Ok(None) => return,
+            Err(e) => {
+                warn!(error = %e, "Schema Registry client build failed");
+                return;
+            }
+        };
+
+        let subject = resolve_value_subject(
+            kafka_config.schema_registry_subject_strategy,
+            kafka_config.schema_registry_record_name.as_deref(),
+            &topic,
+        );
+        let timeout = kafka_config.schema_registry_discovery_timeout;
+
+        match tokio::time::timeout(timeout, sr_client.get_latest_schema(&subject)).await {
+            Ok(Ok(cached)) => {
+                self.metrics.record_sr_discovery_success();
+                info!(%subject, schema_id = cached.id,
+                    fields = cached.arrow_schema.fields().len(),
+                    "discovered Avro schema from Schema Registry");
+                self.schema = cached.arrow_schema;
+            }
+            Ok(Err(e)) => {
+                self.metrics.record_sr_discovery_failure();
+                warn!(%subject, error = %e, "Schema Registry lookup failed");
+            }
+            Err(_) => {
+                self.metrics.record_sr_discovery_timeout();
+                warn!(%subject, timeout_secs = timeout.as_secs(),
+                    "Schema Registry lookup timed out");
+            }
+        }
     }
 
     #[allow(clippy::cast_possible_truncation)] // Kafka partition/offset values fit in narrower types
@@ -1352,6 +1435,26 @@ impl std::fmt::Debug for KafkaSource {
     }
 }
 
+/// Warn if the CREATE-SOURCE catalog schema has drifted from the live
+/// Schema Registry schema. Empty `declared` means nothing was declared.
+fn log_schema_drift(declared: &arrow_schema::Schema, live: &arrow_schema::Schema, subject: &str) {
+    if declared.fields().is_empty() || declared.fields() == live.fields() {
+        return;
+    }
+    let decl: BTreeSet<&str> = declared
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    let lv: BTreeSet<&str> = live.fields().iter().map(|f| f.name().as_str()).collect();
+    warn!(
+        %subject,
+        missing_in_sr = ?decl.difference(&lv).collect::<Vec<_>>(),
+        added_in_sr = ?lv.difference(&decl).collect::<Vec<_>>(),
+        "schema drift: re-apply CREATE SOURCE DDL to pick up the current SR schema"
+    );
+}
+
 fn select_deserializer(format: Format) -> Box<dyn RecordDeserializer> {
     match format {
         Format::Avro => Box::new(AvroDeserializer::new()),
@@ -1530,5 +1633,276 @@ mod tests {
         // No assigned partitions means no offsets should be checkpointed.
         let cp = source.checkpoint();
         assert!(cp.is_empty());
+    }
+
+    // discover_schema tests. Control-flow cases (when to skip, when to
+    // fail) use plain config inputs; the happy path uses a wiremock HTTP
+    // server mocking Confluent Schema Registry's REST API.
+
+    fn empty_schema() -> SchemaRef {
+        Arc::new(Schema::empty())
+    }
+
+    fn props(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn discover_schema_skips_non_avro_format() {
+        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default());
+        source
+            .discover_schema(&props(&[
+                ("bootstrap.servers", "localhost:9092"),
+                ("group.id", "g"),
+                ("topic", "t"),
+                ("format", "json"),
+                ("schema.registry.url", "http://localhost:8081"),
+            ]))
+            .await;
+        // Schema must remain untouched (still empty).
+        assert_eq!(source.schema().fields().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn discover_schema_skips_without_sr_url() {
+        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default());
+        source
+            .discover_schema(&props(&[
+                ("bootstrap.servers", "localhost:9092"),
+                ("group.id", "g"),
+                ("topic", "t"),
+                ("format", "avro"),
+            ]))
+            .await;
+        assert_eq!(source.schema().fields().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn discover_schema_skips_topic_pattern() {
+        // topic.pattern cannot map to a single SR subject. Must skip
+        // cleanly, not panic or select an arbitrary topic.
+        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default());
+        source
+            .discover_schema(&props(&[
+                ("bootstrap.servers", "localhost:9092"),
+                ("group.id", "g"),
+                ("topic.pattern", "events-.*"),
+                ("format", "avro"),
+                ("schema.registry.url", "http://localhost:8081"),
+            ]))
+            .await;
+        assert_eq!(source.schema().fields().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn discover_schema_unreachable_sr_leaves_schema_empty() {
+        // Use a reserved-documentation IP on a closed port and bound the
+        // whole test by a generous wall-clock budget so a bug where we
+        // forgot the timeout would fail loudly.
+        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default());
+        let start = std::time::Instant::now();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            source.discover_schema(&props(&[
+                ("bootstrap.servers", "localhost:9092"),
+                ("group.id", "g"),
+                ("topic", "t"),
+                ("format", "avro"),
+                // TEST-NET-1 per RFC 5737 — guaranteed not to route.
+                ("schema.registry.url", "http://192.0.2.1:65535"),
+            ])),
+        )
+        .await
+        .expect("discover_schema must honor its own 10s timeout");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(15),
+            "discover_schema should have returned well before the outer 20s budget"
+        );
+        assert_eq!(source.schema().fields().len(), 0);
+    }
+
+    /// Happy path: wiremock SR returns a record-with-map Avro schema
+    /// (the original "No Field name data" bug shape); `discover_schema`
+    /// converts it correctly and preserves the Map type.
+    #[tokio::test]
+    async fn discover_schema_happy_path_with_wiremock_sr() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let avro_schema = serde_json::json!({
+            "type": "record",
+            "name": "event",
+            "fields": [
+                {"name": "id", "type": "long"},
+                {"name": "data", "type": {"type": "map", "values": "string"}}
+            ]
+        })
+        .to_string();
+
+        let sr = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/subjects/ion_tw-value/versions/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 42,
+                "version": 1,
+                "subject": "ion_tw-value",
+                "schema": avro_schema,
+                "schemaType": "AVRO",
+            })))
+            .mount(&sr)
+            .await;
+
+        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default());
+        source
+            .discover_schema(&props(&[
+                ("bootstrap.servers", "localhost:9092"),
+                ("group.id", "g"),
+                ("topic", "ion_tw"),
+                ("format", "avro"),
+                ("schema.registry.url", &sr.uri()),
+            ]))
+            .await;
+
+        let schema = source.schema();
+        assert_eq!(schema.fields().len(), 2, "expected [id, data]");
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "data");
+        assert!(
+            matches!(
+                schema.field(1).data_type(),
+                arrow_schema::DataType::Map(_, _)
+            ),
+            "'data' field must survive as a Map type (got {:?})",
+            schema.field(1).data_type()
+        );
+    }
+
+    /// Record-name subject strategy resolves to `{record_name}-value`
+    /// rather than the default `{topic}-value`.
+    #[tokio::test]
+    async fn discover_schema_happy_path_record_name_strategy() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let avro_schema = serde_json::json!({
+            "type": "record",
+            "name": "com.acme.Order",
+            "fields": [
+                {"name": "order_id", "type": "string"},
+                {"name": "amount", "type": "double"}
+            ]
+        })
+        .to_string();
+
+        let sr = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/subjects/com.acme.Order-value/versions/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 7,
+                "version": 1,
+                "subject": "com.acme.Order-value",
+                "schema": avro_schema,
+                "schemaType": "AVRO",
+            })))
+            .mount(&sr)
+            .await;
+
+        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default());
+        source
+            .discover_schema(&props(&[
+                ("bootstrap.servers", "localhost:9092"),
+                ("group.id", "g"),
+                ("topic", "orders"),
+                ("format", "avro"),
+                ("schema.registry.url", &sr.uri()),
+                ("schema.registry.subject.name.strategy", "record-name"),
+                ("schema.registry.record.name", "com.acme.Order"),
+            ]))
+            .await;
+
+        let schema = source.schema();
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "order_id");
+        assert_eq!(schema.field(1).name(), "amount");
+    }
+
+    /// Drift detection: catalog has a stale 2-field schema, live SR
+    /// has evolved to 3 fields. Catalog stays pinned; only
+    /// `last_avro_schema` tracks the live SR shape.
+    #[tokio::test]
+    async fn open_logs_drift_when_sr_evolved_since_ddl() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let evolved_schema = serde_json::json!({
+            "type": "record",
+            "name": "event",
+            "fields": [
+                {"name": "id", "type": "long"},
+                {"name": "data", "type": {"type": "map", "values": "string"}},
+                {"name": "version", "type": "int"}
+            ]
+        })
+        .to_string();
+
+        let sr = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/subjects/ion_tw-value/versions/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": 99,
+                "version": 2,
+                "subject": "ion_tw-value",
+                "schema": evolved_schema,
+                "schemaType": "AVRO",
+            })))
+            .mount(&sr)
+            .await;
+
+        // Catalog schema baked at CREATE SOURCE time — only two fields,
+        // predates the `version` field that was just added in SR.
+        let stale_catalog = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "data",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(arrow_schema::Fields::from(vec![
+                            Field::new("key", DataType::Utf8, false),
+                            Field::new("value", DataType::Utf8, true),
+                        ])),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+        ]));
+
+        let mut cfg = KafkaSourceConfig::default();
+        cfg.bootstrap_servers = "localhost:9092".into();
+        cfg.group_id = "g".into();
+        cfg.subscription = TopicSubscription::Topics(vec!["ion_tw".into()]);
+        cfg.format = Format::Avro;
+        cfg.schema_registry_url = Some(sr.uri());
+        let sr_client = SchemaRegistryClient::new(sr.uri(), None);
+        let mut source = KafkaSource::with_schema_registry(stale_catalog, cfg, sr_client);
+
+        let empty_cfg = crate::config::ConnectorConfig::new("kafka");
+        let _ = source.open(&empty_cfg).await; // broker unreachable — later errors irrelevant
+
+        assert_eq!(
+            source.schema().fields().len(),
+            2,
+            "catalog schema must stay pinned even after SR drift"
+        );
+        assert_eq!(
+            source.last_avro_schema.as_ref().map(|s| s.fields().len()),
+            Some(3),
+            "last_avro_schema should reflect the evolved SR shape"
+        );
     }
 }

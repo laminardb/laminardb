@@ -348,8 +348,12 @@ pub trait SourceConnector: Send {
         max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError>;
 
-    /// Adjust schema based on properties before `open()`. Default: no-op.
-    fn discover_schema(&mut self, _properties: &std::collections::HashMap<String, String>) {}
+    /// Resolve the source schema from the `WITH (...)` properties before
+    /// DDL reaches the planner. Implementations that hit the network
+    /// (e.g. Kafka fetching an Avro schema from a Schema Registry) must
+    /// bound their I/O with a timeout and leave the schema empty on
+    /// failure rather than hang.
+    async fn discover_schema(&mut self, _properties: &std::collections::HashMap<String, String>) {}
 
     /// Returns the schema of records produced by this source.
     fn schema(&self) -> SchemaRef;
@@ -558,6 +562,11 @@ pub trait SinkConnector: Send {
     fn capabilities(&self) -> SinkConnectorCapabilities;
 
     /// Flushes any buffered data to the external system.
+    ///
+    /// Implementations must be internally bounded — the sink task's
+    /// periodic timer calls this on every tick and wraps it only in a
+    /// generous backstop. Thorough drains belong in `pre_commit` /
+    /// `commit_epoch` / `close`, not here.
     ///
     /// # Errors
     ///

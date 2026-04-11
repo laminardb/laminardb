@@ -51,9 +51,6 @@ use crate::config::{ConfigKeySpec, ConnectorInfo};
 use crate::registry::ConnectorRegistry;
 
 /// Registers the Kafka source connector with the given registry.
-///
-/// After registration, the runtime can instantiate `KafkaSource` by
-/// name when processing `CREATE SOURCE ... WITH (connector = 'kafka')`.
 pub fn register_kafka_source(registry: &ConnectorRegistry) {
     let info = ConnectorInfo {
         name: "kafka".to_string(),
@@ -68,25 +65,14 @@ pub fn register_kafka_source(registry: &ConnectorRegistry) {
         "kafka",
         info,
         Arc::new(|| {
-            use arrow_schema::{DataType, Field, Schema};
-
-            // Default schema — will be overridden during open() or via SQL DDL.
-            let default_schema = Arc::new(Schema::new(vec![
-                Field::new("key", DataType::Utf8, true),
-                Field::new("value", DataType::Utf8, false),
-            ]));
-            Box::new(KafkaSource::new(
-                default_schema,
-                KafkaSourceConfig::default(),
-            ))
+            // Empty schema — filled in by discover_schema / open() / SQL DDL columns.
+            let empty = Arc::new(arrow_schema::Schema::empty());
+            Box::new(KafkaSource::new(empty, KafkaSourceConfig::default()))
         }),
     );
 }
 
 /// Registers the Kafka sink connector with the given registry.
-///
-/// After registration, the runtime can instantiate `KafkaSink` by
-/// name when processing `CREATE SINK ... WITH (connector = 'kafka')`.
 pub fn register_kafka_sink(registry: &ConnectorRegistry) {
     let info = ConnectorInfo {
         name: "kafka".to_string(),
@@ -101,14 +87,9 @@ pub fn register_kafka_sink(registry: &ConnectorRegistry) {
         "kafka",
         info,
         Arc::new(|| {
-            use arrow_schema::{DataType, Field, Schema};
-
-            // Default schema — will be overridden during open() or via SQL DDL.
-            let default_schema = Arc::new(Schema::new(vec![
-                Field::new("key", DataType::Utf8, true),
-                Field::new("value", DataType::Utf8, false),
-            ]));
-            Box::new(KafkaSink::new(default_schema, KafkaSinkConfig::default()))
+            // Empty schema — the sink's schema is bound from the upstream query at build time.
+            let empty = Arc::new(arrow_schema::Schema::empty());
+            Box::new(KafkaSink::new(empty, KafkaSinkConfig::default()))
         }),
     );
 }

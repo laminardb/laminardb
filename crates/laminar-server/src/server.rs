@@ -11,7 +11,7 @@ use laminar_core::streaming::checkpoint::StreamCheckpointConfig;
 use laminar_db::{DbError, LaminarDB, Profile};
 
 use crate::config::{
-    ColumnDef, ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
+    ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
 };
 #[cfg(feature = "delta-experimental")]
 use crate::delta_config::{DeltaConfig, DeltaConfigError};
@@ -194,36 +194,23 @@ pub(crate) async fn execute_config_ddl(
     db: &LaminarDB,
     config: &ServerConfig,
 ) -> Result<(), ServerError> {
-    // Auto-populate schema from connector registry when not declared in config.
-    let registry = db.connector_registry();
-    let mut sources = Vec::new();
-    for s in &config.sources {
-        if s.schema.is_empty() {
-            let props: std::collections::HashMap<String, String> = s
-                .properties
-                .iter()
-                .map(|(k, v)| (k.clone(), toml_value_to_sql(v)))
-                .collect();
-            if let Some(cols) = registry.default_source_columns(&s.connector, &props) {
-                let mut s = s.clone();
-                s.schema = cols
-                    .into_iter()
-                    .map(|(name, data_type, nullable)| ColumnDef {
-                        name,
-                        data_type,
-                        nullable,
-                    })
-                    .collect();
-                info!(source = %s.name, columns = s.schema.len(),
-                    "Auto-populated schema from connector");
-                sources.push(s);
-                continue;
-            }
+    // WATERMARK FOR can't compose with auto-discovery: the watermark column
+    // is validated against declared columns before discovery runs.
+    for source in &config.sources {
+        if source.schema.is_empty() && source.watermark.is_some() {
+            return Err(ServerError::Ddl {
+                section: "source".to_string(),
+                name: source.name.clone(),
+                source: DbError::Config(
+                    "schema is empty and a watermark is configured — \
+                     WATERMARK FOR does not compose with auto-discovery. \
+                     Declare columns explicitly in TOML, or configure \
+                     watermarks via the connector's 'event.time.column' \
+                     property instead."
+                        .to_string(),
+                ),
+            });
         }
-        sources.push(s.clone());
-    }
-
-    for source in &sources {
         let ddl = source_to_ddl(source);
         db.execute(&ddl).await.map_err(|e| ServerError::Ddl {
             section: "source".to_string(),
@@ -562,6 +549,37 @@ mod tests {
         assert!(ddl.contains("name VARCHAR"));
         assert!(ddl.contains("FROM KAFKA"));
         assert!(ddl.contains("format = 'json'"));
+    }
+
+    #[tokio::test]
+    async fn execute_config_ddl_rejects_columnless_source_with_watermark() {
+        let mut source = make_source("events", "kafka");
+        source.schema.clear();
+        source.watermark = Some(WatermarkConfig {
+            column: "ts".to_string(),
+            max_out_of_orderness: std::time::Duration::from_secs(5),
+        });
+
+        let db = laminar_db::LaminarDB::open().unwrap();
+        let config = ServerConfig {
+            server: ServerSection::default(),
+            state: StateSection::default(),
+            checkpoint: CheckpointSection::default(),
+            sources: vec![source],
+            lookups: vec![],
+            pipelines: vec![],
+            sinks: vec![],
+            sql: None,
+            discovery: None,
+            coordination: None,
+            node_id: None,
+        };
+        let err = execute_config_ddl(&db, &config).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("WATERMARK FOR does not compose with auto-discovery"),
+            "expected actionable error, got: {msg}"
+        );
     }
 
     #[test]
