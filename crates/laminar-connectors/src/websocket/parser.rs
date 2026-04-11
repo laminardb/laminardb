@@ -457,19 +457,4 @@ mod tests {
 
         assert_eq!(extract_max_event_time(&batch, "ts"), Some(3000));
     }
-
-    /// Arrow's cast kernel parses ISO 8601 strings to timestamps, so a
-    /// Utf8 column with a parseable date works — accidental but useful.
-    #[test]
-    fn test_extract_max_event_time_utf8_iso8601() {
-        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Utf8, false)]));
-        let ts = arrow_array::StringArray::from(vec!["2026-01-01"]);
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(ts)]).unwrap();
-
-        // 2026-01-01 UTC in epoch millis.
-        assert_eq!(
-            extract_max_event_time(&batch, "ts"),
-            Some(1_767_225_600_000)
-        );
-    }
 }

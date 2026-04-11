@@ -325,15 +325,10 @@ mod tests {
         ctx.register_batch("events", batch).unwrap();
 
         // Matches the exact shape of the OTel example's join predicate.
-        let sql = format!(
-            "SELECT id FROM events \
+        let sql = "SELECT id FROM events \
              WHERE ts BETWEEN TIMESTAMP '2023-11-14 22:13:20' \
-                      AND TIMESTAMP '2023-11-14 22:13:20' + INTERVAL '2' MINUTE",
-        );
-        let df = ctx
-            .sql(&sql)
-            .await
-            .expect("BETWEEN with INTERVAL must plan");
+                      AND TIMESTAMP '2023-11-14 22:13:20' + INTERVAL '2' MINUTE";
+        let df = ctx.sql(sql).await.expect("BETWEEN with INTERVAL must plan");
         let mut stream = df.execute_stream().await.unwrap();
         let mut ids: Vec<i64> = Vec::new();
         while let Some(batch) = stream.next().await {
@@ -353,5 +348,54 @@ mod tests {
             vec![1, 2, 3],
             "rows within 2-minute window should match (inclusive on upper bound)"
         );
+    }
+
+    /// Regression for the OTel example's `time_to_response_ms`: timestamp
+    /// subtraction returns `Duration(Nanosecond)` (not `Interval`), and
+    /// `CAST(Duration AS BIGINT) / 1_000_000` gives milliseconds.
+    #[tokio::test]
+    async fn test_datafusion_timestamp_subtraction_cast_to_bigint() {
+        use arrow_array::{Int64Array, RecordBatch, TimestampNanosecondArray};
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+        use datafusion::prelude::SessionContext;
+        use futures::StreamExt;
+        use std::sync::Arc;
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "a_ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new(
+                "p_ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+        ]));
+        let base: i64 = 1_700_000_000_000_000_000;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![base + 500_000_000])),
+                Arc::new(TimestampNanosecondArray::from(vec![base])),
+            ],
+        )
+        .unwrap();
+        ctx.register_batch("events", batch).unwrap();
+
+        let df = ctx
+            .sql("SELECT CAST(a_ts - p_ts AS BIGINT) / 1000000 AS ms FROM events")
+            .await
+            .expect("CAST(Timestamp - Timestamp AS BIGINT) must plan on DataFusion 52");
+        let mut stream = df.execute_stream().await.unwrap();
+        let batch = stream.next().await.unwrap().unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("result should be Int64 after the divide");
+        assert_eq!(col.value(0), 500, "500 ms difference");
     }
 }

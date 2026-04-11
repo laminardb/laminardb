@@ -201,7 +201,7 @@ mod tests {
 
     /// Regression: interval-join operators hit this path, and until the
     /// `Timestamp(_)` migration it only accepted `Timestamp(Millisecond)`.
-    /// The OTel example's `_laminar_received_at` is `Timestamp(Nanosecond)`;
+    /// `_laminar_received_at` is `Timestamp(Nanosecond)` in the OTLP source;
     /// the cast kernel rescales it to millis.
     #[test]
     fn extract_timestamps_handles_nanos() {

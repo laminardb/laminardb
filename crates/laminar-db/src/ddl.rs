@@ -59,6 +59,14 @@ impl LaminarDB {
             })?;
             let normalized = normalize_connector_type(connector_type);
 
+            // Surface unknown-connector errors before discovery so a typo
+            // doesn't get reported as a schema-discovery failure.
+            if self.connector_registry.source_info(&normalized).is_none() {
+                return Err(DbError::Config(format!(
+                    "source '{source_name}': unknown connector type '{normalized}'"
+                )));
+            }
+
             let mut props = resolved.connector_options;
             if let Some(fmt) = resolved.format {
                 props.insert("format".into(), fmt);

@@ -114,19 +114,8 @@ impl WatermarkDynamicFilter {
             return Ok(Some(batch.clone()));
         }
 
-        if batch.schema().index_of(&self.time_column).is_err() {
-            return Err(DataFusionError::Plan(format!(
-                "watermark filter: time column '{}' not found in schema",
-                self.time_column
-            )));
-        }
-
-        Ok(filter_batch_by_timestamp(
-            batch,
-            &self.time_column,
-            wm,
-            ThresholdOp::GreaterEq,
-        ))
+        filter_batch_by_timestamp(batch, &self.time_column, wm, ThresholdOp::GreaterEq)
+            .map_err(|e| DataFusionError::Plan(format!("watermark filter: {e}")))
     }
 }
 

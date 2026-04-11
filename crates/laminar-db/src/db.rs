@@ -100,12 +100,19 @@ pub(crate) fn filter_late_rows(
     column: &str,
     watermark: i64,
 ) -> Option<RecordBatch> {
-    laminar_core::time::filter_batch_by_timestamp(
+    match laminar_core::time::filter_batch_by_timestamp(
         batch,
         column,
         watermark,
         laminar_core::time::ThresholdOp::GreaterEq,
-    )
+    ) {
+        Ok(out) => out,
+        Err(e) => {
+            // Schema drift — drop the batch rather than silently admit late rows.
+            tracing::error!(%column, error = %e, "filter_late_rows: dropping batch");
+            None
+        }
+    }
 }
 
 pub(crate) fn parse_duration_str(s: &str) -> Option<std::time::Duration> {
@@ -4201,10 +4208,8 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
 
-        // Column not found — batch passes through unfiltered.
-        let result = filter_late_rows(&batch, "ts", 1000)
-            .expect("should pass through when column not found");
-        assert_eq!(result.num_rows(), 2);
+        // Missing event-time column is schema drift — drop the batch.
+        assert!(filter_late_rows(&batch, "ts", 1000).is_none());
     }
 
     /// Helper: creates a `RecordBatch` with (id: BIGINT, ts: BIGINT).

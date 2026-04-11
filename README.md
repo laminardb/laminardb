@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         symbol VARCHAR NOT NULL,
         price DOUBLE NOT NULL,
         volume BIGINT NOT NULL,
-        ts BIGINT NOT NULL,
+        ts TIMESTAMP NOT NULL,
         WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
     )").await?;
 
@@ -70,7 +70,7 @@ pip install laminardb
 import laminardb
 
 conn = laminardb.open(":memory:")
-conn.execute("CREATE SOURCE sensors (ts BIGINT, device VARCHAR, value DOUBLE)")
+conn.execute("CREATE SOURCE sensors (ts TIMESTAMP, device VARCHAR, value DOUBLE)")
 conn.insert("sensors", [
     {"ts": 1, "device": "sensor_a", "value": 42.0},
     {"ts": 2, "device": "sensor_b", "value": 43.5},
@@ -176,7 +176,7 @@ JOIN instruments i ON t.symbol = i.symbol;
 
 ```sql
 CREATE SOURCE trades (
-    symbol VARCHAR, price DOUBLE, volume BIGINT, ts BIGINT,
+    symbol VARCHAR, price DOUBLE, volume BIGINT, ts TIMESTAMP,
     WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
 );
 ```
@@ -242,7 +242,7 @@ Cloud storage backends for Delta Lake: S3 (`delta-lake-s3`), Azure ADLS (`delta-
 
 ```sql
 CREATE SOURCE trades (
-    symbol VARCHAR, price DOUBLE, volume BIGINT, ts BIGINT,
+    symbol VARCHAR, price DOUBLE, volume BIGINT, ts TIMESTAMP,
     WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
 ) FROM KAFKA (
     brokers = '${KAFKA_BROKERS}',
