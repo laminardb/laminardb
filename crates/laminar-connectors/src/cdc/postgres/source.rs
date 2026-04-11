@@ -883,7 +883,9 @@ impl SourceConnector for PostgresCdcSource {
                 .await
                 .is_err()
             {
-                tracing::warn!("[postgres-cdc] control-plane task did not exit within 2s; aborting");
+                tracing::warn!(
+                    "[postgres-cdc] control-plane task did not exit within 2s; aborting"
+                );
                 abort.abort();
             }
         }
