@@ -1240,7 +1240,8 @@ impl SourceConnector for KafkaSource {
             let mut columns: Vec<Arc<dyn arrow_array::Array>> = batch.columns().to_vec();
 
             if needs_meta {
-                use arrow_array::{Int32Array, Int64Array};
+                use arrow_array::{Int32Array, Int64Array, TimestampMillisecondArray};
+                use arrow_schema::TimeUnit;
                 fields.push(Arc::new(Field::new("_partition", DataType::Int32, false)));
                 columns.push(Arc::new(Int32Array::from(std::mem::take(
                     &mut self.poll_meta_partitions,
@@ -1249,8 +1250,12 @@ impl SourceConnector for KafkaSource {
                 columns.push(Arc::new(Int64Array::from(std::mem::take(
                     &mut self.poll_meta_offsets,
                 ))));
-                fields.push(Arc::new(Field::new("_timestamp", DataType::Int64, true)));
-                columns.push(Arc::new(Int64Array::from(std::mem::take(
+                fields.push(Arc::new(Field::new(
+                    "_timestamp",
+                    DataType::Timestamp(TimeUnit::Millisecond, None),
+                    true,
+                )));
+                columns.push(Arc::new(TimestampMillisecondArray::from(std::mem::take(
                     &mut self.poll_meta_timestamps,
                 ))));
             }

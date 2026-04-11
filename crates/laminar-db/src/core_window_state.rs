@@ -2631,7 +2631,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tumbling_ratio_projection_pipeline() {
-        use arrow::datatypes::Field;
+        use arrow::datatypes::{Field, TimeUnit};
 
         let ctx = laminar_sql::create_streaming_context_with_validator(
             laminar_sql::StreamingValidatorMode::Off,
@@ -2640,7 +2640,11 @@ mod tests {
             Field::new("symbol", DataType::Utf8, false),
             Field::new("a", DataType::Float64, false),
             Field::new("b", DataType::Float64, false),
-            Field::new("ts", DataType::Int64, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
         ]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -2648,7 +2652,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["X"])),
                 Arc::new(arrow::array::Float64Array::from(vec![1.0])),
                 Arc::new(arrow::array::Float64Array::from(vec![2.0])),
-                Arc::new(Int64Array::from(vec![1000])),
+                Arc::new(arrow::array::TimestampMillisecondArray::from(vec![1000])),
             ],
         )
         .unwrap();

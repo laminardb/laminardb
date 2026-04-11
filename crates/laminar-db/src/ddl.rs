@@ -34,59 +34,73 @@ impl LaminarDB {
             )));
         }
 
-        let mut source_def = streaming_ddl::translate_create_source(create.clone())
-            .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))?;
-
         // IF NOT EXISTS: short-circuit before discovery runs any network I/O.
-        if create.if_not_exists && self.catalog.get_source(&source_def.name).is_some() {
+        let source_name = create.name.to_string();
+        if create.if_not_exists && self.catalog.get_source(&source_name).is_some() {
             return Ok(ExecuteResult::Ddl(DdlInfo {
                 statement_type: "CREATE SOURCE".to_string(),
-                object_name: source_def.name.clone(),
+                object_name: source_name,
             }));
         }
 
-        // No columns + connector = auto-discover (e.g. Kafka Avro via Schema Registry).
-        if source_def.columns.is_empty() && has_connector {
+        // Discover columns from the connector before translating, so
+        // `WATERMARK FOR col` can validate against real columns.
+        let source_def = if create.columns.is_empty() && has_connector {
             let resolved = resolve_connector_info(
                 create.connector_type.as_ref(),
                 &create.connector_options,
                 create.format.as_ref(),
                 &create.with_options,
             );
-            if let Some(ct) = &resolved.connector_type {
-                let normalized = normalize_connector_type(ct);
+            let connector_type = resolved.connector_type.as_deref().ok_or_else(|| {
+                DbError::Config(format!(
+                    "source '{source_name}': no columns declared and no connector type resolved"
+                ))
+            })?;
+            let normalized = normalize_connector_type(connector_type);
 
-                let mut props = resolved.connector_options;
-                if let Some(fmt) = resolved.format {
-                    props.insert("format".into(), fmt);
-                }
-                props.extend(resolved.format_options);
-
-                let discovered = self
-                    .connector_registry
-                    .default_source_schema(&normalized, &props)
-                    .await
-                    .ok_or_else(|| {
-                        DbError::Config(format!(
-                            "source '{}': no columns declared and connector '{normalized}' \
-                             could not auto-discover a schema (check Schema Registry \
-                             connectivity or declare columns explicitly)",
-                            source_def.name
-                        ))
-                    })?;
-
-                source_def.columns = discovered
-                    .fields()
-                    .iter()
-                    .map(|f| ColumnDefinition {
-                        name: f.name().clone(),
-                        data_type: f.data_type().clone(),
-                        nullable: f.is_nullable(),
-                    })
-                    .collect();
-                source_def.schema = discovered;
+            // Surface unknown-connector errors before discovery so a typo
+            // doesn't get reported as a schema-discovery failure.
+            if self.connector_registry.source_info(&normalized).is_none() {
+                return Err(DbError::Config(format!(
+                    "source '{source_name}': unknown connector type '{normalized}'"
+                )));
             }
-        }
+
+            let mut props = resolved.connector_options;
+            if let Some(fmt) = resolved.format {
+                props.insert("format".into(), fmt);
+            }
+            props.extend(resolved.format_options);
+
+            let discovered = self
+                .connector_registry
+                .default_source_schema(&normalized, &props)
+                .await
+                .ok_or_else(|| {
+                    DbError::Config(format!(
+                        "source '{source_name}': no columns declared and connector \
+                         '{normalized}' could not auto-discover a schema (check \
+                         Schema Registry connectivity or declare columns explicitly)"
+                    ))
+                })?;
+
+            let columns: Vec<ColumnDefinition> = discovered
+                .fields()
+                .iter()
+                .map(|f| ColumnDefinition {
+                    name: f.name().clone(),
+                    data_type: f.data_type().clone(),
+                    nullable: f.is_nullable(),
+                })
+                .collect();
+
+            streaming_ddl::translate_create_source_with_columns(create.clone(), columns)
+                .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))?
+        } else {
+            streaming_ddl::translate_create_source(create.clone())
+                .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))?
+        };
 
         let name = &source_def.name;
         let schema = source_def.schema.clone();

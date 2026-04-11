@@ -10,14 +10,12 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow::compute::kernels::cmp::gt_eq;
-use arrow_array::cast::AsArray;
-use arrow_array::types::TimestampMillisecondType;
-use arrow_array::{Int64Array, RecordBatch};
-use arrow_schema::{DataType, SchemaRef, TimeUnit};
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use datafusion::physical_plan::RecordBatchStream;
 use datafusion_common::DataFusionError;
 use futures::Stream;
+use laminar_core::time::{filter_batch_by_timestamp, ThresholdOp};
 
 /// Dynamic filter that drops rows older than the current watermark.
 ///
@@ -97,16 +95,14 @@ impl WatermarkDynamicFilter {
         self.watermark_ms.load(Ordering::Acquire)
     }
 
-    /// Filters a record batch, keeping only rows where `time_column >= watermark`.
-    ///
-    /// Returns `Ok(None)` when all rows are filtered out.
-    /// When watermark < 0 (uninitialized), all rows pass through.
-    ///
-    /// Handles both `Int64` (epoch millis) and `Timestamp(Millisecond, _)` columns.
+    /// Keep only rows where `time_column >= watermark`. Returns
+    /// `Ok(None)` when nothing survives; passes through untouched
+    /// while the watermark is uninitialised (< 0).
     ///
     /// # Errors
     ///
-    /// Returns an error if the time column is missing or has an unsupported type.
+    /// `DataFusionError::Plan` when `time_column` is missing or isn't
+    /// a `Timestamp(_)` (propagated from [`filter_batch_by_timestamp`]).
     pub fn filter_batch(
         &self,
         batch: &RecordBatch,
@@ -116,43 +112,8 @@ impl WatermarkDynamicFilter {
             return Ok(Some(batch.clone()));
         }
 
-        let schema = batch.schema();
-        let col_idx = schema.index_of(&self.time_column).map_err(|_| {
-            DataFusionError::Plan(format!(
-                "watermark filter: time column '{}' not found in schema",
-                self.time_column
-            ))
-        })?;
-
-        let col = batch.column(col_idx);
-        let mask = match col.data_type() {
-            DataType::Int64 => {
-                let ts_array = col
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| DataFusionError::Internal("expected Int64Array".to_string()))?;
-                let threshold = Int64Array::new_scalar(wm);
-                gt_eq(ts_array, &threshold)?
-            }
-            DataType::Timestamp(TimeUnit::Millisecond, _) => {
-                let ts_array = col.as_primitive::<TimestampMillisecondType>();
-                let threshold = arrow_array::TimestampMillisecondArray::new_scalar(wm);
-                gt_eq(ts_array, &threshold)?
-            }
-            other => {
-                return Err(DataFusionError::Plan(format!(
-                    "watermark filter: unsupported time column type {other:?}, \
-                     expected Int64 or Timestamp(Millisecond)"
-                )));
-            }
-        };
-
-        let filtered = arrow::compute::filter_record_batch(batch, &mask)?;
-        if filtered.num_rows() == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(filtered))
-        }
+        filter_batch_by_timestamp(batch, &self.time_column, wm, ThresholdOp::GreaterEq)
+            .map_err(|e| DataFusionError::Plan(format!("watermark filter: {e}")))
     }
 }
 
@@ -221,27 +182,10 @@ impl RecordBatchStream for WatermarkFilterStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::TimestampMillisecondArray;
-    use arrow_schema::{Field, Schema};
+    use arrow_array::{Int64Array, TimestampMillisecondArray, TimestampNanosecondArray};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
 
-    fn make_int64_batch(timestamps: Vec<i64>) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("ts", DataType::Int64, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
-        #[allow(clippy::cast_possible_wrap)]
-        let values: Vec<i64> = (0..timestamps.len() as i64).collect();
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int64Array::from(timestamps)),
-                Arc::new(Int64Array::from(values)),
-            ],
-        )
-        .unwrap()
-    }
-
-    fn make_timestamp_batch(timestamps: Vec<i64>) -> RecordBatch {
+    fn make_millis_batch(timestamps: Vec<i64>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new(
                 "ts",
@@ -262,6 +206,23 @@ mod tests {
         .unwrap()
     }
 
+    fn make_nanos_batch(timestamps: Vec<i64>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        #[allow(clippy::cast_possible_wrap)]
+        let values: Vec<i64> = (0..timestamps.len() as i64).collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampNanosecondArray::from(timestamps)),
+                Arc::new(Int64Array::from(values)),
+            ],
+        )
+        .unwrap()
+    }
+
     fn make_filter(wm: i64) -> WatermarkDynamicFilter {
         WatermarkDynamicFilter::new(
             Arc::new(AtomicI64::new(wm)),
@@ -273,13 +234,13 @@ mod tests {
     #[test]
     fn test_filter_skips_late_data() {
         let filter = make_filter(250);
-        let batch = make_int64_batch(vec![100, 200, 300, 400]);
+        let batch = make_millis_batch(vec![100, 200, 300, 400]);
         let result = filter.filter_batch(&batch).unwrap().unwrap();
         assert_eq!(result.num_rows(), 2);
         let ts = result
             .column(0)
             .as_any()
-            .downcast_ref::<Int64Array>()
+            .downcast_ref::<TimestampMillisecondArray>()
             .unwrap();
         assert_eq!(ts.value(0), 300);
         assert_eq!(ts.value(1), 400);
@@ -288,7 +249,7 @@ mod tests {
     #[test]
     fn test_filter_passes_on_time_data() {
         let filter = make_filter(50);
-        let batch = make_int64_batch(vec![100, 200, 300, 400]);
+        let batch = make_millis_batch(vec![100, 200, 300, 400]);
         let result = filter.filter_batch(&batch).unwrap().unwrap();
         assert_eq!(result.num_rows(), 4);
     }
@@ -308,10 +269,8 @@ mod tests {
     fn test_no_advance_no_generation_change() {
         let filter = make_filter(200);
         assert_eq!(filter.generation(), 0);
-        // Same value — no change
         filter.advance_watermark(200);
         assert_eq!(filter.generation(), 0);
-        // Lower value — no change
         filter.advance_watermark(100);
         assert_eq!(filter.generation(), 0);
         assert_eq!(filter.watermark_ms(), 200);
@@ -320,7 +279,7 @@ mod tests {
     #[test]
     fn test_passes_all_when_uninitialized() {
         let filter = make_filter(-1);
-        let batch = make_int64_batch(vec![100, 200, 300, 400]);
+        let batch = make_millis_batch(vec![100, 200, 300, 400]);
         let result = filter.filter_batch(&batch).unwrap().unwrap();
         assert_eq!(result.num_rows(), 4);
     }
@@ -328,23 +287,24 @@ mod tests {
     #[test]
     fn test_empty_batch_returns_none() {
         let filter = make_filter(500);
-        let batch = make_int64_batch(vec![100, 200, 300, 400]);
+        let batch = make_millis_batch(vec![100, 200, 300, 400]);
         let result = filter.filter_batch(&batch).unwrap();
         assert!(result.is_none());
     }
 
+    /// Watermark 250 ms → threshold 250_000_000 ns for a Nanosecond column.
     #[test]
-    fn test_arrow_timestamp_type() {
+    fn test_nanosecond_timestamp_rescaled_to_watermark() {
         let filter = make_filter(250);
-        let batch = make_timestamp_batch(vec![100, 200, 300, 400]);
+        let batch = make_nanos_batch(vec![100_000_000, 200_000_000, 300_000_000, 400_000_000]);
         let result = filter.filter_batch(&batch).unwrap().unwrap();
         assert_eq!(result.num_rows(), 2);
         let ts = result
             .column(0)
             .as_any()
-            .downcast_ref::<TimestampMillisecondArray>()
+            .downcast_ref::<TimestampNanosecondArray>()
             .unwrap();
-        assert_eq!(ts.value(0), 300);
-        assert_eq!(ts.value(1), 400);
+        assert_eq!(ts.value(0), 300_000_000);
+        assert_eq!(ts.value(1), 400_000_000);
     }
 }

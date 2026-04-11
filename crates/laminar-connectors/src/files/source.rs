@@ -104,7 +104,11 @@ impl SourceConnector for FileSource {
                         Field::new("file_path", DataType::Utf8, false),
                         Field::new("file_name", DataType::Utf8, false),
                         Field::new("file_size", DataType::UInt64, false),
-                        Field::new("file_modification_time", DataType::Int64, true),
+                        Field::new(
+                            "file_modification_time",
+                            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+                            true,
+                        ),
                     ]
                     .into(),
                 ),
@@ -390,7 +394,7 @@ fn append_metadata_column(
     file_size: u64,
     modified_ms: u64,
 ) -> Result<RecordBatch, ConnectorError> {
-    use arrow_array::{ArrayRef, Int64Array, StringArray, StructArray, UInt64Array};
+    use arrow_array::{ArrayRef, StringArray, StructArray, UInt64Array};
 
     let n = batch.num_rows();
     let file_name = std::path::Path::new(file_path)
@@ -402,13 +406,20 @@ fn append_metadata_column(
     let name_array: ArrayRef = Arc::new(StringArray::from(vec![file_name; n]));
     let size_array: ArrayRef = Arc::new(UInt64Array::from(vec![file_size; n]));
     #[allow(clippy::cast_possible_wrap)]
-    let mod_array: ArrayRef = Arc::new(Int64Array::from(vec![modified_ms as i64; n]));
+    let mod_array: ArrayRef = Arc::new(arrow_array::TimestampMillisecondArray::from(vec![
+        modified_ms as i64;
+        n
+    ]));
 
     let fields = vec![
         Field::new("file_path", DataType::Utf8, false),
         Field::new("file_name", DataType::Utf8, false),
         Field::new("file_size", DataType::UInt64, false),
-        Field::new("file_modification_time", DataType::Int64, true),
+        Field::new(
+            "file_modification_time",
+            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+            true,
+        ),
     ];
     let struct_array = StructArray::try_new(
         fields.into(),
@@ -434,7 +445,11 @@ fn append_metadata_column(
                 Field::new("file_path", DataType::Utf8, false),
                 Field::new("file_name", DataType::Utf8, false),
                 Field::new("file_size", DataType::UInt64, false),
-                Field::new("file_modification_time", DataType::Int64, true),
+                Field::new(
+                    "file_modification_time",
+                    DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+                    true,
+                ),
             ]
             .into(),
         ),

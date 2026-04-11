@@ -413,7 +413,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         if let Some(wm_state) = self.watermark_states.get(source_name) {
             let current_wm = wm_state.generator.current_watermark();
             if current_wm > i64::MIN {
-                return filter_late_rows(batch, &wm_state.column, current_wm, wm_state.format);
+                return filter_late_rows(batch, &wm_state.column, current_wm);
             }
         }
         // No watermark configured → pass through all rows.

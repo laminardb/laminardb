@@ -11,7 +11,7 @@
 //! let db = LaminarDB::open()?;
 //!
 //! db.execute("CREATE SOURCE trades (
-//!     symbol VARCHAR, price DOUBLE, ts BIGINT,
+//!     symbol VARCHAR, price DOUBLE, ts TIMESTAMP,
 //!     WATERMARK FOR ts AS ts - INTERVAL '1' SECOND
 //! )").await?;
 //!
@@ -26,7 +26,6 @@
 
 mod aggregate_state;
 mod asof_batch;
-mod batch_filter;
 mod builder;
 mod catalog;
 mod catalog_connector;

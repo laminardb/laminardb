@@ -37,14 +37,14 @@ use super::schema::{cdc_envelope_schema, RelationCache, RelationInfo};
 ///
 /// # Envelope Schema
 ///
-/// | Column   | Type   | Nullable | Description                    |
-/// |----------|--------|----------|--------------------------------|
-/// | `_table` | Utf8   | no       | Schema-qualified table name    |
-/// | `_op`    | Utf8   | no       | Operation: I, U, D             |
-/// | `_lsn`   | UInt64 | no       | WAL position                   |
-/// | `_ts_ms` | Int64  | no       | Commit timestamp (Unix ms)     |
-/// | `_before`| Utf8   | yes      | Old row JSON (for U, D)        |
-/// | `_after` | Utf8   | yes      | New row JSON (for I, U)        |
+/// | Column   | Type          | Nullable | Description                 |
+/// |----------|---------------|----------|-----------------------------|
+/// | `_table` | Utf8          | no       | Schema-qualified table name |
+/// | `_op`    | Utf8          | no       | Operation: I, U, D          |
+/// | `_lsn`   | UInt64        | no       | WAL position                |
+/// | `_ts_ms` | Timestamp(ms) | no       | Commit timestamp            |
+/// | `_before`| Utf8          | yes      | Old row JSON (for U, D)     |
+/// | `_after` | Utf8          | yes      | New row JSON (for I, U)     |
 pub struct PostgresCdcSource {
     /// Connector configuration.
     config: PostgresCdcConfig,

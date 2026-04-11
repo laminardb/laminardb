@@ -83,7 +83,7 @@ name = "price"
 type = "DOUBLE"
 [[source.schema]]
 name = "ts"
-type = "BIGINT"
+type = "TIMESTAMP"
 [source.watermark]
 column = "ts"
 max_out_of_orderness = "5s"

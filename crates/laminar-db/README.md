@@ -29,7 +29,7 @@ let db = LaminarDB::open()?;
 
 // Create a source
 db.execute("CREATE SOURCE trades (
-    symbol VARCHAR, price DOUBLE, ts BIGINT
+    symbol VARCHAR, price DOUBLE, ts TIMESTAMP
 )").await?;
 
 // Create a continuous query
