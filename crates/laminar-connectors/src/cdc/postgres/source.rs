@@ -874,10 +874,18 @@ impl SourceConnector for PostgresCdcSource {
             self.confirmed_lsn_tx = None;
         }
 
-        // Abort the background control-plane connection task.
+        // Await the control-plane connection task briefly so it can
+        // finish any in-flight work before we abort.
         #[cfg(feature = "postgres-cdc")]
         if let Some(handle) = self.connection_handle.take() {
-            handle.abort();
+            let abort = handle.abort_handle();
+            if tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+                .await
+                .is_err()
+            {
+                tracing::warn!("[postgres-cdc] control-plane task did not exit within 2s; aborting");
+                abort.abort();
+            }
         }
 
         self.state = ConnectorState::Closed;

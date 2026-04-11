@@ -817,6 +817,17 @@ impl CoreWindowState {
             #[allow(clippy::cast_possible_truncation)]
             let index_array = arrow::array::UInt32Array::from_value(row as u32, 1);
             let key = self.extract_group_key_row(batch, &index_array)?;
+            // Drop new keys once `session_groups` hits the cap. Existing
+            // keys still aggregate so in-flight sessions aren't corrupted.
+            if !self.session_groups.contains_key(&key)
+                && self.session_groups.len() >= self.max_groups_per_window
+            {
+                tracing::warn!(
+                    max_groups = self.max_groups_per_window,
+                    "Core window session group cardinality limit reached"
+                );
+                continue;
+            }
             self.update_session_window(ts_ms, gap_ms, &key, batch, &index_array)?;
         }
         Ok(())
@@ -2456,6 +2467,41 @@ mod tests {
 
         assert_eq!(results[0], ("A".to_string(), 1000, 30));
         assert_eq!(results[1], ("B".to_string(), 2000, 300));
+    }
+
+    #[test]
+    fn test_session_group_cardinality_cap() {
+        let mut state = make_session_core_window_state(3000);
+        state.max_groups_per_window = 2;
+
+        let batch1 = make_pre_agg_batch(vec!["A", "B"], vec![10, 100], vec![1000, 1000]);
+        state.update_batch(&batch1).unwrap();
+        assert_eq!(state.session_groups.len(), 2);
+
+        // C is new and should be dropped at the cap; A already exists and
+        // continues to aggregate.
+        let batch2 = make_pre_agg_batch(vec!["C", "A"], vec![999, 20], vec![1500, 1500]);
+        state.update_batch(&batch2).unwrap();
+        assert_eq!(state.session_groups.len(), 2);
+
+        let batches = state.close_windows(10_000).unwrap();
+        assert_eq!(batches.len(), 1);
+        let result = &batches[0];
+        let syms = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let totals = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let mut out: Vec<(String, i64)> = (0..result.num_rows())
+            .map(|i| (syms.value(i).to_string(), totals.value(i)))
+            .collect();
+        out.sort();
+        assert_eq!(out, vec![("A".to_string(), 30), ("B".to_string(), 100)]);
     }
 
     #[test]
