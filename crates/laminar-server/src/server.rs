@@ -194,23 +194,13 @@ pub(crate) async fn execute_config_ddl(
     db: &LaminarDB,
     config: &ServerConfig,
 ) -> Result<(), ServerError> {
-    // WATERMARK FOR can't compose with auto-discovery: the watermark column
-    // is validated against declared columns before discovery runs.
+    // Empty-schema + WATERMARK FOR is handled inside the laminar-db DDL
+    // layer: it calls `discover_schema` on the connector, populates the
+    // source columns from the result, then validates the watermark column
+    // against them. Connectors that cannot discover a schema (e.g. Kafka
+    // without a reachable Schema Registry) return a clear error from that
+    // path — we don't need to pre-empt it here.
     for source in &config.sources {
-        if source.schema.is_empty() && source.watermark.is_some() {
-            return Err(ServerError::Ddl {
-                section: "source".to_string(),
-                name: source.name.clone(),
-                source: DbError::Config(
-                    "schema is empty and a watermark is configured — \
-                     WATERMARK FOR does not compose with auto-discovery. \
-                     Declare columns explicitly in TOML, or configure \
-                     watermarks via the connector's 'event.time.column' \
-                     property instead."
-                        .to_string(),
-                ),
-            });
-        }
         let ddl = source_to_ddl(source);
         db.execute(&ddl).await.map_err(|e| ServerError::Ddl {
             section: "source".to_string(),
@@ -551,8 +541,58 @@ mod tests {
         assert!(ddl.contains("format = 'json'"));
     }
 
+    /// Columnless OTel source + WATERMARK FOR must compose: the OTel
+    /// connector implements `discover_schema` so the DDL layer can
+    /// resolve columns before validating the watermark.
+    #[cfg(feature = "otel")]
     #[tokio::test]
-    async fn execute_config_ddl_rejects_columnless_source_with_watermark() {
+    async fn execute_config_ddl_columnless_otel_with_watermark_succeeds() {
+        let mut source = SourceConfig {
+            name: "otel_events".to_string(),
+            connector: "otel".to_string(),
+            format: "json".to_string(),
+            properties: toml::Table::new(),
+            schema: vec![],
+            watermark: Some(WatermarkConfig {
+                column: "_laminar_received_at".to_string(),
+                max_out_of_orderness: std::time::Duration::from_secs(10),
+            }),
+        };
+        // Bind to an ephemeral port so the test doesn't clash with 4317.
+        source
+            .properties
+            .insert("port".to_string(), toml::Value::String("0".to_string()));
+        source.properties.insert(
+            "signals".to_string(),
+            toml::Value::String("logs".to_string()),
+        );
+
+        let db = laminar_db::LaminarDB::open().unwrap();
+        let config = ServerConfig {
+            server: ServerSection::default(),
+            state: StateSection::default(),
+            checkpoint: CheckpointSection::default(),
+            sources: vec![source],
+            lookups: vec![],
+            pipelines: vec![],
+            sinks: vec![],
+            sql: None,
+            discovery: None,
+            coordination: None,
+            node_id: None,
+        };
+        execute_config_ddl(&db, &config)
+            .await
+            .expect("columnless OTel + WATERMARK FOR should compose");
+    }
+
+    /// Columnless Kafka source + WATERMARK FOR: the Kafka connector can't
+    /// discover a schema without a reachable Schema Registry, so the DDL
+    /// layer surfaces a "no columns declared and connector … could not
+    /// auto-discover a schema" error. The server no longer pre-empts this
+    /// — we just check the error bubbles up clearly.
+    #[tokio::test]
+    async fn execute_config_ddl_columnless_kafka_surfaces_discovery_error() {
         let mut source = make_source("events", "kafka");
         source.schema.clear();
         source.watermark = Some(WatermarkConfig {
@@ -577,8 +617,8 @@ mod tests {
         let err = execute_config_ddl(&db, &config).await.unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("WATERMARK FOR does not compose with auto-discovery"),
-            "expected actionable error, got: {msg}"
+            msg.contains("could not auto-discover a schema") || msg.contains("no columns declared"),
+            "expected schema-discovery error from the DDL layer, got: {msg}"
         );
     }
 

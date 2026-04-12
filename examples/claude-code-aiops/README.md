@@ -99,7 +99,7 @@ SELECT p.prompt_id, a.model, a.cost_usd, a.duration_ms
 FROM enriched_events p
 JOIN enriched_events a
     ON p.prompt_id = a.prompt_id
-    AND a.ts_ms BETWEEN p.ts_ms AND p.ts_ms + INTERVAL '2' MINUTE
+    AND a.ts BETWEEN p.ts AND p.ts + INTERVAL '2' MINUTE
 WHERE p.event_name = 'user_prompt'
     AND a.event_name = 'api_request'
 ```

@@ -329,7 +329,7 @@ impl SourceConnector for WebSocketSourceServer {
 
         // Use event time from batch data if configured, otherwise wall-clock.
         if let Some(ref field) = self.config.event_time_field {
-            if let Some(max_ts) = super::parser::extract_max_event_time(&batch, field) {
+            if let Some(max_ts) = super::parser::extract_max_event_time(&batch, field)? {
                 self.checkpoint_state.watermark = max_ts;
             }
         } else {

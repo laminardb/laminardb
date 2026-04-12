@@ -9,8 +9,8 @@ use laminar_core::streaming;
 use rustc_hash::FxHashMap;
 
 use crate::db::{
-    infer_timestamp_format, LaminarDB, SourceWatermarkState, STATE_CREATED, STATE_RUNNING,
-    STATE_SHUTTING_DOWN, STATE_STARTING, STATE_STOPPED,
+    LaminarDB, SourceWatermarkState, STATE_CREATED, STATE_RUNNING, STATE_SHUTTING_DOWN,
+    STATE_STARTING, STATE_STOPPED,
 };
 use crate::error::DbError;
 
@@ -416,8 +416,13 @@ impl LaminarDB {
                      are degraded to at-most-once for this source"
                 );
             }
-            // Wire event.time.column from connector config to the core Source
-            // so SourceWatermarkState can extract watermarks from batch data.
+            // Property-driven watermark wiring. `[source.watermark]` in
+            // TOML is the preferred path (honours max_out_of_orderness);
+            // this exists for sources that pass `event.time.column` /
+            // `event.time.field` as a connector property instead. The
+            // second pass below builds the matching SourceWatermarkState.
+            // Kafka uses `column`, WebSocket uses `field` — both spellings
+            // are live.
             if let Some(entry) = self.catalog.get_source(name) {
                 if entry.source.event_time_column().is_none() {
                     if let Some(col) = config.get("event.time.column") {
@@ -860,10 +865,8 @@ impl LaminarDB {
                 if let (Some(col), Some(dur)) =
                     (&entry.watermark_column, entry.max_out_of_orderness)
                 {
-                    let format = infer_timestamp_format(&entry.schema, col);
-                    let extractor =
-                        laminar_core::time::EventTimeExtractor::from_column(col, format)
-                            .with_mode(laminar_core::time::ExtractionMode::Max);
+                    let extractor = laminar_core::time::EventTimeExtractor::from_column(col)
+                        .with_mode(laminar_core::time::ExtractionMode::Max);
                     let generator: Box<dyn laminar_core::time::WatermarkGenerator> = if entry
                         .is_processing_time
                         .load(std::sync::atomic::Ordering::Relaxed)
@@ -882,7 +885,6 @@ impl LaminarDB {
                             extractor,
                             generator,
                             column: col.clone(),
-                            format,
                         },
                     );
                 }
@@ -890,18 +892,20 @@ impl LaminarDB {
             }
         }
 
-        // Also create watermark state for sources that declared event_time_column
-        // programmatically (via source.set_event_time_column()) but have no SQL WATERMARK
+        // Fallback watermark path for sources that set `event_time_column`
+        // without an SQL `WATERMARK FOR` clause — exercised by the
+        // programmatic API (`handle.set_event_time_column`) and by the
+        // connector-property wiring above. Uses `Duration::ZERO` for
+        // out-of-orderness because those paths don't carry a bound; if
+        // you want a non-zero bound, use `[source.watermark]` instead.
         for name in self.catalog.list_sources() {
             if watermark_states.contains_key(&name) {
                 continue;
             }
             if let Some(entry) = self.catalog.get_source(&name) {
                 if let Some(col) = entry.source.event_time_column() {
-                    let format = infer_timestamp_format(&entry.schema, &col);
-                    let extractor =
-                        laminar_core::time::EventTimeExtractor::from_column(&col, format)
-                            .with_mode(laminar_core::time::ExtractionMode::Max);
+                    let extractor = laminar_core::time::EventTimeExtractor::from_column(&col)
+                        .with_mode(laminar_core::time::ExtractionMode::Max);
                     let generator: Box<dyn laminar_core::time::WatermarkGenerator> = if entry
                         .is_processing_time
                         .load(std::sync::atomic::Ordering::Relaxed)
@@ -922,7 +926,6 @@ impl LaminarDB {
                             extractor,
                             generator,
                             column: col,
-                            format,
                         },
                     );
                 }

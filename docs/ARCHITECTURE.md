@@ -174,7 +174,7 @@ The main entry point. Owns sources, streams, sinks, and the pipeline lifecycle.
 let db = LaminarDB::open()?;
 
 // DDL
-db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts BIGINT)").await?;
+db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts TIMESTAMP)").await?;
 db.execute("CREATE STREAM avg_price AS SELECT symbol, AVG(price) ...").await?;
 
 // Data ingestion

@@ -121,23 +121,30 @@ impl TryFrom<CreateSinkStatement> for SinkDefinition {
 pub fn translate_create_source(
     stmt: CreateSourceStatement,
 ) -> Result<SourceDefinition, ParseError> {
-    // Validate options first - reject 'channel' option
-    validate_source_options(&stmt.with_options)?;
+    let columns = convert_columns(&stmt.columns)?;
+    translate_create_source_with_columns(stmt, columns)
+}
 
-    // Parse configuration options
+/// Translate a CREATE SOURCE statement using an already-resolved column
+/// list. Used by the DDL layer after `discover_schema` so `WATERMARK FOR`
+/// validates against the discovered columns rather than the SQL text.
+///
+/// # Errors
+///
+/// Returns `ParseError` from option validation or watermark parsing.
+pub fn translate_create_source_with_columns(
+    stmt: CreateSourceStatement,
+    columns: Vec<ColumnDefinition>,
+) -> Result<SourceDefinition, ParseError> {
+    validate_source_options(&stmt.with_options)?;
     let config = parse_source_options(&stmt.with_options)?;
 
-    // Convert columns to Arrow types
-    let columns = convert_columns(&stmt.columns)?;
-
-    // Build Arrow schema
     let fields: Vec<Field> = columns
         .iter()
         .map(|col| Field::new(&col.name, col.data_type.clone(), col.nullable))
         .collect();
     let schema = Arc::new(Schema::new(fields));
 
-    // Parse watermark if present
     let watermark = if let Some(wm) = stmt.watermark {
         Some(parse_watermark(&wm, &columns)?)
     } else {

@@ -593,38 +593,36 @@ async fn apply_having_via_sql(
 }
 
 /// Split accumulated batches into closed-window rows (ts < boundary) and
-/// retained rows (ts >= boundary) using timestamp column filtering.
+/// retained rows (ts >= boundary). When the time column is missing or the
+/// wrong type the whole batch goes to `closed` — there is no way to split
+/// it by time, and leaking it into both buckets would double-emit.
 fn split_by_timestamp(
     batches: &[RecordBatch],
     time_column: &str,
     boundary: i64,
 ) -> (Vec<RecordBatch>, Vec<RecordBatch>) {
-    let format = batches
-        .first()
-        .map_or(laminar_core::time::TimestampFormat::UnixMillis, |b| {
-            crate::sql_analysis::infer_ts_format_from_batch(b, time_column)
-        });
+    use laminar_core::time::{filter_batch_by_timestamp, ThresholdOp};
 
     let mut closed_batches = Vec::new();
     let mut retained_batches = Vec::new();
 
     for batch in batches {
-        if let Some(closed) = crate::batch_filter::filter_batch_by_timestamp(
-            batch,
-            time_column,
-            boundary,
-            format,
-            crate::batch_filter::ThresholdOp::Less,
-        ) {
-            closed_batches.push(closed);
+        match filter_batch_by_timestamp(batch, time_column, boundary, ThresholdOp::Less) {
+            Ok(Some(closed)) => closed_batches.push(closed),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    column = %time_column,
+                    error = %e,
+                    "split_by_timestamp: pushing batch to closed bucket due to filter error"
+                );
+                closed_batches.push(batch.clone());
+                continue;
+            }
         }
-        if let Some(retained) = crate::batch_filter::filter_batch_by_timestamp(
-            batch,
-            time_column,
-            boundary,
-            format,
-            crate::batch_filter::ThresholdOp::GreaterEq,
-        ) {
+        if let Ok(Some(retained)) =
+            filter_batch_by_timestamp(batch, time_column, boundary, ThresholdOp::GreaterEq)
+        {
             retained_batches.push(retained);
         }
     }

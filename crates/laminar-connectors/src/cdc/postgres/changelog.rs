@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::builder::{Int64Builder, StringBuilder, UInt64Builder};
+use arrow_array::builder::{StringBuilder, TimestampMillisecondBuilder, UInt64Builder};
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 
@@ -134,7 +134,7 @@ pub fn events_to_record_batch(
     let mut table_builder = StringBuilder::with_capacity(events.len(), events.len() * 32);
     let mut op_builder = StringBuilder::with_capacity(events.len(), events.len());
     let mut lsn_builder = UInt64Builder::with_capacity(events.len());
-    let mut ts_builder = Int64Builder::with_capacity(events.len());
+    let mut ts_builder = TimestampMillisecondBuilder::with_capacity(events.len());
     let mut before_builder = StringBuilder::with_capacity(events.len(), events.len() * 64);
     let mut after_builder = StringBuilder::with_capacity(events.len(), events.len() * 64);
 

@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 
 /// Trace span schema.
 #[must_use]
@@ -30,7 +30,11 @@ pub fn traces_schema() -> SchemaRef {
         Field::new("attributes", DataType::Utf8, true),
         Field::new("events_count", DataType::Int32, false),
         Field::new("links_count", DataType::Int32, false),
-        Field::new("_laminar_received_at", DataType::Int64, false),
+        Field::new(
+            "_laminar_received_at",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
     ]))
 }
 
@@ -51,7 +55,11 @@ pub fn metrics_schema() -> SchemaRef {
         Field::new("resource_attributes", DataType::Utf8, true),
         Field::new("scope_name", DataType::Utf8, true),
         Field::new("attributes", DataType::Utf8, true),
-        Field::new("_laminar_received_at", DataType::Int64, false),
+        Field::new(
+            "_laminar_received_at",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
     ]))
 }
 
@@ -70,7 +78,11 @@ pub fn logs_schema() -> SchemaRef {
         Field::new("resource_attributes", DataType::Utf8, true),
         Field::new("scope_name", DataType::Utf8, true),
         Field::new("attributes", DataType::Utf8, true),
-        Field::new("_laminar_received_at", DataType::Int64, false),
+        Field::new(
+            "_laminar_received_at",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
     ]))
 }
 
@@ -110,15 +122,15 @@ mod tests {
     #[test]
     fn test_traces_schema_timestamps() {
         let schema = traces_schema();
-        for col in [
-            "start_time_unix_nano",
-            "end_time_unix_nano",
-            "duration_ns",
-            "_laminar_received_at",
-        ] {
+        for col in ["start_time_unix_nano", "end_time_unix_nano", "duration_ns"] {
             let field = schema.field_with_name(col).unwrap();
             assert_eq!(*field.data_type(), DataType::Int64, "column {col}");
         }
+        let received_at = schema.field_with_name("_laminar_received_at").unwrap();
+        assert_eq!(
+            *received_at.data_type(),
+            DataType::Timestamp(TimeUnit::Nanosecond, None)
+        );
     }
 
     #[test]
