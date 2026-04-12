@@ -1,7 +1,6 @@
 //! File system watcher for automatic config hot-reload.
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -144,10 +143,7 @@ pub async fn watch_config(config_path: PathBuf, state: Arc<AppState>, debounce: 
         let result = reload::apply_reload(&state.db, &diff).await;
 
         // Update metrics
-        state.reload_total.fetch_add(1, Ordering::Relaxed);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let now = chrono::Utc::now().timestamp() as u64;
-        state.reload_last_ts.store(now, Ordering::Relaxed);
+        state.server_metrics.reload_total.inc();
 
         if result.success {
             let mut current = state.current_config.write().await;

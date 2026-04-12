@@ -292,7 +292,7 @@ pub fn register_mock_source(registry: &ConnectorRegistry) {
             is_sink: false,
             config_keys: vec![],
         },
-        Arc::new(|| Box::new(MockSourceConnector::new())),
+        Arc::new(|_: Option<&prometheus::Registry>| Box::new(MockSourceConnector::new())),
     );
 }
 
@@ -308,7 +308,7 @@ pub fn register_mock_sink(registry: &ConnectorRegistry) {
             is_sink: true,
             config_keys: vec![],
         },
-        Arc::new(|| Box::new(MockSinkConnector::new())),
+        Arc::new(|_: Option<&prometheus::Registry>| Box::new(MockSinkConnector::new())),
     );
 }
 

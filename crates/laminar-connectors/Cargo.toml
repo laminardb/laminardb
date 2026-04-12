@@ -11,7 +11,7 @@ description = "External system connectors for LaminarDB - Kafka, CDC, lookup tab
 
 [dependencies]
 # Core dependencies
-laminar-core = { path = "../laminar-core", version = "0.20.1" }
+laminar-core = { path = "../laminar-core", version = "0.20.2" }
 
 # Kafka
 rdkafka = { version = "0.39", features = ["cmake-build", "ssl-vendored"], optional = true }
@@ -56,6 +56,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
+prometheus = { workspace = true }
 rustc-hash = { workspace = true }
 
 # Arrow for RecordBatch

@@ -1,9 +1,10 @@
 //! HTTP API for LaminarDB server.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+
+use prometheus::Registry;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
@@ -18,18 +19,17 @@ use tracing::{info, warn};
 use laminar_db::LaminarDB;
 
 use crate::config::ServerConfig;
+use crate::metrics::ServerMetrics;
 use crate::reload::{self, ReloadGuard};
 use crate::server::ServerError;
 
 pub struct AppState {
     pub db: Arc<LaminarDB>,
     pub config_path: PathBuf,
-    pub started_at: chrono::DateTime<chrono::Utc>,
     pub current_config: tokio::sync::RwLock<ServerConfig>,
     pub reload_guard: ReloadGuard,
-    pub reload_total: AtomicU64,
-    pub reload_last_ts: AtomicU64,
-    pub ws_connections: AtomicU64,
+    pub registry: Arc<Registry>,
+    pub server_metrics: ServerMetrics,
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -186,101 +186,20 @@ async fn readiness_check(State(state): State<Arc<AppState>>) -> impl IntoRespons
 }
 
 async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let metrics = state.db.metrics();
-    let source_metrics = state.db.all_source_metrics();
-    let pipeline_state = state.db.pipeline_state();
-    let uptime_secs = state.started_at.signed_duration_since(chrono::Utc::now());
-    #[allow(clippy::cast_sign_loss)]
-    let uptime = uptime_secs.num_seconds().unsigned_abs();
-
-    let mut lines = Vec::new();
-
-    lines.push(format!(
-        "laminardb_events_ingested_total {}",
-        metrics.total_events_ingested
-    ));
-    lines.push(format!(
-        "laminardb_events_emitted_total {}",
-        metrics.total_events_emitted
-    ));
-    lines.push(format!(
-        "laminardb_events_dropped_total {}",
-        metrics.total_events_dropped
-    ));
-
-    for sm in &source_metrics {
-        lines.push(format!(
-            "laminardb_source_events_total{{source=\"{}\"}} {}",
-            sm.name, sm.total_events
-        ));
-    }
-
-    lines.push(format!(
-        "laminardb_pipeline_state_info{{state=\"{pipeline_state}\"}} 1"
-    ));
-    lines.push(format!("laminardb_uptime_seconds {uptime}"));
-    lines.push(format!("laminardb_source_count {}", metrics.source_count));
-    lines.push(format!("laminardb_stream_count {}", metrics.stream_count));
-    lines.push(format!("laminardb_sink_count {}", metrics.sink_count));
-
-    // Checkpoint metrics
-    let snap = state.db.counters().snapshot();
-    lines.push(format!(
-        "laminardb_checkpoints_completed_total {}",
-        snap.checkpoints_completed
-    ));
-    lines.push(format!(
-        "laminardb_checkpoints_failed_total {}",
-        snap.checkpoints_failed
-    ));
-    lines.push(format!(
-        "laminardb_checkpoint_epoch {}",
-        snap.checkpoint_epoch
-    ));
-    lines.push(format!(
-        "laminardb_sink_write_failures_total {}",
-        snap.sink_write_failures
-    ));
-    lines.push(format!(
-        "laminardb_sink_write_timeouts_total {}",
-        snap.sink_write_timeouts
-    ));
-    lines.push(format!(
-        "laminardb_sink_task_channel_closed_total {}",
-        snap.sink_task_channel_closed
-    ));
-    if snap.last_checkpoint_duration_ms > 0 {
-        lines.push(format!(
-            "laminardb_checkpoint_last_duration_ms {}",
-            snap.last_checkpoint_duration_ms
-        ));
-    }
-
-    // Cycle duration percentiles
-    lines.push(format!(
-        "laminardb_cycle_duration_p50_ns {}",
-        snap.cycle_p50_ns
-    ));
-    lines.push(format!(
-        "laminardb_cycle_duration_p95_ns {}",
-        snap.cycle_p95_ns
-    ));
-    lines.push(format!(
-        "laminardb_cycle_duration_p99_ns {}",
-        snap.cycle_p99_ns
-    ));
-
-    let reload_total = state.reload_total.load(Ordering::Relaxed);
-    let reload_last_ts = state.reload_last_ts.load(Ordering::Relaxed);
-    lines.push(format!("laminardb_reload_total {reload_total}"));
-    if reload_last_ts > 0 {
-        lines.push(format!("laminardb_reload_last_timestamp {reload_last_ts}"));
-    }
+    // Update uptime gauge on each scrape — cheap, and always fresh.
+    #[allow(clippy::cast_possible_wrap)]
+    state
+        .server_metrics
+        .uptime_seconds
+        .set(state.db.uptime().as_secs() as i64);
 
     (
         StatusCode::OK,
-        [("content-type", "text/plain; charset=utf-8")],
-        lines.join("\n"),
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        crate::metrics::render(&state.registry),
     )
 }
 
@@ -435,10 +354,7 @@ async fn handle_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     let result = reload::apply_reload(&state.db, &diff).await;
 
     // Update metrics
-    state.reload_total.fetch_add(1, Ordering::Relaxed);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let now = chrono::Utc::now().timestamp() as u64;
-    state.reload_last_ts.store(now, Ordering::Relaxed);
+    state.server_metrics.reload_total.inc();
 
     // Update current config on success
     if result.success {
@@ -498,7 +414,7 @@ async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
 // WebSocket stream subscriptions
 // ---------------------------------------------------------------------------
 
-const MAX_WS_CONNECTIONS: u64 = 10_000;
+const MAX_WS_CONNECTIONS: i64 = 10_000;
 const WS_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 async fn ws_upgrade(
@@ -506,7 +422,7 @@ async fn ws_upgrade(
     Path(name): Path<String>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    if state.ws_connections.load(Ordering::Relaxed) >= MAX_WS_CONNECTIONS {
+    if state.server_metrics.ws_connections.get() >= MAX_WS_CONNECTIONS {
         return error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "too many WebSocket connections".to_string(),
@@ -533,9 +449,9 @@ async fn ws_upgrade(
 
     let st = Arc::clone(&state);
     ws.on_upgrade(move |socket| async move {
-        st.ws_connections.fetch_add(1, Ordering::Relaxed);
+        st.server_metrics.ws_connections.inc();
         ws_client(socket, sub, name).await;
-        st.ws_connections.fetch_sub(1, Ordering::Relaxed);
+        st.server_metrics.ws_connections.dec();
     })
     .into_response()
 }
@@ -614,10 +530,17 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_state() -> Arc<AppState> {
+        let registry = Arc::new(crate::metrics::build_registry([
+            ("instance".into(), "test".into()),
+            ("pipeline".into(), "test".into()),
+        ]));
+        let engine_metrics = Arc::new(laminar_db::EngineMetrics::new(&registry));
+        let db = Arc::new(LaminarDB::open().unwrap());
+        db.set_engine_metrics(engine_metrics);
+        let server_metrics = crate::metrics::ServerMetrics::new(&registry);
         Arc::new(AppState {
-            db: Arc::new(LaminarDB::open().unwrap()),
+            db,
             config_path: PathBuf::from("test.toml"),
-            started_at: chrono::Utc::now(),
             current_config: tokio::sync::RwLock::new(crate::config::ServerConfig {
                 server: crate::config::ServerSection::default(),
                 state: crate::config::StateSection::default(),
@@ -632,9 +555,9 @@ mod tests {
                 sql: None,
             }),
             reload_guard: ReloadGuard::new(),
-            reload_total: AtomicU64::new(0),
-            reload_last_ts: AtomicU64::new(0),
-            ws_connections: AtomicU64::new(0),
+
+            registry,
+            server_metrics,
         })
     }
 
@@ -684,13 +607,33 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.contains("text/plain"),
+            "expected text/plain content-type, got: {ct}"
+        );
+
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(text.contains("laminardb_events_ingested_total"));
-        assert!(text.contains("laminardb_pipeline_state_info"));
-        assert!(text.contains("laminardb_uptime_seconds"));
+        assert!(
+            text.contains("laminardb_events_ingested_total"),
+            "missing events_ingested_total"
+        );
+        assert!(
+            text.contains("laminardb_cycles_total"),
+            "missing cycles_total"
+        );
+        assert!(
+            text.contains("laminardb_checkpoints_completed_total"),
+            "missing checkpoints_completed_total"
+        );
     }
 
     #[tokio::test]
@@ -837,10 +780,17 @@ mod tests {
         writeln!(tmpfile, "[server]").unwrap();
         let path = tmpfile.path().to_path_buf();
 
+        let registry = Arc::new(crate::metrics::build_registry([
+            ("instance".into(), "test".into()),
+            ("pipeline".into(), "test".into()),
+        ]));
+        let db = Arc::new(LaminarDB::open().unwrap());
+        let engine_metrics = Arc::new(laminar_db::EngineMetrics::new(&registry));
+        db.set_engine_metrics(engine_metrics);
+        let server_metrics = crate::metrics::ServerMetrics::new(&registry);
         let state = Arc::new(AppState {
-            db: Arc::new(LaminarDB::open().unwrap()),
+            db,
             config_path: path,
-            started_at: chrono::Utc::now(),
             current_config: tokio::sync::RwLock::new(crate::config::ServerConfig {
                 server: crate::config::ServerSection::default(),
                 state: crate::config::StateSection::default(),
@@ -855,9 +805,9 @@ mod tests {
                 sql: None,
             }),
             reload_guard: ReloadGuard::new(),
-            reload_total: AtomicU64::new(0),
-            reload_last_ts: AtomicU64::new(0),
-            ws_connections: AtomicU64::new(0),
+
+            registry,
+            server_metrics,
         });
 
         let app = build_router(state.clone());
@@ -877,10 +827,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_metrics_includes_reload() {
+    async fn test_metrics_contains_help_and_type() {
         let state = test_state();
-        state.reload_total.store(5, Ordering::Relaxed);
-        state.reload_last_ts.store(1_700_000_000, Ordering::Relaxed);
         let app = build_router(state);
 
         let req = Request::builder()
@@ -892,7 +840,8 @@ mod tests {
             .await
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert!(text.contains("laminardb_reload_total 5"));
-        assert!(text.contains("laminardb_reload_last_timestamp 1700000000"));
+        // Prometheus text format includes HELP and TYPE annotations
+        assert!(text.contains("# HELP"), "missing # HELP annotation");
+        assert!(text.contains("# TYPE"), "missing # TYPE annotation");
     }
 }

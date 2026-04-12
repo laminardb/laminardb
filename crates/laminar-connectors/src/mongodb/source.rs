@@ -145,12 +145,12 @@ type ChangeStreamRx = crossfire::AsyncRx<crossfire::mpsc::Array<ChangeStreamPayl
 impl MongoDbCdcSource {
     /// Creates a new `MongoDB` CDC source with the given configuration.
     #[must_use]
-    pub fn new(config: MongoDbSourceConfig) -> Self {
+    pub fn new(config: MongoDbSourceConfig, registry: Option<&prometheus::Registry>) -> Self {
         Self {
             config,
             state: ConnectorState::Created,
             schema: mongodb_cdc_envelope_schema(),
-            metrics: Arc::new(MongoDbCdcMetrics::new()),
+            metrics: Arc::new(MongoDbCdcMetrics::new(registry)),
             event_buffer: VecDeque::new(),
             last_resume_token: None,
             resume_token_store: Box::new(InMemoryResumeTokenStore::new()),
@@ -172,7 +172,7 @@ impl MongoDbCdcSource {
     /// Returns `ConnectorError` if the configuration is invalid.
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
         let mongo_config = MongoDbSourceConfig::from_config(config)?;
-        Ok(Self::new(mongo_config))
+        Ok(Self::new(mongo_config, None))
     }
 
     /// Sets a custom resume token store.
@@ -906,7 +906,7 @@ mod tests {
     #[test]
     fn test_new_source() {
         let config = MongoDbSourceConfig::new("mongodb://localhost:27017", "db", "coll");
-        let source = MongoDbCdcSource::new(config);
+        let source = MongoDbCdcSource::new(config, None);
         assert_eq!(source.buffered_events(), 0);
         assert!(!source.is_invalidated());
         assert!(source.last_resume_token().is_none());
@@ -915,7 +915,7 @@ mod tests {
     #[test]
     fn test_enqueue_event() {
         let config = MongoDbSourceConfig::new("mongodb://localhost:27017", "db", "coll");
-        let mut source = MongoDbCdcSource::new(config);
+        let mut source = MongoDbCdcSource::new(config, None);
 
         source.enqueue_event(sample_event(OperationType::Insert));
         assert_eq!(source.buffered_events(), 1);
@@ -925,7 +925,7 @@ mod tests {
     #[test]
     fn test_enqueue_invalidate() {
         let config = MongoDbSourceConfig::new("mongodb://localhost:27017", "db", "coll");
-        let mut source = MongoDbCdcSource::new(config);
+        let mut source = MongoDbCdcSource::new(config, None);
 
         let mut event = sample_event(OperationType::Invalidate);
         event.full_document = None;
@@ -957,7 +957,7 @@ mod tests {
     #[test]
     fn test_drain_to_batch() {
         let config = MongoDbSourceConfig::new("mongodb://localhost:27017", "db", "coll");
-        let mut source = MongoDbCdcSource::new(config);
+        let mut source = MongoDbCdcSource::new(config, None);
 
         // Empty buffer returns None.
         assert!(source.drain_to_batch(10).unwrap().is_none());
@@ -979,7 +979,7 @@ mod tests {
     #[test]
     fn test_checkpoint() {
         let config = MongoDbSourceConfig::new("mongodb://localhost:27017", "testdb", "users");
-        let mut source = MongoDbCdcSource::new(config);
+        let mut source = MongoDbCdcSource::new(config, None);
 
         // Without resume token.
         let cp = source.checkpoint();
@@ -995,7 +995,7 @@ mod tests {
     #[tokio::test]
     async fn test_restore_checkpoint() {
         let config = MongoDbSourceConfig::new("mongodb://localhost:27017", "db", "coll");
-        let mut source = MongoDbCdcSource::new(config);
+        let mut source = MongoDbCdcSource::new(config, None);
 
         let mut cp = SourceCheckpoint::new(0);
         cp.set_offset("resume_token", "restored_token");
@@ -1010,7 +1010,7 @@ mod tests {
     #[test]
     fn test_health_check() {
         let config = MongoDbSourceConfig::new("mongodb://localhost:27017", "db", "coll");
-        let mut source = MongoDbCdcSource::new(config);
+        let mut source = MongoDbCdcSource::new(config, None);
 
         assert_eq!(source.health_check(), HealthStatus::Unknown);
 
@@ -1027,7 +1027,7 @@ mod tests {
     #[test]
     fn test_drain_tracks_resume_token() {
         let config = MongoDbSourceConfig::new("mongodb://localhost:27017", "db", "coll");
-        let mut source = MongoDbCdcSource::new(config);
+        let mut source = MongoDbCdcSource::new(config, None);
 
         let mut event = sample_event(OperationType::Insert);
         event.resume_token = r#"{"_data": "final_token"}"#.to_string();

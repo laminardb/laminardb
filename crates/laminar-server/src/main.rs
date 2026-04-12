@@ -8,6 +8,7 @@ mod delta;
 #[cfg(feature = "delta-experimental")]
 mod delta_config;
 mod http;
+mod metrics;
 mod reload;
 mod server;
 mod watcher;

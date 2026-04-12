@@ -16,8 +16,8 @@ use datafusion_expr::LogicalPlan;
 use crate::aggregate_state::{
     apply_compiled_having, AggStateCheckpoint, CompiledProjection, IncrementalAggState,
 };
+use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
-use crate::metrics::PipelineCounters;
 use crate::operator_graph::{try_evaluate_compiled, GraphOperator, OperatorCheckpoint};
 use crate::sql_analysis::{extract_projection_filter, single_source_table};
 
@@ -45,7 +45,7 @@ pub(crate) struct SqlQueryOperator {
     sql: String,
     ctx: SessionContext,
     state: QueryState,
-    counters: Option<Arc<PipelineCounters>>,
+    prom: Option<Arc<EngineMetrics>>,
     pending_restore: Option<AggStateCheckpoint>,
     tier_logged: bool,
     cached_having_plan: Option<LogicalPlan>,
@@ -58,7 +58,7 @@ impl SqlQueryOperator {
         name: &str,
         sql: &str,
         ctx: SessionContext,
-        counters: Option<Arc<PipelineCounters>>,
+        prom: Option<Arc<EngineMetrics>>,
         emit_changelog: bool,
         idle_ttl_ms: Option<u64>,
     ) -> Self {
@@ -67,7 +67,7 @@ impl SqlQueryOperator {
             sql: sql.to_string(),
             ctx,
             state: QueryState::Uninit,
-            counters,
+            prom,
             pending_restore: None,
             tier_logged: false,
             cached_having_plan: None,
@@ -148,13 +148,11 @@ impl SqlQueryOperator {
             return;
         }
         self.tier_logged = true;
-        if let Some(ref c) = self.counters {
+        if let Some(ref m) = self.prom {
             if compiled {
-                c.queries_compiled
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                m.queries_compiled.inc();
             } else {
-                c.queries_cached_plan
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                m.queries_cached_plan.inc();
             }
         }
     }

@@ -33,7 +33,13 @@ pub fn register_file_source(registry: &ConnectorRegistry) {
         is_sink: false,
         config_keys: vec![],
     };
-    registry.register_source("files", info, Arc::new(|| Box::new(FileSource::new())));
+    registry.register_source(
+        "files",
+        info,
+        Arc::new(|registry: Option<&prometheus::Registry>| {
+            Box::new(FileSource::with_registry(registry))
+        }),
+    );
 }
 
 /// Registers the file sink connector in the registry.
@@ -48,7 +54,13 @@ pub fn register_file_sink(registry: &ConnectorRegistry) {
         is_sink: true,
         config_keys: vec![],
     };
-    registry.register_sink("files", info, Arc::new(|| Box::new(FileSink::new())));
+    registry.register_sink(
+        "files",
+        info,
+        Arc::new(|registry: Option<&prometheus::Registry>| {
+            Box::new(FileSink::with_registry(registry))
+        }),
+    );
 }
 
 #[cfg(test)]
@@ -89,7 +101,7 @@ mod tests {
         register_file_source(&registry);
 
         let config = crate::config::ConnectorConfig::new("files");
-        let source = registry.create_source(&config);
+        let source = registry.create_source(&config, None);
         assert!(source.is_ok());
     }
 
@@ -99,7 +111,7 @@ mod tests {
         register_file_sink(&registry);
 
         let config = crate::config::ConnectorConfig::new("files");
-        let sink = registry.create_sink(&config);
+        let sink = registry.create_sink(&config, None);
         assert!(sink.is_ok());
     }
 }

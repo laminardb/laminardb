@@ -86,7 +86,11 @@ pub struct PostgresSink {
 impl PostgresSink {
     /// Creates a new `PostgreSQL` sink connector.
     #[must_use]
-    pub fn new(schema: SchemaRef, config: PostgresSinkConfig) -> Self {
+    pub fn new(
+        schema: SchemaRef,
+        config: PostgresSinkConfig,
+        registry: Option<&prometheus::Registry>,
+    ) -> Self {
         let user_schema = build_user_schema(&schema);
         // Pre-allocate buffer to avoid reallocation during first epoch.
         let buf_capacity = (config.batch_size / 1024).max(4);
@@ -100,7 +104,7 @@ impl PostgresSink {
             buffer: Vec::with_capacity(buf_capacity),
             buffered_rows: 0,
             last_flush: Instant::now(),
-            metrics: PostgresSinkMetrics::new(),
+            metrics: PostgresSinkMetrics::new(registry),
             upsert_sql: None,
             copy_sql: None,
             create_table_sql: None,
@@ -995,12 +999,8 @@ impl SinkConnector for PostgresSink {
 
         info!(
             table = %self.config.qualified_table_name(),
-            records = self.metrics.records_written.load(
-                std::sync::atomic::Ordering::Relaxed
-            ),
-            epochs = self.metrics.epochs_committed.load(
-                std::sync::atomic::Ordering::Relaxed
-            ),
+            records = self.metrics.records_written.get(),
+            epochs = self.metrics.epochs_committed.get(),
             "PostgreSQL sink connector closed"
         );
 
@@ -1265,7 +1265,7 @@ mod tests {
 
     #[test]
     fn test_new_defaults() {
-        let sink = PostgresSink::new(test_schema(), test_config());
+        let sink = PostgresSink::new(test_schema(), test_config(), None);
         assert_eq!(sink.state(), ConnectorState::Created);
         assert_eq!(sink.current_epoch(), 0);
         assert_eq!(sink.last_committed_epoch(), 0);
@@ -1281,7 +1281,7 @@ mod tests {
             Field::new("_op", DataType::Utf8, false),
             Field::new("value", DataType::Utf8, true),
         ]));
-        let sink = PostgresSink::new(schema, test_config());
+        let sink = PostgresSink::new(schema, test_config(), None);
         assert_eq!(sink.user_schema.fields().len(), 2);
         assert_eq!(sink.user_schema.field(0).name(), "id");
         assert_eq!(sink.user_schema.field(1).name(), "value");
@@ -1290,7 +1290,7 @@ mod tests {
     #[test]
     fn test_schema_returned() {
         let schema = test_schema();
-        let sink = PostgresSink::new(schema.clone(), test_config());
+        let sink = PostgresSink::new(schema.clone(), test_config(), None);
         assert_eq!(sink.schema(), schema);
     }
 
@@ -1561,7 +1561,7 @@ mod tests {
     async fn test_write_batch_buffering() {
         let mut config = test_config();
         config.batch_size = 100;
-        let mut sink = PostgresSink::new(test_schema(), config);
+        let mut sink = PostgresSink::new(test_schema(), config, None);
         sink.state = ConnectorState::Running;
 
         let batch = test_batch(10);
@@ -1573,7 +1573,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_batch_empty() {
-        let mut sink = PostgresSink::new(test_schema(), test_config());
+        let mut sink = PostgresSink::new(test_schema(), test_config(), None);
         sink.state = ConnectorState::Running;
 
         let batch = test_batch(0);
@@ -1584,7 +1584,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_batch_not_running() {
-        let mut sink = PostgresSink::new(test_schema(), test_config());
+        let mut sink = PostgresSink::new(test_schema(), test_config(), None);
 
         let batch = test_batch(10);
         let result = sink.write_batch(&batch).await;
@@ -1596,7 +1596,7 @@ mod tests {
         let mut config = test_config();
         config.batch_size = 5; // Would normally trigger flush at 10 rows
         config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-        let mut sink = PostgresSink::new(test_schema(), config);
+        let mut sink = PostgresSink::new(test_schema(), config, None);
         sink.state = ConnectorState::Running;
 
         let batch = test_batch(10);
@@ -1611,7 +1611,7 @@ mod tests {
 
     #[test]
     fn test_health_check_created() {
-        let sink = PostgresSink::new(test_schema(), test_config());
+        let sink = PostgresSink::new(test_schema(), test_config(), None);
         assert_eq!(sink.health_check(), HealthStatus::Unknown);
     }
 
@@ -1619,7 +1619,7 @@ mod tests {
 
     #[test]
     fn test_capabilities_append_at_least_once() {
-        let sink = PostgresSink::new(test_schema(), test_config());
+        let sink = PostgresSink::new(test_schema(), test_config(), None);
         let caps = sink.capabilities();
         assert!(caps.idempotent);
         assert!(!caps.upsert);
@@ -1629,7 +1629,7 @@ mod tests {
 
     #[test]
     fn test_capabilities_upsert() {
-        let sink = PostgresSink::new(test_schema(), upsert_config());
+        let sink = PostgresSink::new(test_schema(), upsert_config(), None);
         let caps = sink.capabilities();
         assert!(caps.upsert);
         assert!(caps.idempotent);
@@ -1639,7 +1639,7 @@ mod tests {
     fn test_capabilities_changelog() {
         let mut config = test_config();
         config.changelog_mode = true;
-        let sink = PostgresSink::new(test_schema(), config);
+        let sink = PostgresSink::new(test_schema(), config, None);
         let caps = sink.capabilities();
         assert!(caps.changelog);
     }
@@ -1648,7 +1648,7 @@ mod tests {
     fn test_capabilities_exactly_once() {
         let mut config = upsert_config();
         config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-        let sink = PostgresSink::new(test_schema(), config);
+        let sink = PostgresSink::new(test_schema(), config, None);
         let caps = sink.capabilities();
         assert!(caps.exactly_once);
     }
@@ -1657,7 +1657,7 @@ mod tests {
 
     #[test]
     fn test_metrics_initial() {
-        let sink = PostgresSink::new(test_schema(), test_config());
+        let sink = PostgresSink::new(test_schema(), test_config(), None);
         let m = sink.metrics();
         assert_eq!(m.records_total, 0);
         assert_eq!(m.bytes_total, 0);
@@ -1668,7 +1668,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_epoch_lifecycle_state() {
-        let mut sink = PostgresSink::new(test_schema(), test_config());
+        let mut sink = PostgresSink::new(test_schema(), test_config(), None);
         sink.state = ConnectorState::Running;
 
         sink.begin_epoch(1).await.expect("begin");
@@ -1685,7 +1685,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_epoch_mismatch_rejected() {
-        let mut sink = PostgresSink::new(test_schema(), test_config());
+        let mut sink = PostgresSink::new(test_schema(), test_config(), None);
         sink.state = ConnectorState::Running;
 
         sink.begin_epoch(1).await.expect("begin");
@@ -1697,7 +1697,7 @@ mod tests {
     async fn test_rollback_clears_buffer() {
         let mut config = test_config();
         config.batch_size = 1000;
-        let mut sink = PostgresSink::new(test_schema(), config);
+        let mut sink = PostgresSink::new(test_schema(), config, None);
         sink.state = ConnectorState::Running;
 
         let batch = test_batch(50);
@@ -1712,7 +1712,7 @@ mod tests {
 
     #[test]
     fn test_debug_output() {
-        let sink = PostgresSink::new(test_schema(), test_config());
+        let sink = PostgresSink::new(test_schema(), test_config(), None);
         let debug = format!("{sink:?}");
         assert!(debug.contains("PostgresSink"));
         assert!(debug.contains("public.events"));

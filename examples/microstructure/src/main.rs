@@ -92,8 +92,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.source_count = m.source_count;
         state.stream_count = m.stream_count;
         state.pipeline_watermark = m.pipeline_watermark;
-        state.latency.record(m.last_cycle_duration_ns);
-        state.latency_history.push(m.last_cycle_duration_ns);
 
         let elapsed = last_tp_time.elapsed().as_secs_f64();
         if elapsed >= 1.0 {

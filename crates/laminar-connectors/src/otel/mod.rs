@@ -46,6 +46,8 @@ pub fn register_otel_source(registry: &ConnectorRegistry) {
     registry.register_source(
         "otel",
         info,
-        Arc::new(|| Box::new(OtelSource::new(traces_schema()))),
+        Arc::new(|registry: Option<&prometheus::Registry>| {
+            Box::new(OtelSource::new(traces_schema(), registry))
+        }),
     );
 }

@@ -72,8 +72,11 @@ pub struct LaminarDB {
     pub(crate) runtime_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Signal to stop the processing loop.
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
-    /// Shared pipeline counters for observability.
-    pub(crate) counters: Arc<crate::metrics::PipelineCounters>,
+    /// Prometheus engine metrics. `None` until `set_engine_metrics()` is called.
+    pub(crate) engine_metrics:
+        parking_lot::Mutex<Option<Arc<crate::engine_metrics::EngineMetrics>>>,
+    /// Shared Prometheus registry. `None` until `set_prometheus_registry()` is called.
+    pub(crate) prometheus_registry: parking_lot::Mutex<Option<Arc<prometheus::Registry>>>,
     /// Instant when the database was created, for uptime calculation.
     pub(crate) start_time: std::time::Instant,
     /// Session properties set via `SET key = value`.
@@ -216,7 +219,8 @@ impl LaminarDB {
             state: Arc::new(std::sync::atomic::AtomicU8::new(STATE_CREATED)),
             runtime_handle: parking_lot::Mutex::new(None),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
-            counters: Arc::new(crate::metrics::PipelineCounters::new()),
+            engine_metrics: parking_lot::Mutex::new(None),
+            prometheus_registry: parking_lot::Mutex::new(None),
             start_time: std::time::Instant::now(),
             session_properties: parking_lot::Mutex::new(HashMap::new()),
             pipeline_watermark: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
@@ -2276,7 +2280,9 @@ mod tests {
                         is_sink: false,
                         config_keys: vec![],
                     },
-                    Arc::new(|| Box::new(laminar_connectors::testing::MockSourceConnector::new())),
+                    Arc::new(|_: Option<&prometheus::Registry>| {
+                        Box::new(laminar_connectors::testing::MockSourceConnector::new())
+                    }),
                 );
             })
             .build()
@@ -2440,7 +2446,7 @@ mod tests {
                         is_sink: false,
                         config_keys: vec![],
                     },
-                    Arc::new(move || {
+                    Arc::new(move |_: Option<&prometheus::Registry>| {
                         Box::new(FakeSource {
                             schema: Arc::new(ArrowSchema::empty()),
                             on_discover: discovered.clone(),
@@ -3747,11 +3753,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_counters_accessible() {
+    async fn test_engine_metrics_accessible() {
         let db = LaminarDB::open().unwrap();
-        let c = db.counters();
-        c.events_ingested
-            .fetch_add(42, std::sync::atomic::Ordering::Relaxed);
+        let registry = prometheus::Registry::new();
+        let prom = std::sync::Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+        db.set_engine_metrics(prom.clone());
+        prom.events_ingested.inc_by(42);
         let m = db.metrics();
         assert_eq!(m.total_events_ingested, 42);
     }

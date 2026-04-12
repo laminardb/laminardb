@@ -1717,7 +1717,7 @@ mod tests {
         // Read data via source.
         let mut source_config = DeltaSourceConfig::new(table_path);
         source_config.starting_version = Some(0);
-        let mut source = DeltaSource::new(source_config);
+        let mut source = DeltaSource::new(source_config, None);
         let source_connector_config = ConnectorConfig::new("delta-lake");
         source.open(&source_connector_config).await.unwrap();
 
@@ -1786,7 +1786,7 @@ mod tests {
         // latest version (2) in a single poll, reading the full snapshot.
         let mut source_config = DeltaSourceConfig::new(table_path);
         source_config.starting_version = Some(0);
-        let mut source = DeltaSource::new(source_config.clone());
+        let mut source = DeltaSource::new(source_config.clone(), None);
         let connector_config = ConnectorConfig::new("delta-lake");
         source.open(&connector_config).await.unwrap();
 
@@ -1801,7 +1801,7 @@ mod tests {
         source.close().await.unwrap();
 
         // Restore from checkpoint — should resume at version 2.
-        let mut source2 = DeltaSource::new(source_config);
+        let mut source2 = DeltaSource::new(source_config, None);
         source2.open(&connector_config).await.unwrap();
         source2.restore(&cp).await.unwrap();
 

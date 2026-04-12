@@ -21,8 +21,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use std::sync::atomic::Ordering;
-
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::SourceConnector;
 use laminar_storage::checkpoint_manifest::{
@@ -32,7 +30,6 @@ use laminar_storage::checkpoint_store::CheckpointStore;
 use tracing::{debug, error, info, warn};
 
 use crate::error::DbError;
-use crate::metrics::PipelineCounters;
 
 /// Unified checkpoint configuration.
 #[derive(Debug, Clone)]
@@ -240,8 +237,8 @@ pub struct CheckpointCoordinator {
     last_checkpoint_duration: Option<Duration>,
     /// Rolling histogram of checkpoint durations for percentile tracking.
     duration_histogram: DurationHistogram,
-    /// Shared counters for observability.
-    counters: Option<Arc<PipelineCounters>>,
+    /// Prometheus engine metrics.
+    prom: Option<Arc<crate::engine_metrics::EngineMetrics>>,
     /// Exponential moving average of checkpoint durations (milliseconds).
     smoothed_duration_ms: f64,
     /// Cumulative bytes written across all checkpoints (manifest + sidecar).
@@ -270,7 +267,7 @@ impl CheckpointCoordinator {
             checkpoints_failed: 0,
             last_checkpoint_duration: None,
             duration_histogram: DurationHistogram::new(),
-            counters: None,
+            prom: None,
             smoothed_duration_ms: 0.0,
             total_bytes_written: 0,
         }
@@ -334,29 +331,22 @@ impl CheckpointCoordinator {
         Ok(())
     }
 
-    /// Sets the shared pipeline counters for checkpoint metrics emission.
-    ///
-    /// When set, checkpoint completion and failure will update the counters
-    /// automatically.
-    pub fn set_counters(&mut self, counters: Arc<PipelineCounters>) {
-        self.counters = Some(counters);
+    /// Inject prometheus engine metrics.
+    pub fn set_metrics(&mut self, prom: Arc<crate::engine_metrics::EngineMetrics>) {
+        self.prom = Some(prom);
     }
 
-    /// Emits checkpoint metrics to the shared counters.
+    /// Emits checkpoint metrics to prometheus.
     fn emit_checkpoint_metrics(&self, success: bool, epoch: u64, duration: Duration) {
-        if let Some(ref counters) = self.counters {
+        if let Some(ref m) = self.prom {
             if success {
-                counters
-                    .checkpoints_completed
-                    .fetch_add(1, Ordering::Relaxed);
+                m.checkpoints_completed.inc();
             } else {
-                counters.checkpoints_failed.fetch_add(1, Ordering::Relaxed);
+                m.checkpoints_failed.inc();
             }
-            #[allow(clippy::cast_possible_truncation)]
-            counters
-                .last_checkpoint_duration_ms
-                .store(duration.as_millis() as u64, Ordering::Relaxed);
-            counters.checkpoint_epoch.store(epoch, Ordering::Relaxed);
+            #[allow(clippy::cast_possible_wrap)]
+            m.checkpoint_epoch.set(epoch as i64);
+            m.checkpoint_duration.observe(duration.as_secs_f64());
         }
     }
 
@@ -393,11 +383,9 @@ impl CheckpointCoordinator {
             };
 
         // Record pre-commit duration regardless of success/failure.
-        if let Some(ref counters) = self.counters {
-            #[allow(clippy::cast_possible_truncation)]
-            counters
-                .sink_precommit_duration_us
-                .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if let Some(ref m) = self.prom {
+            m.sink_precommit_duration
+                .observe(start.elapsed().as_secs_f64());
         }
 
         result
@@ -459,11 +447,9 @@ impl CheckpointCoordinator {
         };
 
         // Record commit duration regardless of success/failure.
-        if let Some(ref counters) = self.counters {
-            #[allow(clippy::cast_possible_truncation)]
-            counters
-                .sink_commit_duration_us
-                .store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if let Some(ref m) = self.prom {
+            m.sink_commit_duration
+                .observe(start.elapsed().as_secs_f64());
         }
 
         statuses
@@ -974,19 +960,10 @@ impl CheckpointCoordinator {
         self.duration_histogram.record(duration);
         self.emit_checkpoint_metrics(true, epoch, duration);
 
-        // Emit checkpoint size and lag metrics.
-        if let Some(ref counters) = self.counters {
-            counters
-                .last_checkpoint_size_bytes
-                .store(checkpoint_bytes, Ordering::Relaxed);
-            #[allow(clippy::cast_possible_truncation)]
-            counters.last_checkpoint_timestamp_ms.store(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
-                Ordering::Relaxed,
-            );
+        // Emit checkpoint size metrics.
+        if let Some(ref m) = self.prom {
+            #[allow(clippy::cast_possible_wrap)]
+            m.checkpoint_size_bytes.set(checkpoint_bytes as i64);
         }
 
         self.adjust_interval();
@@ -1436,14 +1413,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_checkpoint_emits_metrics_on_success() {
-        use crate::metrics::PipelineCounters;
-        use std::sync::atomic::Ordering;
-
         let dir = tempfile::tempdir().unwrap();
         let mut coord = make_coordinator(dir.path());
 
-        let counters = Arc::new(PipelineCounters::new());
-        coord.set_counters(Arc::clone(&counters));
+        let registry = prometheus::Registry::new();
+        let prom = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+        coord.set_metrics(Arc::clone(&prom));
 
         let result = coord
             .checkpoint(CheckpointRequest {
@@ -1454,10 +1429,9 @@ mod tests {
             .unwrap();
 
         assert!(result.success);
-        assert_eq!(counters.checkpoints_completed.load(Ordering::Relaxed), 1);
-        assert_eq!(counters.checkpoints_failed.load(Ordering::Relaxed), 0);
-        assert!(counters.last_checkpoint_duration_ms.load(Ordering::Relaxed) < 5000);
-        assert_eq!(counters.checkpoint_epoch.load(Ordering::Relaxed), 1);
+        assert_eq!(prom.checkpoints_completed.get(), 1);
+        assert_eq!(prom.checkpoints_failed.get(), 0);
+        assert_eq!(prom.checkpoint_epoch.get(), 1);
 
         // Second checkpoint
         let result2 = coord
@@ -1469,13 +1443,13 @@ mod tests {
             .unwrap();
 
         assert!(result2.success);
-        assert_eq!(counters.checkpoints_completed.load(Ordering::Relaxed), 2);
-        assert_eq!(counters.checkpoint_epoch.load(Ordering::Relaxed), 2);
+        assert_eq!(prom.checkpoints_completed.get(), 2);
+        assert_eq!(prom.checkpoint_epoch.get(), 2);
     }
 
     #[tokio::test]
-    async fn test_checkpoint_without_counters() {
-        // Verify checkpoint works fine without counters set
+    async fn test_checkpoint_without_metrics() {
+        // Verify checkpoint works fine without metrics set
         let dir = tempfile::tempdir().unwrap();
         let mut coord = make_coordinator(dir.path());
 

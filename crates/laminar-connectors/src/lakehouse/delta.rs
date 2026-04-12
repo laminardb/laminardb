@@ -131,7 +131,7 @@ pub struct DeltaLakeSink {
 impl DeltaLakeSink {
     /// Creates a new Delta Lake sink with the given configuration.
     #[must_use]
-    pub fn new(config: DeltaLakeSinkConfig) -> Self {
+    pub fn new(config: DeltaLakeSinkConfig, registry: Option<&prometheus::Registry>) -> Self {
         Self {
             config,
             schema: None,
@@ -143,7 +143,7 @@ impl DeltaLakeSink {
             buffered_bytes: 0,
             delta_version: 0,
             buffer_start_time: None,
-            metrics: DeltaLakeSinkMetrics::new(),
+            metrics: DeltaLakeSinkMetrics::new(registry),
             epoch_skipped: false,
             staged_batches: Vec::new(),
             staged_rows: 0,
@@ -166,7 +166,7 @@ impl DeltaLakeSink {
     /// Creates a new Delta Lake sink with an explicit schema.
     #[must_use]
     pub fn with_schema(config: DeltaLakeSinkConfig, schema: SchemaRef) -> Self {
-        let mut sink = Self::new(config);
+        let mut sink = Self::new(config, None);
         sink.schema = Some(schema);
         sink
     }
@@ -1331,7 +1331,7 @@ mod tests {
 
     #[test]
     fn test_new_defaults() {
-        let sink = DeltaLakeSink::new(test_config());
+        let sink = DeltaLakeSink::new(test_config(), None);
         assert_eq!(sink.state(), ConnectorState::Created);
         assert_eq!(sink.current_epoch(), 0);
         assert_eq!(sink.last_committed_epoch(), 0);
@@ -1350,7 +1350,7 @@ mod tests {
 
     #[test]
     fn test_schema_empty_when_none() {
-        let sink = DeltaLakeSink::new(test_config());
+        let sink = DeltaLakeSink::new(test_config(), None);
         let schema = sink.schema();
         assert_eq!(schema.fields().len(), 0);
     }
@@ -1358,7 +1358,7 @@ mod tests {
     #[cfg(feature = "delta-lake")]
     #[test]
     fn test_deferred_init_flag_default_false() {
-        let sink = DeltaLakeSink::new(test_config());
+        let sink = DeltaLakeSink::new(test_config(), None);
         assert!(!sink.needs_deferred_delta_init);
     }
 
@@ -1380,7 +1380,7 @@ mod tests {
         use crate::config::ConnectorConfig;
 
         let config = unity_config();
-        let mut sink = DeltaLakeSink::new(config);
+        let mut sink = DeltaLakeSink::new(config, None);
 
         // open() with empty ConnectorConfig (simulates factory path)
         let connector_config = ConnectorConfig::new("delta-lake");
@@ -1402,7 +1402,7 @@ mod tests {
     async fn test_deferred_init_transitions_to_failed_on_error() {
         // When deferred init fails, the sink must transition to Failed
         // to prevent an unbounded retry storm.
-        let mut sink = DeltaLakeSink::new(test_config());
+        let mut sink = DeltaLakeSink::new(test_config(), None);
         sink.state = ConnectorState::Initializing;
         sink.needs_deferred_delta_init = true;
         sink.schema = Some(test_schema());
@@ -1421,7 +1421,7 @@ mod tests {
     async fn test_write_batch_accepts_initializing_state() {
         // During deferred init, write_batch must accept Initializing state
         // so the first batch can provide the schema.
-        let mut sink = DeltaLakeSink::new(test_config());
+        let mut sink = DeltaLakeSink::new(test_config(), None);
         sink.state = ConnectorState::Initializing;
         sink.needs_deferred_delta_init = true;
 
@@ -1440,7 +1440,7 @@ mod tests {
         // Unity catalog without catalog.storage.location should NOT defer.
         let mut config = unity_config();
         config.catalog_storage_location = None;
-        let sink = DeltaLakeSink::new(config);
+        let sink = DeltaLakeSink::new(config, None);
 
         let should_defer = matches!(sink.config.catalog_type, DeltaCatalogType::Unity { .. })
             && sink.config.catalog_storage_location.is_some()
@@ -1462,7 +1462,7 @@ mod tests {
 
     #[test]
     fn test_health_check_initializing_during_deferred() {
-        let mut sink = DeltaLakeSink::new(test_config());
+        let mut sink = DeltaLakeSink::new(test_config(), None);
         sink.state = ConnectorState::Initializing;
         // During deferred init, health should NOT report Healthy.
         assert!(matches!(sink.health_check(), HealthStatus::Unknown));
@@ -1492,7 +1492,7 @@ mod tests {
     fn test_should_flush_by_rows() {
         let mut config = test_config();
         config.max_buffer_records = 100;
-        let mut sink = DeltaLakeSink::new(config);
+        let mut sink = DeltaLakeSink::new(config, None);
         sink.buffered_rows = 99;
         assert!(!sink.should_flush());
         sink.buffered_rows = 100;
@@ -1503,7 +1503,7 @@ mod tests {
     fn test_should_flush_by_bytes() {
         let mut config = test_config();
         config.target_file_size = 1000;
-        let mut sink = DeltaLakeSink::new(config);
+        let mut sink = DeltaLakeSink::new(config, None);
         sink.buffered_bytes = 999;
         assert!(!sink.should_flush());
         sink.buffered_bytes = 1000;
@@ -1512,7 +1512,7 @@ mod tests {
 
     #[test]
     fn test_should_flush_empty() {
-        let sink = DeltaLakeSink::new(test_config());
+        let sink = DeltaLakeSink::new(test_config(), None);
         assert!(!sink.should_flush());
     }
 
@@ -1522,7 +1522,7 @@ mod tests {
     async fn test_write_batch_buffering() {
         let mut config = test_config();
         config.max_buffer_records = 100;
-        let mut sink = DeltaLakeSink::new(config);
+        let mut sink = DeltaLakeSink::new(config, None);
         sink.state = ConnectorState::Running;
 
         let batch = test_batch(10);
@@ -1536,7 +1536,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_batch_empty() {
-        let mut sink = DeltaLakeSink::new(test_config());
+        let mut sink = DeltaLakeSink::new(test_config(), None);
         sink.state = ConnectorState::Running;
 
         let batch = test_batch(0);
@@ -1547,7 +1547,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_batch_not_running() {
-        let mut sink = DeltaLakeSink::new(test_config());
+        let mut sink = DeltaLakeSink::new(test_config(), None);
         // state is Created, not Running
 
         let batch = test_batch(10);
@@ -1557,7 +1557,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_batch_sets_schema() {
-        let mut sink = DeltaLakeSink::new(test_config());
+        let mut sink = DeltaLakeSink::new(test_config(), None);
         sink.state = ConnectorState::Running;
         assert!(sink.schema.is_none());
 
@@ -1571,7 +1571,7 @@ mod tests {
     async fn test_multiple_write_batches_accumulate() {
         let mut config = test_config();
         config.max_buffer_records = 100;
-        let mut sink = DeltaLakeSink::new(config);
+        let mut sink = DeltaLakeSink::new(config, None);
         sink.state = ConnectorState::Running;
 
         let batch = test_batch(10);
@@ -1589,7 +1589,7 @@ mod tests {
     async fn test_rollback_clears_buffer() {
         let mut config = test_config();
         config.max_buffer_records = 1000;
-        let mut sink = DeltaLakeSink::new(config);
+        let mut sink = DeltaLakeSink::new(config, None);
         sink.state = ConnectorState::Running;
 
         let batch = test_batch(50);
@@ -1607,7 +1607,7 @@ mod tests {
     async fn test_rollback_after_pre_commit_discards_staged() {
         let mut config = test_config();
         config.max_buffer_records = 1000;
-        let mut sink = DeltaLakeSink::new(config);
+        let mut sink = DeltaLakeSink::new(config, None);
         sink.state = ConnectorState::Running;
 
         sink.begin_epoch(1).await.unwrap();
@@ -1637,7 +1637,7 @@ mod tests {
     async fn test_staged_data_preserved_until_commit_or_rollback() {
         let mut config = test_config();
         config.max_buffer_records = 1000;
-        let mut sink = DeltaLakeSink::new(config);
+        let mut sink = DeltaLakeSink::new(config, None);
         sink.state = ConnectorState::Running;
 
         sink.begin_epoch(1).await.unwrap();
@@ -1665,7 +1665,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_commit_empty_epoch() {
-        let mut sink = DeltaLakeSink::new(test_config());
+        let mut sink = DeltaLakeSink::new(test_config(), None);
         sink.state = ConnectorState::Running;
 
         sink.begin_epoch(1).await.unwrap();
@@ -1683,7 +1683,7 @@ mod tests {
         let mut config = test_config();
         config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
         config.writer_id = "test-writer".to_string();
-        let mut sink = DeltaLakeSink::new(config);
+        let mut sink = DeltaLakeSink::new(config, None);
         sink.state = ConnectorState::Running;
 
         let batch = test_batch(10);
@@ -1704,7 +1704,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_close() {
-        let mut sink = DeltaLakeSink::new(test_config());
+        let mut sink = DeltaLakeSink::new(test_config(), None);
         sink.state = ConnectorState::Running;
 
         sink.close().await.unwrap();
@@ -1715,34 +1715,34 @@ mod tests {
 
     #[test]
     fn test_health_check_created() {
-        let sink = DeltaLakeSink::new(test_config());
+        let sink = DeltaLakeSink::new(test_config(), None);
         assert_eq!(sink.health_check(), HealthStatus::Unknown);
     }
 
     #[test]
     fn test_health_check_running() {
-        let mut sink = DeltaLakeSink::new(test_config());
+        let mut sink = DeltaLakeSink::new(test_config(), None);
         sink.state = ConnectorState::Running;
         assert_eq!(sink.health_check(), HealthStatus::Healthy);
     }
 
     #[test]
     fn test_health_check_closed() {
-        let mut sink = DeltaLakeSink::new(test_config());
+        let mut sink = DeltaLakeSink::new(test_config(), None);
         sink.state = ConnectorState::Closed;
         assert!(matches!(sink.health_check(), HealthStatus::Unhealthy(_)));
     }
 
     #[test]
     fn test_health_check_failed() {
-        let mut sink = DeltaLakeSink::new(test_config());
+        let mut sink = DeltaLakeSink::new(test_config(), None);
         sink.state = ConnectorState::Failed;
         assert!(matches!(sink.health_check(), HealthStatus::Unhealthy(_)));
     }
 
     #[test]
     fn test_health_check_paused() {
-        let mut sink = DeltaLakeSink::new(test_config());
+        let mut sink = DeltaLakeSink::new(test_config(), None);
         sink.state = ConnectorState::Paused;
         assert!(matches!(sink.health_check(), HealthStatus::Degraded(_)));
     }
@@ -1753,7 +1753,7 @@ mod tests {
     fn test_capabilities_append_exactly_once() {
         let mut config = test_config();
         config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-        let sink = DeltaLakeSink::new(config);
+        let sink = DeltaLakeSink::new(config, None);
         let caps = sink.capabilities();
         assert!(caps.exactly_once);
         assert!(caps.idempotent);
@@ -1765,7 +1765,7 @@ mod tests {
 
     #[test]
     fn test_capabilities_upsert() {
-        let sink = DeltaLakeSink::new(upsert_config());
+        let sink = DeltaLakeSink::new(upsert_config(), None);
         let caps = sink.capabilities();
         assert!(caps.upsert);
         assert!(caps.changelog);
@@ -1776,7 +1776,7 @@ mod tests {
     fn test_capabilities_schema_evolution() {
         let mut config = test_config();
         config.schema_evolution = true;
-        let sink = DeltaLakeSink::new(config);
+        let sink = DeltaLakeSink::new(config, None);
         let caps = sink.capabilities();
         assert!(caps.schema_evolution);
     }
@@ -1785,7 +1785,7 @@ mod tests {
     fn test_capabilities_partitioned() {
         let mut config = test_config();
         config.partition_columns = vec!["trade_date".to_string()];
-        let sink = DeltaLakeSink::new(config);
+        let sink = DeltaLakeSink::new(config, None);
         let caps = sink.capabilities();
         assert!(caps.partitioned);
     }
@@ -1794,7 +1794,7 @@ mod tests {
     fn test_capabilities_at_least_once() {
         let mut config = test_config();
         config.delivery_guarantee = DeliveryGuarantee::AtLeastOnce;
-        let sink = DeltaLakeSink::new(config);
+        let sink = DeltaLakeSink::new(config, None);
         let caps = sink.capabilities();
         assert!(!caps.exactly_once);
         assert!(caps.idempotent);
@@ -1804,7 +1804,7 @@ mod tests {
 
     #[test]
     fn test_metrics_initial() {
-        let sink = DeltaLakeSink::new(test_config());
+        let sink = DeltaLakeSink::new(test_config(), None);
         let m = sink.metrics();
         assert_eq!(m.records_total, 0);
         assert_eq!(m.bytes_total, 0);
@@ -1940,7 +1940,7 @@ mod tests {
 
     #[test]
     fn test_debug_output() {
-        let sink = DeltaLakeSink::new(test_config());
+        let sink = DeltaLakeSink::new(test_config(), None);
         let debug = format!("{sink:?}");
         assert!(debug.contains("DeltaLakeSink"));
         assert!(debug.contains("delta_test_nonexistent_8f3a"));

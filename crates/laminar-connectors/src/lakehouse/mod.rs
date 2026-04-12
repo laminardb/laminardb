@@ -63,7 +63,9 @@ pub fn register_delta_lake_sink(registry: &ConnectorRegistry) {
     registry.register_sink(
         "delta-lake",
         info,
-        Arc::new(|| Box::new(DeltaLakeSink::new(DeltaLakeSinkConfig::default()))),
+        Arc::new(|registry: Option<&prometheus::Registry>| {
+            Box::new(DeltaLakeSink::new(DeltaLakeSinkConfig::default(), registry))
+        }),
     );
 }
 
@@ -81,7 +83,9 @@ pub fn register_delta_lake_source(registry: &ConnectorRegistry) {
     registry.register_source(
         "delta-lake",
         info.clone(),
-        Arc::new(|| Box::new(DeltaSource::new(DeltaSourceConfig::default()))),
+        Arc::new(|registry: Option<&prometheus::Registry>| {
+            Box::new(DeltaSource::new(DeltaSourceConfig::default(), registry))
+        }),
     );
 
     // Also register as a table source so CREATE LOOKUP TABLE ... WITH
@@ -167,7 +171,7 @@ pub fn register_iceberg_sink(registry: &ConnectorRegistry) {
     registry.register_sink(
         "iceberg",
         info,
-        Arc::new(|| {
+        Arc::new(|registry: Option<&prometheus::Registry>| {
             // Default config with placeholder values — real config arrives via open().
             let mut cfg = crate::config::ConnectorConfig::new("iceberg");
             cfg.set("catalog.uri", "http://localhost:8181");
@@ -176,6 +180,7 @@ pub fn register_iceberg_sink(registry: &ConnectorRegistry) {
             cfg.set("table.name", "default");
             Box::new(IcebergSink::new(
                 IcebergSinkConfig::from_config(&cfg).expect("default iceberg sink config"),
+                registry,
             ))
         }),
     );
@@ -196,7 +201,7 @@ pub fn register_iceberg_source(registry: &ConnectorRegistry) {
     registry.register_source(
         "iceberg",
         info.clone(),
-        Arc::new(|| {
+        Arc::new(|registry: Option<&prometheus::Registry>| {
             let mut cfg = crate::config::ConnectorConfig::new("iceberg");
             cfg.set("catalog.uri", "http://localhost:8181");
             cfg.set("warehouse", "s3://default/wh");
@@ -204,6 +209,7 @@ pub fn register_iceberg_source(registry: &ConnectorRegistry) {
             cfg.set("table.name", "default");
             Box::new(IcebergSource::new(
                 IcebergSourceConfig::from_config(&cfg).expect("default iceberg source config"),
+                registry,
             ))
         }),
     );
@@ -650,7 +656,7 @@ mod tests {
         register_delta_lake_sink(&registry);
 
         let config = crate::config::ConnectorConfig::new("delta-lake");
-        let sink = registry.create_sink(&config);
+        let sink = registry.create_sink(&config, None);
         assert!(sink.is_ok());
     }
 
@@ -699,7 +705,7 @@ mod tests {
         register_delta_lake_source(&registry);
 
         let config = crate::config::ConnectorConfig::new("delta-lake");
-        let source = registry.create_source(&config);
+        let source = registry.create_source(&config, None);
         assert!(source.is_ok());
     }
 
@@ -777,7 +783,7 @@ mod tests {
         register_iceberg_sink(&registry);
 
         let config = crate::config::ConnectorConfig::new("iceberg");
-        let sink = registry.create_sink(&config);
+        let sink = registry.create_sink(&config, None);
         assert!(sink.is_ok());
     }
 
@@ -787,7 +793,7 @@ mod tests {
         register_iceberg_source(&registry);
 
         let config = crate::config::ConnectorConfig::new("iceberg");
-        let source = registry.create_source(&config);
+        let source = registry.create_source(&config, None);
         assert!(source.is_ok());
     }
 }

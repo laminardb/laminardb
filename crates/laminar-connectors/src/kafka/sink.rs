@@ -135,7 +135,11 @@ impl KafkaSink {
     /// Panics if `config.format` is not a supported serialization format.
     /// Call [`KafkaSinkConfig::validate`] first to catch this at config time.
     #[must_use]
-    pub fn new(schema: SchemaRef, config: KafkaSinkConfig) -> Self {
+    pub fn new(
+        schema: SchemaRef,
+        config: KafkaSinkConfig,
+        registry: Option<&prometheus::Registry>,
+    ) -> Self {
         let avro_schema_id = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let serializer =
             select_serializer(config.format, &schema, Arc::clone(&avro_schema_id), None)
@@ -152,7 +156,7 @@ impl KafkaSink {
             last_committed_epoch: 0,
             transaction_active: false,
             dlq_producer: None,
-            metrics: KafkaSinkMetrics::new(),
+            metrics: KafkaSinkMetrics::new(registry),
             schema,
             schema_registry: None,
             avro_schema_id,
@@ -193,7 +197,7 @@ impl KafkaSink {
             last_committed_epoch: 0,
             transaction_active: false,
             dlq_producer: None,
-            metrics: KafkaSinkMetrics::new(),
+            metrics: KafkaSinkMetrics::new(None),
             schema,
             schema_registry: Some(sr),
             avro_schema_id,
@@ -1009,7 +1013,7 @@ mod tests {
 
     #[test]
     fn test_new_defaults() {
-        let sink = KafkaSink::new(test_schema(), test_config());
+        let sink = KafkaSink::new(test_schema(), test_config(), None);
         assert_eq!(sink.state(), ConnectorState::Created);
         assert!(sink.producer.is_none());
         assert_eq!(sink.current_epoch(), 0);
@@ -1020,33 +1024,33 @@ mod tests {
     #[test]
     fn test_schema_returned() {
         let schema = test_schema();
-        let sink = KafkaSink::new(schema.clone(), test_config());
+        let sink = KafkaSink::new(schema.clone(), test_config(), None);
         assert_eq!(sink.schema(), schema);
     }
 
     #[test]
     fn test_health_check_created() {
-        let sink = KafkaSink::new(test_schema(), test_config());
+        let sink = KafkaSink::new(test_schema(), test_config(), None);
         assert_eq!(sink.health_check(), HealthStatus::Unknown);
     }
 
     #[test]
     fn test_health_check_running() {
-        let mut sink = KafkaSink::new(test_schema(), test_config());
+        let mut sink = KafkaSink::new(test_schema(), test_config(), None);
         sink.state = ConnectorState::Running;
         assert_eq!(sink.health_check(), HealthStatus::Healthy);
     }
 
     #[test]
     fn test_health_check_closed() {
-        let mut sink = KafkaSink::new(test_schema(), test_config());
+        let mut sink = KafkaSink::new(test_schema(), test_config(), None);
         sink.state = ConnectorState::Closed;
         assert!(matches!(sink.health_check(), HealthStatus::Unhealthy(_)));
     }
 
     #[test]
     fn test_metrics_initial() {
-        let sink = KafkaSink::new(test_schema(), test_config());
+        let sink = KafkaSink::new(test_schema(), test_config(), None);
         let m = sink.metrics();
         assert_eq!(m.records_total, 0);
         assert_eq!(m.bytes_total, 0);
@@ -1055,7 +1059,7 @@ mod tests {
 
     #[test]
     fn test_capabilities_at_least_once() {
-        let sink = KafkaSink::new(test_schema(), test_config());
+        let sink = KafkaSink::new(test_schema(), test_config(), None);
         let caps = sink.capabilities();
         assert!(!caps.exactly_once);
         assert!(caps.idempotent);
@@ -1067,7 +1071,7 @@ mod tests {
     fn test_capabilities_exactly_once() {
         let mut cfg = test_config();
         cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-        let sink = KafkaSink::new(test_schema(), cfg);
+        let sink = KafkaSink::new(test_schema(), cfg, None);
         let caps = sink.capabilities();
         assert!(caps.exactly_once);
         assert!(caps.idempotent);
@@ -1076,7 +1080,7 @@ mod tests {
 
     #[test]
     fn test_serializer_selection_json() {
-        let sink = KafkaSink::new(test_schema(), test_config());
+        let sink = KafkaSink::new(test_schema(), test_config(), None);
         assert_eq!(sink.serializer.format(), Format::Json);
     }
 
@@ -1084,7 +1088,7 @@ mod tests {
     fn test_serializer_selection_avro() {
         let mut cfg = test_config();
         cfg.format = Format::Avro;
-        let sink = KafkaSink::new(test_schema(), cfg);
+        let sink = KafkaSink::new(test_schema(), cfg, None);
         assert_eq!(sink.serializer.format(), Format::Avro);
     }
 
@@ -1104,7 +1108,7 @@ mod tests {
 
     #[test]
     fn test_debug_output() {
-        let sink = KafkaSink::new(test_schema(), test_config());
+        let sink = KafkaSink::new(test_schema(), test_config(), None);
         let debug = format!("{sink:?}");
         assert!(debug.contains("KafkaSink"));
         assert!(debug.contains("output-events"));
@@ -1112,7 +1116,7 @@ mod tests {
 
     #[test]
     fn test_extract_keys_no_key_column() {
-        let sink = KafkaSink::new(test_schema(), test_config());
+        let sink = KafkaSink::new(test_schema(), test_config(), None);
         let batch = arrow_array::RecordBatch::try_new(
             test_schema(),
             vec![
@@ -1128,7 +1132,7 @@ mod tests {
     fn test_extract_keys_with_key_column() {
         let mut cfg = test_config();
         cfg.key_column = Some("value".into());
-        let sink = KafkaSink::new(test_schema(), cfg);
+        let sink = KafkaSink::new(test_schema(), cfg, None);
         let batch = arrow_array::RecordBatch::try_new(
             test_schema(),
             vec![

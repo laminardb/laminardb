@@ -149,12 +149,12 @@ enum WalPayload {
 impl PostgresCdcSource {
     /// Creates a new `PostgreSQL` CDC source with the given configuration.
     #[must_use]
-    pub fn new(config: PostgresCdcConfig) -> Self {
+    pub fn new(config: PostgresCdcConfig, registry: Option<&prometheus::Registry>) -> Self {
         Self {
             config,
             state: ConnectorState::Created,
             schema: cdc_envelope_schema(),
-            metrics: Arc::new(PostgresCdcMetrics::new()),
+            metrics: Arc::new(PostgresCdcMetrics::new(registry)),
             relation_cache: RelationCache::new(),
             event_buffer: VecDeque::new(),
             current_txn: None,
@@ -183,7 +183,7 @@ impl PostgresCdcSource {
     /// Returns `ConnectorError` if the configuration is invalid.
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
         let pg_config = PostgresCdcConfig::from_config(config)?;
-        Ok(Self::new(pg_config))
+        Ok(Self::new(pg_config, None))
     }
 
     /// Returns a reference to the CDC configuration.
@@ -1048,10 +1048,9 @@ mod tests {
     use super::*;
     use crate::cdc::postgres::types::{INT4_OID, INT8_OID, TEXT_OID};
     use arrow_array::cast::AsArray;
-    use std::sync::atomic::Ordering;
 
     fn default_source() -> PostgresCdcSource {
-        PostgresCdcSource::new(PostgresCdcConfig::default())
+        PostgresCdcSource::new(PostgresCdcConfig::default(), None)
     }
 
     fn running_source() -> PostgresCdcSource {
@@ -1349,7 +1348,7 @@ mod tests {
     async fn test_table_exclude_filter() {
         let mut config = PostgresCdcConfig::default();
         config.table_exclude = vec!["users".to_string()];
-        let mut src = PostgresCdcSource::new(config);
+        let mut src = PostgresCdcSource::new(config, None);
         src.state = ConnectorState::Running;
 
         let rel_msg = PostgresCdcSource::build_relation_message(
@@ -1715,6 +1714,6 @@ mod tests {
         assert_eq!(batch.records.num_rows(), 50);
         // 200 - 50 drained = 150 remaining. No events dropped.
         assert_eq!(src.event_buffer.len(), 150);
-        assert_eq!(src.metrics.events_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(src.metrics.events_dropped.get(), 0);
     }
 }

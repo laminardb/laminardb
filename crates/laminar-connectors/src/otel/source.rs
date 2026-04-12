@@ -54,7 +54,7 @@ pub struct OtelSource {
 impl OtelSource {
     /// Create a new OTel source with the given default schema.
     #[must_use]
-    pub fn new(schema: SchemaRef) -> Self {
+    pub fn new(schema: SchemaRef, _registry: Option<&prometheus::Registry>) -> Self {
         Self {
             config: OtelSourceConfig::default(),
             schema,

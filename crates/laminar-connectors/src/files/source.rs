@@ -47,6 +47,12 @@ impl FileSource {
     /// Creates a new file source with a placeholder schema.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_registry(None)
+    }
+
+    /// Creates a new file source with an optional Prometheus registry.
+    #[must_use]
+    pub fn with_registry(_registry: Option<&prometheus::Registry>) -> Self {
         let empty_schema = Arc::new(Schema::empty());
         Self {
             config: None,

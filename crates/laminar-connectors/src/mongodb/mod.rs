@@ -45,7 +45,12 @@ pub fn register_mongodb_cdc_source(registry: &ConnectorRegistry) {
     registry.register_source(
         "mongodb-cdc",
         info,
-        Arc::new(|| Box::new(MongoDbCdcSource::new(MongoDbSourceConfig::default()))),
+        Arc::new(|registry: Option<&prometheus::Registry>| {
+            Box::new(MongoDbCdcSource::new(
+                MongoDbSourceConfig::default(),
+                registry,
+            ))
+        }),
     );
 }
 
@@ -65,12 +70,16 @@ pub fn register_mongodb_sink(registry: &ConnectorRegistry) {
     registry.register_sink(
         "mongodb-sink",
         info,
-        Arc::new(|| {
+        Arc::new(|registry: Option<&prometheus::Registry>| {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("key", DataType::Utf8, true),
                 Field::new("value", DataType::Utf8, false),
             ]));
-            Box::new(MongoDbSink::new(schema, MongoDbSinkConfig::default()))
+            Box::new(MongoDbSink::new(
+                schema,
+                MongoDbSinkConfig::default(),
+                registry,
+            ))
         }),
     );
 }
@@ -180,7 +189,7 @@ mod tests {
         register_mongodb_cdc_source(&registry);
 
         let config = crate::config::ConnectorConfig::new("mongodb-cdc");
-        let source = registry.create_source(&config);
+        let source = registry.create_source(&config, None);
         assert!(source.is_ok());
     }
 
@@ -190,7 +199,7 @@ mod tests {
         register_mongodb_sink(&registry);
 
         let config = crate::config::ConnectorConfig::new("mongodb-sink");
-        let sink = registry.create_sink(&config);
+        let sink = registry.create_sink(&config, None);
         assert!(sink.is_ok());
     }
 }

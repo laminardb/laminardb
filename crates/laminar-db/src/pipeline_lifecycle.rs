@@ -86,6 +86,16 @@ impl LaminarDB {
         self.state
             .store(STATE_STARTING, std::sync::atomic::Ordering::Release);
 
+        // Fallback for embedded use without a server.
+        {
+            let mut guard = self.engine_metrics.lock();
+            if guard.is_none() {
+                *guard = Some(Arc::new(crate::engine_metrics::EngineMetrics::new(
+                    &prometheus::Registry::new(),
+                )));
+            }
+        }
+
         match self.start_inner().await {
             Ok(()) => {
                 self.state
@@ -172,7 +182,9 @@ impl LaminarDB {
                 ..CkpConfig::default()
             };
             let mut coord = CheckpointCoordinator::new(config, store);
-            coord.set_counters(Arc::clone(&self.counters));
+            if let Some(ref prom) = *self.engine_metrics.lock() {
+                coord.set_metrics(Arc::clone(prom));
+            }
 
             *self.coordinator.lock().await = Some(coord);
         }
@@ -265,7 +277,9 @@ impl LaminarDB {
         let mut graph = OperatorGraph::new(ctx);
         graph.set_max_state_bytes(self.config.max_state_bytes_per_operator);
         graph.set_lookup_registry(Arc::clone(&self.lookup_registry));
-        graph.set_counters(Arc::clone(&self.counters));
+        if let Some(ref prom) = *self.engine_metrics.lock() {
+            graph.set_metrics(Arc::clone(prom));
+        }
 
         // Register source schemas for ALL sources (both external connectors
         // and catalog-bridge sources) so the graph can create empty
@@ -383,6 +397,10 @@ impl LaminarDB {
             }
         }
 
+        // Grab the shared Prometheus registry (if set) so connectors can
+        // register their metrics on it.
+        let prom_registry = self.prometheus_registry.lock().clone();
+
         // Build sources as owned SourceRegistrations (no Arc<Mutex>).
         let mut sources: Vec<SourceRegistration> = Vec::new();
         for (name, reg) in &source_regs {
@@ -400,7 +418,7 @@ impl LaminarDB {
 
             let source = self
                 .connector_registry
-                .create_source(&config)
+                .create_source(&config, prom_registry.as_deref())
                 .map_err(|e| {
                     DbError::Connector(format!(
                         "Cannot create source '{}' (type '{}'): {e}",
@@ -537,13 +555,16 @@ impl LaminarDB {
                 continue;
             }
             let config = build_sink_config(reg)?;
-            let mut sink = self.connector_registry.create_sink(&config).map_err(|e| {
-                DbError::Connector(format!(
-                    "Cannot create sink '{}' (type '{}'): {e}",
-                    name,
-                    config.connector_type()
-                ))
-            })?;
+            let mut sink = self
+                .connector_registry
+                .create_sink(&config, prom_registry.as_deref())
+                .map_err(|e| {
+                    DbError::Connector(format!(
+                        "Cannot create sink '{}' (type '{}'): {e}",
+                        name,
+                        config.connector_type()
+                    ))
+                })?;
             // Open the connector before handing it to the task.
             sink.open(&config)
                 .await
@@ -1065,15 +1086,6 @@ impl LaminarDB {
         let shutdown = self.shutdown_signal.clone();
 
         // Build the PipelineCallback implementation that bridges to db.rs internals.
-        let counters = Arc::clone(&self.counters);
-        // Mirror the configured per-operator state cap into the counters
-        // so the /metrics endpoint can report the enforced limit.
-        if let Some(cap) = self.config.max_state_bytes_per_operator {
-            #[allow(clippy::cast_possible_truncation)]
-            counters
-                .max_state_bytes
-                .store(cap as u64, std::sync::atomic::Ordering::Relaxed);
-        }
         let pipeline_watermark = Arc::clone(&self.pipeline_watermark);
         let coordinator = Arc::clone(&self.coordinator);
         let table_store_for_loop = self.table_store.clone();
@@ -1098,6 +1110,11 @@ impl LaminarDB {
         graph.set_query_budget_ns(pipeline_config.query_budget_ns);
         graph.set_max_input_buf_batches(pipeline_config.max_input_buf_batches);
 
+        let prom = self
+            .engine_metrics
+            .lock()
+            .clone()
+            .expect("EngineMetrics must be set before start()");
         let callback = crate::pipeline_callback::ConnectorPipelineCallback {
             graph,
             stream_sources,
@@ -1106,7 +1123,7 @@ impl LaminarDB {
             source_entries_for_wm,
             source_ids,
             tracker,
-            counters,
+            prom,
             pipeline_watermark,
             coordinator,
             table_sources,
@@ -1127,9 +1144,6 @@ impl LaminarDB {
             serialization_timeout: std::time::Duration::from_secs(120),
             sink_event_rx,
             sink_timed_out: false,
-            cycle_histogram: std::cell::RefCell::new(
-                crate::checkpoint_coordinator::DurationHistogram::new(),
-            ),
         };
 
         // Start the streaming coordinator on a dedicated compute thread.

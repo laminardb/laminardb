@@ -59,7 +59,7 @@ pub struct IcebergSource {
 impl IcebergSource {
     /// Creates a new Iceberg source with the given configuration.
     #[must_use]
-    pub fn new(config: IcebergSourceConfig) -> Self {
+    pub fn new(config: IcebergSourceConfig, _registry: Option<&prometheus::Registry>) -> Self {
         Self {
             config,
             schema: None,
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn test_new_source() {
-        let source = IcebergSource::new(test_source_config());
+        let source = IcebergSource::new(test_source_config(), None);
         assert!(source.schema.is_none());
         assert!(source.last_snapshot_id.is_none());
         assert!(source.buffer.is_empty());
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_round_trip() {
-        let mut source = IcebergSource::new(test_source_config());
+        let mut source = IcebergSource::new(test_source_config(), None);
         source.last_snapshot_id = Some(42);
         source.epoch = 5;
 
@@ -307,7 +307,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_restore_from_checkpoint() {
-        let mut source = IcebergSource::new(test_source_config());
+        let mut source = IcebergSource::new(test_source_config(), None);
         let mut cp = SourceCheckpoint::new(10);
         cp.set_offset("snapshot_id", "123");
 
@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn test_supports_replay_false() {
-        let source = IcebergSource::new(test_source_config());
+        let source = IcebergSource::new(test_source_config(), None);
         assert!(!source.supports_replay());
     }
 }

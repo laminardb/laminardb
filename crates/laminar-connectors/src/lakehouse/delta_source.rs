@@ -82,7 +82,7 @@ pub struct DeltaSource {
 impl DeltaSource {
     /// Creates a new Delta Lake source with the given configuration.
     #[must_use]
-    pub fn new(config: DeltaSourceConfig) -> Self {
+    pub fn new(config: DeltaSourceConfig, _registry: Option<&prometheus::Registry>) -> Self {
         Self {
             config,
             state: ConnectorState::Created,
@@ -615,7 +615,7 @@ mod tests {
 
     #[test]
     fn test_new_defaults() {
-        let source = DeltaSource::new(test_config());
+        let source = DeltaSource::new(test_config(), None);
         assert_eq!(source.state(), ConnectorState::Created);
         assert_eq!(source.current_version(), -1);
         assert!(source.schema.is_none());
@@ -623,7 +623,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_roundtrip() {
-        let mut source = DeltaSource::new(test_config());
+        let mut source = DeltaSource::new(test_config(), None);
         source.current_version = 42;
 
         let cp = source.checkpoint();
@@ -632,7 +632,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_restore_from_checkpoint() {
-        let mut source = DeltaSource::new(test_config());
+        let mut source = DeltaSource::new(test_config(), None);
         assert_eq!(source.current_version(), -1);
 
         let mut cp = SourceCheckpoint::new(0);
@@ -644,7 +644,7 @@ mod tests {
 
     #[test]
     fn test_health_check() {
-        let mut source = DeltaSource::new(test_config());
+        let mut source = DeltaSource::new(test_config(), None);
         assert_eq!(source.health_check(), HealthStatus::Unknown);
 
         source.state = ConnectorState::Running;
@@ -656,14 +656,14 @@ mod tests {
 
     #[test]
     fn test_schema_empty_when_none() {
-        let source = DeltaSource::new(test_config());
+        let source = DeltaSource::new(test_config(), None);
         let schema = source.schema();
         assert_eq!(schema.fields().len(), 0);
     }
 
     #[tokio::test]
     async fn test_poll_not_running() {
-        let mut source = DeltaSource::new(test_config());
+        let mut source = DeltaSource::new(test_config(), None);
         // state is Created, not Running
         let result = source.poll_batch(100).await;
         assert!(result.is_err());
@@ -671,7 +671,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_poll_returns_buffered_batches() {
-        let mut source = DeltaSource::new(test_config());
+        let mut source = DeltaSource::new(test_config(), None);
         source.state = ConnectorState::Running;
 
         // Manually buffer some batches.
@@ -694,7 +694,7 @@ mod tests {
     /// incrementally; with the feature, `read_batches_at_version` applies LIMIT.
     #[tokio::test]
     async fn test_poll_batch_returns_buffered_incrementally() {
-        let mut source = DeltaSource::new(test_config());
+        let mut source = DeltaSource::new(test_config(), None);
         source.state = ConnectorState::Running;
 
         // Simulate what read_batches_at_version produces: many small batches
@@ -715,7 +715,7 @@ mod tests {
     /// until the last batch is consumed, then jumps to the target version.
     #[tokio::test]
     async fn test_version_deferred_until_buffer_drained() {
-        let mut source = DeltaSource::new(test_config());
+        let mut source = DeltaSource::new(test_config(), None);
         source.state = ConnectorState::Running;
         source.current_version = 5;
 
@@ -750,7 +750,7 @@ mod tests {
     fn test_poll_interval_is_stored() {
         let mut config = test_config();
         config.poll_interval = std::time::Duration::from_millis(500);
-        let source = DeltaSource::new(config);
+        let source = DeltaSource::new(config, None);
         assert_eq!(
             source.config().poll_interval,
             std::time::Duration::from_millis(500)
@@ -759,7 +759,7 @@ mod tests {
 
     #[test]
     fn test_debug_output() {
-        let source = DeltaSource::new(test_config());
+        let source = DeltaSource::new(test_config(), None);
         let debug = format!("{source:?}");
         assert!(debug.contains("DeltaSource"));
         assert!(debug.contains("/tmp/delta_source_test"));
@@ -767,7 +767,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_close() {
-        let mut source = DeltaSource::new(test_config());
+        let mut source = DeltaSource::new(test_config(), None);
         source.state = ConnectorState::Running;
         source.pending_batches.push_back(test_batch(5));
 
@@ -780,7 +780,7 @@ mod tests {
     #[cfg(not(feature = "delta-lake"))]
     #[tokio::test]
     async fn test_open_requires_feature() {
-        let mut source = DeltaSource::new(test_config());
+        let mut source = DeltaSource::new(test_config(), None);
         let connector_config = crate::config::ConnectorConfig::new("delta-lake");
         let result = source.open(&connector_config).await;
         assert!(result.is_err());

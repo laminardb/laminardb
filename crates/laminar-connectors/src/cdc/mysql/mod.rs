@@ -54,8 +54,9 @@ pub fn register_mysql_cdc_source(registry: &ConnectorRegistry) {
     registry.register_source(
         "mysql-cdc",
         info.clone(),
-        Arc::new(|| {
-            Box::new(MySqlCdcSource::new(MySqlCdcConfig::default())) as Box<dyn SourceConnector>
+        Arc::new(|registry: Option<&prometheus::Registry>| {
+            Box::new(MySqlCdcSource::new(MySqlCdcConfig::default(), registry))
+                as Box<dyn SourceConnector>
         }),
     );
 
@@ -63,7 +64,7 @@ pub fn register_mysql_cdc_source(registry: &ConnectorRegistry) {
         "mysql-cdc",
         info,
         Arc::new(|config| {
-            let connector = Box::new(MySqlCdcSource::new(MySqlCdcConfig::default()));
+            let connector = Box::new(MySqlCdcSource::new(MySqlCdcConfig::default(), None));
             Ok(Box::new(crate::lookup::cdc_adapter::CdcTableSource::new(
                 connector,
                 config.clone(),
@@ -195,7 +196,7 @@ mod tests {
         let _config = MySqlCdcConfig::default();
         let _ssl = SslMode::Preferred;
         let _snapshot = SnapshotMode::Initial;
-        let _metrics = MySqlCdcMetrics::new();
+        let _metrics = MySqlCdcMetrics::new(None);
         let _cache = TableCache::new();
         let _op = CdcOperation::Insert;
     }
