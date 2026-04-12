@@ -86,10 +86,6 @@ The `StreamingPhysicalValidator` rule catches invalid physical plans (e.g., Sort
 - **Warn** -- logs a warning but allows execution
 - **Off** -- disables validation
 
-## Watermark Filter Pushdown
-
-The `WatermarkDynamicFilter` pushes `ts >= watermark` predicates down to `StreamingScanExec` so late rows are dropped before expression evaluation. Uses shared `Arc<AtomicI64>` for zero-copy watermark updates from the coordinator.
-
 ## Public API
 
 ```rust

@@ -24,7 +24,7 @@ pub use datafusion::execute::execute_streaming_sql;
 pub use datafusion::{
     base_session_config, create_session_context, create_streaming_context_with_validator,
     register_streaming_functions, register_streaming_functions_with_watermark, DdlResult,
-    QueryResult, StreamingSqlResult, WatermarkDynamicFilter,
+    QueryResult, StreamingSqlResult,
 };
 
 /// Result type for SQL operations
