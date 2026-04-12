@@ -431,6 +431,27 @@ impl LaminarDB {
                         entry.source.set_event_time_column(col);
                     }
                 }
+                // Carry the out-of-orderness bound alongside the column so
+                // the fallback watermark path below uses the configured
+                // tolerance instead of Duration::ZERO.
+                if let Some(ms_str) = config.get("max.out.of.orderness.ms") {
+                    match ms_str.parse::<u64>() {
+                        Ok(ms) => {
+                            entry
+                                .source
+                                .set_max_out_of_orderness(std::time::Duration::from_millis(ms));
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                source = %name,
+                                value = %ms_str,
+                                error = %e,
+                                "ignoring unparseable max.out.of.orderness.ms — \
+                                 watermark will use Duration::ZERO"
+                            );
+                        }
+                    }
+                }
             }
 
             sources.push(SourceRegistration {
@@ -895,9 +916,10 @@ impl LaminarDB {
         // Fallback watermark path for sources that set `event_time_column`
         // without an SQL `WATERMARK FOR` clause — exercised by the
         // programmatic API (`handle.set_event_time_column`) and by the
-        // connector-property wiring above. Uses `Duration::ZERO` for
-        // out-of-orderness because those paths don't carry a bound; if
-        // you want a non-zero bound, use `[source.watermark]` instead.
+        // connector-property wiring above. Uses the bound from
+        // `source.max_out_of_orderness()` if one was wired from connector
+        // properties (e.g. Kafka `max.out.of.orderness.ms`), otherwise
+        // falls back to `Duration::ZERO`.
         for name in self.catalog.list_sources() {
             if watermark_states.contains_key(&name) {
                 continue;
@@ -906,6 +928,10 @@ impl LaminarDB {
                 if let Some(col) = entry.source.event_time_column() {
                     let extractor = laminar_core::time::EventTimeExtractor::from_column(&col)
                         .with_mode(laminar_core::time::ExtractionMode::Max);
+                    let ooo_bound = entry
+                        .source
+                        .max_out_of_orderness()
+                        .unwrap_or(std::time::Duration::ZERO);
                     let generator: Box<dyn laminar_core::time::WatermarkGenerator> = if entry
                         .is_processing_time
                         .load(std::sync::atomic::Ordering::Relaxed)
@@ -914,7 +940,7 @@ impl LaminarDB {
                     } else {
                         Box::new(
                             laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
-                                std::time::Duration::ZERO,
+                                ooo_bound,
                             ),
                         )
                     };

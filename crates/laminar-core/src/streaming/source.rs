@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
@@ -124,6 +125,10 @@ struct SourceInner<T: Record> {
     /// Event-time column name set via programmatic API.
     /// Read once at pipeline startup, not on the hot path.
     event_time_column: OnceLock<String>,
+
+    /// Max out-of-orderness bound, paired with `event_time_column`.
+    /// Read once at pipeline startup, not on the hot path.
+    max_out_of_orderness: OnceLock<Duration>,
 }
 
 /// A streaming data source. Cloneable for multi-producer use.
@@ -146,6 +151,7 @@ impl<T: Record> Source<T> {
             name: config.name,
             sequence: Arc::new(AtomicU64::new(0)),
             event_time_column: OnceLock::new(),
+            max_out_of_orderness: OnceLock::new(),
         });
 
         let source = Self { inner };
@@ -348,6 +354,19 @@ impl<T: Record> Source<T> {
     pub fn event_time_column(&self) -> Option<String> {
         self.inner.event_time_column.get().cloned()
     }
+
+    /// Set the max out-of-orderness bound for watermark generation.
+    ///
+    /// Only the first call takes effect; subsequent calls are silently ignored.
+    pub fn set_max_out_of_orderness(&self, dur: Duration) {
+        let _ = self.inner.max_out_of_orderness.set(dur);
+    }
+
+    /// Returns the configured max out-of-orderness, if any.
+    #[must_use]
+    pub fn max_out_of_orderness(&self) -> Option<Duration> {
+        self.inner.max_out_of_orderness.get().copied()
+    }
 }
 
 impl<T: Record> Clone for Source<T> {
@@ -358,6 +377,11 @@ impl<T: Record> Clone for Source<T> {
         if let Some(col) = event_time_col {
             let _ = event_time_column.set(col);
         }
+        let max_ooo = self.inner.max_out_of_orderness.get().copied();
+        let max_out_of_orderness = OnceLock::new();
+        if let Some(dur) = max_ooo {
+            let _ = max_out_of_orderness.set(dur);
+        }
         Self {
             inner: Arc::new(SourceInner {
                 producer,
@@ -366,6 +390,7 @@ impl<T: Record> Clone for Source<T> {
                 name: self.inner.name.clone(),
                 sequence: Arc::clone(&self.inner.sequence),
                 event_time_column,
+                max_out_of_orderness,
             }),
         }
     }
