@@ -1048,7 +1048,6 @@ mod tests {
     use super::*;
     use crate::cdc::postgres::types::{INT4_OID, INT8_OID, TEXT_OID};
     use arrow_array::cast::AsArray;
-    use std::sync::atomic::Ordering;
 
     fn default_source() -> PostgresCdcSource {
         PostgresCdcSource::new(PostgresCdcConfig::default(), None)

@@ -134,9 +134,7 @@ pub async fn run_server(
         .map_err(|e| ServerError::Build(e.to_string()))?;
     let db = Arc::new(db);
 
-    // Build the prometheus registry and inject it BEFORE start() so
-    // connectors created during pipeline startup register their metrics
-    // on the shared registry.
+    // Prometheus registry — must be set before start().
     let hostname = gethostname::gethostname().to_string_lossy().into_owned();
     let pipeline_name = config
         .pipelines

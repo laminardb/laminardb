@@ -86,6 +86,16 @@ impl LaminarDB {
         self.state
             .store(STATE_STARTING, std::sync::atomic::Ordering::Release);
 
+        // Fallback for embedded use without a server.
+        {
+            let mut guard = self.engine_metrics.lock();
+            if guard.is_none() {
+                *guard = Some(Arc::new(crate::engine_metrics::EngineMetrics::new(
+                    &prometheus::Registry::new(),
+                )));
+            }
+        }
+
         match self.start_inner().await {
             Ok(()) => {
                 self.state
@@ -1100,21 +1110,11 @@ impl LaminarDB {
         graph.set_query_budget_ns(pipeline_config.query_budget_ns);
         graph.set_max_input_buf_batches(pipeline_config.max_input_buf_batches);
 
-        let prom = {
-            let mut guard = self.engine_metrics.lock();
-            if let Some(ref m) = *guard {
-                Arc::clone(m)
-            } else {
-                // No external EngineMetrics was injected — create a private one
-                // so the pipeline always has a metrics instance. Store it back
-                // so `metrics()` / `total_events_processed()` can read it too.
-                let m = Arc::new(crate::engine_metrics::EngineMetrics::new(
-                    &prometheus::Registry::new(),
-                ));
-                *guard = Some(Arc::clone(&m));
-                m
-            }
-        };
+        let prom = self
+            .engine_metrics
+            .lock()
+            .clone()
+            .expect("EngineMetrics must be set before start()");
         let callback = crate::pipeline_callback::ConnectorPipelineCallback {
             graph,
             stream_sources,

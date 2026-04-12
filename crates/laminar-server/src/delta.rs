@@ -371,6 +371,21 @@ pub async fn start_delta(
         .map_err(|e| DeltaStartupError::EngineConstruction(e.to_string()))?;
     let db = Arc::new(db);
 
+    // Build prometheus registry before start() so connectors register on it.
+    let hostname = gethostname::gethostname().to_string_lossy().into_owned();
+    let pipeline_name = config
+        .pipelines
+        .first()
+        .map_or("default", |p| p.name.as_str())
+        .to_string();
+    let registry = Arc::new(crate::metrics::build_registry([
+        ("instance".into(), hostname),
+        ("pipeline".into(), pipeline_name),
+    ]));
+    let engine_metrics = Arc::new(laminar_db::EngineMetrics::new(&registry));
+    db.set_engine_metrics(engine_metrics);
+    db.set_prometheus_registry(Arc::clone(&registry));
+
     server::execute_config_ddl(&db, &config)
         .await
         .map_err(|e| DeltaStartupError::EngineConstruction(e.to_string()))?;
@@ -381,7 +396,7 @@ pub async fn start_delta(
     info!("Pipeline started");
 
     let (app_state, api_handle) =
-        server::start_http_api(Arc::clone(&db), config_path.clone(), config)
+        server::start_http_api(Arc::clone(&db), registry, config_path.clone(), config)
             .await
             .map_err(|e| DeltaStartupError::HttpStartup(e.to_string()))?;
     let watcher_handle = server::spawn_config_watcher(&app_state, config_path);

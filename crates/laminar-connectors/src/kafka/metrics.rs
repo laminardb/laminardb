@@ -330,7 +330,7 @@ mod tests {
 
         // Verify the metrics are registered on the registry.
         let families = reg.gather();
-        let names: Vec<&str> = families.iter().map(|f| f.get_name()).collect();
+        let names: Vec<&str> = families.iter().map(|f| f.name()).collect();
         assert!(names.contains(&"kafka_source_records_polled_total"));
         assert!(names.contains(&"kafka_source_errors_total"));
     }
