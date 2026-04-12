@@ -541,8 +541,6 @@ mod tests {
         assert!(!store.is_persistent("t"));
     }
 
-    // ── Partial cache mode tests ──
-
     #[test]
     fn test_partial_cache_lookup_populates_lru() {
         let mut store = TableStore::new();
@@ -758,8 +756,6 @@ mod tests {
         let row = store.lookup("t", "1").unwrap();
         assert_eq!(row.num_rows(), 1);
     }
-
-    // ── Row count tracking tests ──
 
     #[test]
     fn test_row_count_tracks_upserts_and_deletes() {

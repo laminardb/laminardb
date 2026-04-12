@@ -1,31 +1,8 @@
-//! End-to-end streaming SQL execution
-//!
-//! Provides [`execute_streaming_sql`] for parsing, planning, and executing
-//! streaming SQL statements through the `DataFusion` engine.
-//!
-//! # Architecture
-//!
-//! ```text
-//! SQL string
-//!     │
-//!     ▼
-//! parse_streaming_sql()  →  StreamingStatement
-//!     │
-//!     ▼
-//! StreamingPlanner::plan()  →  StreamingPlan
-//!     │
-//!     ├─ DDL (CREATE SOURCE/SINK)  →  DdlResult
-//!     │
-//!     ├─ Query (windows/joins)     →  LogicalPlan → DataFrame → stream
-//!     │                                + QueryPlan metadata
-//!     │
-//!     └─ Standard SQL              →  DataFusion ctx.sql() → stream
-//! ```
+//! Streaming SQL execution via DataFusion.
 
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 
-use crate::parser::interval_rewriter::rewrite_interval_arithmetic;
 use crate::parser::parse_streaming_sql;
 use crate::planner::{QueryPlan, StreamingPlan, StreamingPlanner};
 use crate::Error;
@@ -108,12 +85,7 @@ pub async fn execute_streaming_sql(
     let plan = planner.plan(statement)?;
 
     match plan {
-        StreamingPlan::RegisterSource(_) | StreamingPlan::RegisterSink(_) => {
-            Ok(StreamingSqlResult::Ddl(DdlResult { plan }))
-        }
-        StreamingPlan::Query(mut query_plan) => {
-            // Rewrite INTERVAL arithmetic for BIGINT timestamp columns
-            rewrite_interval_arithmetic(&mut query_plan.statement);
+        StreamingPlan::Query(query_plan) => {
             let logical_plan = planner.to_logical_plan(&query_plan, ctx).await?;
             let df = ctx.execute_logical_plan(logical_plan).await?;
             let stream = df.execute_stream().await?;
@@ -123,9 +95,7 @@ pub async fn execute_streaming_sql(
                 query_plan: Some(query_plan),
             }))
         }
-        StreamingPlan::Standard(mut stmt) => {
-            // Rewrite INTERVAL arithmetic for BIGINT timestamp columns
-            rewrite_interval_arithmetic(&mut stmt);
+        StreamingPlan::Standard(stmt) => {
             let sql_str = stmt.to_string();
             let df = ctx.sql(&sql_str).await?;
             let stream = df.execute_stream().await?;
@@ -135,7 +105,8 @@ pub async fn execute_streaming_sql(
                 query_plan: None,
             }))
         }
-        StreamingPlan::DagExplain(_)
+        StreamingPlan::RegisterSource(_)
+        | StreamingPlan::RegisterSink(_)
         | StreamingPlan::RegisterLookupTable(_)
         | StreamingPlan::DropLookupTable { .. } => Ok(StreamingSqlResult::Ddl(DdlResult { plan })),
     }
@@ -269,5 +240,162 @@ mod tests {
             }
             StreamingSqlResult::Ddl(_) => panic!("Expected Query result"),
         }
+    }
+
+    /// Regression: DataFusion must plan `Timestamp(Nanosecond) + INTERVAL`
+    /// natively. If this breaks on a DF upgrade, the OTel example's
+    /// interval-join predicates stop working.
+    #[tokio::test]
+    async fn test_datafusion_timestamp_plus_interval_native() {
+        use arrow_array::{RecordBatch, TimestampNanosecondArray};
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+        use datafusion::prelude::SessionContext;
+        use futures::StreamExt;
+        use std::sync::Arc;
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]));
+
+        // Year 2023 → ns. Add 5s; expect +5_000_000_000 ns.
+        let base_ns: i64 = 1_700_000_000_500_000_000;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(TimestampNanosecondArray::from(vec![base_ns]))],
+        )
+        .unwrap();
+
+        ctx.register_batch("events", batch).unwrap();
+
+        let df = ctx
+            .sql("SELECT ts + INTERVAL '5' SECOND AS shifted FROM events")
+            .await
+            .expect("DataFusion must plan Timestamp(Nanosecond) + INTERVAL natively");
+
+        let result_schema = df.schema().clone();
+        let shifted_type = result_schema.field(0).data_type();
+        assert!(
+            matches!(shifted_type, DataType::Timestamp(_, _)),
+            "expected Timestamp return type from Timestamp + INTERVAL, got {shifted_type:?}"
+        );
+
+        let mut stream = df.execute_stream().await.unwrap();
+        let batch = stream.next().await.unwrap().unwrap();
+        let col = batch.column(0);
+        let arr = col
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .expect("DataFusion should preserve Nanosecond precision");
+        assert_eq!(
+            arr.value(0),
+            base_ns + 5_000_000_000,
+            "Timestamp(Nanosecond) + INTERVAL '5' SECOND should add exactly 5_000_000_000 ns"
+        );
+    }
+
+    /// Regression: `BETWEEN t AND t + INTERVAL 'N' MINUTE` is the
+    /// exact shape the OTel example's interval join uses.
+    #[tokio::test]
+    async fn test_datafusion_timestamp_between_interval_native() {
+        use arrow_array::{Int64Array, RecordBatch, TimestampNanosecondArray};
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+        use datafusion::prelude::SessionContext;
+        use futures::StreamExt;
+        use std::sync::Arc;
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        ]));
+
+        let base_ns: i64 = 1_700_000_000_000_000_000;
+        let ids = Int64Array::from(vec![1, 2, 3, 4]);
+        let tses = TimestampNanosecondArray::from(vec![
+            base_ns,                   // inside the window
+            base_ns + 30_000_000_000,  // 30s later, inside
+            base_ns + 120_000_000_000, // exactly 2 min later, inclusive
+            base_ns + 180_000_000_000, // 3 min later, outside
+        ]);
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(ids), Arc::new(tses)]).unwrap();
+        ctx.register_batch("events", batch).unwrap();
+
+        // Matches the exact shape of the OTel example's join predicate.
+        let sql = "SELECT id FROM events \
+             WHERE ts BETWEEN TIMESTAMP '2023-11-14 22:13:20' \
+                      AND TIMESTAMP '2023-11-14 22:13:20' + INTERVAL '2' MINUTE";
+        let df = ctx.sql(sql).await.expect("BETWEEN with INTERVAL must plan");
+        let mut stream = df.execute_stream().await.unwrap();
+        let mut ids: Vec<i64> = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.unwrap();
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                ids.push(col.value(i));
+            }
+        }
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "rows within 2-minute window should match (inclusive on upper bound)"
+        );
+    }
+
+    /// Regression for the OTel example's `time_to_response_ms`: timestamp
+    /// subtraction returns `Duration(Nanosecond)` (not `Interval`), and
+    /// `CAST(Duration AS BIGINT) / 1_000_000` gives milliseconds.
+    #[tokio::test]
+    async fn test_datafusion_timestamp_subtraction_cast_to_bigint() {
+        use arrow_array::{Int64Array, RecordBatch, TimestampNanosecondArray};
+        use arrow_schema::{DataType, Field, Schema, TimeUnit};
+        use datafusion::prelude::SessionContext;
+        use futures::StreamExt;
+        use std::sync::Arc;
+
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "a_ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new(
+                "p_ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+        ]));
+        let base: i64 = 1_700_000_000_000_000_000;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampNanosecondArray::from(vec![base + 500_000_000])),
+                Arc::new(TimestampNanosecondArray::from(vec![base])),
+            ],
+        )
+        .unwrap();
+        ctx.register_batch("events", batch).unwrap();
+
+        let df = ctx
+            .sql("SELECT CAST(a_ts - p_ts AS BIGINT) / 1000000 AS ms FROM events")
+            .await
+            .expect("CAST(Timestamp - Timestamp AS BIGINT) must plan on DataFusion 52");
+        let mut stream = df.execute_stream().await.unwrap();
+        let batch = stream.next().await.unwrap().unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("result should be Int64 after the divide");
+        assert_eq!(col.value(0), 500, "500 ms difference");
     }
 }

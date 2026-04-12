@@ -47,6 +47,11 @@ pub trait PipelineCallback: Send + 'static {
     /// Called with results to push to stream subscriptions.
     fn push_to_streams(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>);
 
+    /// Update materialized view stores with cycle results.
+    fn update_mv_stores(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
+        let _ = results;
+    }
+
     /// Called with results to write to sinks.
     async fn write_to_sinks(&mut self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>);
 
@@ -95,4 +100,15 @@ pub trait PipelineCallback: Send + 'static {
 
     /// Apply a DDL control message (add/drop stream) to the running pipeline.
     fn apply_control(&mut self, msg: super::ControlMsg);
+
+    /// Returns `true` when internal buffers are near capacity and the
+    /// caller should stop feeding new data. Default returns `false`.
+    fn is_backpressured(&self) -> bool {
+        false
+    }
+
+    /// Returns `true` when deferred operators have pending input to drain.
+    fn has_deferred_input(&self) -> bool {
+        false
+    }
 }

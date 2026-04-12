@@ -1,37 +1,4 @@
-//! SQL DDL to Streaming API translation.
-//!
-//! This module translates parsed SQL CREATE SOURCE/SINK statements into
-//! typed streaming definitions that can be used to configure the runtime.
-//!
-//! ## Supported Syntax
-//!
-//! ```sql
-//! -- In-memory streaming source
-//! CREATE SOURCE trades (
-//!     symbol VARCHAR NOT NULL,
-//!     price DOUBLE NOT NULL,
-//!     quantity BIGINT NOT NULL,
-//!     ts TIMESTAMP NOT NULL,
-//!     WATERMARK FOR ts AS ts - INTERVAL '100' MILLISECONDS
-//! ) WITH (
-//!     buffer_size = 131072,
-//!     backpressure = 'block'
-//! );
-//!
-//! -- In-memory streaming sink
-//! CREATE SINK trade_aggregates AS
-//!     SELECT * FROM trade_stats
-//! WITH (
-//!     buffer_size = 65536
-//! );
-//! ```
-//!
-//! ## Validation
-//!
-//! - Rejects `channel = ...` option (channel type is auto-derived)
-//! - Validates buffer_size is within bounds
-//! - Validates backpressure strategy names
-//! - Validates wait_strategy names
+//! SQL DDL to streaming API translation.
 
 #[allow(clippy::disallowed_types)] // cold path: SQL translation
 use std::collections::HashMap;
@@ -154,23 +121,30 @@ impl TryFrom<CreateSinkStatement> for SinkDefinition {
 pub fn translate_create_source(
     stmt: CreateSourceStatement,
 ) -> Result<SourceDefinition, ParseError> {
-    // Validate options first - reject 'channel' option
-    validate_source_options(&stmt.with_options)?;
+    let columns = convert_columns(&stmt.columns)?;
+    translate_create_source_with_columns(stmt, columns)
+}
 
-    // Parse configuration options
+/// Translate a CREATE SOURCE statement using an already-resolved column
+/// list. Used by the DDL layer after `discover_schema` so `WATERMARK FOR`
+/// validates against the discovered columns rather than the SQL text.
+///
+/// # Errors
+///
+/// Returns `ParseError` from option validation or watermark parsing.
+pub fn translate_create_source_with_columns(
+    stmt: CreateSourceStatement,
+    columns: Vec<ColumnDefinition>,
+) -> Result<SourceDefinition, ParseError> {
+    validate_source_options(&stmt.with_options)?;
     let config = parse_source_options(&stmt.with_options)?;
 
-    // Convert columns to Arrow types
-    let columns = convert_columns(&stmt.columns)?;
-
-    // Build Arrow schema
     let fields: Vec<Field> = columns
         .iter()
         .map(|col| Field::new(&col.name, col.data_type.clone(), col.nullable))
         .collect();
     let schema = Arc::new(Schema::new(fields));
 
-    // Parse watermark if present
     let watermark = if let Some(wm) = stmt.watermark {
         Some(parse_watermark(&wm, &columns)?)
     } else {
@@ -391,10 +365,27 @@ pub fn sql_type_to_arrow(sql_type: &SqlDataType) -> Result<DataType, ParseError>
             arrow::datatypes::IntervalUnit::MonthDayNano,
         )),
 
-        // Unsupported types
+        // Array type: ARRAY<T>, T[], Array(T)
+        SqlDataType::Array(elem_def) => {
+            let item_type = match elem_def {
+                sqlparser::ast::ArrayElemTypeDef::AngleBracket(t)
+                | sqlparser::ast::ArrayElemTypeDef::SquareBracket(t, _)
+                | sqlparser::ast::ArrayElemTypeDef::Parenthesis(t) => sql_type_to_arrow(t)?,
+                sqlparser::ast::ArrayElemTypeDef::None => {
+                    return Err(ParseError::ValidationError(
+                        "ARRAY type requires element type, e.g. ARRAY<INT>".into(),
+                    ));
+                }
+            };
+            Ok(DataType::List(Arc::new(Field::new(
+                "item", item_type, true,
+            ))))
+        }
+
+        // Complex types (MAP, STRUCT, nested records) — use auto-discovery instead.
         _ => Err(ParseError::ValidationError(format!(
-            "unsupported data type: {:?}",
-            sql_type
+            "unsupported data type in hand-declared column: {sql_type:?} \
+             — use auto-discovery with an Avro source for complex types"
         ))),
     }
 }
@@ -875,5 +866,32 @@ mod tests {
 
         let wm = def.watermark.unwrap();
         assert!(!wm.is_processing_time);
+    }
+
+    #[test]
+    fn array_of_int_parses() {
+        let def = parse_and_translate("CREATE SOURCE events (tags ARRAY<INT>)").unwrap();
+        match &def.columns[0].data_type {
+            DataType::List(field) => assert_eq!(field.data_type(), &DataType::Int32),
+            other => panic!("expected DataType::List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decimal_with_precision_parses() {
+        let def = parse_and_translate("CREATE SOURCE events (amount DECIMAL(10, 2))").unwrap();
+        assert_eq!(def.columns[0].data_type, DataType::Decimal128(10, 2));
+    }
+
+    /// Hand-declared MAP columns point users at auto-discovery.
+    #[test]
+    fn hand_declared_map_column_errors_actionably() {
+        let err =
+            parse_and_translate("CREATE SOURCE events (data MAP(VARCHAR, VARCHAR))").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("use auto-discovery") || msg.contains("unsupported"),
+            "expected actionable error for hand-declared MAP, got: {msg}"
+        );
     }
 }

@@ -1,17 +1,4 @@
-//! Incremental per-window accumulator state for EOWC queries.
-//!
-//! Replaces the raw-batch accumulation pattern (`EowcState.accumulated_sources`)
-//! with per-window-per-group incremental `Accumulator` state. This reduces
-//! memory from O(events) to O(windows * groups) and window-close latency
-//! from O(N) to O(groups).
-//!
-//! # Architecture
-//!
-//! ```text
-//! Source batch → pre-agg SQL → assign windows → per-window accumulators
-//!                                                    ↕ (persists across cycles)
-//! Watermark advance → close windows → evaluate() → emit RecordBatch
-//! ```
+//! Incremental EOWC (Emit On Window Close) aggregation state.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -33,19 +20,14 @@ use crate::aggregate_state::{
 };
 use crate::error::DbError;
 
-/// Window type with parameters for window assignment.
 #[derive(Debug, Clone)]
 pub(crate) enum EowcWindowType {
-    /// Tumbling: non-overlapping, fixed-size windows.
     Tumbling { size_ms: i64 },
-    /// Hopping: overlapping windows with fixed size and slide.
     Hopping { size_ms: i64, slide_ms: i64 },
-    /// Session: gap-based windows (simplified, non-merging).
     Session { gap_ms: i64 },
 }
 
 impl EowcWindowType {
-    /// Convert from a `WindowOperatorConfig`.
     fn from_config(config: &WindowOperatorConfig) -> Self {
         match config.window_type {
             WindowType::Tumbling | WindowType::Cumulate => {
@@ -68,7 +50,6 @@ impl EowcWindowType {
         }
     }
 
-    /// Window size in milliseconds (for close boundary computation).
     fn size_ms(&self) -> i64 {
         match self {
             EowcWindowType::Tumbling { size_ms } | EowcWindowType::Hopping { size_ms, .. } => {
@@ -79,7 +60,6 @@ impl EowcWindowType {
     }
 }
 
-/// Assign a timestamp to one or more window start boundaries.
 fn assign_windows(ts_ms: i64, window_type: &EowcWindowType) -> Vec<i64> {
     match window_type {
         EowcWindowType::Tumbling { size_ms } => {
@@ -127,35 +107,21 @@ fn assign_windows(ts_ms: i64, window_type: &EowcWindowType) -> Vec<i64> {
 /// Keyed by window start timestamp (ms since epoch). Each window contains
 /// per-group accumulators that are updated incrementally as batches arrive.
 pub(crate) struct IncrementalEowcState {
-    /// Window type determines assignment logic.
     window_type: EowcWindowType,
-    /// Per-window aggregate state: `window_start` -> per-group accumulators.
     #[allow(clippy::type_complexity)]
-    windows: BTreeMap<i64, AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>>,
-    /// Aggregate function specs (extracted once from the query plan).
+    windows:
+        BTreeMap<i64, AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>>,
+    row_converter: arrow::row::RowConverter,
     agg_specs: Vec<AggFuncSpec>,
-    /// Number of group-by columns in pre-agg output.
     num_group_cols: usize,
-    /// Group-by column names in output schema.
-    #[allow(dead_code)]
-    group_col_names: Vec<String>,
-    /// Group-by column data types.
     group_types: Vec<DataType>,
-    /// Pre-aggregation SQL for expression evaluation (kept for fallback + fingerprint).
     pre_agg_sql: String,
-    /// Output schema for emitted batches (`window_start` + `window_end` + group cols + agg results).
     output_schema: SchemaRef,
-    /// Index of the time column in the pre-agg output.
     time_col_index: usize,
-    /// Compiled pre-agg projection (single-source queries only).
     compiled_projection: Option<CompiledProjection>,
-    /// Cached optimized logical plan for the pre-agg SQL (multi-source queries).
     cached_pre_agg_plan: Option<datafusion_expr::LogicalPlan>,
-    /// Compiled HAVING predicate.
     having_filter: Option<Arc<dyn PhysicalExpr>>,
-    /// HAVING predicate SQL fallback.
     having_sql: Option<String>,
-    /// Maximum groups per window before new groups are dropped.
     max_groups_per_window: usize,
     /// Grace period (ms) after window end before closing. Late events
     /// arriving within this window are included instead of dropped.
@@ -197,7 +163,7 @@ impl IncrementalEowcState {
 
         // Determine if we should attempt to compile pre-agg expressions.
         // Use single_source_table (counts occurrences) to reject self-joins.
-        let compile_source = crate::stream_executor::single_source_table(sql);
+        let compile_source = crate::sql_analysis::single_source_table(sql);
         let state = ctx.state();
         let props = state.execution_props();
         let input_df_schema = &agg_info.input_df_schema;
@@ -426,6 +392,7 @@ impl IncrementalEowcState {
                     output_name,
                     return_type,
                     distinct: is_distinct,
+                    is_count_star: agg_func.params.args.is_empty(),
                     filter_col_index,
                 });
             } else {
@@ -531,12 +498,19 @@ impl IncrementalEowcState {
             None
         };
 
+        let sort_fields: Vec<arrow::row::SortField> = group_types
+            .iter()
+            .map(|dt| arrow::row::SortField::new(dt.clone()))
+            .collect();
+        let row_converter = arrow::row::RowConverter::new(sort_fields)
+            .map_err(|e| DbError::Pipeline(format!("row converter init: {e}")))?;
+
         Ok(Some(Self {
             window_type,
             windows: BTreeMap::new(),
+            row_converter,
             agg_specs,
             num_group_cols,
-            group_col_names,
             group_types,
             pre_agg_sql,
             output_schema,
@@ -564,27 +538,23 @@ impl IncrementalEowcState {
         let ts_array = extract_i64_timestamps(batch, self.time_col_index)?;
         let has_groups = self.num_group_cols > 0;
 
-        // Batch-level group key extraction via RowConverter
-        let (converter, rows) = if has_groups {
+        // Batch-level group key extraction via persistent RowConverter
+        let rows = if has_groups {
             let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
                 .map(|i| Arc::clone(batch.column(i)))
                 .collect();
-            let sort_fields: Vec<arrow::row::SortField> = group_cols
-                .iter()
-                .map(|c| arrow::row::SortField::new(c.data_type().clone()))
-                .collect();
-            let converter = arrow::row::RowConverter::new(sort_fields)
-                .map_err(|e| DbError::Pipeline(format!("row converter: {e}")))?;
-            let rows = converter
+            let rows = self
+                .row_converter
                 .convert_columns(&group_cols)
                 .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
-            (Some(converter), Some(rows))
+            Some(rows)
         } else {
-            (None, None)
+            None
         };
 
         // Group row indices by (window_start, group_key).
         if !has_groups {
+            let empty_key = crate::aggregate_state::global_aggregate_key();
             let mut grouped: AHashMap<i64, Vec<u32>> = AHashMap::new();
             for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
                 if ts_ms == NULL_TIMESTAMP {
@@ -597,10 +567,9 @@ impl IncrementalEowcState {
                 }
             }
             for (window_start, indices) in &grouped {
-                let sv_key: Vec<ScalarValue> = Vec::new();
                 let needs_insert = {
                     let wg = self.windows.entry(*window_start).or_default();
-                    !wg.contains_key(&sv_key)
+                    !wg.contains_key(&empty_key)
                 };
                 if needs_insert {
                     let mut accs = Vec::with_capacity(self.agg_specs.len());
@@ -610,12 +579,12 @@ impl IncrementalEowcState {
                     self.windows
                         .entry(*window_start)
                         .or_default()
-                        .insert(sv_key.clone(), accs);
+                        .insert(empty_key.clone(), accs);
                 }
                 let Some(accs) = self
                     .windows
                     .get_mut(window_start)
-                    .and_then(|g| g.get_mut(&sv_key))
+                    .and_then(|g| g.get_mut(&empty_key))
                 else {
                     continue;
                 };
@@ -624,6 +593,7 @@ impl IncrementalEowcState {
                     batch,
                     indices,
                     &self.agg_specs,
+                    None,
                 )?;
             }
             return Ok(());
@@ -644,18 +614,11 @@ impl IncrementalEowcState {
             }
         }
 
-        let conv = converter.as_ref().expect("converter set when has_groups");
         for ((window_start, row_key), indices) in &grouped {
-            let sv_key = crate::aggregate_state::row_to_scalar_key_with_types(
-                conv,
-                row_key,
-                &self.group_types,
-            )?;
-
             // Ensure group exists (borrow-split pattern)
             let needs_insert = {
                 let window_groups = self.windows.entry(*window_start).or_default();
-                if window_groups.contains_key(&sv_key) {
+                if window_groups.contains_key(row_key) {
                     false
                 } else if window_groups.len() >= self.max_groups_per_window {
                     tracing::warn!(
@@ -676,13 +639,13 @@ impl IncrementalEowcState {
                 self.windows
                     .entry(*window_start)
                     .or_default()
-                    .insert(sv_key.clone(), accs);
+                    .insert(row_key.clone(), accs);
             }
 
             let Some(accs) = self
                 .windows
                 .get_mut(window_start)
-                .and_then(|g| g.get_mut(&sv_key))
+                .and_then(|g| g.get_mut(row_key))
             else {
                 continue;
             };
@@ -692,6 +655,7 @@ impl IncrementalEowcState {
                 batch,
                 indices,
                 &self.agg_specs,
+                None,
             )?;
         }
 
@@ -745,56 +709,44 @@ impl IncrementalEowcState {
         Ok(result_batches)
     }
 
-    /// Emit a single window's accumulated state as a `RecordBatch`.
     fn emit_window(
         &self,
         window_start: i64,
         window_end: i64,
-        groups: AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>,
+        groups: AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>,
     ) -> Result<Option<RecordBatch>, DbError> {
         crate::aggregate_state::emit_window_batch(
             window_start,
             window_end,
             groups,
-            &self.group_types,
+            &self.row_converter,
+            self.num_group_cols,
             &self.agg_specs,
             &self.output_schema,
         )
     }
 
-    /// Pre-aggregation SQL.
-    #[allow(dead_code)] // Available for diagnostics.
-    pub fn pre_agg_sql(&self) -> &str {
-        &self.pre_agg_sql
-    }
-
-    /// HAVING predicate SQL, if any.
     pub fn having_sql(&self) -> Option<&str> {
         self.having_sql.as_deref()
     }
 
-    /// Compiled HAVING predicate, if available.
     pub fn having_filter(&self) -> Option<&Arc<dyn PhysicalExpr>> {
         self.having_filter.as_ref()
     }
 
-    /// Compiled pre-agg projection, if available.
     pub fn compiled_projection(&self) -> Option<&CompiledProjection> {
         self.compiled_projection.as_ref()
     }
 
-    /// Cached optimized logical plan for the pre-agg SQL.
     pub fn cached_pre_agg_plan(&self) -> Option<&datafusion_expr::LogicalPlan> {
         self.cached_pre_agg_plan.as_ref()
     }
 
-    /// Return the number of open windows.
     #[cfg(test)]
     pub fn open_window_count(&self) -> usize {
         self.windows.len()
     }
 
-    /// Compute a fingerprint for this query (SQL + schema).
     pub(crate) fn query_fingerprint(&self) -> u64 {
         crate::aggregate_state::query_fingerprint(&self.pre_agg_sql, &self.output_schema)
     }
@@ -807,21 +759,13 @@ impl IncrementalEowcState {
         let mut total = 0;
         for groups in self.windows.values() {
             for (key, accs) in groups {
-                for sv in key {
-                    total += sv.size();
-                }
+                total += key.as_ref().len();
                 for acc in accs {
                     total += acc.size();
                 }
             }
         }
         total
-    }
-
-    /// Total number of distinct groups across all open windows.
-    #[allow(dead_code)]
-    pub(crate) fn group_count(&self) -> usize {
-        self.windows.values().map(|g| g.len()).sum()
     }
 
     /// Checkpoint all per-window group states into a serializable struct.
@@ -833,7 +777,12 @@ impl IncrementalEowcState {
         for (&window_start, groups) in &mut self.windows {
             let mut group_checkpoints = Vec::with_capacity(groups.len());
             for (key, accs) in groups {
-                let key_json: Vec<serde_json::Value> = key.iter().map(scalar_to_json).collect();
+                let sv_key = crate::aggregate_state::row_to_scalar_key_with_types(
+                    &self.row_converter,
+                    key,
+                    &self.group_types,
+                )?;
+                let key_json: Vec<serde_json::Value> = sv_key.iter().map(scalar_to_json).collect();
                 let mut acc_states = Vec::with_capacity(accs.len());
                 for acc in accs {
                     let state = acc
@@ -844,6 +793,7 @@ impl IncrementalEowcState {
                 group_checkpoints.push(GroupCheckpoint {
                     key: key_json,
                     acc_states,
+                    last_updated_ms: i64::MIN,
                 });
             }
             windows.push(WindowCheckpoint {
@@ -876,8 +826,14 @@ impl IncrementalEowcState {
         for wc in &checkpoint.windows {
             let mut groups = AHashMap::new();
             for gc in &wc.groups {
-                let key: Result<Vec<ScalarValue>, _> = gc.key.iter().map(json_to_scalar).collect();
-                let key = key?;
+                let sv_key: Result<Vec<ScalarValue>, _> =
+                    gc.key.iter().map(json_to_scalar).collect();
+                let sv_key = sv_key?;
+                let row_key = crate::aggregate_state::scalar_key_to_owned_row(
+                    &self.row_converter,
+                    &sv_key,
+                    &self.group_types,
+                )?;
                 let mut accs = Vec::with_capacity(self.agg_specs.len());
                 for (i, spec) in self.agg_specs.iter().enumerate() {
                     let mut acc = spec.create_accumulator()?;
@@ -897,7 +853,7 @@ impl IncrementalEowcState {
                     }
                     accs.push(acc);
                 }
-                groups.insert(key, accs);
+                groups.insert(row_key, accs);
                 total_groups += 1;
             }
             self.windows.insert(wc.window_start, groups);
@@ -1017,8 +973,6 @@ mod tests {
     use super::*;
     use arrow::array::Int64Array;
 
-    // ── Window assignment tests ──────────────────────────────────────
-
     #[test]
     fn test_tumbling_window_assignment_aligns_to_boundary() {
         let wt = EowcWindowType::Tumbling { size_ms: 1000 };
@@ -1060,8 +1014,6 @@ mod tests {
         assert_eq!(assign_windows(500, &wt), vec![0]);
     }
 
-    // ── Timestamp extraction tests ───────────────────────────────────
-
     #[test]
     fn test_extract_i64_timestamps_from_int64() {
         let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
@@ -1091,8 +1043,6 @@ mod tests {
         let ts = extract_i64_timestamps(&batch, 0).unwrap();
         assert_eq!(ts, vec![100, 200, 300]);
     }
-
-    // ── Incremental state tests ──────────────────────────────────────
 
     fn make_pre_agg_batch(
         groups: Vec<&str>,
@@ -1134,6 +1084,7 @@ mod tests {
             output_name: "total".to_string(),
             return_type: DataType::Int64,
             distinct: false,
+            is_count_star: false,
             filter_col_index: None,
         }];
 
@@ -1149,8 +1100,11 @@ mod tests {
             windows: BTreeMap::new(),
             agg_specs,
             num_group_cols: 1,
-            group_col_names: vec!["symbol".to_string()],
             group_types: vec![DataType::Utf8],
+            row_converter: arrow::row::RowConverter::new(vec![arrow::row::SortField::new(
+                DataType::Utf8,
+            )])
+            .unwrap(),
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
@@ -1302,8 +1256,6 @@ mod tests {
         assert_eq!(schema.field(3).name(), "total");
         assert_eq!(schema.fields().len(), 4);
     }
-
-    // ── Checkpoint/restore tests ─────────────────────────────────────
 
     #[test]
     fn test_eowc_checkpoint_roundtrip_tumbling() {

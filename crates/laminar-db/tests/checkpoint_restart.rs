@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{Float64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use laminar_core::streaming::StreamCheckpointConfig;
 use laminar_db::{LaminarConfig, LaminarDB};
 use laminar_storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
@@ -25,11 +25,16 @@ fn config_for(dir: &std::path::Path) -> LaminarConfig {
     }
 }
 
-fn make_batch(symbol: &str, price: f64, ts: i64) -> RecordBatch {
+/// `ts TIMESTAMP` in DDL maps to `Timestamp(Microsecond)`; callers pass
+/// the timestamp in milliseconds and we scale to µs here.
+fn make_batch(symbol: &str, price: f64, ts_ms: i64) -> RecordBatch {
     RecordBatch::try_from_iter(vec![
         ("symbol", Arc::new(StringArray::from(vec![symbol])) as _),
         ("price", Arc::new(Float64Array::from(vec![price])) as _),
-        ("ts", Arc::new(Int64Array::from(vec![ts])) as _),
+        (
+            "ts",
+            Arc::new(TimestampMicrosecondArray::from(vec![ts_ms * 1000])) as _,
+        ),
     ])
     .unwrap()
 }
@@ -46,7 +51,7 @@ async fn test_checkpoint_survives_restart() {
         let db = LaminarDB::open_with_config(config_for(&storage)).unwrap();
 
         db.execute(
-            "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts BIGINT, \
+            "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts TIMESTAMP, \
              WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
         )
         .await
@@ -105,7 +110,7 @@ async fn test_checkpoint_survives_restart() {
 
         // Re-register the same source and stream (DDL is not persisted)
         db.execute(
-            "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts BIGINT, \
+            "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts TIMESTAMP, \
              WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
         )
         .await

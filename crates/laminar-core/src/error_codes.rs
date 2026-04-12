@@ -19,9 +19,8 @@
 //! | `LDB-7xxx` | DataFusion / Arrow interop |
 //! | `LDB-8xxx` | Internal / should-not-happen |
 //!
-//! Codes within the `LDB-1xxx` through `LDB-3xxx` ranges are defined in
-//! `laminar-sql::error::codes` (the SQL layer) and are re-exported here
-//! for reference. This module is the canonical registry for all other ranges.
+//! This module is the canonical registry for all error code ranges.
+//! Downstream crates (`laminar-sql`, `laminar-db`, etc.) re-export from here.
 
 // ── General / Configuration (LDB-0xxx) ──
 
@@ -39,10 +38,8 @@ pub const INVALID_OPERATION: &str = "LDB-0005";
 pub const SCHEMA_MISMATCH: &str = "LDB-0006";
 
 // ── SQL Parsing & Validation (LDB-1xxx) ──
-// Canonical definitions are in `laminar_sql::error::codes`.
-// Repeated here for reference only.
 
-/// Unsupported SQL syntax (canonical: `laminar_sql::error::codes::UNSUPPORTED_SQL`).
+/// Unsupported SQL syntax.
 pub const SQL_UNSUPPORTED: &str = "LDB-1001";
 /// Query planning failed.
 pub const SQL_PLANNING_FAILED: &str = "LDB-1002";

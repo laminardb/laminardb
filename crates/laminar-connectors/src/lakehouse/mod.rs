@@ -1,39 +1,4 @@
 //! Lakehouse connectors (Delta Lake, Apache Iceberg).
-//!
-//! Writes Arrow `RecordBatch` data to lakehouse table formats with
-//! ACID transactions and at-least-once delivery (exactly-once opt-in).
-//!
-//! # Architecture
-//!
-//! ```text
-//! Ring 0 (Hot Path):  SPSC push only (~5ns, zero sink code)
-//! Ring 1 (Background): Batch buffering -> Parquet writes -> transaction commits
-//! Ring 2 (Control):    Schema management, configuration, health checks
-//! ```
-//!
-//! # Module Structure
-//!
-//! ## Delta Lake
-//! - `delta` - `DeltaLakeSink` implementing `SinkConnector`
-//! - `delta_config` - Configuration and enums
-//! - `delta_metrics` - Lock-free atomic metrics
-//!
-//! # Usage
-//!
-//! ## Delta Lake
-//!
-//! ```rust,ignore
-//! use laminar_connectors::lakehouse::{DeltaLakeSink, DeltaLakeSinkConfig, DeltaWriteMode};
-//!
-//! let config = DeltaLakeSinkConfig {
-//!     table_path: "s3://data-lake/trades/".to_string(),
-//!     write_mode: DeltaWriteMode::Append,
-//!     partition_columns: vec!["trade_date".to_string()],
-//!     ..Default::default()
-//! };
-//!
-//! let sink = DeltaLakeSink::new(config);
-//! ```
 
 // Delta Lake modules
 pub mod delta;

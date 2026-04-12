@@ -29,17 +29,17 @@ delta-lake-glue = ["laminar-connectors/delta-lake-glue"]
 delta-lake-all = ["delta-lake", "delta-lake-s3", "delta-lake-azure", "delta-lake-gcs", "delta-lake-unity", "delta-lake-glue"]
 parquet-lookup = ["laminar-connectors/parquet-lookup"]
 files = ["laminar-connectors/files"]
+otel = ["laminar-connectors/otel"]
 delta = ["laminar-core/delta"]
-io-uring = ["laminar-core/io-uring"]
 aws = ["laminar-storage/aws"]
 gcs = ["laminar-storage/gcs"]
 azure = ["laminar-storage/azure"]
 
 [dependencies]
-laminar-core = { path = "../laminar-core", version = "0.18.10" }
-laminar-sql = { path = "../laminar-sql", version = "0.18.10" }
-laminar-storage = { path = "../laminar-storage", version = "0.18.10" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.18.10" }
+laminar-core = { path = "../laminar-core", version = "0.20.1" }
+laminar-sql = { path = "../laminar-sql", version = "0.20.1" }
+laminar-storage = { path = "../laminar-storage", version = "0.20.1" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.20.1" }
 
 # Arrow
 arrow = { workspace = true }
@@ -52,16 +52,12 @@ datafusion = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
 
-# Arena allocator
-bumpalo = { workspace = true }
-
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 
 # SQL parser (for AST type references)
 sqlparser = { workspace = true }
@@ -71,6 +67,7 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+crossfire = { workspace = true }
 
 # Concurrency
 parking_lot = { workspace = true }
@@ -90,8 +87,8 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
-laminar-derive = { path = "../laminar-derive", version = "0.18.10" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.18.10", features = ["testing"] }
+laminar-derive = { path = "../laminar-derive", version = "0.20.1" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.20.1", features = ["testing"] }
 criterion = { workspace = true }
 
 [[bench]]

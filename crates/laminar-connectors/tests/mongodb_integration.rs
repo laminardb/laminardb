@@ -593,14 +593,14 @@ async fn sink_cdc_replay() {
     sink.open(&connector_config).await.unwrap();
 
     // Build CDC insert events.
-    use arrow_array::builder::{Int64Builder, StringBuilder, UInt32Builder};
+    use arrow_array::builder::{StringBuilder, TimestampMillisecondBuilder, UInt32Builder};
 
     let mut ns_b = StringBuilder::new();
     let mut op_b = StringBuilder::new();
     let mut dk_b = StringBuilder::new();
     let mut cts_b = UInt32Builder::new();
     let mut cti_b = UInt32Builder::new();
-    let mut wt_b = Int64Builder::new();
+    let mut wt_b = TimestampMillisecondBuilder::new();
     let mut fd_b = StringBuilder::new();
     let mut ud_b = StringBuilder::new();
     let mut rt_b = StringBuilder::new();
@@ -643,7 +643,7 @@ async fn sink_cdc_replay() {
     let mut dk_b = StringBuilder::new();
     let mut cts_b = UInt32Builder::new();
     let mut cti_b = UInt32Builder::new();
-    let mut wt_b = Int64Builder::new();
+    let mut wt_b = TimestampMillisecondBuilder::new();
     let mut fd_b = StringBuilder::new();
     let mut ud_b = StringBuilder::new();
     let mut rt_b = StringBuilder::new();

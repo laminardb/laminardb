@@ -18,7 +18,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use arrow_array::builder::{Int64Builder, StringBuilder, UInt32Builder};
+use arrow_array::builder::{StringBuilder, UInt32Builder};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
@@ -33,7 +33,7 @@ use crate::metrics::ConnectorMetrics;
 
 use super::change_event::{MongoDbChangeEvent, OperationType};
 use super::config::MongoDbSourceConfig;
-use super::metrics::MongoSourceMetrics;
+use super::metrics::MongoDbCdcMetrics;
 use super::resume_token::{InMemoryResumeTokenStore, ResumeToken, ResumeTokenStore};
 
 /// Returns the Arrow schema for `MongoDB` CDC envelope records.
@@ -45,7 +45,7 @@ use super::resume_token::{InMemoryResumeTokenStore, ResumeToken, ResumeTokenStor
 /// | `_document_key`     | Utf8   | no       | Document key JSON                  |
 /// | `_cluster_time_s`   | UInt32 | no       | Cluster time seconds               |
 /// | `_cluster_time_i`   | UInt32 | no       | Cluster time increment             |
-/// | `_wall_time_ms`     | Int64  | no       | Wall clock timestamp (Unix ms)     |
+/// | `_wall_time_ms`     | Timestamp(ms) | no | Wall clock timestamp             |
 /// | `_full_document`    | Utf8   | yes      | Full document JSON                 |
 /// | `_update_desc`      | Utf8   | yes      | Update description JSON            |
 /// | `_resume_token`     | Utf8   | no       | Opaque resume token JSON           |
@@ -57,7 +57,11 @@ pub fn mongodb_cdc_envelope_schema() -> SchemaRef {
         Field::new("_document_key", DataType::Utf8, false),
         Field::new("_cluster_time_s", DataType::UInt32, false),
         Field::new("_cluster_time_i", DataType::UInt32, false),
-        Field::new("_wall_time_ms", DataType::Int64, false),
+        Field::new(
+            "_wall_time_ms",
+            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+            false,
+        ),
         Field::new("_full_document", DataType::Utf8, true),
         Field::new("_update_desc", DataType::Utf8, true),
         Field::new("_resume_token", DataType::Utf8, false),
@@ -92,7 +96,7 @@ pub struct MongoDbCdcSource {
     schema: SchemaRef,
 
     /// Lock-free metrics.
-    metrics: Arc<MongoSourceMetrics>,
+    metrics: Arc<MongoDbCdcMetrics>,
 
     /// Buffered change events awaiting `poll_batch`.
     event_buffer: VecDeque<MongoDbChangeEvent>,
@@ -115,7 +119,7 @@ pub struct MongoDbCdcSource {
 
     /// Channel receiver for change events from the background task.
     #[cfg(feature = "mongodb-cdc")]
-    event_rx: Option<tokio::sync::mpsc::Receiver<ChangeStreamPayload>>,
+    event_rx: Option<ChangeStreamRx>,
 
     /// Shutdown signal for the background reader task.
     #[cfg(feature = "mongodb-cdc")]
@@ -131,6 +135,13 @@ enum ChangeStreamPayload {
     Error(String),
 }
 
+/// Cloneable async sender for the change stream reader → `poll_batch` queue.
+#[cfg(feature = "mongodb-cdc")]
+type ChangeStreamTx = crossfire::MAsyncTx<crossfire::mpsc::Array<ChangeStreamPayload>>;
+/// Single-consumer async receiver for the change stream reader → `poll_batch` queue.
+#[cfg(feature = "mongodb-cdc")]
+type ChangeStreamRx = crossfire::AsyncRx<crossfire::mpsc::Array<ChangeStreamPayload>>;
+
 impl MongoDbCdcSource {
     /// Creates a new `MongoDB` CDC source with the given configuration.
     #[must_use]
@@ -139,7 +150,7 @@ impl MongoDbCdcSource {
             config,
             state: ConnectorState::Created,
             schema: mongodb_cdc_envelope_schema(),
-            metrics: Arc::new(MongoSourceMetrics::new()),
+            metrics: Arc::new(MongoDbCdcMetrics::new()),
             event_buffer: VecDeque::new(),
             last_resume_token: None,
             resume_token_store: Box::new(InMemoryResumeTokenStore::new()),
@@ -246,7 +257,7 @@ fn events_to_record_batch(
     let mut dk_builder = StringBuilder::with_capacity(len, len * 64);
     let mut cts_builder = UInt32Builder::with_capacity(len);
     let mut ct_inc_builder = UInt32Builder::with_capacity(len);
-    let mut wt_builder = Int64Builder::with_capacity(len);
+    let mut wt_builder = arrow_array::builder::TimestampMillisecondBuilder::with_capacity(len);
     let mut fd_builder = StringBuilder::with_capacity(len, len * 128);
     let mut ud_builder = StringBuilder::with_capacity(len, len * 64);
     let mut rt_builder = StringBuilder::with_capacity(len, len * 64);
@@ -455,7 +466,8 @@ impl MongoDbCdcSource {
             preflight_timeseries_guard(&db, &self.config.database, &self.config.collection).await?;
         }
 
-        let (tx, rx) = tokio::sync::mpsc::channel(self.config.max_buffered_events);
+        let (tx, rx) =
+            crossfire::mpsc::bounded_async::<ChangeStreamPayload>(self.config.max_buffered_events);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let config = self.config.clone();
@@ -556,10 +568,10 @@ async fn run_change_stream_reader(
     db: mongodb::Database,
     config: MongoDbSourceConfig,
     resume_token: Option<ResumeToken>,
-    tx: tokio::sync::mpsc::Sender<ChangeStreamPayload>,
+    tx: ChangeStreamTx,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     data_ready: Arc<Notify>,
-    metrics: Arc<MongoSourceMetrics>,
+    metrics: Arc<MongoDbCdcMetrics>,
 ) -> Result<(), ConnectorError> {
     use futures_util::StreamExt;
     use mongodb::options::ChangeStreamOptions;

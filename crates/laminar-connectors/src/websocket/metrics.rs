@@ -1,4 +1,4 @@
-//! WebSocket source connector metrics.
+//! `WebSocket` source connector metrics.
 //!
 //! [`WebSocketSourceMetrics`] provides lock-free atomic counters for
 //! tracking WebSocket source statistics, convertible to the SDK's

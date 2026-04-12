@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray, UInt64Array};
+use arrow_array::{ArrayRef, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 
 use super::decoder::{
@@ -203,10 +203,15 @@ pub fn delete_to_events(
 /// Schema for CDC metadata columns.
 #[must_use]
 pub fn cdc_metadata_schema() -> Schema {
+    use arrow_schema::TimeUnit;
     Schema::new(vec![
         Field::new("_table", DataType::Utf8, false),
         Field::new("_op", DataType::Utf8, false),
-        Field::new("_ts_ms", DataType::Int64, false),
+        Field::new(
+            "_ts_ms",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
         Field::new("_binlog_file", DataType::Utf8, true),
         Field::new("_binlog_pos", DataType::UInt64, true),
         Field::new("_gtid", DataType::Utf8, true),
@@ -245,7 +250,7 @@ pub fn events_to_record_batch(
     let mut columns: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(tables)),
         Arc::new(StringArray::from(ops)),
-        Arc::new(Int64Array::from(timestamps)),
+        Arc::new(arrow_array::TimestampMillisecondArray::from(timestamps)),
         Arc::new(StringArray::from(binlog_files)),
         Arc::new(UInt64Array::from(binlog_positions)),
         Arc::new(StringArray::from(gtids)),
@@ -280,10 +285,15 @@ pub fn events_to_record_batch(
 
 /// Builds the full CDC schema including metadata and row columns.
 fn build_cdc_schema(row_schema: &Schema) -> Schema {
+    use arrow_schema::TimeUnit;
     let mut fields = vec![
         Field::new("_table", DataType::Utf8, false),
         Field::new("_op", DataType::Utf8, false),
-        Field::new("_ts_ms", DataType::Int64, false),
+        Field::new(
+            "_ts_ms",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
         Field::new("_binlog_file", DataType::Utf8, true),
         Field::new("_binlog_pos", DataType::UInt64, true),
         Field::new("_gtid", DataType::Utf8, true),

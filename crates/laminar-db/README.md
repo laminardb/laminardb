@@ -16,7 +16,7 @@ Unified database facade for LaminarDB.
 - **`TypedSubscription<T>`** -- Subscription to a named stream with automatic RecordBatch-to-struct conversion.
 - **`CheckpointCoordinator`** -- Orchestrates two-phase commit checkpoints across all operators and sinks.
 - **`RecoveryManager`** -- Restores operator state, connector offsets, and watermarks from the latest checkpoint.
-- **`Profile`** -- Deployment profile (InMemory, Durable, Delta).
+- **`Profile`** -- Deployment profile (`BareMetal`, `Embedded`, `Durable`, `Delta`).
 - **`PipelineMetrics`** / **`PipelineCounters`** -- Real-time pipeline observability.
 - **`DbError`** -- Structured error type with `code()` returning stable `LDB-NNNN` codes and `is_transient()` for retry logic.
 
@@ -29,7 +29,7 @@ let db = LaminarDB::open()?;
 
 // Create a source
 db.execute("CREATE SOURCE trades (
-    symbol VARCHAR, price DOUBLE, ts BIGINT
+    symbol VARCHAR, price DOUBLE, ts TIMESTAMP
 )").await?;
 
 // Create a continuous query
@@ -72,9 +72,9 @@ This crate sits at the top of the dependency graph, integrating all other Lamina
 
 ```
 laminar-db
-  |-- laminar-core        (Ring 0 engine)
+  |-- laminar-core        (operators, streaming channels, checkpoint barriers)
   |-- laminar-sql         (SQL parsing + DataFusion)
-  |-- laminar-storage     (WAL + checkpointing)
+  |-- laminar-storage     (checkpoint manifest + object store persistence)
   |-- laminar-connectors  (external connectors)
 ```
 
@@ -83,20 +83,27 @@ laminar-db
 | Flag | Purpose |
 |------|---------|
 | `api` | FFI-friendly API module with `Connection`, `Writer`, `QueryStream` |
-| `ffi` | C FFI layer with `extern "C"` functions and Arrow C Data Interface |
-| `jit` | Cranelift JIT compilation (forwards to laminar-core) |
+| `ffi` | C FFI layer with `extern "C"` functions and Arrow C Data Interface (implies `api`) |
 | `kafka` | Kafka source/sink connector |
-| `postgres-cdc` | PostgreSQL CDC source |
+| `postgres-cdc` | PostgreSQL CDC source (also enables Postgres lookup) |
 | `postgres-sink` | PostgreSQL sink |
-| `delta-lake` | Delta Lake sink and source |
-| `durable` | Object-store checkpoint profiles |
-| `websocket` | WebSocket source and sink connectors |
 | `mysql-cdc` | MySQL CDC source via binlog |
-| `delta` | Full distributed mode (Durable + gRPC + gossip + Raft) |
+| `mongodb-cdc` | MongoDB CDC source and sink |
+| `delta-lake` | Delta Lake sink and source |
+| `delta-lake-s3` / `delta-lake-azure` / `delta-lake-gcs` | Cloud storage backends for Delta Lake |
+| `delta-lake-unity` / `delta-lake-glue` | Databricks Unity / AWS Glue catalogs for Delta Lake |
+| `delta-lake-all` | All Delta Lake storage backends and catalogs |
+| `iceberg` | Apache Iceberg source and sink |
+| `websocket` | WebSocket source and sink connectors |
+| `files` | File source (AutoLoader) and sink (rolling files) |
+| `parquet-lookup` | Parquet lookup source for reference tables |
+| `otel` | OpenTelemetry OTLP/gRPC source |
+| `delta` | Full distributed mode scaffolding (gRPC, gossip, Raft) — not production-ready |
+| `aws` / `gcs` / `azure` | Object-store checkpoint backends (forwards to laminar-storage) |
 
 ## Internal Architecture
 
-### Ring 0 SQL Operator Routing
+### Core SQL Operator Routing
 
 The `core_window_state` module routes tumbling, hopping, and session window aggregates through optimized `CoreWindowAssigner` state instead of the generic DataFusion path. Detection is lazy on the first EOWC (Emit On Window Close) cycle, and non-qualifying queries fall through to `IncrementalEowcState` or raw-batch processing.
 
@@ -106,8 +113,8 @@ The `eowc_state` module provides incremental per-window accumulators that mainta
 
 ## Related Crates
 
-- [`laminar-core`](../laminar-core) -- Ring 0 engine (operators, state, streaming)
+- [`laminar-core`](../laminar-core) -- Operators, streaming channels, window assigners, checkpoint barriers
 - [`laminar-sql`](../laminar-sql) -- SQL parser and DataFusion integration
-- [`laminar-storage`](../laminar-storage) -- WAL and checkpointing
+- [`laminar-storage`](../laminar-storage) -- Checkpoint persistence
 - [`laminar-connectors`](../laminar-connectors) -- External system connectors
 - [`laminar-derive`](../laminar-derive) -- Derive macros for typed data handling

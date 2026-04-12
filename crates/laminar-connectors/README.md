@@ -1,6 +1,6 @@
 # laminar-connectors
 
-External system connectors for LaminarDB -- Kafka, CDC, MongoDB, WebSocket, Delta Lake, and files.
+External system connectors for LaminarDB -- Kafka, CDC, MongoDB, WebSocket, OpenTelemetry, Delta Lake, Iceberg, and files.
 
 ## Overview
 
@@ -15,11 +15,15 @@ Source and sink connectors for external systems. Each connector implements the `
 | Kafka | `kafka` | rdkafka consumer groups, Schema Registry | Implemented |
 | PostgreSQL CDC | `postgres-cdc` | pgoutput logical replication | Implemented |
 | MySQL CDC | `mysql-cdc` | Binlog decoding, GTID position tracking | Implemented |
-| MongoDB CDC | `mongodb-cdc` | Change streams, resume token tracking | Implemented |
+| MongoDB CDC | `mongodb-cdc` | Change streams, resume token tracking, `$changeStreamSplitLargeEvent` support | Implemented |
+| OpenTelemetry (OTLP/gRPC) | `otel` | OTLP/gRPC receiver (traces, metrics, logs) via tonic | Implemented |
 | WebSocket Client | `websocket` | tokio-tungstenite | Implemented |
 | WebSocket Server | `websocket` | tokio-tungstenite listener | Implemented |
 | Delta Lake Source | `delta-lake` | Version polling via deltalake crate | Implemented |
-| File Auto-Loader | `files` | Directory watch, glob pattern discovery | Implemented |
+| Iceberg Source | `iceberg` | REST/Glue/Hive catalog, incremental reads | Implemented |
+| File Auto-Loader | `files` | Directory watch, glob pattern discovery, Parquet/CSV/JSON | Implemented |
+| Postgres Lookup | `postgres-cdc` | Pool-backed lookup source with predicate pushdown | Implemented |
+| Parquet Lookup | `parquet-lookup` | Static / slowly-changing dimension table source | Implemented |
 
 ### Sink Connectors
 
@@ -28,7 +32,8 @@ Source and sink connectors for external systems. Each connector implements the `
 | Kafka | `kafka` | rdkafka transactions | Implemented |
 | PostgreSQL | `postgres-sink` | COPY BINARY, upsert, co-transactional | Implemented |
 | MongoDB | `mongodb-cdc` | Ordered/unordered writes, upsert, CDC replay | Implemented |
-| Delta Lake | `delta-lake` | Epoch-aligned Parquet commits | Implemented |
+| Delta Lake | `delta-lake` | Epoch-aligned Parquet commits, recovery, compaction, schema evolution | Implemented |
+| Iceberg | `iceberg` | REST/Glue/Hive catalog commits | Implemented |
 | WebSocket Server | `websocket` | Fan-out to connected subscribers | Implemented |
 | WebSocket Client | `websocket` | Push to external server | Implemented |
 | Files | `files` | CSV, JSON, Parquet, rolling file output | Implemented |
@@ -45,8 +50,9 @@ Source and sink connectors for external systems. Each connector implements the `
 | `cdc/postgres` | PostgreSQL CDC source (pgoutput decoder, Z-set changelog, replication I/O) |
 | `cdc/mysql` | MySQL CDC source (binlog decoder, GTID, Z-set changelog) |
 | `mongodb` | MongoDB CDC source (change streams, resume tokens) and sink (ordered/unordered writes) |
+| `otel` | OpenTelemetry OTLP/gRPC receiver for traces, metrics, and logs (tonic server) |
 | `websocket` | WebSocket source/sink (client, server, fan-out, backpressure, reconnect) |
-| `lakehouse` | Delta Lake source and sink (buffering, epoch, changelog) |
+| `lakehouse` | Delta Lake source and sink (buffering, epoch, changelog, recovery, compaction, schema evolution) and Apache Iceberg source and sink (REST/Glue/Hive catalogs) |
 | `files` | File source (auto-loader, glob, watch) and sink (rolling, CSV/JSON/Parquet) |
 | `lookup` | Lookup table support: PostgreSQL and Parquet reference tables |
 | `reference` | Reference table source trait and refresh modes |
@@ -74,16 +80,18 @@ Source and sink connectors for external systems. Each connector implements the `
 | Flag | Purpose |
 |------|---------|
 | `kafka` | rdkafka, Avro serde, schema registry (reqwest) |
-| `postgres-cdc` | PostgreSQL CDC via pgwire-replication |
+| `postgres-cdc` | PostgreSQL CDC via pgwire-replication (also enables Postgres lookup source) |
 | `postgres-sink` | PostgreSQL sink via tokio-postgres |
 | `mysql-cdc` | MySQL CDC via mysql_async (rustls, no OpenSSL) |
-| `mongodb-cdc` | MongoDB CDC source/sink via mongodb crate |
+| `mongodb-cdc` | MongoDB CDC source and sink via mongodb crate |
 | `delta-lake` | Delta Lake sink/source via deltalake crate |
 | `delta-lake-s3` | S3 storage backend for Delta Lake |
 | `delta-lake-azure` | Azure storage backend for Delta Lake |
 | `delta-lake-gcs` | GCS storage backend for Delta Lake |
 | `delta-lake-unity` | Databricks Unity catalog for Delta Lake |
 | `delta-lake-glue` | AWS Glue catalog for Delta Lake |
+| `iceberg` | Apache Iceberg source and sink (REST/Glue/Hive catalogs) |
+| `otel` | OpenTelemetry OTLP/gRPC source (traces, metrics, logs) |
 | `parquet-lookup` | Parquet file lookup source |
 | `websocket` | WebSocket source and sink (tokio-tungstenite) |
 | `files` | File source (auto-loader) and sink (rolling files) |

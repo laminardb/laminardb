@@ -14,13 +14,13 @@ use std::any::Any;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Int64Type, TimeUnit, TimestampMillisecondType};
-use arrow_array::cast::AsArray;
+use arrow::datatypes::{DataType, TimeUnit};
 use arrow_array::{ArrayRef, TimestampMillisecondArray};
 use datafusion_common::{DataFusionError, Result, ScalarValue};
 use datafusion_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
+use laminar_core::time::cast_to_millis_array;
 
 // ─── TumbleWindowStart ───────────────────────────────────────────────────────
 
@@ -463,30 +463,21 @@ fn compute_tumble(value: &ColumnarValue, interval_ms: i64) -> Result<ColumnarVal
     }
 }
 
+/// Normalise a timestamp array to `TimestampMillisecond` for the window
+/// math below. Wraps the shared helper so DataFusion gets a `Plan` error
+/// on non-timestamp columns.
+fn to_millis_array(array: &ArrayRef) -> Result<TimestampMillisecondArray> {
+    cast_to_millis_array(array.as_ref()).map_err(|e| DataFusionError::Plan(e.to_string()))
+}
+
 /// Computes tumble window start for an array of timestamps.
 fn compute_tumble_array(array: &ArrayRef, interval_ms: i64) -> Result<ArrayRef> {
-    match array.data_type() {
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let input = array.as_primitive::<TimestampMillisecondType>();
-            let result: TimestampMillisecondArray = input
-                .iter()
-                .map(|opt_ts| opt_ts.map(|ts| ts - ts.rem_euclid(interval_ms)))
-                .collect();
-            Ok(Arc::new(result))
-        }
-        DataType::Int64 => {
-            let input = array.as_primitive::<Int64Type>();
-            let result: TimestampMillisecondArray = input
-                .iter()
-                .map(|opt_ts| opt_ts.map(|ts| ts - ts.rem_euclid(interval_ms)))
-                .collect();
-            Ok(Arc::new(result))
-        }
-        other => Err(DataFusionError::Plan(format!(
-            "Unsupported timestamp type for tumble(): {other:?}. \
-             Use TimestampMillisecond or Int64."
-        ))),
-    }
+    let input = to_millis_array(array)?;
+    let result: TimestampMillisecondArray = input
+        .iter()
+        .map(|opt_ts| opt_ts.map(|ts| ts - ts.rem_euclid(interval_ms)))
+        .collect();
+    Ok(Arc::new(result))
 }
 
 /// Computes tumble window start with offset for a `ColumnarValue`.
@@ -523,38 +514,17 @@ fn compute_tumble_array_with_offset(
     interval_ms: i64,
     offset_ms: i64,
 ) -> Result<ArrayRef> {
-    match array.data_type() {
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let input = array.as_primitive::<TimestampMillisecondType>();
-            let result: TimestampMillisecondArray = input
-                .iter()
-                .map(|opt_ts| {
-                    opt_ts.map(|ts| {
-                        let adj = ts - offset_ms;
-                        (adj - adj.rem_euclid(interval_ms)) + offset_ms
-                    })
-                })
-                .collect();
-            Ok(Arc::new(result))
-        }
-        DataType::Int64 => {
-            let input = array.as_primitive::<Int64Type>();
-            let result: TimestampMillisecondArray = input
-                .iter()
-                .map(|opt_ts| {
-                    opt_ts.map(|ts| {
-                        let adj = ts - offset_ms;
-                        (adj - adj.rem_euclid(interval_ms)) + offset_ms
-                    })
-                })
-                .collect();
-            Ok(Arc::new(result))
-        }
-        other => Err(DataFusionError::Plan(format!(
-            "Unsupported timestamp type for tumble(): {other:?}. \
-             Use TimestampMillisecond or Int64."
-        ))),
-    }
+    let input = to_millis_array(array)?;
+    let result: TimestampMillisecondArray = input
+        .iter()
+        .map(|opt_ts| {
+            opt_ts.map(|ts| {
+                let adj = ts - offset_ms;
+                (adj - adj.rem_euclid(interval_ms)) + offset_ms
+            })
+        })
+        .collect();
+    Ok(Arc::new(result))
 }
 
 /// Computes hop (earliest) window start for a `ColumnarValue`.
@@ -577,28 +547,12 @@ fn compute_hop(value: &ColumnarValue, slide_ms: i64, size_ms: i64) -> Result<Col
 
 /// Computes hop window start for an array of timestamps.
 fn compute_hop_array(array: &ArrayRef, slide_ms: i64, size_ms: i64) -> Result<ArrayRef> {
-    match array.data_type() {
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let input = array.as_primitive::<TimestampMillisecondType>();
-            let result: TimestampMillisecondArray = input
-                .iter()
-                .map(|opt_ts| opt_ts.map(|ts| hop_earliest_start(ts, slide_ms, size_ms)))
-                .collect();
-            Ok(Arc::new(result))
-        }
-        DataType::Int64 => {
-            let input = array.as_primitive::<Int64Type>();
-            let result: TimestampMillisecondArray = input
-                .iter()
-                .map(|opt_ts| opt_ts.map(|ts| hop_earliest_start(ts, slide_ms, size_ms)))
-                .collect();
-            Ok(Arc::new(result))
-        }
-        other => Err(DataFusionError::Plan(format!(
-            "Unsupported timestamp type for hop(): {other:?}. \
-             Use TimestampMillisecond or Int64."
-        ))),
-    }
+    let input = to_millis_array(array)?;
+    let result: TimestampMillisecondArray = input
+        .iter()
+        .map(|opt_ts| opt_ts.map(|ts| hop_earliest_start(ts, slide_ms, size_ms)))
+        .collect();
+    Ok(Arc::new(result))
 }
 
 /// Computes the earliest window start for a hopping window containing `ts`.
@@ -645,56 +599,27 @@ fn compute_hop_array_with_offset(
     size_ms: i64,
     offset_ms: i64,
 ) -> Result<ArrayRef> {
-    match array.data_type() {
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let input = array.as_primitive::<TimestampMillisecondType>();
-            let result: TimestampMillisecondArray = input
-                .iter()
-                .map(|opt_ts| {
-                    opt_ts
-                        .map(|ts| hop_earliest_start(ts - offset_ms, slide_ms, size_ms) + offset_ms)
-                })
-                .collect();
-            Ok(Arc::new(result))
-        }
-        DataType::Int64 => {
-            let input = array.as_primitive::<Int64Type>();
-            let result: TimestampMillisecondArray = input
-                .iter()
-                .map(|opt_ts| {
-                    opt_ts
-                        .map(|ts| hop_earliest_start(ts - offset_ms, slide_ms, size_ms) + offset_ms)
-                })
-                .collect();
-            Ok(Arc::new(result))
-        }
-        other => Err(DataFusionError::Plan(format!(
-            "Unsupported timestamp type for hop(): {other:?}. \
-             Use TimestampMillisecond or Int64."
-        ))),
-    }
+    let input = to_millis_array(array)?;
+    let result: TimestampMillisecondArray = input
+        .iter()
+        .map(|opt_ts| {
+            opt_ts.map(|ts| hop_earliest_start(ts - offset_ms, slide_ms, size_ms) + offset_ms)
+        })
+        .collect();
+    Ok(Arc::new(result))
 }
 
 /// Converts a timestamp array to `TimestampMillisecond` for consistent output.
 fn convert_to_timestamp_ms_array(array: &ArrayRef) -> Result<ArrayRef> {
-    match array.data_type() {
-        DataType::Timestamp(TimeUnit::Millisecond, _) => Ok(Arc::clone(array)),
-        DataType::Int64 => {
-            let input = array.as_primitive::<Int64Type>();
-            let result: TimestampMillisecondArray = input.iter().collect();
-            Ok(Arc::new(result))
-        }
-        other => Err(DataFusionError::Plan(format!(
-            "Unsupported timestamp type for session(): {other:?}. \
-             Use TimestampMillisecond or Int64."
-        ))),
-    }
+    let ms = to_millis_array(array)?;
+    Ok(Arc::new(ms))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{IntervalDayTime, IntervalMonthDayNano};
+    use arrow::datatypes::{IntervalDayTime, IntervalMonthDayNano, TimestampMillisecondType};
+    use arrow_array::cast::AsArray;
     use arrow_array::Array;
     use arrow_schema::Field;
     use datafusion_common::config::ConfigOptions;
@@ -800,6 +725,68 @@ mod tests {
                 assert_eq!(r.value(2), 300_000);
                 assert_eq!(r.value(3), 300_000);
                 assert!(r.is_null(4));
+            }
+            ColumnarValue::Scalar(_) => panic!("Expected array result"),
+        }
+    }
+
+    /// Regression: TUMBLE over a `Timestamp(Nanosecond)` column used to
+    /// bail out with "Unsupported timestamp type for tumble()" because
+    /// the array fast path only handled `Timestamp(Millisecond)` and
+    /// `Int64`. `to_millis_array` now casts any Timestamp precision.
+    #[test]
+    fn test_tumble_array_input_nanosecond() {
+        use arrow_array::TimestampNanosecondArray;
+
+        let udf = TumbleWindowStart::new();
+        // 0s, 150s, 300s, 420s in ns.
+        let ts_array = TimestampNanosecondArray::from(vec![
+            Some(0),
+            Some(150_000_000_000),
+            Some(300_000_000_000),
+            Some(420_000_000_000),
+            None,
+        ]);
+        let ts = ColumnarValue::Array(Arc::new(ts_array));
+        let interval = interval_dt(0, 300_000); // 5 minutes
+
+        let result = udf
+            .invoke_with_args(make_args(vec![ts, interval], 5))
+            .unwrap();
+        match result {
+            ColumnarValue::Array(arr) => {
+                let r = arr.as_primitive::<TimestampMillisecondType>();
+                assert_eq!(r.value(0), 0);
+                assert_eq!(r.value(1), 0);
+                assert_eq!(r.value(2), 300_000);
+                assert_eq!(r.value(3), 300_000);
+                assert!(r.is_null(4));
+            }
+            ColumnarValue::Scalar(_) => panic!("Expected array result"),
+        }
+    }
+
+    /// Regression: HOP over a `Timestamp(Nanosecond)` column — same
+    /// missing arm as TUMBLE, fixed by the same `to_millis_array` helper.
+    #[test]
+    fn test_hop_array_input_nanosecond() {
+        use arrow_array::TimestampNanosecondArray;
+
+        let udf = HopWindowStart::new();
+        // 7 minutes in ns.
+        let ts_array = TimestampNanosecondArray::from(vec![Some(420_000_000_000)]);
+        let ts = ColumnarValue::Array(Arc::new(ts_array));
+        // slide=5min, size=10min
+        let result = udf
+            .invoke_with_args(make_args(
+                vec![ts, interval_dt(0, 300_000), interval_dt(0, 600_000)],
+                1,
+            ))
+            .unwrap();
+        match result {
+            ColumnarValue::Array(arr) => {
+                let r = arr.as_primitive::<TimestampMillisecondType>();
+                assert_eq!(r.value(0), 0);
             }
             ColumnarValue::Scalar(_) => panic!("Expected array result"),
         }

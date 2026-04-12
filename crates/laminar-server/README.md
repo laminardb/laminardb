@@ -53,7 +53,7 @@ See the [Configuration Reference](https://laminardb.io/docs/) for every field, o
 
 ```toml
 [server]
-mode = "embedded"           # "embedded" (single-node) or "delta" (multi-node, planned)
+mode = "embedded"           # "embedded" (single-node) or "delta" (multi-node scaffolding, not production-hardened)
 bind = "0.0.0.0:8080"       # HTTP API bind address
 workers = 0                 # 0 = auto-detect CPU count
 log_level = "info"
@@ -83,7 +83,7 @@ name = "price"
 type = "DOUBLE"
 [[source.schema]]
 name = "ts"
-type = "BIGINT"
+type = "TIMESTAMP"
 [source.watermark]
 column = "ts"
 max_out_of_orderness = "5s"
@@ -123,8 +123,7 @@ format = "json"
 | POST | `/api/v1/sql` | Execute ad-hoc SQL (`{"sql": "..."}`) |
 | POST | `/api/v1/reload` | Hot-reload configuration |
 | GET | `/api/v1/cluster` | Cluster status (delta mode only) |
-| POST | `/api/v1/pause` | Pause pipeline (stub — returns 501) |
-| POST | `/api/v1/resume` | Resume pipeline (stub — returns 501) |
+| GET | `/ws/{name}` | WebSocket upgrade for push-based subscriptions to a stream |
 
 ## Hot Reload
 
@@ -144,4 +143,4 @@ See [deploy/README.md](../../deploy/README.md) for binary downloads, Docker, and
 - [`laminar-db`](../laminar-db) -- Database facade
 - [`laminar-connectors`](../laminar-connectors) -- External system connectors
 - [`laminar-core`](../laminar-core) -- Streaming engine
-- [`laminar-storage`](../laminar-storage) -- WAL and checkpoint storage
+- [`laminar-storage`](../laminar-storage) -- Checkpoint storage

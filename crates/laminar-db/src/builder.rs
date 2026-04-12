@@ -177,6 +177,38 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Source → coordinator channel capacity (default 64). Increase for
+    /// burst absorption at the cost of memory.
+    #[must_use]
+    pub fn pipeline_channel_capacity(mut self, capacity: usize) -> Self {
+        self.config.pipeline_channel_capacity = Some(capacity);
+        self
+    }
+
+    /// Micro-batch coalescing window (default 5ms for connectors, 0 for
+    /// embedded). Larger values amortize per-cycle SQL overhead.
+    #[must_use]
+    pub fn pipeline_batch_window(mut self, window: std::time::Duration) -> Self {
+        self.config.pipeline_batch_window = Some(window);
+        self
+    }
+
+    /// Max time draining the source channel per cycle, in nanoseconds
+    /// (default 1ms). Increase to process more messages per SQL execution.
+    #[must_use]
+    pub fn pipeline_drain_budget_ns(mut self, ns: u64) -> Self {
+        self.config.pipeline_drain_budget_ns = Some(ns);
+        self
+    }
+
+    /// Per-query execution budget in nanoseconds (default 8ms). When
+    /// exceeded, remaining queries are deferred to the next cycle.
+    #[must_use]
+    pub fn pipeline_query_budget_ns(mut self, ns: u64) -> Self {
+        self.config.pipeline_query_budget_ns = Some(ns);
+        self
+    }
+
     /// Register custom connectors with the `ConnectorRegistry`.
     ///
     /// The callback is invoked after the database is created and built-in

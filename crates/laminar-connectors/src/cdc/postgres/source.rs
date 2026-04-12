@@ -27,7 +27,7 @@ use super::changelog::{events_to_record_batch, tuple_to_json, CdcOperation, Chan
 use super::config::PostgresCdcConfig;
 use super::decoder::{decode_message, WalMessage};
 use super::lsn::Lsn;
-use super::metrics::CdcMetrics;
+use super::metrics::PostgresCdcMetrics;
 use super::schema::{cdc_envelope_schema, RelationCache, RelationInfo};
 /// `PostgreSQL` CDC source connector.
 ///
@@ -37,14 +37,14 @@ use super::schema::{cdc_envelope_schema, RelationCache, RelationInfo};
 ///
 /// # Envelope Schema
 ///
-/// | Column   | Type   | Nullable | Description                    |
-/// |----------|--------|----------|--------------------------------|
-/// | `_table` | Utf8   | no       | Schema-qualified table name    |
-/// | `_op`    | Utf8   | no       | Operation: I, U, D             |
-/// | `_lsn`   | UInt64 | no       | WAL position                   |
-/// | `_ts_ms` | Int64  | no       | Commit timestamp (Unix ms)     |
-/// | `_before`| Utf8   | yes      | Old row JSON (for U, D)        |
-/// | `_after` | Utf8   | yes      | New row JSON (for I, U)        |
+/// | Column   | Type          | Nullable | Description                 |
+/// |----------|---------------|----------|-----------------------------|
+/// | `_table` | Utf8          | no       | Schema-qualified table name |
+/// | `_op`    | Utf8          | no       | Operation: I, U, D          |
+/// | `_lsn`   | UInt64        | no       | WAL position                |
+/// | `_ts_ms` | Timestamp(ms) | no       | Commit timestamp            |
+/// | `_before`| Utf8          | yes      | Old row JSON (for U, D)     |
+/// | `_after` | Utf8          | yes      | New row JSON (for I, U)     |
 pub struct PostgresCdcSource {
     /// Connector configuration.
     config: PostgresCdcConfig,
@@ -56,7 +56,7 @@ pub struct PostgresCdcSource {
     schema: SchemaRef,
 
     /// Lock-free metrics.
-    metrics: Arc<CdcMetrics>,
+    metrics: Arc<PostgresCdcMetrics>,
 
     /// Cached relation (table) schemas from Relation messages.
     relation_cache: RelationCache,
@@ -90,7 +90,7 @@ pub struct PostgresCdcSource {
 
     /// Channel receiver for WAL events from the background reader task.
     #[cfg(feature = "postgres-cdc")]
-    wal_rx: Option<tokio::sync::mpsc::Receiver<WalPayload>>,
+    wal_rx: Option<WalPayloadRx>,
 
     /// Background WAL reader task handle.
     #[cfg(feature = "postgres-cdc")]
@@ -117,6 +117,10 @@ struct TransactionState {
     /// Change events accumulated in this transaction.
     events: Vec<ChangeEvent>,
 }
+
+/// Single-consumer async receiver for the WAL reader → `poll_batch` queue.
+#[cfg(feature = "postgres-cdc")]
+type WalPayloadRx = crossfire::AsyncRx<crossfire::mpsc::Array<WalPayload>>;
 
 /// WAL event payload sent from the background reader task to [`PostgresCdcSource::poll_batch`].
 #[allow(dead_code)] // constructed + consumed only with feature = "postgres-cdc"
@@ -150,7 +154,7 @@ impl PostgresCdcSource {
             config,
             state: ConnectorState::Created,
             schema: cdc_envelope_schema(),
-            metrics: Arc::new(CdcMetrics::new()),
+            metrics: Arc::new(PostgresCdcMetrics::new()),
             relation_cache: RelationCache::new(),
             event_buffer: VecDeque::new(),
             current_txn: None,
@@ -558,7 +562,7 @@ impl SourceConnector for PostgresCdcSource {
                 })?;
 
             // Spawn background reader task for event-driven wake-up.
-            let (wal_tx, wal_rx) = tokio::sync::mpsc::channel(4096);
+            let (wal_tx, wal_rx) = crossfire::mpsc::bounded_async::<WalPayload>(4096);
             let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
             let (confirmed_lsn_tx, mut confirmed_lsn_rx) =
                 tokio::sync::watch::channel(self.confirmed_flush_lsn.as_u64());
@@ -735,8 +739,8 @@ impl SourceConnector for PostgresCdcSource {
                     {
                         match rx.try_recv() {
                             Ok(payload) => payloads.push(payload),
-                            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            Err(crossfire::TryRecvError::Empty) => break,
+                            Err(crossfire::TryRecvError::Disconnected) => {
                                 reader_closed = true;
                                 break;
                             }
@@ -870,10 +874,26 @@ impl SourceConnector for PostgresCdcSource {
             self.confirmed_lsn_tx = None;
         }
 
-        // Abort the background control-plane connection task.
+        // Await the control-plane connection task briefly so it can
+        // finish any in-flight work before we abort.
         #[cfg(feature = "postgres-cdc")]
         if let Some(handle) = self.connection_handle.take() {
-            handle.abort();
+            let abort = handle.abort_handle();
+            match tokio::time::timeout(std::time::Duration::from_secs(2), handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(join_err)) => {
+                    tracing::warn!(
+                        error = %join_err,
+                        "[postgres-cdc] control-plane task exited with error"
+                    );
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        "[postgres-cdc] control-plane task did not exit within 2s; aborting"
+                    );
+                    abort.abort();
+                }
+            }
         }
 
         self.state = ConnectorState::Closed;

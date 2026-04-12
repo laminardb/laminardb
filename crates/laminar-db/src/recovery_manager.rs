@@ -84,28 +84,9 @@ impl RecoveredState {
     pub fn table_store_checkpoint_path(&self) -> Option<&str> {
         self.manifest.table_store_checkpoint_path.as_deref()
     }
-
-    /// Returns whether this checkpoint has in-flight data (unaligned checkpoint).
-    ///
-    /// When true, the caller should replay the in-flight events before resuming
-    /// normal processing to maintain exactly-once semantics.
-    #[must_use]
-    pub fn has_inflight_data(&self) -> bool {
-        !self.manifest.inflight_data.is_empty()
-    }
-
-    /// Returns the in-flight data from an unaligned checkpoint.
-    ///
-    /// Key: operator name. Value: list of in-flight records per input channel.
-    #[must_use]
-    pub fn inflight_data(
-        &self,
-    ) -> &HashMap<String, Vec<laminar_storage::checkpoint_manifest::InFlightRecord>> {
-        &self.manifest.inflight_data
-    }
 }
 
-/// Unified recovery manager.
+/// Recovery manager.
 ///
 /// Loads the latest [`CheckpointManifest`] from a [`CheckpointStore`] and
 /// restores all registered sources, sinks, and tables to their checkpointed
@@ -212,9 +193,7 @@ impl<'a> RecoveryManager<'a> {
         }
 
         // Fallback: iterate through all checkpoints in reverse order.
-        let checkpoints = self.store.list().map_err(|e| {
-            DbError::Checkpoint(format!("failed to list checkpoints for fallback: {e}"))
-        })?;
+        let checkpoints = self.store.list().map_err(DbError::from)?;
 
         if checkpoints.is_empty() {
             warn!("no checkpoints available for fallback, starting fresh");
@@ -489,17 +468,33 @@ impl<'a> RecoveryManager<'a> {
             }
             if let Some(cp) = manifest.source_offsets.get(&source.name) {
                 let source_cp = connector_to_source_checkpoint(cp);
-                let mut connector = source.connector.lock().await;
-                match connector.restore(&source_cp).await {
-                    Ok(()) => {
-                        result.sources_restored += 1;
-                        debug!(source = %source.name, epoch = cp.epoch, "source restored");
+                let mut last_err = None;
+                for attempt in 0..3u32 {
+                    let mut connector = source.connector.lock().await;
+                    match connector.restore(&source_cp).await {
+                        Ok(()) => {
+                            last_err = None;
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(
+                                source = %source.name, attempt,
+                                error = %e, "source restore failed, retrying"
+                            );
+                            last_err = Some(e);
+                            drop(connector);
+                            if attempt < 2 {
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            }
+                        }
                     }
-                    Err(e) => {
-                        let msg = format!("source restore failed: {e}");
-                        warn!(source = %source.name, error = %e, "source restore failed");
-                        result.source_errors.insert(source.name.clone(), msg);
-                    }
+                }
+                if let Some(e) = last_err {
+                    let msg = format!("source restore failed after 3 attempts: {e}");
+                    result.source_errors.insert(source.name.clone(), msg);
+                } else {
+                    result.sources_restored += 1;
+                    debug!(source = %source.name, epoch = cp.epoch, "source restored");
                 }
             }
         }
@@ -544,20 +539,24 @@ impl<'a> RecoveryManager<'a> {
                     continue;
                 }
 
-                // Rollback is fire-and-forget via the task channel.
-                sink.handle.rollback_epoch(manifest.epoch).await;
-                result.sinks_rolled_back += 1;
-                debug!(sink = %sink.name, epoch = manifest.epoch, "sink rolled back");
+                match sink.handle.rollback_epoch(manifest.epoch).await {
+                    Ok(()) => {
+                        result.sinks_rolled_back += 1;
+                        debug!(sink = %sink.name, epoch = manifest.epoch, "sink rolled back");
+                    }
+                    Err(e) => {
+                        result
+                            .sink_errors
+                            .insert(sink.name.clone(), format!("rollback failed: {e}"));
+                        warn!(
+                            sink = %sink.name,
+                            epoch = manifest.epoch,
+                            error = %e,
+                            "[LDB-6016] sink rollback failed during recovery"
+                        );
+                    }
+                }
             }
-        }
-
-        // Log inflight data if present (unaligned checkpoint recovery).
-        if !manifest.inflight_data.is_empty() {
-            let total_records: usize = manifest.inflight_data.values().map(Vec::len).sum();
-            info!(
-                operators = manifest.inflight_data.len(),
-                total_records, "unaligned checkpoint: inflight data present for replay"
-            );
         }
 
         info!(
@@ -567,7 +566,6 @@ impl<'a> RecoveryManager<'a> {
             tables_restored = result.tables_restored,
             sinks_rolled_back = result.sinks_rolled_back,
             errors = result.source_errors.len() + result.sink_errors.len(),
-            has_inflight_data = !manifest.inflight_data.is_empty(),
             "recovery complete"
         );
 
@@ -664,9 +662,7 @@ impl<'a> RecoveryManager<'a> {
     ///
     /// Returns `DbError::Checkpoint` if the store fails.
     pub fn load_latest(&self) -> Result<Option<CheckpointManifest>, DbError> {
-        self.store
-            .load_latest()
-            .map_err(|e| DbError::Checkpoint(format!("failed to load checkpoint: {e}")))
+        self.store.load_latest().map_err(DbError::from)
     }
 
     /// Loads a specific checkpoint by ID.
@@ -675,9 +671,7 @@ impl<'a> RecoveryManager<'a> {
     ///
     /// Returns `DbError::Checkpoint` if the store fails.
     pub fn load_by_id(&self, checkpoint_id: u64) -> Result<Option<CheckpointManifest>, DbError> {
-        self.store.load_by_id(checkpoint_id).map_err(|e| {
-            DbError::Checkpoint(format!("failed to load checkpoint {checkpoint_id}: {e}"))
-        })
+        self.store.load_by_id(checkpoint_id).map_err(DbError::from)
     }
 }
 
@@ -927,36 +921,6 @@ mod tests {
 
         let big = result.operator_states().get("big-op").unwrap();
         assert_eq!(big.decode_inline().unwrap(), large_data);
-    }
-
-    #[tokio::test]
-    async fn test_recover_with_inflight_data() {
-        use laminar_storage::checkpoint_manifest::InFlightRecord;
-
-        let dir = tempfile::tempdir().unwrap();
-        let store = make_store(dir.path());
-
-        let mut manifest = CheckpointManifest::new(1, 5);
-        // Pre-encoded "inflight-event" in base64
-        let record = InFlightRecord {
-            input_id: 0,
-            data_b64: "aW5mbGlnaHQtZXZlbnQ=".into(),
-        };
-        manifest
-            .inflight_data
-            .insert("join-op".into(), vec![record]);
-        store.save(&manifest).unwrap();
-
-        let mgr = RecoveryManager::new(&store);
-        let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
-
-        assert!(result.has_inflight_data());
-        let inflight = result.inflight_data();
-        assert_eq!(inflight.len(), 1);
-        let records = inflight.get("join-op").unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].input_id, 0);
-        assert_eq!(records[0].data_b64, "aW5mbGlnaHQtZXZlbnQ=");
     }
 
     #[tokio::test]

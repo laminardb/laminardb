@@ -1,13 +1,6 @@
 #![deny(clippy::disallowed_types)]
 
-//! Core window state for EOWC queries routed through core operators.
-//!
-//! Routes qualifying SQL EOWC queries through the core engine's canonical
-//! window assigners (`TumblingWindowAssigner`, `SlidingWindowAssigner`, or
-//! session-gap logic) for window assignment while using `DataFusion`
-//! `Accumulator`s for aggregation. This eliminates the duplicated window
-//! assignment logic in `IncrementalEowcState`.
-//!
+//! Core window state for tumbling/hopping/session aggregate queries.
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -42,28 +35,21 @@ enum CoreWindowAssigner {
 
 /// Pre-compiled post-aggregate projection (e.g., `SUM(a)/SUM(b) AS ratio`).
 struct PostProjection {
-    /// One `PhysicalExpr` per column in `final_schema`, evaluated against
-    /// an intermediate batch with the `Aggregate` node's output schema.
     exprs: Vec<Arc<dyn PhysicalExpr>>,
-    /// Output schema after projection: `[window_start, window_end, projected...]`.
     final_schema: SchemaRef,
-    /// Schema matching the `Aggregate` output: `[group_cols..., agg_results...]`.
     intermediate_schema: SchemaRef,
 }
 
-/// Accumulator state for a single session window instance.
 struct SessionAccState {
     start: i64,
     end: i64,
     accs: Vec<Box<dyn datafusion_expr::Accumulator>>,
 }
 
-/// Per-group session state: active sessions keyed by start timestamp.
 struct SessionGroupState {
     sessions: BTreeMap<i64, SessionAccState>,
 }
 
-/// Serializable checkpoint for a single session.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SessionCheckpoint {
     pub start: i64,
@@ -71,17 +57,14 @@ pub(crate) struct SessionCheckpoint {
     pub acc_states: Vec<Vec<serde_json::Value>>,
 }
 
-/// Serializable checkpoint for one group's sessions.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SessionGroupCheckpoint {
     pub key: Vec<serde_json::Value>,
     pub sessions: Vec<SessionCheckpoint>,
 }
 
-/// Serializable checkpoint for a core window pipeline state.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CoreWindowCheckpoint {
-    /// Query fingerprint for schema validation.
     pub fingerprint: u64,
     /// Per-window checkpoint data (reuses EOWC format) — used by
     /// tumbling and hopping assigners.
@@ -105,15 +88,15 @@ fn default_window_type_tag() -> String {
 pub(crate) struct CoreWindowState {
     assigner: CoreWindowAssigner,
     /// Per-window aggregate state: `window_start` -> per-group accumulators.
-    /// Used by tumbling and hopping assigners.
     #[allow(clippy::type_complexity)]
-    windows: BTreeMap<i64, AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>>,
+    windows:
+        BTreeMap<i64, AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>>,
     /// Per-group session state. Only populated for session windows.
-    session_groups: AHashMap<Vec<ScalarValue>, SessionGroupState>,
+    session_groups: AHashMap<arrow::row::OwnedRow, SessionGroupState>,
+    /// Persistent row converter for group key encoding/decoding.
+    row_converter: arrow::row::RowConverter,
     agg_specs: Vec<AggFuncSpec>,
     num_group_cols: usize,
-    #[allow(dead_code)]
-    group_col_names: Vec<String>,
     group_types: Vec<DataType>,
     pre_agg_sql: String,
     time_col_index: usize,
@@ -128,6 +111,11 @@ pub(crate) struct CoreWindowState {
     /// arriving within this window are included instead of dropped.
     allowed_lateness_ms: i64,
     post_projection: Option<PostProjection>,
+    /// Reusable scratch map for no-group window assignment (avoids per-batch allocation).
+    scratch_nogroup: AHashMap<i64, Vec<u32>>,
+    /// Reusable scratch map for grouped window assignment (avoids per-batch allocation).
+    #[allow(clippy::type_complexity)]
+    scratch_grouped: AHashMap<(i64, arrow::row::OwnedRow), Vec<u32>>,
 }
 
 impl CoreWindowState {
@@ -214,7 +202,7 @@ impl CoreWindowState {
 
         // Determine if we should attempt to compile pre-agg expressions.
         // Use single_source_table (counts occurrences) to reject self-joins.
-        let compile_source = crate::stream_executor::single_source_table(sql);
+        let compile_source = crate::sql_analysis::single_source_table(sql);
         let state_ref = ctx.state();
         let compile_props = state_ref.execution_props();
         let input_df_schema = &agg_info.input_df_schema;
@@ -472,6 +460,7 @@ impl CoreWindowState {
                     output_name,
                     return_type,
                     distinct: is_distinct,
+                    is_count_star: agg_func.params.args.is_empty(),
                     filter_col_index,
                 });
             } else {
@@ -610,13 +599,20 @@ impl CoreWindowState {
             None
         };
 
+        let sort_fields: Vec<arrow::row::SortField> = group_types
+            .iter()
+            .map(|dt| arrow::row::SortField::new(dt.clone()))
+            .collect();
+        let row_converter = arrow::row::RowConverter::new(sort_fields)
+            .map_err(|e| DbError::Pipeline(format!("row converter init: {e}")))?;
+
         Ok(Some(Self {
             assigner,
             windows: BTreeMap::new(),
             session_groups: AHashMap::new(),
+            row_converter,
             agg_specs,
             num_group_cols,
-            group_col_names,
             group_types,
             pre_agg_sql,
             output_schema,
@@ -629,6 +625,8 @@ impl CoreWindowState {
             allowed_lateness_ms: i64::try_from(window_config.allowed_lateness.as_millis())
                 .unwrap_or(0),
             post_projection,
+            scratch_nogroup: AHashMap::new(),
+            scratch_grouped: AHashMap::new(),
         }))
     }
 
@@ -654,25 +652,18 @@ impl CoreWindowState {
             return self.update_batch_session(batch, &ts_array);
         }
 
-        // ── Vectorized path for tumbling/hopping ────────────────────────
-
-        // Batch-level group key extraction via RowConverter (one allocation)
-        let (converter, rows) = if self.num_group_cols > 0 {
+        // Batch-level group key extraction via persistent RowConverter
+        let rows = if self.num_group_cols > 0 {
             let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
                 .map(|i| Arc::clone(batch.column(i)))
                 .collect();
-            let sort_fields: Vec<arrow::row::SortField> = group_cols
-                .iter()
-                .map(|c| arrow::row::SortField::new(c.data_type().clone()))
-                .collect();
-            let converter = arrow::row::RowConverter::new(sort_fields)
-                .map_err(|e| DbError::Pipeline(format!("row converter: {e}")))?;
-            let rows = converter
+            let rows = self
+                .row_converter
                 .convert_columns(&group_cols)
                 .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
-            (Some(converter), Some(rows))
+            Some(rows)
         } else {
-            (None, None)
+            None
         };
 
         // Group row indices by (window_start, group_key).
@@ -681,7 +672,9 @@ impl CoreWindowState {
 
         // For no-group case, just group by window_start
         if !has_groups {
-            let mut grouped: AHashMap<i64, Vec<u32>> = AHashMap::new();
+            let empty_key = crate::aggregate_state::global_aggregate_key();
+            let mut grouped = std::mem::take(&mut self.scratch_nogroup);
+            grouped.clear();
             for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
                 if ts_ms == NULL_TIMESTAMP {
                     continue; // skip rows with null timestamps
@@ -701,22 +694,21 @@ impl CoreWindowState {
                 }
             }
             for (window_start, indices) in &grouped {
-                let sv_key: Vec<ScalarValue> = Vec::new();
                 let needs_insert = {
                     let wg = self.windows.entry(*window_start).or_default();
-                    !wg.contains_key(&sv_key)
+                    !wg.contains_key(&empty_key)
                 };
                 if needs_insert {
                     let accs = self.create_fresh_accumulators()?;
                     self.windows
                         .entry(*window_start)
                         .or_default()
-                        .insert(sv_key.clone(), accs);
+                        .insert(empty_key.clone(), accs);
                 }
                 let Some(accs) = self
                     .windows
                     .get_mut(window_start)
-                    .and_then(|g| g.get_mut(&sv_key))
+                    .and_then(|g| g.get_mut(&empty_key))
                 else {
                     continue;
                 };
@@ -725,14 +717,17 @@ impl CoreWindowState {
                     batch,
                     indices,
                     &self.agg_specs,
+                    None,
                 )?;
             }
+            self.scratch_nogroup = grouped;
             return Ok(());
         }
 
         // Grouped path: OwnedRow as key (one owned() per row, ~8-32 bytes each)
         let rows_ref = rows.as_ref().expect("rows set when has_groups");
-        let mut grouped: AHashMap<(i64, arrow::row::OwnedRow), Vec<u32>> = AHashMap::new();
+        let mut grouped = std::mem::take(&mut self.scratch_grouped);
+        grouped.clear();
 
         for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
             if ts_ms == NULL_TIMESTAMP {
@@ -760,18 +755,11 @@ impl CoreWindowState {
             }
         }
 
-        let conv = converter.as_ref().expect("converter set when has_groups");
         for ((window_start, row_key), indices) in &grouped {
-            let sv_key = crate::aggregate_state::row_to_scalar_key_with_types(
-                conv,
-                row_key,
-                &self.group_types,
-            )?;
-
             // Ensure group exists in window state (borrow-split pattern)
             let needs_insert = {
                 let window_groups = self.windows.entry(*window_start).or_default();
-                if window_groups.contains_key(&sv_key) {
+                if window_groups.contains_key(row_key) {
                     false
                 } else if window_groups.len() >= self.max_groups_per_window {
                     tracing::warn!(
@@ -789,13 +777,13 @@ impl CoreWindowState {
                 self.windows
                     .entry(*window_start)
                     .or_default()
-                    .insert(sv_key.clone(), accs);
+                    .insert(row_key.clone(), accs);
             }
 
             let Some(accs) = self
                 .windows
                 .get_mut(window_start)
-                .and_then(|g| g.get_mut(&sv_key))
+                .and_then(|g| g.get_mut(row_key))
             else {
                 continue;
             };
@@ -805,9 +793,11 @@ impl CoreWindowState {
                 batch,
                 indices,
                 &self.agg_specs,
+                None,
             )?;
         }
 
+        self.scratch_grouped = grouped;
         Ok(())
     }
 
@@ -824,25 +814,45 @@ impl CoreWindowState {
             if ts_ms == NULL_TIMESTAMP {
                 continue; // skip rows with null timestamps
             }
-            let key = self.extract_group_key_scalar(batch, row)?;
-            self.update_session_window(ts_ms, gap_ms, &key, batch, row)?;
+            #[allow(clippy::cast_possible_truncation)]
+            let index_array = arrow::array::UInt32Array::from_value(row as u32, 1);
+            let key = self.extract_group_key_row(batch, &index_array)?;
+            // Drop new keys once `session_groups` hits the cap. Existing
+            // keys still aggregate so in-flight sessions aren't corrupted.
+            if !self.session_groups.contains_key(&key)
+                && self.session_groups.len() >= self.max_groups_per_window
+            {
+                tracing::warn!(
+                    max_groups = self.max_groups_per_window,
+                    "Core window session group cardinality limit reached"
+                );
+                continue;
+            }
+            self.update_session_window(ts_ms, gap_ms, &key, batch, &index_array)?;
         }
         Ok(())
     }
 
     /// Extract group key for a single row (scalar fallback for session windows).
-    fn extract_group_key_scalar(
+    fn extract_group_key_row(
         &self,
         batch: &RecordBatch,
-        row: usize,
-    ) -> Result<Vec<ScalarValue>, DbError> {
-        let mut key = Vec::with_capacity(self.num_group_cols);
-        for col_idx in 0..self.num_group_cols {
-            let sv = ScalarValue::try_from_array(batch.column(col_idx), row)
-                .map_err(|e| DbError::Pipeline(format!("group key extraction: {e}")))?;
-            key.push(sv);
+        index_array: &arrow::array::UInt32Array,
+    ) -> Result<arrow::row::OwnedRow, DbError> {
+        if self.num_group_cols == 0 {
+            return Ok(crate::aggregate_state::global_aggregate_key());
         }
-        Ok(key)
+        let group_cols: Vec<ArrayRef> = (0..self.num_group_cols)
+            .map(|i| {
+                compute::take(batch.column(i), index_array, None)
+                    .map_err(|e| DbError::Pipeline(format!("group key take: {e}")))
+            })
+            .collect::<Result<_, _>>()?;
+        let rows = self
+            .row_converter
+            .convert_columns(&group_cols)
+            .map_err(|e| DbError::Pipeline(format!("group key row conversion: {e}")))?;
+        Ok(rows.row(0).owned())
     }
 
     /// Update accumulators for a session window, merging overlapping sessions.
@@ -851,9 +861,9 @@ impl CoreWindowState {
         &mut self,
         ts_ms: i64,
         gap_ms: i64,
-        key: &[ScalarValue],
+        key: &arrow::row::OwnedRow,
         batch: &RecordBatch,
-        row: usize,
+        index_array: &arrow::array::UInt32Array,
     ) -> Result<(), DbError> {
         let new_start = ts_ms;
         let new_end = ts_ms.saturating_add(gap_ms);
@@ -874,10 +884,10 @@ impl CoreWindowState {
         match overlapping.len() {
             0 => {
                 let mut accs = self.create_fresh_accumulators()?;
-                Self::update_accumulators(&mut accs, &self.agg_specs, batch, row)?;
+                Self::update_accumulators(&mut accs, &self.agg_specs, batch, index_array)?;
                 let group =
                     self.session_groups
-                        .entry(key.to_vec())
+                        .entry(key.clone())
                         .or_insert_with(|| SessionGroupState {
                             sessions: BTreeMap::new(),
                         });
@@ -898,7 +908,7 @@ impl CoreWindowState {
                 let merged_end = sess.end.max(new_end);
                 sess.start = merged_start;
                 sess.end = merged_end;
-                Self::update_accumulators(&mut sess.accs, &self.agg_specs, batch, row)?;
+                Self::update_accumulators(&mut sess.accs, &self.agg_specs, batch, index_array)?;
                 if merged_start != sess_key {
                     let sess = group.sessions.remove(&sess_key).unwrap();
                     group.sessions.insert(merged_start, sess);
@@ -938,7 +948,7 @@ impl CoreWindowState {
                 }
 
                 let mut accs = survivor_accs.unwrap();
-                Self::update_accumulators(&mut accs, &self.agg_specs, batch, row)?;
+                Self::update_accumulators(&mut accs, &self.agg_specs, batch, index_array)?;
                 group.sessions.insert(
                     merged_start,
                     SessionAccState {
@@ -969,22 +979,18 @@ impl CoreWindowState {
         accs: &mut [Box<dyn datafusion_expr::Accumulator>],
         agg_specs: &[AggFuncSpec],
         batch: &RecordBatch,
-        row: usize,
+        index_array: &arrow::array::UInt32Array,
     ) -> Result<(), DbError> {
-        let index_array = arrow::array::UInt32Array::from(vec![
-            #[allow(clippy::cast_possible_truncation)]
-            (row as u32),
-        ]);
         for (i, spec) in agg_specs.iter().enumerate() {
             let mut input_arrays: Vec<ArrayRef> = Vec::with_capacity(spec.input_col_indices.len());
             for &col_idx in &spec.input_col_indices {
-                let arr = compute::take(batch.column(col_idx), &index_array, None)
+                let arr = compute::take(batch.column(col_idx), index_array, None)
                     .map_err(|e| DbError::Pipeline(format!("array take: {e}")))?;
                 input_arrays.push(arr);
             }
 
             if let Some(filter_idx) = spec.filter_col_index {
-                let filter_arr = compute::take(batch.column(filter_idx), &index_array, None)
+                let filter_arr = compute::take(batch.column(filter_idx), index_array, None)
                     .map_err(|e| DbError::Pipeline(format!("filter take: {e}")))?;
                 if let Some(mask) = filter_arr
                     .as_any()
@@ -1082,7 +1088,7 @@ impl CoreWindowState {
         let mut rows: Vec<(
             i64,
             i64,
-            Vec<ScalarValue>,
+            arrow::row::OwnedRow,
             Vec<Box<dyn datafusion_expr::Accumulator>>,
         )> = Vec::new();
 
@@ -1127,7 +1133,7 @@ impl CoreWindowState {
         rows: Vec<(
             i64,
             i64,
-            Vec<ScalarValue>,
+            arrow::row::OwnedRow,
             Vec<Box<dyn datafusion_expr::Accumulator>>,
         )>,
     ) -> Result<Vec<RecordBatch>, DbError> {
@@ -1135,9 +1141,7 @@ impl CoreWindowState {
 
         let mut starts = Vec::with_capacity(num_rows);
         let mut ends = Vec::with_capacity(num_rows);
-        let mut group_scalars: Vec<Vec<ScalarValue>> = (0..self.num_group_cols)
-            .map(|_| Vec::with_capacity(num_rows))
-            .collect();
+        let mut row_keys: Vec<arrow::row::OwnedRow> = Vec::with_capacity(num_rows);
         let mut agg_scalars: Vec<Vec<ScalarValue>> = (0..self.agg_specs.len())
             .map(|_| Vec::with_capacity(num_rows))
             .collect();
@@ -1145,9 +1149,7 @@ impl CoreWindowState {
         for (ws, we, key, mut accs) in rows {
             starts.push(ws);
             ends.push(we);
-            for (i, sv) in key.into_iter().enumerate() {
-                group_scalars[i].push(sv);
-            }
+            row_keys.push(key);
             for (i, acc) in accs.iter_mut().enumerate() {
                 let sv = acc
                     .evaluate()
@@ -1159,18 +1161,27 @@ impl CoreWindowState {
         let win_start_array: ArrayRef = Arc::new(arrow::array::Int64Array::from(starts));
         let win_end_array: ArrayRef = Arc::new(arrow::array::Int64Array::from(ends));
 
-        let mut group_arrays: Vec<ArrayRef> = Vec::with_capacity(self.num_group_cols);
-        for (col_idx, scalars) in group_scalars.into_iter().enumerate() {
-            let array = ScalarValue::iter_to_array(scalars)
-                .map_err(|e| DbError::Pipeline(format!("group key array: {e}")))?;
-            let dt = &self.group_types[col_idx];
-            if array.data_type() == dt {
-                group_arrays.push(array);
-            } else {
-                let casted = arrow::compute::cast(&array, dt).unwrap_or(array);
-                group_arrays.push(casted);
-            }
-        }
+        // Convert OwnedRow keys back to columnar arrays via RowConverter
+        let group_arrays: Vec<ArrayRef> = if self.num_group_cols > 0 {
+            let row_refs: Vec<arrow::row::Row<'_>> = row_keys.iter().map(|r| r.row()).collect();
+            let cols = self
+                .row_converter
+                .convert_rows(row_refs)
+                .map_err(|e| DbError::Pipeline(format!("session group key arrays: {e}")))?;
+            cols.into_iter()
+                .enumerate()
+                .map(|(col_idx, arr)| {
+                    let dt = &self.group_types[col_idx];
+                    if arr.data_type() == dt {
+                        arr
+                    } else {
+                        arrow::compute::cast(&arr, dt).unwrap_or(arr)
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         let mut agg_arrays: Vec<ArrayRef> = Vec::with_capacity(self.agg_specs.len());
         for (agg_idx, scalars) in agg_scalars.into_iter().enumerate() {
@@ -1200,13 +1211,14 @@ impl CoreWindowState {
         &self,
         window_start: i64,
         window_end: i64,
-        groups: AHashMap<Vec<ScalarValue>, Vec<Box<dyn datafusion_expr::Accumulator>>>,
+        groups: AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>,
     ) -> Result<Option<RecordBatch>, DbError> {
         crate::aggregate_state::emit_window_batch(
             window_start,
             window_end,
             groups,
-            &self.group_types,
+            &self.row_converter,
+            self.num_group_cols,
             &self.agg_specs,
             &self.output_schema,
         )
@@ -1260,33 +1272,27 @@ impl CoreWindowState {
         Ok(result)
     }
 
-    /// Pre-aggregation SQL.
-    #[allow(dead_code)] // Accessed in tests and available for diagnostics.
+    #[cfg(test)]
     pub fn pre_agg_sql(&self) -> &str {
         &self.pre_agg_sql
     }
 
-    /// HAVING predicate SQL, if any.
     pub fn having_sql(&self) -> Option<&str> {
         self.having_sql.as_deref()
     }
 
-    /// Compiled HAVING filter, if available.
     pub fn having_filter(&self) -> Option<&Arc<dyn PhysicalExpr>> {
         self.having_filter.as_ref()
     }
 
-    /// Compiled pre-aggregation projection, if available.
     pub fn compiled_projection(&self) -> Option<&CompiledProjection> {
         self.compiled_projection.as_ref()
     }
 
-    /// Cached optimized logical plan for the pre-agg SQL.
     pub fn cached_pre_agg_plan(&self) -> Option<&datafusion_expr::LogicalPlan> {
         self.cached_pre_agg_plan.as_ref()
     }
 
-    /// Compute a fingerprint for this query (SQL + schema).
     pub(crate) fn query_fingerprint(&self) -> u64 {
         query_fingerprint(&self.pre_agg_sql, &self.output_schema)
     }
@@ -1311,9 +1317,7 @@ impl CoreWindowState {
         // Tumbling/hopping windows
         for groups in self.windows.values() {
             for (key, accs) in groups {
-                for sv in key {
-                    total += sv.size();
-                }
+                total += key.as_ref().len();
                 for acc in accs {
                     total += acc.size();
                 }
@@ -1321,9 +1325,7 @@ impl CoreWindowState {
         }
         // Session windows
         for (key, group_state) in &self.session_groups {
-            for sv in key {
-                total += sv.size();
-            }
+            total += key.as_ref().len();
             for session in group_state.sessions.values() {
                 for acc in &session.accs {
                     total += acc.size();
@@ -1333,17 +1335,6 @@ impl CoreWindowState {
             }
         }
         total
-    }
-
-    /// Total number of distinct groups across all windows.
-    ///
-    /// For tumbling/hopping: sums group counts across all open windows.
-    /// For session: counts groups in `session_groups`.
-    #[allow(dead_code)]
-    pub(crate) fn group_count(&self) -> usize {
-        let windowed: usize = self.windows.values().map(|g| g.len()).sum();
-        let session = self.session_groups.len();
-        windowed + session
     }
 
     /// Checkpoint all per-window group states into a serializable struct.
@@ -1359,8 +1350,13 @@ impl CoreWindowState {
                 for (&window_start, groups) in &mut self.windows {
                     let mut group_checkpoints = Vec::with_capacity(groups.len());
                     for (key, accs) in groups {
+                        let sv_key = crate::aggregate_state::row_to_scalar_key_with_types(
+                            &self.row_converter,
+                            key,
+                            &self.group_types,
+                        )?;
                         let key_json: Vec<serde_json::Value> =
-                            key.iter().map(scalar_to_json).collect();
+                            sv_key.iter().map(scalar_to_json).collect();
                         let mut acc_states = Vec::with_capacity(accs.len());
                         for acc in accs {
                             let state = acc.state().map_err(|e| {
@@ -1371,6 +1367,7 @@ impl CoreWindowState {
                         group_checkpoints.push(GroupCheckpoint {
                             key: key_json,
                             acc_states,
+                            last_updated_ms: i64::MIN,
                         });
                     }
                     windows.push(WindowCheckpoint {
@@ -1388,7 +1385,13 @@ impl CoreWindowState {
             CoreWindowAssigner::Session { .. } => {
                 let mut session_state = Vec::with_capacity(self.session_groups.len());
                 for (key, group) in &mut self.session_groups {
-                    let key_json: Vec<serde_json::Value> = key.iter().map(scalar_to_json).collect();
+                    let sv_key = crate::aggregate_state::row_to_scalar_key_with_types(
+                        &self.row_converter,
+                        key,
+                        &self.group_types,
+                    )?;
+                    let key_json: Vec<serde_json::Value> =
+                        sv_key.iter().map(scalar_to_json).collect();
                     let mut sessions = Vec::with_capacity(group.sessions.len());
                     for sess in group.sessions.values_mut() {
                         let mut acc_states = Vec::with_capacity(sess.accs.len());
@@ -1451,8 +1454,14 @@ impl CoreWindowState {
         for wc in &checkpoint.windows {
             let mut groups = AHashMap::new();
             for gc in &wc.groups {
-                let key: Result<Vec<ScalarValue>, _> = gc.key.iter().map(json_to_scalar).collect();
-                let key = key?;
+                let sv_key: Result<Vec<ScalarValue>, _> =
+                    gc.key.iter().map(json_to_scalar).collect();
+                let sv_key = sv_key?;
+                let row_key = crate::aggregate_state::scalar_key_to_owned_row(
+                    &self.row_converter,
+                    &sv_key,
+                    &self.group_types,
+                )?;
                 let mut accs = Vec::with_capacity(self.agg_specs.len());
                 for (i, spec) in self.agg_specs.iter().enumerate() {
                     let mut acc = spec.create_accumulator()?;
@@ -1472,7 +1481,7 @@ impl CoreWindowState {
                     }
                     accs.push(acc);
                 }
-                groups.insert(key, accs);
+                groups.insert(row_key, accs);
                 total_groups += 1;
             }
             self.windows.insert(wc.window_start, groups);
@@ -1490,8 +1499,13 @@ impl CoreWindowState {
         self.session_groups.clear();
         let mut total_sessions = 0usize;
         for sgc in &checkpoint.session_state {
-            let key: Result<Vec<ScalarValue>, _> = sgc.key.iter().map(json_to_scalar).collect();
-            let key = key?;
+            let sv_key: Result<Vec<ScalarValue>, _> = sgc.key.iter().map(json_to_scalar).collect();
+            let sv_key = sv_key?;
+            let row_key = crate::aggregate_state::scalar_key_to_owned_row(
+                &self.row_converter,
+                &sv_key,
+                &self.group_types,
+            )?;
             let mut sessions = BTreeMap::new();
             for sc in &sgc.sessions {
                 let mut accs = Vec::with_capacity(self.agg_specs.len());
@@ -1525,7 +1539,7 @@ impl CoreWindowState {
                 total_sessions += 1;
             }
             self.session_groups
-                .insert(key, SessionGroupState { sessions });
+                .insert(row_key, SessionGroupState { sessions });
         }
         Ok(total_sessions)
     }
@@ -1578,6 +1592,7 @@ mod tests {
             output_name: "total".to_string(),
             return_type: DataType::Int64,
             distinct: false,
+            is_count_star: false,
             filter_col_index: None,
         }];
 
@@ -1594,8 +1609,11 @@ mod tests {
             session_groups: AHashMap::new(),
             agg_specs,
             num_group_cols: 1,
-            group_col_names: vec!["symbol".to_string()],
             group_types: vec![DataType::Utf8],
+            row_converter: arrow::row::RowConverter::new(vec![arrow::row::SortField::new(
+                DataType::Utf8,
+            )])
+            .unwrap(),
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
@@ -1606,6 +1624,8 @@ mod tests {
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
             post_projection: None,
+            scratch_nogroup: AHashMap::new(),
+            scratch_grouped: AHashMap::new(),
         }
     }
 
@@ -1623,6 +1643,7 @@ mod tests {
                 output_name: "total".to_string(),
                 return_type: DataType::Int64,
                 distinct: false,
+                is_count_star: false,
                 filter_col_index: None,
             },
             AggFuncSpec {
@@ -1632,6 +1653,7 @@ mod tests {
                 output_name: "cnt".to_string(),
                 return_type: DataType::Int64,
                 distinct: false,
+                is_count_star: false,
                 filter_col_index: None,
             },
         ];
@@ -1650,8 +1672,11 @@ mod tests {
             session_groups: AHashMap::new(),
             agg_specs,
             num_group_cols: 1,
-            group_col_names: vec!["symbol".to_string()],
             group_types: vec![DataType::Utf8],
+            row_converter: arrow::row::RowConverter::new(vec![arrow::row::SortField::new(
+                DataType::Utf8,
+            )])
+            .unwrap(),
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
@@ -1662,6 +1687,8 @@ mod tests {
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
             post_projection: None,
+            scratch_nogroup: AHashMap::new(),
+            scratch_grouped: AHashMap::new(),
         }
     }
 
@@ -1677,6 +1704,7 @@ mod tests {
             output_name: "total".to_string(),
             return_type: DataType::Int64,
             distinct: false,
+            is_count_star: false,
             filter_col_index: None,
         }];
 
@@ -1695,8 +1723,11 @@ mod tests {
             session_groups: AHashMap::new(),
             agg_specs,
             num_group_cols: 1,
-            group_col_names: vec!["symbol".to_string()],
             group_types: vec![DataType::Utf8],
+            row_converter: arrow::row::RowConverter::new(vec![arrow::row::SortField::new(
+                DataType::Utf8,
+            )])
+            .unwrap(),
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
@@ -1707,6 +1738,8 @@ mod tests {
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
             post_projection: None,
+            scratch_nogroup: AHashMap::new(),
+            scratch_grouped: AHashMap::new(),
         }
     }
 
@@ -1722,6 +1755,7 @@ mod tests {
             output_name: "total".to_string(),
             return_type: DataType::Int64,
             distinct: false,
+            is_count_star: false,
             filter_col_index: None,
         }];
 
@@ -1738,8 +1772,11 @@ mod tests {
             session_groups: AHashMap::new(),
             agg_specs,
             num_group_cols: 1,
-            group_col_names: vec!["symbol".to_string()],
             group_types: vec![DataType::Utf8],
+            row_converter: arrow::row::RowConverter::new(vec![arrow::row::SortField::new(
+                DataType::Utf8,
+            )])
+            .unwrap(),
             pre_agg_sql: String::new(),
             output_schema,
             time_col_index: 2,
@@ -1750,10 +1787,10 @@ mod tests {
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
             post_projection: None,
+            scratch_nogroup: AHashMap::new(),
+            scratch_grouped: AHashMap::new(),
         }
     }
-
-    // ── Detection tests ─────────────────────────────────────────────
 
     #[tokio::test]
     async fn test_detect_tumbling_aggregate_returns_core_window() {
@@ -1866,8 +1903,6 @@ mod tests {
         assert!(result.is_none(), "Projection-only should return None");
     }
 
-    // ── Pipeline tests ──────────────────────────────────────────────
-
     #[test]
     fn test_core_window_tumbling_sum() {
         let mut state = make_core_window_state(1000);
@@ -1976,11 +2011,9 @@ mod tests {
         assert!(batches.is_empty());
     }
 
-    // ── Emit clause bridge test ─────────────────────────────────────
-
     #[test]
     fn test_emit_clause_to_core_all_variants() {
-        use crate::stream_executor::{emit_clause_to_core, sql_emit_to_core};
+        use crate::sql_analysis::{emit_clause_to_core, sql_emit_to_core};
         use laminar_sql::parser::EmitStrategy as SqlEmit;
 
         assert_eq!(
@@ -2009,8 +2042,6 @@ mod tests {
             CoreEmit::Final
         );
     }
-
-    // ── Checkpoint/Restore tests ────────────────────────────────────
 
     #[test]
     fn test_core_window_checkpoint_roundtrip() {
@@ -2071,8 +2102,6 @@ mod tests {
         let result = state2.restore_windows(&cp);
         assert!(result.is_err(), "Should fail on fingerprint mismatch");
     }
-
-    // ── New detection tests (hopping/session) ──────────────────────
 
     #[tokio::test]
     async fn test_detect_sliding_aggregate_returns_core_window() {
@@ -2179,8 +2208,6 @@ mod tests {
         assert!(result.is_none(), "Session with gap=0 should return None");
     }
 
-    // ── Hopping pipeline tests ─────────────────────────────────────
-
     #[test]
     fn test_hopping_basic_sum() {
         // 4s window, 2s slide → each event in 2 windows
@@ -2276,8 +2303,6 @@ mod tests {
         let batches = state.close_windows(5000).unwrap();
         assert!(batches.is_empty());
     }
-
-    // ── Session pipeline tests ─────────────────────────────────────
 
     #[test]
     fn test_session_basic_sum() {
@@ -2444,7 +2469,40 @@ mod tests {
         assert_eq!(results[1], ("B".to_string(), 2000, 300));
     }
 
-    // ── Hopping checkpoint tests ───────────────────────────────────
+    #[test]
+    fn test_session_group_cardinality_cap() {
+        let mut state = make_session_core_window_state(3000);
+        state.max_groups_per_window = 2;
+
+        let batch1 = make_pre_agg_batch(vec!["A", "B"], vec![10, 100], vec![1000, 1000]);
+        state.update_batch(&batch1).unwrap();
+        assert_eq!(state.session_groups.len(), 2);
+
+        // C is new and should be dropped at the cap; A already exists and
+        // continues to aggregate.
+        let batch2 = make_pre_agg_batch(vec!["C", "A"], vec![999, 20], vec![1500, 1500]);
+        state.update_batch(&batch2).unwrap();
+        assert_eq!(state.session_groups.len(), 2);
+
+        let batches = state.close_windows(10_000).unwrap();
+        assert_eq!(batches.len(), 1);
+        let result = &batches[0];
+        let syms = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let totals = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let mut out: Vec<(String, i64)> = (0..result.num_rows())
+            .map(|i| (syms.value(i).to_string(), totals.value(i)))
+            .collect();
+        out.sort();
+        assert_eq!(out, vec![("A".to_string(), 30), ("B".to_string(), 100)]);
+    }
 
     #[test]
     fn test_hopping_checkpoint_roundtrip() {
@@ -2510,8 +2568,6 @@ mod tests {
         );
     }
 
-    // ── Post-aggregate projection tests ──────────────────────────────
-
     #[tokio::test]
     async fn test_post_aggregate_projection_detection() {
         use arrow::datatypes::Field;
@@ -2575,7 +2631,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tumbling_ratio_projection_pipeline() {
-        use arrow::datatypes::Field;
+        use arrow::datatypes::{Field, TimeUnit};
 
         let ctx = laminar_sql::create_streaming_context_with_validator(
             laminar_sql::StreamingValidatorMode::Off,
@@ -2584,7 +2640,11 @@ mod tests {
             Field::new("symbol", DataType::Utf8, false),
             Field::new("a", DataType::Float64, false),
             Field::new("b", DataType::Float64, false),
-            Field::new("ts", DataType::Int64, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
         ]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
@@ -2592,7 +2652,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["X"])),
                 Arc::new(arrow::array::Float64Array::from(vec![1.0])),
                 Arc::new(arrow::array::Float64Array::from(vec![2.0])),
-                Arc::new(Int64Array::from(vec![1000])),
+                Arc::new(arrow::array::TimestampMillisecondArray::from(vec![1000])),
             ],
         )
         .unwrap();

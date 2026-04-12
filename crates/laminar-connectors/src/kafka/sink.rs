@@ -1,30 +1,4 @@
-//! Kafka sink connector implementation.
-//!
-//! [`KafkaSink`] implements the [`SinkConnector`] trait, writing Arrow
-//! `RecordBatch` data to Kafka topics via rdkafka's `FutureProducer`.
-//! Supports at-least-once (idempotent) and exactly-once (transactional)
-//! delivery, configurable partitioning, and dead-letter queue routing.
-//!
-//! # Exactly-once architecture
-//!
-//! Recovery uses the checkpoint **manifest** as the authoritative source of
-//! committed offsets — NOT broker consumer group state. Broker-committed
-//! offsets are advisory only (for monitoring via `kafka-consumer-groups`).
-//!
-//! `send_offsets_to_transaction()` is intentionally NOT wired. It would add
-//! cross-connector plumbing complexity for zero correctness benefit: the
-//! manifest is what recovery reads, not the broker consumer group.
-//!
-//! The 2PC protocol is:
-//! 1. `pre_commit()` / `flush()` — ensure all records are delivered to brokers
-//! 2. Manifest persist — checkpoint coordinator writes the epoch to storage
-//! 3. `commit_transaction()` — atomically commit the Kafka transaction
-//!
-//! **Known window**: a crash between `commit_transaction()` success and the
-//! manifest status update to `Committed` will cause the next recovery to
-//! replay the epoch (at-least-once for that window). This is the classic
-//! 2PC coordinator crash problem; `send_offsets_to_transaction` does not
-//! fix it.
+//! Kafka sink connector.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -32,8 +6,9 @@ use std::time::{Duration, Instant};
 use arrow_array::{Array, StringArray};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::OwnedHeaders;
-use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
+use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord, Producer};
 use rdkafka::ClientConfig;
 use tracing::{debug, info, warn};
 
@@ -55,6 +30,12 @@ use crate::connector::DeliveryGuarantee;
 
 /// Fallback partition count used only when broker metadata query fails.
 const FALLBACK_PARTITION_COUNT: i32 = 1;
+
+/// Short deadline used by `SinkConnector::flush` — kept well below any
+/// outer tokio timeout so a `spawn_blocking` flush can't outlive its
+/// caller and leak a blocking thread. Thorough drains go through
+/// `pre_commit` / `commit_epoch` / `close` with their own budgets.
+const PERIODIC_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Contiguous key buffer — stores all key bytes in a single allocation
 /// with per-row `(offset, length)` pairs. Avoids N separate heap
@@ -148,11 +129,17 @@ pub struct KafkaSink {
 
 impl KafkaSink {
     /// Creates a new Kafka sink connector with explicit schema.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.format` is not a supported serialization format.
+    /// Call [`KafkaSinkConfig::validate`] first to catch this at config time.
     #[must_use]
     pub fn new(schema: SchemaRef, config: KafkaSinkConfig) -> Self {
         let avro_schema_id = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let serializer =
-            select_serializer(config.format, &schema, Arc::clone(&avro_schema_id), None);
+            select_serializer(config.format, &schema, Arc::clone(&avro_schema_id), None)
+                .expect("format validated in KafkaSinkConfig::validate()");
         let partitioner = select_partitioner(config.partitioner);
 
         Self {
@@ -174,6 +161,11 @@ impl KafkaSink {
     }
 
     /// Creates a new Kafka sink with Schema Registry integration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.format` is not a supported serialization format.
+    /// Call [`KafkaSinkConfig::validate`] first to catch this at config time.
     #[must_use]
     pub fn with_schema_registry(
         schema: SchemaRef,
@@ -187,7 +179,8 @@ impl KafkaSink {
             &schema,
             Arc::clone(&avro_schema_id),
             Some(Arc::clone(&sr)),
-        );
+        )
+        .expect("format validated in KafkaSinkConfig::validate()");
         let partitioner = select_partitioner(config.partitioner);
 
         Self {
@@ -285,7 +278,7 @@ impl KafkaSink {
                 &self.schema,
                 Arc::clone(&self.avro_schema_id),
                 self.schema_registry.clone(),
-            );
+            )?;
         }
 
         Ok(())
@@ -367,7 +360,10 @@ impl KafkaSink {
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .unwrap_or_else(|_| {
+                tracing::warn!("system clock before Unix epoch — using 0 for DLQ timestamp");
+                std::time::Duration::ZERO
+            })
             .as_millis()
             .to_string();
         let epoch_str = self.current_epoch.to_string();
@@ -406,6 +402,64 @@ impl KafkaSink {
         self.metrics.record_dlq();
         Ok(())
     }
+
+    /// Synchronously enqueue a record with a short retry on `QueueFull`.
+    /// Uses `send_result` rather than `send`, because the latter is
+    /// `async fn` in rdkafka 0.39+ and only enqueues when polled — which
+    /// would defeat the Vec-of-futures pipelining in `write_batch`.
+    async fn enqueue_with_queue_retry(
+        producer: &FutureProducer,
+        mut record: FutureRecord<'_, [u8], [u8]>,
+        queue_timeout: Duration,
+    ) -> Result<DeliveryFuture, ConnectorError> {
+        let start = Instant::now();
+        loop {
+            match producer.send_result(record) {
+                Ok(fut) => return Ok(fut),
+                Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), r))
+                    if start.elapsed() < queue_timeout =>
+                {
+                    record = r;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err((e, _)) => {
+                    return Err(ConnectorError::WriteError(format!(
+                        "Kafka enqueue failed: {e}"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Flush on the blocking pool — `Producer::flush()` is a synchronous
+    /// FFI call that would stall the sink task's async select loop.
+    async fn flush_producer_async(
+        producer: &FutureProducer,
+        timeout: Duration,
+    ) -> Result<(), rdkafka::error::KafkaError> {
+        let p = producer.clone();
+        match tokio::task::spawn_blocking(move || p.flush(timeout)).await {
+            Ok(result) => result,
+            Err(join_err) => {
+                warn!("flush blocking task failed: {join_err}");
+                Err(rdkafka::error::KafkaError::Canceled)
+            }
+        }
+    }
+
+    /// Run a blocking producer operation on the thread pool. All
+    /// librdkafka transaction calls (`begin_transaction`,
+    /// `commit_transaction`, `abort_transaction`) are synchronous FFI.
+    async fn producer_blocking<F, R>(producer: &FutureProducer, op: F) -> R
+    where
+        F: FnOnce(&FutureProducer) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let p = producer.clone();
+        tokio::task::spawn_blocking(move || op(&p))
+            .await
+            .expect("producer_blocking: blocking task panicked")
+    }
 }
 
 #[async_trait]
@@ -423,7 +477,7 @@ impl SinkConnector for KafkaSink {
                 &self.schema,
                 Arc::clone(&self.avro_schema_id),
                 self.schema_registry.clone(),
-            );
+            )?;
             self.partitioner = select_partitioner(self.config.partitioner);
         }
 
@@ -568,20 +622,15 @@ impl SinkConnector for KafkaSink {
         let mut records_written: usize = 0;
         let mut bytes_written: u64 = 0;
 
-        // Phase 1: Enqueue records into librdkafka's internal queue.
-        // Flush every flush_batch_size records to bound memory usage
-        // and provide delivery confirmation in chunks.
+        // Phase 1: enqueue every record into librdkafka's internal queue.
+        // Flush every flush_batch_size records to bound in-flight memory.
         let flush_threshold = self.config.flush_batch_size;
         let mut delivery_futures = Vec::with_capacity(payloads.len());
         for (i, payload) in payloads.iter().enumerate() {
             let key: Option<&[u8]> = keys.as_ref().map(|kb| kb.key(i)).filter(|k| !k.is_empty());
-
-            // Determine partition using the count queried from broker metadata in open().
             let partition = self.partitioner.partition(key, self.topic_partition_count);
 
-            // Build the Kafka record.
-            let mut record = FutureRecord::to(&self.config.topic).payload(payload);
-
+            let mut record = FutureRecord::to(&self.config.topic).payload(payload.as_slice());
             if let Some(k) = key {
                 record = record.key(k);
             }
@@ -589,44 +638,51 @@ impl SinkConnector for KafkaSink {
                 record = record.partition(p);
             }
 
-            // Allow 500ms for rdkafka's internal queue to drain before failing
-            // with QueueFull. Zero timeout causes legitimate messages to be
-            // rejected under transient burst load.
-            delivery_futures.push((
-                Instant::now(),
-                producer.send(record, Duration::from_millis(500)),
-            ));
+            // 500ms matches the old `send(record, 500ms)` contract: ride
+            // out transient QueueFull bursts before giving up.
+            let fut = Self::enqueue_with_queue_retry(producer, record, Duration::from_millis(500))
+                .await?;
+            delivery_futures.push((Instant::now(), fut));
 
-            // Intermediate flush to bound in-flight records and memory.
             if flush_threshold > 0 && (i + 1) % flush_threshold == 0 {
-                producer
-                    .flush(self.config.delivery_timeout)
+                Self::flush_producer_async(producer, self.config.delivery_timeout)
+                    .await
                     .map_err(|e| ConnectorError::WriteError(format!("flush failed: {e}")))?;
             }
         }
 
-        // Phase 2: Collect delivery reports.
+        // Phase 2: await each delivery report. Outer Err = oneshot canceled
+        // (producer dropped); inner Err = Kafka delivery error.
+        let mut failed: usize = 0;
+        let mut first_error: Option<String> = None;
         for (i, (send_time, future)) in delivery_futures.into_iter().enumerate() {
-            match future.await {
-                Ok(_delivery) => {
+            let err_msg = match future.await {
+                Ok(Ok(_)) => {
                     let latency_us = send_time.elapsed().as_micros() as u64;
                     self.metrics.record_produce_latency(latency_us);
                     records_written += 1;
                     bytes_written += payloads[i].len() as u64;
+                    continue;
                 }
-                Err((err, _msg)) => {
-                    self.metrics.record_error();
-                    let err_msg = err.to_string();
+                Ok(Err((err, _))) => err.to_string(),
+                Err(_canceled) => "delivery canceled — producer dropped before ack".into(),
+            };
 
-                    if self.dlq_producer.is_some() {
-                        let key: Option<&[u8]> =
-                            keys.as_ref().map(|kb| kb.key(i)).filter(|k| !k.is_empty());
-                        self.route_to_dlq(&payloads[i], key, &err_msg).await?;
-                    } else {
-                        return Err(ConnectorError::WriteError(format!(
-                            "Kafka produce failed: {err_msg}"
-                        )));
-                    }
+            self.metrics.record_error();
+            failed += 1;
+            if first_error.is_none() {
+                first_error = Some(err_msg.clone());
+            }
+
+            if self.dlq_producer.is_some() {
+                let key: Option<&[u8]> =
+                    keys.as_ref().map(|kb| kb.key(i)).filter(|k| !k.is_empty());
+                if let Err(dlq_err) = self.route_to_dlq(&payloads[i], key, &err_msg).await {
+                    warn!(
+                        original_error = %err_msg,
+                        dlq_error = %dlq_err,
+                        "failed to route record to DLQ — record lost"
+                    );
                 }
             }
         }
@@ -637,8 +693,19 @@ impl SinkConnector for KafkaSink {
         debug!(
             records = records_written,
             bytes = bytes_written,
+            failed,
             "wrote batch to Kafka"
         );
+
+        // With DLQ, failures are already routed — report success. Without,
+        // surface the aggregate so the sink task can poison the epoch.
+        if failed > 0 && self.dlq_producer.is_none() {
+            return Err(ConnectorError::WriteError(format!(
+                "Kafka produce: {failed}/{} records failed, first error: {}",
+                payloads.len(),
+                first_error.unwrap_or_else(|| "unknown".into())
+            )));
+        }
 
         Ok(WriteResult::new(records_written, bytes_written))
     }
@@ -659,11 +726,26 @@ impl SinkConnector for KafkaSink {
                     actual: self.state.to_string(),
                 })?;
 
-            producer.begin_transaction().map_err(|e| {
-                ConnectorError::TransactionError(format!(
-                    "failed to begin transaction for epoch {epoch}: {e}"
-                ))
-            })?;
+            if self.transaction_active {
+                warn!(epoch, "aborting stale transaction before new epoch");
+                let txn_timeout = self.config.transaction_timeout;
+                Self::producer_blocking(producer, move |p| p.abort_transaction(txn_timeout))
+                    .await
+                    .map_err(|e| {
+                        ConnectorError::TransactionError(format!(
+                            "cannot begin epoch {epoch}: abort of stale transaction failed: {e}"
+                        ))
+                    })?;
+                self.transaction_active = false;
+            }
+
+            Self::producer_blocking(producer, FutureProducer::begin_transaction)
+                .await
+                .map_err(|e| {
+                    ConnectorError::TransactionError(format!(
+                        "failed to begin transaction for epoch {epoch}: {e}"
+                    ))
+                })?;
 
             self.transaction_active = true;
         }
@@ -683,11 +765,13 @@ impl SinkConnector for KafkaSink {
 
         // Flush all pending messages to Kafka brokers (phase 1).
         if let Some(ref producer) = self.producer {
-            producer.flush(self.config.delivery_timeout).map_err(|e| {
-                ConnectorError::TransactionError(format!(
-                    "failed to flush before pre-commit for epoch {epoch}: {e}"
-                ))
-            })?;
+            Self::flush_producer_async(producer, self.config.delivery_timeout)
+                .await
+                .map_err(|e| {
+                    ConnectorError::TransactionError(format!(
+                        "failed to flush before pre-commit for epoch {epoch}: {e}"
+                    ))
+                })?;
         }
 
         debug!(epoch, "pre-committed epoch (flushed)");
@@ -711,14 +795,15 @@ impl SinkConnector for KafkaSink {
                     actual: self.state.to_string(),
                 })?;
 
-            // Flush all pending messages.
-            producer.flush(self.config.delivery_timeout).map_err(|e| {
-                ConnectorError::TransactionError(format!("failed to flush before commit: {e}"))
-            })?;
+            Self::flush_producer_async(producer, self.config.delivery_timeout)
+                .await
+                .map_err(|e| {
+                    ConnectorError::TransactionError(format!("failed to flush before commit: {e}"))
+                })?;
 
-            // Commit the Kafka transaction.
-            producer
-                .commit_transaction(self.config.transaction_timeout)
+            let txn_timeout = self.config.transaction_timeout;
+            Self::producer_blocking(producer, move |p| p.commit_transaction(txn_timeout))
+                .await
                 .map_err(|e| {
                     ConnectorError::TransactionError(format!(
                         "failed to commit transaction for epoch {epoch}: {e}"
@@ -729,11 +814,13 @@ impl SinkConnector for KafkaSink {
         } else {
             // At-least-once: just flush pending messages.
             if let Some(ref producer) = self.producer {
-                producer.flush(self.config.delivery_timeout).map_err(|e| {
-                    ConnectorError::TransactionError(format!(
-                        "failed to flush for epoch {epoch}: {e}"
-                    ))
-                })?;
+                Self::flush_producer_async(producer, self.config.delivery_timeout)
+                    .await
+                    .map_err(|e| {
+                        ConnectorError::TransactionError(format!(
+                            "failed to flush for epoch {epoch}: {e}"
+                        ))
+                    })?;
             }
         }
 
@@ -755,8 +842,9 @@ impl SinkConnector for KafkaSink {
                     actual: self.state.to_string(),
                 })?;
 
-            producer
-                .abort_transaction(self.config.transaction_timeout)
+            let txn_timeout = self.config.transaction_timeout;
+            Self::producer_blocking(producer, move |p| p.abort_transaction(txn_timeout))
+                .await
                 .map_err(|e| {
                     ConnectorError::TransactionError(format!(
                         "failed to abort transaction for epoch {epoch}: {e}"
@@ -787,7 +875,9 @@ impl SinkConnector for KafkaSink {
     }
 
     fn capabilities(&self) -> SinkConnectorCapabilities {
-        let mut caps = SinkConnectorCapabilities::default()
+        // Catch stuck-broker scenarios faster than librdkafka's
+        // delivery.timeout.ms (default 5min).
+        let mut caps = SinkConnectorCapabilities::new(Duration::from_secs(10))
             .with_idempotent()
             .with_partitioned();
 
@@ -804,8 +894,8 @@ impl SinkConnector for KafkaSink {
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
         if let Some(ref producer) = self.producer {
-            producer
-                .flush(self.config.delivery_timeout)
+            Self::flush_producer_async(producer, PERIODIC_FLUSH_TIMEOUT)
+                .await
                 .map_err(|e| ConnectorError::WriteError(format!("flush failed: {e}")))?;
         }
         Ok(())
@@ -821,10 +911,23 @@ impl SinkConnector for KafkaSink {
             }
         }
 
-        // Flush remaining messages.
+        let mut first_err: Option<ConnectorError> = None;
+
         if let Some(ref producer) = self.producer {
-            if let Err(e) = producer.flush(Duration::from_secs(30)) {
+            if let Err(e) = Self::flush_producer_async(producer, Duration::from_secs(30)).await {
                 warn!(error = %e, "failed to flush on close");
+                first_err.get_or_insert(ConnectorError::WriteError(format!(
+                    "flush failed on close: {e}"
+                )));
+            }
+        }
+
+        if let Some(ref dlq) = self.dlq_producer {
+            if let Err(e) = Self::flush_producer_async(dlq, Duration::from_secs(10)).await {
+                warn!(error = %e, "failed to flush DLQ producer on close");
+                first_err.get_or_insert(ConnectorError::WriteError(format!(
+                    "DLQ flush failed on close: {e}"
+                )));
             }
         }
 
@@ -832,7 +935,10 @@ impl SinkConnector for KafkaSink {
         self.dlq_producer = None;
         self.state = ConnectorState::Closed;
         info!("Kafka sink connector closed");
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -859,16 +965,15 @@ fn select_serializer(
     schema: &SchemaRef,
     schema_id: Arc<std::sync::atomic::AtomicU32>,
     registry: Option<Arc<SchemaRegistryClient>>,
-) -> Box<dyn RecordSerializer> {
+) -> Result<Box<dyn RecordSerializer>, ConnectorError> {
     match format {
-        Format::Avro => Box::new(AvroSerializer::with_shared_schema_id(
+        Format::Avro => Ok(Box::new(AvroSerializer::with_shared_schema_id(
             schema.clone(),
             schema_id,
             registry,
-        )),
-        other => serde::create_serializer(other).unwrap_or_else(|_| {
-            tracing::warn!(format = %other, "unsupported serializer format, falling back to JSON");
-            Box::new(serde::json::JsonSerializer::new())
+        ))),
+        other => serde::create_serializer(other).map_err(|e| {
+            ConnectorError::ConfigurationError(format!("unsupported sink format '{other}': {e}"))
         }),
     }
 }

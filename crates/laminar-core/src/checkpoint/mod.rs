@@ -1,23 +1,11 @@
-//! # Distributed Checkpoint Module
+//! Checkpoint barrier protocol.
 //!
-//! Chandy-Lamport style barrier protocol for consistent distributed snapshots.
-//!
-//! ## Module Overview
-//!
-//! - `barrier`: Checkpoint barrier types, `StreamMessage<T>` enum, and
-//!   cross-thread barrier injection
-//! - `unaligned`: Unaligned checkpoint protocol with optional timeout-based
-//!   semantics for alignment-less checkpointing
+//! Coordinator-triggered barriers flow through sources to trigger consistent
+//! state snapshots. The fast path is a single `AtomicU64` load (~10ns).
 
 /// Checkpoint barrier types and cross-thread injection.
 pub mod barrier;
-/// Unaligned checkpoint protocol with optional timeout-based semantics.
-pub mod unaligned;
 
-// Re-export key types
 pub use barrier::{
     flags, BarrierPollHandle, CheckpointBarrier, CheckpointBarrierInjector, StreamMessage,
-};
-pub use unaligned::{
-    InFlightChannelData, UnalignedAction, UnalignedCheckpointConfig, UnalignedSnapshot,
 };

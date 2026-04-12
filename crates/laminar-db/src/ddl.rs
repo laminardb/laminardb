@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use laminar_sql::parser::StreamingStatement;
-use laminar_sql::translator::streaming_ddl;
+use laminar_sql::translator::streaming_ddl::{self, ColumnDefinition};
 
 use crate::connector_manager::normalize_connector_type;
 use crate::db::{parse_duration_str, streaming_statement_to_sql, LaminarDB};
@@ -18,7 +18,7 @@ use crate::handle::{DdlInfo, ExecuteResult};
 impl LaminarDB {
     /// Handle CREATE SOURCE statement.
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn handle_create_source(
+    pub(crate) async fn handle_create_source(
         &self,
         create: &laminar_sql::parser::CreateSourceStatement,
     ) -> Result<ExecuteResult, DbError> {
@@ -34,8 +34,73 @@ impl LaminarDB {
             )));
         }
 
-        let source_def = streaming_ddl::translate_create_source(create.clone())
-            .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))?;
+        // IF NOT EXISTS: short-circuit before discovery runs any network I/O.
+        let source_name = create.name.to_string();
+        if create.if_not_exists && self.catalog.get_source(&source_name).is_some() {
+            return Ok(ExecuteResult::Ddl(DdlInfo {
+                statement_type: "CREATE SOURCE".to_string(),
+                object_name: source_name,
+            }));
+        }
+
+        // Discover columns from the connector before translating, so
+        // `WATERMARK FOR col` can validate against real columns.
+        let source_def = if create.columns.is_empty() && has_connector {
+            let resolved = resolve_connector_info(
+                create.connector_type.as_ref(),
+                &create.connector_options,
+                create.format.as_ref(),
+                &create.with_options,
+            );
+            let connector_type = resolved.connector_type.as_deref().ok_or_else(|| {
+                DbError::Config(format!(
+                    "source '{source_name}': no columns declared and no connector type resolved"
+                ))
+            })?;
+            let normalized = normalize_connector_type(connector_type);
+
+            // Surface unknown-connector errors before discovery so a typo
+            // doesn't get reported as a schema-discovery failure.
+            if self.connector_registry.source_info(&normalized).is_none() {
+                return Err(DbError::Config(format!(
+                    "source '{source_name}': unknown connector type '{normalized}'"
+                )));
+            }
+
+            let mut props = resolved.connector_options;
+            if let Some(fmt) = resolved.format {
+                props.insert("format".into(), fmt);
+            }
+            props.extend(resolved.format_options);
+
+            let discovered = self
+                .connector_registry
+                .default_source_schema(&normalized, &props)
+                .await
+                .ok_or_else(|| {
+                    DbError::Config(format!(
+                        "source '{source_name}': no columns declared and connector \
+                         '{normalized}' could not auto-discover a schema (check \
+                         Schema Registry connectivity or declare columns explicitly)"
+                    ))
+                })?;
+
+            let columns: Vec<ColumnDefinition> = discovered
+                .fields()
+                .iter()
+                .map(|f| ColumnDefinition {
+                    name: f.name().clone(),
+                    data_type: f.data_type().clone(),
+                    nullable: f.is_nullable(),
+                })
+                .collect();
+
+            streaming_ddl::translate_create_source_with_columns(create.clone(), columns)
+                .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))?
+        } else {
+            streaming_ddl::translate_create_source(create.clone())
+                .map_err(|e| DbError::Sql(laminar_sql::Error::ParseError(e)))?
+        };
 
         let name = &source_def.name;
         let schema = source_def.schema.clone();
@@ -125,35 +190,14 @@ impl LaminarDB {
         }
 
         // Register connector info in ConnectorManager if external connector specified.
-        // Supports two syntax forms:
-        //   1. FROM KAFKA ('topic' = 'events', ...) — connector_type is set
-        //   2. WITH ('connector' = 'kafka', 'topic' = 'events', ...) — extract from with_options
-        let (
-            resolved_connector_type,
-            resolved_connector_options,
-            resolved_format,
-            resolved_format_options,
-        ) = if create.connector_type.is_some() {
-            (
-                create.connector_type.clone(),
-                create.connector_options.clone(),
-                create.format.as_ref().map(|f| f.format_type.clone()),
-                create
-                    .format
-                    .as_ref()
-                    .map(|f| f.options.clone())
-                    .unwrap_or_default(),
-            )
-        } else if let Some(ct) = create.with_options.get("connector") {
-            // WITH-syntax: extract connector type and options from with_options
-            let (conn_opts, fmt, fmt_opts) =
-                extract_connector_from_with_options(&create.with_options);
-            (Some(ct.to_uppercase()), conn_opts, fmt, fmt_opts)
-        } else {
-            (None, HashMap::new(), None, HashMap::new())
-        };
+        let resolved = resolve_connector_info(
+            create.connector_type.as_ref(),
+            &create.connector_options,
+            create.format.as_ref(),
+            &create.with_options,
+        );
 
-        if let Some(ref ct) = resolved_connector_type {
+        if let Some(ref ct) = resolved.connector_type {
             let normalized = normalize_connector_type(ct);
             if self.connector_registry.source_info(&normalized).is_none() {
                 return Err(DbError::Connector(format!(
@@ -162,19 +206,15 @@ impl LaminarDB {
                 )));
             }
 
-            // Validate format
-            if let Some(ref fmt_str) = resolved_format {
-                laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase())
-                    .map_err(|e| DbError::Connector(format!("Unknown format '{fmt_str}': {e}")))?;
-            }
+            validate_format(resolved.format.as_ref())?;
 
             let mut mgr = self.connector_manager.lock();
             mgr.register_source(crate::connector_manager::SourceRegistration {
                 name: name.clone(),
                 connector_type: Some(ct.clone()),
-                connector_options: resolved_connector_options,
-                format: resolved_format,
-                format_options: resolved_format_options,
+                connector_options: resolved.connector_options,
+                format: resolved.format,
+                format_options: resolved.format_options,
             });
         }
 
@@ -223,34 +263,14 @@ impl LaminarDB {
         }
 
         // Register connector info in ConnectorManager if external connector specified.
-        // Supports two syntax forms:
-        //   1. INTO KAFKA ('topic' = 'events', ...) — connector_type is set
-        //   2. WITH ('connector' = 'kafka', 'topic' = 'events', ...) — extract from with_options
-        let (
-            resolved_connector_type,
-            resolved_connector_options,
-            resolved_format,
-            resolved_format_options,
-        ) = if create.connector_type.is_some() {
-            (
-                create.connector_type.clone(),
-                create.connector_options.clone(),
-                create.format.as_ref().map(|f| f.format_type.clone()),
-                create
-                    .format
-                    .as_ref()
-                    .map(|f| f.options.clone())
-                    .unwrap_or_default(),
-            )
-        } else if let Some(ct) = create.with_options.get("connector") {
-            let (conn_opts, fmt, fmt_opts) =
-                extract_connector_from_with_options(&create.with_options);
-            (Some(ct.to_uppercase()), conn_opts, fmt, fmt_opts)
-        } else {
-            (None, HashMap::new(), None, HashMap::new())
-        };
+        let resolved = resolve_connector_info(
+            create.connector_type.as_ref(),
+            &create.connector_options,
+            create.format.as_ref(),
+            &create.with_options,
+        );
 
-        if let Some(ref ct) = resolved_connector_type {
+        if let Some(ref ct) = resolved.connector_type {
             let normalized = normalize_connector_type(ct);
             if self.connector_registry.sink_info(&normalized).is_none() {
                 return Err(DbError::Connector(format!(
@@ -259,20 +279,16 @@ impl LaminarDB {
                 )));
             }
 
-            // Validate format
-            if let Some(ref fmt_str) = resolved_format {
-                laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase())
-                    .map_err(|e| DbError::Connector(format!("Unknown format '{fmt_str}': {e}")))?;
-            }
+            validate_format(resolved.format.as_ref())?;
 
             let mut mgr = self.connector_manager.lock();
             mgr.register_sink(crate::connector_manager::SinkRegistration {
                 name: name.clone(),
                 input: input.clone(),
                 connector_type: Some(ct.clone()),
-                connector_options: resolved_connector_options,
-                format: resolved_format,
-                format_options: resolved_format_options,
+                connector_options: resolved.connector_options,
+                format: resolved.format,
+                format_options: resolved.format_options,
                 filter_expr: create.filter.as_ref().map(std::string::ToString::to_string),
             });
         }
@@ -444,9 +460,7 @@ impl LaminarDB {
                     format,
                     format_options,
                     refresh: refresh_mode,
-                    cache_mode: cache_mode.clone(),
                     cache_max_entries,
-                    storage: storage.clone(),
                 });
             }
         }
@@ -795,7 +809,7 @@ impl LaminarDB {
         {
             let mgr = self.connector_manager.lock();
             for (stream_name, reg) in mgr.streams() {
-                let refs = crate::stream_executor::extract_table_references(&reg.query_sql);
+                let refs = crate::sql_analysis::extract_table_references(&reg.query_sql);
                 if refs.contains(name) {
                     dependents.push(stream_name.clone());
                 }
@@ -840,6 +854,7 @@ impl LaminarDB {
     /// Registers the view in the MV registry with dependency tracking,
     /// then executes the backing query through `DataFusion` to obtain the
     /// output schema.
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn handle_create_materialized_view(
         &self,
         sql: &str,
@@ -883,7 +898,7 @@ impl LaminarDB {
         };
 
         // Discover source references via AST-based extraction (not substring matching)
-        let table_refs = crate::stream_executor::extract_table_references(&query_sql);
+        let table_refs = crate::sql_analysis::extract_table_references(&query_sql);
         let catalog_sources = self.catalog.list_sources();
         let mut sources: Vec<String> = catalog_sources
             .into_iter()
@@ -902,7 +917,8 @@ impl LaminarDB {
 
         // Register in the MV registry
         {
-            let mv = laminar_core::mv::MaterializedView::new(&name_str, sql, sources, schema);
+            let mv =
+                laminar_core::mv::MaterializedView::new(&name_str, sql, sources, schema.clone());
 
             let mut registry = self.mv_registry.lock();
 
@@ -943,6 +959,51 @@ impl LaminarDB {
             mgr.register_stream(crate::connector_manager::StreamRegistration {
                 name: name_str.clone(),
                 query_sql: query_sql.clone(),
+                emit_clause: plan_emit.clone(),
+                window_config: plan_window.clone(),
+                order_config: plan_order.clone(),
+            });
+        }
+
+        // Register MV result store + DataFusion table provider.
+        {
+            use crate::mv_store::MvStorageMode;
+
+            // Non-windowed aggregates (IncrementalAggState) emit ALL groups
+            // every cycle → replace-all is correct.
+            // Windowed aggregates (CoreWindowState) only emit closing windows
+            // → must append to keep previous windows' results.
+            let has_aggregate = self.ctx.sql(&query_sql).await.ok().is_some_and(|df| {
+                crate::aggregate_state::find_aggregate(df.logical_plan()).is_some()
+            });
+            let mode = if has_aggregate && plan_window.is_none() {
+                MvStorageMode::Aggregate
+            } else {
+                MvStorageMode::append_default()
+            };
+
+            self.mv_store
+                .write()
+                .create_mv(&name_str, schema.clone(), mode);
+
+            let provider = crate::table_provider::MvTableProvider::new(
+                name_str.clone(),
+                schema,
+                self.mv_store.clone(),
+            );
+            let _ = self.ctx.deregister_table(&name_str);
+            self.ctx
+                .register_table(&name_str, Arc::new(provider))
+                .map_err(|e| {
+                    DbError::MaterializedView(format!("Failed to register MV table provider: {e}"))
+                })?;
+        }
+
+        // If the pipeline is already running, hot-add the query.
+        if let Some(ref tx) = *self.control_tx.lock() {
+            let _ = tx.try_send(crate::pipeline::ControlMsg::AddStream {
+                name: name_str.clone(),
+                sql: query_sql,
                 emit_clause: plan_emit,
                 window_config: plan_window,
                 order_config: plan_order,
@@ -989,11 +1050,23 @@ impl LaminarDB {
             }
         }
 
-        // Remove stream registrations for dropped MVs
+        // Remove stream registrations and MV result stores for dropped MVs
         {
             let mut mgr = self.connector_manager.lock();
+            let mut mv_store = self.mv_store.write();
             for dropped in &dropped_names {
                 mgr.unregister_stream(dropped);
+                mv_store.drop_mv(dropped);
+                let _ = self.ctx.deregister_table(dropped);
+            }
+        }
+
+        // Notify running coordinator to remove the queries.
+        if let Some(ref tx) = *self.control_tx.lock() {
+            for dropped in &dropped_names {
+                let _ = tx.try_send(crate::pipeline::ControlMsg::DropStream {
+                    name: dropped.clone(),
+                });
             }
         }
 
@@ -1067,6 +1140,68 @@ const STREAMING_OPTION_KEYS: &[&str] = &[
     "event_time",
     "watermark_delay",
 ];
+
+/// Resolved connector metadata extracted from a CREATE SOURCE/SINK statement.
+///
+/// Both `handle_create_source` and `handle_create_sink` support two syntax
+/// forms (`FROM KAFKA (...)` vs `WITH ('connector' = ...)`). This struct
+/// captures the resolved result so the resolution logic lives in one place.
+pub(crate) struct ResolvedConnector {
+    pub connector_type: Option<String>,
+    pub connector_options: HashMap<String, String>,
+    pub format: Option<String>,
+    pub format_options: HashMap<String, String>,
+}
+
+/// Resolve connector info from a DDL statement that has `connector_type`,
+/// `connector_options`, `format`, and `with_options` fields.
+///
+/// Supports:
+///   1. `FROM KAFKA ('topic' = 'events', ...)` — `connector_type` is set
+///   2. `WITH ('connector' = 'kafka', ...)` — extracted from `with_options`
+pub(crate) fn resolve_connector_info(
+    connector_type: Option<&String>,
+    connector_options: &HashMap<String, String>,
+    format: Option<&laminar_sql::parser::FormatSpec>,
+    with_options: &HashMap<String, String>,
+) -> ResolvedConnector {
+    if connector_type.is_some() {
+        ResolvedConnector {
+            connector_type: connector_type.cloned(),
+            connector_options: connector_options.clone(),
+            format: format.map(|f| f.format_type.clone()),
+            format_options: format.map(|f| f.options.clone()).unwrap_or_default(),
+        }
+    } else if let Some(ct) = with_options
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("connector"))
+        .map(|(_, v)| v)
+    {
+        let (conn_opts, fmt, fmt_opts) = extract_connector_from_with_options(with_options);
+        ResolvedConnector {
+            connector_type: Some(ct.to_uppercase()),
+            connector_options: conn_opts,
+            format: fmt,
+            format_options: fmt_opts,
+        }
+    } else {
+        ResolvedConnector {
+            connector_type: None,
+            connector_options: HashMap::new(),
+            format: None,
+            format_options: HashMap::new(),
+        }
+    }
+}
+
+/// Validate that a resolved format string is known.
+pub(crate) fn validate_format(format: Option<&String>) -> Result<(), DbError> {
+    if let Some(fmt_str) = format {
+        laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase())
+            .map_err(|e| DbError::Connector(format!("Unknown format '{fmt_str}': {e}")))?;
+    }
+    Ok(())
+}
 
 /// Extracts connector-specific options from a `WITH (...)` clause map.
 ///

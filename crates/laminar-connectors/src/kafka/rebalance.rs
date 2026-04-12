@@ -33,9 +33,12 @@ impl RebalanceState {
 
     /// Handles a partition assignment event.
     ///
-    /// Replaces the current assignment set and increments the rebalance counter.
+    /// Additive: inserts new partitions without clearing existing ones.
+    /// This is correct for both eager and cooperative rebalance protocols:
+    /// - Eager: the preceding `on_revoke(all)` already clears the set.
+    /// - Cooperative: `Assign` only contains newly assigned partitions,
+    ///   so clearing would lose existing assignments.
     pub fn on_assign(&mut self, partitions: &[(String, i32)]) {
-        self.assigned.clear();
         for (topic, partition) in partitions {
             self.assigned.insert((topic.clone(), *partition));
         }
@@ -97,6 +100,13 @@ pub struct LaminarConsumerContext {
     /// partitions for backpressure. On `Assign`, newly assigned partitions
     /// must be re-paused if this flag is true.
     reader_paused: Arc<AtomicBool>,
+    /// Set by `commit_callback` on broker rejection; reader task escalates
+    /// to `CommitMode::Sync` on the next timer tick.
+    commit_retry_needed: Arc<AtomicBool>,
+    /// Snapshot of consumed offsets, updated once per `poll_batch()` cycle.
+    /// Read on Assign to seek newly assigned partitions to last-consumed
+    /// offset + 1, preventing duplicates after broker failures.
+    offset_snapshot: Arc<Mutex<super::offsets::OffsetTracker>>,
 }
 
 impl LaminarConsumerContext {
@@ -108,6 +118,8 @@ impl LaminarConsumerContext {
         rebalance_metric: Arc<AtomicU64>,
         revoke_generation: Arc<AtomicU64>,
         reader_paused: Arc<AtomicBool>,
+        commit_retry_needed: Arc<AtomicBool>,
+        offset_snapshot: Arc<Mutex<super::offsets::OffsetTracker>>,
     ) -> Self {
         Self {
             checkpoint_requested,
@@ -116,6 +128,8 @@ impl LaminarConsumerContext {
             rebalance_metric,
             revoke_generation,
             reader_paused,
+            commit_retry_needed,
+            offset_snapshot,
         }
     }
 
@@ -129,6 +143,22 @@ impl LaminarConsumerContext {
     #[must_use]
     pub fn revoke_generation(&self) -> &Arc<AtomicU64> {
         &self.revoke_generation
+    }
+
+    /// Locks the rebalance state, recovering from poison.
+    fn lock_rebalance_state(&self) -> std::sync::MutexGuard<'_, RebalanceState> {
+        self.rebalance_state.lock().unwrap_or_else(|poisoned| {
+            warn!("rebalance_state mutex poisoned, recovering");
+            poisoned.into_inner()
+        })
+    }
+
+    /// Locks the offset snapshot, recovering from poison.
+    fn lock_offset_snapshot(&self) -> std::sync::MutexGuard<'_, super::offsets::OffsetTracker> {
+        self.offset_snapshot.lock().unwrap_or_else(|poisoned| {
+            warn!("offset_snapshot mutex poisoned, recovering");
+            poisoned.into_inner()
+        })
     }
 }
 
@@ -155,15 +185,9 @@ impl ConsumerContext for LaminarConsumerContext {
                     .iter()
                     .map(|e| (e.topic().to_string(), e.partition()))
                     .collect();
-                match self.rebalance_state.lock() {
-                    Ok(mut state) => state.on_revoke(&partitions),
-                    Err(poisoned) => {
-                        warn!("rebalance_state mutex poisoned, recovering");
-                        poisoned.into_inner().on_revoke(&partitions);
-                    }
-                }
+                self.lock_rebalance_state().on_revoke(&partitions);
                 self.revoke_generation
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
                 self.rebalance_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.rebalance_metric
@@ -182,13 +206,7 @@ impl ConsumerContext for LaminarConsumerContext {
                     .iter()
                     .map(|e| (e.topic().to_string(), e.partition()))
                     .collect();
-                match self.rebalance_state.lock() {
-                    Ok(mut state) => state.on_assign(&partitions),
-                    Err(poisoned) => {
-                        warn!("rebalance_state mutex poisoned, recovering");
-                        poisoned.into_inner().on_assign(&partitions);
-                    }
-                }
+                self.lock_rebalance_state().on_assign(&partitions);
                 self.rebalance_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.rebalance_metric
@@ -200,6 +218,29 @@ impl ConsumerContext for LaminarConsumerContext {
         }
     }
 
+    fn commit_callback(
+        &self,
+        result: rdkafka::error::KafkaResult<()>,
+        offsets: &rdkafka::TopicPartitionList,
+    ) {
+        match result {
+            Ok(()) => {
+                tracing::debug!(
+                    partition_count = offsets.count(),
+                    "broker offset commit confirmed"
+                );
+            }
+            Err(e) => {
+                self.commit_retry_needed.store(true, Ordering::Release);
+                warn!(
+                    error = %e,
+                    partition_count = offsets.count(),
+                    "broker offset commit failed — scheduling sync retry"
+                );
+            }
+        }
+    }
+
     fn post_rebalance(
         &self,
         base_consumer: &rdkafka::consumer::BaseConsumer<Self>,
@@ -207,16 +248,55 @@ impl ConsumerContext for LaminarConsumerContext {
     ) {
         use rdkafka::consumer::Rebalance;
 
-        // After an Assign, the new partitions are committed to the consumer.
-        // If the reader task has paused partitions for backpressure, re-pause
-        // the newly assigned partitions before the next poll delivers messages.
         if let Rebalance::Assign(tpl) = rebalance {
-            if self.reader_paused.load(Ordering::Relaxed) {
+            // Seek assigned partitions to tracked offsets so we don't fall
+            // back to broker-stored group offsets (which may be stale or
+            // reset to earliest after a broker failure).
+            //
+            // Uses seek_partitions() instead of assign() to avoid clobbering
+            // the partition set under cooperative rebalancing, where the tpl
+            // contains only NEWLY assigned partitions (not the full set).
+            let assigned: Vec<(String, i32)> = tpl
+                .elements()
+                .iter()
+                .map(|e| (e.topic().to_string(), e.partition()))
+                .collect();
+
+            let seek_tpl = self.lock_offset_snapshot().to_seek_tpl(&assigned);
+
+            if seek_tpl.count() > 0 {
+                // Non-zero timeout: Duration::ZERO returns "In Progress" for every partition.
+                match base_consumer.seek_partitions(seek_tpl, std::time::Duration::from_secs(10)) {
+                    Ok(result) => {
+                        let errors: Vec<_> = result
+                            .elements()
+                            .iter()
+                            .filter(|e| e.error().is_err())
+                            .map(|e| format!("{}[{}]: {:?}", e.topic(), e.partition(), e.error()))
+                            .collect();
+                        if errors.is_empty() {
+                            info!(
+                                partition_count = result.count(),
+                                "seeked assigned partitions to tracked offsets"
+                            );
+                        } else {
+                            warn!(?errors, "some partitions failed to seek to tracked offsets");
+                        }
+                    }
+                    Err(e) => warn!(
+                        error = %e,
+                        "failed to seek assigned partitions to tracked offsets"
+                    ),
+                }
+            }
+
+            // Re-pause newly assigned partitions if backpressure is active.
+            if self.reader_paused.load(Ordering::Acquire) {
                 if let Err(e) = base_consumer.pause(tpl) {
                     warn!(error = %e, "failed to re-pause newly assigned partitions");
                 } else {
                     info!(
-                        partitions = tpl.count(),
+                        partition_count = tpl.count(),
                         "re-paused newly assigned partitions (reader backpressure active)"
                     );
                 }
@@ -258,16 +338,31 @@ mod tests {
     }
 
     #[test]
-    fn test_reassign() {
+    fn test_eager_reassign() {
         let mut state = RebalanceState::new();
         state.on_assign(&[("events".into(), 0), ("events".into(), 1)]);
-        // New assignment replaces old
+        // Eager rebalance: revoke all first, then assign new set
+        state.on_revoke(&[("events".into(), 0), ("events".into(), 1)]);
         state.on_assign(&[("events".into(), 2), ("events".into(), 3)]);
 
         assert_eq!(state.assigned_partitions().len(), 2);
         assert!(!state.is_assigned("events", 0));
         assert!(state.is_assigned("events", 2));
         assert_eq!(state.rebalance_count(), 2);
+    }
+
+    #[test]
+    fn test_cooperative_assign() {
+        let mut state = RebalanceState::new();
+        state.on_assign(&[("events".into(), 0), ("events".into(), 1)]);
+        // Cooperative: only revoke subset, assign new subset
+        state.on_revoke(&[("events".into(), 1)]);
+        state.on_assign(&[("events".into(), 2)]);
+
+        assert_eq!(state.assigned_partitions().len(), 2);
+        assert!(state.is_assigned("events", 0)); // retained
+        assert!(!state.is_assigned("events", 1)); // revoked
+        assert!(state.is_assigned("events", 2)); // newly assigned
     }
 
     #[test]
@@ -284,12 +379,16 @@ mod tests {
         let metric = Arc::new(AtomicU64::new(0));
         let revoke_gen = Arc::new(AtomicU64::new(0));
         let reader_paused = Arc::new(AtomicBool::new(false));
+        let commit_retry = Arc::new(AtomicBool::new(false));
+        let offset_snapshot = Arc::new(Mutex::new(super::super::offsets::OffsetTracker::new()));
         let ctx = LaminarConsumerContext::new(
             Arc::clone(&flag),
             state,
             metric,
             revoke_gen,
             reader_paused,
+            commit_retry,
+            offset_snapshot,
         );
         (flag, ctx)
     }

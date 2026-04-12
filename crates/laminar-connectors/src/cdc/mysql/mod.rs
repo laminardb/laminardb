@@ -1,84 +1,21 @@
-//! MySQL binlog replication CDC source connector.
-//!
-// Note: Many functions are not yet used because actual I/O is not implemented.
-// These allows will be removed when we add the binlog reader.
-#![allow(dead_code)]
-// MySQL CDC docs reference many MySQL-specific terms that clippy wants backticks for.
-// This is a domain-specific module where MySQL terminology is ubiquitous.
-#![allow(clippy::doc_markdown)]
+//! MySQL binlog replication CDC source connector. Reads row-level changes from
+//! a MySQL server's binlog (GTID or file/position based), decodes them via the
+//! `decoder` submodule, resolves column types against `schema::TableCache`, and
+//! emits Z-set `changelog::ChangeEvent`s that `MySqlCdcSource` converts into
+//! Arrow `RecordBatch`es on `poll_batch`.
+#![allow(dead_code)] // reader path is feature-gated; helpers are used conditionally
+#![allow(clippy::doc_markdown)] // MySQL terminology dominates — backtick-warning noise
 
-//!
-//! This module implements a MySQL CDC source that reads change events from
-//! MySQL binary log (binlog) replication stream. It supports:
-//!
-//! - GTID-based and file/position-based replication
-//! - Row-based replication format (INSERT/UPDATE/DELETE events)
-//! - Table filtering with include/exclude patterns
-//! - SSL/TLS connections
-//! - Automatic schema discovery via TABLE_MAP events
-//! - Z-set changelog format
-//!
-//! # Architecture
-//!
-//! ```text
-//! MySQL Server
-//!      │
-//!      │ Binlog Replication Protocol
-//!      ▼
-//! ┌─────────────────────────────────────────┐
-//! │           MySqlCdcSource                │
-//! │  ┌─────────────┐  ┌─────────────────┐  │
-//! │  │   Decoder   │  │   TableCache    │  │
-//! │  │ (binlog →   │  │ (TABLE_MAP →    │  │
-//! │  │  messages)  │  │  Arrow schema)  │  │
-//! │  └─────────────┘  └─────────────────┘  │
-//! │          │                │            │
-//! │          ▼                ▼            │
-//! │  ┌─────────────────────────────────┐   │
-//! │  │        ChangeEvent              │   │
-//! │  │  (Z-set with before/after)      │   │
-//! │  └─────────────────────────────────┘   │
-//! └─────────────────────────────────────────┘
-//!      │
-//!      ▼
-//!  RecordBatch (Arrow)
-//! ```
-//!
-//! # Example
-//!
-//! ```ignore
-//! use laminar_connectors::cdc::mysql::{MySqlCdcSource, MySqlCdcConfig};
-//!
-//! let config = MySqlCdcConfig {
-//!     host: "localhost".to_string(),
-//!     port: 3306,
-//!     username: "replicator".to_string(),
-//!     password: "secret".to_string(),
-//!     database: Some("mydb".to_string()),
-//!     server_id: 12345,
-//!     use_gtid: true,
-//!     ..Default::default()
-//! };
-//!
-//! let mut source = MySqlCdcSource::new(config);
-//! source.open(&Default::default()).await?;
-//!
-//! while let Some(batch) = source.poll_batch(1000).await? {
-//!     // Process CDC events as Arrow RecordBatch
-//!     println!("Received {} rows", batch.num_rows());
-//! }
-//! ```
-
-mod changelog;
-mod config;
-mod decoder;
-mod gtid;
-mod metrics;
+pub mod changelog;
+pub mod config;
+pub mod decoder;
+pub mod gtid;
+pub mod metrics;
 #[cfg(feature = "mysql-cdc")]
 pub mod mysql_io;
-mod schema;
-mod source;
-mod types;
+pub mod schema;
+pub mod source;
+pub mod types;
 
 // Primary types
 pub use changelog::{
@@ -103,12 +40,7 @@ use crate::config::{ConfigKeySpec, ConnectorInfo};
 use crate::connector::SourceConnector;
 use crate::registry::ConnectorRegistry;
 
-/// Registers the MySQL CDC source connector factory.
-///
-/// After calling this function, the connector can be created via:
-/// ```ignore
-/// let source = registry.create_source(&config)?;
-/// ```
+/// Registers the MySQL CDC source connector factory on the given registry.
 pub fn register_mysql_cdc_source(registry: &ConnectorRegistry) {
     let info = ConnectorInfo {
         name: "mysql-cdc".to_string(),
@@ -116,7 +48,7 @@ pub fn register_mysql_cdc_source(registry: &ConnectorRegistry) {
         version: env!("CARGO_PKG_VERSION").to_string(),
         is_source: true,
         is_sink: false,
-        config_keys: config_key_specs(),
+        config_keys: mysql_cdc_config_keys(),
     };
 
     registry.register_source(
@@ -144,9 +76,8 @@ pub fn register_mysql_cdc_source(registry: &ConnectorRegistry) {
 /// Returns the configuration key specifications for `MySQL` CDC source.
 ///
 /// This is used for configuration discovery and validation.
-#[must_use]
 #[allow(clippy::too_many_lines)]
-pub fn config_key_specs() -> Vec<ConfigKeySpec> {
+fn mysql_cdc_config_keys() -> Vec<ConfigKeySpec> {
     vec![
         // Connection settings
         ConfigKeySpec::optional("host", "MySQL server hostname", "localhost"),
@@ -232,8 +163,8 @@ mod tests {
     }
 
     #[test]
-    fn test_config_key_specs() {
-        let specs = config_key_specs();
+    fn test_mysql_cdc_config_keys() {
+        let specs = mysql_cdc_config_keys();
 
         // Should have all expected keys
         assert!(specs.len() >= 15);

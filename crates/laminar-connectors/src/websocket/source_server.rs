@@ -9,9 +9,10 @@ use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
+use crossfire::{mpsc, AsyncRx, TryRecvError};
 use futures_util::StreamExt;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use crate::checkpoint::SourceCheckpoint;
@@ -47,7 +48,7 @@ pub struct WebSocketSourceServer {
     /// Checkpoint state.
     checkpoint_state: WebSocketSourceCheckpoint,
     /// Bounded channel receiver for messages from client handler tasks.
-    rx: Option<mpsc::Receiver<Vec<u8>>>,
+    rx: Option<AsyncRx<mpsc::Array<Vec<u8>>>>,
     /// Shutdown signal sender.
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     /// Handle to the spawned acceptor task.
@@ -139,7 +140,7 @@ impl SourceConnector for WebSocketSourceServer {
         })?;
 
         let channel_capacity = 10_000;
-        let (tx, rx) = mpsc::channel(channel_capacity);
+        let (tx, rx) = mpsc::bounded_async::<Vec<u8>>(channel_capacity);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         let connected = Arc::clone(&self.connected_clients);
@@ -294,8 +295,8 @@ impl SourceConnector for WebSocketSourceServer {
                     self.metrics.record_message(payload.len() as u64);
                     self.message_buffer.push(payload);
                 }
-                Err(mpsc::error::TryRecvError::Empty) => break,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
                     if self.message_buffer.is_empty() {
                         self.state = ConnectorState::Failed;
                         return Err(ConnectorError::ReadError(
@@ -328,7 +329,7 @@ impl SourceConnector for WebSocketSourceServer {
 
         // Use event time from batch data if configured, otherwise wall-clock.
         if let Some(ref field) = self.config.event_time_field {
-            if let Some(max_ts) = super::parser::extract_max_event_time(&batch, field) {
+            if let Some(max_ts) = super::parser::extract_max_event_time(&batch, field)? {
                 self.checkpoint_state.watermark = max_ts;
             }
         } else {

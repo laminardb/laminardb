@@ -1,4 +1,4 @@
-//! WebSocket connection management: reconnection, failover, heartbeat.
+//! `WebSocket` connection management: reconnection, failover, heartbeat.
 //!
 //! Provides exponential backoff with jitter for reconnection attempts
 //! and multi-URL failover support.

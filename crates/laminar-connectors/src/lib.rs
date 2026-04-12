@@ -1,28 +1,4 @@
-//! # `LaminarDB` Connectors
-//!
-//! External system connectors and the Connector SDK for streaming data
-//! in and out of `LaminarDB`.
-//!
-//! ## Connector SDK
-//!
-//! The SDK provides traits and utilities for building connectors:
-//!
-//! - [`connector`] - Core traits (`SourceConnector`, `SinkConnector`)
-//! - [`serde`] - Serialization framework (JSON, CSV, Debezium)
-//! - [`registry`] - Factory pattern for connector instantiation
-//! - `testing` - Mock connectors and test utilities (feature-gated)
-//!
-//! ## Architecture
-//!
-//! ```text
-//! Ring 0: Hot Path
-//!   Source<T>::push_arrow() <-- deserialized RecordBatch
-//!   Subscription::poll()   --> RecordBatch for serialization
-//!
-//! Ring 1: Connectors
-//!   SourceConnector(poll) -> Serde(deser) -> push_arrow
-//!   SinkConnector(write)  <- Serde(ser)   <- subscription(poll)
-//! ```
+//! `LaminarDB` connector framework.
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
@@ -117,6 +93,10 @@ pub mod websocket;
 /// MongoDB CDC source and sink connectors.
 #[cfg(feature = "mongodb-cdc")]
 pub mod mongodb;
+
+/// OpenTelemetry OTLP/gRPC source connector.
+#[cfg(feature = "otel")]
+pub mod otel;
 
 /// AutoLoader-style file source and sink connectors.
 #[cfg(feature = "files")]

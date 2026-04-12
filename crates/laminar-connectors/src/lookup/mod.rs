@@ -1,37 +1,4 @@
-//! # External Lookup Tables for Enrichment Joins
-//!
-//! This module provides the `TableLoader` trait for loading data from external
-//! reference tables (dimension tables) to enrich streaming events.
-//!
-//! ## Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────┐
-//! │                    LookupJoinOperator                       │
-//! │  (laminar-core)                                             │
-//! │  ┌─────────┐    ┌─────────┐    ┌─────────────────────────┐ │
-//! │  │ Event   │───▶│  Cache  │───▶│  Output (enriched)      │ │
-//! │  │ Stream  │    │ (State) │    │                         │ │
-//! │  └─────────┘    └────┬────┘    └─────────────────────────┘ │
-//! │                      │ miss                                 │
-//! │                      ▼                                      │
-//! │               ┌─────────────┐                               │
-//! │               │ TableLoader │  (trait, implemented here)    │
-//! │               └──────┬──────┘                               │
-//! └──────────────────────┼──────────────────────────────────────┘
-//!                        │
-//!                        ▼
-//!             ┌──────────────────────┐
-//!             │   External Systems   │
-//!             │ (Redis, PostgreSQL,  │
-//!             │  HTTP APIs, etc.)    │
-//!             └──────────────────────┘
-//! ```
-//!
-//! ## Implementations
-//!
-//! - `InMemoryTableLoader` - For testing and static reference data
-//! - Redis, PostgreSQL, HTTP loaders
+//! Lookup tables for enrichment joins.
 
 /// CDC-to-reference-table adapter for using CDC sources as lookup tables.
 pub mod cdc_adapter;
@@ -46,6 +13,10 @@ pub mod delta_lookup;
 /// PostgreSQL lookup source with connection pooling and predicate pushdown.
 #[cfg(feature = "postgres-cdc")]
 pub mod postgres_source;
+
+/// PostgreSQL poll-based reference table source (no CDC required).
+#[cfg(feature = "postgres-cdc")]
+pub mod postgres_reference;
 
 #[cfg(feature = "postgres-cdc")]
 pub use postgres_source::{PostgresLookupSource, PostgresLookupSourceConfig};

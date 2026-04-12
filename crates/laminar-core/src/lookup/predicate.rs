@@ -1,16 +1,4 @@
-//! Predicate types for lookup table query pushdown.
-//!
-//! These types represent filter predicates that can be pushed down to
-//! [`LookupSource`](crate::lookup) implementations. Sources that support
-//! predicate pushdown can filter data at the source, reducing network
-//! and deserialization costs.
-//!
-//! ## Pushdown Flow
-//!
-//! 1. SQL planner extracts WHERE predicates from a lookup join
-//! 2. [`split_predicates`] classifies each predicate as pushable or local
-//! 3. Pushable predicates are sent to the source via `LookupSource::query()`
-//! 4. Local predicates are applied after fetching results
+//! Predicate types for lookup source pushdown.
 
 use std::fmt;
 

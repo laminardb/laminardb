@@ -14,17 +14,21 @@ LaminarDB is an embedded streaming database designed for sub-microsecond latency
 
 ## Architecture Overview
 
-The system has a coordinator layer (SQL execution, compiled projections), a background I/O layer (WAL, checkpoints, connector I/O), and a control plane (admin API, metrics).
+The system has a coordinator layer (SQL execution, compiled projections), a background I/O layer (checkpoints, connector I/O), and a control plane (admin API, metrics).
 
 ```text
 +------------------------------------------------------------------+
 |                     SOURCE CONNECTORS                             |
-|  Kafka, Postgres CDC, MySQL CDC, WebSocket, Files                |
-|  (tokio tasks, push RecordBatches via mpsc channels)             |
+|  Kafka, Postgres CDC, MySQL CDC, MongoDB CDC, WebSocket,          |
+|  OpenTelemetry OTLP/gRPC, Files (AutoLoader), Delta Lake,         |
+|  Iceberg                                                          |
+|  (tokio tasks on the main runtime, push RecordBatches via         |
+|   tokio::sync::mpsc to the compute thread)                        |
 +------------------------------------------------------------------+
 |                  STREAMING COORDINATOR                             |
-|  Single tokio task: SQL cycles, compiled projections,             |
-|  cached logical plans, checkpoint barriers                        |
+|  Single tokio task on dedicated `laminar-compute` thread:          |
+|  SQL cycles, compiled projections, cached logical plans,          |
+|  checkpoint barrier injection and alignment                       |
 |  +-----------+ +-----------+ +-----------+ +-----------+         |
 |  | Compiled  | | Operators | |   State   | |   Sink    |         |
 |  | Projection| | (window,  | | (FxHashMap| |  Writers  |         |
@@ -34,28 +38,35 @@ The system has a coordinator layer (SQL execution, compiled projections), a back
 +------------------------------------------------------------------+
 |                     BACKGROUND I/O                                |
 |  Tokio async runtime, bounded latency impact                      |
-|  +-----------+ +-----------+ +-----------+ +-----------+         |
-|  | Checkpoint| |    WAL    | | Changelog | |   Timer   |         |
-|  |  Manager  | |   Writer  | |  Drainer  | |   Wheel   |         |
-|  +-----------+ +-----------+ +-----------+ +-----------+         |
+|  +--------------+ +--------------+                                |
+|  |  Checkpoint  | |   Sink I/O   |                                |
+|  | Coordinator  | |  (external   |                                |
+|  |  (2PC, store)| |  writers)    |                                |
+|  +--------------+ +--------------+                                |
 +------------------------------------------------------------------+
 |                      CONTROL PLANE                                |
 |  +-----------+ +-----------+ +-----------+                       |
 |  |   Admin   | |  Metrics  | |   Config  |                      |
-|  |    API    | |   Export   | |  Manager  |                      |
+|  |    API    | |   Export  | |  Manager  |                      |
 |  +-----------+ +-----------+ +-----------+                       |
 +------------------------------------------------------------------+
 ```
 
 ### Streaming Coordinator (Hot Path)
 
-A single `StreamingCoordinator` tokio task receives batches from source connectors via `tokio::sync::mpsc`, executes SQL cycles via `PipelineCallback`, and delegates checkpoint barriers.
+A single `StreamingCoordinator` tokio task runs on a dedicated single-threaded
+runtime (the `laminar-compute` thread, spawned with
+`tokio::runtime::Builder::new_current_thread()`), isolating CPU-bound event
+processing from I/O tasks on the main work-stealing runtime. Source tokio
+tasks deliver batches to the coordinator over `tokio::sync::mpsc` channels,
+and the coordinator executes SQL cycles via `PipelineCallback::execute_cycle()`
+and injects/aligns checkpoint barriers (Chandy-Lamport protocol).
 
 **Components:**
-- **StreamExecutor** -- Drives DataFusion SQL execution per cycle. Three optimization tiers: `CompiledProjection` (single-source non-aggregate queries compiled to `PhysicalExpr`), `IncrementalAggState` (incremental GROUP BY with per-group accumulators), and `CoreWindowState` (tumbling/hopping/session windows via optimized `CoreWindowAssigner`). Queries that don't match these tiers fall back to full DataFusion execution.
+- **StreamExecutor** -- Drives DataFusion SQL execution per cycle. Optimization tiers: `CompiledProjection` (single-source non-aggregate queries compiled to `PhysicalExpr`), `IncrementalAggState` (incremental GROUP BY with per-group accumulators), and `CoreWindowState` (tumbling/hopping/session windows via optimized `CoreWindowAssigner`). Queries that don't match these tiers fall back to full DataFusion execution.
 - **Operators** -- Stateless transforms (map, filter, project) and stateful operators (tumbling/sliding/hopping/session windows, stream-stream joins, ASOF joins, temporal joins, lookup joins, lag/lead, ranking).
-- **State** -- Operators hold state in internal `FxHashMap`s (per-group accumulators, window buffers, join buffers). Checkpointed via JSON serialization of `StreamExecutorCheckpoint`.
-- **Emit** -- Pushes output RecordBatches to downstream streams and sinks via mpsc channels.
+- **State** -- Operators hold state in internal `FxHashMap`s (per-group accumulators, window buffers, join buffers). Checkpointed via JSON serialization into the `CheckpointManifest`.
+- **Emit** -- Pushes output RecordBatches to downstream streams and sinks via tokio mpsc channels.
 
 **Compiled query execution**: Non-aggregate single-source queries are compiled to `PhysicalExpr` projections on first execution, eliminating per-cycle SQL overhead. Complex queries cache their optimized logical plans.
 
@@ -69,13 +80,12 @@ A single `StreamingCoordinator` tokio task receives batches from source connecto
 
 ### Background I/O
 
-Durability and I/O, runs on Tokio async runtime.
+Durability and I/O, runs on the main tokio async runtime (not the compute thread).
 
 **Components:**
-- **Checkpoint Manager** -- Incremental checkpointing with directory-based snapshots. `CheckpointCoordinator` orchestrates two-phase commit across exactly-once sinks (`laminar-db/src/checkpoint_coordinator.rs`).
-- **Changelog Drainer** -- Consumes Ring 0 changelog entries for backpressure relief (`laminar-storage/src/changelog_drainer.rs`).
-- **Recovery Manager** -- Loads the latest checkpoint manifest and restores all operator state, connector offsets, and watermarks on startup (`laminar-db/src/recovery_manager.rs`).
-- **Connectors** -- External source/sink connectors (Kafka, CDC, Delta Lake, WebSocket) run as Tokio tasks.
+- **Checkpoint Coordinator** -- Orchestrates periodic full-state snapshots with manifest-based persistence via two-phase commit across exactly-once sinks (`laminar-db/src/checkpoint_coordinator.rs`). Manifests are written via filesystem or object store (`laminar-storage/src/checkpoint_store.rs`).
+- **Recovery Manager** -- Loads the latest checkpoint manifest and restores operator state, connector offsets, and watermarks on startup (`laminar-db/src/recovery_manager.rs`).
+- **Connectors** -- External source/sink connectors (Kafka, CDC, Delta Lake, Iceberg, WebSocket, OTEL, Files) run as tokio tasks on the main runtime.
 
 ### Control Plane
 
@@ -103,7 +113,7 @@ How an event moves through the system:
     |                      |                            |
     |          Background  | checkpoint                 |
     |            +---------v--------+                   |
-    |            |  WAL + Directory |                   |
+    |            |  Directory       |                   |
     |            |  Checkpoints     |                   |
     |            +------------------+                   |
     |                                                   |
@@ -114,42 +124,44 @@ How an event moves through the system:
 2. **Watermark tracking**: Each source maintains an `EventTimeExtractor` + `BoundedOutOfOrdernessGenerator` for watermark computation. Late rows are filtered. Watermarks can be per-partition, per-key, or aligned across sources.
 3. **Operator processing**: The coordinator runs batches through SQL execution cycles (windows, joins, aggregations, filters). State is held in per-group accumulators and window buffers.
 4. **Emit**: Results are published to named streams. Subscribers receive RecordBatches via typed `TypedSubscription<T>` or callback subscriptions.
-5. **Durability**: Changelog entries flow to background I/O, which writes to WAL and periodically takes directory-based checkpoints.
+5. **Durability**: Operator state is periodically snapshotted to directory-based checkpoints (JSON manifest + optional binary sidecar), persisted atomically via temp-file + rename.
 6. **Sink output**: External sinks (Kafka, PostgreSQL, Delta Lake, WebSocket) receive batches with exactly-once semantics via two-phase commit.
 
 ## Crate Map
 
 ```text
-laminar-core          Core: reactor, operators, state stores, time/watermarks,
-                      streaming channels, DAG pipeline, subscriptions,
-                      lookup tables, secondary indexes, cross-partition aggregation,
-                      checkpoint barriers, task budgets
+laminar-core          Core: operators, window assigners, time/watermarks,
+                      streaming channels (crossfire), subscriptions,
+                      lookup tables, checkpoint barrier protocol, error codes
                       |
 laminar-sql           SQL parser (streaming extensions), query planner,
                       DataFusion integration, operator config translators,
                       custom UDFs (tumble, hop, session, slide, first_value, last_value),
                       streaming physical optimizer, watermark filter pushdown,
-                      cooperative scheduling, PROCTIME() UDF
+                      cooperative scheduling, PROCTIME() UDF,
+                      temporal probe join translator
                       |
-laminar-storage       Background I/O: WAL, incremental checkpointing,
-                      checkpoint manifest, checkpoint store, changelog drainer
+laminar-storage       Checkpoint persistence: manifest, checkpoint store
+                      (filesystem + object store), object store builder
                       |
 laminar-connectors    Kafka source/sink, PostgreSQL CDC/sink, MySQL CDC,
                       MongoDB CDC source/sink, WebSocket source/sink,
-                      Delta Lake sink/source, file source/sink,
+                      OpenTelemetry OTLP/gRPC source, file source/sink,
+                      Delta Lake source/sink, Iceberg source/sink,
                       schema framework (inference, evolution),
                       format decoders (JSON, CSV, Avro, Parquet),
                       lookup tables, reference tables, cloud storage infrastructure
                       |
 laminar-db            Unified facade: LaminarDB struct, LaminarDbBuilder,
-                      SQL execution, checkpoint coordination, recovery manager,
+                      StreamingCoordinator, checkpoint coordinator, recovery manager,
                       connector manager, pipeline observability, deployment profiles,
                       FFI API (C bindings, Arrow C Data Interface),
                       SQL operator routing (core_window_state),
                       EOWC incremental window accumulators (eowc_state)
                       |
 laminar-derive        Proc macros: #[derive(Record, FromRecordBatch, FromRow, ConnectorConfig)]
-laminar-server        Standalone binary: CLI args, logging init (skeleton with TODOs)
+laminar-server        Standalone binary: TOML config, Axum HTTP REST + WebSocket,
+                      Prometheus metrics, hot reload, checkpoint validation CLI
 ```
 
 ## Key Abstractions
@@ -162,7 +174,7 @@ The main entry point. Owns sources, streams, sinks, and the pipeline lifecycle.
 let db = LaminarDB::open()?;
 
 // DDL
-db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts BIGINT)").await?;
+db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts TIMESTAMP)").await?;
 db.execute("CREATE STREAM avg_price AS SELECT symbol, AVG(price) ...").await?;
 
 // Data ingestion
@@ -207,44 +219,13 @@ let db = LaminarDB::builder()
     .await?;
 ```
 
-### State Store
+### Operator State
 
-The `StateStore` trait provides key-value storage for DAG operators:
-
-```rust
-pub trait StateStore: Send {
-    fn get(&self, key: &[u8]) -> Option<&[u8]>;
-    fn put(&mut self, key: &[u8], value: &[u8]);
-    fn delete(&mut self, key: &[u8]);
-    fn prefix_scan(&self, prefix: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])>;
-}
-```
-
-Implementations:
-- `InMemoryStore` -- BTreeMap-based, used by DAG operators
-- `AHashMapStore` -- AHashMap-based, for fast key lookups
-- `MmapStateStore` -- Memory-mapped file backing for persistent state
-
-The production SQL execution path (`StreamExecutor`) holds state in internal FxHashMaps (per-group accumulators, window buffers) and checkpoints via JSON serialization. DAG operators that use `StateStore` are: `stream_join`, `session_window`, `sliding_window`, `window`.
+The production SQL execution path (`StreamExecutor`) holds state in internal FxHashMaps (per-group accumulators, window buffers) and checkpoints via JSON serialization. Each stateful operator (`SqlQuery`, `EowcQuery`, `CoreWindowState`, `IncrementalAggState`) implements its own `checkpoint()`/`restore()` methods.
 
 ### Streaming Channels
 
-Lock-free channels between components:
-
-- **RingBuffer** -- Fixed-capacity, cache-line-padded ring buffer
-- **SPSC Channel** -- Single-producer single-consumer, zero-allocation on hot path
-- **MPSC Channel** -- Auto-upgrading multi-producer variant
-- **Broadcast Channel** -- One-to-many fan-out
-
-### DAG Pipeline
-
-Operators wired into a DAG:
-
-- **Core DAG Topology** -- Nodes (operators) and edges (channels) with type-safe wiring
-- **Multicast & Routing** -- Fan-out and key-based routing between DAG nodes
-- **DAG Executor** -- Processes batches through the DAG with backpressure
-- **DAG Checkpointing** -- Barrier-based consistent snapshots across the DAG
-- **Connector Bridge** -- Integrates external source/sink connectors as DAG nodes
+Source and Sink objects in the public streaming API (`laminar_core::streaming`) are backed by `crossfire::mpsc::Array<T>` channels (bounded, blocking sender + async receiver). Clone the `Source<T>` for multi-producer use. Internally, the `StreamingCoordinator` uses `tokio::sync::mpsc` for source-task → coordinator communication across runtimes, and subscribers receive updates via the subscription registry in `laminar_core::streaming::subscription`.
 
 ### Connector SDK
 
@@ -288,13 +269,16 @@ Enrichment joins via `CREATE LOOKUP TABLE` DDL with hash-probe physical executio
 
 ### Deployment Profiles
 
-Pre-configured deployment tiers:
+Pre-configured deployment tiers (`laminar_db::Profile`). Each tier includes all capabilities of the tiers below it: `BareMetal ⊂ Embedded ⊂ Durable ⊂ Delta`.
 
 | Profile | Description |
 |---------|-------------|
-| `InMemory` | Default. All state in memory, no durability. |
-| `Durable` | Object-store checkpoints for recovery. Requires `durable` feature. |
-| `Delta` | Distributed scaffolding (gossip, Raft, gRPC stubs). Not production-ready. Requires `delta` feature. |
+| `BareMetal` | Default. In-memory only, no persistence. Fastest startup. |
+| `Embedded` | Local filesystem checkpoint persistence for single-node embedded use. |
+| `Durable` | Object-store checkpoints (S3/GCS/Azure) for recovery. |
+| `Delta` | Distributed scaffolding (gossip, Raft, gRPC stubs). Not production-ready. Requires the `delta` feature. |
+
+The builder can auto-detect the appropriate profile from the configured checkpoint URL and discovery settings.
 
 ## Streaming SQL
 
@@ -310,7 +294,7 @@ SQL parsing goes through sqlparser-rs with these streaming extensions:
 | Hopping windows | `hop(ts_col, size, hop)` | Periodic windows |
 | Session windows | `session(ts_col, gap)` | Activity-based |
 | Watermarks | `WATERMARK FOR col AS expr` | Event time tracking |
-| Late data | `ALLOWED_LATENESS INTERVAL` | Grace periods |
+| Late data | `ALLOW LATENESS INTERVAL` / `LATE DATA TO <sink>` | Grace periods, side outputs |
 | EMIT clause | `EMIT ON WINDOW CLOSE` | Output control |
 | ASOF JOIN | `ASOF JOIN ... ON ... AND ts >= ts` | Point-in-time lookups |
 | Lookup tables | `CREATE LOOKUP TABLE ... FROM POSTGRES(...)` | Reference data |
@@ -326,12 +310,12 @@ Queries are planned by `StreamingPlanner` and executed via DataFusion, with comp
 | Operation | Target | Measured | Technique |
 |-----------|--------|----------|-----------|
 | State lookup | < 500ns | 10-105ns (AHash get_ref: 10-16ns) | AHashMap, cache-aligned keys |
-| Event processing | < 1us | 0.55-1.16us | Zero allocation, inlined operators |
+| Event processing | < 1us | 0.55-1.16us | Zero per-event allocation, compiled projections |
 | Throughput/core | 500K/s | 1.1-1.46M/s | Batch processing, Arrow columnar |
 | Checkpoint | < 10s recovery | 1.39ms | Full snapshots, manifest-based recovery |
-| Window trigger | < 10us | not yet measured | Hierarchical timer wheel |
+| Window trigger | < 10us | not yet measured | Watermark-driven emission |
 
-See [BENCHMARKS.md](BENCHMARKS.md) for full benchmark baselines with hardware details.
+See [BENCHMARKS.md](BENCHMARKS.md) for historical benchmark baselines with hardware details.
 
 ## Execution Model
 
@@ -342,30 +326,20 @@ The thread-per-core model described in earlier documentation was removed in PR #
 3. Manages checkpoint barriers for exactly-once semantics
 4. Routes results to sink connectors
 
-### Two Execution Paths
+### Coordinator and Executor
 
-LaminarDB provides two **intentionally separate** execution paths for different use cases:
+**Execution:** SQL queries are executed through `StreamExecutor::execute_cycle()`, processing `RecordBatch` micro-batches with per-group `FxHashMap` state. The `OperatorGraph` manages the operator topology.
 
-| Aspect | SQL Path | DAG Path |
-|--------|----------|----------|
-| Entry | `StreamExecutor::execute_cycle()` | `DagExecutor::process_event()` |
-| Data unit | `RecordBatch` (micro-batch) | `Event` (per-event) |
-| State | `FxHashMap` in StreamExecutor fields | `Box<dyn StateStore>` in NodeRuntime |
-| Scheduling | Cycle budget (configurable) | Synchronous per-event |
-| Crate | `laminar-db` | `laminar-core` |
-| API | SQL (`CREATE STREAM AS SELECT ...`) | Rust (`DagBuilder::new().source()...build()`) |
-
-The SQL path is the production path for SQL users. The DAG path is a programmatic Rust API for custom operator pipelines, exercised by tests and benchmarks.
-
-**Coordinator → Executor relationship (SQL path):** `StreamingCoordinator` is the
+**Coordinator → Executor relationship:** `StreamingCoordinator` is the
 single tokio task that owns the event loop. It calls `PipelineCallback::execute_cycle()`,
-which delegates to `StreamExecutor::execute_cycle()`. These are **not** three competing
-loops — the coordinator drives the executor through a callback interface.
+which delegates to `StreamExecutor::execute_cycle()`. The coordinator drives the
+executor through a callback interface — there is a single execution loop, not
+multiple competing ones.
 
 ### Deployment Model
 
 LaminarDB is a **single-node** embedded database. All operator state is keyed by
-operator index (position in the query DAG). Multi-node partitioning
+operator index (position in the operator graph). Multi-node partitioning
 (VNode-scoped state, distributed barriers, partition migration) is deferred to
 a future phase.
 
@@ -374,18 +348,17 @@ a future phase.
 Exactly-once processing works through:
 
 1. **Source offsets** -- Tracked per-source, persisted in checkpoint manifests
-2. **Barrier-based snapshots** -- `StreamingCoordinator` injects checkpoint barriers at sources; all sources align on the barrier before operator state is captured. Barriers flow between sources and the coordinator (not through the operator graph) in the production path. The DAG path (`dag/checkpoint.rs`) has true operator-level barrier alignment but is not the default execution path yet
-3. **WAL** -- Per-core WAL segments with CRC32C checksums and torn write detection
-4. **Incremental checkpoints** -- Directory-based snapshots of operator state (JSON-serialized `StreamExecutorCheckpoint`)
-5. **Two-phase commit** -- Coordinated across exactly-once sinks via `CheckpointCoordinator` (at-most-once sinks receive no pre_commit/commit guarantees)
-6. **Recovery** -- `RecoveryManager` restores from the latest checkpoint manifest, replays WAL entries, and resumes from committed offsets
+2. **Barrier-based snapshots** -- `StreamingCoordinator` injects checkpoint barriers at sources; all sources align on the barrier before operator state is captured
+3. **Checkpoints** -- Periodic full-state snapshots: JSON-serialized operator state, source offsets, sink epochs, watermarks. Persisted atomically via temp-file + rename
+4. **Two-phase commit** -- Coordinated across exactly-once sinks via `CheckpointCoordinator` (at-most-once sinks receive no pre_commit/commit guarantees)
+5. **Recovery** -- `RecoveryManager` loads the latest checkpoint manifest, restores source offsets, rolls back exactly-once sinks, and resumes from committed state. Falls back to older checkpoints if latest is corrupt
 
 ## Delta Architecture (Distributed Mode)
 
 With the `delta` feature enabled, multi-node operation:
 
 - **Discovery** -- Static configuration, gossip-based (chitchat), or Kafka group discovery. Discovery via chitchat gossip is implemented.
-- **Coordination** -- Raft-based metadata consensus via openraft
+- **Coordination** -- Metadata consensus (scaffolding only, not production-ready)
 - **Partition Ownership** -- Epoch-fenced partition guards with consistent assignment
 - **Distributed Checkpoints** -- Cross-node barrier coordination (planned; not yet implemented in checkpoint_coordinator)
 - **Cross-Node Aggregation** -- Gossip partial aggregates and gRPC fan-out

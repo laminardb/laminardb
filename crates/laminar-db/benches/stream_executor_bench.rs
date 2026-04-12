@@ -1,5 +1,6 @@
 #![allow(clippy::disallowed_types)]
-//! StreamExecutor micro-benchmark: measures per-cycle SQL overhead.
+//! Pipeline micro-benchmark: measures per-cycle SQL overhead through
+//! the `LaminarDB` public API (OperatorGraph execution path).
 //!
 //! Compares plain SQL execution (full DataFusion planning each cycle) against
 //! compiled projections and cached logical plans.
@@ -70,7 +71,7 @@ impl laminar_db::FromBatch for RowCount {
 
 /// Wait for at least one output batch on the given stream (with timeout).
 fn wait_for_output(db: &LaminarDB, stream: &str, timeout: Duration) {
-    let sub = db.subscribe::<RowCount>(stream).unwrap();
+    let mut sub = db.subscribe::<RowCount>(stream).unwrap();
     let _ = sub.recv_timeout(timeout);
 }
 

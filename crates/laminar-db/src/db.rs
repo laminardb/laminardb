@@ -21,8 +21,12 @@ use crate::handle::{
     DdlInfo, ExecuteResult, QueryHandle, QueryInfo, SinkInfo, SourceHandle, SourceInfo,
     UntypedSourceHandle,
 };
+use crate::pipeline::ControlMsg;
 use crate::pipeline_lifecycle::url_to_checkpoint_prefix;
 use crate::sql_utils;
+
+/// Cloneable async sender for the live-DDL control channel.
+pub(crate) type ControlMsgTx = crossfire::MAsyncTx<crossfire::mpsc::Array<ControlMsg>>;
 
 pub(crate) const STATE_CREATED: u8 = 0;
 pub(crate) const STATE_STARTING: u8 = 1;
@@ -30,7 +34,10 @@ pub(crate) const STATE_RUNNING: u8 = 2;
 pub(crate) const STATE_SHUTTING_DOWN: u8 = 3;
 pub(crate) const STATE_STOPPED: u8 = 4;
 
-/// Extract SQL text from a `StreamingStatement` for storage in the connector manager.
+fn cache_entries_from_memory(mem: laminar_sql::parser::lookup_table::ByteSize) -> usize {
+    (mem.as_bytes() / 256).max(1024) as usize
+}
+
 pub(crate) fn streaming_statement_to_sql(stmt: &StreamingStatement) -> String {
     match stmt {
         StreamingStatement::Standard(sql_stmt) => sql_stmt.to_string(),
@@ -46,23 +53,6 @@ pub(crate) fn streaming_statement_to_sql(stmt: &StreamingStatement) -> String {
 /// Provides a unified interface for SQL execution, data ingestion,
 /// and result consumption. All streaming infrastructure (sources, sinks,
 /// channels, subscriptions) is managed internally.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use laminar_db::LaminarDB;
-///
-/// let db = LaminarDB::open()?;
-///
-/// db.execute("CREATE SOURCE trades (
-///     symbol VARCHAR, price DOUBLE, ts BIGINT,
-///     WATERMARK FOR ts AS ts - INTERVAL '1' SECOND
-/// )").await?;
-///
-/// let query = db.execute("SELECT symbol, AVG(price) FROM trades
-///     GROUP BY symbol, TUMBLE(ts, INTERVAL '1' MINUTE)
-/// ").await?;
-/// ```
 pub struct LaminarDB {
     pub(crate) catalog: Arc<SourceCatalog>,
     pub(crate) planner: parking_lot::Mutex<StreamingPlanner>,
@@ -77,7 +67,7 @@ pub struct LaminarDB {
     pub(crate) connector_registry: Arc<laminar_connectors::registry::ConnectorRegistry>,
     pub(crate) mv_registry: parking_lot::Mutex<laminar_core::mv::MvRegistry>,
     pub(crate) table_store: Arc<parking_lot::RwLock<crate::table_store::TableStore>>,
-    pub(crate) state: std::sync::atomic::AtomicU8,
+    pub(crate) state: Arc<std::sync::atomic::AtomicU8>,
     /// Handle to the background processing task (if running).
     pub(crate) runtime_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Signal to stop the processing loop.
@@ -94,59 +84,37 @@ pub struct LaminarDB {
     pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
     /// Control channel sender for live DDL to the running coordinator.
     /// `None` before `start()` or after `shutdown()`.
-    pub(crate) control_tx:
-        parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<crate::pipeline::ControlMsg>>>,
+    pub(crate) control_tx: parking_lot::Mutex<Option<ControlMsgTx>>,
+    /// Materialized view result store (shared with compute thread and query threads).
+    pub(crate) mv_store: Arc<parking_lot::RwLock<crate::mv_store::MvStore>>,
 }
 
-/// Per-source watermark tracking state for the pipeline loop.
-///
-/// Combines an `EventTimeExtractor` (to find the max timestamp in each batch)
-/// with a watermark generator (to compute the watermark with delay).
 pub(crate) struct SourceWatermarkState {
     pub(crate) extractor: laminar_core::time::EventTimeExtractor,
     pub(crate) generator: Box<dyn laminar_core::time::WatermarkGenerator>,
-    /// Watermark column name for late-row filtering.
     pub(crate) column: String,
-    /// Timestamp format for late-row filtering.
-    pub(crate) format: laminar_core::time::TimestampFormat,
 }
 
-/// Infer the `TimestampFormat` from a schema column's `DataType`.
-pub(crate) fn infer_timestamp_format(
-    schema: &arrow::datatypes::SchemaRef,
-    column: &str,
-) -> laminar_core::time::TimestampFormat {
-    if let Ok(idx) = schema.index_of(column) {
-        match schema.field(idx).data_type() {
-            DataType::Timestamp(_, _) => laminar_core::time::TimestampFormat::ArrowNative,
-            _ => laminar_core::time::TimestampFormat::UnixMillis,
-        }
-    } else {
-        laminar_core::time::TimestampFormat::UnixMillis
-    }
-}
-
-/// Filters rows from a `RecordBatch` whose timestamp is behind the watermark.
-///
-/// Returns `None` if all rows are late (i.e., filtered result is empty).
-/// For sources without a watermark column, callers should skip this function
-/// and pass the batch through unfiltered.
 pub(crate) fn filter_late_rows(
     batch: &RecordBatch,
     column: &str,
     watermark: i64,
-    format: laminar_core::time::TimestampFormat,
 ) -> Option<RecordBatch> {
-    crate::batch_filter::filter_batch_by_timestamp(
+    match laminar_core::time::filter_batch_by_timestamp(
         batch,
         column,
         watermark,
-        format,
-        crate::batch_filter::ThresholdOp::GreaterEq,
-    )
+        laminar_core::time::ThresholdOp::GreaterEq,
+    ) {
+        Ok(out) => out,
+        Err(e) => {
+            // Schema drift — drop the batch rather than silently admit late rows.
+            tracing::error!(%column, error = %e, "filter_late_rows: dropping batch");
+            None
+        }
+    }
 }
 
-/// Parse a human-readable duration string (e.g., "5s", "1m", "500ms", "30s").
 pub(crate) fn parse_duration_str(s: &str) -> Option<std::time::Duration> {
     let s = s.trim();
     if s.ends_with("ms") {
@@ -194,6 +162,11 @@ impl LaminarDB {
         config: LaminarConfig,
         config_vars: HashMap<String, String>,
     ) -> Result<Self, DbError> {
+        // One-time crossfire backoff tuning. No-op on multi-core; on single-core
+        // VMs this swaps spin-loops for yields (~2x channel throughput).
+        // Idempotent via an internal atomic — safe to call on every instance.
+        crossfire::detect_backoff_cfg();
+
         let lookup_registry = Arc::new(laminar_sql::datafusion::LookupTableRegistry::new());
 
         // Build a SessionContext with the LookupJoinExtensionPlanner wired
@@ -240,7 +213,7 @@ impl LaminarDB {
             table_store: Arc::new(parking_lot::RwLock::new(
                 crate::table_store::TableStore::new(),
             )),
-            state: std::sync::atomic::AtomicU8::new(STATE_CREATED),
+            state: Arc::new(std::sync::atomic::AtomicU8::new(STATE_CREATED)),
             runtime_handle: parking_lot::Mutex::new(None),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             counters: Arc::new(crate::metrics::PipelineCounters::new()),
@@ -249,6 +222,7 @@ impl LaminarDB {
             pipeline_watermark: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
             lookup_registry,
             control_tx: parking_lot::Mutex::new(None),
+            mv_store: Arc::new(parking_lot::RwLock::new(crate::mv_store::MvStore::new())),
         })
     }
 
@@ -268,7 +242,7 @@ impl LaminarDB {
         }
         #[cfg(feature = "postgres-cdc")]
         {
-            laminar_connectors::cdc::postgres::register_postgres_cdc(registry);
+            laminar_connectors::cdc::postgres::register_postgres_cdc_source(registry);
         }
         #[cfg(feature = "postgres-sink")]
         {
@@ -295,7 +269,7 @@ impl LaminarDB {
         }
         #[cfg(feature = "mongodb-cdc")]
         {
-            laminar_connectors::mongodb::register_mongodb_cdc(registry);
+            laminar_connectors::mongodb::register_mongodb_cdc_source(registry);
             laminar_connectors::mongodb::register_mongodb_sink(registry);
         }
         #[cfg(feature = "files")]
@@ -303,6 +277,171 @@ impl LaminarDB {
             laminar_connectors::files::register_file_source(registry);
             laminar_connectors::files::register_file_sink(registry);
         }
+        #[cfg(feature = "otel")]
+        {
+            laminar_connectors::otel::register_otel_source(registry);
+        }
+    }
+
+    /// Handle `CREATE LOOKUP TABLE` by registering the table in the
+    /// `TableStore`, `ConnectorManager`, `DataFusion` catalog, and lookup
+    /// registry.
+    fn handle_register_lookup_table(
+        &self,
+        info: laminar_sql::planner::LookupTableInfo,
+    ) -> Result<ExecuteResult, DbError> {
+        use laminar_sql::parser::lookup_table::ConnectorType;
+
+        if info.primary_key.len() != 1 {
+            return Err(DbError::InvalidOperation(
+                "Lookup table requires a single-column primary key".into(),
+            ));
+        }
+        let pk = info.primary_key[0].clone();
+
+        // Register in TableStore for PK-based upsert
+        let cache_mode = info.properties.cache_memory.map(|mem| {
+            let max_entries = cache_entries_from_memory(mem);
+            crate::table_cache_mode::TableCacheMode::Partial { max_entries }
+        });
+        if let Some(cache) = cache_mode {
+            self.table_store.write().create_table_with_cache(
+                &info.name,
+                info.arrow_schema.clone(),
+                &pk,
+                cache,
+            )?;
+        } else {
+            self.table_store
+                .write()
+                .create_table(&info.name, info.arrow_schema.clone(), &pk)?;
+        }
+
+        // For external connectors: register in ConnectorManager so
+        // start_connector_pipeline() handles snapshot + CDC loading
+        if !matches!(info.properties.connector, ConnectorType::Static) {
+            self.register_lookup_connector(&info, &pk)?;
+        }
+
+        // Register in DataFusion for SELECT/JOIN queries
+        {
+            let provider = crate::table_provider::ReferenceTableProvider::new(
+                info.name.clone(),
+                info.arrow_schema.clone(),
+                self.table_store.clone(),
+            );
+            let _ = self.ctx.deregister_table(&info.name);
+            self.ctx
+                .register_table(&info.name, Arc::new(provider))
+                .map_err(|e| {
+                    DbError::InvalidOperation(format!("Failed to register lookup table: {e}"))
+                })?;
+        }
+
+        // Register snapshot in the lookup registry so the physical
+        // planner can build LookupJoinExec nodes for JOIN queries.
+        if let Some(batch) = self.table_store.read().to_record_batch(&info.name) {
+            self.lookup_registry.register(
+                &info.name,
+                laminar_sql::datafusion::LookupSnapshot {
+                    batch,
+                    key_columns: info.primary_key.clone(),
+                },
+            );
+        }
+
+        // Register the logical optimizer rule so JOINs referencing
+        // this table are rewritten to LookupJoinNode.
+        self.refresh_lookup_optimizer_rule();
+
+        Ok(ExecuteResult::Ddl(DdlInfo {
+            statement_type: "CREATE LOOKUP TABLE".to_string(),
+            object_name: info.name,
+        }))
+    }
+
+    /// Register an external connector for a lookup table in the
+    /// `ConnectorManager` and `TableStore`.
+    #[allow(clippy::unnecessary_wraps)]
+    fn register_lookup_connector(
+        &self,
+        info: &laminar_sql::planner::LookupTableInfo,
+        pk: &str,
+    ) -> Result<(), DbError> {
+        use laminar_sql::parser::lookup_table::ConnectorType;
+
+        let connector_type_str = match &info.properties.connector {
+            ConnectorType::Postgres => "postgres",
+            ConnectorType::PostgresCdc => "postgres-cdc",
+            ConnectorType::MysqlCdc => "mysql-cdc",
+            ConnectorType::Redis => "redis",
+            ConnectorType::S3Parquet => "s3-parquet",
+            ConnectorType::DeltaLake => "delta-lake",
+            ConnectorType::Custom(s) => s.as_str(),
+            ConnectorType::Static => unreachable!(),
+        };
+
+        self.table_store
+            .write()
+            .set_connector(&info.name, connector_type_str);
+
+        let refresh = match info.properties.strategy {
+            laminar_sql::parser::lookup_table::LookupStrategy::Replicated
+            | laminar_sql::parser::lookup_table::LookupStrategy::Partitioned => {
+                // Standalone postgres uses snapshot-only (no CDC slot needed).
+                if matches!(info.properties.connector, ConnectorType::Postgres) {
+                    Some(laminar_connectors::reference::RefreshMode::SnapshotOnly)
+                } else {
+                    Some(laminar_connectors::reference::RefreshMode::SnapshotPlusCdc)
+                }
+            }
+            laminar_sql::parser::lookup_table::LookupStrategy::OnDemand => {
+                Some(laminar_connectors::reference::RefreshMode::Manual)
+            }
+        };
+
+        // Build connector options and format options from raw WITH clause.
+        // Keys consumed by LookupTableProperties are excluded; keys starting
+        // with "format." are routed to format_options (prefix stripped).
+        let consumed = [
+            "connector",
+            "strategy",
+            "cache.memory",
+            "cache.disk",
+            "cache.ttl",
+            "pushdown",
+            "format",
+        ];
+        let mut connector_options = HashMap::with_capacity(info.raw_options.len());
+        let mut format_options = HashMap::with_capacity(4);
+        for (k, v) in &info.raw_options {
+            let lower = k.to_lowercase();
+            if consumed.contains(&lower.as_str()) {
+                continue;
+            }
+            if let Some(suffix) = lower.strip_prefix("format.") {
+                format_options.insert(suffix.to_string(), v.clone());
+            } else {
+                connector_options.insert(k.clone(), v.clone());
+            }
+        }
+
+        let cache_max = info.properties.cache_memory.map(cache_entries_from_memory);
+
+        self.connector_manager
+            .lock()
+            .register_table(crate::connector_manager::TableRegistration {
+                name: info.name.clone(),
+                primary_key: pk.to_string(),
+                connector_type: Some(connector_type_str.to_string()),
+                connector_options,
+                format: info.raw_options.get("format").cloned(),
+                format_options,
+                refresh,
+                cache_max_entries: cache_max,
+            });
+
+        Ok(())
     }
 
     /// Replaces the `LookupJoinRewriteRule` on the `DataFusion` context
@@ -408,7 +547,7 @@ impl LaminarDB {
             storage_options,
         )
         .await
-        .map_err(|e| DbError::Connector(e.to_string()))
+        .map_err(DbError::from)
     }
 
     /// Execute a SQL statement.
@@ -466,7 +605,7 @@ impl LaminarDB {
 
         match statement {
             StreamingStatement::CreateSource(create) => {
-                let result = self.handle_create_source(create)?;
+                let result = self.handle_create_source(create).await?;
                 if let ExecuteResult::Ddl(ref info) = result {
                     self.connector_manager
                         .lock()
@@ -657,13 +796,10 @@ impl LaminarDB {
         Ok(ExecuteResult::RowsAffected(values.len() as u64))
     }
 
-    /// Handle CREATE TABLE statement.
+    /// Handle RESTORE FROM CHECKPOINT statement (not yet implemented).
     ///
-    /// Creates a static reference/dimension table backed by a `DataFusion`
-    /// `MemTable`. If a PRIMARY KEY is specified, the table is also registered
-    /// in the `TableStore` for upsert/delete/lookup semantics.
-    /// If `WITH (...)` options include a `connector` key, the table is
-    /// registered in the `ConnectorManager` for connector-backed population.
+    /// Will eventually stop the pipeline, reload state from the checkpoint
+    /// manifest, seek source offsets, and restart the pipeline.
     #[allow(clippy::unused_self)] // will use self when restore is implemented
     fn handle_restore_checkpoint(&self, _checkpoint_id: u64) -> Result<ExecuteResult, DbError> {
         Err(DbError::Unsupported(
@@ -705,12 +841,13 @@ impl LaminarDB {
         Ok(crate::handle::TypedSubscription::from_raw(sub))
     }
 
-    /// Get a raw Arrow subscription for a named stream (crate-internal).
+    /// Subscribe to a named stream's output.
     ///
-    /// Used by `api::Connection::subscribe` to create an `ArrowSubscription`
-    /// without requiring the `FromBatch` trait bound.
+    /// # Errors
+    ///
+    /// Returns `DbError::StreamNotFound` if the stream doesn't exist.
     #[cfg(feature = "api")]
-    pub(crate) fn subscribe_raw(
+    pub fn subscribe_raw(
         &self,
         name: &str,
     ) -> Result<laminar_core::streaming::Subscription<crate::catalog::ArrowRecord>, DbError> {
@@ -737,7 +874,6 @@ impl LaminarDB {
                         laminar_sql::planner::StreamingPlan::RegisterSource(_) => "RegisterSource",
                         laminar_sql::planner::StreamingPlan::RegisterSink(_) => "RegisterSink",
                         laminar_sql::planner::StreamingPlan::Standard(_) => "Standard",
-                        laminar_sql::planner::StreamingPlan::DagExplain(_) => "DagExplain",
                         laminar_sql::planner::StreamingPlan::RegisterLookupTable(_) => {
                             "RegisterLookupTable"
                         }
@@ -785,9 +921,6 @@ impl LaminarDB {
                     }
                     laminar_sql::planner::StreamingPlan::Standard(_) => {
                         rows.push(("execution".into(), "DataFusion pass-through".into()));
-                    }
-                    laminar_sql::planner::StreamingPlan::DagExplain(output) => {
-                        rows.push(("dag_topology".into(), output.topology_text.clone()));
                     }
                     laminar_sql::planner::StreamingPlan::RegisterLookupTable(info) => {
                         rows.push(("lookup_table".into(), info.name.clone()));
@@ -951,151 +1084,8 @@ impl LaminarDB {
 
                 Ok(self.bridge_query_stream(sql, stream))
             }
-            laminar_sql::planner::StreamingPlan::DagExplain(output) => {
-                Ok(ExecuteResult::Ddl(DdlInfo {
-                    statement_type: "EXPLAIN DAG".to_string(),
-                    object_name: output.topology_text,
-                }))
-            }
             laminar_sql::planner::StreamingPlan::RegisterLookupTable(info) => {
-                use laminar_sql::parser::lookup_table::ConnectorType;
-
-                let pk = info
-                    .primary_key
-                    .first()
-                    .ok_or_else(|| {
-                        DbError::InvalidOperation("Lookup table requires a primary key".into())
-                    })?
-                    .clone();
-
-                // Register in TableStore for PK-based upsert
-                let cache_mode = info.properties.cache_memory.map(|mem| {
-                    let max_entries = (mem.as_bytes() / 256).max(1024) as usize;
-                    crate::table_cache_mode::TableCacheMode::Partial { max_entries }
-                });
-                if let Some(cache) = cache_mode {
-                    self.table_store.write().create_table_with_cache(
-                        &info.name,
-                        info.arrow_schema.clone(),
-                        &pk,
-                        cache,
-                    )?;
-                } else {
-                    self.table_store.write().create_table(
-                        &info.name,
-                        info.arrow_schema.clone(),
-                        &pk,
-                    )?;
-                }
-
-                // For external connectors: register in ConnectorManager so
-                // start_connector_pipeline() handles snapshot + CDC loading
-                if !matches!(info.properties.connector, ConnectorType::Static) {
-                    let connector_type_str = match &info.properties.connector {
-                        ConnectorType::PostgresCdc => "postgres-cdc",
-                        ConnectorType::MysqlCdc => "mysql-cdc",
-                        ConnectorType::Redis => "redis",
-                        ConnectorType::S3Parquet => "s3-parquet",
-                        ConnectorType::DeltaLake => "delta-lake",
-                        ConnectorType::Custom(s) => s.as_str(),
-                        ConnectorType::Static => unreachable!(),
-                    };
-
-                    self.table_store
-                        .write()
-                        .set_connector(&info.name, connector_type_str);
-
-                    let refresh = match info.properties.strategy {
-                        laminar_sql::parser::lookup_table::LookupStrategy::Replicated
-                        | laminar_sql::parser::lookup_table::LookupStrategy::Partitioned => {
-                            Some(laminar_connectors::reference::RefreshMode::SnapshotPlusCdc)
-                        }
-                        laminar_sql::parser::lookup_table::LookupStrategy::OnDemand => {
-                            Some(laminar_connectors::reference::RefreshMode::Manual)
-                        }
-                    };
-
-                    // Build connector options from raw WITH clause
-                    // (exclude keys already consumed by LookupTableProperties)
-                    let connector_options: HashMap<String, String> = info
-                        .raw_options
-                        .iter()
-                        .filter(|(k, _)| {
-                            ![
-                                "connector",
-                                "strategy",
-                                "cache.memory",
-                                "cache.disk",
-                                "cache.ttl",
-                                "pushdown",
-                            ]
-                            .contains(&k.as_str())
-                        })
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
-
-                    let table_cache_mode = info.properties.cache_memory.map(|mem| {
-                        let max_entries = (mem.as_bytes() / 256).max(1024) as usize;
-                        crate::table_cache_mode::TableCacheMode::Partial { max_entries }
-                    });
-                    let cache_max = info
-                        .properties
-                        .cache_memory
-                        .map(|mem| (mem.as_bytes() / 256).max(1024) as usize);
-
-                    self.connector_manager.lock().register_table(
-                        crate::connector_manager::TableRegistration {
-                            name: info.name.clone(),
-                            primary_key: pk,
-                            connector_type: Some(connector_type_str.to_string()),
-                            connector_options,
-                            format: info.raw_options.get("format").cloned(),
-                            format_options: HashMap::new(),
-                            refresh,
-                            cache_mode: table_cache_mode,
-                            cache_max_entries: cache_max,
-                            storage: None,
-                        },
-                    );
-                }
-
-                // Register in DataFusion for SELECT/JOIN queries
-                {
-                    let provider = crate::table_provider::ReferenceTableProvider::new(
-                        info.name.clone(),
-                        info.arrow_schema.clone(),
-                        self.table_store.clone(),
-                    );
-                    let _ = self.ctx.deregister_table(&info.name);
-                    self.ctx
-                        .register_table(&info.name, Arc::new(provider))
-                        .map_err(|e| {
-                            DbError::InvalidOperation(format!(
-                                "Failed to register lookup table: {e}"
-                            ))
-                        })?;
-                }
-
-                // Register snapshot in the lookup registry so the physical
-                // planner can build LookupJoinExec nodes for JOIN queries.
-                if let Some(batch) = self.table_store.read().to_record_batch(&info.name) {
-                    self.lookup_registry.register(
-                        &info.name,
-                        laminar_sql::datafusion::LookupSnapshot {
-                            batch,
-                            key_columns: info.primary_key.clone(),
-                        },
-                    );
-                }
-
-                // Register the logical optimizer rule so JOINs referencing
-                // this table are rewritten to LookupJoinNode.
-                self.refresh_lookup_optimizer_rule();
-
-                Ok(ExecuteResult::Ddl(DdlInfo {
-                    statement_type: "CREATE LOOKUP TABLE".to_string(),
-                    object_name: info.name,
-                }))
+                self.handle_register_lookup_table(info)
             }
             laminar_sql::planner::StreamingPlan::DropLookupTable { name } => {
                 self.table_store.write().drop_table(&name);
@@ -1241,6 +1231,8 @@ impl LaminarDB {
     /// # Errors
     ///
     /// Returns `DbError::SourceNotFound` if the source is not registered.
+    /// Returns `DbError::SchemaMismatch` if the Rust type's schema does not
+    /// match the source's SQL schema.
     pub fn source<T: laminar_core::streaming::Record>(
         &self,
         name: &str,
@@ -1486,7 +1478,7 @@ impl LaminarDB {
             DbError::Checkpoint("coordinator not initialized — call start() first".to_string())
         })?;
         coord
-            .checkpoint(HashMap::new(), None, None, HashMap::new(), None)
+            .checkpoint(crate::checkpoint_coordinator::CheckpointRequest::default())
             .await
     }
 
@@ -1822,8 +1814,6 @@ mod tests {
         assert_eq!(db.source_count(), 1);
     }
 
-    // ── Multi-statement execution tests ─────────────────
-
     #[tokio::test]
     async fn test_multi_statement_execution() {
         let db = LaminarDB::open().unwrap();
@@ -1853,8 +1843,6 @@ mod tests {
         assert_eq!(db.source_count(), 1);
     }
 
-    // ── Config variable substitution tests ──────────────
-
     #[tokio::test]
     async fn test_config_var_substitution() {
         let db = LaminarDB::builder()
@@ -1867,8 +1855,6 @@ mod tests {
         db.execute("CREATE SOURCE events (id INT)").await.unwrap();
         assert_eq!(db.source_count(), 1);
     }
-
-    // ── CREATE STREAM tests ─────────────────────────────
 
     #[tokio::test]
     async fn test_create_stream() {
@@ -2066,8 +2052,6 @@ mod tests {
             _ => panic!("Expected RowsAffected"),
         }
     }
-
-    // ── Connector registry / DDL validation tests ──
 
     #[tokio::test]
     async fn test_create_source_unknown_connector() {
@@ -2267,6 +2251,10 @@ mod tests {
             expected_sources += 1; // file source
             expected_sinks += 1; // file sink
         }
+        #[cfg(feature = "otel")]
+        {
+            expected_sources += 1; // otel source
+        }
 
         assert_eq!(registry.list_sources().len(), expected_sources);
         assert_eq!(registry.list_sinks().len(), expected_sinks);
@@ -2298,7 +2286,174 @@ mod tests {
         assert!(registry.list_sources().contains(&"test-source".to_string()));
     }
 
-    // ── Materialized View Catalog tests ──
+    /// SQL DDL auto-discovery must land a `Map` column in the catalog
+    /// verbatim from the connector — no SQL string round-trip.
+    #[tokio::test]
+    async fn test_sql_create_source_auto_discovers_map_column() {
+        use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema};
+
+        let map_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "data",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(Fields::from(vec![
+                            Field::new("key", DataType::Utf8, false),
+                            Field::new("value", DataType::Utf8, true),
+                        ])),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+        ]));
+
+        let (db, _) = fake_source_db("fake-avro", Some(Arc::clone(&map_schema))).await;
+        db.execute(
+            "CREATE SOURCE events WITH ('connector' = 'fake-avro', \
+             'schema.registry.url' = 'http://irrelevant', 'topic' = 'events')",
+        )
+        .await
+        .unwrap();
+
+        let entry = db.catalog.get_source("events").expect("source in catalog");
+        assert_eq!(entry.schema.fields().len(), 2);
+        assert_eq!(entry.schema.field(0).data_type(), &DataType::Int64);
+        assert!(
+            matches!(entry.schema.field(1).data_type(), DataType::Map(_, _)),
+            "auto-discovered `data` must arrive as Map, got {:?}",
+            entry.schema.field(1).data_type()
+        );
+    }
+
+    /// CREATE SOURCE IF NOT EXISTS must skip auto-discovery when the
+    /// source already exists — no wasted Schema Registry round trip.
+    #[tokio::test]
+    async fn test_sql_create_source_if_not_exists_skips_discovery() {
+        use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+
+        let discovered = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )]));
+        let (db, counter) = fake_source_db("counting-fake", Some(discovered)).await;
+
+        db.execute("CREATE SOURCE events WITH ('connector' = 'counting-fake')")
+            .await
+            .unwrap();
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        db.execute("CREATE SOURCE IF NOT EXISTS events WITH ('connector' = 'counting-fake')")
+            .await
+            .unwrap();
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "IF NOT EXISTS should short-circuit before discovery"
+        );
+    }
+
+    /// CREATE SOURCE without columns must fail loudly when discovery
+    /// yields an empty schema, not register a zero-column table.
+    #[tokio::test]
+    async fn test_sql_create_source_errors_when_discovery_yields_empty() {
+        let (db, _) = fake_source_db("empty-fake", None).await;
+        let err = db
+            .execute("CREATE SOURCE events WITH ('connector' = 'empty-fake')")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("could not auto-discover a schema"),
+            "expected actionable discovery-failure error, got: {err}"
+        );
+    }
+
+    /// Build a `LaminarDB` with one fake source plus a shared counter
+    /// that ticks on every `discover_schema` call.
+    async fn fake_source_db(
+        name: &'static str,
+        discovered: Option<Arc<arrow::datatypes::Schema>>,
+    ) -> (LaminarDB, Arc<std::sync::atomic::AtomicUsize>) {
+        use arrow::datatypes::Schema as ArrowSchema;
+        use async_trait::async_trait;
+        use laminar_connectors::checkpoint::SourceCheckpoint;
+        use laminar_connectors::config::{ConnectorConfig, ConnectorInfo};
+        use laminar_connectors::connector::{SourceBatch, SourceConnector};
+        use laminar_connectors::error::ConnectorError;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FakeSource {
+            schema: Arc<ArrowSchema>,
+            on_discover: Option<Arc<ArrowSchema>>,
+            counter: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl SourceConnector for FakeSource {
+            async fn open(&mut self, _: &ConnectorConfig) -> Result<(), ConnectorError> {
+                Ok(())
+            }
+            async fn poll_batch(
+                &mut self,
+                _: usize,
+            ) -> Result<Option<SourceBatch>, ConnectorError> {
+                Ok(None)
+            }
+            async fn discover_schema(&mut self, _: &std::collections::HashMap<String, String>) {
+                self.counter.fetch_add(1, Ordering::SeqCst);
+                if let Some(s) = &self.on_discover {
+                    self.schema = Arc::clone(s);
+                }
+            }
+            fn schema(&self) -> Arc<ArrowSchema> {
+                Arc::clone(&self.schema)
+            }
+            fn checkpoint(&self) -> SourceCheckpoint {
+                SourceCheckpoint::new(0)
+            }
+            async fn restore(&mut self, _: &SourceCheckpoint) -> Result<(), ConnectorError> {
+                Ok(())
+            }
+            async fn close(&mut self) -> Result<(), ConnectorError> {
+                Ok(())
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&counter);
+
+        let db = LaminarDB::builder()
+            .register_connector(move |registry| {
+                let discovered = discovered.clone();
+                let counter = Arc::clone(&counter_clone);
+                registry.register_source(
+                    name,
+                    ConnectorInfo {
+                        name: name.into(),
+                        display_name: name.into(),
+                        version: "0.1.0".into(),
+                        is_source: true,
+                        is_sink: false,
+                        config_keys: vec![],
+                    },
+                    Arc::new(move || {
+                        Box::new(FakeSource {
+                            schema: Arc::new(ArrowSchema::empty()),
+                            on_discover: discovered.clone(),
+                            counter: Arc::clone(&counter),
+                        })
+                    }),
+                );
+            })
+            .build()
+            .await
+            .unwrap();
+        (db, counter)
+    }
 
     #[tokio::test]
     async fn test_create_materialized_view() {
@@ -2509,8 +2664,6 @@ mod tests {
         );
     }
 
-    // ── Pipeline Topology Introspection tests ──
-
     #[tokio::test]
     async fn test_pipeline_topology_empty() {
         let db = LaminarDB::open().unwrap();
@@ -2663,8 +2816,6 @@ mod tests {
         assert_eq!(find("st").node_type, PipelineNodeType::Stream);
         assert_eq!(find("sk").node_type, PipelineNodeType::Sink);
     }
-
-    // ── Reference Table tests ──
 
     #[tokio::test]
     async fn test_create_table_with_primary_key() {
@@ -2819,8 +2970,6 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // ── HAVING clause tests ─────────────────────────────
-
     #[tokio::test]
     async fn test_having_filters_grouped_results() {
         let db = LaminarDB::open().unwrap();
@@ -2933,8 +3082,6 @@ mod tests {
         // C: cnt=2>=2 AND total=30>25 ✓
         assert_eq!(total_rows, 2);
     }
-
-    // ── Multi-way JOIN tests ─────────────────────────────
 
     #[tokio::test]
     async fn test_multi_join_two_way_lookup() {
@@ -3099,8 +3246,6 @@ mod tests {
         assert_eq!(total_rows, 2);
     }
 
-    // ── Window Frame tests ────────────────────────────────
-
     #[tokio::test]
     async fn test_frame_moving_average() {
         let db = LaminarDB::open().unwrap();
@@ -3244,8 +3389,6 @@ mod tests {
         assert_eq!(cnt_col.value(1), 2);
         assert_eq!(cnt_col.value(2), 2);
     }
-
-    // ── Connector-Backed Table Population ──
 
     /// Helper: create a test `RecordBatch` for table population tests.
     fn table_test_batch(ids: &[i32], symbols: &[&str]) -> RecordBatch {
@@ -3455,8 +3598,6 @@ mod tests {
         // The change batch id=2/GOOG should NOT be present
         assert!(ts.lookup("instruments", "2").is_none());
     }
-
-    // ── PARTIAL Cache Mode DDL tests ──
 
     #[tokio::test]
     async fn test_create_table_partial_cache_mode() {
@@ -3682,8 +3823,6 @@ mod tests {
         let db = LaminarDB::open().unwrap();
         assert!(db.stream_metrics("nonexistent").is_none());
     }
-
-    // ── Watermark Source Tracker tests ──────────────────────────────────
 
     /// Helper: push a batch with `Timestamp(µs)` column to a source.
     ///
@@ -3960,7 +4099,7 @@ mod tests {
             .await
             .unwrap();
 
-        let sub = db.catalog.get_stream_subscription("out").unwrap();
+        let mut sub = db.catalog.get_stream_subscription("out").unwrap();
         db.start().await.unwrap();
 
         let handle = db.source_untyped("events").unwrap();
@@ -4004,33 +4143,29 @@ mod tests {
 
     #[test]
     fn test_filter_late_rows_filters_correctly() {
-        use arrow::array::Int64Array;
+        use arrow::array::{Int64Array, TimestampMillisecondArray};
 
-        // Int64 / UnixMillis format
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
-            Field::new("ts", DataType::Int64, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                false,
+            ),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
-                Arc::new(Int64Array::from(vec![100, 500, 200, 800])),
+                Arc::new(TimestampMillisecondArray::from(vec![100, 500, 200, 800])),
             ],
         )
         .unwrap();
 
-        // Watermark at 300: rows with ts >= 300 survive (ts=500, ts=800)
-        let filtered = filter_late_rows(
-            &batch,
-            "ts",
-            300,
-            laminar_core::time::TimestampFormat::UnixMillis,
-        );
-        let filtered = filtered.expect("should have some on-time rows");
+        // Watermark at 300: rows with ts >= 300 survive (ts=500, ts=800).
+        let filtered = filter_late_rows(&batch, "ts", 300).expect("should have some on-time rows");
         assert_eq!(filtered.num_rows(), 2);
 
-        // Check values
         let ids = filtered
             .column(0)
             .as_any()
@@ -4042,28 +4177,26 @@ mod tests {
 
     #[test]
     fn test_filter_late_rows_all_late() {
-        use arrow::array::Int64Array;
+        use arrow::array::{Int64Array, TimestampMillisecondArray};
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
-            Field::new("ts", DataType::Int64, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                false,
+            ),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(Int64Array::from(vec![1, 2])),
-                Arc::new(Int64Array::from(vec![100, 200])),
+                Arc::new(TimestampMillisecondArray::from(vec![100, 200])),
             ],
         )
         .unwrap();
 
-        // Watermark at 1000: all rows are late
-        let result = filter_late_rows(
-            &batch,
-            "ts",
-            1000,
-            laminar_core::time::TimestampFormat::UnixMillis,
-        );
+        let result = filter_late_rows(&batch, "ts", 1000);
         assert!(result.is_none(), "all-late batch should return None");
     }
 
@@ -4075,48 +4208,24 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
 
-        // Column not found — batch passes through unfiltered
-        let result = filter_late_rows(
-            &batch,
-            "ts",
-            1000,
-            laminar_core::time::TimestampFormat::UnixMillis,
-        );
-        let result = result.expect("should pass through when column not found");
-        assert_eq!(result.num_rows(), 2);
+        // Missing event-time column is schema drift — drop the batch.
+        assert!(filter_late_rows(&batch, "ts", 1000).is_none());
     }
 
     /// Helper: creates a `RecordBatch` with (id: BIGINT, ts: BIGINT).
-    fn make_bigint_ts_batch(
-        schema: &arrow::datatypes::SchemaRef,
-        timestamps: &[i64],
-    ) -> RecordBatch {
-        RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(arrow::array::Int64Array::from(
-                    (1..=i64::try_from(timestamps.len()).expect("len fits i64"))
-                        .collect::<Vec<_>>(),
-                )),
-                Arc::new(arrow::array::Int64Array::from(timestamps.to_vec())),
-            ],
-        )
-        .unwrap()
-    }
-
     #[tokio::test]
     async fn test_programmatic_watermark_filters_late_rows() {
         // Source with set_event_time_column("ts"), no SQL WATERMARK clause.
         // Push data, advance watermark, push late data, verify late data filtered.
         let db = LaminarDB::open().unwrap();
-        db.execute("CREATE SOURCE events (id BIGINT, ts BIGINT)")
+        db.execute("CREATE SOURCE events (id BIGINT, ts TIMESTAMP)")
             .await
             .unwrap();
         db.execute("CREATE STREAM out AS SELECT id, ts FROM events")
             .await
             .unwrap();
 
-        let sub = db.catalog.get_stream_subscription("out").unwrap();
+        let mut sub = db.catalog.get_stream_subscription("out").unwrap();
 
         let handle = db.source_untyped("events").unwrap();
         handle.set_event_time_column("ts");
@@ -4126,7 +4235,7 @@ mod tests {
         let schema = handle.schema().clone();
 
         // Step 1: Push on-time data
-        let batch1 = make_bigint_ts_batch(&schema, &[1000, 2000, 3000]);
+        let batch1 = make_ts_batch(&schema, &[1000, 2000, 3000]);
         handle.push_arrow(batch1).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -4145,7 +4254,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         // Step 3: Push late data (all timestamps < 200_000)
-        let late_batch = make_bigint_ts_batch(&schema, &[100, 200, 300]);
+        let late_batch = make_ts_batch(&schema, &[100, 200, 300]);
         handle.push_arrow(late_batch).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -4164,21 +4273,21 @@ mod tests {
     async fn test_sql_watermark_for_col_filters_late_rows() {
         // Source with WATERMARK FOR ts (no AS expr), should use zero delay.
         let db = LaminarDB::open().unwrap();
-        db.execute("CREATE SOURCE events (id BIGINT, ts BIGINT, WATERMARK FOR ts)")
+        db.execute("CREATE SOURCE events (id BIGINT, ts TIMESTAMP, WATERMARK FOR ts)")
             .await
             .unwrap();
         db.execute("CREATE STREAM out AS SELECT id, ts FROM events")
             .await
             .unwrap();
 
-        let sub = db.catalog.get_stream_subscription("out").unwrap();
+        let mut sub = db.catalog.get_stream_subscription("out").unwrap();
         db.start().await.unwrap();
 
         let handle = db.source_untyped("events").unwrap();
         let schema = handle.schema().clone();
 
         // Push on-time data
-        let batch1 = make_bigint_ts_batch(&schema, &[1000, 2000, 3000]);
+        let batch1 = make_ts_batch(&schema, &[1000, 2000, 3000]);
         handle.push_arrow(batch1).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -4196,7 +4305,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         // Push late data
-        let late_batch = make_bigint_ts_batch(&schema, &[100, 200, 300]);
+        let late_batch = make_ts_batch(&schema, &[100, 200, 300]);
         handle.push_arrow(late_batch).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -4214,26 +4323,26 @@ mod tests {
     async fn test_no_watermark_passes_all_data() {
         // Source without any watermark config — all data should pass through.
         let db = LaminarDB::open().unwrap();
-        db.execute("CREATE SOURCE events (id BIGINT, ts BIGINT)")
+        db.execute("CREATE SOURCE events (id BIGINT, ts TIMESTAMP)")
             .await
             .unwrap();
         db.execute("CREATE STREAM out AS SELECT id, ts FROM events")
             .await
             .unwrap();
 
-        let sub = db.catalog.get_stream_subscription("out").unwrap();
+        let mut sub = db.catalog.get_stream_subscription("out").unwrap();
         db.start().await.unwrap();
 
         let handle = db.source_untyped("events").unwrap();
         let schema = handle.schema().clone();
 
         // Push two batches — no watermark filtering should happen
-        let batch1 = make_bigint_ts_batch(&schema, &[1000, 2000, 3000]);
+        let batch1 = make_ts_batch(&schema, &[1000, 2000, 3000]);
         handle.push_arrow(batch1).unwrap();
         handle.watermark(200_000); // watermark without event_time_column is a no-op for filtering
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        let batch2 = make_bigint_ts_batch(&schema, &[100, 200, 300]);
+        let batch2 = make_ts_batch(&schema, &[100, 200, 300]);
         handle.push_arrow(batch2).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -4266,7 +4375,8 @@ mod tests {
             ExecuteResult::Query(mut q) => {
                 // The bridge_query_stream spawns a tokio task; yield to let it run.
                 tokio::task::yield_now().await;
-                let sub = q.subscribe_raw().unwrap();
+                let mut sub = q.subscribe_raw().unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 let mut total_rows = 0;
                 for _ in 0..256 {
                     match sub.poll() {
@@ -4313,8 +4423,8 @@ mod tests {
         let result = db.execute("SELECT * FROM sensors").await.unwrap();
         match result {
             ExecuteResult::Query(mut q) => {
-                tokio::task::yield_now().await;
-                let sub = q.subscribe_raw().unwrap();
+                let mut sub = q.subscribe_raw().unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 let mut total_rows = 0;
                 for _ in 0..256 {
                     match sub.poll() {
@@ -4490,8 +4600,6 @@ mod tests {
             Some("1000".to_string())
         );
     }
-
-    // ── extract_connector_from_with_options tests ──
 
     #[test]
     fn test_extract_connector_from_with_options_basic() {
@@ -4823,7 +4931,7 @@ mod tests {
 
         // A real source with a watermark that the pipeline will process.
         db.execute(
-            "CREATE SOURCE trades (id BIGINT, price DOUBLE, ts BIGINT, \
+            "CREATE SOURCE trades (id BIGINT, price DOUBLE, ts TIMESTAMP, \
              WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
         )
         .await
@@ -4835,7 +4943,8 @@ mod tests {
 
         db.start().await.unwrap();
 
-        // Push data into the real source.
+        // Push data into the real source. `ts TIMESTAMP` maps to
+        // Timestamp(Microsecond), so values here are in µs.
         let handle = db.source_untyped("trades").unwrap();
         let schema = handle.schema().clone();
         let batch = RecordBatch::try_new(
@@ -4843,7 +4952,9 @@ mod tests {
             vec![
                 Arc::new(arrow::array::Int64Array::from(vec![1, 2])),
                 Arc::new(arrow::array::Float64Array::from(vec![100.0, 200.0])),
-                Arc::new(arrow::array::Int64Array::from(vec![1000, 2000])),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                    1_000_000, 2_000_000,
+                ])),
             ],
         )
         .unwrap();
@@ -4878,5 +4989,195 @@ mod tests {
             m2.total_events_ingested >= m.total_events_ingested,
             "pipeline should continue after connector-less source push"
         );
+    }
+
+    /// Poll an MV until it has at least `min_rows` rows, or timeout.
+    async fn poll_mv(db: &LaminarDB, mv: &str, min_rows: usize) -> usize {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let df = db.ctx.sql(&format!("SELECT * FROM {mv}")).await.unwrap();
+            let batches = df.collect().await.unwrap();
+            let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            if rows >= min_rows || std::time::Instant::now() > deadline {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mv_aggregate_queryable_with_pipeline() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts TIMESTAMP, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+
+        db.execute(
+            "CREATE MATERIALIZED VIEW trade_counts AS \
+             SELECT symbol, COUNT(*) as cnt FROM trades GROUP BY symbol",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(poll_mv(&db, "trade_counts", 0).await, 0);
+
+        db.start().await.unwrap();
+
+        let handle = db.source_untyped("trades").unwrap();
+        let schema = handle.schema().clone();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["AAPL", "GOOG"])),
+                Arc::new(arrow::array::Float64Array::from(vec![150.0, 2800.0])),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                    1_000_000, 2_000_000,
+                ])),
+            ],
+        )
+        .unwrap();
+        handle.push_arrow(batch).unwrap();
+
+        let rows = poll_mv(&db, "trade_counts", 1).await;
+        assert!(rows > 0, "MV should have data after pipeline processes");
+    }
+
+    #[tokio::test]
+    async fn test_mv_append_mode_queryable() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE events (id INT, value DOUBLE, ts TIMESTAMP, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+
+        db.execute(
+            "CREATE MATERIALIZED VIEW filtered AS \
+             SELECT id, value FROM events WHERE value > 10.0",
+        )
+        .await
+        .unwrap();
+
+        db.start().await.unwrap();
+
+        let handle = db.source_untyped("events").unwrap();
+        let schema = handle.schema().clone();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3])),
+                Arc::new(arrow::array::Float64Array::from(vec![5.0, 15.0, 25.0])),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                    1_000_000, 2_000_000, 3_000_000,
+                ])),
+            ],
+        )
+        .unwrap();
+        handle.push_arrow(batch).unwrap();
+
+        let rows = poll_mv(&db, "filtered", 2).await;
+        assert_eq!(rows, 2, "filter MV should have 2 matching rows");
+    }
+
+    #[tokio::test]
+    async fn test_mv_drop_cleans_up_table() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT, value DOUBLE)")
+            .await
+            .unwrap();
+        db.execute("CREATE MATERIALIZED VIEW ev_mv AS SELECT * FROM events")
+            .await
+            .unwrap();
+
+        assert!(db.ctx.sql("SELECT * FROM ev_mv").await.is_ok());
+        assert!(db.mv_store.read().has_mv("ev_mv"));
+
+        db.execute("DROP MATERIALIZED VIEW ev_mv").await.unwrap();
+
+        assert!(!db.mv_store.read().has_mv("ev_mv"));
+        assert!(
+            db.ctx.sql("SELECT * FROM ev_mv").await.is_err(),
+            "table should be deregistered after DROP"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mv_empty_returns_correct_schema() {
+        let db = LaminarDB::open().unwrap();
+        db.execute("CREATE SOURCE events (id INT, value DOUBLE)")
+            .await
+            .unwrap();
+        db.execute("CREATE MATERIALIZED VIEW ev_mv AS SELECT id, value FROM events")
+            .await
+            .unwrap();
+
+        let df = db.ctx.sql("SELECT * FROM ev_mv").await.unwrap();
+        let schema = df.schema().clone();
+        let batches = df.collect().await.unwrap();
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 0);
+
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert!(
+            names.contains(&"id") && names.contains(&"value"),
+            "schema should contain projected columns, got: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mv_hot_add_while_pipeline_running() {
+        let db = LaminarDB::open().unwrap();
+        db.execute(
+            "CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts TIMESTAMP, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+
+        // Need at least one stream before start() for the pipeline to launch.
+        db.execute("CREATE STREAM noop AS SELECT * FROM trades")
+            .await
+            .unwrap();
+
+        db.start().await.unwrap();
+
+        // Create MV AFTER pipeline is running (hot-add via ControlMsg).
+        db.execute(
+            "CREATE MATERIALIZED VIEW trade_counts AS \
+             SELECT symbol, COUNT(*) as cnt FROM trades GROUP BY symbol",
+        )
+        .await
+        .unwrap();
+
+        // Wait for the coordinator to process the AddStream control message.
+        // Poll observable state instead of a fixed sleep.
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while db.metrics().total_cycles == 0 && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+
+        let handle = db.source_untyped("trades").unwrap();
+        let schema = handle.schema().clone();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["AAPL"])),
+                Arc::new(arrow::array::Float64Array::from(vec![150.0])),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                    1_000_000,
+                ])),
+            ],
+        )
+        .unwrap();
+        handle.push_arrow(batch).unwrap();
+
+        let rows = poll_mv(&db, "trade_counts", 1).await;
+        assert!(rows > 0, "hot-added MV should receive pipeline data");
     }
 }

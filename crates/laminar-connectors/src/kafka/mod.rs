@@ -1,46 +1,7 @@
-//! Kafka source and sink connectors for LaminarDB.
-//!
-//! Provides a `KafkaSource` that consumes from Kafka topics and
-//! produces Arrow `RecordBatch` data through the [`SourceConnector`]
-//! trait, and a `KafkaSink` that writes Arrow `RecordBatch` data
-//! to Kafka topics through the [`SinkConnector`] trait.
-//!
-//! Both connectors support JSON, CSV, Raw, Debezium, and Avro
-//! formats, with full Confluent Schema Registry integration for Avro.
-//!
-//! # Features
-//!
-//! - Per-partition offset tracking with checkpoint/restore (source)
-//! - At-least-once and exactly-once delivery (sink)
-//! - Confluent Schema Registry with caching and compatibility checking
-//! - Avro serialization/deserialization via `arrow-avro` (Confluent wire format)
-//! - Configurable partitioning: key-hash, round-robin, sticky (sink)
-//! - Backpressure control with high/low watermark hysteresis (source)
-//! - Consumer group rebalance tracking (source)
-//! - Dead letter queue for failed records (sink)
-//! - Atomic metrics counters
-//!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use laminar_connectors::kafka::{KafkaSource, KafkaSourceConfig};
-//! use laminar_connectors::kafka::{KafkaSink, KafkaSinkConfig};
-//!
-//! // Source
-//! let config = KafkaSourceConfig::from_config(&connector_config)?;
-//! let source = KafkaSource::new(schema, config);
-//!
-//! // Sink
-//! let config = KafkaSinkConfig::from_config(&connector_config)?;
-//! let sink = KafkaSink::new(schema, config);
-//! ```
-//!
-//! [`SourceConnector`]: crate::connector::SourceConnector
-//! [`SinkConnector`]: crate::connector::SinkConnector
+//! Kafka source and sink connectors.
 
 // Source modules
 pub mod avro;
-pub mod backpressure;
 pub mod config;
 pub mod metrics;
 pub mod offsets;
@@ -58,23 +19,17 @@ pub mod sink_metrics;
 // Shared modules
 pub mod schema_registry;
 
-// Discovery module (requires delta feature from laminar-core)
-#[cfg(feature = "kafka-discovery")]
-pub mod discovery;
-
 // Source re-exports
 pub use avro::AvroDeserializer;
 pub use config::{
     AssignmentStrategy, CompatibilityLevel, IsolationLevel, KafkaSourceConfig, OffsetReset,
-    SaslMechanism, SecurityProtocol, SrAuth, StartupMode, TopicSubscription,
+    SaslMechanism, SchemaEvolutionStrategy, SecurityProtocol, SrAuth, StartupMode,
+    TopicSubscription,
 };
 pub use metrics::KafkaSourceMetrics;
 pub use offsets::OffsetTracker;
 pub use source::KafkaSource;
-pub use watermarks::{
-    AlignmentCheckResult, KafkaAlignmentConfig, KafkaAlignmentMode, KafkaWatermarkTracker,
-    WatermarkMetrics, WatermarkMetricsSnapshot,
-};
+pub use watermarks::{KafkaWatermarkTracker, WatermarkMetrics};
 
 // Sink re-exports
 pub use avro_serializer::AvroSerializer;
@@ -96,9 +51,6 @@ use crate::config::{ConfigKeySpec, ConnectorInfo};
 use crate::registry::ConnectorRegistry;
 
 /// Registers the Kafka source connector with the given registry.
-///
-/// After registration, the runtime can instantiate `KafkaSource` by
-/// name when processing `CREATE SOURCE ... WITH (connector = 'kafka')`.
 pub fn register_kafka_source(registry: &ConnectorRegistry) {
     let info = ConnectorInfo {
         name: "kafka".to_string(),
@@ -113,25 +65,14 @@ pub fn register_kafka_source(registry: &ConnectorRegistry) {
         "kafka",
         info,
         Arc::new(|| {
-            use arrow_schema::{DataType, Field, Schema};
-
-            // Default schema — will be overridden during open() or via SQL DDL.
-            let default_schema = Arc::new(Schema::new(vec![
-                Field::new("key", DataType::Utf8, true),
-                Field::new("value", DataType::Utf8, false),
-            ]));
-            Box::new(KafkaSource::new(
-                default_schema,
-                KafkaSourceConfig::default(),
-            ))
+            // Empty schema — filled in by discover_schema / open() / SQL DDL columns.
+            let empty = Arc::new(arrow_schema::Schema::empty());
+            Box::new(KafkaSource::new(empty, KafkaSourceConfig::default()))
         }),
     );
 }
 
 /// Registers the Kafka sink connector with the given registry.
-///
-/// After registration, the runtime can instantiate `KafkaSink` by
-/// name when processing `CREATE SINK ... WITH (connector = 'kafka')`.
 pub fn register_kafka_sink(registry: &ConnectorRegistry) {
     let info = ConnectorInfo {
         name: "kafka".to_string(),
@@ -146,14 +87,9 @@ pub fn register_kafka_sink(registry: &ConnectorRegistry) {
         "kafka",
         info,
         Arc::new(|| {
-            use arrow_schema::{DataType, Field, Schema};
-
-            // Default schema — will be overridden during open() or via SQL DDL.
-            let default_schema = Arc::new(Schema::new(vec![
-                Field::new("key", DataType::Utf8, true),
-                Field::new("value", DataType::Utf8, false),
-            ]));
-            Box::new(KafkaSink::new(default_schema, KafkaSinkConfig::default()))
+            // Empty schema — the sink's schema is bound from the upstream query at build time.
+            let empty = Arc::new(arrow_schema::Schema::empty());
+            Box::new(KafkaSink::new(empty, KafkaSinkConfig::default()))
         }),
     );
 }
@@ -218,7 +154,6 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
             "read_committed",
         ),
         ConfigKeySpec::optional("max.poll.records", "Max records per poll", "1000"),
-        ConfigKeySpec::optional("poll.timeout.ms", "Poll timeout in milliseconds", "100"),
         ConfigKeySpec::optional(
             "partition.assignment.strategy",
             "Partition assignment (range/roundrobin/cooperative-sticky)",
@@ -281,21 +216,6 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
             "Enable per-partition watermark tracking",
             "false",
         ),
-        ConfigKeySpec::optional(
-            "alignment.group.id",
-            "Alignment group ID for multi-source coordination",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "alignment.max.drift.ms",
-            "Maximum allowed drift between sources in alignment group",
-            "",
-        ),
-        ConfigKeySpec::optional(
-            "alignment.mode",
-            "Alignment enforcement mode (pause/warn-only/drop-excess)",
-            "pause",
-        ),
         // Backpressure
         ConfigKeySpec::optional(
             "backpressure.high.watermark",
@@ -305,6 +225,12 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
         ConfigKeySpec::optional(
             "backpressure.low.watermark",
             "Channel fill ratio to resume",
+            "0.5",
+        ),
+        // Error handling
+        ConfigKeySpec::optional(
+            "max.deser.error.rate",
+            "Max tolerated deserialization error rate per batch (0.0-1.0)",
             "0.5",
         ),
         // Schema Registry
@@ -334,6 +260,11 @@ fn kafka_source_config_keys() -> Vec<ConfigKeySpec> {
             "schema.compatibility",
             "Schema compatibility level override",
             "",
+        ),
+        ConfigKeySpec::optional(
+            "schema.evolution.strategy",
+            "Runtime schema evolution handling (log/reject/ignore)",
+            "log",
         ),
     ]
 }

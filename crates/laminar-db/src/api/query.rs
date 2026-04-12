@@ -116,7 +116,7 @@ impl QueryStream {
     /// Returns `ApiError` if receiving fails.
     #[allow(clippy::should_implement_trait)] // FFI method name, not Iterator
     pub fn next(&mut self) -> Result<Option<RecordBatch>, ApiError> {
-        match &self.subscription {
+        match &mut self.subscription {
             Some(sub) => match sub.recv() {
                 Ok(batch) => Ok(Some(batch)),
                 Err(laminar_core::streaming::RecvError::Disconnected) => Ok(None),
@@ -134,7 +134,7 @@ impl QueryStream {
     ///
     /// Returns `ApiError` if receiving fails.
     pub fn try_next(&mut self) -> Result<Option<RecordBatch>, ApiError> {
-        match &self.subscription {
+        match &mut self.subscription {
             Some(sub) => Ok(sub.poll()),
             None => Ok(None),
         }

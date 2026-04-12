@@ -17,155 +17,22 @@
 //! - **Sparse reference streams**: if the correct ASOF match predates the
 //!   eviction cutoff, the lookup returns NULL. Dense reference streams avoid this.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
-};
+use arrow::array::{ArrayRef, Int64Array, RecordBatch};
 use arrow::compute::concat_batches;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use laminar_sql::translator::TemporalProbeConfig;
 
 use crate::error::DbError;
+use crate::key_column::{extract_column_as_timestamps, take_with_nulls, CompositeKey};
 
 const COMPACTION_THRESHOLD: u32 = 32;
 const MAX_PENDING_PROBES: usize = 100_000;
-
-enum KeyColumn<'a> {
-    Utf8(&'a StringArray),
-    Int64(&'a Int64Array),
-}
-
-impl KeyColumn<'_> {
-    fn is_null(&self, i: usize) -> bool {
-        match self {
-            KeyColumn::Utf8(a) => a.is_null(i),
-            KeyColumn::Int64(a) => a.is_null(i),
-        }
-    }
-
-    fn hash_into(&self, i: usize, hasher: &mut DefaultHasher) {
-        match self {
-            KeyColumn::Utf8(a) => a.value(i).hash(hasher),
-            KeyColumn::Int64(a) => a.value(i).hash(hasher),
-        }
-    }
-
-    fn eq_at(&self, i: usize, other: &KeyColumn<'_>, j: usize) -> bool {
-        match (self, other) {
-            (KeyColumn::Utf8(a), KeyColumn::Utf8(b)) => a.value(i) == b.value(j),
-            (KeyColumn::Int64(a), KeyColumn::Int64(b)) => a.value(i) == b.value(j),
-            _ => false,
-        }
-    }
-}
-
-/// Multi-column key extractor for composite join keys.
-struct CompositeKey<'a> {
-    columns: Vec<KeyColumn<'a>>,
-}
-
-impl<'a> CompositeKey<'a> {
-    fn extract(batch: &'a RecordBatch, col_names: &[String]) -> Result<Self, DbError> {
-        let mut columns = Vec::with_capacity(col_names.len());
-        for name in col_names {
-            columns.push(extract_key_column(batch, name)?);
-        }
-        Ok(Self { columns })
-    }
-
-    fn hash_at(&self, i: usize) -> Option<u64> {
-        if self.columns.iter().any(|c| c.is_null(i)) {
-            return None;
-        }
-        let mut hasher = DefaultHasher::new();
-        for col in &self.columns {
-            col.hash_into(i, &mut hasher);
-        }
-        Some(hasher.finish())
-    }
-
-    fn keys_equal(&self, i: usize, other: &CompositeKey<'_>, j: usize) -> bool {
-        if self.columns.len() != other.columns.len() {
-            return false;
-        }
-        for (a, b) in self.columns.iter().zip(other.columns.iter()) {
-            if a.is_null(i) || b.is_null(j) || !a.eq_at(i, b, j) {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-fn extract_key_column<'a>(
-    batch: &'a RecordBatch,
-    col_name: &str,
-) -> Result<KeyColumn<'a>, DbError> {
-    let col_idx = batch
-        .schema()
-        .index_of(col_name)
-        .map_err(|_| DbError::Pipeline(format!("Column '{col_name}' not found")))?;
-    let array = batch.column(col_idx);
-    match array.data_type() {
-        DataType::Utf8 => Ok(KeyColumn::Utf8(
-            array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Utf8")))?,
-        )),
-        DataType::Int64 => Ok(KeyColumn::Int64(
-            array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Int64")))?,
-        )),
-        other => Err(DbError::Pipeline(format!(
-            "Unsupported key column type: {other}"
-        ))),
-    }
-}
-
-fn extract_timestamps(batch: &RecordBatch, col_name: &str) -> Result<Vec<i64>, DbError> {
-    let col_idx = batch
-        .schema()
-        .index_of(col_name)
-        .map_err(|_| DbError::Pipeline(format!("Timestamp column '{col_name}' not found")))?;
-    let array = batch.column(col_idx);
-    match array.data_type() {
-        DataType::Int64 => {
-            let a = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| DbError::Pipeline("Not Int64".into()))?;
-            Ok(a.values().to_vec())
-        }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let a = array
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .ok_or_else(|| DbError::Pipeline("Not TimestampMillisecond".into()))?;
-            Ok(a.values().to_vec())
-        }
-        DataType::Float64 => {
-            let a = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| DbError::Pipeline("Not Float64".into()))?;
-            #[allow(clippy::cast_possible_truncation)]
-            Ok(a.values().iter().map(|v| *v as i64).collect())
-        }
-        other => Err(DbError::Pipeline(format!(
-            "Unsupported timestamp type for '{col_name}': {other}"
-        ))),
-    }
-}
 
 /// Per-key reference stream buffer with ASOF lookup and bounded memory.
 #[derive(Debug, Default)]
@@ -202,7 +69,7 @@ impl RefBuffer {
             return Ok(());
         }
 
-        let timestamps = extract_timestamps(&new_batch, time_col)?;
+        let timestamps = extract_column_as_timestamps(&new_batch, time_col)?;
         let key_hashes: Vec<Option<u64>> = {
             let keys = CompositeKey::extract(&new_batch, key_cols)?;
             (0..new_batch.num_rows()).map(|i| keys.hash_at(i)).collect()
@@ -569,7 +436,7 @@ pub(crate) fn execute_temporal_probe_cycle(
 
         if left_concat.num_rows() > 0 {
             let left_keys = CompositeKey::extract(&left_concat, &config.key_columns)?;
-            let left_ts = extract_timestamps(&left_concat, &config.left_time_column)?;
+            let left_ts = extract_column_as_timestamps(&left_concat, &config.left_time_column)?;
 
             let right_schema = state
                 .ref_buffer
@@ -652,10 +519,10 @@ pub(crate) fn execute_temporal_probe_cycle(
 
             if state.carried_probes.len() > MAX_PENDING_PROBES {
                 let excess = state.carried_probes.len() - MAX_PENDING_PROBES;
-                tracing::warn!(
+                tracing::error!(
                     excess,
                     limit = MAX_PENDING_PROBES,
-                    "temporal probe: pending probes exceed limit, dropping oldest"
+                    "temporal probe: pending probes exceed limit, dropping oldest — DATA LOSS"
                 );
                 state.carried_probes.drain(..excess);
             }
@@ -845,28 +712,11 @@ fn build_output_batch(
         .map_err(|e| DbError::Pipeline(format!("temporal probe output: {e}")))
 }
 
-fn take_with_nulls(
-    array: &dyn Array,
-    indices: &[Option<usize>],
-    num_rows: usize,
-) -> Result<ArrayRef, DbError> {
-    if array.is_empty() {
-        return Ok(arrow::array::new_null_array(array.data_type(), num_rows));
-    }
-    #[allow(clippy::cast_possible_truncation)]
-    let idx_array = arrow::array::UInt32Array::from(
-        indices
-            .iter()
-            .map(|opt| opt.map(|i| i as u32))
-            .collect::<Vec<Option<u32>>>(),
-    );
-    arrow::compute::take(array, &idx_array, None)
-        .map_err(|e| DbError::Pipeline(format!("temporal probe right take: {e}")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Float64Array, StringArray};
+    use arrow::datatypes::DataType;
     use laminar_sql::translator::ProbeOffsetSpec;
 
     fn trades_batch(symbols: &[&str], timestamps: &[i64], prices: &[f64]) -> RecordBatch {

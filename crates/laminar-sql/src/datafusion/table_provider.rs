@@ -46,11 +46,6 @@ pub struct StreamingTableProvider {
 
 impl StreamingTableProvider {
     /// Creates a new streaming table provider.
-    ///
-    /// # Arguments
-    ///
-    /// * `name` - Name of the table (used for display/debugging)
-    /// * `source` - The streaming source backing this table
     #[must_use]
     pub fn new(name: impl Into<String>, source: StreamSourceRef) -> Self {
         Self {

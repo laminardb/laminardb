@@ -171,6 +171,30 @@ impl OffsetTracker {
         tpl
     }
 
+    /// Builds a [`TopicPartitionList`] for seeking after a rebalance assign.
+    ///
+    /// Only includes partitions where the tracker holds a known offset,
+    /// using `Offset::Offset(offset + 1)` (next-to-fetch). Partitions NOT
+    /// in the tracker are omitted — callers should let `auto.offset.reset`
+    /// handle those.
+    #[must_use]
+    pub fn to_seek_tpl(&self, assigned: &[(String, i32)]) -> TopicPartitionList {
+        let mut tpl = TopicPartitionList::new();
+        for (topic, partition) in assigned {
+            if let Some(off) = self.get(topic, *partition) {
+                if let Err(e) = tpl.add_partition_offset(topic, *partition, Offset::Offset(off + 1))
+                {
+                    tracing::warn!(
+                        %topic, partition, offset = off,
+                        error = %e,
+                        "failed to add partition to rebalance seek list"
+                    );
+                }
+            }
+        }
+        tpl
+    }
+
     /// Removes partitions that are not in the `assigned` set.
     ///
     /// Called after a rebalance revoke to purge offsets for partitions this
@@ -422,5 +446,38 @@ mod tests {
         let cp = tracker.to_checkpoint_filtered(&HashSet::new());
 
         assert!(cp.is_empty());
+    }
+
+    #[test]
+    fn test_to_seek_tpl_known_and_unknown() {
+        let mut tracker = OffsetTracker::new();
+        tracker.update("events", 0, 99);
+        tracker.update("events", 1, 199);
+
+        let assigned = vec![
+            ("events".to_string(), 0),
+            ("events".to_string(), 1),
+            ("events".to_string(), 2), // unknown — omitted from seek TPL
+        ];
+        let tpl = tracker.to_seek_tpl(&assigned);
+        // Only partitions with known offsets are included.
+        assert_eq!(tpl.count(), 2);
+
+        for elem in tpl.elements() {
+            match (elem.topic(), elem.partition()) {
+                ("events", 0) => assert_eq!(elem.offset(), Offset::Offset(100)),
+                ("events", 1) => assert_eq!(elem.offset(), Offset::Offset(200)),
+                _ => panic!("unexpected partition {}-{}", elem.topic(), elem.partition()),
+            }
+        }
+    }
+
+    #[test]
+    fn test_to_seek_tpl_empty_tracker() {
+        let tracker = OffsetTracker::new();
+        let assigned = vec![("events".to_string(), 0)];
+        let tpl = tracker.to_seek_tpl(&assigned);
+        // No known offsets → empty TPL.
+        assert_eq!(tpl.count(), 0);
     }
 }

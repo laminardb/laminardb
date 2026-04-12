@@ -178,25 +178,7 @@ pub enum StartupMode {
     Timestamp(i64),
 }
 
-impl StartupMode {
-    /// Returns true if this mode overrides auto.offset.reset behavior.
-    #[must_use]
-    pub fn overrides_offset_reset(&self) -> bool {
-        !matches!(self, StartupMode::GroupOffsets)
-    }
-
-    /// Returns the equivalent auto.offset.reset value, if applicable.
-    #[must_use]
-    pub fn as_offset_reset(&self) -> Option<&'static str> {
-        match self {
-            StartupMode::Earliest => Some("earliest"),
-            StartupMode::Latest => Some("latest"),
-            StartupMode::GroupOffsets
-            | StartupMode::SpecificOffsets(_)
-            | StartupMode::Timestamp(_) => None,
-        }
-    }
-}
+impl StartupMode {}
 
 impl std::str::FromStr for StartupMode {
     type Err = ConnectorError;
@@ -383,6 +365,97 @@ impl std::fmt::Display for CompatibilityLevel {
     }
 }
 
+/// Strategy for handling Avro schema evolution at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SchemaEvolutionStrategy {
+    /// Log schema changes, continue processing.
+    #[default]
+    Log,
+    /// Return an error on incompatible schema changes.
+    Reject,
+    /// No detection — skip schema diffing entirely.
+    Ignore,
+}
+
+str_enum!(fromstr SchemaEvolutionStrategy, lowercase, ConnectorError,
+    "invalid schema.evolution.strategy",
+    Log => "log";
+    Reject => "reject";
+    Ignore => "ignore"
+);
+
+impl std::fmt::Display for SchemaEvolutionStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaEvolutionStrategy::Log => write!(f, "log"),
+            SchemaEvolutionStrategy::Reject => write!(f, "reject"),
+            SchemaEvolutionStrategy::Ignore => write!(f, "ignore"),
+        }
+    }
+}
+
+/// Confluent subject-name strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubjectNameStrategy {
+    /// `{topic}-value` (Confluent default).
+    #[default]
+    TopicName,
+    /// `{record_name}-value`. Requires `schema.registry.record.name`.
+    RecordName,
+    /// `{topic}-{record_name}-value`. Requires `schema.registry.record.name`.
+    TopicRecordName,
+}
+
+str_enum!(fromstr SubjectNameStrategy, lowercase_nodash, ConnectorError,
+    "invalid schema.registry.subject.name.strategy",
+    TopicName => "topic-name", "topicname", "topicnamestrategy";
+    RecordName => "record-name", "recordname", "recordnamestrategy";
+    TopicRecordName => "topic-record-name", "topicrecordname", "topicrecordnamestrategy"
+);
+
+impl std::fmt::Display for SubjectNameStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubjectNameStrategy::TopicName => write!(f, "topic-name"),
+            SubjectNameStrategy::RecordName => write!(f, "record-name"),
+            SubjectNameStrategy::TopicRecordName => write!(f, "topic-record-name"),
+        }
+    }
+}
+
+/// Build the SR `-value` subject for a topic. `from_config` validates
+/// that `record_name` is present for the record-based strategies, so
+/// the `expect`s are unreachable in practice.
+pub(crate) fn resolve_value_subject(
+    strategy: SubjectNameStrategy,
+    record_name: Option<&str>,
+    topic: &str,
+) -> String {
+    let name = || record_name.expect("from_config validates record.name");
+    match strategy {
+        SubjectNameStrategy::TopicName => format!("{topic}-value"),
+        SubjectNameStrategy::RecordName => format!("{}-value", name()),
+        SubjectNameStrategy::TopicRecordName => format!("{topic}-{}-value", name()),
+    }
+}
+
+/// Maps the Kafka-level [`CompatibilityLevel`] to the schema module's
+/// `CompatibilityMode` for evolution evaluation.
+impl From<CompatibilityLevel> for crate::schema::traits::CompatibilityMode {
+    fn from(level: CompatibilityLevel) -> Self {
+        use crate::schema::traits::CompatibilityMode;
+        match level {
+            CompatibilityLevel::Backward => CompatibilityMode::Backward,
+            CompatibilityLevel::BackwardTransitive => CompatibilityMode::BackwardTransitive,
+            CompatibilityLevel::Forward => CompatibilityMode::Forward,
+            CompatibilityLevel::ForwardTransitive => CompatibilityMode::ForwardTransitive,
+            CompatibilityLevel::Full => CompatibilityMode::Full,
+            CompatibilityLevel::FullTransitive => CompatibilityMode::FullTransitive,
+            CompatibilityLevel::None => CompatibilityMode::None,
+        }
+    }
+}
+
 /// Schema Registry authentication credentials.
 #[derive(Clone)]
 pub struct SrAuth {
@@ -406,6 +479,7 @@ impl std::fmt::Debug for SrAuth {
 /// Uses a custom `Debug` impl that redacts `sasl_password` and
 /// `ssl_key_password` to prevent credential leakage in logs.
 #[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)] // Config struct — each bool is an independent user-facing knob.
 pub struct KafkaSourceConfig {
     // -- Required --
     /// Comma-separated list of broker addresses.
@@ -442,12 +516,21 @@ pub struct KafkaSourceConfig {
     pub schema_registry_auth: Option<SrAuth>,
     /// Override compatibility level for the subject.
     pub schema_compatibility: Option<CompatibilityLevel>,
+    /// How to handle Avro schema evolution detected at runtime.
+    pub schema_evolution_strategy: SchemaEvolutionStrategy,
     /// Schema Registry SSL CA certificate path.
     pub schema_registry_ssl_ca_location: Option<String>,
     /// Schema Registry SSL client certificate path.
     pub schema_registry_ssl_certificate_location: Option<String>,
     /// Schema Registry SSL client key path.
     pub schema_registry_ssl_key_location: Option<String>,
+    /// Confluent subject-name strategy. Default: `TopicName`.
+    pub schema_registry_subject_strategy: SubjectNameStrategy,
+    /// Record name for `record-name` / `topic-record-name` strategies.
+    pub schema_registry_record_name: Option<String>,
+    /// Deadline for Schema Registry lookups performed during schema
+    /// auto-discovery at DDL time. Default: 10s.
+    pub schema_registry_discovery_timeout: Duration,
     /// Column name containing the event timestamp.
     pub event_time_column: Option<String>,
     /// Whether to include Kafka metadata columns (_partition, _offset, _timestamp).
@@ -482,13 +565,6 @@ pub struct KafkaSourceConfig {
     pub idle_timeout: Duration,
     /// Enable per-partition watermark tracking (integrates with watermark tracking).
     pub enable_watermark_tracking: bool,
-    /// Alignment group ID for multi-source coordination (integrates with watermark tracking).
-    pub alignment_group_id: Option<String>,
-    /// Maximum allowed drift between sources in alignment group.
-    pub alignment_max_drift: Option<Duration>,
-    /// Enforcement mode for watermark alignment.
-    pub alignment_mode: Option<super::watermarks::KafkaAlignmentMode>,
-
     // -- Consumer group timing --
     /// Consumer session timeout (default: 45s — production-safe; rdkafka's
     /// aggressive 10s default causes rebalance storms under GC pauses).
@@ -513,7 +589,7 @@ pub struct KafkaSourceConfig {
     /// This is advisory — it keeps `kafka-consumer-groups` lag monitoring
     /// accurate. The authoritative offset state lives in `LaminarDB`'s
     /// checkpoint system. Set to `Duration::ZERO` to disable periodic
-    /// broker commits (default: 60s).
+    /// broker commits (default: 5s).
     pub broker_commit_interval: Duration,
 
     // -- Backpressure --
@@ -524,6 +600,15 @@ pub struct KafkaSourceConfig {
     pub backpressure_high_watermark: f64,
     /// Channel fill ratio at which to resume consumption.
     pub backpressure_low_watermark: f64,
+
+    // -- Error handling --
+    /// Maximum tolerated deserialization error rate per batch (0.0-1.0).
+    ///
+    /// When the poison pill fallback is active and the error rate exceeds
+    /// this threshold, the batch is rejected instead of returning partial
+    /// results. Prevents silent data loss when a schema change makes most
+    /// records unparseable. Default: 0.5 (50%).
+    pub max_deser_error_rate: f64,
 
     // -- Pass-through --
     /// Additional rdkafka properties passed directly to librdkafka.
@@ -568,9 +653,13 @@ impl Default for KafkaSourceConfig {
             schema_registry_url: None,
             schema_registry_auth: None,
             schema_compatibility: None,
+            schema_evolution_strategy: SchemaEvolutionStrategy::default(),
             schema_registry_ssl_ca_location: None,
             schema_registry_ssl_certificate_location: None,
             schema_registry_ssl_key_location: None,
+            schema_registry_subject_strategy: SubjectNameStrategy::default(),
+            schema_registry_record_name: None,
+            schema_registry_discovery_timeout: Duration::from_secs(10),
             event_time_column: None,
             include_metadata: false,
             include_headers: false,
@@ -586,17 +675,15 @@ impl Default for KafkaSourceConfig {
             max_out_of_orderness: Duration::from_secs(5),
             idle_timeout: Duration::from_secs(30),
             enable_watermark_tracking: false,
-            alignment_group_id: None,
-            alignment_max_drift: None,
-            alignment_mode: None,
             session_timeout: Duration::from_secs(45),
             heartbeat_interval: Duration::from_secs(10),
             max_poll_interval: Duration::from_secs(600),
             queued_max_messages_kbytes: 16384,
-            broker_commit_interval: Duration::from_secs(60),
+            broker_commit_interval: Duration::from_secs(5),
             reader_channel_capacity: 1024,
             backpressure_high_watermark: 0.8,
             backpressure_low_watermark: 0.5,
+            max_deser_error_rate: 0.5,
             kafka_properties: HashMap::new(),
         }
     }
@@ -672,6 +759,11 @@ impl KafkaSourceConfig {
             None => None,
         };
 
+        let schema_evolution_strategy = match config.get("schema.evolution.strategy") {
+            Some(s) => s.parse::<SchemaEvolutionStrategy>()?,
+            None => SchemaEvolutionStrategy::default(),
+        };
+
         let schema_registry_ssl_ca_location = config
             .get("schema.registry.ssl.ca.location")
             .map(String::from);
@@ -681,6 +773,30 @@ impl KafkaSourceConfig {
         let schema_registry_ssl_key_location = config
             .get("schema.registry.ssl.key.location")
             .map(String::from);
+
+        let schema_registry_subject_strategy =
+            match config.get("schema.registry.subject.name.strategy") {
+                Some(s) => s.parse::<SubjectNameStrategy>()?,
+                None => SubjectNameStrategy::default(),
+            };
+
+        let schema_registry_record_name =
+            config.get("schema.registry.record.name").map(String::from);
+
+        if matches!(
+            schema_registry_subject_strategy,
+            SubjectNameStrategy::RecordName | SubjectNameStrategy::TopicRecordName
+        ) && schema_registry_record_name.is_none()
+        {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "schema.registry.subject.name.strategy={schema_registry_subject_strategy} \
+                 requires schema.registry.record.name"
+            )));
+        }
+
+        let schema_registry_discovery_timeout = config
+            .get_parsed::<u64>("schema.registry.discovery.timeout.ms")?
+            .map_or(Duration::from_secs(10), Duration::from_millis);
 
         let event_time_column = config.get("event.time.column").map(String::from);
 
@@ -709,9 +825,17 @@ impl KafkaSourceConfig {
             }
         };
 
-        let auto_offset_reset = match config.get("auto.offset.reset") {
-            Some(s) => s.parse::<OffsetReset>()?,
-            None => OffsetReset::Earliest,
+        // StartupMode::Earliest/Latest override auto.offset.reset so that
+        // `startup.mode = latest` works without requiring the user to also
+        // set `auto.offset.reset = latest` (the previous disconnect was a
+        // silent data-correctness bug: consumers started from earliest).
+        let auto_offset_reset = match &startup_mode {
+            StartupMode::Earliest => OffsetReset::Earliest,
+            StartupMode::Latest => OffsetReset::Latest,
+            _ => match config.get("auto.offset.reset") {
+                Some(s) => s.parse::<OffsetReset>()?,
+                None => OffsetReset::Earliest,
+            },
         };
 
         let isolation_level = match config.get("isolation.level") {
@@ -745,18 +869,6 @@ impl KafkaSourceConfig {
             .get_parsed::<bool>("enable.watermark.tracking")?
             .unwrap_or(false);
 
-        let alignment_group_id = config.get("alignment.group.id").map(String::from);
-
-        let alignment_max_drift_ms = config.get_parsed::<u64>("alignment.max.drift.ms")?;
-
-        let alignment_mode = match config.get("alignment.mode") {
-            Some(s) => Some(
-                s.parse::<super::watermarks::KafkaAlignmentMode>()
-                    .map_err(ConnectorError::ConfigurationError)?,
-            ),
-            None => None,
-        };
-
         let session_timeout_ms = config
             .get_parsed::<u64>("session.timeout.ms")?
             .unwrap_or(45_000);
@@ -772,7 +884,7 @@ impl KafkaSourceConfig {
 
         let broker_commit_interval_ms = config
             .get_parsed::<u64>("broker.commit.interval.ms")?
-            .unwrap_or(60_000);
+            .unwrap_or(5_000);
 
         let reader_channel_capacity = config
             .get_parsed::<usize>("reader.channel.capacity")?
@@ -784,6 +896,10 @@ impl KafkaSourceConfig {
 
         let backpressure_low_watermark = config
             .get_parsed::<f64>("backpressure.low.watermark")?
+            .unwrap_or(0.5);
+
+        let max_deser_error_rate = config
+            .get_parsed::<f64>("max.deser.error.rate")?
             .unwrap_or(0.5);
 
         let kafka_properties = config.properties_with_prefix("kafka.");
@@ -804,9 +920,13 @@ impl KafkaSourceConfig {
             schema_registry_url,
             schema_registry_auth,
             schema_compatibility,
+            schema_evolution_strategy,
             schema_registry_ssl_ca_location,
             schema_registry_ssl_certificate_location,
             schema_registry_ssl_key_location,
+            schema_registry_subject_strategy,
+            schema_registry_record_name,
+            schema_registry_discovery_timeout,
             event_time_column,
             include_metadata,
             include_headers,
@@ -822,9 +942,6 @@ impl KafkaSourceConfig {
             max_out_of_orderness: Duration::from_millis(max_out_of_orderness_ms),
             idle_timeout: Duration::from_millis(idle_timeout_ms),
             enable_watermark_tracking,
-            alignment_group_id,
-            alignment_max_drift: alignment_max_drift_ms.map(Duration::from_millis),
-            alignment_mode,
             session_timeout: Duration::from_millis(session_timeout_ms),
             heartbeat_interval: Duration::from_millis(heartbeat_interval_ms),
             max_poll_interval: Duration::from_millis(max_poll_interval_ms),
@@ -833,6 +950,7 @@ impl KafkaSourceConfig {
             reader_channel_capacity,
             backpressure_high_watermark,
             backpressure_low_watermark,
+            max_deser_error_rate,
             kafka_properties,
         };
 
@@ -943,6 +1061,12 @@ impl KafkaSourceConfig {
             ));
         }
 
+        if !(0.0..=1.0).contains(&self.max_deser_error_rate) {
+            return Err(ConnectorError::ConfigurationError(
+                "max.deser.error.rate must be between 0.0 and 1.0".into(),
+            ));
+        }
+
         if self.format == Format::Avro && self.schema_registry_url.is_none() {
             return Err(ConnectorError::ConfigurationError(
                 "schema.registry.url is required when format is 'avro'".into(),
@@ -960,6 +1084,7 @@ impl KafkaSourceConfig {
         config.set("bootstrap.servers", &self.bootstrap_servers);
         config.set("group.id", &self.group_id);
         config.set("enable.auto.commit", "false");
+        config.set("enable.auto.offset.store", "false");
         config.set("auto.offset.reset", self.auto_offset_reset.as_rdkafka_str());
         config.set(
             "partition.assignment.strategy",
@@ -1056,7 +1181,9 @@ fn is_blocked_passthrough_key(key: &str) -> bool {
                 | "ssl.key.password"
                 | "ssl.endpoint.identification.algorithm"
                 | "enable.auto.commit"
+                | "enable.auto.offset.store"
                 | "enable.idempotence"
+                | "auto.offset.reset"
                 | "session.timeout.ms"
                 | "heartbeat.interval.ms"
                 | "max.poll.interval.ms"
@@ -1181,7 +1308,7 @@ mod tests {
         assert!(cfg.schema_registry_url.is_none());
         assert_eq!(cfg.security_protocol, SecurityProtocol::Plaintext);
         assert!(cfg.sasl_mechanism.is_none());
-        assert_eq!(cfg.broker_commit_interval, Duration::from_secs(60));
+        assert_eq!(cfg.broker_commit_interval, Duration::from_secs(5));
         assert_eq!(cfg.reader_channel_capacity, 1024);
     }
 
@@ -1642,20 +1769,28 @@ mod tests {
     }
 
     #[test]
-    fn test_startup_mode_helpers() {
-        assert!(!StartupMode::GroupOffsets.overrides_offset_reset());
-        assert!(StartupMode::Earliest.overrides_offset_reset());
-        assert!(StartupMode::Latest.overrides_offset_reset());
-        assert!(StartupMode::SpecificOffsets(HashMap::new()).overrides_offset_reset());
-        assert!(StartupMode::Timestamp(0).overrides_offset_reset());
+    fn test_startup_mode_latest_overrides_offset_reset() {
+        let cfg =
+            KafkaSourceConfig::from_config(&make_config(&[("startup.mode", "latest")])).unwrap();
+        assert_eq!(cfg.auto_offset_reset, OffsetReset::Latest);
+        let rdkafka = cfg.to_rdkafka_config();
+        assert_eq!(rdkafka.get("auto.offset.reset"), Some("latest"));
+    }
 
-        assert!(StartupMode::GroupOffsets.as_offset_reset().is_none());
-        assert_eq!(StartupMode::Earliest.as_offset_reset(), Some("earliest"));
-        assert_eq!(StartupMode::Latest.as_offset_reset(), Some("latest"));
-        assert!(StartupMode::SpecificOffsets(HashMap::new())
-            .as_offset_reset()
-            .is_none());
-        assert!(StartupMode::Timestamp(0).as_offset_reset().is_none());
+    #[test]
+    fn test_startup_mode_earliest_overrides_offset_reset() {
+        let cfg =
+            KafkaSourceConfig::from_config(&make_config(&[("startup.mode", "earliest")])).unwrap();
+        assert_eq!(cfg.auto_offset_reset, OffsetReset::Earliest);
+    }
+
+    #[test]
+    fn test_startup_mode_group_offsets_uses_explicit_offset_reset() {
+        // When startup.mode is group-offsets (default), the explicit
+        // auto.offset.reset setting should be used.
+        let cfg = KafkaSourceConfig::from_config(&make_config(&[("auto.offset.reset", "latest")]))
+            .unwrap();
+        assert_eq!(cfg.auto_offset_reset, OffsetReset::Latest);
     }
 
     #[test]
@@ -1754,9 +1889,6 @@ mod tests {
         assert_eq!(cfg.max_out_of_orderness, Duration::from_secs(5));
         assert_eq!(cfg.idle_timeout, Duration::from_secs(30));
         assert!(!cfg.enable_watermark_tracking);
-        assert!(cfg.alignment_group_id.is_none());
-        assert!(cfg.alignment_max_drift.is_none());
-        assert!(cfg.alignment_mode.is_none());
     }
 
     #[test]
@@ -1771,45 +1903,6 @@ mod tests {
         assert!(cfg.enable_watermark_tracking);
         assert_eq!(cfg.max_out_of_orderness, Duration::from_millis(10_000));
         assert_eq!(cfg.idle_timeout, Duration::from_millis(60_000));
-    }
-
-    #[test]
-    fn test_parse_alignment_config() {
-        use crate::kafka::KafkaAlignmentMode;
-
-        let cfg = KafkaSourceConfig::from_config(&make_config(&[
-            ("alignment.group.id", "orders-payments"),
-            ("alignment.max.drift.ms", "300000"),
-            ("alignment.mode", "pause"),
-        ]))
-        .unwrap();
-
-        assert_eq!(cfg.alignment_group_id, Some("orders-payments".to_string()));
-        assert_eq!(
-            cfg.alignment_max_drift,
-            Some(Duration::from_millis(300_000))
-        );
-        assert_eq!(cfg.alignment_mode, Some(KafkaAlignmentMode::Pause));
-    }
-
-    #[test]
-    fn test_parse_alignment_mode_variants() {
-        use crate::kafka::KafkaAlignmentMode;
-
-        let cfg = KafkaSourceConfig::from_config(&make_config(&[("alignment.mode", "warn-only")]))
-            .unwrap();
-        assert_eq!(cfg.alignment_mode, Some(KafkaAlignmentMode::WarnOnly));
-
-        let cfg =
-            KafkaSourceConfig::from_config(&make_config(&[("alignment.mode", "drop-excess")]))
-                .unwrap();
-        assert_eq!(cfg.alignment_mode, Some(KafkaAlignmentMode::DropExcess));
-    }
-
-    #[test]
-    fn test_parse_alignment_mode_invalid() {
-        let config = make_config(&[("alignment.mode", "invalid")]);
-        assert!(KafkaSourceConfig::from_config(&config).is_err());
     }
 
     // -- startup.mode = timestamp error --
@@ -1916,5 +2009,91 @@ mod tests {
                 .unwrap();
         let rdkafka = cfg.to_rdkafka_config();
         assert_eq!(rdkafka.get("queued.max.messages.kbytes"), Some("8192"));
+    }
+
+    // ── Schema Registry subject-name strategy ──
+
+    #[test]
+    fn resolve_subject_topic_name() {
+        assert_eq!(
+            resolve_value_subject(SubjectNameStrategy::TopicName, None, "orders"),
+            "orders-value"
+        );
+    }
+
+    #[test]
+    fn resolve_subject_record_name() {
+        assert_eq!(
+            resolve_value_subject(
+                SubjectNameStrategy::RecordName,
+                Some("com.acme.Order"),
+                "orders"
+            ),
+            "com.acme.Order-value"
+        );
+    }
+
+    #[test]
+    fn resolve_subject_topic_record_name() {
+        assert_eq!(
+            resolve_value_subject(
+                SubjectNameStrategy::TopicRecordName,
+                Some("com.acme.Order"),
+                "orders"
+            ),
+            "orders-com.acme.Order-value"
+        );
+    }
+
+    #[test]
+    fn parse_subject_strategy_from_config() {
+        let cfg = KafkaSourceConfig::from_config(&make_config(&[
+            ("schema.registry.url", "http://sr:8081"),
+            ("schema.registry.subject.name.strategy", "record-name"),
+            ("schema.registry.record.name", "com.acme.Order"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            cfg.schema_registry_subject_strategy,
+            SubjectNameStrategy::RecordName
+        );
+        assert_eq!(
+            cfg.schema_registry_record_name.as_deref(),
+            Some("com.acme.Order")
+        );
+    }
+
+    #[test]
+    fn parse_subject_strategy_rejects_missing_record_name() {
+        let err = KafkaSourceConfig::from_config(&make_config(&[
+            ("schema.registry.url", "http://sr:8081"),
+            ("schema.registry.subject.name.strategy", "record-name"),
+        ]))
+        .unwrap_err();
+        assert!(matches!(err, ConnectorError::ConfigurationError(_)));
+    }
+
+    #[test]
+    fn parse_discovery_timeout_default_ten_seconds() {
+        let cfg =
+            KafkaSourceConfig::from_config(&make_config(&[("schema.registry.url", "http://sr")]))
+                .unwrap();
+        assert_eq!(
+            cfg.schema_registry_discovery_timeout,
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn parse_discovery_timeout_override() {
+        let cfg = KafkaSourceConfig::from_config(&make_config(&[
+            ("schema.registry.url", "http://sr"),
+            ("schema.registry.discovery.timeout.ms", "25000"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            cfg.schema_registry_discovery_timeout,
+            Duration::from_millis(25000)
+        );
     }
 }

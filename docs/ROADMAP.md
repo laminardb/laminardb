@@ -68,7 +68,7 @@ LaminarDB development is organized into phases, each building on the previous. D
 - FIRST/LAST aggregates, cascading materialized views (F059-F060)
 - EMIT clause extension, changelog/retraction Z-sets (F011B, F063)
 - Per-partition, keyed, and alignment group watermarks (F064-F066)
-- io_uring optimization, NUMA-aware memory (F067-F068) (feature-gated, not enabled in default builds)
+- io_uring optimization, NUMA-aware memory (F067-F068) (removed — dead feature flags with no implementation)
 - StreamingCoordinator I/O architecture, task budget enforcement (F069-F070)
 - Zero-allocation enforcement, zero-allocation polling (F071, F073)
 - XDP/eBPF network optimization (F072)

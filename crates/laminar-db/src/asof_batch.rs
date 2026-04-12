@@ -5,97 +5,22 @@
 //! Implements the ASOF join algorithm for batch data, matching each left row
 //! to the closest right row by timestamp within the same key partition.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use arrow::array::{
-    Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
-};
+use arrow::array::{ArrayRef, RecordBatch};
 use arrow::compute::concat_batches;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{Field, Schema, SchemaRef};
 
 use laminar_sql::parser::join_parser::AsofSqlDirection;
 use laminar_sql::translator::{AsofJoinTranslatorConfig, AsofSqlJoinType};
 
 use crate::error::DbError;
-
-/// A borrowed reference to a key column, avoiding per-row String allocations.
-enum KeyColumn<'a> {
-    Utf8(&'a StringArray),
-    Int64(&'a Int64Array),
-}
-
-impl KeyColumn<'_> {
-    /// Returns true if the key at row `i` is null.
-    fn is_null(&self, i: usize) -> bool {
-        match self {
-            KeyColumn::Utf8(a) => a.is_null(i),
-            KeyColumn::Int64(a) => a.is_null(i),
-        }
-    }
-
-    /// Computes a hash for the key at row `i`. Returns `None` for null keys.
-    fn hash_at(&self, i: usize) -> Option<u64> {
-        if self.is_null(i) {
-            return None;
-        }
-        let mut hasher = DefaultHasher::new();
-        match self {
-            KeyColumn::Utf8(a) => a.value(i).hash(&mut hasher),
-            KeyColumn::Int64(a) => a.value(i).hash(&mut hasher),
-        }
-        Some(hasher.finish())
-    }
-
-    /// Returns true if the keys at the given indices in two `KeyColumn`s are equal.
-    /// Returns false if either key is null (SQL three-valued logic).
-    fn keys_equal(&self, i: usize, other: &KeyColumn<'_>, j: usize) -> bool {
-        if self.is_null(i) || other.is_null(j) {
-            return false;
-        }
-        match (self, other) {
-            (KeyColumn::Utf8(a), KeyColumn::Utf8(b)) => a.value(i) == b.value(j),
-            (KeyColumn::Int64(a), KeyColumn::Int64(b)) => a.value(i) == b.value(j),
-            _ => false,
-        }
-    }
-}
-
-/// Extracts a key column from a `RecordBatch` without per-row allocation.
-fn extract_key_column<'a>(
-    batch: &'a RecordBatch,
-    col_name: &str,
-) -> Result<KeyColumn<'a>, DbError> {
-    let col_idx = batch
-        .schema()
-        .index_of(col_name)
-        .map_err(|_| DbError::Pipeline(format!("Column '{col_name}' not found")))?;
-    let array = batch.column(col_idx);
-
-    match array.data_type() {
-        DataType::Utf8 => {
-            let string_array = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Utf8")))?;
-            Ok(KeyColumn::Utf8(string_array))
-        }
-        DataType::Int64 => {
-            let int_array = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Int64")))?;
-            Ok(KeyColumn::Int64(int_array))
-        }
-        other => Err(DbError::Pipeline(format!(
-            "Unsupported key column type: {other}"
-        ))),
-    }
-}
+use crate::key_column::{
+    extract_column_as_timestamps, extract_key_column, take_with_nulls, KeyColumn,
+};
 
 /// Execute an ASOF join on two sets of `RecordBatch`es.
 ///
@@ -190,18 +115,23 @@ pub(crate) fn execute_asof_join_batch(
             continue;
         };
 
-        // Look up by hash, then verify key equality on candidates to handle collisions
+        // Walk timestamps in direction order, verifying key equality at each.
+        // This handles hash collisions: if a different key occupies the closest
+        // timestamp, we continue to the next timestamp rather than giving up.
         let matched_right = right_index.get(&left_hash).and_then(|btree| {
-            let candidates = find_match(btree, left_ts, config.direction, tolerance_ms)?;
-            // Iterate candidates at the best timestamp and take the first with matching key
             if let Some(ref rk) = right_keys_col {
-                for &candidate in &candidates {
-                    if left_keys_col.keys_equal(left_idx, rk, candidate) {
-                        return Some(candidate);
-                    }
-                }
+                find_verified_match(
+                    btree,
+                    left_ts,
+                    config.direction,
+                    tolerance_ms,
+                    &left_keys_col,
+                    left_idx,
+                    rk,
+                )
+            } else {
+                None
             }
-            None
         });
 
         match (&config.join_type, matched_right) {
@@ -230,106 +160,87 @@ pub(crate) fn execute_asof_join_batch(
     )
 }
 
-/// Find all candidate right row indices at the best matching timestamp,
-/// given direction and tolerance.
-fn find_match(
+/// Walk timestamps in direction order, returning the first row index where the
+/// key matches. Handles hash collisions by continuing to the next-best timestamp
+/// when no key match is found at the closest one.
+fn find_verified_match(
     btree: &BTreeMap<i64, Vec<usize>>,
     left_ts: i64,
     direction: AsofSqlDirection,
     tolerance_ms: Option<i64>,
-) -> Option<Vec<usize>> {
-    let candidate = match direction {
+    left_keys: &KeyColumn<'_>,
+    left_idx: usize,
+    right_keys: &KeyColumn<'_>,
+) -> Option<usize> {
+    match direction {
         AsofSqlDirection::Backward => {
-            // Find most recent right row <= left_ts
-            btree
-                .range(..=left_ts)
-                .next_back()
-                .map(|(&ts, indices)| (ts, indices.clone()))
-        }
-        AsofSqlDirection::Forward => {
-            // Find earliest right row >= left_ts
-            btree
-                .range(left_ts..)
-                .next()
-                .map(|(&ts, indices)| (ts, indices.clone()))
-        }
-        AsofSqlDirection::Nearest => {
-            // Check both backward and forward, return whichever is closer
-            let backward = btree
-                .range(..=left_ts)
-                .next_back()
-                .map(|(&ts, indices)| (ts, indices.clone()));
-            let forward = btree
-                .range(left_ts..)
-                .next()
-                .map(|(&ts, indices)| (ts, indices.clone()));
-            match (backward, forward) {
-                (Some((b_ts, b_indices)), Some((f_ts, f_indices))) => {
-                    let b_diff = (left_ts - b_ts).abs();
-                    let f_diff = (f_ts - left_ts).abs();
-                    if b_diff <= f_diff {
-                        Some((b_ts, b_indices))
-                    } else {
-                        Some((f_ts, f_indices))
+            for (&ts, indices) in btree.range(..=left_ts).rev() {
+                if let Some(tol) = tolerance_ms {
+                    if left_ts - ts > tol {
+                        break;
                     }
                 }
-                (Some(b), None) => Some(b),
-                (None, Some(f)) => Some(f),
-                (None, None) => None,
+                for &idx in indices {
+                    if left_keys.keys_equal(left_idx, right_keys, idx) {
+                        return Some(idx);
+                    }
+                }
+            }
+            None
+        }
+        AsofSqlDirection::Forward => {
+            for (&ts, indices) in btree.range(left_ts..) {
+                if let Some(tol) = tolerance_ms {
+                    if ts - left_ts > tol {
+                        break;
+                    }
+                }
+                for &idx in indices {
+                    if left_keys.keys_equal(left_idx, right_keys, idx) {
+                        return Some(idx);
+                    }
+                }
+            }
+            None
+        }
+        AsofSqlDirection::Nearest => {
+            let mut back = btree.range(..=left_ts).rev().peekable();
+            let mut fwd = btree.range(left_ts.saturating_add(1)..).peekable();
+            loop {
+                let b_dist = back.peek().map(|(&ts, _)| left_ts - ts);
+                let f_dist = fwd.peek().map(|(&ts, _)| ts - left_ts);
+                match (b_dist, f_dist) {
+                    (None, None) => return None,
+                    (Some(bd), f) if f.is_none_or(|fd| bd <= fd) => {
+                        if let Some(tol) = tolerance_ms {
+                            if bd > tol {
+                                return None;
+                            }
+                        }
+                        let (_, indices) = back.next().unwrap();
+                        for &idx in indices {
+                            if left_keys.keys_equal(left_idx, right_keys, idx) {
+                                return Some(idx);
+                            }
+                        }
+                    }
+                    (_, Some(fd)) => {
+                        if let Some(tol) = tolerance_ms {
+                            if fd > tol {
+                                return None;
+                            }
+                        }
+                        let (_, indices) = fwd.next().unwrap();
+                        for &idx in indices {
+                            if left_keys.keys_equal(left_idx, right_keys, idx) {
+                                return Some(idx);
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                }
             }
         }
-    };
-
-    candidate.and_then(|(right_ts, indices)| {
-        if let Some(tol) = tolerance_ms {
-            if (left_ts - right_ts).abs() <= tol {
-                Some(indices)
-            } else {
-                None
-            }
-        } else {
-            Some(indices)
-        }
-    })
-}
-
-/// Extract a column's values as `i64` timestamps (epoch millis).
-fn extract_column_as_timestamps(batch: &RecordBatch, col_name: &str) -> Result<Vec<i64>, DbError> {
-    let col_idx = batch
-        .schema()
-        .index_of(col_name)
-        .map_err(|_| DbError::Pipeline(format!("Timestamp column '{col_name}' not found")))?;
-    let array = batch.column(col_idx);
-
-    match array.data_type() {
-        DataType::Int64 => {
-            let int_array = array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Int64")))?;
-            Ok(int_array.values().to_vec())
-        }
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            let ts_array = array
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .ok_or_else(|| {
-                    DbError::Pipeline(format!("Column '{col_name}' is not TimestampMillisecond"))
-                })?;
-            Ok(ts_array.values().to_vec())
-        }
-        DataType::Float64 => {
-            // Support float timestamps (cast to i64 millis)
-            let f_array = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| DbError::Pipeline(format!("Column '{col_name}' is not Float64")))?;
-            #[allow(clippy::cast_possible_truncation)]
-            Ok(f_array.values().iter().map(|v| *v as i64).collect())
-        }
-        other => Err(DbError::Pipeline(format!(
-            "Unsupported timestamp column type for '{col_name}': {other}"
-        ))),
     }
 }
 
@@ -416,33 +327,340 @@ fn build_output_batch(
         .map_err(|e| DbError::query_pipeline_arrow("ASOF join (result)", &e))
 }
 
-/// Take rows from an array using optional indices (None = null).
-fn take_with_nulls(
-    array: &dyn Array,
-    indices: &[Option<usize>],
-    num_rows: usize,
-) -> Result<ArrayRef, DbError> {
-    if array.is_empty() {
-        // Right side is empty — produce typed all-null array matching the source dtype
-        return Ok(arrow::array::new_null_array(array.data_type(), num_rows));
+const ASOF_COMPACTION_THRESHOLD: u32 = 32;
+
+/// Right-side index: `key_hash → BTreeMap<timestamp, Vec<row_index>>`.
+type RightIndex = FxHashMap<u64, BTreeMap<i64, Vec<usize>>>;
+
+/// Right-side state for streaming ASOF joins. Persists across execution cycles.
+#[derive(Default)]
+pub(crate) struct AsofRightBuffer {
+    index: RightIndex,
+    right_concat: Option<RecordBatch>,
+    ingest_count: u32,
+}
+
+impl AsofRightBuffer {
+    /// Ingest new right-side batches, appending to the concatenated batch and
+    /// updating the index.
+    pub fn ingest(
+        &mut self,
+        batches: &[RecordBatch],
+        key_col: &str,
+        time_col: &str,
+    ) -> Result<(), DbError> {
+        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+            return Ok(());
+        }
+
+        // Filter out CDC negative events (D, U-) before buffering
+        let filtered: Vec<RecordBatch> = batches
+            .iter()
+            .map(crate::changelog_filter::filter_positive_events)
+            .collect::<Result<Vec<_>, _>>()?;
+        let batches = &filtered[..];
+        if batches.is_empty() || batches.iter().all(|b| b.num_rows() == 0) {
+            return Ok(());
+        }
+
+        let schema = batches[0].schema();
+        let new_batch = arrow::compute::concat_batches(&schema, batches)
+            .map_err(|e| DbError::query_pipeline_arrow("ASOF right buffer concat", &e))?;
+        if new_batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        let timestamps = extract_column_as_timestamps(&new_batch, time_col)?;
+        // Pre-compute hashes before new_batch is moved into concat.
+        let key_hashes: Vec<Option<u64>> = {
+            let keys = extract_key_column(&new_batch, key_col)?;
+            (0..new_batch.num_rows()).map(|i| keys.hash_at(i)).collect()
+        };
+
+        let (merged, offset) = if let Some(ref existing) = self.right_concat {
+            let offset = existing.num_rows();
+            let merged = arrow::compute::concat_batches(&schema, &[existing.clone(), new_batch])
+                .map_err(|e| DbError::query_pipeline_arrow("ASOF right buffer merge", &e))?;
+            (merged, offset)
+        } else {
+            (new_batch, 0)
+        };
+
+        for (i, &ts) in timestamps.iter().enumerate() {
+            if let Some(key_hash) = key_hashes[i] {
+                self.index
+                    .entry(key_hash)
+                    .or_default()
+                    .entry(ts)
+                    .or_default()
+                    .push(offset + i);
+            }
+        }
+
+        self.right_concat = Some(merged);
+        self.ingest_count += 1;
+        Ok(())
     }
 
-    // Build a UInt32Array with null entries for unmatched rows
-    #[allow(clippy::cast_possible_truncation)]
-    let index_array = arrow::array::UInt32Array::from(
-        indices
-            .iter()
-            .map(|opt| opt.map(|i| i as u32))
-            .collect::<Vec<Option<u32>>>(),
-    );
+    /// Evict all rows with `ts < cutoff`.
+    pub fn evict_before(&mut self, cutoff: i64) -> Result<(), DbError> {
+        for btree in self.index.values_mut() {
+            let keep = btree.split_off(&cutoff);
+            *btree = keep;
+        }
+        self.index.retain(|_, btree| !btree.is_empty());
 
-    arrow::compute::take(array, &index_array, None)
-        .map_err(|e| DbError::query_pipeline_arrow("ASOF join (right take)", &e))
+        if self.ingest_count >= ASOF_COMPACTION_THRESHOLD {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    fn compact(&mut self) -> Result<(), DbError> {
+        let Some(ref batch) = self.right_concat else {
+            return Ok(());
+        };
+
+        let mut live_rows: Vec<usize> = Vec::new();
+        for btree in self.index.values() {
+            for indices in btree.values() {
+                live_rows.extend_from_slice(indices);
+            }
+        }
+
+        if live_rows.is_empty() {
+            self.right_concat = None;
+            self.index.clear();
+            self.ingest_count = 0;
+            return Ok(());
+        }
+
+        live_rows.sort_unstable();
+        live_rows.dedup();
+
+        let mut idx_map: FxHashMap<usize, usize> = FxHashMap::default();
+        for (new_idx, &old_idx) in live_rows.iter().enumerate() {
+            idx_map.insert(old_idx, new_idx);
+        }
+
+        #[allow(clippy::cast_possible_truncation)]
+        let take_indices = arrow::array::UInt32Array::from(
+            live_rows.iter().map(|&i| i as u32).collect::<Vec<_>>(),
+        );
+        let schema = batch.schema();
+        let columns: Result<Vec<ArrayRef>, _> = (0..batch.num_columns())
+            .map(|col| arrow::compute::take(batch.column(col), &take_indices, None))
+            .collect();
+        let columns =
+            columns.map_err(|e| DbError::query_pipeline_arrow("ASOF right buffer compact", &e))?;
+        let compacted = RecordBatch::try_new(schema, columns)
+            .map_err(|e| DbError::query_pipeline_arrow("ASOF right buffer compact batch", &e))?;
+
+        for btree in self.index.values_mut() {
+            for indices in btree.values_mut() {
+                for idx in indices.iter_mut() {
+                    *idx = idx_map[idx];
+                }
+            }
+        }
+
+        self.right_concat = Some(compacted);
+        self.ingest_count = 0;
+        Ok(())
+    }
+
+    pub fn estimated_size_bytes(&self) -> usize {
+        let index_size: usize = self
+            .index
+            .values()
+            .map(|btree| btree.len() * (8 + 8 + 24))
+            .sum();
+        let batch_size = self
+            .right_concat
+            .as_ref()
+            .map_or(0, RecordBatch::get_array_memory_size);
+        index_size + batch_size
+    }
+}
+
+/// Execute an ASOF join of left batches against a stateful right buffer.
+/// The right buffer must have been pre-populated via `AsofRightBuffer::ingest`.
+pub(crate) fn execute_asof_join_with_state(
+    left_batches: &[RecordBatch],
+    right_buffer: &AsofRightBuffer,
+    config: &AsofJoinTranslatorConfig,
+) -> Result<RecordBatch, DbError> {
+    if left_batches.is_empty() {
+        return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
+    }
+
+    let left_schema = left_batches[0].schema();
+    let left = concat_batches(&left_schema, left_batches)
+        .map_err(|e| DbError::query_pipeline_arrow("ASOF join (left)", &e))?;
+
+    let Some(right) = right_buffer.right_concat.clone() else {
+        // No right data buffered yet. Left join emits all with nulls; inner emits nothing.
+        if config.join_type == AsofSqlJoinType::Left {
+            let right_schema = Arc::new(Schema::empty());
+            let output_schema = build_output_schema(&left_schema, &right_schema, config);
+            let left_indices: Vec<usize> = (0..left.num_rows()).collect();
+            let right_indices: Vec<Option<usize>> = vec![None; left.num_rows()];
+            return build_output_batch(
+                &left,
+                &RecordBatch::new_empty(right_schema),
+                &left_indices,
+                &right_indices,
+                &output_schema,
+                config,
+            );
+        }
+        return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
+    };
+
+    let right_schema = right.schema();
+    let output_schema = build_output_schema(&left_schema, &right_schema, config);
+
+    let left_keys_col = extract_key_column(&left, &config.key_column)?;
+    let left_timestamps = extract_column_as_timestamps(&left, &config.left_time_column)?;
+    let right_keys_col = extract_key_column(&right, &config.key_column)?;
+
+    let tolerance_ms = config
+        .tolerance
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+
+    let mut left_indices: Vec<usize> = Vec::with_capacity(left.num_rows());
+    let mut right_indices: Vec<Option<usize>> = Vec::with_capacity(left.num_rows());
+
+    for (left_idx, &left_ts) in left_timestamps.iter().enumerate() {
+        let Some(left_hash) = left_keys_col.hash_at(left_idx) else {
+            if config.join_type == AsofSqlJoinType::Left {
+                left_indices.push(left_idx);
+                right_indices.push(None);
+            }
+            continue;
+        };
+
+        let matched_right = right_buffer.index.get(&left_hash).and_then(|btree| {
+            find_verified_match(
+                btree,
+                left_ts,
+                config.direction,
+                tolerance_ms,
+                &left_keys_col,
+                left_idx,
+                &right_keys_col,
+            )
+        });
+
+        match (&config.join_type, matched_right) {
+            (_, Some(right_idx)) => {
+                left_indices.push(left_idx);
+                right_indices.push(Some(right_idx));
+            }
+            (AsofSqlJoinType::Left, None) => {
+                left_indices.push(left_idx);
+                right_indices.push(None);
+            }
+            (AsofSqlJoinType::Inner, None) => {}
+        }
+    }
+
+    build_output_batch(
+        &left,
+        &right,
+        &left_indices,
+        &right_indices,
+        &output_schema,
+        config,
+    )
+}
+
+/// Serializable checkpoint for `AsofRightBuffer`.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct AsofBufferCheckpoint {
+    #[serde(default)]
+    pub right_buffer_ipc: Vec<u8>,
+    #[serde(default)]
+    pub index_entries: Vec<(u64, i64, Vec<usize>)>,
+    #[serde(default = "default_evicted_watermark")]
+    pub last_evicted_watermark: i64,
+}
+
+fn default_evicted_watermark() -> i64 {
+    i64::MIN
+}
+
+impl AsofRightBuffer {
+    pub fn snapshot_checkpoint(
+        &mut self,
+        last_evicted_watermark: i64,
+    ) -> Result<AsofBufferCheckpoint, DbError> {
+        self.compact()?;
+
+        let right_buffer_ipc = if let Some(ref batch) = self.right_concat {
+            if batch.num_rows() > 0 {
+                laminar_core::serialization::serialize_batch_stream(batch).map_err(|e| {
+                    DbError::Pipeline(format!("ASOF checkpoint right buffer serialization: {e}"))
+                })?
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        let mut index_entries = Vec::new();
+        for (&key_hash, btree) in &self.index {
+            for (&ts, indices) in btree {
+                index_entries.push((key_hash, ts, indices.clone()));
+            }
+        }
+
+        Ok(AsofBufferCheckpoint {
+            right_buffer_ipc,
+            index_entries,
+            last_evicted_watermark,
+        })
+    }
+
+    pub fn from_checkpoint(cp: &AsofBufferCheckpoint) -> Result<(Self, i64), DbError> {
+        let right_concat = if cp.right_buffer_ipc.is_empty() {
+            None
+        } else {
+            Some(
+                laminar_core::serialization::deserialize_batch_stream(&cp.right_buffer_ipc)
+                    .map_err(|e| {
+                        DbError::Pipeline(format!(
+                            "ASOF checkpoint right buffer deserialization: {e}"
+                        ))
+                    })?,
+            )
+        };
+
+        let mut index: RightIndex = FxHashMap::default();
+        for &(key_hash, ts, ref indices) in &cp.index_entries {
+            index
+                .entry(key_hash)
+                .or_default()
+                .insert(ts, indices.clone());
+        }
+
+        Ok((
+            Self {
+                index,
+                right_concat,
+                ingest_count: 0,
+            },
+            cp.last_evicted_watermark,
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{Float64Array, Int64Array, StringArray};
+    use arrow::datatypes::DataType;
     use std::time::Duration;
 
     fn trades_batch() -> RecordBatch {

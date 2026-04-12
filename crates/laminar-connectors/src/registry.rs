@@ -7,6 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use arrow_schema::SchemaRef;
 use parking_lot::RwLock;
 
 use crate::config::{ConnectorConfig, ConnectorInfo};
@@ -99,17 +100,40 @@ impl ConnectorRegistry {
         self.sinks.write().insert(name.into(), (info, factory));
     }
 
+    /// Run a connector's `discover_schema` against the given
+    /// properties and return the resulting Arrow schema. `None` means
+    /// the connector type is unknown or discovery produced no fields.
+    pub async fn default_source_schema(
+        &self,
+        connector_type: &str,
+        properties: &std::collections::HashMap<String, String>,
+    ) -> Option<SchemaRef> {
+        // Release the read lock before awaiting — `discover_schema` may
+        // do network I/O.
+        let factory = {
+            let sources = self.sources.read();
+            let (_, factory) = sources.get(connector_type)?;
+            factory.clone()
+        };
+
+        let mut instance = factory();
+        instance.discover_schema(properties).await;
+        let schema = instance.schema();
+        if schema.fields().is_empty() {
+            None
+        } else {
+            Some(schema)
+        }
+    }
+
     /// Creates a new source connector instance.
-    ///
-    /// The connector type is determined by `config.connector_type()`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConnectorError::ConfigurationError` if the connector type
-    /// is not registered.
     ///
     /// The factory creates a default-configured connector. The caller must
     /// subsequently call `open(config)` to forward WITH clause properties.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ConnectorError::ConfigurationError` if not registered.
     pub fn create_source(
         &self,
         config: &ConnectorConfig,
@@ -373,6 +397,29 @@ mod tests {
         assert!(registry.create_deserializer("json").is_ok());
         assert!(registry.create_serializer("csv").is_ok());
         assert!(registry.create_deserializer("unknown").is_err());
+    }
+
+    #[tokio::test]
+    async fn default_source_schema_some_when_discovered() {
+        let registry = ConnectorRegistry::new();
+        registry.register_source(
+            "mock",
+            mock_info("mock", true, false),
+            Arc::new(|| Box::new(MockSourceConnector::new())),
+        );
+        let schema = registry
+            .default_source_schema("mock", &std::collections::HashMap::new())
+            .await;
+        assert!(schema.is_some_and(|s| !s.fields().is_empty()));
+    }
+
+    #[tokio::test]
+    async fn default_source_schema_none_for_unknown_connector() {
+        let registry = ConnectorRegistry::new();
+        assert!(registry
+            .default_source_schema("nope", &std::collections::HashMap::new())
+            .await
+            .is_none());
     }
 
     // ── Table source factory tests ──

@@ -1,19 +1,4 @@
 //! Static seed-list discovery with TCP heartbeats.
-//!
-//! Nodes are configured with a static list of seed addresses. Each node
-//! periodically sends heartbeats to all seeds and tracks failures based
-//! on missed heartbeat counts:
-//! - `suspect_threshold` missed → `Suspected`
-//! - `dead_threshold` missed → `Left`
-//!
-//! Design constraints:
-//! - The **heartbeater** (outbound) is the sole authority on failure state.
-//!   It increments `missed_heartbeats` on failed sends and transitions
-//!   peers through `Active → Suspected → Left`.
-//! - The **listener** (inbound) records that a peer exists and updates its
-//!   addresses/metadata, but never resets the heartbeater's failure counter.
-//!   This prevents a half-open partition (peer can send to us, but we cannot
-//!   reach it) from masking a failure.
 
 #![allow(clippy::disallowed_types)] // cold path: static discovery coordination
 use std::collections::HashMap;

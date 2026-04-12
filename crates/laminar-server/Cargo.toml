@@ -16,19 +16,23 @@ path = "src/main.rs"
 
 [dependencies]
 # All LaminarDB crates
-laminar-core = { path = "../laminar-core", version = "0.18.10", features = ["delta"] }
-laminar-sql = { path = "../laminar-sql", version = "0.18.10" }
-laminar-storage = { path = "../laminar-storage", version = "0.18.10" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.18.10" }
-laminar-db = { path = "../laminar-db", version = "0.18.10" }
+laminar-core = { path = "../laminar-core", version = "0.20.1" }
+laminar-sql = { path = "../laminar-sql", version = "0.20.1" }
+laminar-storage = { path = "../laminar-storage", version = "0.20.1" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.20.1" }
+laminar-db = { path = "../laminar-db", version = "0.20.1", features = ["api"] }
+
+# Arrow (for WS JSON serialization)
+arrow-array = { workspace = true }
+arrow-json = { workspace = true }
+parking_lot = { workspace = true }
 
 # CLI and configuration
 clap = { version = "4.6", features = ["derive", "env"] }
-config = { version = "0.15", default-features = false, features = ["toml"] }
-directories = "6.0"
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
+crossfire = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
@@ -41,10 +45,10 @@ thiserror = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = "1.0"
+toml = "1.1"
 
 # Web framework
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 
@@ -56,10 +60,10 @@ chrono = { workspace = true }
 # File watching for hot reload
 notify = { workspace = true }
 
-# Delta mode: hostname discovery and unique node IDs
-gethostname = { workspace = true }
-uuid = { workspace = true }
-xxhash-rust = { workspace = true }
+# Delta mode: hostname discovery and unique node IDs (only needed with delta-experimental)
+gethostname = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+xxhash-rust = { workspace = true, optional = true }
 
 # Vendored OpenSSL for musl cross-compilation (behind vendored-openssl feature)
 openssl = { version = "0.10", features = ["vendored"], optional = true }
@@ -77,8 +81,7 @@ mimalloc = { workspace = true, optional = true }
 tempfile = { workspace = true }
 
 [features]
-# Cross-platform defaults. On Linux, add `--features linux-perf` for
-# io_uring, NUMA topology, and XDP/eBPF optimizations.
+# Cross-platform defaults.
 default = [
     "jemalloc",
     "mimalloc",
@@ -92,6 +95,7 @@ default = [
     "mongodb-cdc",
     "files",
     "parquet-lookup",
+    "otel",
 ]
 jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
@@ -112,19 +116,22 @@ delta-lake-glue = ["delta-lake", "laminar-db/delta-lake-glue"]
 delta = ["delta-lake", "delta-lake-s3", "delta-lake-azure", "delta-lake-gcs", "delta-lake-unity", "delta-lake-glue", "laminar-db/delta-lake-all"]
 iceberg = ["laminar-db/iceberg"]
 files = ["laminar-db/files"]
+otel = ["laminar-db/otel"]
 parquet-lookup = ["laminar-db/parquet-lookup"]
 # Cloud object store backends for checkpoints
 aws = ["laminar-db/aws"]
 gcs = ["laminar-db/gcs"]
 azure = ["laminar-db/azure"]
-# Performance features
-# Linux-only performance features (cannot be default — crates won't compile on Windows/macOS)
-io-uring = ["laminar-storage/io-uring"]     # Linux 5.10+: async I/O for WAL/checkpoints
-hwloc = ["laminar-core/hwloc"]              # Linux/macOS: NUMA topology discovery
-# Meta-feature: enable all Linux-specific performance optimizations.
-# Recommended for production Linux deployments:
-#   cargo build --release --features linux-perf
-linux-perf = ["io-uring", "hwloc"]
 # Compile OpenSSL from source — required for musl cross-compilation where
 # system libssl-dev is not available for the target triple.
+# Delta/cluster mode: experimental multi-node support. This mode is NOT
+# production-ready — it requires Raft, inter-node RPC, and partition-aware
+# routing that are not yet functional. Gate it behind an explicit feature
+# so the binary does not present it as a first-class option.
+delta-experimental = [
+    "laminar-core/delta",
+    "dep:gethostname",
+    "dep:uuid",
+    "dep:xxhash-rust",
+]
 vendored-openssl = ["dep:openssl"]

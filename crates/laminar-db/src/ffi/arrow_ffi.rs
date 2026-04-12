@@ -1,32 +1,4 @@
 //! Arrow C Data Interface for zero-copy data exchange.
-//!
-//! This module provides `extern "C"` functions for exporting and importing
-//! Arrow data via the [Arrow C Data Interface](https://arrow.apache.org/docs/format/CDataInterface.html).
-//!
-//! # Zero-Copy Export
-//!
-//! The export functions transfer ownership of data buffers to the consumer.
-//! The consumer must call the release callbacks when done.
-//!
-//! # Usage
-//!
-//! ```c
-//! #include "laminar.h"
-//!
-//! // Query and get a batch
-//! LaminarRecordBatch* batch = ...;
-//!
-//! // Export to Arrow C Data Interface (caller allocates structs)
-//! struct ArrowArray array;
-//! struct ArrowSchema schema;
-//! int32_t rc = laminar_batch_export(batch, &array, &schema);
-//!
-//! // Consumer uses the data...
-//!
-//! // Consumer releases when done
-//! if (array.release) array.release(&array);
-//! if (schema.release) schema.release(&schema);
-//! ```
 
 use arrow::array::{Array, RecordBatch, StructArray};
 use arrow::ffi::{from_ffi, to_ffi, FFI_ArrowArray, FFI_ArrowSchema};

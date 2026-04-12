@@ -5,11 +5,12 @@
 
 use std::sync::Arc;
 
-use arrow_array::builder::{BinaryBuilder, StringBuilder};
+use arrow_array::builder::BinaryBuilder;
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
 use crate::error::ConnectorError;
+use crate::schema::csv::{CsvDecoder, CsvDecoderConfig};
 use crate::schema::json::decoder::{JsonDecoder, JsonDecoderConfig};
 use crate::schema::traits::FormatDecoder;
 use crate::schema::types::RawRecord;
@@ -24,6 +25,8 @@ pub struct MessageParser {
     format: MessageFormat,
     /// Type-aware JSON decoder (set for JSON/JsonLines formats).
     json_decoder: Option<JsonDecoder>,
+    /// Type-aware CSV decoder (set for CSV format).
+    csv_decoder: Option<CsvDecoder>,
 }
 
 impl MessageParser {
@@ -40,10 +43,26 @@ impl MessageParser {
             }
             _ => None,
         };
+        let csv_decoder = match &format {
+            MessageFormat::Csv {
+                delimiter,
+                has_header,
+            } => {
+                #[allow(clippy::cast_possible_truncation)]
+                let csv_config = CsvDecoderConfig {
+                    delimiter: *delimiter as u8,
+                    has_header: *has_header,
+                    ..CsvDecoderConfig::default()
+                };
+                Some(CsvDecoder::with_config(schema.clone(), csv_config))
+            }
+            _ => None,
+        };
         Self {
             schema,
             format,
             json_decoder,
+            csv_decoder,
         }
     }
 
@@ -66,7 +85,7 @@ impl MessageParser {
         match &self.format {
             MessageFormat::Json | MessageFormat::JsonLines => self.parse_json_batch(messages),
             MessageFormat::Binary => self.parse_binary_batch(messages),
-            MessageFormat::Csv { delimiter, .. } => self.parse_csv_batch(messages, *delimiter),
+            MessageFormat::Csv { .. } => self.parse_csv_batch(messages),
         }
     }
 
@@ -111,83 +130,40 @@ impl MessageParser {
 
     /// Parses CSV text messages into a `RecordBatch`.
     ///
-    /// Each message is treated as one or more CSV rows.
-    fn parse_csv_batch(
-        &self,
-        messages: &[&[u8]],
-        delimiter: char,
-    ) -> Result<RecordBatch, ConnectorError> {
-        let mut builders: Vec<StringBuilder> = self
-            .schema
-            .fields()
+    /// Delegates to [`CsvDecoder`] for schema-directed type coercion.
+    fn parse_csv_batch(&self, messages: &[&[u8]]) -> Result<RecordBatch, ConnectorError> {
+        let decoder = self.csv_decoder.as_ref().ok_or_else(|| {
+            ConnectorError::Internal("csv_decoder not initialized for CSV format".into())
+        })?;
+        let records: Vec<RawRecord> = messages
             .iter()
-            .map(|_| StringBuilder::with_capacity(messages.len(), messages.len() * 32))
+            .map(|m| RawRecord::new(m.to_vec()))
             .collect();
-
-        let num_fields = self.schema.fields().len();
-
-        for msg in messages {
-            let text = std::str::from_utf8(msg).map_err(|e| {
-                ConnectorError::Serde(crate::error::SerdeError::MalformedInput(format!(
-                    "invalid UTF-8 in CSV message: {e}"
-                )))
-            })?;
-
-            for line in text.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-
-                let fields: Vec<&str> = line.split(delimiter).collect();
-                for (i, builder) in builders.iter_mut().enumerate().take(num_fields) {
-                    if i < fields.len() {
-                        builder.append_value(fields[i].trim());
-                    } else {
-                        builder.append_null();
-                    }
-                }
-            }
-        }
-
-        let arrays: Vec<Arc<dyn arrow_array::Array>> = builders
-            .into_iter()
-            .map(|mut b| Arc::new(b.finish()) as _)
-            .collect();
-
-        RecordBatch::try_new(self.schema.clone(), arrays).map_err(|e| {
-            ConnectorError::Serde(crate::error::SerdeError::Csv(format!(
-                "failed to build CSV RecordBatch: {e}"
-            )))
-        })
+        decoder.decode_batch(&records).map_err(ConnectorError::from)
     }
 }
 
-/// Extracts the maximum event time (as epoch milliseconds) from a named column.
+/// Max event time (epoch ms) from a named `Timestamp(_)` column.
+/// `Ok(None)` when every row is null.
 ///
-/// Supports `Int64` and `TimestampMillisecond` column types. Returns `None`
-/// if the column is missing, has an unsupported type, or is entirely null.
-#[must_use]
-#[allow(clippy::cast_possible_truncation)]
-pub fn extract_max_event_time(batch: &RecordBatch, field: &str) -> Option<i64> {
-    let col_idx = batch.schema().index_of(field).ok()?;
-    let col = batch.column(col_idx);
-
-    if let Some(arr) = col.as_any().downcast_ref::<arrow_array::Int64Array>() {
-        (0..arr.len())
-            .filter(|&i| !arr.is_null(i))
-            .map(|i| arr.value(i))
-            .max()
-    } else if let Some(arr) = col
-        .as_any()
-        .downcast_ref::<arrow_array::TimestampMillisecondArray>()
-    {
-        (0..arr.len())
-            .filter(|&i| !arr.is_null(i))
-            .map(|i| arr.value(i))
-            .max()
-    } else {
-        None
-    }
+/// # Errors
+///
+/// `SchemaMismatch` if `field` is missing or isn't a `Timestamp(_)`.
+pub fn extract_max_event_time(
+    batch: &RecordBatch,
+    field: &str,
+) -> Result<Option<i64>, ConnectorError> {
+    let col_idx = batch.schema().index_of(field).map_err(|_| {
+        ConnectorError::SchemaMismatch(format!(
+            "event-time column '{field}' not found in batch schema"
+        ))
+    })?;
+    let arr = laminar_core::time::cast_to_millis_array(batch.column(col_idx).as_ref())
+        .map_err(|e| ConnectorError::SchemaMismatch(format!("event-time column '{field}': {e}")))?;
+    Ok((0..arr.len())
+        .filter(|&i| !arr.is_null(i))
+        .map(|i| arr.value(i))
+        .max())
 }
 
 /// Creates a default schema for JSON messages when no explicit schema is provided.
@@ -439,38 +415,64 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_max_event_time_int64() {
-        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
-        let ts = arrow_array::Int64Array::from(vec![1000, 3000, 2000]);
+    fn test_extract_max_event_time_millis() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+            false,
+        )]));
+        let ts = arrow_array::TimestampMillisecondArray::from(vec![1000, 3000, 2000]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(ts)]).unwrap();
 
-        assert_eq!(extract_max_event_time(&batch, "ts"), Some(3000));
+        assert_eq!(extract_max_event_time(&batch, "ts").unwrap(), Some(3000));
     }
 
     #[test]
-    fn test_extract_max_event_time_missing_column() {
+    fn test_extract_max_event_time_nanos_rescaled() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        let ts = arrow_array::TimestampNanosecondArray::from(vec![
+            1_000_000_000,
+            3_000_000_000,
+            2_000_000_000,
+        ]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ts)]).unwrap();
+
+        assert_eq!(extract_max_event_time(&batch, "ts").unwrap(), Some(3_000));
+    }
+
+    #[test]
+    fn test_extract_max_event_time_missing_column_errors() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         let ids = arrow_array::Int64Array::from(vec![1, 2, 3]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(ids)]).unwrap();
 
-        assert_eq!(extract_max_event_time(&batch, "ts"), None);
+        assert!(extract_max_event_time(&batch, "ts").is_err());
+    }
+
+    #[test]
+    fn test_extract_max_event_time_non_timestamp_column_errors() {
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
+        let ts = arrow_array::Int64Array::from(vec![1, 2, 3]);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ts)]).unwrap();
+
+        assert!(extract_max_event_time(&batch, "ts").is_err());
     }
 
     #[test]
     fn test_extract_max_event_time_with_nulls() {
-        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, true)]));
-        let ts = arrow_array::Int64Array::from(vec![Some(1000), None, Some(3000), None]);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
+            true,
+        )]));
+        let ts =
+            arrow_array::TimestampMillisecondArray::from(vec![Some(1000), None, Some(3000), None]);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(ts)]).unwrap();
 
-        assert_eq!(extract_max_event_time(&batch, "ts"), Some(3000));
-    }
-
-    #[test]
-    fn test_extract_max_event_time_unsupported_type() {
-        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Utf8, false)]));
-        let ts = arrow_array::StringArray::from(vec!["2026-01-01"]);
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(ts)]).unwrap();
-
-        assert_eq!(extract_max_event_time(&batch, "ts"), None);
+        assert_eq!(extract_max_event_time(&batch, "ts").unwrap(), Some(3000));
     }
 }

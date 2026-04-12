@@ -6,7 +6,9 @@
 
 use std::collections::HashMap;
 
-use laminar_db::checkpoint_coordinator::{CheckpointConfig, CheckpointCoordinator};
+use laminar_db::checkpoint_coordinator::{
+    CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
+};
 use laminar_db::recovery_manager::RecoveryManager;
 use laminar_storage::checkpoint_manifest::{
     CheckpointManifest, ConnectorCheckpoint, OperatorCheckpoint,
@@ -36,7 +38,11 @@ async fn test_happy_path_checkpoint_and_recovery() {
     ops.insert("window-agg".into(), b"accumulated-state".to_vec());
 
     let result = coord
-        .checkpoint(ops, Some(5000), None, HashMap::new(), None)
+        .checkpoint(CheckpointRequest {
+            operator_states: ops,
+            watermark: Some(5000),
+            ..CheckpointRequest::default()
+        })
         .await
         .unwrap();
 
@@ -177,13 +183,10 @@ async fn test_table_store_checkpoint_path_recovery() {
 
     let mut coord = make_coordinator(dir.path());
     let result = coord
-        .checkpoint(
-            HashMap::new(),
-            None,
-            Some("/data/rocksdb_cp_001".into()),
-            HashMap::new(),
-            None,
-        )
+        .checkpoint(CheckpointRequest {
+            table_store_checkpoint_path: Some("/data/rocksdb_cp_001".into()),
+            ..CheckpointRequest::default()
+        })
         .await
         .unwrap();
 
@@ -210,11 +213,17 @@ async fn test_coordinator_resumes_epoch_after_recovery() {
     {
         let mut coord = make_coordinator(dir.path());
         coord
-            .checkpoint(HashMap::new(), Some(1000), None, HashMap::new(), None)
+            .checkpoint(CheckpointRequest {
+                watermark: Some(1000),
+                ..CheckpointRequest::default()
+            })
             .await
             .unwrap();
         coord
-            .checkpoint(HashMap::new(), Some(2000), None, HashMap::new(), None)
+            .checkpoint(CheckpointRequest {
+                watermark: Some(2000),
+                ..CheckpointRequest::default()
+            })
             .await
             .unwrap();
 
@@ -226,31 +235,6 @@ async fn test_coordinator_resumes_epoch_after_recovery() {
     let coord2 = make_coordinator(dir.path());
     assert_eq!(coord2.epoch(), 3);
     assert_eq!(coord2.next_checkpoint_id(), 3);
-}
-
-// ── Scenario 9: Incremental checkpoint flag ──
-
-#[tokio::test]
-async fn test_incremental_checkpoint_flag() {
-    let dir = tempfile::tempdir().unwrap();
-
-    let config = CheckpointConfig {
-        incremental: true,
-        ..CheckpointConfig::default()
-    };
-    let store = Box::new(make_store(dir.path()));
-    let mut coord = CheckpointCoordinator::new(config, store);
-
-    let result = coord
-        .checkpoint(HashMap::new(), None, None, HashMap::new(), None)
-        .await
-        .unwrap();
-
-    assert!(result.success);
-
-    let store = make_store(dir.path());
-    let loaded = store.load_latest().unwrap().unwrap();
-    assert!(loaded.is_incremental);
 }
 
 // ── Scenario 10: Table offsets round-trip ──
@@ -312,8 +296,6 @@ fn test_checkpoint_store_prune_keeps_latest() {
 fn test_manifest_full_round_trip() {
     let mut manifest = CheckpointManifest::new(42, 100);
     manifest.watermark = Some(999_999);
-    manifest.is_incremental = true;
-    manifest.parent_id = Some(41);
     manifest.table_store_checkpoint_path = Some("/tmp/cp".into());
 
     manifest.source_offsets.insert(
@@ -339,8 +321,6 @@ fn test_manifest_full_round_trip() {
     assert_eq!(restored.checkpoint_id, 42);
     assert_eq!(restored.epoch, 100);
     assert_eq!(restored.watermark, Some(999_999));
-    assert!(restored.is_incremental);
-    assert_eq!(restored.parent_id, Some(41));
     assert_eq!(
         restored.table_store_checkpoint_path.as_deref(),
         Some("/tmp/cp")

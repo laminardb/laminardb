@@ -14,7 +14,7 @@ exclude = [
 resolver = "2"
 
 [workspace.package]
-version = "0.18.12"
+version = "0.20.1"
 authors = ["LaminarDB Contributors"]
 edition = "2021"
 rust-version = "1.85"
@@ -28,7 +28,7 @@ categories = ["database", "embedded", "data-structures"]
 
 [workspace.dependencies]
 # Core dependencies
-tokio = { version = "1.50", features = ["full"] }
+tokio = { version = "1.51", features = ["full"] }
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -48,11 +48,9 @@ mimalloc = { version = "0.1", default-features = false }  # mimalloc for Windows
 rustc-hash = "2.1"  # Faster than std HashMap (replaces unmaintained fxhash)
 parking_lot = "0.12"  # Faster Mutex/RwLock
 memmap2 = "0.9"  # Memory-mapped files
-bumpalo = "3.20"  # Arena allocator
-uuid = { version = "1.22", features = ["v4", "v7", "serde"] }  # Unique IDs
+uuid = { version = "1.23", features = ["v4", "v7", "serde"] }  # Unique IDs
 gethostname = "0.5"  # Pure Rust hostname lookup
 ahash = "0.8"  # Fast hashing for state stores
-papaya = "0.2"  # Lock-free concurrent HashMap
 foyer = { version = "0.22", features = ["serde"] }  # High-performance cache (S3-FIFO eviction, serde for HybridCache)
 sha2 = "0.10"  # SHA-256 for checkpoint integrity
 lz4_flex = "0.12"  # Pure Rust LZ4 compression (fastest decompression for recovery)
@@ -68,7 +66,9 @@ arrow = { version = "57.2", default-features = true }
 arrow-array = "57.2"
 arrow-schema = "57.2"
 arrow-cast = "57.2"
+arrow-csv = "57.2"
 arrow-ipc = "57.2"
+arrow-json = "57.2"
 arrow-select = "57.2"
 datafusion = "52.3"
 datafusion-common = "52.0"
@@ -80,6 +80,7 @@ sqlparser = "0.59"
 # Async
 tokio-stream = "0.1"
 futures = "0.3"
+crossfire = "3"
 
 # Collections
 smallvec = { version = "1.15", features = ["const_new", "union"] }
@@ -87,7 +88,6 @@ arrayvec = "0.7"
 
 # Platform-specific
 libc = "0.2"
-io-uring = "0.7"  # Low-level io_uring bindings (Linux only)
 
 # Probabilistic data structures
 xorf = "0.12"
@@ -110,7 +110,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 # Testing
 criterion = { version = "0.8", features = ["html_reports"] }
-proptest = "1.10"
+proptest = "1.11"
 tempfile = "3.27"
 
 [profile.release]

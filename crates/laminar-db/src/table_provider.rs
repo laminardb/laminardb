@@ -18,6 +18,7 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 
 use crate::catalog::SourceEntry;
+use crate::mv_store::MvStore;
 use crate::table_store::TableStore;
 
 /// A `DataFusion` table provider that reads live data from `TableStore`.
@@ -167,6 +168,79 @@ impl std::fmt::Debug for SourceSnapshotProvider {
         f.debug_struct("SourceSnapshotProvider")
             .field("source", &self.source_entry.name)
             .field("num_partitions", &self.num_partitions)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A `DataFusion` table provider for materialized view results.
+///
+/// Registered once at `CREATE MATERIALIZED VIEW` time. Each `scan()` reads
+/// the latest results from the shared `MvStore`.
+pub(crate) struct MvTableProvider {
+    mv_name: String,
+    schema: SchemaRef,
+    mv_store: Arc<parking_lot::RwLock<MvStore>>,
+}
+
+impl MvTableProvider {
+    /// Create a new provider for the given materialized view.
+    pub fn new(
+        mv_name: String,
+        schema: SchemaRef,
+        mv_store: Arc<parking_lot::RwLock<MvStore>>,
+    ) -> Self {
+        Self {
+            mv_name,
+            schema,
+            mv_store,
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for MvTableProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::View
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        let batch = self
+            .mv_store
+            .read()
+            .to_record_batch(&self.mv_name)
+            .unwrap_or_else(|| arrow::array::RecordBatch::new_empty(self.schema.clone()));
+
+        let schema = batch.schema();
+        let data = if batch.num_rows() > 0 {
+            vec![vec![batch]]
+        } else {
+            vec![vec![]]
+        };
+
+        let mem_table = datafusion::datasource::MemTable::try_new(schema, data)?;
+        mem_table.scan(state, projection, filters, limit).await
+    }
+}
+
+impl std::fmt::Debug for MvTableProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MvTableProvider")
+            .field("mv_name", &self.mv_name)
+            .field("schema", &self.schema)
             .finish_non_exhaustive()
     }
 }

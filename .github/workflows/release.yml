@@ -72,29 +72,24 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             cross: true
-            # Cross builds: skip hwloc (needs target-arch libhwloc);
-            # io-uring is pure syscalls so cross-compiles fine;
             # vendored-openssl compiles OpenSSL from source for the target triple
-            features: --features "io-uring,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket,vendored-openssl"
+            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket,vendored-openssl"
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: true
             # vendored-openssl: musl has no system libssl-dev; compile from source
-            features: --features "io-uring,kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket,vendored-openssl"
+            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket,vendored-openssl"
           - os: macos-15  # ARM64
             target: aarch64-apple-darwin
             cross: false
-            # macOS: skip Linux-only features (hwloc, io-uring)
             features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
           - os: macos-15  # Cross-compile Intel from ARM64 (macos-13 deprecated)
             target: x86_64-apple-darwin
             cross: false
-            # macOS: skip Linux-only features (hwloc, io-uring)
             features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             cross: false
-            # Windows: skip Linux-only features (hwloc, io-uring)
             features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
     steps:
       - uses: actions/checkout@v6
@@ -135,7 +130,7 @@ jobs:
 
       - name: Install system dependencies (Linux native)
         if: runner.os == 'Linux' && !matrix.cross
-        run: sudo apt-get update && sudo apt-get install -y libhwloc-dev libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
@@ -376,17 +371,6 @@ jobs:
 
       - name: Wait for index
         run: sleep 30
-
-      - name: Strip iceberg feature before publishing laminar-db
-        run: |
-          # The iceberg feature is a placeholder that aliases laminar-connectors/delta-lake.
-          # Real iceberg support is not yet implemented — strip it so cargo publish
-          # doesn't advertise a non-functional feature.
-          # Also strip from laminar-server (publish=false, but workspace resolution
-          # requires consistency).
-          for TOML in crates/laminar-db/Cargo.toml crates/laminar-server/Cargo.toml; do
-            perl -i -ne 'print unless /^iceberg\s*=/' "$TOML"
-          done
 
       - name: Publish laminar-db
         run: cargo publish -p laminar-db --registry crates-io --allow-dirty --no-verify

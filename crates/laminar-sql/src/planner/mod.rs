@@ -33,8 +33,8 @@ use crate::parser::{
     StreamingStatement, WindowFunction, WindowRewriter,
 };
 use crate::translator::{
-    AnalyticWindowConfig, DagExplainOutput, HavingFilterConfig, JoinOperatorConfig,
-    OrderOperatorConfig, WindowFrameConfig, WindowOperatorConfig,
+    AnalyticWindowConfig, HavingFilterConfig, JoinOperatorConfig, OrderOperatorConfig,
+    WindowFrameConfig, WindowOperatorConfig,
 };
 
 /// Information about a registered lookup table.
@@ -101,9 +101,6 @@ pub enum StreamingPlan {
 
     /// Standard SQL statement (pass-through to DataFusion)
     Standard(Box<Statement>),
-
-    /// DAG topology explanation (from EXPLAIN DAG)
-    DagExplain(DagExplainOutput),
 
     /// Lookup table registration (DDL)
     RegisterLookupTable(LookupTableInfo),
@@ -575,18 +572,11 @@ impl StreamingPlanner {
         self.lookup_tables.clone()
     }
 
-    /// Creates a `DataFusion` logical plan from a query plan.
-    ///
-    /// Converts the query plan's SQL statement into a `DataFusion`
-    /// `LogicalPlan` using the session context's state. Window UDFs
-    /// (TUMBLE, HOP, SESSION) must be registered on the context via
+    /// Converts a query plan's SQL statement into a `DataFusion`
+    /// `LogicalPlan`. Window UDFs (TUMBLE, HOP, SESSION) must be registered
+    /// on `ctx` via
     /// [`register_streaming_functions`](crate::datafusion::register_streaming_functions)
     /// for windowed queries to resolve correctly.
-    ///
-    /// # Arguments
-    ///
-    /// * `plan` - The streaming query plan containing the SQL statement
-    /// * `ctx` - `DataFusion` session context with registered UDFs
     ///
     /// # Errors
     ///

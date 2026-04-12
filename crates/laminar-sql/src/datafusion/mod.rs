@@ -1,72 +1,5 @@
-//! `DataFusion` integration for SQL processing
-//!
-//! This module provides the integration layer between `LaminarDB`'s push-based
-//! streaming engine and `DataFusion`'s pull-based SQL query execution.
-//!
-//! # Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────────────────────────────────┐
-//! │                    Ring 2: Query Planning                        │
-//! │  SQL Query → SessionContext → LogicalPlan → ExecutionPlan       │
-//! │                                      │                          │
-//! │                            StreamingScanExec                    │
-//! │                                      │                          │
-//! │                              ┌───────▼──────┐                   │
-//! │                              │ StreamBridge │ (tokio channel)   │
-//! │                              └───────▲──────┘                   │
-//! ├──────────────────────────────────────┼──────────────────────────┤
-//! │                    Ring 0: Hot Path   │                          │
-//! │                                      │                          │
-//! │  Source → Reactor.poll() ────────────┘                          │
-//! │              (Events with RecordBatch data)                     │
-//! └─────────────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! # Components
-//!
-//! - [`StreamSource`]: Trait for streaming data sources
-//! - [`StreamBridge`]: Channel-based push-to-pull bridge
-//! - [`StreamingScanExec`]: `DataFusion` execution plan for streaming scans
-//! - [`StreamingTableProvider`]: `DataFusion` table provider for streaming sources
-//! - [`ChannelStreamSource`]: Concrete source using channels
-//!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use laminar_sql::datafusion::{
-//!     create_streaming_context, ChannelStreamSource, StreamingTableProvider,
-//! };
-//! use std::sync::Arc;
-//!
-//! // Create a streaming context
-//! let ctx = create_streaming_context();
-//!
-//! // Create a channel source
-//! let schema = Arc::new(Schema::new(vec![
-//!     Field::new("id", DataType::Int64, false),
-//!     Field::new("value", DataType::Float64, true),
-//! ]));
-//! let source = Arc::new(ChannelStreamSource::new(schema));
-//! let sender = source.sender();
-//!
-//! // Register as a table
-//! let provider = StreamingTableProvider::new("events", source);
-//! ctx.register_table("events", Arc::new(provider))?;
-//!
-//! // Push data from the Reactor
-//! sender.send(batch).await?;
-//!
-//! // Execute SQL queries
-//! let df = ctx.sql("SELECT * FROM events WHERE value > 100").await?;
-//! ```
+//! DataFusion integration for SQL processing.
 
-/// DataFusion aggregate bridge for streaming aggregation.
-///
-/// Bridges DataFusion's `Accumulator` trait with `laminar-core`'s
-/// `DynAccumulator` / `DynAggregatorFactory` traits. This avoids
-/// duplicating aggregation logic.
-pub mod aggregate_bridge;
 mod bridge;
 mod channel_source;
 /// Lambda higher-order functions for arrays and maps (F-SCHEMA-015 Tier 3)
@@ -90,6 +23,8 @@ pub mod json_types;
 pub mod json_udaf;
 /// PostgreSQL-compatible JSON scalar UDFs
 pub mod json_udf;
+/// Live source provider for streaming execution with plan caching
+pub mod live_source;
 /// Lookup join plan node for DataFusion.
 pub mod lookup_join;
 /// Physical execution plan and extension planner for lookup joins.
@@ -105,10 +40,6 @@ pub mod watermark_udf;
 /// Window function UDFs (TUMBLE, HOP, SESSION, CUMULATE)
 pub mod window_udf;
 
-pub use aggregate_bridge::{
-    create_aggregate_factory, lookup_aggregate_udf, result_to_scalar_value, scalar_value_to_result,
-    DataFusionAccumulatorAdapter, DataFusionAggregateFactory,
-};
 pub use bridge::{BridgeSendError, BridgeSender, BridgeStream, BridgeTrySendError, StreamBridge};
 pub use channel_source::ChannelStreamSource;
 pub use complex_type_lambda::{
@@ -137,6 +68,7 @@ pub use json_udf::{
     JsonbExistsAll, JsonbExistsAny, JsonbGet, JsonbGetIdx, JsonbGetPath, JsonbGetPathText,
     JsonbGetText, JsonbGetTextIdx, ToJsonb,
 };
+pub use live_source::{LiveSourceHandle, LiveSourceProvider};
 pub use lookup_join_exec::{
     LookupJoinExec, LookupJoinExtensionPlanner, LookupSnapshot, LookupTableRegistry,
     PartialLookupJoinExec, PartialLookupState, RegisteredLookup, VersionedLookupJoinExec,
@@ -168,6 +100,10 @@ use crate::planner::streaming_optimizer::{StreamingPhysicalValidator, StreamingV
 pub fn base_session_config() -> SessionConfig {
     let mut config = SessionConfig::new();
     config.options_mut().sql_parser.enable_ident_normalization = false;
+    // Single partition for streaming micro-batch execution. Multi-partition
+    // plans contain stateful operators (RepartitionExec) that cannot be
+    // reused across cycles, causing panics on cached physical plans.
+    config = config.with_target_partitions(1);
     config
 }
 
@@ -215,9 +151,7 @@ pub fn create_streaming_context() -> SessionContext {
 /// (no plan-time validation).
 #[must_use]
 pub fn create_streaming_context_with_validator(mode: StreamingValidatorMode) -> SessionContext {
-    let config = base_session_config()
-        .with_batch_size(8192)
-        .with_target_partitions(1); // Single partition for streaming
+    let config = base_session_config().with_batch_size(8192);
 
     let ctx = if matches!(mode, StreamingValidatorMode::Off) {
         SessionContext::new_with_config(config)

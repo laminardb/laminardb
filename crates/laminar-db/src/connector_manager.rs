@@ -10,89 +10,55 @@ use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::reference::RefreshMode;
 
 use crate::error::DbError;
-use crate::table_cache_mode::TableCacheMode;
 
-/// Registration of a source from DDL.
 #[derive(Debug, Clone)]
 pub(crate) struct SourceRegistration {
-    /// Source name.
     pub name: String,
-    /// Connector type (e.g., "KAFKA", "POSTGRES").
     pub connector_type: Option<String>,
-    /// Connector-specific options (e.g., topic, bootstrap.servers).
     pub connector_options: HashMap<String, String>,
-    /// Format type (e.g., "JSON", "AVRO").
     pub format: Option<String>,
-    /// Format-specific options.
     pub format_options: HashMap<String, String>,
 }
 
-/// Registration of a sink from DDL.
 #[derive(Debug, Clone)]
 pub(crate) struct SinkRegistration {
-    /// Sink name.
     pub name: String,
-    /// Input source or stream name (used for schema lookup and routing).
+    /// Input source or stream name (schema lookup + routing).
     pub input: String,
-    /// Connector type (e.g., "KAFKA", "POSTGRES").
     pub connector_type: Option<String>,
-    /// Connector-specific options.
     pub connector_options: HashMap<String, String>,
-    /// Format type (e.g., "JSON", "AVRO").
     pub format: Option<String>,
-    /// Format-specific options.
     pub format_options: HashMap<String, String>,
-    /// Optional WHERE filter expression as SQL text.
+    /// WHERE filter expression as SQL text.
     pub filter_expr: Option<String>,
 }
 
-/// Registration of a stream from DDL.
 #[derive(Debug, Clone)]
 pub(crate) struct StreamRegistration {
-    /// Stream name.
     pub name: String,
-    /// SQL query that defines the stream.
     pub query_sql: String,
-    /// EMIT clause from the planner (e.g., `OnWindowClose`, `Final`).
     pub emit_clause: Option<laminar_sql::parser::EmitClause>,
-    /// Window configuration from the planner (window type, size, gap, etc.).
     pub window_config: Option<laminar_sql::translator::WindowOperatorConfig>,
-    /// ORDER BY configuration from the planner (Top-K, `PerGroupTopK`, etc.).
     pub order_config: Option<laminar_sql::translator::OrderOperatorConfig>,
 }
 
-/// Registration of a reference/dimension table from DDL.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields populated from DDL, read when connector support lands
 pub(crate) struct TableRegistration {
-    /// Table name.
     pub name: String,
-    /// Primary key column name.
     pub primary_key: String,
-    /// Connector type backing this table (e.g., "kafka" for compacted topics).
     pub connector_type: Option<String>,
-    /// Connector-specific options.
     pub connector_options: HashMap<String, String>,
-    /// Format type (e.g., "JSON", "AVRO").
     pub format: Option<String>,
-    /// Format-specific options.
     pub format_options: HashMap<String, String>,
-    /// How the table should be refreshed from the connector.
     pub refresh: Option<RefreshMode>,
-    /// Cache mode for this table (Full, Partial, or None).
-    pub cache_mode: Option<TableCacheMode>,
-    /// Override for maximum LRU cache entries (used with Partial mode).
     pub cache_max_entries: Option<usize>,
-    /// Storage backend: `None` for in-memory tables.
-    pub storage: Option<String>,
 }
 
-/// Normalize a connector type to the canonical registry form (lowercase, hyphens).
+/// Lowercase + replace underscores with hyphens.
 pub(crate) fn normalize_connector_type(raw: &str) -> String {
     raw.to_lowercase().replace('_', "-")
 }
 
-/// Map SQL-friendly option names to connector-native names.
 fn normalize_option_key(key: &str) -> String {
     match key {
         "brokers" => "bootstrap.servers".to_string(),
@@ -102,102 +68,70 @@ fn normalize_option_key(key: &str) -> String {
     }
 }
 
+/// Build a `ConnectorConfig` from any registration that has connector fields.
+fn build_connector_config(
+    kind: &str,
+    name: &str,
+    connector_type: Option<&str>,
+    connector_options: &HashMap<String, String>,
+    format: Option<&str>,
+    format_options: &HashMap<String, String>,
+) -> Result<ConnectorConfig, DbError> {
+    let ct = connector_type
+        .ok_or_else(|| DbError::Connector(format!("{kind} '{name}' has no connector type")))?;
+    let mut config = ConnectorConfig::new(normalize_connector_type(ct));
+    for (k, v) in connector_options {
+        config.set(normalize_option_key(k), v.clone());
+    }
+    if let Some(fmt_str) = format {
+        let lower = fmt_str.to_lowercase();
+        laminar_connectors::serde::Format::parse(&lower).map_err(|e| {
+            DbError::Connector(format!(
+                "Invalid format '{fmt_str}' for {kind} '{name}': {e}"
+            ))
+        })?;
+        config.set("format".to_string(), lower);
+    }
+    for (k, v) in format_options {
+        config.set(format!("format.{k}"), v.clone());
+    }
+    Ok(config)
+}
+
 pub(crate) fn build_source_config(reg: &SourceRegistration) -> Result<ConnectorConfig, DbError> {
-    let connector_type = reg.connector_type.as_deref().ok_or_else(|| {
-        DbError::Connector(format!("Source '{}' has no connector type", reg.name))
-    })?;
-
-    let mut config = ConnectorConfig::new(normalize_connector_type(connector_type));
-    for (k, v) in &reg.connector_options {
-        config.set(normalize_option_key(k), v.clone());
-    }
-
-    if let Some(ref fmt_str) = reg.format {
-        laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase()).map_err(|e| {
-            DbError::Connector(format!(
-                "Invalid format '{}' for source '{}': {e}",
-                fmt_str, reg.name,
-            ))
-        })?;
-        config.set("format".to_string(), fmt_str.to_lowercase());
-    }
-
-    for (k, v) in &reg.format_options {
-        config.set(format!("format.{k}"), v.clone());
-    }
-
-    Ok(config)
+    build_connector_config(
+        "Source",
+        &reg.name,
+        reg.connector_type.as_deref(),
+        &reg.connector_options,
+        reg.format.as_deref(),
+        &reg.format_options,
+    )
 }
 
-/// Build a [`ConnectorConfig`] from a [`SinkRegistration`].
-///
-/// Same normalization and validation as [`build_source_config`].
 pub(crate) fn build_sink_config(reg: &SinkRegistration) -> Result<ConnectorConfig, DbError> {
-    let connector_type = reg
-        .connector_type
-        .as_deref()
-        .ok_or_else(|| DbError::Connector(format!("Sink '{}' has no connector type", reg.name)))?;
-
-    let mut config = ConnectorConfig::new(normalize_connector_type(connector_type));
-    for (k, v) in &reg.connector_options {
-        config.set(normalize_option_key(k), v.clone());
-    }
-
-    if let Some(ref fmt_str) = reg.format {
-        laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase()).map_err(|e| {
-            DbError::Connector(format!(
-                "Invalid format '{}' for sink '{}': {e}",
-                fmt_str, reg.name,
-            ))
-        })?;
-        config.set("format".to_string(), fmt_str.to_lowercase());
-    }
-
-    for (k, v) in &reg.format_options {
-        config.set(format!("format.{k}"), v.clone());
-    }
-
-    Ok(config)
+    build_connector_config(
+        "Sink",
+        &reg.name,
+        reg.connector_type.as_deref(),
+        &reg.connector_options,
+        reg.format.as_deref(),
+        &reg.format_options,
+    )
 }
 
-/// Build a [`ConnectorConfig`] from a [`TableRegistration`].
-///
-/// Same normalization and validation as [`build_source_config`].
 pub(crate) fn build_table_config(reg: &TableRegistration) -> Result<ConnectorConfig, DbError> {
-    let connector_type = reg
-        .connector_type
-        .as_deref()
-        .ok_or_else(|| DbError::Connector(format!("Table '{}' has no connector type", reg.name)))?;
-
-    let mut config = ConnectorConfig::new(normalize_connector_type(connector_type));
-    for (k, v) in &reg.connector_options {
-        config.set(normalize_option_key(k), v.clone());
-    }
-
-    if let Some(ref fmt_str) = reg.format {
-        laminar_connectors::serde::Format::parse(&fmt_str.to_lowercase()).map_err(|e| {
-            DbError::Connector(format!(
-                "Invalid format '{}' for table '{}': {e}",
-                fmt_str, reg.name,
-            ))
-        })?;
-        config.set("format".to_string(), fmt_str.to_lowercase());
-    }
-
-    for (k, v) in &reg.format_options {
-        config.set(format!("format.{k}"), v.clone());
-    }
-
-    Ok(config)
+    build_connector_config(
+        "Table",
+        &reg.name,
+        reg.connector_type.as_deref(),
+        &reg.connector_options,
+        reg.format.as_deref(),
+        &reg.format_options,
+    )
 }
 
-/// Parse a refresh mode string from DDL `WITH (refresh = '...')`.
-///
-/// Supported values:
-/// - `"snapshot_only"` / `"snapshot"` → `RefreshMode::SnapshotOnly`
-/// - `"cdc"` / `"snapshot_plus_cdc"` → `RefreshMode::SnapshotPlusCdc`
-/// - `"periodic:<seconds>"` → `RefreshMode::Periodic { interval }`
-/// - `"manual"` → `RefreshMode::Manual`
+/// Parse DDL `WITH (refresh = '...')` into a `RefreshMode`.
 pub(crate) fn parse_refresh_mode(s: &str) -> Result<RefreshMode, DbError> {
     let lower = s.to_lowercase();
     match lower.as_str() {
@@ -221,21 +155,18 @@ pub(crate) fn parse_refresh_mode(s: &str) -> Result<RefreshMode, DbError> {
     }
 }
 
-/// Manages connector registrations from SQL DDL.
-///
-/// Accumulates source, sink, and stream registrations during the DDL phase,
-/// then constructs the runtime pipeline when `build()` is called.
+/// Accumulates DDL registrations; pipeline lifecycle reads them at start.
 pub struct ConnectorManager {
     sources: HashMap<String, SourceRegistration>,
     sinks: HashMap<String, SinkRegistration>,
     streams: HashMap<String, StreamRegistration>,
     tables: HashMap<String, TableRegistration>,
-    /// Original DDL text for SHOW CREATE statements, keyed by object name.
+    /// Original DDL text for SHOW CREATE, keyed by object name.
     ddl_store: HashMap<String, String>,
 }
 
 impl ConnectorManager {
-    /// Create a new empty connector manager.
+    /// Create an empty manager.
     pub fn new() -> Self {
         Self {
             sources: HashMap::new(),
@@ -246,79 +177,79 @@ impl ConnectorManager {
         }
     }
 
-    /// Store original DDL text for an object.
+    /// Store DDL text for SHOW CREATE.
     pub fn store_ddl(&mut self, name: &str, ddl: &str) {
         self.ddl_store.insert(name.to_string(), ddl.to_string());
     }
 
-    /// Retrieve stored DDL text for an object.
+    /// Retrieve stored DDL text.
     pub fn get_ddl(&self, name: &str) -> Option<&str> {
         self.ddl_store.get(name).map(String::as_str)
     }
 
-    /// Register a source from DDL.
+    /// Register a source.
     pub fn register_source(&mut self, reg: SourceRegistration) {
         self.sources.insert(reg.name.clone(), reg);
     }
 
-    /// Register a sink from DDL.
+    /// Register a sink.
     pub fn register_sink(&mut self, reg: SinkRegistration) {
         self.sinks.insert(reg.name.clone(), reg);
     }
 
-    /// Register a stream from DDL.
+    /// Register a stream.
     pub fn register_stream(&mut self, reg: StreamRegistration) {
         self.streams.insert(reg.name.clone(), reg);
     }
 
-    /// Remove a source registration.
+    /// Returns `true` if it existed.
     pub fn unregister_source(&mut self, name: &str) -> bool {
         self.sources.remove(name).is_some()
     }
 
-    /// Remove a sink registration.
+    /// Returns `true` if it existed.
     pub fn unregister_sink(&mut self, name: &str) -> bool {
         self.sinks.remove(name).is_some()
     }
 
-    /// Remove a stream registration.
+    /// Returns `true` if it existed.
     pub fn unregister_stream(&mut self, name: &str) -> bool {
         self.streams.remove(name).is_some()
     }
 
-    /// Register a reference table from DDL.
+    /// Register a reference/dimension table.
     pub fn register_table(&mut self, reg: TableRegistration) {
         self.tables.insert(reg.name.clone(), reg);
     }
 
-    /// Remove a table registration.
+    /// Returns `true` if it existed.
     pub fn unregister_table(&mut self, name: &str) -> bool {
         self.tables.remove(name).is_some()
     }
 
-    /// Get all table registrations.
+    /// All table registrations.
     pub fn tables(&self) -> &HashMap<String, TableRegistration> {
         &self.tables
     }
 
-    /// Check if a connector type requires external runtime (e.g., Kafka).
+    /// True if any registration has a non-`None` connector type.
     pub fn has_external_connectors(&self) -> bool {
         self.sources.values().any(|s| s.connector_type.is_some())
             || self.sinks.values().any(|s| s.connector_type.is_some())
             || self.tables.values().any(|t| t.connector_type.is_some())
     }
 
-    /// Get all source registrations.
+    /// All source registrations.
     pub fn sources(&self) -> &HashMap<String, SourceRegistration> {
         &self.sources
     }
 
-    /// Get all sink registrations.
+    /// All sink registrations.
     pub fn sinks(&self) -> &HashMap<String, SinkRegistration> {
         &self.sinks
     }
 
-    /// Get all stream registrations.
+    /// All stream registrations.
     pub fn streams(&self) -> &HashMap<String, StreamRegistration> {
         &self.streams
     }
@@ -588,8 +519,6 @@ mod tests {
         assert_eq!(mgr.registration_count(), 0);
     }
 
-    // ── Table registration tests ──
-
     #[test]
     fn test_register_table() {
         let mut mgr = ConnectorManager::new();
@@ -601,9 +530,7 @@ mod tests {
             format: Some("JSON".to_string()),
             format_options: HashMap::new(),
             refresh: None,
-            cache_mode: None,
             cache_max_entries: None,
-            storage: None,
         });
         assert_eq!(mgr.table_names().len(), 1);
         assert!(mgr.has_external_connectors());
@@ -620,9 +547,7 @@ mod tests {
             format: None,
             format_options: HashMap::new(),
             refresh: None,
-            cache_mode: None,
             cache_max_entries: None,
-            storage: None,
         });
         assert!(mgr.unregister_table("t"));
         assert!(!mgr.unregister_table("t"));
@@ -640,16 +565,12 @@ mod tests {
             format: None,
             format_options: HashMap::new(),
             refresh: None,
-            cache_mode: None,
             cache_max_entries: None,
-            storage: None,
         });
         assert_eq!(mgr.registration_count(), 1);
         mgr.clear();
         assert_eq!(mgr.registration_count(), 0);
     }
-
-    // ── build_source_config / build_sink_config tests ──
 
     #[test]
     fn test_build_source_config_valid() {
@@ -778,8 +699,6 @@ mod tests {
         }
     }
 
-    // ── build_table_config tests ──
-
     #[test]
     fn test_build_table_config_valid() {
         let reg = TableRegistration {
@@ -790,9 +709,7 @@ mod tests {
             format: Some("JSON".to_string()),
             format_options: HashMap::new(),
             refresh: None,
-            cache_mode: None,
             cache_max_entries: None,
-            storage: None,
         };
         let config = build_table_config(&reg).unwrap();
         assert_eq!(config.connector_type(), "kafka");
@@ -810,15 +727,11 @@ mod tests {
             format: None,
             format_options: HashMap::new(),
             refresh: None,
-            cache_mode: None,
             cache_max_entries: None,
-            storage: None,
         };
         let err = build_table_config(&reg).unwrap_err();
         assert!(err.to_string().contains("no connector type"));
     }
-
-    // ── parse_refresh_mode tests ──
 
     #[test]
     fn test_parse_refresh_mode_variants() {
@@ -860,8 +773,6 @@ mod tests {
         assert!(parse_refresh_mode("bogus").is_err());
         assert!(parse_refresh_mode("periodic:abc").is_err());
     }
-
-    // ── normalize_connector_type tests ──
 
     #[test]
     fn test_normalize_connector_type_variants() {

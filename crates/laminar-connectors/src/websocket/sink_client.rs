@@ -4,6 +4,7 @@
 //! WebSocket server by connecting as a client.
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
@@ -294,7 +295,7 @@ impl SinkConnector for WebSocketSinkClient {
     }
 
     fn capabilities(&self) -> SinkConnectorCapabilities {
-        SinkConnectorCapabilities::default()
+        SinkConnectorCapabilities::new(Duration::from_secs(10))
     }
 
     async fn begin_epoch(&mut self, epoch: u64) -> Result<(), ConnectorError> {

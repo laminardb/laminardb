@@ -1,41 +1,4 @@
-//! MongoDB source and sink connectors.
-//!
-//! Provides a CDC source connector that streams change events from MongoDB
-//! change streams, and a sink connector that writes to MongoDB collections
-//! (including time series).
-//!
-//! # Architecture
-//!
-//! ```text
-//! Ring 0 (Hot Path):  SPSC pop/push only (~5ns, zero MongoDB code)
-//! Ring 1 (Background): Change stream consumption / batch writes
-//! Ring 2 (Control):    Connection management, collection validation
-//! ```
-//!
-//! # Module Structure
-//!
-//! - `config` — Source and sink configuration
-//! - `change_event` — Change event types and operation mapping
-//! - `resume_token` — Resume token persistence (file, MongoDB, in-memory)
-//! - `large_event` — Split large event fragment reassembly
-//! - `write_model` — Write mode enum and time series validation
-//! - `timeseries` — Time series collection configuration
-//! - `metrics` — Lock-free atomic CDC and sink metrics
-//! - `source` — `MongoDbCdcSource` implementing `SourceConnector`
-//! - `sink` — `MongoDbSink` implementing `SinkConnector`
-//!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use laminar_connectors::mongodb::{MongoDbCdcSource, MongoDbSourceConfig};
-//!
-//! let config = MongoDbSourceConfig::new(
-//!     "mongodb://localhost:27017",
-//!     "mydb",
-//!     "users",
-//! );
-//! let source = MongoDbCdcSource::new(config);
-//! ```
+//! `MongoDB` CDC source and sink connectors.
 
 pub mod change_event;
 pub mod config;
@@ -69,7 +32,7 @@ use crate::config::{ConfigKeySpec, ConnectorInfo};
 use crate::registry::ConnectorRegistry;
 
 /// Registers the `MongoDB` CDC source connector with the given registry.
-pub fn register_mongodb_cdc(registry: &ConnectorRegistry) {
+pub fn register_mongodb_cdc_source(registry: &ConnectorRegistry) {
     let info = ConnectorInfo {
         name: "mongodb-cdc".to_string(),
         display_name: "MongoDB CDC Source".to_string(),
@@ -158,9 +121,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_register_mongodb_cdc() {
+    fn test_register_mongodb_cdc_source() {
         let registry = ConnectorRegistry::new();
-        register_mongodb_cdc(&registry);
+        register_mongodb_cdc_source(&registry);
 
         let info = registry.source_info("mongodb-cdc");
         assert!(info.is_some());
@@ -214,7 +177,7 @@ mod tests {
     #[test]
     fn test_factory_creates_source() {
         let registry = ConnectorRegistry::new();
-        register_mongodb_cdc(&registry);
+        register_mongodb_cdc_source(&registry);
 
         let config = crate::config::ConnectorConfig::new("mongodb-cdc");
         let source = registry.create_source(&config);

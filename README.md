@@ -17,7 +17,7 @@ Stream processing today means running a JVM cluster (Flink), paying for a manage
 
 ```toml
 [dependencies]
-laminar-db = "0.18"
+laminar-db = "0.20"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         symbol VARCHAR NOT NULL,
         price DOUBLE NOT NULL,
         volume BIGINT NOT NULL,
-        ts BIGINT NOT NULL,
+        ts TIMESTAMP NOT NULL,
         WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
     )").await?;
 
@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-This example compiles and runs against the `laminar-db` v0.18 public API. See [`examples/binance-ws`](examples/binance-ws) for a complete working demo that streams live Binance trades through 18 SQL pipeline stages with a TUI dashboard.
+This example compiles and runs against the `laminar-db` v0.20 public API. See [`examples/binance-ws`](examples/binance-ws) for a complete working demo that streams live Binance trades through 18 SQL pipeline stages with a TUI dashboard.
 
 ### Python
 
@@ -70,7 +70,7 @@ pip install laminardb
 import laminardb
 
 conn = laminardb.open(":memory:")
-conn.execute("CREATE SOURCE sensors (ts BIGINT, device VARCHAR, value DOUBLE)")
+conn.execute("CREATE SOURCE sensors (ts TIMESTAMP, device VARCHAR, value DOUBLE)")
 conn.insert("sensors", [
     {"ts": 1, "device": "sensor_a", "value": 42.0},
     {"ts": 2, "device": "sensor_b", "value": 43.5},
@@ -91,7 +91,7 @@ Three deployment modes:
 |------|-----|--------|
 | **Embedded** | `cargo add laminar-db` — runs inside your Rust process | ✅ Implemented |
 | **Standalone** | `laminardb` binary — TOML config, REST API, Prometheus metrics, hot-reload | ✅ Implemented |
-| **Distributed** | Multi-node via gossip discovery, Raft consensus, gRPC — `--features delta` | 📋 Planned (skeleton only; Phase 6c) |
+| **Distributed** | Multi-node via gossip discovery, Raft consensus, gRPC — `--features delta` | 🚧 Scaffolding only (Phase 6c production hardening in progress) |
 
 The embedded mode is the primary deployment target. You get a `LaminarDB` handle, register sources with SQL DDL, push `RecordBatch` data in, subscribe to output streams, and let the engine handle windowing, joins, checkpointing, and exactly-once delivery.
 
@@ -163,9 +163,12 @@ JOIN instruments i ON t.symbol = i.symbol;
 
 | Strategy | Behavior |
 |----------|----------|
+| `EMIT AFTER WATERMARK` / `EMIT ON WATERMARK` | Emit when the watermark advances past the window end |
 | `EMIT ON WINDOW CLOSE` | Emit once when the window closes |
+| `EMIT ON UPDATE` | Emit on every update (incremental) |
+| `EMIT EVERY INTERVAL 'N' UNIT` (or `EMIT PERIODICALLY INTERVAL 'N' UNIT`) | Emit on a fixed time interval |
 | `EMIT CHANGES` | Emit insert/retract pairs (Z-set changelog) on every update |
-| `EMIT FINAL` | Alias for ON WINDOW CLOSE |
+| `EMIT FINAL` | Emit the final result only |
 
 `EMIT CHANGES` produces `+1` insert and `-1` retraction pairs, enabling correct incremental computation and cascading materialized views.
 
@@ -173,12 +176,12 @@ JOIN instruments i ON t.symbol = i.symbol;
 
 ```sql
 CREATE SOURCE trades (
-    symbol VARCHAR, price DOUBLE, volume BIGINT, ts BIGINT,
+    symbol VARCHAR, price DOUBLE, volume BIGINT, ts TIMESTAMP,
     WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
 );
 ```
 
-Watermark types: per-partition, per-key, and alignment groups (synchronized across related sources for join correctness). Late data can be dropped or redirected to a side output.
+Watermark types: per-partition, per-key, and alignment groups (synchronized across related sources for join correctness). Late data can be dropped, tolerated with `ALLOW LATENESS INTERVAL 'N' UNIT`, or redirected to a side output with `LATE DATA TO <sink_name>`.
 
 ### DDL
 
@@ -211,12 +214,14 @@ Feature-gated connectors for external systems. Each implements `SourceConnector`
 | PostgreSQL CDC | `postgres-cdc` | Logical replication (pgoutput), Z-set changelog | ✅ |
 | MySQL CDC | `mysql-cdc` | Binlog replication, GTID position tracking | ✅ |
 | MongoDB CDC | `mongodb-cdc` | Change streams, resume token tracking | ✅ |
+| OpenTelemetry OTLP | `otel` | OTLP/gRPC receiver for traces, metrics, and logs | ✅ |
 | WebSocket Client | `websocket` | Connect to external WebSocket servers | ✅ |
 | WebSocket Server | `websocket` | Accept incoming WebSocket connections | ✅ |
 | Delta Lake | `delta-lake` | Read from Delta Lake tables, version polling | ✅ |
+| Iceberg | `iceberg` | Apache Iceberg table source (REST/Glue/Hive catalogs) | ✅ |
 | Files (AutoLoader) | `files` | Glob pattern discovery, watch mode, Parquet/CSV | ✅ |
 | Parquet Lookup | `parquet-lookup` | Read Parquet files as reference tables | ✅ |
-| Postgres Lookup | -- | Query external Postgres tables for enrichment | ✅ |
+| Postgres Lookup | `postgres-cdc` | Query external Postgres tables for enrichment | ✅ |
 
 ### Sinks
 
@@ -226,6 +231,7 @@ Feature-gated connectors for external systems. Each implements `SourceConnector`
 | PostgreSQL | `postgres-sink` | COPY BINARY, upsert, co-transactional exactly-once | ✅ |
 | MongoDB | `mongodb-cdc` | Ordered/unordered writes, upsert, CDC replay | ✅ |
 | Delta Lake | `delta-lake` | S3/Azure/GCS, epoch-aligned Parquet commits | ✅ |
+| Iceberg | `iceberg` | Apache Iceberg sink (REST/Glue/Hive catalogs) | ✅ |
 | WebSocket Server | `websocket` | Fan-out to connected subscribers | ✅ |
 | WebSocket Client | `websocket` | Push to external WebSocket server | ✅ |
 | Files | `files` | Parquet/CSV with timestamp/partition templates | ✅ |
@@ -236,7 +242,7 @@ Cloud storage backends for Delta Lake: S3 (`delta-lake-s3`), Azure ADLS (`delta-
 
 ```sql
 CREATE SOURCE trades (
-    symbol VARCHAR, price DOUBLE, volume BIGINT, ts BIGINT,
+    symbol VARCHAR, price DOUBLE, volume BIGINT, ts TIMESTAMP,
     WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
 ) FROM KAFKA (
     brokers = '${KAFKA_BROKERS}',
@@ -264,51 +270,53 @@ Custom connectors can be built by implementing the `SourceConnector` or `SinkCon
 ```text
 ┌──────────────────────────────────────────────────────────────┐
 │                     SOURCE CONNECTORS                        │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐                  │
-│  │ Kafka    │  │ Postgres │  │  File    │  tokio tasks      │
-│  │ Source   │  │ CDC      │  │ Source   │                   │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘                  │
-│       │ mpsc         │ mpsc        │ mpsc                    │
-│       └──────┬───────┘─────────────┘                         │
-│              ▼                                                │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                   │
+│  │  Kafka   │  │ Postgres │  │   File   │  tokio tasks      │
+│  │  Source  │  │   CDC    │  │  Source  │  (main runtime)   │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘                   │
+│       │              │              │                        │
+│       └──── tokio::sync::mpsc ──────┘                         │
+│                      ▼                                        │
 ├──────────────────────────────────────────────────────────────┤
-│                  STREAMING COORDINATOR                        │
-│  Single tokio task: SQL cycles, compiled projections,         │
-│  cached logical plans, checkpoint barriers                    │
+│              STREAMING COORDINATOR                            │
+│  Single tokio task on dedicated `laminar-compute` thread:     │
+│  SQL cycles, compiled projections, cached logical plans,     │
+│  barrier injection and alignment                              │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐    │
 │  │ Compiled │→ │ Operators│→ │  State   │→ │  Sink    │    │
-│  │Projection│  │ (window, │  │  Store   │  │ Writers  │    │
-│  │/ Cached  │  │  join,   │  │ (ahash/  │  │          │    │
-│  │  Plans   │  │  filter) │  │  foyer)  │  │          │    │
+│  │Projection│  │ (window, │  │ (per-grp │  │ Writers  │    │
+│  │/ Cached  │  │  join,   │  │ FxHashMap│  │          │    │
+│  │  Plans   │  │  filter) │  │ / foyer) │  │          │    │
 │  └──────────┘  └──────────┘  └──────────┘  └──────────┘    │
 ├──────────────────────────────────────────────────────────────┤
 │                     BACKGROUND I/O                            │
-│  Tokio async runtime, bounded latency impact                  │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐    │
-│  │Checkpoint│  │   WAL    │  │Changelog │  │  Timer   │    │
-│  │ Manager  │  │  Writer  │  │ Drainer  │  │  Wheel   │    │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────┘    │
+│  Main tokio runtime, runs alongside source/sink tasks         │
+│  ┌──────────────┐  ┌──────────────┐                          │
+│  │  Checkpoint  │  │   Sink I/O   │                          │
+│  │ Coordinator  │  │ (Kafka/Delta │                          │
+│  │  (2PC, store)│  │  /Postgres…) │                          │
+│  └──────────────┘  └──────────────┘                          │
 ├──────────────────────────────────────────────────────────────┤
 │                      CONTROL PLANE                            │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐                  │
-│  │  Admin   │  │ Metrics  │  │  Config  │                  │
-│  │   API    │  │  Export  │  │ Manager  │                  │
-│  └──────────┘  └──────────┘  └──────────┘                  │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐                   │
+│  │  Admin   │  │ Metrics  │  │  Config  │                   │
+│  │   API    │  │  Export  │  │ Manager  │                   │
+│  └──────────┘  └──────────┘  └──────────┘                   │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **Streaming coordinator** — Single tokio task driving SQL execution cycles. Source connectors push batches via mpsc channels; the coordinator runs compiled projections / cached logical plans, routes results to sinks, and manages checkpoint barriers. Sub-microsecond for compiled single-source projections; microseconds for incremental aggregations and cached-plan queries; DataFusion fallback for complex queries.
-- **Background I/O** — Tokio async runtime handling WAL writes, checkpointing, connector I/O, and changelog draining.
+- **Streaming coordinator** — Single tokio task on a dedicated single-threaded runtime (the `laminar-compute` thread), isolating CPU-bound event processing from I/O tasks on the main runtime. Source connectors push batches via `tokio::sync::mpsc` channels; the coordinator runs compiled projections / cached logical plans, routes results to sinks, and manages checkpoint barriers. Sub-microsecond for compiled single-source projections; microseconds for incremental aggregations and cached-plan queries; DataFusion fallback for complex queries.
+- **Background I/O** — Source connectors, sink writers, and the checkpoint coordinator all run on the main tokio work-stealing runtime.
 - **Admin** — HTTP REST API (Axum), Prometheus metrics, ad-hoc SQL, hot-reload, checkpoint triggers. Auth is planned (Phase 4).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 
 ### Checkpointing and Recovery
 
-1. **WAL** — Write-ahead log segments with CRC32C checksums and torn write detection
-2. **Coordinated Snapshots** — Barrier-based checkpoint protocol: coordinator injects barriers into all sources; operators with multiple inputs align barriers before snapshotting
-3. **Two-Phase Commit** — Sinks participate in pre-commit/commit phases for exactly-once delivery
-4. **Recovery** — `RecoveryManager` restores from the latest checkpoint manifest, replays WAL, resumes connectors from committed offsets
+1. **Coordinated Snapshots** — Barrier-based (Chandy-Lamport) checkpoint protocol: the coordinator injects barriers into all sources; operators with multiple inputs align barriers before snapshotting
+2. **Two-Phase Commit** — Exactly-once sinks participate in pre-commit/commit phases, coordinated by `CheckpointCoordinator`
+3. **Atomic Manifest** — Each checkpoint writes a JSON manifest (with operator state and connector offsets) via temp-file-plus-rename to filesystem or object store (S3/GCS/Azure)
+4. **Recovery** — `RecoveryManager` loads the latest manifest, restores operator state, rolls back exactly-once sinks, and resumes connectors from committed offsets
 
 ```rust
 // Note: StreamCheckpointConfig is from laminar-core (add as a dependency)
@@ -332,18 +340,20 @@ Non-aggregate single-source queries are compiled to `PhysicalExpr` projections o
 
 ## Benchmarks
 
-Benchmark suites are in `crates/laminar-core/benches/`, `crates/laminar-storage/benches/`, and `crates/laminar-db/benches/` (14 total, using Criterion):
+Benchmark suites live under `crates/laminar-core/benches/`, `crates/laminar-db/benches/`, and `crates/laminar-connectors/benches/` (all using Criterion):
 
-| Metric | Target | Measured (mean) | Benchmark File |
-|--------|--------|-----------------|----------------|
-| State lookup | < 500ns | 10–105ns | `state_bench.rs` |
-| Throughput/core | 500K events/sec | 1.1–1.46M events/sec | `streaming_bench.rs` |
-| Event latency | < 10us | 0.55–1.16us | `latency_bench.rs` |
-| Checkpoint recovery | < 10s | 1.39ms | `checkpoint_bench.rs` |
+| Metric | Target | Benchmark File |
+|--------|--------|----------------|
+| Throughput/core | 500K events/sec | `crates/laminar-core/benches/streaming_bench.rs` |
+| Event latency | < 10us | `crates/laminar-core/benches/latency_bench.rs` |
+| Window operations | -- | `crates/laminar-core/benches/window_bench.rs` |
+| Lookup join | -- | `crates/laminar-core/benches/lookup_join_bench.rs` |
+| foyer cache | -- | `crates/laminar-core/benches/cache_bench.rs` |
+| Stream executor | -- | `crates/laminar-db/benches/stream_executor_bench.rs` |
+| Checkpoint recovery | < 10s | `crates/laminar-db/benches/recovery_bench.rs` |
+| MongoDB throughput | -- | `crates/laminar-connectors/benches/mongodb_throughput.rs` |
 
-These are Criterion mean latencies measured on development hardware (AMD Ryzen AI 7 350, see [BENCHMARKS.md](docs/BENCHMARKS.md)) against minimal operator chains (single tumbling window for latency, single state lookup for state bench). Real pipelines with multiple operators, joins, and state lookups will show higher latency. p99 under sustained load is not yet measured. Run `cargo bench` to measure on your own hardware.
-
-Additional benchmark suites: `window_bench`, `join_bench`, `lookup_join_bench`, `cache_bench`, `streaming_bench`, `subscription_bench`, `dag_bench`, `dag_stress`, `wal_bench`, `recovery_bench`.
+Historical mean latencies measured on an AMD Ryzen AI 7 350 development laptop (see [BENCHMARKS.md](docs/BENCHMARKS.md)) against minimal operator chains showed state lookups in the 10-105ns range, per-event latency of 0.55-1.16µs, and single-core throughput of 1.1-1.46M events/sec. Real pipelines with multiple operators, joins, and state lookups will show higher latency. p99 under sustained load is not yet measured. Run `cargo bench` to measure on your own hardware.
 
 ---
 
@@ -353,7 +363,7 @@ Additional benchmark suites: `window_bench`, `join_bench`, `lookup_join_bench`, 
 |----------|---------|--------|
 | **Rust** | [`laminar-db`](https://crates.io/crates/laminar-db) | Primary API |
 | **Python** | [`laminardb`](https://pypi.org/project/laminardb/) | Via [`laminardb-python`](https://github.com/laminardb/laminardb-python) (separate repo) |
-| **C/C++** | Via FFI (`--features ffi`) | ✅ Arrow C Data Interface, 78 exported functions |
+| **C/C++** | Via FFI (`--features ffi`) | ✅ Arrow C Data Interface, 50+ exported functions |
 | Java | `laminardb-java` | 📋 Planned |
 | Node.js | `@laminardb/node` | 📋 Planned |
 
@@ -388,22 +398,22 @@ Additional benchmark suites: `window_bench`, `join_bench`, `lookup_join_bench`, 
 
 ## Project Status
 
-**Version 0.18.12** — active development, pre-1.0. APIs may change between minor versions.
+**Version 0.20.1** — active development, pre-1.0. APIs may change between minor versions.
 
 | Phase | Description | Progress |
 |-------|-------------|----------|
 | Phase 1 | Core Engine | ✅ 12/12 |
 | Phase 1.5 | SQL Parser | ✅ 1/1 |
 | Phase 2 | Production Hardening | ✅ 38/38 |
-| Phase 2.5 | JIT Compiler | ❌ Removed |
-| Phase 3 | Connectors & Integration | 🔧 85/100 |
+| Phase 2.5 | JIT Compiler | ❌ Removed (replaced by compiled `PhysicalExpr` projections) |
+| Phase 3 | Connectors & Integration | 🔧 95/100 |
 | Phase 4 | Enterprise Security (Auth, RBAC) | 📋 Planned |
-| Phase 5 | Admin & Observability | 📋 Planned |
-| Phase 6a | Distributed Partition-Parallel | ✅ 27/29 (+2 superseded) |
-| Phase 6b | Distributed Foundation | ✅ 14/14 |
-| Phase 6c | Distributed Production Hardening | 📋 Planned |
+| Phase 5 | Admin & Observability | 🔧 4/10 |
+| Phase 6a | Partition-Parallel Embedded | ✅ 27/29 |
+| Phase 6b | Delta Foundation | ✅ 14/14 |
+| Phase 6c | Delta Production Hardening | 🔧 8/10 |
 
-Test coverage: 3,000+ tests (unit + integration). CI runs on Linux and Windows.
+Test coverage: ~2,700 tests across the workspace. CI runs on Linux and Windows.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the full phase timeline.
 
@@ -414,19 +424,20 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for the full phase timeline.
 | Flag | Description |
 |------|-------------|
 | `kafka` | Kafka source/sink, Avro serde, Schema Registry |
-| `postgres-cdc` | PostgreSQL CDC source via logical replication |
+| `postgres-cdc` | PostgreSQL CDC source via logical replication (also enables Postgres lookup) |
 | `postgres-sink` | PostgreSQL sink via COPY BINARY |
 | `mysql-cdc` | MySQL CDC source via binlog replication |
 | `mongodb-cdc` | MongoDB CDC source and sink |
 | `delta-lake` | Delta Lake source and sink |
-| `delta-lake-s3` / `delta-lake-azure` / `delta-lake-gcs` | Cloud storage backends |
+| `delta-lake-s3` / `delta-lake-azure` / `delta-lake-gcs` | Cloud storage backends for Delta Lake |
+| `delta-lake-unity` / `delta-lake-glue` | Databricks Unity / AWS Glue catalogs for Delta Lake |
+| `iceberg` | Apache Iceberg source and sink |
 | `websocket` | WebSocket source and sink connectors |
-| `files` | File source and sink (Parquet, CSV) |
-| `ffi` | C FFI with Arrow C Data Interface |
-| `delta` | Distributed mode (gossip, Raft, gRPC) |
+| `files` | File source (AutoLoader) and sink (rolling Parquet/CSV/JSON) |
+| `otel` | OpenTelemetry OTLP/gRPC source (traces, metrics, logs) |
 | `parquet-lookup` | Parquet lookup source for reference tables |
-| `allocation-tracking` | Panic on hot-path allocation (`laminar-core` only) |
-| `io-uring` | Linux 5.10+ io_uring integration |
+| `api` / `ffi` | C FFI layer with Arrow C Data Interface |
+| `delta` | Distributed mode scaffolding (gossip, Raft, gRPC) — not production-ready |
 
 ---
 
@@ -454,17 +465,19 @@ cargo run -p binance-ws
 
 ```text
 crates/
-  laminar-core/        Core engine: reactor, operators, state, windows, joins
-  laminar-sql/         SQL parser, DataFusion integration, streaming optimizer
-  laminar-storage/     WAL, checkpointing, per-core WAL, recovery
-  laminar-connectors/  Kafka, CDC, MongoDB, WebSocket, Delta Lake, files
-  laminar-db/          Unified database facade, checkpoint coordination, FFI
+  laminar-core/        Core engine: operators, windows, streaming channels, checkpoint barriers, error codes
+  laminar-sql/         SQL parser, planner, DataFusion integration, streaming optimizer, watermark pushdown
+  laminar-storage/     Checkpoint manifest and store (filesystem + object store)
+  laminar-connectors/  Kafka, CDC (PG/MySQL/Mongo), WebSocket, Files, Delta Lake, Iceberg, OTEL
+  laminar-db/          Unified database facade, StreamingCoordinator, checkpoint coordination, recovery, FFI
   laminar-derive/      Derive macros: Record, FromRecordBatch, FromRow, ConnectorConfig
   laminar-server/      Standalone server binary (HTTP API, Docker, Helm)
 examples/
   demo/                Market data TUI demo with Ratatui
   binance-ws/          Live Binance WebSocket streaming SQL demo
   microstructure/      Market microstructure analysis demo
+  claude-code-aiops/   OpenTelemetry ingest + streaming SQL dashboard
+  server-demo/         Standalone server walkthrough
 ```
 
 ---

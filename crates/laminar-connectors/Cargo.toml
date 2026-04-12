@@ -11,8 +11,7 @@ description = "External system connectors for LaminarDB - Kafka, CDC, lookup tab
 
 [dependencies]
 # Core dependencies
-laminar-core = { path = "../laminar-core", version = "0.18.10" }
-laminar-storage = { path = "../laminar-storage", version = "0.18.10" }
+laminar-core = { path = "../laminar-core", version = "0.20.1" }
 
 # Kafka
 rdkafka = { version = "0.39", features = ["cmake-build", "ssl-vendored"], optional = true }
@@ -50,6 +49,7 @@ foyer = { workspace = true }
 
 # Common
 tokio = { workspace = true }
+crossfire = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -61,7 +61,10 @@ rustc-hash = { workspace = true }
 # Arrow for RecordBatch
 arrow-array = { workspace = true }
 arrow-cast = { workspace = true }
+arrow-ipc = { workspace = true }
 arrow-row = { version = "57.2", optional = true }
+arrow-csv = { workspace = true }
+arrow-json = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 
@@ -83,11 +86,16 @@ tokio-tungstenite = { version = "0.28", features = ["native-tls"], optional = tr
 tungstenite = { version = "0.28", optional = true }
 futures-util = { version = "0.3", features = ["sink"], optional = true }
 
+# OpenTelemetry OTLP/gRPC receiver
+opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "trace", "metrics", "logs"], optional = true }
+tonic = { version = "0.14", optional = true }
+prost = { version = "0.14", optional = true }
+base64 = { workspace = true, optional = true }
+
 # File source/sink
 globset = { workspace = true, optional = true }
 notify = { workspace = true, optional = true }
-xorf = { workspace = true }
-base64 = { workspace = true }
+xorf = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 
 [features]
@@ -116,14 +124,17 @@ kafka-discovery = ["kafka", "laminar-core/delta", "dep:tokio-util"]
 # WebSocket source and sink
 websocket = ["dep:tokio-tungstenite", "dep:tungstenite", "dep:futures-util", "dep:url"]
 # File source and sink (AutoLoader-style)
-files = ["dep:notify", "dep:globset", "dep:object_store", "dep:parquet", "dep:libc", "dep:tokio-stream"]
+files = ["dep:notify", "dep:globset", "dep:object_store", "dep:parquet", "dep:libc", "dep:tokio-stream", "dep:xorf"]
+# OpenTelemetry OTLP/gRPC source
+otel = ["dep:opentelemetry-proto", "dep:tonic", "dep:prost", "dep:base64"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { workspace = true }
+wiremock = "0.6"
 
 [[bench]]
 name = "mongodb_throughput"

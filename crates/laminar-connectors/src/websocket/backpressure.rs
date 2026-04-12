@@ -28,8 +28,8 @@ pub enum WsBackpressure {
     Block,
     /// Drop oldest messages from bounded channel when full.
     ///
-    /// The channel evicts the oldest buffered message to make room for
-    /// each new arrival. Good for "latest value wins" use cases.
+    /// **Not yet implemented** -- falls back to `DropNewest` behavior
+    /// (incoming message silently discarded via `try_send`).
     DropOldest,
     /// Drop incoming message when channel full (don't enqueue).
     ///
@@ -38,18 +38,18 @@ pub enum WsBackpressure {
     DropNewest,
     /// Buffer up to `max_bytes`, then drop oldest.
     ///
-    /// An intermediate strategy: an additional byte-bounded buffer sits
-    /// in front of the channel. Once the buffer exceeds `max_bytes`, the
-    /// oldest buffered messages are evicted.
+    /// **Not yet implemented** -- falls back to `DropNewest` behavior
+    /// (incoming message silently discarded via `try_send`).
+    /// The `max_bytes` field is parsed from SQL WITH but currently ignored.
     Buffer {
         /// Maximum buffer size in bytes before eviction kicks in.
         max_bytes: usize,
     },
     /// Sample: keep every Nth message.
     ///
-    /// Under sustained backpressure, only every `rate`-th message is
-    /// forwarded. All others are dropped. Useful for high-frequency
-    /// telemetry where statistical sampling is acceptable.
+    /// **Not yet implemented** -- falls back to `DropNewest` behavior
+    /// (incoming message silently discarded via `try_send`).
+    /// The `rate` field is parsed from SQL WITH but currently ignored.
     Sample {
         /// Keep every Nth message (e.g., `rate = 10` keeps 10% of messages).
         rate: u32,

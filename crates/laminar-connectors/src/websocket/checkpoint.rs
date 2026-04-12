@@ -1,6 +1,6 @@
-//! WebSocket source checkpoint types.
+//! `WebSocket` source checkpoint types.
 //!
-//! WebSocket is non-replayable -- checkpoints capture state for best-effort recovery.
+//! `WebSocket` is non-replayable -- checkpoints capture state for best-effort recovery.
 //! On recovery, data gaps should be expected and logged.
 
 use serde::{Deserialize, Serialize};
@@ -35,15 +35,9 @@ pub struct WebSocketSourceCheckpoint {
 const CHECKPOINT_KEY: &str = "websocket_state";
 
 impl WebSocketSourceCheckpoint {
-    /// Serializes this checkpoint into a [`SourceCheckpoint`].
-    ///
-    /// The entire struct is stored as a JSON string under the key
-    /// `"websocket_state"` in the checkpoint's offsets map.
-    ///
-    /// # Arguments
-    ///
-    /// * `epoch` - The epoch number for the checkpoint.
-    ///
+    /// Serializes this checkpoint into a [`SourceCheckpoint`]. The entire
+    /// struct is stored as a JSON string under `"websocket_state"` in the
+    /// checkpoint's offsets map.
     #[must_use]
     pub fn to_source_checkpoint(&self, epoch: u64) -> SourceCheckpoint {
         let json = match serde_json::to_string(self) {

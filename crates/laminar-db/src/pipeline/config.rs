@@ -71,9 +71,10 @@ pub struct PipelineConfig {
     /// low-priority tasks (table polling) are skipped. Default: 5ms.
     pub background_budget_ns: u64,
 
-    /// Maximum time to wait for a single sink `write_batch` before dropping
-    /// the batch. Default: 30s (accommodates slow sinks like Delta Lake).
-    pub sink_write_timeout: Duration,
+    /// Maximum `RecordBatch`es buffered per operator input port. When
+    /// fan-out within a cycle would exceed this limit, the oldest batches
+    /// are shed and a warning is logged. `0` means unlimited. Default: 256.
+    pub max_input_buf_batches: usize,
 }
 
 impl Default for PipelineConfig {
@@ -90,7 +91,7 @@ impl Default for PipelineConfig {
             drain_budget_ns: 1_000_000,      // 1ms
             query_budget_ns: 8_000_000,      // 8ms
             background_budget_ns: 5_000_000, // 5ms
-            sink_write_timeout: Duration::from_secs(30),
+            max_input_buf_batches: 256,
         }
     }
 }

@@ -13,10 +13,9 @@ use tokio::sync::Notify;
 
 use laminar_core::streaming::{self, BackpressureStrategy, SourceConfig, WaitStrategy};
 
-/// Internal record type for untyped sources (stores raw `RecordBatch`).
+/// Record type for Arrow-based streaming subscriptions.
 #[derive(Clone, Debug)]
-pub(crate) struct ArrowRecord {
-    /// The record batch.
+pub struct ArrowRecord {
     pub(crate) batch: RecordBatch,
 }
 
@@ -34,12 +33,10 @@ impl laminar_core::streaming::Record for ArrowRecord {
 
 /// Bounded ring buffer for snapshot batches.
 ///
-/// Uses an atomic tail counter (`fetch_add`) so concurrent `push()`
-/// calls from multiple threads each get a unique slot — no lost writes.
-/// Per-slot `parking_lot::Mutex` protects the actual slot write/read.
+/// Concurrent `push()` calls each get a unique slot via atomic `fetch_add`.
+/// Per-slot mutex protects the actual read/write.
 struct SnapshotRing {
     slots: Box<[parking_lot::Mutex<Option<RecordBatch>>]>,
-    /// Monotonically increasing write counter. `tail % capacity` = next slot.
     tail: AtomicUsize,
     capacity: usize,
 }
@@ -91,76 +88,53 @@ pub struct SourceEntry {
     pub watermark_column: Option<String>,
     /// Maximum out-of-orderness for watermark generation.
     pub max_out_of_orderness: Option<Duration>,
-    /// Whether this source uses processing-time watermarks (`PROCTIME()`).
+    /// Whether this source uses `PROCTIME()` watermarks.
     pub is_processing_time: std::sync::atomic::AtomicBool,
-    /// The underlying streaming source (type-erased via `ArrowRecord`).
     pub(crate) source: streaming::Source<ArrowRecord>,
-    /// The underlying streaming sink (type-erased via `ArrowRecord`).
     pub(crate) sink: streaming::Sink<ArrowRecord>,
-    /// Lock-free bounded ring buffer for ad-hoc snapshot queries.
     buffer: SnapshotRing,
-    /// Notification handle for event-driven wakeup on `db.insert()`.
+    /// Wakeup handle for `db.insert()` event-driven notification.
     data_notify: Arc<Notify>,
 }
 
 impl SourceEntry {
-    /// Push a batch to both the SPSC channel and the snapshot buffer.
-    ///
-    /// The snapshot buffer is bounded — oldest batches are dropped when
-    /// capacity is exceeded. The SPSC push is the primary delivery path;
-    /// the snapshot ring is only for ad-hoc queries.
+    /// Push a batch to both the channel and the snapshot ring.
     pub(crate) fn push_and_buffer(
         &self,
         batch: RecordBatch,
     ) -> Result<(), laminar_core::streaming::StreamingError> {
         self.source.push_arrow(batch.clone())?;
         self.buffer.push(batch);
-        // notify_one() stores a permit so the CatalogSourceConnector
-        // IO thread wakes immediately. Assumes exactly one IO thread per
-        // source — if multiple consumers are added, switch to notify_waiters().
         self.data_notify.notify_one();
         Ok(())
     }
 
-    /// Return a snapshot of all buffered batches for ad-hoc queries.
     pub(crate) fn snapshot(&self) -> Vec<RecordBatch> {
         self.buffer.snapshot()
     }
 
-    /// Get the notification handle for event-driven wakeup on data insertion.
     pub(crate) fn data_notify(&self) -> Arc<Notify> {
         Arc::clone(&self.data_notify)
     }
 }
 
-/// A registered sink in the catalog.
 pub(crate) struct SinkEntry {
-    /// Input source or table name.
     pub(crate) input: String,
 }
 
-/// A registered query.
 pub(crate) struct QueryEntry {
-    /// Query identifier.
     pub(crate) id: u64,
-    /// Human-readable name or SQL text.
     pub(crate) sql: String,
-    /// Whether the query is still active.
     pub(crate) active: bool,
 }
 
-/// A registered stream in the catalog.
-#[allow(dead_code)]
 pub(crate) struct StreamEntry {
-    /// Stream name.
     pub(crate) name: String,
-    /// The underlying streaming source (for pushing data into the stream).
     pub(crate) source: streaming::Source<ArrowRecord>,
-    /// The underlying streaming sink (for subscribing to the stream).
     pub(crate) sink: streaming::Sink<ArrowRecord>,
 }
 
-/// Catalog of registered sources, sinks, streams, and queries.
+/// Central registry of sources, sinks, streams, and queries.
 pub struct SourceCatalog {
     sources: RwLock<HashMap<String, Arc<SourceEntry>>>,
     sinks: RwLock<HashMap<String, SinkEntry>>,
@@ -172,7 +146,7 @@ pub struct SourceCatalog {
 }
 
 impl SourceCatalog {
-    /// Create a new empty catalog.
+    /// Create a catalog with the given defaults for new sources.
     #[must_use]
     pub fn new(buffer_size: usize, backpressure: BackpressureStrategy) -> Self {
         Self {
@@ -186,7 +160,6 @@ impl SourceCatalog {
         }
     }
 
-    /// Register a source from a SQL CREATE SOURCE definition.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn register_source(
         &self,
@@ -205,9 +178,11 @@ impl SourceCatalog {
         let buf_size = buffer_size.unwrap_or(self.default_buffer_size);
         let bp = backpressure.unwrap_or(self.default_backpressure);
 
+        // Channel buffer is at least 1024 to avoid blocking on small snapshot rings.
+        let channel_buf = buf_size.max(1024);
         let config = SourceConfig {
             channel: streaming::ChannelConfig {
-                buffer_size: buf_size,
+                buffer_size: channel_buf,
                 backpressure: bp,
                 wait_strategy: WaitStrategy::SpinYield,
                 track_stats: false,
@@ -233,7 +208,6 @@ impl SourceCatalog {
         Ok(entry)
     }
 
-    /// Register a source, replacing if it already exists.
     pub(crate) fn register_source_or_replace(
         &self,
         name: &str,
@@ -257,17 +231,16 @@ impl SourceCatalog {
         .unwrap()
     }
 
-    /// Get a registered source by name.
+    /// Look up a registered source by name.
     pub fn get_source(&self, name: &str) -> Option<Arc<SourceEntry>> {
         self.sources.read().get(name).cloned()
     }
 
-    /// Remove a source by name.
+    /// Returns `true` if the source existed.
     pub fn drop_source(&self, name: &str) -> bool {
         self.sources.write().remove(name).is_some()
     }
 
-    /// Register a sink.
     pub(crate) fn register_sink(&self, name: &str, input: &str) -> Result<(), crate::DbError> {
         let mut sinks = self.sinks.write();
         if sinks.contains_key(name) {
@@ -282,12 +255,11 @@ impl SourceCatalog {
         Ok(())
     }
 
-    /// Remove a sink by name.
+    /// Returns `true` if the sink existed.
     pub fn drop_sink(&self, name: &str) -> bool {
         self.sinks.write().remove(name).is_some()
     }
 
-    /// Register a named stream.
     pub(crate) fn register_stream(&self, name: &str) -> Result<(), crate::DbError> {
         let mut streams = self.streams.write();
         if streams.contains_key(name) {
@@ -317,7 +289,6 @@ impl SourceCatalog {
         Ok(())
     }
 
-    /// Get a subscription to a named stream.
     pub(crate) fn get_stream_subscription(
         &self,
         name: &str,
@@ -328,12 +299,10 @@ impl SourceCatalog {
             .map(|entry| entry.sink.subscribe())
     }
 
-    /// Get a stream entry by name.
     pub(crate) fn get_stream_entry(&self, name: &str) -> Option<Arc<StreamEntry>> {
         self.streams.read().get(name).cloned()
     }
 
-    /// Get a clone of the stream's source handle (for pushing results).
     pub(crate) fn get_stream_source(&self, name: &str) -> Option<streaming::Source<ArrowRecord>> {
         self.streams
             .read()
@@ -341,32 +310,31 @@ impl SourceCatalog {
             .map(|entry| entry.source.clone())
     }
 
-    /// Remove a stream by name.
+    /// Returns `true` if the stream existed.
     pub fn drop_stream(&self, name: &str) -> bool {
         self.streams.write().remove(name).is_some()
     }
 
-    /// List all stream names.
+    /// All registered stream names.
     pub fn list_streams(&self) -> Vec<String> {
         self.streams.read().keys().cloned().collect()
     }
 
-    /// List all source names.
+    /// All registered source names.
     pub fn list_sources(&self) -> Vec<String> {
         self.sources.read().keys().cloned().collect()
     }
 
-    /// List all sink names.
+    /// All registered sink names.
     pub fn list_sinks(&self) -> Vec<String> {
         self.sinks.read().keys().cloned().collect()
     }
 
-    /// Get the input name for a registered sink.
+    /// Input source/table name for a sink, if registered.
     pub fn get_sink_input(&self, name: &str) -> Option<String> {
         self.sinks.read().get(name).map(|e| e.input.clone())
     }
 
-    /// Register a query and return its ID.
     pub(crate) fn register_query(&self, sql: &str) -> u64 {
         let id = self.next_query_id.fetch_add(1, Ordering::Relaxed);
         let mut queries = self.queries.write();
@@ -381,7 +349,6 @@ impl SourceCatalog {
         id
     }
 
-    /// Mark a query as inactive. Returns `true` if the query existed.
     pub(crate) fn deactivate_query(&self, id: u64) -> bool {
         if let Some(entry) = self.queries.write().get_mut(&id) {
             entry.active = false;
@@ -391,7 +358,6 @@ impl SourceCatalog {
         }
     }
 
-    /// List all queries.
     pub(crate) fn list_queries(&self) -> Vec<(u64, String, bool)> {
         self.queries
             .read()
@@ -400,7 +366,7 @@ impl SourceCatalog {
             .collect()
     }
 
-    /// Get source schema for DESCRIBE.
+    /// Schema for DESCRIBE queries.
     pub fn describe_source(&self, name: &str) -> Option<SchemaRef> {
         self.sources.read().get(name).map(|e| e.schema.clone())
     }
@@ -418,16 +384,16 @@ mod tests {
         ]))
     }
 
-    #[test]
-    fn test_register_source() {
+    #[tokio::test]
+    async fn test_register_source() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         let result = catalog.register_source("test", test_schema(), None, None, None, None);
         assert!(result.is_ok());
         assert!(catalog.get_source("test").is_some());
     }
 
-    #[test]
-    fn test_register_duplicate_source() {
+    #[tokio::test]
+    async fn test_register_duplicate_source() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         catalog
             .register_source("test", test_schema(), None, None, None, None)
@@ -439,8 +405,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_drop_source() {
+    #[tokio::test]
+    async fn test_drop_source() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         catalog
             .register_source("test", test_schema(), None, None, None, None)
@@ -449,8 +415,8 @@ mod tests {
         assert!(catalog.get_source("test").is_none());
     }
 
-    #[test]
-    fn test_list_sources() {
+    #[tokio::test]
+    async fn test_list_sources() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         catalog
             .register_source("a", test_schema(), None, None, None, None)
@@ -463,15 +429,15 @@ mod tests {
         assert_eq!(names, vec!["a", "b"]);
     }
 
-    #[test]
-    fn test_register_sink() {
+    #[tokio::test]
+    async fn test_register_sink() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         assert!(catalog.register_sink("output", "events").is_ok());
         assert_eq!(catalog.list_sinks(), vec!["output"]);
     }
 
-    #[test]
-    fn test_register_query() {
+    #[tokio::test]
+    async fn test_register_query() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         let id = catalog.register_query("SELECT * FROM events");
         assert_eq!(id, 1);
@@ -480,8 +446,8 @@ mod tests {
         assert!(queries[0].2); // active
     }
 
-    #[test]
-    fn test_deactivate_query() {
+    #[tokio::test]
+    async fn test_deactivate_query() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         let id = catalog.register_query("SELECT * FROM events");
         catalog.deactivate_query(id);
@@ -489,8 +455,8 @@ mod tests {
         assert!(!queries[0].2); // inactive
     }
 
-    #[test]
-    fn test_describe_source() {
+    #[tokio::test]
+    async fn test_describe_source() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         let schema = test_schema();
         catalog
@@ -501,8 +467,8 @@ mod tests {
         assert_eq!(result.unwrap().fields().len(), 2);
     }
 
-    #[test]
-    fn test_or_replace() {
+    #[tokio::test]
+    async fn test_or_replace() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         catalog
             .register_source("test", test_schema(), None, None, None, None)
@@ -518,8 +484,8 @@ mod tests {
         assert_eq!(entry.watermark_column, Some("ts".to_string()));
     }
 
-    #[test]
-    fn test_push_and_buffer_snapshot() {
+    #[tokio::test]
+    async fn test_push_and_buffer_snapshot() {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         let schema = test_schema();
         let entry = catalog
@@ -541,9 +507,9 @@ mod tests {
         assert_eq!(snap[0].num_rows(), 1);
     }
 
-    #[test]
-    fn test_buffer_capacity_drops_oldest() {
-        // Use a small buffer size so we can test overflow
+    #[tokio::test]
+    async fn test_buffer_capacity_drops_oldest() {
+        // SnapshotRing capacity=2; channel gets a larger buffer so pushes don't block.
         let catalog = SourceCatalog::new(2, BackpressureStrategy::DropOldest);
         let schema = test_schema();
         let entry = catalog
@@ -564,7 +530,7 @@ mod tests {
         }
 
         let snap = entry.snapshot();
-        // buffer_capacity=2, so only the last 2 batches should remain
+        // SnapshotRing capacity=2, so only the last 2 batches remain
         assert_eq!(snap.len(), 2);
         let col = snap[0]
             .column(0)

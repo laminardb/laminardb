@@ -1,15 +1,4 @@
-//! Async data source trait for lookup table refresh and query.
-//!
-//! [`LookupSource`] is the evolution of the connector-level
-//! `TableLoader` trait. It uses RPITIT (Rust 1.75+) for zero-overhead
-//! async — no `async_trait` boxing needed.
-//!
-//! ## Key differences from `TableLoader`
-//!
-//! - Supports predicate pushdown via [`Predicate`]
-//! - Supports projection pushdown via [`ColumnId`]
-//! - Advertises capabilities via [`LookupSourceCapabilities`]
-//! - Uses [`PushdownAdapter`] to wrap sources that lack pushdown support
+//! Async lookup source trait with predicate and projection pushdown.
 
 use std::future::Future;
 use std::time::Duration;

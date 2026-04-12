@@ -1,7 +1,4 @@
-//! Hot-reload config diff engine and incremental DDL application.
-//!
-//! Compares two `ServerConfig` snapshots, computes the diff, and applies
-//! incremental DDL (DROP + CREATE) against a live `LaminarDB` instance.
+//! Hot-reload: config diff engine and incremental DDL application.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,7 +11,6 @@ use laminar_db::LaminarDB;
 use crate::config::{LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig};
 use crate::server;
 
-/// Diff between two configuration snapshots.
 #[derive(Debug, Default)]
 pub struct ConfigDiff {
     pub sources_added: Vec<SourceConfig>,
@@ -37,7 +33,6 @@ pub struct ConfigDiff {
 }
 
 impl ConfigDiff {
-    /// Returns `true` when no reloadable changes were detected.
     pub fn is_empty(&self) -> bool {
         self.sources_added.is_empty()
             && self.sources_removed.is_empty()
@@ -54,7 +49,6 @@ impl ConfigDiff {
     }
 }
 
-/// Result of applying a reload diff.
 #[derive(Debug, Serialize)]
 pub struct ReloadResult {
     pub success: bool,
@@ -63,7 +57,6 @@ pub struct ReloadResult {
     pub warnings: Vec<String>,
 }
 
-/// A successfully applied reload operation.
 #[derive(Debug, Serialize)]
 pub struct ReloadOp {
     pub action: String,
@@ -71,7 +64,6 @@ pub struct ReloadOp {
     pub name: String,
 }
 
-/// A failed reload operation.
 #[derive(Debug, Serialize)]
 pub struct ReloadFailure {
     pub action: String,
@@ -79,10 +71,6 @@ pub struct ReloadFailure {
     pub name: String,
     pub error: String,
 }
-
-// ---------------------------------------------------------------------------
-// Config diffing
-// ---------------------------------------------------------------------------
 
 /// Compute the diff between an old and new configuration.
 pub fn diff_configs(old: &ServerConfig, new: &ServerConfig) -> ConfigDiff {
@@ -158,7 +146,6 @@ pub fn diff_configs(old: &ServerConfig, new: &ServerConfig) -> ConfigDiff {
     diff
 }
 
-/// Generic helper: diff two name-keyed Vec slices using `PartialEq`.
 fn diff_named_section<T: Clone + PartialEq>(
     old: &[T],
     new: &[T],
@@ -193,251 +180,189 @@ fn diff_named_section<T: Clone + PartialEq>(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Apply reload
-// ---------------------------------------------------------------------------
-
 /// Apply a config diff to a live `LaminarDB` instance via incremental DDL.
 ///
-/// **Remove phase** (reverse dependency order): sinks → streams → lookups → sources
-/// **Create phase** (dependency order): sources → lookups → pipelines → sinks
-///
-/// Each operation is independent — failures are recorded but do not stop
-/// remaining operations.
+/// Remove phase (reverse dependency order): sinks → streams → lookups → sources.
+/// Create phase (dependency order): sources → lookups → pipelines → sinks.
 pub async fn apply_reload(db: &LaminarDB, diff: &ConfigDiff) -> ReloadResult {
     let mut applied = Vec::new();
     let mut failed = Vec::new();
 
-    // --- Remove phase (reverse dependency order) ---
-
-    // Remove sinks (removed + changed)
+    // Remove phase (reverse dependency order)
     for sink in diff.sinks_removed.iter().chain(diff.sinks_changed.iter()) {
         let ddl = format!("DROP SINK IF EXISTS {} CASCADE", sink.name);
-        match db.execute(&ddl).await {
-            Ok(_) => {
-                info!("Dropped sink: {}", sink.name);
-                applied.push(ReloadOp {
-                    action: "drop".to_string(),
-                    object_type: "sink".to_string(),
-                    name: sink.name.clone(),
-                });
-            }
-            Err(e) => {
-                warn!("Failed to drop sink '{}': {}", sink.name, e);
-                failed.push(ReloadFailure {
-                    action: "drop".to_string(),
-                    object_type: "sink".to_string(),
-                    name: sink.name.clone(),
-                    error: e.to_string(),
-                });
-            }
-        }
+        exec_ddl(
+            db,
+            &ddl,
+            "drop",
+            "sink",
+            &sink.name,
+            &mut applied,
+            &mut failed,
+        )
+        .await;
     }
-
-    // Remove pipelines/streams (removed + changed)
-    for pipeline in diff
+    for p in diff
         .pipelines_removed
         .iter()
         .chain(diff.pipelines_changed.iter())
     {
-        let ddl = format!("DROP STREAM IF EXISTS {} CASCADE", pipeline.name);
-        match db.execute(&ddl).await {
-            Ok(_) => {
-                info!("Dropped stream: {}", pipeline.name);
-                applied.push(ReloadOp {
-                    action: "drop".to_string(),
-                    object_type: "stream".to_string(),
-                    name: pipeline.name.clone(),
-                });
-            }
-            Err(e) => {
-                warn!("Failed to drop stream '{}': {}", pipeline.name, e);
-                failed.push(ReloadFailure {
-                    action: "drop".to_string(),
-                    object_type: "stream".to_string(),
-                    name: pipeline.name.clone(),
-                    error: e.to_string(),
-                });
-            }
-        }
+        let ddl = format!("DROP STREAM IF EXISTS {} CASCADE", p.name);
+        exec_ddl(
+            db,
+            &ddl,
+            "drop",
+            "stream",
+            &p.name,
+            &mut applied,
+            &mut failed,
+        )
+        .await;
     }
-
-    // Remove lookups (removed + changed)
-    for lookup in diff
+    for l in diff
         .lookups_removed
         .iter()
         .chain(diff.lookups_changed.iter())
     {
-        let ddl = format!("DROP LOOKUP TABLE IF EXISTS {} CASCADE", lookup.name);
-        match db.execute(&ddl).await {
-            Ok(_) => {
-                info!("Dropped lookup table: {}", lookup.name);
-                applied.push(ReloadOp {
-                    action: "drop".to_string(),
-                    object_type: "lookup".to_string(),
-                    name: lookup.name.clone(),
-                });
-            }
-            Err(e) => {
-                warn!("Failed to drop lookup table '{}': {}", lookup.name, e);
-                failed.push(ReloadFailure {
-                    action: "drop".to_string(),
-                    object_type: "lookup".to_string(),
-                    name: lookup.name.clone(),
-                    error: e.to_string(),
-                });
-            }
-        }
+        let ddl = format!("DROP LOOKUP TABLE IF EXISTS {} CASCADE", l.name);
+        exec_ddl(
+            db,
+            &ddl,
+            "drop",
+            "lookup",
+            &l.name,
+            &mut applied,
+            &mut failed,
+        )
+        .await;
     }
-
-    // Remove sources (removed + changed)
-    for source in diff
+    for s in diff
         .sources_removed
         .iter()
         .chain(diff.sources_changed.iter())
     {
-        let ddl = format!("DROP SOURCE IF EXISTS {} CASCADE", source.name);
-        match db.execute(&ddl).await {
-            Ok(_) => {
-                info!("Dropped source: {}", source.name);
-                applied.push(ReloadOp {
-                    action: "drop".to_string(),
-                    object_type: "source".to_string(),
-                    name: source.name.clone(),
-                });
-            }
-            Err(e) => {
-                warn!("Failed to drop source '{}': {}", source.name, e);
-                failed.push(ReloadFailure {
-                    action: "drop".to_string(),
-                    object_type: "source".to_string(),
-                    name: source.name.clone(),
-                    error: e.to_string(),
-                });
-            }
-        }
+        let ddl = format!("DROP SOURCE IF EXISTS {} CASCADE", s.name);
+        exec_ddl(
+            db,
+            &ddl,
+            "drop",
+            "source",
+            &s.name,
+            &mut applied,
+            &mut failed,
+        )
+        .await;
     }
 
-    // --- Create phase (dependency order) ---
-
-    // Create sources (added + changed)
-    for source in diff.sources_added.iter().chain(diff.sources_changed.iter()) {
-        let ddl = server::source_to_ddl(source);
-        match db.execute(&ddl).await {
-            Ok(_) => {
-                info!("Created source: {}", source.name);
-                applied.push(ReloadOp {
-                    action: "create".to_string(),
-                    object_type: "source".to_string(),
-                    name: source.name.clone(),
-                });
-            }
-            Err(e) => {
-                warn!("Failed to create source '{}': {}", source.name, e);
-                failed.push(ReloadFailure {
-                    action: "create".to_string(),
-                    object_type: "source".to_string(),
-                    name: source.name.clone(),
-                    error: e.to_string(),
-                });
-            }
-        }
+    // Create phase (dependency order)
+    for s in diff.sources_added.iter().chain(diff.sources_changed.iter()) {
+        let ddl = server::source_to_ddl(s);
+        exec_ddl(
+            db,
+            &ddl,
+            "create",
+            "source",
+            &s.name,
+            &mut applied,
+            &mut failed,
+        )
+        .await;
     }
-
-    // Create lookups (added + changed)
-    for lookup in diff.lookups_added.iter().chain(diff.lookups_changed.iter()) {
-        let ddl = server::lookup_to_ddl(lookup);
-        match db.execute(&ddl).await {
-            Ok(_) => {
-                info!("Created lookup table: {}", lookup.name);
-                applied.push(ReloadOp {
-                    action: "create".to_string(),
-                    object_type: "lookup".to_string(),
-                    name: lookup.name.clone(),
-                });
+    for l in diff.lookups_added.iter().chain(diff.lookups_changed.iter()) {
+        match server::lookup_to_ddl(l) {
+            Ok(ddl) => {
+                exec_ddl(
+                    db,
+                    &ddl,
+                    "create",
+                    "lookup",
+                    &l.name,
+                    &mut applied,
+                    &mut failed,
+                )
+                .await;
             }
             Err(e) => {
-                warn!("Failed to create lookup table '{}': {}", lookup.name, e);
+                warn!("Invalid lookup config '{}': {e}", l.name);
                 failed.push(ReloadFailure {
                     action: "create".to_string(),
                     object_type: "lookup".to_string(),
-                    name: lookup.name.clone(),
+                    name: l.name.clone(),
                     error: e.to_string(),
                 });
             }
         }
     }
-
-    // Create pipelines (added + changed)
-    for pipeline in diff
+    for p in diff
         .pipelines_added
         .iter()
         .chain(diff.pipelines_changed.iter())
     {
-        let ddl = server::pipeline_to_ddl(pipeline);
-        match db.execute(&ddl).await {
-            Ok(_) => {
-                info!("Created pipeline: {}", pipeline.name);
-                applied.push(ReloadOp {
-                    action: "create".to_string(),
-                    object_type: "stream".to_string(),
-                    name: pipeline.name.clone(),
-                });
-            }
-            Err(e) => {
-                warn!("Failed to create pipeline '{}': {}", pipeline.name, e);
-                failed.push(ReloadFailure {
-                    action: "create".to_string(),
-                    object_type: "stream".to_string(),
-                    name: pipeline.name.clone(),
-                    error: e.to_string(),
-                });
-            }
-        }
+        let ddl = server::pipeline_to_ddl(p);
+        exec_ddl(
+            db,
+            &ddl,
+            "create",
+            "stream",
+            &p.name,
+            &mut applied,
+            &mut failed,
+        )
+        .await;
     }
-
-    // Create sinks (added + changed)
     for sink in diff.sinks_added.iter().chain(diff.sinks_changed.iter()) {
         let ddl = server::sink_to_ddl(sink);
-        match db.execute(&ddl).await {
-            Ok(_) => {
-                info!("Created sink: {}", sink.name);
-                applied.push(ReloadOp {
-                    action: "create".to_string(),
-                    object_type: "sink".to_string(),
-                    name: sink.name.clone(),
-                });
-            }
-            Err(e) => {
-                warn!("Failed to create sink '{}': {}", sink.name, e);
-                failed.push(ReloadFailure {
-                    action: "create".to_string(),
-                    object_type: "sink".to_string(),
-                    name: sink.name.clone(),
-                    error: e.to_string(),
-                });
-            }
-        }
+        exec_ddl(
+            db,
+            &ddl,
+            "create",
+            "sink",
+            &sink.name,
+            &mut applied,
+            &mut failed,
+        )
+        .await;
     }
 
-    let success = failed.is_empty();
-    let warnings = diff.warnings.clone();
     ReloadResult {
-        success,
+        success: failed.is_empty(),
         applied,
         failed,
-        warnings,
+        warnings: diff.warnings.clone(),
     }
 }
 
-// ---------------------------------------------------------------------------
-// Concurrency guard
-// ---------------------------------------------------------------------------
+async fn exec_ddl(
+    db: &LaminarDB,
+    ddl: &str,
+    action: &str,
+    object_type: &str,
+    name: &str,
+    applied: &mut Vec<ReloadOp>,
+    failed: &mut Vec<ReloadFailure>,
+) {
+    match db.execute(ddl).await {
+        Ok(_) => {
+            info!("{action} {object_type}: {name}");
+            applied.push(ReloadOp {
+                action: action.to_string(),
+                object_type: object_type.to_string(),
+                name: name.to_string(),
+            });
+        }
+        Err(e) => {
+            warn!("Failed to {action} {object_type} '{name}': {e}");
+            failed.push(ReloadFailure {
+                action: action.to_string(),
+                object_type: object_type.to_string(),
+                name: name.to_string(),
+                error: e.to_string(),
+            });
+        }
+    }
+}
 
-/// Prevents concurrent reloads.
-///
-/// Acquire via [`try_acquire`](ReloadGuard::try_acquire). The returned
-/// [`ReloadGuardHandle`] releases the guard on drop.
+/// Prevents concurrent reloads via CAS on an `AtomicBool`.
 #[derive(Clone)]
 pub struct ReloadGuard {
     in_progress: Arc<AtomicBool>,
@@ -450,8 +375,6 @@ impl ReloadGuard {
         }
     }
 
-    /// Try to acquire the reload guard. Returns `None` if another reload
-    /// is already in progress.
     pub fn try_acquire(&self) -> Option<ReloadGuardHandle> {
         let was_free =
             self.in_progress
@@ -466,7 +389,6 @@ impl ReloadGuard {
     }
 }
 
-/// RAII handle that releases the [`ReloadGuard`] on drop.
 pub struct ReloadGuardHandle {
     flag: Arc<AtomicBool>,
 }
@@ -476,10 +398,6 @@ impl Drop for ReloadGuardHandle {
         self.flag.store(false, Ordering::Release);
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -517,7 +435,6 @@ mod tests {
         PipelineConfig {
             name: name.to_string(),
             sql: sql.to_string(),
-            parallelism: None,
         }
     }
 
@@ -536,9 +453,9 @@ mod tests {
             name: name.to_string(),
             connector: "postgres".to_string(),
             strategy: "poll".to_string(),
-            pushdown: true,
             cache: LookupCacheConfig::default(),
             properties: toml::Table::new(),
+            primary_key: vec![],
             schema: vec![],
         }
     }

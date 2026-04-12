@@ -1,13 +1,7 @@
-//! Delta mode startup orchestrator.
-//!
-//! Wires the server binary to the delta subsystems in `laminar-core::delta`.
-//! When `mode = "delta"` is configured, this module performs the full startup
-//! sequence: discover peers, create `DeltaManager`, assign partitions, start
-//! RPC pool, build engine, start pipeline, and start HTTP + gRPC services.
+//! Delta (multi-node) mode startup orchestrator.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use tokio::signal;
@@ -20,10 +14,7 @@ use laminar_core::delta::discovery::{
     NodeMetadata, NodeState, StaticDiscovery, StaticDiscoveryConfig,
 };
 use laminar_core::delta::partition::assignment::{AssignmentConstraints, ConsistentHashAssigner};
-/// Enum dispatch for discovery implementations.
-///
-/// The `Discovery` trait uses `async fn` which is not dyn-compatible,
-/// so we use an enum to dispatch between implementations.
+/// Enum dispatch — `Discovery` trait uses `async fn` (not dyn-compatible).
 enum DiscoveryImpl {
     Static(StaticDiscovery),
     Gossip(GossipDiscovery),
@@ -44,14 +35,6 @@ impl DiscoveryImpl {
         }
     }
 
-    #[allow(dead_code)]
-    async fn announce(&self, info: NodeInfo) -> Result<(), DiscoveryError> {
-        match self {
-            Self::Static(d) => d.announce(info).await,
-            Self::Gossip(d) => d.announce(info).await,
-        }
-    }
-
     fn membership_watch(&self) -> watch::Receiver<Vec<NodeInfo>> {
         match self {
             Self::Static(d) => d.membership_watch(),
@@ -67,11 +50,7 @@ impl DiscoveryImpl {
     }
 }
 
-/// Spawn a background task that watches for membership changes and logs
-/// peer join, leave, state-change, and suspected-crash events.
-///
-/// Compares the previous peer list to the new one on each update from
-/// the discovery layer's `watch::Receiver`.
+/// Watches membership changes and logs peer join/leave/crash events.
 fn spawn_membership_watcher(
     local_node_id: &str,
     mut rx: watch::Receiver<Vec<NodeInfo>>,
@@ -154,83 +133,29 @@ use laminar_db::{LaminarDB, Profile};
 
 use crate::config::ServerConfig;
 use crate::delta_config::DeltaConfig;
-use crate::reload::ReloadGuard;
-use crate::{http, server};
+use crate::server;
 
-/// Errors during delta startup.
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code)]
 pub enum DeltaStartupError {
-    /// Failed to start the discovery layer.
     #[error("discovery failed: {0}")]
     Discovery(String),
-
-    /// Timed out waiting for initial peer formation.
     #[error("formation timeout: only {found} of {needed} peers discovered")]
-    FormationTimeout {
-        /// Number of peers found.
-        found: usize,
-        /// Number of peers needed (minimum quorum).
-        needed: usize,
-    },
-
-    /// Raft formation failed.
-    #[error("raft formation failed: {0}")]
-    RaftFormation(String),
-
-    /// Timed out waiting for Raft quorum.
-    #[error("quorum timeout: only {found} of {needed} nodes joined raft")]
-    QuorumTimeout {
-        /// Nodes that joined.
-        found: usize,
-        /// Minimum quorum size.
-        needed: usize,
-    },
-
-    /// Partition assignment failed.
-    #[error("partition assignment failed: {0}")]
-    PartitionAssignment(String),
-
-    /// Timed out waiting for partition assignment.
-    #[error("assignment timeout after {0:?}")]
-    AssignmentTimeout(std::time::Duration),
-
-    /// Failed to build the LaminarDB engine.
+    FormationTimeout { found: usize, needed: usize },
     #[error("engine construction failed: {0}")]
     EngineConstruction(String),
-
-    /// Failed to start gRPC services.
-    #[error("gRPC startup failed: {0}")]
-    GrpcStartup(String),
-
-    /// Failed to start HTTP API.
     #[error("HTTP startup failed: {0}")]
     HttpStartup(String),
 }
 
-/// Handle to a running delta-mode LaminarDB server.
-///
-/// Holds all delta subsystem resources and provides graceful shutdown.
-#[allow(dead_code)]
 pub struct DeltaHandle {
-    /// Node identity.
-    node_id: String,
-    /// LaminarDB engine instance.
     db: Arc<LaminarDB>,
-    /// Delta lifecycle manager (owns partition guards).
-    manager: DeltaManager,
-    /// Discovery layer.
     discovery: DiscoveryImpl,
-    /// HTTP API server task.
     api_handle: tokio::task::JoinHandle<()>,
-    /// Config file watcher task.
     watcher_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Membership change watcher task.
     membership_handle: tokio::task::JoinHandle<()>,
 }
 
 impl DeltaHandle {
-    /// Block until ctrl-c, then gracefully shut down all subsystems.
     pub async fn wait_for_shutdown(mut self) -> Result<(), DeltaStartupError> {
         signal::ctrl_c()
             .await
@@ -265,18 +190,6 @@ impl DeltaHandle {
 }
 
 /// Start a LaminarDB server in delta (multi-node) mode.
-///
-/// Performs the full startup sequence:
-/// 1. Start discovery layer
-/// 2. Wait for peers
-/// 3. Create `DeltaManager` and advance to Active
-/// 4. Compute initial partition assignment
-/// 5. Create partition guards and RPC pool
-/// 6. Build `LaminarDB` with `Profile::Delta`
-/// 7. Execute DDL for sources/lookups/pipelines/sinks
-/// 8. Start pipeline
-/// 9. Start HTTP API
-/// 10. Spawn config watcher
 pub async fn start_delta(
     config: ServerConfig,
     delta_cfg: DeltaConfig,
@@ -430,7 +343,7 @@ pub async fn start_delta(
     }
     info!("Created {} partition guards", manager.guards().len());
 
-    // 6. Build LaminarDB with Profile::Delta
+    // Build LaminarDB with Profile::Delta
     let mut builder = LaminarDB::builder();
     builder = builder.profile(Profile::Delta);
 
@@ -439,9 +352,7 @@ pub async fn start_delta(
         builder = builder.storage_dir(&config.state.path);
     }
 
-    // Delta profile always requires an object_store_url. In delta mode,
-    // namespace checkpoints per node so nodes can read each other's state
-    // during partition migration.
+    // Namespace checkpoints per node for partition migration reads.
     let checkpoint_url = {
         let base = &config.checkpoint.url;
         if base.is_empty() {
@@ -452,28 +363,7 @@ pub async fn start_delta(
             format!("{base}/nodes/{node_id_str}/")
         }
     };
-    if !checkpoint_url.is_empty() {
-        builder = builder.object_store_url(checkpoint_url.clone());
-        if !config.checkpoint.storage.is_empty() {
-            builder = builder.object_store_options(config.checkpoint.storage.clone());
-        }
-    }
-
-    let checkpoint_cfg = laminar_core::streaming::checkpoint::StreamCheckpointConfig {
-        interval_ms: Some(config.checkpoint.interval.as_millis() as u64),
-        data_dir: if checkpoint_url.starts_with("file:///") {
-            Some(PathBuf::from(
-                checkpoint_url
-                    .strip_prefix("file://")
-                    .unwrap_or(&checkpoint_url),
-            ))
-        } else {
-            None
-        },
-        max_retained: Some(10),
-        ..laminar_core::streaming::checkpoint::StreamCheckpointConfig::default()
-    };
-    builder = builder.checkpoint(checkpoint_cfg);
+    builder = server::apply_checkpoint_config(builder, &checkpoint_url, &config.checkpoint);
 
     let db = builder
         .build()
@@ -481,92 +371,30 @@ pub async fn start_delta(
         .map_err(|e| DeltaStartupError::EngineConstruction(e.to_string()))?;
     let db = Arc::new(db);
 
-    // 8. Execute DDL for sources/lookups/pipelines/sinks
-    for source in &config.sources {
-        let ddl = server::source_to_ddl(source);
-        db.execute(&ddl)
-            .await
-            .map_err(|e| DeltaStartupError::EngineConstruction(format!("source DDL: {e}")))?;
-        info!("Created source: {}", source.name);
-    }
+    server::execute_config_ddl(&db, &config)
+        .await
+        .map_err(|e| DeltaStartupError::EngineConstruction(e.to_string()))?;
 
-    for lookup in &config.lookups {
-        let ddl = server::lookup_to_ddl(lookup);
-        db.execute(&ddl)
-            .await
-            .map_err(|e| DeltaStartupError::EngineConstruction(format!("lookup DDL: {e}")))?;
-        info!("Created lookup table: {}", lookup.name);
-    }
-
-    for pipeline in &config.pipelines {
-        let ddl = server::pipeline_to_ddl(pipeline);
-        db.execute(&ddl)
-            .await
-            .map_err(|e| DeltaStartupError::EngineConstruction(format!("pipeline DDL: {e}")))?;
-        info!("Created pipeline: {}", pipeline.name);
-    }
-
-    for sink in &config.sinks {
-        let ddl = server::sink_to_ddl(sink);
-        db.execute(&ddl)
-            .await
-            .map_err(|e| DeltaStartupError::EngineConstruction(format!("sink DDL: {e}")))?;
-        info!("Created sink: {}", sink.name);
-    }
-
-    // 9. Start pipeline
     db.start()
         .await
         .map_err(|e| DeltaStartupError::EngineConstruction(format!("pipeline start: {e}")))?;
     info!("Pipeline started");
 
-    // 10. Start HTTP API
-    let bind = config.server.bind.clone();
-    let app_state = Arc::new(http::AppState {
-        db: Arc::clone(&db),
-        config_path: config_path.clone(),
-        started_at: chrono::Utc::now(),
-        current_config: tokio::sync::RwLock::new(config),
-        reload_guard: ReloadGuard::new(),
-        reload_total: AtomicU64::new(0),
-        reload_last_ts: AtomicU64::new(0),
-    });
-    let router = http::build_router(Arc::clone(&app_state));
-    let api_handle = http::serve(router, &bind)
-        .await
-        .map_err(|e| DeltaStartupError::HttpStartup(e.to_string()))?;
-    info!("HTTP API listening on {bind}");
+    let (app_state, api_handle) =
+        server::start_http_api(Arc::clone(&db), config_path.clone(), config)
+            .await
+            .map_err(|e| DeltaStartupError::HttpStartup(e.to_string()))?;
+    let watcher_handle = server::spawn_config_watcher(&app_state, config_path);
 
-    // 11. Spawn config file watcher
-    let watcher_handle = {
-        let watcher_state = Arc::clone(&app_state);
-        let watcher_path = config_path;
-        Some(tokio::spawn(async move {
-            crate::watcher::watch_config(
-                watcher_path,
-                watcher_state,
-                std::time::Duration::from_millis(500),
-            )
-            .await;
-        }))
-    };
-    info!("Config file watcher started");
-
-    // 12. Spawn membership watcher for peer join/leave/crash notifications
     let membership_rx = discovery.membership_watch();
     let membership_handle = spawn_membership_watcher(&node_id_str, membership_rx);
     info!("Membership watcher started");
 
-    info!(
-        "Delta node '{}' started with {} partitions",
-        node_id_str,
-        manager.guards().len()
-    );
+    let num_guards = manager.guards().len();
+    info!("Delta node '{node_id_str}' started with {num_guards} partitions");
 
     Ok(DeltaHandle {
-        node_id: node_id_str,
         db,
-        manager,
         discovery,
         api_handle,
         watcher_handle,
@@ -580,37 +408,23 @@ fn num_cpus() -> u32 {
         .unwrap_or(1)
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_delta_startup_error_variants() {
+    fn test_delta_startup_error_display() {
         let errors: Vec<DeltaStartupError> = vec![
             DeltaStartupError::Discovery("connection refused".into()),
             DeltaStartupError::FormationTimeout {
                 found: 1,
                 needed: 3,
             },
-            DeltaStartupError::RaftFormation("no leader".into()),
-            DeltaStartupError::QuorumTimeout {
-                found: 2,
-                needed: 3,
-            },
-            DeltaStartupError::PartitionAssignment("no nodes".into()),
-            DeltaStartupError::AssignmentTimeout(std::time::Duration::from_secs(30)),
             DeltaStartupError::EngineConstruction("build failed".into()),
-            DeltaStartupError::GrpcStartup("bind failed".into()),
             DeltaStartupError::HttpStartup("port in use".into()),
         ];
-
         for err in &errors {
-            let msg = err.to_string();
-            assert!(!msg.is_empty(), "error should have a display message");
+            assert!(!err.to_string().is_empty());
         }
     }
 
@@ -621,18 +435,7 @@ mod tests {
             needed: 3,
         };
         let msg = err.to_string();
-        assert!(msg.contains('1'), "should include found count");
-        assert!(msg.contains('3'), "should include needed count");
-    }
-
-    #[test]
-    fn test_quorum_timeout_includes_counts() {
-        let err = DeltaStartupError::QuorumTimeout {
-            found: 2,
-            needed: 3,
-        };
-        let msg = err.to_string();
-        assert!(msg.contains('2'), "should include found count");
-        assert!(msg.contains('3'), "should include needed count");
+        assert!(msg.contains('1'));
+        assert!(msg.contains('3'));
     }
 }

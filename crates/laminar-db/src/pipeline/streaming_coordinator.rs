@@ -1,6 +1,6 @@
 //! Simplified pipeline coordinator.
 //!
-//! Sources push directly to the coordinator via `tokio::sync::mpsc`.
+//! Sources push directly to the coordinator via `crossfire::mpsc`.
 //! The coordinator runs on a dedicated single-threaded tokio runtime
 //! (`laminar-compute` thread), isolating CPU-bound event processing
 //! from IO tasks (Kafka poll, S3 checkpoint writes, HTTP) on the main
@@ -12,11 +12,11 @@
 //! Source task (main tokio runtime)
 //!   │  connector.poll_batch().await
 //!   │
-//!   └──── mpsc::Sender ────► StreamingCoordinator (dedicated compute thread)
-//!                                 │  callback.execute_cycle()
-//!                                 │  callback.write_to_sinks()
-//!                                 ▼
-//!                               Sinks
+//!   └──── MAsyncTx ────► StreamingCoordinator (dedicated compute thread)
+//!                              │  callback.execute_cycle()
+//!                              │  callback.write_to_sinks()
+//!                              ▼
+//!                            Sinks
 //! ```
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,28 +24,44 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
+use crossfire::{mpsc, AsyncRx};
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::DeliveryGuarantee;
 use laminar_core::alloc::{PriorityClass, PriorityGuard};
 use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
 use rustc_hash::{FxHashMap, FxHashSet};
-use tokio::sync::mpsc;
 
 use super::callback::{PipelineCallback, SourceRegistration};
 use super::config::PipelineConfig;
 use crate::error::DbError;
 
+/// Single-consumer async receiver for source → coordinator batches.
+type SourceMsgRx = AsyncRx<mpsc::Array<SourceMsg>>;
+/// Single-consumer async receiver for live DDL control messages.
+type ControlMsgRx = AsyncRx<mpsc::Array<super::ControlMsg>>;
+
 /// Message sent from a source task to the coordinator.
+///
+/// Each variant carries the [`SourceCheckpoint`] captured at the point the
+/// message was produced.  Co-locating the offset with the data guarantees
+/// the coordinator never checkpoints an offset for data it has not yet
+/// processed (eliminates the offset-before-batch race).
 enum SourceMsg {
     /// A batch of records from a source.
     Batch {
         source_idx: usize,
         batch: RecordBatch,
+        /// Offset snapshot captured *after* `poll_batch` drained the reader
+        /// channel.  Committed to `committed_offsets` only when the batch
+        /// is actually processed (not when deferred to `post_barrier_buf`).
+        checkpoint: SourceCheckpoint,
     },
     /// Checkpoint barrier injected at the source.
     Barrier {
         source_idx: usize,
         barrier: CheckpointBarrier,
+        /// Offset snapshot captured at barrier injection (consistent cut).
+        checkpoint: SourceCheckpoint,
     },
 }
 
@@ -54,7 +70,6 @@ struct SourceHandle {
     name: Arc<str>,
     shutdown: Arc<tokio::sync::Notify>,
     join: tokio::task::JoinHandle<()>,
-    checkpoint_rx: tokio::sync::watch::Receiver<SourceCheckpoint>,
     /// Injector for Chandy-Lamport checkpoint barriers.
     barrier_injector: CheckpointBarrierInjector,
 }
@@ -66,7 +81,7 @@ struct SourceHandle {
 pub struct StreamingCoordinator {
     config: PipelineConfig,
     /// Receives all source messages (batches + barriers).
-    rx: mpsc::Receiver<SourceMsg>,
+    rx: SourceMsgRx,
     /// Handles to source tasks (for shutdown + checkpoint queries).
     source_handles: Vec<SourceHandle>,
     /// Source name cache indexed by `source_idx`.
@@ -85,14 +100,22 @@ pub struct StreamingCoordinator {
     source_batches_buf: FxHashMap<Arc<str>, Vec<RecordBatch>>,
     /// Batches received after a barrier from the same source in the same
     /// drain cycle. These belong to the NEXT checkpoint epoch and must not
-    /// be included in the current checkpoint state.
+    /// be included in the current checkpoint state. Bounded in practice by
+    /// `channel_capacity` (max messages available per drain cycle).
     post_barrier_buf: Vec<SourceMsg>,
+    pending_watermark_batches: Vec<(Arc<str>, RecordBatch)>,
     /// Source indices that have delivered a barrier during the current drain
     /// cycle. Any subsequent batch from these sources goes to
     /// `post_barrier_buf`.
     barrier_seen: FxHashSet<usize>,
+    /// Latest durably-processed source offset per source index.  Merged
+    /// from `pending_offsets` only after a successful `execute_cycle`.
+    committed_offsets: Vec<Option<SourceCheckpoint>>,
+    /// Offsets staged by `process_msg`.  Merged into `committed_offsets`
+    /// after a successful `execute_cycle`, discarded on failure.
+    pending_offsets: Vec<Option<SourceCheckpoint>>,
     /// Control channel for live DDL (add/drop stream) from `LaminarDB`.
-    control_rx: mpsc::Receiver<super::ControlMsg>,
+    control_rx: ControlMsgRx,
 }
 
 /// Tracks in-flight checkpoint barrier alignment.
@@ -130,9 +153,6 @@ impl PendingBarrier {
 /// Fallback timeout for idle wake.
 const IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 
-/// Barrier alignment timeout.
-const BARRIER_TIMEOUT: Duration = Duration::from_secs(60);
-
 impl StreamingCoordinator {
     /// Create a new streaming coordinator.
     ///
@@ -148,7 +168,7 @@ impl StreamingCoordinator {
         sources: Vec<SourceRegistration>,
         config: PipelineConfig,
         shutdown: Arc<tokio::sync::Notify>,
-        control_rx: mpsc::Receiver<super::ControlMsg>,
+        control_rx: ControlMsgRx,
     ) -> Result<Self, DbError> {
         // Validate delivery guarantee constraints.
         if config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
@@ -167,32 +187,32 @@ impl StreamingCoordinator {
             }
         }
 
+        if config.channel_capacity == 0 {
+            return Err(DbError::Config(
+                "[LDB-0010] channel_capacity must be > 0".into(),
+            ));
+        }
+
         // Channel for all source messages.
-        let (tx, rx) = mpsc::channel(8192);
+        let (tx, rx) = mpsc::bounded_async::<SourceMsg>(config.channel_capacity);
 
         let mut source_handles = Vec::with_capacity(sources.len());
         let mut source_names = Vec::with_capacity(sources.len());
         let mut checkpoint_request_flags = Vec::new();
+        let mut committed_offsets = Vec::with_capacity(sources.len());
 
         for (idx, src) in sources.into_iter().enumerate() {
             if let Some(flag) = src.connector.checkpoint_requested() {
                 checkpoint_request_flags.push(flag);
             }
 
-            // Initialize watch with the restored checkpoint (not zero) so
-            // maybe_checkpoint() sees correct offsets from the start.
-            let initial_cp = src
-                .restore_checkpoint
-                .clone()
-                .unwrap_or_else(|| SourceCheckpoint::new(0));
-            let (cp_tx, cp_rx) = tokio::sync::watch::channel(initial_cp);
             let task_shutdown = Arc::new(tokio::sync::Notify::new());
             let task_shutdown_clone = Arc::clone(&task_shutdown);
             let task_tx = tx.clone();
             let max_poll = config.max_poll_records;
             let poll_interval = config.fallback_poll_interval;
             let src_name = src.name.clone();
-            let restore = src.restore_checkpoint;
+            let restore = src.restore_checkpoint.clone();
             let mut connector = src.connector;
             let connector_config = src.config;
 
@@ -212,8 +232,9 @@ impl StreamingCoordinator {
                 }
             }
 
-            // Publish initial offset after open/restore.
-            let _ = cp_tx.send(connector.checkpoint());
+            // Seed committed_offsets with the restore checkpoint so a
+            // shutdown before any data still checkpoints the restore position.
+            committed_offsets.push(src.restore_checkpoint);
 
             // Barrier injection: coordinator triggers → source polls → sends SourceMsg::Barrier
             let barrier_injector = CheckpointBarrierInjector::new();
@@ -233,14 +254,14 @@ impl StreamingCoordinator {
 
                     match poll_result {
                         Ok(Some(batch)) => {
-                            // Publish offset BEFORE sending the batch so
-                            // maybe_checkpoint() never sees an offset ahead
-                            // of what the coordinator has consumed.
-                            let _ = cp_tx.send(connector.checkpoint());
-
+                            // Offset travels with the batch — no separate
+                            // watch channel.  The coordinator commits the
+                            // offset only after processing the batch.
+                            let cp = connector.checkpoint();
                             let msg = SourceMsg::Batch {
                                 source_idx: idx,
                                 batch: batch.records,
+                                checkpoint: cp,
                             };
                             if task_tx.send(msg).await.is_err() {
                                 break; // Coordinator dropped
@@ -254,8 +275,12 @@ impl StreamingCoordinator {
                                 () = tokio::time::sleep(poll_interval) => {}
                             }
                         }
+                        Err(e) if !e.is_transient() => {
+                            tracing::error!(source = %src_name, error = %e, "terminal poll error");
+                            break;
+                        }
                         Err(e) => {
-                            tracing::warn!(source = %src_name, error = %e, "poll error");
+                            tracing::warn!(source = %src_name, error = %e, "poll error (retrying)");
                             tokio::select! {
                                 biased;
                                 () = task_shutdown_clone.notified() => break,
@@ -267,11 +292,11 @@ impl StreamingCoordinator {
                     // Poll for pending checkpoint barrier.
                     if let Some(barrier) = barrier_handle.poll(epoch) {
                         epoch += 1;
-                        // Capture offset at barrier point (consistent cut).
-                        let _ = cp_tx.send(connector.checkpoint());
+                        let cp = connector.checkpoint();
                         let msg = SourceMsg::Barrier {
                             source_idx: idx,
                             barrier,
+                            checkpoint: cp,
                         };
                         if task_tx.send(msg).await.is_err() {
                             break;
@@ -279,7 +304,21 @@ impl StreamingCoordinator {
                     }
                 }
 
-                // Close connector.
+                // Drain remaining data from the connector's internal
+                // buffer before closing — close() drops the buffer and
+                // anything not drained here is lost.
+                while let Ok(Some(batch)) = connector.poll_batch(max_poll).await {
+                    let cp = connector.checkpoint();
+                    let msg = SourceMsg::Batch {
+                        source_idx: idx,
+                        batch: batch.records,
+                        checkpoint: cp,
+                    };
+                    if task_tx.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+
                 if let Err(e) = connector.close().await {
                     tracing::warn!(source = %src_name, error = %e, "source close error");
                 }
@@ -290,7 +329,6 @@ impl StreamingCoordinator {
                 name: Arc::clone(&arc_name),
                 shutdown: task_shutdown,
                 join,
-                checkpoint_rx: cp_rx,
                 barrier_injector,
             });
             source_names.push(arc_name);
@@ -308,7 +346,10 @@ impl StreamingCoordinator {
             checkpoint_request_flags,
             source_batches_buf: FxHashMap::default(),
             post_barrier_buf: Vec::new(),
+            pending_watermark_batches: Vec::new(),
             barrier_seen: FxHashSet::default(),
+            pending_offsets: vec![None; committed_offsets.len()],
+            committed_offsets,
             control_rx,
         })
     }
@@ -332,7 +373,7 @@ impl StreamingCoordinator {
         const MAX_DRAIN_PER_CYCLE: usize = 10_000;
 
         let batch_window = self.config.batch_window;
-        let mut barriers_buf: Vec<(usize, CheckpointBarrier)> = Vec::new();
+        let mut barriers_buf: Vec<(usize, CheckpointBarrier, SourceCheckpoint)> = Vec::new();
 
         loop {
             // Step: Wait for data, shutdown, or idle timeout.
@@ -341,7 +382,7 @@ impl StreamingCoordinator {
                 () = self.shutdown.notified() => break,
                 msg = self.rx.recv() => {
                     match msg {
-                        Some(m) => {
+                        Ok(m) => {
                             // If batch_window > 0, coalesce: sleep briefly
                             // to let more data accumulate.
                             if !batch_window.is_zero() {
@@ -349,7 +390,7 @@ impl StreamingCoordinator {
                             }
                             Some(m)
                         }
-                        None => break, // All senders dropped
+                        Err(_) => break, // All senders dropped
                     }
                 }
                 () = tokio::time::sleep(IDLE_TIMEOUT) => None,
@@ -359,6 +400,7 @@ impl StreamingCoordinator {
             let event_priority = PriorityGuard::enter(PriorityClass::EventProcessing);
             self.source_batches_buf.clear();
             self.barrier_seen.clear();
+            self.discard_pending_offsets();
             barriers_buf.clear();
             let mut cycle_events: u64 = 0;
             let cycle_start = Instant::now();
@@ -376,6 +418,7 @@ impl StreamingCoordinator {
                 );
             }
 
+            let had_data = msg.is_some();
             if let Some(first_msg) = msg {
                 self.process_msg(
                     first_msg,
@@ -386,11 +429,18 @@ impl StreamingCoordinator {
             }
 
             // Drain any additional buffered messages (batch coalescing).
-            // Terminates on count limit OR time budget, whichever comes first.
+            // Terminates on count limit, time budget, or backpressure.
+            // Only check backpressure on active wakeups to avoid bumping
+            // the counter on idle timeouts.
             let mut drain_count = 0;
             let drain_budget_ns = self.config.drain_budget_ns;
+            let backpressured = had_data && callback.is_backpressured();
+            if backpressured {
+                tracing::debug!("operator graph backpressured — skipping drain");
+            }
             #[allow(clippy::cast_possible_truncation)]
-            while drain_count < MAX_DRAIN_PER_CYCLE
+            while !backpressured
+                && drain_count < MAX_DRAIN_PER_CYCLE
                 && (cycle_start.elapsed().as_nanos() as u64) < drain_budget_ns
             {
                 match self.rx.try_recv() {
@@ -402,16 +452,25 @@ impl StreamingCoordinator {
                 }
             }
 
-            // Step: Execute SQL cycle (before committing barriers so that
-            // checkpoint state includes the processed batches).
-            if !self.source_batches_buf.is_empty() {
+            for (name, batch) in self.pending_watermark_batches.drain(..) {
+                callback.extract_watermark(&name, &batch);
+            }
+
+            // Step: Execute SQL cycle. Also runs on idle wakeups when
+            // operators have deferred input from a prior budget-exceeded
+            // cycle — otherwise that data is stuck forever once the source
+            // goes idle.
+            if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
                 let wm = callback.current_watermark();
                 match callback.execute_cycle(&self.source_batches_buf, wm).await {
                     Ok(results) => {
+                        self.commit_pending_offsets();
+                        callback.update_mv_stores(&results);
                         callback.push_to_streams(&results);
                         callback.write_to_sinks(&results).await;
                     }
                     Err(e) => {
+                        self.discard_pending_offsets();
                         tracing::warn!(error = %e, "[LDB-3020] SQL cycle error");
                     }
                 }
@@ -439,8 +498,8 @@ impl StreamingCoordinator {
 
             // Step: Handle barriers — always process (cheap, O(num_sources)
             // hash lookups, must not be deferred for correctness).
-            for (source_idx, barrier) in &barriers_buf {
-                self.handle_barrier(*source_idx, barrier, &mut callback)
+            for (source_idx, barrier, cp) in &barriers_buf {
+                self.handle_barrier(*source_idx, barrier, cp, &mut callback)
                     .await;
             }
 
@@ -470,7 +529,7 @@ impl StreamingCoordinator {
 
             // Step: Barrier timeout check.
             if self.pending_barrier.active
-                && self.pending_barrier.started_at.elapsed() > BARRIER_TIMEOUT
+                && self.pending_barrier.started_at.elapsed() > self.config.barrier_alignment_timeout
             {
                 tracing::warn!(
                     checkpoint_id = self.pending_barrier.checkpoint_id,
@@ -480,31 +539,110 @@ impl StreamingCoordinator {
             }
         }
 
-        // Shutdown: signal all source tasks to stop producing, then await
-        // completion so checkpoint_rx stops advancing before we read it.
+        // Signal source tasks to stop.
         for handle in &self.source_handles {
             handle.shutdown.notify_one();
         }
 
-        // Await each source task, then read its final (now-stable) checkpoint.
-        let checkpoint_enabled = self.config.checkpoint_interval.is_some();
-        let mut source_offsets = FxHashMap::default();
-        for (idx, handle) in std::mem::take(&mut self.source_handles)
-            .into_iter()
-            .enumerate()
-        {
-            if let Err(e) = handle.join.await {
-                tracing::warn!(source = %handle.name, error = ?e, "source task panicked");
+        // Drain rx BEFORE joining source tasks. Source tasks may be
+        // blocked on task_tx.send() (channel full because the pipeline
+        // is slower than the source). Draining first frees channel
+        // slots so those source tasks can unblock, see the shutdown
+        // signal, and exit. Joining before draining deadlocks.
+        self.source_batches_buf.clear();
+        self.barrier_seen.clear();
+        self.discard_pending_offsets();
+        let mut drain_barriers: Vec<(usize, CheckpointBarrier, SourceCheckpoint)> = Vec::new();
+        let mut drain_events: u64 = 0;
+
+        loop {
+            let deferred = std::mem::take(&mut self.post_barrier_buf);
+            let mut got_any = !deferred.is_empty();
+            for msg in deferred {
+                self.process_msg(msg, &mut callback, &mut drain_barriers, &mut drain_events);
             }
-            if checkpoint_enabled {
-                if let Some(name) = self.source_names.get(idx) {
-                    source_offsets.insert(name.to_string(), handle.checkpoint_rx.borrow().clone());
+            while let Ok(msg) = self.rx.try_recv() {
+                got_any = true;
+                self.process_msg(msg, &mut callback, &mut drain_barriers, &mut drain_events);
+            }
+            if !got_any {
+                break;
+            }
+        }
+
+        for (name, batch) in self.pending_watermark_batches.drain(..) {
+            callback.extract_watermark(&name, &batch);
+        }
+        if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
+            let wm = callback.current_watermark();
+            match callback.execute_cycle(&self.source_batches_buf, wm).await {
+                Ok(results) => {
+                    self.commit_pending_offsets();
+                    callback.update_mv_stores(&results);
+                    callback.push_to_streams(&results);
+                    callback.write_to_sinks(&results).await;
+                }
+                Err(e) => {
+                    self.discard_pending_offsets();
+                    tracing::warn!(error = %e, "[LDB-3020] SQL cycle error during shutdown drain");
                 }
             }
         }
 
-        if checkpoint_enabled && callback.maybe_checkpoint(true, source_offsets).await {
-            tracing::info!("final checkpoint completed before shutdown");
+        // Join source tasks (unblocked by the drain above).
+        for handle in std::mem::take(&mut self.source_handles) {
+            if let Err(e) = handle.join.await {
+                tracing::warn!(source = %handle.name, error = ?e, "source task panicked");
+            }
+        }
+
+        // Final drain: pick up any messages source tasks sent between
+        // the first drain and their exit.
+        self.source_batches_buf.clear();
+        self.barrier_seen.clear();
+        self.discard_pending_offsets();
+        drain_barriers.clear();
+        while let Ok(msg) = self.rx.try_recv() {
+            self.process_msg(msg, &mut callback, &mut drain_barriers, &mut drain_events);
+        }
+        for (name, batch) in self.pending_watermark_batches.drain(..) {
+            callback.extract_watermark(&name, &batch);
+        }
+        if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
+            let wm = callback.current_watermark();
+            match callback.execute_cycle(&self.source_batches_buf, wm).await {
+                Ok(results) => {
+                    self.commit_pending_offsets();
+                    callback.update_mv_stores(&results);
+                    callback.push_to_streams(&results);
+                    callback.write_to_sinks(&results).await;
+                }
+                Err(e) => {
+                    self.discard_pending_offsets();
+                    tracing::warn!(error = %e, "[LDB-3020] SQL cycle error during final drain");
+                }
+            }
+        }
+
+        // Final checkpoint uses committed_offsets — only reflects data
+        // that successfully passed through execute_cycle.
+        let checkpoint_enabled = self.config.checkpoint_interval.is_some();
+        if checkpoint_enabled {
+            let source_offsets: FxHashMap<String, SourceCheckpoint> = self
+                .committed_offsets
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, cp)| {
+                    cp.as_ref().and_then(|c| {
+                        self.source_names
+                            .get(idx)
+                            .map(|name| (name.to_string(), c.clone()))
+                    })
+                })
+                .collect();
+            if callback.maybe_checkpoint(true, source_offsets).await {
+                tracing::info!("final checkpoint completed before shutdown");
+            }
         }
     }
 
@@ -517,40 +655,75 @@ impl StreamingCoordinator {
         &mut self,
         msg: SourceMsg,
         callback: &mut impl PipelineCallback,
-        barriers: &mut Vec<(usize, CheckpointBarrier)>,
+        barriers: &mut Vec<(usize, CheckpointBarrier, SourceCheckpoint)>,
         cycle_events: &mut u64,
     ) {
         match msg {
-            SourceMsg::Batch { source_idx, batch } => {
+            SourceMsg::Batch {
+                source_idx,
+                batch,
+                checkpoint,
+            } => {
                 // If this source already delivered a barrier in this drain
                 // cycle, this batch is post-barrier data — defer it.
                 if self.barrier_seen.contains(&source_idx) {
-                    self.post_barrier_buf
-                        .push(SourceMsg::Batch { source_idx, batch });
+                    self.post_barrier_buf.push(SourceMsg::Batch {
+                        source_idx,
+                        batch,
+                        checkpoint,
+                    });
                     return;
                 }
 
+                // Stage offset (committed after successful execute_cycle).
+                if source_idx < self.pending_offsets.len() {
+                    self.pending_offsets[source_idx] = Some(checkpoint);
+                }
+
                 if let Some(name) = self.source_names.get(source_idx) {
-                    callback.extract_watermark(name, &batch);
                     #[allow(clippy::cast_possible_truncation)]
                     {
                         *cycle_events += batch.num_rows() as u64;
                     }
+                    // Filter with the PRE-DRAIN watermark. Watermark extraction
+                    // is deferred to after all batches in this drain cycle are
+                    // filtered — otherwise batch N's watermark advance causes
+                    // batch N+1's slightly-older rows to be dropped as "late."
                     if let Some(filtered) = callback.filter_late_rows(name, &batch) {
                         self.source_batches_buf
                             .entry(Arc::clone(name))
                             .or_default()
                             .push(filtered);
                     }
+                    self.pending_watermark_batches
+                        .push((Arc::clone(name), batch));
                 }
             }
             SourceMsg::Barrier {
                 source_idx,
                 barrier,
+                checkpoint,
             } => {
                 self.barrier_seen.insert(source_idx);
-                barriers.push((source_idx, barrier));
+                barriers.push((source_idx, barrier, checkpoint));
             }
+        }
+    }
+
+    /// Merge staged offsets into `committed_offsets`.  Called after a
+    /// successful `execute_cycle`.
+    fn commit_pending_offsets(&mut self) {
+        for (i, pending) in self.pending_offsets.iter_mut().enumerate() {
+            if let Some(cp) = pending.take() {
+                self.committed_offsets[i] = Some(cp);
+            }
+        }
+    }
+
+    /// Discard staged offsets.  Called when `execute_cycle` fails.
+    fn discard_pending_offsets(&mut self) {
+        for slot in &mut self.pending_offsets {
+            *slot = None;
         }
     }
 
@@ -559,6 +732,7 @@ impl StreamingCoordinator {
         &mut self,
         source_idx: usize,
         barrier: &CheckpointBarrier,
+        barrier_checkpoint: &SourceCheckpoint,
         callback: &mut impl PipelineCallback,
     ) {
         if !self.pending_barrier.active
@@ -567,15 +741,12 @@ impl StreamingCoordinator {
             return;
         }
 
-        // Record this source's checkpoint.
+        // Use the checkpoint that traveled atomically with the barrier
+        // message — no watch-channel race.
         if let Some(name) = self.source_names.get(source_idx) {
-            let cp = self.source_handles[source_idx]
-                .checkpoint_rx
-                .borrow()
-                .clone();
             self.pending_barrier
                 .source_checkpoints
-                .insert(name.to_string(), cp);
+                .insert(name.to_string(), barrier_checkpoint.clone());
         }
 
         self.pending_barrier.sources_aligned.insert(source_idx);
@@ -584,19 +755,14 @@ impl StreamingCoordinator {
         if self.pending_barrier.sources_aligned.len() >= self.pending_barrier.sources_total {
             let checkpoints = std::mem::take(&mut self.pending_barrier.source_checkpoints);
             let ok = callback.checkpoint_with_barrier(checkpoints).await;
-            if ok {
-                self.pending_barrier.active = false;
-                self.last_checkpoint = Instant::now();
-            } else {
+            if !ok {
                 tracing::warn!(
                     checkpoint_id = self.pending_barrier.checkpoint_id,
                     "barrier checkpoint failed, will retry on next interval"
                 );
-                // Keep active=true so next periodic trigger retries.
-                // Source checkpoints were consumed; sources will re-checkpoint
-                // on the next barrier injection.
-                self.pending_barrier.active = false;
             }
+            self.pending_barrier.active = false;
+            self.last_checkpoint = Instant::now();
         }
     }
 
@@ -736,10 +902,10 @@ mod tests {
     #[tokio::test]
     async fn test_coordinator_direct_channel() {
         let shutdown = Arc::new(tokio::sync::Notify::new());
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
 
         // Create coordinator directly (bypassing source spawning).
-        let (_control_tx, control_rx) = mpsc::channel(64);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
         let coordinator = StreamingCoordinator {
             config: PipelineConfig {
                 batch_window: Duration::ZERO,
@@ -748,12 +914,12 @@ mod tests {
                 fallback_poll_interval: Duration::from_millis(10),
                 checkpoint_interval: None,
                 delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
-                barrier_alignment_timeout: BARRIER_TIMEOUT,
+                barrier_alignment_timeout: Duration::from_secs(30),
                 cycle_budget_ns: 10_000_000,
                 drain_budget_ns: 1_000_000,
                 query_budget_ns: 8_000_000,
                 background_budget_ns: 5_000_000,
-                sink_write_timeout: Duration::from_secs(30),
+                max_input_buf_batches: 256,
             },
             rx,
             source_handles: Vec::new(),
@@ -765,7 +931,10 @@ mod tests {
             checkpoint_request_flags: Vec::new(),
             source_batches_buf: FxHashMap::default(),
             post_barrier_buf: Vec::new(),
+            pending_watermark_batches: Vec::new(),
             barrier_seen: FxHashSet::default(),
+            committed_offsets: vec![None],
+            pending_offsets: vec![None],
             control_rx,
         };
 
@@ -778,6 +947,7 @@ mod tests {
         tx.send(SourceMsg::Batch {
             source_idx: 0,
             batch,
+            checkpoint: SourceCheckpoint::new(1),
         })
         .await
         .unwrap();
@@ -801,8 +971,8 @@ mod tests {
     #[tokio::test]
     async fn test_final_checkpoint_on_shutdown() {
         let shutdown = Arc::new(tokio::sync::Notify::new());
-        let (tx, rx) = mpsc::channel(64);
-        let (_control_tx, control_rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
 
         let coordinator = StreamingCoordinator {
             config: PipelineConfig {
@@ -812,12 +982,12 @@ mod tests {
                 fallback_poll_interval: Duration::from_millis(10),
                 checkpoint_interval: Some(Duration::from_secs(60)),
                 delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
-                barrier_alignment_timeout: BARRIER_TIMEOUT,
+                barrier_alignment_timeout: Duration::from_secs(30),
                 cycle_budget_ns: 10_000_000,
                 drain_budget_ns: 1_000_000,
                 query_budget_ns: 8_000_000,
                 background_budget_ns: 5_000_000,
-                sink_write_timeout: Duration::from_secs(30),
+                max_input_buf_batches: 256,
             },
             rx,
             source_handles: Vec::new(),
@@ -829,7 +999,10 @@ mod tests {
             checkpoint_request_flags: Vec::new(),
             source_batches_buf: FxHashMap::default(),
             post_barrier_buf: Vec::new(),
+            pending_watermark_batches: Vec::new(),
             barrier_seen: FxHashSet::default(),
+            committed_offsets: vec![None],
+            pending_offsets: vec![None],
             control_rx,
         };
 
@@ -843,6 +1016,7 @@ mod tests {
         tx.send(SourceMsg::Batch {
             source_idx: 0,
             batch,
+            checkpoint: SourceCheckpoint::new(1),
         })
         .await
         .unwrap();
@@ -869,7 +1043,7 @@ mod tests {
         let shutdown = Arc::new(tokio::sync::Notify::new());
         let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
 
-        let (_control_tx2, control_rx2) = mpsc::channel(64);
+        let (_control_tx2, control_rx2) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
         let mut coordinator = StreamingCoordinator {
             config: PipelineConfig {
                 batch_window: Duration::ZERO,
@@ -878,14 +1052,14 @@ mod tests {
                 fallback_poll_interval: Duration::from_millis(10),
                 checkpoint_interval: None,
                 delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
-                barrier_alignment_timeout: BARRIER_TIMEOUT,
+                barrier_alignment_timeout: Duration::from_secs(30),
                 cycle_budget_ns: 10_000_000,
                 drain_budget_ns: 1_000_000,
                 query_budget_ns: 8_000_000,
                 background_budget_ns: 5_000_000,
-                sink_write_timeout: Duration::from_secs(30),
+                max_input_buf_batches: 256,
             },
-            rx: mpsc::channel(64).1, // dummy, not used
+            rx: mpsc::bounded_async::<SourceMsg>(64).1, // dummy, not used
             source_handles: Vec::new(),
             source_names: vec![Arc::from("s0"), Arc::from("s1")],
             shutdown: Arc::clone(&shutdown),
@@ -895,7 +1069,10 @@ mod tests {
             checkpoint_request_flags: Vec::new(),
             source_batches_buf: FxHashMap::default(),
             post_barrier_buf: Vec::new(),
+            pending_watermark_batches: Vec::new(),
             barrier_seen: FxHashSet::default(),
+            committed_offsets: vec![None, None],
+            pending_offsets: vec![None, None],
             control_rx: control_rx2,
         };
 
@@ -920,6 +1097,7 @@ mod tests {
             SourceMsg::Batch {
                 source_idx: 0,
                 batch: batch_1,
+                checkpoint: SourceCheckpoint::new(10),
             },
             &mut callback,
             &mut barriers,
@@ -929,6 +1107,7 @@ mod tests {
             SourceMsg::Barrier {
                 source_idx: 0,
                 barrier,
+                checkpoint: SourceCheckpoint::new(10),
             },
             &mut callback,
             &mut barriers,
@@ -938,6 +1117,7 @@ mod tests {
             SourceMsg::Batch {
                 source_idx: 0,
                 batch: batch_2,
+                checkpoint: SourceCheckpoint::new(20),
             },
             &mut callback,
             &mut barriers,
@@ -954,6 +1134,7 @@ mod tests {
             SourceMsg::Batch {
                 source_idx: 1,
                 batch: batch_s1,
+                checkpoint: SourceCheckpoint::new(5),
             },
             &mut callback,
             &mut barriers,
@@ -963,6 +1144,7 @@ mod tests {
             SourceMsg::Barrier {
                 source_idx: 1,
                 barrier,
+                checkpoint: SourceCheckpoint::new(5),
             },
             &mut callback,
             &mut barriers,
@@ -994,7 +1176,218 @@ mod tests {
             "post_barrier_buf should have 1 deferred batch"
         );
 
+        // pending_offsets: pre-barrier only (post-barrier deferred, not staged).
+        assert_eq!(
+            coordinator.pending_offsets[0].as_ref().unwrap().epoch(),
+            10,
+            "s0 pending offset should be the pre-barrier batch"
+        );
+        assert_eq!(
+            coordinator.pending_offsets[1].as_ref().unwrap().epoch(),
+            5,
+            "s1 pending offset should be epoch 5"
+        );
+        // committed_offsets must still be None — no execute_cycle has run.
+        assert!(
+            coordinator.committed_offsets[0].is_none(),
+            "s0 committed offset should be None before execute_cycle"
+        );
+        assert!(
+            coordinator.committed_offsets[1].is_none(),
+            "s1 committed offset should be None before execute_cycle"
+        );
+
+        // Simulate successful cycle → commit.
+        coordinator.commit_pending_offsets();
+        assert_eq!(
+            coordinator.committed_offsets[0].as_ref().unwrap().epoch(),
+            10,
+            "s0 committed after cycle"
+        );
+        assert_eq!(
+            coordinator.committed_offsets[1].as_ref().unwrap().epoch(),
+            5,
+            "s1 committed after cycle"
+        );
+
         // Barriers should have both sources.
         assert_eq!(barriers.len(), 2, "should have barriers from both sources");
+    }
+
+    #[allow(clippy::disallowed_types)] // test-only: std::sync::Mutex is fine here
+    struct BackpressuredCallback {
+        inner: MockCallback,
+        cycle_count: Arc<std::sync::atomic::AtomicU32>,
+        events_per_cycle: Arc<std::sync::Mutex<Vec<u64>>>,
+    }
+
+    impl BackpressuredCallback {
+        #[allow(clippy::disallowed_types)]
+        fn new(
+            cycle_count: Arc<std::sync::atomic::AtomicU32>,
+            events_per_cycle: Arc<std::sync::Mutex<Vec<u64>>>,
+        ) -> Self {
+            Self {
+                inner: MockCallback::new(),
+                cycle_count,
+                events_per_cycle,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PipelineCallback for BackpressuredCallback {
+        async fn execute_cycle(
+            &mut self,
+            source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
+            watermark: i64,
+        ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
+            self.cycle_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let total: u64 = source_batches
+                .values()
+                .flat_map(|bs| bs.iter())
+                .map(|b| b.num_rows() as u64)
+                .sum();
+            self.events_per_cycle.lock().unwrap().push(total);
+            self.inner.execute_cycle(source_batches, watermark).await
+        }
+
+        fn push_to_streams(&self, r: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
+            self.inner.push_to_streams(r);
+        }
+        async fn write_to_sinks(&mut self, r: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
+            self.inner.write_to_sinks(r).await;
+        }
+        fn extract_watermark(&mut self, s: &str, b: &RecordBatch) {
+            self.inner.extract_watermark(s, b);
+        }
+        fn filter_late_rows(&self, s: &str, b: &RecordBatch) -> Option<RecordBatch> {
+            self.inner.filter_late_rows(s, b)
+        }
+        fn current_watermark(&self) -> i64 {
+            self.inner.current_watermark()
+        }
+        async fn maybe_checkpoint(
+            &mut self,
+            force: bool,
+            offsets: FxHashMap<String, SourceCheckpoint>,
+        ) -> bool {
+            self.inner.maybe_checkpoint(force, offsets).await
+        }
+        async fn checkpoint_with_barrier(
+            &mut self,
+            cp: FxHashMap<String, SourceCheckpoint>,
+        ) -> bool {
+            self.inner.checkpoint_with_barrier(cp).await
+        }
+        fn record_cycle(&self, e: u64, b: u64, ns: u64) {
+            self.inner.record_cycle(e, b, ns);
+        }
+        async fn poll_tables(&mut self) {
+            self.inner.poll_tables().await;
+        }
+        fn apply_control(&mut self, msg: crate::pipeline::ControlMsg) {
+            self.inner.apply_control(msg);
+        }
+
+        fn is_backpressured(&self) -> bool {
+            true // Always backpressured — drain loop should never fire.
+        }
+    }
+
+    /// With `is_backpressured() == true`, the coordinator processes only
+    /// the first wakeup message per cycle (no drain coalescing). With 5
+    /// messages pre-loaded and `batch_window=0`, each cycle should see
+    /// exactly 1 event, spread across multiple cycles.
+    #[tokio::test]
+    async fn test_drain_skip_under_backpressure() {
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let (tx, rx) = mpsc::bounded_async::<SourceMsg>(64);
+        let (_control_tx, control_rx) = mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
+
+        let coordinator = StreamingCoordinator {
+            config: PipelineConfig {
+                batch_window: Duration::ZERO,
+                max_poll_records: 1000,
+                channel_capacity: 64,
+                fallback_poll_interval: Duration::from_millis(10),
+                checkpoint_interval: None,
+                delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
+                barrier_alignment_timeout: Duration::from_secs(30),
+                cycle_budget_ns: 10_000_000,
+                drain_budget_ns: 1_000_000,
+                query_budget_ns: 8_000_000,
+                background_budget_ns: 5_000_000,
+                max_input_buf_batches: 256,
+            },
+            rx,
+            source_handles: Vec::new(),
+            source_names: vec![Arc::from("src")],
+            shutdown: Arc::clone(&shutdown),
+            pending_barrier: PendingBarrier::new(),
+            next_checkpoint_id: 1,
+            last_checkpoint: Instant::now(),
+            checkpoint_request_flags: Vec::new(),
+            source_batches_buf: FxHashMap::default(),
+            post_barrier_buf: Vec::new(),
+            pending_watermark_batches: Vec::new(),
+            barrier_seen: FxHashSet::default(),
+            committed_offsets: vec![None],
+            pending_offsets: vec![None],
+            control_rx,
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+
+        // Pre-load 5 batches (1 row each).
+        for i in 0..5 {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(vec![i]))],
+            )
+            .unwrap();
+            tx.send(SourceMsg::Batch {
+                source_idx: 0,
+                batch,
+                checkpoint: SourceCheckpoint::new(u64::try_from(i).unwrap()),
+            })
+            .await
+            .unwrap();
+        }
+
+        let shutdown_clone = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            shutdown_clone.notify_one();
+        });
+
+        let cycle_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        #[allow(clippy::disallowed_types)]
+        let events_per_cycle = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback =
+            BackpressuredCallback::new(Arc::clone(&cycle_count), Arc::clone(&events_per_cycle));
+        coordinator.run(callback).await;
+
+        let cycles = cycle_count.load(std::sync::atomic::Ordering::SeqCst);
+        let epc = events_per_cycle.lock().unwrap();
+        let total: u64 = epc.iter().sum();
+
+        // All 5 events must be processed (no data loss).
+        assert_eq!(total, 5, "all events must be processed, got {total}");
+        // Under backpressure each cycle gets only the wakeup message (1
+        // event), so we need at least 5 cycles for 5 messages. Without
+        // backpressure, cycle 1 would drain all 5 in one shot.
+        assert!(
+            cycles >= 5,
+            "expected >=5 cycles (1 event each), got {cycles} cycles with events/cycle: {epc:?}"
+        );
+        // Each cycle sees at most 1 event (the wakeup message; drain skipped).
+        for (i, &events) in epc.iter().enumerate() {
+            assert!(
+                events <= 1,
+                "cycle {i} saw {events} events, expected <=1 under backpressure"
+            );
+        }
     }
 }

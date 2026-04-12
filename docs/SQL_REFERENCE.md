@@ -10,9 +10,9 @@ LaminarDB uses [Apache DataFusion](https://datafusion.apache.org/) as its SQL en
 
 | What you might try | What actually works | Notes |
 |---|---|---|
-| `TUMBLE_START(ts, ...)` | `CAST(tumble(ts, ...) AS BIGINT)` | DataFusion doesn't have `TUMBLE_START()` |
+| `TUMBLE_START(ts, ...)` | `tumble(ts, ...)` | Returns `Timestamp(Millisecond)` directly |
 | `FIRST(price)` / `LAST(price)` | `first_value(price)` / `last_value(price)` | DataFusion aggregate function names |
-| `ts - INTERVAL '10' SECOND` (on BIGINT) | `ts - 10000` | INTERVAL only works on TIMESTAMP types |
+| `ts - INTERVAL '10' SECOND` | `ts - INTERVAL '10' SECOND` | Native on `TIMESTAMP` columns since v0.20.1 |
 | `CASE WHEN ... THEN vol ELSE 0` | `CASE WHEN ... THEN vol ELSE CAST(0 AS BIGINT)` | ELSE branch must match column type |
 | `SHOW TABLES` | `SHOW SOURCES` / `SHOW STREAMS` | LaminarDB uses source/stream terminology |
 | `date_trunc('hour', ts)` | `date_trunc('hour', ts)` | Available via DataFusion 52 built-ins |
@@ -22,7 +22,9 @@ LaminarDB uses [Apache DataFusion](https://datafusion.apache.org/) as its SQL en
 
 ## Sources
 
-Create data sources using `CREATE SOURCE`. All timestamp columns should be BIGINT (milliseconds since epoch) and annotated with `#[event_time]` in Rust structs.
+Create data sources using `CREATE SOURCE`. Event-time columns must be
+declared as `TIMESTAMP` — LaminarDB uses Arrow `Timestamp(_)` internally
+at any precision and rescales to milliseconds via the Arrow cast kernel.
 
 ```sql
 CREATE SOURCE trades (
@@ -32,9 +34,16 @@ CREATE SOURCE trades (
     price      DOUBLE NOT NULL,
     volume     BIGINT NOT NULL,
     order_ref  VARCHAR NOT NULL,
-    ts         BIGINT NOT NULL
+    ts         TIMESTAMP NOT NULL,
+    WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
 )
 ```
+
+Note: `TIMESTAMP` in DDL maps to `Timestamp(Microsecond, None)` on the
+Arrow side. Connectors that produce their own schemas (OTel, Kafka+Avro,
+CDC) may use a different precision (nanosecond for OTel's
+`_laminar_received_at`, millisecond for CDC's `_ts_ms`); all precisions
+compose correctly with `INTERVAL` arithmetic and window functions.
 
 **Rust side:**
 ```rust
@@ -47,7 +56,7 @@ pub struct Trade {
     pub volume: i64,
     pub order_ref: String,
     #[event_time]
-    pub ts: i64,
+    pub ts: i64,  // epoch microseconds; the record macro handles the Arrow mapping
 }
 ```
 
@@ -62,7 +71,7 @@ Non-overlapping windows of fixed size. Every event belongs to exactly one window
 ```sql
 CREATE STREAM ohlc AS
 SELECT symbol,
-       CAST(tumble(ts, INTERVAL '5' SECOND) AS BIGINT) AS window_start,
+       tumble(ts, INTERVAL '5' SECOND) AS window_start,
        first_value(price) AS open,
        MAX(price) AS high,
        MIN(price) AS low,
@@ -78,7 +87,7 @@ GROUP BY symbol, tumble(ts, INTERVAL '5' SECOND)
 ```sql
 -- Tumble with 8-hour offset (align to UTC+8 day boundaries)
 SELECT symbol,
-       CAST(tumble(ts, INTERVAL '1' HOUR, INTERVAL '8' HOUR) AS BIGINT) AS window_start,
+       tumble(ts, INTERVAL '1' HOUR, INTERVAL '8' HOUR) AS window_start,
        COUNT(*) AS trade_count
 FROM trades
 GROUP BY symbol, tumble(ts, INTERVAL '1' HOUR, INTERVAL '8' HOUR)
@@ -86,7 +95,7 @@ GROUP BY symbol, tumble(ts, INTERVAL '1' HOUR, INTERVAL '8' HOUR)
 
 **Key points:**
 - Use lowercase `tumble()` (not `TUMBLE()` — both work, but lowercase is canonical)
-- Extract window start with `CAST(tumble(...) AS BIGINT)` — there is no `TUMBLE_START()` function
+- `tumble()` returns `Timestamp(Millisecond)` directly — there is no `TUMBLE_START()` function
 - Optional third argument for timezone offset alignment
 - Window closes when watermark passes window end
 
@@ -150,11 +159,12 @@ SELECT t.symbol,
 FROM trades t
 INNER JOIN orders o
 ON t.symbol = o.symbol
-AND o.ts BETWEEN t.ts - 10000 AND t.ts + 10000
+AND o.ts BETWEEN t.ts - INTERVAL '10' SECOND AND t.ts + INTERVAL '10' SECOND
 ```
 
 **Key points:**
-- Use numeric arithmetic for BIGINT timestamps: `t.ts - 10000` (not `INTERVAL '10' SECOND`)
+- `INTERVAL` arithmetic on `TIMESTAMP` columns is handled natively by
+  DataFusion — no need for the old `ts - 10000` millisecond tricks
 - Both sources need watermarks advanced for the join to emit
 - Column aliases (`AS trade_price`) are required when both sources have columns with the same name
 
@@ -321,14 +331,29 @@ EXPLAIN ANALYZE SELECT symbol, COUNT(*) FROM trades GROUP BY symbol;
 
 ## Common Gotchas
 
-### 1. BIGINT timestamps + INTERVAL don't mix
+### 1. Event-time columns must be `TIMESTAMP`, not `BIGINT`
+
+Declaring `ts BIGINT` and watermarking on it used to work via unit
+inference; as of v0.20.1 the event-time path requires a real Arrow
+`Timestamp(_)` column. Declare `ts TIMESTAMP` (or any precision your
+connector emits) and `INTERVAL` arithmetic composes natively.
 
 ```sql
--- FAILS: INTERVAL on BIGINT column
-WHERE o.ts BETWEEN t.ts - INTERVAL '10' SECOND AND t.ts + INTERVAL '10' SECOND
+-- WORKS on v0.20.1+
+CREATE SOURCE trades (symbol VARCHAR, price DOUBLE, ts TIMESTAMP,
+                      WATERMARK FOR ts AS ts - INTERVAL '5' SECOND);
 
--- WORKS: numeric arithmetic (BIGINT milliseconds)
-WHERE o.ts BETWEEN t.ts - 10000 AND t.ts + 10000
+-- Join predicates on Timestamp columns compose with INTERVAL:
+WHERE o.ts BETWEEN t.ts - INTERVAL '10' SECOND AND t.ts + INTERVAL '10' SECOND
+```
+
+If you need an `i64` millis derived column for downstream consumption
+(e.g. a dashboard that wants a plain number), cast the Timestamp and
+divide by the precision factor:
+
+```sql
+CAST(ts AS BIGINT) / 1000   -- Timestamp(Microsecond) → epoch millis
+CAST(ts AS BIGINT) / 1000000 -- Timestamp(Nanosecond) → epoch millis
 ```
 
 ### 2. Type mismatch in CASE WHEN
@@ -348,7 +373,7 @@ SUM(CASE WHEN side = 'buy' THEN volume ELSE CAST(0 AS BIGINT) END)
 SELECT TUMBLE_START(ts, INTERVAL '5' SECOND), FIRST(price), LAST(price)
 
 -- WORKS
-SELECT CAST(tumble(ts, INTERVAL '5' SECOND) AS BIGINT), first_value(price), last_value(price)
+SELECT tumble(ts, INTERVAL '5' SECOND), first_value(price), last_value(price)
 ```
 
 ### 4. FromRow field ordering
@@ -412,14 +437,29 @@ The following patterns are confirmed working in LaminarDB embedded mode (tested 
 
 ## Type Mapping
 
-| SQL Type | Rust Type | Notes |
-|----------|-----------|-------|
-| `VARCHAR` | `String` | |
-| `BIGINT` | `i64` | Use for timestamps, volumes, counts |
-| `DOUBLE` | `f64` | Use for prices, averages |
-| `INT` / `INTEGER` | `i32` | Avoid mixing with BIGINT in CASE WHEN |
-| `BOOLEAN` | `bool` | |
+| SQL Type | Arrow Type | Rust Type | Notes |
+|----------|------------|-----------|-------|
+| `VARCHAR` | `Utf8` | `String` | |
+| `BIGINT` | `Int64` | `i64` | Use for volumes, counts; **not** event-time columns |
+| `TIMESTAMP` | `Timestamp(Microsecond)` | `i64` µs | Declared in DDL |
+| `DOUBLE` | `Float64` | `f64` | Use for prices, averages |
+| `INT` / `INTEGER` | `Int32` | `i32` | Avoid mixing with BIGINT in CASE WHEN |
+| `BOOLEAN` | `Boolean` | `bool` | |
+
+Connector-produced schemas may use other `Timestamp(_)` precisions:
+
+| Column | Precision | Source |
+|--------|-----------|--------|
+| `_laminar_received_at` | `Timestamp(Nanosecond)` | OTel |
+| `_ts_ms` | `Timestamp(Millisecond)` | Postgres / MySQL CDC |
+| `_timestamp` | `Timestamp(Millisecond)` | Kafka metadata |
+| `_wall_time_ms` | `Timestamp(Millisecond)` | MongoDB CDC |
+| `file_modification_time` | `Timestamp(Millisecond)` | Files connector |
+
+Despite the `_ms` / `_ns` suffixes in some historical names, these are
+real Arrow `Timestamp` columns — not `Int64`. `INTERVAL` arithmetic and
+window functions compose correctly against any precision.
 
 ---
 
-*This reference is based on LaminarDB v0.18.x with DataFusion 52.x and Arrow 57.x. Contributions and corrections welcome -- please open an issue or PR.*
+*This reference is based on LaminarDB v0.20.1 with DataFusion 52.x and Arrow 57.x. Contributions and corrections welcome — please open an issue or PR.*

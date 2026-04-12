@@ -1,36 +1,4 @@
-//! PostgreSQL CDC source connector.
-//!
-//! Streams row-level changes from PostgreSQL using logical replication
-//! (pgoutput plugin). Supports INSERT, UPDATE, DELETE operations with
-//! Z-set changelog integration.
-//!
-//! # Architecture
-//!
-//! ```text
-//! Ring 0 (Hot Path):  SPSC pop only (~5ns, zero CDC code)
-//! Ring 1 (Background): WAL consumption → pgoutput decode → Arrow conversion
-//! Ring 2 (Control):    Slot management, schema discovery, health checks
-//! ```
-//!
-//! # Module Structure
-//!
-//! - `config` - Connection and replication configuration
-//! - `lsn` - Log Sequence Number type
-//! - `types` - PostgreSQL OID to Arrow type mapping
-//! - `decoder` - pgoutput binary protocol parser
-//! - `schema` - Relation (table) schema cache
-//! - `changelog` - Z-set change event conversion
-//! - `metrics` - Lock-free atomic CDC metrics
-//! - `source` - `PostgresCdcSource` implementing `SourceConnector`
-//!
-//! # Usage
-//!
-//! ```rust,ignore
-//! use laminar_connectors::cdc::postgres::{PostgresCdcSource, PostgresCdcConfig};
-//!
-//! let config = PostgresCdcConfig::new("localhost", "mydb", "laminar_slot", "laminar_pub");
-//! let mut source = PostgresCdcSource::new(config);
-//! ```
+//! `PostgreSQL` CDC source connector.
 
 pub mod changelog;
 pub mod config;
@@ -53,7 +21,7 @@ use crate::config::{ConfigKeySpec, ConnectorInfo};
 use crate::registry::ConnectorRegistry;
 
 /// Registers the `PostgreSQL` CDC source connector with the given registry.
-pub fn register_postgres_cdc(registry: &ConnectorRegistry) {
+pub fn register_postgres_cdc_source(registry: &ConnectorRegistry) {
     let info = ConnectorInfo {
         name: "postgres-cdc".to_string(),
         display_name: "PostgreSQL CDC Source".to_string(),
@@ -81,6 +49,28 @@ pub fn register_postgres_cdc(registry: &ConnectorRegistry) {
                 config.clone(),
                 4096,
             )))
+        }),
+    );
+
+    // Register standalone "postgres" table source for poll-based snapshot
+    // lookups (no replication slot / CDC required).
+    let pg_info = ConnectorInfo {
+        name: "postgres".to_string(),
+        display_name: "PostgreSQL Lookup Source".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        is_source: true,
+        is_sink: false,
+        config_keys: vec![],
+    };
+    registry.register_table_source(
+        "postgres",
+        pg_info,
+        Arc::new(|config| {
+            Ok(Box::new(
+                crate::lookup::postgres_reference::PostgresReferenceTableSource::new(
+                    config.clone(),
+                ),
+            ))
         }),
     );
 }
@@ -136,9 +126,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_register_postgres_cdc() {
+    fn test_register_postgres_cdc_source() {
         let registry = ConnectorRegistry::new();
-        register_postgres_cdc(&registry);
+        register_postgres_cdc_source(&registry);
 
         let info = registry.source_info("postgres-cdc");
         assert!(info.is_some());

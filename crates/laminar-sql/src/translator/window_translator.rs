@@ -309,15 +309,8 @@ impl WindowOperatorConfig {
     }
 
     /// Validates that the window operator configuration is used in a valid context.
-    ///
-    /// Checks:
-    /// - `EMIT ON WINDOW CLOSE` and `EMIT FINAL` require a watermark on the source
-    /// - `EMIT ON WINDOW CLOSE` and `EMIT FINAL` require a windowed aggregation
-    ///
-    /// # Arguments
-    ///
-    /// * `has_watermark` - Whether the source has a watermark definition
-    /// * `has_window` - Whether the query contains a windowed aggregation
+    /// Specifically, `EMIT ON WINDOW CLOSE` and `EMIT FINAL` both require a
+    /// watermark on the source *and* a windowed aggregation in the query.
     ///
     /// # Errors
     ///

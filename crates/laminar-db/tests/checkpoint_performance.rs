@@ -1,5 +1,7 @@
 #![allow(clippy::disallowed_types)]
-use laminar_db::checkpoint_coordinator::{CheckpointConfig, CheckpointCoordinator};
+use laminar_db::checkpoint_coordinator::{
+    CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
+};
 use laminar_storage::checkpoint_manifest::CheckpointManifest;
 use laminar_storage::checkpoint_store::{CheckpointStore, CheckpointStoreError};
 use std::time::{Duration, Instant};
@@ -56,7 +58,7 @@ async fn test_checkpoint_non_blocking() {
 
     // Spawn a background task that measures tick intervals
     // If the runtime is blocked, these intervals will spike
-    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    let (tx, rx) = crossfire::mpsc::bounded_async::<Duration>(100);
 
     let ticker = tokio::spawn(async move {
         let mut last_tick = Instant::now();
@@ -75,13 +77,7 @@ async fn test_checkpoint_non_blocking() {
     // This should take ~200ms total
     let start = Instant::now();
     let result = coordinator
-        .checkpoint(
-            std::collections::HashMap::new(),
-            None,
-            None,
-            std::collections::HashMap::new(),
-            None,
-        )
+        .checkpoint(CheckpointRequest::default())
         .await
         .unwrap();
     let duration = start.elapsed();

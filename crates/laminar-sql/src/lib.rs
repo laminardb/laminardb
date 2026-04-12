@@ -1,31 +1,4 @@
-//! # `LaminarDB` SQL
-//!
-//! SQL interface for `LaminarDB` with streaming extensions.
-//!
-//! This crate provides:
-//! - SQL parsing with streaming extensions (windows, watermarks, EMIT)
-//! - Query planning and optimization via `DataFusion`
-//! - Streaming-aware physical operators
-//! - SQL-to-operator translation
-//!
-//! ## Streaming SQL Extensions
-//!
-//! ```sql
-//! -- Tumbling window with EMIT
-//! SELECT
-//!   window_start,
-//!   COUNT(*) as event_count
-//! FROM events
-//! GROUP BY TUMBLE(event_time, INTERVAL '5' MINUTE)
-//! EMIT AFTER WATERMARK;
-//!
-//! -- Stream-to-stream join
-//! SELECT *
-//! FROM orders o
-//! JOIN order_items i
-//!   ON o.order_id = i.order_id
-//!   AND i.event_time BETWEEN o.event_time AND o.event_time + INTERVAL '1' HOUR;
-//! ```
+//! LaminarDB SQL parser, planner, and DataFusion integration.
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]

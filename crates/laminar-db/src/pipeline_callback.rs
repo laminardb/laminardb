@@ -1,6 +1,4 @@
-//! `PipelineCallback` implementation bridging the event-driven pipeline
-//! coordinator to the stream executor, sinks, watermarks, checkpoints,
-//! and table sources.
+//! Production `PipelineCallback` bridging coordinator to sinks, checkpoints, and watermarks.
 #![allow(clippy::disallowed_types)] // cold path
 
 use std::sync::Arc;
@@ -46,6 +44,7 @@ pub(crate) struct ConnectorPipelineCallback {
         crate::sink_task::SinkTaskHandle,
         Option<String>,
         String, // input stream name (FROM clause target)
+        bool,   // changelog-capable sink
     )>,
     pub(crate) watermark_states: FxHashMap<String, SourceWatermarkState>,
     pub(crate) source_entries_for_wm: FxHashMap<String, Arc<crate::catalog::SourceEntry>>,
@@ -62,6 +61,7 @@ pub(crate) struct ConnectorPipelineCallback {
         laminar_connectors::reference::RefreshMode,
     )>,
     pub(crate) table_store: Arc<parking_lot::RwLock<crate::table_store::TableStore>>,
+    pub(crate) mv_store: Arc<parking_lot::RwLock<crate::mv_store::MvStore>>,
     pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
     /// Cached `SessionContext` for sink WHERE filters (avoids per-batch allocation).
     pub(crate) filter_ctx: SessionContext,
@@ -72,9 +72,12 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) checkpoint_interval: Option<std::time::Duration>,
     pub(crate) pipeline_hash: Option<u64>,
     pub(crate) delivery_guarantee: laminar_connectors::connector::DeliveryGuarantee,
-    pub(crate) sink_write_timeout: Duration,
+    /// Maximum time to wait for operator state serialization.
+    pub(crate) serialization_timeout: Duration,
+    /// Drained once per cycle by `write_to_sinks` to update sink metrics.
+    pub(crate) sink_event_rx: laminar_core::streaming::AsyncConsumer<crate::sink_task::SinkEvent>,
     /// Set when a sink write times out in this cycle. Suppresses the next
-    /// periodic checkpoint to avoid advancing offsets past dropped batches.
+    /// checkpoint to preserve the replay window.
     pub(crate) sink_timed_out: bool,
     /// Cycle duration histogram for percentile tracking (single-threaded access).
     pub(crate) cycle_histogram:
@@ -82,9 +85,6 @@ pub(crate) struct ConnectorPipelineCallback {
 }
 
 impl ConnectorPipelineCallback {
-    /// Snapshot operator state inline, then offload `serde_json::to_vec()`
-    /// to `spawn_blocking` so the coordinator's I/O reactor is not blocked.
-    /// The coordinator still awaits the result (no concurrent event processing).
     async fn capture_and_serialize_operator_state(
         &mut self,
     ) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
@@ -95,17 +95,30 @@ impl ConnectorPipelineCallback {
             Err(e) => return Err(format!("snapshot failed: {e}")),
         };
         // Offload CPU-bound serialization to blocking thread pool.
-        let bytes = tokio::task::spawn_blocking(move || {
-            crate::operator_graph::OperatorGraph::serialize_checkpoint(&cp)
-        })
+        let timeout = self.serialization_timeout;
+        let bytes = tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || {
+                crate::operator_graph::OperatorGraph::serialize_checkpoint(&cp)
+            }),
+        )
         .await
+        .map_err(|_| format!("[LDB-6017] operator state serialization timed out ({timeout:?})"))?
         .map_err(|e| format!("serialize join error: {e}"))?
         .map_err(|e| format!("serialize error: {e}"))?;
         operator_states.insert("operator_graph".to_string(), bytes);
+
+        // Serialize MV result store — each MV gets its own entry keyed "mv:{name}".
+        let mv_states = self
+            .mv_store
+            .read()
+            .checkpoint_states()
+            .map_err(|e| format!("MV checkpoint failed: {e}"))?;
+        operator_states.extend(mv_states);
+
         Ok(operator_states)
     }
 
-    /// Try to compile sink filter SQL to `PhysicalExpr` for sinks that haven't been compiled yet.
     async fn compile_pending_sink_filters(
         &mut self,
         results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
@@ -115,7 +128,7 @@ impl ConnectorPipelineCallback {
             self.compiled_sink_filters.push(None);
         }
 
-        for (i, (_, _, filter_sql, sink_input)) in self.sinks.iter().enumerate() {
+        for (i, (_, _, filter_sql, sink_input, _)) in self.sinks.iter().enumerate() {
             // Skip if no filter or already compiled.
             if filter_sql.is_none() || self.compiled_sink_filters[i].is_some() {
                 continue;
@@ -146,9 +159,26 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         watermark: i64,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
+        let source_wms: FxHashMap<Arc<str>, i64> = if let Some(ref tracker) = self.tracker {
+            self.source_ids
+                .iter()
+                .filter_map(|(name, &sid)| {
+                    tracker
+                        .source_watermark(sid)
+                        .map(|wm| (Arc::from(name.as_str()), wm))
+                })
+                .collect()
+        } else {
+            FxHashMap::default()
+        };
+        let swm_ref = if source_wms.is_empty() {
+            None
+        } else {
+            Some(&source_wms)
+        };
         let results = self
             .graph
-            .execute_cycle(source_batches, watermark)
+            .execute_cycle(source_batches, watermark, swm_ref)
             .await
             .map_err(|e| format!("{e}"))?;
 
@@ -178,113 +208,154 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
     }
 
+    fn update_mv_stores(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
+        if results.is_empty() {
+            return;
+        }
+        let mut store = self.mv_store.write();
+        let mut updates = 0u64;
+        for (stream_name, batches) in results {
+            if store.has_mv(stream_name) {
+                for batch in batches {
+                    if batch.num_rows() > 0 {
+                        store.update(stream_name, batch);
+                        updates += 1;
+                    }
+                }
+            }
+        }
+        if updates > 0 {
+            self.counters
+                .mv_updates
+                .fetch_add(updates, std::sync::atomic::Ordering::Relaxed);
+            #[allow(clippy::cast_possible_truncation)]
+            self.counters.mv_bytes_stored.store(
+                store.total_bytes() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
     async fn write_to_sinks(&mut self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
         // Lazy-compile any pending sink filters.
         self.compile_pending_sink_filters(results).await;
 
-        // Shared flag — set by any sink future on timeout, read after join_all.
-        let had_timeout = std::sync::atomic::AtomicBool::new(false);
-        let is_exactly_once = self.delivery_guarantee
-            == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce;
-        let write_timeout = self.sink_write_timeout;
-
         // Route results to sinks concurrently, filtered by FROM clause.
+        // The per-call I/O timeout is enforced inside the sink task; the
+        // bounded command channel backpressures us naturally. Failures
+        // and timeouts are reported out of band via SinkEvents drained
+        // below after join_all.
         let filter_ctx = self.filter_ctx.clone(); // Arc bump — cheap
         let sink_futures: Vec<_> = self
             .sinks
             .iter()
             .enumerate()
-            .filter_map(|(sink_idx, (sink_name, handle, filter_expr, sink_input))| {
-                // Route by FROM clause: only send matching results.
-                let batches = results.get(sink_input.as_str())?;
-                if batches.is_empty() {
-                    return None;
-                }
-                let sink_name = sink_name.clone();
-                let handle = handle.clone();
-                let compiled_filter = self
-                    .compiled_sink_filters
-                    .get(sink_idx)
-                    .and_then(Clone::clone);
-                let filter_expr = filter_expr.clone();
-                let batches = batches.clone();
-                let ctx = filter_ctx.clone();
-                let had_timeout = &had_timeout;
-                Some(async move {
-                    for batch in &batches {
-                        let filtered = if let Some(ref phys) = compiled_filter {
-                            // Use compiled PhysicalExpr — no SQL overhead
-                            match apply_compiled_sink_filter(batch, phys) {
-                                Ok(Some(fb)) => fb,
-                                Ok(None) => continue,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        sink = %sink_name,
-                                        error = %e,
-                                        "Compiled sink filter error"
-                                    );
-                                    continue;
-                                }
-                            }
-                        } else if let Some(ref filter_sql) = filter_expr {
-                            // Fallback to SQL-based filter
-                            match apply_filter(&ctx, batch, filter_sql).await {
-                                Ok(Some(fb)) => fb,
-                                Ok(None) => continue,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        sink = %sink_name,
-                                        filter = %filter_sql,
-                                        error = %e,
-                                        "Sink filter error"
-                                    );
-                                    continue;
-                                }
-                            }
-                        } else {
-                            batch.clone()
-                        };
-
-                        if filtered.num_rows() > 0 {
-                            match tokio::time::timeout(write_timeout, handle.write_batch(filtered))
-                                .await
-                            {
-                                Ok(Err(e)) => {
-                                    tracing::warn!(
-                                        sink = %sink_name,
-                                        error = %e,
-                                        "Sink write error"
-                                    );
-                                }
-                                Err(_elapsed) => {
-                                    had_timeout.store(true, Ordering::Relaxed);
-                                    if is_exactly_once {
-                                        tracing::error!(
-                                            sink = %sink_name,
-                                            timeout_secs = write_timeout.as_secs(),
-                                            "[LDB-5040] Sink write timed out, batch dropped \
-                                             (EXACTLY-ONCE VIOLATION — next checkpoint suppressed)"
-                                        );
-                                    } else {
+            .filter_map(
+                |(sink_idx, (sink_name, handle, filter_expr, sink_input, changelog_capable))| {
+                    // Route by FROM clause: only send matching results.
+                    let batches = results.get(sink_input.as_str())?;
+                    if batches.is_empty() {
+                        return None;
+                    }
+                    let sink_name = sink_name.clone();
+                    let handle = handle.clone();
+                    let compiled_filter = self
+                        .compiled_sink_filters
+                        .get(sink_idx)
+                        .and_then(Clone::clone);
+                    let filter_expr = filter_expr.clone();
+                    let batches = batches.clone();
+                    let ctx = filter_ctx.clone();
+                    Some(async move {
+                        for batch in &batches {
+                            let filtered = if let Some(ref phys) = compiled_filter {
+                                // Use compiled PhysicalExpr — no SQL overhead
+                                match apply_compiled_sink_filter(batch, phys) {
+                                    Ok(Some(fb)) => fb,
+                                    Ok(None) => continue,
+                                    Err(e) => {
                                         tracing::warn!(
                                             sink = %sink_name,
-                                            timeout_secs = write_timeout.as_secs(),
-                                            "[LDB-5040] Sink write timed out, batch dropped \
-                                             (next checkpoint suppressed to allow replay)"
+                                            error = %e,
+                                            "Compiled sink filter error"
                                         );
+                                        continue;
                                     }
                                 }
-                                Ok(Ok(())) => {}
+                            } else if let Some(ref filter_sql) = filter_expr {
+                                // Fallback to SQL-based filter
+                                match apply_filter(&ctx, batch, filter_sql).await {
+                                    Ok(Some(fb)) => fb,
+                                    Ok(None) => continue,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            sink = %sink_name,
+                                            filter = %filter_sql,
+                                            error = %e,
+                                            "Sink filter error"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                batch.clone()
+                            };
+
+                            let filtered = crate::changelog_filter::prepare_for_sink(
+                                &filtered,
+                                *changelog_capable,
+                            );
+
+                            if filtered.num_rows() > 0 {
+                                if let Err(e) = handle.write_batch(filtered).await {
+                                    // ChannelClosed metric is incremented when
+                                    // we drain the event channel below; here
+                                    // we just log and stop sending to this sink.
+                                    tracing::warn!(
+                                        sink = %sink_name,
+                                        error = %e,
+                                        "Sink command channel closed"
+                                    );
+                                    break;
+                                }
                             }
                         }
-                    }
-                })
-            })
+                    })
+                },
+            )
             .collect();
         futures::future::join_all(sink_futures).await;
 
-        if had_timeout.load(Ordering::Relaxed) {
-            self.sink_timed_out = true;
+        // Barrier: wait for every sink task to finish processing the
+        // commands we just enqueued, so the drain below catches any
+        // failures before maybe_checkpoint can advance source offsets.
+        let sync_futures = self.sinks.iter().map(|(name, handle, _, _, _)| {
+            let name = name.clone();
+            let handle = handle.clone();
+            async move {
+                if let Err(e) = handle.sync().await {
+                    tracing::warn!(sink = %name, error = %e, "sink sync barrier failed");
+                }
+            }
+        });
+        futures::future::join_all(sync_futures).await;
+
+        // Drain SinkEvents emitted by sink tasks during this cycle.
+        while let Ok(event) = self.sink_event_rx.try_recv() {
+            tracing::debug!(?event, "sink event");
+            let counter = match &event {
+                crate::sink_task::SinkEvent::WriteError { .. } => {
+                    &self.counters.sink_write_failures
+                }
+                crate::sink_task::SinkEvent::WriteTimeout { .. } => {
+                    self.sink_timed_out = true;
+                    &self.counters.sink_write_timeouts
+                }
+                crate::sink_task::SinkEvent::ChannelClosed { .. } => {
+                    &self.counters.sink_task_channel_closed
+                }
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -342,7 +413,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         if let Some(wm_state) = self.watermark_states.get(source_name) {
             let current_wm = wm_state.generator.current_watermark();
             if current_wm > i64::MIN {
-                return filter_late_rows(batch, &wm_state.column, current_wm, wm_state.format);
+                return filter_late_rows(batch, &wm_state.column, current_wm);
             }
         }
         // No watermark configured → pass through all rows.
@@ -442,22 +513,21 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
 
+        let request = crate::checkpoint_coordinator::CheckpointRequest {
+            operator_states,
+            watermark: None,
+            table_store_checkpoint_path: None,
+            extra_table_offsets: extra_tables,
+            source_watermarks: per_source_watermarks,
+            pipeline_hash: self.pipeline_hash,
+            source_offset_overrides: source_overrides,
+        };
+
         if force {
             // Blocking checkpoint at shutdown.
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
-                match coord
-                    .checkpoint_with_offsets(
-                        operator_states,
-                        None,
-                        None,
-                        extra_tables,
-                        per_source_watermarks,
-                        self.pipeline_hash,
-                        source_overrides,
-                    )
-                    .await
-                {
+                match coord.checkpoint_with_offsets(request).await {
                     Ok(result) if result.success => {
                         tracing::info!(epoch = result.epoch, "Final pipeline checkpoint saved");
                     }
@@ -478,18 +548,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             // parallelism to exploit with tokio::spawn).
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
-                match coord
-                    .checkpoint_with_offsets(
-                        operator_states,
-                        None,
-                        None,
-                        extra_tables,
-                        per_source_watermarks,
-                        self.pipeline_hash,
-                        source_overrides,
-                    )
-                    .await
-                {
+                match coord.checkpoint_with_offsets(request).await {
                     Ok(result) if result.success => {
                         tracing::info!(
                             epoch = result.epoch,
@@ -531,11 +590,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             return false;
         }
 
-        // A sink timeout in this cycle means some data was dropped.
-        // Committing offsets would skip that data on recovery.
-        // Do NOT clear the flag here — maybe_checkpoint is the sole consumer,
-        // ensuring both paths are suppressed in the same coordinator cycle.
+        // Clear after one suppression — the timer-based path that also
+        // clears this flag is unreachable when barrier checkpointing is active.
         if self.sink_timed_out {
+            self.sink_timed_out = false;
             tracing::warn!(
                 "skipping barrier checkpoint after sink timeout to preserve replay window"
             );
@@ -582,19 +640,18 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         let mut guard = self.coordinator.lock().await;
+        let request = crate::checkpoint_coordinator::CheckpointRequest {
+            operator_states,
+            watermark: None,
+            table_store_checkpoint_path: None,
+            extra_table_offsets: extra_tables,
+            source_watermarks: per_source_watermarks,
+            pipeline_hash: self.pipeline_hash,
+            source_offset_overrides: source_overrides,
+        };
+
         if let Some(ref mut coord) = *guard {
-            match coord
-                .checkpoint_with_offsets(
-                    operator_states,
-                    None,
-                    None,
-                    extra_tables,
-                    per_source_watermarks,
-                    self.pipeline_hash,
-                    source_overrides,
-                )
-                .await
-            {
+            match coord.checkpoint_with_offsets(request).await {
                 Ok(result) if result.success => {
                     tracing::info!(
                         epoch = result.epoch,
@@ -663,8 +720,14 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 window_config,
                 order_config,
             } => {
-                self.graph
-                    .add_query(name.clone(), sql, emit_clause, window_config, order_config);
+                self.graph.add_query(
+                    name.clone(),
+                    sql,
+                    emit_clause,
+                    window_config,
+                    order_config,
+                    None,
+                );
                 tracing::info!(stream = %name, "Stream added via control channel");
             }
             crate::pipeline::ControlMsg::DropStream { name } => {
@@ -675,6 +738,20 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 self.graph.register_source_schema(name, schema);
             }
         }
+    }
+
+    fn is_backpressured(&self) -> bool {
+        let bp = self.graph.input_buf_pressure() > 0.8;
+        if bp {
+            self.counters
+                .cycles_backpressured
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        bp
+    }
+
+    fn has_deferred_input(&self) -> bool {
+        self.graph.has_pending_input()
     }
 
     async fn poll_tables(&mut self) {
@@ -698,7 +775,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         update_partial_cache_from_batch(partial, &batch);
                         let mut ts = self.table_store.write();
                         if let Err(e) = ts.upsert_and_rebuild(name, &batch) {
-                            tracing::warn!(table=%name, error=%e, "Table upsert error (partial)");
+                            #[allow(clippy::cast_possible_truncation)]
+                            let dropped = batch.num_rows() as u64;
+                            self.counters
+                                .events_dropped
+                                .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+                            tracing::error!(
+                                table=%name, error=%e, rows_dropped=dropped,
+                                "[LDB-5030] Table upsert failed (partial); \
+                                 {dropped} rows dropped"
+                            );
                         }
                     } else if let Some(
                         laminar_sql::datafusion::lookup_join_exec::RegisteredLookup::Versioned(
@@ -751,6 +837,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                                 &combined,
                                 &key_indices,
                                 version_col_idx,
+                                versioned.max_versions_per_key,
                             ) {
                                 Ok(idx) => Arc::new(idx),
                                 Err(e) => {
@@ -769,17 +856,36 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                                 key_columns: versioned.key_columns.clone(),
                                 version_column: versioned.version_column.clone(),
                                 stream_time_column: versioned.stream_time_column.clone(),
+                                max_versions_per_key: versioned.max_versions_per_key,
                             },
                         );
                         let mut ts = self.table_store.write();
                         if let Err(e) = ts.upsert_and_rebuild(name, &batch) {
-                            tracing::warn!(table=%name, error=%e, "Table upsert error (versioned)");
+                            #[allow(clippy::cast_possible_truncation)]
+                            let dropped = batch.num_rows() as u64;
+                            self.counters
+                                .events_dropped
+                                .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+                            tracing::error!(
+                                table=%name, error=%e, rows_dropped=dropped,
+                                "[LDB-5030] Table upsert failed (versioned); \
+                                 {dropped} rows dropped"
+                            );
                         }
                     } else {
                         let maybe_batch = {
                             let mut ts = self.table_store.write();
                             if let Err(e) = ts.upsert_and_rebuild(name, &batch) {
-                                tracing::warn!(table=%name, error=%e, "Table upsert error");
+                                #[allow(clippy::cast_possible_truncation)]
+                                let dropped = batch.num_rows() as u64;
+                                self.counters
+                                    .events_dropped
+                                    .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+                                tracing::error!(
+                                    table=%name, error=%e, rows_dropped=dropped,
+                                    "[LDB-5030] Table upsert failed; \
+                                     {dropped} rows dropped"
+                                );
                                 None
                             } else if ts.is_persistent(name) {
                                 None
@@ -879,17 +985,9 @@ fn update_partial_cache_from_batch(
     }
 }
 
-/// Encode an Arrow schema as a compact string for passing through `ConnectorConfig`.
-///
-/// Format: `name:type,name:type,...` where type is the Arrow `DataType` debug name.
-/// Example: `symbol:Utf8,price:Float64,volume:Int64`
+/// Encode an Arrow schema as a hex-encoded IPC flatbuffer for `ConnectorConfig`.
 pub(crate) fn encode_arrow_schema(schema: &arrow_schema::Schema) -> String {
-    schema
-        .fields()
-        .iter()
-        .map(|f| format!("{}:{:?}", f.name(), f.data_type()))
-        .collect::<Vec<_>>()
-        .join(",")
+    laminar_connectors::config::encode_arrow_schema_ipc(schema)
 }
 
 /// Apply a SQL WHERE filter to a `RecordBatch` using a cached `SessionContext`.

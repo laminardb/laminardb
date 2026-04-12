@@ -1,51 +1,5 @@
-//! Kafka watermark integration.
-//!
-//! Integrates `laminar-core` per-partition watermarks and watermark
-//! alignment groups with the Kafka source connector.
-//!
-//! # Per-Partition Watermarks
-//!
-//! Tracks watermarks at Kafka partition granularity, allowing progress even
-//! when some partitions are slow or idle:
-//!
-//! ```rust,ignore
-//! use laminar_connectors::kafka::watermarks::KafkaWatermarkTracker;
-//! use std::time::Duration;
-//!
-//! let mut tracker = KafkaWatermarkTracker::new(0, Duration::from_secs(30));
-//! tracker.register_partitions(4);
-//!
-//! // Update individual partitions
-//! tracker.update_partition(0, 5000);
-//! tracker.update_partition(1, 3000); // slow partition
-//!
-//! // Combined watermark is minimum (3000)
-//! assert_eq!(tracker.current_watermark(), Some(3000));
-//!
-//! // Mark slow partition as idle
-//! tracker.mark_idle(1);
-//!
-//! // Now watermark advances (5000)
-//! assert_eq!(tracker.current_watermark(), Some(5000));
-//! ```
-//!
-//! # Watermark Alignment
-//!
-//! For multi-topic joins, alignment prevents fast topics from building
-//! unbounded state while waiting for slow topics:
-//!
-//! ```rust,ignore
-//! use laminar_connectors::kafka::watermarks::{KafkaAlignmentConfig, KafkaAlignmentMode};
-//! use std::time::Duration;
-//!
-//! let config = KafkaAlignmentConfig {
-//!     group_id: "orders-payments".to_string(),
-//!     max_drift: Duration::from_secs(300), // 5 minutes
-//!     mode: KafkaAlignmentMode::Pause,
-//! };
-//! ```
+//! Kafka per-partition watermark tracking.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Kafka-specific watermark tracker wrapping `PartitionedWatermarkTracker`.
@@ -93,38 +47,11 @@ impl PartitionState {
 }
 
 /// Metrics for watermark tracking.
-#[derive(Debug, Default)]
+///
+/// The tracker is single-threaded (owned by `KafkaSource`), so plain
+/// `u64` counters are used instead of atomics.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct WatermarkMetrics {
-    /// Total watermark updates.
-    pub updates: AtomicU64,
-    /// Watermark advances.
-    pub advances: AtomicU64,
-    /// Partitions marked idle.
-    pub idle_transitions: AtomicU64,
-    /// Partitions resumed from idle.
-    pub active_transitions: AtomicU64,
-}
-
-impl WatermarkMetrics {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns a snapshot of current metrics.
-    #[must_use]
-    pub fn snapshot(&self) -> WatermarkMetricsSnapshot {
-        WatermarkMetricsSnapshot {
-            updates: self.updates.load(Ordering::Relaxed),
-            advances: self.advances.load(Ordering::Relaxed),
-            idle_transitions: self.idle_transitions.load(Ordering::Relaxed),
-            active_transitions: self.active_transitions.load(Ordering::Relaxed),
-        }
-    }
-}
-
-/// Snapshot of watermark metrics.
-#[derive(Debug, Clone, Default)]
-pub struct WatermarkMetricsSnapshot {
     /// Total watermark updates.
     pub updates: u64,
     /// Watermark advances.
@@ -150,7 +77,7 @@ impl KafkaWatermarkTracker {
             combined_watermark: i64::MIN,
             idle_timeout,
             max_out_of_orderness: Duration::from_secs(5),
-            metrics: WatermarkMetrics::new(),
+            metrics: WatermarkMetrics::default(),
         }
     }
 
@@ -196,6 +123,11 @@ impl KafkaWatermarkTracker {
             self.partition_watermarks[idx].is_idle = true;
             self.partition_watermarks[idx].watermark = i64::MAX; // Exclude from min
         }
+        // Truncate trailing idle entries so the Vec doesn't retain
+        // capacity for revoked high-numbered partitions.
+        while self.partition_watermarks.last().is_some_and(|s| s.is_idle) {
+            self.partition_watermarks.pop();
+        }
         self.recompute_combined();
     }
 
@@ -220,14 +152,12 @@ impl KafkaWatermarkTracker {
 
         let state = &mut self.partition_watermarks[idx];
         state.last_activity = Instant::now();
-        self.metrics.updates.fetch_add(1, Ordering::Relaxed);
+        self.metrics.updates += 1;
 
         // Resume if was idle
         if state.is_idle {
             state.is_idle = false;
-            self.metrics
-                .active_transitions
-                .fetch_add(1, Ordering::Relaxed);
+            self.metrics.active_transitions += 1;
         }
 
         // Update max event time
@@ -255,9 +185,7 @@ impl KafkaWatermarkTracker {
         };
         if idx < self.partition_watermarks.len() && !self.partition_watermarks[idx].is_idle {
             self.partition_watermarks[idx].is_idle = true;
-            self.metrics
-                .idle_transitions
-                .fetch_add(1, Ordering::Relaxed);
+            self.metrics.idle_transitions += 1;
             self.recompute_combined();
         }
     }
@@ -272,9 +200,7 @@ impl KafkaWatermarkTracker {
         for state in &mut self.partition_watermarks {
             if !state.is_idle && now.duration_since(state.last_activity) > self.idle_timeout {
                 state.is_idle = true;
-                self.metrics
-                    .idle_transitions
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.idle_transitions += 1;
                 any_changed = true;
             }
         }
@@ -366,7 +292,7 @@ impl KafkaWatermarkTracker {
 
         let advanced = self.combined_watermark > old && old != i64::MIN;
         if advanced {
-            self.metrics.advances.fetch_add(1, Ordering::Relaxed);
+            self.metrics.advances += 1;
         }
         advanced
     }
@@ -376,83 +302,6 @@ impl Default for KafkaWatermarkTracker {
     fn default() -> Self {
         Self::new(0, Duration::from_secs(30))
     }
-}
-
-/// Alignment mode for multi-source watermark coordination.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum KafkaAlignmentMode {
-    /// Pause fast sources until slow sources catch up.
-    #[default]
-    Pause,
-    /// Emit warnings but don't pause.
-    WarnOnly,
-    /// Drop events from fast sources that exceed drift.
-    DropExcess,
-}
-
-str_enum!(KafkaAlignmentMode, lowercase_udash, String, "invalid alignment mode",
-    Pause => "pause";
-    WarnOnly => "warn-only", "warnonly", "warn";
-    DropExcess => "drop-excess", "dropexcess", "drop"
-);
-
-/// Configuration for Kafka source watermark alignment.
-///
-/// When multiple Kafka sources are used in a join, alignment ensures
-/// fast sources don't get too far ahead of slow sources.
-#[derive(Debug, Clone)]
-pub struct KafkaAlignmentConfig {
-    /// Alignment group identifier (sources with same ID coordinate).
-    pub group_id: String,
-    /// Maximum allowed drift between fastest and slowest source.
-    pub max_drift: Duration,
-    /// Enforcement mode.
-    pub mode: KafkaAlignmentMode,
-}
-
-impl KafkaAlignmentConfig {
-    /// Creates a new alignment config with defaults.
-    #[must_use]
-    pub fn new(group_id: impl Into<String>) -> Self {
-        Self {
-            group_id: group_id.into(),
-            max_drift: Duration::from_secs(300), // 5 minutes
-            mode: KafkaAlignmentMode::Pause,
-        }
-    }
-
-    /// Sets the maximum drift.
-    #[must_use]
-    pub fn with_max_drift(mut self, max_drift: Duration) -> Self {
-        self.max_drift = max_drift;
-        self
-    }
-
-    /// Sets the enforcement mode.
-    #[must_use]
-    pub fn with_mode(mut self, mode: KafkaAlignmentMode) -> Self {
-        self.mode = mode;
-        self
-    }
-}
-
-impl Default for KafkaAlignmentConfig {
-    fn default() -> Self {
-        Self::new("default")
-    }
-}
-
-/// Result of an alignment check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AlignmentCheckResult {
-    /// Continue processing normally.
-    Continue,
-    /// Source should pause (too far ahead).
-    Pause,
-    /// Source can resume (caught up).
-    Resume,
-    /// Event should be dropped (`DropExcess` mode).
-    Drop,
 }
 
 #[cfg(test)]
@@ -576,38 +425,10 @@ mod tests {
         tracker.mark_idle(1);
         tracker.update_partition(1, 4000); // resume
 
-        let snapshot = tracker.metrics().snapshot();
-        assert_eq!(snapshot.updates, 3);
-        assert_eq!(snapshot.idle_transitions, 1);
-        assert_eq!(snapshot.active_transitions, 1);
-    }
-
-    #[test]
-    fn test_alignment_mode_parsing() {
-        assert_eq!(
-            "pause".parse::<KafkaAlignmentMode>().unwrap(),
-            KafkaAlignmentMode::Pause
-        );
-        assert_eq!(
-            "warn-only".parse::<KafkaAlignmentMode>().unwrap(),
-            KafkaAlignmentMode::WarnOnly
-        );
-        assert_eq!(
-            "drop-excess".parse::<KafkaAlignmentMode>().unwrap(),
-            KafkaAlignmentMode::DropExcess
-        );
-        assert!("invalid".parse::<KafkaAlignmentMode>().is_err());
-    }
-
-    #[test]
-    fn test_alignment_config() {
-        let config = KafkaAlignmentConfig::new("test-group")
-            .with_max_drift(Duration::from_secs(60))
-            .with_mode(KafkaAlignmentMode::WarnOnly);
-
-        assert_eq!(config.group_id, "test-group");
-        assert_eq!(config.max_drift, Duration::from_secs(60));
-        assert_eq!(config.mode, KafkaAlignmentMode::WarnOnly);
+        let m = tracker.metrics();
+        assert_eq!(m.updates, 3);
+        assert_eq!(m.idle_transitions, 1);
+        assert_eq!(m.active_transitions, 1);
     }
 
     #[test]
@@ -622,5 +443,35 @@ mod tests {
 
         // No active partitions - no watermark
         assert!(tracker.current_watermark().is_none());
+    }
+
+    #[test]
+    fn test_remove_partition_truncates_trailing() {
+        let mut tracker = KafkaWatermarkTracker::new(0, Duration::from_secs(30));
+        tracker.register_partitions(4); // 0, 1, 2, 3
+        tracker.update_partition(0, 1000);
+        tracker.update_partition(1, 1000);
+        tracker.update_partition(3, 2000);
+
+        // Remove trailing partitions — Vec should shrink.
+        // Partition 2 was never updated but is still active (idle=false).
+        // Removing partition 3 (last, now idle) truncates to len=3.
+        // Removing partition 2 marks it idle — but it's not trailing
+        // because partition 2 was registered as active (idle=false) by
+        // register_partitions. We need to remove it explicitly.
+        tracker.remove_partition(3);
+        assert_eq!(tracker.partition_count(), 3, "trailing idle p3 truncated");
+        tracker.remove_partition(2);
+        assert_eq!(tracker.partition_count(), 2, "trailing idle p2 truncated");
+
+        // Remove middle partition — Vec should NOT shrink past active.
+        tracker.register_partitions(4);
+        tracker.update_partition(3, 2000);
+        tracker.remove_partition(1);
+        assert_eq!(
+            tracker.partition_count(),
+            4,
+            "middle idle does not truncate"
+        );
     }
 }

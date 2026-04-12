@@ -1,20 +1,4 @@
-//! Capability traits for the extensible connector framework.
-//!
-//! Six traits define the schema capabilities a connector can implement:
-//!
-//! | Trait | Purpose | Sync/Async |
-//! |-------|---------|------------|
-//! | [`FormatDecoder`] | Decode raw bytes → Arrow | Sync |
-//! | [`FormatEncoder`] | Encode Arrow → raw bytes | Sync |
-//! | [`SchemaProvider`] | Authoritative schema from source | Async |
-//! | (inference) | Sample-based schema inference | Via `FormatInference` |
-//! | [`SchemaRegistryAware`] | Schema registry integration | Async |
-//! | [`SchemaEvolution`](super::evolution::SchemaEvolution) | Schema evolution & diffing | Sync |
-//!
-//! Connectors opt in to capabilities by implementing the relevant traits
-//! and returning `Some(self)` from the corresponding `as_*()` method on
-//! [`SourceConnector`](crate::connector::SourceConnector) or
-//! [`SinkConnector`](crate::connector::SinkConnector).
+//! Capability traits for the connector schema framework.
 #![allow(clippy::disallowed_types)] // cold path: schema management
 
 use std::collections::HashMap;

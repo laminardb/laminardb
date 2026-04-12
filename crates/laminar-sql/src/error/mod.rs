@@ -19,37 +19,29 @@ pub mod suggest;
 use suggest::{closest_match, resolve_column_name};
 
 /// Structured error code constants.
+///
+/// Codes in the `LDB-1xxx`..`LDB-3xxx` ranges are re-exported from the
+/// canonical registry in `laminar_core::error_codes`. The `LDB-9xxx` codes
+/// are SQL-layer specific and defined here.
 pub mod codes {
-    /// Unsupported SQL syntax.
-    pub const UNSUPPORTED_SQL: &str = "LDB-1001";
-    /// Query planning failed.
-    pub const PLANNING_FAILED: &str = "LDB-1002";
-    /// Column not found.
-    pub const COLUMN_NOT_FOUND: &str = "LDB-1100";
-    /// Table or source not found.
-    pub const TABLE_NOT_FOUND: &str = "LDB-1101";
-    /// Type mismatch.
-    pub const TYPE_MISMATCH: &str = "LDB-1200";
+    // Re-export LDB-1xxx (SQL parsing & validation) from laminar-core.
+    pub use laminar_core::error_codes::SQL_COLUMN_NOT_FOUND as COLUMN_NOT_FOUND;
+    pub use laminar_core::error_codes::SQL_PLANNING_FAILED as PLANNING_FAILED;
+    pub use laminar_core::error_codes::SQL_TABLE_NOT_FOUND as TABLE_NOT_FOUND;
+    pub use laminar_core::error_codes::SQL_TYPE_MISMATCH as TYPE_MISMATCH;
+    pub use laminar_core::error_codes::SQL_UNSUPPORTED as UNSUPPORTED_SQL;
 
-    // Window / watermark errors (2000-2099)
-    /// Watermark required for this operation.
-    pub const WATERMARK_REQUIRED: &str = "LDB-2001";
-    /// Invalid window specification.
-    pub const WINDOW_INVALID: &str = "LDB-2002";
-    /// Window size must be positive.
-    pub const WINDOW_SIZE_INVALID: &str = "LDB-2003";
-    /// Late data rejected by window policy.
-    pub const LATE_DATA_REJECTED: &str = "LDB-2004";
+    // Re-export LDB-2xxx (window / watermark) from laminar-core.
+    pub use laminar_core::error_codes::LATE_DATA_REJECTED;
+    pub use laminar_core::error_codes::WATERMARK_REQUIRED;
+    pub use laminar_core::error_codes::WINDOW_INVALID;
+    pub use laminar_core::error_codes::WINDOW_SIZE_INVALID;
 
-    // Join errors (3000-3099)
-    /// Join key column not found or invalid.
-    pub const JOIN_KEY_MISSING: &str = "LDB-3001";
-    /// Time bound required for stream-stream join.
-    pub const JOIN_TIME_BOUND_MISSING: &str = "LDB-3002";
-    /// Temporal join requires a primary key on the right-side table.
-    pub const TEMPORAL_JOIN_NO_PK: &str = "LDB-3003";
-    /// Unsupported join type for streaming queries.
-    pub const JOIN_TYPE_UNSUPPORTED: &str = "LDB-3004";
+    // Re-export LDB-3xxx (join) from laminar-core.
+    pub use laminar_core::error_codes::JOIN_KEY_MISSING;
+    pub use laminar_core::error_codes::JOIN_TIME_BOUND_MISSING;
+    pub use laminar_core::error_codes::JOIN_TYPE_UNSUPPORTED;
+    pub use laminar_core::error_codes::TEMPORAL_JOIN_NO_PK;
 
     /// Internal query error (unrecognized pattern).
     pub const INTERNAL: &str = "LDB-9000";
@@ -133,12 +125,14 @@ fn extract_quoted(s: &str) -> Option<&str> {
     } else if let Some(rest) = s.strip_prefix('"') {
         rest.find('"').map(|end| &rest[..end])
     } else {
-        // Bare word — up to whitespace or punctuation
+        // Bare word — up to whitespace or punctuation, then strip
+        // sentence-ending period (DataFusion 52.x: "No field named col.")
         let end = s.find(|c: char| c.is_whitespace() || c == ',' || c == ')');
         let word = match end {
             Some(i) => &s[..i],
             None => s,
         };
+        let word = word.strip_suffix('.').unwrap_or(word);
         if word.is_empty() {
             None
         } else {
@@ -450,6 +444,35 @@ mod tests {
         let t = translate_datafusion_error("Schema error: No field named 'baz'");
         assert_eq!(t.code, codes::COLUMN_NOT_FOUND);
         assert!(t.message.contains("baz"));
+    }
+
+    #[test]
+    fn test_column_not_found_bare_word_with_trailing_period() {
+        let t = translate_datafusion_error("No field named ref_price.");
+        assert_eq!(t.code, codes::COLUMN_NOT_FOUND);
+        assert!(
+            t.message.contains("'ref_price'"),
+            "should strip trailing period: {}",
+            t.message
+        );
+        assert!(
+            !t.message.contains("ref_price."),
+            "should not include trailing period: {}",
+            t.message
+        );
+    }
+
+    #[test]
+    fn test_column_not_found_bare_word_with_valid_fields() {
+        let t = translate_datafusion_error(
+            "Schema error: No field named ref_price. Valid fields: symbol, event_time",
+        );
+        assert_eq!(t.code, codes::COLUMN_NOT_FOUND);
+        assert!(
+            t.message.contains("'ref_price'"),
+            "should extract clean column name: {}",
+            t.message
+        );
     }
 
     #[test]

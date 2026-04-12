@@ -1,6 +1,4 @@
 //! Pipeline lifecycle management: start, close, shutdown.
-//!
-//! Reopened `impl LaminarDB` — split from `db.rs`.
 #![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::HashMap;
@@ -11,15 +9,11 @@ use laminar_core::streaming;
 use rustc_hash::FxHashMap;
 
 use crate::db::{
-    infer_timestamp_format, LaminarDB, SourceWatermarkState, STATE_RUNNING, STATE_SHUTTING_DOWN,
+    LaminarDB, SourceWatermarkState, STATE_CREATED, STATE_RUNNING, STATE_SHUTTING_DOWN,
     STATE_STARTING, STATE_STOPPED,
 };
 use crate::error::DbError;
 
-/// Extract a checkpoint path prefix from an object store URL.
-///
-/// For `s3://bucket/prefix/path` → `"prefix/path/"`.
-/// For `file:///some/path` → `""` (local FS uses the path directly).
 pub(crate) fn url_to_checkpoint_prefix(url: &str) -> String {
     // Strip scheme
     let after_scheme = url.find("://").map_or(url, |i| &url[i + 3..]);
@@ -51,14 +45,11 @@ impl LaminarDB {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Check if the database is shut down.
+    /// Returns `true` if the database has been shut down.
     pub fn is_closed(&self) -> bool {
         self.shutdown.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Check if the streaming pipeline is active (starting, running, or
-    /// shutting down). DDL that requires connector instantiation or task
-    /// cancellation is unsafe in all three states.
     pub(crate) fn is_pipeline_running(&self) -> bool {
         let s = self.state.load(std::sync::atomic::Ordering::Acquire);
         s == STATE_RUNNING || s == STATE_STARTING || s == STATE_SHUTTING_DOWN
@@ -78,8 +69,9 @@ impl LaminarDB {
     ///
     /// # Errors
     ///
-    /// Returns an error if the pipeline cannot be started.
-    #[allow(clippy::too_many_lines)]
+    /// Returns an error if the pipeline cannot be started. On failure, the
+    /// instance is unwound back to `STATE_CREATED` so the caller can retry
+    /// after fixing the offending config.
     pub async fn start(&self) -> Result<(), DbError> {
         let current = self.state.load(std::sync::atomic::Ordering::Acquire);
         if current == STATE_RUNNING || current == STATE_STARTING {
@@ -94,6 +86,28 @@ impl LaminarDB {
         self.state
             .store(STATE_STARTING, std::sync::atomic::Ordering::Release);
 
+        match self.start_inner().await {
+            Ok(()) => {
+                self.state
+                    .store(STATE_RUNNING, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+            Err(e) => {
+                // Any failure between STATE_STARTING and STATE_RUNNING must
+                // unwind — otherwise the instance is wedged and a retry from
+                // the caller silently succeeds without actually starting.
+                self.state
+                    .store(STATE_CREATED, std::sync::atomic::Ordering::Release);
+                Err(e)
+            }
+        }
+    }
+
+    /// Runs the actual startup sequence. Called exclusively by
+    /// [`LaminarDB::start`], which handles the `STATE_STARTING` ↔
+    /// `STATE_RUNNING` / `STATE_CREATED` transitions around it.
+    #[allow(clippy::too_many_lines)]
+    async fn start_inner(&self) -> Result<(), DbError> {
         // Snapshot connector registrations under the lock
         let (source_regs, sink_regs, stream_regs, table_regs, has_external) = {
             let mgr = self.connector_manager.lock();
@@ -188,8 +202,6 @@ impl LaminarDB {
             );
         }
 
-        self.state
-            .store(STATE_RUNNING, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -222,6 +234,34 @@ impl LaminarDB {
         // Build OperatorGraph
         let ctx = laminar_sql::create_session_context();
         laminar_sql::register_streaming_functions(&ctx);
+
+        // Register lookup/reference tables in the operator graph's
+        // SessionContext so JOIN queries can resolve them.
+        let lookup_tables: Vec<(String, arrow::datatypes::SchemaRef)> = {
+            let ts = self.table_store.read();
+            ts.table_names()
+                .into_iter()
+                .filter_map(|name| {
+                    let schema = ts.table_schema(&name)?;
+                    Some((name, schema))
+                })
+                .collect()
+        };
+        for (name, schema) in lookup_tables {
+            let provider = crate::table_provider::ReferenceTableProvider::new(
+                name.clone(),
+                schema,
+                self.table_store.clone(),
+            );
+            if let Err(e) = ctx.register_table(&name, Arc::new(provider)) {
+                tracing::warn!(
+                    table = %name,
+                    error = %e,
+                    "failed to register lookup table in operator graph context"
+                );
+            }
+        }
+
         let mut graph = OperatorGraph::new(ctx);
         graph.set_max_state_bytes(self.config.max_state_bytes_per_operator);
         graph.set_lookup_registry(Arc::clone(&self.lookup_registry));
@@ -243,6 +283,7 @@ impl LaminarDB {
                 reg.emit_clause.clone(),
                 reg.window_config.clone(),
                 reg.order_config.clone(),
+                None,
             );
         }
 
@@ -269,13 +310,35 @@ impl LaminarDB {
                     .iter()
                     .filter_map(|k| initial_batch.schema().index_of(k).ok())
                     .collect();
-                let Ok(version_col_idx) =
-                    initial_batch.schema().index_of(&tcfg.table_version_column)
+
+                // When table_version_column is empty (translator couldn't resolve it
+                // from the AS OF clause), pick the first timestamp/int column that
+                // isn't the join key.
+                let resolved_version_col = if tcfg.table_version_column.is_empty() {
+                    let schema = initial_batch.schema();
+                    schema
+                        .fields()
+                        .iter()
+                        .find(|f| {
+                            f.name() != &tcfg.table_key_column
+                                && matches!(
+                                    f.data_type(),
+                                    arrow::datatypes::DataType::Int64
+                                        | arrow::datatypes::DataType::Timestamp(_, _)
+                                )
+                        })
+                        .map(|f| f.name().clone())
+                        .unwrap_or_default()
+                } else {
+                    tcfg.table_version_column.clone()
+                };
+
+                let Ok(version_col_idx) = initial_batch.schema().index_of(&resolved_version_col)
                 else {
                     if !initial_batch.schema().fields().is_empty() {
                         tracing::warn!(
                             table=%tcfg.table_name,
-                            version_col=%tcfg.table_version_column,
+                            version_col=%resolved_version_col,
                             "Version column not found in temporal table schema; \
                              will resolve on first CDC batch"
                         );
@@ -290,8 +353,9 @@ impl LaminarDB {
                                 ),
                             ),
                             key_columns,
-                            version_column: tcfg.table_version_column.clone(),
+                            version_column: resolved_version_col,
                             stream_time_column: tcfg.stream_time_column.clone(),
+                            max_versions_per_key: usize::MAX,
                         },
                     );
                     continue;
@@ -301,6 +365,7 @@ impl LaminarDB {
                         &initial_batch,
                         &key_indices,
                         version_col_idx,
+                        usize::MAX,
                     )
                     .unwrap_or_default(),
                 );
@@ -310,8 +375,9 @@ impl LaminarDB {
                         batch: initial_batch,
                         index,
                         key_columns,
-                        version_column: tcfg.table_version_column.clone(),
+                        version_column: resolved_version_col,
                         stream_time_column: tcfg.stream_time_column.clone(),
+                        max_versions_per_key: usize::MAX,
                     },
                 );
             }
@@ -350,8 +416,13 @@ impl LaminarDB {
                      are degraded to at-most-once for this source"
                 );
             }
-            // Wire event.time.column from connector config to the core Source
-            // so SourceWatermarkState can extract watermarks from batch data.
+            // Property-driven watermark wiring. `[source.watermark]` in
+            // TOML is the preferred path (honours max_out_of_orderness);
+            // this exists for sources that pass `event.time.column` /
+            // `event.time.field` as a connector property instead. The
+            // second pass below builds the matching SourceWatermarkState.
+            // Kafka uses `column`, WebSocket uses `field` — both spellings
+            // are live.
             if let Some(entry) = self.catalog.get_source(name) {
                 if entry.source.event_time_column().is_none() {
                     if let Some(col) = config.get("event.time.column") {
@@ -425,16 +496,20 @@ impl LaminarDB {
             }
         }
 
-        // Build sinks via registry (generic — no connector-specific code).
-        // Each sink runs in its own tokio task with a bounded command channel,
-        // eliminating Arc<Mutex> contention between pipeline writes and
-        // checkpoint operations.
+        // Build sinks. Each runs in its own tokio task with a bounded
+        // command channel and shares one event channel back to the
+        // pipeline callback.
+        let (sink_event_tx, sink_event_rx) =
+            laminar_core::streaming::channel::channel::<crate::sink_task::SinkEvent>(
+                crate::sink_task::SINK_EVENT_CHANNEL_CAPACITY,
+            );
         #[allow(clippy::type_complexity)]
         let mut sinks: Vec<(
             String,
             crate::sink_task::SinkTaskHandle,
             Option<String>,
             String, // input stream name (FROM clause target)
+            bool,   // changelog-capable
         )> = Vec::new();
         for (name, reg) in &sink_regs {
             if reg.connector_type.is_none() {
@@ -452,15 +527,50 @@ impl LaminarDB {
             sink.open(&config)
                 .await
                 .map_err(|e| DbError::Connector(format!("Failed to open sink '{name}': {e}")))?;
-            let exactly_once = sink.capabilities().exactly_once;
-            let handle = crate::sink_task::SinkTaskHandle::spawn(name.clone(), sink, exactly_once);
+            let caps = sink.capabilities();
+            // Resolve per-sink write timeout: user override (property)
+            // takes precedence over the sink's declared suggestion.
+            let write_timeout =
+                match config
+                    .get_parsed::<u64>("sink.write.timeout.ms")
+                    .map_err(|e| {
+                        DbError::Connector(format!(
+                            "Invalid 'sink.write.timeout.ms' for sink '{name}': {e}"
+                        ))
+                    })? {
+                    Some(ms) => std::time::Duration::from_millis(ms),
+                    None => caps.suggested_write_timeout,
+                };
+            if write_timeout.is_zero() {
+                return Err(DbError::Connector(format!(
+                    "sink '{name}': write_timeout must be > 0 \
+                     (check 'sink.write.timeout.ms' or the sink's \
+                     suggested_write_timeout)"
+                )));
+            }
+            let sink_id: std::sync::Arc<str> = std::sync::Arc::from(name.as_str());
+            let handle =
+                crate::sink_task::SinkTaskHandle::spawn(crate::sink_task::SinkTaskConfig {
+                    name: name.clone(),
+                    sink_id,
+                    connector: sink,
+                    exactly_once: caps.exactly_once,
+                    channel_capacity: crate::sink_task::DEFAULT_CHANNEL_CAPACITY,
+                    flush_interval: crate::sink_task::DEFAULT_FLUSH_INTERVAL,
+                    write_timeout,
+                    event_tx: sink_event_tx.clone(),
+                });
             sinks.push((
                 name.clone(),
                 handle,
                 reg.filter_expr.clone(),
                 reg.input.clone(),
+                caps.changelog,
             ));
         }
+        // Drop the local sender so the channel disconnects when all
+        // sink tasks exit.
+        drop(sink_event_tx);
 
         // Build table sources from registrations
         let mut table_sources: Vec<(String, Box<dyn ReferenceTableSource>, RefreshMode)> =
@@ -486,7 +596,7 @@ impl LaminarDB {
         {
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
-                for (name, handle, _, _) in &sinks {
+                for (name, handle, _, _, _) in &sinks {
                     let exactly_once = handle.exactly_once();
                     coord.register_sink(name.clone(), handle.clone(), exactly_once);
                 }
@@ -536,7 +646,7 @@ impl LaminarDB {
                                 src.restore_checkpoint = Some(restored);
                             }
                         }
-                        // Restore operator graph state (new format)
+                        let mut graph_restore_failed = false;
                         if let Some(op) = recovered.manifest.operator_states.get("operator_graph") {
                             if let Some(bytes) = op.decode_inline() {
                                 match graph.restore_from_bytes(&bytes) {
@@ -547,6 +657,7 @@ impl LaminarDB {
                                         );
                                     }
                                     Err(e) => {
+                                        graph_restore_failed = true;
                                         tracing::warn!(
                                             error = %e,
                                             "Operator graph state restore failed, starting fresh"
@@ -559,10 +670,36 @@ impl LaminarDB {
                             .operator_states
                             .contains_key("stream_executor")
                         {
+                            graph_restore_failed = true;
                             tracing::warn!(
                                 "Found old stream_executor checkpoint format; \
                                  skipping restore (clean break). Starting fresh."
                             );
+                        }
+
+                        // Skip MV restore when operator state failed to load —
+                        // stale MV data with fresh operators is inconsistent.
+                        // No operator state at all (stateless pipeline) is fine.
+                        if !graph_restore_failed {
+                            let prefix = crate::mv_store::CHECKPOINT_KEY_PREFIX;
+                            let mut store = self.mv_store.write();
+                            let mut restored = 0usize;
+                            for (key, op) in &recovered.manifest.operator_states {
+                                if let Some(name) = key.strip_prefix(prefix) {
+                                    if let Some(bytes) = op.decode_inline() {
+                                        match store.restore_from_ipc(name, &bytes) {
+                                            Ok(true) => restored += 1,
+                                            Ok(false) => {} // MV no longer registered
+                                            Err(e) => {
+                                                tracing::warn!(mv = name, error = %e, "MV restore failed");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if restored > 0 {
+                                tracing::info!(mvs = restored, "Restored MV state from checkpoint");
+                            }
                         }
                         tracing::info!(
                             epoch = recovered.epoch(),
@@ -728,10 +865,8 @@ impl LaminarDB {
                 if let (Some(col), Some(dur)) =
                     (&entry.watermark_column, entry.max_out_of_orderness)
                 {
-                    let format = infer_timestamp_format(&entry.schema, col);
-                    let extractor =
-                        laminar_core::time::EventTimeExtractor::from_column(col, format)
-                            .with_mode(laminar_core::time::ExtractionMode::Max);
+                    let extractor = laminar_core::time::EventTimeExtractor::from_column(col)
+                        .with_mode(laminar_core::time::ExtractionMode::Max);
                     let generator: Box<dyn laminar_core::time::WatermarkGenerator> = if entry
                         .is_processing_time
                         .load(std::sync::atomic::Ordering::Relaxed)
@@ -750,7 +885,6 @@ impl LaminarDB {
                             extractor,
                             generator,
                             column: col.clone(),
-                            format,
                         },
                     );
                 }
@@ -758,18 +892,20 @@ impl LaminarDB {
             }
         }
 
-        // Also create watermark state for sources that declared event_time_column
-        // programmatically (via source.set_event_time_column()) but have no SQL WATERMARK
+        // Fallback watermark path for sources that set `event_time_column`
+        // without an SQL `WATERMARK FOR` clause — exercised by the
+        // programmatic API (`handle.set_event_time_column`) and by the
+        // connector-property wiring above. Uses `Duration::ZERO` for
+        // out-of-orderness because those paths don't carry a bound; if
+        // you want a non-zero bound, use `[source.watermark]` instead.
         for name in self.catalog.list_sources() {
             if watermark_states.contains_key(&name) {
                 continue;
             }
             if let Some(entry) = self.catalog.get_source(&name) {
                 if let Some(col) = entry.source.event_time_column() {
-                    let format = infer_timestamp_format(&entry.schema, &col);
-                    let extractor =
-                        laminar_core::time::EventTimeExtractor::from_column(&col, format)
-                            .with_mode(laminar_core::time::ExtractionMode::Max);
+                    let extractor = laminar_core::time::EventTimeExtractor::from_column(&col)
+                        .with_mode(laminar_core::time::ExtractionMode::Max);
                     let generator: Box<dyn laminar_core::time::WatermarkGenerator> = if entry
                         .is_processing_time
                         .load(std::sync::atomic::Ordering::Relaxed)
@@ -790,7 +926,6 @@ impl LaminarDB {
                             extractor,
                             generator,
                             column: col,
-                            format,
                         },
                     );
                 }
@@ -825,27 +960,37 @@ impl LaminarDB {
         // minimal latency — data is processed as soon as it arrives.
         // Connector mode: 5ms batch window amortizes SQL overhead across
         // high-throughput external sources (Kafka, CDC).
+        let drain_budget_ns = self.config.pipeline_drain_budget_ns.unwrap_or(1_000_000);
+        let query_budget_ns = self.config.pipeline_query_budget_ns.unwrap_or(8_000_000);
         let pipeline_config = PipelineConfig {
             max_poll_records: max_poll,
-            channel_capacity: 64,
+            channel_capacity: self.config.pipeline_channel_capacity.unwrap_or(64),
             fallback_poll_interval: if has_external {
                 std::time::Duration::from_millis(10)
             } else {
                 std::time::Duration::from_millis(1)
             },
             checkpoint_interval,
-            batch_window: if has_external {
-                std::time::Duration::from_millis(5)
-            } else {
-                std::time::Duration::ZERO
-            },
+            batch_window: self
+                .config
+                .pipeline_batch_window
+                .unwrap_or(if has_external {
+                    std::time::Duration::from_millis(5)
+                } else {
+                    std::time::Duration::ZERO
+                }),
+            // Tracks CheckpointConfig::default().alignment_timeout.
+            // TODO: expose alignment_timeout_ms in LaminarDbConfig.checkpoint
+            // so users can configure this.
             barrier_alignment_timeout: std::time::Duration::from_secs(30),
             delivery_guarantee: self.config.delivery_guarantee,
-            cycle_budget_ns: 10_000_000,     // 10ms
-            drain_budget_ns: 1_000_000,      // 1ms
-            query_budget_ns: 8_000_000,      // 8ms
+            // cycle_budget is a soft cap for logging; ensure it's at least
+            // drain + query so sub-budgets can actually be used.
+            cycle_budget_ns: 10_000_000_u64.max(drain_budget_ns + query_budget_ns),
+            drain_budget_ns,
+            query_budget_ns,
             background_budget_ns: 5_000_000, // 5ms
-            sink_write_timeout: std::time::Duration::from_secs(30),
+            max_input_buf_batches: 256,
         };
 
         // Validate delivery guarantee constraints.
@@ -862,7 +1007,7 @@ impl LaminarDB {
                         )));
                     }
                 }
-                for (name, handle, _, _) in &sinks {
+                for (name, handle, _, _, _) in &sinks {
                     if !handle.exactly_once() {
                         return Err(DbError::Config(format!(
                             "[LDB-5031] exactly-once requires all sinks to support \
@@ -880,7 +1025,7 @@ impl LaminarDB {
                 }
             } else if pipeline_config.delivery_guarantee == DeliveryGuarantee::AtLeastOnce {
                 let has_non_replayable = sources.iter().any(|s| !s.supports_replay);
-                let has_eo_sink = sinks.iter().any(|(_, h, _, _)| h.exactly_once());
+                let has_eo_sink = sinks.iter().any(|(_, h, _, _, _)| h.exactly_once());
                 if has_non_replayable && has_eo_sink {
                     tracing::warn!(
                         "[LDB-5033] pipeline has exactly-once sinks but some sources \
@@ -923,8 +1068,9 @@ impl LaminarDB {
             Some(hasher.finish())
         };
 
-        // Wire per-query budget from pipeline config.
+        // Wire per-query budget and input buffer cap from pipeline config.
         graph.set_query_budget_ns(pipeline_config.query_budget_ns);
+        graph.set_max_input_buf_batches(pipeline_config.max_input_buf_batches);
 
         let callback = crate::pipeline_callback::ConnectorPipelineCallback {
             graph,
@@ -939,6 +1085,7 @@ impl LaminarDB {
             coordinator,
             table_sources,
             table_store: table_store_for_loop,
+            mv_store: self.mv_store.clone(),
             lookup_registry: Arc::clone(&self.lookup_registry),
             filter_ctx: laminar_sql::create_session_context(),
             compiled_sink_filters: Vec::new(),
@@ -951,7 +1098,8 @@ impl LaminarDB {
                 .map(std::time::Duration::from_millis),
             pipeline_hash,
             delivery_guarantee: pipeline_config.delivery_guarantee,
-            sink_write_timeout: pipeline_config.sink_write_timeout,
+            serialization_timeout: std::time::Duration::from_secs(120),
+            sink_event_rx,
             sink_timed_out: false,
             cycle_histogram: std::cell::RefCell::new(
                 crate::checkpoint_coordinator::DurationHistogram::new(),
@@ -961,11 +1109,11 @@ impl LaminarDB {
         // Start the streaming coordinator on a dedicated compute thread.
         // Source tasks were already spawned on the main tokio runtime in
         // StreamingCoordinator::new(). The coordinator communicates with
-        // them via tokio::sync::mpsc which works across runtimes.
+        // them via crossfire mpsc which works across runtimes.
         {
             // Control channel for live DDL (add/drop stream).
             let (control_tx, control_rx) =
-                tokio::sync::mpsc::channel::<crate::pipeline::ControlMsg>(64);
+                crossfire::mpsc::bounded_async::<crate::pipeline::ControlMsg>(64);
             *self.control_tx.lock() = Some(control_tx);
 
             let coordinator = crate::pipeline::StreamingCoordinator::new(
@@ -976,8 +1124,8 @@ impl LaminarDB {
             )
             .await?;
 
-            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
-            let (startup_tx, startup_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+            let (done_tx, done_rx) = crossfire::oneshot::oneshot::<()>();
+            let (startup_tx, startup_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();
             match std::thread::Builder::new()
                 .name("laminar-compute".into())
                 .spawn(move || {
@@ -986,18 +1134,30 @@ impl LaminarDB {
                         .build()
                     {
                         Ok(rt) => {
-                            let _ = startup_tx.send(Ok(()));
+                            startup_tx.send(Ok(()));
                             rt
                         }
                         Err(e) => {
-                            let _ = startup_tx.send(Err(format!("compute runtime: {e}")));
+                            startup_tx.send(Err(format!("compute runtime: {e}")));
                             return;
                         }
                     };
-                    rt.block_on(async move {
-                        coordinator.run(callback).await;
-                    });
-                    let _ = done_tx.send(());
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        rt.block_on(async move {
+                            coordinator.run(callback).await;
+                        });
+                    }));
+                    if let Err(panic) = result {
+                        let msg = panic
+                            .downcast_ref::<String>()
+                            .map(String::as_str)
+                            .or_else(|| panic.downcast_ref::<&str>().copied())
+                            .unwrap_or("unknown");
+                        tracing::error!(panic = msg, "laminar-compute thread panicked");
+                        // done_tx dropped → done_rx returns Err → logged by watcher task
+                        return;
+                    }
+                    done_tx.send(());
                 }) {
                 Ok(_) => {}
                 Err(e) => {
@@ -1018,8 +1178,14 @@ impl LaminarDB {
                 }
             }
 
+            let watcher_state = Arc::clone(&self.state);
+            let watcher_shutdown = Arc::clone(&self.shutdown_signal);
             let handle = tokio::spawn(async move {
-                let _ = done_rx.await;
+                if done_rx.await.is_err() {
+                    tracing::error!("laminar-compute thread exited unexpectedly");
+                    watcher_state.store(STATE_STOPPED, std::sync::atomic::Ordering::Release);
+                    watcher_shutdown.notify_one();
+                }
             });
 
             *self.runtime_handle.lock() = Some(handle);

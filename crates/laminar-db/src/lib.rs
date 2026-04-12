@@ -11,7 +11,7 @@
 //! let db = LaminarDB::open()?;
 //!
 //! db.execute("CREATE SOURCE trades (
-//!     symbol VARCHAR, price DOUBLE, ts BIGINT,
+//!     symbol VARCHAR, price DOUBLE, ts TIMESTAMP,
 //!     WATERMARK FOR ts AS ts - INTERVAL '1' SECOND
 //! )").await?;
 //!
@@ -26,10 +26,10 @@
 
 mod aggregate_state;
 mod asof_batch;
-mod batch_filter;
 mod builder;
 mod catalog;
 mod catalog_connector;
+mod changelog_filter;
 /// Unified checkpoint coordination.
 pub mod checkpoint_coordinator;
 mod config;
@@ -53,10 +53,12 @@ mod ddl;
 mod error;
 mod handle;
 mod interval_join;
+mod key_column;
 mod metrics;
 mod metrics_api;
+mod mv_store;
+mod operator;
 mod operator_graph;
-mod operators;
 /// Thread-per-core connector pipeline.
 pub mod pipeline;
 mod pipeline_callback;
@@ -65,10 +67,11 @@ mod pipeline_lifecycle;
 pub mod profile;
 /// Unified recovery manager.
 pub mod recovery_manager;
+mod retractable_accumulator;
 mod show_commands;
 mod sink_task;
+mod sql_analysis;
 mod sql_utils;
-mod stream_executor;
 mod table_backend;
 mod table_cache_mode;
 mod table_provider;
@@ -88,9 +91,10 @@ mod temporal_probe;
 pub mod ffi;
 
 pub use builder::LaminarDbBuilder;
-pub use catalog::{SourceCatalog, SourceEntry};
+pub use catalog::{ArrowRecord, SourceCatalog, SourceEntry};
 pub use checkpoint_coordinator::{
-    CheckpointConfig, CheckpointCoordinator, CheckpointPhase, CheckpointResult, CheckpointStats,
+    CheckpointConfig, CheckpointCoordinator, CheckpointPhase, CheckpointRequest, CheckpointResult,
+    CheckpointStats,
 };
 pub use config::{IdentifierCaseSensitivity, LaminarConfig, TieringConfig};
 pub use db::LaminarDB;

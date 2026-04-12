@@ -21,7 +21,7 @@
 //! - **Ring 2**: Schema management, configuration, health checks.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::SchemaRef;
@@ -887,12 +887,19 @@ impl SinkConnector for DeltaLakeSink {
                      available — deferring Delta table init to first begin_epoch"
                 );
                 self.needs_deferred_delta_init = true;
-                // Stay in Initializing until init completes in begin_epoch().
                 self.state = ConnectorState::Initializing;
                 return Ok(());
             }
 
             self.init_delta_table().await?;
+
+            // If table still has no version after init (new table, no schema yet),
+            // defer full creation to the first write_batch() when schema is available.
+            if self.table.as_ref().is_some_and(|t| t.version().is_none()) && self.schema.is_none() {
+                self.needs_deferred_delta_init = true;
+                self.state = ConnectorState::Initializing;
+                return Ok(());
+            }
         }
 
         #[cfg(not(feature = "delta-lake"))]
@@ -1125,7 +1132,8 @@ impl SinkConnector for DeltaLakeSink {
     }
 
     fn capabilities(&self) -> SinkConnectorCapabilities {
-        let mut caps = SinkConnectorCapabilities::default().with_idempotent();
+        // Delta commits can run long under compaction or contention.
+        let mut caps = SinkConnectorCapabilities::new(Duration::from_secs(180)).with_idempotent();
 
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             caps = caps.with_exactly_once().with_two_phase_commit();
@@ -1289,7 +1297,11 @@ mod tests {
     }
 
     fn test_config() -> DeltaLakeSinkConfig {
-        DeltaLakeSinkConfig::new("/tmp/delta_test")
+        #[cfg(unix)]
+        let path = "/tmp/delta_test_nonexistent_8f3a";
+        #[cfg(windows)]
+        let path = "C:\\delta_test_nonexistent_8f3a";
+        DeltaLakeSinkConfig::new(path)
     }
 
     fn upsert_config() -> DeltaLakeSinkConfig {
@@ -1931,6 +1943,6 @@ mod tests {
         let sink = DeltaLakeSink::new(test_config());
         let debug = format!("{sink:?}");
         assert!(debug.contains("DeltaLakeSink"));
-        assert!(debug.contains("/tmp/delta_test"));
+        assert!(debug.contains("delta_test_nonexistent_8f3a"));
     }
 }

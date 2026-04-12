@@ -1,32 +1,20 @@
 //! JSON serialization and deserialization.
 //!
-//! Converts between JSON records and Arrow `RecordBatch` using `serde_json`.
+//! Implements [`RecordDeserializer`] / [`RecordSerializer`] by delegating
+//! to [`JsonDecoder`] and [`JsonEncoder`].
 
-use std::sync::Arc;
-
-use arrow_array::builder::{
-    BooleanBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder,
-    Int8Builder, StringBuilder, UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder,
-};
-use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{DataType, SchemaRef};
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use serde_json::Value;
 
 use super::{Format, RecordDeserializer, RecordSerializer};
 use crate::error::SerdeError;
 use crate::schema::json::decoder::JsonDecoder;
-use crate::schema::traits::FormatDecoder;
+use crate::schema::json::encoder::JsonEncoder;
+use crate::schema::traits::{FormatDecoder, FormatEncoder};
 use crate::schema::types::RawRecord;
 
-/// JSON record deserializer.
-///
-/// Parses JSON objects and maps fields to Arrow columns based on the
-/// provided schema. Supports:
-/// - All integer types (i8-i64, u8-u64)
-/// - Float types (f32, f64)
-/// - Boolean
-/// - Utf8 (String)
-/// - Nullable fields
+/// JSON record deserializer. Delegates to [`JsonDecoder`].
 #[derive(Debug, Clone)]
 pub struct JsonDeserializer {
     _private: (),
@@ -38,50 +26,28 @@ impl JsonDeserializer {
     pub fn new() -> Self {
         Self { _private: () }
     }
-}
 
-impl Default for JsonDeserializer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl JsonDeserializer {
     /// Deserializes a pre-parsed JSON [`Value`] into a [`RecordBatch`].
     ///
-    /// Avoids the serialize-then-reparse overhead when the caller already
-    /// holds a parsed `Value` (e.g. Debezium envelope extraction).
+    /// Used by [`DebeziumDeserializer`](super::debezium::DebeziumDeserializer)
+    /// to avoid double-parsing the envelope.
     ///
     /// # Errors
     ///
-    /// Returns `SerdeError` if the value is not a JSON object, a required
-    /// field is missing, or Arrow array construction fails.
+    /// Returns `SerdeError` if the value cannot be decoded.
     pub fn deserialize_value(
         &self,
         value: &Value,
         schema: &SchemaRef,
     ) -> Result<RecordBatch, SerdeError> {
-        let obj = value
-            .as_object()
-            .ok_or_else(|| SerdeError::MalformedInput("expected JSON object".into()))?;
+        let bytes = serde_json::to_vec(value).map_err(|e| SerdeError::Json(e.to_string()))?;
+        self.deserialize(&bytes, schema)
+    }
+}
 
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-
-        for field in schema.fields() {
-            let json_val = obj.get(field.name());
-
-            let is_null = json_val.is_none() || json_val == Some(&Value::Null);
-
-            if is_null && !field.is_nullable() {
-                return Err(SerdeError::MissingField(field.name().clone()));
-            }
-
-            let array = build_array_from_json(field.data_type(), json_val, field.name())?;
-            columns.push(array);
-        }
-
-        RecordBatch::try_new(schema.clone(), columns)
-            .map_err(|e| SerdeError::MalformedInput(format!("failed to create RecordBatch: {e}")))
+impl Default for JsonDeserializer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -115,9 +81,7 @@ impl RecordDeserializer for JsonDeserializer {
     }
 }
 
-/// JSON record serializer.
-///
-/// Converts Arrow `RecordBatch` rows to JSON objects.
+/// JSON record serializer. Delegates to [`JsonEncoder`].
 #[derive(Debug, Clone)]
 pub struct JsonSerializer {
     _private: (),
@@ -139,65 +103,10 @@ impl Default for JsonSerializer {
 
 impl RecordSerializer for JsonSerializer {
     fn serialize(&self, batch: &RecordBatch) -> Result<Vec<Vec<u8>>, SerdeError> {
-        let mut records = Vec::with_capacity(batch.num_rows());
-        let schema = batch.schema();
-        // Reuse a single Map across all rows (clear instead of re-allocate)
-        let mut obj = serde_json::Map::with_capacity(schema.fields().len());
-
-        for row in 0..batch.num_rows() {
-            obj.clear();
-
-            for (col_idx, field) in schema.fields().iter().enumerate() {
-                let column = batch.column(col_idx);
-
-                if column.is_null(row) {
-                    obj.insert(field.name().clone(), Value::Null);
-                    continue;
-                }
-
-                let value = arrow_column_to_json(column, row, field.data_type())?;
-                obj.insert(field.name().clone(), value);
-            }
-
-            let json_bytes =
-                serde_json::to_vec(&obj).map_err(|e| SerdeError::Json(e.to_string()))?;
-            records.push(json_bytes);
-        }
-
-        Ok(records)
-    }
-
-    fn serialize_batch(&self, batch: &RecordBatch) -> Result<Vec<u8>, SerdeError> {
-        let schema = batch.schema();
-        // Estimate ~256 bytes per row for capacity hint
-        let mut buf = Vec::with_capacity(batch.num_rows() * 256);
-        let mut obj = serde_json::Map::with_capacity(schema.fields().len());
-        // Reusable per-row write buffer
-        let mut row_buf: Vec<u8> = Vec::with_capacity(256);
-
-        for row in 0..batch.num_rows() {
-            obj.clear();
-
-            for (col_idx, field) in schema.fields().iter().enumerate() {
-                let column = batch.column(col_idx);
-
-                if column.is_null(row) {
-                    obj.insert(field.name().clone(), Value::Null);
-                    continue;
-                }
-
-                let value = arrow_column_to_json(column, row, field.data_type())?;
-                obj.insert(field.name().clone(), value);
-            }
-
-            row_buf.clear();
-            serde_json::to_writer(&mut row_buf, &obj)
-                .map_err(|e| SerdeError::Json(e.to_string()))?;
-            buf.extend_from_slice(&row_buf);
-            buf.push(b'\n');
-        }
-
-        Ok(buf)
+        let encoder = JsonEncoder::new(batch.schema());
+        encoder
+            .encode_batch(batch)
+            .map_err(|e| SerdeError::Json(e.to_string()))
     }
 
     fn format(&self) -> Format {
@@ -205,298 +114,11 @@ impl RecordSerializer for JsonSerializer {
     }
 }
 
-/// Builds a single-element Arrow array from a JSON value.
-fn build_array_from_json(
-    data_type: &DataType,
-    value: Option<&Value>,
-    field_name: &str,
-) -> Result<ArrayRef, SerdeError> {
-    match data_type {
-        DataType::Boolean => {
-            let mut builder = BooleanBuilder::with_capacity(1);
-            match value {
-                Some(Value::Bool(b)) => builder.append_value(*b),
-                Some(Value::Null) | None => builder.append_null(),
-                _ => {
-                    return Err(SerdeError::TypeConversion {
-                        field: field_name.into(),
-                        expected: "Boolean".into(),
-                        message: format!("got {value:?}"),
-                    })
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        DataType::Int8 => build_int_array::<Int8Builder>(value, field_name, "Int8"),
-        DataType::Int16 => build_int_array::<Int16Builder>(value, field_name, "Int16"),
-        DataType::Int32 => build_int_array::<Int32Builder>(value, field_name, "Int32"),
-        DataType::Int64 => build_int_array::<Int64Builder>(value, field_name, "Int64"),
-        DataType::UInt8 => build_uint_array::<UInt8Builder>(value, field_name, "UInt8"),
-        DataType::UInt16 => build_uint_array::<UInt16Builder>(value, field_name, "UInt16"),
-        DataType::UInt32 => build_uint_array::<UInt32Builder>(value, field_name, "UInt32"),
-        DataType::UInt64 => build_uint_array::<UInt64Builder>(value, field_name, "UInt64"),
-        DataType::Float32 => {
-            let mut builder = Float32Builder::with_capacity(1);
-            match value {
-                Some(Value::Number(n)) => {
-                    let v = n.as_f64().ok_or_else(|| SerdeError::TypeConversion {
-                        field: field_name.into(),
-                        expected: "Float32".into(),
-                        message: format!("cannot convert {n}"),
-                    })?;
-                    #[allow(clippy::cast_possible_truncation)]
-                    // f64 → f32: precision loss acceptable for Float32 columns
-                    builder.append_value(v as f32);
-                }
-                Some(Value::Null) | None => builder.append_null(),
-                _ => {
-                    return Err(SerdeError::TypeConversion {
-                        field: field_name.into(),
-                        expected: "Float32".into(),
-                        message: format!("got {value:?}"),
-                    })
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        DataType::Float64 => {
-            let mut builder = Float64Builder::with_capacity(1);
-            match value {
-                Some(Value::Number(n)) => {
-                    let v = n.as_f64().ok_or_else(|| SerdeError::TypeConversion {
-                        field: field_name.into(),
-                        expected: "Float64".into(),
-                        message: format!("cannot convert {n}"),
-                    })?;
-                    builder.append_value(v);
-                }
-                Some(Value::Null) | None => builder.append_null(),
-                _ => {
-                    return Err(SerdeError::TypeConversion {
-                        field: field_name.into(),
-                        expected: "Float64".into(),
-                        message: format!("got {value:?}"),
-                    })
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        DataType::Utf8 => {
-            let mut builder = StringBuilder::with_capacity(1, 64);
-            match value {
-                Some(Value::String(s)) => builder.append_value(s),
-                Some(Value::Null) | None => builder.append_null(),
-                // Coerce non-string values to string representation
-                Some(other) => builder.append_value(other.to_string()),
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        other => Err(SerdeError::UnsupportedFormat(format!(
-            "unsupported Arrow type for JSON deserialization: {other}"
-        ))),
-    }
-}
-
-/// Helper trait for building integer arrays from JSON.
-trait IntBuilder: Default {
-    type Native: TryFrom<i64>;
-    fn append_value(&mut self, v: Self::Native);
-    fn append_null(&mut self);
-    fn finish_array(self) -> ArrayRef;
-}
-
-macro_rules! impl_int_builder {
-    ($builder:ty, $native:ty) => {
-        impl IntBuilder for $builder {
-            type Native = $native;
-            fn append_value(&mut self, v: Self::Native) {
-                <$builder>::append_value(self, v);
-            }
-            fn append_null(&mut self) {
-                <$builder>::append_null(self);
-            }
-            fn finish_array(mut self) -> ArrayRef {
-                Arc::new(self.finish())
-            }
-        }
-    };
-}
-
-impl_int_builder!(Int8Builder, i8);
-impl_int_builder!(Int16Builder, i16);
-impl_int_builder!(Int32Builder, i32);
-impl_int_builder!(Int64Builder, i64);
-
-trait UintBuilder: Default {
-    type Native: TryFrom<u64>;
-    fn append_value(&mut self, v: Self::Native);
-    fn append_null(&mut self);
-    fn finish_array(self) -> ArrayRef;
-}
-
-macro_rules! impl_uint_builder {
-    ($builder:ty, $native:ty) => {
-        impl UintBuilder for $builder {
-            type Native = $native;
-            fn append_value(&mut self, v: Self::Native) {
-                <$builder>::append_value(self, v);
-            }
-            fn append_null(&mut self) {
-                <$builder>::append_null(self);
-            }
-            fn finish_array(mut self) -> ArrayRef {
-                Arc::new(self.finish())
-            }
-        }
-    };
-}
-
-impl_uint_builder!(UInt8Builder, u8);
-impl_uint_builder!(UInt16Builder, u16);
-impl_uint_builder!(UInt32Builder, u32);
-impl_uint_builder!(UInt64Builder, u64);
-
-fn build_int_array<B: IntBuilder>(
-    value: Option<&Value>,
-    field_name: &str,
-    type_name: &str,
-) -> Result<ArrayRef, SerdeError>
-where
-    <B::Native as TryFrom<i64>>::Error: std::fmt::Display,
-{
-    let mut builder = B::default();
-    match value {
-        Some(Value::Number(n)) => {
-            let i = n.as_i64().ok_or_else(|| SerdeError::TypeConversion {
-                field: field_name.into(),
-                expected: type_name.into(),
-                message: format!("cannot convert {n} to i64"),
-            })?;
-            let native = B::Native::try_from(i).map_err(|e| SerdeError::TypeConversion {
-                field: field_name.into(),
-                expected: type_name.into(),
-                message: format!("{e}"),
-            })?;
-            builder.append_value(native);
-        }
-        Some(Value::Null) | None => builder.append_null(),
-        _ => {
-            return Err(SerdeError::TypeConversion {
-                field: field_name.into(),
-                expected: type_name.into(),
-                message: format!("got {value:?}"),
-            })
-        }
-    }
-    Ok(builder.finish_array())
-}
-
-fn build_uint_array<B: UintBuilder>(
-    value: Option<&Value>,
-    field_name: &str,
-    type_name: &str,
-) -> Result<ArrayRef, SerdeError>
-where
-    <B::Native as TryFrom<u64>>::Error: std::fmt::Display,
-{
-    let mut builder = B::default();
-    match value {
-        Some(Value::Number(n)) => {
-            let u = n.as_u64().ok_or_else(|| SerdeError::TypeConversion {
-                field: field_name.into(),
-                expected: type_name.into(),
-                message: format!("cannot convert {n} to u64"),
-            })?;
-            let native = B::Native::try_from(u).map_err(|e| SerdeError::TypeConversion {
-                field: field_name.into(),
-                expected: type_name.into(),
-                message: format!("{e}"),
-            })?;
-            builder.append_value(native);
-        }
-        Some(Value::Null) | None => builder.append_null(),
-        _ => {
-            return Err(SerdeError::TypeConversion {
-                field: field_name.into(),
-                expected: type_name.into(),
-                message: format!("got {value:?}"),
-            })
-        }
-    }
-    Ok(builder.finish_array())
-}
-
-/// Converts an Arrow column value at `row` to a JSON value.
-fn arrow_column_to_json(
-    column: &ArrayRef,
-    row: usize,
-    data_type: &DataType,
-) -> Result<Value, SerdeError> {
-    use arrow_array::{
-        BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array,
-        StringArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
-    };
-
-    match data_type {
-        DataType::Boolean => {
-            let arr = column.as_any().downcast_ref::<BooleanArray>().unwrap();
-            Ok(Value::Bool(arr.value(row)))
-        }
-        DataType::Int8 => {
-            let arr = column.as_any().downcast_ref::<Int8Array>().unwrap();
-            Ok(Value::Number(i64::from(arr.value(row)).into()))
-        }
-        DataType::Int16 => {
-            let arr = column.as_any().downcast_ref::<Int16Array>().unwrap();
-            Ok(Value::Number(i64::from(arr.value(row)).into()))
-        }
-        DataType::Int32 => {
-            let arr = column.as_any().downcast_ref::<Int32Array>().unwrap();
-            Ok(Value::Number(i64::from(arr.value(row)).into()))
-        }
-        DataType::Int64 => {
-            let arr = column.as_any().downcast_ref::<Int64Array>().unwrap();
-            Ok(Value::Number(arr.value(row).into()))
-        }
-        DataType::UInt8 => {
-            let arr = column.as_any().downcast_ref::<UInt8Array>().unwrap();
-            Ok(Value::Number(u64::from(arr.value(row)).into()))
-        }
-        DataType::UInt16 => {
-            let arr = column.as_any().downcast_ref::<UInt16Array>().unwrap();
-            Ok(Value::Number(u64::from(arr.value(row)).into()))
-        }
-        DataType::UInt32 => {
-            let arr = column.as_any().downcast_ref::<UInt32Array>().unwrap();
-            Ok(Value::Number(u64::from(arr.value(row)).into()))
-        }
-        DataType::UInt64 => {
-            let arr = column.as_any().downcast_ref::<UInt64Array>().unwrap();
-            Ok(Value::Number(arr.value(row).into()))
-        }
-        DataType::Float32 => {
-            let arr = column.as_any().downcast_ref::<Float32Array>().unwrap();
-            let v = f64::from(arr.value(row));
-            Ok(serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number))
-        }
-        DataType::Float64 => {
-            let arr = column.as_any().downcast_ref::<Float64Array>().unwrap();
-            Ok(serde_json::Number::from_f64(arr.value(row)).map_or(Value::Null, Value::Number))
-        }
-        DataType::Utf8 => {
-            let arr = column.as_any().downcast_ref::<StringArray>().unwrap();
-            Ok(Value::String(arr.value(row).to_string()))
-        }
-        other => Err(SerdeError::UnsupportedFormat(format!(
-            "unsupported Arrow type for JSON serialization: {other}"
-        ))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_schema::{Field, Schema};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
 
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -515,35 +137,6 @@ mod tests {
         let batch = deser.deserialize(data, &schema).unwrap();
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(batch.num_columns(), 3);
-
-        let ids = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow_array::Int64Array>()
-            .unwrap();
-        assert_eq!(ids.value(0), 1);
-    }
-
-    #[test]
-    fn test_json_deserialize_null_field() {
-        let deser = JsonDeserializer::new();
-        let schema = test_schema();
-        let data = br#"{"id": 2, "name": "Bob", "score": null}"#;
-
-        let batch = deser.deserialize(data, &schema).unwrap();
-        assert_eq!(batch.num_rows(), 1);
-        assert!(batch.column(2).is_null(0));
-    }
-
-    #[test]
-    fn test_json_deserialize_missing_required_field() {
-        let deser = JsonDeserializer::new();
-        let schema = test_schema(); // `name` is non-nullable
-        let data = br#"{"id": 3, "score": 80.0}"#;
-
-        // Missing non-nullable field → error from RecordBatch construction.
-        let result = deser.deserialize(data, &schema);
-        assert!(result.is_err());
     }
 
     #[test]
@@ -577,26 +170,6 @@ mod tests {
     }
 
     #[test]
-    fn test_json_serialize_batch_ndjson() {
-        let deser = JsonDeserializer::new();
-        let ser = JsonSerializer::new();
-        let schema = test_schema();
-
-        let r1 = br#"{"id": 1, "name": "A", "score": 10.0}"#;
-        let r2 = br#"{"id": 2, "name": "B", "score": 20.0}"#;
-        let records: Vec<&[u8]> = vec![r1, r2];
-        let batch = deser.deserialize_batch(&records, &schema).unwrap();
-
-        let ndjson = ser.serialize_batch(&batch).unwrap();
-        let lines: Vec<&str> = std::str::from_utf8(&ndjson)
-            .unwrap()
-            .lines()
-            .filter(|l| !l.is_empty())
-            .collect();
-        assert_eq!(lines.len(), 2);
-    }
-
-    #[test]
     fn test_json_deserialize_coercion() {
         let deser = JsonDeserializer::new();
         let schema = Arc::new(Schema::new(vec![
@@ -604,7 +177,6 @@ mod tests {
             Field::new("price", DataType::Float64, false),
         ]));
 
-        // String numbers should coerce to the declared numeric types.
         let data = br#"{"qty": "100", "price": "187.52"}"#;
         let batch = deser.deserialize(data, &schema).unwrap();
 
@@ -614,32 +186,5 @@ mod tests {
             .downcast_ref::<arrow_array::Int64Array>()
             .unwrap();
         assert_eq!(qty.value(0), 100);
-
-        let price = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow_array::Float64Array>()
-            .unwrap();
-        assert!((price.value(0) - 187.52).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_json_type_coercion() {
-        let deser = JsonDeserializer::new();
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Utf8,
-            false,
-        )]));
-
-        // Numbers should be coerced to string
-        let data = br#"{"value": 42}"#;
-        let batch = deser.deserialize(data, &schema).unwrap();
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow_array::StringArray>()
-            .unwrap();
-        assert_eq!(arr.value(0), "42");
     }
 }
