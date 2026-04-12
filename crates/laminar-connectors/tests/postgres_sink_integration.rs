@@ -91,7 +91,7 @@ async fn test_append_flush_writes_data() {
     let (_container, host, port) = start_pg().await;
 
     let config = sink_config(&host, port, WriteMode::Append);
-    let mut sink = PostgresSink::new(test_schema(), config);
+    let mut sink = PostgresSink::new(test_schema(), config, None);
     sink.open(&ConnectorConfig::new("postgres-sink"))
         .await
         .expect("open");
@@ -125,7 +125,7 @@ async fn test_append_multiple_flushes() {
     let (_container, host, port) = start_pg().await;
 
     let config = sink_config(&host, port, WriteMode::Append);
-    let mut sink = PostgresSink::new(test_schema(), config);
+    let mut sink = PostgresSink::new(test_schema(), config, None);
     sink.open(&ConnectorConfig::new("postgres-sink"))
         .await
         .expect("open");
@@ -159,7 +159,7 @@ async fn test_upsert_insert_and_update() {
     let (_container, host, port) = start_pg().await;
 
     let config = sink_config(&host, port, WriteMode::Upsert);
-    let mut sink = PostgresSink::new(test_schema(), config);
+    let mut sink = PostgresSink::new(test_schema(), config, None);
     sink.open(&ConnectorConfig::new("postgres-sink"))
         .await
         .expect("open");
@@ -207,7 +207,7 @@ async fn test_auto_flush_on_batch_size() {
 
     let mut config = sink_config(&host, port, WriteMode::Append);
     config.batch_size = 5; // Flush after 5 rows.
-    let mut sink = PostgresSink::new(test_schema(), config);
+    let mut sink = PostgresSink::new(test_schema(), config, None);
     sink.open(&ConnectorConfig::new("postgres-sink"))
         .await
         .expect("open");
@@ -242,7 +242,7 @@ async fn test_exactly_once_commit() {
 
     let mut config = sink_config(&host, port, WriteMode::Upsert);
     config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-    let mut sink = PostgresSink::new(test_schema(), config);
+    let mut sink = PostgresSink::new(test_schema(), config, None);
     sink.open(&ConnectorConfig::new("postgres-sink"))
         .await
         .expect("open");
@@ -279,7 +279,7 @@ async fn test_exactly_once_rollback_discards() {
 
     let mut config = sink_config(&host, port, WriteMode::Upsert);
     config.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-    let mut sink = PostgresSink::new(test_schema(), config);
+    let mut sink = PostgresSink::new(test_schema(), config, None);
     sink.open(&ConnectorConfig::new("postgres-sink"))
         .await
         .expect("open");
@@ -322,7 +322,7 @@ async fn test_auto_create_table() {
     assert!(!exists, "table should not exist yet");
 
     let config = sink_config(&host, port, WriteMode::Upsert);
-    let mut sink = PostgresSink::new(test_schema(), config);
+    let mut sink = PostgresSink::new(test_schema(), config, None);
     sink.open(&ConnectorConfig::new("postgres-sink"))
         .await
         .expect("open");
@@ -356,7 +356,7 @@ async fn test_changelog_upsert_and_delete() {
 
     let mut config = sink_config(&host, port, WriteMode::Upsert);
     config.changelog_mode = true;
-    let mut sink = PostgresSink::new(changelog_schema.clone(), config);
+    let mut sink = PostgresSink::new(changelog_schema.clone(), config, None);
     sink.open(&ConnectorConfig::new("postgres-sink"))
         .await
         .expect("open");
@@ -403,7 +403,7 @@ async fn test_epoch_recovery_skips_replay() {
 
     // First sink: commit epoch 5.
     {
-        let mut sink = PostgresSink::new(test_schema(), config.clone());
+        let mut sink = PostgresSink::new(test_schema(), config.clone(), None);
         sink.open(&ConnectorConfig::new("postgres-sink"))
             .await
             .expect("open1");
@@ -418,7 +418,7 @@ async fn test_epoch_recovery_skips_replay() {
 
     // Second sink: simulate recovery replay of epoch 5.
     {
-        let mut sink = PostgresSink::new(test_schema(), config.clone());
+        let mut sink = PostgresSink::new(test_schema(), config.clone(), None);
         sink.open(&ConnectorConfig::new("postgres-sink"))
             .await
             .expect("open2");

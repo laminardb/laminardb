@@ -58,7 +58,11 @@ pub struct WebSocketSinkServer {
 impl WebSocketSinkServer {
     /// Creates a new WebSocket sink server connector.
     #[must_use]
-    pub fn new(schema: SchemaRef, config: WebSocketSinkConfig) -> Self {
+    pub fn new(
+        schema: SchemaRef,
+        config: WebSocketSinkConfig,
+        registry: Option<&prometheus::Registry>,
+    ) -> Self {
         let serializer = BatchSerializer::new(config.format.clone());
 
         let (buffer_capacity, policy, replay_size) = match &config.mode {
@@ -87,7 +91,7 @@ impl WebSocketSinkServer {
             serializer,
             fanout,
             state: ConnectorState::Created,
-            metrics: Arc::new(WebSocketSinkMetrics::new()),
+            metrics: Arc::new(WebSocketSinkMetrics::new(registry)),
             current_epoch: 0,
             shutdown_tx: None,
             acceptor_handle: None,
@@ -485,7 +489,7 @@ mod tests {
 
     #[test]
     fn test_new() {
-        let sink = WebSocketSinkServer::new(test_schema(), test_config());
+        let sink = WebSocketSinkServer::new(test_schema(), test_config(), None);
         assert_eq!(sink.state(), ConnectorState::Created);
         assert_eq!(sink.connected_clients(), 0);
     }
@@ -493,13 +497,13 @@ mod tests {
     #[test]
     fn test_schema_returned() {
         let schema = test_schema();
-        let sink = WebSocketSinkServer::new(schema.clone(), test_config());
+        let sink = WebSocketSinkServer::new(schema.clone(), test_config(), None);
         assert_eq!(sink.schema(), schema);
     }
 
     #[test]
     fn test_capabilities() {
-        let sink = WebSocketSinkServer::new(test_schema(), test_config());
+        let sink = WebSocketSinkServer::new(test_schema(), test_config(), None);
         let caps = sink.capabilities();
         assert!(!caps.exactly_once);
         assert!(!caps.upsert);
@@ -507,13 +511,13 @@ mod tests {
 
     #[test]
     fn test_health_created() {
-        let sink = WebSocketSinkServer::new(test_schema(), test_config());
+        let sink = WebSocketSinkServer::new(test_schema(), test_config(), None);
         assert_eq!(sink.health_check(), HealthStatus::Unknown);
     }
 
     #[test]
     fn test_metrics_initial() {
-        let sink = WebSocketSinkServer::new(test_schema(), test_config());
+        let sink = WebSocketSinkServer::new(test_schema(), test_config(), None);
         let m = sink.metrics();
         assert_eq!(m.records_total, 0);
     }

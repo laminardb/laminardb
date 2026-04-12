@@ -50,7 +50,7 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) source_entries_for_wm: FxHashMap<String, Arc<crate::catalog::SourceEntry>>,
     pub(crate) source_ids: FxHashMap<String, usize>,
     pub(crate) tracker: Option<laminar_core::time::WatermarkTracker>,
-    pub(crate) counters: Arc<crate::metrics::PipelineCounters>,
+    pub(crate) prom: Arc<crate::engine_metrics::EngineMetrics>,
     pub(crate) pipeline_watermark: Arc<std::sync::atomic::AtomicI64>,
     pub(crate) coordinator:
         Arc<tokio::sync::Mutex<Option<crate::checkpoint_coordinator::CheckpointCoordinator>>>,
@@ -79,9 +79,6 @@ pub(crate) struct ConnectorPipelineCallback {
     /// Set when a sink write times out in this cycle. Suppresses the next
     /// checkpoint to preserve the replay window.
     pub(crate) sink_timed_out: bool,
-    /// Cycle duration histogram for percentile tracking (single-threaded access).
-    pub(crate) cycle_histogram:
-        std::cell::RefCell<crate::checkpoint_coordinator::DurationHistogram>,
 }
 
 impl ConnectorPipelineCallback {
@@ -192,15 +189,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                     if batch.num_rows() > 0 {
                         #[allow(clippy::cast_possible_truncation)]
                         let row_count = batch.num_rows() as u64;
-                        self.counters
-                            .events_emitted
-                            .fetch_add(row_count, std::sync::atomic::Ordering::Relaxed);
+                        self.prom.events_emitted.inc_by(row_count);
                         if src.push_arrow(batch.clone()).is_err() {
                             #[allow(clippy::cast_possible_truncation)]
                             let dropped = batch.num_rows() as u64;
-                            self.counters
-                                .events_dropped
-                                .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+                            self.prom.events_dropped.inc_by(dropped);
                         }
                     }
                 }
@@ -225,14 +218,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
         if updates > 0 {
-            self.counters
-                .mv_updates
-                .fetch_add(updates, std::sync::atomic::Ordering::Relaxed);
+            self.prom.mv_updates.inc_by(updates);
             #[allow(clippy::cast_possible_truncation)]
-            self.counters.mv_bytes_stored.store(
-                store.total_bytes() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
+            let bytes = store.total_bytes() as u64;
+            #[allow(clippy::cast_possible_wrap)]
+            self.prom.mv_bytes_stored.set(bytes as i64);
         }
     }
 
@@ -343,19 +333,18 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         // Drain SinkEvents emitted by sink tasks during this cycle.
         while let Ok(event) = self.sink_event_rx.try_recv() {
             tracing::debug!(?event, "sink event");
-            let counter = match &event {
+            match &event {
                 crate::sink_task::SinkEvent::WriteError { .. } => {
-                    &self.counters.sink_write_failures
+                    self.prom.sink_write_failures.inc();
                 }
                 crate::sink_task::SinkEvent::WriteTimeout { .. } => {
                     self.sink_timed_out = true;
-                    &self.counters.sink_write_timeouts
+                    self.prom.sink_write_timeouts.inc();
                 }
                 crate::sink_task::SinkEvent::ChannelClosed { .. } => {
-                    &self.counters.sink_task_channel_closed
+                    self.prom.sink_task_channel_closed.inc();
                 }
-            };
-            counter.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -401,12 +390,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         // Update ingestion counters.
         #[allow(clippy::cast_possible_truncation)]
         let row_count = batch.num_rows() as u64;
-        self.counters
-            .events_ingested
-            .fetch_add(row_count, std::sync::atomic::Ordering::Relaxed);
-        self.counters
-            .total_batches
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.prom.events_ingested.inc_by(row_count);
+        self.prom.batches.inc();
     }
 
     fn filter_late_rows(&self, source_name: &str, batch: &RecordBatch) -> Option<RecordBatch> {
@@ -449,12 +434,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             return false;
         }
 
-        if self
-            .counters
-            .cycles
-            .load(std::sync::atomic::Ordering::Relaxed)
-            == 0
-        {
+        if self.prom.cycles.get() == 0 {
             return false;
         }
 
@@ -581,12 +561,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
         let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
 
-        if self
-            .counters
-            .cycles
-            .load(std::sync::atomic::Ordering::Relaxed)
-            == 0
-        {
+        if self.prom.cycles.get() == 0 {
             return false;
         }
 
@@ -679,36 +654,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
     fn record_cycle(&self, events_ingested: u64, _batches: u64, elapsed_ns: u64) {
         let _ = events_ingested; // already recorded in extract_watermark
-        self.counters
-            .cycles
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.counters
-            .last_cycle_duration_ns
-            .store(elapsed_ns, std::sync::atomic::Ordering::Relaxed);
-
-        // Record to histogram for percentile tracking.
-        self.cycle_histogram
-            .borrow_mut()
-            .record(std::time::Duration::from_nanos(elapsed_ns));
-
-        // Update percentile atomics every 100 cycles to amortize sort cost.
-        let cycle_count = self
-            .counters
-            .cycles
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if cycle_count.is_multiple_of(100) {
-            let (p50, p95, p99) = self.cycle_histogram.borrow().percentiles();
-            // DurationHistogram records in microseconds; convert to nanoseconds.
-            self.counters
-                .cycle_p50_ns
-                .store(p50 * 1_000, std::sync::atomic::Ordering::Relaxed);
-            self.counters
-                .cycle_p95_ns
-                .store(p95 * 1_000, std::sync::atomic::Ordering::Relaxed);
-            self.counters
-                .cycle_p99_ns
-                .store(p99 * 1_000, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.prom.cycles.inc();
+        #[allow(clippy::cast_precision_loss)]
+        self.prom
+            .cycle_duration
+            .observe(elapsed_ns as f64 / 1_000_000_000.0);
     }
 
     fn apply_control(&mut self, msg: crate::pipeline::ControlMsg) {
@@ -743,9 +693,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     fn is_backpressured(&self) -> bool {
         let bp = self.graph.input_buf_pressure() > 0.8;
         if bp {
-            self.counters
-                .cycles_backpressured
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.prom.cycles_backpressured.inc();
         }
         bp
     }
@@ -777,9 +725,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         if let Err(e) = ts.upsert_and_rebuild(name, &batch) {
                             #[allow(clippy::cast_possible_truncation)]
                             let dropped = batch.num_rows() as u64;
-                            self.counters
-                                .events_dropped
-                                .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+                            self.prom.events_dropped.inc_by(dropped);
                             tracing::error!(
                                 table=%name, error=%e, rows_dropped=dropped,
                                 "[LDB-5030] Table upsert failed (partial); \
@@ -863,9 +809,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         if let Err(e) = ts.upsert_and_rebuild(name, &batch) {
                             #[allow(clippy::cast_possible_truncation)]
                             let dropped = batch.num_rows() as u64;
-                            self.counters
-                                .events_dropped
-                                .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+                            self.prom.events_dropped.inc_by(dropped);
                             tracing::error!(
                                 table=%name, error=%e, rows_dropped=dropped,
                                 "[LDB-5030] Table upsert failed (versioned); \
@@ -878,9 +822,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                             if let Err(e) = ts.upsert_and_rebuild(name, &batch) {
                                 #[allow(clippy::cast_possible_truncation)]
                                 let dropped = batch.num_rows() as u64;
-                                self.counters
-                                    .events_dropped
-                                    .fetch_add(dropped, std::sync::atomic::Ordering::Relaxed);
+                                self.prom.events_dropped.inc_by(dropped);
                                 tracing::error!(
                                     table=%name, error=%e, rows_dropped=dropped,
                                     "[LDB-5030] Table upsert failed; \

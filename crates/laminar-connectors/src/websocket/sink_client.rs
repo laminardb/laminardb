@@ -61,7 +61,11 @@ pub struct WebSocketSinkClient {
 impl WebSocketSinkClient {
     /// Creates a new WebSocket sink client connector.
     #[must_use]
-    pub fn new(schema: SchemaRef, config: WebSocketSinkConfig) -> Self {
+    pub fn new(
+        schema: SchemaRef,
+        config: WebSocketSinkConfig,
+        registry: Option<&prometheus::Registry>,
+    ) -> Self {
         let serializer = BatchSerializer::new(config.format.clone());
 
         let max_buffer_bytes = match &config.mode {
@@ -79,7 +83,7 @@ impl WebSocketSinkClient {
             conn_mgr: None,
             ws_sink: None,
             state: ConnectorState::Created,
-            metrics: WebSocketSinkMetrics::new(),
+            metrics: WebSocketSinkMetrics::new(registry),
             current_epoch: 0,
             disconnect_buffer: VecDeque::new(),
             max_buffer_bytes,
@@ -368,7 +372,7 @@ mod tests {
 
     #[test]
     fn test_new() {
-        let sink = WebSocketSinkClient::new(test_schema(), test_config());
+        let sink = WebSocketSinkClient::new(test_schema(), test_config(), None);
         assert_eq!(sink.state(), ConnectorState::Created);
         assert!(sink.ws_sink.is_none());
     }
@@ -376,13 +380,13 @@ mod tests {
     #[test]
     fn test_schema_returned() {
         let schema = test_schema();
-        let sink = WebSocketSinkClient::new(schema.clone(), test_config());
+        let sink = WebSocketSinkClient::new(schema.clone(), test_config(), None);
         assert_eq!(sink.schema(), schema);
     }
 
     #[test]
     fn test_buffer_message() {
-        let mut sink = WebSocketSinkClient::new(test_schema(), test_config());
+        let mut sink = WebSocketSinkClient::new(test_schema(), test_config(), None);
         sink.buffer_message("hello".into());
         sink.buffer_message("world".into());
         assert_eq!(sink.disconnect_buffer.len(), 2);
@@ -402,7 +406,7 @@ mod tests {
             format: super::super::sink_config::SinkFormat::Json,
             auth: None,
         };
-        let mut sink = WebSocketSinkClient::new(test_schema(), config);
+        let mut sink = WebSocketSinkClient::new(test_schema(), config, None);
 
         sink.buffer_message("12345".into()); // 5 bytes
         sink.buffer_message("67890".into()); // 5 bytes, total 10
@@ -426,21 +430,21 @@ mod tests {
             format: super::super::sink_config::SinkFormat::Json,
             auth: None,
         };
-        let mut sink = WebSocketSinkClient::new(test_schema(), config);
+        let mut sink = WebSocketSinkClient::new(test_schema(), config, None);
         sink.buffer_message("hello".into());
         assert!(sink.disconnect_buffer.is_empty());
     }
 
     #[test]
     fn test_capabilities() {
-        let sink = WebSocketSinkClient::new(test_schema(), test_config());
+        let sink = WebSocketSinkClient::new(test_schema(), test_config(), None);
         let caps = sink.capabilities();
         assert!(!caps.exactly_once);
     }
 
     #[test]
     fn test_health_created() {
-        let sink = WebSocketSinkClient::new(test_schema(), test_config());
+        let sink = WebSocketSinkClient::new(test_schema(), test_config(), None);
         assert_eq!(sink.health_check(), HealthStatus::Unknown);
     }
 }

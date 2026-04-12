@@ -66,7 +66,11 @@ pub struct WebSocketSourceServer {
 impl WebSocketSourceServer {
     /// Creates a new WebSocket source connector in server mode.
     #[must_use]
-    pub fn new(schema: SchemaRef, config: WebSocketSourceConfig) -> Self {
+    pub fn new(
+        schema: SchemaRef,
+        config: WebSocketSourceConfig,
+        registry: Option<&prometheus::Registry>,
+    ) -> Self {
         let parser = MessageParser::new(
             schema.clone(),
             config.format.clone(),
@@ -78,7 +82,7 @@ impl WebSocketSourceServer {
             schema,
             parser,
             state: ConnectorState::Created,
-            metrics: WebSocketSourceMetrics::new(),
+            metrics: WebSocketSourceMetrics::new(registry),
             checkpoint_state: WebSocketSourceCheckpoint::default(),
             rx: None,
             shutdown_tx: None,
@@ -446,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_new() {
-        let server = WebSocketSourceServer::new(test_schema(), test_config());
+        let server = WebSocketSourceServer::new(test_schema(), test_config(), None);
         assert_eq!(server.state(), ConnectorState::Created);
         assert_eq!(server.connected_clients(), 0);
     }
@@ -454,13 +458,13 @@ mod tests {
     #[test]
     fn test_schema_returned() {
         let schema = test_schema();
-        let server = WebSocketSourceServer::new(schema.clone(), test_config());
+        let server = WebSocketSourceServer::new(schema.clone(), test_config(), None);
         assert_eq!(server.schema(), schema);
     }
 
     #[test]
     fn test_health_created() {
-        let server = WebSocketSourceServer::new(test_schema(), test_config());
+        let server = WebSocketSourceServer::new(test_schema(), test_config(), None);
         assert_eq!(server.health_check(), HealthStatus::Unknown);
     }
 }

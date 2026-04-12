@@ -1,14 +1,13 @@
 //! Engine construction and lifecycle for LaminarDB server.
 
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use tokio::signal;
 use tracing::info;
 
 use laminar_core::streaming::checkpoint::StreamCheckpointConfig;
-use laminar_db::{DbError, LaminarDB, Profile};
+use laminar_db::{DbError, EngineMetrics, LaminarDB, Profile};
 
 use crate::config::{
     ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
@@ -16,6 +15,7 @@ use crate::config::{
 #[cfg(feature = "delta-experimental")]
 use crate::delta_config::{DeltaConfig, DeltaConfigError};
 use crate::http;
+use crate::metrics::ServerMetrics;
 use crate::reload::ReloadGuard;
 
 /// Handle to a running LaminarDB server. Call `wait_for_shutdown` to block until Ctrl-C.
@@ -134,6 +134,23 @@ pub async fn run_server(
         .map_err(|e| ServerError::Build(e.to_string()))?;
     let db = Arc::new(db);
 
+    // Build the prometheus registry and inject it BEFORE start() so
+    // connectors created during pipeline startup register their metrics
+    // on the shared registry.
+    let hostname = gethostname::gethostname().to_string_lossy().into_owned();
+    let pipeline_name = config
+        .pipelines
+        .first()
+        .map_or("default", |p| p.name.as_str())
+        .to_string();
+    let registry = Arc::new(crate::metrics::build_registry([
+        ("instance".into(), hostname),
+        ("pipeline".into(), pipeline_name),
+    ]));
+    let engine_metrics = Arc::new(EngineMetrics::new(&registry));
+    db.set_engine_metrics(Arc::clone(&engine_metrics));
+    db.set_prometheus_registry(Arc::clone(&registry));
+
     execute_config_ddl(&db, &config).await?;
 
     db.start()
@@ -142,7 +159,7 @@ pub async fn run_server(
     info!("Pipeline started");
 
     let (app_state, api_handle) =
-        start_http_api(Arc::clone(&db), config_path.clone(), config).await?;
+        start_http_api(Arc::clone(&db), registry, config_path.clone(), config).await?;
     let watcher_handle = spawn_config_watcher(&app_state, config_path);
 
     Ok(ServerHandle::Embedded {
@@ -261,19 +278,21 @@ pub(crate) async fn execute_config_ddl(
 /// Start HTTP API server and return (shared state, join handle).
 pub(crate) async fn start_http_api(
     db: Arc<LaminarDB>,
+    registry: Arc<prometheus::Registry>,
     config_path: PathBuf,
     config: ServerConfig,
 ) -> Result<(Arc<http::AppState>, tokio::task::JoinHandle<()>), ServerError> {
     let bind = config.server.bind.clone();
+
+    let server_metrics = ServerMetrics::new(&registry);
+
     let app_state = Arc::new(http::AppState {
         db,
         config_path,
-        started_at: chrono::Utc::now(),
         current_config: tokio::sync::RwLock::new(config),
         reload_guard: ReloadGuard::new(),
-        reload_total: AtomicU64::new(0),
-        reload_last_ts: AtomicU64::new(0),
-        ws_connections: AtomicU64::new(0),
+        registry,
+        server_metrics,
     });
     let router = http::build_router(Arc::clone(&app_state));
     let api_handle = http::serve(router, &bind).await?;

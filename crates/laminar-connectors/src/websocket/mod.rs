@@ -71,7 +71,7 @@ pub fn register_websocket_source(registry: &ConnectorRegistry) {
     registry.register_source(
         "websocket",
         info,
-        Arc::new(|| {
+        Arc::new(|registry: Option<&prometheus::Registry>| {
             use arrow_schema::{DataType, Field, Schema};
 
             let default_schema = Arc::new(Schema::new(vec![
@@ -81,6 +81,7 @@ pub fn register_websocket_source(registry: &ConnectorRegistry) {
             Box::new(WebSocketSource::new(
                 default_schema,
                 WebSocketSourceConfig::default(),
+                registry,
             ))
         }),
     );
@@ -103,7 +104,7 @@ pub fn register_websocket_sink(registry: &ConnectorRegistry) {
     registry.register_sink(
         "websocket",
         info,
-        Arc::new(|| {
+        Arc::new(|registry: Option<&prometheus::Registry>| {
             use arrow_schema::{DataType, Field, Schema};
 
             let default_schema = Arc::new(Schema::new(vec![
@@ -113,6 +114,7 @@ pub fn register_websocket_sink(registry: &ConnectorRegistry) {
             Box::new(WebSocketSinkServer::new(
                 default_schema,
                 WebSocketSinkConfig::default(),
+                registry,
             ))
         }),
     );

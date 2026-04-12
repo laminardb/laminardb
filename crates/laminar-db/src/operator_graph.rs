@@ -11,8 +11,8 @@ use laminar_sql::datafusion::live_source::{LiveSourceHandle, LiveSourceProvider}
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
+use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
-use crate::metrics::PipelineCounters;
 use crate::sql_analysis::{
     apply_topk_filter, detect_asof_query, detect_stream_join_query, detect_temporal_probe_query,
     detect_temporal_query, extract_table_references, StreamJoinDetection,
@@ -195,7 +195,7 @@ pub(crate) struct OperatorGraph {
     deferred_scan_offset: usize,
     max_state_bytes: Option<usize>,
     ctx: SessionContext,
-    counters: Option<Arc<PipelineCounters>>,
+    prom: Option<Arc<EngineMetrics>>,
     lookup_registry: Option<Arc<laminar_sql::datafusion::LookupTableRegistry>>,
     source_schemas: FxHashMap<String, SchemaRef>,
     temporal_configs: Vec<TemporalJoinTranslatorConfig>,
@@ -225,7 +225,7 @@ impl OperatorGraph {
             deferred_scan_offset: 0,
             max_state_bytes: None,
             ctx,
-            counters: None,
+            prom: None,
             lookup_registry: None,
             source_schemas: FxHashMap::default(),
             temporal_configs: Vec::new(),
@@ -247,8 +247,8 @@ impl OperatorGraph {
         self.query_budget_ns = ns;
     }
 
-    pub fn set_counters(&mut self, c: Arc<PipelineCounters>) {
-        self.counters = Some(c);
+    pub fn set_metrics(&mut self, m: Arc<EngineMetrics>) {
+        self.prom = Some(m);
     }
 
     #[allow(clippy::cast_precision_loss)]
@@ -753,7 +753,7 @@ impl OperatorGraph {
                 emit_clause.cloned(),
                 window_config.cloned(),
                 self.ctx.clone(),
-                self.counters.clone(),
+                self.prom.clone(),
             ));
         }
 
@@ -763,7 +763,7 @@ impl OperatorGraph {
             name,
             sql,
             self.ctx.clone(),
-            self.counters.clone(),
+            self.prom.clone(),
             emit_changelog,
             idle_ttl_ms,
         ))

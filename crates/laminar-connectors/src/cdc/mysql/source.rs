@@ -104,7 +104,7 @@ impl std::fmt::Debug for MySqlCdcSource {
 impl MySqlCdcSource {
     /// Creates a new MySQL CDC source with the given configuration.
     #[must_use]
-    pub fn new(config: MySqlCdcConfig) -> Self {
+    pub fn new(config: MySqlCdcConfig, registry: Option<&prometheus::Registry>) -> Self {
         Self {
             config,
             connected: false,
@@ -114,7 +114,7 @@ impl MySqlCdcSource {
             current_binlog_file: String::new(),
             current_gtid: None,
             event_buffer: Vec::new(),
-            metrics: MySqlCdcMetrics::new(),
+            metrics: MySqlCdcMetrics::new(registry),
             schema: None,
             last_activity: None,
             data_ready: Arc::new(Notify::new()),
@@ -134,7 +134,7 @@ impl MySqlCdcSource {
     /// Returns error if required configuration keys are missing.
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
         let mysql_config = MySqlCdcConfig::from_config(config)?;
-        Ok(Self::new(mysql_config))
+        Ok(Self::new(mysql_config, None))
     }
 
     /// Returns the number of cached table schemas.
@@ -548,10 +548,7 @@ impl SourceConnector for MySqlCdcSource {
         }
 
         // Check error count
-        let errors = self
-            .metrics
-            .errors
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let errors = self.metrics.errors.get();
         if errors > 100 {
             return HealthStatus::Degraded(format!("{errors} errors encountered"));
         }
@@ -607,7 +604,7 @@ mod tests {
     #[test]
     fn test_new_source() {
         let config = test_config();
-        let source = MySqlCdcSource::new(config);
+        let source = MySqlCdcSource::new(config, None);
 
         assert!(!source.is_connected());
         assert_eq!(source.cached_table_count(), 0);
@@ -640,7 +637,7 @@ mod tests {
 
     #[test]
     fn test_restore_position_gtid() {
-        let mut source = MySqlCdcSource::new(test_config());
+        let mut source = MySqlCdcSource::new(test_config(), None);
 
         let mut checkpoint = SourceCheckpoint::new(1);
         checkpoint.set_offset("gtid", "3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5");
@@ -651,7 +648,7 @@ mod tests {
 
     #[test]
     fn test_restore_position_file() {
-        let mut source = MySqlCdcSource::new(test_config());
+        let mut source = MySqlCdcSource::new(test_config(), None);
 
         let mut checkpoint = SourceCheckpoint::new(1);
         checkpoint.set_offset("binlog_file", "mysql-bin.000003");
@@ -665,7 +662,7 @@ mod tests {
 
     #[test]
     fn test_create_checkpoint_gtid() {
-        let mut source = MySqlCdcSource::new(test_config());
+        let mut source = MySqlCdcSource::new(test_config(), None);
         source.config.use_gtid = true;
         source.gtid_set = Some("3E11FA47-71CA-11E1-9E33-C80AA9429562:1-5".parse().unwrap());
 
@@ -677,7 +674,7 @@ mod tests {
 
     #[test]
     fn test_create_checkpoint_file() {
-        let mut source = MySqlCdcSource::new(test_config());
+        let mut source = MySqlCdcSource::new(test_config(), None);
         source.config.use_gtid = false;
         source.position = Some(BinlogPosition::new("mysql-bin.000003".to_string(), 9999));
 
@@ -691,7 +688,7 @@ mod tests {
 
     #[test]
     fn test_schema() {
-        let source = MySqlCdcSource::new(test_config());
+        let source = MySqlCdcSource::new(test_config(), None);
         let schema = source.schema();
 
         // Should have CDC envelope fields
@@ -703,7 +700,7 @@ mod tests {
 
     #[test]
     fn test_health_check_not_connected() {
-        let source = MySqlCdcSource::new(test_config());
+        let source = MySqlCdcSource::new(test_config(), None);
 
         match source.health_check() {
             HealthStatus::Unhealthy(message) => {
@@ -715,7 +712,7 @@ mod tests {
 
     #[test]
     fn test_health_check_healthy() {
-        let mut source = MySqlCdcSource::new(test_config());
+        let mut source = MySqlCdcSource::new(test_config(), None);
         source.connected = true;
         source.last_activity = Some(Instant::now());
 
@@ -724,7 +721,7 @@ mod tests {
 
     #[test]
     fn test_health_check_degraded_no_activity() {
-        let mut source = MySqlCdcSource::new(test_config());
+        let mut source = MySqlCdcSource::new(test_config(), None);
         source.connected = true;
         source.config.heartbeat_interval = Duration::from_millis(1);
         source.last_activity = Instant::now().checked_sub(Duration::from_secs(10));
@@ -739,7 +736,7 @@ mod tests {
 
     #[test]
     fn test_health_check_degraded_errors() {
-        let mut source = MySqlCdcSource::new(test_config());
+        let mut source = MySqlCdcSource::new(test_config(), None);
         source.connected = true;
         source.last_activity = Some(Instant::now());
 
@@ -758,7 +755,7 @@ mod tests {
 
     #[test]
     fn test_metrics() {
-        let mut source = MySqlCdcSource::new(test_config());
+        let mut source = MySqlCdcSource::new(test_config(), None);
         source.metrics.inc_inserts(100);
         source.metrics.inc_updates(50);
         source.metrics.inc_deletes(25);
@@ -776,7 +773,7 @@ mod tests {
         let mut config = test_config();
         config.table_include = vec!["users".to_string(), "orders".to_string()];
 
-        let source = MySqlCdcSource::new(config);
+        let source = MySqlCdcSource::new(config, None);
 
         assert!(source.should_include_table("testdb", "users"));
         assert!(source.should_include_table("testdb", "orders"));
@@ -787,7 +784,7 @@ mod tests {
     #[cfg(not(feature = "mysql-cdc"))]
     #[tokio::test]
     async fn test_open_fails_without_feature() {
-        let mut source = MySqlCdcSource::new(test_config());
+        let mut source = MySqlCdcSource::new(test_config(), None);
 
         let result = source.open(&ConnectorConfig::default()).await;
         assert!(result.is_err());
@@ -800,7 +797,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_poll_not_connected() {
-        let mut source = MySqlCdcSource::new(test_config());
+        let mut source = MySqlCdcSource::new(test_config(), None);
 
         let result = source.poll_batch(100).await;
         assert!(result.is_err());
@@ -811,7 +808,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_restore_async() {
-        let mut source = MySqlCdcSource::new(test_config());
+        let mut source = MySqlCdcSource::new(test_config(), None);
 
         let mut checkpoint = SourceCheckpoint::new(1);
         checkpoint.set_offset("binlog_file", "mysql-bin.000005");

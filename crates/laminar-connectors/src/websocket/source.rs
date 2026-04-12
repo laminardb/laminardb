@@ -79,7 +79,11 @@ pub struct WebSocketSource {
 impl WebSocketSource {
     /// Creates a new WebSocket source connector in client mode.
     #[must_use]
-    pub fn new(schema: SchemaRef, config: WebSocketSourceConfig) -> Self {
+    pub fn new(
+        schema: SchemaRef,
+        config: WebSocketSourceConfig,
+        registry: Option<&prometheus::Registry>,
+    ) -> Self {
         let parser = MessageParser::new(
             schema.clone(),
             config.format.clone(),
@@ -91,7 +95,7 @@ impl WebSocketSource {
             schema,
             parser,
             state: ConnectorState::Created,
-            metrics: WebSocketSourceMetrics::new(),
+            metrics: WebSocketSourceMetrics::new(registry),
             checkpoint_state: WebSocketSourceCheckpoint::default(),
             rx: None,
             shutdown_tx: None,
@@ -590,33 +594,33 @@ mod tests {
 
     #[test]
     fn test_new_defaults() {
-        let source = WebSocketSource::new(test_schema(), test_config());
+        let source = WebSocketSource::new(test_schema(), test_config(), None);
         assert_eq!(source.state(), ConnectorState::Created);
     }
 
     #[test]
     fn test_schema_returned() {
         let schema = test_schema();
-        let source = WebSocketSource::new(schema.clone(), test_config());
+        let source = WebSocketSource::new(schema.clone(), test_config(), None);
         assert_eq!(source.schema(), schema);
     }
 
     #[test]
     fn test_checkpoint_empty() {
-        let source = WebSocketSource::new(test_schema(), test_config());
+        let source = WebSocketSource::new(test_schema(), test_config(), None);
         let cp = source.checkpoint();
         assert!(!cp.is_empty()); // has websocket_state key
     }
 
     #[test]
     fn test_health_check_created() {
-        let source = WebSocketSource::new(test_schema(), test_config());
+        let source = WebSocketSource::new(test_schema(), test_config(), None);
         assert_eq!(source.health_check(), HealthStatus::Unknown);
     }
 
     #[test]
     fn test_metrics_initial() {
-        let source = WebSocketSource::new(test_schema(), test_config());
+        let source = WebSocketSource::new(test_schema(), test_config(), None);
         let m = source.metrics();
         assert_eq!(m.records_total, 0);
         assert_eq!(m.bytes_total, 0);

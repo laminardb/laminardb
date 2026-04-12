@@ -32,13 +32,17 @@ pub fn register_postgres_sink(registry: &ConnectorRegistry) {
     registry.register_sink(
         "postgres-sink",
         info,
-        Arc::new(|| {
+        Arc::new(|registry: Option<&prometheus::Registry>| {
             // Default schema (overridden during open).
             let schema = Arc::new(Schema::new(vec![
                 Field::new("key", DataType::Utf8, true),
                 Field::new("value", DataType::Utf8, false),
             ]));
-            Box::new(PostgresSink::new(schema, PostgresSinkConfig::default()))
+            Box::new(PostgresSink::new(
+                schema,
+                PostgresSinkConfig::default(),
+                registry,
+            ))
         }),
     );
 }
@@ -149,7 +153,7 @@ mod tests {
         register_postgres_sink(&registry);
 
         let config = crate::config::ConnectorConfig::new("postgres-sink");
-        let sink = registry.create_sink(&config);
+        let sink = registry.create_sink(&config, None);
         assert!(sink.is_ok());
     }
 }

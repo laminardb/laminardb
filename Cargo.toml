@@ -14,7 +14,7 @@ exclude = [
 resolver = "2"
 
 [workspace.package]
-version = "0.20.1"
+version = "0.20.2"
 authors = ["LaminarDB Contributors"]
 edition = "2021"
 rust-version = "1.85"
@@ -97,6 +97,9 @@ base64 = "0.22"
 
 # Randomness
 rand = "0.10"
+
+# Metrics
+prometheus = { version = "0.14", features = ["process"] }
 
 # Apache Iceberg
 iceberg = "0.9.0"

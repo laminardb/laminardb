@@ -142,8 +142,12 @@ pub struct KafkaSource {
 impl KafkaSource {
     /// Creates a new Kafka source connector with explicit schema.
     #[must_use]
-    pub fn new(schema: SchemaRef, config: KafkaSourceConfig) -> Self {
-        Self::build_base(schema, config, select_deserializer, None)
+    pub fn new(
+        schema: SchemaRef,
+        config: KafkaSourceConfig,
+        registry: Option<&prometheus::Registry>,
+    ) -> Self {
+        Self::build_base(schema, config, select_deserializer, None, registry)
     }
 
     /// Creates a new Kafka source connector with Schema Registry.
@@ -162,7 +166,7 @@ impl KafkaSource {
                 select_deserializer(format)
             }
         };
-        Self::build_base(schema, config, deser_factory, Some(sr))
+        Self::build_base(schema, config, deser_factory, Some(sr), None)
     }
 
     /// Build a Schema Registry client from the parsed config, or
@@ -192,6 +196,7 @@ impl KafkaSource {
         config: KafkaSourceConfig,
         deser_factory: impl FnOnce(Format) -> Box<dyn RecordDeserializer>,
         schema_registry: Option<Arc<SchemaRegistryClient>>,
+        registry: Option<&prometheus::Registry>,
     ) -> Self {
         let deserializer = deser_factory(config.format);
         let channel_len = Arc::new(AtomicUsize::new(0));
@@ -211,7 +216,7 @@ impl KafkaSource {
             deserializer,
             offsets: OffsetTracker::new(),
             state: ConnectorState::Created,
-            metrics: KafkaSourceMetrics::new(),
+            metrics: KafkaSourceMetrics::new(registry),
             schema,
             channel_len,
             rebalance_state: Arc::new(Mutex::new(RebalanceState::new())),
@@ -1492,7 +1497,7 @@ mod tests {
 
     #[test]
     fn test_new_defaults() {
-        let source = KafkaSource::new(test_schema(), test_config());
+        let source = KafkaSource::new(test_schema(), test_config(), None);
         assert_eq!(source.state(), ConnectorState::Created);
         assert!(source.consumer.is_none());
         assert_eq!(source.offsets().partition_count(), 0);
@@ -1501,20 +1506,20 @@ mod tests {
     #[test]
     fn test_schema_returned() {
         let schema = test_schema();
-        let source = KafkaSource::new(schema.clone(), test_config());
+        let source = KafkaSource::new(schema.clone(), test_config(), None);
         assert_eq!(source.schema(), schema);
     }
 
     #[test]
     fn test_checkpoint_empty() {
-        let source = KafkaSource::new(test_schema(), test_config());
+        let source = KafkaSource::new(test_schema(), test_config(), None);
         let cp = source.checkpoint();
         assert!(cp.is_empty());
     }
 
     #[test]
     fn test_checkpoint_with_offsets() {
-        let mut source = KafkaSource::new(test_schema(), test_config());
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
         source.offsets.update("events", 0, 100);
         source.offsets.update("events", 1, 200);
 
@@ -1531,27 +1536,27 @@ mod tests {
 
     #[test]
     fn test_health_check_created() {
-        let source = KafkaSource::new(test_schema(), test_config());
+        let source = KafkaSource::new(test_schema(), test_config(), None);
         assert_eq!(source.health_check(), HealthStatus::Unknown);
     }
 
     #[test]
     fn test_health_check_running() {
-        let mut source = KafkaSource::new(test_schema(), test_config());
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
         source.state = ConnectorState::Running;
         assert_eq!(source.health_check(), HealthStatus::Healthy);
     }
 
     #[test]
     fn test_health_check_closed() {
-        let mut source = KafkaSource::new(test_schema(), test_config());
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
         source.state = ConnectorState::Closed;
         assert!(matches!(source.health_check(), HealthStatus::Unhealthy(_)));
     }
 
     #[test]
     fn test_metrics_initial() {
-        let source = KafkaSource::new(test_schema(), test_config());
+        let source = KafkaSource::new(test_schema(), test_config(), None);
         let m = source.metrics();
         assert_eq!(m.records_total, 0);
         assert_eq!(m.bytes_total, 0);
@@ -1560,7 +1565,7 @@ mod tests {
 
     #[test]
     fn test_deserializer_selection_json() {
-        let source = KafkaSource::new(test_schema(), test_config());
+        let source = KafkaSource::new(test_schema(), test_config(), None);
         assert_eq!(source.deserializer.format(), Format::Json);
     }
 
@@ -1568,7 +1573,7 @@ mod tests {
     fn test_deserializer_selection_csv() {
         let mut cfg = test_config();
         cfg.format = Format::Csv;
-        let source = KafkaSource::new(test_schema(), cfg);
+        let source = KafkaSource::new(test_schema(), cfg, None);
         assert_eq!(source.deserializer.format(), Format::Csv);
     }
 
@@ -1603,7 +1608,7 @@ mod tests {
 
     #[test]
     fn test_debug_output() {
-        let source = KafkaSource::new(test_schema(), test_config());
+        let source = KafkaSource::new(test_schema(), test_config(), None);
         let debug = format!("{source:?}");
         assert!(debug.contains("KafkaSource"));
         assert!(debug.contains("events"));
@@ -1611,7 +1616,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_filters_revoked_partitions() {
-        let mut source = KafkaSource::new(test_schema(), test_config());
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
         source.offsets.update("events", 0, 100);
         source.offsets.update("events", 1, 200);
         source.offsets.update("events", 2, 300);
@@ -1630,7 +1635,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_empty_before_first_rebalance() {
-        let mut source = KafkaSource::new(test_schema(), test_config());
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
         source.offsets.update("events", 0, 100);
         source.offsets.update("events", 1, 200);
 
@@ -1657,7 +1662,7 @@ mod tests {
 
     #[tokio::test]
     async fn discover_schema_skips_non_avro_format() {
-        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default());
+        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default(), None);
         source
             .discover_schema(&props(&[
                 ("bootstrap.servers", "localhost:9092"),
@@ -1673,7 +1678,7 @@ mod tests {
 
     #[tokio::test]
     async fn discover_schema_skips_without_sr_url() {
-        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default());
+        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default(), None);
         source
             .discover_schema(&props(&[
                 ("bootstrap.servers", "localhost:9092"),
@@ -1689,7 +1694,7 @@ mod tests {
     async fn discover_schema_skips_topic_pattern() {
         // topic.pattern cannot map to a single SR subject. Must skip
         // cleanly, not panic or select an arbitrary topic.
-        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default());
+        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default(), None);
         source
             .discover_schema(&props(&[
                 ("bootstrap.servers", "localhost:9092"),
@@ -1707,7 +1712,7 @@ mod tests {
         // Use a reserved-documentation IP on a closed port and bound the
         // whole test by a generous wall-clock budget so a bug where we
         // forgot the timeout would fail loudly.
-        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default());
+        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default(), None);
         let start = std::time::Instant::now();
         tokio::time::timeout(
             std::time::Duration::from_secs(20),
@@ -1760,7 +1765,7 @@ mod tests {
             .mount(&sr)
             .await;
 
-        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default());
+        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default(), None);
         source
             .discover_schema(&props(&[
                 ("bootstrap.servers", "localhost:9092"),
@@ -1815,7 +1820,7 @@ mod tests {
             .mount(&sr)
             .await;
 
-        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default());
+        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default(), None);
         source
             .discover_schema(&props(&[
                 ("bootstrap.servers", "localhost:9092"),

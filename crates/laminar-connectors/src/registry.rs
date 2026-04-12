@@ -17,10 +17,18 @@ use crate::reference::ReferenceTableSource;
 use crate::serde::{self, Format, RecordDeserializer, RecordSerializer};
 
 /// Factory function type for creating source connectors.
-pub type SourceFactory = Arc<dyn Fn() -> Box<dyn SourceConnector> + Send + Sync>;
+///
+/// The optional `&prometheus::Registry` allows connectors to register
+/// their metrics on the shared Prometheus registry when one is available.
+pub type SourceFactory =
+    Arc<dyn Fn(Option<&prometheus::Registry>) -> Box<dyn SourceConnector> + Send + Sync>;
 
 /// Factory function type for creating sink connectors.
-pub type SinkFactory = Arc<dyn Fn() -> Box<dyn SinkConnector> + Send + Sync>;
+///
+/// The optional `&prometheus::Registry` allows connectors to register
+/// their metrics on the shared Prometheus registry when one is available.
+pub type SinkFactory =
+    Arc<dyn Fn(Option<&prometheus::Registry>) -> Box<dyn SinkConnector> + Send + Sync>;
 
 /// Factory function type for creating reference table sources.
 pub type TableSourceFactory = Arc<
@@ -116,7 +124,7 @@ impl ConnectorRegistry {
             factory.clone()
         };
 
-        let mut instance = factory();
+        let mut instance = factory(None);
         instance.discover_schema(properties).await;
         let schema = instance.schema();
         if schema.fields().is_empty() {
@@ -131,12 +139,16 @@ impl ConnectorRegistry {
     /// The factory creates a default-configured connector. The caller must
     /// subsequently call `open(config)` to forward WITH clause properties.
     ///
+    /// If a `prometheus::Registry` is provided, the connector will register
+    /// its metrics on it so they appear in the scrape output.
+    ///
     /// # Errors
     ///
     /// Returns `ConnectorError::ConfigurationError` if not registered.
     pub fn create_source(
         &self,
         config: &ConnectorConfig,
+        registry: Option<&prometheus::Registry>,
     ) -> Result<Box<dyn SourceConnector>, ConnectorError> {
         let sources = self.sources.read();
         let (_, factory) = sources.get(config.connector_type()).ok_or_else(|| {
@@ -145,12 +157,15 @@ impl ConnectorRegistry {
                 config.connector_type()
             ))
         })?;
-        Ok(factory())
+        Ok(factory(registry))
     }
 
     /// Creates a new sink connector instance.
     ///
     /// The connector type is determined by `config.connector_type()`.
+    ///
+    /// If a `prometheus::Registry` is provided, the connector will register
+    /// its metrics on it so they appear in the scrape output.
     ///
     /// # Errors
     ///
@@ -159,6 +174,7 @@ impl ConnectorRegistry {
     pub fn create_sink(
         &self,
         config: &ConnectorConfig,
+        registry: Option<&prometheus::Registry>,
     ) -> Result<Box<dyn SinkConnector>, ConnectorError> {
         let sinks = self.sinks.read();
         let (_, factory) = sinks.get(config.connector_type()).ok_or_else(|| {
@@ -167,7 +183,7 @@ impl ConnectorRegistry {
                 config.connector_type()
             ))
         })?;
-        Ok(factory())
+        Ok(factory(registry))
     }
 
     /// Registers a reference table source factory.
@@ -320,11 +336,11 @@ mod tests {
         registry.register_source(
             "mock",
             mock_info("mock", true, false),
-            Arc::new(|| Box::new(MockSourceConnector::new())),
+            Arc::new(|_: Option<&prometheus::Registry>| Box::new(MockSourceConnector::new())),
         );
 
         let config = ConnectorConfig::new("mock");
-        let connector = registry.create_source(&config);
+        let connector = registry.create_source(&config, None);
         assert!(connector.is_ok());
     }
 
@@ -334,11 +350,11 @@ mod tests {
         registry.register_sink(
             "mock",
             mock_info("mock", false, true),
-            Arc::new(|| Box::new(MockSinkConnector::new())),
+            Arc::new(|_: Option<&prometheus::Registry>| Box::new(MockSinkConnector::new())),
         );
 
         let config = ConnectorConfig::new("mock");
-        let connector = registry.create_sink(&config);
+        let connector = registry.create_sink(&config, None);
         assert!(connector.is_ok());
     }
 
@@ -347,8 +363,8 @@ mod tests {
         let registry = ConnectorRegistry::new();
         let config = ConnectorConfig::new("nonexistent");
 
-        assert!(registry.create_source(&config).is_err());
-        assert!(registry.create_sink(&config).is_err());
+        assert!(registry.create_source(&config, None).is_err());
+        assert!(registry.create_sink(&config, None).is_err());
     }
 
     #[test]
@@ -357,12 +373,12 @@ mod tests {
         registry.register_source(
             "kafka",
             mock_info("kafka", true, false),
-            Arc::new(|| Box::new(MockSourceConnector::new())),
+            Arc::new(|_: Option<&prometheus::Registry>| Box::new(MockSourceConnector::new())),
         );
         registry.register_sink(
             "delta",
             mock_info("delta", false, true),
-            Arc::new(|| Box::new(MockSinkConnector::new())),
+            Arc::new(|_: Option<&prometheus::Registry>| Box::new(MockSinkConnector::new())),
         );
 
         let sources = registry.list_sources();
@@ -380,7 +396,7 @@ mod tests {
         registry.register_source(
             "kafka",
             mock_info("kafka", true, false),
-            Arc::new(|| Box::new(MockSourceConnector::new())),
+            Arc::new(|_: Option<&prometheus::Registry>| Box::new(MockSourceConnector::new())),
         );
 
         let info = registry.source_info("kafka");
@@ -405,7 +421,7 @@ mod tests {
         registry.register_source(
             "mock",
             mock_info("mock", true, false),
-            Arc::new(|| Box::new(MockSourceConnector::new())),
+            Arc::new(|_: Option<&prometheus::Registry>| Box::new(MockSourceConnector::new())),
         );
         let schema = registry
             .default_source_schema("mock", &std::collections::HashMap::new())

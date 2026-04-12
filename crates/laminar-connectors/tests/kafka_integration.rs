@@ -132,7 +132,7 @@ async fn roundtrip(brokers: &str) {
     produce_messages(brokers, topic, n).await;
 
     let cfg = make_config(brokers, "test-roundtrip-group", topic);
-    let mut source = KafkaSource::new(test_schema(), cfg);
+    let mut source = KafkaSource::new(test_schema(), cfg, None);
     let connector_cfg = ConnectorConfig::new("kafka");
     source.open(&connector_cfg).await.unwrap();
 
@@ -172,7 +172,7 @@ async fn checkpoint_restore(brokers: &str) {
     let cfg = make_config(brokers, "test-checkpoint-group", topic);
     let connector_cfg = ConnectorConfig::new("kafka");
 
-    let mut source = KafkaSource::new(test_schema(), cfg.clone());
+    let mut source = KafkaSource::new(test_schema(), cfg.clone(), None);
     source.open(&connector_cfg).await.unwrap();
 
     poll_all(&mut source, n, Duration::from_secs(30)).await;
@@ -182,7 +182,7 @@ async fn checkpoint_restore(brokers: &str) {
     let extra = 10;
     produce_messages(brokers, topic, extra).await;
 
-    let mut source2 = KafkaSource::new(test_schema(), cfg);
+    let mut source2 = KafkaSource::new(test_schema(), cfg, None);
     source2.open(&connector_cfg).await.unwrap();
     source2.restore(&checkpoint).await.unwrap();
 
@@ -224,7 +224,7 @@ async fn poison_pill(brokers: &str) {
         ..make_config(brokers, "test-poison-group", topic)
     };
 
-    let mut source = KafkaSource::new(test_schema(), cfg);
+    let mut source = KafkaSource::new(test_schema(), cfg, None);
     let connector_cfg = ConnectorConfig::new("kafka");
     source.open(&connector_cfg).await.unwrap();
 

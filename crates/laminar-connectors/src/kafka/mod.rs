@@ -64,10 +64,14 @@ pub fn register_kafka_source(registry: &ConnectorRegistry) {
     registry.register_source(
         "kafka",
         info,
-        Arc::new(|| {
+        Arc::new(|registry: Option<&prometheus::Registry>| {
             // Empty schema — filled in by discover_schema / open() / SQL DDL columns.
             let empty = Arc::new(arrow_schema::Schema::empty());
-            Box::new(KafkaSource::new(empty, KafkaSourceConfig::default()))
+            Box::new(KafkaSource::new(
+                empty,
+                KafkaSourceConfig::default(),
+                registry,
+            ))
         }),
     );
 }
@@ -86,10 +90,10 @@ pub fn register_kafka_sink(registry: &ConnectorRegistry) {
     registry.register_sink(
         "kafka",
         info,
-        Arc::new(|| {
+        Arc::new(|registry: Option<&prometheus::Registry>| {
             // Empty schema — the sink's schema is bound from the upstream query at build time.
             let empty = Arc::new(arrow_schema::Schema::empty());
-            Box::new(KafkaSink::new(empty, KafkaSinkConfig::default()))
+            Box::new(KafkaSink::new(empty, KafkaSinkConfig::default(), registry))
         }),
     );
 }
@@ -629,7 +633,7 @@ mod tests {
         register_kafka_source(&registry);
 
         let config = crate::config::ConnectorConfig::new("kafka");
-        let source = registry.create_source(&config);
+        let source = registry.create_source(&config, None);
         assert!(source.is_ok());
     }
 
@@ -656,7 +660,7 @@ mod tests {
         register_kafka_sink(&registry);
 
         let config = crate::config::ConnectorConfig::new("kafka");
-        let sink = registry.create_sink(&config);
+        let sink = registry.create_sink(&config, None);
         assert!(sink.is_ok());
     }
 }

@@ -50,7 +50,7 @@ fn source_event_throughput(c: &mut Criterion) {
                 b.iter(|| {
                     let config =
                         MongoDbSourceConfig::new("mongodb://localhost:27017", "bench", "coll");
-                    let mut source = MongoDbCdcSource::new(config);
+                    let mut source = MongoDbCdcSource::new(config, None);
 
                     for i in 0..n {
                         source.enqueue_event(sample_event(i));

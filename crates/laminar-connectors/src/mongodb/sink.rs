@@ -77,7 +77,11 @@ pub struct MongoDbSink {
 impl MongoDbSink {
     /// Creates a new `MongoDB` sink connector.
     #[must_use]
-    pub fn new(schema: SchemaRef, config: MongoDbSinkConfig) -> Self {
+    pub fn new(
+        schema: SchemaRef,
+        config: MongoDbSinkConfig,
+        registry: Option<&prometheus::Registry>,
+    ) -> Self {
         let buf_capacity = (config.batch_size / 128).max(4);
         Self {
             config,
@@ -86,7 +90,7 @@ impl MongoDbSink {
             buffer: Vec::with_capacity(buf_capacity),
             buffered_rows: 0,
             last_flush: Instant::now(),
-            metrics: MongoDbSinkMetrics::new(),
+            metrics: MongoDbSinkMetrics::new(registry),
             #[cfg(feature = "mongodb-cdc")]
             client: None,
             #[cfg(feature = "mongodb-cdc")]
@@ -104,7 +108,7 @@ impl MongoDbSink {
         config: &ConnectorConfig,
     ) -> Result<Self, ConnectorError> {
         let mongo_config = MongoDbSinkConfig::from_config(config)?;
-        Ok(Self::new(schema, mongo_config))
+        Ok(Self::new(schema, mongo_config, None))
     }
 
     /// Returns a reference to the sink configuration.
@@ -745,14 +749,14 @@ mod tests {
     #[test]
     fn test_new_sink() {
         let config = MongoDbSinkConfig::new("mongodb://localhost:27017", "db", "coll");
-        let sink = MongoDbSink::new(test_schema(), config);
+        let sink = MongoDbSink::new(test_schema(), config, None);
         assert_eq!(sink.buffered_rows(), 0);
     }
 
     #[test]
     fn test_sink_capabilities_insert() {
         let config = MongoDbSinkConfig::default();
-        let sink = MongoDbSink::new(test_schema(), config);
+        let sink = MongoDbSink::new(test_schema(), config, None);
         let caps = sink.capabilities();
         assert!(caps.idempotent);
         assert!(!caps.upsert);
@@ -765,7 +769,7 @@ mod tests {
         config.write_mode = WriteMode::Upsert {
             key_fields: vec!["id".to_string()],
         };
-        let sink = MongoDbSink::new(test_schema(), config);
+        let sink = MongoDbSink::new(test_schema(), config, None);
         let caps = sink.capabilities();
         assert!(caps.upsert);
     }
@@ -774,7 +778,7 @@ mod tests {
     fn test_sink_capabilities_cdc_replay() {
         let mut config = MongoDbSinkConfig::default();
         config.write_mode = WriteMode::CdcReplay;
-        let sink = MongoDbSink::new(test_schema(), config);
+        let sink = MongoDbSink::new(test_schema(), config, None);
         let caps = sink.capabilities();
         assert!(caps.changelog);
     }
@@ -782,7 +786,7 @@ mod tests {
     #[test]
     fn test_batches_to_json() {
         let config = MongoDbSinkConfig::default();
-        let mut sink = MongoDbSink::new(test_schema(), config);
+        let mut sink = MongoDbSink::new(test_schema(), config, None);
         sink.buffer.push(test_batch(3));
         sink.buffered_rows = 3;
 
@@ -798,7 +802,7 @@ mod tests {
     fn test_should_flush_batch_size() {
         let mut config = MongoDbSinkConfig::default();
         config.batch_size = 100;
-        let mut sink = MongoDbSink::new(test_schema(), config);
+        let mut sink = MongoDbSink::new(test_schema(), config, None);
 
         assert!(!sink.should_flush());
         sink.buffered_rows = 100;
@@ -808,7 +812,7 @@ mod tests {
     #[test]
     fn test_clear_buffer() {
         let config = MongoDbSinkConfig::default();
-        let mut sink = MongoDbSink::new(test_schema(), config);
+        let mut sink = MongoDbSink::new(test_schema(), config, None);
 
         sink.buffer.push(test_batch(5));
         sink.buffered_rows = 5;
@@ -821,7 +825,7 @@ mod tests {
     #[test]
     fn test_health_check() {
         let config = MongoDbSinkConfig::default();
-        let mut sink = MongoDbSink::new(test_schema(), config);
+        let mut sink = MongoDbSink::new(test_schema(), config, None);
 
         assert_eq!(sink.health_check(), HealthStatus::Unknown);
 

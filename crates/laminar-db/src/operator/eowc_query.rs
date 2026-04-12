@@ -20,9 +20,9 @@ use datafusion::prelude::SessionContext;
 
 use crate::aggregate_state::{apply_compiled_having, EowcStateCheckpoint};
 use crate::core_window_state::{CoreWindowCheckpoint, CoreWindowState};
+use crate::engine_metrics::EngineMetrics;
 use crate::eowc_state::IncrementalEowcState;
 use crate::error::DbError;
-use crate::metrics::PipelineCounters;
 use crate::operator_graph::{try_evaluate_compiled, GraphOperator, OperatorCheckpoint};
 use crate::sql_analysis::compute_closed_boundary;
 use laminar_sql::parser::EmitClause;
@@ -79,7 +79,7 @@ impl EowcQueryOperator {
         emit_clause: Option<EmitClause>,
         window_config: Option<WindowOperatorConfig>,
         ctx: SessionContext,
-        _counters: Option<Arc<PipelineCounters>>,
+        _prom: Option<Arc<EngineMetrics>>,
     ) -> Self {
         Self {
             op_name: Arc::from(name),

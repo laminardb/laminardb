@@ -93,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let m = db.metrics();
         state.total_events = m.total_events_ingested;
-        state.cycle_ns = m.last_cycle_duration_ns;
+        state.cycle_ns = 0; // cycle latency now in prometheus histogram
         state.source_count = m.source_count;
         state.stream_count = m.stream_count;
         let elapsed = last_tp_time.elapsed().as_secs_f64();

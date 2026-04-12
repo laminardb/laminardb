@@ -10,6 +10,32 @@ use crate::db::{
 use crate::error::DbError;
 
 impl LaminarDB {
+    /// Time elapsed since the database was created.
+    #[must_use]
+    pub fn uptime(&self) -> std::time::Duration {
+        self.start_time.elapsed()
+    }
+
+    /// Inject prometheus engine metrics. Called once at startup before `start()`.
+    pub fn set_engine_metrics(&self, metrics: Arc<crate::engine_metrics::EngineMetrics>) {
+        *self.engine_metrics.lock() = Some(metrics);
+    }
+
+    /// Inject a shared Prometheus registry for connector-level metrics.
+    ///
+    /// Called once at startup, after the registry is constructed but before
+    /// `start()`. Connectors created after this call will register their
+    /// metrics on this registry so they appear in the scrape output.
+    pub fn set_prometheus_registry(&self, registry: Arc<prometheus::Registry>) {
+        *self.prometheus_registry.lock() = Some(registry);
+    }
+
+    /// Get the engine metrics if set.
+    #[must_use]
+    pub fn engine_metrics(&self) -> Option<Arc<crate::engine_metrics::EngineMetrics>> {
+        self.engine_metrics.lock().clone()
+    }
+
     /// Get the current pipeline state as a string.
     pub fn pipeline_state(&self) -> &'static str {
         match self.state.load(std::sync::atomic::Ordering::Acquire) {
@@ -24,26 +50,40 @@ impl LaminarDB {
 
     /// Get a pipeline-wide metrics snapshot.
     ///
-    /// Reads shared atomic counters and catalog sizes to produce a
+    /// Reads prometheus engine metrics and catalog sizes to produce a
     /// point-in-time view of pipeline health.
     #[must_use]
+    #[allow(clippy::cast_sign_loss)]
     pub fn metrics(&self) -> crate::metrics::PipelineMetrics {
-        let snap = self.counters.snapshot();
+        let guard = self.engine_metrics.lock();
+        let (ingested, emitted, dropped, cycles, batches, mv_updates, mv_bytes) =
+            if let Some(ref m) = *guard {
+                (
+                    m.events_ingested.get(),
+                    m.events_emitted.get(),
+                    m.events_dropped.get(),
+                    m.cycles.get(),
+                    m.batches.get(),
+                    m.mv_updates.get(),
+                    m.mv_bytes_stored.get() as u64,
+                )
+            } else {
+                (0, 0, 0, 0, 0, 0, 0)
+            };
         crate::metrics::PipelineMetrics {
-            total_events_ingested: snap.events_ingested,
-            total_events_emitted: snap.events_emitted,
-            total_events_dropped: snap.events_dropped,
-            total_cycles: snap.cycles,
-            total_batches: snap.total_batches,
+            total_events_ingested: ingested,
+            total_events_emitted: emitted,
+            total_events_dropped: dropped,
+            total_cycles: cycles,
+            total_batches: batches,
             uptime: self.start_time.elapsed(),
             state: self.pipeline_state_enum(),
-            last_cycle_duration_ns: snap.last_cycle_duration_ns,
             source_count: self.catalog.list_sources().len(),
             stream_count: self.catalog.list_streams().len(),
             sink_count: self.catalog.list_sinks().len(),
             pipeline_watermark: self.pipeline_watermark(),
-            mv_updates: snap.mv_updates,
-            mv_bytes_stored: snap.mv_bytes_stored,
+            mv_updates,
+            mv_bytes_stored: mv_bytes,
         }
     }
 
@@ -110,17 +150,12 @@ impl LaminarDB {
     /// Get the total number of events processed (ingested + emitted).
     #[must_use]
     pub fn total_events_processed(&self) -> u64 {
-        let snap = self.counters.snapshot();
-        snap.events_ingested + snap.events_emitted
-    }
-
-    /// Get a reference to the shared pipeline counters.
-    ///
-    /// Useful for external code that needs to read counters directly
-    /// (e.g. a TUI dashboard polling at high frequency).
-    #[must_use]
-    pub fn counters(&self) -> &Arc<crate::metrics::PipelineCounters> {
-        &self.counters
+        let guard = self.engine_metrics.lock();
+        if let Some(ref m) = *guard {
+            m.events_ingested.get() + m.events_emitted.get()
+        } else {
+            0
+        }
     }
 
     /// Returns the global pipeline watermark (minimum across all source watermarks).
@@ -168,15 +203,6 @@ impl LaminarDB {
     /// Get the number of registered sinks.
     pub fn sink_count(&self) -> usize {
         self.catalog.list_sinks().len()
-    }
-
-    /// Returns cycle duration percentiles from atomic counters (non-blocking).
-    ///
-    /// Returns (`p50_ns`, `p95_ns`, `p99_ns`).
-    #[must_use]
-    pub fn cycle_duration_percentiles(&self) -> (u64, u64, u64) {
-        let snap = self.counters.snapshot();
-        (snap.cycle_p50_ns, snap.cycle_p95_ns, snap.cycle_p99_ns)
     }
 
     /// Returns checkpoint statistics if available (non-blocking).

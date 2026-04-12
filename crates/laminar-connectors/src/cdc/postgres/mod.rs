@@ -34,7 +34,12 @@ pub fn register_postgres_cdc_source(registry: &ConnectorRegistry) {
     registry.register_source(
         "postgres-cdc",
         info.clone(),
-        Arc::new(|| Box::new(PostgresCdcSource::new(PostgresCdcConfig::default()))),
+        Arc::new(|registry: Option<&prometheus::Registry>| {
+            Box::new(PostgresCdcSource::new(
+                PostgresCdcConfig::default(),
+                registry,
+            ))
+        }),
     );
 
     // Also register as a table source so CREATE LOOKUP TABLE ... WITH
@@ -43,7 +48,7 @@ pub fn register_postgres_cdc_source(registry: &ConnectorRegistry) {
         "postgres-cdc",
         info,
         Arc::new(|config| {
-            let connector = Box::new(PostgresCdcSource::new(PostgresCdcConfig::default()));
+            let connector = Box::new(PostgresCdcSource::new(PostgresCdcConfig::default(), None));
             Ok(Box::new(crate::lookup::cdc_adapter::CdcTableSource::new(
                 connector,
                 config.clone(),

@@ -67,7 +67,7 @@ pub struct IcebergSink {
 impl IcebergSink {
     /// Creates a new Iceberg sink with the given configuration.
     #[must_use]
-    pub fn new(config: IcebergSinkConfig) -> Self {
+    pub fn new(config: IcebergSinkConfig, _registry: Option<&prometheus::Registry>) -> Self {
         Self {
             config,
             schema: None,
@@ -550,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_new_sink() {
-        let sink = IcebergSink::new(test_config());
+        let sink = IcebergSink::new(test_config(), None);
         assert!(sink.schema.is_none());
         assert_eq!(sink.current_epoch, 0);
         assert_eq!(sink.buffered_rows, 0);
@@ -558,7 +558,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write_buffers_batches() {
-        let mut sink = IcebergSink::new(test_config());
+        let mut sink = IcebergSink::new(test_config(), None);
         sink.begin_epoch(1).await.unwrap();
 
         let result = sink.write_batch(&test_batch(100)).await.unwrap();
@@ -574,7 +574,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pre_commit_stages_buffer() {
-        let mut sink = IcebergSink::new(test_config());
+        let mut sink = IcebergSink::new(test_config(), None);
         sink.begin_epoch(1).await.unwrap();
         sink.write_batch(&test_batch(100)).await.unwrap();
 
@@ -587,7 +587,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_rollback_clears_staged() {
-        let mut sink = IcebergSink::new(test_config());
+        let mut sink = IcebergSink::new(test_config(), None);
         sink.begin_epoch(1).await.unwrap();
         sink.write_batch(&test_batch(100)).await.unwrap();
         sink.pre_commit(1).await.unwrap();
@@ -600,7 +600,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_epoch_skip_when_already_committed() {
-        let mut sink = IcebergSink::new(test_config());
+        let mut sink = IcebergSink::new(test_config(), None);
         sink.last_committed_epoch = 5;
 
         sink.begin_epoch(3).await.unwrap();
@@ -612,7 +612,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_empty_epoch_commit() {
-        let mut sink = IcebergSink::new(test_config());
+        let mut sink = IcebergSink::new(test_config(), None);
         sink.begin_epoch(1).await.unwrap();
         sink.pre_commit(1).await.unwrap();
         sink.commit_epoch(1).await.unwrap();
@@ -620,7 +620,7 @@ mod tests {
 
     #[test]
     fn test_capabilities() {
-        let sink = IcebergSink::new(test_config());
+        let sink = IcebergSink::new(test_config(), None);
         let caps = sink.capabilities();
         assert!(caps.exactly_once);
         assert!(caps.two_phase_commit);

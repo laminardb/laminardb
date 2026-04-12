@@ -105,7 +105,7 @@ async fn insert_cdc() {
 
     // Open the change stream before inserting.
     let config = MongoDbSourceConfig::new(&uri, "test_insert_cdc", "events");
-    let mut source = MongoDbCdcSource::new(config);
+    let mut source = MongoDbCdcSource::new(config, None);
     let connector_config = ConnectorConfig::new("mongodb-cdc");
     source.open(&connector_config).await.unwrap();
 
@@ -149,7 +149,7 @@ async fn resume_after_disconnect() {
 
     // Phase 1: Insert 5 docs and capture resume token.
     let config = MongoDbSourceConfig::new(&uri, "test_resume", "docs");
-    let mut source = MongoDbCdcSource::new(config);
+    let mut source = MongoDbCdcSource::new(config, None);
     let connector_config = ConnectorConfig::new("mongodb-cdc");
     source.open(&connector_config).await.unwrap();
     sleep(Duration::from_secs(1)).await;
@@ -178,7 +178,7 @@ async fn resume_after_disconnect() {
     }
 
     let config2 = MongoDbSourceConfig::new(&uri, "test_resume", "docs");
-    let mut source2 = MongoDbCdcSource::new(config2);
+    let mut source2 = MongoDbCdcSource::new(config2, None);
     source2.restore(&checkpoint).await.unwrap();
     source2.open(&connector_config).await.unwrap();
     sleep(Duration::from_secs(1)).await;
@@ -209,7 +209,7 @@ async fn sink_insert() {
     let (_container, uri) = start_mongo().await;
 
     let config = MongoDbSinkConfig::new(&uri, "test_sink_insert", "out");
-    let mut sink = MongoDbSink::new(sink_test_schema(), config);
+    let mut sink = MongoDbSink::new(sink_test_schema(), config, None);
     let connector_config = ConnectorConfig::new("mongodb-sink");
     sink.open(&connector_config).await.unwrap();
 
@@ -241,7 +241,7 @@ async fn sink_upsert() {
     config.write_mode = WriteMode::Upsert {
         key_fields: vec!["_id".to_string()],
     };
-    let mut sink = MongoDbSink::new(sink_test_schema(), config);
+    let mut sink = MongoDbSink::new(sink_test_schema(), config, None);
     let connector_config = ConnectorConfig::new("mongodb-sink");
     sink.open(&connector_config).await.unwrap();
 
@@ -286,7 +286,7 @@ async fn timeseries_source_guard() {
 
     // Attempt to open a CDC source on the time series collection.
     let config = MongoDbSourceConfig::new(&uri, "test_ts_guard", "metrics");
-    let mut source = MongoDbCdcSource::new(config);
+    let mut source = MongoDbCdcSource::new(config, None);
     let connector_config = ConnectorConfig::new("mongodb-cdc");
     let result = source.open(&connector_config).await;
 
@@ -322,7 +322,7 @@ async fn timeseries_insert() {
         Field::new("value", DataType::Int64, false),
     ]));
 
-    let mut sink = MongoDbSink::new(schema, config);
+    let mut sink = MongoDbSink::new(schema, config, None);
     let connector_config = ConnectorConfig::new("mongodb-sink");
     sink.open(&connector_config).await.unwrap();
 
@@ -362,7 +362,7 @@ async fn update_delta_mode() {
 
     // Open change stream in Delta mode (default).
     let config = MongoDbSourceConfig::new(&uri, "test_update_delta", "docs");
-    let mut source = MongoDbCdcSource::new(config);
+    let mut source = MongoDbCdcSource::new(config, None);
     let connector_config = ConnectorConfig::new("mongodb-cdc");
     source.open(&connector_config).await.unwrap();
     sleep(Duration::from_secs(1)).await;
@@ -433,7 +433,7 @@ async fn update_lookup_mode() {
 
     let mut config = MongoDbSourceConfig::new(&uri, "test_update_lookup", "docs");
     config.full_document_mode = FullDocumentMode::UpdateLookup;
-    let mut source = MongoDbCdcSource::new(config);
+    let mut source = MongoDbCdcSource::new(config, None);
     let connector_config = ConnectorConfig::new("mongodb-cdc");
     source.open(&connector_config).await.unwrap();
     sleep(Duration::from_secs(1)).await;
@@ -492,7 +492,7 @@ async fn replace_cdc() {
         .unwrap();
 
     let config = MongoDbSourceConfig::new(&uri, "test_replace_cdc", "docs");
-    let mut source = MongoDbCdcSource::new(config);
+    let mut source = MongoDbCdcSource::new(config, None);
     let connector_config = ConnectorConfig::new("mongodb-cdc");
     source.open(&connector_config).await.unwrap();
     sleep(Duration::from_secs(1)).await;
@@ -544,7 +544,7 @@ async fn delete_cdc() {
         .unwrap();
 
     let config = MongoDbSourceConfig::new(&uri, "test_delete_cdc", "docs");
-    let mut source = MongoDbCdcSource::new(config);
+    let mut source = MongoDbCdcSource::new(config, None);
     let connector_config = ConnectorConfig::new("mongodb-cdc");
     source.open(&connector_config).await.unwrap();
     sleep(Duration::from_secs(1)).await;
@@ -588,7 +588,7 @@ async fn sink_cdc_replay() {
 
     let mut config = MongoDbSinkConfig::new(&uri, "test_cdc_replay", "replay_out");
     config.write_mode = WriteMode::CdcReplay;
-    let mut sink = MongoDbSink::new(schema.clone(), config);
+    let mut sink = MongoDbSink::new(schema.clone(), config, None);
     let connector_config = ConnectorConfig::new("mongodb-sink");
     sink.open(&connector_config).await.unwrap();
 

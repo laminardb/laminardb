@@ -36,6 +36,8 @@ mod config;
 mod connector_manager;
 mod core_window_state;
 mod db;
+/// Prometheus metrics for the streaming engine.
+pub mod engine_metrics;
 mod eowc_state;
 // Reopened `impl LaminarDB` modules — split from db.rs
 /// FFI-friendly API for language bindings.
@@ -98,13 +100,14 @@ pub use checkpoint_coordinator::{
 };
 pub use config::{IdentifierCaseSensitivity, LaminarConfig, TieringConfig};
 pub use db::LaminarDB;
+pub use engine_metrics::EngineMetrics;
 pub use error::DbError;
 pub use handle::{
     DdlInfo, ExecuteResult, FromBatch, PipelineEdge, PipelineNode, PipelineNodeType,
     PipelineTopology, QueryHandle, QueryInfo, SinkInfo, SourceHandle, SourceInfo, StreamInfo,
     TypedSubscription, UntypedSourceHandle,
 };
-pub use metrics::{PipelineCounters, PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
+pub use metrics::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
 pub use profile::{Profile, ProfileError};
 pub use recovery_manager::{RecoveredState, RecoveryManager};
 
