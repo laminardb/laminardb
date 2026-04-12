@@ -148,19 +148,23 @@ impl EngineMetrics {
                     .buckets(vec![1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3]),
             )
             .unwrap()),
+            // Checkpoint: serialization_timeout=120s, so max bucket must cover that.
+            // 0.01 * 2^14 = 163.84s.
             checkpoint_duration: reg!(Histogram::with_opts(
                 HistogramOpts::new("checkpoint_duration_seconds", "Checkpoint cycle duration")
-                    .buckets(prometheus::exponential_buckets(0.01, 2.0, 10).unwrap()),
+                    .buckets(prometheus::exponential_buckets(0.01, 2.0, 15).unwrap()),
             )
             .unwrap()),
+            // pre_commit_timeout=30s. 0.005 * 2^13 = 40.96s.
             sink_precommit_duration: reg!(Histogram::with_opts(
                 HistogramOpts::new("sink_precommit_duration_seconds", "Sink pre-commit latency")
-                    .buckets(prometheus::exponential_buckets(0.001, 2.0, 10).unwrap()),
+                    .buckets(prometheus::exponential_buckets(0.005, 2.0, 14).unwrap()),
             )
             .unwrap()),
+            // commit_timeout=60s. 0.005 * 2^14 = 81.92s.
             sink_commit_duration: reg!(Histogram::with_opts(
                 HistogramOpts::new("sink_commit_duration_seconds", "Sink commit latency")
-                    .buckets(prometheus::exponential_buckets(0.001, 2.0, 10).unwrap()),
+                    .buckets(prometheus::exponential_buckets(0.005, 2.0, 15).unwrap()),
             )
             .unwrap()),
         }
