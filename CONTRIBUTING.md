@@ -166,21 +166,6 @@ chore(deps): update arrow to 57.2
 
 ### Review policy
 
-We welcome AI-assisted contributions, but we need a human in the loop.
-
-**Every PR has a CI-enforced human attestation gate.** The PR template includes two checkboxes and a reviewer notes section. CI will block your PR if:
-
-- The "I have personally reviewed this entire diff" checkbox isn't checked
-- The "review comments explain why" checkbox isn't checked
-- The reviewer notes section is empty or too brief (minimum 30 characters explaining what you verified and why the change is correct)
-- The "Why" section doesn't explain the motivation (minimum 20 characters)
-
-This gate is a required status check on `main` -- there's no way around it.
-
-**AI-generated code is fine.** Use Copilot, Claude, Cursor, whatever helps you write better code faster. But *you* must understand what the code does, *you* must have run the tests, and *you* must be able to explain it in review.
-
-**Automated PR bots will be blocked.** If we see a pattern of PRs that look like an agent running on autopilot -- bulk low-quality PRs, no human in the review loop, copy-paste responses to review comments -- we'll close them and may block the account.
-
 **Open a draft PR early** if you want feedback before finishing. We'd rather help you course-correct than review a big surprise.
 
 ## Good places to start
