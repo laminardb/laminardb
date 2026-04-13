@@ -1,0 +1,14 @@
+{
+  "name": "laminardb-rag-chatbot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "index": "node build-index.mjs",
+    "index:full": "node build-index.mjs --full",
+    "deploy": "wrangler deploy",
+    "index-and-deploy": "node build-index.mjs && wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "engines": { "node": ">=18" }
+}
