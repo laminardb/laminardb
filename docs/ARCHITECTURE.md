@@ -72,8 +72,6 @@ and injects/aligns checkpoint barriers (Chandy-Lamport protocol).
 
 **Streaming physical optimizer** (`StreamingPhysicalValidator`): Catches invalid physical plans (e.g., SortExec on unbounded streams) before execution. Configurable via `StreamingValidatorMode` (Reject, Warn, Off).
 
-**Dynamic watermark filter pushdown** (`WatermarkDynamicFilter`): Pushes `ts >= watermark` predicates down to `StreamingScanExec` so late rows are dropped before expression evaluation, using shared `Arc<AtomicI64>` watermarks.
-
 **Cooperative scheduling**: DataFusion's cooperative scheduling integration marks `StreamingScanExec` as `NonCooperative` so the engine wraps it with budget-aware `CooperativeExec` automatically.
 
 **Structured error codes**: Every error carries a stable `LDB-NNNN` code (8 code ranges from general through internal). Hot-path errors use a zero-alloc `HotPathError` enum (2 bytes, `Copy`).
@@ -137,9 +135,8 @@ laminar-core          Core: operators, window assigners, time/watermarks,
 laminar-sql           SQL parser (streaming extensions), query planner,
                       DataFusion integration, operator config translators,
                       custom UDFs (tumble, hop, session, slide, first_value, last_value),
-                      streaming physical optimizer, watermark filter pushdown,
-                      cooperative scheduling, PROCTIME() UDF,
-                      temporal probe join translator
+                      streaming physical optimizer, cooperative scheduling,
+                      PROCTIME() UDF, temporal probe join translator
                       |
 laminar-storage       Checkpoint persistence: manifest, checkpoint store
                       (filesystem + object store), object store builder
@@ -307,15 +304,18 @@ Queries are planned by `StreamingPlanner` and executed via DataFusion, with comp
 
 ## Performance Characteristics
 
+Historical mean-latency measurements (laptop hardware, Criterion microbenchmarks):
+
 | Operation | Target | Measured | Technique |
 |-----------|--------|----------|-----------|
-| State lookup | < 500ns | 10-105ns (AHash get_ref: 10-16ns) | AHashMap, cache-aligned keys |
-| Event processing | < 1us | 0.55-1.16us | Zero per-event allocation, compiled projections |
-| Throughput/core | 500K/s | 1.1-1.46M/s | Batch processing, Arrow columnar |
-| Checkpoint | < 10s recovery | 1.39ms | Full snapshots, manifest-based recovery |
-| Window trigger | < 10us | not yet measured | Watermark-driven emission |
+| Event processing (mean) | < 10us | 0.55-1.16us | Zero per-event allocation, compiled projections |
+| Throughput/core (reactor+window) | 500K/s | 1.1-1.46M/s | Batch processing, Arrow columnar |
+| Checkpoint recovery | < 10s | 1.39ms | Full snapshots, manifest-based recovery |
 
-See [BENCHMARKS.md](BENCHMARKS.md) for historical benchmark baselines with hardware details.
+These are Criterion means from a developer laptop, not continuously
+validated in CI. True p99 under sustained load is not currently
+measured. See [BENCHMARKS.md](BENCHMARKS.md) for the historical
+baseline and caveats.
 
 ## Execution Model
 

@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.20.2]
+
+### Added
+
+- **Production-grade Prometheus metrics** (#339) — expanded `/metrics`
+  with pipeline counters, cycle duration percentiles, checkpoint
+  telemetry, sink error/timeout counters, and per-connector gauges.
+- **Temporal probe join DDL round-trip** — `CREATE STREAM` and
+  `CREATE MATERIALIZED VIEW` now preserve the raw query text between
+  `AS` and `EMIT` via a `query_sql` field on the AST, so custom
+  streaming syntax (e.g. `TEMPORAL PROBE JOIN ... LIST (...)`,
+  `RANGE FROM ... TO ... STEP ...`) survives the DDL parse / replay
+  cycle used by `SHOW CREATE` and hot reload.
+
+### Changed / Removed
+
+- **Removed `WatermarkDynamicFilter`** (#338) — the dead dynamic
+  filter module was deleted. Watermark-based row filtering now runs
+  through the standard streaming scan path.
+- **Moved `examples/microstructure/pipeline.sql`** to use `TIMESTAMP`
+  for the event-time column `"T"` (matches the v0.20.1 timestamp
+  migration).
+- **Deleted stale planning docs** — `docs/features/INDEX.md` and the
+  `docs/plans/` directory were removed. `docs/ROADMAP.md` is the
+  canonical feature tracker.
+
+### Fixed
+
+- **Watermark fallback wiring** (#337) — `max.out.of.orderness.ms` is
+  now respected when event-time extraction falls back to default
+  generators. The attestation gate on the fallback path was removed.
+- **Session window cardinality + CDC / sink shutdown** (#335) —
+  session windows cap per-key sessions to prevent unbounded state
+  growth; sinks and CDC sources shut down cleanly when the pipeline
+  stops.
+
 ## [0.20.1]
 
 ### Breaking — Timestamp column migration
@@ -61,9 +97,12 @@ DataFusion handles `Timestamp ± INTERVAL` arithmetic natively.
   if the column is used in a watermark or window. Plain `BIGINT`
   columns unrelated to event time are unchanged.
 
-## [Unreleased]
+## [0.20.0] and earlier — notable additions
 
-### Added — MongoDB CDC Source & Sink (`mongodb-cdc` feature)
+### Added — MongoDB CDC Source & Sink (`mongodb-cdc` feature) — PR #255
+
+Landed in the 0.20.x line via PR #255; the API surface below is what
+the `mongodb-cdc` feature exposes today.
 
 New public API symbols in `laminar_connectors::mongodb`:
 
