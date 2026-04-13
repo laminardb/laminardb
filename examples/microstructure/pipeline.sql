@@ -18,7 +18,7 @@
 -- json.path = 'data' unwraps {"stream":"...","data":{trade fields}}.
 
 CREATE SOURCE all_trades (
-    s VARCHAR, p DOUBLE, q DOUBLE, "T" BIGINT, m BOOLEAN,
+    s VARCHAR, p DOUBLE, q DOUBLE, "T" TIMESTAMP, m BOOLEAN,
     WATERMARK FOR "T" AS "T" - INTERVAL '0' SECOND
 ) FROM WEBSOCKET (
     url = 'wss://stream.binance.com:9443/stream?streams=btcusdt@trade/ethusdt@trade/solusdt@trade/dogeusdt@trade/xrpusdt@trade/bnbusdt@trade',
