@@ -1101,5 +1101,366 @@ CREATE SINK lake INTO DELTA_LAKE (
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-rust.min.js"></script>
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
   <script defer src="js/main.js"></script>
+  
+  
+  <!--
+  LaminarDB RAG Chat Widget
+  Paste just before </body> in your GitHub Pages HTML.
+  Replace WORKER_URL with your deployed Cloudflare Worker URL.
+-->
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+
+  #ldb-chat-root {
+    --ldb-bg: #0d1117;
+    --ldb-surface: #161b22;
+    --ldb-border: #30363d;
+    --ldb-accent: #00d4ff;
+    --ldb-accent-dim: rgba(0, 212, 255, 0.12);
+    --ldb-text: #e6edf3;
+    --ldb-muted: #8b949e;
+    --ldb-radius: 6px;
+    --ldb-font-sans: 'IBM Plex Sans', system-ui, sans-serif;
+    --ldb-font-mono: 'IBM Plex Mono', monospace;
+    font-family: var(--ldb-font-sans);
+  }
+
+  #ldb-toggle {
+    position: fixed; bottom: 28px; right: 28px; z-index: 9999;
+    width: 52px; height: 52px; border-radius: 50%;
+    background: var(--ldb-accent); border: none; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 0 0 1px rgba(0,212,255,0.3), 0 4px 24px rgba(0,212,255,0.25);
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+  }
+  #ldb-toggle:hover {
+    transform: scale(1.08);
+    box-shadow: 0 0 0 1px rgba(0,212,255,0.5), 0 6px 32px rgba(0,212,255,0.35);
+  }
+
+  #ldb-panel {
+    position: fixed; bottom: 92px; right: 28px; z-index: 9998;
+    width: 400px; max-width: calc(100vw - 40px);
+    height: 560px; max-height: calc(100vh - 120px);
+    background: var(--ldb-bg); border: 1px solid var(--ldb-border);
+    border-radius: 10px; display: flex; flex-direction: column; overflow: hidden;
+    box-shadow: 0 24px 64px rgba(0,0,0,0.6), 0 0 0 1px rgba(0,212,255,0.08);
+    transform: translateY(12px) scale(0.97); opacity: 0; pointer-events: none;
+    transition: opacity 0.2s ease, transform 0.2s ease;
+  }
+  #ldb-panel.ldb-open { opacity: 1; pointer-events: all; transform: none; }
+
+  #ldb-header {
+    padding: 14px 16px; background: var(--ldb-surface);
+    border-bottom: 1px solid var(--ldb-border);
+    display: flex; align-items: center; gap: 10px; flex-shrink: 0;
+  }
+  #ldb-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--ldb-accent); box-shadow: 0 0 8px var(--ldb-accent);
+    animation: ldb-pulse 2.4s ease-in-out infinite; flex-shrink: 0;
+  }
+  @keyframes ldb-pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+  #ldb-title { font-size: 13px; font-weight: 600; color: var(--ldb-text); flex: 1; }
+  #ldb-subtitle { font-size: 11px; color: var(--ldb-muted); font-family: var(--ldb-font-mono); }
+  #ldb-close {
+    background: none; border: none; cursor: pointer; color: var(--ldb-muted);
+    padding: 2px; display: flex; align-items: center; border-radius: 4px;
+    transition: color 0.15s, background 0.15s;
+  }
+  #ldb-close:hover { color: var(--ldb-text); background: rgba(255,255,255,0.06); }
+
+  #ldb-messages {
+    flex: 1; overflow-y: auto; padding: 16px;
+    display: flex; flex-direction: column; gap: 14px;
+    scrollbar-width: thin; scrollbar-color: var(--ldb-border) transparent;
+  }
+  #ldb-messages::-webkit-scrollbar { width: 4px; }
+  #ldb-messages::-webkit-scrollbar-thumb { background: var(--ldb-border); border-radius: 4px; }
+
+  .ldb-msg { display: flex; flex-direction: column; gap: 3px; animation: ldb-in 0.18s ease; }
+  @keyframes ldb-in { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:none} }
+
+  .ldb-label {
+    font-size: 10px; font-family: var(--ldb-font-mono); font-weight: 500;
+    letter-spacing: 0.08em; text-transform: uppercase;
+  }
+  .ldb-user .ldb-label { color: var(--ldb-accent); text-align: right; }
+  .ldb-bot .ldb-label { color: var(--ldb-muted); }
+
+  .ldb-bubble {
+    padding: 10px 13px; border-radius: var(--ldb-radius);
+    font-size: 13.5px; line-height: 1.6; color: var(--ldb-text); word-break: break-word;
+  }
+  .ldb-user .ldb-bubble {
+    background: var(--ldb-accent-dim); border: 1px solid rgba(0,212,255,0.2);
+    align-self: flex-end; border-bottom-right-radius: 2px;
+  }
+  .ldb-bot .ldb-bubble {
+    background: var(--ldb-surface); border: 1px solid var(--ldb-border);
+    align-self: flex-start; border-bottom-left-radius: 2px;
+  }
+  .ldb-bubble code {
+    font-family: var(--ldb-font-mono); font-size: 12px;
+    background: rgba(0,212,255,0.08); border: 1px solid rgba(0,212,255,0.15);
+    padding: 1px 5px; border-radius: 3px; color: var(--ldb-accent);
+  }
+  .ldb-bubble pre {
+    background: #0a0d12; border: 1px solid var(--ldb-border);
+    border-radius: var(--ldb-radius); padding: 10px 12px;
+    overflow-x: auto; margin: 8px 0 2px;
+  }
+  .ldb-bubble pre code { background:none; border:none; padding:0; color:#a8d8a8; font-size:12px; }
+  .ldb-bubble strong { color: #fff; font-weight: 600; }
+  .ldb-bubble p { margin: 0 0 6px; }
+  .ldb-bubble p:last-child { margin: 0; }
+
+  /* Source citations */
+  .ldb-sources {
+    display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; padding-left: 2px;
+  }
+  .ldb-source-tag {
+    font-family: var(--ldb-font-mono); font-size: 10px;
+    color: var(--ldb-muted); background: rgba(255,255,255,0.04);
+    border: 1px solid var(--ldb-border); border-radius: 3px;
+    padding: 1px 6px;
+  }
+
+  .ldb-typing {
+    display: flex; gap: 4px; padding: 10px 13px;
+    background: var(--ldb-surface); border: 1px solid var(--ldb-border);
+    border-radius: var(--ldb-radius); border-bottom-left-radius: 2px;
+    align-self: flex-start; width: fit-content;
+  }
+  .ldb-typing span {
+    width: 6px; height: 6px; background: var(--ldb-muted);
+    border-radius: 50%; animation: ldb-bounce 1.2s ease-in-out infinite;
+  }
+  .ldb-typing span:nth-child(2){animation-delay:.2s}
+  .ldb-typing span:nth-child(3){animation-delay:.4s}
+  @keyframes ldb-bounce{0%,80%,100%{transform:translateY(0);opacity:.4}40%{transform:translateY(-5px);opacity:1}}
+
+  #ldb-examples { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+  .ldb-ex {
+    background: none; border: 1px solid var(--ldb-border); border-radius: var(--ldb-radius);
+    color: var(--ldb-muted); font-size: 12px; font-family: var(--ldb-font-sans);
+    padding: 7px 10px; cursor: pointer; text-align: left;
+    transition: border-color 0.15s, color 0.15s, background 0.15s;
+  }
+  .ldb-ex:hover { border-color: rgba(0,212,255,0.4); color: var(--ldb-text); background: var(--ldb-accent-dim); }
+
+  #ldb-footer {
+    padding: 12px; border-top: 1px solid var(--ldb-border);
+    background: var(--ldb-surface); flex-shrink: 0;
+  }
+  #ldb-row { display: flex; gap: 8px; align-items: flex-end; }
+  #ldb-input {
+    flex: 1; background: var(--ldb-bg); border: 1px solid var(--ldb-border);
+    border-radius: var(--ldb-radius); color: var(--ldb-text);
+    font-family: var(--ldb-font-sans); font-size: 13px;
+    padding: 9px 12px; resize: none; outline: none; max-height: 100px;
+    transition: border-color 0.15s; line-height: 1.5;
+  }
+  #ldb-input::placeholder { color: var(--ldb-muted); }
+  #ldb-input:focus { border-color: rgba(0,212,255,0.4); }
+  #ldb-send {
+    background: var(--ldb-accent); border: none; border-radius: var(--ldb-radius);
+    color: #000; cursor: pointer; width: 36px; height: 36px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    transition: opacity 0.15s, transform 0.15s;
+  }
+  #ldb-send:hover:not(:disabled){opacity:.85;transform:scale(1.05)}
+  #ldb-send:disabled{opacity:.35;cursor:not-allowed}
+  #ldb-note { font-size: 10px; color: var(--ldb-muted); font-family: var(--ldb-font-mono); margin-top: 8px; text-align: center; }
+</style>
+
+<div id="ldb-chat-root">
+  <button id="ldb-toggle" aria-label="Open LaminarDB assistant">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#000" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+    </svg>
+  </button>
+
+  <div id="ldb-panel" role="dialog" aria-label="LaminarDB assistant">
+    <div id="ldb-header">
+      <div id="ldb-dot"></div>
+      <div id="ldb-title">LaminarDB Assistant</div>
+      <span id="ldb-subtitle">streaming SQL · Rust</span>
+      <button id="ldb-close" aria-label="Close">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+
+    <div id="ldb-messages">
+      <div class="ldb-msg ldb-bot">
+        <span class="ldb-label">laminar</span>
+        <div class="ldb-bubble">Ask me anything about LaminarDB — window syntax, stream joins, connectors, the Ring model, checkpointing, or Python bindings.</div>
+      </div>
+      <div id="ldb-examples">
+        <button class="ldb-ex">How do I define a TUMBLE window?</button>
+        <button class="ldb-ex">What's the difference between ASOF and interval joins?</button>
+        <button class="ldb-ex">How does Ring 0 enforce zero-alloc?</button>
+        <button class="ldb-ex">How do I connect a Kafka source?</button>
+      </div>
+    </div>
+
+    <div id="ldb-footer">
+      <div id="ldb-row">
+        <textarea id="ldb-input" rows="1" placeholder="Ask about SQL syntax, connectors, architecture…" aria-label="Message"></textarea>
+        <button id="ldb-send" aria-label="Send">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+          </svg>
+        </button>
+      </div>
+      <div id="ldb-note">answers grounded in source code · laminardb.io</div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const WORKER_URL = "https://laminardb-chatbot.sujitnair.workers.dev";
+
+  const panel    = document.getElementById("ldb-panel");
+  const toggle   = document.getElementById("ldb-toggle");
+  const closeBtn = document.getElementById("ldb-close");
+  const messages = document.getElementById("ldb-messages");
+  const input    = document.getElementById("ldb-input");
+  const sendBtn  = document.getElementById("ldb-send");
+
+  let history = [];
+  let busy = false;
+
+  toggle.addEventListener("click", () => {
+    panel.classList.toggle("ldb-open");
+    if (panel.classList.contains("ldb-open")) input.focus();
+  });
+  closeBtn.addEventListener("click", () => panel.classList.remove("ldb-open"));
+
+  document.querySelectorAll(".ldb-ex").forEach(btn => {
+    btn.addEventListener("click", () => {
+      input.value = btn.textContent;
+      document.getElementById("ldb-examples")?.remove();
+      send();
+    });
+  });
+
+  input.addEventListener("input", () => {
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 100) + "px";
+  });
+  input.addEventListener("keydown", e => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+  sendBtn.addEventListener("click", send);
+
+  function addMessage(role, html, sources) {
+    const wrap = document.createElement("div");
+    wrap.className = `ldb-msg ldb-${role === "user" ? "user" : "bot"}`;
+
+    const label = document.createElement("span");
+    label.className = "ldb-label";
+    label.textContent = role === "user" ? "you" : "laminar";
+
+    const bubble = document.createElement("div");
+    bubble.className = "ldb-bubble";
+    bubble.innerHTML = html;
+
+    wrap.appendChild(label);
+    wrap.appendChild(bubble);
+
+    // Source citations (bot only)
+    if (role !== "user" && sources?.length) {
+      const srcRow = document.createElement("div");
+      srcRow.className = "ldb-sources";
+      sources.slice(0, 5).forEach(s => {
+        const tag = document.createElement("span");
+        tag.className = "ldb-source-tag";
+        tag.textContent = s.split("/").pop(); // just filename
+        tag.title = s; // full path on hover
+        srcRow.appendChild(tag);
+      });
+      wrap.appendChild(srcRow);
+    }
+
+    messages.appendChild(wrap);
+    messages.scrollTop = messages.scrollHeight;
+  }
+
+  function showTyping() {
+    const wrap = document.createElement("div");
+    wrap.className = "ldb-msg ldb-bot";
+    wrap.id = "ldb-typing";
+    const label = document.createElement("span");
+    label.className = "ldb-label";
+    label.textContent = "laminar";
+    const dots = document.createElement("div");
+    dots.className = "ldb-typing";
+    dots.innerHTML = "<span></span><span></span><span></span>";
+    wrap.appendChild(label);
+    wrap.appendChild(dots);
+    messages.appendChild(wrap);
+    messages.scrollTop = messages.scrollHeight;
+  }
+
+  function removeTyping() {
+    document.getElementById("ldb-typing")?.remove();
+  }
+
+  function md(text) {
+    return text
+      .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+      .replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) =>
+        `<pre><code>${code.trim()}</code></pre>`)
+      .replace(/`([^`]+)`/g, "<code>$1</code>")
+      .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+      .replace(/\n{2,}/g, "</p><p>")
+      .replace(/\n/g, "<br>")
+      .replace(/^/, "<p>").replace(/$/, "</p>")
+      .replace(/<p><\/p>/g, "");
+  }
+
+  async function send() {
+    const text = input.value.trim();
+    if (!text || busy) return;
+
+    busy = true;
+    sendBtn.disabled = true;
+    input.value = "";
+    input.style.height = "auto";
+
+    addMessage("user", md(text));
+    history.push({ role: "user", content: text });
+    showTyping();
+
+    try {
+      const res = await fetch(WORKER_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: history }),
+      });
+
+      removeTyping();
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const reply = data.reply ?? "Something went wrong.";
+      const sources = data.sources ?? [];
+
+      history.push({ role: "assistant", content: reply });
+      addMessage("assistant", md(reply), sources);
+    } catch (err) {
+      removeTyping();
+      addMessage("assistant", `<span style="color:#ff6b6b">Error: ${err.message}</span>`);
+    }
+
+    busy = false;
+    sendBtn.disabled = false;
+    input.focus();
+  }
+})();
+</script>
+
 </body>
 </html>
