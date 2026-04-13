@@ -124,6 +124,8 @@ pub enum StreamingStatement {
         or_replace: bool,
         /// Whether IF NOT EXISTS was specified
         if_not_exists: bool,
+        /// Raw query text between `AS` and `EMIT`.
+        query_sql: String,
     },
 
     /// CREATE STREAM — named streaming pipeline
@@ -138,6 +140,8 @@ pub enum StreamingStatement {
         or_replace: bool,
         /// Whether IF NOT EXISTS was specified
         if_not_exists: bool,
+        /// Raw query text between `AS` and `EMIT`.
+        query_sql: String,
     },
 
     /// DROP STREAM statement
@@ -804,6 +808,7 @@ mod tests {
             emit_clause: Some(EmitClause::OnWindowClose),
             or_replace: false,
             if_not_exists: true,
+            query_sql: "SELECT COUNT(*) FROM events".to_string(),
         };
         match stmt {
             StreamingStatement::CreateMaterializedView {

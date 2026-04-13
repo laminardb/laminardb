@@ -11,7 +11,7 @@ use laminar_sql::parser::StreamingStatement;
 use laminar_sql::translator::streaming_ddl::{self, ColumnDefinition};
 
 use crate::connector_manager::normalize_connector_type;
-use crate::db::{parse_duration_str, streaming_statement_to_sql, LaminarDB};
+use crate::db::{parse_duration_str, LaminarDB};
 use crate::error::DbError;
 use crate::handle::{DdlInfo, ExecuteResult};
 
@@ -638,11 +638,12 @@ impl LaminarDB {
         name: &sqlparser::ast::ObjectName,
         query: &StreamingStatement,
         emit_clause: Option<&laminar_sql::parser::EmitClause>,
+        query_sql: &str,
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
-
-        // Register in catalog as a stream
         self.catalog.register_stream(&name_str)?;
+
+        let query_sql = query_sql.to_string();
 
         // Plan the statement to extract emit_clause, window_config, and order_config
         let (plan_emit, plan_window, plan_order) = {
@@ -653,6 +654,7 @@ impl LaminarDB {
                 emit_clause: emit_clause.cloned(),
                 or_replace: false,
                 if_not_exists: false,
+                query_sql: query_sql.clone(),
             };
             match planner.plan(&stmt) {
                 Ok(laminar_sql::planner::StreamingPlan::Query(ref qp)) => (
@@ -663,8 +665,6 @@ impl LaminarDB {
                 _ => (emit_clause.cloned(), None, None),
             }
         };
-
-        let query_sql = streaming_statement_to_sql(query);
 
         // Store the query SQL for stream execution at start()
         {
@@ -862,6 +862,7 @@ impl LaminarDB {
         query: &StreamingStatement,
         or_replace: bool,
         if_not_exists: bool,
+        query_sql: &str,
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
 
@@ -883,8 +884,7 @@ impl LaminarDB {
             }
         }
 
-        // Convert the inner query to SQL for execution
-        let query_sql = streaming_statement_to_sql(query);
+        let query_sql = query_sql.to_string();
 
         // Execute the backing query to get the output schema
         let result = self.handle_query(&query_sql).await?;
@@ -942,6 +942,7 @@ impl LaminarDB {
                 emit_clause: None,
                 or_replace: false,
                 if_not_exists: false,
+                query_sql: query_sql.clone(),
             };
             match planner.plan(&stmt) {
                 Ok(laminar_sql::planner::StreamingPlan::Query(ref qp)) => (
