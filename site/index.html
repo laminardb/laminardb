@@ -1337,6 +1337,16 @@ CREATE SINK lake INTO DELTA_LAKE (
     if (panel.classList.contains("ldb-open")) input.focus();
   });
   closeBtn.addEventListener("click", () => panel.classList.remove("ldb-open"));
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape" && panel.classList.contains("ldb-open")) {
+      panel.classList.remove("ldb-open");
+      toggle.focus();
+    }
+  });
+
+  const escapeHtml = s => s.replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
 
   document.querySelectorAll(".ldb-ex").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -1452,7 +1462,7 @@ CREATE SINK lake INTO DELTA_LAKE (
       addMessage("assistant", md(reply), sources);
     } catch (err) {
       removeTyping();
-      addMessage("assistant", `<span style="color:#ff6b6b">Error: ${err.message}</span>`);
+      addMessage("assistant", `<span style="color:#ff6b6b">Error: ${escapeHtml(err.message)}</span>`);
     }
 
     busy = false;

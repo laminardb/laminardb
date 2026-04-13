@@ -1528,8 +1528,14 @@ mod tests {
         let StreamingStatement::CreateStream { query_sql, .. } = parse_one(sql) else {
             panic!("expected CreateStream");
         };
-        assert!(query_sql.to_uppercase().contains("TEMPORAL PROBE JOIN"), "got: {query_sql}");
-        assert!(query_sql.contains("LIST (0s, 1s, 5s, 30s)"), "got: {query_sql}");
+        assert!(
+            query_sql.to_uppercase().contains("TEMPORAL PROBE JOIN"),
+            "got: {query_sql}"
+        );
+        assert!(
+            query_sql.contains("LIST (0s, 1s, 5s, 30s)"),
+            "got: {query_sql}"
+        );
         assert!(query_sql.contains("AS p"), "got: {query_sql}");
     }
 
@@ -1542,7 +1548,10 @@ mod tests {
         let StreamingStatement::CreateStream { query_sql, .. } = parse_one(sql) else {
             panic!("expected CreateStream");
         };
-        assert!(query_sql.contains("RANGE FROM 0s TO 30s STEP 5s"), "got: {query_sql}");
+        assert!(
+            query_sql.contains("RANGE FROM 0s TO 30s STEP 5s"),
+            "got: {query_sql}"
+        );
     }
 
     #[test]
@@ -1553,20 +1562,28 @@ mod tests {
         let StreamingStatement::CreateMaterializedView { query_sql, .. } = parse_one(sql) else {
             panic!("expected CreateMaterializedView");
         };
-        assert!(query_sql.to_uppercase().contains("TEMPORAL PROBE JOIN"), "got: {query_sql}");
+        assert!(
+            query_sql.to_uppercase().contains("TEMPORAL PROBE JOIN"),
+            "got: {query_sql}"
+        );
     }
 
     #[test]
     fn create_stream_emit_is_not_captured_in_query_sql() {
         let sql = "CREATE STREAM s AS SELECT COUNT(*) FROM events EMIT ON WINDOW CLOSE";
         let StreamingStatement::CreateStream {
-            query_sql, emit_clause, ..
+            query_sql,
+            emit_clause,
+            ..
         } = parse_one(sql)
         else {
             panic!("expected CreateStream");
         };
         assert_eq!(emit_clause, Some(EmitClause::OnWindowClose));
-        assert!(!query_sql.to_uppercase().contains("EMIT"), "got: {query_sql}");
+        assert!(
+            !query_sql.to_uppercase().contains("EMIT"),
+            "got: {query_sql}"
+        );
         assert!(query_sql.contains("FROM events"), "got: {query_sql}");
     }
 
