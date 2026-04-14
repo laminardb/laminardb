@@ -344,8 +344,8 @@ Benchmark suites live under `crates/laminar-core/benches/`, `crates/laminar-db/b
 
 | Metric | Target | Benchmark File |
 |--------|--------|----------------|
-| Throughput/core | 500K events/sec | `crates/laminar-core/benches/streaming_bench.rs` |
-| Event latency | < 10us | `crates/laminar-core/benches/latency_bench.rs` |
+| Streaming throughput | 500K events/sec | `crates/laminar-core/benches/streaming_bench.rs` |
+| Event latency (mean) | < 10us | `crates/laminar-core/benches/latency_bench.rs` |
 | Window operations | -- | `crates/laminar-core/benches/window_bench.rs` |
 | Lookup join | -- | `crates/laminar-core/benches/lookup_join_bench.rs` |
 | foyer cache | -- | `crates/laminar-core/benches/cache_bench.rs` |
@@ -353,7 +353,7 @@ Benchmark suites live under `crates/laminar-core/benches/`, `crates/laminar-db/b
 | Checkpoint recovery | < 10s | `crates/laminar-db/benches/recovery_bench.rs` |
 | MongoDB throughput | -- | `crates/laminar-connectors/benches/mongodb_throughput.rs` |
 
-Historical mean latencies measured on an AMD Ryzen AI 7 350 development laptop (see [BENCHMARKS.md](docs/BENCHMARKS.md)) against minimal operator chains showed state lookups in the 10-105ns range, per-event latency of 0.55-1.16µs, and single-core throughput of 1.1-1.46M events/sec. Real pipelines with multiple operators, joins, and state lookups will show higher latency. p99 under sustained load is not yet measured. Run `cargo bench` to measure on your own hardware.
+Historical mean latencies measured on an AMD Ryzen AI 7 350 development laptop (see [BENCHMARKS.md](docs/BENCHMARKS.md)) against minimal operator chains showed per-event latency of 0.55-1.16µs and single-core throughput of 1.1-1.46M events/sec on a reactor+window pipeline. Real pipelines with multiple operators, joins, and state lookups will show higher latency. p99 under sustained load is not continuously measured in CI. Run `cargo bench` to measure on your own hardware.
 
 ---
 
@@ -398,7 +398,7 @@ Historical mean latencies measured on an AMD Ryzen AI 7 350 development laptop (
 
 ## Project Status
 
-**Version 0.20.1** — active development, pre-1.0. APIs may change between minor versions.
+**Version 0.20.2** — active development, pre-1.0. APIs may change between minor versions.
 
 | Phase | Description | Progress |
 |-------|-------------|----------|

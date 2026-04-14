@@ -109,16 +109,19 @@ Gossip discovery, Raft consensus, partition ownership, distributed checkpoints, 
 
 | Metric | Target | Validated | Benchmark |
 |--------|--------|-----------|-----------|
-| State lookup | < 500ns | Benchmarks exist | `state_bench` |
-| Throughput/core | 500K/sec | Benchmarks exist | `throughput_bench` |
-| p99 latency | < 10us | Benchmarks exist | `latency_bench` |
-| Checkpoint recovery | < 10s | Integration tests | `checkpoint_bench` |
-| Window trigger | < 10us | Benchmarks exist | `window_bench` |
-| Join throughput | -- | Benchmarks exist | `join_bench`, `lookup_join_bench` |
-| Cache performance | -- | Benchmarks exist | `cache_bench` |
-| JIT compilation | -- | Benchmarks exist | `compiler_bench` |
+| Event latency (mean) | < 10us | Criterion bench exists | `latency_bench` (laminar-core) |
+| Streaming throughput | 500K events/sec/core | Criterion bench exists | `streaming_bench` (laminar-core) |
+| Window operators | -- | Criterion bench exists | `window_bench` (laminar-core) |
+| Lookup joins | -- | Criterion bench exists | `lookup_join_bench` (laminar-core) |
+| Foyer cache | -- | Criterion bench exists | `cache_bench` (laminar-core) |
+| Stream executor | -- | Criterion bench exists | `stream_executor_bench` (laminar-db) |
+| Checkpoint recovery | < 10s | Criterion bench + tests | `recovery_bench` (laminar-db) |
+| MongoDB sink | -- | Criterion bench exists | `mongodb_throughput` (laminar-connectors) |
 
-17 benchmark suites exist in `laminar-core`, 2 in `laminar-storage`.
+5 benchmark suites in `laminar-core`, 2 in `laminar-db`, 1 in
+`laminar-connectors`. `p99` percentiles are not measured — the
+numbers above are Criterion means/medians. CI does not currently
+publish continuous benchmark tracking.
 
 ---
 

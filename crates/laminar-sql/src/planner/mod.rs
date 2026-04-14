@@ -159,6 +159,7 @@ impl StreamingPlanner {
                 name,
                 query,
                 emit_clause,
+                ..
             }
             | StreamingStatement::CreateStream {
                 name,

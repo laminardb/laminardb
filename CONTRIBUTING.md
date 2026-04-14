@@ -34,7 +34,7 @@ LaminarDB is a Rust workspace with 7 crates. Here's what each one does:
 | Crate | What it does |
 |-------|-------------|
 | **laminar-core** | The engine. Operators, window assigners, streaming channels (crossfire), checkpoint barrier protocol, lookup tables, time/watermarks, structured error codes. |
-| **laminar-sql** | SQL parser with streaming extensions (EMIT, watermarks, windows, ASOF), query planner, DataFusion integration, custom UDFs, streaming physical optimizer, watermark filter pushdown. |
+| **laminar-sql** | SQL parser with streaming extensions (EMIT, watermarks, windows, ASOF, temporal probe joins), query planner, DataFusion integration, custom UDFs, streaming physical optimizer. |
 | **laminar-storage** | Checkpoint manifests, filesystem/object-store checkpoint persistence, object-store builder. |
 | **laminar-connectors** | All external connectors: Kafka, PostgreSQL CDC, MySQL CDC, MongoDB CDC, Delta Lake, Iceberg, WebSocket, OpenTelemetry (OTLP/gRPC), files, Postgres/Parquet lookup. Also the schema framework and serde layer. |
 | **laminar-db** | The main entry point. Ties everything together -- `StreamingCoordinator` pipeline, checkpoint coordination, recovery, FFI API. |
@@ -59,7 +59,7 @@ A few common starting points:
 - **Recovery manager**: `crates/laminar-db/src/recovery_manager.rs`
 - **Server HTTP API**: `crates/laminar-server/src/http.rs` -- REST endpoints
 - **FFI layer**: `crates/laminar-db/src/ffi/` -- C bindings for language interop
-- **Feature tracking**: `docs/features/INDEX.md` -- what's done, what's not
+- **Roadmap**: `docs/ROADMAP.md` -- phase timeline and feature status
 
 ## Feature flags
 
@@ -102,8 +102,8 @@ If you're not sure whether your code is on the hot path, it probably isn't. The 
 Run benchmarks before and after if you're touching performance-sensitive code:
 
 ```bash
-cargo bench --bench latency_bench     # End-to-end event latency (<10us target)
-cargo bench --bench streaming_bench   # Throughput per core (500K events/sec target)
+cargo bench --bench latency_bench     # End-to-end event latency (<10us mean target)
+cargo bench --bench streaming_bench   # Streaming channel / source throughput
 ```
 
 Benchmark suites live under `crates/*/benches/` -- see each crate for the full list.
@@ -124,7 +124,7 @@ cargo test -p laminar-sql test_parse_tumbling_window
 cargo test --all --features kafka,postgres-cdc,mysql-cdc
 
 # Benchmarks
-cargo bench --bench dag_bench
+cargo bench --bench streaming_bench
 ```
 
 We have ~2,700 tests across the workspace. If you're adding new functionality, please add tests. If you're fixing a bug, a regression test is always welcome.

@@ -4,7 +4,7 @@ SQL layer for LaminarDB with streaming extensions.
 
 ## Overview
 
-Streaming SQL extensions on top of sqlparser-rs: tumbling windows, session windows, watermarks, EMIT clauses, ASOF joins. DataFusion handles query planning and execution.
+Streaming SQL extensions on top of sqlparser-rs: tumbling windows, session windows, watermarks, EMIT clauses, ASOF joins, temporal probe joins. DataFusion handles query planning and execution.
 
 ## Key Modules
 
@@ -13,7 +13,7 @@ Streaming SQL extensions on top of sqlparser-rs: tumbling windows, session windo
 | `parser` | Streaming SQL parser: windows, emit, late data, joins, aggregation, analytics, ranking, DDL (CREATE SOURCE/STREAM/SINK/LOOKUP TABLE) |
 | `planner` | `StreamingPlanner` converts parsed SQL into `StreamingPlan` / `QueryPlan` |
 | `translator` | Operator config builders: window, join, analytic, order, having, DDL, ASOF join, temporal probe join |
-| `datafusion` | DataFusion integration: custom UDFs (tumble, hop, session, slide, first_value, last_value), aggregate bridge, `execute_streaming_sql`, watermark filter pushdown, PROCTIME() UDF, JSON functions, complex type functions |
+| `datafusion` | DataFusion integration: custom UDFs (tumble, hop, session, slide, first_value, last_value), aggregate bridge, `execute_streaming_sql`, PROCTIME() UDF, JSON functions, complex type functions |
 | `error` | User-friendly DataFusion error translation with `LDB-NNNN` codes |
 
 ## Streaming SQL Extensions

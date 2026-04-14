@@ -1,10 +1,23 @@
 # LaminarDB Benchmark Baselines
 
-**Date:** 2026-02-28
+**Date:** 2026-02-28 (historical — pre-dates the checkpoint/DAG dead-code removal in PRs #315/#316)
 **Commit:** `ac90086` (main)
 **Toolchain:** rustc 1.93.0 (stable)
 **Profile:** `release` (LTO=fat, codegen-units=1, opt-level=3)
 **Framework:** Criterion 0.8.1
+
+> **Note:** Several benchmark suites referenced below have since been
+> deleted along with their corresponding code paths. The remaining
+> suites are: `cache_bench`, `latency_bench`, `lookup_join_bench`,
+> `streaming_bench`, `window_bench` (laminar-core); `recovery_bench`,
+> `stream_executor_bench` (laminar-db); `mongodb_throughput`
+> (laminar-connectors). Numbers in the sections below that reference
+> `state_bench`, `wal_bench`, `reactor_bench`, `throughput_bench`,
+> `dag_bench`, `tpc_bench`, `compiler_bench`, `io_uring_bench`,
+> `subscription_bench`, `join_bench`, `delta_checkpoint_bench`, or
+> `checkpoint_bench` (laminar-core/storage) cannot be reproduced on
+> current `main`; they describe the older engine shape before the
+> DAG/TPC/Cranelift/WAL deletions.
 
 ## Hardware
 
@@ -246,37 +259,28 @@ is not yet measured. 14 of 18 benchmark suites were not run in this session
 
 ---
 
-## Benchmarks Not Run (This Session)
-
-The following benchmarks were not run due to disk space constraints or platform limitations:
-
-- `reactor_bench` — Reactor event loop overhead
-- `window_bench` — Window operator latency by type
-- `join_bench` — Join operator latency
-- `streaming_bench` — End-to-end streaming pipeline
-- `compiler_bench` — JIT compilation latency
-- `dag_bench` / `dag_stress` — DAG execution engine
-- `tpc_bench` — Thread-per-core multi-core scaling
-- `cache_bench` — Foyer S3-FIFO cache performance
-- `checkpoint_bench` (laminar-core) — Barrier/aligner performance
-- `subscription_bench` — Subscription fan-out
-- `lookup_join_bench` — Lookup join with reference tables
-- `io_uring_bench` — Linux-only, not applicable on Windows
-- `delta_checkpoint_bench` — Requires `delta` feature
-- `recovery_bench` (laminar-db) — End-to-end recovery
-
-## Reproducing
+## Reproducing (current `main`)
 
 ```bash
-# Core performance benchmarks
-cargo bench --bench state_bench
-cargo bench --bench latency_bench
-cargo bench --bench throughput_bench
+# laminar-core benchmarks
+cargo bench -p laminar-core --bench latency_bench
+cargo bench -p laminar-core --bench streaming_bench
+cargo bench -p laminar-core --bench window_bench
+cargo bench -p laminar-core --bench lookup_join_bench
+cargo bench -p laminar-core --bench cache_bench
 
-# Storage benchmarks
-cargo bench --bench wal_bench -p laminar-storage
-cargo bench --bench checkpoint_bench -p laminar-core
+# laminar-db benchmarks
+cargo bench -p laminar-db --bench recovery_bench
+cargo bench -p laminar-db --bench stream_executor_bench
 
-# All benchmarks (requires ~20GB free disk, Linux for io_uring)
+# laminar-connectors benchmarks
+cargo bench -p laminar-connectors --bench mongodb_throughput
+
+# All benchmarks
 cargo bench
 ```
+
+Numbers will vary with hardware. CI does not currently publish
+continuous benchmark tracking, so these baselines are a snapshot
+from a developer laptop rather than an up-to-date performance
+dashboard.

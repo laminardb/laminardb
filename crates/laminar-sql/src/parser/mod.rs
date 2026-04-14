@@ -149,7 +149,7 @@ impl StreamingParser {
             StreamingDdlKind::CreateMaterializedView { .. } => {
                 let mut parser =
                     sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
-                let stmt = parse_create_materialized_view(&mut parser)
+                let stmt = parse_create_materialized_view(&mut parser, sql_trimmed)
                     .map_err(parse_error_to_parser_error)?;
                 Ok(vec![stmt])
             }
@@ -441,7 +441,7 @@ fn parse_drop_materialized_view(
 /// Returns `ParseError` if the statement syntax is invalid.
 fn parse_create_stream(
     parser: &mut sqlparser::parser::Parser,
-    _original_sql: &str,
+    original_sql: &str,
 ) -> Result<StreamingStatement, ParseError> {
     parser
         .expect_keyword(sqlparser::keywords::Keyword::CREATE)
@@ -471,6 +471,8 @@ fn parse_create_stream(
     // Collect remaining tokens and split at EMIT boundary
     let remaining = collect_remaining_tokens(parser);
     let (query_tokens, emit_tokens) = split_at_emit(&remaining);
+
+    let query_sql = query_body_sql(original_sql, &query_tokens, &emit_tokens);
 
     let stream_dialect = LaminarDialect::default();
 
@@ -503,6 +505,44 @@ fn parse_create_stream(
         emit_clause,
         or_replace,
         if_not_exists,
+        query_sql,
+    })
+}
+
+/// Slice `original_sql` from the first query token to the start of EMIT
+/// (or end of input). Preserves custom streaming syntax that sqlparser's
+/// AST would drop. Falls back to joining token text if spans are empty.
+pub(super) fn query_body_sql(
+    original_sql: &str,
+    query_tokens: &[sqlparser::tokenizer::TokenWithSpan],
+    emit_tokens: &[sqlparser::tokenizer::TokenWithSpan],
+) -> String {
+    use sqlparser::tokenizer::Token;
+
+    let from_spans = || -> Option<String> {
+        let first = query_tokens
+            .iter()
+            .find(|t| !matches!(t.token, Token::EOF))?;
+        let start = location_to_byte_offset(original_sql, first.span.start)?;
+        let end = match emit_tokens.first() {
+            Some(t) => location_to_byte_offset(original_sql, t.span.start)?,
+            None => original_sql.len(),
+        };
+        let slice = original_sql.get(start..end)?;
+        Some(
+            slice
+                .trim_end_matches(|c: char| c.is_whitespace() || c == ';')
+                .to_string(),
+        )
+    };
+
+    from_spans().unwrap_or_else(|| {
+        query_tokens
+            .iter()
+            .take_while(|t| !matches!(t.token, Token::EOF))
+            .map(|t| t.token.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
     })
 }
 
@@ -736,6 +776,7 @@ fn parse_explain(
 /// Returns `ParseError` if the statement syntax is invalid.
 fn parse_create_materialized_view(
     parser: &mut sqlparser::parser::Parser,
+    original_sql: &str,
 ) -> Result<StreamingStatement, ParseError> {
     parser
         .expect_keyword(sqlparser::keywords::Keyword::CREATE)
@@ -771,6 +812,8 @@ fn parse_create_materialized_view(
     let remaining = collect_remaining_tokens(parser);
     let (query_tokens, emit_tokens) = split_at_emit(&remaining);
 
+    let query_sql = query_body_sql(original_sql, &query_tokens, &emit_tokens);
+
     let mv_dialect = LaminarDialect::default();
 
     let query = if query_tokens.is_empty() {
@@ -802,7 +845,28 @@ fn parse_create_materialized_view(
         emit_clause,
         or_replace,
         if_not_exists,
+        query_sql,
     })
+}
+
+/// Byte offset in `sql` for a sqlparser `Location` (1-indexed line/column).
+fn location_to_byte_offset(sql: &str, loc: sqlparser::tokenizer::Location) -> Option<usize> {
+    if loc.line == 0 {
+        return None;
+    }
+    let (mut line, mut col) = (1u64, 1u64);
+    for (idx, ch) in sql.char_indices() {
+        if line == loc.line && col == loc.column {
+            return Some(idx);
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line == loc.line && col == loc.column).then_some(sql.len())
 }
 
 /// Collect all remaining tokens from the parser into a Vec.
@@ -1452,5 +1516,84 @@ mod tests {
             }
             _ => panic!("Expected Show(CreateSink), got {stmt:?}"),
         }
+    }
+
+    #[test]
+    fn create_stream_preserves_temporal_probe_join() {
+        let sql = "CREATE STREAM markouts_long AS \
+                   SELECT t.s, p.offset_ms FROM trade_probe t \
+                   TEMPORAL PROBE JOIN price_ref r \
+                       ON (s) TIMESTAMPS (ts, ts) \
+                       LIST (0s, 1s, 5s, 30s) AS p";
+        let StreamingStatement::CreateStream { query_sql, .. } = parse_one(sql) else {
+            panic!("expected CreateStream");
+        };
+        assert!(
+            query_sql.to_uppercase().contains("TEMPORAL PROBE JOIN"),
+            "got: {query_sql}"
+        );
+        assert!(
+            query_sql.contains("LIST (0s, 1s, 5s, 30s)"),
+            "got: {query_sql}"
+        );
+        assert!(query_sql.contains("AS p"), "got: {query_sql}");
+    }
+
+    #[test]
+    fn create_stream_temporal_probe_range_step_preserved() {
+        let sql = "CREATE STREAM mk AS \
+                   SELECT s FROM trades t TEMPORAL PROBE JOIN prices r \
+                   ON (symbol) TIMESTAMPS (ts, ts) \
+                   RANGE FROM 0s TO 30s STEP 5s AS p";
+        let StreamingStatement::CreateStream { query_sql, .. } = parse_one(sql) else {
+            panic!("expected CreateStream");
+        };
+        assert!(
+            query_sql.contains("RANGE FROM 0s TO 30s STEP 5s"),
+            "got: {query_sql}"
+        );
+    }
+
+    #[test]
+    fn create_mv_preserves_temporal_probe_join() {
+        let sql = "CREATE MATERIALIZED VIEW mv AS \
+                   SELECT t.s FROM trades t TEMPORAL PROBE JOIN prices r \
+                   ON (s) TIMESTAMPS (ts, ts) LIST (0s, 5s) AS p";
+        let StreamingStatement::CreateMaterializedView { query_sql, .. } = parse_one(sql) else {
+            panic!("expected CreateMaterializedView");
+        };
+        assert!(
+            query_sql.to_uppercase().contains("TEMPORAL PROBE JOIN"),
+            "got: {query_sql}"
+        );
+    }
+
+    #[test]
+    fn create_stream_emit_is_not_captured_in_query_sql() {
+        let sql = "CREATE STREAM s AS SELECT COUNT(*) FROM events EMIT ON WINDOW CLOSE";
+        let StreamingStatement::CreateStream {
+            query_sql,
+            emit_clause,
+            ..
+        } = parse_one(sql)
+        else {
+            panic!("expected CreateStream");
+        };
+        assert_eq!(emit_clause, Some(EmitClause::OnWindowClose));
+        assert!(
+            !query_sql.to_uppercase().contains("EMIT"),
+            "got: {query_sql}"
+        );
+        assert!(query_sql.contains("FROM events"), "got: {query_sql}");
+    }
+
+    #[test]
+    fn create_stream_plain_select_query_sql_executes() {
+        let sql = "CREATE STREAM counts AS SELECT COUNT(*) AS c FROM events";
+        let StreamingStatement::CreateStream { query_sql, .. } = parse_one(sql) else {
+            panic!("expected CreateStream");
+        };
+        assert!(query_sql.to_uppercase().contains("SELECT"));
+        assert!(query_sql.contains("FROM events"));
     }
 }

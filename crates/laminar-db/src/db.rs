@@ -38,16 +38,6 @@ fn cache_entries_from_memory(mem: laminar_sql::parser::lookup_table::ByteSize) -
     (mem.as_bytes() / 256).max(1024) as usize
 }
 
-pub(crate) fn streaming_statement_to_sql(stmt: &StreamingStatement) -> String {
-    match stmt {
-        StreamingStatement::Standard(sql_stmt) => sql_stmt.to_string(),
-        StreamingStatement::CreateContinuousQuery { query, .. } => {
-            streaming_statement_to_sql(query)
-        }
-        other => format!("{other:?}"),
-    }
-}
-
 /// The main `LaminarDB` database handle.
 ///
 /// Provides a unified interface for SQL execution, data ingestion,
@@ -630,8 +620,9 @@ impl LaminarDB {
                 name,
                 query,
                 emit_clause,
+                query_sql,
                 ..
-            } => self.handle_create_stream(name, query, emit_clause.as_ref()),
+            } => self.handle_create_stream(name, query, emit_clause.as_ref(), query_sql),
             StreamingStatement::CreateContinuousQuery { .. }
             | StreamingStatement::CreateLookupTable(_)
             | StreamingStatement::DropLookupTable { .. } => self.handle_query(sql).await,
@@ -724,10 +715,18 @@ impl LaminarDB {
                 query,
                 or_replace,
                 if_not_exists,
+                query_sql,
                 ..
             } => {
-                self.handle_create_materialized_view(sql, name, query, *or_replace, *if_not_exists)
-                    .await
+                self.handle_create_materialized_view(
+                    sql,
+                    name,
+                    query,
+                    *or_replace,
+                    *if_not_exists,
+                    query_sql,
+                )
+                .await
             }
             StreamingStatement::AlterSource { name, operation } => {
                 self.handle_alter_source(name, operation)

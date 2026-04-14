@@ -103,13 +103,17 @@ fn strip_literals_and_comments(sql: &str) -> String {
 pub(crate) fn extract_table_references(sql: &str) -> FxHashSet<String> {
     let mut tables = FxHashSet::default();
     let dialect = GenericDialect {};
-    let Ok(statements) = Parser::parse_sql(&dialect, sql) else {
-        return tables;
-    };
-    for stmt in &statements {
-        if let Statement::Query(query) = stmt {
-            collect_tables_from_set_expr(query.body.as_ref(), &mut tables);
+    if let Ok(statements) = Parser::parse_sql(&dialect, sql) {
+        for stmt in &statements {
+            if let Statement::Query(query) = stmt {
+                collect_tables_from_set_expr(query.body.as_ref(), &mut tables);
+            }
         }
+    }
+    // sqlparser drops TEMPORAL PROBE JOIN; merge its tables from the detector.
+    if let (Some(config), _) = detect_temporal_probe_query(sql) {
+        tables.insert(config.left_table.clone());
+        tables.insert(config.right_table.clone());
     }
     tables
 }
@@ -1809,6 +1813,17 @@ mod tests {
         );
         assert!(refs.contains("events"), "got {refs:?}");
         assert!(refs.contains("dim"), "got {refs:?}");
+    }
+
+    #[test]
+    fn extract_table_refs_temporal_probe_join() {
+        let refs = extract_table_references(
+            "SELECT t.s FROM trades t \
+             TEMPORAL PROBE JOIN prices r ON (s) TIMESTAMPS (ts, ts) \
+             LIST (0s, 5s) AS p",
+        );
+        assert!(refs.contains("trades"), "got {refs:?}");
+        assert!(refs.contains("prices"), "got {refs:?}");
     }
 
     #[test]

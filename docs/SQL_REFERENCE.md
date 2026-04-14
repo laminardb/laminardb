@@ -462,4 +462,4 @@ window functions compose correctly against any precision.
 
 ---
 
-*This reference is based on LaminarDB v0.20.1 with DataFusion 52.x and Arrow 57.x. Contributions and corrections welcome — please open an issue or PR.*
+*This reference is based on LaminarDB v0.20.2 with DataFusion 52.x and Arrow 57.x. Contributions and corrections welcome — please open an issue or PR.*
