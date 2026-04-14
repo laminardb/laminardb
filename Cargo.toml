@@ -41,7 +41,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4"
 
 # Allocators
-tikv-jemallocator = "0.6"  # jemalloc for reduced fragmentation in Ring 1/2 (Unix)
+tikv-jemallocator = { version = "0.6", features = [
+    "unprefixed_malloc_on_supported_platforms",
+    "background_threads",
+    "profiling",
+] }  # jemalloc: unprefixed interposes libc malloc for C deps (librdkafka, OpenSSL, glibc)
 mimalloc = { version = "0.1", default-features = false }  # mimalloc for Windows MSVC
 
 # Performance-critical
