@@ -438,15 +438,10 @@ pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperator
                 tracing::warn!("cumulate window size is zero or negative, EOWC filtering disabled");
                 return watermark_ms;
             }
-            // Same offset-aware floor as Tumbling
             let offset = config.offset_ms;
-            let adjusted = watermark_ms - offset;
-            let floored = if adjusted >= 0 {
-                (adjusted / size) * size
-            } else {
-                ((adjusted - size + 1) / size) * size
-            };
-            floored + offset
+            let adjusted = watermark_ms.saturating_sub(offset);
+            let floored = adjusted.div_euclid(size).saturating_mul(size);
+            floored.saturating_add(offset)
         }
     }
 }
@@ -1064,27 +1059,33 @@ fn parse_pair(toks: &[&TokenWithSpan], i: &mut usize) -> Option<(String, String)
 // `0s` / `-5s` tokenize as Number + Word / Minus + Number + Word; Display
 // concatenation reassembles the literal for `parse_interval_to_ms`.
 fn token_text(toks: &[&TokenWithSpan], start: usize, end: usize) -> String {
-    toks[start..end].iter().map(|t| t.token.to_string()).collect()
+    toks[start..end]
+        .iter()
+        .map(|t| t.token.to_string())
+        .collect()
 }
 
-fn parse_list(toks: &[&TokenWithSpan], i: &mut usize) -> Option<laminar_sql::translator::ProbeOffsetSpec> {
+fn parse_list(
+    toks: &[&TokenWithSpan],
+    i: &mut usize,
+) -> Option<laminar_sql::translator::ProbeOffsetSpec> {
     expect(toks, i, &Token::LParen)?;
     let mut items = Vec::new();
     let mut item_start = *i;
     loop {
         match &toks.get(*i)?.token {
             Token::Comma => {
-                items.push(laminar_sql::translator::parse_interval_to_ms(
-                    &token_text(toks, item_start, *i),
-                )?);
+                items.push(laminar_sql::translator::parse_interval_to_ms(&token_text(
+                    toks, item_start, *i,
+                ))?);
                 *i += 1;
                 item_start = *i;
             }
             Token::RParen => {
                 if *i > item_start {
-                    items.push(laminar_sql::translator::parse_interval_to_ms(
-                        &token_text(toks, item_start, *i),
-                    )?);
+                    items.push(laminar_sql::translator::parse_interval_to_ms(&token_text(
+                        toks, item_start, *i,
+                    ))?);
                 }
                 *i += 1;
                 break;
@@ -1095,7 +1096,10 @@ fn parse_list(toks: &[&TokenWithSpan], i: &mut usize) -> Option<laminar_sql::tra
     (!items.is_empty()).then_some(laminar_sql::translator::ProbeOffsetSpec::List(items))
 }
 
-fn parse_range(toks: &[&TokenWithSpan], i: &mut usize) -> Option<laminar_sql::translator::ProbeOffsetSpec> {
+fn parse_range(
+    toks: &[&TokenWithSpan],
+    i: &mut usize,
+) -> Option<laminar_sql::translator::ProbeOffsetSpec> {
     if kw_at(toks, *i, "FROM") {
         *i += 1;
     }

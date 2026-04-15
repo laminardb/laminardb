@@ -1,6 +1,8 @@
 //! Prometheus metrics for the streaming engine.
 
-use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, IntGaugeVec, Opts, Registry};
+use prometheus::{
+    Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+};
 
 /// Pipeline metrics registered on an explicit prometheus `Registry`.
 ///
@@ -33,6 +35,10 @@ pub struct EngineMetrics {
     pub source_watermark_ms: IntGaugeVec,
     /// Per-stream watermark (epoch-ms). Label: `stream`.
     pub stream_watermark_ms: IntGaugeVec,
+    /// Per-stream input-port buffered bytes. Label: `stream`.
+    pub input_buf_bytes: IntGaugeVec,
+    /// Per-stream rows shed by the `ShedOldest` policy. Label: `stream`.
+    pub shed_records_total: IntCounterVec,
     /// Completed checkpoints.
     pub checkpoints_completed: IntCounter,
     /// Failed checkpoints.
@@ -122,6 +128,16 @@ impl EngineMetrics {
             .unwrap()),
             stream_watermark_ms: reg!(IntGaugeVec::new(
                 Opts::new("stream_watermark_ms", "Per-stream watermark (epoch-ms)"),
+                &["stream"],
+            )
+            .unwrap()),
+            input_buf_bytes: reg!(IntGaugeVec::new(
+                Opts::new("input_buf_bytes", "Per-stream input buffer bytes"),
+                &["stream"],
+            )
+            .unwrap()),
+            shed_records_total: reg!(IntCounterVec::new(
+                Opts::new("shed_records_total", "Rows shed by ShedOldest policy"),
                 &["stream"],
             )
             .unwrap()),

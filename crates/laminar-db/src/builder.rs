@@ -209,13 +209,27 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Per-port operator input-buffer cap, in batches (default 256). `0` is
-    /// "unlimited" — disables the credit gate and the drain-halt signal, so
-    /// a wedged downstream lets `source_batches_buf` grow without bound. Use
-    /// only in tests; production code should leave the cap finite.
+    /// Per-port operator input-buffer cap in batches (default 256).
     #[must_use]
     pub fn pipeline_max_input_buf_batches(mut self, batches: usize) -> Self {
         self.config.pipeline_max_input_buf_batches = Some(batches);
+        self
+    }
+
+    /// Per-port operator input-buffer cap in bytes.
+    #[must_use]
+    pub fn pipeline_max_input_buf_bytes(mut self, bytes: usize) -> Self {
+        self.config.pipeline_max_input_buf_bytes = Some(bytes);
+        self
+    }
+
+    /// Backpressure policy (default `Backpressure`).
+    #[must_use]
+    pub fn pipeline_backpressure_policy(
+        mut self,
+        policy: crate::config::BackpressurePolicy,
+    ) -> Self {
+        self.config.pipeline_backpressure_policy = policy;
         self
     }
 
@@ -268,6 +282,8 @@ impl LaminarDbBuilder {
             .validate_config(&self.config, self.config.object_store_url.as_deref())
             .map_err(|e| DbError::Config(e.to_string()))?;
 
+        Self::validate_backpressure(&self.config)?;
+
         // Apply profile defaults for fields the user hasn't set.
         self.profile.apply_defaults(&mut self.config);
 
@@ -282,6 +298,37 @@ impl LaminarDbBuilder {
             db.register_custom_udaf(udaf);
         }
         Ok(db)
+    }
+
+    fn validate_backpressure(config: &LaminarConfig) -> Result<(), DbError> {
+        use crate::config::BackpressurePolicy;
+        use laminar_connectors::connector::DeliveryGuarantee;
+
+        let policy = config.pipeline_backpressure_policy;
+        if policy == BackpressurePolicy::Backpressure {
+            return Ok(());
+        }
+
+        // Non-default policy needs at least one finite cap to do anything.
+        let has_count_cap = config.pipeline_max_input_buf_batches.is_none_or(|c| c > 0);
+        let has_byte_cap = config.pipeline_max_input_buf_bytes.is_some();
+        if !has_count_cap && !has_byte_cap {
+            return Err(DbError::Config(format!(
+                "backpressure_policy={policy:?} requires at least one of \
+                 pipeline_max_input_buf_batches (>0) or pipeline_max_input_buf_bytes"
+            )));
+        }
+
+        if policy == BackpressurePolicy::ShedOldest
+            && config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce
+        {
+            return Err(DbError::Config(
+                "ShedOldest drops data; it is incompatible with exactly-once \
+                 delivery. Use Backpressure or Fail, or downgrade the guarantee."
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -317,6 +364,44 @@ mod tests {
     #[tokio::test]
     async fn test_default_builder() {
         let db = LaminarDbBuilder::new().build().await.unwrap();
+        assert!(!db.is_closed());
+    }
+
+    #[tokio::test]
+    async fn test_shed_oldest_requires_cap() {
+        use crate::config::BackpressurePolicy;
+        let err = LaminarDbBuilder::new()
+            .pipeline_backpressure_policy(BackpressurePolicy::ShedOldest)
+            .pipeline_max_input_buf_batches(0)
+            .build()
+            .await
+            .expect_err("ShedOldest with no caps must be rejected");
+        assert!(err.to_string().contains("requires at least one"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_shed_oldest_rejects_exactly_once() {
+        use crate::config::BackpressurePolicy;
+        use laminar_connectors::connector::DeliveryGuarantee;
+        let err = LaminarDbBuilder::new()
+            .pipeline_backpressure_policy(BackpressurePolicy::ShedOldest)
+            .pipeline_max_input_buf_batches(64)
+            .delivery_guarantee(DeliveryGuarantee::ExactlyOnce)
+            .build()
+            .await
+            .expect_err("ShedOldest + ExactlyOnce must be rejected");
+        assert!(err.to_string().contains("exactly-once"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_valid_shed_oldest_builds() {
+        use crate::config::BackpressurePolicy;
+        let db = LaminarDbBuilder::new()
+            .pipeline_backpressure_policy(BackpressurePolicy::ShedOldest)
+            .pipeline_max_input_buf_batches(64)
+            .build()
+            .await
+            .unwrap();
         assert!(!db.is_closed());
     }
 

@@ -7,6 +7,18 @@ use std::path::PathBuf;
 use laminar_connectors::connector::DeliveryGuarantee;
 use laminar_core::streaming::{BackpressureStrategy, StreamCheckpointConfig};
 
+/// What to do when an operator's input buffer exceeds its cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackpressurePolicy {
+    /// Defer the producer; sources block on `send`. No data loss.
+    #[default]
+    Backpressure,
+    /// Drop oldest batches; counted in `shed_records_total`.
+    ShedOldest,
+    /// Error out the cycle.
+    Fail,
+}
+
 /// How unquoted SQL identifiers are matched against Arrow schema field names.
 ///
 /// Defaults to `CaseSensitive` so mixed-case columns from external sources
@@ -79,8 +91,12 @@ pub struct LaminarConfig {
     pub pipeline_drain_budget_ns: Option<u64>,
     /// Per-query budget (ns). `None` = 8ms.
     pub pipeline_query_budget_ns: Option<u64>,
-    /// Per-port operator input-buffer cap (batches). `None` = 256, `0` = unlimited.
+    /// Per-port operator input-buffer cap (batches). `None` = 256.
     pub pipeline_max_input_buf_batches: Option<usize>,
+    /// Per-port operator input-buffer cap (bytes). `None` = disabled.
+    pub pipeline_max_input_buf_bytes: Option<usize>,
+    /// Backpressure policy. See [`BackpressurePolicy`].
+    pub pipeline_backpressure_policy: BackpressurePolicy,
 }
 
 impl Default for LaminarConfig {
@@ -101,6 +117,8 @@ impl Default for LaminarConfig {
             pipeline_drain_budget_ns: None,
             pipeline_query_budget_ns: None,
             pipeline_max_input_buf_batches: None,
+            pipeline_max_input_buf_bytes: None,
+            pipeline_backpressure_policy: BackpressurePolicy::default(),
         }
     }
 }

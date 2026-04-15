@@ -1037,10 +1037,9 @@ impl LaminarDB {
             drain_budget_ns,
             query_budget_ns,
             background_budget_ns: 5_000_000, // 5ms
-            max_input_buf_batches: self
-                .config
-                .pipeline_max_input_buf_batches
-                .unwrap_or(256),
+            max_input_buf_batches: self.config.pipeline_max_input_buf_batches.unwrap_or(256),
+            max_input_buf_bytes: self.config.pipeline_max_input_buf_bytes,
+            backpressure_policy: self.config.pipeline_backpressure_policy,
         };
 
         // Validate delivery guarantee constraints.
@@ -1112,6 +1111,8 @@ impl LaminarDB {
         // Wire per-query budget and input buffer cap from pipeline config.
         graph.set_query_budget_ns(pipeline_config.query_budget_ns);
         graph.set_max_input_buf_batches(pipeline_config.max_input_buf_batches);
+        graph.set_max_input_buf_bytes(pipeline_config.max_input_buf_bytes);
+        graph.set_backpressure_policy(pipeline_config.backpressure_policy);
 
         let prom = self
             .engine_metrics
@@ -1147,6 +1148,7 @@ impl LaminarDB {
             serialization_timeout: std::time::Duration::from_secs(120),
             sink_event_rx,
             sink_timed_out: false,
+            shutdown_signal: Arc::clone(&self.shutdown_signal),
         };
 
         // Start the streaming coordinator on a dedicated compute thread.

@@ -11,6 +11,7 @@ use laminar_sql::datafusion::live_source::{LiveSourceHandle, LiveSourceProvider}
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
+use crate::config::BackpressurePolicy;
 use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
 use crate::sql_analysis::{
@@ -44,6 +45,14 @@ pub(crate) trait GraphOperator: Send {
 pub(crate) struct OperatorCheckpoint {
     pub data: Vec<u8>,
 }
+
+enum GateDecision {
+    Run,
+    Skip,
+    Fail,
+}
+
+const STATS_SAMPLE_INTERVAL: u64 = 32;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct GraphCheckpoint {
@@ -178,21 +187,24 @@ pub(crate) struct OperatorGraph {
     topo_order: Vec<usize>,
     topo_dirty: bool,
     source_map: FxHashMap<Arc<str>, usize>,
+    source_list: Vec<(Arc<str>, usize)>,
     /// Cached set of source node IDs for O(1) lookup in `execute_single_operator`.
     source_node_ids: FxHashSet<usize>,
     output_map: FxHashMap<Arc<str>, usize>,
     input_bufs: Vec<Vec<Vec<RecordBatch>>>,
+    input_buf_bytes: Vec<Vec<usize>>,
     /// Per-node, per-input-port upstream node id. `input_sources[node][port] = upstream_node`.
     input_sources: Vec<Vec<usize>>,
     /// Per-node output watermark, set during `execute_cycle`.
     output_watermarks: Vec<i64>,
-    /// Maximum batches per input port before shedding. Prevents unbounded
-    /// fan-out growth within a single cycle. `0` means unlimited (default).
     max_input_buf_batches: usize,
+    max_input_buf_bytes: Option<usize>,
+    backpressure_policy: BackpressurePolicy,
     query_budget_ns: u64,
     /// Round-robin offset for deferred operator selection. Ensures fair
     /// scheduling when budget is continuously exceeded (not checkpointed).
     deferred_scan_offset: usize,
+    stats_tick: u64,
     max_state_bytes: Option<usize>,
     ctx: SessionContext,
     prom: Option<Arc<EngineMetrics>>,
@@ -215,14 +227,19 @@ impl OperatorGraph {
             topo_order: Vec::new(),
             topo_dirty: true,
             source_map: FxHashMap::default(),
+            source_list: Vec::new(),
             source_node_ids: FxHashSet::default(),
             output_map: FxHashMap::default(),
             input_bufs: Vec::new(),
+            input_buf_bytes: Vec::new(),
             input_sources: Vec::new(),
             output_watermarks: Vec::new(),
             max_input_buf_batches: 0,
+            max_input_buf_bytes: None,
+            backpressure_policy: BackpressurePolicy::default(),
             query_budget_ns: 8_000_000,
             deferred_scan_offset: 0,
+            stats_tick: 0,
             max_state_bytes: None,
             ctx,
             prom: None,
@@ -243,6 +260,14 @@ impl OperatorGraph {
         self.max_input_buf_batches = cap;
     }
 
+    pub fn set_max_input_buf_bytes(&mut self, cap: Option<usize>) {
+        self.max_input_buf_bytes = cap;
+    }
+
+    pub fn set_backpressure_policy(&mut self, policy: BackpressurePolicy) {
+        self.backpressure_policy = policy;
+    }
+
     pub fn set_query_budget_ns(&mut self, ns: u64) {
         self.query_budget_ns = ns;
     }
@@ -254,17 +279,34 @@ impl OperatorGraph {
     #[allow(clippy::cast_precision_loss)]
     pub fn input_buf_pressure(&self) -> f64 {
         let cap = self.max_input_buf_batches;
-        if cap == 0 {
-            return 0.0;
-        }
-        let max_len = self
-            .input_bufs
-            .iter()
-            .flat_map(|ports| ports.iter())
-            .map(Vec::len)
-            .max()
-            .unwrap_or(0);
-        (max_len as f64 / cap as f64).min(1.0)
+        let max_bytes = self.max_input_buf_bytes;
+
+        let count_ratio = if cap > 0 {
+            let max_len = self
+                .input_bufs
+                .iter()
+                .flat_map(|ports| ports.iter())
+                .map(Vec::len)
+                .max()
+                .unwrap_or(0);
+            max_len as f64 / cap as f64
+        } else {
+            0.0
+        };
+
+        let bytes_ratio = if let Some(max) = max_bytes {
+            let max_bytes_used = self
+                .input_buf_bytes
+                .iter()
+                .flat_map(|ports| ports.iter().copied())
+                .max()
+                .unwrap_or(0);
+            max_bytes_used as f64 / max as f64
+        } else {
+            0.0
+        };
+
+        count_ratio.max(bytes_ratio).min(1.0)
     }
 
     pub fn has_pending_input(&self) -> bool {
@@ -281,16 +323,110 @@ impl OperatorGraph {
         self.lookup_registry = Some(registry);
     }
 
-    /// True if any of this node's output ports is at or above the buffer cap.
-    fn is_downstream_full(&self, node_id: usize) -> bool {
+    fn is_downstream_at_capacity(&self, node_id: usize) -> bool {
         let cap = self.max_input_buf_batches;
-        if cap == 0 {
+        let max_bytes = self.max_input_buf_bytes;
+        if cap == 0 && max_bytes.is_none() {
             return false;
         }
         self.nodes[node_id]
             .output_routes
             .iter()
-            .any(|&(target, port)| self.input_bufs[target][port as usize].len() >= cap)
+            .any(|&(target, port)| {
+                let p = port as usize;
+                let over_count = cap > 0 && self.input_bufs[target][p].len() >= cap;
+                let over_bytes =
+                    max_bytes.is_some_and(|max| self.input_buf_bytes[target][p] >= max);
+                over_count || over_bytes
+            })
+    }
+
+    fn shed_to_cap(&mut self, target: usize, port: u8) -> usize {
+        if !matches!(self.backpressure_policy, BackpressurePolicy::ShedOldest) {
+            return 0;
+        }
+        let cap = self.max_input_buf_batches;
+        let max_bytes = self.max_input_buf_bytes;
+        let p = port as usize;
+
+        let mut drop_n = if cap > 0 && self.input_bufs[target][p].len() > cap {
+            self.input_bufs[target][p].len() - cap
+        } else {
+            0
+        };
+        if let Some(max) = max_bytes {
+            let buf = &self.input_bufs[target][p];
+            let mut remaining = self.input_buf_bytes[target][p];
+            for b in buf.iter().take(drop_n) {
+                remaining = remaining.saturating_sub(b.get_array_memory_size());
+            }
+            while remaining > max && drop_n < buf.len() {
+                remaining = remaining.saturating_sub(buf[drop_n].get_array_memory_size());
+                drop_n += 1;
+            }
+        }
+        if drop_n == 0 {
+            return 0;
+        }
+        let mut bytes_removed = 0usize;
+        let rows: usize = self.input_bufs[target][p]
+            .drain(..drop_n)
+            .map(|b| {
+                bytes_removed += b.get_array_memory_size();
+                b.num_rows()
+            })
+            .sum();
+        let slot = &mut self.input_buf_bytes[target][p];
+        *slot = slot.saturating_sub(bytes_removed);
+        rows
+    }
+
+    fn gate_decision(&self, node_id: usize) -> GateDecision {
+        if !self.is_downstream_at_capacity(node_id) {
+            return GateDecision::Run;
+        }
+        match self.backpressure_policy {
+            BackpressurePolicy::Backpressure => GateDecision::Skip,
+            BackpressurePolicy::Fail => GateDecision::Fail,
+            BackpressurePolicy::ShedOldest => GateDecision::Run,
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_byte_sums(&self) {
+        for (id, ports) in self.input_bufs.iter().enumerate() {
+            for (port, buf) in ports.iter().enumerate() {
+                let actual: usize = buf.iter().map(RecordBatch::get_array_memory_size).sum();
+                debug_assert_eq!(
+                    self.input_buf_bytes[id][port], actual,
+                    "input_buf_bytes drift at node={} port={}",
+                    &*self.nodes[id].name, port,
+                );
+            }
+        }
+    }
+
+    fn push_to_port(&mut self, target: usize, port: u8, batches: Vec<RecordBatch>, bytes: usize) {
+        let buf = &mut self.input_bufs[target][port as usize];
+        if buf.is_empty() {
+            *buf = batches;
+        } else {
+            buf.extend(batches);
+        }
+        self.input_buf_bytes[target][port as usize] += bytes;
+        self.record_shed(target, port);
+    }
+
+    fn record_shed(&mut self, target: usize, port: u8) {
+        let rows = self.shed_to_cap(target, port);
+        if rows == 0 {
+            return;
+        }
+        if let Some(ref prom) = self.prom {
+            prom.shed_records_total
+                .with_label_values(&[&self.nodes[target].name])
+                .inc_by(rows as u64);
+        }
     }
 
     pub fn register_source_schema(&mut self, name: String, schema: SchemaRef) {
@@ -344,6 +480,7 @@ impl OperatorGraph {
             removed: false,
         });
         self.input_bufs.push(vec![Vec::new()]);
+        self.input_buf_bytes.push(vec![0]);
         self.input_sources.push(vec![usize::MAX]); // source nodes: no upstream
         self.output_watermarks.push(i64::MIN);
         self.source_map.insert(name, node_id);
@@ -361,6 +498,7 @@ impl OperatorGraph {
             removed: false,
         });
         self.input_bufs.push(vec![Vec::new()]);
+        self.input_buf_bytes.push(vec![0]);
         self.input_sources.push(vec![usize::MAX]);
         self.output_watermarks.push(i64::MIN);
         self.add_edge(source_id, node_id, 0);
@@ -592,6 +730,7 @@ impl OperatorGraph {
             self.nodes[placeholder_id].operator = operator;
             self.nodes[placeholder_id].input_port_count = input_port_count;
             self.input_bufs[placeholder_id] = vec![Vec::new(); input_port_count];
+            self.input_buf_bytes[placeholder_id] = vec![0; input_port_count];
             self.input_sources[placeholder_id] = vec![usize::MAX; input_port_count];
             self.source_map.remove(name.as_str());
             // Clear source classification so output_watermarks updates per run.
@@ -656,6 +795,7 @@ impl OperatorGraph {
             removed: false,
         });
         self.input_bufs.push(vec![Vec::new(); input_port_count]);
+        self.input_buf_bytes.push(vec![0; input_port_count]);
         self.input_sources.push(vec![usize::MAX; input_port_count]);
         self.output_watermarks.push(i64::MIN);
 
@@ -788,6 +928,9 @@ impl OperatorGraph {
             for port_buf in &mut self.input_bufs[id] {
                 port_buf.clear();
             }
+            for slot in &mut self.input_buf_bytes[id] {
+                *slot = 0;
+            }
             self.order_configs.remove(&id);
             self.depends_on_stream.remove(&id);
             self.edges.retain(|e| e.source != id && e.target != id);
@@ -865,6 +1008,10 @@ impl OperatorGraph {
             }
         }
 
+        self.source_list.clear();
+        self.source_list
+            .extend(self.source_map.iter().map(|(k, v)| (Arc::clone(k), *v)));
+
         self.topo_dirty = false;
     }
 
@@ -899,6 +1046,7 @@ impl OperatorGraph {
         results: &mut FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<(), DbError> {
         let inputs = std::mem::take(&mut self.input_bufs[node_id]);
+        let input_bytes = std::mem::take(&mut self.input_buf_bytes[node_id]);
 
         let port_count = self.nodes[node_id].input_port_count;
         let watermarks: smallvec::SmallVec<[i64; 2]> = (0..port_count)
@@ -911,7 +1059,6 @@ impl OperatorGraph {
                 }
             })
             .collect();
-
 
         let output_result = self.nodes[node_id]
             .operator
@@ -938,12 +1085,14 @@ impl OperatorGraph {
             Ok(b) => {
                 let port_count = self.nodes[node_id].input_port_count;
                 self.input_bufs[node_id] = vec![Vec::new(); port_count];
+                self.input_buf_bytes[node_id] = vec![0; port_count];
                 b
             }
             Err(e) => {
                 if self.depends_on_stream.contains(&node_id) {
                     // Put batches back so they're retried next cycle.
                     self.input_bufs[node_id] = inputs;
+                    self.input_buf_bytes[node_id] = input_bytes;
                     tracing::debug!(
                         query = %self.nodes[node_id].name,
                         error = %e,
@@ -953,6 +1102,7 @@ impl OperatorGraph {
                 }
                 let port_count = self.nodes[node_id].input_port_count;
                 self.input_bufs[node_id] = vec![Vec::new(); port_count];
+                self.input_buf_bytes[node_id] = vec![0; port_count];
                 return Err(e);
             }
         };
@@ -1007,26 +1157,25 @@ impl OperatorGraph {
                 results.insert(node_name, batches.clone());
             }
 
-            // Cap is enforced upstream via `is_downstream_full`; never shed here.
             let routes = self.nodes[node_id].output_routes.clone();
+            let bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
             if routes.len() == 1 {
                 let (target, port) = routes[0];
-                let buf = &mut self.input_bufs[target][port as usize];
-                if buf.is_empty() {
-                    *buf = batches;
-                } else {
-                    buf.extend(batches);
-                }
+                self.push_to_port(target, port, batches, bytes);
             } else if routes.len() > 1 {
-                for &(target, port) in &routes {
-                    self.input_bufs[target][port as usize].extend(batches.iter().cloned());
+                let last = routes.len() - 1;
+                for &(target, port) in &routes[..last] {
+                    self.push_to_port(target, port, batches.clone(), bytes);
                 }
+                let (target, port) = routes[last];
+                self.push_to_port(target, port, batches, bytes);
             }
         }
 
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn execute_cycle(
         &mut self,
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
@@ -1039,12 +1188,12 @@ impl OperatorGraph {
 
         self.register_source_tables(source_batches);
 
-        // Extend (not overwrite): if downstream is full this cycle, data
-        // stays buffered here and drives the pressure signal upstream.
-        for (name, &node_id) in &self.source_map {
+        for &(ref name, node_id) in &self.source_list {
             if let Some(batches) = source_batches.get(name) {
                 if !batches.is_empty() {
+                    let bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
                     self.input_bufs[node_id][0].extend(batches.iter().cloned());
+                    self.input_buf_bytes[node_id][0] += bytes;
                 }
             }
             let wm = source_watermarks
@@ -1052,9 +1201,7 @@ impl OperatorGraph {
                 .unwrap_or(current_watermark);
             self.output_watermarks[node_id] = wm;
             if let Some(ref prom) = self.prom {
-                prom.stream_watermark_ms
-                    .with_label_values(&[name])
-                    .set(wm);
+                prom.stream_watermark_ms.with_label_values(&[name]).set(wm);
             }
         }
 
@@ -1069,13 +1216,16 @@ impl OperatorGraph {
                 continue;
             }
 
-            // Credit gate: defer when downstream is at cap; data stays buffered.
-            if self.is_downstream_full(node_id) {
-                tracing::trace!(
-                    node = %self.nodes[node_id].name,
-                    "deferred — downstream at cap"
-                );
-                continue;
+            match self.gate_decision(node_id) {
+                GateDecision::Run => {}
+                GateDecision::Skip => continue,
+                GateDecision::Fail => {
+                    self.finish_cycle();
+                    return Err(DbError::BackpressureFail(format!(
+                        "input buffer at capacity downstream of '{}'",
+                        self.nodes[node_id].name
+                    )));
+                }
             }
 
             // Budget check
@@ -1106,8 +1256,16 @@ impl OperatorGraph {
                         if !has_input {
                             continue;
                         }
-                        if self.is_downstream_full(deferred_id) {
-                            continue;
+                        match self.gate_decision(deferred_id) {
+                            GateDecision::Skip => continue,
+                            GateDecision::Fail => {
+                                self.finish_cycle();
+                                return Err(DbError::BackpressureFail(format!(
+                                    "input buffer at capacity downstream of '{}'",
+                                    self.nodes[deferred_id].name
+                                )));
+                            }
+                            GateDecision::Run => {}
                         }
                         if let Err(e) = self
                             .execute_single_operator(deferred_id, current_watermark, &mut results)
@@ -1134,6 +1292,25 @@ impl OperatorGraph {
         }
 
         self.finish_cycle();
+
+        #[cfg(debug_assertions)]
+        self.debug_assert_byte_sums();
+
+        self.stats_tick = self.stats_tick.wrapping_add(1);
+        if self.stats_tick.is_multiple_of(STATS_SAMPLE_INTERVAL) {
+            if let Some(ref prom) = self.prom {
+                for (id, ports) in self.input_buf_bytes.iter().enumerate() {
+                    if self.nodes[id].removed {
+                        continue;
+                    }
+                    let total: usize = ports.iter().sum();
+                    prom.input_buf_bytes
+                        .with_label_values(&[&self.nodes[id].name])
+                        .set(i64::try_from(total).unwrap_or(i64::MAX));
+                }
+            }
+        }
+
         Ok(results)
     }
 
@@ -1954,7 +2131,7 @@ mod tests {
         );
         // Push some data into the source buffer
         if let Some(&node_id) = graph.source_map.get("trades") {
-            graph.input_bufs[node_id][0] = vec![test_batch(); 10];
+            prefill_port(&mut graph, node_id, 0, vec![test_batch(); 10]);
         }
         assert!((graph.input_buf_pressure() - 0.0).abs() < f64::EPSILON);
     }
@@ -1973,7 +2150,7 @@ mod tests {
         );
         // Fill source buffer to 50% of cap
         if let Some(&node_id) = graph.source_map.get("trades") {
-            graph.input_bufs[node_id][0] = vec![test_batch(); 50];
+            prefill_port(&mut graph, node_id, 0, vec![test_batch(); 50]);
         }
         assert!((graph.input_buf_pressure() - 0.5).abs() < f64::EPSILON);
     }
@@ -1992,7 +2169,7 @@ mod tests {
         );
         // Overfill the buffer beyond cap — pressure clamps at 1.0.
         if let Some(&node_id) = graph.source_map.get("trades") {
-            graph.input_bufs[node_id][0] = vec![test_batch(); 20];
+            prefill_port(&mut graph, node_id, 0, vec![test_batch(); 20]);
         }
         assert!((graph.input_buf_pressure() - 1.0).abs() < f64::EPSILON);
     }
@@ -2031,12 +2208,12 @@ mod tests {
         // Find the downstream node id and pre-fill its input buffer at cap,
         // simulating a slow consumer.
         let downstream_id = *graph.output_map.get("downstream").unwrap();
-        graph.input_bufs[downstream_id][0] = vec![test_batch(); 4];
+        prefill_port(&mut graph, downstream_id, 0, vec![test_batch(); 4]);
 
         let proj_id = *graph.output_map.get("proj").unwrap();
         assert!(
-            graph.is_downstream_full(proj_id),
-            "proj's downstream should register as full at cap"
+            graph.is_downstream_at_capacity(proj_id),
+            "proj's downstream should register as at capacity"
         );
 
         // Run a cycle with trade input. proj must be deferred because its
@@ -2114,7 +2291,7 @@ mod tests {
 
         // Cycle 1: sink's input pre-filled to cap, trades deferred, trades
         // input extended by 1.
-        graph.input_bufs[sink_id][0] = vec![test_batch(); 2];
+        prefill_port(&mut graph, sink_id, 0, vec![test_batch(); 2]);
         let _ = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
         assert_eq!(
             graph.input_bufs[source_id][0].len(),
@@ -2124,7 +2301,7 @@ mod tests {
 
         // Cycle 2: re-fill sink to cap so trades stays deferred; trades input
         // must grow from 1 to 2 (extend, not clone_from).
-        graph.input_bufs[sink_id][0] = vec![test_batch(); 2];
+        prefill_port(&mut graph, sink_id, 0, vec![test_batch(); 2]);
         let _ = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
         assert_eq!(
             graph.input_bufs[source_id][0].len(),
@@ -2280,5 +2457,123 @@ mod tests {
             total_rows > 0,
             "should produce matches from prefiltered self-join"
         );
+    }
+
+    fn prefill_port(
+        graph: &mut OperatorGraph,
+        node: usize,
+        port: usize,
+        batches: Vec<RecordBatch>,
+    ) {
+        let bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+        graph.input_bufs[node][port] = batches;
+        graph.input_buf_bytes[node][port] = bytes;
+    }
+
+    fn producer_consumer_graph(policy: BackpressurePolicy, cap: usize) -> (OperatorGraph, usize) {
+        let mut graph = test_graph();
+        graph.set_max_input_buf_batches(cap);
+        graph.set_backpressure_policy(policy);
+        graph.add_query(
+            "producer".to_string(),
+            "SELECT symbol, price FROM trades".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        graph.add_query(
+            "consumer".to_string(),
+            "SELECT symbol FROM producer".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let consumer_id = *graph.output_map.get("consumer").unwrap();
+        prefill_port(&mut graph, consumer_id, 0, vec![test_batch(); cap]);
+        (graph, consumer_id)
+    }
+
+    fn trades_source() -> FxHashMap<Arc<str>, Vec<RecordBatch>> {
+        let mut s = FxHashMap::default();
+        s.insert(Arc::from("trades"), vec![test_batch()]);
+        s
+    }
+
+    #[tokio::test]
+    async fn test_backpressure_policy_defers_without_shedding() {
+        let (mut graph, consumer_id) = producer_consumer_graph(BackpressurePolicy::Backpressure, 2);
+        let _ = graph
+            .execute_cycle(&trades_source(), i64::MAX, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            graph.input_bufs[consumer_id][0].len(),
+            2,
+            "consumer input stays at cap — producer must have been deferred"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shed_oldest_policy_drops_rows_and_increments_counter() {
+        let registry = prometheus::Registry::new();
+        let prom = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+        let (mut graph, consumer_id) = producer_consumer_graph(BackpressurePolicy::ShedOldest, 2);
+        graph.set_metrics(Arc::clone(&prom));
+
+        let _ = graph
+            .execute_cycle(&trades_source(), i64::MAX, None)
+            .await
+            .unwrap();
+
+        assert!(graph.input_bufs[consumer_id][0].len() <= 2);
+        assert!(
+            prom.shed_records_total
+                .with_label_values(&["consumer"])
+                .get()
+                > 0,
+            "shed_records_total should have incremented"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fail_policy_returns_error_at_cap() {
+        let (mut graph, _) = producer_consumer_graph(BackpressurePolicy::Fail, 2);
+        let err = graph
+            .execute_cycle(&trades_source(), i64::MAX, None)
+            .await
+            .expect_err("Fail policy must return an error at capacity");
+        assert!(
+            matches!(err, DbError::BackpressureFail(_)),
+            "expected DbError::BackpressureFail, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_byte_budget_gates_capacity() {
+        let mut graph = test_graph();
+        graph.set_max_input_buf_bytes(Some(1));
+        graph.add_query(
+            "producer".to_string(),
+            "SELECT symbol, price FROM trades".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        graph.add_query(
+            "consumer".to_string(),
+            "SELECT symbol FROM producer".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let consumer_id = *graph.output_map.get("consumer").unwrap();
+        prefill_port(&mut graph, consumer_id, 0, vec![test_batch()]);
+
+        let producer_id = *graph.output_map.get("producer").unwrap();
+        assert!(graph.is_downstream_at_capacity(producer_id));
     }
 }
