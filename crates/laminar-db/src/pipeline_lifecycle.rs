@@ -1037,7 +1037,10 @@ impl LaminarDB {
             drain_budget_ns,
             query_budget_ns,
             background_budget_ns: 5_000_000, // 5ms
-            max_input_buf_batches: 256,
+            max_input_buf_batches: self
+                .config
+                .pipeline_max_input_buf_batches
+                .unwrap_or(256),
         };
 
         // Validate delivery guarantee constraints.

@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>LaminarDB — Real-Time Mark-Out Analysis · BTC-USDT-PERP</title>
+    <link rel="stylesheet" href="dashboard.css?v=6">
+</head>
+<body>
+    <header>
+        <div class="brand">
+            <span class="logo">&#9672;</span>
+            <span class="title">LaminarDB</span>
+            <span class="sep">/</span>
+            <span class="subtitle">Real-Time Mark-Out Analysis</span>
+        </div>
+        <div class="market">
+            <span class="sym">BTC-USDT-PERP</span>
+            <span class="venue">Binance USDT-M Futures</span>
+            <span class="status" id="status">connecting&#8230;</span>
+        </div>
+    </header>
+
+    <section class="scatter-panel">
+        <div class="panel-head">
+            <h2>Signed mark-out · 1s horizon</h2>
+            <div class="legend">
+                <span class="dot buy"></span>BUY aggressor
+                <span class="dot sell"></span>SELL aggressor
+                <span class="axis-note">Y: bps &#xb7; X: last 5 min</span>
+            </div>
+        </div>
+        <canvas id="scatter"></canvas>
+    </section>
+
+    <section class="metrics">
+        <div class="card" id="card-markout">
+            <div class="card-label">Avg mark-out 1s</div>
+            <div class="card-value" id="m-avg">&#8212;</div>
+            <div class="card-unit">bps</div>
+        </div>
+        <div class="card" id="card-adverse">
+            <div class="card-label">Adverse selection</div>
+            <div class="card-value" id="m-adverse">&#8212;</div>
+            <div class="card-unit">of 30s trades</div>
+        </div>
+        <div class="card" id="card-count">
+            <div class="card-label">Trades per 30s</div>
+            <div class="card-value" id="m-count">&#8212;</div>
+            <div class="card-unit">&nbsp;</div>
+        </div>
+    </section>
+
+    <section class="by-side-panel">
+        <h2>Flow by aggressor side</h2>
+        <div class="by-side-grid">
+            <div class="side-col buy">
+                <div class="side-head">BUY aggressor</div>
+                <table>
+                    <tr><th>horizon</th><th>avg markout (bps)</th><th>trades</th><th>volume (BTC)</th></tr>
+                    <tr data-side="BUY" data-offset="1000"><td>1s</td><td class="v-markout">&#8212;</td><td class="v-trades">&#8212;</td><td class="v-vol">&#8212;</td></tr>
+                    <tr data-side="BUY" data-offset="5000"><td>5s</td><td class="v-markout">&#8212;</td><td class="v-trades">&#8212;</td><td class="v-vol">&#8212;</td></tr>
+                    <tr data-side="BUY" data-offset="30000"><td>30s</td><td class="v-markout">&#8212;</td><td class="v-trades">&#8212;</td><td class="v-vol">&#8212;</td></tr>
+                </table>
+            </div>
+            <div class="side-col sell">
+                <div class="side-head">SELL aggressor</div>
+                <table>
+                    <tr><th>horizon</th><th>avg markout (bps)</th><th>trades</th><th>volume (BTC)</th></tr>
+                    <tr data-side="SELL" data-offset="1000"><td>1s</td><td class="v-markout">&#8212;</td><td class="v-trades">&#8212;</td><td class="v-vol">&#8212;</td></tr>
+                    <tr data-side="SELL" data-offset="5000"><td>5s</td><td class="v-markout">&#8212;</td><td class="v-trades">&#8212;</td><td class="v-vol">&#8212;</td></tr>
+                    <tr data-side="SELL" data-offset="30000"><td>30s</td><td class="v-markout">&#8212;</td><td class="v-trades">&#8212;</td><td class="v-vol">&#8212;</td></tr>
+                </table>
+            </div>
+        </div>
+    </section>
+
+    <section class="alerts">
+        <h2>Toxicity alerts</h2>
+        <ul id="alert-feed"><li class="placeholder">no alerts yet</li></ul>
+    </section>
+
+    <footer>
+        <span>All numbers sourced live from Binance USDT-M futures WebSocket. No simulation, no replay.</span>
+        <span class="conns">
+            <span id="conn-markouts" class="conn off">markouts</span>
+            <span id="conn-toxicity" class="conn off">toxicity</span>
+            <span id="conn-by_side" class="conn off">by_side</span>
+            <span id="conn-alerts" class="conn off">alerts</span>
+        </span>
+    </footer>
+
+    <script src="dashboard.js?v=6"></script>
+</body>
+</html>

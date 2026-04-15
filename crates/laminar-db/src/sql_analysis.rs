@@ -430,17 +430,12 @@ pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperator
                 tracing::warn!("tumbling window size is zero or negative, EOWC filtering disabled");
                 return watermark_ms;
             }
-            // Floor to nearest window boundary, accounting for offset.
-            // Must match TumblingWindowAssigner::assign() formula:
-            //   floor((ts - offset) / size) * size + offset
+            // floor((ts - offset) / size) * size + offset, saturating so
+            // the i64::MIN initial-watermark sentinel doesn't panic.
             let offset = config.offset_ms;
-            let adjusted = watermark_ms - offset;
-            let floored = if adjusted >= 0 {
-                (adjusted / size) * size
-            } else {
-                ((adjusted - size + 1) / size) * size
-            };
-            floored + offset
+            let adjusted = watermark_ms.saturating_sub(offset);
+            let floored = adjusted.div_euclid(size).saturating_mul(size);
+            floored.saturating_add(offset)
         }
         WindowType::Session => {
             #[allow(clippy::cast_possible_truncation)]
@@ -937,7 +932,27 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection>
     })
 }
 
+/// Strip matching SQL identifier quotes (`"..."`, backticks, `[...]`).
+fn unquote_identifier(s: &str) -> &str {
+    let s = s.trim();
+    let b = s.as_bytes();
+    match (b.first(), b.last()) {
+        (Some(b'"'), Some(b'"')) | (Some(b'`'), Some(b'`')) | (Some(b'['), Some(b']'))
+            if b.len() >= 2 =>
+        {
+            &s[1..s.len() - 1]
+        }
+        _ => s,
+    }
+}
+
 /// Not recognized by sqlparser, so detection works on the raw SQL string.
+//
+// TODO(sql-grammar): replace this `&str`-find scanner with a tokenizer-based
+// recognizer that runs over sqlparser's `Token` stream. The string scan
+// false-matches inside SQL string literals and block comments, and several
+// downstream helpers (`unquote_identifier`, `LIST(...)` / `RANGE … TO …`
+// extraction) are defensive workarounds for the same root cause.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn detect_temporal_probe_query(
     sql: &str,
@@ -992,11 +1007,11 @@ pub(crate) fn detect_temporal_probe_query(
         let end_paren = rest.find(')').unwrap_or(rest.len());
         rest[..end_paren]
             .split(',')
-            .map(|s| s.trim().to_string())
+            .map(|s| unquote_identifier(s.trim()).to_string())
             .filter(|s| !s.is_empty())
             .collect()
     } else {
-        vec![after_on.split_whitespace().next().unwrap_or("").to_string()]
+        vec![unquote_identifier(after_on.split_whitespace().next().unwrap_or("")).to_string()]
     };
 
     // Parse optional TIMESTAMPS (left_col, right_col) clause
@@ -1008,8 +1023,8 @@ pub(crate) fn detect_temporal_probe_query(
                 let end_paren = rest.find(')').unwrap_or(rest.len());
                 let cols: Vec<&str> = rest[..end_paren].split(',').map(str::trim).collect();
                 (
-                    cols.first().unwrap_or(&"ts").to_string(),
-                    cols.get(1).unwrap_or(&"ts").to_string(),
+                    unquote_identifier(cols.first().unwrap_or(&"ts")).to_string(),
+                    unquote_identifier(cols.get(1).unwrap_or(&"ts")).to_string(),
                 )
             } else {
                 ("ts".into(), "ts".into())
@@ -1793,6 +1808,34 @@ mod tests {
         let refs = extract_table_references("SELECT * FROM events WHERE id > 1");
         assert_eq!(refs.len(), 1);
         assert!(refs.contains("events"));
+    }
+
+    #[test]
+    fn test_unquote_identifier() {
+        for (input, want) in [
+            ("\"E\"", "E"),
+            ("`col`", "col"),
+            ("[col]", "col"),
+            ("ts", "ts"),
+            ("  ts  ", "ts"),
+            ("", ""),
+            ("\"ts", "\"ts"),
+            ("ts\"", "ts\""),
+        ] {
+            assert_eq!(unquote_identifier(input), want, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn test_temporal_probe_strips_quoted_timestamp_columns() {
+        let sql = "SELECT t.s FROM trades t \
+                   TEMPORAL PROBE JOIN book r \
+                   ON (s) TIMESTAMPS (\"T\", \"E\") \
+                   LIST (0s, 1s) AS p";
+        let (config, _) = detect_temporal_probe_query(sql);
+        let config = config.expect("temporal probe detected");
+        assert_eq!(config.left_time_column, "T");
+        assert_eq!(config.right_time_column, "E");
     }
 
     #[test]

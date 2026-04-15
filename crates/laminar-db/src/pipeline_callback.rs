@@ -348,6 +348,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
     }
 
+    // TODO(observability): expose per-source and per-stream watermarks as
+    // Prometheus gauges (register in lifecycle alongside the existing
+    // `EngineMetrics`, set them at the `pipeline_watermark.store` sites
+    // below and at `output_watermarks[node_id]` writes in operator_graph).
+    // Without this, an `i64::MIN`-stuck watermark is invisible from the
+    // outside and only debuggable via tracing.
     fn extract_watermark(&mut self, source_name: &str, batch: &RecordBatch) {
         if let Some(wm_state) = self.watermark_states.get_mut(source_name) {
             // Check external watermarks from Source::watermark() calls.

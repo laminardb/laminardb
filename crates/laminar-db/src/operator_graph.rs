@@ -281,23 +281,16 @@ impl OperatorGraph {
         self.lookup_registry = Some(registry);
     }
 
-    fn enforce_input_buf_cap(&mut self, node: usize, port: usize) {
+    /// True if any of this node's output ports is at or above the buffer cap.
+    fn is_downstream_full(&self, node_id: usize) -> bool {
         let cap = self.max_input_buf_batches;
         if cap == 0 {
-            return;
+            return false;
         }
-        let buf = &mut self.input_bufs[node][port];
-        if buf.len() > cap {
-            let shed = buf.len() - cap;
-            buf.drain(..shed);
-            tracing::warn!(
-                node = %self.nodes[node].name,
-                port,
-                shed,
-                cap,
-                "input buffer exceeded cap — shed oldest batches"
-            );
-        }
+        self.nodes[node_id]
+            .output_routes
+            .iter()
+            .any(|&(target, port)| self.input_bufs[target][port as usize].len() >= cap)
     }
 
     pub fn register_source_schema(&mut self, name: String, schema: SchemaRef) {
@@ -601,6 +594,8 @@ impl OperatorGraph {
             self.input_bufs[placeholder_id] = vec![Vec::new(); input_port_count];
             self.input_sources[placeholder_id] = vec![usize::MAX; input_port_count];
             self.source_map.remove(name.as_str());
+            // Clear source classification so output_watermarks updates per run.
+            self.source_node_ids.remove(&placeholder_id);
 
             let node_id = placeholder_id;
 
@@ -917,6 +912,7 @@ impl OperatorGraph {
             })
             .collect();
 
+
         let output_result = self.nodes[node_id]
             .operator
             .process(&inputs, &watermarks)
@@ -1005,7 +1001,7 @@ impl OperatorGraph {
                 results.insert(node_name, batches.clone());
             }
 
-            // Route to downstream operator input buffers.
+            // Cap is enforced upstream via `is_downstream_full`; never shed here.
             let routes = self.nodes[node_id].output_routes.clone();
             if routes.len() == 1 {
                 let (target, port) = routes[0];
@@ -1015,11 +1011,9 @@ impl OperatorGraph {
                 } else {
                     buf.extend(batches);
                 }
-                self.enforce_input_buf_cap(target, port as usize);
             } else if routes.len() > 1 {
                 for &(target, port) in &routes {
                     self.input_bufs[target][port as usize].extend(batches.iter().cloned());
-                    self.enforce_input_buf_cap(target, port as usize);
                 }
             }
         }
@@ -1039,9 +1033,13 @@ impl OperatorGraph {
 
         self.register_source_tables(source_batches);
 
+        // Extend (not overwrite): if downstream is full this cycle, data
+        // stays buffered here and drives the pressure signal upstream.
         for (name, &node_id) in &self.source_map {
             if let Some(batches) = source_batches.get(name) {
-                self.input_bufs[node_id][0].clone_from(batches);
+                if !batches.is_empty() {
+                    self.input_bufs[node_id][0].extend(batches.iter().cloned());
+                }
             }
             let wm = source_watermarks
                 .and_then(|m| m.get(name).copied())
@@ -1057,6 +1055,15 @@ impl OperatorGraph {
             let node_id = self.topo_order[i];
 
             if self.nodes[node_id].removed {
+                continue;
+            }
+
+            // Credit gate: defer when downstream is at cap; data stays buffered.
+            if self.is_downstream_full(node_id) {
+                tracing::trace!(
+                    node = %self.nodes[node_id].name,
+                    "deferred — downstream at cap"
+                );
                 continue;
             }
 
@@ -1086,6 +1093,9 @@ impl OperatorGraph {
                             .iter()
                             .any(|port| !port.is_empty());
                         if !has_input {
+                            continue;
+                        }
+                        if self.is_downstream_full(deferred_id) {
                             continue;
                         }
                         if let Err(e) = self
@@ -1969,8 +1979,7 @@ mod tests {
             None,
             None,
         );
-        // Overfill buffer beyond cap (enforce_input_buf_cap only runs
-        // during execute_cycle routing, not here).
+        // Overfill the buffer beyond cap — pressure clamps at 1.0.
         if let Some(&node_id) = graph.source_map.get("trades") {
             graph.input_bufs[node_id][0] = vec![test_batch(); 20];
         }
@@ -1981,6 +1990,136 @@ mod tests {
     fn test_pressure_empty_graph() {
         let graph = test_graph();
         assert!((graph.input_buf_pressure() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_credit_gate_defers_producer_when_downstream_full() {
+        let mut graph = test_graph();
+        graph.set_max_input_buf_batches(4);
+
+        // Two queries chained via an intermediate stream: the first projects
+        // `trades`, the second reads from the first. The gate should skip the
+        // first when the second's input port is full.
+        graph.add_query(
+            "proj".to_string(),
+            "SELECT symbol, price FROM trades".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+        graph.add_query(
+            "downstream".to_string(),
+            "SELECT symbol FROM proj".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        // Find the downstream node id and pre-fill its input buffer at cap,
+        // simulating a slow consumer.
+        let downstream_id = *graph.output_map.get("downstream").unwrap();
+        graph.input_bufs[downstream_id][0] = vec![test_batch(); 4];
+
+        let proj_id = *graph.output_map.get("proj").unwrap();
+        assert!(
+            graph.is_downstream_full(proj_id),
+            "proj's downstream should register as full at cap"
+        );
+
+        // Run a cycle with trade input. proj must be deferred because its
+        // downstream is full — so proj's output_bufs should still hold its
+        // source input, and downstream's input should not grow.
+        let before_len = graph.input_bufs[downstream_id][0].len();
+        let mut source = FxHashMap::default();
+        source.insert(Arc::from("trades"), vec![test_batch()]);
+        let _ = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
+        assert_eq!(
+            graph.input_bufs[downstream_id][0].len(),
+            before_len,
+            "deferred producer must not have extended a full downstream buffer"
+        );
+    }
+
+    // Replacing a SourcePassthrough placeholder must also clear source_node_ids,
+    // otherwise the node keeps its source-class flag and output_watermarks is
+    // never advanced — downstream TUMBLE windows never close.
+    #[tokio::test]
+    async fn test_placeholder_replacement_clears_source_classification() {
+        let mut graph = test_graph();
+
+        // Register the downstream query FIRST — its SQL references
+        // `derived`, which triggers an `ensure_source_node("derived")` and
+        // seeds `source_node_ids` with the placeholder.
+        graph.add_query(
+            "aggregate".to_string(),
+            "SELECT symbol, SUM(price) AS total FROM derived GROUP BY symbol".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        // Now register `derived` — this replaces the placeholder.
+        graph.add_query(
+            "derived".to_string(),
+            "SELECT symbol, price FROM trades".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let derived_id = *graph.output_map.get("derived").unwrap();
+        assert!(
+            !graph.source_node_ids.contains(&derived_id),
+            "real operator node must not be classified as a source after \
+             placeholder replacement (blocks output_watermarks updates)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_source_inputs_accumulate_when_deferred() {
+        let mut graph = test_graph();
+        graph.set_max_input_buf_batches(2);
+        graph.add_query(
+            "sink".to_string(),
+            "SELECT symbol FROM trades".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        // Pre-fill sink's input at cap. Because sink has no downstream, sink
+        // will still run this cycle — so to keep trades deferred across a
+        // second cycle we keep the cap threshold tight and re-fill sink each
+        // cycle, simulating a continuous slow-consumer scenario.
+        let sink_id = *graph.output_map.get("sink").unwrap();
+        let source_id = *graph.source_map.get("trades").unwrap();
+        let mut source = FxHashMap::default();
+        source.insert(Arc::from("trades"), vec![test_batch()]);
+
+        // Cycle 1: sink's input pre-filled to cap, trades deferred, trades
+        // input extended by 1.
+        graph.input_bufs[sink_id][0] = vec![test_batch(); 2];
+        let _ = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
+        assert_eq!(
+            graph.input_bufs[source_id][0].len(),
+            1,
+            "deferred source must accumulate its input buffer"
+        );
+
+        // Cycle 2: re-fill sink to cap so trades stays deferred; trades input
+        // must grow from 1 to 2 (extend, not clone_from).
+        graph.input_bufs[sink_id][0] = vec![test_batch(); 2];
+        let _ = graph.execute_cycle(&source, i64::MAX, None).await.unwrap();
+        assert_eq!(
+            graph.input_bufs[source_id][0].len(),
+            2,
+            "source input must accumulate across deferred cycles"
+        );
     }
 
     /// Regression test: LEFT JOIN between a streaming source and a

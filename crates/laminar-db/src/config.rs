@@ -79,6 +79,8 @@ pub struct LaminarConfig {
     pub pipeline_drain_budget_ns: Option<u64>,
     /// Per-query budget (ns). `None` = 8ms.
     pub pipeline_query_budget_ns: Option<u64>,
+    /// Per-port operator input-buffer cap (batches). `None` = 256, `0` = unlimited.
+    pub pipeline_max_input_buf_batches: Option<usize>,
 }
 
 impl Default for LaminarConfig {
@@ -98,6 +100,7 @@ impl Default for LaminarConfig {
             pipeline_batch_window: None,
             pipeline_drain_budget_ns: None,
             pipeline_query_budget_ns: None,
+            pipeline_max_input_buf_batches: None,
         }
     }
 }

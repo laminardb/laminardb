@@ -209,6 +209,16 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Per-port operator input-buffer cap, in batches (default 256). `0` is
+    /// "unlimited" — disables the credit gate and the drain-halt signal, so
+    /// a wedged downstream lets `source_batches_buf` grow without bound. Use
+    /// only in tests; production code should leave the cap finite.
+    #[must_use]
+    pub fn pipeline_max_input_buf_batches(mut self, batches: usize) -> Self {
+        self.config.pipeline_max_input_buf_batches = Some(batches);
+        self
+    }
+
     /// Register custom connectors with the `ConnectorRegistry`.
     ///
     /// The callback is invoked after the database is created and built-in

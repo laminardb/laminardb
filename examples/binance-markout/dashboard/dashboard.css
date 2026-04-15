@@ -1,0 +1,202 @@
+:root {
+    --bg: #0b0d10;
+    --bg-alt: #12161b;
+    --panel: #161b22;
+    --border: #222a33;
+    --fg: #d4dae0;
+    --fg-dim: #7d8794;
+    --fg-faint: #4b5563;
+    --accent: #e6edf3;
+    --buy: #3fb950;
+    --buy-dim: #1a4e23;
+    --sell: #f85149;
+    --sell-dim: #5a1d1d;
+    --warn: #d29922;
+    --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    height: 100vh;
+}
+
+body {
+    display: grid;
+    grid-template-rows: auto 1fr auto auto auto auto;
+    grid-template-areas:
+        "header"
+        "scatter"
+        "metrics"
+        "by-side"
+        "alerts"
+        "footer";
+    min-height: 100vh;
+    padding: 14px;
+    gap: 12px;
+}
+
+header {
+    grid-area: header;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 14px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-alt);
+}
+
+.brand { display: flex; align-items: center; gap: 8px; }
+.brand .logo { color: var(--buy); font-size: 15px; }
+.brand .title { font-weight: 600; letter-spacing: 0.2px; }
+.brand .sep { color: var(--fg-faint); }
+.brand .subtitle { color: var(--fg-dim); }
+
+.market { display: flex; align-items: center; gap: 14px; font-family: var(--font-mono); font-size: 11px; }
+.market .sym { color: var(--accent); font-weight: 600; letter-spacing: 0.5px; }
+.market .venue { color: var(--fg-dim); }
+.market .status { padding: 2px 8px; border: 1px solid var(--border); border-radius: 3px; color: var(--fg-dim); }
+.market .status.live { color: var(--buy); border-color: var(--buy-dim); }
+.market .status.degraded { color: var(--warn); border-color: var(--warn); }
+
+.panel-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 8px;
+}
+
+h2 {
+    margin: 0 0 6px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    color: var(--fg-dim);
+}
+
+.scatter-panel {
+    grid-area: scatter;
+    padding: 12px 14px 6px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--panel);
+    display: flex;
+    flex-direction: column;
+    min-height: 340px;
+}
+
+.scatter-panel h2 { margin-bottom: 0; color: var(--accent); }
+
+.legend {
+    display: flex;
+    gap: 14px;
+    align-items: center;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--fg-dim);
+}
+.legend .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+.legend .dot.buy { background: var(--buy); }
+.legend .dot.sell { background: var(--sell); }
+.legend .axis-note { color: var(--fg-faint); margin-left: 8px; }
+
+#scatter {
+    flex: 1;
+    width: 100%;
+    min-height: 280px;
+    display: block;
+}
+
+.metrics {
+    grid-area: metrics;
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+}
+
+.card {
+    padding: 16px 18px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--panel);
+}
+.card-label { font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--fg-dim); }
+.card-value { font-family: var(--font-mono); font-size: 32px; font-weight: 600; color: var(--accent); margin-top: 6px; line-height: 1; }
+.card-unit { font-family: var(--font-mono); font-size: 10px; color: var(--fg-faint); margin-top: 4px; }
+
+.card-value.pos { color: var(--buy); }
+.card-value.neg { color: var(--sell); }
+.card-value.warn { color: var(--warn); }
+
+.by-side-panel {
+    grid-area: by-side;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--panel);
+}
+
+.by-side-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    margin-top: 6px;
+}
+
+.side-col { padding: 10px 12px; border: 1px solid var(--border); border-radius: 3px; background: var(--bg-alt); }
+.side-head { font-family: var(--font-mono); font-size: 11px; letter-spacing: 1px; font-weight: 600; margin-bottom: 8px; }
+.side-col.buy .side-head { color: var(--buy); }
+.side-col.sell .side-head { color: var(--sell); }
+
+.side-col table { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 11px; }
+.side-col th { text-align: left; font-weight: 400; color: var(--fg-faint); padding: 4px 6px; border-bottom: 1px solid var(--border); letter-spacing: 0.5px; }
+.side-col td { padding: 5px 6px; color: var(--fg); }
+.side-col td:first-child { color: var(--fg-dim); width: 60px; }
+.side-col td.pos { color: var(--buy); }
+.side-col td.neg { color: var(--sell); }
+
+.alerts {
+    grid-area: alerts;
+    padding: 12px 14px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--panel);
+    max-height: 180px;
+    overflow-y: auto;
+}
+
+#alert-feed { list-style: none; margin: 0; padding: 0; font-family: var(--font-mono); font-size: 11px; }
+#alert-feed li { padding: 6px 4px; border-bottom: 1px solid var(--border); display: flex; gap: 14px; }
+#alert-feed li:last-child { border-bottom: none; }
+#alert-feed li .t { color: var(--fg-faint); width: 80px; }
+#alert-feed li .b { color: var(--sell); }
+#alert-feed li .m { color: var(--fg); flex: 1; }
+#alert-feed li.placeholder { color: var(--fg-faint); font-style: italic; justify-content: center; }
+
+footer {
+    grid-area: footer;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 14px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-alt);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--fg-faint);
+}
+
+.conns { display: flex; gap: 10px; }
+.conn { padding: 1px 7px; border: 1px solid var(--border); border-radius: 2px; letter-spacing: 0.5px; }
+.conn.on { color: var(--buy); border-color: var(--buy-dim); }
+.conn.off { color: var(--sell); border-color: var(--sell-dim); }
