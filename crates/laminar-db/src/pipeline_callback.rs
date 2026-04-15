@@ -348,18 +348,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
     }
 
-    // TODO(observability): expose per-source and per-stream watermarks as
-    // Prometheus gauges (register in lifecycle alongside the existing
-    // `EngineMetrics`, set them at the `pipeline_watermark.store` sites
-    // below and at `output_watermarks[node_id]` writes in operator_graph).
-    // Without this, an `i64::MIN`-stuck watermark is invisible from the
-    // outside and only debuggable via tracing.
     fn extract_watermark(&mut self, source_name: &str, batch: &RecordBatch) {
         if let Some(wm_state) = self.watermark_states.get_mut(source_name) {
             // Check external watermarks from Source::watermark() calls.
             if let Some(entry) = self.source_entries_for_wm.get(source_name) {
                 let external_wm = entry.source.current_watermark();
                 if let Some(wm) = wm_state.generator.advance_watermark(external_wm) {
+                    self.prom
+                        .source_watermark_ms
+                        .with_label_values(&[source_name])
+                        .set(wm.timestamp());
                     if let Some(ref mut trk) = self.tracker {
                         if let Some(sid) = self.source_ids.get(source_name) {
                             if let Some(global_wm) = trk.update_source(*sid, wm.timestamp()) {
@@ -379,6 +377,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                     if let Some(entry) = self.source_entries_for_wm.get(source_name) {
                         entry.source.watermark(wm.timestamp());
                     }
+                    self.prom
+                        .source_watermark_ms
+                        .with_label_values(&[source_name])
+                        .set(wm.timestamp());
                     if let Some(ref mut trk) = self.tracker {
                         if let Some(sid) = self.source_ids.get(source_name) {
                             if let Some(global_wm) = trk.update_source(*sid, wm.timestamp()) {

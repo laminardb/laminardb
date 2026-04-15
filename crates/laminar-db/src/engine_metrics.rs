@@ -1,6 +1,6 @@
 //! Prometheus metrics for the streaming engine.
 
-use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, Registry};
+use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, IntGaugeVec, Opts, Registry};
 
 /// Pipeline metrics registered on an explicit prometheus `Registry`.
 ///
@@ -29,6 +29,10 @@ pub struct EngineMetrics {
     pub mv_bytes_stored: IntGauge,
     /// Global pipeline watermark.
     pub pipeline_watermark: IntGauge,
+    /// Per-source watermark (epoch-ms). Label: `source`.
+    pub source_watermark_ms: IntGaugeVec,
+    /// Per-stream watermark (epoch-ms). Label: `stream`.
+    pub stream_watermark_ms: IntGaugeVec,
     /// Completed checkpoints.
     pub checkpoints_completed: IntCounter,
     /// Failed checkpoints.
@@ -108,6 +112,17 @@ impl EngineMetrics {
             pipeline_watermark: reg!(IntGauge::new(
                 "pipeline_watermark",
                 "Global pipeline watermark"
+            )
+            .unwrap()),
+            // Labels are catalog-bound, so cardinality is finite.
+            source_watermark_ms: reg!(IntGaugeVec::new(
+                Opts::new("source_watermark_ms", "Per-source watermark (epoch-ms)"),
+                &["source"],
+            )
+            .unwrap()),
+            stream_watermark_ms: reg!(IntGaugeVec::new(
+                Opts::new("stream_watermark_ms", "Per-stream watermark (epoch-ms)"),
+                &["stream"],
             )
             .unwrap()),
             checkpoints_completed: reg!(IntCounter::new(

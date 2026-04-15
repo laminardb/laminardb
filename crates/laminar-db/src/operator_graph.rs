@@ -921,11 +921,17 @@ impl OperatorGraph {
         // Source nodes (input_sources = [usize::MAX]) have output_watermarks
         // pre-seeded from per-source watermarks in execute_cycle. Don't overwrite.
         if !self.source_node_ids.contains(&node_id) {
-            self.output_watermarks[node_id] = watermarks
+            let wm = watermarks
                 .iter()
                 .copied()
                 .min()
                 .unwrap_or(current_watermark);
+            self.output_watermarks[node_id] = wm;
+            if let Some(ref prom) = self.prom {
+                prom.stream_watermark_ms
+                    .with_label_values(&[&self.nodes[node_id].name])
+                    .set(wm);
+            }
         }
 
         let batches = match output_result {
@@ -1045,6 +1051,11 @@ impl OperatorGraph {
                 .and_then(|m| m.get(name).copied())
                 .unwrap_or(current_watermark);
             self.output_watermarks[node_id] = wm;
+            if let Some(ref prom) = self.prom {
+                prom.stream_watermark_ms
+                    .with_label_values(&[name])
+                    .set(wm);
+            }
         }
 
         let mut results = FxHashMap::default();
