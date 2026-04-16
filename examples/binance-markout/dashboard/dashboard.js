@@ -4,6 +4,8 @@ const STREAMS = [
     { name: 'curve',    port: 9002, path: '/curve'    },
     { name: 'toxicity', port: 9003, path: '/toxicity' },
     { name: 'alerts',   port: 9004, path: '/alerts'   },
+    { name: 'regime',   port: 9005, path: '/regime'   },
+    { name: 'signal',   port: 9006, path: '/signal'   },
 ];
 
 const HORIZONS = [5000, 15000, 30000, 60000];
@@ -14,7 +16,7 @@ const SCATTER_WINDOW_MS = 5 * 60 * 1000;
 const CURVE_HISTORY = 5;      // keep last 5 curve snapshots per side
 const HEATMAP_ROWS = 12;       // 12 × 30s = 6 minutes
 
-const msgCounts = { markouts: 0, curve: 0, toxicity: 0, alerts: 0 };
+const msgCounts = { markouts: 0, curve: 0, toxicity: 0, alerts: 0, regime: 0, signal: 0 };
 const scatterPoints = [];
 const curveHistory = { BUY: [], SELL: [] };
 const heatmapWindows = []; // [{ ts, cells: {5000: bps, 15000: bps, ...} }]
@@ -99,6 +101,8 @@ function handleRow(stream, row) {
     if (stream === 'curve')    return onCurve(row);
     if (stream === 'toxicity') return onToxicity(row);
     if (stream === 'alerts')   return onAlert(row);
+    if (stream === 'regime')   return onRegime(row);
+    if (stream === 'signal')   return onSignal(row);
 }
 
 // ------------------------------------------------------------------
@@ -155,6 +159,60 @@ function onToxicity(row) {
     }
     if (offset === 60000) {
         setCard('m-mk60', formatBps(avg), signClass(avg, 0.5, -0.5));
+    }
+}
+
+const REGIME_CLASS = {
+    CLEAN:         'clean',
+    INFORMED:      'informed',
+    ADVERSE:       'adverse',
+    TEMP_IMPACT:   'temp',
+    SLOW_INFORMED: 'slow',
+    MIXED:         'mixed',
+    UNKNOWN:       'mixed',
+};
+
+function onRegime(row) {
+    const side = String(row.side || '').toUpperCase();
+    if (side !== 'BUY' && side !== 'SELL') return;
+    const regime = String(row.regime || 'UNKNOWN');
+    const mk5 = Number(row.avg_5s);
+    const mk60 = Number(row.avg_60s);
+    const cls = REGIME_CLASS[regime] || 'mixed';
+    const idPrefix = side === 'BUY' ? 'buy' : 'sell';
+
+    const el = document.getElementById(`${idPrefix}-regime`);
+    el.textContent = regime;
+    el.className = `signal-value regime ${cls}`;
+
+    const sub = document.getElementById(`${idPrefix}-markout`);
+    sub.textContent = `5s ${formatBps(mk5)} · 60s ${formatBps(mk60)}`;
+}
+
+function onSignal(row) {
+    const skew = Number(row.skew_bps);
+    const adv = Number(row.max_adverse_rate);
+
+    const skewEl = document.getElementById('skew-bps');
+    if (Number.isFinite(skew)) {
+        const arrow = skew > 0.3 ? ' ↑' : skew < -0.3 ? ' ↓' : '';
+        skewEl.textContent = `${formatBps(skew)}${arrow}`;
+        skewEl.classList.remove('pos', 'neg', 'warn');
+        if (skew > 0.5) skewEl.classList.add('pos');
+        else if (skew < -0.5) skewEl.classList.add('neg');
+    } else {
+        skewEl.textContent = '—';
+    }
+
+    const advEl = document.getElementById('max-adverse');
+    if (Number.isFinite(adv)) {
+        advEl.textContent = formatPct(adv);
+        advEl.classList.remove('pos', 'neg', 'warn');
+        if (adv > 0.6) advEl.classList.add('neg');
+        else if (adv > 0.5) advEl.classList.add('warn');
+        else advEl.classList.add('pos');
+    } else {
+        advEl.textContent = '—';
     }
 }
 

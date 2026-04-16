@@ -44,6 +44,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  ws://127.0.0.1:9002/curve      (1-min per-side markout curve)");
     println!("  ws://127.0.0.1:9003/toxicity   (30s per-horizon metrics)");
     println!("  ws://127.0.0.1:9004/alerts     (adverse-selection alerts)");
+    println!("  ws://127.0.0.1:9005/regime     (1-min per-side flow regime)");
+    println!("  ws://127.0.0.1:9006/signal     (30s MM quote-skew signal)");
     println!();
     println!("Press Ctrl-C to stop.");
     println!();

@@ -111,6 +111,56 @@ FROM flow_toxicity_30s
 WHERE offset_ms = 5000
   AND (adverse_selection_rate > 0.6 OR avg_markout_bps < -2.0);
 
+-- ── 6a. Flow regime classifier (per side, 1-min cadence) ─────────
+-- Projects markout_curve into a regime label using short- vs long-horizon
+-- markout shape. Operator-level decision aid: tells you whether to adjust.
+
+CREATE STREAM flow_regime AS
+SELECT
+    *,
+    CASE
+      WHEN avg_5s IS NULL OR avg_60s IS NULL                                THEN 'UNKNOWN'
+      WHEN avg_5s > -0.5 AND avg_5s < 0.5 AND avg_60s > -0.5 AND avg_60s < 0.5
+                                                                            THEN 'CLEAN'
+      WHEN avg_5s >  2.0 AND avg_60s >  2.0                                 THEN 'INFORMED'
+      WHEN avg_5s < -2.0 AND avg_60s < -2.0                                 THEN 'ADVERSE'
+      WHEN (avg_5s > 2.0 OR avg_5s < -2.0)
+            AND avg_60s > -0.5 AND avg_60s < 0.5                            THEN 'TEMP_IMPACT'
+      WHEN avg_5s > -1.0 AND avg_5s < 1.0
+            AND (avg_60s > 2.0 OR avg_60s < -2.0)                           THEN 'SLOW_INFORMED'
+      ELSE                                                                        'MIXED'
+    END AS regime
+FROM markout_curve;
+
+-- ── 6b. MM quote-skew signal (30-second cadence) ─────────────────
+-- Pivots 60s markouts by aggressor side in one aggregation. Tells a maker
+-- how to adjust quotes: skew_bps = direction, max_adverse_rate = size cut.
+
+CREATE STREAM quote_signal AS
+SELECT
+    AVG(CASE WHEN side = 'BUY'  THEN signed_markout_bps END)   AS buy_avg_60s,
+    AVG(CASE WHEN side = 'SELL' THEN signed_markout_bps END)   AS sell_avg_60s,
+    (AVG(CASE WHEN side = 'BUY'  THEN signed_markout_bps END)
+       - AVG(CASE WHEN side = 'SELL' THEN signed_markout_bps END)) / 2.0
+                                                                AS skew_bps,
+    AVG(CASE WHEN side = 'BUY'  AND signed_markout_bps < 0 THEN 1.0
+             WHEN side = 'BUY'                              THEN 0.0 END)
+                                                                AS buy_adverse,
+    AVG(CASE WHEN side = 'SELL' AND signed_markout_bps < 0 THEN 1.0
+             WHEN side = 'SELL'                             THEN 0.0 END)
+                                                                AS sell_adverse,
+    GREATEST(
+        AVG(CASE WHEN side = 'BUY'  AND signed_markout_bps < 0 THEN 1.0
+                 WHEN side = 'BUY'                              THEN 0.0 END),
+        AVG(CASE WHEN side = 'SELL' AND signed_markout_bps < 0 THEN 1.0
+                 WHEN side = 'SELL'                             THEN 0.0 END)
+    )                                                           AS max_adverse_rate,
+    COUNT(*)                                                    AS trade_count
+FROM markouts_long
+WHERE offset_ms = 60000
+GROUP BY TUMBLE("T", INTERVAL '30' SECOND)
+EMIT ON WINDOW CLOSE;
+
 -- ── 7. WebSocket sinks — one port per dashboard panel ────────────
 
 CREATE SINK markouts_sink FROM markouts_long
@@ -142,5 +192,21 @@ INTO WEBSOCKET (
     mode           = 'server',
     'bind.address' = '127.0.0.1:9004',
     path           = '/alerts',
+    format         = 'json'
+);
+
+CREATE SINK regime_sink FROM flow_regime
+INTO WEBSOCKET (
+    mode           = 'server',
+    'bind.address' = '127.0.0.1:9005',
+    path           = '/regime',
+    format         = 'json'
+);
+
+CREATE SINK signal_sink FROM quote_signal
+INTO WEBSOCKET (
+    mode           = 'server',
+    'bind.address' = '127.0.0.1:9006',
+    path           = '/signal',
     format         = 'json'
 );

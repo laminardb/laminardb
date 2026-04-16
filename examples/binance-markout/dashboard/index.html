@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <title>LaminarDB — Real-Time Multi-Horizon Mark-Out Analysis</title>
-    <link rel="stylesheet" href="dashboard.css?v=7">
+    <link rel="stylesheet" href="dashboard.css?v=8">
 </head>
 <body>
     <header>
@@ -66,6 +66,34 @@
         <canvas id="heatmap"></canvas>
     </section>
 
+    <section class="signal-panel">
+        <div class="panel-head">
+            <h2>MM signal &middot; regime (1-min) &amp; quote adjustment (30s)</h2>
+        </div>
+        <div class="signal-grid">
+            <div class="signal-block">
+                <div class="signal-label">BUY regime</div>
+                <div class="signal-value regime" id="buy-regime">&#8212;</div>
+                <div class="signal-sub" id="buy-markout">&#8212;</div>
+            </div>
+            <div class="signal-block">
+                <div class="signal-label">SELL regime</div>
+                <div class="signal-value regime" id="sell-regime">&#8212;</div>
+                <div class="signal-sub" id="sell-markout">&#8212;</div>
+            </div>
+            <div class="signal-block">
+                <div class="signal-label">Skew recommendation</div>
+                <div class="signal-value" id="skew-bps">&#8212;</div>
+                <div class="signal-sub">bps &middot; shift both quotes</div>
+            </div>
+            <div class="signal-block">
+                <div class="signal-label">Max adverse rate</div>
+                <div class="signal-value" id="max-adverse">&#8212;</div>
+                <div class="signal-sub">reduce size when red</div>
+            </div>
+        </div>
+    </section>
+
     <section class="metrics">
         <div class="card" id="card-mk5">
             <div class="card-label">Avg mark-out 5s</div>
@@ -101,9 +129,11 @@
             <span id="conn-curve" class="conn off">curve</span>
             <span id="conn-toxicity" class="conn off">toxicity</span>
             <span id="conn-alerts" class="conn off">alerts</span>
+            <span id="conn-regime" class="conn off">regime</span>
+            <span id="conn-signal" class="conn off">signal</span>
         </span>
     </footer>
 
-    <script src="dashboard.js?v=7"></script>
+    <script src="dashboard.js?v=8"></script>
 </body>
 </html>

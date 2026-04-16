@@ -29,12 +29,13 @@ html, body {
 
 body {
     display: grid;
-    grid-template-rows: auto auto auto auto auto auto auto;
+    grid-template-rows: auto auto auto auto auto auto auto auto;
     grid-template-areas:
         "header"
         "curve"
         "scatter"
         "heatmap"
+        "signal"
         "metrics"
         "alerts"
         "footer";
@@ -91,7 +92,7 @@ h2 {
     color: var(--fg-dim);
 }
 
-.curve-panel, .scatter-panel, .heatmap-panel, .alerts {
+.curve-panel, .scatter-panel, .heatmap-panel, .signal-panel, .alerts {
     padding: 12px 14px;
     border: 1px solid var(--border);
     border-radius: 4px;
@@ -103,7 +104,35 @@ h2 {
 .curve-panel   { grid-area: curve;   min-height: 420px; }
 .scatter-panel { grid-area: scatter; min-height: 260px; }
 .heatmap-panel { grid-area: heatmap; min-height: 320px; }
+.signal-panel  { grid-area: signal; }
 .alerts        { grid-area: alerts;  max-height: 180px; overflow-y: auto; }
+
+.signal-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-top: 4px;
+}
+.signal-block {
+    padding: 14px 16px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-alt);
+}
+.signal-label { font-size: 10px; letter-spacing: 1px; text-transform: uppercase; color: var(--fg-dim); }
+.signal-value { font-family: var(--font-mono); font-size: 24px; font-weight: 600; color: var(--accent); margin-top: 6px; line-height: 1; }
+.signal-value.pos  { color: var(--buy); }
+.signal-value.neg  { color: var(--sell); }
+.signal-value.warn { color: var(--warn); }
+.signal-sub   { font-family: var(--font-mono); font-size: 10px; color: var(--fg-faint); margin-top: 6px; }
+
+.signal-value.regime { font-size: 16px; letter-spacing: 1px; }
+.signal-value.regime.clean    { color: var(--fg-dim); }
+.signal-value.regime.informed { color: var(--buy); }
+.signal-value.regime.adverse  { color: var(--sell); }
+.signal-value.regime.temp     { color: var(--warn); }
+.signal-value.regime.slow     { color: #7aa2ff; }
+.signal-value.regime.mixed    { color: var(--fg-faint); }
 
 .curve-panel h2, .scatter-panel h2, .heatmap-panel h2 { color: var(--accent); }
 
