@@ -109,7 +109,7 @@ impl Default for MySqlCdcConfig {
             max_poll_records: 1000,
             heartbeat_interval: Duration::from_secs(30),
             connect_timeout: Duration::from_secs(10),
-            read_timeout: Duration::from_secs(60),
+            read_timeout: Duration::from_mins(1),
             table_include: Vec::new(),
             table_exclude: Vec::new(),
             database_filter: None,

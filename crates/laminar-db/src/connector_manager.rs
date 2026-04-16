@@ -757,7 +757,7 @@ mod tests {
         assert_eq!(
             parse_refresh_mode("periodic:60").unwrap(),
             RefreshMode::Periodic {
-                interval: Duration::from_secs(60)
+                interval: Duration::from_mins(1)
             }
         );
         assert_eq!(

@@ -257,7 +257,7 @@ pub async fn start_delta(
                 seed_nodes: delta_cfg.discovery.seeds.clone(),
                 gossip_interval: std::time::Duration::from_secs(1),
                 phi_threshold: 8.0,
-                dead_node_grace_period: std::time::Duration::from_secs(60),
+                dead_node_grace_period: std::time::Duration::from_mins(1),
                 cluster_id: "laminardb".to_string(),
                 node_id,
                 local_node: local_node.clone(),

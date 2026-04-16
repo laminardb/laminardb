@@ -293,7 +293,7 @@ impl JoinOperatorConfig {
                     JoinType::Inner => LookupJoinType::Inner,
                     _ => LookupJoinType::Left,
                 },
-                cache_ttl: Duration::from_secs(300), // Default 5 min
+                cache_ttl: Duration::from_mins(5), // Default 5 min
             })
         } else {
             JoinOperatorConfig::StreamStream(StreamJoinConfig {
@@ -303,7 +303,7 @@ impl JoinOperatorConfig {
                 right_time_column: analysis.right_time_column.clone().unwrap_or_default(),
                 left_table: analysis.left_table.clone(),
                 right_table: analysis.right_table.clone(),
-                time_bound: analysis.time_bound.unwrap_or(Duration::from_secs(3600)),
+                time_bound: analysis.time_bound.unwrap_or(Duration::from_hours(1)),
                 join_type: match analysis.join_type {
                     // RightSemi/RightAnti map to Inner here but are rejected
                     // at detection time in sql_analysis.rs before reaching execution.
@@ -437,7 +437,7 @@ impl LookupJoinConfig {
             stream_key,
             lookup_key,
             LookupJoinType::Inner,
-            Duration::from_secs(300),
+            Duration::from_mins(5),
         )
     }
 
@@ -448,7 +448,7 @@ impl LookupJoinConfig {
             stream_key,
             lookup_key,
             LookupJoinType::Left,
-            Duration::from_secs(300),
+            Duration::from_mins(5),
         )
     }
 
@@ -469,23 +469,23 @@ mod tests {
         let config = StreamJoinConfig::inner(
             "order_id".to_string(),
             "order_id".to_string(),
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
         );
 
         assert_eq!(config.left_key, "order_id");
         assert_eq!(config.right_key, "order_id");
-        assert_eq!(config.time_bound, Duration::from_secs(3600));
+        assert_eq!(config.time_bound, Duration::from_hours(1));
         assert_eq!(config.join_type, StreamJoinType::Inner);
     }
 
     #[test]
     fn test_lookup_join_config() {
         let config = LookupJoinConfig::inner("customer_id".to_string(), "id".to_string())
-            .with_cache_ttl(Duration::from_secs(600));
+            .with_cache_ttl(Duration::from_mins(10));
 
         assert_eq!(config.stream_key, "customer_id");
         assert_eq!(config.lookup_key, "id");
-        assert_eq!(config.cache_ttl, Duration::from_secs(600));
+        assert_eq!(config.cache_ttl, Duration::from_mins(10));
         assert_eq!(config.join_type, LookupJoinType::Inner);
     }
 
@@ -514,7 +514,7 @@ mod tests {
             "payments".to_string(),
             "order_id".to_string(),
             "order_id".to_string(),
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             JoinType::Inner,
         );
 
@@ -524,7 +524,7 @@ mod tests {
         assert!(!config.is_lookup());
 
         if let JoinOperatorConfig::StreamStream(stream_config) = config {
-            assert_eq!(stream_config.time_bound, Duration::from_secs(3600));
+            assert_eq!(stream_config.time_bound, Duration::from_hours(1));
             assert_eq!(stream_config.join_type, StreamJoinType::Inner);
         }
     }
@@ -558,7 +558,7 @@ mod tests {
             AsofSqlDirection::Forward,
             "trade_ts".to_string(),
             "quote_ts".to_string(),
-            Some(Duration::from_millis(5000)),
+            Some(Duration::from_secs(5)),
         );
 
         let config = JoinOperatorConfig::from_analysis(&analysis);
@@ -566,7 +566,7 @@ mod tests {
             assert_eq!(asof.direction, AsofSqlDirection::Forward);
             assert_eq!(asof.left_time_column, "trade_ts");
             assert_eq!(asof.right_time_column, "quote_ts");
-            assert_eq!(asof.tolerance, Some(Duration::from_millis(5000)));
+            assert_eq!(asof.tolerance, Some(Duration::from_secs(5)));
             assert_eq!(asof.key_column, "symbol");
             assert_eq!(asof.join_type, AsofSqlJoinType::Left);
         } else {
@@ -700,7 +700,7 @@ mod tests {
             "payments".to_string(),
             "id".to_string(),
             "order_id".to_string(),
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
             JoinType::Inner,
         );
         let j2 = JoinAnalysis::lookup(
@@ -739,7 +739,7 @@ mod tests {
             "c".to_string(),
             "k2".to_string(),
             "k2".to_string(),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             JoinType::Left,
         );
         let j3 = JoinAnalysis::lookup(
@@ -777,7 +777,7 @@ mod tests {
             "b".to_string(),
             "id".to_string(),
             "id".to_string(),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             JoinType::Left,
         );
 
@@ -792,7 +792,7 @@ mod tests {
             "b".to_string(),
             "id".to_string(),
             "id".to_string(),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             JoinType::Right,
         );
 
@@ -807,7 +807,7 @@ mod tests {
             "b".to_string(),
             "id".to_string(),
             "id".to_string(),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             JoinType::Full,
         );
 
@@ -823,7 +823,7 @@ mod tests {
         let mut config = StreamJoinConfig::inner(
             "order_id".to_string(),
             "order_id".to_string(),
-            Duration::from_secs(3600),
+            Duration::from_hours(1),
         );
         config.left_table = "orders".to_string();
         config.right_table = "payments".to_string();
@@ -882,7 +882,7 @@ mod tests {
             "b".to_string(),
             "id".to_string(),
             "id".to_string(),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             JoinType::LeftSemi,
         );
         if let JoinOperatorConfig::StreamStream(config) = JoinOperatorConfig::from_analysis(&semi) {
@@ -896,7 +896,7 @@ mod tests {
             "b".to_string(),
             "id".to_string(),
             "id".to_string(),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             JoinType::LeftAnti,
         );
         if let JoinOperatorConfig::StreamStream(config) = JoinOperatorConfig::from_analysis(&anti) {
@@ -911,7 +911,7 @@ mod tests {
             "b".to_string(),
             "id".to_string(),
             "id".to_string(),
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             JoinType::RightAnti,
         );
         if let JoinOperatorConfig::StreamStream(config) =

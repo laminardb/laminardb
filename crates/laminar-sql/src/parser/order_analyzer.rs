@@ -307,17 +307,13 @@ fn extract_rn_filter_limit(selection: Option<&Expr>, alias: &str) -> Option<usiz
     if let Expr::BinaryOp { left, op, right } = where_expr {
         use sqlparser::ast::BinaryOperator;
         match op {
-            BinaryOperator::LtEq => {
+            BinaryOperator::LtEq if extract_column_name(left)? == alias => {
                 // rn <= N
-                if extract_column_name(left)? == alias {
-                    return expr_to_usize(right);
-                }
+                return expr_to_usize(right);
             }
-            BinaryOperator::Lt => {
+            BinaryOperator::Lt if extract_column_name(left)? == alias => {
                 // rn < N -> k = N - 1
-                if extract_column_name(left)? == alias {
-                    return expr_to_usize(right).map(|n| n.saturating_sub(1));
-                }
+                return expr_to_usize(right).map(|n| n.saturating_sub(1));
             }
             _ => {}
         }

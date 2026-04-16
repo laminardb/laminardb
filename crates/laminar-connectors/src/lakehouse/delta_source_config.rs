@@ -136,7 +136,7 @@ impl Default for DeltaSourceConfig {
         Self {
             table_path: String::new(),
             starting_version: None,
-            poll_interval: Duration::from_millis(1000),
+            poll_interval: Duration::from_secs(1),
             read_mode: DeltaReadMode::default(),
             partition_filter: None,
             schema_evolution_action: SchemaEvolutionAction::default(),
@@ -346,7 +346,7 @@ mod tests {
         let cfg = DeltaSourceConfig::default();
         assert!(cfg.table_path.is_empty());
         assert!(cfg.starting_version.is_none());
-        assert_eq!(cfg.poll_interval, Duration::from_millis(1000));
+        assert_eq!(cfg.poll_interval, Duration::from_secs(1));
     }
 
     #[test]

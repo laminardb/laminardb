@@ -465,7 +465,7 @@ mod tests {
     async fn test_drain_empty() {
         let config = DiscoveryConfig {
             path: "/nonexistent_test_dir_12345".into(),
-            poll_interval: Duration::from_secs(60),
+            poll_interval: Duration::from_mins(1),
             stabilisation_delay: Duration::from_secs(1),
             glob_pattern: None,
         };

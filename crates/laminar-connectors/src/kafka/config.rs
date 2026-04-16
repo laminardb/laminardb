@@ -677,7 +677,7 @@ impl Default for KafkaSourceConfig {
             enable_watermark_tracking: false,
             session_timeout: Duration::from_secs(45),
             heartbeat_interval: Duration::from_secs(10),
-            max_poll_interval: Duration::from_secs(600),
+            max_poll_interval: Duration::from_mins(10),
             queued_max_messages_kbytes: 16384,
             broker_commit_interval: Duration::from_secs(5),
             reader_channel_capacity: 1024,
@@ -1317,7 +1317,7 @@ mod tests {
         let cfg =
             KafkaSourceConfig::from_config(&make_config(&[("broker.commit.interval.ms", "5000")]))
                 .unwrap();
-        assert_eq!(cfg.broker_commit_interval, Duration::from_millis(5000));
+        assert_eq!(cfg.broker_commit_interval, Duration::from_secs(5));
     }
 
     #[test]

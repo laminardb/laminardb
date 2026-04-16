@@ -1145,7 +1145,7 @@ impl LaminarDB {
                 .map(std::time::Duration::from_millis),
             pipeline_hash,
             delivery_guarantee: pipeline_config.delivery_guarantee,
-            serialization_timeout: std::time::Duration::from_secs(120),
+            serialization_timeout: std::time::Duration::from_mins(2),
             sink_event_rx,
             sink_timed_out: false,
             shutdown_signal: Arc::clone(&self.shutdown_signal),

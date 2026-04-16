@@ -506,7 +506,7 @@ impl SinkConnector for IcebergSink {
 
     fn capabilities(&self) -> SinkConnectorCapabilities {
         // Iceberg catalog writes can be slow under contention.
-        SinkConnectorCapabilities::new(Duration::from_secs(300))
+        SinkConnectorCapabilities::new(Duration::from_mins(5))
             .with_exactly_once()
             .with_two_phase_commit()
     }

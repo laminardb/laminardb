@@ -159,7 +159,7 @@ impl IcebergSourceConfig {
 
         let poll_interval = config
             .get_parsed::<u64>("poll.interval.ms")?
-            .map_or(Duration::from_secs(60), Duration::from_millis);
+            .map_or(Duration::from_mins(1), Duration::from_millis);
 
         let snapshot_id = config.get_parsed::<i64>("snapshot.id")?;
 

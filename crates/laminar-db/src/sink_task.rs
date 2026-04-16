@@ -623,7 +623,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let sink = SlowSink {
             schema,
-            sleep: Duration::from_secs(60),
+            sleep: Duration::from_mins(1),
         };
         let (handle, events) =
             spawn_with_defaults("slow", Box::new(sink), Duration::from_millis(50));

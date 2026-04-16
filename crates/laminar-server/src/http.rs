@@ -502,6 +502,8 @@ async fn ws_client(
                 }
             }
             msg = socket.recv() => {
+                // `data` moves into `Pong`, so the inner `if` can't fold into the guard.
+                #[allow(clippy::collapsible_match)]
                 match msg {
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(Message::Ping(data))) => {

@@ -64,7 +64,7 @@ impl Default for GossipDiscoveryConfig {
             seed_nodes: Vec::new(),
             gossip_interval: Duration::from_millis(500),
             phi_threshold: 8.0,
-            dead_node_grace_period: Duration::from_secs(300),
+            dead_node_grace_period: Duration::from_mins(5),
             cluster_id: "laminardb-default".into(),
             node_id: NodeId(1),
             local_node: NodeInfo {

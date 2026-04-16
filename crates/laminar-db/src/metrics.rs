@@ -167,7 +167,7 @@ mod tests {
             total_events_dropped: 0,
             total_cycles: 10,
             total_batches: 5,
-            uptime: Duration::from_secs(60),
+            uptime: Duration::from_mins(1),
             state: PipelineState::Running,
             source_count: 2,
             stream_count: 1,

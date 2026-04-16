@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn test_update_partition() {
         let mut tracker = KafkaWatermarkTracker::new(0, Duration::from_secs(30))
-            .with_max_out_of_orderness(Duration::from_millis(1000));
+            .with_max_out_of_orderness(Duration::from_secs(1));
         tracker.register_partitions(2);
 
         tracker.update_partition(0, 5000);
@@ -341,7 +341,7 @@ mod tests {
     #[test]
     fn test_idle_partition() {
         let mut tracker = KafkaWatermarkTracker::new(0, Duration::from_secs(30))
-            .with_max_out_of_orderness(Duration::from_millis(1000));
+            .with_max_out_of_orderness(Duration::from_secs(1));
         tracker.register_partitions(2);
 
         tracker.update_partition(0, 5000);
@@ -359,7 +359,7 @@ mod tests {
     #[test]
     fn test_resume_from_idle() {
         let mut tracker = KafkaWatermarkTracker::new(0, Duration::from_secs(30))
-            .with_max_out_of_orderness(Duration::from_millis(1000));
+            .with_max_out_of_orderness(Duration::from_secs(1));
         tracker.register_partitions(2);
 
         tracker.update_partition(0, 5000);
@@ -376,7 +376,7 @@ mod tests {
     #[test]
     fn test_add_partition_dynamically() {
         let mut tracker = KafkaWatermarkTracker::new(0, Duration::from_secs(30))
-            .with_max_out_of_orderness(Duration::from_millis(1000));
+            .with_max_out_of_orderness(Duration::from_secs(1));
 
         tracker.update_partition(0, 5000);
         tracker.add_partition(5);
@@ -389,7 +389,7 @@ mod tests {
     #[test]
     fn test_remove_partition() {
         let mut tracker = KafkaWatermarkTracker::new(0, Duration::from_secs(30))
-            .with_max_out_of_orderness(Duration::from_millis(1000));
+            .with_max_out_of_orderness(Duration::from_secs(1));
         tracker.register_partitions(2);
 
         tracker.update_partition(0, 5000);
@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn test_partition_watermark() {
         let mut tracker = KafkaWatermarkTracker::new(0, Duration::from_secs(30))
-            .with_max_out_of_orderness(Duration::from_millis(1000));
+            .with_max_out_of_orderness(Duration::from_secs(1));
         tracker.register_partitions(2);
 
         tracker.update_partition(0, 5000);

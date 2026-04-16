@@ -111,7 +111,7 @@ impl Default for AdaptiveCheckpointConfig {
     fn default() -> Self {
         Self {
             min_interval: Duration::from_secs(10),
-            max_interval: Duration::from_secs(300),
+            max_interval: Duration::from_mins(5),
             target_overhead_ratio: 0.1,
             smoothing_alpha: 0.3,
         }
@@ -121,14 +121,14 @@ impl Default for AdaptiveCheckpointConfig {
 impl Default for CheckpointConfig {
     fn default() -> Self {
         Self {
-            interval: Some(Duration::from_secs(60)),
+            interval: Some(Duration::from_mins(1)),
             max_retained: 3,
             alignment_timeout: Duration::from_secs(30),
             pre_commit_timeout: Duration::from_secs(30),
-            persist_timeout: Duration::from_secs(120),
-            commit_timeout: Duration::from_secs(60),
+            persist_timeout: Duration::from_mins(2),
+            commit_timeout: Duration::from_mins(1),
             rollback_timeout: Duration::from_secs(30),
-            serialization_timeout: Duration::from_secs(120),
+            serialization_timeout: Duration::from_mins(2),
             state_inline_threshold: 1_048_576,
             max_checkpoint_bytes: None,
             adaptive: None,
@@ -1594,7 +1594,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let coord = make_coordinator(dir.path());
         assert!(coord.config().adaptive.is_none());
-        assert_eq!(coord.config().interval, Some(Duration::from_secs(60)));
+        assert_eq!(coord.config().interval, Some(Duration::from_mins(1)));
     }
 
     #[test]
@@ -1648,7 +1648,7 @@ mod tests {
         let config = CheckpointConfig {
             adaptive: Some(AdaptiveCheckpointConfig {
                 min_interval: Duration::from_secs(20),
-                max_interval: Duration::from_secs(120),
+                max_interval: Duration::from_mins(2),
                 target_overhead_ratio: 0.1,
                 smoothing_alpha: 1.0, // Full weight on latest
             }),
@@ -1657,10 +1657,10 @@ mod tests {
         let mut coord = CheckpointCoordinator::new(config, store);
 
         // Very slow → clamp to max
-        coord.last_checkpoint_duration = Some(Duration::from_secs(60));
+        coord.last_checkpoint_duration = Some(Duration::from_mins(1));
         coord.adjust_interval();
         let interval = coord.config().interval.unwrap();
-        assert_eq!(interval, Duration::from_secs(120), "should clamp to max");
+        assert_eq!(interval, Duration::from_mins(2), "should clamp to max");
 
         // Very fast → clamp to min
         coord.last_checkpoint_duration = Some(Duration::from_millis(10));
@@ -1677,7 +1677,7 @@ mod tests {
         let config = CheckpointConfig {
             adaptive: Some(AdaptiveCheckpointConfig {
                 min_interval: Duration::from_secs(1),
-                max_interval: Duration::from_secs(600),
+                max_interval: Duration::from_mins(10),
                 target_overhead_ratio: 0.1,
                 smoothing_alpha: 0.5,
             }),
@@ -1686,17 +1686,17 @@ mod tests {
         let mut coord = CheckpointCoordinator::new(config, store);
 
         // First observation: 1000ms → EMA = 1000 (cold start)
-        coord.last_checkpoint_duration = Some(Duration::from_millis(1000));
+        coord.last_checkpoint_duration = Some(Duration::from_secs(1));
         coord.adjust_interval();
         assert!((coord.smoothed_duration_ms() - 1000.0).abs() < 1.0);
 
         // Second observation: 2000ms → EMA = 0.5*2000 + 0.5*1000 = 1500
-        coord.last_checkpoint_duration = Some(Duration::from_millis(2000));
+        coord.last_checkpoint_duration = Some(Duration::from_secs(2));
         coord.adjust_interval();
         assert!((coord.smoothed_duration_ms() - 1500.0).abs() < 1.0);
 
         // Third observation: 2000ms → EMA = 0.5*2000 + 0.5*1500 = 1750
-        coord.last_checkpoint_duration = Some(Duration::from_millis(2000));
+        coord.last_checkpoint_duration = Some(Duration::from_secs(2));
         coord.adjust_interval();
         assert!((coord.smoothed_duration_ms() - 1750.0).abs() < 1.0);
     }

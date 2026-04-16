@@ -267,7 +267,7 @@ impl SinkConnector for MockSinkConnector {
     }
 
     fn capabilities(&self) -> SinkConnectorCapabilities {
-        SinkConnectorCapabilities::new(Duration::from_secs(60))
+        SinkConnectorCapabilities::new(Duration::from_mins(1))
             .with_exactly_once()
             .with_idempotent()
             .with_two_phase_commit()

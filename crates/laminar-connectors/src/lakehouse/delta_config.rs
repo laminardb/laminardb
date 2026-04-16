@@ -100,14 +100,14 @@ impl Default for DeltaLakeSinkConfig {
             partition_columns: Vec::new(),
             target_file_size: 128 * 1024 * 1024, // 128 MB
             max_buffer_records: 100_000,
-            max_buffer_duration: Duration::from_secs(60),
+            max_buffer_duration: Duration::from_mins(1),
             checkpoint_interval: 10,
             schema_evolution: false,
             write_mode: DeltaWriteMode::Append,
             merge_key_columns: Vec::new(),
             storage_options: HashMap::new(),
             compaction: CompactionConfig::default(),
-            vacuum_retention: Duration::from_secs(7 * 24 * 3600), // 7 days
+            vacuum_retention: Duration::from_hours(7 * 24),
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
             writer_id: uuid::Uuid::new_v4().to_string(),
             catalog_type: DeltaCatalogType::None,
@@ -418,7 +418,7 @@ impl DeltaLakeSinkConfig {
                 "compaction.check-interval.ms must be > 0".into(),
             ));
         }
-        if self.vacuum_retention < Duration::from_secs(24 * 3600) {
+        if self.vacuum_retention < Duration::from_hours(24) {
             return Err(ConnectorError::ConfigurationError(
                 "vacuum.retention.hours must be >= 24 (Delta Lake safety minimum)".into(),
             ));
@@ -651,7 +651,7 @@ impl Default for CompactionConfig {
             min_files_for_compaction: 10,
             target_file_size: 128 * 1024 * 1024, // 128 MB
             z_order_columns: Vec::new(),
-            check_interval: Duration::from_secs(3600), // 60 minutes
+            check_interval: Duration::from_hours(1), // 60 minutes
         }
     }
 }
@@ -862,7 +862,7 @@ mod tests {
         assert_eq!(cfg.partition_columns, vec!["trade_date", "hour"]);
         assert_eq!(cfg.target_file_size, 67_108_864);
         assert_eq!(cfg.max_buffer_records, 50_000);
-        assert_eq!(cfg.max_buffer_duration, Duration::from_millis(30_000));
+        assert_eq!(cfg.max_buffer_duration, Duration::from_secs(30));
         assert_eq!(cfg.checkpoint_interval, 20);
         assert!(cfg.schema_evolution);
         assert_eq!(cfg.write_mode, DeltaWriteMode::Upsert);
@@ -874,7 +874,7 @@ mod tests {
             vec!["customer_id", "product_id"]
         );
         assert_eq!(cfg.compaction.min_files_for_compaction, 20);
-        assert_eq!(cfg.vacuum_retention, Duration::from_secs(336 * 3600));
+        assert_eq!(cfg.vacuum_retention, Duration::from_hours(336));
         assert_eq!(cfg.writer_id, "my-writer");
         assert_eq!(
             cfg.storage_options.get("aws_access_key_id"),
@@ -1023,7 +1023,7 @@ mod tests {
         assert!(cfg.table_path.is_empty());
         assert_eq!(cfg.target_file_size, 128 * 1024 * 1024);
         assert_eq!(cfg.max_buffer_records, 100_000);
-        assert_eq!(cfg.max_buffer_duration, Duration::from_secs(60));
+        assert_eq!(cfg.max_buffer_duration, Duration::from_mins(1));
         assert_eq!(cfg.checkpoint_interval, 10);
         assert!(!cfg.schema_evolution);
         assert_eq!(cfg.write_mode, DeltaWriteMode::Append);
@@ -1120,7 +1120,7 @@ mod tests {
         assert_eq!(cfg.min_files_for_compaction, 10);
         assert_eq!(cfg.target_file_size, 128 * 1024 * 1024);
         assert!(cfg.z_order_columns.is_empty());
-        assert_eq!(cfg.check_interval, Duration::from_secs(3600));
+        assert_eq!(cfg.check_interval, Duration::from_hours(1));
     }
 
     #[test]
