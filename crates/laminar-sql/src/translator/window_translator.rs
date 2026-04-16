@@ -483,9 +483,7 @@ mod tests {
         assert!(!config.has_late_data_handling());
 
         // With allowed lateness
-        let config2 = config
-            .clone()
-            .with_allowed_lateness(Duration::from_mins(1));
+        let config2 = config.clone().with_allowed_lateness(Duration::from_mins(1));
         assert!(config2.has_late_data_handling());
 
         // With side output
