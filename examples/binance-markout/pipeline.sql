@@ -1,5 +1,6 @@
--- LaminarDB Mark-Out Demo on BTC-USDT-PERP.
+-- LaminarDB Multi-Horizon Mark-Out Demo on BTC-USDT-PERP.
 -- Binance USDT-M futures trade and bookTicker streams.
+-- Horizons: 5s / 15s / 30s / 60s. Primary horizon (scatter, alerts) is 5s.
 
 -- ── 1. Sources ────────────────────────────────────────────────────
 
@@ -36,10 +37,11 @@ SELECT
     "E"
 FROM btc_book;
 
--- ── 3. Mark-outs at 0s / 1s / 5s / 30s horizons ──────────────────
--- Probe emits one row per (trade × horizon); signed_markout_bps is positive
--- when the price moved in the aggressor's favour. Probe alias is `mo` to
--- avoid colliding with the left-side column `p` (trade price).
+-- ── 3. Mark-outs at 5s / 15s / 30s / 60s horizons ────────────────
+-- One probe operator, one shared right-side buffer. Each trade emits
+-- four rows (one per offset) with `offset_ms` as a column.
+-- Reference is the trade price (execution markout).
+
 CREATE STREAM markouts_long AS
 SELECT
     s,
@@ -57,9 +59,29 @@ SELECT
 FROM btc_trades t
 TEMPORAL PROBE JOIN book_mid mp
     ON (s) TIMESTAMPS ("T", "E")
-    LIST (0s, 1s, 5s, 30s) AS mo;
+    LIST (5s, 15s, 30s, 60s) AS mo;
 
--- ── 5. Rolling 30s aggregates ────────────────────────────────────
+-- ── 4. Markout curve (centrepiece) ────────────────────────────────
+-- Per 1-minute window, per aggressor side: the shape of markout across
+-- horizons. Wide form so the dashboard can plot one polyline per side.
+-- Each trade contributes 4 rows to markouts_long, so COUNT/SUM / 4.
+
+CREATE STREAM markout_curve AS
+SELECT
+    side,
+    AVG(CASE WHEN offset_ms = 5000  THEN signed_markout_bps END) AS avg_5s,
+    AVG(CASE WHEN offset_ms = 15000 THEN signed_markout_bps END) AS avg_15s,
+    AVG(CASE WHEN offset_ms = 30000 THEN signed_markout_bps END) AS avg_30s,
+    AVG(CASE WHEN offset_ms = 60000 THEN signed_markout_bps END) AS avg_60s,
+    COUNT(*) / 4                                                 AS trade_count,
+    SUM(quantity) / 4.0                                          AS total_volume
+FROM markouts_long
+GROUP BY side, TUMBLE("T", INTERVAL '1' MINUTE)
+EMIT ON WINDOW CLOSE;
+
+-- ── 5. 30-second per-offset metrics (heatmap + cards) ────────────
+-- Long form keyed by offset_ms. Heatmap reads every row; metric cards
+-- filter to 5000 and 60000.
 
 CREATE STREAM flow_toxicity_30s AS
 SELECT
@@ -74,64 +96,51 @@ FROM markouts_long
 GROUP BY offset_ms, TUMBLE("T", INTERVAL '30' SECOND)
 EMIT ON WINDOW CLOSE;
 
-CREATE STREAM flow_by_side_30s AS
-SELECT
-    offset_ms,
-    side,
-    COUNT(*)                AS trade_count,
-    AVG(signed_markout_bps) AS avg_markout_bps,
-    SUM(quantity)           AS volume
-FROM markouts_long
-GROUP BY offset_ms, side, TUMBLE("T", INTERVAL '30' SECOND)
-EMIT ON WINDOW CLOSE;
-
-CREATE STREAM vwap_markout_30s AS
-SELECT
-    offset_ms,
-    SUM(signed_markout_bps * quantity) / SUM(quantity) AS vwap_markout_bps,
-    SUM(quantity)                                      AS total_volume
-FROM markouts_long
-GROUP BY offset_ms, TUMBLE("T", INTERVAL '30' SECOND)
-EMIT ON WINDOW CLOSE;
-
 -- ── 6. Toxicity alerts ───────────────────────────────────────────
+-- Fired when 5s adverse selection breaches 60%, or 5s avg markout
+-- runs sufficiently negative. 5s is the primary horizon.
 
 CREATE STREAM toxicity_alerts AS
-SELECT *
+SELECT
+    'HIGH_ADVERSE_SELECTION'                          AS alert_type,
+    offset_ms,
+    adverse_selection_rate,
+    avg_markout_bps,
+    trade_count
 FROM flow_toxicity_30s
-WHERE offset_ms = 1000
+WHERE offset_ms = 5000
   AND (adverse_selection_rate > 0.6 OR avg_markout_bps < -2.0);
 
 -- ── 7. WebSocket sinks — one port per dashboard panel ────────────
 
 CREATE SINK markouts_sink FROM markouts_long
 INTO WEBSOCKET (
-    mode         = 'server',
+    mode           = 'server',
     'bind.address' = '127.0.0.1:9001',
     path           = '/markouts',
-    format       = 'json'
+    format         = 'json'
+);
+
+CREATE SINK curve_sink FROM markout_curve
+INTO WEBSOCKET (
+    mode           = 'server',
+    'bind.address' = '127.0.0.1:9002',
+    path           = '/curve',
+    format         = 'json'
 );
 
 CREATE SINK toxicity_sink FROM flow_toxicity_30s
 INTO WEBSOCKET (
-    mode         = 'server',
-    'bind.address' = '127.0.0.1:9002',
-    path         = '/toxicity',
-    format       = 'json'
-);
-
-CREATE SINK by_side_sink FROM flow_by_side_30s
-INTO WEBSOCKET (
-    mode         = 'server',
+    mode           = 'server',
     'bind.address' = '127.0.0.1:9003',
-    path         = '/by_side',
-    format       = 'json'
+    path           = '/toxicity',
+    format         = 'json'
 );
 
 CREATE SINK alerts_sink FROM toxicity_alerts
 INTO WEBSOCKET (
-    mode         = 'server',
+    mode           = 'server',
     'bind.address' = '127.0.0.1:9004',
-    path         = '/alerts',
-    format       = 'json'
+    path           = '/alerts',
+    format         = 'json'
 );

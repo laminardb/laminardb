@@ -40,9 +40,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  book:   wss://fstream.binance.com/ws/btcusdt@bookTicker");
     println!();
     println!("Dashboard WebSocket endpoints:");
-    println!("  ws://127.0.0.1:9001/markouts   (per-trade scatter + horizons)");
-    println!("  ws://127.0.0.1:9002/toxicity   (30s rolling per-horizon metrics)");
-    println!("  ws://127.0.0.1:9003/by_side    (30s BUY/SELL breakdown)");
+    println!("  ws://127.0.0.1:9001/markouts   (per-trade, 5/15/30/60s horizons)");
+    println!("  ws://127.0.0.1:9002/curve      (1-min per-side markout curve)");
+    println!("  ws://127.0.0.1:9003/toxicity   (30s per-horizon metrics)");
     println!("  ws://127.0.0.1:9004/alerts     (adverse-selection alerts)");
     println!();
     println!("Press Ctrl-C to stop.");

@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
     <meta charset="utf-8">
-    <title>LaminarDB — Real-Time Mark-Out Analysis · BTC-USDT-PERP</title>
-    <link rel="stylesheet" href="dashboard.css?v=6">
+    <title>LaminarDB — Real-Time Multi-Horizon Mark-Out Analysis</title>
+    <link rel="stylesheet" href="dashboard.css?v=7">
 </head>
 <body>
     <header>
@@ -11,71 +11,86 @@
             <span class="logo">&#9672;</span>
             <span class="title">LaminarDB</span>
             <span class="sep">/</span>
-            <span class="subtitle">Real-Time Mark-Out Analysis</span>
+            <span class="subtitle">Real-Time Multi-Horizon Mark-Out Analysis</span>
         </div>
         <div class="market">
-            <span class="sym">BTC-USDT-PERP</span>
-            <span class="venue">Binance USDT-M Futures</span>
-            <span class="status" id="status">connecting&#8230;</span>
+            <span class="sym">BTC/USDT</span>
+            <span class="venue">Live Binance Data</span>
+            <span class="status" id="status">
+                <span class="live-dot"></span>
+                <span id="status-text">connecting&#8230;</span>
+            </span>
         </div>
     </header>
 
-    <section class="scatter-panel">
+    <section class="curve-panel">
         <div class="panel-head">
-            <h2>Signed mark-out · 1s horizon</h2>
+            <h2>Mark-out curve &middot; 1-min windows across 5s / 15s / 30s / 60s</h2>
             <div class="legend">
                 <span class="dot buy"></span>BUY aggressor
                 <span class="dot sell"></span>SELL aggressor
-                <span class="axis-note">Y: bps &#xb7; X: last 5 min</span>
+                <span class="axis-note">history fades; latest is solid</span>
+            </div>
+        </div>
+        <canvas id="curve"></canvas>
+        <div class="curve-footer">
+            Flat near zero &rarr; uninformed flow.
+            Rising across all horizons &rarr; sustained informed flow.
+            Spike at 5s, reverts by 60s &rarr; temporary impact.
+            Lines diverging &rarr; directional pressure.
+        </div>
+    </section>
+
+    <section class="scatter-panel">
+        <div class="panel-head">
+            <h2>Per-trade signed mark-out &middot; 5s horizon</h2>
+            <div class="legend">
+                <span class="dot buy"></span>BUY aggressor
+                <span class="dot sell"></span>SELL aggressor
+                <span class="axis-note">Y: bps &middot; X: last 5 min</span>
             </div>
         </div>
         <canvas id="scatter"></canvas>
     </section>
 
-    <section class="metrics">
-        <div class="card" id="card-markout">
-            <div class="card-label">Avg mark-out 1s</div>
-            <div class="card-value" id="m-avg">&#8212;</div>
-            <div class="card-unit">bps</div>
+    <section class="heatmap-panel">
+        <div class="panel-head">
+            <h2>Horizon heatmap &middot; 30s rows &times; horizon columns</h2>
+            <div class="legend">
+                <span class="swatch pos"></span>positive markout
+                <span class="swatch neu"></span>flat
+                <span class="swatch neg"></span>negative markout
+                <span class="axis-note">most recent on top</span>
+            </div>
         </div>
-        <div class="card" id="card-adverse">
-            <div class="card-label">Adverse selection</div>
-            <div class="card-value" id="m-adverse">&#8212;</div>
-            <div class="card-unit">of 30s trades</div>
-        </div>
-        <div class="card" id="card-count">
-            <div class="card-label">Trades per 30s</div>
-            <div class="card-value" id="m-count">&#8212;</div>
-            <div class="card-unit">&nbsp;</div>
-        </div>
+        <canvas id="heatmap"></canvas>
     </section>
 
-    <section class="by-side-panel">
-        <h2>Flow by aggressor side</h2>
-        <div class="by-side-grid">
-            <div class="side-col buy">
-                <div class="side-head">BUY aggressor</div>
-                <table>
-                    <tr><th>horizon</th><th>avg markout (bps)</th><th>trades</th><th>volume (BTC)</th></tr>
-                    <tr data-side="BUY" data-offset="1000"><td>1s</td><td class="v-markout">&#8212;</td><td class="v-trades">&#8212;</td><td class="v-vol">&#8212;</td></tr>
-                    <tr data-side="BUY" data-offset="5000"><td>5s</td><td class="v-markout">&#8212;</td><td class="v-trades">&#8212;</td><td class="v-vol">&#8212;</td></tr>
-                    <tr data-side="BUY" data-offset="30000"><td>30s</td><td class="v-markout">&#8212;</td><td class="v-trades">&#8212;</td><td class="v-vol">&#8212;</td></tr>
-                </table>
-            </div>
-            <div class="side-col sell">
-                <div class="side-head">SELL aggressor</div>
-                <table>
-                    <tr><th>horizon</th><th>avg markout (bps)</th><th>trades</th><th>volume (BTC)</th></tr>
-                    <tr data-side="SELL" data-offset="1000"><td>1s</td><td class="v-markout">&#8212;</td><td class="v-trades">&#8212;</td><td class="v-vol">&#8212;</td></tr>
-                    <tr data-side="SELL" data-offset="5000"><td>5s</td><td class="v-markout">&#8212;</td><td class="v-trades">&#8212;</td><td class="v-vol">&#8212;</td></tr>
-                    <tr data-side="SELL" data-offset="30000"><td>30s</td><td class="v-markout">&#8212;</td><td class="v-trades">&#8212;</td><td class="v-vol">&#8212;</td></tr>
-                </table>
-            </div>
+    <section class="metrics">
+        <div class="card" id="card-mk5">
+            <div class="card-label">Avg mark-out 5s</div>
+            <div class="card-value" id="m-mk5">&#8212;</div>
+            <div class="card-unit">bps / 30s</div>
+        </div>
+        <div class="card" id="card-mk60">
+            <div class="card-label">Avg mark-out 60s</div>
+            <div class="card-value" id="m-mk60">&#8212;</div>
+            <div class="card-unit">bps / 30s</div>
+        </div>
+        <div class="card" id="card-adv">
+            <div class="card-label">Adverse selection 5s</div>
+            <div class="card-value" id="m-adv">&#8212;</div>
+            <div class="card-unit">of 30s trades</div>
+        </div>
+        <div class="card" id="card-cnt">
+            <div class="card-label">Trades / 30s</div>
+            <div class="card-value" id="m-cnt">&#8212;</div>
+            <div class="card-unit">count</div>
         </div>
     </section>
 
     <section class="alerts">
-        <h2>Toxicity alerts</h2>
+        <div class="panel-head"><h2>Toxicity alerts</h2></div>
         <ul id="alert-feed"><li class="placeholder">no alerts yet</li></ul>
     </section>
 
@@ -83,12 +98,12 @@
         <span>All numbers sourced live from Binance USDT-M futures WebSocket. No simulation, no replay.</span>
         <span class="conns">
             <span id="conn-markouts" class="conn off">markouts</span>
+            <span id="conn-curve" class="conn off">curve</span>
             <span id="conn-toxicity" class="conn off">toxicity</span>
-            <span id="conn-by_side" class="conn off">by_side</span>
             <span id="conn-alerts" class="conn off">alerts</span>
         </span>
     </footer>
 
-    <script src="dashboard.js?v=6"></script>
+    <script src="dashboard.js?v=7"></script>
 </body>
 </html>
