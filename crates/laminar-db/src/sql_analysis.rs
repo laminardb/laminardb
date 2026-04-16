@@ -419,15 +419,12 @@ pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperator
             // belongs only to fully closed windows.
             // Account for window offset to match SlidingWindowAssigner.
             let offset = config.offset_ms;
-            let base = (watermark_ms - offset).saturating_sub(size);
-            let boundary = if base >= 0 {
-                (base / slide).saturating_add(1).saturating_mul(slide)
-            } else {
-                ((base - slide + 1) / slide)
-                    .saturating_add(1)
-                    .saturating_mul(slide)
-            };
-            boundary + offset
+            let base = watermark_ms.saturating_sub(offset).saturating_sub(size);
+            let boundary = base
+                .div_euclid(slide)
+                .saturating_add(1)
+                .saturating_mul(slide);
+            boundary.saturating_add(offset)
         }
         WindowType::Cumulate => {
             // Cumulate windows share the same epoch alignment as tumbling.
@@ -1018,12 +1015,20 @@ fn read_qualified(toks: &[&TokenWithSpan], i: &mut usize) -> Option<String> {
 }
 
 fn parse_table_ref(toks: &[&TokenWithSpan]) -> Option<TableRef> {
-    let name = ident(toks.first()?)?;
-    let alias = match toks.len() {
-        1 => None,
-        2 => ident(toks[1]),
-        _ if kw(toks[1], "AS") => ident(toks[2]),
-        _ => ident(toks[1]),
+    let mut i = 0;
+    let mut name = ident(toks.first()?)?;
+    i += 1;
+    while toks.get(i).map(|t| &t.token) == Some(&Token::Period) {
+        let next = ident(toks.get(i + 1)?)?;
+        name.push('.');
+        name.push_str(&next);
+        i += 2;
+    }
+    let alias = match toks.len() - i {
+        0 => None,
+        1 => ident(toks[i]),
+        _ if kw(toks[i], "AS") => ident(toks.get(i + 1)?),
+        _ => ident(toks[i]),
     };
     Some(TableRef { name, alias })
 }

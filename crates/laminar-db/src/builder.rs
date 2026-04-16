@@ -309,9 +309,9 @@ impl LaminarDbBuilder {
             return Ok(());
         }
 
-        // Non-default policy needs at least one finite cap to do anything.
+        // Non-default policy needs at least one finite, non-zero cap.
         let has_count_cap = config.pipeline_max_input_buf_batches.is_none_or(|c| c > 0);
-        let has_byte_cap = config.pipeline_max_input_buf_bytes.is_some();
+        let has_byte_cap = config.pipeline_max_input_buf_bytes.is_some_and(|b| b > 0);
         if !has_count_cap && !has_byte_cap {
             return Err(DbError::Config(format!(
                 "backpressure_policy={policy:?} requires at least one of \
