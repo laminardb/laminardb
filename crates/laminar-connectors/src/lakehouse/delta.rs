@@ -549,7 +549,20 @@ impl DeltaLakeSink {
                     {
                         self.delta_version = table.version().unwrap_or(0) as u64;
                     }
-                    self.table = Some(table);
+
+                    // delta-rs' in-memory Snapshot grows by one commit's Add/Remove
+                    // actions every write and is never compacted in place, even when
+                    // we write a `_delta_log/*.checkpoint.parquet` file on disk. Drop
+                    // the handle on checkpoint boundaries so the next flush re-loads
+                    // from the checkpoint + subsequent commits, producing a compact
+                    // snapshot. Without this, the handle grows unboundedly (~1 commit
+                    // of state per `max_buffer_duration`).
+                    let crossed_checkpoint = self.config.checkpoint_interval > 0
+                        && self.delta_version > 0
+                        && self
+                            .delta_version
+                            .is_multiple_of(self.config.checkpoint_interval);
+                    self.table = if crossed_checkpoint { None } else { Some(table) };
 
                     // Clear staged state only after confirmed success.
                     self.staged_batches.clear();
@@ -565,6 +578,7 @@ impl DeltaLakeSink {
                         bytes = estimated_bytes,
                         delta_version = self.delta_version,
                         attempt = attempt + 1,
+                        reopened = crossed_checkpoint,
                         "Delta Lake: committed staged data to Delta"
                     );
 
