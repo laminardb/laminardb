@@ -706,105 +706,6 @@ impl WatermarkGenerator for ProcessingTimeGenerator {
     }
 }
 
-/// Metrics for watermark tracking.
-#[derive(Debug, Clone, Default)]
-pub struct WatermarkMetrics {
-    /// Current watermark timestamp
-    pub current_watermark: i64,
-    /// Maximum observed event timestamp
-    pub max_event_timestamp: i64,
-    /// Number of watermark emissions
-    pub watermarks_emitted: u64,
-    /// Number of late events detected
-    pub late_events: u64,
-}
-
-impl WatermarkMetrics {
-    /// Creates new metrics.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns the watermark lag (difference between max event time and watermark).
-    #[must_use]
-    pub fn lag(&self) -> i64 {
-        self.max_event_timestamp
-            .saturating_sub(self.current_watermark)
-    }
-}
-
-/// Watermark generator wrapper that collects metrics.
-pub struct MeteredGenerator<G: WatermarkGenerator> {
-    inner: G,
-    metrics: WatermarkMetrics,
-}
-
-impl<G: WatermarkGenerator> MeteredGenerator<G> {
-    /// Creates a new metered generator.
-    #[must_use]
-    pub fn new(inner: G) -> Self {
-        Self {
-            inner,
-            metrics: WatermarkMetrics::new(),
-        }
-    }
-
-    /// Returns the current metrics.
-    #[must_use]
-    pub fn metrics(&self) -> &WatermarkMetrics {
-        &self.metrics
-    }
-
-    /// Returns a mutable reference to the inner generator.
-    pub fn inner_mut(&mut self) -> &mut G {
-        &mut self.inner
-    }
-
-    /// Records a late event.
-    pub fn record_late_event(&mut self) {
-        self.metrics.late_events += 1;
-    }
-}
-
-impl<G: WatermarkGenerator> WatermarkGenerator for MeteredGenerator<G> {
-    fn on_event(&mut self, timestamp: i64) -> Option<Watermark> {
-        // Track max event timestamp
-        if timestamp > self.metrics.max_event_timestamp {
-            self.metrics.max_event_timestamp = timestamp;
-        }
-
-        let wm = self.inner.on_event(timestamp);
-        if let Some(ref w) = wm {
-            self.metrics.current_watermark = w.timestamp();
-            self.metrics.watermarks_emitted += 1;
-        }
-        wm
-    }
-
-    fn on_periodic(&mut self) -> Option<Watermark> {
-        let wm = self.inner.on_periodic();
-        if let Some(ref w) = wm {
-            self.metrics.current_watermark = w.timestamp();
-            self.metrics.watermarks_emitted += 1;
-        }
-        wm
-    }
-
-    fn current_watermark(&self) -> i64 {
-        self.inner.current_watermark()
-    }
-
-    fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark> {
-        let wm = self.inner.advance_watermark(timestamp);
-        if let Some(ref w) = wm {
-            self.metrics.current_watermark = w.timestamp();
-            self.metrics.watermarks_emitted += 1;
-        }
-        wm
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1039,51 +940,6 @@ mod tests {
         assert_eq!(gen.current_watermark(), 500);
     }
 
-    #[test]
-    fn test_metered_generator_tracks_metrics() {
-        let inner = BoundedOutOfOrdernessGenerator::new(100);
-        let mut gen = MeteredGenerator::new(inner);
-
-        gen.on_event(1000);
-        gen.on_event(2000);
-        gen.on_event(1500); // Out of order
-
-        let metrics = gen.metrics();
-        assert_eq!(metrics.max_event_timestamp, 2000);
-        assert_eq!(metrics.watermarks_emitted, 2); // 1000 and 2000 advanced
-    }
-
-    #[test]
-    fn test_metered_generator_lag() {
-        let inner = BoundedOutOfOrdernessGenerator::new(100);
-        let mut gen = MeteredGenerator::new(inner);
-
-        gen.on_event(1000);
-
-        let metrics = gen.metrics();
-        assert_eq!(metrics.lag(), 100); // max_event (1000) - watermark (900)
-    }
-
-    #[test]
-    fn test_metered_generator_late_events() {
-        let inner = BoundedOutOfOrdernessGenerator::new(100);
-        let mut gen = MeteredGenerator::new(inner);
-
-        gen.record_late_event();
-        gen.record_late_event();
-
-        assert_eq!(gen.metrics().late_events, 2);
-    }
-
-    #[test]
-    fn test_watermark_metrics_default() {
-        let metrics = WatermarkMetrics::new();
-        assert_eq!(metrics.current_watermark, 0);
-        assert_eq!(metrics.max_event_timestamp, 0);
-        assert_eq!(metrics.watermarks_emitted, 0);
-        assert_eq!(metrics.late_events, 0);
-    }
-
     // --- advance_watermark() tests ---
 
     #[test]
@@ -1191,26 +1047,6 @@ mod tests {
         // No regression
         let wm = gen.advance_watermark(300);
         assert_eq!(wm, None);
-    }
-
-    #[test]
-    fn test_advance_watermark_metered_generator() {
-        let inner = BoundedOutOfOrdernessGenerator::new(100);
-        let mut gen = MeteredGenerator::new(inner);
-
-        let wm = gen.advance_watermark(500);
-        assert_eq!(wm, Some(Watermark::new(500)));
-        assert_eq!(gen.metrics().current_watermark, 500);
-        assert_eq!(gen.metrics().watermarks_emitted, 1);
-
-        // Advance further
-        gen.advance_watermark(800);
-        assert_eq!(gen.metrics().current_watermark, 800);
-        assert_eq!(gen.metrics().watermarks_emitted, 2);
-
-        // No regression doesn't bump metrics
-        gen.advance_watermark(600);
-        assert_eq!(gen.metrics().watermarks_emitted, 2);
     }
 
     // --- ProcessingTimeGenerator tests ---

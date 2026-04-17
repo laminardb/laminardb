@@ -2,19 +2,7 @@
 
 use std::fmt;
 
-/// WAL mode for checkpoint durability (reserved for future use).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WalMode {
-    /// Asynchronous WAL writes.
-    Async,
-    /// Synchronous WAL writes.
-    Sync,
-}
-
 /// Configuration for streaming checkpoints.
-///
-/// Only `interval_ms`, `data_dir`, and `max_retained` are wired to the
-/// checkpoint coordinator. Other fields are reserved for future use.
 #[derive(Debug, Clone, Default)]
 pub struct StreamCheckpointConfig {
     /// Checkpoint interval in milliseconds. `None` = manual only.

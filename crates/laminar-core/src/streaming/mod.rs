@@ -9,7 +9,7 @@ pub mod source;
 pub mod subscription;
 
 pub use channel::{channel, AsyncConsumer, Producer};
-pub use checkpoint::{CheckpointError, StreamCheckpointConfig, WalMode};
+pub use checkpoint::{CheckpointError, StreamCheckpointConfig};
 pub use config::{BackpressureStrategy, ChannelConfig, SourceConfig, WaitStrategy};
 pub use error::{RecvError, StreamingError, TryPushError};
 pub use sink::Sink;

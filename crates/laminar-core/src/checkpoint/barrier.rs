@@ -135,21 +135,6 @@ impl<T> StreamMessage<T> {
     }
 }
 
-/// Pack `checkpoint_id` (upper 32) | flags (lower 32) into one `AtomicU64` word. 0 = no barrier.
-#[inline]
-const fn pack_barrier_cmd(checkpoint_id: u32, flags: u32) -> u64 {
-    ((checkpoint_id as u64) << 32) | (flags as u64)
-}
-
-/// Unpack a barrier command into (`checkpoint_id`, flags).
-#[inline]
-#[allow(clippy::cast_possible_truncation)]
-const fn unpack_barrier_cmd(packed: u64) -> (u32, u32) {
-    let checkpoint_id = (packed >> 32) as u32;
-    let flags = packed as u32;
-    (checkpoint_id, flags)
-}
-
 /// Cross-thread barrier injector for source operators.
 ///
 /// The coordinator thread stores a packed barrier command via
@@ -213,7 +198,8 @@ impl CheckpointBarrierInjector {
             u32::try_from(barrier_flags).is_ok(),
             "barrier_flags {barrier_flags:#x} exceeds u32::MAX"
         );
-        let packed = pack_barrier_cmd(checkpoint_id as u32, barrier_flags as u32);
+        // Pack checkpoint_id (upper 32) | flags (lower 32). 0 = no barrier.
+        let packed = (u64::from(checkpoint_id as u32) << 32) | u64::from(barrier_flags as u32);
         self.cmd.store(packed, Ordering::Release);
         self.epoch.fetch_add(1, Ordering::Relaxed);
     }
@@ -272,11 +258,10 @@ impl BarrierPollHandle {
             .compare_exchange(packed, 0, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
-            let (checkpoint_id, barrier_flags) = unpack_barrier_cmd(packed);
             Some(CheckpointBarrier {
-                checkpoint_id: u64::from(checkpoint_id),
+                checkpoint_id: packed >> 32,
                 epoch,
-                flags: u64::from(barrier_flags),
+                flags: packed & 0xFFFF_FFFF,
             })
         } else {
             // Another thread claimed it first
@@ -314,16 +299,14 @@ mod tests {
     }
 
     #[test]
-    fn test_pack_unpack_barrier_cmd() {
-        let packed = pack_barrier_cmd(42, 0x03);
-        let (id, flags) = unpack_barrier_cmd(packed);
-        assert_eq!(id, 42);
-        assert_eq!(flags, 0x03);
-
-        // Zero encodes "no command"
-        let (id, flags) = unpack_barrier_cmd(0);
-        assert_eq!(id, 0);
-        assert_eq!(flags, 0);
+    fn test_barrier_roundtrip_via_injector() {
+        let injector = CheckpointBarrierInjector::new();
+        let handle = injector.handle();
+        injector.trigger(42, flags::DRAIN);
+        let barrier = handle.poll(0).expect("barrier should be available");
+        assert_eq!(barrier.checkpoint_id, 42);
+        assert_eq!(barrier.flags, flags::DRAIN);
+        assert!(handle.poll(1).is_none(), "cleared after one poll");
     }
 
     #[test]
