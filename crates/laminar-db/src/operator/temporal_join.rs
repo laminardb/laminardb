@@ -186,7 +186,6 @@ impl TemporalJoinOperator {
 
         Ok(batches)
     }
-
 }
 
 /// Build the merged output schema: stream fields followed by table fields.

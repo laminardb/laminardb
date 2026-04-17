@@ -22,14 +22,16 @@ mod compile;
 mod keys;
 mod scalar_json;
 pub(crate) use checkpoints::{
-    query_fingerprint, AggStateCheckpoint, EmittedCheckpoint, EowcStateCheckpoint,
-    GroupCheckpoint, JoinStateCheckpoint, WindowCheckpoint,
+    query_fingerprint, AggStateCheckpoint, EmittedCheckpoint, EowcStateCheckpoint, GroupCheckpoint,
+    JoinStateCheckpoint, WindowCheckpoint,
 };
 pub(crate) use compile::{
     apply_compiled_having, compile_having_filter, expr_to_sql, extract_clauses, find_aggregate,
     resolve_expr_type, CompiledProjection,
 };
-pub(crate) use keys::{global_aggregate_key, row_to_scalar_key_with_types, scalar_key_to_owned_row};
+pub(crate) use keys::{
+    global_aggregate_key, row_to_scalar_key_with_types, scalar_key_to_owned_row,
+};
 pub(crate) use scalar_json::{json_to_scalar, scalar_to_json};
 
 pub(crate) fn emit_window_batch(
@@ -97,7 +99,6 @@ pub(crate) fn emit_window_batch(
 
     Ok(Some(batch))
 }
-
 
 pub(crate) struct AggFuncSpec {
     pub(crate) udf: Arc<AggregateUDF>,

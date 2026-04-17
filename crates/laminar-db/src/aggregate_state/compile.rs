@@ -1,9 +1,4 @@
 //! Plan introspection + SQL compilation helpers for aggregate operators.
-//!
-//! - `find_aggregate` walks a `LogicalPlan` to find the GROUP BY node.
-//! - `expr_to_sql` reconstructs a SQL fragment from a `DataFusion` expression.
-//! - `CompiledProjection` and the HAVING helpers evaluate precompiled
-//!   physical expressions against `RecordBatch`es.
 
 use std::sync::Arc;
 
@@ -491,7 +486,6 @@ pub(crate) fn resolve_expr_type(
         _ => fallback_type.clone(),
     }
 }
-
 
 #[cfg(test)]
 mod tests {

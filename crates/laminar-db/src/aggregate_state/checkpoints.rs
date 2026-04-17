@@ -1,7 +1,5 @@
-//! Serializable checkpoint shapes for aggregate / window / join state.
-//!
-//! These are the on-disk forms — field names and `#[serde(default = ...)]`
-//! fallbacks are part of the format. Don't rename without a migration.
+//! Serializable checkpoint shapes. These are the on-disk forms — field
+//! names and `#[serde(default = ...)]` fallbacks are part of the format.
 
 use std::hash::{Hash, Hasher};
 

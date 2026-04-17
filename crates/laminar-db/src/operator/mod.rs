@@ -81,9 +81,7 @@ fn apply_compiled_post_projection(
         .map_err(|e| DbError::Pipeline(format!("post-projection batch: {e}")))
 }
 
-/// Shared state for the four join operators (asof, interval, temporal,
-/// temporal-probe). Owns the post-projection SQL and its compile cache so
-/// each operator keeps only its own join state.
+/// Post-projection state shared by the four join operators.
 pub(crate) struct ProjectingJoinState {
     pub(crate) op_name: Arc<str>,
     ctx: SessionContext,

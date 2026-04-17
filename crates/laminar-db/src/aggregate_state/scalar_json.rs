@@ -1,5 +1,5 @@
-//! JSON roundtrip for `ScalarValue`. Used by checkpoint serialisation; the
-//! type tags are part of the on-disk checkpoint format, don't rename them.
+//! JSON roundtrip for `ScalarValue`. Type tags are part of the on-disk
+//! checkpoint format — don't rename them.
 
 use std::sync::Arc;
 
