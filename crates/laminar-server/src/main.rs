@@ -3,9 +3,9 @@
 #![allow(clippy::disallowed_types)] // cold path: server startup and config only
 
 mod config;
-#[cfg(feature = "delta-experimental")]
+#[cfg(feature = "cluster-unstable")]
 mod delta;
-#[cfg(feature = "delta-experimental")]
+#[cfg(feature = "cluster-unstable")]
 mod delta_config;
 mod http;
 mod metrics;

@@ -120,8 +120,8 @@ delta-lake-glue = ["delta-lake", "delta-lake-s3", "deltalake/glue", "dep:deltala
 iceberg = ["dep:iceberg", "dep:iceberg-catalog-rest", "dep:iceberg-storage-opendal", "dep:tokio-stream", "dep:parquet"]
 # Parquet file lookup source
 parquet-lookup = ["dep:parquet", "dep:object_store"]
-# Kafka-based discovery for delta
-kafka-discovery = ["kafka", "laminar-core/delta", "dep:tokio-util"]
+# Kafka-based discovery for cluster mode
+kafka-discovery = ["kafka", "laminar-core/cluster-unstable", "dep:tokio-util"]
 # WebSocket source and sink
 websocket = ["dep:tokio-tungstenite", "dep:tungstenite", "dep:futures-util", "dep:url"]
 # File source and sink (AutoLoader-style)

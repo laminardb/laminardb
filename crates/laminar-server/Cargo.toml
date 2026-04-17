@@ -127,12 +127,11 @@ gcs = ["laminar-db/gcs"]
 azure = ["laminar-db/azure"]
 # Compile OpenSSL from source — required for musl cross-compilation where
 # system libssl-dev is not available for the target triple.
-# Delta/cluster mode: experimental multi-node support. This mode is NOT
-# production-ready — it requires Raft, inter-node RPC, and partition-aware
-# routing that are not yet functional. Gate it behind an explicit feature
-# so the binary does not present it as a first-class option.
-delta-experimental = [
-    "laminar-core/delta",
+# Cluster mode: experimental multi-node support. NOT production-ready —
+# requires Raft, inter-node RPC, and partition-aware routing that are not
+# yet implemented. Gated so the default binary does not advertise it.
+cluster-unstable = [
+    "laminar-core/cluster-unstable",
     "dep:uuid",
     "dep:xxhash-rust",
 ]

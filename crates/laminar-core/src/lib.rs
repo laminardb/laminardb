@@ -20,8 +20,8 @@ pub mod serialization;
 pub mod streaming;
 pub mod time;
 
-/// Distributed delta mode (multi-node coordination).
-#[cfg(feature = "delta")]
+/// Distributed cluster coordination. Unstable: gated behind `cluster-unstable`.
+#[cfg(feature = "cluster-unstable")]
 pub mod delta;
 
 /// Result type for laminar-core operations
