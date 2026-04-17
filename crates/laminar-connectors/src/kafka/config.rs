@@ -1317,7 +1317,7 @@ mod tests {
         let cfg =
             KafkaSourceConfig::from_config(&make_config(&[("broker.commit.interval.ms", "5000")]))
                 .unwrap();
-        assert_eq!(cfg.broker_commit_interval, Duration::from_millis(5000));
+        assert_eq!(cfg.broker_commit_interval, Duration::from_secs(5));
     }
 
     #[test]
@@ -1901,8 +1901,8 @@ mod tests {
         .unwrap();
 
         assert!(cfg.enable_watermark_tracking);
-        assert_eq!(cfg.max_out_of_orderness, Duration::from_millis(10_000));
-        assert_eq!(cfg.idle_timeout, Duration::from_millis(60_000));
+        assert_eq!(cfg.max_out_of_orderness, Duration::from_secs(10));
+        assert_eq!(cfg.idle_timeout, Duration::from_secs(60));
     }
 
     // -- startup.mode = timestamp error --
@@ -1934,8 +1934,8 @@ mod tests {
             ("heartbeat.interval.ms", "15000"),
         ]))
         .unwrap();
-        assert_eq!(cfg.session_timeout, Duration::from_millis(60_000));
-        assert_eq!(cfg.heartbeat_interval, Duration::from_millis(15_000));
+        assert_eq!(cfg.session_timeout, Duration::from_secs(60));
+        assert_eq!(cfg.heartbeat_interval, Duration::from_secs(15));
     }
 
     #[test]
@@ -1958,8 +1958,8 @@ mod tests {
             ("heartbeat.interval.ms", "10000"),
         ]))
         .unwrap();
-        assert_eq!(cfg.session_timeout, Duration::from_millis(45_000));
-        assert_eq!(cfg.heartbeat_interval, Duration::from_millis(10_000));
+        assert_eq!(cfg.session_timeout, Duration::from_secs(45));
+        assert_eq!(cfg.heartbeat_interval, Duration::from_secs(10));
     }
 
     #[test]
@@ -2093,7 +2093,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             cfg.schema_registry_discovery_timeout,
-            Duration::from_millis(25000)
+            Duration::from_secs(25)
         );
     }
 }

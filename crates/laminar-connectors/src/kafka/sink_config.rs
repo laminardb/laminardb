@@ -729,7 +729,7 @@ mod tests {
         assert_eq!(cfg.format, Format::Avro);
         assert_eq!(cfg.delivery_guarantee, DeliveryGuarantee::ExactlyOnce);
         assert_eq!(cfg.transactional_id.as_deref(), Some("my-txn"));
-        assert_eq!(cfg.transaction_timeout, Duration::from_millis(30_000));
+        assert_eq!(cfg.transaction_timeout, Duration::from_secs(30));
         assert_eq!(cfg.key_column.as_deref(), Some("order_id"));
         assert_eq!(cfg.partitioner, PartitionStrategy::RoundRobin);
         assert_eq!(cfg.linger_ms, 10);
@@ -738,7 +738,7 @@ mod tests {
         assert_eq!(cfg.compression, CompressionType::Zstd);
         assert_eq!(cfg.acks, Acks::Leader);
         assert_eq!(cfg.max_in_flight, 3);
-        assert_eq!(cfg.delivery_timeout, Duration::from_millis(60_000));
+        assert_eq!(cfg.delivery_timeout, Duration::from_secs(60));
         assert_eq!(cfg.dlq_topic.as_deref(), Some("my-dlq"));
         assert_eq!(cfg.flush_batch_size, 500);
         assert_eq!(cfg.schema_registry_url.as_deref(), Some("http://sr:8081"));

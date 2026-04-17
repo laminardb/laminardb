@@ -60,3 +60,6 @@ docs/adr/
 .desloppify/
 /examples/microstructure/target
 /examples/microstructure/Cargo.lock
+/examples/binance-markout/target
+/examples/binance-markout/Cargo.lock
+/examples/binance-markout/smoke-report.txt

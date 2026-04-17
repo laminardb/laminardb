@@ -12,7 +12,7 @@ use laminar_db::{DbError, EngineMetrics, LaminarDB, Profile};
 use crate::config::{
     ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
 };
-#[cfg(feature = "delta-experimental")]
+#[cfg(feature = "cluster-unstable")]
 use crate::delta_config::{DeltaConfig, DeltaConfigError};
 use crate::http;
 use crate::metrics::ServerMetrics;
@@ -25,7 +25,7 @@ pub enum ServerHandle {
         api_handle: tokio::task::JoinHandle<()>,
         watcher_handle: Option<tokio::task::JoinHandle<()>>,
     },
-    #[cfg(feature = "delta-experimental")]
+    #[cfg(feature = "cluster-unstable")]
     Delta(Box<crate::delta::DeltaHandle>),
 }
 
@@ -53,7 +53,7 @@ impl ServerHandle {
                 info!("Shutdown complete");
                 Ok(())
             }
-            #[cfg(feature = "delta-experimental")]
+            #[cfg(feature = "cluster-unstable")]
             Self::Delta(handle) => (*handle)
                 .wait_for_shutdown()
                 .await
@@ -90,8 +90,8 @@ pub async fn run_server(
     config: ServerConfig,
     config_path: PathBuf,
 ) -> Result<ServerHandle, ServerError> {
-    // Delta mode: gate behind the `delta-experimental` feature flag.
-    #[cfg(feature = "delta-experimental")]
+    // Cluster mode: gated behind the `cluster-unstable` feature flag.
+    #[cfg(feature = "cluster-unstable")]
     {
         let delta_cfg = DeltaConfig::from_server_config(&config)?;
 
@@ -102,10 +102,10 @@ pub async fn run_server(
             return Ok(ServerHandle::Delta(Box::new(handle)));
         }
     }
-    #[cfg(not(feature = "delta-experimental"))]
+    #[cfg(not(feature = "cluster-unstable"))]
     if config.server.mode == "delta" {
         return Err(ServerError::Delta(
-            "Delta/cluster mode requires the 'delta-experimental' feature flag. \
+            "Delta/cluster mode requires the 'cluster-unstable' feature flag. \
              This mode is not yet production-ready."
                 .to_string(),
         ));
@@ -515,7 +515,7 @@ pub enum ServerError {
     Config(#[from] ConfigError),
     #[error("delta mode error: {0}")]
     Delta(String),
-    #[cfg(feature = "delta-experimental")]
+    #[cfg(feature = "cluster-unstable")]
     #[error(transparent)]
     DeltaConfig(#[from] DeltaConfigError),
 }

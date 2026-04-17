@@ -544,14 +544,25 @@ impl DeltaLakeSink {
 
             match write_result {
                 Ok(table) => {
-                    // ── Success: commit state ──
                     #[allow(clippy::cast_sign_loss)]
                     {
                         self.delta_version = table.version().unwrap_or(0) as u64;
                     }
-                    self.table = Some(table);
 
-                    // Clear staged state only after confirmed success.
+                    // delta-rs' in-memory Snapshot grows per commit and is not
+                    // compacted in place; drop on checkpoint boundaries so the
+                    // next flush re-opens from the checkpoint file.
+                    let crossed_checkpoint = self.config.checkpoint_interval > 0
+                        && self.delta_version > 0
+                        && self
+                            .delta_version
+                            .is_multiple_of(self.config.checkpoint_interval);
+                    self.table = if crossed_checkpoint {
+                        None
+                    } else {
+                        Some(table)
+                    };
+
                     self.staged_batches.clear();
                     self.staged_rows = 0;
                     self.staged_bytes = 0;
@@ -565,6 +576,7 @@ impl DeltaLakeSink {
                         bytes = estimated_bytes,
                         delta_version = self.delta_version,
                         attempt = attempt + 1,
+                        reopened = crossed_checkpoint,
                         "Delta Lake: committed staged data to Delta"
                     );
 

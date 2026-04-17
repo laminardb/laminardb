@@ -79,9 +79,19 @@ pub(crate) struct ConnectorPipelineCallback {
     /// Set when a sink write times out in this cycle. Suppresses the next
     /// checkpoint to preserve the replay window.
     pub(crate) sink_timed_out: bool,
+    pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
 }
 
 impl ConnectorPipelineCallback {
+    /// `BackpressureFail` raises `shutdown`; coordinator exits via its drain path.
+    fn map_graph_error(err: &crate::error::DbError, shutdown: &tokio::sync::Notify) -> String {
+        if let crate::error::DbError::BackpressureFail(msg) = err {
+            tracing::error!(reason = %msg, "backpressure_policy=Fail tripped; halting pipeline");
+            shutdown.notify_one();
+        }
+        format!("{err}")
+    }
+
     async fn capture_and_serialize_operator_state(
         &mut self,
     ) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
@@ -173,13 +183,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         } else {
             Some(&source_wms)
         };
-        let results = self
-            .graph
+        self.graph
             .execute_cycle(source_batches, watermark, swm_ref)
             .await
-            .map_err(|e| format!("{e}"))?;
-
-        Ok(results)
+            .map_err(|e| Self::map_graph_error(&e, &self.shutdown_signal))
     }
 
     fn push_to_streams(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
@@ -354,6 +361,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             if let Some(entry) = self.source_entries_for_wm.get(source_name) {
                 let external_wm = entry.source.current_watermark();
                 if let Some(wm) = wm_state.generator.advance_watermark(external_wm) {
+                    self.prom
+                        .source_watermark_ms
+                        .with_label_values(&[source_name])
+                        .set(wm.timestamp());
                     if let Some(ref mut trk) = self.tracker {
                         if let Some(sid) = self.source_ids.get(source_name) {
                             if let Some(global_wm) = trk.update_source(*sid, wm.timestamp()) {
@@ -373,6 +384,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                     if let Some(entry) = self.source_entries_for_wm.get(source_name) {
                         entry.source.watermark(wm.timestamp());
                     }
+                    self.prom
+                        .source_watermark_ms
+                        .with_label_values(&[source_name])
+                        .set(wm.timestamp());
                     if let Some(ref mut trk) = self.tracker {
                         if let Some(sid) = self.source_ids.get(source_name) {
                             if let Some(global_wm) = trk.update_source(*sid, wm.timestamp()) {
@@ -1072,5 +1087,33 @@ fn find_filter_predicate(plan: &datafusion_expr::LogicalPlan) -> Option<datafusi
             }
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::DbError;
+
+    #[tokio::test]
+    async fn test_backpressure_fail_notifies_shutdown() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let err = DbError::BackpressureFail("downstream of 'q'".into());
+        let msg = ConnectorPipelineCallback::map_graph_error(&err, &notify);
+        assert!(msg.contains("Backpressure fail"), "unexpected: {msg}");
+
+        tokio::time::timeout(Duration::from_millis(50), notify.notified())
+            .await
+            .expect("shutdown should have been notified");
+    }
+
+    #[tokio::test]
+    async fn test_non_backpressure_error_does_not_notify() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let err = DbError::Pipeline("unrelated".into());
+        let _ = ConnectorPipelineCallback::map_graph_error(&err, &notify);
+
+        let got = tokio::time::timeout(Duration::from_millis(50), notify.notified()).await;
+        assert!(got.is_err(), "non-Fail errors must not trigger shutdown");
     }
 }

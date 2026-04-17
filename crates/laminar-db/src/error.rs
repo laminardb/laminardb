@@ -77,6 +77,9 @@ pub enum DbError {
     /// Pipeline error (start/shutdown lifecycle)
     Pipeline(String),
 
+    /// `BackpressurePolicy::Fail` tripped; coordinator halts the pipeline.
+    BackpressureFail(String),
+
     /// Query pipeline error — wraps a `DataFusion` error with stream context.
     /// Unlike `Pipeline`, this variant is translated to user-friendly messages.
     QueryPipeline {
@@ -171,7 +174,7 @@ impl DbError {
             Self::Checkpoint(_) | Self::CheckpointStore(_) => error_codes::CHECKPOINT_FAILED,
             Self::UnresolvedConfigVar(_) => error_codes::UNRESOLVED_CONFIG_VAR,
             Self::Connector(_) | Self::ConnectorOp(_) => error_codes::CONNECTOR_CONNECTION_FAILED,
-            Self::Pipeline(_) => error_codes::PIPELINE_ERROR,
+            Self::Pipeline(_) | Self::BackpressureFail(_) => error_codes::PIPELINE_ERROR,
             Self::QueryPipeline { .. } => error_codes::QUERY_PIPELINE_ERROR,
             Self::MaterializedView(_) => error_codes::MATERIALIZED_VIEW_ERROR,
             Self::Storage(_) => error_codes::WAL_ERROR,
@@ -260,6 +263,9 @@ impl std::fmt::Display for DbError {
             }
             Self::Pipeline(msg) => {
                 write!(f, "[{}] Pipeline error: {msg}", self.code())
+            }
+            Self::BackpressureFail(msg) => {
+                write!(f, "[{}] Backpressure fail: {msg}", self.code())
             }
             Self::QueryPipeline {
                 context,

@@ -15,20 +15,16 @@ use datafusion::prelude::SessionContext;
 use laminar_sql::translator::TemporalProbeConfig;
 
 use crate::error::DbError;
+use crate::operator::ProjectingJoinState;
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
-use crate::sql_analysis::CompiledPostProjection;
 use crate::temporal_probe::{
     execute_temporal_probe_cycle, TemporalProbeCheckpoint, TemporalProbeState,
 };
 
 pub(crate) struct TemporalProbeJoinOperator {
-    op_name: Arc<str>,
     config: TemporalProbeConfig,
     state: TemporalProbeState,
-    projection_sql: Option<Arc<str>>,
-    ctx: SessionContext,
-    compiled_post_proj: Option<CompiledPostProjection>,
-    post_proj_compile_failed: bool,
+    projection: ProjectingJoinState,
 }
 
 impl TemporalProbeJoinOperator {
@@ -39,30 +35,10 @@ impl TemporalProbeJoinOperator {
         ctx: SessionContext,
     ) -> Self {
         Self {
-            op_name: Arc::from(name),
             config,
             state: TemporalProbeState::new(),
-            projection_sql,
-            ctx,
-            compiled_post_proj: None,
-            post_proj_compile_failed: false,
+            projection: ProjectingJoinState::new(name, ctx, projection_sql, "__temporal_probe_tmp"),
         }
-    }
-
-    async fn apply_projection(
-        &mut self,
-        join_result: Vec<RecordBatch>,
-    ) -> Result<Vec<RecordBatch>, DbError> {
-        super::apply_post_projection(
-            &self.ctx,
-            &self.op_name,
-            "__temporal_probe_tmp",
-            self.projection_sql.as_deref(),
-            &mut self.compiled_post_proj,
-            &mut self.post_proj_compile_failed,
-            join_result,
-        )
-        .await
     }
 }
 
@@ -85,7 +61,7 @@ impl GraphOperator for TemporalProbeJoinOperator {
             watermark,
         )?;
 
-        self.apply_projection(join_result).await
+        self.projection.apply(join_result).await
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
@@ -94,7 +70,7 @@ impl GraphOperator for TemporalProbeJoinOperator {
         let data = serde_json::to_vec(&cp).map_err(|e| {
             DbError::Pipeline(format!(
                 "temporal probe [{}]: checkpoint serialization: {e}",
-                self.op_name
+                self.projection.op_name
             ))
         })?;
 
@@ -106,7 +82,7 @@ impl GraphOperator for TemporalProbeJoinOperator {
             serde_json::from_slice(&checkpoint.data).map_err(|e| {
                 DbError::Pipeline(format!(
                     "temporal probe [{}]: checkpoint deserialization: {e}",
-                    self.op_name
+                    self.projection.op_name
                 ))
             })?;
 

@@ -3850,6 +3850,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_watermark_gauges_advance_on_push() {
+        let db = LaminarDB::open().unwrap();
+        let registry = prometheus::Registry::new();
+        let prom = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+        db.set_engine_metrics(Arc::clone(&prom));
+
+        db.execute(
+            "CREATE SOURCE events (id BIGINT, ts TIMESTAMP, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .unwrap();
+        db.execute("CREATE STREAM out AS SELECT id, ts FROM events")
+            .await
+            .unwrap();
+        db.start().await.unwrap();
+
+        let handle = db.source_untyped("events").unwrap();
+        let schema = handle.schema().clone();
+        handle
+            .push_arrow(make_ts_batch(&schema, &[1000, 2000, 3000]))
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let source_wm = prom
+            .source_watermark_ms
+            .with_label_values(&["events"])
+            .get();
+        assert_eq!(source_wm, 3000);
+        let stream_wm = prom.stream_watermark_ms.with_label_values(&["out"]).get();
+        assert_eq!(stream_wm, 3000);
+    }
+
+    #[tokio::test]
     async fn test_watermark_advances_on_push() {
         let db = LaminarDB::open().unwrap();
         db.execute(

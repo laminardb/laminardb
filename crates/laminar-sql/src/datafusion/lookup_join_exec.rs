@@ -1322,8 +1322,7 @@ async fn probe_partial_batch_with_fallback(
 
             match source_results {
                 Ok(results) => {
-                    for ((idx, key_bytes), maybe_batch) in miss_keys.iter().zip(results.into_iter())
-                    {
+                    for ((idx, key_bytes), maybe_batch) in miss_keys.iter().zip(results) {
                         if let Some(batch) = maybe_batch {
                             foyer_cache.insert(key_bytes, batch.clone());
                             lookup_batches[*idx] = Some(batch);

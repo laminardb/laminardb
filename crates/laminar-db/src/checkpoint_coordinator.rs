@@ -1686,17 +1686,17 @@ mod tests {
         let mut coord = CheckpointCoordinator::new(config, store);
 
         // First observation: 1000ms → EMA = 1000 (cold start)
-        coord.last_checkpoint_duration = Some(Duration::from_millis(1000));
+        coord.last_checkpoint_duration = Some(Duration::from_secs(1));
         coord.adjust_interval();
         assert!((coord.smoothed_duration_ms() - 1000.0).abs() < 1.0);
 
         // Second observation: 2000ms → EMA = 0.5*2000 + 0.5*1000 = 1500
-        coord.last_checkpoint_duration = Some(Duration::from_millis(2000));
+        coord.last_checkpoint_duration = Some(Duration::from_secs(2));
         coord.adjust_interval();
         assert!((coord.smoothed_duration_ms() - 1500.0).abs() < 1.0);
 
         // Third observation: 2000ms → EMA = 0.5*2000 + 0.5*1500 = 1750
-        coord.last_checkpoint_duration = Some(Duration::from_millis(2000));
+        coord.last_checkpoint_duration = Some(Duration::from_secs(2));
         coord.adjust_interval();
         assert!((coord.smoothed_duration_ms() - 1750.0).abs() < 1.0);
     }

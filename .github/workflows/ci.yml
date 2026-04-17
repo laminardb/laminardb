@@ -186,10 +186,10 @@ jobs:
         run: |
           # Core features
           cargo check -p laminar-core --no-default-features
-          cargo check -p laminar-core --features delta
+          cargo check -p laminar-core --features cluster-unstable
 
           # DB features
-          cargo check -p laminar-db --features delta
+          cargo check -p laminar-db --features cluster-unstable
 
           # Connector features
           cargo check -p laminar-connectors --no-default-features

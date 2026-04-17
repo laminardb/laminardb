@@ -242,8 +242,7 @@ impl PostgresSink {
             .map(|(i, col)| {
                 let dt = schema
                     .field_with_name(col)
-                    .map(|f| f.data_type().clone())
-                    .unwrap_or(DataType::Utf8);
+                    .map_or(DataType::Utf8, |f| f.data_type().clone());
                 let pg_type = arrow_type_to_pg_sql(&dt);
                 format!("{col} = ANY(${}::{}[])", i + 1, pg_type)
             })

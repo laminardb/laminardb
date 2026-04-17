@@ -2,6 +2,7 @@
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
+#![allow(clippy::duration_suboptimal_units)] // MSRV 1.85; from_mins/from_hours are 1.91+
 #![allow(clippy::module_name_repetitions)]
 // Allow unsafe in alloc module for zero-copy optimizations
 #![allow(unsafe_code)]
@@ -20,8 +21,8 @@ pub mod serialization;
 pub mod streaming;
 pub mod time;
 
-/// Distributed delta mode (multi-node coordination).
-#[cfg(feature = "delta")]
+/// Distributed cluster coordination. Unstable: gated behind `cluster-unstable`.
+#[cfg(feature = "cluster-unstable")]
 pub mod delta;
 
 /// Result type for laminar-core operations

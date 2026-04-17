@@ -10,9 +10,9 @@ pub use event_time::{EventTimeError, EventTimeExtractor, ExtractionMode, Timesta
 pub use filter::{filter_batch_by_timestamp, ThresholdOp};
 
 pub use watermark::{
-    AscendingTimestampsGenerator, BoundedOutOfOrdernessGenerator, MeteredGenerator,
-    PeriodicGenerator, ProcessingTimeGenerator, PunctuatedGenerator, SourceProvidedGenerator,
-    WatermarkGenerator, WatermarkMetrics, WatermarkTracker,
+    AscendingTimestampsGenerator, BoundedOutOfOrdernessGenerator, PeriodicGenerator,
+    ProcessingTimeGenerator, PunctuatedGenerator, SourceProvidedGenerator, WatermarkGenerator,
+    WatermarkTracker,
 };
 
 use smallvec::SmallVec;

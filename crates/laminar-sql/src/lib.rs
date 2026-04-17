@@ -2,6 +2,7 @@
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
+#![allow(clippy::duration_suboptimal_units)] // MSRV 1.85; from_mins/from_hours are 1.91+
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::disallowed_types)] // cold path: SQL parsing and query planning only
 #![allow(clippy::doc_markdown)]

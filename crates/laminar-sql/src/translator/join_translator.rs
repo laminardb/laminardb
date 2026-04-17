@@ -558,7 +558,7 @@ mod tests {
             AsofSqlDirection::Forward,
             "trade_ts".to_string(),
             "quote_ts".to_string(),
-            Some(Duration::from_millis(5000)),
+            Some(Duration::from_secs(5)),
         );
 
         let config = JoinOperatorConfig::from_analysis(&analysis);
@@ -566,7 +566,7 @@ mod tests {
             assert_eq!(asof.direction, AsofSqlDirection::Forward);
             assert_eq!(asof.left_time_column, "trade_ts");
             assert_eq!(asof.right_time_column, "quote_ts");
-            assert_eq!(asof.tolerance, Some(Duration::from_millis(5000)));
+            assert_eq!(asof.tolerance, Some(Duration::from_secs(5)));
             assert_eq!(asof.key_column, "symbol");
             assert_eq!(asof.join_type, AsofSqlJoinType::Left);
         } else {

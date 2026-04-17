@@ -1248,7 +1248,7 @@ mod tests {
 
         assert!(analysis.is_asof_join);
         assert_eq!(analysis.asof_direction, Some(AsofSqlDirection::Backward));
-        assert_eq!(analysis.asof_tolerance, Some(Duration::from_millis(5000)));
+        assert_eq!(analysis.asof_tolerance, Some(Duration::from_secs(5)));
     }
 
     #[test]

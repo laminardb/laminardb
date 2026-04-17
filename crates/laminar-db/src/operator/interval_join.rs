@@ -17,18 +17,13 @@ use laminar_sql::translator::StreamJoinConfig;
 use crate::aggregate_state::JoinStateCheckpoint;
 use crate::error::DbError;
 use crate::interval_join::{execute_interval_join_cycle, IntervalJoinState};
+use crate::operator::ProjectingJoinState;
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
-use crate::sql_analysis::CompiledPostProjection;
 
-/// Checkpoint format version for interval join state.
 pub(crate) struct IntervalJoinOperator {
-    op_name: Arc<str>,
     config: StreamJoinConfig,
     state: IntervalJoinState,
-    projection_sql: Option<Arc<str>>,
-    ctx: SessionContext,
-    compiled_post_proj: Option<CompiledPostProjection>,
-    post_proj_compile_failed: bool,
+    projection: ProjectingJoinState,
 }
 
 impl IntervalJoinOperator {
@@ -39,30 +34,10 @@ impl IntervalJoinOperator {
         ctx: SessionContext,
     ) -> Self {
         Self {
-            op_name: Arc::from(name),
             config,
             state: IntervalJoinState::new(),
-            projection_sql,
-            ctx,
-            compiled_post_proj: None,
-            post_proj_compile_failed: false,
+            projection: ProjectingJoinState::new(name, ctx, projection_sql, "__interval_tmp"),
         }
-    }
-
-    async fn apply_projection(
-        &mut self,
-        join_result: Vec<RecordBatch>,
-    ) -> Result<Vec<RecordBatch>, DbError> {
-        super::apply_post_projection(
-            &self.ctx,
-            &self.op_name,
-            "__interval_tmp",
-            self.projection_sql.as_deref(),
-            &mut self.compiled_post_proj,
-            &mut self.post_proj_compile_failed,
-            join_result,
-        )
-        .await
     }
 }
 
@@ -87,7 +62,7 @@ impl GraphOperator for IntervalJoinOperator {
             right_wm,
         )?;
 
-        self.apply_projection(join_result).await
+        self.projection.apply(join_result).await
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
@@ -101,7 +76,7 @@ impl GraphOperator for IntervalJoinOperator {
         let data = serde_json::to_vec(&cp).map_err(|e| {
             DbError::Pipeline(format!(
                 "interval join [{}]: checkpoint serialization: {e}",
-                self.op_name
+                self.projection.op_name
             ))
         })?;
 
@@ -112,7 +87,7 @@ impl GraphOperator for IntervalJoinOperator {
         let cp: JoinStateCheckpoint = serde_json::from_slice(&checkpoint.data).map_err(|e| {
             DbError::Pipeline(format!(
                 "interval join [{}]: checkpoint deserialization: {e}",
-                self.op_name
+                self.projection.op_name
             ))
         })?;
 
@@ -275,6 +250,6 @@ mod tests {
     fn test_name() {
         let ctx = laminar_sql::create_session_context();
         let op = IntervalJoinOperator::new("my_interval_join", test_config(), None, ctx);
-        assert_eq!(&*op.op_name, "my_interval_join");
+        assert_eq!(&*op.projection.op_name, "my_interval_join");
     }
 }

@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use laminar_connectors::connector::DeliveryGuarantee;
 
+use crate::config::BackpressurePolicy;
+
 /// Configuration for the event-driven connector pipeline.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
@@ -71,10 +73,14 @@ pub struct PipelineConfig {
     /// low-priority tasks (table polling) are skipped. Default: 5ms.
     pub background_budget_ns: u64,
 
-    /// Maximum `RecordBatch`es buffered per operator input port. When
-    /// fan-out within a cycle would exceed this limit, the oldest batches
-    /// are shed and a warning is logged. `0` means unlimited. Default: 256.
+    /// Per-input-port batch cap. Default: 256.
     pub max_input_buf_batches: usize,
+
+    /// Per-input-port byte cap. `None` = disabled.
+    pub max_input_buf_bytes: Option<usize>,
+
+    /// What to do when either cap is exceeded.
+    pub backpressure_policy: BackpressurePolicy,
 }
 
 impl Default for PipelineConfig {
@@ -92,6 +98,8 @@ impl Default for PipelineConfig {
             query_budget_ns: 8_000_000,      // 8ms
             background_budget_ns: 5_000_000, // 5ms
             max_input_buf_batches: 256,
+            max_input_buf_bytes: None,
+            backpressure_policy: BackpressurePolicy::default(),
         }
     }
 }

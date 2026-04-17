@@ -734,7 +734,7 @@ mod tests {
     #[test]
     fn test_sink_config_flush_interval() {
         let cfg = MongoDbSinkConfig::default();
-        assert_eq!(cfg.flush_interval(), Duration::from_millis(1000));
+        assert_eq!(cfg.flush_interval(), Duration::from_secs(1));
     }
 
     #[test]

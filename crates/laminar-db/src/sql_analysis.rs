@@ -15,6 +15,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Location, Token, TokenWithSpan};
 
 use laminar_sql::parser::join_parser::analyze_joins;
 #[cfg(test)]
@@ -49,48 +50,6 @@ pub(crate) fn emit_clause_to_core(
 ) -> Result<laminar_core::operator::window::EmitStrategy, laminar_sql::parser::ParseError> {
     let sql_strategy = clause.to_emit_strategy()?;
     Ok(sql_emit_to_core(&sql_strategy))
-}
-
-// ---------------------------------------------------------------------------
-// String literal / comment stripping
-// ---------------------------------------------------------------------------
-
-fn strip_literals_and_comments(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let bytes = sql.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\'' {
-            // Single-quoted string: replace content with spaces
-            out.push(' ');
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'\'' {
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                        // Escaped quote (''): skip both
-                        out.push_str("  ");
-                        i += 2;
-                        continue;
-                    }
-                    out.push(' ');
-                    i += 1;
-                    break;
-                }
-                out.push(' ');
-                i += 1;
-            }
-        } else if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-            // Line comment: replace until newline
-            while i < bytes.len() && bytes[i] != b'\n' {
-                out.push(' ');
-                i += 1;
-            }
-        } else {
-            out.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -430,17 +389,12 @@ pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperator
                 tracing::warn!("tumbling window size is zero or negative, EOWC filtering disabled");
                 return watermark_ms;
             }
-            // Floor to nearest window boundary, accounting for offset.
-            // Must match TumblingWindowAssigner::assign() formula:
-            //   floor((ts - offset) / size) * size + offset
+            // floor((ts - offset) / size) * size + offset, saturating so
+            // the i64::MIN initial-watermark sentinel doesn't panic.
             let offset = config.offset_ms;
-            let adjusted = watermark_ms - offset;
-            let floored = if adjusted >= 0 {
-                (adjusted / size) * size
-            } else {
-                ((adjusted - size + 1) / size) * size
-            };
-            floored + offset
+            let adjusted = watermark_ms.saturating_sub(offset);
+            let floored = adjusted.div_euclid(size).saturating_mul(size);
+            floored.saturating_add(offset)
         }
         WindowType::Session => {
             #[allow(clippy::cast_possible_truncation)]
@@ -465,15 +419,12 @@ pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperator
             // belongs only to fully closed windows.
             // Account for window offset to match SlidingWindowAssigner.
             let offset = config.offset_ms;
-            let base = (watermark_ms - offset).saturating_sub(size);
-            let boundary = if base >= 0 {
-                (base / slide).saturating_add(1).saturating_mul(slide)
-            } else {
-                ((base - slide + 1) / slide)
-                    .saturating_add(1)
-                    .saturating_mul(slide)
-            };
-            boundary + offset
+            let base = watermark_ms.saturating_sub(offset).saturating_sub(size);
+            let boundary = base
+                .div_euclid(slide)
+                .saturating_add(1)
+                .saturating_mul(slide);
+            boundary.saturating_add(offset)
         }
         WindowType::Cumulate => {
             // Cumulate windows share the same epoch alignment as tumbling.
@@ -484,15 +435,10 @@ pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperator
                 tracing::warn!("cumulate window size is zero or negative, EOWC filtering disabled");
                 return watermark_ms;
             }
-            // Same offset-aware floor as Tumbling
             let offset = config.offset_ms;
-            let adjusted = watermark_ms - offset;
-            let floored = if adjusted >= 0 {
-                (adjusted / size) * size
-            } else {
-                ((adjusted - size + 1) / size) * size
-            };
-            floored + offset
+            let adjusted = watermark_ms.saturating_sub(offset);
+            let floored = adjusted.div_euclid(size).saturating_mul(size);
+            floored.saturating_add(offset)
         }
     }
 }
@@ -937,204 +883,277 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection>
     })
 }
 
-/// Not recognized by sqlparser, so detection works on the raw SQL string.
-#[allow(clippy::too_many_lines)]
+/// TEMPORAL PROBE JOIN is not in sqlparser's grammar — recognize it by
+/// walking the token stream directly.
 pub(crate) fn detect_temporal_probe_query(
     sql: &str,
 ) -> (
     Option<laminar_sql::translator::TemporalProbeConfig>,
     Option<String>,
 ) {
-    // Strip string literals and single-line comments before keyword search
-    // to avoid false positives from SQL like WHERE msg = 'TEMPORAL PROBE JOIN'.
-    let stripped = strip_literals_and_comments(sql);
-    let upper = stripped.to_uppercase();
-    let Some(tpj_pos) = upper.find("TEMPORAL PROBE JOIN") else {
-        return (None, None);
-    };
-
-    let from_pos = upper[..tpj_pos].rfind("FROM").unwrap_or(0);
-    let between_from_and_tpj = sql[from_pos + 4..tpj_pos].trim();
-
-    let left_parts: Vec<&str> = between_from_and_tpj.split_whitespace().collect();
-    if left_parts.is_empty() {
-        return (None, None);
+    match parse_probe(sql) {
+        Some((cfg, proj)) => (Some(cfg), proj),
+        None => (None, None),
     }
-    let left_table = left_parts[0].to_string();
-    let left_alias = if left_parts.len() >= 3 && left_parts[1].eq_ignore_ascii_case("AS") {
-        Some(left_parts[2].to_string())
+}
+
+fn parse_probe(
+    sql: &str,
+) -> Option<(laminar_sql::translator::TemporalProbeConfig, Option<String>)> {
+    let raw = sqlparser::tokenizer::Tokenizer::new(&GenericDialect {}, sql)
+        .tokenize_with_location()
+        .ok()?;
+    let toks: Vec<&TokenWithSpan> = raw
+        .iter()
+        .filter(|t| !matches!(t.token, Token::Whitespace(_)))
+        .collect();
+
+    let tpj = (0..toks.len().saturating_sub(2)).find(|&i| {
+        kw(toks[i], "TEMPORAL") && kw(toks[i + 1], "PROBE") && kw(toks[i + 2], "JOIN")
+    })?;
+    let from = (0..tpj).rev().find(|&i| kw(toks[i], "FROM"))?;
+    let left = parse_table_ref(&toks[from + 1..tpj])?;
+
+    let after_tpj = tpj + 3;
+    let on = (after_tpj..toks.len()).find(|&i| kw(toks[i], "ON"))?;
+    let right = parse_table_ref(&toks[after_tpj..on])?;
+
+    let mut i = on + 1;
+    let keys = parse_key_columns(&toks, &mut i)?;
+
+    let (left_time, right_time) = if kw_at(&toks, i, "TIMESTAMPS") {
+        i += 1;
+        parse_pair(&toks, &mut i)?
     } else {
-        left_parts.get(1).map(ToString::to_string)
+        tracing::warn!(
+            left = %left.name, right = %right.name,
+            "TEMPORAL PROBE JOIN: no TIMESTAMPS clause; defaulting to 'ts'",
+        );
+        ("ts".into(), "ts".into())
     };
 
-    let after_tpj = &sql[tpj_pos + "TEMPORAL PROBE JOIN".len()..];
-    let after_tpj_trimmed = after_tpj.trim_start();
-
-    let after_upper = after_tpj_trimmed.to_uppercase();
-    let Some(on_pos) = after_upper.find(" ON ") else {
-        return (None, None);
+    let offsets = if kw_at(&toks, i, "LIST") {
+        i += 1;
+        parse_list(&toks, &mut i)?
+    } else if kw_at(&toks, i, "RANGE") {
+        i += 1;
+        parse_range(&toks, &mut i)?
+    } else {
+        return None;
     };
 
-    let right_part = after_tpj_trimmed[..on_pos].trim();
-    let right_parts: Vec<&str> = right_part.split_whitespace().collect();
-    if right_parts.is_empty() {
-        return (None, None);
+    if !kw_at(&toks, i, "AS") {
+        return None;
     }
-    let right_table = right_parts[0].to_string();
-    let right_alias = if right_parts.len() >= 3 && right_parts[1].eq_ignore_ascii_case("AS") {
-        Some(right_parts[2].to_string())
-    } else {
-        right_parts.get(1).map(ToString::to_string)
-    };
+    i += 1;
+    let alias_tok = *toks.get(i)?;
+    let probe_alias = ident(alias_tok)?;
 
-    let after_on = after_tpj_trimmed[on_pos + 4..].trim_start();
-    let key_columns: Vec<String> = if let Some(rest) = after_on.strip_prefix('(') {
-        let end_paren = rest.find(')').unwrap_or(rest.len());
-        rest[..end_paren]
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    } else {
-        vec![after_on.split_whitespace().next().unwrap_or("").to_string()]
-    };
-
-    // Parse optional TIMESTAMPS (left_col, right_col) clause
-    let after_on_upper = after_on.to_uppercase();
-    let (left_time_column, right_time_column) =
-        if let Some(ts_pos) = after_on_upper.find("TIMESTAMPS") {
-            let ts_text = &after_on[ts_pos + "TIMESTAMPS".len()..].trim_start();
-            if let Some(rest) = ts_text.strip_prefix('(') {
-                let end_paren = rest.find(')').unwrap_or(rest.len());
-                let cols: Vec<&str> = rest[..end_paren].split(',').map(str::trim).collect();
-                (
-                    cols.first().unwrap_or(&"ts").to_string(),
-                    cols.get(1).unwrap_or(&"ts").to_string(),
-                )
-            } else {
-                ("ts".into(), "ts".into())
-            }
-        } else {
-            tracing::warn!(
-                %left_table,
-                %right_table,
-                "temporal probe join: no TIMESTAMPS clause, defaulting to 'ts'. \
-                 Use TIMESTAMPS (left_col, right_col) to specify."
-            );
-            ("ts".into(), "ts".into())
-        };
-
-    let (offsets, alias_search_start) = if let Some(range_pos) = after_on_upper.find("RANGE ") {
-        let range_text = &after_on[range_pos + 6..];
-        let range_upper = range_text.to_uppercase();
-        let from_pos = range_upper.find("FROM ").map_or(0, |p| p + 5);
-        let to_pos = range_upper.find(" TO ").unwrap_or(range_text.len());
-        let step_pos = range_upper.find(" STEP ");
-
-        let start_str = range_text[from_pos..to_pos].trim();
-        let start_ms = if let Some(v) = laminar_sql::translator::parse_interval_to_ms(start_str) {
-            v
-        } else {
-            tracing::warn!(
-                "TEMPORAL PROBE JOIN: invalid RANGE start '{start_str}', defaulting to 0"
-            );
-            0
-        };
-
-        let (end_str, step_str) = if let Some(sp) = step_pos {
-            let to_end = &range_text[to_pos + 4..sp];
-            let as_pos = range_upper[sp + 6..].find(" AS ");
-            let step_end = as_pos.map_or(range_text.len(), |p| sp + 6 + p);
-            (to_end.trim(), range_text[sp + 6..step_end].trim())
-        } else {
-            let as_pos = range_upper[to_pos + 4..].find(" AS ");
-            let end_pos = as_pos.map_or(range_text.len(), |p| to_pos + 4 + p);
-            (range_text[to_pos + 4..end_pos].trim(), "1s")
-        };
-
-        let end_ms = if let Some(v) = laminar_sql::translator::parse_interval_to_ms(end_str) {
-            v
-        } else {
-            tracing::warn!("TEMPORAL PROBE JOIN: invalid RANGE end '{end_str}', defaulting to 0");
-            0
-        };
-        let step_ms = if let Some(v) = laminar_sql::translator::parse_interval_to_ms(step_str) {
-            v
-        } else {
-            tracing::warn!(
-                "TEMPORAL PROBE JOIN: invalid RANGE step '{step_str}', defaulting to 1s"
-            );
-            1000
-        };
-
-        (
-            laminar_sql::translator::ProbeOffsetSpec::Range {
-                start_ms,
-                end_ms,
-                step_ms,
-            },
-            range_pos,
-        )
-    } else if let Some(list_pos) = after_on_upper.find("LIST ") {
-        let list_text = &after_on[list_pos + 5..];
-        let Some(open_paren) = list_text.find('(') else {
-            return (None, None);
-        };
-        let Some(close_paren) = list_text.find(')') else {
-            return (None, None);
-        };
-        let items_str = &list_text[open_paren + 1..close_paren];
-        let offsets_ms: Vec<i64> = items_str
-            .split(',')
-            .filter_map(|s| laminar_sql::translator::parse_interval_to_ms(s.trim()))
-            .collect();
-        if offsets_ms.is_empty() {
-            return (None, None);
-        }
-        (
-            laminar_sql::translator::ProbeOffsetSpec::List(offsets_ms),
-            list_pos,
-        )
-    } else {
-        return (None, None);
-    };
-
-    let remaining = &after_on[alias_search_start..];
-    let remaining_upper = remaining.to_uppercase();
-    let Some(as_pos) = remaining_upper.rfind(" AS ") else {
-        return (None, None);
-    };
-
-    let after_as = remaining[as_pos + 4..].trim();
-    let probe_alias = after_as
-        .split(|c: char| c.is_whitespace() || c == ';' || c == ')')
-        .next()
-        .unwrap_or("p")
-        .to_string();
-
-    let config = laminar_sql::translator::TemporalProbeConfig::new(
-        left_table.clone(),
-        right_table.clone(),
-        left_alias.clone(),
-        right_alias.clone(),
-        key_columns,
-        left_time_column,
-        right_time_column,
+    let cfg = laminar_sql::translator::TemporalProbeConfig::new(
+        left.name,
+        right.name,
+        left.alias.clone(),
+        right.alias.clone(),
+        keys,
+        left_time,
+        right_time,
         &offsets,
         probe_alias,
     );
 
-    // Build projection SQL by pre-processing the original SQL into a form
-    // sqlparser can parse, then walking the AST for safe rewriting.
-    let projection_sql = build_probe_projection_via_ast(
+    let projection = build_probe_projection_via_ast(
         sql,
-        tpj_pos,
-        &config,
-        left_alias.as_deref(),
-        right_alias.as_deref(),
+        location_to_byte(sql, toks[tpj].span.start),
+        location_to_byte(sql, alias_tok.span.end),
+        &cfg,
+        left.alias.as_deref(),
+        right.alias.as_deref(),
     );
 
-    (Some(config), projection_sql)
+    Some((cfg, projection))
+}
+
+struct TableRef {
+    name: String,
+    alias: Option<String>,
+}
+
+fn kw(t: &TokenWithSpan, s: &str) -> bool {
+    matches!(&t.token, Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(s))
+}
+
+fn kw_at(toks: &[&TokenWithSpan], i: usize, s: &str) -> bool {
+    toks.get(i).is_some_and(|t| kw(t, s))
+}
+
+fn ident(t: &TokenWithSpan) -> Option<String> {
+    match &t.token {
+        Token::Word(w) => Some(w.value.clone()),
+        _ => None,
+    }
+}
+
+fn expect(toks: &[&TokenWithSpan], i: &mut usize, want: &Token) -> Option<()> {
+    if toks.get(*i).map(|t| &t.token) == Some(want) {
+        *i += 1;
+        Some(())
+    } else {
+        None
+    }
+}
+
+/// Reads `a.b.c` and returns the last segment (the column name).
+fn read_qualified(toks: &[&TokenWithSpan], i: &mut usize) -> Option<String> {
+    let mut last = ident(toks.get(*i)?)?;
+    *i += 1;
+    while toks.get(*i).map(|t| &t.token) == Some(&Token::Period) {
+        *i += 1;
+        last = ident(toks.get(*i)?)?;
+        *i += 1;
+    }
+    Some(last)
+}
+
+fn parse_table_ref(toks: &[&TokenWithSpan]) -> Option<TableRef> {
+    let mut i = 0;
+    let mut name = ident(toks.first()?)?;
+    i += 1;
+    while toks.get(i).map(|t| &t.token) == Some(&Token::Period) {
+        let next = ident(toks.get(i + 1)?)?;
+        name.push('.');
+        name.push_str(&next);
+        i += 2;
+    }
+    let alias = match toks.len() - i {
+        0 => None,
+        1 => ident(toks[i]),
+        _ if kw(toks[i], "AS") => ident(toks.get(i + 1)?),
+        _ => ident(toks[i]),
+    };
+    Some(TableRef { name, alias })
+}
+
+fn parse_key_columns(toks: &[&TokenWithSpan], i: &mut usize) -> Option<Vec<String>> {
+    if toks.get(*i).map(|t| &t.token) != Some(&Token::LParen) {
+        return Some(vec![read_qualified(toks, i)?]);
+    }
+    *i += 1;
+    let mut cols = Vec::new();
+    loop {
+        cols.push(read_qualified(toks, i)?);
+        match toks.get(*i).map(|t| &t.token) {
+            Some(Token::Comma) => *i += 1,
+            Some(Token::RParen) => {
+                *i += 1;
+                return (!cols.is_empty()).then_some(cols);
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn parse_pair(toks: &[&TokenWithSpan], i: &mut usize) -> Option<(String, String)> {
+    expect(toks, i, &Token::LParen)?;
+    let l = read_qualified(toks, i)?;
+    expect(toks, i, &Token::Comma)?;
+    let r = read_qualified(toks, i)?;
+    expect(toks, i, &Token::RParen)?;
+    Some((l, r))
+}
+
+// `0s` / `-5s` tokenize as Number + Word / Minus + Number + Word; Display
+// concatenation reassembles the literal for `parse_interval_to_ms`.
+fn token_text(toks: &[&TokenWithSpan], start: usize, end: usize) -> String {
+    toks[start..end]
+        .iter()
+        .map(|t| t.token.to_string())
+        .collect()
+}
+
+fn parse_list(
+    toks: &[&TokenWithSpan],
+    i: &mut usize,
+) -> Option<laminar_sql::translator::ProbeOffsetSpec> {
+    expect(toks, i, &Token::LParen)?;
+    let mut items = Vec::new();
+    let mut item_start = *i;
+    loop {
+        match &toks.get(*i)?.token {
+            Token::Comma => {
+                items.push(laminar_sql::translator::parse_interval_to_ms(&token_text(
+                    toks, item_start, *i,
+                ))?);
+                *i += 1;
+                item_start = *i;
+            }
+            Token::RParen => {
+                if *i > item_start {
+                    items.push(laminar_sql::translator::parse_interval_to_ms(&token_text(
+                        toks, item_start, *i,
+                    ))?);
+                }
+                *i += 1;
+                break;
+            }
+            _ => *i += 1,
+        }
+    }
+    (!items.is_empty()).then_some(laminar_sql::translator::ProbeOffsetSpec::List(items))
+}
+
+fn parse_range(
+    toks: &[&TokenWithSpan],
+    i: &mut usize,
+) -> Option<laminar_sql::translator::ProbeOffsetSpec> {
+    if kw_at(toks, *i, "FROM") {
+        *i += 1;
+    }
+    let start_ms = laminar_sql::translator::parse_interval_to_ms(&take_until(toks, i, &["TO"]))?;
+    if !kw_at(toks, *i, "TO") {
+        return None;
+    }
+    *i += 1;
+    let end_ms =
+        laminar_sql::translator::parse_interval_to_ms(&take_until(toks, i, &["STEP", "AS"]))?;
+    let step_ms = if kw_at(toks, *i, "STEP") {
+        *i += 1;
+        laminar_sql::translator::parse_interval_to_ms(&take_until(toks, i, &["AS"]))?
+    } else {
+        1000
+    };
+    Some(laminar_sql::translator::ProbeOffsetSpec::Range {
+        start_ms,
+        end_ms,
+        step_ms,
+    })
+}
+
+fn take_until(toks: &[&TokenWithSpan], i: &mut usize, stops: &[&str]) -> String {
+    let start = *i;
+    while *i < toks.len() && !stops.iter().any(|s| kw(toks[*i], s)) {
+        *i += 1;
+    }
+    token_text(toks, start, *i)
+}
+
+fn location_to_byte(sql: &str, loc: Location) -> usize {
+    if loc.line == 0 {
+        return 0;
+    }
+    let mut line: u64 = 1;
+    let mut col: u64 = 1;
+    for (b, ch) in sql.char_indices() {
+        if line == loc.line && col == loc.column {
+            return b;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    sql.len()
 }
 
 // ---------------------------------------------------------------------------
@@ -1593,18 +1612,12 @@ fn rewrite_stream_join_expr(
 fn build_probe_projection_via_ast(
     original_sql: &str,
     tpj_pos: usize,
+    probe_clause_end: usize,
     config: &laminar_sql::translator::TemporalProbeConfig,
     left_alias: Option<&str>,
     right_alias: Option<&str>,
 ) -> Option<String> {
     let probe = &config.probe_alias;
-    let upper = original_sql.to_uppercase();
-
-    // Find end of the probe clause: last "AS <alias>" after TEMPORAL PROBE JOIN
-    let after_tpj_upper = &upper[tpj_pos..];
-    let as_needle = format!(" AS {}", probe.to_uppercase());
-    let as_off = after_tpj_upper.rfind(&as_needle)?;
-    let probe_clause_end = tpj_pos + as_off + as_needle.len();
 
     // Build standard JOIN to replace the probe clause
     let left_ref = left_alias.unwrap_or(&config.left_table);
@@ -1793,6 +1806,76 @@ mod tests {
         let refs = extract_table_references("SELECT * FROM events WHERE id > 1");
         assert_eq!(refs.len(), 1);
         assert!(refs.contains("events"));
+    }
+
+    #[test]
+    fn test_temporal_probe_strips_quoted_timestamp_columns() {
+        let sql = "SELECT t.s FROM trades t \
+                   TEMPORAL PROBE JOIN book r \
+                   ON (s) TIMESTAMPS (\"T\", \"E\") \
+                   LIST (0s, 1s) AS p";
+        let (config, _) = detect_temporal_probe_query(sql);
+        let config = config.expect("temporal probe detected");
+        assert_eq!(config.left_time_column, "T");
+        assert_eq!(config.right_time_column, "E");
+    }
+
+    #[test]
+    fn test_temporal_probe_ignores_literal_in_where() {
+        let sql = "SELECT * FROM trades WHERE msg = 'TEMPORAL PROBE JOIN'";
+        let (config, _) = detect_temporal_probe_query(sql);
+        assert!(
+            config.is_none(),
+            "must not detect a probe join inside a string literal"
+        );
+    }
+
+    #[test]
+    fn test_temporal_probe_ignores_block_comment_literal() {
+        let sql = "SELECT * FROM trades WHERE comment = '/* TEMPORAL PROBE JOIN */'";
+        let (config, _) = detect_temporal_probe_query(sql);
+        assert!(config.is_none());
+    }
+
+    #[test]
+    fn test_temporal_probe_through_block_comments() {
+        let sql = "SELECT t.s FROM trades t \
+                   /* outer */ TEMPORAL PROBE JOIN /* inner */ book r \
+                   ON (s) TIMESTAMPS (ts, ts) \
+                   LIST (0s, 1s) AS p";
+        let (config, _) = detect_temporal_probe_query(sql);
+        let config = config.expect("block comments must not block detection");
+        assert_eq!(config.left_table, "trades");
+        assert_eq!(config.right_table, "book");
+    }
+
+    #[test]
+    fn test_temporal_probe_qualified_quoted_timestamps() {
+        let sql = "SELECT t.s FROM trades t \
+                   TEMPORAL PROBE JOIN book r \
+                   ON (s) TIMESTAMPS (t.\"T\", r.\"E\") \
+                   LIST (0s, 1s) AS p";
+        let (config, _) = detect_temporal_probe_query(sql);
+        let config = config.expect("qualified quoted idents must resolve");
+        assert_eq!(config.left_time_column, "T");
+        assert_eq!(config.right_time_column, "E");
+    }
+
+    #[test]
+    fn test_temporal_probe_range_spec() {
+        let sql = "SELECT t.s FROM trades t \
+                   TEMPORAL PROBE JOIN book r \
+                   ON (s) TIMESTAMPS (ts, ts) \
+                   RANGE FROM 0s TO 30s STEP 5s AS p";
+        let (config, _) = detect_temporal_probe_query(sql);
+        let config = config.expect("range spec must parse");
+        // 0,5,10,15,20,25,30 = 7 offsets
+        assert_eq!(
+            config.expanded_offsets_ms.len(),
+            7,
+            "got {:?}",
+            config.expanded_offsets_ms
+        );
     }
 
     #[test]

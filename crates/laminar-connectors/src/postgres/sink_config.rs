@@ -364,7 +364,7 @@ mod tests {
         assert_eq!(cfg.batch_size, 8192);
         assert_eq!(cfg.flush_interval, Duration::from_millis(500));
         assert_eq!(cfg.pool_size, 8);
-        assert_eq!(cfg.connect_timeout, Duration::from_millis(5000));
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(5));
         assert_eq!(cfg.ssl_mode, SslMode::Require);
         assert!(cfg.auto_create_table);
         assert!(cfg.changelog_mode);

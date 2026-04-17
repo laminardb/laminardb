@@ -107,7 +107,7 @@ impl Default for DeltaLakeSinkConfig {
             merge_key_columns: Vec::new(),
             storage_options: HashMap::new(),
             compaction: CompactionConfig::default(),
-            vacuum_retention: Duration::from_secs(7 * 24 * 3600), // 7 days
+            vacuum_retention: Duration::from_secs(7 * 24 * 3600),
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
             writer_id: uuid::Uuid::new_v4().to_string(),
             catalog_type: DeltaCatalogType::None,
@@ -418,7 +418,7 @@ impl DeltaLakeSinkConfig {
                 "compaction.check-interval.ms must be > 0".into(),
             ));
         }
-        if self.vacuum_retention < Duration::from_secs(24 * 3600) {
+        if self.vacuum_retention < Duration::from_secs(86400) {
             return Err(ConnectorError::ConfigurationError(
                 "vacuum.retention.hours must be >= 24 (Delta Lake safety minimum)".into(),
             ));
@@ -862,7 +862,7 @@ mod tests {
         assert_eq!(cfg.partition_columns, vec!["trade_date", "hour"]);
         assert_eq!(cfg.target_file_size, 67_108_864);
         assert_eq!(cfg.max_buffer_records, 50_000);
-        assert_eq!(cfg.max_buffer_duration, Duration::from_millis(30_000));
+        assert_eq!(cfg.max_buffer_duration, Duration::from_secs(30));
         assert_eq!(cfg.checkpoint_interval, 20);
         assert!(cfg.schema_evolution);
         assert_eq!(cfg.write_mode, DeltaWriteMode::Upsert);
@@ -874,7 +874,7 @@ mod tests {
             vec!["customer_id", "product_id"]
         );
         assert_eq!(cfg.compaction.min_files_for_compaction, 20);
-        assert_eq!(cfg.vacuum_retention, Duration::from_secs(336 * 3600));
+        assert_eq!(cfg.vacuum_retention, Duration::from_secs(1209600));
         assert_eq!(cfg.writer_id, "my-writer");
         assert_eq!(
             cfg.storage_options.get("aws_access_key_id"),

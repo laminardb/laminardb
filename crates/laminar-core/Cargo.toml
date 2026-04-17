@@ -11,8 +11,10 @@ description = "Core streaming engine for LaminarDB - operators, checkpoint barri
 
 [features]
 default = []
-# Enable distributed delta mode (multi-node) — heavy deps, server-only
-delta = [
+# Distributed cluster coordination. Unstable: discovery + partition guards
+# work, but Raft consensus, inter-node RPC, and rebalance-on-membership are
+# not yet implemented. Do not enable in production.
+cluster-unstable = [
     "dep:chitchat", "dep:tokio-util", "dep:xxhash-rust",
 ]
 [dependencies]
