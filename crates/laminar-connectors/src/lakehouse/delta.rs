@@ -557,7 +557,11 @@ impl DeltaLakeSink {
                         && self
                             .delta_version
                             .is_multiple_of(self.config.checkpoint_interval);
-                    self.table = if crossed_checkpoint { None } else { Some(table) };
+                    self.table = if crossed_checkpoint {
+                        None
+                    } else {
+                        Some(table)
+                    };
 
                     self.staged_batches.clear();
                     self.staged_rows = 0;
