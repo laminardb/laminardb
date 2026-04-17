@@ -13,16 +13,12 @@ use laminar_sql::translator::AsofJoinTranslatorConfig;
 
 use crate::asof_batch::{execute_asof_join_with_state, AsofBufferCheckpoint, AsofRightBuffer};
 use crate::error::DbError;
+use crate::operator::ProjectingJoinState;
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
-use crate::sql_analysis::CompiledPostProjection;
 
 pub(crate) struct AsofJoinOperator {
-    op_name: Arc<str>,
     config: AsofJoinTranslatorConfig,
-    projection_sql: Option<Arc<str>>,
-    ctx: SessionContext,
-    compiled_post_proj: Option<CompiledPostProjection>,
-    post_proj_compile_failed: bool,
+    projection: ProjectingJoinState,
     right_buffer: AsofRightBuffer,
     last_evicted_watermark: i64,
 }
@@ -35,31 +31,11 @@ impl AsofJoinOperator {
         ctx: SessionContext,
     ) -> Self {
         Self {
-            op_name: Arc::from(name),
             config,
-            projection_sql,
-            ctx,
-            compiled_post_proj: None,
-            post_proj_compile_failed: false,
+            projection: ProjectingJoinState::new(name, ctx, projection_sql, "__asof_tmp"),
             right_buffer: AsofRightBuffer::default(),
             last_evicted_watermark: i64::MIN,
         }
-    }
-
-    async fn apply_projection(
-        &mut self,
-        batches: Vec<RecordBatch>,
-    ) -> Result<Vec<RecordBatch>, DbError> {
-        super::apply_post_projection(
-            &self.ctx,
-            &self.op_name,
-            "__asof_tmp",
-            self.projection_sql.as_deref(),
-            &mut self.compiled_post_proj,
-            &mut self.post_proj_compile_failed,
-            batches,
-        )
-        .await
     }
 }
 
@@ -103,7 +79,7 @@ impl GraphOperator for AsofJoinOperator {
             return Ok(Vec::new());
         }
 
-        self.apply_projection(vec![joined]).await
+        self.projection.apply(vec![joined]).await
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
@@ -114,7 +90,7 @@ impl GraphOperator for AsofJoinOperator {
         let data = serde_json::to_vec(&cp).map_err(|e| {
             DbError::Pipeline(format!(
                 "ASOF join [{}]: checkpoint serialization: {e}",
-                self.op_name
+                self.projection.op_name
             ))
         })?;
 
@@ -125,7 +101,7 @@ impl GraphOperator for AsofJoinOperator {
         let cp: AsofBufferCheckpoint = serde_json::from_slice(&checkpoint.data).map_err(|e| {
             DbError::Pipeline(format!(
                 "ASOF join [{}]: checkpoint deserialization: {e}",
-                self.op_name
+                self.projection.op_name
             ))
         })?;
 
@@ -322,7 +298,7 @@ mod tests {
     fn test_name() {
         let ctx = laminar_sql::create_session_context();
         let op = AsofJoinOperator::new("my_asof_query", test_config(), None, ctx);
-        assert_eq!(&*op.op_name, "my_asof_query");
+        assert_eq!(&*op.projection.op_name, "my_asof_query");
     }
 
     #[test]

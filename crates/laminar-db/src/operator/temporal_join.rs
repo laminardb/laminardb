@@ -19,18 +19,16 @@ use laminar_sql::datafusion::lookup_join_exec::{
 use laminar_sql::translator::TemporalJoinTranslatorConfig;
 
 use crate::error::DbError;
+use crate::operator::ProjectingJoinState;
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
-use crate::sql_analysis::CompiledPostProjection;
 
 pub(crate) struct TemporalJoinOperator {
     op_name: Arc<str>,
     config: TemporalJoinTranslatorConfig,
-    projection_sql: Option<Arc<str>>,
     ctx: SessionContext,
     lookup_registry: Option<Arc<LookupTableRegistry>>,
     last_temporal_row_count: usize,
-    compiled_post_proj: Option<CompiledPostProjection>,
-    post_proj_compile_failed: bool,
+    projection: ProjectingJoinState,
 }
 
 impl TemporalJoinOperator {
@@ -44,12 +42,10 @@ impl TemporalJoinOperator {
         Self {
             op_name: Arc::from(name),
             config,
-            projection_sql,
-            ctx,
+            ctx: ctx.clone(),
             lookup_registry,
             last_temporal_row_count: 0,
-            compiled_post_proj: None,
-            post_proj_compile_failed: false,
+            projection: ProjectingJoinState::new(name, ctx, projection_sql, "__temporal_tmp"),
         }
     }
 
@@ -191,21 +187,6 @@ impl TemporalJoinOperator {
         Ok(batches)
     }
 
-    async fn apply_projection(
-        &mut self,
-        batches: Vec<RecordBatch>,
-    ) -> Result<Vec<RecordBatch>, DbError> {
-        super::apply_post_projection(
-            &self.ctx,
-            &self.op_name,
-            "__temporal_tmp",
-            self.projection_sql.as_deref(),
-            &mut self.compiled_post_proj,
-            &mut self.post_proj_compile_failed,
-            batches,
-        )
-        .await
-    }
 }
 
 /// Build the merged output schema: stream fields followed by table fields.
@@ -229,7 +210,7 @@ impl GraphOperator for TemporalJoinOperator {
         }
 
         let joined = self.execute_versioned_join(stream_batches).await?;
-        self.apply_projection(joined).await
+        self.projection.apply(joined).await
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {

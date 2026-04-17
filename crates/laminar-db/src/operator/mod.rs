@@ -81,6 +81,52 @@ fn apply_compiled_post_projection(
         .map_err(|e| DbError::Pipeline(format!("post-projection batch: {e}")))
 }
 
+/// Shared state for the four join operators (asof, interval, temporal,
+/// temporal-probe). Owns the post-projection SQL and its compile cache so
+/// each operator keeps only its own join state.
+pub(crate) struct ProjectingJoinState {
+    pub(crate) op_name: Arc<str>,
+    ctx: SessionContext,
+    projection_sql: Option<Arc<str>>,
+    tmp_table_name: &'static str,
+    compiled: Option<CompiledPostProjection>,
+    compile_failed: bool,
+}
+
+impl ProjectingJoinState {
+    pub(crate) fn new(
+        op_name: &str,
+        ctx: SessionContext,
+        projection_sql: Option<Arc<str>>,
+        tmp_table_name: &'static str,
+    ) -> Self {
+        Self {
+            op_name: Arc::from(op_name),
+            ctx,
+            projection_sql,
+            tmp_table_name,
+            compiled: None,
+            compile_failed: false,
+        }
+    }
+
+    pub(crate) async fn apply(
+        &mut self,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        apply_post_projection(
+            &self.ctx,
+            &self.op_name,
+            self.tmp_table_name,
+            self.projection_sql.as_deref(),
+            &mut self.compiled,
+            &mut self.compile_failed,
+            batches,
+        )
+        .await
+    }
+}
+
 pub(crate) async fn apply_post_projection(
     ctx: &SessionContext,
     op_name: &str,
