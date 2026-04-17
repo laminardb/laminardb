@@ -1318,36 +1318,21 @@ impl SourceConnector for KafkaSource {
 
     /// Restores the consumer to checkpointed offsets.
     ///
-    /// **Single-instance limitation**: This implementation assumes a single
-    /// consumer instance per `group.id`. Checkpoint offsets are stored in
-    /// `LaminarDB`'s manifest and restored via `consumer.assign()`, bypassing
-    /// the Kafka consumer group protocol. Running multiple instances with
-    /// the same `group.id` will cause offset conflicts between the manifest
-    /// and broker-managed group offsets.
+    /// Offsets are staged in `offset_snapshot`; the actual `seek_partitions`
+    /// runs in `post_rebalance` when the group coordinator hands us the
+    /// assignment. Calling `consumer.assign()` here would switch out of
+    /// subscribe() mode and produce `Local: Erroneous state`.
     async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
         info!(
             epoch = checkpoint.epoch(),
-            "restoring Kafka source from checkpoint"
+            partition_count = checkpoint.offsets().len(),
+            "staging checkpointed offsets for seek-on-assign"
         );
 
         self.offsets = OffsetTracker::from_checkpoint(checkpoint);
-
-        // Propagate restored offsets to the rebalance callback so a
-        // rebalance before the first poll_batch() also seeks correctly.
         match self.offset_snapshot.lock() {
             Ok(mut snapshot) => snapshot.clone_from(&self.offsets),
             Err(poisoned) => poisoned.into_inner().clone_from(&self.offsets),
-        }
-
-        if let Some(ref consumer) = self.consumer {
-            let tpl = self.offsets.to_topic_partition_list();
-            consumer.assign(&tpl).map_err(|e| {
-                ConnectorError::CheckpointError(format!("failed to seek to offsets: {e}"))
-            })?;
-            info!(
-                partition_count = self.offsets.partition_count(),
-                "restored consumer to checkpointed offsets"
-            );
         }
 
         Ok(())
