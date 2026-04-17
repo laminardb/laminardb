@@ -1321,7 +1321,7 @@ impl SourceConnector for KafkaSource {
     /// Offsets are staged in `offset_snapshot`; the actual `seek_partitions`
     /// runs in `post_rebalance` when the group coordinator hands us the
     /// assignment. Calling `consumer.assign()` here would switch out of
-    /// subscribe() mode and produce `Local: Erroneous state`.
+    /// `subscribe()` mode and produce `Local: Erroneous state`.
     async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
         info!(
             epoch = checkpoint.epoch(),
