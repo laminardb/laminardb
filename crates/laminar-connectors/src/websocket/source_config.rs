@@ -864,9 +864,9 @@ mod tests {
                 assert_eq!(subscribe_message.as_deref(), Some(r#"{"op":"subscribe"}"#));
                 assert!(reconnect.enabled);
                 assert_eq!(reconnect.initial_delay, Duration::from_millis(200));
-                assert_eq!(reconnect.max_delay, Duration::from_millis(60_000));
-                assert_eq!(*ping_interval, Duration::from_millis(15_000));
-                assert_eq!(*ping_timeout, Duration::from_millis(5_000));
+                assert_eq!(reconnect.max_delay, Duration::from_mins(1));
+                assert_eq!(*ping_interval, Duration::from_secs(15));
+                assert_eq!(*ping_timeout, Duration::from_secs(5));
             }
             SourceMode::Server { .. } => panic!("expected Client mode"),
         }
