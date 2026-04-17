@@ -111,7 +111,7 @@ impl Default for PostgresCdcConfig {
             poll_timeout: Duration::from_millis(100),
             max_poll_records: 1000,
             keepalive_interval: Duration::from_secs(10),
-            wal_sender_timeout: Duration::from_mins(1),
+            wal_sender_timeout: Duration::from_secs(60),
             table_include: Vec::new(),
             table_exclude: Vec::new(),
             max_buffered_events: 100_000,

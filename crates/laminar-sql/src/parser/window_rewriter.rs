@@ -641,7 +641,7 @@ mod tests {
                         if let WindowFunction::Tumble { interval, .. } = window {
                             let duration =
                                 WindowRewriter::parse_interval_to_duration(&interval).unwrap();
-                            assert_eq!(duration, std::time::Duration::from_mins(5));
+                            assert_eq!(duration, std::time::Duration::from_secs(300));
                         }
                     }
                 }
@@ -843,13 +843,13 @@ mod tests {
                         } => {
                             let dur =
                                 WindowRewriter::parse_interval_to_duration(&interval).unwrap();
-                            assert_eq!(dur, std::time::Duration::from_hours(1));
+                            assert_eq!(dur, std::time::Duration::from_secs(3600));
                             assert!(offset.is_some(), "Expected offset to be set");
                             let off_dur = WindowRewriter::parse_interval_to_duration(
                                 offset.as_ref().unwrap(),
                             )
                             .unwrap();
-                            assert_eq!(off_dur, std::time::Duration::from_mins(30));
+                            assert_eq!(off_dur, std::time::Duration::from_secs(1800));
                         }
                         _ => panic!("Expected Tumble window"),
                     }
@@ -882,14 +882,14 @@ mod tests {
                                 .unwrap();
                             let size = WindowRewriter::parse_interval_to_duration(&window_interval)
                                 .unwrap();
-                            assert_eq!(slide, std::time::Duration::from_mins(5));
-                            assert_eq!(size, std::time::Duration::from_mins(15));
+                            assert_eq!(slide, std::time::Duration::from_secs(300));
+                            assert_eq!(size, std::time::Duration::from_secs(900));
                             assert!(offset.is_some(), "Expected offset to be set");
                             let off_dur = WindowRewriter::parse_interval_to_duration(
                                 offset.as_ref().unwrap(),
                             )
                             .unwrap();
-                            assert_eq!(off_dur, std::time::Duration::from_mins(2));
+                            assert_eq!(off_dur, std::time::Duration::from_secs(120));
                         }
                         _ => panic!("Expected Hop window"),
                     }

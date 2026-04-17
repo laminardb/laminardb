@@ -671,7 +671,7 @@ mod tests {
         let rc = ReconnectConfig {
             enabled: false,
             initial_delay: Duration::from_millis(500),
-            max_delay: Duration::from_mins(1),
+            max_delay: Duration::from_secs(60),
             backoff_multiplier: 1.5,
             max_retries: Some(10),
             jitter: false,
@@ -682,7 +682,7 @@ mod tests {
 
         assert!(!deser.enabled);
         assert_eq!(deser.initial_delay, Duration::from_millis(500));
-        assert_eq!(deser.max_delay, Duration::from_mins(1));
+        assert_eq!(deser.max_delay, Duration::from_secs(60));
         assert!((deser.backoff_multiplier - 1.5).abs() < f64::EPSILON);
         assert_eq!(deser.max_retries, Some(10));
         assert!(!deser.jitter);
@@ -864,7 +864,7 @@ mod tests {
                 assert_eq!(subscribe_message.as_deref(), Some(r#"{"op":"subscribe"}"#));
                 assert!(reconnect.enabled);
                 assert_eq!(reconnect.initial_delay, Duration::from_millis(200));
-                assert_eq!(reconnect.max_delay, Duration::from_mins(1));
+                assert_eq!(reconnect.max_delay, Duration::from_secs(60));
                 assert_eq!(*ping_interval, Duration::from_secs(15));
                 assert_eq!(*ping_timeout, Duration::from_secs(5));
             }

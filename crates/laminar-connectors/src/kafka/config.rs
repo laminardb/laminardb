@@ -677,7 +677,7 @@ impl Default for KafkaSourceConfig {
             enable_watermark_tracking: false,
             session_timeout: Duration::from_secs(45),
             heartbeat_interval: Duration::from_secs(10),
-            max_poll_interval: Duration::from_mins(10),
+            max_poll_interval: Duration::from_secs(600),
             queued_max_messages_kbytes: 16384,
             broker_commit_interval: Duration::from_secs(5),
             reader_channel_capacity: 1024,
@@ -1902,7 +1902,7 @@ mod tests {
 
         assert!(cfg.enable_watermark_tracking);
         assert_eq!(cfg.max_out_of_orderness, Duration::from_secs(10));
-        assert_eq!(cfg.idle_timeout, Duration::from_mins(1));
+        assert_eq!(cfg.idle_timeout, Duration::from_secs(60));
     }
 
     // -- startup.mode = timestamp error --
@@ -1934,7 +1934,7 @@ mod tests {
             ("heartbeat.interval.ms", "15000"),
         ]))
         .unwrap();
-        assert_eq!(cfg.session_timeout, Duration::from_mins(1));
+        assert_eq!(cfg.session_timeout, Duration::from_secs(60));
         assert_eq!(cfg.heartbeat_interval, Duration::from_secs(15));
     }
 

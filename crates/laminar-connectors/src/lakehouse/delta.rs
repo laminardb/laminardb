@@ -217,7 +217,7 @@ impl DeltaLakeSink {
         let init_timeout = self
             .config
             .write_timeout
-            .max(std::time::Duration::from_mins(2));
+            .max(std::time::Duration::from_secs(120));
         let table = tokio::time::timeout(
             init_timeout,
             delta_io::open_or_create_table(
@@ -686,7 +686,7 @@ async fn compaction_loop(
     use super::delta_io;
 
     /// Minimum adaptive compaction interval (floor).
-    const MIN_COMPACTION_INTERVAL: std::time::Duration = std::time::Duration::from_mins(1);
+    const MIN_COMPACTION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
     let base_interval = config.check_interval;
     let mut current_interval = base_interval;
@@ -1133,7 +1133,7 @@ impl SinkConnector for DeltaLakeSink {
 
     fn capabilities(&self) -> SinkConnectorCapabilities {
         // Delta commits can run long under compaction or contention.
-        let mut caps = SinkConnectorCapabilities::new(Duration::from_mins(3)).with_idempotent();
+        let mut caps = SinkConnectorCapabilities::new(Duration::from_secs(180)).with_idempotent();
 
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             caps = caps.with_exactly_once().with_two_phase_commit();

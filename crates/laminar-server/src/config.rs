@@ -417,7 +417,7 @@ fn default_cache_size() -> u64 {
     100 * 1024 * 1024
 }
 fn default_cache_ttl() -> Duration {
-    Duration::from_mins(5)
+    Duration::from_secs(300)
 }
 fn default_delivery() -> String {
     "at_least_once".to_string()
@@ -749,7 +749,7 @@ interval = "30s"
 interval = "1m"
 "#;
         let config2: ServerConfig = toml::from_str(toml2).unwrap();
-        assert_eq!(config2.checkpoint.interval, Duration::from_mins(1));
+        assert_eq!(config2.checkpoint.interval, Duration::from_secs(60));
 
         let toml3 = r#"
 [checkpoint]
@@ -779,7 +779,7 @@ max_out_of_orderness = "10s"
     fn test_lookup_cache_defaults() {
         let cache = LookupCacheConfig::default();
         assert_eq!(cache.size_bytes, 100 * 1024 * 1024);
-        assert_eq!(cache.ttl, Duration::from_mins(5));
+        assert_eq!(cache.ttl, Duration::from_secs(300));
     }
 
     #[test]

@@ -757,7 +757,7 @@ mod tests {
         .unwrap();
 
         let wm = def.watermark.unwrap();
-        assert_eq!(wm.max_out_of_orderness, Duration::from_mins(5));
+        assert_eq!(wm.max_out_of_orderness, Duration::from_secs(300));
     }
 
     #[test]

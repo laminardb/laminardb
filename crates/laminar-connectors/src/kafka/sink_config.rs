@@ -126,10 +126,10 @@ impl Default for KafkaSinkConfig {
             schema_registry_ssl_ca_location: None,
             delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
             transactional_id: None,
-            transaction_timeout: Duration::from_mins(1),
+            transaction_timeout: Duration::from_secs(60),
             acks: Acks::All,
             max_in_flight: 5,
-            delivery_timeout: Duration::from_mins(2),
+            delivery_timeout: Duration::from_secs(120),
             key_column: None,
             partitioner: PartitionStrategy::KeyHash,
             linger_ms: 5,
@@ -738,7 +738,7 @@ mod tests {
         assert_eq!(cfg.compression, CompressionType::Zstd);
         assert_eq!(cfg.acks, Acks::Leader);
         assert_eq!(cfg.max_in_flight, 3);
-        assert_eq!(cfg.delivery_timeout, Duration::from_mins(1));
+        assert_eq!(cfg.delivery_timeout, Duration::from_secs(60));
         assert_eq!(cfg.dlq_topic.as_deref(), Some("my-dlq"));
         assert_eq!(cfg.flush_batch_size, 500);
         assert_eq!(cfg.schema_registry_url.as_deref(), Some("http://sr:8081"));

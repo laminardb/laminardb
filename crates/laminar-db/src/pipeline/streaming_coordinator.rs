@@ -982,7 +982,7 @@ mod tests {
                 max_poll_records: 1000,
                 channel_capacity: 64,
                 fallback_poll_interval: Duration::from_millis(10),
-                checkpoint_interval: Some(Duration::from_mins(1)),
+                checkpoint_interval: Some(Duration::from_secs(60)),
                 delivery_guarantee: DeliveryGuarantee::AtLeastOnce,
                 barrier_alignment_timeout: Duration::from_secs(30),
                 cycle_budget_ns: 10_000_000,

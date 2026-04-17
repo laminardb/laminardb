@@ -2,6 +2,7 @@
 
 #![deny(missing_docs)]
 #![warn(clippy::all, clippy::pedantic)]
+#![allow(clippy::duration_suboptimal_units)] // MSRV 1.85; from_mins/from_hours are 1.91+
 #![allow(clippy::module_name_repetitions)]
 // Connectors are Ring 1 (cold path): std HashMap/HashSet are acceptable
 // throughout config, registry, schema, checkpoint, and CDC modules.

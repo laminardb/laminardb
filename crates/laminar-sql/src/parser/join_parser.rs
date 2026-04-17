@@ -1124,7 +1124,7 @@ mod tests {
 
         assert!(!analysis.is_lookup_join);
         assert!(analysis.time_bound.is_some());
-        assert_eq!(analysis.time_bound.unwrap(), Duration::from_hours(1));
+        assert_eq!(analysis.time_bound.unwrap(), Duration::from_secs(3600));
     }
 
     #[test]

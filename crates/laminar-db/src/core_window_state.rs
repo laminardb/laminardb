@@ -1812,7 +1812,7 @@ mod tests {
         let window_config = WindowOperatorConfig {
             window_type: WindowType::Tumbling,
             time_column: "ts".to_string(),
-            size: Duration::from_mins(1),
+            size: Duration::from_secs(60),
             slide: None,
             gap: None,
             offset_ms: 0,
@@ -1849,7 +1849,7 @@ mod tests {
             window_type: WindowType::Sliding,
             time_column: "ts".to_string(),
             size: Duration::from_secs(10),
-            slide: Some(Duration::from_mins(1)),
+            slide: Some(Duration::from_secs(60)),
             gap: None,
             offset_ms: 0,
             allowed_lateness: Duration::ZERO,
@@ -1886,7 +1886,7 @@ mod tests {
         let window_config = WindowOperatorConfig {
             window_type: WindowType::Tumbling,
             time_column: "ts".to_string(),
-            size: Duration::from_mins(1),
+            size: Duration::from_secs(60),
             slide: None,
             gap: None,
             offset_ms: 0,
@@ -2122,7 +2122,7 @@ mod tests {
         let window_config = WindowOperatorConfig {
             window_type: WindowType::Sliding,
             time_column: "ts".to_string(),
-            size: Duration::from_mins(1),
+            size: Duration::from_secs(60),
             slide: Some(Duration::from_secs(10)),
             gap: None,
             offset_ms: 0,

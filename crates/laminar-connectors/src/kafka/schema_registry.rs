@@ -64,7 +64,7 @@ impl Default for SchemaRegistryCacheConfig {
     fn default() -> Self {
         Self {
             max_entries: 1000,
-            ttl: Some(Duration::from_hours(1)),
+            ttl: Some(Duration::from_secs(3600)),
         }
     }
 }
@@ -1421,7 +1421,7 @@ mod tests {
     fn test_cache_config_defaults() {
         let config = SchemaRegistryCacheConfig::default();
         assert_eq!(config.max_entries, 1000);
-        assert_eq!(config.ttl, Some(Duration::from_hours(1)));
+        assert_eq!(config.ttl, Some(Duration::from_secs(3600)));
     }
 
     #[test]

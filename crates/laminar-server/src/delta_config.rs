@@ -69,7 +69,7 @@ pub struct DeltaConfig {
 }
 
 impl DeltaConfig {
-    const DEFAULT_FORMATION_TIMEOUT: Duration = Duration::from_mins(1);
+    const DEFAULT_FORMATION_TIMEOUT: Duration = Duration::from_secs(60);
 
     pub fn from_server_config(config: &ServerConfig) -> Result<Option<Self>, DeltaConfigError> {
         if config.server.mode != "delta" {
@@ -161,7 +161,7 @@ mod tests {
         assert_eq!(delta_cfg.node_id.as_str(), "test-node-1");
         assert_eq!(delta_cfg.discovery.strategy, "static");
         assert_eq!(delta_cfg.coordination.raft_port, 7947);
-        assert_eq!(delta_cfg.formation_timeout, Duration::from_mins(1));
+        assert_eq!(delta_cfg.formation_timeout, Duration::from_secs(60));
     }
 
     #[test]
