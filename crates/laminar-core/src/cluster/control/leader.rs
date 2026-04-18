@@ -1,18 +1,9 @@
-//! Weak leader election: the lowest-ID live instance is the leader.
-//!
-//! No lease, no Raft, no CAS. The leader's only responsibilities are
-//! triggering checkpoints and driving the assignment snapshot; both
-//! tolerate a brief split-brain during phi-accrual failover because the
-//! commit manifest (`epoch=N/_COMMIT`) is CAS-guarded. See the parent
-//! design doc §7 for why this is enough.
+//! Weak leader election: lowest-ID live instance wins. Split-brain is
+//! tolerated because `epoch=N/_COMMIT` is CAS-guarded.
 
 use crate::cluster::discovery::NodeId;
 
-/// Pick the leader from a set of live instance IDs.
-///
-/// Returns `None` if the set is empty or contains only the sentinel
-/// `NodeId::UNASSIGNED`. Otherwise returns the smallest non-sentinel
-/// ID.
+/// Smallest non-sentinel ID in `live`, or `None` if empty/all-sentinel.
 #[must_use]
 pub fn leader_of(live: &[NodeId]) -> Option<NodeId> {
     live.iter()

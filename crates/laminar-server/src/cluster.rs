@@ -8,7 +8,6 @@ use tokio::signal;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use laminar_core::cluster::coordination::{ClusterManager, NodeLifecyclePhase};
 use laminar_core::cluster::discovery::{
     Discovery, DiscoveryError, GossipDiscovery, GossipDiscoveryConfig, NodeId, NodeInfo,
     NodeMetadata, NodeState, StaticDiscovery, StaticDiscoveryConfig,
@@ -301,33 +300,6 @@ pub async fn start_cluster(
     })?;
     info!("Discovered {} peer(s)", peers.len());
 
-    // 3. Create ClusterManager and advance to Active
-    let mut manager = ClusterManager::new(node_id);
-    manager.transition(NodeLifecyclePhase::FormingRaft);
-    manager.transition(NodeLifecyclePhase::WaitingForAssignment);
-    manager.transition(NodeLifecyclePhase::Active);
-    info!("ClusterManager phase: {}", manager.phase());
-
-    // Partition assignment (placeholder until Phase C lands Kafka consumer group +
-    // per-connector dispatch). For now this node owns a symbolic partition set
-    // sized to its worker count, which is enough to exercise the
-    // PartitionGuardSet plumbing without pretending to assign across peers.
-    let workers = if config.server.workers == 0 {
-        num_cpus() as usize
-    } else {
-        config.server.workers
-    };
-    #[allow(clippy::cast_possible_truncation)]
-    let num_partitions = (workers * 4).max(16) as u32;
-    for partition_id in 0..num_partitions {
-        manager.guards_mut().insert(partition_id, 1);
-    }
-    info!(
-        "Placeholder assignment: {num_partitions} partitions owned by this node \
-         ({} peers discovered; real cross-node assignment ships in Phase C)",
-        peers.len()
-    );
-
     // Build LaminarDB with Profile::Cluster
     let mut builder = LaminarDB::builder();
     builder = builder.profile(Profile::Cluster);
@@ -373,6 +345,64 @@ pub async fn start_cluster(
     };
     builder = server::apply_checkpoint_config(builder, &checkpoint_url, &config.checkpoint);
 
+    // Wire the state backend + vnode registry so the checkpoint
+    // coordinator's durability gate runs. The assignment is a static
+    // round-robin split across every peer visible at cluster start;
+    // dynamic rebalance on join/leave is deferred work.
+    let state_backend = config
+        .state
+        .build()
+        .await
+        .map_err(|e| ClusterStartupError::EngineConstruction(format!("state backend: {e}")))?;
+    let vnode_count = config.state.vnode_capacity();
+    let vnode_registry = {
+        use laminar_core::state::{round_robin_assignment, NodeId, VnodeRegistry};
+        let peer_ids: Vec<NodeId> = peers
+            .iter()
+            .map(|p| NodeId(p.id.0))
+            .chain(std::iter::once(NodeId(node_id.0)))
+            .collect();
+        let registry = VnodeRegistry::new(vnode_count);
+        registry.set_assignment(round_robin_assignment(vnode_count, &peer_ids));
+        Arc::new(registry)
+    };
+    builder = builder
+        .state_backend(state_backend)
+        .vnode_registry(Arc::clone(&vnode_registry));
+
+    // Bind on all interfaces — peers connect in from wherever discovery
+    // puts them. A future iteration can read a configured internal
+    // address; today every `laminardb-cluster.toml` uses the same
+    // semantics.
+    let shuffle_receiver = Arc::new(
+        laminar_core::shuffle::ShuffleReceiver::bind(
+            node_id.0,
+            "0.0.0.0:0".parse().unwrap(),
+        )
+        .await
+        .map_err(|e| ClusterStartupError::EngineConstruction(format!("shuffle bind: {e}")))?,
+    );
+    let shuffle_sender = Arc::new(build_shuffle_sender(
+        node_id.0,
+        &discovery,
+        shuffle_receiver.local_addr(),
+    ).await);
+    let distributed_rule = Arc::new(
+        laminar_sql::datafusion::distributed_aggregate_rule::DistributedAggregateRule::new(
+            Arc::clone(&vnode_registry),
+            Arc::clone(&shuffle_sender),
+            Arc::clone(&shuffle_receiver),
+            laminar_core::state::NodeId(node_id.0),
+        ),
+    );
+    builder = builder
+        .physical_optimizer_rule(distributed_rule)
+        // DataFusion's `EnforceDistribution` only inserts a hash
+        // repartition (the shape we rewrite) when target_partitions > 1.
+        // Safe here because the rule we just registered replaces the
+        // stock RepartitionExec with our reusable ClusterRepartitionExec.
+        .target_partitions(vnode_count as usize);
+
     let db = builder
         .build()
         .await
@@ -413,8 +443,7 @@ pub async fn start_cluster(
     let membership_handle = spawn_membership_watcher(&node_id_str, membership_rx);
     info!("Membership watcher started");
 
-    let num_guards = manager.guards().len();
-    info!("Cluster node '{node_id_str}' started with {num_guards} partitions");
+    info!("Cluster node '{node_id_str}' started");
 
     Ok(ClusterHandle {
         db,
@@ -429,6 +458,30 @@ fn num_cpus() -> u32 {
     std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(1)
+}
+
+/// Build an outbound shuffle sender. When gossip discovery is active,
+/// publish `local_addr` under `SHUFFLE_ADDR_KEY` so peers find us, and
+/// give the sender a KV handle for reverse lookup. Static discovery
+/// has no KV tier, so we hand back a bare sender — peers must be
+/// registered explicitly by whatever sets up the shuffle topology.
+async fn build_shuffle_sender(
+    node_id: u64,
+    discovery: &DiscoveryImpl,
+    local_addr: std::net::SocketAddr,
+) -> laminar_core::shuffle::ShuffleSender {
+    use laminar_core::cluster::control::{ChitchatKv, ClusterKv};
+    use laminar_core::shuffle::{ShuffleSender, SHUFFLE_ADDR_KEY};
+
+    let DiscoveryImpl::Gossip(gossip) = discovery else {
+        return ShuffleSender::new(node_id);
+    };
+    let Some(handle) = gossip.chitchat_handle() else {
+        return ShuffleSender::new(node_id);
+    };
+    let kv: Arc<dyn ClusterKv> = Arc::new(ChitchatKv::from_handle(handle));
+    kv.write(SHUFFLE_ADDR_KEY, local_addr.to_string()).await;
+    ShuffleSender::with_kv(node_id, kv)
 }
 
 #[cfg(test)]

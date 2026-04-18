@@ -194,6 +194,43 @@ impl LaminarDB {
                 coord.set_cluster_controller(controller);
             }
 
+            // Durability gate wiring: if both the state backend and vnode
+            // registry are installed, tell the coordinator which vnodes
+            // this instance owns. In cluster mode the owner id comes from
+            // the cluster controller; in single-instance mode we assume
+            // a `single_owner` registry and pass `NodeId(0)`.
+            if let (Some(backend), Some(registry)) = (
+                self.state_backend.lock().clone(),
+                self.vnode_registry.lock().clone(),
+            ) {
+                let owner = {
+                    #[cfg(feature = "cluster-unstable")]
+                    {
+                        self.cluster_controller.lock().as_ref().map_or(
+                            laminar_core::state::NodeId(0),
+                            |c| laminar_core::state::NodeId(c.instance_id().0),
+                        )
+                    }
+                    #[cfg(not(feature = "cluster-unstable"))]
+                    {
+                        laminar_core::state::NodeId(0)
+                    }
+                };
+                coord.set_state_backend(backend);
+                coord.set_vnode_set(laminar_core::state::owned_vnodes(&registry, owner));
+                // Leader's gate checks the full registry — across all
+                // instances — so the 2PC commit only fires when every
+                // follower has also persisted its markers.
+                coord.set_gate_vnode_set((0..registry.vnode_count()).collect());
+            }
+
+            // Cluster recovery: if this instance is the new leader and
+            // the last manifest was a prepared-not-committed epoch,
+            // announce Abort so surviving followers roll back. See
+            // `docs/plans/checkpoint-2pc-sequencing.md` §6.1.
+            #[cfg(feature = "cluster-unstable")]
+            coord.reconcile_orphaned_prepare().await;
+
             *self.coordinator.lock().await = Some(coord);
         }
 
@@ -1157,6 +1194,10 @@ impl LaminarDB {
             sink_event_rx,
             sink_timed_out: false,
             shutdown_signal: Arc::clone(&self.shutdown_signal),
+            #[cfg(feature = "cluster-unstable")]
+            cluster_controller: self.cluster_controller.lock().clone(),
+            #[cfg(feature = "cluster-unstable")]
+            last_follower_epoch: None,
         };
 
         // Start the streaming coordinator on a dedicated compute thread.

@@ -248,10 +248,16 @@ pub struct CheckpointCoordinator {
     /// commit to verify per-vnode durability. See
     /// `docs/plans/two-phase-ordering.md`.
     state_backend: Option<Arc<dyn StateBackend>>,
-    /// Vnodes whose partials must be durable before sinks commit. Empty
-    /// skips the durability gate (single-instance, non-sharded operators).
-    /// Populated by Phase C once the `VnodeRegistry` is plumbed through.
+    /// Vnodes this coordinator owns. Drives the per-vnode marker
+    /// writes — each checkpoint publishes one marker per entry.
+    /// Empty disables marker writes.
     vnode_set: Vec<u32>,
+    /// Vnodes the leader's durability gate checks. In a cluster this is
+    /// the full registry (so the gate verifies markers from every
+    /// follower's shared-storage writes, not just the leader's). In
+    /// single-instance mode it's populated the same as `vnode_set`.
+    /// Empty disables the gate.
+    gate_vnode_set: Vec<u32>,
     /// Cluster control facade. `Some` when running in cluster mode;
     /// `None` in single-instance / embedded. The leader / follower
     /// distinction and the quorum-wait flow consume this in the
@@ -288,53 +294,49 @@ impl CheckpointCoordinator {
             total_bytes_written: 0,
             state_backend: None,
             vnode_set: Vec::new(),
+            gate_vnode_set: Vec::new(),
             #[cfg(feature = "cluster-unstable")]
             cluster_controller: None,
         }
     }
 
-    /// Install a cluster control facade. Activates cluster-mode
-    /// checkpoint semantics (leader announce, follower ack, quorum
-    /// wait). When not called, the coordinator behaves as in
-    /// single-instance mode.
+    /// Activates cluster-mode 2PC. Without this the coordinator runs
+    /// single-instance semantics.
     #[cfg(feature = "cluster-unstable")]
-    #[allow(dead_code)] // wired into the checkpoint flow in the C.5-final protocol change
-    pub(crate) fn set_cluster_controller(
+    pub fn set_cluster_controller(
         &mut self,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
     ) {
         self.cluster_controller = Some(controller);
     }
 
-    /// Borrow the installed cluster controller, if any. Used by the
-    /// checkpoint flow to detect leader / follower role and drive the
-    /// barrier protocol.
     #[cfg(feature = "cluster-unstable")]
-    #[allow(dead_code)] // call sites land in the C.5-final protocol change
+    #[allow(dead_code)] // kept for future role-aware call sites
     pub(crate) fn cluster_controller(
         &self,
     ) -> Option<&Arc<laminar_core::cluster::control::ClusterController>> {
         self.cluster_controller.as_ref()
     }
 
-    /// Install a state backend so the commit path consults
-    /// `epoch_complete` between manifest persist and sink commit.
-    ///
-    /// Phase B exposes this for tests; Phase C wires it into
-    /// `LaminarDB::builder()` so cluster-mode startup populates it.
-    #[allow(dead_code)] // call sites land in Phase C
-    pub(crate) fn set_state_backend(&mut self, backend: Arc<dyn StateBackend>) {
+    /// Wired with a non-empty `vnode_set` to enable per-vnode markers
+    /// and the `epoch_complete` durability gate.
+    pub fn set_state_backend(&mut self, backend: Arc<dyn StateBackend>) {
         self.state_backend = Some(backend);
     }
 
-    /// Set the vnodes whose partials must be durable for
-    /// `epoch_complete` to return true. Empty disables the gate.
-    ///
-    /// Phase B exposes this for tests; Phase C populates it from the
-    /// `VnodeRegistry`.
-    #[allow(dead_code)] // call sites land in Phase C
-    pub(crate) fn set_vnode_set(&mut self, vnodes: Vec<u32>) {
+    /// Vnodes this instance owns; drives marker writes. Also the
+    /// default gate set until [`Self::set_gate_vnode_set`] is called.
+    pub fn set_vnode_set(&mut self, vnodes: Vec<u32>) {
+        if self.gate_vnode_set.is_empty() {
+            self.gate_vnode_set.clone_from(&vnodes);
+        }
         self.vnode_set = vnodes;
+    }
+
+    /// Set the vnodes the leader's durability gate checks (the full
+    /// registry in cluster mode). Defaults to `vnode_set` when unset.
+    pub fn set_gate_vnode_set(&mut self, vnodes: Vec<u32>) {
+        self.gate_vnode_set = vnodes;
     }
 
     /// Registers a sink connector for checkpoint coordination.
@@ -576,6 +578,144 @@ impl CheckpointCoordinator {
                  filesystem may be degraded",
                 timeout_dur.as_secs()
             ))),
+        }
+    }
+
+    /// Writes a per-vnode durability marker so the leader's
+    /// `epoch_complete` gate returns true and sinks can commit.
+    async fn write_vnode_markers(&self, epoch: u64, checkpoint_id: u64) -> Result<(), DbError> {
+        let Some(ref backend) = self.state_backend else {
+            return Ok(());
+        };
+        if self.vnode_set.is_empty() {
+            return Ok(());
+        }
+        let payload = bytes::Bytes::from(format!("ckpt:{checkpoint_id}").into_bytes());
+        for &v in &self.vnode_set {
+            backend
+                .write_partial(v, epoch, payload.clone())
+                .await
+                .map_err(|e| {
+                    DbError::Checkpoint(format!(
+                        "[LDB-6024] vnode marker write failed (vnode={v}, epoch={epoch}): {e}"
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
+    /// At cluster startup: if we're the new leader and the last
+    /// persisted epoch has any `Pending` sink, announce `Abort` so
+    /// surviving followers clear their prepared state. Idempotent.
+    #[cfg(feature = "cluster-unstable")]
+    pub async fn reconcile_orphaned_prepare(&self) {
+        let Some(cc) = self.cluster_controller.as_ref() else { return };
+        if !cc.is_leader() {
+            return;
+        }
+        let Ok(Some(last)) = self.store.load_latest() else { return };
+        let has_pending = last
+            .sink_commit_statuses
+            .values()
+            .any(|s| matches!(s, SinkCommitStatus::Pending));
+        if !has_pending {
+            return;
+        }
+        warn!(
+            epoch = last.epoch,
+            checkpoint_id = last.checkpoint_id,
+            "[LDB-6035] orphaned prepared epoch detected on startup — \
+             announcing Abort to surviving instances",
+        );
+        self.announce_if_leader(
+            last.epoch,
+            last.checkpoint_id,
+            laminar_core::cluster::control::Phase::Abort,
+        )
+        .await;
+        // Small pause to let the announcement gossip before the next
+        // tick triggers a fresh PREPARE.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    /// No-op when not the leader. Errors are logged — worst case is a
+    /// longer follower timeout, not a correctness issue.
+    #[cfg(feature = "cluster-unstable")]
+    async fn announce_if_leader(
+        &self,
+        epoch: u64,
+        checkpoint_id: u64,
+        phase: laminar_core::cluster::control::Phase,
+    ) {
+        let Some(cc) = self.cluster_controller.as_ref() else {
+            return;
+        };
+        if !cc.is_leader() {
+            return;
+        }
+        let ann = laminar_core::cluster::control::BarrierAnnouncement {
+            epoch,
+            checkpoint_id,
+            phase,
+            flags: 0,
+        };
+        if let Err(e) = cc.announce_barrier(&ann).await {
+            warn!(
+                epoch,
+                checkpoint_id,
+                ?phase,
+                error = %e,
+                "[LDB-6031] barrier announcement failed",
+            );
+        }
+    }
+
+    /// Announce PREPARE and block for follower acks. Returns `None` on
+    /// quorum or no-op (not leader); `Some(msg)` with the failure.
+    #[cfg(feature = "cluster-unstable")]
+    async fn await_prepare_quorum(
+        &self,
+        epoch: u64,
+        checkpoint_id: u64,
+    ) -> Option<String> {
+        use laminar_core::cluster::control::{Phase, QuorumOutcome};
+        let cc = self.cluster_controller.as_ref()?;
+        if !cc.is_leader() {
+            return None;
+        }
+        self.announce_if_leader(epoch, checkpoint_id, Phase::Prepare)
+            .await;
+
+        let mut followers = cc.live_instances();
+        followers.retain(|id| *id != cc.instance_id());
+        if followers.is_empty() {
+            return None;
+        }
+
+        let outcome = cc
+            .wait_for_quorum(epoch, &followers, Duration::from_secs(30))
+            .await;
+        match outcome {
+            QuorumOutcome::Reached { .. } => None,
+            QuorumOutcome::TimedOut { missing, .. } => {
+                self.announce_if_leader(epoch, checkpoint_id, Phase::Abort)
+                    .await;
+                Some(format!(
+                    "quorum timeout: {} follower(s) did not ack",
+                    missing.len()
+                ))
+            }
+            QuorumOutcome::Failed { failures } => {
+                self.announce_if_leader(epoch, checkpoint_id, Phase::Abort)
+                    .await;
+                let first = failures
+                    .first()
+                    .map_or("unknown", |(_, msg)| msg.as_str());
+                Some(format!(
+                    "follower snapshot failed on {} peer(s): {first}",
+                    failures.len()
+                ))
+            }
         }
     }
 
@@ -831,6 +971,130 @@ impl CheckpointCoordinator {
         self.checkpoint_inner(request).await
     }
 
+    /// Follower half of a cluster checkpoint: pre-commit + save +
+    /// markers + ack, then wait for the leader's commit/abort.
+    /// `Ok(true)` = committed, `Ok(false)` = aborted/timed out.
+    ///
+    /// # Errors
+    /// Propagates sink pre-commit, manifest save, or marker-write failures.
+    #[cfg(feature = "cluster-unstable")]
+    pub async fn follower_checkpoint(
+        &mut self,
+        request: CheckpointRequest,
+        ann: laminar_core::cluster::control::BarrierAnnouncement,
+        decision_timeout: Duration,
+    ) -> Result<bool, DbError> {
+        use laminar_core::cluster::control::{BarrierAck, Phase};
+
+        let Some(cc) = self.cluster_controller.clone() else {
+            return Err(DbError::Checkpoint(
+                "[LDB-6033] follower_checkpoint called without cluster controller".into(),
+            ));
+        };
+
+        let epoch = ann.epoch;
+        let checkpoint_id = ann.checkpoint_id;
+        // Align our local counters with the leader's so any subsequent
+        // leader-mode call on this coordinator resumes correctly.
+        self.epoch = epoch;
+        self.next_checkpoint_id = checkpoint_id.saturating_add(1);
+
+        // Phase 1: local prepare.
+        let prepare_result = self.follower_prepare(request, epoch, checkpoint_id).await;
+        let prepare_err = prepare_result.as_ref().err().map(ToString::to_string);
+        cc.ack_barrier(&BarrierAck {
+            epoch,
+            ok: prepare_err.is_none(),
+            error: prepare_err.clone(),
+        })
+        .await
+        .ok(); // best effort; leader's quorum wait tolerates missed acks
+        if let Err(e) = prepare_result {
+            self.rollback_sinks(epoch).await.ok();
+            return Err(e);
+        }
+
+        // Phase 2: wait for the leader's decision. Poll the same KV the
+        // leader writes to; `observe_barrier` already filters on current
+        // leader and returns the freshest announcement.
+        let deadline = Instant::now() + decision_timeout;
+        loop {
+            match cc.observe_barrier().await.ok().flatten() {
+                Some(a) if a.epoch == epoch && a.phase == Phase::Commit => {
+                    let statuses = self.commit_sinks_tracked(epoch).await;
+                    self.checkpoints_completed += 1;
+                    let _ = statuses; // persisted in the leader's manifest; follower's local sinks may have their own status
+                    return Ok(true);
+                }
+                Some(a) if a.epoch == epoch && a.phase == Phase::Abort => {
+                    self.rollback_sinks(epoch).await.ok();
+                    self.checkpoints_failed += 1;
+                    return Ok(false);
+                }
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                warn!(
+                    epoch,
+                    checkpoint_id,
+                    "[LDB-6034] follower decision timeout; rolling back local prepare",
+                );
+                self.rollback_sinks(epoch).await.ok();
+                self.checkpoints_failed += 1;
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Pre-commit + save manifest + write vnode markers.
+    #[cfg(feature = "cluster-unstable")]
+    async fn follower_prepare(
+        &mut self,
+        request: CheckpointRequest,
+        epoch: u64,
+        checkpoint_id: u64,
+    ) -> Result<(), DbError> {
+        let CheckpointRequest {
+            operator_states,
+            watermark,
+            table_store_checkpoint_path,
+            extra_table_offsets,
+            source_watermarks,
+            pipeline_hash,
+            source_offset_overrides,
+        } = request;
+
+        self.phase = CheckpointPhase::PreCommitting;
+        self.pre_commit_sinks(epoch).await?;
+
+        let mut manifest = CheckpointManifest::new(checkpoint_id, epoch);
+        manifest.source_offsets = source_offset_overrides;
+        manifest.table_offsets = extra_table_offsets;
+        manifest.sink_epochs = self.collect_sink_epochs();
+        manifest.sink_commit_statuses = self.initial_sink_commit_statuses();
+        manifest.watermark = watermark;
+        manifest.source_watermarks = source_watermarks;
+        manifest.table_store_checkpoint_path = table_store_checkpoint_path;
+        manifest.source_names = {
+            let mut names: Vec<String> = manifest.source_offsets.keys().cloned().collect();
+            names.sort();
+            names
+        };
+        manifest.sink_names = self.sorted_sink_names();
+        manifest.pipeline_hash = pipeline_hash;
+        let state_data = Self::pack_operator_states(
+            &mut manifest,
+            &operator_states,
+            self.config.state_inline_threshold,
+        );
+
+        self.phase = CheckpointPhase::Persisting;
+        self.save_manifest(manifest, state_data).await?;
+        self.write_vnode_markers(epoch, checkpoint_id).await?;
+        Ok(())
+    }
+
     /// Shared checkpoint implementation for all checkpoint entry points.
     ///
     /// When [`CheckpointRequest::source_offset_overrides`] is non-empty,
@@ -978,25 +1242,83 @@ impl CheckpointCoordinator {
             });
         }
 
+        // Bridge: publish per-vnode durability markers so the gate below
+        // has something to check. Replace with real per-operator partial
+        // writes when operators adopt the state backend directly.
+        if let Err(e) = self.write_vnode_markers(epoch, checkpoint_id).await {
+            self.phase = CheckpointPhase::Idle;
+            self.checkpoints_failed += 1;
+            let duration = start.elapsed();
+            self.emit_checkpoint_metrics(false, epoch, duration);
+            if let Err(rollback_err) = self.rollback_sinks(epoch).await {
+                error!(
+                    checkpoint_id,
+                    epoch,
+                    error = %rollback_err,
+                    "[LDB-6025] sink rollback failed after marker write failure",
+                );
+            }
+            error!(checkpoint_id, epoch, error = %e, "vnode marker write failed");
+            return Ok(CheckpointResult {
+                success: false,
+                checkpoint_id,
+                epoch,
+                duration,
+                error: Some(format!("vnode marker write failed: {e}")),
+            });
+        }
+
+        // Cluster 2PC phase 1: announce PREPARE and wait for followers
+        // to snapshot + ack. See docs/plans/checkpoint-2pc-sequencing.md.
+        #[cfg(feature = "cluster-unstable")]
+        {
+            if let Some(quorum_failure) =
+                self.await_prepare_quorum(epoch, checkpoint_id).await
+            {
+                self.phase = CheckpointPhase::Idle;
+                self.checkpoints_failed += 1;
+                let duration = start.elapsed();
+                self.emit_checkpoint_metrics(false, epoch, duration);
+                if let Err(rollback_err) = self.rollback_sinks(epoch).await {
+                    error!(
+                        checkpoint_id,
+                        epoch,
+                        error = %rollback_err,
+                        "[LDB-6032] sink rollback failed after quorum miss",
+                    );
+                }
+                return Ok(CheckpointResult {
+                    success: false,
+                    checkpoint_id,
+                    epoch,
+                    duration,
+                    error: Some(quorum_failure),
+                });
+            }
+        }
+
         // Durability gate: confirm every participating vnode has its
         // partial persisted before sinks commit. See
         // docs/plans/two-phase-ordering.md §"The ordering" step 5.
         //
-        // Trivially satisfied in single-instance mode (empty vnode_set or
-        // backend-not-installed); load-bearing in Phase C once partials
-        // are written per-vnode.
+        // `gate_vnode_set` is the FULL registry in cluster mode, so the
+        // leader verifies markers from every follower's shared-storage
+        // writes — not just its own. Single-instance defaults to
+        // `vnode_set` (the two sets match).
         if let Some(ref backend) = self.state_backend {
-            if !self.vnode_set.is_empty() {
-                match backend.epoch_complete(epoch, &self.vnode_set).await {
+            if !self.gate_vnode_set.is_empty() {
+                match backend.epoch_complete(epoch, &self.gate_vnode_set).await {
                     Ok(true) => {}
                     Ok(false) => {
                         warn!(
                             checkpoint_id,
                             epoch,
-                            vnodes = self.vnode_set.len(),
+                            vnodes = self.gate_vnode_set.len(),
                             "[LDB-6020] state durability gate returned false — \
                              rolling back sinks",
                         );
+                        #[cfg(feature = "cluster-unstable")]
+                        self.announce_if_leader(epoch, checkpoint_id, laminar_core::cluster::control::Phase::Abort).await;
                         self.checkpoints_failed += 1;
                         self.phase = CheckpointPhase::Idle;
                         let duration = start.elapsed();
@@ -1025,6 +1347,8 @@ impl CheckpointCoordinator {
                             "[LDB-6022] state backend error during durability gate — \
                              treating as gate miss, rolling back sinks",
                         );
+                        #[cfg(feature = "cluster-unstable")]
+                        self.announce_if_leader(epoch, checkpoint_id, laminar_core::cluster::control::Phase::Abort).await;
                         self.checkpoints_failed += 1;
                         self.phase = CheckpointPhase::Idle;
                         let duration = start.elapsed();
@@ -1048,6 +1372,9 @@ impl CheckpointCoordinator {
                 }
             }
         }
+
+        #[cfg(feature = "cluster-unstable")]
+        self.announce_if_leader(epoch, checkpoint_id, laminar_core::cluster::control::Phase::Commit).await;
 
         self.phase = CheckpointPhase::Committing;
         let sink_statuses = self.commit_sinks_tracked(epoch).await;
@@ -1741,44 +2068,340 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durability_gate_passes_when_partials_present() {
+    async fn bridge_writes_markers_and_gate_passes() {
         use laminar_core::state::InProcessBackend;
         let dir = tempfile::tempdir().unwrap();
         let mut coord = make_coordinator(dir.path());
         let backend = Arc::new(InProcessBackend::new(4));
-        // Pre-populate vnode=0's partial for the epoch the coordinator
-        // will use (starts at 1 for a fresh store).
-        backend
-            .write_partial(0, 1, bytes::Bytes::from_static(b"ok"))
-            .await
-            .unwrap();
         coord.set_state_backend(backend.clone());
-        coord.set_vnode_set(vec![0]);
+        coord.set_vnode_set(vec![0, 1, 2, 3]);
 
         let result = coord
             .checkpoint(CheckpointRequest::default())
             .await
             .unwrap();
-        assert!(result.success, "gate should pass: partial was pre-written");
+        assert!(result.success, "bridge writes markers → gate passes");
+        // Every owned vnode has a marker for the completed epoch.
+        for v in 0..4 {
+            assert!(
+                backend.read_partial(v, 1).await.unwrap().is_some(),
+                "bridge should have written marker for vnode {v}",
+            );
+        }
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    #[tokio::test]
+    async fn reconcile_announces_abort_for_pending_manifest() {
+        use laminar_core::cluster::control::{
+            BarrierAnnouncement, ClusterController, ClusterKv, InMemoryKv, Phase, ANNOUNCEMENT_KEY,
+        };
+        use laminar_core::cluster::discovery::NodeId;
+        use laminar_storage::checkpoint_manifest::SinkCommitStatus;
+        use tokio::sync::watch;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Seed a manifest with a Pending sink — simulates a leader crash
+        // between sink precommit and commit.
+        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
+        let mut orphan = CheckpointManifest::new(42, 7);
+        orphan
+            .sink_commit_statuses
+            .insert("kafka_out".into(), SinkCommitStatus::Pending);
+        store.save_with_state(&orphan, None).unwrap();
+
+        let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store);
+        let self_id = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(self_id));
+        let kv_trait: Arc<dyn ClusterKv> = kv.clone();
+        let (_tx, rx) = watch::channel(Vec::new()); // solo → we're leader
+        let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, rx));
+        let mut coord = coord;
+        coord.set_cluster_controller(controller);
+
+        coord.reconcile_orphaned_prepare().await;
+
+        let raw = kv.read_from(self_id, ANNOUNCEMENT_KEY).await.unwrap();
+        let ann: BarrierAnnouncement = serde_json::from_str(&raw).unwrap();
+        assert_eq!(ann.phase, Phase::Abort);
+        assert_eq!(ann.epoch, 7);
+        assert_eq!(ann.checkpoint_id, 42);
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    #[tokio::test]
+    async fn reconcile_silent_when_manifest_clean() {
+        use laminar_core::cluster::control::{
+            ClusterController, ClusterKv, InMemoryKv, ANNOUNCEMENT_KEY,
+        };
+        use laminar_core::cluster::discovery::NodeId;
+        use laminar_storage::checkpoint_manifest::SinkCommitStatus;
+        use tokio::sync::watch;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
+        let mut clean = CheckpointManifest::new(5, 3);
+        clean
+            .sink_commit_statuses
+            .insert("out".into(), SinkCommitStatus::Committed);
+        store.save_with_state(&clean, None).unwrap();
+
+        let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store);
+        let self_id = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(self_id));
+        let kv_trait: Arc<dyn ClusterKv> = kv.clone();
+        let (_tx, rx) = watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, rx));
+        let mut coord = coord;
+        coord.set_cluster_controller(controller);
+
+        coord.reconcile_orphaned_prepare().await;
+
+        // No announcement emitted.
+        assert!(kv.read_from(self_id, ANNOUNCEMENT_KEY).await.is_none());
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    #[tokio::test]
+    async fn follower_checkpoint_commits_on_leader_commit() {
+        use laminar_core::cluster::control::{
+            BarrierAck, BarrierAnnouncement, ClusterController, ClusterKv, InMemoryKv, Phase,
+            ACK_KEY, ANNOUNCEMENT_KEY,
+        };
+        use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
+        use tokio::sync::watch;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path());
+
+        let leader_id = NodeId(1);
+        let follower_id = NodeId(7);
+
+        // Follower's KV sees both its own writes and a seeded view of the
+        // leader's announcements. `members_rx` includes the leader so
+        // `current_leader()` picks the lowest id (the leader, not self).
+        let kv = Arc::new(InMemoryKv::new(follower_id));
+        let kv_trait: Arc<dyn ClusterKv> = kv.clone();
+        let leader_info = NodeInfo {
+            id: leader_id,
+            name: "leader".into(),
+            rpc_address: String::new(),
+            raft_address: String::new(),
+            state: NodeState::Active,
+            metadata: NodeMetadata::default(),
+            last_heartbeat_ms: 0,
+        };
+        let (_tx, rx) = watch::channel(vec![leader_info]);
+        let controller = Arc::new(ClusterController::new(follower_id, kv_trait, None, rx));
+        coord.set_cluster_controller(controller);
+
+        // Leader has already announced PREPARE and COMMIT (simulates
+        // a fast-gossip scenario; follower sees both on its first poll).
+        let prepare_json = serde_json::to_string(&BarrierAnnouncement {
+            epoch: 1,
+            checkpoint_id: 1,
+            phase: Phase::Prepare,
+            flags: 0,
+        })
+        .unwrap();
+        let commit_json = serde_json::to_string(&BarrierAnnouncement {
+            epoch: 1,
+            checkpoint_id: 1,
+            phase: Phase::Commit,
+            flags: 0,
+        })
+        .unwrap();
+        // Overwrite the prepare with commit — observe_barrier reads the
+        // latest value. Real gossip shows both in order; for the unit
+        // test, landing on Commit is enough for the decision loop.
+        kv.seed(leader_id, ANNOUNCEMENT_KEY, prepare_json);
+        kv.seed(leader_id, ANNOUNCEMENT_KEY, commit_json);
+
+        let ann = BarrierAnnouncement {
+            epoch: 1,
+            checkpoint_id: 1,
+            phase: Phase::Prepare,
+            flags: 0,
+        };
+        let committed = coord
+            .follower_checkpoint(CheckpointRequest::default(), ann, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(committed, "follower should commit on leader's Commit");
+
+        // Follower's ack landed in its own KV.
+        let ack_raw = kv.read_from(follower_id, ACK_KEY).await.unwrap();
+        let ack: BarrierAck = serde_json::from_str(&ack_raw).unwrap();
+        assert_eq!(ack.epoch, 1);
+        assert!(ack.ok, "prepare succeeded, ack should be ok");
+
+        // Follower's manifest is on disk at the leader's epoch.
+        let stored = coord.store().load_latest().unwrap().unwrap();
+        assert_eq!(stored.epoch, 1);
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    #[tokio::test]
+    async fn follower_checkpoint_rolls_back_on_leader_abort() {
+        use laminar_core::cluster::control::{
+            BarrierAnnouncement, ClusterController, ClusterKv, InMemoryKv, Phase, ANNOUNCEMENT_KEY,
+        };
+        use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
+        use tokio::sync::watch;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path());
+
+        let leader_id = NodeId(1);
+        let follower_id = NodeId(9);
+        let kv = Arc::new(InMemoryKv::new(follower_id));
+        let kv_trait: Arc<dyn ClusterKv> = kv.clone();
+        let leader_info = NodeInfo {
+            id: leader_id,
+            name: "leader".into(),
+            rpc_address: String::new(),
+            raft_address: String::new(),
+            state: NodeState::Active,
+            metadata: NodeMetadata::default(),
+            last_heartbeat_ms: 0,
+        };
+        let (_tx, rx) = watch::channel(vec![leader_info]);
+        let controller = Arc::new(ClusterController::new(follower_id, kv_trait, None, rx));
+        coord.set_cluster_controller(controller);
+
+        let abort_json = serde_json::to_string(&BarrierAnnouncement {
+            epoch: 1,
+            checkpoint_id: 1,
+            phase: Phase::Abort,
+            flags: 0,
+        })
+        .unwrap();
+        kv.seed(leader_id, ANNOUNCEMENT_KEY, abort_json);
+
+        let ann = BarrierAnnouncement {
+            epoch: 1,
+            checkpoint_id: 1,
+            phase: Phase::Prepare,
+            flags: 0,
+        };
+        let committed = coord
+            .follower_checkpoint(CheckpointRequest::default(), ann, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(!committed, "follower should roll back on leader's Abort");
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    #[tokio::test]
+    async fn leader_announces_prepare_and_commit_on_solo_cluster() {
+        use laminar_core::cluster::control::{
+            ClusterController, ClusterKv, InMemoryKv, Phase, ANNOUNCEMENT_KEY,
+        };
+        use laminar_core::cluster::discovery::NodeId;
+        use tokio::sync::watch;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path());
+
+        let self_id = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(self_id));
+        let kv_trait: Arc<dyn ClusterKv> = kv.clone();
+        let (_tx, rx) = watch::channel(Vec::new()); // solo — no peers
+        let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, rx));
+        coord.set_cluster_controller(controller);
+
+        let result = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(result.success, "solo-cluster checkpoint should succeed");
+
+        // The last announce on the leader's KV is COMMIT (PREPARE was
+        // overwritten in the same slot).
+        let raw = kv.read_from(self_id, ANNOUNCEMENT_KEY).await.unwrap();
+        let ann: laminar_core::cluster::control::BarrierAnnouncement =
+            serde_json::from_str(&raw).unwrap();
+        assert_eq!(ann.phase, Phase::Commit);
+        assert_eq!(ann.epoch, result.epoch);
     }
 
     #[tokio::test]
-    async fn durability_gate_rolls_back_when_vnode_missing() {
+    async fn gate_checks_full_registry_not_just_owned() {
+        // Leader owns vnodes {0, 1}. Cluster has 4 vnodes total; a
+        // follower (simulated by pre-populating half the backend) owns
+        // {2, 3}. If the follower's markers are missing, the leader's
+        // gate must fail even though the leader wrote its own.
         use laminar_core::state::InProcessBackend;
         let dir = tempfile::tempdir().unwrap();
         let mut coord = make_coordinator(dir.path());
-        // Backend exists but no partial for vnode=0 at the current epoch →
-        // epoch_complete returns false → gate must roll back.
-        coord.set_state_backend(Arc::new(InProcessBackend::new(4)));
-        coord.set_vnode_set(vec![0]);
+        let backend = Arc::new(InProcessBackend::new(4));
+        coord.set_state_backend(backend.clone());
+        coord.set_vnode_set(vec![0, 1]); // leader's owned subset
+        coord.set_gate_vnode_set(vec![0, 1, 2, 3]); // full cluster registry
 
         let result = coord
             .checkpoint(CheckpointRequest::default())
             .await
             .unwrap();
-        assert!(!result.success, "gate should fail: no partial");
-        let err = result.error.expect("gate-miss produces an error message");
-        assert!(err.contains("not all vnodes persisted"), "got: {err}");
+        assert!(
+            !result.success,
+            "gate must fail when follower markers are missing",
+        );
+        let err = result.error.expect("failure produces an error message");
+        assert!(
+            err.contains("not all vnodes persisted"),
+            "expected full-registry gate miss, got: {err}",
+        );
+    }
+
+    #[tokio::test]
+    async fn gate_passes_when_all_registry_markers_present() {
+        // Same topology as the previous test, but now the follower's
+        // markers are pre-populated — the gate sees a complete set
+        // across the full registry and the checkpoint succeeds.
+        use bytes::Bytes;
+        use laminar_core::state::InProcessBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path());
+        let backend = Arc::new(InProcessBackend::new(4));
+        // Simulate the follower's prior write on vnodes {2, 3} for the
+        // epoch the leader is about to use (fresh store starts at 1).
+        backend
+            .write_partial(2, 1, Bytes::from_static(b"follower"))
+            .await
+            .unwrap();
+        backend
+            .write_partial(3, 1, Bytes::from_static(b"follower"))
+            .await
+            .unwrap();
+        coord.set_state_backend(backend);
+        coord.set_vnode_set(vec![0, 1]);
+        coord.set_gate_vnode_set(vec![0, 1, 2, 3]);
+
+        let result = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(result.success, "gate should pass: every vnode has a marker");
+    }
+
+    #[tokio::test]
+    async fn marker_write_failure_aborts_checkpoint() {
+        use laminar_core::state::InProcessBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path());
+        // Backend is sized for 2 vnodes, but we claim to own vnode 99 →
+        // bridge fails its write, checkpoint aborts cleanly.
+        coord.set_state_backend(Arc::new(InProcessBackend::new(2)));
+        coord.set_vnode_set(vec![0, 99]);
+
+        let result = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(!result.success, "out-of-range vnode must fail the checkpoint");
+        let err = result.error.expect("failure produces an error message");
+        assert!(err.contains("vnode marker write failed"), "got: {err}");
     }
 
     #[test]

@@ -30,7 +30,7 @@ delta-lake-all = ["delta-lake", "delta-lake-s3", "delta-lake-azure", "delta-lake
 parquet-lookup = ["laminar-connectors/parquet-lookup"]
 files = ["laminar-connectors/files"]
 otel = ["laminar-connectors/otel"]
-cluster-unstable = ["laminar-core/cluster-unstable"]
+cluster-unstable = ["laminar-core/cluster-unstable", "laminar-sql/cluster-unstable"]
 aws = ["laminar-storage/aws"]
 gcs = ["laminar-storage/gcs"]
 azure = ["laminar-storage/azure"]
@@ -87,6 +87,9 @@ tracing = { workspace = true }
 # Metrics
 prometheus = { workspace = true }
 
+# Zero-copy byte buffers (used by state backend payloads).
+bytes = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
@@ -94,6 +97,22 @@ laminar-derive = { path = "../laminar-derive", version = "0.20.2" }
 laminar-connectors = { path = "../laminar-connectors", version = "0.20.2", features = ["testing"] }
 criterion = { workspace = true }
 bytes = { workspace = true }
+# Kafka producer/admin client used by `kafka_docker_scenarios.rs` integration tests.
+# Tests skip gracefully when the Redpanda broker started by
+# `tests/docker/compose.yml` is not reachable on `localhost:19092`.
+# On Windows the build picks up OpenSSL via `OPENSSL_DIR`
+# (`C:\Program Files\OpenSSL-Win64` by default).
+
+[target.'cfg(not(target_os = "windows"))'.dev-dependencies]
+rdkafka = { version = "0.39", features = ["cmake-build", "ssl-vendored"] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+rdkafka = { version = "0.39", features = ["cmake-build"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# S3-compatible object store client used by the MinIO-backed integration
+# test. Workspace feature set + aws for the AmazonS3 builder.
+object_store = { workspace = true, features = ["aws"] }
 
 [[bench]]
 name = "recovery_bench"

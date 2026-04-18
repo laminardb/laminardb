@@ -1,15 +1,5 @@
-//! `ClusterController` — the facade the checkpoint coordinator and
-//! shuffle layer use to talk to the cluster control plane.
-//!
-//! Composes the primitives from this module: a [`ClusterKv`] for
-//! gossip-based coordination, a [`BarrierCoordinator`] for checkpoint
-//! barrier announce/ack, an optional [`AssignmentSnapshotStore`] for
-//! durable assignment history, and a `watch::Receiver<Vec<NodeInfo>>`
-//! from discovery to derive leader / live-instance queries.
-//!
-//! Wired into `LaminarDB` via `LaminarDbBuilder::cluster_controller`.
-//! Held as an optional field on `CheckpointCoordinator`; when present,
-//! cluster mode is active. When `None`, single-instance semantics.
+//! Facade over `ClusterKv` + `BarrierCoordinator` + membership watch.
+//! `None` on `CheckpointCoordinator` means single-instance mode.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,11 +13,7 @@ use super::leader::leader_of;
 use super::snapshot::AssignmentSnapshotStore;
 use crate::cluster::discovery::{NodeId, NodeInfo, NodeState};
 
-/// Thin facade composing the cluster-control primitives.
-///
-/// Construction is "wire up what's already running" — this type
-/// doesn't start any background tasks. It holds references; the
-/// discovery layer continues to drive the membership watch.
+/// Facade composing the cluster-control primitives.
 pub struct ClusterController {
     instance_id: NodeId,
     barrier: BarrierCoordinator,
@@ -66,12 +52,7 @@ impl ClusterController {
         self.instance_id
     }
 
-    /// Derive the current leader from the membership watch. Returns
-    /// `None` if no live instances are visible yet.
-    ///
-    /// Only `Active` peers count — suspected / draining / left nodes
-    /// are filtered out so a crashed leader isn't chosen again before
-    /// phi-accrual clears its entry.
+    /// Current leader (lowest id among `Active` peers plus self).
     #[must_use]
     pub fn current_leader(&self) -> Option<NodeId> {
         let members = self.members_rx.borrow();
@@ -91,8 +72,7 @@ impl ClusterController {
         self.current_leader() == Some(self.instance_id)
     }
 
-    /// Snapshot of currently-live instance IDs (`Active`-state peers
-    /// plus self).
+    /// Live instance IDs: `Active` peers plus self.
     #[must_use]
     pub fn live_instances(&self) -> Vec<NodeId> {
         let mut ids: Vec<NodeId> = self
@@ -106,7 +86,7 @@ impl ClusterController {
         ids
     }
 
-    /// Leader-side: announce a barrier.
+    /// Leader-side announce.
     ///
     /// # Errors
     /// Propagates [`BarrierCoordinator::announce`] errors.
@@ -114,11 +94,10 @@ impl ClusterController {
         self.barrier.announce(ann).await
     }
 
-    /// Follower-side: read the current leader's barrier announcement.
+    /// Follower-side observe; `Ok(None)` if no leader is visible.
     ///
     /// # Errors
-    /// Propagates [`BarrierCoordinator::observe`] errors. Returns
-    /// `Ok(None)` if no leader is currently visible.
+    /// Propagates [`BarrierCoordinator::observe`] errors.
     pub async fn observe_barrier(&self) -> Result<Option<BarrierAnnouncement>, String> {
         let Some(leader) = self.current_leader() else {
             return Ok(None);
@@ -126,7 +105,7 @@ impl ClusterController {
         self.barrier.observe(leader).await
     }
 
-    /// Follower-side: publish this instance's ack.
+    /// Follower-side ack.
     ///
     /// # Errors
     /// Propagates [`BarrierCoordinator::ack`] errors.
@@ -134,8 +113,7 @@ impl ClusterController {
         self.barrier.ack(ack).await
     }
 
-    /// Leader-side: poll until every expected instance acks, or until
-    /// `deadline` passes.
+    /// Leader-side: poll until quorum or `deadline`.
     pub async fn wait_for_quorum(
         &self,
         epoch: u64,
@@ -145,7 +123,7 @@ impl ClusterController {
         self.barrier.wait_for_quorum(epoch, expected, deadline).await
     }
 
-    /// Access the assignment snapshot store, if configured.
+    /// Assignment snapshot store, if configured.
     #[must_use]
     pub fn snapshot_store(&self) -> Option<&AssignmentSnapshotStore> {
         self.snapshot.as_deref()
@@ -203,6 +181,7 @@ mod tests {
         c.announce_barrier(&BarrierAnnouncement {
             epoch: 5,
             checkpoint_id: 1,
+            phase: crate::cluster::control::Phase::Prepare,
             flags: 0,
         })
         .await

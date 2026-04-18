@@ -131,6 +131,22 @@ pub async fn run_server(
     builder = builder.profile(profile);
     builder = apply_checkpoint_config(builder, &config.checkpoint.url, &config.checkpoint);
 
+    // Build the state backend + single-owner vnode registry from config so
+    // the checkpoint coordinator's durability gate runs with real markers.
+    // Cluster mode overrides the owner id after its controller is built.
+    let state_backend = config
+        .state
+        .build()
+        .await
+        .map_err(|e| ServerError::Build(format!("state backend: {e}")))?;
+    let vnode_registry = Arc::new(laminar_core::state::VnodeRegistry::single_owner(
+        config.state.vnode_capacity(),
+        laminar_core::state::NodeId(0),
+    ));
+    builder = builder
+        .state_backend(state_backend)
+        .vnode_registry(vnode_registry);
+
     let db = builder
         .build()
         .await

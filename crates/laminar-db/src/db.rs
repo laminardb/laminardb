@@ -87,6 +87,17 @@ pub struct LaminarDB {
     pub(crate) cluster_controller: parking_lot::Mutex<
         Option<Arc<laminar_core::cluster::control::ClusterController>>,
     >,
+    /// State backend for durability-gate participation. Installed by
+    /// `LaminarDbBuilder::state_backend`. When paired with a
+    /// `vnode_registry` the coordinator writes per-vnode markers each
+    /// checkpoint and the gate runs.
+    pub(crate) state_backend:
+        parking_lot::Mutex<Option<Arc<dyn laminar_core::state::StateBackend>>>,
+    /// Vnode topology + assignment. Installed by
+    /// `LaminarDbBuilder::vnode_registry`. Needed for the coordinator to
+    /// know which vnodes this instance owns.
+    pub(crate) vnode_registry:
+        parking_lot::Mutex<Option<Arc<laminar_core::state::VnodeRegistry>>>,
 }
 
 pub(crate) struct SourceWatermarkState {
@@ -162,6 +173,21 @@ impl LaminarDB {
         config: LaminarConfig,
         config_vars: HashMap<String, String>,
     ) -> Result<Self, DbError> {
+        Self::open_with_config_and_vars_and_rules(config, config_vars, &[], None)
+    }
+
+    /// Same as [`Self::open_with_config_and_vars`] but also installs
+    /// the given physical-optimizer rules on the `DataFusion` session.
+    /// Cluster mode uses this to register `DistributedAggregateRule`.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn open_with_config_and_vars_and_rules(
+        config: LaminarConfig,
+        config_vars: HashMap<String, String>,
+        extra_optimizer_rules: &[Arc<
+            dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync,
+        >],
+        target_partitions: Option<usize>,
+    ) -> Result<Self, DbError> {
         // One-time crossfire backoff tuning. No-op on multi-core; on single-core
         // VMs this swaps spin-loops for yields (~2x channel throughput).
         // Idempotent via an internal atomic — safe to call on every instance.
@@ -172,7 +198,10 @@ impl LaminarDB {
         // Build a SessionContext with the LookupJoinExtensionPlanner wired
         // into the physical planner so LookupJoinNode → LookupJoinExec works.
         let ctx = {
-            let session_config = laminar_sql::datafusion::base_session_config();
+            let mut session_config = laminar_sql::datafusion::base_session_config();
+            if let Some(n) = target_partitions {
+                session_config = session_config.with_target_partitions(n);
+            }
             let extension_planner: Arc<
                 dyn datafusion::physical_planner::ExtensionPlanner + Send + Sync,
             > = Arc::new(laminar_sql::datafusion::LookupJoinExtensionPlanner::new(
@@ -180,12 +209,14 @@ impl LaminarDB {
             ));
             let query_planner: Arc<dyn datafusion::execution::context::QueryPlanner + Send + Sync> =
                 Arc::new(LookupQueryPlanner { extension_planner });
-            let state = datafusion::execution::SessionStateBuilder::new()
+            let mut state_builder = datafusion::execution::SessionStateBuilder::new()
                 .with_config(session_config)
                 .with_default_features()
-                .with_query_planner(query_planner)
-                .build();
-            SessionContext::new_with_state(state)
+                .with_query_planner(query_planner);
+            for rule in extra_optimizer_rules {
+                state_builder = state_builder.with_physical_optimizer_rule(Arc::clone(rule));
+            }
+            SessionContext::new_with_state(state_builder.build())
         };
         register_streaming_functions(&ctx);
 
@@ -226,6 +257,8 @@ impl LaminarDB {
             mv_store: Arc::new(parking_lot::RwLock::new(crate::mv_store::MvStore::new())),
             #[cfg(feature = "cluster-unstable")]
             cluster_controller: parking_lot::Mutex::new(None),
+            state_backend: parking_lot::Mutex::new(None),
+            vnode_registry: parking_lot::Mutex::new(None),
         })
     }
 
@@ -239,6 +272,28 @@ impl LaminarDB {
         controller: Arc<laminar_core::cluster::control::ClusterController>,
     ) {
         *self.cluster_controller.lock() = Some(controller);
+    }
+
+    /// Install a state backend so the checkpoint coordinator publishes
+    /// per-vnode durability markers and the gate runs. Pair with
+    /// [`Self::set_vnode_registry`]; either alone is a no-op.
+    pub fn set_state_backend(&self, backend: Arc<dyn laminar_core::state::StateBackend>) {
+        *self.state_backend.lock() = Some(backend);
+    }
+
+    /// Install a vnode registry so the checkpoint coordinator knows
+    /// which vnodes this instance owns. Pair with
+    /// [`Self::set_state_backend`]; either alone is a no-op.
+    pub fn set_vnode_registry(&self, registry: Arc<laminar_core::state::VnodeRegistry>) {
+        *self.vnode_registry.lock() = Some(registry);
+    }
+
+    /// Underlying `DataFusion` `SessionContext`. Primarily for tests
+    /// that need to compile SQL through the same session the engine
+    /// uses.
+    #[must_use]
+    pub fn session_context(&self) -> &SessionContext {
+        &self.ctx
     }
 
     /// Get a fluent builder for constructing a `LaminarDB`.

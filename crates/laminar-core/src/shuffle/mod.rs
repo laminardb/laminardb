@@ -26,9 +26,15 @@
 //! - Integration with `CheckpointBarrierInjector` so barriers flow
 //!   in-band.
 
+pub mod barrier_tracker;
 pub mod flow;
 pub mod message;
+pub mod transport;
 
+pub use barrier_tracker::BarrierTracker;
 pub use flow::CreditSemaphore;
 pub use message::{read_message, write_message, ShuffleMessage, TAG_BARRIER, TAG_CLOSE,
-    TAG_CREDIT, TAG_DATA};
+    TAG_CREDIT, TAG_DATA, TAG_HELLO, TAG_VNODE_DATA};
+pub use transport::{fan_out_barrier, ShufflePeerId, ShuffleReceiver, ShuffleSender};
+#[cfg(feature = "cluster-unstable")]
+pub use transport::SHUFFLE_ADDR_KEY;

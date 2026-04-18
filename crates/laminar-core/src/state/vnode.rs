@@ -13,25 +13,46 @@
 //! [`key_hash`] (xxh3) and modulo `vnode_count`. Connectors that
 //! need a vnode ID for an event call [`VnodeRegistry::vnode_for_key`].
 
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 
-/// Identifier for a cluster node owning some subset of vnodes.
-///
-/// `u64::MAX` is the sentinel for "unassigned".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Unique identifier for a node. Also the owner id for vnodes; cluster
+/// membership and vnode ownership identify the same thing.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub struct NodeId(pub u64);
 
 impl NodeId {
-    /// Sentinel value for an unowned vnode.
-    pub const UNASSIGNED: Self = Self(u64::MAX);
+    /// Sentinel meaning "unassigned".
+    pub const UNASSIGNED: Self = Self(0);
 
-    /// Returns true if this is the unassigned sentinel.
+    /// True if this is the unassigned sentinel.
     #[must_use]
     pub const fn is_unassigned(&self) -> bool {
-        self.0 == u64::MAX
+        self.0 == 0
+    }
+}
+
+impl fmt::Display for NodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "node-{}", self.0)
     }
 }
 
@@ -148,6 +169,42 @@ pub fn key_hash(key: &[u8]) -> u64 {
     xxhash_rust::xxh3::xxh3_64(key)
 }
 
+/// Build a vnode-to-owner assignment by round-robin across sorted peers.
+///
+/// Deterministic for a given `(vnode_count, peers)` input — every node
+/// computing this independently agrees, given the same peer list. Uses
+/// sort-by-id + modulo: vnode `v` → `peers[v % peers.len()]` after
+/// sorting. Simple and fine for uniform key distributions.
+///
+/// **Not** consistent hashing — a peer join/leave reshuffles every
+/// vnode. Acceptable for the current phase since reassignment happens
+/// only at cluster start; dynamic rebalance is deferred work.
+///
+/// # Panics
+/// Panics if `peers` is empty.
+#[must_use]
+pub fn round_robin_assignment(vnode_count: u32, peers: &[NodeId]) -> Arc<[NodeId]> {
+    assert!(!peers.is_empty(), "round_robin_assignment needs at least one peer");
+    let mut sorted: Vec<NodeId> = peers.to_vec();
+    sorted.sort_by_key(|n| n.0);
+    (0..vnode_count)
+        .map(|v| sorted[(v as usize) % sorted.len()])
+        .collect::<Vec<_>>()
+        .into()
+}
+
+/// Vnodes currently assigned to `owner`.
+///
+/// Used by the checkpoint coordinator to decide which vnodes' durability
+/// markers it is responsible for writing each epoch, and by the leader's
+/// `epoch_complete` gate to know the full set to check.
+#[must_use]
+pub fn owned_vnodes(registry: &VnodeRegistry, owner: NodeId) -> Vec<u32> {
+    (0..registry.vnode_count())
+        .filter(|&v| registry.owner(v) == owner)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +264,51 @@ mod tests {
     fn vnode_for_key_is_deterministic() {
         let r = VnodeRegistry::new(16);
         assert_eq!(r.vnode_for_key(b"key-x"), r.vnode_for_key(b"key-x"));
+    }
+
+    #[test]
+    fn owned_vnodes_filters_by_owner() {
+        let r = VnodeRegistry::new(4);
+        r.set_assignment(vec![NodeId(1), NodeId(2), NodeId(1), NodeId(2)].into());
+        assert_eq!(owned_vnodes(&r, NodeId(1)), vec![0, 2]);
+        assert_eq!(owned_vnodes(&r, NodeId(2)), vec![1, 3]);
+        assert!(owned_vnodes(&r, NodeId(99)).is_empty());
+    }
+
+    #[test]
+    fn owned_vnodes_single_owner_returns_all() {
+        let r = VnodeRegistry::single_owner(8, NodeId(42));
+        assert_eq!(owned_vnodes(&r, NodeId(42)), (0..8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn round_robin_is_deterministic_and_balanced() {
+        // 8 vnodes, 3 peers → 3+3+2 distribution after modulo.
+        let peers = vec![NodeId(7), NodeId(3), NodeId(5)];
+        let assignment = round_robin_assignment(8, &peers);
+        // Sorted: [3, 5, 7]. vnode v owned by sorted[v % 3].
+        assert_eq!(
+            &*assignment,
+            &[
+                NodeId(3), NodeId(5), NodeId(7),
+                NodeId(3), NodeId(5), NodeId(7),
+                NodeId(3), NodeId(5),
+            ][..]
+        );
+        // Input order doesn't matter.
+        let reversed = vec![NodeId(3), NodeId(5), NodeId(7)];
+        assert_eq!(round_robin_assignment(8, &reversed), assignment);
+    }
+
+    #[test]
+    fn round_robin_single_peer_owns_everything() {
+        let assignment = round_robin_assignment(4, &[NodeId(99)]);
+        assert!(assignment.iter().all(|&n| n == NodeId(99)));
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one peer")]
+    fn round_robin_rejects_empty_peer_list() {
+        let _ = round_robin_assignment(4, &[]);
     }
 }

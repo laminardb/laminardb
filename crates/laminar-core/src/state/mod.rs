@@ -32,4 +32,4 @@ pub use config::{
 pub use in_process::InProcessBackend;
 pub use local::LocalBackend;
 pub use object_store::ObjectStoreBackend;
-pub use vnode::{key_hash, NodeId as VnodeNodeId, VnodeRegistry};
+pub use vnode::{key_hash, owned_vnodes, round_robin_assignment, NodeId, VnodeRegistry};

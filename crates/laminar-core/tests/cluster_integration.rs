@@ -90,6 +90,7 @@ async fn barrier_announce_then_follower_observes_and_acks() {
     let announcement = BarrierAnnouncement {
         epoch: 7,
         checkpoint_id: 101,
+        phase: laminar_core::cluster::control::Phase::Prepare,
         flags: 0,
     };
 
@@ -522,6 +523,7 @@ async fn quorum_times_out_when_follower_silent() {
         .announce_barrier(&BarrierAnnouncement {
             epoch: 42,
             checkpoint_id: 1,
+            phase: laminar_core::cluster::control::Phase::Prepare,
             flags: 0,
         })
         .await

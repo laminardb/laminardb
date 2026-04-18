@@ -133,6 +133,7 @@ azure = ["laminar-db/azure"]
 cluster-unstable = [
     "laminar-core/cluster-unstable",
     "laminar-db/cluster-unstable",
+    "laminar-sql/cluster-unstable",
     "dep:uuid",
     "dep:xxhash-rust",
 ]

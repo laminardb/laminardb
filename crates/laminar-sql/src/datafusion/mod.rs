@@ -29,6 +29,19 @@ pub mod live_source;
 pub mod lookup_join;
 /// Physical execution plan and extension planner for lookup joins.
 pub mod lookup_join_exec;
+/// Cross-instance hash repartition for distributed GROUP BY — phase A
+/// of `docs/plans/sharded-operator.md`. Gated on the `cluster-unstable`
+/// feature because it pulls in the shuffle transport.
+#[cfg(feature = "cluster-unstable")]
+pub mod cluster_repartition;
+/// Physical optimizer rule that splices `ClusterRepartitionExec`
+/// into DataFusion plans — phase B of `docs/plans/sharded-operator.md`.
+#[cfg(feature = "cluster-unstable")]
+pub mod distributed_aggregate_rule;
+/// Phase D writer — wraps `ClusterRepartitionExec` to persist
+/// per-partition partial state on each aligned checkpoint.
+#[cfg(feature = "cluster-unstable")]
+pub mod checkpointed_repartition;
 /// Processing-time UDF for `PROCTIME()` support
 pub mod proctime_udf;
 mod source;

@@ -80,6 +80,17 @@ pub(crate) struct ConnectorPipelineCallback {
     /// checkpoint to preserve the replay window.
     pub(crate) sink_timed_out: bool,
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
+    /// Cluster control facade. Present only when this instance was
+    /// built with a controller. Used to gate the periodic checkpoint
+    /// trigger on `is_leader()` and to run `follower_checkpoint` on
+    /// non-leaders.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) cluster_controller:
+        Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    /// Highest epoch a non-leader has already prepared for. Prevents
+    /// re-running `follower_checkpoint` on the same announcement.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) last_follower_epoch: Option<u64>,
 }
 
 impl ConnectorPipelineCallback {
@@ -90,6 +101,87 @@ impl ConnectorPipelineCallback {
             shutdown.notify_one();
         }
         format!("{err}")
+    }
+
+    /// Follower-side dispatch: poll the leader's announcement, and
+    /// if a fresh PREPARE is visible, capture local state and run
+    /// `CheckpointCoordinator::follower_checkpoint`. Returns `true`
+    /// when a checkpoint was driven this tick.
+    #[cfg(feature = "cluster-unstable")]
+    async fn maybe_follower_checkpoint(
+        &mut self,
+        controller: Arc<laminar_core::cluster::control::ClusterController>,
+        source_offsets: FxHashMap<String, SourceCheckpoint>,
+    ) -> bool {
+        use crate::checkpoint_coordinator::source_to_connector_checkpoint;
+        use laminar_core::cluster::control::Phase;
+
+        let ann = match controller.observe_barrier().await {
+            Ok(Some(a)) if a.phase == Phase::Prepare => a,
+            _ => return false,
+        };
+        if self.last_follower_epoch.is_some_and(|e| e >= ann.epoch) {
+            return false;
+        }
+        self.last_follower_epoch = Some(ann.epoch);
+
+        let operator_states = match self.capture_and_serialize_operator_state().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "follower state capture failed — skipping");
+                return false;
+            }
+        };
+        let mut extra_tables = HashMap::with_capacity(self.table_sources.len());
+        for (name, source, _) in &self.table_sources {
+            extra_tables.insert(
+                name.clone(),
+                source_to_connector_checkpoint(&source.checkpoint()),
+            );
+        }
+        let source_overrides: HashMap<String, _> = source_offsets
+            .iter()
+            .map(|(name, cp)| (name.clone(), source_to_connector_checkpoint(cp)))
+            .collect();
+        let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
+        for (name, wm_state) in &self.watermark_states {
+            let wm = wm_state.generator.current_watermark();
+            if wm > i64::MIN {
+                per_source_watermarks.insert(name.clone(), wm);
+            }
+        }
+        let request = crate::checkpoint_coordinator::CheckpointRequest {
+            operator_states,
+            watermark: None,
+            table_store_checkpoint_path: None,
+            extra_table_offsets: extra_tables,
+            source_watermarks: per_source_watermarks,
+            pipeline_hash: self.pipeline_hash,
+            source_offset_overrides: source_overrides,
+        };
+
+        let mut guard = self.coordinator.lock().await;
+        let Some(ref mut coord) = *guard else {
+            return false;
+        };
+        match coord
+            .follower_checkpoint(request, ann, std::time::Duration::from_secs(30))
+            .await
+        {
+            Ok(true) => {
+                tracing::info!("follower checkpoint committed");
+                self.last_checkpoint = std::time::Instant::now();
+                true
+            }
+            Ok(false) => {
+                tracing::warn!("follower checkpoint aborted (leader signalled Abort)");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "follower checkpoint errored");
+                false
+            }
+        }
     }
 
     async fn capture_and_serialize_operator_state(
@@ -438,6 +530,19 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     ) -> bool {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
         let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
+
+        // Cluster mode: only the leader fires periodic checkpoints.
+        // Followers mirror the leader's epoch via `follower_checkpoint`
+        // on observed PREPARE announcements. Forced checkpoints
+        // (shutdown) run on whatever instance is shutting down.
+        #[cfg(feature = "cluster-unstable")]
+        if !force {
+            if let Some(cc) = self.cluster_controller.clone() {
+                if !cc.is_leader() {
+                    return self.maybe_follower_checkpoint(cc, source_offsets).await;
+                }
+            }
+        }
 
         // Under exactly-once, only barrier-aligned checkpoints are consistent.
         // Timer-based checkpoints are skipped (barrier path handles exactly-once).

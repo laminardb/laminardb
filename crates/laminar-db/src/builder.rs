@@ -41,6 +41,23 @@ pub struct LaminarDbBuilder {
     #[cfg(feature = "cluster-unstable")]
     cluster_controller:
         Option<std::sync::Arc<laminar_core::cluster::control::ClusterController>>,
+    /// Optional state backend. When paired with `vnode_registry`, the
+    /// coordinator writes per-vnode durability markers each checkpoint
+    /// and consults `epoch_complete` before committing sinks.
+    state_backend: Option<std::sync::Arc<dyn laminar_core::state::StateBackend>>,
+    /// Optional vnode topology. See `state_backend`.
+    vnode_registry: Option<std::sync::Arc<laminar_core::state::VnodeRegistry>>,
+    /// Extra physical optimizer rules installed on the `SessionState`
+    /// at construction. Used by cluster mode to register
+    /// `DistributedAggregateRule`.
+    physical_optimizer_rules: Vec<
+        std::sync::Arc<
+            dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync,
+        >,
+    >,
+    /// Override for `target_partitions`; cluster mode sets this to
+    /// `vnode_count`. Default 1 for single-instance streaming.
+    target_partitions: Option<usize>,
 }
 
 impl LaminarDbBuilder {
@@ -59,7 +76,55 @@ impl LaminarDbBuilder {
             custom_udafs: Vec::new(),
             #[cfg(feature = "cluster-unstable")]
             cluster_controller: None,
+            state_backend: None,
+            vnode_registry: None,
+            physical_optimizer_rules: Vec::new(),
+            target_partitions: None,
         }
+    }
+
+    /// Override `target_partitions`; requires a distributed-aware
+    /// physical optimizer rule to replace `RepartitionExec`.
+    #[must_use]
+    pub fn target_partitions(mut self, n: usize) -> Self {
+        self.target_partitions = Some(n);
+        self
+    }
+
+    /// Register an additional `PhysicalOptimizerRule` on the session
+    /// state. Cluster mode uses this to install
+    /// `DistributedAggregateRule`.
+    #[must_use]
+    pub fn physical_optimizer_rule(
+        mut self,
+        rule: std::sync::Arc<
+            dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync,
+        >,
+    ) -> Self {
+        self.physical_optimizer_rules.push(rule);
+        self
+    }
+
+    /// Install a state backend. Pair with [`Self::vnode_registry`];
+    /// without the registry this call has no effect.
+    #[must_use]
+    pub fn state_backend(
+        mut self,
+        backend: std::sync::Arc<dyn laminar_core::state::StateBackend>,
+    ) -> Self {
+        self.state_backend = Some(backend);
+        self
+    }
+
+    /// Install a vnode registry. Pair with [`Self::state_backend`];
+    /// without the backend this call has no effect.
+    #[must_use]
+    pub fn vnode_registry(
+        mut self,
+        registry: std::sync::Arc<laminar_core::state::VnodeRegistry>,
+    ) -> Self {
+        self.vnode_registry = Some(registry);
+        self
     }
 
     /// Install a cluster control facade. Activates cluster-mode
@@ -308,7 +373,12 @@ impl LaminarDbBuilder {
         // Apply profile defaults for fields the user hasn't set.
         self.profile.apply_defaults(&mut self.config);
 
-        let db = LaminarDB::open_with_config_and_vars(self.config, self.config_vars)?;
+        let db = LaminarDB::open_with_config_and_vars_and_rules(
+            self.config,
+            self.config_vars,
+            &self.physical_optimizer_rules,
+            self.target_partitions,
+        )?;
         for callback in self.connector_callbacks {
             callback(db.connector_registry());
         }
@@ -321,6 +391,12 @@ impl LaminarDbBuilder {
         #[cfg(feature = "cluster-unstable")]
         if let Some(controller) = self.cluster_controller {
             db.set_cluster_controller(controller);
+        }
+        if let Some(backend) = self.state_backend {
+            db.set_state_backend(backend);
+        }
+        if let Some(registry) = self.vnode_registry {
+            db.set_vnode_registry(registry);
         }
         Ok(db)
     }

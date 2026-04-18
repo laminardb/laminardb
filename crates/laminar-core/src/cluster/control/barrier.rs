@@ -1,13 +1,5 @@
-//! Cross-instance barrier coordination via chitchat KV.
-//!
-//! The elected leader writes a `BarrierAnnouncement` under its own
-//! chitchat KV key. Each follower observes via gossip (~100 ms
-//! propagation), triggers its local barrier injection, snapshots state,
-//! then writes its own `BarrierAck`. The leader polls for acks and
-//! decides quorum.
-//!
-//! See the parent design doc §7 (control plane) and §9 (barrier
-//! protocol) plus `docs/plans/two-phase-ordering.md`.
+//! Cross-instance barrier protocol over a gossip KV. Leader announces,
+//! followers ack, leader polls for quorum.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,85 +11,81 @@ use serde::{Deserialize, Serialize};
 
 use crate::cluster::discovery::NodeId;
 
-/// Chitchat KV key (on the leader's own state) announcing a barrier.
+/// KV key for the leader's barrier announcement.
 pub const ANNOUNCEMENT_KEY: &str = "control:barrier";
 
-/// Chitchat KV key (on each follower's own state) carrying that
-/// follower's ack. Readers iterate all nodes' states and pick up the
-/// key from each.
+/// KV key for a follower's barrier ack.
 pub const ACK_KEY: &str = "control:barrier-ack";
 
-/// Barrier announcement written by the elected leader into its own
-/// chitchat KV state. Followers observe via gossip.
+/// Barrier phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Phase {
+    /// Snapshot state and pre-commit sinks.
+    Prepare,
+    /// Durability gate passed; commit sinks.
+    Commit,
+    /// Prepare failed; roll back.
+    Abort,
+}
+
+/// Leader-written barrier announcement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BarrierAnnouncement {
-    /// Monotonic epoch identifier.
+    /// Monotonic epoch id.
     pub epoch: u64,
-    /// Checkpoint identifier assigned by the leader's coordinator.
+    /// Coordinator-assigned checkpoint id.
     pub checkpoint_id: u64,
-    /// Barrier flags (see `checkpoint::barrier::flags`).
+    /// Phase this announcement signals.
+    pub phase: Phase,
+    /// Reserved for unaligned/other flags.
     pub flags: u64,
 }
 
-/// Follower's acknowledgment that it has snapshotted state for the
-/// announced epoch. Written into the follower's own chitchat KV state.
+/// Follower ack. `ok = false` forces the leader to abort instead of wait.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BarrierAck {
-    /// The epoch being acknowledged.
+    /// Epoch being acknowledged.
     pub epoch: u64,
-    /// Whether the follower's snapshot succeeded. Failed snapshots
-    /// still ack (with `ok = false`) so the leader doesn't timeout
-    /// waiting for a doomed peer; the leader then aborts the epoch.
+    /// `false` = snapshot failed locally; leader should abort.
     pub ok: bool,
-    /// Optional error message when `ok = false`.
+    /// Free-text error; populated when `ok = false`.
     pub error: Option<String>,
 }
 
-/// Outcome of a `wait_for_quorum` call.
+/// Outcome of `wait_for_quorum`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuorumOutcome {
-    /// Every expected instance acked successfully.
+    /// All expected peers acked with `ok = true`.
     Reached {
-        /// Instances that acked with `ok = true`.
+        /// Peers that acked successfully.
         acks: Vec<NodeId>,
     },
-    /// Deadline passed before every expected instance acked.
+    /// Deadline expired with at least one peer silent.
     TimedOut {
-        /// Instances that acked (in any state).
+        /// Peers that did ack.
         got: Vec<NodeId>,
-        /// Instances that did not ack.
+        /// Peers that didn't.
         missing: Vec<NodeId>,
     },
-    /// At least one follower reported snapshot failure.
+    /// At least one peer acked `ok = false`.
     Failed {
-        /// Instances that reported failure, with the error message.
+        /// `(peer, error_message)` for every failed ack.
         failures: Vec<(NodeId, String)>,
     },
 }
 
-/// The KV operations the coordinator needs from the gossip layer.
-///
-/// Two impls today: [`InMemoryKv`] for tests and
-/// [`ChitchatKv`](super::chitchat_kv::ChitchatKv) for production.
-/// Methods are `async` because chitchat's cluster state lives behind
-/// a `tokio::sync::Mutex`; the in-memory impl simply returns
-/// immediately.
+/// Gossip-KV seam.
 #[async_trait]
 pub trait ClusterKv: Send + Sync + 'static {
-    /// Write `value` under `key` into this instance's own state.
-    /// Overwrites any prior value for the same key.
+    /// Write `value` to this instance's `key` slot (overwrites).
     async fn write(&self, key: &str, value: String);
-
-    /// Read `key` from the named instance's state, if present.
+    /// Read `key` from `who`'s slot.
     async fn read_from(&self, who: NodeId, key: &str) -> Option<String>;
-
-    /// Iterate every live instance's state and pull out the value for
-    /// `key` where it exists. Used to collect acks.
+    /// Every visible instance's value for `key`.
     async fn scan(&self, key: &str) -> Vec<(NodeId, String)>;
 }
 
-/// In-memory KV for tests. Simulates gossip by making writes
-/// immediately visible to all readers.
+/// In-memory KV for tests.
 #[derive(Debug)]
 pub struct InMemoryKv {
     local_id: NodeId,
@@ -114,8 +102,7 @@ impl InMemoryKv {
         }
     }
 
-    /// Seed a remote peer's state (for simulating multi-instance gossip
-    /// in a single test).
+    /// Seed a remote peer's state for tests.
     pub fn seed(&self, peer: NodeId, key: &str, value: String) {
         self.state.lock().insert((peer, key.to_string()), value);
     }
@@ -143,7 +130,7 @@ impl ClusterKv for InMemoryKv {
     }
 }
 
-/// Coordinates cross-instance barriers on top of a [`ClusterKv`] seam.
+/// Cross-instance barrier coordination over a [`ClusterKv`].
 pub struct BarrierCoordinator {
     kv: Arc<dyn ClusterKv>,
 }
@@ -161,23 +148,20 @@ impl BarrierCoordinator {
         Self { kv }
     }
 
-    /// Leader-side: publish a barrier announcement. Followers observe
-    /// via gossip once this is written.
+    /// Leader-side announce.
     ///
     /// # Errors
-    /// Returns a string error if JSON encoding fails (shouldn't happen
-    /// for the fixed-shape announcement type).
+    /// Returns a string on JSON encode failure.
     pub async fn announce(&self, ann: &BarrierAnnouncement) -> Result<(), String> {
         let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;
         self.kv.write(ANNOUNCEMENT_KEY, json).await;
         Ok(())
     }
 
-    /// Follower-side: read the leader's current announcement, if any.
+    /// Follower-side observe.
     ///
     /// # Errors
-    /// Returns a string error if the leader's stored announcement
-    /// can't be decoded.
+    /// Returns a string on JSON decode failure.
     pub async fn observe(&self, leader: NodeId) -> Result<Option<BarrierAnnouncement>, String> {
         match self.kv.read_from(leader, ANNOUNCEMENT_KEY).await {
             Some(json) => serde_json::from_str(&json).map(Some).map_err(|e| e.to_string()),
@@ -185,22 +169,17 @@ impl BarrierCoordinator {
         }
     }
 
-    /// Follower-side: write this instance's ack for an epoch.
+    /// Follower-side ack.
     ///
     /// # Errors
-    /// String error on JSON encode failure.
+    /// Returns a string on JSON encode failure.
     pub async fn ack(&self, ack: &BarrierAck) -> Result<(), String> {
         let json = serde_json::to_string(ack).map_err(|e| e.to_string())?;
         self.kv.write(ACK_KEY, json).await;
         Ok(())
     }
 
-    /// Leader-side: poll until every expected instance acks, or until
-    /// `deadline` passes. Returns a [`QuorumOutcome`] describing the
-    /// terminal state.
-    ///
-    /// Poll interval is 50 ms — tight enough to see gossip updates
-    /// promptly but loose enough to not hammer the KV.
+    /// Leader-side: poll acks every 50 ms until quorum or `deadline`.
     pub async fn wait_for_quorum(
         &self,
         epoch: u64,
@@ -272,6 +251,7 @@ mod tests {
             .announce(&BarrierAnnouncement {
                 epoch: 5,
                 checkpoint_id: 42,
+                phase: Phase::Prepare,
                 flags: 0,
             })
             .await

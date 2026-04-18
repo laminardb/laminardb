@@ -1,14 +1,5 @@
-//! Chitchat-backed implementation of [`ClusterKv`].
-//!
-//! Writes go to this instance's own `self_node_state`; gossip
-//! propagates them to peers in ~100 ms. Reads pull from the in-memory
-//! cluster state, filtering by chitchat's `live_nodes()` so that acks
-//! from phi-accrual-suspected peers don't count.
-//!
-//! [`ChitchatKv`] is gated behind the `cluster-unstable` feature (same
-//! as the rest of the chitchat integration). Library users running
-//! single-instance get the in-memory impl without the UDP / gossip
-//! pull-in.
+//! Chitchat-backed [`ClusterKv`]. Reads filter by `live_nodes()` so
+//! suspected peers don't count toward quorum.
 
 use std::sync::Arc;
 
@@ -18,9 +9,6 @@ use super::barrier::ClusterKv;
 use crate::cluster::discovery::NodeId;
 
 /// Chitchat-backed cluster KV.
-///
-/// Wraps the `Arc<Mutex<Chitchat>>` obtained from
-/// [`chitchat::ChitchatHandle::chitchat()`].
 pub struct ChitchatKv {
     chitchat: Arc<tokio::sync::Mutex<chitchat::Chitchat>>,
 }
@@ -40,23 +28,17 @@ impl ChitchatKv {
         }
     }
 
-    /// Construct directly from the shared chitchat state. Useful when
-    /// multiple components (discovery, control, shuffle-peer-registry)
-    /// share a single chitchat instance.
+    /// Construct from a shared chitchat state.
     #[must_use]
     pub fn from_chitchat(chitchat: Arc<tokio::sync::Mutex<chitchat::Chitchat>>) -> Self {
         Self { chitchat }
     }
 }
 
-/// Format a `NodeId` as its chitchat `node_id` string. Must match the
-/// convention used by `cluster::discovery::gossip_discovery`.
 fn encode_node_id(node_id: NodeId) -> String {
     format!("node-{}", node_id.0)
 }
 
-/// Inverse of [`encode_node_id`]. Returns `None` if the string isn't in
-/// the `node-<u64>` form.
 fn decode_chitchat_id(id: &chitchat::ChitchatId) -> Option<NodeId> {
     id.node_id.strip_prefix("node-")?.parse::<u64>().ok().map(NodeId)
 }
@@ -81,9 +63,6 @@ impl ClusterKv for ChitchatKv {
 
     async fn scan(&self, key: &str) -> Vec<(NodeId, String)> {
         let guard = self.chitchat.lock().await;
-        // Filter by live nodes so stale acks from suspected peers
-        // don't satisfy quorum. Linear scan is fine at cluster sizes
-        // we target (N ≤ 16).
         let live: Vec<&chitchat::ChitchatId> = guard.live_nodes().collect();
         let mut out = Vec::new();
         for (cc_id, state) in guard.node_states() {

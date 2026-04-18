@@ -23,6 +23,14 @@ pub const TAG_DATA: u8 = 0x01;
 pub const TAG_BARRIER: u8 = 0x02;
 /// Flow-control credit replenishment from receiver to sender.
 pub const TAG_CREDIT: u8 = 0x03;
+/// Connection handshake — one `Hello(node_id)` is the first frame
+/// exchanged in each direction. Used by the receiver to attribute
+/// incoming frames to the right peer.
+pub const TAG_HELLO: u8 = 0x04;
+/// Pre-routed data: sender has already classified the batch's rows
+/// as all belonging to `vnode`. The receiver forwards directly to
+/// that vnode's local partition without re-hashing.
+pub const TAG_VNODE_DATA: u8 = 0x05;
 /// Graceful-close signal with a short UTF-8 reason string.
 pub const TAG_CLOSE: u8 = 0xFF;
 
@@ -35,6 +43,11 @@ pub enum ShuffleMessage {
     Barrier(CheckpointBarrier),
     /// Receiver grants `delta_bytes` of additional send credit.
     Credit(u64),
+    /// Peer identifying itself during the connection handshake.
+    Hello(u64),
+    /// Data pre-routed to a specific vnode by the sender. Skips
+    /// re-hashing on the receive side.
+    VnodeData(u32, RecordBatch),
     /// Sender announcing graceful shutdown with a brief reason.
     Close(String),
 }
@@ -68,6 +81,15 @@ where
             (TAG_BARRIER, buf)
         }
         ShuffleMessage::Credit(delta) => (TAG_CREDIT, delta.to_le_bytes().to_vec()),
+        ShuffleMessage::Hello(node_id) => (TAG_HELLO, node_id.to_le_bytes().to_vec()),
+        ShuffleMessage::VnodeData(vnode, batch) => {
+            let ipc = serialize_batch_stream(batch)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let mut buf = Vec::with_capacity(4 + ipc.len());
+            buf.extend_from_slice(&vnode.to_le_bytes());
+            buf.extend_from_slice(&ipc);
+            (TAG_VNODE_DATA, buf)
+        }
         ShuffleMessage::Close(reason) => (TAG_CLOSE, reason.as_bytes().to_vec()),
     };
 
@@ -163,6 +185,28 @@ where
             let delta = u64::from_le_bytes(payload[..].try_into().unwrap());
             Ok(ShuffleMessage::Credit(delta))
         }
+        TAG_HELLO => {
+            if payload.len() != 8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("hello payload {} bytes, expected 8", payload.len()),
+                ));
+            }
+            let node_id = u64::from_le_bytes(payload[..].try_into().unwrap());
+            Ok(ShuffleMessage::Hello(node_id))
+        }
+        TAG_VNODE_DATA => {
+            if payload.len() < 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("vnode-data payload {} bytes, expected ≥4", payload.len()),
+                ));
+            }
+            let vnode = u32::from_le_bytes(payload[..4].try_into().unwrap());
+            let batch = deserialize_batch_stream(&payload[4..])
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            Ok(ShuffleMessage::VnodeData(vnode, batch))
+        }
         TAG_CLOSE => {
             let reason = String::from_utf8(payload).map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("close reason: {e}"))
@@ -227,6 +271,32 @@ mod tests {
         assert_eq!(
             read_message(&mut b).await.unwrap(),
             ShuffleMessage::Credit(16 * 1024 * 1024)
+        );
+    }
+
+    #[tokio::test]
+    async fn vnode_data_roundtrip() {
+        let (mut a, mut b) = duplex(64 * 1024);
+        let batch = sample_batch();
+        write_message(&mut a, &ShuffleMessage::VnodeData(42, batch.clone()))
+            .await
+            .unwrap();
+        match read_message(&mut b).await.unwrap() {
+            ShuffleMessage::VnodeData(v, got) => {
+                assert_eq!(v, 42);
+                assert_eq!(got, batch);
+            }
+            other => panic!("expected VnodeData, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hello_roundtrip() {
+        let (mut a, mut b) = duplex(64);
+        write_message(&mut a, &ShuffleMessage::Hello(0xDEAD_BEEF)).await.unwrap();
+        assert_eq!(
+            read_message(&mut b).await.unwrap(),
+            ShuffleMessage::Hello(0xDEAD_BEEF)
         );
     }
 

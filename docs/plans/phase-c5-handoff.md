@@ -88,9 +88,74 @@ All of them pass in ~6.5 s total. 5× consecutive stable.
 
 ## The three remaining items
 
-### (1) CheckpointCoordinator leader/follower flow — BIGGEST, MOST IMPACTFUL
+### (1) CheckpointCoordinator leader/follower flow — PARTIALLY DONE
 
-**Status:** `ClusterController` is plumbed onto `CheckpointCoordinator` (field + setter wired end-to-end) but **not consumed in `checkpoint_inner()`**. Single-instance behavior is unchanged; multi-instance is currently N independent coordinators, not a coordinated 2PC.
+**Status:** sub-split into (1a), (1b) — both landed — and (1c) — deferred.
+Sequencing details in `docs/plans/checkpoint-2pc-sequencing.md`.
+
+- **(1a) ✓ done.** `VnodeRegistry` + `StateBackend` plumbed through
+  `LaminarDbBuilder` → pipeline lifecycle → coordinator. Bridge in
+  `save_manifest` writes per-vnode durability markers so the
+  `epoch_complete` gate is load-bearing. New tests:
+  `bridge_writes_markers_and_gate_passes`,
+  `marker_write_failure_aborts_checkpoint`.
+- **(1b) ✓ done.** Leader path in `checkpoint_inner`: announce
+  `Phase::Prepare` + `wait_for_quorum` (30s) + gate + announce
+  `Phase::Commit`/`Phase::Abort`. Single-node cluster path verified
+  by `leader_announces_prepare_and_commit_on_solo_cluster`.
+- **(1c) ✓ done.** `CheckpointCoordinator::follower_checkpoint`
+  entry point runs the follower half atomically: pre-commit +
+  save-manifest + write-markers + ack, then polls `observe_barrier`
+  for the leader's decision and commits or rolls back. Two new unit
+  tests: `follower_checkpoint_commits_on_leader_commit`,
+  `follower_checkpoint_rolls_back_on_leader_abort`.
+- **(1d) ✓ done.** `ConnectorPipelineCallback` holds the controller
+  and `last_follower_epoch`. `maybe_checkpoint` now dispatches on
+  role: leader runs the existing periodic path; followers delegate to
+  a new `maybe_follower_checkpoint` method that polls
+  `observe_barrier`, captures local state, and calls
+  `follower_checkpoint`. Forced (shutdown) checkpoints still run on
+  any instance.
+- **End-to-end 2-node integration test.** New test
+  `crates/laminar-db/tests/cluster_2pc_flow.rs::two_node_leader_commits_follower_mirrors`
+  spins up a real 2-node `MiniCluster` over UDP gossip, wires each
+  node's `CheckpointCoordinator` to its controller + a shared
+  `InProcessBackend` + a split `VnodeRegistry`, and drives the leader
+  + follower halves concurrently. Verifies leader commits, follower
+  mirrors, and every vnode's marker is on the shared backend.
+  Runtime: ~1.1s per run after compile.
+- **(1e) ✓ done.** `CheckpointCoordinator::reconcile_orphaned_prepare`
+  runs on startup (from `pipeline_lifecycle`). If this instance is
+  the leader and the last manifest has any `Pending` sink, it
+  announces `Phase::Abort` for that epoch so other survivors clear
+  their prepared state. Two new unit tests
+  (`reconcile_announces_abort_for_pending_manifest`,
+  `reconcile_silent_when_manifest_clean`).
+- **(1f) ✓ done.** `laminar-server` now builds a `StateBackend` from
+  `config.state.build()` and a `VnodeRegistry::single_owner` sized to
+  `config.state.vnode_capacity()`, then passes both to
+  `LaminarDbBuilder`. Production server startup now activates the
+  durability gate + marker bridge. Cluster-mode owner override (from
+  the controller's instance_id) is still follow-up work in
+  `cluster.rs`.
+- **(1g) ✓ done.** Leader's durability gate now checks the **full
+  registry**, not just this instance's owned vnodes. New
+  `gate_vnode_set` field + `set_gate_vnode_set` setter; populated from
+  `(0..registry.vnode_count())` at pipeline-lifecycle time. Cross-
+  instance durability is verified end-to-end (leader's `epoch_complete`
+  sees every follower's shared-storage markers) — not just via the 2PC
+  ack. Two new unit tests:
+  `gate_checks_full_registry_not_just_owned`,
+  `gate_passes_when_all_registry_markers_present`.
+- **(1h) ✓ done.** Cluster-path vnode assignment is now a
+  round-robin split across every peer visible at cluster start, not
+  `single_owner(self)`. New `laminar_core::state::round_robin_assignment`
+  helper (pure fn, deterministic by sort-by-id + modulo) with 3 unit
+  tests. `laminar-server/src/cluster.rs::start_cluster` uses it in
+  place of `single_owner`. Static-at-startup; dynamic rebalance on
+  join/leave still deferred.
+
+**Below is the original pre-split plan, kept for reference.**
 
 **What needs building:**
 
@@ -131,9 +196,47 @@ Complications to handle:
 
 **Estimated scope:** ~500 LOC + 3-5 new integration tests. Real 1-week slice.
 
-### (2) `ShuffleSender` + `ShuffleReceiver` high-level types — MEDIUM
+### (2) `ShuffleSender` + `ShuffleReceiver` high-level types — ✓ done
 
-**Status:** TCP + codec + credit flow proven via `shuffle_tcp_integration.rs`. Higher-level pool is mechanical.
+**Status:** landed. Codec now has `ShuffleMessage::Hello(u64)` (tag `0x04`).
+New module `crates/laminar-core/src/shuffle/transport.rs` wraps that codec
+into concrete TCP `ShuffleSender` (lazy pool keyed by peer id) and
+`ShuffleReceiver` (accept loop + hello demux). Tests:
+`sender_to_receiver_delivers_with_peer_attribution`,
+`sender_reuses_connection_across_sends`,
+`send_to_unregistered_peer_errors` (unit), plus
+`shuffle_transport_integration.rs::two_nodes_exchange_data_bidirectionally`,
+`unregistered_peer_returns_not_found` (integration).
+
+**Peer discovery via gossip ✓ landed.** `ShuffleReceiver::bind_with_kv`
+publishes the bound socket address under `SHUFFLE_ADDR_KEY` in the
+instance's own `ClusterKv` state. `ShuffleSender::with_kv` reads it
+back when `send_to` is called for a peer not pre-registered. Reuses
+the existing `ClusterKv` seam (no new types). Test:
+`discover_peer_reads_registered_address_from_kv`.
+
+**Shuffle-barrier scaffolding ✓ landed (partial).**
+- `shuffle/barrier_tracker.rs` — per-operator `BarrierTracker` for
+  Chandy–Lamport alignment across multiple shuffle inputs. One instance
+  per sharded operator. 6 unit tests (alignment, idempotent repeats,
+  independent checkpoints, forget, panic guards).
+- `shuffle::fan_out_barrier(&sender, &[peer_ids], barrier)` free
+  function — leader ships a `ShuffleMessage::Barrier` frame to every
+  registered peer.
+- `shuffle_barrier_integration.rs` — end-to-end test across real
+  loopback TCP: leader fans a barrier out to 2 peers, each peer's
+  receiver feeds the arriving frame into its `BarrierTracker`, the
+  tracker aligns and fires when the per-operator local input had
+  already observed the same epoch.
+
+**Scoped out by design:** no actual sharded operator consumes these
+yet — wiring into a distributed GROUP BY or join is the next major
+piece. Without a consumer, coupling `fan_out_barrier` into
+`CheckpointCoordinator::checkpoint_inner` would be unwired code.
+
+**Still out of scope:** idle-timeout eviction on the connection pool.
+
+**Below is the original pre-landing plan, kept for reference.**
 
 **What needs building:**
 
@@ -147,7 +250,28 @@ Integration test: two instances on loopback, bidirectional send, assert all mess
 
 **Estimated scope:** ~400 LOC + 2-3 tests. 3-4 day slice.
 
-### (3) Testcontainers-based Kafka scenarios — SEPARATE INFRA
+### (3) Docker-compose Kafka scenarios — ✓ done
+
+**Status:** landed as docker-compose rather than testcontainers (works on
+both Linux and Windows with precompiled OpenSSL).
+
+- `tests/docker/compose.yml` — single-node Redpanda on host port 19092.
+- `tests/docker/README.md` — setup, invocation, Windows OpenSSL env
+  vars.
+- `crates/laminar-db/tests/common/mod.rs` — broker probe (tests skip
+  when Docker is down), topic admin, JSON produce/consume, `compose()`
+  exec, `wait_for_broker()`.
+- `crates/laminar-db/tests/kafka_docker_scenarios.rs` — four scenarios:
+  round-trip, broker-kill mid-stream, exactly-once across DB restart,
+  consumer rebalance. Scenarios 2 + 4 marked `#[ignore]` so the default
+  `cargo test` doesn't take the broker down under other concurrent
+  tests; `--include-ignored --test-threads=1` runs the full set in
+  ~40 s.
+- All four verified locally end-to-end against the real broker.
+
+**Below is the original pre-landing plan, kept for reference.**
+
+### (3-orig) Testcontainers-based Kafka scenarios — SEPARATE INFRA
 
 **Status:** Not started. Requires `testcontainers` crate + Redpanda image.
 

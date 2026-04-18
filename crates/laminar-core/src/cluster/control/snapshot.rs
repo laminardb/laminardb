@@ -1,15 +1,6 @@
-//! Durable assignment snapshot on the object store.
-//!
-//! The cluster control plane writes its current split→instance mapping
-//! to `control/assignment-snapshot.json` so that a full-cluster restart
-//! can recover the assignment without starting from scratch. Chitchat
-//! KV carries the ephemeral hot-path version; this file is the cold-
-//! storage source of truth.
-//!
-//! Format is JSON (debuggable from the command line). Writes use the
-//! object store's `PutMode::Create` + `ETag` compare to detect
-//! concurrent updates — standard optimistic concurrency. See the
-//! parent design doc §7.
+//! Durable split→instance assignment snapshot at
+//! `control/assignment-snapshot.json`. Chitchat carries the ephemeral
+//! copy; this file survives full-cluster restart.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -23,12 +14,7 @@ use crate::cluster::discovery::NodeId;
 
 const SNAPSHOT_PATH: &str = "control/assignment-snapshot.json";
 
-/// A split-to-instance assignment durable snapshot.
-///
-/// `version` is monotonic within a cluster's lifetime; writers include
-/// it on every update to detect conflicts. `splits` keys are
-/// source-specific split identifiers (Kafka partition, file path, CDC
-/// singleton tag).
+/// Durable split-to-instance assignment snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssignmentSnapshot {
     /// Monotonic version. Writers bump on each update.
@@ -50,8 +36,7 @@ impl AssignmentSnapshot {
         }
     }
 
-    /// Produce the next snapshot with the given split map and a bumped
-    /// version. `updated_at_ms` is taken from the system clock.
+    /// Next snapshot with bumped version and current wall-clock time.
     #[must_use]
     pub fn next(&self, splits: BTreeMap<String, NodeId>) -> Self {
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
@@ -96,12 +81,10 @@ impl AssignmentSnapshotStore {
         Self { store }
     }
 
-    /// Load the current snapshot. Returns `Ok(None)` if no snapshot has
-    /// ever been written (fresh cluster).
+    /// Load the current snapshot; `Ok(None)` on fresh cluster.
     ///
     /// # Errors
-    /// Returns [`SnapshotError::Io`] on any non-`NotFound` store error,
-    /// and [`SnapshotError::Json`] if the stored bytes don't decode.
+    /// Object-store I/O or JSON decode failure.
     pub async fn load(&self) -> Result<Option<AssignmentSnapshot>, SnapshotError> {
         let path = OsPath::from(SNAPSHOT_PATH);
         match self.store.get(&path).await {
@@ -115,17 +98,10 @@ impl AssignmentSnapshotStore {
         }
     }
 
-    /// Save `snapshot` unconditionally. Overwrites any prior snapshot
-    /// at the same path.
-    ///
-    /// Concurrent writes are not guarded here; the cluster-control
-    /// layer serializes writes through the elected leader. If two
-    /// instances both think they're leader and race, the later write
-    /// wins — acceptable because the loser's assignment is about to be
-    /// superseded anyway when the real leader re-observes membership.
+    /// Save `snapshot`, last-write-wins. Leader serializes writes.
     ///
     /// # Errors
-    /// Returns [`SnapshotError::Io`] or [`SnapshotError::Json`].
+    /// Object-store I/O or JSON encode failure.
     pub async fn save(&self, snapshot: &AssignmentSnapshot) -> Result<(), SnapshotError> {
         let path = OsPath::from(SNAPSHOT_PATH);
         let bytes = serde_json::to_vec_pretty(snapshot)?;

@@ -4641,8 +4641,10 @@ dependencies = [
  "laminar-derive",
  "laminar-sql",
  "laminar-storage",
+ "object_store 0.13.2",
  "parking_lot 0.12.5",
  "prometheus",
+ "rdkafka",
  "rustc-hash",
  "serde",
  "serde_json",
@@ -4716,6 +4718,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "async-trait",
+ "bytes",
  "chrono",
  "criterion",
  "crossfire",
@@ -4732,6 +4735,7 @@ dependencies = [
  "sqlparser",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tracing",
 ]
 

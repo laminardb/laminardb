@@ -238,6 +238,16 @@ impl StateBackendConfig {
     pub fn is_durable(&self) -> bool {
         !matches!(self, Self::InProcess { .. })
     }
+
+    /// Number of vnodes this backend is sized for.
+    #[must_use]
+    pub fn vnode_capacity(&self) -> u32 {
+        match self {
+            Self::InProcess { vnode_capacity }
+            | Self::Local { vnode_capacity, .. }
+            | Self::ObjectStore { vnode_capacity, .. } => *vnode_capacity,
+        }
+    }
 }
 
 /// Dispatch a URL to the matching `object_store` implementation.
