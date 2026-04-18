@@ -235,8 +235,10 @@ pub trait CheckpointStore: Send + Sync {
             Err(e) => return Err(e),
         };
 
-        // Basic manifest validation
-        for err in manifest.validate() {
+        // Basic manifest validation.
+        // `DEFAULT_VNODE_COUNT` holds until Phase B plumbs the runtime
+        // `VnodeRegistry` value through the restore path.
+        for err in manifest.validate(crate::checkpoint_manifest::DEFAULT_VNODE_COUNT) {
             issues.push(format!("manifest validation: {err}"));
         }
 
@@ -542,8 +544,9 @@ impl CheckpointStore for FileSystemCheckpointStore {
         let json = std::fs::read_to_string(&path)?;
         let manifest: CheckpointManifest = serde_json::from_str(&json)?;
 
-        // Validate manifest consistency on load
-        let errors = manifest.validate();
+        // Validate manifest consistency on load. See integrity-check site
+        // above for the note on `DEFAULT_VNODE_COUNT`.
+        let errors = manifest.validate(crate::checkpoint_manifest::DEFAULT_VNODE_COUNT);
         if !errors.is_empty() {
             tracing::warn!(
                 checkpoint_id = id,

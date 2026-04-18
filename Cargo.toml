@@ -105,6 +105,9 @@ rand = "0.10"
 # Metrics
 prometheus = { version = "0.14", features = ["process"] }
 
+# Object store (S3/GCS/Azure/local filesystem) — shared across crates.
+object_store = "0.13"
+
 # Apache Iceberg
 iceberg = "0.9.0"
 iceberg-catalog-rest = "0.9.0"

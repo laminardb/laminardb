@@ -18,12 +18,17 @@ pub mod mv;
 pub mod operator;
 /// Shared Arrow IPC serialization for `RecordBatch` ↔ bytes.
 pub mod serialization;
+/// Cross-instance shuffle: message codec, credit flow, wire protocol.
+/// See `docs/plans/shuffle-protocol.md`.
+pub mod shuffle;
+/// Pluggable state backend (`StateBackend` trait + impls).
+pub mod state;
 pub mod streaming;
 pub mod time;
 
 /// Distributed cluster coordination. Unstable: gated behind `cluster-unstable`.
 #[cfg(feature = "cluster-unstable")]
-pub mod delta;
+pub mod cluster;
 
 /// Result type for laminar-core operations
 pub type Result<T> = std::result::Result<T, Error>;

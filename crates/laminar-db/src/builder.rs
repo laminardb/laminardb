@@ -36,6 +36,11 @@ pub struct LaminarDbBuilder {
     object_store_options: HashMap<String, String>,
     custom_udfs: Vec<ScalarUDF>,
     custom_udafs: Vec<AggregateUDF>,
+    /// Cluster control facade installed at cluster-mode startup.
+    /// Stays `None` in embedded / single-instance builds.
+    #[cfg(feature = "cluster-unstable")]
+    cluster_controller:
+        Option<std::sync::Arc<laminar_core::cluster::control::ClusterController>>,
 }
 
 impl LaminarDbBuilder {
@@ -52,7 +57,23 @@ impl LaminarDbBuilder {
             object_store_options: HashMap::new(),
             custom_udfs: Vec::new(),
             custom_udafs: Vec::new(),
+            #[cfg(feature = "cluster-unstable")]
+            cluster_controller: None,
         }
+    }
+
+    /// Install a cluster control facade. Activates cluster-mode
+    /// checkpoint / shuffle semantics inside the engine. Called from
+    /// `laminar-server`'s cluster startup path after discovery has
+    /// converged.
+    #[cfg(feature = "cluster-unstable")]
+    #[must_use]
+    pub fn cluster_controller(
+        mut self,
+        controller: std::sync::Arc<laminar_core::cluster::control::ClusterController>,
+    ) -> Self {
+        self.cluster_controller = Some(controller);
+        self
     }
 
     /// Set a config variable for `${VAR}` substitution in SQL.
@@ -103,7 +124,7 @@ impl LaminarDbBuilder {
     /// Set the object-store URL for durable checkpoints.
     ///
     /// Required when using [`Profile::Durable`] or
-    /// [`Profile::Delta`].
+    /// [`Profile::Cluster`].
     #[must_use]
     pub fn object_store_url(mut self, url: impl Into<String>) -> Self {
         self.object_store_url = Some(url.into());
@@ -297,6 +318,10 @@ impl LaminarDbBuilder {
         for udaf in self.custom_udafs {
             db.register_custom_udaf(udaf);
         }
+        #[cfg(feature = "cluster-unstable")]
+        if let Some(controller) = self.cluster_controller {
+            db.set_cluster_controller(controller);
+        }
         Ok(db)
     }
 
@@ -353,7 +378,7 @@ impl std::fmt::Debug for LaminarDbBuilder {
             .field("connector_callbacks", &self.connector_callbacks.len())
             .field("custom_udfs", &self.custom_udfs.len())
             .field("custom_udafs", &self.custom_udafs.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

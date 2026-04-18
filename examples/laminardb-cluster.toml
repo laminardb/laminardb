@@ -1,23 +1,23 @@
-# LaminarDB Server Configuration — Delta Mode (multi-node distributed)
+# LaminarDB Server Configuration — Cluster Mode (multi-node distributed)
 #
 # Each node in the cluster runs with its own copy of this config file,
 # with a unique node_id.
 #
 # Start with:
-#   laminardb --config laminardb-delta.toml
+#   laminardb --config laminardb-cluster.toml
 
 node_id = "star-1"
 
 [server]
-mode = "delta"
+mode = "cluster"
 bind = "0.0.0.0:8080"
 metrics_bind = "0.0.0.0:9090"
 workers = 8
 
 [state]
-backend = "mmap"
+backend = "local"
 path = "/data/laminardb/state"
-max_size_bytes = 10737418240  # 10 GB
+vnode_capacity = 256
 
 [checkpoint]
 url = "s3://laminardb-checkpoints/prod"

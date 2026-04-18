@@ -93,6 +93,7 @@ tempfile = { workspace = true }
 laminar-derive = { path = "../laminar-derive", version = "0.20.2" }
 laminar-connectors = { path = "../laminar-connectors", version = "0.20.2", features = ["testing"] }
 criterion = { workspace = true }
+bytes = { workspace = true }
 
 [[bench]]
 name = "recovery_bench"

@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::SourceConnector;
+use laminar_core::state::StateBackend;
 use laminar_storage::checkpoint_manifest::{
     CheckpointManifest, ConnectorCheckpoint, SinkCommitStatus,
 };
@@ -243,6 +244,21 @@ pub struct CheckpointCoordinator {
     smoothed_duration_ms: f64,
     /// Cumulative bytes written across all checkpoints (manifest + sidecar).
     total_bytes_written: u64,
+    /// Optional state backend consulted between manifest persist and sink
+    /// commit to verify per-vnode durability. See
+    /// `docs/plans/two-phase-ordering.md`.
+    state_backend: Option<Arc<dyn StateBackend>>,
+    /// Vnodes whose partials must be durable before sinks commit. Empty
+    /// skips the durability gate (single-instance, non-sharded operators).
+    /// Populated by Phase C once the `VnodeRegistry` is plumbed through.
+    vnode_set: Vec<u32>,
+    /// Cluster control facade. `Some` when running in cluster mode;
+    /// `None` in single-instance / embedded. The leader / follower
+    /// distinction and the quorum-wait flow consume this in the
+    /// C.5-final protocol change.
+    #[cfg(feature = "cluster-unstable")]
+    cluster_controller:
+        Option<Arc<laminar_core::cluster::control::ClusterController>>,
 }
 
 impl CheckpointCoordinator {
@@ -270,7 +286,55 @@ impl CheckpointCoordinator {
             prom: None,
             smoothed_duration_ms: 0.0,
             total_bytes_written: 0,
+            state_backend: None,
+            vnode_set: Vec::new(),
+            #[cfg(feature = "cluster-unstable")]
+            cluster_controller: None,
         }
+    }
+
+    /// Install a cluster control facade. Activates cluster-mode
+    /// checkpoint semantics (leader announce, follower ack, quorum
+    /// wait). When not called, the coordinator behaves as in
+    /// single-instance mode.
+    #[cfg(feature = "cluster-unstable")]
+    #[allow(dead_code)] // wired into the checkpoint flow in the C.5-final protocol change
+    pub(crate) fn set_cluster_controller(
+        &mut self,
+        controller: Arc<laminar_core::cluster::control::ClusterController>,
+    ) {
+        self.cluster_controller = Some(controller);
+    }
+
+    /// Borrow the installed cluster controller, if any. Used by the
+    /// checkpoint flow to detect leader / follower role and drive the
+    /// barrier protocol.
+    #[cfg(feature = "cluster-unstable")]
+    #[allow(dead_code)] // call sites land in the C.5-final protocol change
+    pub(crate) fn cluster_controller(
+        &self,
+    ) -> Option<&Arc<laminar_core::cluster::control::ClusterController>> {
+        self.cluster_controller.as_ref()
+    }
+
+    /// Install a state backend so the commit path consults
+    /// `epoch_complete` between manifest persist and sink commit.
+    ///
+    /// Phase B exposes this for tests; Phase C wires it into
+    /// `LaminarDB::builder()` so cluster-mode startup populates it.
+    #[allow(dead_code)] // call sites land in Phase C
+    pub(crate) fn set_state_backend(&mut self, backend: Arc<dyn StateBackend>) {
+        self.state_backend = Some(backend);
+    }
+
+    /// Set the vnodes whose partials must be durable for
+    /// `epoch_complete` to return true. Empty disables the gate.
+    ///
+    /// Phase B exposes this for tests; Phase C populates it from the
+    /// `VnodeRegistry`.
+    #[allow(dead_code)] // call sites land in Phase C
+    pub(crate) fn set_vnode_set(&mut self, vnodes: Vec<u32>) {
+        self.vnode_set = vnodes;
     }
 
     /// Registers a sink connector for checkpoint coordination.
@@ -912,6 +976,77 @@ impl CheckpointCoordinator {
                 duration,
                 error: Some(format!("manifest persist failed: {e}")),
             });
+        }
+
+        // Durability gate: confirm every participating vnode has its
+        // partial persisted before sinks commit. See
+        // docs/plans/two-phase-ordering.md §"The ordering" step 5.
+        //
+        // Trivially satisfied in single-instance mode (empty vnode_set or
+        // backend-not-installed); load-bearing in Phase C once partials
+        // are written per-vnode.
+        if let Some(ref backend) = self.state_backend {
+            if !self.vnode_set.is_empty() {
+                match backend.epoch_complete(epoch, &self.vnode_set).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        warn!(
+                            checkpoint_id,
+                            epoch,
+                            vnodes = self.vnode_set.len(),
+                            "[LDB-6020] state durability gate returned false — \
+                             rolling back sinks",
+                        );
+                        self.checkpoints_failed += 1;
+                        self.phase = CheckpointPhase::Idle;
+                        let duration = start.elapsed();
+                        self.emit_checkpoint_metrics(false, epoch, duration);
+                        if let Err(rollback_err) = self.rollback_sinks(epoch).await {
+                            error!(
+                                checkpoint_id,
+                                epoch,
+                                error = %rollback_err,
+                                "[LDB-6021] sink rollback failed after durability gate miss",
+                            );
+                        }
+                        return Ok(CheckpointResult {
+                            success: false,
+                            checkpoint_id,
+                            epoch,
+                            duration,
+                            error: Some("state durability gate: not all vnodes persisted".into()),
+                        });
+                    }
+                    Err(e) => {
+                        warn!(
+                            checkpoint_id,
+                            epoch,
+                            error = %e,
+                            "[LDB-6022] state backend error during durability gate — \
+                             treating as gate miss, rolling back sinks",
+                        );
+                        self.checkpoints_failed += 1;
+                        self.phase = CheckpointPhase::Idle;
+                        let duration = start.elapsed();
+                        self.emit_checkpoint_metrics(false, epoch, duration);
+                        if let Err(rollback_err) = self.rollback_sinks(epoch).await {
+                            error!(
+                                checkpoint_id,
+                                epoch,
+                                error = %rollback_err,
+                                "[LDB-6023] sink rollback failed after durability gate error",
+                            );
+                        }
+                        return Ok(CheckpointResult {
+                            success: false,
+                            checkpoint_id,
+                            epoch,
+                            duration,
+                            error: Some(format!("state durability gate: {e}")),
+                        });
+                    }
+                }
+            }
         }
 
         self.phase = CheckpointPhase::Committing;
@@ -1587,6 +1722,63 @@ mod tests {
 
         // No sidecar file
         assert!(coord.store().load_state_data(1).unwrap().is_none());
+    }
+
+    // Durability gate — SB-08 / Phase B. See docs/plans/two-phase-ordering.md.
+
+    #[tokio::test]
+    async fn durability_gate_skipped_when_vnode_set_empty() {
+        // With no state backend installed AND empty vnode set, the commit
+        // path behaves as before. Regression guard: Phase B must not change
+        // single-instance semantics.
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path());
+        let result = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(result.success, "baseline checkpoint must succeed");
+    }
+
+    #[tokio::test]
+    async fn durability_gate_passes_when_partials_present() {
+        use laminar_core::state::InProcessBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path());
+        let backend = Arc::new(InProcessBackend::new(4));
+        // Pre-populate vnode=0's partial for the epoch the coordinator
+        // will use (starts at 1 for a fresh store).
+        backend
+            .write_partial(0, 1, bytes::Bytes::from_static(b"ok"))
+            .await
+            .unwrap();
+        coord.set_state_backend(backend.clone());
+        coord.set_vnode_set(vec![0]);
+
+        let result = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(result.success, "gate should pass: partial was pre-written");
+    }
+
+    #[tokio::test]
+    async fn durability_gate_rolls_back_when_vnode_missing() {
+        use laminar_core::state::InProcessBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path());
+        // Backend exists but no partial for vnode=0 at the current epoch →
+        // epoch_complete returns false → gate must roll back.
+        coord.set_state_backend(Arc::new(InProcessBackend::new(4)));
+        coord.set_vnode_set(vec![0]);
+
+        let result = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(!result.success, "gate should fail: no partial");
+        let err = result.error.expect("gate-miss produces an error message");
+        assert!(err.contains("not all vnodes persisted"), "got: {err}");
     }
 
     #[test]

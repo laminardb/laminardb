@@ -186,6 +186,14 @@ impl LaminarDB {
                 coord.set_metrics(Arc::clone(prom));
             }
 
+            // Cluster mode: install the controller so the coordinator
+            // can consult it for leader / follower role once the
+            // barrier-protocol flow change lands.
+            #[cfg(feature = "cluster-unstable")]
+            if let Some(controller) = self.cluster_controller.lock().clone() {
+                coord.set_cluster_controller(controller);
+            }
+
             *self.coordinator.lock().await = Some(coord);
         }
 

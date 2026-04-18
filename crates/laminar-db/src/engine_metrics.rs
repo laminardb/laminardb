@@ -1,7 +1,8 @@
 //! Prometheus metrics for the streaming engine.
 
 use prometheus::{
-    Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+    Opts, Registry,
 };
 
 /// Pipeline metrics registered on an explicit prometheus `Registry`.
@@ -61,6 +62,22 @@ pub struct EngineMetrics {
     pub sink_precommit_duration: Histogram,
     /// Sink commit round-trip (2PC phase 2).
     pub sink_commit_duration: Histogram,
+    /// Time an operator spent waiting for the slowest input to deliver
+    /// its checkpoint barrier (aligned-checkpoint alignment wait).
+    /// Label: `operator`. Zero for single-input operators.
+    /// Drives the unaligned-checkpoint decision — see Addendum A.2 of
+    /// `docs/plans/distributed-stateful-pipelines.md`. Written by
+    /// per-operator shuffle code in Phase C.
+    pub barrier_alignment_wait: HistogramVec,
+    /// Delay between local watermark advancement and the first peer's
+    /// observation via the cluster watermark bus. Drives the
+    /// watermark-transport decision — see Addendum A.3. Written by the
+    /// `ChitchatWatermarkBus` in Phase C.
+    pub watermark_propagation: Histogram,
+    /// End-to-end event latency, source ingest to sink commit.
+    /// Label: `pipeline`. The primary SLA metric. Written by sink-side
+    /// timing in Phase C once cross-instance barriers land.
+    pub pipeline_e2e_latency: HistogramVec,
 }
 
 impl EngineMetrics {
@@ -196,6 +213,38 @@ impl EngineMetrics {
             sink_commit_duration: reg!(Histogram::with_opts(
                 HistogramOpts::new("sink_commit_duration_seconds", "Sink commit latency")
                     .buckets(prometheus::exponential_buckets(0.005, 2.0, 15).unwrap()),
+            )
+            .unwrap()),
+            // Alignment wait: typical <1ms, worst-case tens of seconds
+            // under skew. 0.0001s * 2^16 = 6.5s base range; tail captured.
+            barrier_alignment_wait: reg!(HistogramVec::new(
+                HistogramOpts::new(
+                    "barrier_alignment_wait_seconds",
+                    "Operator wait for slowest input barrier",
+                )
+                .buckets(prometheus::exponential_buckets(0.0001, 2.0, 16).unwrap()),
+                &["operator"],
+            )
+            .unwrap()),
+            // Watermark propagation: gossip is ~100ms–1s; coordinator-
+            // mediated could push down to 20–50ms. Bucketing covers both.
+            watermark_propagation: reg!(Histogram::with_opts(
+                HistogramOpts::new(
+                    "watermark_propagation_seconds",
+                    "Delay between local watermark advancement and peer observation",
+                )
+                .buckets(prometheus::exponential_buckets(0.001, 2.0, 14).unwrap()),
+            )
+            .unwrap()),
+            // E2E latency: dominated by checkpoint cadence, so same
+            // bucket shape as checkpoint_duration.
+            pipeline_e2e_latency: reg!(HistogramVec::new(
+                HistogramOpts::new(
+                    "pipeline_e2e_latency_seconds",
+                    "End-to-end event latency, source to sink commit",
+                )
+                .buckets(prometheus::exponential_buckets(0.01, 2.0, 15).unwrap()),
+                &["pipeline"],
             )
             .unwrap()),
         }

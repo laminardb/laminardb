@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::delta::discovery::NodeId;
+use crate::cluster::discovery::NodeId;
 
 /// Error returned when an epoch fence check fails.
 #[derive(Debug, thiserror::Error)]

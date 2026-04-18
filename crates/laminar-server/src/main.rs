@@ -4,9 +4,9 @@
 
 mod config;
 #[cfg(feature = "cluster-unstable")]
-mod delta;
+mod cluster;
 #[cfg(feature = "cluster-unstable")]
-mod delta_config;
+mod cluster_config;
 mod http;
 mod metrics;
 mod reload;

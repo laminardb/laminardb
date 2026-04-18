@@ -80,6 +80,13 @@ pub struct LaminarDB {
     pub(crate) control_tx: parking_lot::Mutex<Option<ControlMsgTx>>,
     /// Materialized view result store (shared with compute thread and query threads).
     pub(crate) mv_store: Arc<parking_lot::RwLock<crate::mv_store::MvStore>>,
+    /// Cluster control facade, installed by `LaminarDbBuilder::cluster_controller`.
+    /// `None` in embedded / single-instance mode; `Some` activates the
+    /// leader / follower checkpoint flow when the coordinator starts.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) cluster_controller: parking_lot::Mutex<
+        Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    >,
 }
 
 pub(crate) struct SourceWatermarkState {
@@ -217,7 +224,21 @@ impl LaminarDB {
             lookup_registry,
             control_tx: parking_lot::Mutex::new(None),
             mv_store: Arc::new(parking_lot::RwLock::new(crate::mv_store::MvStore::new())),
+            #[cfg(feature = "cluster-unstable")]
+            cluster_controller: parking_lot::Mutex::new(None),
         })
+    }
+
+    /// Install the cluster control facade. Called by
+    /// [`LaminarDbBuilder::cluster_controller`](crate::LaminarDbBuilder::cluster_controller)
+    /// before the pipeline starts; the `CheckpointCoordinator` picks
+    /// it up when constructed in `pipeline_lifecycle`.
+    #[cfg(feature = "cluster-unstable")]
+    pub fn set_cluster_controller(
+        &self,
+        controller: Arc<laminar_core::cluster::control::ClusterController>,
+    ) {
+        *self.cluster_controller.lock() = Some(controller);
     }
 
     /// Get a fluent builder for constructing a `LaminarDB`.

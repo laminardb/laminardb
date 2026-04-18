@@ -21,13 +21,15 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-/// Unique identifier for a node in the delta.
+/// Unique identifier for a node in the cluster.
 #[derive(
     Debug,
     Clone,
     Copy,
     PartialEq,
     Eq,
+    PartialOrd,
+    Ord,
     Hash,
     Serialize,
     Deserialize,

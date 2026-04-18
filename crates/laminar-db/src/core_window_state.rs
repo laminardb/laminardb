@@ -54,12 +54,16 @@ struct SessionGroupState {
 pub(crate) struct SessionCheckpoint {
     pub start: i64,
     pub end: i64,
-    pub acc_states: Vec<Vec<serde_json::Value>>,
+    /// One Arrow IPC blob per aggregate; each encodes that aggregate's
+    /// `Accumulator::state()` tuple as a one-row batch. See
+    /// [`crate::aggregate_state::scalars_to_ipc`].
+    pub acc_states: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SessionGroupCheckpoint {
-    pub key: Vec<serde_json::Value>,
+    /// Arrow IPC bytes for the group-key tuple.
+    pub key: Vec<u8>,
     pub sessions: Vec<SessionCheckpoint>,
 }
 
@@ -1339,7 +1343,7 @@ impl CoreWindowState {
 
     /// Checkpoint all per-window group states into a serializable struct.
     pub(crate) fn checkpoint_windows(&mut self) -> Result<CoreWindowCheckpoint, DbError> {
-        use crate::aggregate_state::scalar_to_json;
+        use crate::aggregate_state::scalars_to_ipc;
 
         let fingerprint = self.query_fingerprint();
         let window_type = self.window_type_tag().to_string();
@@ -1355,17 +1359,16 @@ impl CoreWindowState {
                             key,
                             &self.group_types,
                         )?;
-                        let key_json: Vec<serde_json::Value> =
-                            sv_key.iter().map(scalar_to_json).collect();
+                        let key_ipc = scalars_to_ipc(&sv_key)?;
                         let mut acc_states = Vec::with_capacity(accs.len());
                         for acc in accs {
                             let state = acc.state().map_err(|e| {
                                 DbError::Pipeline(format!("accumulator state: {e}"))
                             })?;
-                            acc_states.push(state.iter().map(scalar_to_json).collect());
+                            acc_states.push(scalars_to_ipc(&state)?);
                         }
                         group_checkpoints.push(GroupCheckpoint {
-                            key: key_json,
+                            key: key_ipc,
                             acc_states,
                             last_updated_ms: i64::MIN,
                         });
@@ -1390,8 +1393,7 @@ impl CoreWindowState {
                         key,
                         &self.group_types,
                     )?;
-                    let key_json: Vec<serde_json::Value> =
-                        sv_key.iter().map(scalar_to_json).collect();
+                    let key_ipc = scalars_to_ipc(&sv_key)?;
                     let mut sessions = Vec::with_capacity(group.sessions.len());
                     for sess in group.sessions.values_mut() {
                         let mut acc_states = Vec::with_capacity(sess.accs.len());
@@ -1399,7 +1401,7 @@ impl CoreWindowState {
                             let state = acc.state().map_err(|e| {
                                 DbError::Pipeline(format!("session accumulator state: {e}"))
                             })?;
-                            acc_states.push(state.iter().map(scalar_to_json).collect());
+                            acc_states.push(scalars_to_ipc(&state)?);
                         }
                         sessions.push(SessionCheckpoint {
                             start: sess.start,
@@ -1408,7 +1410,7 @@ impl CoreWindowState {
                         });
                     }
                     session_state.push(SessionGroupCheckpoint {
-                        key: key_json,
+                        key: key_ipc,
                         sessions,
                     });
                 }
@@ -1447,16 +1449,14 @@ impl CoreWindowState {
         &mut self,
         checkpoint: &CoreWindowCheckpoint,
     ) -> Result<usize, DbError> {
-        use crate::aggregate_state::json_to_scalar;
+        use crate::aggregate_state::ipc_to_scalars;
 
         self.windows.clear();
         let mut total_groups = 0usize;
         for wc in &checkpoint.windows {
             let mut groups = AHashMap::new();
             for gc in &wc.groups {
-                let sv_key: Result<Vec<ScalarValue>, _> =
-                    gc.key.iter().map(json_to_scalar).collect();
-                let sv_key = sv_key?;
+                let sv_key = ipc_to_scalars(&gc.key)?;
                 let row_key = crate::aggregate_state::scalar_key_to_owned_row(
                     &self.row_converter,
                     &sv_key,
@@ -1466,9 +1466,7 @@ impl CoreWindowState {
                 for (i, spec) in self.agg_specs.iter().enumerate() {
                     let mut acc = spec.create_accumulator()?;
                     if i < gc.acc_states.len() {
-                        let state_scalars: Result<Vec<ScalarValue>, _> =
-                            gc.acc_states[i].iter().map(json_to_scalar).collect();
-                        let state_scalars = state_scalars?;
+                        let state_scalars = ipc_to_scalars(&gc.acc_states[i])?;
                         let arrays: Vec<arrow::array::ArrayRef> = state_scalars
                             .iter()
                             .map(|sv| {
@@ -1494,13 +1492,12 @@ impl CoreWindowState {
         &mut self,
         checkpoint: &CoreWindowCheckpoint,
     ) -> Result<usize, DbError> {
-        use crate::aggregate_state::json_to_scalar;
+        use crate::aggregate_state::ipc_to_scalars;
 
         self.session_groups.clear();
         let mut total_sessions = 0usize;
         for sgc in &checkpoint.session_state {
-            let sv_key: Result<Vec<ScalarValue>, _> = sgc.key.iter().map(json_to_scalar).collect();
-            let sv_key = sv_key?;
+            let sv_key = ipc_to_scalars(&sgc.key)?;
             let row_key = crate::aggregate_state::scalar_key_to_owned_row(
                 &self.row_converter,
                 &sv_key,
@@ -1512,9 +1509,7 @@ impl CoreWindowState {
                 for (i, spec) in self.agg_specs.iter().enumerate() {
                     let mut acc = spec.create_accumulator()?;
                     if i < sc.acc_states.len() {
-                        let state_scalars: Result<Vec<ScalarValue>, _> =
-                            sc.acc_states[i].iter().map(json_to_scalar).collect();
-                        let state_scalars = state_scalars?;
+                        let state_scalars = ipc_to_scalars(&sc.acc_states[i])?;
                         let arrays: Vec<arrow::array::ArrayRef> = state_scalars
                             .iter()
                             .map(|sv| {

@@ -1,16 +1,15 @@
-//! # Delta Coordination
+//! # Cluster Coordination
 //!
-//! Implements the orchestration layer for the delta.
-//! This module manages the lifecycle of a node in the delta:
-//! discovery, partition assignment, and graceful shutdown.
+//! Implements the orchestration layer for the cluster. Manages the
+//! lifecycle of a node: discovery, partition assignment, and graceful
+//! shutdown.
 
 use std::fmt;
 
-use crate::delta::discovery::{MembershipEvent, NodeId, NodeState};
-use crate::delta::partition::assignment::AssignmentConstraints;
-use crate::delta::partition::guard::PartitionGuardSet;
+use crate::cluster::discovery::{MembershipEvent, NodeId, NodeState};
+use crate::cluster::partition::guard::PartitionGuardSet;
 
-/// The current lifecycle phase of a node in the delta.
+/// The current lifecycle phase of a node in the cluster.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeLifecyclePhase {
     /// Discovering other nodes via the configured discovery backend.
@@ -57,18 +56,17 @@ impl fmt::Display for NodeLifecyclePhase {
     }
 }
 
-/// Top-level delta lifecycle orchestrator.
+/// Top-level cluster lifecycle orchestrator.
 ///
 /// Manages the node lifecycle and coordinates partition ownership
 /// when cluster membership changes.
-pub struct DeltaManager {
+pub struct ClusterManager {
     node_id: NodeId,
     phase: NodeLifecyclePhase,
     guards: PartitionGuardSet,
-    constraints: AssignmentConstraints,
 }
 
-impl DeltaManager {
+impl ClusterManager {
     /// Create a new manager.
     #[must_use]
     pub fn new(node_id: NodeId) -> Self {
@@ -76,7 +74,6 @@ impl DeltaManager {
             node_id,
             phase: NodeLifecyclePhase::Discovering,
             guards: PartitionGuardSet::new(node_id),
-            constraints: AssignmentConstraints::default(),
         }
     }
 
@@ -164,21 +161,16 @@ impl DeltaManager {
         }
     }
 
-    /// Get the current assignment constraints.
-    #[must_use]
-    pub fn constraints(&self) -> &AssignmentConstraints {
-        &self.constraints
-    }
-
-    /// Update the assignment constraints.
-    pub fn set_constraints(&mut self, constraints: AssignmentConstraints) {
-        self.constraints = constraints;
-    }
+    // Note: `AssignmentConstraints` and the constraint setter used to live
+    // here. They were removed alongside `ConsistentHashAssigner` in Phase
+    // A of the distributed-pipelines plan; real constraints handling will
+    // land with the Phase C control plane (Kafka consumer group +
+    // per-connector dispatch).
 }
 
-impl fmt::Debug for DeltaManager {
+impl fmt::Debug for ClusterManager {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DeltaManager")
+        f.debug_struct("ClusterManager")
             .field("node_id", &self.node_id)
             .field("phase", &self.phase)
             .field("guards", &self.guards.len())
@@ -189,10 +181,10 @@ impl fmt::Debug for DeltaManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delta::discovery::NodeMetadata;
+    use crate::cluster::discovery::NodeMetadata;
 
-    fn make_node(id: u64, cores: u32) -> crate::delta::discovery::NodeInfo {
-        crate::delta::discovery::NodeInfo {
+    fn make_node(id: u64, cores: u32) -> crate::cluster::discovery::NodeInfo {
+        crate::cluster::discovery::NodeInfo {
             id: NodeId(id),
             name: format!("node-{id}"),
             rpc_address: format!("127.0.0.1:{}", 9000 + id),
@@ -229,14 +221,14 @@ mod tests {
 
     #[test]
     fn test_manager_initial_phase() {
-        let mgr = DeltaManager::new(NodeId(1));
+        let mgr = ClusterManager::new(NodeId(1));
         assert_eq!(mgr.phase(), NodeLifecyclePhase::Discovering);
         assert!(mgr.guards().is_empty());
     }
 
     #[test]
     fn test_valid_transitions() {
-        let mut mgr = DeltaManager::new(NodeId(1));
+        let mut mgr = ClusterManager::new(NodeId(1));
 
         assert!(mgr.transition(NodeLifecyclePhase::FormingRaft));
         assert_eq!(mgr.phase(), NodeLifecyclePhase::FormingRaft);
@@ -259,7 +251,7 @@ mod tests {
 
     #[test]
     fn test_skip_restore_transition() {
-        let mut mgr = DeltaManager::new(NodeId(1));
+        let mut mgr = ClusterManager::new(NodeId(1));
         mgr.transition(NodeLifecyclePhase::FormingRaft);
         mgr.transition(NodeLifecyclePhase::WaitingForAssignment);
         assert!(mgr.transition(NodeLifecyclePhase::Active));
@@ -267,7 +259,7 @@ mod tests {
 
     #[test]
     fn test_invalid_transitions() {
-        let mut mgr = DeltaManager::new(NodeId(1));
+        let mut mgr = ClusterManager::new(NodeId(1));
         assert!(!mgr.transition(NodeLifecyclePhase::Active));
         assert_eq!(mgr.phase(), NodeLifecyclePhase::Discovering);
 
@@ -278,7 +270,7 @@ mod tests {
 
     #[test]
     fn test_should_rebalance_when_active() {
-        let mut mgr = DeltaManager::new(NodeId(1));
+        let mut mgr = ClusterManager::new(NodeId(1));
         mgr.transition(NodeLifecyclePhase::FormingRaft);
         mgr.transition(NodeLifecyclePhase::WaitingForAssignment);
         mgr.transition(NodeLifecyclePhase::Active);
@@ -289,13 +281,13 @@ mod tests {
 
     #[test]
     fn test_should_not_rebalance_when_discovering() {
-        let mgr = DeltaManager::new(NodeId(1));
+        let mgr = ClusterManager::new(NodeId(1));
         assert!(!mgr.should_rebalance(&MembershipEvent::NodeJoined(Box::new(make_node(2, 4)))));
     }
 
     #[test]
     fn test_apply_migration_result_source() {
-        let mut mgr = DeltaManager::new(NodeId(1));
+        let mut mgr = ClusterManager::new(NodeId(1));
         mgr.guards_mut().insert(5, 1);
         mgr.apply_migration_result(5, NodeId(1), NodeId(2), 2);
         assert!(mgr.guards().is_empty());
@@ -303,28 +295,17 @@ mod tests {
 
     #[test]
     fn test_apply_migration_result_target() {
-        let mut mgr = DeltaManager::new(NodeId(2));
+        let mut mgr = ClusterManager::new(NodeId(2));
         mgr.apply_migration_result(5, NodeId(1), NodeId(2), 2);
         assert_eq!(mgr.guards().len(), 1);
         assert!(mgr.guards().check(5).is_ok());
     }
 
     #[test]
-    fn test_manager_set_constraints() {
-        let mut mgr = DeltaManager::new(NodeId(1));
-        let constraints = AssignmentConstraints {
-            max_partitions_per_node: 20,
-            ..AssignmentConstraints::default()
-        };
-        mgr.set_constraints(constraints);
-        assert_eq!(mgr.constraints().max_partitions_per_node, 20);
-    }
-
-    #[test]
     fn test_manager_debug() {
-        let mgr = DeltaManager::new(NodeId(1));
+        let mgr = ClusterManager::new(NodeId(1));
         let debug = format!("{mgr:?}");
-        assert!(debug.contains("DeltaManager"));
+        assert!(debug.contains("ClusterManager"));
         assert!(debug.contains("NodeId(1)"));
     }
 }

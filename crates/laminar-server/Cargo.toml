@@ -132,6 +132,7 @@ azure = ["laminar-db/azure"]
 # yet implemented. Gated so the default binary does not advertise it.
 cluster-unstable = [
     "laminar-core/cluster-unstable",
+    "laminar-db/cluster-unstable",
     "dep:uuid",
     "dep:xxhash-rust",
 ]

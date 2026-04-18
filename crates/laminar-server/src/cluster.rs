@@ -1,4 +1,4 @@
-//! Delta (multi-node) mode startup orchestrator.
+//! Cluster (multi-node) mode startup orchestrator.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -8,12 +8,11 @@ use tokio::signal;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use laminar_core::delta::coordination::{DeltaManager, NodeLifecyclePhase};
-use laminar_core::delta::discovery::{
+use laminar_core::cluster::coordination::{ClusterManager, NodeLifecyclePhase};
+use laminar_core::cluster::discovery::{
     Discovery, DiscoveryError, GossipDiscovery, GossipDiscoveryConfig, NodeId, NodeInfo,
     NodeMetadata, NodeState, StaticDiscovery, StaticDiscoveryConfig,
 };
-use laminar_core::delta::partition::assignment::{AssignmentConstraints, ConsistentHashAssigner};
 /// Enum dispatch — `Discovery` trait uses `async fn` (not dyn-compatible).
 enum DiscoveryImpl {
     Static(StaticDiscovery),
@@ -132,11 +131,11 @@ fn spawn_membership_watcher(
 use laminar_db::{LaminarDB, Profile};
 
 use crate::config::ServerConfig;
-use crate::delta_config::DeltaConfig;
+use crate::cluster_config::ClusterConfig;
 use crate::server;
 
 #[derive(Debug, thiserror::Error)]
-pub enum DeltaStartupError {
+pub enum ClusterStartupError {
     #[error("discovery failed: {0}")]
     Discovery(String),
     #[error("formation timeout: only {found} of {needed} peers discovered")]
@@ -147,7 +146,7 @@ pub enum DeltaStartupError {
     HttpStartup(String),
 }
 
-pub struct DeltaHandle {
+pub struct ClusterHandle {
     db: Arc<LaminarDB>,
     discovery: DiscoveryImpl,
     api_handle: tokio::task::JoinHandle<()>,
@@ -155,13 +154,13 @@ pub struct DeltaHandle {
     membership_handle: tokio::task::JoinHandle<()>,
 }
 
-impl DeltaHandle {
-    pub async fn wait_for_shutdown(mut self) -> Result<(), DeltaStartupError> {
+impl ClusterHandle {
+    pub async fn wait_for_shutdown(mut self) -> Result<(), ClusterStartupError> {
         signal::ctrl_c()
             .await
-            .map_err(|e| DeltaStartupError::Discovery(format!("signal handler: {e}")))?;
+            .map_err(|e| ClusterStartupError::Discovery(format!("signal handler: {e}")))?;
 
-        info!("Received shutdown signal, shutting down delta node...");
+        info!("Received shutdown signal, shutting down cluster node...");
 
         // Stop membership watcher
         self.membership_handle.abort();
@@ -184,18 +183,18 @@ impl DeltaHandle {
         // Abort HTTP
         self.api_handle.abort();
 
-        info!("Delta node shutdown complete");
+        info!("Cluster node shutdown complete");
         Ok(())
     }
 }
 
-/// Start a LaminarDB server in delta (multi-node) mode.
-pub async fn start_delta(
+/// Start a LaminarDB server in cluster (multi-node) mode.
+pub async fn start_cluster(
     config: ServerConfig,
-    delta_cfg: DeltaConfig,
+    cluster_cfg: ClusterConfig,
     config_path: PathBuf,
-) -> Result<DeltaHandle, DeltaStartupError> {
-    let node_id_str = delta_cfg.node_id.as_str().to_string();
+) -> Result<ClusterHandle, ClusterStartupError> {
+    let node_id_str = cluster_cfg.node_id.as_str().to_string();
     // Use xxhash3 (deterministic across Rust versions) for the numeric NodeId.
     // DefaultHasher is explicitly unstable across compiler versions (C4 fix).
     let node_id_num = {
@@ -210,7 +209,7 @@ pub async fn start_delta(
     let node_id = NodeId(node_id_num);
 
     let bind_addr = &config.server.bind;
-    let coordination = &delta_cfg.coordination;
+    let coordination = &cluster_cfg.coordination;
     let raft_port = coordination.raft_port;
     // RPC port = raft_port + 1. Guard against u16 overflow (W17 fix).
     let rpc_port = raft_port.checked_add(1).unwrap_or(raft_port);
@@ -246,15 +245,15 @@ pub async fn start_delta(
 
     // 1. Start discovery layer
     info!(
-        "Starting delta discovery (strategy: {})",
-        delta_cfg.discovery.strategy
+        "Starting cluster discovery (strategy: {})",
+        cluster_cfg.discovery.strategy
     );
 
-    let mut discovery: DiscoveryImpl = match delta_cfg.discovery.strategy.as_str() {
+    let mut discovery: DiscoveryImpl = match cluster_cfg.discovery.strategy.as_str() {
         "gossip" => {
             let gossip_config = GossipDiscoveryConfig {
-                gossip_address: format!("0.0.0.0:{}", delta_cfg.discovery.gossip_port),
-                seed_nodes: delta_cfg.discovery.seeds.clone(),
+                gossip_address: format!("0.0.0.0:{}", cluster_cfg.discovery.gossip_port),
+                seed_nodes: cluster_cfg.discovery.seeds.clone(),
                 gossip_interval: std::time::Duration::from_secs(1),
                 phi_threshold: 8.0,
                 dead_node_grace_period: std::time::Duration::from_secs(60),
@@ -268,11 +267,11 @@ pub async fn start_delta(
             // Default to static discovery
             let static_config = StaticDiscoveryConfig {
                 local_node: local_node.clone(),
-                seeds: delta_cfg.discovery.seeds.clone(),
+                seeds: cluster_cfg.discovery.seeds.clone(),
                 heartbeat_interval: std::time::Duration::from_secs(1),
                 suspect_threshold: 3,
                 dead_threshold: 10,
-                listen_address: format!("0.0.0.0:{}", delta_cfg.discovery.gossip_port),
+                listen_address: format!("0.0.0.0:{}", cluster_cfg.discovery.gossip_port),
             };
             DiscoveryImpl::Static(StaticDiscovery::new(static_config))
         }
@@ -281,11 +280,11 @@ pub async fn start_delta(
     discovery
         .start()
         .await
-        .map_err(|e| DeltaStartupError::Discovery(e.to_string()))?;
+        .map_err(|e| ClusterStartupError::Discovery(e.to_string()))?;
     info!("Discovery layer started");
 
     // 2. Wait for peers with formation timeout
-    let peers: Vec<NodeInfo> = tokio::time::timeout(delta_cfg.formation_timeout, async {
+    let peers: Vec<NodeInfo> = tokio::time::timeout(cluster_cfg.formation_timeout, async {
         loop {
             if let Ok(p) = discovery.peers().await {
                 if !p.is_empty() {
@@ -296,60 +295,69 @@ pub async fn start_delta(
         }
     })
     .await
-    .map_err(|_| DeltaStartupError::FormationTimeout {
+    .map_err(|_| ClusterStartupError::FormationTimeout {
         found: 0,
         needed: 1,
     })?;
     info!("Discovered {} peer(s)", peers.len());
 
-    // 3. Create DeltaManager and advance to Active
-    let mut manager = DeltaManager::new(node_id);
+    // 3. Create ClusterManager and advance to Active
+    let mut manager = ClusterManager::new(node_id);
     manager.transition(NodeLifecyclePhase::FormingRaft);
     manager.transition(NodeLifecyclePhase::WaitingForAssignment);
     manager.transition(NodeLifecyclePhase::Active);
-    info!("DeltaManager phase: {}", manager.phase());
+    info!("ClusterManager phase: {}", manager.phase());
 
-    // 4. Compute initial partition assignment
+    // Partition assignment (placeholder until Phase C lands Kafka consumer group +
+    // per-connector dispatch). For now this node owns a symbolic partition set
+    // sized to its worker count, which is enough to exercise the
+    // PartitionGuardSet plumbing without pretending to assign across peers.
     let workers = if config.server.workers == 0 {
         num_cpus() as usize
     } else {
         config.server.workers
     };
+    #[allow(clippy::cast_possible_truncation)]
     let num_partitions = (workers * 4).max(16) as u32;
-
-    let assigner = ConsistentHashAssigner::new();
-    let all_nodes: Vec<NodeInfo> = {
-        let mut v = vec![local_node];
-        v.extend(peers);
-        v
-    };
-    let plan = assigner.initial_assignment(
-        num_partitions,
-        &all_nodes,
-        &AssignmentConstraints::default(),
-    );
-    info!(
-        "Partition assignment: {} partitions across {} nodes ({} assigned to this node)",
-        plan.stats.total_partitions,
-        all_nodes.len(),
-        plan.assignments.values().filter(|&&n| n == node_id).count(),
-    );
-
-    // 5. Populate partition guards for partitions assigned to this node
-    for (&partition_id, &assigned_node) in &plan.assignments {
-        if assigned_node == node_id {
-            manager.guards_mut().insert(partition_id, 1); // epoch 1 for initial assignment
-        }
+    for partition_id in 0..num_partitions {
+        manager.guards_mut().insert(partition_id, 1);
     }
-    info!("Created {} partition guards", manager.guards().len());
+    info!(
+        "Placeholder assignment: {num_partitions} partitions owned by this node \
+         ({} peers discovered; real cross-node assignment ships in Phase C)",
+        peers.len()
+    );
 
-    // Build LaminarDB with Profile::Delta
+    // Build LaminarDB with Profile::Cluster
     let mut builder = LaminarDB::builder();
-    builder = builder.profile(Profile::Delta);
+    builder = builder.profile(Profile::Cluster);
 
-    let has_storage = config.state.backend != "memory";
-    if has_storage {
-        builder = builder.storage_dir(&config.state.path);
+    if let Some(path) = config.state.local_storage_dir() {
+        builder = builder.storage_dir(path);
+    }
+
+    // Construct the ClusterController if we have a chitchat handle
+    // (gossip discovery only — static discovery has no KV tier).
+    // The controller is available to the CheckpointCoordinator for the
+    // leader / follower barrier protocol once the flow change lands.
+    if let DiscoveryImpl::Gossip(ref gossip) = discovery {
+        if let Some(handle) = gossip.chitchat_handle() {
+            use laminar_core::cluster::control::{ChitchatKv, ClusterController, ClusterKv};
+            let kv: Arc<dyn ClusterKv> = Arc::new(ChitchatKv::from_handle(handle));
+            let members_rx = discovery.membership_watch();
+            let controller = Arc::new(ClusterController::new(node_id, kv, None, members_rx));
+            info!(
+                "ClusterController installed (leader={})",
+                controller.is_leader()
+            );
+            builder = builder.cluster_controller(controller);
+        }
+    } else {
+        info!(
+            "Static discovery — cluster control plane skipped \
+             (no chitchat KV). Leader/follower barrier protocol \
+             inactive in this mode."
+        );
     }
 
     // Namespace checkpoints per node for partition migration reads.
@@ -368,7 +376,7 @@ pub async fn start_delta(
     let db = builder
         .build()
         .await
-        .map_err(|e| DeltaStartupError::EngineConstruction(e.to_string()))?;
+        .map_err(|e| ClusterStartupError::EngineConstruction(e.to_string()))?;
     let db = Arc::new(db);
 
     // Build prometheus registry before start() so connectors register on it.
@@ -388,17 +396,17 @@ pub async fn start_delta(
 
     server::execute_config_ddl(&db, &config)
         .await
-        .map_err(|e| DeltaStartupError::EngineConstruction(e.to_string()))?;
+        .map_err(|e| ClusterStartupError::EngineConstruction(e.to_string()))?;
 
     db.start()
         .await
-        .map_err(|e| DeltaStartupError::EngineConstruction(format!("pipeline start: {e}")))?;
+        .map_err(|e| ClusterStartupError::EngineConstruction(format!("pipeline start: {e}")))?;
     info!("Pipeline started");
 
     let (app_state, api_handle) =
         server::start_http_api(Arc::clone(&db), registry, config_path.clone(), config)
             .await
-            .map_err(|e| DeltaStartupError::HttpStartup(e.to_string()))?;
+            .map_err(|e| ClusterStartupError::HttpStartup(e.to_string()))?;
     let watcher_handle = server::spawn_config_watcher(&app_state, config_path);
 
     let membership_rx = discovery.membership_watch();
@@ -406,9 +414,9 @@ pub async fn start_delta(
     info!("Membership watcher started");
 
     let num_guards = manager.guards().len();
-    info!("Delta node '{node_id_str}' started with {num_guards} partitions");
+    info!("Cluster node '{node_id_str}' started with {num_guards} partitions");
 
-    Ok(DeltaHandle {
+    Ok(ClusterHandle {
         db,
         discovery,
         api_handle,
@@ -428,15 +436,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_delta_startup_error_display() {
-        let errors: Vec<DeltaStartupError> = vec![
-            DeltaStartupError::Discovery("connection refused".into()),
-            DeltaStartupError::FormationTimeout {
+    fn test_cluster_startup_error_display() {
+        let errors: Vec<ClusterStartupError> = vec![
+            ClusterStartupError::Discovery("connection refused".into()),
+            ClusterStartupError::FormationTimeout {
                 found: 1,
                 needed: 3,
             },
-            DeltaStartupError::EngineConstruction("build failed".into()),
-            DeltaStartupError::HttpStartup("port in use".into()),
+            ClusterStartupError::EngineConstruction("build failed".into()),
+            ClusterStartupError::HttpStartup("port in use".into()),
         ];
         for err in &errors {
             assert!(!err.to_string().is_empty());
@@ -445,7 +453,7 @@ mod tests {
 
     #[test]
     fn test_formation_timeout_includes_counts() {
-        let err = DeltaStartupError::FormationTimeout {
+        let err = ClusterStartupError::FormationTimeout {
             found: 1,
             needed: 3,
         };

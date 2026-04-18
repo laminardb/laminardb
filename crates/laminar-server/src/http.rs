@@ -545,7 +545,7 @@ mod tests {
             config_path: PathBuf::from("test.toml"),
             current_config: tokio::sync::RwLock::new(crate::config::ServerConfig {
                 server: crate::config::ServerSection::default(),
-                state: crate::config::StateSection::default(),
+                state: laminar_core::state::StateBackendConfig::default(),
                 checkpoint: crate::config::CheckpointSection::default(),
                 sources: vec![],
                 lookups: vec![],
@@ -795,7 +795,7 @@ mod tests {
             config_path: path,
             current_config: tokio::sync::RwLock::new(crate::config::ServerConfig {
                 server: crate::config::ServerSection::default(),
-                state: crate::config::StateSection::default(),
+                state: laminar_core::state::StateBackendConfig::default(),
                 checkpoint: crate::config::CheckpointSection::default(),
                 sources: vec![],
                 lookups: vec![],

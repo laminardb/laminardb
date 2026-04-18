@@ -12,8 +12,10 @@ use laminar_db::{DbError, EngineMetrics, LaminarDB, Profile};
 use crate::config::{
     ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
 };
+#[cfg(test)]
+use laminar_core::state::StateBackendConfig;
 #[cfg(feature = "cluster-unstable")]
-use crate::delta_config::{DeltaConfig, DeltaConfigError};
+use crate::cluster_config::{ClusterConfig, ClusterConfigError};
 use crate::http;
 use crate::metrics::ServerMetrics;
 use crate::reload::ReloadGuard;
@@ -26,7 +28,7 @@ pub enum ServerHandle {
         watcher_handle: Option<tokio::task::JoinHandle<()>>,
     },
     #[cfg(feature = "cluster-unstable")]
-    Delta(Box<crate::delta::DeltaHandle>),
+    Cluster(Box<crate::cluster::ClusterHandle>),
 }
 
 impl ServerHandle {
@@ -54,10 +56,10 @@ impl ServerHandle {
                 Ok(())
             }
             #[cfg(feature = "cluster-unstable")]
-            Self::Delta(handle) => (*handle)
+            Self::Cluster(handle) => (*handle)
                 .wait_for_shutdown()
                 .await
-                .map_err(|e| ServerError::Delta(e.to_string())),
+                .map_err(|e| ServerError::Cluster(e.to_string())),
         }
     }
 }
@@ -93,19 +95,19 @@ pub async fn run_server(
     // Cluster mode: gated behind the `cluster-unstable` feature flag.
     #[cfg(feature = "cluster-unstable")]
     {
-        let delta_cfg = DeltaConfig::from_server_config(&config)?;
+        let cluster_cfg = ClusterConfig::from_server_config(&config)?;
 
-        if let Some(delta_cfg) = delta_cfg {
-            let handle = crate::delta::start_delta(config, delta_cfg, config_path)
+        if let Some(cluster_cfg) = cluster_cfg {
+            let handle = crate::cluster::start_cluster(config, cluster_cfg, config_path)
                 .await
-                .map_err(|e| ServerError::Delta(e.to_string()))?;
-            return Ok(ServerHandle::Delta(Box::new(handle)));
+                .map_err(|e| ServerError::Cluster(e.to_string()))?;
+            return Ok(ServerHandle::Cluster(Box::new(handle)));
         }
     }
     #[cfg(not(feature = "cluster-unstable"))]
-    if config.server.mode == "delta" {
-        return Err(ServerError::Delta(
-            "Delta/cluster mode requires the 'cluster-unstable' feature flag. \
+    if config.server.mode == "cluster" {
+        return Err(ServerError::Cluster(
+            "Cluster mode requires the 'cluster-unstable' feature flag. \
              This mode is not yet production-ready."
                 .to_string(),
         ));
@@ -114,15 +116,16 @@ pub async fn run_server(
     // Build LaminarDB via builder API
     let mut builder = LaminarDB::builder();
 
-    let has_storage = config.state.backend != "memory";
-    if has_storage {
-        builder = builder.storage_dir(&config.state.path);
+    let storage_dir = config.state.local_storage_dir();
+    let has_storage = config.state.is_durable();
+    if let Some(path) = storage_dir {
+        builder = builder.storage_dir(path);
     }
 
     let profile = match config.server.mode.as_str() {
         "embedded" if has_storage => Profile::Embedded,
         "embedded" => Profile::BareMetal,
-        "delta" => Profile::Delta,
+        "cluster" => Profile::Cluster,
         _ => Profile::BareMetal,
     };
     builder = builder.profile(profile);
@@ -168,7 +171,7 @@ pub async fn run_server(
 }
 
 // ---------------------------------------------------------------------------
-// Shared helpers (used by both embedded and delta startup)
+// Shared helpers (used by both embedded and cluster startup)
 // ---------------------------------------------------------------------------
 
 /// Apply checkpoint settings to a `LaminarDB` builder.
@@ -513,11 +516,11 @@ pub enum ServerError {
     Shutdown(String),
     #[error(transparent)]
     Config(#[from] ConfigError),
-    #[error("delta mode error: {0}")]
-    Delta(String),
+    #[error("cluster mode error: {0}")]
+    Cluster(String),
     #[cfg(feature = "cluster-unstable")]
     #[error(transparent)]
-    DeltaConfig(#[from] DeltaConfigError),
+    ClusterConfig(#[from] ClusterConfigError),
 }
 
 #[cfg(test)]
@@ -587,7 +590,7 @@ mod tests {
         let db = laminar_db::LaminarDB::open().unwrap();
         let config = ServerConfig {
             server: ServerSection::default(),
-            state: StateSection::default(),
+            state: StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
             sources: vec![source],
             lookups: vec![],
@@ -620,7 +623,7 @@ mod tests {
         let db = laminar_db::LaminarDB::open().unwrap();
         let config = ServerConfig {
             server: ServerSection::default(),
-            state: StateSection::default(),
+            state: StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
             sources: vec![source],
             lookups: vec![],

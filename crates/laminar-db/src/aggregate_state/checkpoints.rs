@@ -1,5 +1,11 @@
-//! Serializable checkpoint shapes. These are the on-disk forms — field
-//! names and `#[serde(default = ...)]` fallbacks are part of the format.
+//! Serializable checkpoint shapes.
+//!
+//! **Wire format note:** each `Vec<u8>` / `Vec<Vec<u8>>` below is an
+//! Arrow IPC stream produced by
+//! [`scalars_to_ipc`](super::scalars_to_ipc). Historically these were
+//! `Vec<serde_json::Value>` and `Vec<Vec<serde_json::Value>>` — see
+//! [`scalar_ipc`](super::scalar_ipc) for the rationale and for the
+//! one-row-batch encoding of a scalar tuple.
 
 use std::hash::{Hash, Hasher};
 
@@ -7,8 +13,11 @@ use arrow::datatypes::Schema;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GroupCheckpoint {
-    pub key: Vec<serde_json::Value>,
-    pub acc_states: Vec<Vec<serde_json::Value>>,
+    /// IPC bytes encoding the group key tuple (`Vec<ScalarValue>`).
+    pub key: Vec<u8>,
+    /// One IPC blob per aggregate, each encoding that aggregate's
+    /// `Accumulator::state()` tuple.
+    pub acc_states: Vec<Vec<u8>>,
     #[serde(default = "default_last_updated")]
     pub last_updated_ms: i64,
 }
@@ -27,8 +36,10 @@ pub(crate) struct AggStateCheckpoint {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct EmittedCheckpoint {
-    pub key: Vec<serde_json::Value>,
-    pub values: Vec<serde_json::Value>,
+    /// IPC bytes for the key tuple.
+    pub key: Vec<u8>,
+    /// IPC bytes for the emitted value tuple.
+    pub values: Vec<u8>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]

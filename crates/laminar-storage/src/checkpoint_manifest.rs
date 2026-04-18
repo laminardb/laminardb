@@ -22,8 +22,16 @@ pub enum SinkCommitStatus {
     Failed(String),
 }
 
-/// Virtual partition count for state key distribution.
-pub const VNODE_COUNT: u16 = 256;
+/// Default virtual partition count for state key distribution.
+///
+/// Manifests are written with this value unless the caller overrides via
+/// [`CheckpointManifest::new_with_vnode_count`]. On restore, the runtime's
+/// actual vnode count is supplied to [`CheckpointManifest::validate`] so
+/// that a pipeline configured with a different count sees a validation
+/// error. Before the `VnodeRegistry` was runtime-configurable this was a
+/// hard compile-time constant; keeping the default here preserves the old
+/// on-disk behavior until Phase B plumbs the runtime value through.
+pub const DEFAULT_VNODE_COUNT: u16 = 256;
 
 /// A point-in-time snapshot of all pipeline state.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -125,11 +133,16 @@ impl std::fmt::Display for ManifestValidationError {
 impl CheckpointManifest {
     /// Validates manifest consistency before recovery.
     ///
+    /// `expected_vnode_count` is the runtime's configured vnode count;
+    /// a manifest written with a different count can't be safely restored
+    /// because state keys won't map to the same shards. Pass
+    /// [`DEFAULT_VNODE_COUNT`] if the runtime hasn't overridden it.
+    ///
     /// Returns a list of issues found. An empty list means the manifest is valid.
     /// Callers should treat non-empty results as warnings (recovery may still
     /// proceed) or errors depending on severity.
     #[must_use]
-    pub fn validate(&self) -> Vec<ManifestValidationError> {
+    pub fn validate(&self, expected_vnode_count: u16) -> Vec<ManifestValidationError> {
         let mut errors = Vec::new();
 
         if self.version == 0 {
@@ -182,10 +195,10 @@ impl CheckpointManifest {
             errors.push(ManifestValidationError {
                 message: "vnode_count is 0 (missing or legacy checkpoint)".into(),
             });
-        } else if self.vnode_count != VNODE_COUNT {
+        } else if self.vnode_count != expected_vnode_count {
             errors.push(ManifestValidationError {
                 message: format!(
-                    "vnode_count mismatch: checkpoint has {}, runtime expects {VNODE_COUNT}",
+                    "vnode_count mismatch: checkpoint has {}, runtime expects {expected_vnode_count}",
                     self.vnode_count,
                 ),
             });
@@ -194,9 +207,17 @@ impl CheckpointManifest {
         errors
     }
 
-    /// Creates a new manifest with the given ID and epoch.
+    /// Creates a new manifest with the given ID and epoch, using the
+    /// default vnode count. Use [`Self::new_with_vnode_count`] when a
+    /// pipeline runs with a non-default vnode count.
     #[must_use]
     pub fn new(checkpoint_id: u64, epoch: u64) -> Self {
+        Self::new_with_vnode_count(checkpoint_id, epoch, DEFAULT_VNODE_COUNT)
+    }
+
+    /// Creates a new manifest with an explicit vnode count.
+    #[must_use]
+    pub fn new_with_vnode_count(checkpoint_id: u64, epoch: u64, vnode_count: u16) -> Self {
         #[allow(clippy::cast_possible_truncation)] // u64 millis won't overflow until year 584M
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -219,7 +240,7 @@ impl CheckpointManifest {
             source_names: Vec::new(),
             sink_names: Vec::new(),
             pipeline_hash: None,
-            vnode_count: VNODE_COUNT,
+            vnode_count,
             state_checksum: None,
         }
     }
@@ -540,7 +561,7 @@ mod tests {
         m.source_offsets
             .insert("c".into(), ConnectorCheckpoint::new(1));
 
-        let errors = m.validate();
+        let errors = m.validate(DEFAULT_VNODE_COUNT);
         assert!(
             errors
                 .iter()

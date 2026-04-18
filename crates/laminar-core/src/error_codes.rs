@@ -144,6 +144,20 @@ pub const CHECKPOINT_PRUNE_FAILED: &str = "LDB-6009";
 pub const SIDECAR_CORRUPTION: &str = "LDB-6010";
 /// Source offset metadata missing during recovery.
 pub const OFFSET_METADATA_MISSING: &str = "LDB-6011";
+/// State durability gate returned false before sink commit. One or more
+/// vnodes had not persisted their partials for the epoch. The coordinator
+/// rolls back sinks and retries on the next checkpoint. See
+/// `docs/plans/two-phase-ordering.md`.
+pub const DURABILITY_GATE_MISS: &str = "LDB-6020";
+/// Sink rollback failed after a durability-gate miss. Sinks may be in an
+/// inconsistent state; recovery uses `sink_commit_statuses` to resolve.
+pub const DURABILITY_GATE_ROLLBACK_FAILED: &str = "LDB-6021";
+/// State backend returned an error during the durability gate (backend
+/// unreachable, permission denied). Treated as a gate miss; sinks rolled
+/// back and the next checkpoint retries.
+pub const DURABILITY_GATE_BACKEND_ERROR: &str = "LDB-6022";
+/// Sink rollback failed after a durability-gate backend error.
+pub const DURABILITY_GATE_ROLLBACK_ON_ERROR_FAILED: &str = "LDB-6023";
 
 // ── DataFusion / Arrow Interop (LDB-7xxx) ──
 
