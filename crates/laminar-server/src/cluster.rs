@@ -349,7 +349,7 @@ pub async fn start_cluster(
     // coordinator's durability gate runs. The assignment is a static
     // round-robin split across every peer visible at cluster start;
     // dynamic rebalance on join/leave is deferred work.
-    let state_backend = config
+    let state_backend: Arc<dyn laminar_core::state::StateBackend> = config
         .state
         .build()
         .await
@@ -367,7 +367,7 @@ pub async fn start_cluster(
         Arc::new(registry)
     };
     builder = builder
-        .state_backend(state_backend)
+        .state_backend(Arc::clone(&state_backend))
         .vnode_registry(Arc::clone(&vnode_registry));
 
     // Bind on all interfaces — peers connect in from wherever discovery
@@ -393,7 +393,8 @@ pub async fn start_cluster(
             Arc::clone(&shuffle_sender),
             Arc::clone(&shuffle_receiver),
             laminar_core::state::NodeId(node_id.0),
-        ),
+        )
+        .with_state_backend(Arc::clone(&state_backend)),
     );
     builder = builder
         .physical_optimizer_rule(distributed_rule)

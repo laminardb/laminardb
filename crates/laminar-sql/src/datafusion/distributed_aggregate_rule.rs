@@ -17,8 +17,9 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
-use laminar_core::state::{NodeId, VnodeRegistry};
+use laminar_core::state::{owned_vnodes, NodeId, StateBackend, VnodeRegistry};
 
+use super::checkpointed_repartition::CheckpointedRepartitionExec;
 use super::cluster_repartition::ClusterRepartitionExec;
 
 /// Built once per cluster `SessionState`; a no-op on non-matching plans.
@@ -27,6 +28,7 @@ pub struct DistributedAggregateRule {
     sender: Arc<ShuffleSender>,
     receiver: Arc<ShuffleReceiver>,
     self_id: NodeId,
+    state_backend: Option<Arc<dyn StateBackend>>,
 }
 
 impl DistributedAggregateRule {
@@ -43,7 +45,16 @@ impl DistributedAggregateRule {
             sender,
             receiver,
             self_id,
+            state_backend: None,
         }
+    }
+
+    /// Attach a state backend so partial-state is snapshotted per epoch.
+    /// Without it, aggregates reset to empty on restart.
+    #[must_use]
+    pub fn with_state_backend(mut self, backend: Arc<dyn StateBackend>) -> Self {
+        self.state_backend = Some(backend);
+        self
     }
 }
 
@@ -84,15 +95,24 @@ impl PhysicalOptimizerRule for DistributedAggregateRule {
                 hash_columns.push(col.index());
             }
 
-            let new_exec = ClusterRepartitionExec::try_new(
+            let cluster_exec = Arc::new(ClusterRepartitionExec::try_new(
                 Arc::clone(input),
                 hash_columns,
                 Arc::clone(&self.registry),
                 Arc::clone(&self.sender),
                 Arc::clone(&self.receiver),
                 self.self_id,
-            )?;
-            Ok(Transformed::yes(Arc::new(new_exec) as Arc<dyn ExecutionPlan>))
+            )?);
+
+            let replacement: Arc<dyn ExecutionPlan> = match &self.state_backend {
+                Some(backend) => Arc::new(CheckpointedRepartitionExec::new(
+                    Arc::clone(&cluster_exec),
+                    Arc::clone(backend),
+                    owned_vnodes(&self.registry, self.self_id),
+                )),
+                None => cluster_exec,
+            };
+            Ok(Transformed::yes(replacement))
         })?;
         Ok(transformed.data)
     }
@@ -216,6 +236,24 @@ mod tests {
         assert!(
             !stripped.contains("RepartitionExec"),
             "rule must REPLACE the RepartitionExec, not add alongside; plan was:\n{after}",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rule_wraps_with_checkpointed_when_backend_attached() {
+        use laminar_core::state::InProcessBackend;
+        let rule = build_rule().await.with_state_backend(
+            Arc::new(InProcessBackend::new(4)) as Arc<dyn laminar_core::state::StateBackend>,
+        );
+        let plan = build_plan();
+        let optimized = rule.optimize(plan, &ConfigOptions::new()).unwrap();
+        let after = format!(
+            "{}",
+            datafusion::physical_plan::displayable(optimized.as_ref()).indent(true),
+        );
+        assert!(
+            after.contains("CheckpointedRepartitionExec"),
+            "rule must wrap ClusterRepartitionExec when a backend is attached; plan was:\n{after}",
         );
     }
 
