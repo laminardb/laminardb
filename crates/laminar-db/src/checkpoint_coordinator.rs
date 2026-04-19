@@ -284,6 +284,11 @@ pub struct CheckpointCoordinator {
     #[cfg(feature = "cluster-unstable")]
     cluster_controller:
         Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    /// Sorted sink names cached from the last `register_sink` call.
+    /// Cleared (set to `None`) whenever a new sink is registered so
+    /// subsequent checkpoints re-compute, and populated lazily inside
+    /// `sorted_sink_names()`. Saves an O(N log N) sort per checkpoint.
+    cached_sorted_sink_names: Option<Vec<String>>,
 }
 
 impl CheckpointCoordinator {
@@ -320,6 +325,7 @@ impl CheckpointCoordinator {
             gate_vnode_set: Vec::new(),
             #[cfg(feature = "cluster-unstable")]
             cluster_controller: None,
+            cached_sorted_sink_names: None,
         }
     }
 
@@ -393,6 +399,9 @@ impl CheckpointCoordinator {
             handle,
             exactly_once,
         });
+        // Invalidate the sorted-name cache; the next checkpoint will
+        // rebuild it.
+        self.cached_sorted_sink_names = None;
     }
 
     /// Begins the initial epoch on all exactly-once sinks.
@@ -969,10 +978,18 @@ impl CheckpointCoordinator {
     }
 
     /// Returns sorted sink names for topology tracking in the manifest.
-    fn sorted_sink_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.sinks.iter().map(|s| s.name.clone()).collect();
-        names.sort();
-        names
+    ///
+    /// Computed once per topology change (via `register_sink`) and
+    /// cached; subsequent checkpoints clone the cached Vec rather than
+    /// re-sorting the sinks list.
+    fn sorted_sink_names(&mut self) -> Vec<String> {
+        if self.cached_sorted_sink_names.is_none() {
+            let mut names: Vec<String> = self.sinks.iter().map(|s| s.name.clone()).collect();
+            names.sort();
+            self.cached_sorted_sink_names = Some(names);
+        }
+        // Invariant: set above.
+        self.cached_sorted_sink_names.as_ref().unwrap().clone()
     }
 
     /// Returns the current phase.
