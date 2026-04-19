@@ -279,6 +279,25 @@ impl ShuffleReceiver {
         self.rx.lock().await.recv().await
     }
 
+    /// Drain every currently-available `(peer_id, msg)` without blocking.
+    /// Returns immediately when the internal queue is empty.
+    ///
+    /// Used by the row-shuffle aggregator path to pull remote rows into
+    /// the current streaming cycle without waiting for more. Uses
+    /// `tokio::sync::Mutex::try_lock` so a concurrent `recv()` doesn't
+    /// block us — we just skip this tick when contended (next tick picks
+    /// up the messages).
+    pub fn drain_available(&self) -> Vec<(ShufflePeerId, ShuffleMessage)> {
+        let Ok(mut guard) = self.rx.try_lock() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        while let Ok(msg) = guard.try_recv() {
+            out.push(msg);
+        }
+        out
+    }
+
     async fn accept_loop(
         listener: TcpListener,
         tx: mpsc::UnboundedSender<(ShufflePeerId, ShuffleMessage)>,

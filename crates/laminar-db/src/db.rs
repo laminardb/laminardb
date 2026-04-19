@@ -98,6 +98,31 @@ pub struct LaminarDB {
     /// know which vnodes this instance owns.
     pub(crate) vnode_registry:
         parking_lot::Mutex<Option<Arc<laminar_core::state::VnodeRegistry>>>,
+    /// Extra physical optimizer rules registered via the builder.
+    /// Applied both to `self.ctx` (used by `db.execute()`) and to the
+    /// streaming pipeline's internal `OperatorGraph` context built in
+    /// `pipeline_lifecycle::start_connector_pipeline`. Without the
+    /// pipeline-side application, cluster-mode rules like
+    /// `DistributedAggregateRule` reach `db.execute()`-style queries but
+    /// never affect what runs each cycle inside the streaming engine.
+    pub(crate) physical_optimizer_rules: Arc<
+        [Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>],
+    >,
+    /// `target_partitions` override from the builder. Mirrored into the
+    /// pipeline-side `SessionContext` so `DataFusion`'s
+    /// `EnforceDistribution` inserts the hash repartition that
+    /// `DistributedAggregateRule` rewrites.
+    pub(crate) pipeline_target_partitions: Option<usize>,
+    /// Outbound shuffle handle. Installed via `LaminarDbBuilder::shuffle_sender`;
+    /// used by `SqlQueryOperator` to row-shuffle pre-aggregate batches to vnode
+    /// owners. See Phase 0a in `docs/plans/cluster-production-readiness.md`.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) shuffle_sender:
+        parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleSender>>>,
+    /// Inbound shuffle handle. Installed via `LaminarDbBuilder::shuffle_receiver`.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) shuffle_receiver:
+        parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleReceiver>>>,
 }
 
 pub(crate) struct SourceWatermarkState {
@@ -259,7 +284,35 @@ impl LaminarDB {
             cluster_controller: parking_lot::Mutex::new(None),
             state_backend: parking_lot::Mutex::new(None),
             vnode_registry: parking_lot::Mutex::new(None),
+            physical_optimizer_rules: extra_optimizer_rules.to_vec().into(),
+            pipeline_target_partitions: target_partitions,
+            #[cfg(feature = "cluster-unstable")]
+            shuffle_sender: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster-unstable")]
+            shuffle_receiver: parking_lot::Mutex::new(None),
         })
+    }
+
+    /// Install the outbound shuffle handle used by cluster-mode streaming
+    /// aggregates to route pre-aggregate rows to vnode owners. Called by
+    /// [`LaminarDbBuilder::shuffle_sender`]. Must be set before `start()`
+    /// to take effect.
+    #[cfg(feature = "cluster-unstable")]
+    pub fn set_shuffle_sender(
+        &self,
+        sender: Arc<laminar_core::shuffle::ShuffleSender>,
+    ) {
+        *self.shuffle_sender.lock() = Some(sender);
+    }
+
+    /// Install the inbound shuffle handle. Pair with
+    /// [`Self::set_shuffle_sender`]; neither alone is a no-op.
+    #[cfg(feature = "cluster-unstable")]
+    pub fn set_shuffle_receiver(
+        &self,
+        receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
+    ) {
+        *self.shuffle_receiver.lock() = Some(receiver);
     }
 
     /// Install the cluster control facade. Called by

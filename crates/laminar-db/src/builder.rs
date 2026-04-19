@@ -41,6 +41,15 @@ pub struct LaminarDbBuilder {
     #[cfg(feature = "cluster-unstable")]
     cluster_controller:
         Option<std::sync::Arc<laminar_core::cluster::control::ClusterController>>,
+    /// Outbound shuffle handle for cluster-mode streaming aggregates.
+    /// Pair with `shuffle_receiver`; without it, streaming aggregates
+    /// run single-node even when the cluster controller is installed
+    /// (see Phase 0a in `docs/plans/cluster-production-readiness.md`).
+    #[cfg(feature = "cluster-unstable")]
+    shuffle_sender: Option<std::sync::Arc<laminar_core::shuffle::ShuffleSender>>,
+    /// Inbound shuffle handle for cluster-mode streaming aggregates.
+    #[cfg(feature = "cluster-unstable")]
+    shuffle_receiver: Option<std::sync::Arc<laminar_core::shuffle::ShuffleReceiver>>,
     /// Optional state backend. When paired with `vnode_registry`, the
     /// coordinator writes per-vnode durability markers each checkpoint
     /// and consults `epoch_complete` before committing sinks.
@@ -76,6 +85,10 @@ impl LaminarDbBuilder {
             custom_udafs: Vec::new(),
             #[cfg(feature = "cluster-unstable")]
             cluster_controller: None,
+            #[cfg(feature = "cluster-unstable")]
+            shuffle_sender: None,
+            #[cfg(feature = "cluster-unstable")]
+            shuffle_receiver: None,
             state_backend: None,
             vnode_registry: None,
             physical_optimizer_rules: Vec::new(),
@@ -138,6 +151,33 @@ impl LaminarDbBuilder {
         controller: std::sync::Arc<laminar_core::cluster::control::ClusterController>,
     ) -> Self {
         self.cluster_controller = Some(controller);
+        self
+    }
+
+    /// Install the outbound shuffle handle used by cluster-mode streaming
+    /// aggregates. Rows whose group key hashes to a remote vnode are
+    /// shipped through this sender. Pair with [`Self::shuffle_receiver`];
+    /// either alone is a no-op.
+    #[cfg(feature = "cluster-unstable")]
+    #[must_use]
+    pub fn shuffle_sender(
+        mut self,
+        sender: std::sync::Arc<laminar_core::shuffle::ShuffleSender>,
+    ) -> Self {
+        self.shuffle_sender = Some(sender);
+        self
+    }
+
+    /// Install the inbound shuffle handle used by cluster-mode streaming
+    /// aggregates. Remote partial-aggregate rows arrive here and are
+    /// drained into the local accumulator each cycle.
+    #[cfg(feature = "cluster-unstable")]
+    #[must_use]
+    pub fn shuffle_receiver(
+        mut self,
+        receiver: std::sync::Arc<laminar_core::shuffle::ShuffleReceiver>,
+    ) -> Self {
+        self.shuffle_receiver = Some(receiver);
         self
     }
 
@@ -391,6 +431,14 @@ impl LaminarDbBuilder {
         #[cfg(feature = "cluster-unstable")]
         if let Some(controller) = self.cluster_controller {
             db.set_cluster_controller(controller);
+        }
+        #[cfg(feature = "cluster-unstable")]
+        if let Some(sender) = self.shuffle_sender {
+            db.set_shuffle_sender(sender);
+        }
+        #[cfg(feature = "cluster-unstable")]
+        if let Some(receiver) = self.shuffle_receiver {
+            db.set_shuffle_receiver(receiver);
         }
         if let Some(backend) = self.state_backend {
             db.set_state_backend(backend);

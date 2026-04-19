@@ -288,8 +288,25 @@ impl LaminarDB {
         use crate::pipeline::{PipelineConfig, SourceRegistration};
         use laminar_connectors::reference::{ReferenceTableSource, RefreshMode};
 
-        // Build OperatorGraph
-        let ctx = laminar_sql::create_session_context();
+        // Build OperatorGraph context. Mirrors the rules + partition
+        // count installed on `LaminarDB::ctx` via the builder so that
+        // cluster-mode rules like `DistributedAggregateRule` actually
+        // fire each cycle inside the streaming pipeline (not just on
+        // `db.execute()` queries against the outer context).
+        let ctx = {
+            use datafusion::execution::SessionStateBuilder;
+            let mut session_config = laminar_sql::datafusion::base_session_config();
+            if let Some(n) = self.pipeline_target_partitions {
+                session_config = session_config.with_target_partitions(n);
+            }
+            let mut state_builder = SessionStateBuilder::new()
+                .with_config(session_config)
+                .with_default_features();
+            for rule in self.physical_optimizer_rules.iter() {
+                state_builder = state_builder.with_physical_optimizer_rule(Arc::clone(rule));
+            }
+            datafusion::prelude::SessionContext::new_with_state(state_builder.build())
+        };
         laminar_sql::register_streaming_functions(&ctx);
 
         // Register lookup/reference tables in the operator graph's
@@ -324,6 +341,31 @@ impl LaminarDB {
         graph.set_lookup_registry(Arc::clone(&self.lookup_registry));
         if let Some(ref prom) = *self.engine_metrics.lock() {
             graph.set_metrics(Arc::clone(prom));
+        }
+
+        // Install the cluster row-shuffle config if all the pieces are
+        // present (registry, sender, receiver, controller). Without any
+        // one of them, aggregate queries run single-node.
+        #[cfg(feature = "cluster-unstable")]
+        {
+            let sender = self.shuffle_sender.lock().clone();
+            let receiver = self.shuffle_receiver.lock().clone();
+            let registry = self.vnode_registry.lock().clone();
+            let controller = self.cluster_controller.lock().clone();
+            if let (Some(sender), Some(receiver), Some(registry), Some(controller)) =
+                (sender, receiver, registry, controller)
+            {
+                let self_id =
+                    laminar_core::state::NodeId(controller.instance_id().0);
+                graph.set_cluster_shuffle(
+                    crate::operator::sql_query::ClusterShuffleConfig {
+                        registry,
+                        sender,
+                        receiver,
+                        self_id,
+                    },
+                );
+            }
         }
 
         // Register source schemas for ALL sources (both external connectors

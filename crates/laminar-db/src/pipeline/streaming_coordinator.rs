@@ -776,6 +776,16 @@ impl StreamingCoordinator {
             return; // Already tracking a barrier.
         }
 
+        // Always give the callback a chance to run cluster-follower
+        // polling. `ConnectorPipelineCallback::maybe_checkpoint` routes
+        // to `maybe_follower_checkpoint` on non-leader nodes before
+        // checking the timer, so a follower with no data-path events
+        // still picks up the leader's PREPARE announcements from gossip.
+        // Leader-side nodes short-circuit here (no checkpoint_interval
+        // configured in the tests that drive `db.checkpoint()` manually).
+        let offsets = FxHashMap::default();
+        callback.maybe_checkpoint(false, offsets).await;
+
         let should_checkpoint = self
             .config
             .checkpoint_interval

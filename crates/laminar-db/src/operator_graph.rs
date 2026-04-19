@@ -217,6 +217,12 @@ pub(crate) struct OperatorGraph {
     /// Covers both source tables (from `register_source_schema`) and
     /// intermediate tables (created lazily on first operator output).
     live_handles: FxHashMap<String, LiveSourceHandle>,
+    /// Cluster-mode row-shuffle config for streaming aggregates.
+    /// `None` outside cluster mode; threaded to `SqlQueryOperator` so
+    /// pre-aggregate rows can be hash-routed to vnode owners. See
+    /// Phase 0a in `docs/plans/cluster-production-readiness.md`.
+    #[cfg(feature = "cluster-unstable")]
+    cluster_shuffle: Option<crate::operator::sql_query::ClusterShuffleConfig>,
 }
 
 impl OperatorGraph {
@@ -241,6 +247,8 @@ impl OperatorGraph {
             deferred_scan_offset: 0,
             stats_tick: 0,
             max_state_bytes: None,
+            #[cfg(feature = "cluster-unstable")]
+            cluster_shuffle: None,
             ctx,
             prom: None,
             lookup_registry: None,
@@ -321,6 +329,17 @@ impl OperatorGraph {
         registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
     ) {
         self.lookup_registry = Some(registry);
+    }
+
+    /// Install the row-shuffle config used by streaming aggregates in
+    /// cluster mode. See Phase 0a in
+    /// `docs/plans/cluster-production-readiness.md`.
+    #[cfg(feature = "cluster-unstable")]
+    pub fn set_cluster_shuffle(
+        &mut self,
+        config: crate::operator::sql_query::ClusterShuffleConfig,
+    ) {
+        self.cluster_shuffle = Some(config);
     }
 
     fn is_downstream_at_capacity(&self, node_id: usize) -> bool {
@@ -894,14 +913,19 @@ impl OperatorGraph {
 
         let emit_changelog = emit_clause.is_some_and(|ec| matches!(ec, EmitClause::Changes));
 
-        Box::new(operator::sql_query::SqlQueryOperator::new(
+        let mut op = operator::sql_query::SqlQueryOperator::new(
             name,
             sql,
             self.ctx.clone(),
             self.prom.clone(),
             emit_changelog,
             idle_ttl_ms,
-        ))
+        );
+        #[cfg(feature = "cluster-unstable")]
+        if let Some(ref cfg) = self.cluster_shuffle {
+            op.attach_cluster_shuffle(cfg.clone());
+        }
+        Box::new(op)
     }
 
     pub fn remove_query(&mut self, name: &str) {

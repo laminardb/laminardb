@@ -819,6 +819,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn has_deferred_input(&self) -> bool {
+        // In cluster mode, always claim pending input so the coordinator
+        // runs `execute_cycle` each idle tick — otherwise a follower with
+        // no local source events never drains the shuffle receiver and
+        // remote rows sit stranded. Non-cluster path unchanged.
+        #[cfg(feature = "cluster-unstable")]
+        {
+            if self.cluster_controller.is_some() {
+                return true;
+            }
+        }
         self.graph.has_pending_input()
     }
 

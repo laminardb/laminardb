@@ -203,6 +203,16 @@ pub(crate) struct IncrementalAggState {
     weight_col_idx: Option<usize>,
 }
 
+impl IncrementalAggState {
+    /// Number of leading GROUP BY columns in this aggregate's pre-agg
+    /// output (and in `output_schema`). Used by the cluster row-shuffle
+    /// path to know which columns to hash.
+    #[must_use]
+    pub(crate) fn num_group_cols(&self) -> usize {
+        self.num_group_cols
+    }
+}
+
 /// Name of the Z-set weight column appended to changelog output.
 pub(crate) const WEIGHT_COLUMN: &str = "__weight";
 
