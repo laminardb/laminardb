@@ -248,6 +248,13 @@ pub struct CheckpointCoordinator {
     /// commit to verify per-vnode durability. See
     /// `docs/plans/two-phase-ordering.md`.
     state_backend: Option<Arc<dyn StateBackend>>,
+    /// Authoritative assignment generation this coordinator writes with.
+    /// Stamped into every `write_partial` so the backend's Phase 1.4
+    /// fence can reject writes from stale peers. Zero = unconfigured
+    /// (pre-Phase-1.2 single-instance path); any non-zero is treated
+    /// as the current generation. Set via
+    /// [`set_assignment_version`](Self::set_assignment_version).
+    assignment_version: u64,
     /// Vnodes this coordinator owns. Drives the per-vnode marker
     /// writes — each checkpoint publishes one marker per entry.
     /// Empty disables marker writes.
@@ -293,6 +300,7 @@ impl CheckpointCoordinator {
             smoothed_duration_ms: 0.0,
             total_bytes_written: 0,
             state_backend: None,
+            assignment_version: 0,
             vnode_set: Vec::new(),
             gate_vnode_set: Vec::new(),
             #[cfg(feature = "cluster-unstable")]
@@ -322,6 +330,16 @@ impl CheckpointCoordinator {
     /// and the `epoch_complete` durability gate.
     pub fn set_state_backend(&mut self, backend: Arc<dyn StateBackend>) {
         self.state_backend = Some(backend);
+    }
+
+    /// Record the assignment generation this coordinator is writing
+    /// with. Forwarded to `backend.write_partial` so the Phase 1.4
+    /// split-brain fence can reject stale writers. Host sets this
+    /// whenever a fresh [`AssignmentSnapshot`] rotates in.
+    ///
+    /// [`AssignmentSnapshot`]: laminar_core::cluster::control::AssignmentSnapshot
+    pub fn set_assignment_version(&mut self, version: u64) {
+        self.assignment_version = version;
     }
 
     /// Vnodes this instance owns; drives marker writes. Also the
@@ -621,15 +639,22 @@ impl CheckpointCoordinator {
             return Ok(());
         }
         let payload = bytes::Bytes::from(format!("ckpt:{checkpoint_id}").into_bytes());
+        // Phase 1.4: stamp every marker with the current assignment
+        // generation. Zero means the host hasn't wired a version (e.g.
+        // pre-Phase-1.2 single-instance path) and the fence is a no-op.
+        let caller_version = self.assignment_version;
         let writes = self.vnode_set.iter().map(|&v| {
             let backend = Arc::clone(backend);
             let payload = payload.clone();
             async move {
-                backend.write_partial(v, epoch, payload).await.map_err(|e| {
-                    DbError::Checkpoint(format!(
-                        "[LDB-6024] vnode marker write failed (vnode={v}, epoch={epoch}): {e}"
-                    ))
-                })
+                backend
+                    .write_partial(v, epoch, caller_version, payload)
+                    .await
+                    .map_err(|e| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6024] vnode marker write failed (vnode={v}, epoch={epoch}): {e}"
+                        ))
+                    })
             }
         });
         futures::future::try_join_all(writes).await.map(|_| ())
@@ -2411,11 +2436,11 @@ mod tests {
         // Simulate the follower's prior write on vnodes {2, 3} for the
         // epoch the leader is about to use (fresh store starts at 1).
         backend
-            .write_partial(2, 1, Bytes::from_static(b"follower"))
+            .write_partial(2, 1, 0, Bytes::from_static(b"follower"))
             .await
             .unwrap();
         backend
-            .write_partial(3, 1, Bytes::from_static(b"follower"))
+            .write_partial(3, 1, 0, Bytes::from_static(b"follower"))
             .await
             .unwrap();
         coord.set_state_backend(backend);

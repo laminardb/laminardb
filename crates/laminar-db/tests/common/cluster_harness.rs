@@ -146,9 +146,10 @@ impl ClusterEngineHarness {
         // Resolve the cluster's vnode assignment ONCE, before per-node
         // wiring. Load the stored snapshot; if absent, compute the
         // initial round-robin and CAS-create. All nodes end up with the
-        // identical assignment whether they read or wrote — the AC from
-        // Phase 1.2.
-        let assignment: Arc<[NodeId]> =
+        // identical assignment AND the same `assignment_version`
+        // whether they read or wrote — Phase 1.2 AC plus the Phase 1.4
+        // fence-generation source of truth.
+        let (assignment, snapshot_version) =
             resolve_assignment(&snapshot_store, vnode_count, &peer_ids).await;
 
         // Bind every node's receiver up front so we can cross-register
@@ -181,14 +182,30 @@ impl ClusterEngineHarness {
             }
             let sender = Arc::new(sender);
 
-            let state_backend: Arc<dyn StateBackend> = Arc::new(ObjectStoreBackend::new(
+            // Concrete backend first, so we can call the Phase 1.4
+            // fence setter before erasing to `dyn StateBackend`.
+            let concrete_backend = ObjectStoreBackend::new(
                 Arc::clone(&shared_store),
                 self_id.0.to_string(),
                 vnode_count,
-            ));
+            );
+            // Every node starts with the same authoritative version —
+            // the one that rode into the stored snapshot. Stale peers
+            // bringing a smaller version will be rejected at
+            // `write_partial`.
+            concrete_backend.set_authoritative_version(snapshot_version);
+            let state_backend: Arc<dyn StateBackend> = Arc::new(concrete_backend);
 
             let registry = Arc::new(VnodeRegistry::new(vnode_count));
             registry.set_assignment(Arc::clone(&assignment));
+            // Bump the registry's local assignment version to match the
+            // snapshot's so fence-aware writers (CheckpointedRepartitionExec)
+            // stamp their writes with the correct caller version.
+            while registry.assignment_version() < snapshot_version {
+                // `set_assignment` monotonically bumps by 1. Cheap loop
+                // to align with the persisted generation number.
+                registry.set_assignment(Arc::clone(&assignment));
+            }
 
             // NOTE: `DistributedAggregateRule` is intentionally NOT installed
             // here. Row-shuffle (Phase 0a) handles cluster aggregates via
@@ -308,8 +325,9 @@ impl ClusterEngineHarness {
 
 /// Load the cluster-wide vnode assignment from `store`, falling back to
 /// computing a fresh round-robin and CAS-creating it. Returns the
-/// assignment in `Arc<[NodeId]>` shape ready to hand to
-/// [`VnodeRegistry::set_assignment`].
+/// assignment ready to hand to [`VnodeRegistry::set_assignment`] AND
+/// the snapshot's `version` — used by Phase 1.4's split-brain fence to
+/// seed each backend's authoritative generation.
 ///
 /// Implements the Phase 1.2 boot-time contract:
 /// - If a snapshot is already stored, every caller loads and uses it
@@ -327,23 +345,24 @@ async fn resolve_assignment(
     store: &AssignmentSnapshotStore,
     vnode_count: u32,
     peer_ids: &[NodeId],
-) -> Arc<[NodeId]> {
+) -> (Arc<[NodeId]>, u64) {
     if let Some(snap) = store.load().await.expect("load snapshot") {
-        return snap.to_vnode_vec(vnode_count).into();
+        return (snap.to_vnode_vec(vnode_count).into(), snap.version);
     }
 
     let fresh = round_robin_assignment(vnode_count, peer_ids);
     let snap = AssignmentSnapshot::empty()
         .next(AssignmentSnapshot::vnodes_from_vec(&fresh));
     match store.save_if_absent(&snap).await.expect("save_if_absent") {
-        Some(_) => fresh,
-        None => store
-            .load()
-            .await
-            .expect("load after CAS loss")
-            .expect("snapshot present after CAS loss")
-            .to_vnode_vec(vnode_count)
-            .into(),
+        Some(winner) => (fresh, winner.version),
+        None => {
+            let loaded = store
+                .load()
+                .await
+                .expect("load after CAS loss")
+                .expect("snapshot present after CAS loss");
+            (loaded.to_vnode_vec(vnode_count).into(), loaded.version)
+        }
     }
 }
 

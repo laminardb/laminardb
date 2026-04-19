@@ -61,6 +61,14 @@ struct RuntimeState {
 }
 
 impl ClusterRepartitionExec {
+    /// Handle on the vnode registry. `CheckpointedRepartitionExec`
+    /// reads `assignment_version()` from here to stamp each state
+    /// write — see Phase 1.4 split-brain fence.
+    #[must_use]
+    pub fn registry(&self) -> &Arc<VnodeRegistry> {
+        &self.registry
+    }
+
     /// Construct the exec.
     ///
     /// # Errors

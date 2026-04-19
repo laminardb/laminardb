@@ -25,7 +25,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use datafusion_common::DataFusionError;
 use futures::stream::{self, StreamExt};
 use laminar_core::serialization::{deserialize_batch_stream, serialize_batch_stream};
-use laminar_core::state::StateBackend;
+use laminar_core::state::{StateBackend, VnodeRegistry};
 use parking_lot::Mutex;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -103,9 +103,11 @@ impl CheckpointedRepartitionExec {
             let owned = self.owned_vnodes.clone();
             let schema = Arc::clone(&self.schema);
             let backend = Arc::clone(&self.state_backend);
+            let registry = Arc::clone(self.inner.registry());
             let tx = self.last_checkpoint.clone();
             let handle = tokio::spawn(async move {
-                snapshot_loop(aligned_rx, buffers, owned, schema, backend, tx).await;
+                snapshot_loop(aligned_rx, buffers, owned, schema, backend, registry, tx)
+                    .await;
             });
             Arc::new(RuntimeState {
                 _snapshotter: handle,
@@ -213,13 +215,17 @@ impl ExecutionPlan for CheckpointedRepartitionExec {
 }
 
 /// On each aligned-epoch fire, serialise every partition's buffered
-/// batches and `write_partial(vnode, epoch, bytes)`.
+/// batches and `write_partial(vnode, epoch, assignment_version, bytes)`.
+/// The assignment version is re-read from the registry at write time
+/// so the Phase 1.4 fence sees the freshest generation this instance
+/// believes it owns the vnode at.
 async fn snapshot_loop(
     mut aligned_rx: watch::Receiver<u64>,
     buffers: Arc<Mutex<Vec<Vec<RecordBatch>>>>,
     owned_vnodes: Vec<u32>,
     schema: SchemaRef,
     backend: Arc<dyn StateBackend>,
+    registry: Arc<VnodeRegistry>,
     last_checkpoint: watch::Sender<u64>,
 ) {
     loop {
@@ -263,12 +269,13 @@ async fn snapshot_loop(
                     continue;
                 }
             };
+            let caller_version = registry.assignment_version();
             if let Err(e) = backend
-                .write_partial(vnode, epoch, Bytes::from(bytes))
+                .write_partial(vnode, epoch, caller_version, Bytes::from(bytes))
                 .await
             {
                 tracing::error!(
-                    vnode, epoch, error = %e,
+                    vnode, epoch, caller_version, error = %e,
                     "checkpointed repartition: write_partial failed — \
                      peer's durability gate will reject this epoch",
                 );
@@ -454,7 +461,7 @@ mod tests {
         // Pre-seed (vnode=0, epoch=9) with a canonical marker batch.
         let seed = batch([(42, 420), (43, 430)]);
         let seed_bytes = Bytes::from(serialize_batch_stream(&seed).unwrap());
-        backend.write_partial(0, 9, seed_bytes).await.unwrap();
+        backend.write_partial(0, 9, 0, seed_bytes).await.unwrap();
 
         // Fresh exec, empty upstream — the only output should be the
         // recovery batch.

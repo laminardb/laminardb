@@ -37,6 +37,74 @@ use cluster_harness::manifest_epoch;
 const VNODE_COUNT: u32 = 4;
 const N_NODES: usize = 2;
 
+/// Phase 1.4 — split-brain fence on `write_partial`.
+///
+/// Plan AC: "force two nodes to claim same vnode; one is rejected."
+/// Here the "two nodes" are modelled as two `ObjectStoreBackend`
+/// instances over the same shared-state dir — exactly what a
+/// split-brained cluster would look like from the object-store's
+/// point of view. One side has advanced its authoritative generation
+/// (via a fresh snapshot); the stale side tries to write at the old
+/// version and must be rejected.
+///
+/// The harness already wires `set_authoritative_version` from the
+/// loaded snapshot, so this test operates directly on the underlying
+/// backend type — end-to-end fence-through-checkpoint is covered by
+/// the smoke test (which passes `registry.assignment_version()`
+/// through the full write path).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn split_brain_write_partial_rejected() {
+    use bytes::Bytes;
+    use laminar_core::state::{ObjectStoreBackend, StateBackend, StateBackendError};
+    use object_store::local::LocalFileSystem;
+    use object_store::ObjectStore;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(
+        LocalFileSystem::new_with_prefix(dir.path()).expect("local fs"),
+    );
+
+    let fresh = ObjectStoreBackend::new(std::sync::Arc::clone(&store), "leader", 4);
+    let stale = ObjectStoreBackend::new(std::sync::Arc::clone(&store), "ex-leader", 4);
+
+    // Fresh side has adopted snapshot version 3 (simulates a new
+    // assignment generation rolling through via AssignmentSnapshotStore).
+    fresh.set_authoritative_version(3);
+    fresh
+        .write_partial(0, 1, 3, Bytes::from_static(b"fresh"))
+        .await
+        .expect("fresh write at current version");
+
+    // Stale side learned about the new generation too (e.g. via its
+    // own harness loading the same snapshot on reconnect), but a
+    // lingering writer from its in-flight pipeline is still stamping
+    // writes with caller=2 — that's the split-brain footprint.
+    stale.set_authoritative_version(3);
+    let err = stale
+        .write_partial(0, 1, 2, Bytes::from_static(b"stale"))
+        .await
+        .expect_err("stale write must be rejected");
+    match err {
+        StateBackendError::StaleVersion {
+            caller,
+            authoritative,
+        } => {
+            assert_eq!(caller, 2);
+            assert_eq!(authoritative, 3);
+        }
+        other => panic!("expected StaleVersion, got {other:?}"),
+    }
+
+    // Final correctness: the only bytes on disk at the shared path
+    // are the fresh side's. The stale attempt never touched storage.
+    let got = fresh
+        .read_partial(0, 1)
+        .await
+        .expect("read_partial")
+        .expect("present");
+    assert_eq!(&got[..], b"fresh");
+}
+
 /// Phase 1.2 — coordinated assignment via stored snapshot.
 ///
 /// The plan's AC: "partition cluster, both halves independently arrive

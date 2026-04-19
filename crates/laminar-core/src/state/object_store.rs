@@ -6,6 +6,7 @@
 //! epoch. The `_COMMIT` marker is the durability boundary the
 //! checkpoint coordinator consults before releasing sinks.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -20,6 +21,16 @@ pub struct ObjectStoreBackend {
     store: Arc<dyn ObjectStore>,
     instance_id: String,
     vnode_capacity: u32,
+    /// Authoritative vnode-assignment version known to this backend.
+    /// Phase 1.4 split-brain fence: [`write_partial`](Self::write_partial)
+    /// rejects any caller whose `assignment_version` is strictly less
+    /// than this value. Updated via
+    /// [`set_authoritative_version`](Self::set_authoritative_version)
+    /// whenever the host sees a newer `AssignmentSnapshot` rotate in.
+    ///
+    /// Default is `0`, which disables the fence — unconfigured
+    /// callers (most single-instance paths) are accepted unchanged.
+    authoritative_version: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for ObjectStoreBackend {
@@ -43,6 +54,7 @@ impl ObjectStoreBackend {
             store,
             instance_id: instance_id.into(),
             vnode_capacity,
+            authoritative_version: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -50,6 +62,48 @@ impl ObjectStoreBackend {
     #[must_use]
     pub fn vnode_capacity(&self) -> u32 {
         self.vnode_capacity
+    }
+
+    /// Current authoritative assignment version known to this backend.
+    /// Zero means the fence is disabled (accepting any caller version).
+    #[must_use]
+    pub fn authoritative_version(&self) -> u64 {
+        self.authoritative_version.load(Ordering::Acquire)
+    }
+
+    /// Raise the authoritative version to `version`. Monotonic: a call
+    /// with a value less than or equal to the current one is a no-op.
+    ///
+    /// The host should call this whenever it adopts a newer
+    /// [`AssignmentSnapshot`] (on initial load and on each subsequent
+    /// rotation). After this call, any in-flight `write_partial` from
+    /// a stale writer whose caller version is below `version` is
+    /// rejected with [`StateBackendError::StaleVersion`].
+    ///
+    /// [`AssignmentSnapshot`]: crate::cluster::control::AssignmentSnapshot
+    pub fn set_authoritative_version(&self, version: u64) {
+        // CAS-like loop to avoid lowering the version on a late call.
+        let mut cur = self.authoritative_version.load(Ordering::Acquire);
+        while version > cur {
+            match self.authoritative_version.compare_exchange(
+                cur,
+                version,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// Shared handle to the authoritative version counter. Callers that
+    /// want to bump several objects (e.g. backend plus a future metric)
+    /// from a single owner can clone this handle instead of relaying
+    /// through [`set_authoritative_version`].
+    #[must_use]
+    pub fn authoritative_version_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.authoritative_version)
     }
 
     fn check_vnode(&self, v: u32) -> Result<(), StateBackendError> {
@@ -78,9 +132,22 @@ impl StateBackend for ObjectStoreBackend {
         &self,
         vnode: u32,
         epoch: u64,
+        assignment_version: u64,
         bytes: Bytes,
     ) -> Result<(), StateBackendError> {
         self.check_vnode(vnode)?;
+        // Phase 1.4 split-brain fence. `authoritative_version == 0`
+        // means "unconfigured" — accept every write (matches the
+        // legacy single-instance behavior). Non-zero authoritative
+        // means we know of a specific assignment generation; writes
+        // stamped with an older generation are rejected.
+        let authoritative = self.authoritative_version.load(Ordering::Acquire);
+        if authoritative > 0 && assignment_version < authoritative {
+            return Err(StateBackendError::StaleVersion {
+                caller: assignment_version,
+                authoritative,
+            });
+        }
         let path = Self::partial_path(epoch, vnode);
         self.store
             .put(&path, PutPayload::from(bytes))
@@ -159,7 +226,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
         backend
-            .write_partial(0, 1, Bytes::from_static(b"hello"))
+            .write_partial(0, 1, 0, Bytes::from_static(b"hello"))
             .await
             .unwrap();
         let got = backend.read_partial(0, 1).await.unwrap().unwrap();
@@ -175,13 +242,76 @@ mod tests {
         assert!(!backend.epoch_complete(1, &vnodes).await.unwrap());
         for v in &vnodes {
             backend
-                .write_partial(*v, 1, Bytes::from_static(b"y"))
+                .write_partial(*v, 1, 0, Bytes::from_static(b"y"))
                 .await
                 .unwrap();
         }
         assert!(backend.epoch_complete(1, &vnodes).await.unwrap());
         // Idempotent.
         assert!(backend.epoch_complete(1, &vnodes).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn stale_version_rejected() {
+        // Phase 1.4 AC: force two "nodes" (backend instances wrapping
+        // the same store) to claim the same vnode at different
+        // generations. The stale writer must be rejected.
+        let dir = tempdir().unwrap();
+        let store = make_store(dir.path());
+        let stale = ObjectStoreBackend::new(Arc::clone(&store), "node-stale", 4);
+        let fresh = ObjectStoreBackend::new(Arc::clone(&store), "node-fresh", 4);
+
+        // Fresh learns about a new assignment generation — e.g. a new
+        // snapshot rotated in after a leader election.
+        fresh.set_authoritative_version(2);
+
+        // Fresh writes at the current version: accepted.
+        fresh
+            .write_partial(0, 1, 2, Bytes::from_static(b"fresh"))
+            .await
+            .unwrap();
+
+        // Stale tries to write at version 1 — but only IF it's also
+        // learned of the rotation. Model that by promoting stale's
+        // view too; the check is intra-backend here because the
+        // durable version-broadcast channel is Phase 2.3 territory.
+        stale.set_authoritative_version(2);
+        let err = stale
+            .write_partial(0, 1, 1, Bytes::from_static(b"stale"))
+            .await
+            .unwrap_err();
+        match err {
+            StateBackendError::StaleVersion {
+                caller,
+                authoritative,
+            } => {
+                assert_eq!(caller, 1);
+                assert_eq!(authoritative, 2);
+            }
+            other => panic!("expected StaleVersion, got {other:?}"),
+        }
+
+        // Fence-disabled backend (authoritative stays at 0) accepts
+        // any version — preserves legacy single-instance behavior.
+        let unfenced = ObjectStoreBackend::new(Arc::clone(&store), "node-unfenced", 4);
+        unfenced
+            .write_partial(1, 1, 0, Bytes::from_static(b"ok"))
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn authoritative_version_is_monotonic() {
+        let dir = tempdir().unwrap();
+        let b = ObjectStoreBackend::new(make_store(dir.path()), "node", 2);
+        assert_eq!(b.authoritative_version(), 0);
+        b.set_authoritative_version(3);
+        assert_eq!(b.authoritative_version(), 3);
+        // Attempts to lower the version are no-ops.
+        b.set_authoritative_version(1);
+        assert_eq!(b.authoritative_version(), 3);
+        b.set_authoritative_version(4);
+        assert_eq!(b.authoritative_version(), 4);
     }
 
     #[tokio::test]

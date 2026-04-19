@@ -24,6 +24,22 @@ pub enum StateBackendError {
         /// Epoch number.
         epoch: u64,
     },
+
+    /// The caller's assignment version is older than the backend's
+    /// authoritative version. Thrown by [`StateBackend::write_partial`]
+    /// when a stale writer (e.g. the losing side of a split-brain)
+    /// attempts to persist state at a version that has since been
+    /// superseded. The caller should abandon the write, refresh its
+    /// assignment snapshot, and retry at the new version.
+    #[error(
+        "stale assignment version: caller={caller} < authoritative={authoritative}"
+    )]
+    StaleVersion {
+        /// Version the writer believes is current.
+        caller: u64,
+        /// Authoritative version seen by the backend.
+        authoritative: u64,
+    },
 }
 
 /// A pluggable state store used by streaming operators for partial
@@ -54,10 +70,20 @@ pub enum StateBackendError {
 #[async_trait]
 pub trait StateBackend: Send + Sync + 'static {
     /// Persist a partial aggregate for `(vnode, epoch)`.
+    ///
+    /// `assignment_version` is the [`VnodeRegistry::assignment_version`]
+    /// the writer observed when it started this write. Backends that
+    /// implement the split-brain fence (Phase 1.4) compare it against
+    /// their own authoritative version and return
+    /// [`StateBackendError::StaleVersion`] if the writer is behind.
+    /// Backends that opt out of fencing accept any version.
+    ///
+    /// [`VnodeRegistry::assignment_version`]: crate::state::VnodeRegistry::assignment_version
     async fn write_partial(
         &self,
         vnode: u32,
         epoch: u64,
+        assignment_version: u64,
         bytes: Bytes,
     ) -> Result<(), StateBackendError>;
 

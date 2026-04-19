@@ -330,7 +330,7 @@ seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
         let c = StateBackendConfig::in_process();
         let backend = c.build().await.unwrap();
         backend
-            .write_partial(0, 1, Bytes::from_static(b"ok"))
+            .write_partial(0, 1, 0, Bytes::from_static(b"ok"))
             .await
             .unwrap();
         assert_eq!(
@@ -345,7 +345,7 @@ seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
         let c = StateBackendConfig::local(dir.path());
         let backend = c.build().await.unwrap();
         backend
-            .write_partial(0, 1, bytes::Bytes::from_static(b"z"))
+            .write_partial(0, 1, 0, bytes::Bytes::from_static(b"z"))
             .await
             .unwrap();
         assert_eq!(
@@ -361,7 +361,7 @@ seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
         let c = StateBackendConfig::object_store(url, "node-0");
         let backend = c.build().await.unwrap();
         backend
-            .write_partial(0, 1, bytes::Bytes::from_static(b"z"))
+            .write_partial(0, 1, 0, bytes::Bytes::from_static(b"z"))
             .await
             .unwrap();
         let got = backend.read_partial(0, 1).await.unwrap().unwrap();

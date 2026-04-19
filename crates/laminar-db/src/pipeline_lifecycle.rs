@@ -217,6 +217,10 @@ impl LaminarDB {
                     }
                 };
                 coord.set_state_backend(backend);
+                // Phase 1.4 fence: stamp marker writes with the live
+                // registry generation. Zero until a snapshot rotates
+                // in; harmless no-op on the backend side.
+                coord.set_assignment_version(registry.assignment_version());
                 coord.set_vnode_set(laminar_core::state::owned_vnodes(&registry, owner));
                 // Leader's gate checks the full registry — across all
                 // instances — so the 2PC commit only fires when every

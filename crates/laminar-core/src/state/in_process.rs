@@ -45,10 +45,14 @@ impl InProcessBackend {
 
 #[async_trait]
 impl StateBackend for InProcessBackend {
+    /// In-process backend opts out of the split-brain fence — there's
+    /// only one process so the scenario is moot. `assignment_version`
+    /// is accepted and ignored.
     async fn write_partial(
         &self,
         vnode: u32,
         epoch: u64,
+        _assignment_version: u64,
         bytes: Bytes,
     ) -> Result<(), StateBackendError> {
         self.check_vnode(vnode)?;
@@ -89,7 +93,7 @@ mod tests {
     async fn write_read_roundtrip() {
         let b = InProcessBackend::new(4);
         let payload = Bytes::from_static(b"hello");
-        b.write_partial(2, 7, payload.clone()).await.unwrap();
+        b.write_partial(2, 7, 0, payload.clone()).await.unwrap();
         let got = b.read_partial(2, 7).await.unwrap().unwrap();
         assert_eq!(got, payload);
         assert!(b.read_partial(2, 8).await.unwrap().is_none());
@@ -100,10 +104,10 @@ mod tests {
         let b = InProcessBackend::new(4);
         let vnodes = [0u32, 1, 2];
         assert!(!b.epoch_complete(1, &vnodes).await.unwrap());
-        b.write_partial(0, 1, Bytes::from_static(b"a")).await.unwrap();
-        b.write_partial(1, 1, Bytes::from_static(b"b")).await.unwrap();
+        b.write_partial(0, 1, 0, Bytes::from_static(b"a")).await.unwrap();
+        b.write_partial(1, 1, 0, Bytes::from_static(b"b")).await.unwrap();
         assert!(!b.epoch_complete(1, &vnodes).await.unwrap());
-        b.write_partial(2, 1, Bytes::from_static(b"c")).await.unwrap();
+        b.write_partial(2, 1, 0, Bytes::from_static(b"c")).await.unwrap();
         assert!(b.epoch_complete(1, &vnodes).await.unwrap());
         assert!(!b.epoch_complete(2, &vnodes).await.unwrap());
     }
@@ -112,7 +116,7 @@ mod tests {
     async fn out_of_range_vnode_errors() {
         let b = InProcessBackend::new(2);
         let r = b
-            .write_partial(5, 1, Bytes::from_static(b"x"))
+            .write_partial(5, 1, 0, Bytes::from_static(b"x"))
             .await
             .unwrap_err();
         assert!(matches!(r, StateBackendError::Io(_)));
