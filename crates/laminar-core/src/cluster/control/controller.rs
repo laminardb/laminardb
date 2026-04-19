@@ -75,6 +75,28 @@ impl ClusterController {
         Arc::clone(&self.cluster_min_watermark)
     }
 
+    /// Leader-side monotonic publish. The leader computes the
+    /// cluster-wide minimum watermark in `await_prepare_quorum`
+    /// (its own local watermark folded with every follower's ack)
+    /// and must mirror it into the controller atomic so its own
+    /// operators see the same value that followers pick up via
+    /// `observe_barrier` on the matching `Commit`. Never lowers the
+    /// published value — event-time progress is monotonic. Phase 1.3.
+    pub fn publish_cluster_min_watermark(&self, wm: i64) {
+        let mut cur = self.cluster_min_watermark.load(Ordering::Acquire);
+        while wm > cur {
+            match self.cluster_min_watermark.compare_exchange(
+                cur,
+                wm,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
     /// This instance's ID.
     #[must_use]
     pub fn instance_id(&self) -> NodeId {
@@ -244,6 +266,29 @@ mod tests {
         .unwrap();
         let got = c.observe_barrier().await.unwrap().unwrap();
         assert_eq!(got.epoch, 5);
+    }
+
+    #[test]
+    fn publish_cluster_min_watermark_is_monotonic() {
+        // Leader-side publish mirrors the monotonic contract the
+        // follower path already enforces via observe_barrier. Phase 1.3.
+        let c = ctl(1, vec![]);
+        assert_eq!(c.cluster_min_watermark(), None);
+
+        c.publish_cluster_min_watermark(100);
+        assert_eq!(c.cluster_min_watermark(), Some(100));
+
+        // Higher value advances.
+        c.publish_cluster_min_watermark(250);
+        assert_eq!(c.cluster_min_watermark(), Some(250));
+
+        // Lower value must not regress.
+        c.publish_cluster_min_watermark(42);
+        assert_eq!(c.cluster_min_watermark(), Some(250));
+
+        // Equal value is a no-op; still Some(250).
+        c.publish_cluster_min_watermark(250);
+        assert_eq!(c.cluster_min_watermark(), Some(250));
     }
 
     #[tokio::test]

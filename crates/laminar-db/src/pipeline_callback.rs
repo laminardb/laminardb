@@ -110,6 +110,24 @@ impl ConnectorPipelineCallback {
         format!("{err}")
     }
 
+    /// Phase 1.3: cap each source's tracker-reported watermark by the
+    /// cluster-wide minimum, when one has been published. A `None`
+    /// `cluster_wm` (no controller, or atomic still at its `i64::MIN`
+    /// sentinel before the first committed checkpoint) leaves the map
+    /// untouched — blindly capping to MIN would freeze every downstream
+    /// event-time decision and hang the pipeline.
+    fn cap_source_watermarks_by_cluster_min(
+        source_wms: &mut FxHashMap<Arc<str>, i64>,
+        cluster_wm: Option<i64>,
+    ) {
+        let Some(cluster_wm) = cluster_wm else { return };
+        for wm in source_wms.values_mut() {
+            if cluster_wm < *wm {
+                *wm = cluster_wm;
+            }
+        }
+    }
+
     /// Follower-side dispatch: poll the leader's announcement, and
     /// if a fresh PREPARE is visible, capture local state and run
     /// `CheckpointCoordinator::follower_checkpoint`. Returns `true`
@@ -334,7 +352,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         watermark: i64,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
-        let source_wms: FxHashMap<Arc<str>, i64> = if let Some(ref tracker) = self.tracker {
+        let mut source_wms: FxHashMap<Arc<str>, i64> = if let Some(ref tracker) = self.tracker {
             self.source_ids
                 .iter()
                 .filter_map(|(name, &sid)| {
@@ -346,6 +364,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         } else {
             FxHashMap::default()
         };
+
+        #[cfg(feature = "cluster-unstable")]
+        {
+            let cluster_wm = self
+                .cluster_controller
+                .as_ref()
+                .and_then(|cc| cc.cluster_min_watermark());
+            Self::cap_source_watermarks_by_cluster_min(&mut source_wms, cluster_wm);
+        }
+
         let swm_ref = if source_wms.is_empty() {
             None
         } else {
@@ -1330,5 +1358,50 @@ mod tests {
 
         let got = tokio::time::timeout(Duration::from_millis(50), notify.notified()).await;
         assert!(got.is_err(), "non-Fail errors must not trigger shutdown");
+    }
+
+    /// Phase 1.3: the consumer-side cap is a no-op when the cluster has
+    /// not yet published a minimum watermark. Otherwise every event-time
+    /// decision would freeze behind the `i64::MIN` sentinel.
+    #[test]
+    fn cap_source_watermarks_none_cluster_wm_leaves_map_untouched() {
+        let mut wms: FxHashMap<Arc<str>, i64> = FxHashMap::default();
+        wms.insert(Arc::from("a"), 1_000);
+        wms.insert(Arc::from("b"), 500);
+
+        ConnectorPipelineCallback::cap_source_watermarks_by_cluster_min(&mut wms, None);
+
+        assert_eq!(wms.get(&Arc::<str>::from("a")).copied(), Some(1_000));
+        assert_eq!(wms.get(&Arc::<str>::from("b")).copied(), Some(500));
+    }
+
+    /// Phase 1.3: when a cluster-wide minimum is published, sources that
+    /// have advanced past it get pulled back to it; sources already at or
+    /// below the cap are left alone (cap must not push watermarks
+    /// *forward*, only restrain them).
+    #[test]
+    fn cap_source_watermarks_lowers_only_sources_above_cluster_min() {
+        let mut wms: FxHashMap<Arc<str>, i64> = FxHashMap::default();
+        wms.insert(Arc::from("ahead"), 2_000);
+        wms.insert(Arc::from("at"), 1_500);
+        wms.insert(Arc::from("behind"), 800);
+
+        ConnectorPipelineCallback::cap_source_watermarks_by_cluster_min(&mut wms, Some(1_500));
+
+        assert_eq!(
+            wms.get(&Arc::<str>::from("ahead")).copied(),
+            Some(1_500),
+            "source above cluster min must be capped down",
+        );
+        assert_eq!(
+            wms.get(&Arc::<str>::from("at")).copied(),
+            Some(1_500),
+            "source at cluster min unchanged",
+        );
+        assert_eq!(
+            wms.get(&Arc::<str>::from("behind")).copied(),
+            Some(800),
+            "source below cluster min must NOT be advanced by the cap",
+        );
     }
 }

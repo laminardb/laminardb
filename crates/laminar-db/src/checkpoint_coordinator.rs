@@ -786,6 +786,9 @@ impl CheckpointCoordinator {
             // Leader-only cluster — cluster-wide min is just the
             // leader's local watermark (if any).
             self.cluster_min_watermark = self.local_watermark_ms;
+            if let Some(wm) = self.local_watermark_ms {
+                cc.publish_cluster_min_watermark(wm);
+            }
             return None;
         }
 
@@ -807,6 +810,14 @@ impl CheckpointCoordinator {
                     (None, None) => None,
                 };
                 self.cluster_min_watermark = merged;
+                // Leader-side mirror: publish to the controller atomic
+                // so this instance's operators see the same value the
+                // followers will pick up via `observe_barrier(Commit)`.
+                // Without this, the leader's event-time decisions lag a
+                // full checkpoint behind its own announcements.
+                if let Some(wm) = merged {
+                    cc.publish_cluster_min_watermark(wm);
+                }
                 None
             }
             QuorumOutcome::TimedOut { missing, .. } => {
@@ -2434,6 +2445,59 @@ mod tests {
             .await
             .unwrap();
         assert!(!committed, "follower should roll back on leader's Abort");
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    #[tokio::test]
+    async fn leader_publishes_cluster_min_watermark_to_controller() {
+        // Phase 1.3b: on a solo cluster, `await_prepare_quorum` computes
+        // the cluster-wide min as "leader's local watermark" (no followers
+        // to fold). This must be mirrored into the controller atomic so
+        // the leader's own operators consume the same value that
+        // followers pick up via `observe_barrier(Commit)` — otherwise
+        // the leader would drive event-time decisions off a watermark
+        // that none of its peers have acked yet.
+        use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+        use laminar_core::cluster::discovery::NodeId;
+        use tokio::sync::watch;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path());
+
+        let self_id = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(self_id));
+        let kv_trait: Arc<dyn ClusterKv> = kv.clone();
+        let (_tx, rx) = watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, rx));
+        coord.set_cluster_controller(Arc::clone(&controller));
+
+        // Pre-condition: controller atomic is at its "unset" sentinel.
+        assert_eq!(controller.cluster_min_watermark(), None);
+
+        // Seed a local watermark on the coordinator and drive a full
+        // checkpoint. Solo cluster → leader's local value *is* the
+        // cluster-wide min.
+        coord.set_local_watermark_ms(Some(12_345));
+        let result = coord.checkpoint(CheckpointRequest::default()).await.unwrap();
+        assert!(result.success, "solo-cluster checkpoint should succeed");
+
+        assert_eq!(
+            controller.cluster_min_watermark(),
+            Some(12_345),
+            "leader must mirror the cluster-wide min into its controller",
+        );
+
+        // A subsequent checkpoint with a lower local watermark must
+        // NOT regress the published value — event-time progress is
+        // monotonic (same invariant the follower path already enforces).
+        coord.set_local_watermark_ms(Some(42));
+        let result = coord.checkpoint(CheckpointRequest::default()).await.unwrap();
+        assert!(result.success);
+        assert_eq!(
+            controller.cluster_min_watermark(),
+            Some(12_345),
+            "stale local watermark must not lower the published cluster min",
+        );
     }
 
     #[cfg(feature = "cluster-unstable")]
