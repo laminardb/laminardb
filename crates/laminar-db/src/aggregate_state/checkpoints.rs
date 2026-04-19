@@ -11,7 +11,14 @@ use std::hash::{Hash, Hasher};
 
 use arrow::datatypes::Schema;
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub(crate) struct GroupCheckpoint {
     /// IPC bytes encoding the group key tuple (`Vec<ScalarValue>`).
     pub key: Vec<u8>,
@@ -26,7 +33,14 @@ fn default_last_updated() -> i64 {
     i64::MIN
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub(crate) struct AggStateCheckpoint {
     pub fingerprint: u64,
     pub groups: Vec<GroupCheckpoint>,
@@ -34,7 +48,14 @@ pub(crate) struct AggStateCheckpoint {
     pub last_emitted: Vec<EmittedCheckpoint>,
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub(crate) struct EmittedCheckpoint {
     /// IPC bytes for the key tuple.
     pub key: Vec<u8>,
@@ -42,19 +63,40 @@ pub(crate) struct EmittedCheckpoint {
     pub values: Vec<u8>,
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub(crate) struct WindowCheckpoint {
     pub window_start: i64,
     pub groups: Vec<GroupCheckpoint>,
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub(crate) struct EowcStateCheckpoint {
     pub fingerprint: u64,
     pub windows: Vec<WindowCheckpoint>,
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub(crate) struct JoinStateCheckpoint {
     #[serde(default)]
     pub left_buffer_rows: u64,

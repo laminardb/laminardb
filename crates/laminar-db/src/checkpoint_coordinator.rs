@@ -462,16 +462,29 @@ impl CheckpointCoordinator {
     /// Only sinks with `exactly_once = true` participate in two-phase commit.
     /// At-most-once sinks are skipped — they receive no `pre_commit`/`commit`
     /// calls and provide no transactional guarantees.
+    ///
+    /// Fires every sink's `pre_commit` concurrently via `try_join_all` —
+    /// matching the rollback path's shape. The serial version was
+    /// `sum(per-sink pre-commit latency)`; with 4 Delta sinks at ~200ms
+    /// S3 write each, that was 800ms serial. Concurrent = 200ms.
     async fn pre_commit_sinks_inner(&self, epoch: u64) -> Result<(), DbError> {
-        for sink in &self.sinks {
-            if sink.exactly_once {
-                sink.handle.pre_commit(epoch).await.map_err(|e| {
-                    DbError::Checkpoint(format!("sink '{}' pre-commit failed: {e}", sink.name))
-                })?;
-                debug!(sink = %sink.name, epoch, "sink pre-committed");
+        let futures = self.sinks.iter().filter(|s| s.exactly_once).map(|sink| {
+            let handle = sink.handle.clone();
+            let name = sink.name.clone();
+            async move {
+                let result = handle.pre_commit(epoch).await;
+                match result {
+                    Ok(()) => {
+                        debug!(sink = %name, epoch, "sink pre-committed");
+                        Ok(())
+                    }
+                    Err(e) => Err(DbError::Checkpoint(format!(
+                        "sink '{name}' pre-commit failed: {e}"
+                    ))),
+                }
             }
-        }
-        Ok(())
+        });
+        futures::future::try_join_all(futures).await.map(|_| ())
     }
 
     /// Commits all exactly-once sinks with per-sink status tracking.
@@ -522,26 +535,33 @@ impl CheckpointCoordinator {
     }
 
     /// Inner commit loop (no timeout).
+    ///
+    /// Fires every sink's `commit_epoch` concurrently via `join_all`
+    /// (not `try_join_all` — one sink failing must not short-circuit
+    /// the others, because each sink's status is tracked independently
+    /// and callers inspect the map). Matches the rollback path's
+    /// pattern at `rollback_sinks_inner`.
     async fn commit_sinks_inner(&self, epoch: u64) -> HashMap<String, SinkCommitStatus> {
-        let mut statuses = HashMap::with_capacity(self.sinks.len());
-
-        for sink in &self.sinks {
-            if sink.exactly_once {
-                match sink.handle.commit_epoch(epoch).await {
+        let futures = self.sinks.iter().filter(|s| s.exactly_once).map(|sink| {
+            let handle = sink.handle.clone();
+            let name = sink.name.clone();
+            async move {
+                let status = match handle.commit_epoch(epoch).await {
                     Ok(()) => {
-                        statuses.insert(sink.name.clone(), SinkCommitStatus::Committed);
-                        debug!(sink = %sink.name, epoch, "sink committed");
+                        debug!(sink = %name, epoch, "sink committed");
+                        SinkCommitStatus::Committed
                     }
                     Err(e) => {
-                        let msg = format!("sink '{}' commit failed: {e}", sink.name);
-                        error!(sink = %sink.name, epoch, error = %e, "sink commit failed");
-                        statuses.insert(sink.name.clone(), SinkCommitStatus::Failed(msg));
+                        let msg = format!("sink '{name}' commit failed: {e}");
+                        error!(sink = %name, epoch, error = %e, "sink commit failed");
+                        SinkCommitStatus::Failed(msg)
                     }
-                }
+                };
+                (name, status)
             }
-        }
-
-        statuses
+        });
+        let results = futures::future::join_all(futures).await;
+        results.into_iter().collect()
     }
 
     /// Saves a manifest to the checkpoint store (blocking I/O on a task).
@@ -550,14 +570,17 @@ impl CheckpointCoordinator {
     /// data **before** the manifest, ensuring atomicity: if the sidecar write
     /// fails, the manifest is never persisted.
     ///
-    /// Takes `manifest` by value to avoid cloning on the common path.
-    /// Callers that need the manifest after save should clone before calling.
+    /// Takes `Arc<CheckpointManifest>` so the caller can retain its own
+    /// copy without a deep clone — the refcount bump is essentially
+    /// free. Callers that need to mutate the manifest after save use
+    /// `Arc::make_mut` (COW: no copy when the `spawn_blocking` task
+    /// has already returned and we're the sole owner).
     ///
     /// Bounded by [`CheckpointConfig::persist_timeout`] to prevent a hung
     /// filesystem from stalling the runtime indefinitely.
     async fn save_manifest(
         &self,
-        manifest: CheckpointManifest,
+        manifest: Arc<CheckpointManifest>,
         state_data: Option<Vec<u8>>,
     ) -> Result<(), DbError> {
         let store = Arc::clone(&self.store);
@@ -583,6 +606,13 @@ impl CheckpointCoordinator {
 
     /// Writes a per-vnode durability marker so the leader's
     /// `epoch_complete` gate returns true and sinks can commit.
+    ///
+    /// Fires every vnode marker concurrently via `try_join_all`.
+    /// The serial version was O(`vnode_count` × per-write latency) —
+    /// ~256 awaits on a typical cluster, trivial CPU but each a
+    /// scheduling hop (and on remote object-store backends each
+    /// write is tens to hundreds of ms). Concurrent dispatch
+    /// collapses that to one round-trip's worth of wall time.
     async fn write_vnode_markers(&self, epoch: u64, checkpoint_id: u64) -> Result<(), DbError> {
         let Some(ref backend) = self.state_backend else {
             return Ok(());
@@ -591,17 +621,18 @@ impl CheckpointCoordinator {
             return Ok(());
         }
         let payload = bytes::Bytes::from(format!("ckpt:{checkpoint_id}").into_bytes());
-        for &v in &self.vnode_set {
-            backend
-                .write_partial(v, epoch, payload.clone())
-                .await
-                .map_err(|e| {
+        let writes = self.vnode_set.iter().map(|&v| {
+            let backend = Arc::clone(backend);
+            let payload = payload.clone();
+            async move {
+                backend.write_partial(v, epoch, payload).await.map_err(|e| {
                     DbError::Checkpoint(format!(
                         "[LDB-6024] vnode marker write failed (vnode={v}, epoch={epoch}): {e}"
                     ))
-                })?;
-        }
-        Ok(())
+                })
+            }
+        });
+        futures::future::try_join_all(writes).await.map(|_| ())
     }
 
     /// At cluster startup: if we're the new leader and the last
@@ -722,9 +753,14 @@ impl CheckpointCoordinator {
     /// Overwrites an existing manifest with updated fields (e.g., sink commit
     /// statuses after Step 6). Uses [`CheckpointStore::update_manifest`] which
     /// does NOT use conditional PUT, so the overwrite always succeeds.
-    async fn update_manifest_only(&self, manifest: &CheckpointManifest) -> Result<(), DbError> {
+    ///
+    /// Takes `Arc<CheckpointManifest>` — the refcount bump into
+    /// `spawn_blocking` replaces the previous unconditional deep clone.
+    async fn update_manifest_only(
+        &self,
+        manifest: Arc<CheckpointManifest>,
+    ) -> Result<(), DbError> {
         let store = Arc::clone(&self.store);
-        let manifest = manifest.clone();
         let timeout_dur = self.config.persist_timeout;
 
         let task = tokio::task::spawn_blocking(move || store.update_manifest(&manifest));
@@ -1090,7 +1126,7 @@ impl CheckpointCoordinator {
         );
 
         self.phase = CheckpointPhase::Persisting;
-        self.save_manifest(manifest, state_data).await?;
+        self.save_manifest(Arc::new(manifest), state_data).await?;
         self.write_vnode_markers(epoch, checkpoint_id).await?;
         Ok(())
     }
@@ -1218,7 +1254,12 @@ impl CheckpointCoordinator {
         let checkpoint_bytes = sidecar_bytes as u64;
 
         self.phase = CheckpointPhase::Persisting;
-        if let Err(e) = self.save_manifest(manifest.clone(), state_data).await {
+        // Arc-wrap so the save task gets a cheap refcount bump instead of
+        // a deep clone. After `save_manifest.await` the task drops its
+        // Arc and we're the sole owner; `Arc::make_mut` below gets us a
+        // free mutable reference for the post-commit sink-status update.
+        let mut manifest = Arc::new(manifest);
+        if let Err(e) = self.save_manifest(Arc::clone(&manifest), state_data).await {
             self.phase = CheckpointPhase::Idle;
             self.checkpoints_failed += 1;
             let duration = start.elapsed();
@@ -1383,8 +1424,11 @@ impl CheckpointCoordinator {
             .any(|s| matches!(s, SinkCommitStatus::Failed(_)));
 
         if !sink_statuses.is_empty() {
-            manifest.sink_commit_statuses = sink_statuses;
-            if let Err(e) = self.update_manifest_only(&manifest).await {
+            // `Arc::make_mut`: COW. Refcount is 1 here (spawn_blocking
+            // task in save_manifest has already returned and dropped its
+            // clone), so this is a zero-copy mutable borrow.
+            Arc::make_mut(&mut manifest).sink_commit_statuses = sink_statuses;
+            if let Err(e) = self.update_manifest_only(Arc::clone(&manifest)).await {
                 warn!(
                     checkpoint_id,
                     epoch,

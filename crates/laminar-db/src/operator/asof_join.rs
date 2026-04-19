@@ -87,18 +87,22 @@ impl GraphOperator for AsofJoinOperator {
             .right_buffer
             .snapshot_checkpoint(self.last_evicted_watermark)?;
 
-        let data = serde_json::to_vec(&cp).map_err(|e| {
-            DbError::Pipeline(format!(
-                "ASOF join [{}]: checkpoint serialization: {e}",
-                self.projection.op_name
-            ))
-        })?;
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&cp)
+            .map(|v| v.to_vec())
+            .map_err(|e| {
+                DbError::Pipeline(format!(
+                    "ASOF join [{}]: checkpoint serialization: {e}",
+                    self.projection.op_name
+                ))
+            })?;
 
         Ok(Some(OperatorCheckpoint { data }))
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        let cp: AsofBufferCheckpoint = serde_json::from_slice(&checkpoint.data).map_err(|e| {
+        let cp: AsofBufferCheckpoint =
+            rkyv::from_bytes::<AsofBufferCheckpoint, rkyv::rancor::Error>(&checkpoint.data)
+                .map_err(|e| {
             DbError::Pipeline(format!(
                 "ASOF join [{}]: checkpoint deserialization: {e}",
                 self.projection.op_name

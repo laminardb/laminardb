@@ -50,7 +50,14 @@ struct SessionGroupState {
     sessions: BTreeMap<i64, SessionAccState>,
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub(crate) struct SessionCheckpoint {
     pub start: i64,
     pub end: i64,
@@ -60,14 +67,28 @@ pub(crate) struct SessionCheckpoint {
     pub acc_states: Vec<Vec<u8>>,
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub(crate) struct SessionGroupCheckpoint {
     /// Arrow IPC bytes for the group-key tuple.
     pub key: Vec<u8>,
     pub sessions: Vec<SessionCheckpoint>,
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 pub(crate) struct CoreWindowCheckpoint {
     pub fingerprint: u64,
     /// Per-window checkpoint data (reuses EOWC format) — used by

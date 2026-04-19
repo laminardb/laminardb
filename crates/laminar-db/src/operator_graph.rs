@@ -54,10 +54,19 @@ enum GateDecision {
 
 const STATS_SAMPLE_INTERVAL: u64 = 32;
 
-#[derive(Serialize, Deserialize)]
+/// `operators` uses std `HashMap` so rkyv's stock `Archive`/`Serialize`/
+/// `Deserialize` impls apply (it supports `HashMap<K, V>` natively but
+/// not `HashMap<K, V, FxHasher>`). Cold path — written once per
+/// checkpoint interval, not on the hot query path. The `clippy::disallowed_types`
+/// allow is scoped to the single file-level type alias below rather
+/// than `#![allow]`-ing the whole module.
+#[allow(clippy::disallowed_types)]
+pub(crate) type OperatorStateMap = std::collections::HashMap<String, Vec<u8>>;
+
+#[derive(Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct GraphCheckpoint {
     pub version: u32,
-    pub operators: FxHashMap<String, Vec<u8>>,
+    pub operators: OperatorStateMap,
 }
 
 struct GraphNode {
@@ -1340,7 +1349,7 @@ impl OperatorGraph {
 
     // &mut self: some accumulators need &mut for state()
     pub fn snapshot_state(&mut self) -> Result<Option<GraphCheckpoint>, DbError> {
-        let mut operators = FxHashMap::default();
+        let mut operators = OperatorStateMap::new();
         for node in &mut self.nodes {
             if node.removed {
                 continue;
@@ -1375,14 +1384,16 @@ impl OperatorGraph {
     }
 
     pub fn serialize_checkpoint(cp: &GraphCheckpoint) -> Result<Vec<u8>, DbError> {
-        serde_json::to_vec(cp)
+        rkyv::to_bytes::<rkyv::rancor::Error>(cp)
+            .map(|v| v.to_vec())
             .map_err(|e| DbError::Pipeline(format!("operator graph checkpoint serialization: {e}")))
     }
 
     pub fn restore_from_bytes(&mut self, bytes: &[u8]) -> Result<usize, DbError> {
-        let checkpoint: GraphCheckpoint = serde_json::from_slice(bytes).map_err(|e| {
-            DbError::Pipeline(format!("operator graph checkpoint deserialization: {e}"))
-        })?;
+        let checkpoint: GraphCheckpoint =
+            rkyv::from_bytes::<GraphCheckpoint, rkyv::rancor::Error>(bytes).map_err(|e| {
+                DbError::Pipeline(format!("operator graph checkpoint deserialization: {e}"))
+            })?;
         self.restore_state(&checkpoint)
     }
 }

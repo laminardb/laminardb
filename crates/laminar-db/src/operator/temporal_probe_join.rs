@@ -67,19 +67,22 @@ impl GraphOperator for TemporalProbeJoinOperator {
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
         let cp = self.state.snapshot_checkpoint()?;
 
-        let data = serde_json::to_vec(&cp).map_err(|e| {
-            DbError::Pipeline(format!(
-                "temporal probe [{}]: checkpoint serialization: {e}",
-                self.projection.op_name
-            ))
-        })?;
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&cp)
+            .map(|v| v.to_vec())
+            .map_err(|e| {
+                DbError::Pipeline(format!(
+                    "temporal probe [{}]: checkpoint serialization: {e}",
+                    self.projection.op_name
+                ))
+            })?;
 
         Ok(Some(OperatorCheckpoint { data }))
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
         let cp: TemporalProbeCheckpoint =
-            serde_json::from_slice(&checkpoint.data).map_err(|e| {
+            rkyv::from_bytes::<TemporalProbeCheckpoint, rkyv::rancor::Error>(&checkpoint.data)
+                .map_err(|e| {
                 DbError::Pipeline(format!(
                     "temporal probe [{}]: checkpoint deserialization: {e}",
                     self.projection.op_name

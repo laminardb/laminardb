@@ -661,12 +661,14 @@ impl GraphOperator for SqlQueryOperator {
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
         if matches!(self.state, QueryState::Uninit) {
             if let Some(ref cp) = self.pending_restore {
-                let data = serde_json::to_vec(cp).map_err(|e| {
-                    DbError::Pipeline(format!(
-                        "checkpoint serialization of pending restore for '{}': {e}",
-                        self.op_name
-                    ))
-                })?;
+                let data = rkyv::to_bytes::<rkyv::rancor::Error>(cp)
+                    .map(|v| v.to_vec())
+                    .map_err(|e| {
+                        DbError::Pipeline(format!(
+                            "checkpoint serialization of pending restore for '{}': {e}",
+                            self.op_name
+                        ))
+                    })?;
                 return Ok(Some(OperatorCheckpoint { data }));
             }
             return Ok(None);
@@ -677,17 +679,21 @@ impl GraphOperator for SqlQueryOperator {
         };
 
         let cp = agg_state.checkpoint_groups()?;
-        let data = serde_json::to_vec(&cp).map_err(|e| {
-            DbError::Pipeline(format!(
-                "checkpoint serialization for '{}': {e}",
-                self.op_name
-            ))
-        })?;
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&cp)
+            .map(|v| v.to_vec())
+            .map_err(|e| {
+                DbError::Pipeline(format!(
+                    "checkpoint serialization for '{}': {e}",
+                    self.op_name
+                ))
+            })?;
         Ok(Some(OperatorCheckpoint { data }))
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        let cp: AggStateCheckpoint = serde_json::from_slice(&checkpoint.data).map_err(|e| {
+        let cp: AggStateCheckpoint =
+            rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(&checkpoint.data)
+                .map_err(|e| {
             DbError::Pipeline(format!(
                 "checkpoint deserialization for '{}': {e}",
                 self.op_name
