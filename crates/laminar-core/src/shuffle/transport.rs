@@ -5,6 +5,7 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -37,12 +38,22 @@ struct ShuffleConnection {
     writer: Mutex<tokio::io::WriteHalf<TcpStream>>,
     /// The reader task. Kept so dropping the connection cancels it.
     reader: JoinHandle<()>,
+    /// Liveness flag shared with the reader task. Flipped to `false`
+    /// when the reader exits (peer closed the socket cleanly OR an
+    /// IO error hit). [`ShuffleSender::connection_for`] consults it
+    /// before handing out the cached `Arc`; dead entries are purged
+    /// and the next send reconnects. Phase 2.2.
+    alive: Arc<AtomicBool>,
 }
 
 impl ShuffleConnection {
     async fn send(&self, msg: &ShuffleMessage) -> io::Result<()> {
         let mut w = self.writer.lock().await;
         write_message(&mut *w, msg).await
+    }
+
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
     }
 }
 
@@ -147,8 +158,30 @@ impl ShuffleSender {
     }
 
     async fn connection_for(&self, peer: ShufflePeerId) -> io::Result<Arc<ShuffleConnection>> {
+        // Fast path: hand out the cached connection if its reader task
+        // is still alive. A dead connection is one whose reader has
+        // exited (peer closed or IO error) — the socket's write half is
+        // useless even though the `Arc` still exists.
         if let Some(existing) = self.pool.read().await.get(&peer).cloned() {
-            return Ok(existing);
+            if existing.is_alive() {
+                return Ok(existing);
+            }
+        }
+
+        // Purge the dead pool entry so we reconnect below. We do NOT
+        // touch `peers` here: the caller (gossip watcher / explicit
+        // `register_peer`) owns the address mapping. If the cached
+        // address is stale, `TcpStream::connect` will surface that
+        // as a connect error and the caller retries after re-register;
+        // if callers use KV discovery, a missing `peers` entry triggers
+        // `discover_peer` in the next block. Phase 2.2.
+        {
+            let mut pool = self.pool.write().await;
+            if let Some(c) = pool.get(&peer) {
+                if !c.is_alive() {
+                    pool.remove(&peer);
+                }
+            }
         }
 
         let addr = if let Some(a) = self.peers.read().await.get(&peer).copied() {
@@ -176,7 +209,10 @@ impl ShuffleSender {
         // closes or the socket errors. Nothing currently acts on reply
         // traffic on the outbound side (credit frames are handled by
         // the inbound `ShuffleReceiver` on the other instance), so we
-        // just discard.
+        // just discard. Flip `alive` to `false` on exit so the next
+        // `connection_for` call evicts this entry and reconnects.
+        let alive = Arc::new(AtomicBool::new(true));
+        let alive_for_reader = Arc::clone(&alive);
         let reader = tokio::spawn(async move {
             let _ = peer;
             loop {
@@ -185,18 +221,24 @@ impl ShuffleSender {
                     Ok(_) => {}
                 }
             }
+            alive_for_reader.store(false, Ordering::Release);
         });
 
         let conn = Arc::new(ShuffleConnection {
             writer: Mutex::new(writer_half),
             reader,
+            alive,
         });
 
         // Race: another task may have created a connection in the
-        // meantime. Cheap to discard ours; pool stays consistent.
+        // meantime. Cheap to discard ours — but only if the winner is
+        // still alive. A dead winner (raced with an earlier reader
+        // exit) must be superseded.
         let mut pool = self.pool.write().await;
         if let Some(winner) = pool.get(&peer).cloned() {
-            return Ok(winner);
+            if winner.is_alive() {
+                return Ok(winner);
+            }
         }
         pool.insert(peer, Arc::clone(&conn));
         Ok(conn)
@@ -211,8 +253,26 @@ impl ShuffleSender {
 pub struct ShuffleReceiver {
     local_id: ShufflePeerId,
     local_addr: SocketAddr,
-    _accept: JoinHandle<()>,
+    accept: JoinHandle<()>,
+    /// Per-peer reader tasks spawned by the accept loop. Tracked so
+    /// [`Drop`] can abort them — otherwise detached tasks keep the
+    /// socket open, peers never see EOF, and senders can't detect
+    /// that we went away. Phase 2.2.
+    peer_tasks: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
     rx: Mutex<mpsc::UnboundedReceiver<(ShufflePeerId, ShuffleMessage)>>,
+}
+
+impl Drop for ShuffleReceiver {
+    fn drop(&mut self) {
+        // Abort accept first so no new peer tasks are spawned, then
+        // abort any in-flight peer tasks. Aborting drops each socket,
+        // which surfaces as EOF on the sender's reader half — exactly
+        // what the stale-connection purge in `connection_for` relies on.
+        self.accept.abort();
+        for h in self.peer_tasks.lock().drain(..) {
+            h.abort();
+        }
+    }
 }
 
 impl std::fmt::Debug for ShuffleReceiver {
@@ -258,12 +318,19 @@ impl ShuffleReceiver {
         let local_addr = listener.local_addr()?;
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let accept = tokio::spawn(Self::accept_loop(listener, tx));
+        let peer_tasks: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>> =
+            Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let accept = tokio::spawn(Self::accept_loop(
+            listener,
+            tx,
+            Arc::clone(&peer_tasks),
+        ));
 
         Ok(Self {
             local_id,
             local_addr,
-            _accept: accept,
+            accept,
+            peer_tasks,
             rx: Mutex::new(rx),
         })
     }
@@ -301,6 +368,7 @@ impl ShuffleReceiver {
     async fn accept_loop(
         listener: TcpListener,
         tx: mpsc::UnboundedSender<(ShufflePeerId, ShuffleMessage)>,
+        peer_tasks: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
     ) {
         loop {
             let Ok((stream, _peer_addr)) = listener.accept().await else { break };
@@ -308,7 +376,13 @@ impl ShuffleReceiver {
                 continue;
             }
             let tx = tx.clone();
-            tokio::spawn(Self::per_peer_loop(stream, tx));
+            let handle = tokio::spawn(Self::per_peer_loop(stream, tx));
+            // Sweep finished tasks so the vec doesn't grow unbounded
+            // under a long-lived receiver with churning peers, then
+            // track the fresh one so Drop can abort it.
+            let mut tasks = peer_tasks.lock();
+            tasks.retain(|h| !h.is_finished());
+            tasks.push(handle);
         }
     }
 
@@ -418,5 +492,90 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// Phase 2.2 AC: when a peer restarts at a different address, the
+    /// sender's cached connection flips dead (reader exits on EOF), the
+    /// next `send_to` purges the stale entry and reconnects against the
+    /// freshly-registered address.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_reconnects_after_peer_restart_at_new_address() {
+        // 1. Peer binds on an ephemeral port.
+        let recv_v1 = bind_on_loopback(2).await;
+        let addr_v1 = recv_v1.local_addr();
+
+        let sender = ShuffleSender::new(1);
+        sender.register_peer(2, addr_v1).await;
+
+        // 2. First send establishes the pooled connection.
+        sender
+            .send_to(2, &ShuffleMessage::Hello(111))
+            .await
+            .unwrap();
+        let (from, msg) = recv_v1.recv().await.unwrap();
+        assert_eq!(from, 1);
+        assert_eq!(msg, ShuffleMessage::Hello(111));
+
+        // Pool has exactly the one connection, and it's alive.
+        {
+            let pool = sender.pool.read().await;
+            assert_eq!(pool.len(), 1, "one pooled connection");
+            assert!(pool.get(&2).unwrap().is_alive(), "alive after first send");
+        }
+
+        // 3. "Crash" the peer: drop the receiver so the listener and
+        //    the per-peer task go away. The sender's reader half will
+        //    observe EOF and flip `alive=false`.
+        drop(recv_v1);
+
+        // Spin until the reader task notices the shutdown. Bounded
+        // wait so a hung test fails loudly instead of running forever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let alive = {
+                let pool = sender.pool.read().await;
+                pool.get(&2).is_none_or(|c| c.is_alive())
+            };
+            if !alive {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reader task did not flip alive=false within 5s",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // 4. Peer "restarts" on a fresh ephemeral port — almost
+        //    certainly different from addr_v1. Re-register its new
+        //    address on the sender (mimicking gossip discovery).
+        let recv_v2 = bind_on_loopback(2).await;
+        let addr_v2 = recv_v2.local_addr();
+        assert_ne!(
+            addr_v1, addr_v2,
+            "ephemeral rebind must pick a different port",
+        );
+        sender.register_peer(2, addr_v2).await;
+
+        // 5. `send_to` must purge the dead entry and reconnect against
+        //    addr_v2. If the purge is broken, we'd either reuse the
+        //    dead writer (io error) or dial the stale addr_v1.
+        sender
+            .send_to(2, &ShuffleMessage::Hello(222))
+            .await
+            .expect("reconnect after restart");
+
+        let (from, msg) = recv_v2.recv().await.unwrap();
+        assert_eq!(from, 1);
+        assert_eq!(
+            msg,
+            ShuffleMessage::Hello(222),
+            "delivered to the restarted peer, not the dead one",
+        );
+
+        // Pool still holds exactly one connection — the fresh one.
+        let pool = sender.pool.read().await;
+        assert_eq!(pool.len(), 1);
+        assert!(pool.get(&2).unwrap().is_alive());
     }
 }
