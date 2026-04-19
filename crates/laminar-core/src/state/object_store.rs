@@ -20,6 +20,10 @@ use super::backend::{StateBackend, StateBackendError};
 pub struct ObjectStoreBackend {
     store: Arc<dyn ObjectStore>,
     instance_id: String,
+    /// Pre-encoded audit body for the `_COMMIT` CAS — derived once
+    /// from `instance_id` to avoid cloning a String into `Bytes` on
+    /// every commit attempt.
+    committer_bytes: Bytes,
     vnode_capacity: u32,
     /// Authoritative vnode-assignment version known to this backend.
     /// Phase 1.4 split-brain fence: [`write_partial`](Self::write_partial)
@@ -50,9 +54,12 @@ impl ObjectStoreBackend {
         instance_id: impl Into<String>,
         vnode_capacity: u32,
     ) -> Self {
+        let instance_id = instance_id.into();
+        let committer_bytes = Bytes::from(instance_id.clone().into_bytes());
         Self {
             store,
-            instance_id: instance_id.into(),
+            instance_id,
+            committer_bytes,
             vnode_capacity,
             authoritative_version: Arc::new(AtomicU64::new(0)),
         }
@@ -192,18 +199,39 @@ impl StateBackend for ObjectStoreBackend {
             Err(e) => return Err(StateBackendError::Io(e.to_string())),
         }
 
+        // Parallel HEAD fan-out. Sequential was O(vnodes × RTT) — on S3
+        // that's ~256 round-trips per commit gate, seconds of latency
+        // for no reason. JoinSet keeps the code dep-free (no `futures`)
+        // while overlapping all lookups.
+        let mut set = tokio::task::JoinSet::new();
         for &v in vnodes {
             self.check_vnode(v)?;
+            let store = Arc::clone(&self.store);
             let path = Self::partial_path(epoch, v);
-            match self.store.head(&path).await {
-                Ok(_) => {}
-                Err(object_store::Error::NotFound { .. }) => return Ok(false),
-                Err(e) => return Err(StateBackendError::Io(e.to_string())),
+            set.spawn(async move { store.head(&path).await });
+        }
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(Ok(_)) => {}
+                Ok(Err(object_store::Error::NotFound { .. })) => {
+                    set.abort_all();
+                    return Ok(false);
+                }
+                Ok(Err(e)) => {
+                    set.abort_all();
+                    return Err(StateBackendError::Io(e.to_string()));
+                }
+                Err(join_err) => {
+                    set.abort_all();
+                    return Err(StateBackendError::Io(format!(
+                        "epoch_complete HEAD task failed: {join_err}"
+                    )));
+                }
             }
         }
 
         // CAS the commit marker; payload is the committer's id for audit.
-        let payload = PutPayload::from(Bytes::from(self.instance_id.clone()));
+        let payload = PutPayload::from(self.committer_bytes.clone());
         let opts = PutOptions {
             mode: PutMode::Create,
             ..Default::default()
