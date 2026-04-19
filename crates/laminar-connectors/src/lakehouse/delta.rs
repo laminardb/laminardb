@@ -126,6 +126,10 @@ pub struct DeltaLakeSink {
     /// configured but the pipeline schema is not yet available at `open()` time.
     #[cfg(feature = "delta-lake")]
     needs_deferred_delta_init: bool,
+    /// Background reopen kicked off after a checkpoint-boundary drop, so
+    /// the next flush doesn't pay the table-load cost on the commit path.
+    #[cfg(feature = "delta-lake")]
+    pending_reopen: Option<tokio::task::JoinHandle<Result<DeltaTable, ConnectorError>>>,
 }
 
 impl DeltaLakeSink {
@@ -160,6 +164,8 @@ impl DeltaLakeSink {
             compaction_handle: None,
             #[cfg(feature = "delta-lake")]
             needs_deferred_delta_init: false,
+            #[cfg(feature = "delta-lake")]
+            pending_reopen: None,
         }
     }
 
@@ -407,6 +413,52 @@ impl DeltaLakeSink {
         Ok(())
     }
 
+    /// Spawn a background reopen of the Delta table so the next flush
+    /// doesn't pay the load cost on its hot path. An already-in-flight
+    /// reopen is aborted — the fresher one supersedes it.
+    #[cfg(feature = "delta-lake")]
+    fn schedule_background_reopen(&mut self) {
+        if let Some(prev) = self.pending_reopen.take() {
+            prev.abort();
+        }
+        let path = self.resolved_table_path.clone();
+        let opts = self.resolved_storage_options.clone();
+        let schema = self.schema.clone();
+        self.pending_reopen = Some(tokio::spawn(async move {
+            super::delta_io::open_or_create_table(&path, opts, schema.as_ref()).await
+        }));
+    }
+
+    /// Install a previously-scheduled background reopen. Returns `false`
+    /// on miss — no pending reopen, task failure, or timeout — so callers
+    /// fall through to the synchronous `reopen_table()` path.
+    #[cfg(feature = "delta-lake")]
+    async fn try_install_pending_reopen(&mut self, timeout: std::time::Duration) -> bool {
+        let Some(mut pending) = self.pending_reopen.take() else { return false };
+        let table = match tokio::time::timeout(timeout, &mut pending).await {
+            Ok(Ok(Ok(t))) => t,
+            Ok(Ok(Err(e))) => {
+                warn!(error = %e, "Delta background reopen failed");
+                return false;
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "Delta background reopen task ended unexpectedly");
+                return false;
+            }
+            Err(_) => {
+                warn!(timeout_secs = timeout.as_secs(), "Delta background reopen timed out");
+                pending.abort();
+                return false;
+            }
+        };
+        #[allow(clippy::cast_sign_loss)]
+        {
+            self.delta_version = table.version().unwrap_or(0) as u64;
+        }
+        self.table = Some(table);
+        true
+    }
+
     /// Attempts a single Delta write/merge and returns the updated table on success.
     #[cfg(feature = "delta-lake")]
     async fn attempt_delta_write(
@@ -503,18 +555,21 @@ impl DeltaLakeSink {
         let mut last_error: Option<ConnectorError> = None;
 
         for attempt in 0..max_attempts {
-            // delta-rs write/merge APIs consume DeltaTable by value.
-            // If self.table is None (from a previous failed attempt), re-open it.
+            // delta-rs consumes DeltaTable by value. If self.table is None
+            // (prior failure or checkpoint-boundary drop) reinstall it —
+            // prefer a scheduled background reopen, fall back to sync.
             if self.table.is_none() {
                 let reopen_timeout = self.config.write_timeout;
-                tokio::time::timeout(reopen_timeout, self.reopen_table())
-                    .await
-                    .map_err(|_| {
-                        ConnectorError::ConnectionFailed(format!(
-                            "Delta table reopen timed out after {}s",
-                            reopen_timeout.as_secs()
-                        ))
-                    })??;
+                if !self.try_install_pending_reopen(reopen_timeout).await {
+                    tokio::time::timeout(reopen_timeout, self.reopen_table())
+                        .await
+                        .map_err(|_| {
+                            ConnectorError::ConnectionFailed(format!(
+                                "Delta table reopen timed out after {}s",
+                                reopen_timeout.as_secs()
+                            ))
+                        })??;
+                }
             }
 
             let table = self
@@ -551,17 +606,19 @@ impl DeltaLakeSink {
 
                     // delta-rs' in-memory Snapshot grows per commit and is not
                     // compacted in place; drop on checkpoint boundaries so the
-                    // next flush re-opens from the checkpoint file.
+                    // next flush re-opens from the checkpoint file. Pre-open
+                    // in the background so the next commit doesn't block.
                     let crossed_checkpoint = self.config.checkpoint_interval > 0
                         && self.delta_version > 0
                         && self
                             .delta_version
                             .is_multiple_of(self.config.checkpoint_interval);
-                    self.table = if crossed_checkpoint {
-                        None
+                    if crossed_checkpoint {
+                        self.table = None;
+                        self.schedule_background_reopen();
                     } else {
-                        Some(table)
-                    };
+                        self.table = Some(table);
+                    }
 
                     self.staged_batches.clear();
                     self.staged_rows = 0;
@@ -1230,6 +1287,11 @@ impl SinkConnector for DeltaLakeSink {
                 // Wait up to 5 seconds for the compaction task to finish.
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
             }
+        }
+
+        #[cfg(feature = "delta-lake")]
+        if let Some(pending) = self.pending_reopen.take() {
+            pending.abort();
         }
 
         // Drop the table handle when closing.
