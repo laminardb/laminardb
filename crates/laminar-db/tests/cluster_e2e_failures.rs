@@ -37,6 +37,57 @@ use cluster_harness::manifest_epoch;
 const VNODE_COUNT: u32 = 4;
 const N_NODES: usize = 2;
 
+/// Phase 1.2 — coordinated assignment via stored snapshot.
+///
+/// The plan's AC: "partition cluster, both halves independently arrive
+/// at the same assignment from the stored snapshot." We stand in for
+/// the partition by spawning two harnesses sequentially against the
+/// same backing store. The first writes the initial snapshot via
+/// CAS-create; the second reads the snapshot back rather than
+/// recomputing. Without coordination both halves would compute
+/// `round_robin_assignment` independently against whatever peers each
+/// half could see — which during a partition is a subset, producing
+/// disjoint vnode ownership and silently split state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn assignment_snapshot_unifies_cluster_view() {
+    // First cluster: creates the snapshot.
+    let harness_a = cluster_harness::ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+    let assignment_a: Vec<cluster_harness::NodeIdView> = harness_a
+        .nodes
+        .iter()
+        .map(|n| (n.instance_id, n.owned_vnodes()))
+        .collect();
+    let (shared_dir, _cp_dirs) = harness_a.shutdown_keep_dirs().await;
+
+    // Second cluster pointing at the same state dir (and therefore the
+    // same `control/assignment-snapshot.json`). The boot-time resolve
+    // path must load the existing snapshot instead of re-computing.
+    let cp_dirs2: Vec<_> = (0..N_NODES)
+        .map(|_| tempfile::tempdir().expect("cp dir"))
+        .collect();
+    let harness_b = cluster_harness::ClusterEngineHarness::spawn_with_dirs(
+        N_NODES,
+        VNODE_COUNT,
+        shared_dir,
+        cp_dirs2,
+    )
+    .await;
+    let assignment_b: Vec<cluster_harness::NodeIdView> = harness_b
+        .nodes
+        .iter()
+        .map(|n| (n.instance_id, n.owned_vnodes()))
+        .collect();
+
+    assert_eq!(
+        assignment_a, assignment_b,
+        "post-restart cluster must adopt the stored assignment \
+         (independent round-robin recompute would disagree here if, \
+         say, the sort order of peer ids ever changed or a new peer \
+         joined)",
+    );
+    harness_b.shutdown().await;
+}
+
 /// Install `CREATE SOURCE` + `CREATE MATERIALIZED VIEW sums` on a single
 /// engine. Idempotent-ish: succeeds the first time; on a post-restart
 /// engine the MV may already exist from restored state (tracked under

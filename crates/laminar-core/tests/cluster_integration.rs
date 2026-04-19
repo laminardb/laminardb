@@ -295,16 +295,16 @@ async fn snapshot_save_fails_under_object_store_fault_and_recovers() {
     ));
 
     // Step 1: save baseline.
-    let mut splits_v1 = BTreeMap::new();
-    splits_v1.insert("kafka-0".into(), NodeId(1));
-    let v1 = AssignmentSnapshot::empty().next(splits_v1);
+    let mut v1_map = BTreeMap::new();
+    v1_map.insert(0u32, NodeId(1));
+    let v1 = AssignmentSnapshot::empty().next(v1_map);
     store.save(&v1).await.expect("baseline save");
 
     // Step 2: turn writes off; the next save must fail.
     faulty.set_fault(ObjectStoreFault::FailWrites);
-    let mut splits_v2 = BTreeMap::new();
-    splits_v2.insert("kafka-0".into(), NodeId(2));
-    let v2 = v1.next(splits_v2);
+    let mut v2_map = BTreeMap::new();
+    v2_map.insert(0u32, NodeId(2));
+    let v2 = v1.next(v2_map);
     let write_err = store.save(&v2).await.expect_err("write should fail");
     assert!(
         format!("{write_err}").to_lowercase().contains("injected")
@@ -338,7 +338,7 @@ async fn snapshot_save_fails_under_object_store_fault_and_recovers() {
     store.save(&v2).await.expect("save after heal");
     let loaded = store.load().await.unwrap().unwrap();
     assert_eq!(loaded.version, 2);
-    assert_eq!(loaded.splits.get("kafka-0"), Some(&NodeId(2)));
+    assert_eq!(loaded.vnodes.get(&0), Some(&NodeId(2)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -368,11 +368,11 @@ async fn assignment_snapshot_survives_full_cluster_restart() {
     let leader = &cluster_a.nodes[0];
     assert!(leader.controller.is_leader());
 
-    let mut splits = BTreeMap::new();
-    splits.insert("kafka-orders-0".into(), NodeId(1));
-    splits.insert("kafka-orders-1".into(), NodeId(2));
-    splits.insert("kafka-orders-2".into(), NodeId(3));
-    let snapshot = AssignmentSnapshot::empty().next(splits);
+    let mut vnodes = BTreeMap::new();
+    vnodes.insert(0u32, NodeId(1));
+    vnodes.insert(1u32, NodeId(2));
+    vnodes.insert(2u32, NodeId(3));
+    let snapshot = AssignmentSnapshot::empty().next(vnodes);
 
     leader
         .controller
@@ -407,7 +407,7 @@ async fn assignment_snapshot_survives_full_cluster_restart() {
         .expect("snapshot present");
 
     assert_eq!(loaded.version, snapshot.version);
-    assert_eq!(loaded.splits, snapshot.splits);
+    assert_eq!(loaded.vnodes, snapshot.vnodes);
 
     cluster_b.shutdown().await;
 }

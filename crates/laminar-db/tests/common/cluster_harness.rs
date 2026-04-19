@@ -31,6 +31,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use laminar_core::cluster::control::{AssignmentSnapshot, AssignmentSnapshotStore};
 use laminar_core::cluster::testing::MiniCluster;
 use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
 use laminar_core::state::{
@@ -101,7 +102,22 @@ impl ClusterEngineHarness {
     ) -> Self {
         assert_eq!(checkpoint_dirs.len(), n, "one checkpoint dir per node");
 
-        let cluster = MiniCluster::spawn(n).await;
+        // Coordinated assignment snapshot store (Phase 1.2). Every
+        // node's ClusterController sees the same store, so the vnode
+        // assignment becomes the cluster's source of truth rather than
+        // each node independently computing round-robin at boot. On
+        // first boot the store is empty; whichever node CAS-creates
+        // the initial snapshot wins, every other node reads that
+        // snapshot back via `load`.
+        let snapshot_store: Arc<AssignmentSnapshotStore> = {
+            let fs: Arc<dyn ObjectStore> = Arc::new(
+                LocalFileSystem::new_with_prefix(shared_state_dir.path())
+                    .expect("LocalFileSystem over shared state dir for snapshot"),
+            );
+            Arc::new(AssignmentSnapshotStore::new(fs))
+        };
+
+        let cluster = MiniCluster::spawn_with_snapshot(n, Arc::clone(&snapshot_store)).await;
         cluster
             .wait_for_convergence(CONVERGENCE_DEADLINE)
             .await
@@ -126,6 +142,14 @@ impl ClusterEngineHarness {
             .iter()
             .map(|nh| NodeId(nh.instance_id.0))
             .collect();
+
+        // Resolve the cluster's vnode assignment ONCE, before per-node
+        // wiring. Load the stored snapshot; if absent, compute the
+        // initial round-robin and CAS-create. All nodes end up with the
+        // identical assignment whether they read or wrote — the AC from
+        // Phase 1.2.
+        let assignment: Arc<[NodeId]> =
+            resolve_assignment(&snapshot_store, vnode_count, &peer_ids).await;
 
         // Bind every node's receiver up front so we can cross-register
         // addresses on the senders below.
@@ -164,7 +188,7 @@ impl ClusterEngineHarness {
             ));
 
             let registry = Arc::new(VnodeRegistry::new(vnode_count));
-            registry.set_assignment(round_robin_assignment(vnode_count, &peer_ids));
+            registry.set_assignment(Arc::clone(&assignment));
 
             // NOTE: `DistributedAggregateRule` is intentionally NOT installed
             // here. Row-shuffle (Phase 0a) handles cluster aggregates via
@@ -282,6 +306,47 @@ impl ClusterEngineHarness {
     }
 }
 
+/// Load the cluster-wide vnode assignment from `store`, falling back to
+/// computing a fresh round-robin and CAS-creating it. Returns the
+/// assignment in `Arc<[NodeId]>` shape ready to hand to
+/// [`VnodeRegistry::set_assignment`].
+///
+/// Implements the Phase 1.2 boot-time contract:
+/// - If a snapshot is already stored, every caller loads and uses it
+///   unchanged — even partitioned halves of a running cluster arrive
+///   at the same assignment.
+/// - If no snapshot exists, the first caller to reach
+///   [`AssignmentSnapshotStore::save_if_absent`] wins; every losing
+///   caller loads the winner. No caller writes a snapshot that would
+///   disagree with another.
+///
+/// Out of scope here (covered by Phase 2.3): dynamic rebalancing when
+/// membership changes, version bumping on leader promotion. The stored
+/// snapshot is written once at first boot and then left alone.
+async fn resolve_assignment(
+    store: &AssignmentSnapshotStore,
+    vnode_count: u32,
+    peer_ids: &[NodeId],
+) -> Arc<[NodeId]> {
+    if let Some(snap) = store.load().await.expect("load snapshot") {
+        return snap.to_vnode_vec(vnode_count).into();
+    }
+
+    let fresh = round_robin_assignment(vnode_count, peer_ids);
+    let snap = AssignmentSnapshot::empty()
+        .next(AssignmentSnapshot::vnodes_from_vec(&fresh));
+    match store.save_if_absent(&snap).await.expect("save_if_absent") {
+        Some(_) => fresh,
+        None => store
+            .load()
+            .await
+            .expect("load after CAS loss")
+            .expect("snapshot present after CAS loss")
+            .to_vnode_vec(vnode_count)
+            .into(),
+    }
+}
+
 /// Build a `file:///` URL from an absolute filesystem path.
 ///
 /// On Windows this produces `file:///C:/path/with/forward/slashes`;
@@ -296,6 +361,10 @@ fn file_url_from_path(path: &std::path::Path) -> String {
         format!("file:///{normalized}")
     }
 }
+
+/// Diagnostic tuple `(instance_id, owned_vnodes)` — used by tests that
+/// compare the per-node view of the cluster's vnode assignment.
+pub type NodeIdView = (NodeId, Vec<u32>);
 
 // ── Test-side helpers shared between smoke and failures suites ────
 
