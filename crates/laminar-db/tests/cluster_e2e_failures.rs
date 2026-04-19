@@ -215,6 +215,14 @@ async fn crash_mid_stream_loses_in_flight() {
 #[cfg(feature = "phase-1-recovery")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_recovers_sum_aggregate() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_test_writer()
+        .try_init();
+
     let harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
     let leader_idx = harness.leader_idx();
     let follower_idx = harness.follower_idxs()[0];

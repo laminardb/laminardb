@@ -91,6 +91,13 @@ pub(crate) struct ConnectorPipelineCallback {
     /// re-running `follower_checkpoint` on the same announcement.
     #[cfg(feature = "cluster-unstable")]
     pub(crate) last_follower_epoch: Option<u64>,
+    /// Inbound channel for `db.checkpoint()` requests. The db sends a
+    /// oneshot sender here; on the next cycle the callback captures
+    /// operator state (via `checkpoint_with_barrier`-style path) and
+    /// replies on that sender. Without this, `db.checkpoint()` reaches
+    /// the coordinator with an empty `CheckpointRequest` and the
+    /// leader's manifest is useless for restart recovery.
+    pub(crate) force_ckpt_rx: Option<crate::db::ForceCheckpointRx>,
 }
 
 impl ConnectorPipelineCallback {
@@ -107,6 +114,63 @@ impl ConnectorPipelineCallback {
     /// if a fresh PREPARE is visible, capture local state and run
     /// `CheckpointCoordinator::follower_checkpoint`. Returns `true`
     /// when a checkpoint was driven this tick.
+    /// Driven by `db.checkpoint()` via the `force_ckpt_rx` channel.
+    /// Captures operator state (plus table/watermark metadata) and
+    /// commits the manifest through the coordinator, returning the
+    /// full `CheckpointResult` for the caller. Mirrors
+    /// `checkpoint_with_barrier` but without the barrier-alignment
+    /// gate — the caller has chosen to take a consistent snapshot
+    /// of whatever state is currently in the accumulators.
+    async fn force_capture_and_checkpoint(
+        &mut self,
+    ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
+        use crate::checkpoint_coordinator::source_to_connector_checkpoint;
+        let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
+
+        let operator_states = self
+            .capture_and_serialize_operator_state()
+            .await
+            .map_err(DbError::Checkpoint)?;
+
+        let mut extra_tables = HashMap::with_capacity(self.table_sources.len());
+        for (name, source, _) in &self.table_sources {
+            extra_tables.insert(
+                name.clone(),
+                source_to_connector_checkpoint(&source.checkpoint()),
+            );
+        }
+
+        let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
+        for (name, wm_state) in &self.watermark_states {
+            let wm = wm_state.generator.current_watermark();
+            if wm > i64::MIN {
+                per_source_watermarks.insert(name.clone(), wm);
+            }
+        }
+
+        let request = crate::checkpoint_coordinator::CheckpointRequest {
+            operator_states,
+            watermark: None,
+            table_store_checkpoint_path: None,
+            extra_table_offsets: extra_tables,
+            source_watermarks: per_source_watermarks,
+            pipeline_hash: self.pipeline_hash,
+            source_offset_overrides: HashMap::new(),
+        };
+
+        let mut guard = self.coordinator.lock().await;
+        let coord = guard.as_mut().ok_or_else(|| {
+            DbError::Checkpoint(
+                "coordinator not initialized when force_capture_and_checkpoint ran".into(),
+            )
+        })?;
+        let result = coord.checkpoint_with_offsets(request).await?;
+        if result.success {
+            self.last_checkpoint = std::time::Instant::now();
+        }
+        Ok(result)
+    }
+
     #[cfg(feature = "cluster-unstable")]
     async fn maybe_follower_checkpoint(
         &mut self,
@@ -530,6 +594,30 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     ) -> bool {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
         let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
+
+        // Drain any pending `db.checkpoint()` requests first. Each
+        // request gets a capture of operator state (the same path the
+        // periodic barrier-aligned checkpoint uses), committed through
+        // the coordinator, and the full `CheckpointResult` returned on
+        // the oneshot. Without this, `db.checkpoint()` reaches the
+        // coordinator with an empty `CheckpointRequest` and the
+        // manifest has no operator state — restart loses every
+        // `IncrementalAggState` accumulator on the invoking node. See
+        // Phase 1.1 in docs/plans/cluster-production-readiness.md.
+        let mut force_reqs: Vec<
+            tokio::sync::oneshot::Sender<
+                Result<crate::checkpoint_coordinator::CheckpointResult, DbError>,
+            >,
+        > = Vec::new();
+        if let Some(rx) = self.force_ckpt_rx.as_mut() {
+            while let Ok(reply) = rx.try_recv() {
+                force_reqs.push(reply);
+            }
+        }
+        for reply_tx in force_reqs {
+            let result = self.force_capture_and_checkpoint().await;
+            let _ = reply_tx.send(result);
+        }
 
         // Cluster mode: only the leader fires periodic checkpoints.
         // Followers mirror the leader's epoch via `follower_checkpoint`

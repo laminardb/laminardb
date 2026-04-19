@@ -123,7 +123,26 @@ pub struct LaminarDB {
     #[cfg(feature = "cluster-unstable")]
     pub(crate) shuffle_receiver:
         parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleReceiver>>>,
+    /// Forwards `db.checkpoint()` requests to the running pipeline so
+    /// the callback captures operator state before the manifest is
+    /// packed. `None` before `start()` or after `shutdown()`; when
+    /// `None`, `db.checkpoint()` falls back to the direct coordinator
+    /// path (only valid when the engine has no stateful operators).
+    pub(crate) force_ckpt_tx: parking_lot::Mutex<Option<ForceCheckpointTx>>,
 }
+
+/// Oneshot reply carrying the full `CheckpointResult` back to the
+/// caller of `db.checkpoint()`. Created per-request.
+pub(crate) type ForceCheckpointReply =
+    tokio::sync::oneshot::Sender<Result<crate::checkpoint_coordinator::CheckpointResult, DbError>>;
+
+/// Channel used by `db.checkpoint()` to hand a reply sender to the
+/// running pipeline callback.
+pub(crate) type ForceCheckpointTx = tokio::sync::mpsc::UnboundedSender<ForceCheckpointReply>;
+
+/// Paired receive-side of [`ForceCheckpointTx`], held by
+/// `ConnectorPipelineCallback`.
+pub(crate) type ForceCheckpointRx = tokio::sync::mpsc::UnboundedReceiver<ForceCheckpointReply>;
 
 pub(crate) struct SourceWatermarkState {
     pub(crate) extractor: laminar_core::time::EventTimeExtractor,
@@ -290,6 +309,7 @@ impl LaminarDB {
             shuffle_sender: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster-unstable")]
             shuffle_receiver: parking_lot::Mutex::new(None),
+            force_ckpt_tx: parking_lot::Mutex::new(None),
         })
     }
 
@@ -1605,6 +1625,32 @@ impl LaminarDB {
                 "checkpointing is not enabled".to_string(),
             ));
         }
+
+        // When the streaming pipeline is live, route through the
+        // pipeline callback so it captures operator state (via the same
+        // path that the periodic checkpoint timer uses). Without this,
+        // the manifest has an empty `operator_states` map and restart
+        // loses everything the `IncrementalAggState` accumulators
+        // held. See Phase 1.1 in docs/plans/cluster-production-readiness.md.
+        let tx = self.force_ckpt_tx.lock().clone();
+        if let Some(tx) = tx {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            tx.send(reply_tx).map_err(|_| {
+                DbError::Checkpoint(
+                    "pipeline callback receiver closed — engine may be shutting down".into(),
+                )
+            })?;
+            return reply_rx.await.map_err(|_| {
+                DbError::Checkpoint(
+                    "pipeline callback dropped oneshot before replying".into(),
+                )
+            })?;
+        }
+
+        // Fallback: no running pipeline (e.g., engine built but not yet
+        // started). Drive the coordinator directly. Operator state will
+        // be empty, but restart from this manifest is still well-defined
+        // because there's nothing to restore anyway.
         let mut guard = self.coordinator.lock().await;
         let coord = guard.as_mut().ok_or_else(|| {
             DbError::Checkpoint("coordinator not initialized — call start() first".to_string())

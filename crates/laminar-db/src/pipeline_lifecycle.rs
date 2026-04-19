@@ -776,6 +776,27 @@ impl LaminarDB {
                             }
                         }
                         let mut graph_restore_failed = false;
+                        let op_keys: Vec<&String> =
+                            recovered.manifest.operator_states.keys().collect();
+                        let instance_hint = {
+                            #[cfg(feature = "cluster-unstable")]
+                            {
+                                self.cluster_controller
+                                    .lock()
+                                    .as_ref()
+                                    .map_or(0, |c| c.instance_id().0)
+                            }
+                            #[cfg(not(feature = "cluster-unstable"))]
+                            {
+                                0u64
+                            }
+                        };
+                        tracing::info!(
+                            instance = instance_hint,
+                            count = op_keys.len(),
+                            keys = ?op_keys,
+                            "manifest operator_states summary"
+                        );
                         if let Some(op) = recovered.manifest.operator_states.get("operator_graph") {
                             if let Some(bytes) = op.decode_inline() {
                                 match graph.restore_from_bytes(&bytes) {
@@ -793,6 +814,10 @@ impl LaminarDB {
                                         );
                                     }
                                 }
+                            } else {
+                                tracing::warn!(
+                                    "manifest has 'operator_graph' but decode_inline returned None"
+                                );
                             }
                         } else if recovered
                             .manifest
@@ -1206,6 +1231,14 @@ impl LaminarDB {
             .lock()
             .clone()
             .expect("EngineMetrics must be set before start()");
+
+        // Force-checkpoint channel: `db.checkpoint()` on the caller side
+        // hands a oneshot sender across to the callback, which captures
+        // operator state and replies. Installed here so both ends exist
+        // before the compute thread spawns.
+        let (force_ckpt_tx, force_ckpt_rx) = tokio::sync::mpsc::unbounded_channel();
+        *self.force_ckpt_tx.lock() = Some(force_ckpt_tx);
+
         let callback = crate::pipeline_callback::ConnectorPipelineCallback {
             graph,
             stream_sources,
@@ -1240,6 +1273,7 @@ impl LaminarDB {
             cluster_controller: self.cluster_controller.lock().clone(),
             #[cfg(feature = "cluster-unstable")]
             last_follower_epoch: None,
+            force_ckpt_rx: Some(force_ckpt_rx),
         };
 
         // Start the streaming coordinator on a dedicated compute thread.
@@ -1346,6 +1380,12 @@ impl LaminarDB {
 
         self.state
             .store(STATE_SHUTTING_DOWN, std::sync::atomic::Ordering::Release);
+
+        // Drop the force-checkpoint sender before signalling shutdown.
+        // Any subsequent `db.checkpoint()` call falls through to the
+        // (now-defunct) coordinator path, which errors cleanly instead
+        // of hanging on a oneshot that will never be answered.
+        *self.force_ckpt_tx.lock() = None;
 
         // Signal the runtime loop to stop
         self.shutdown_signal.notify_one();
