@@ -401,6 +401,28 @@ impl OperatorCheckpoint {
             (Self::external(current_offset, length), Some(data.to_vec()))
         }
     }
+
+    /// Shared-buffer variant of [`Self::from_bytes`].
+    ///
+    /// Takes an owned [`bytes::Bytes`] and returns the same type on the
+    /// external path, avoiding the `data.to_vec()` copy the `&[u8]`
+    /// version has to make. The checkpoint pipeline passes rkyv output
+    /// through as `Bytes`, so per-operator state no longer doubles in
+    /// memory when crossing this boundary.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn from_bytes_shared(
+        data: bytes::Bytes,
+        threshold: usize,
+        current_offset: u64,
+    ) -> (Self, Option<bytes::Bytes>) {
+        if data.len() <= threshold {
+            (Self::inline(&data), None)
+        } else {
+            let length = data.len() as u64;
+            (Self::external(current_offset, length), Some(data))
+        }
+    }
 }
 
 #[cfg(test)]

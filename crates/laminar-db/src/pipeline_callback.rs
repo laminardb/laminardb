@@ -279,7 +279,7 @@ impl ConnectorPipelineCallback {
 
     async fn capture_and_serialize_operator_state(
         &mut self,
-    ) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
+    ) -> Result<std::collections::HashMap<String, bytes::Bytes>, String> {
         let mut operator_states = HashMap::with_capacity(2);
         let cp = match self.graph.snapshot_state() {
             Ok(Some(cp)) => cp,
@@ -298,7 +298,7 @@ impl ConnectorPipelineCallback {
         .map_err(|_| format!("[LDB-6017] operator state serialization timed out ({timeout:?})"))?
         .map_err(|e| format!("serialize join error: {e}"))?
         .map_err(|e| format!("serialize error: {e}"))?;
-        operator_states.insert("operator_graph".to_string(), bytes);
+        operator_states.insert("operator_graph".to_string(), bytes::Bytes::from(bytes));
 
         // Serialize MV result store — each MV gets its own entry keyed "mv:{name}".
         let mv_states = self

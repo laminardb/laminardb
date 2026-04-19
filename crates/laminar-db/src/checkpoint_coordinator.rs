@@ -140,8 +140,10 @@ impl Default for CheckpointConfig {
 /// Parameters for a checkpoint operation.
 #[derive(Debug, Clone, Default)]
 pub struct CheckpointRequest {
-    /// Serialized operator states.
-    pub operator_states: HashMap<String, Vec<u8>>,
+    /// Serialized operator states. `Bytes` (not `Vec<u8>`) so producers
+    /// (rkyv output, MV IPC bytes) can hand off the buffer without an
+    /// extra copy at each stage of the checkpoint pipeline.
+    pub operator_states: HashMap<String, bytes::Bytes>,
     /// Current watermark timestamp.
     pub watermark: Option<i64>,
     /// Path for table store checkpoint data.
@@ -890,17 +892,22 @@ impl CheckpointCoordinator {
     /// Packs operator states into a manifest with optional sidecar blob.
     ///
     /// States larger than `threshold` are stored in a sidecar blob rather
-    /// than base64-inlined in the JSON manifest.
+    /// than base64-inlined in the JSON manifest. The concatenation into
+    /// `sidecar_blobs` still costs one copy of the total external bytes
+    /// (the shared `CheckpointStore::save_with_state` API takes `&[u8]`);
+    /// the zero-copy path used in `from_bytes_shared` eliminates the
+    /// earlier per-operator copy that `from_bytes` incurred on the
+    /// external path.
     fn pack_operator_states(
         manifest: &mut CheckpointManifest,
-        operator_states: &HashMap<String, Vec<u8>>,
+        operator_states: &HashMap<String, bytes::Bytes>,
         threshold: usize,
     ) -> Option<Vec<u8>> {
         let mut sidecar_blobs: Vec<u8> = Vec::new();
         for (name, data) in operator_states {
             let (op_ckpt, maybe_blob) =
-                laminar_storage::checkpoint_manifest::OperatorCheckpoint::from_bytes(
-                    data,
+                laminar_storage::checkpoint_manifest::OperatorCheckpoint::from_bytes_shared(
+                    data.clone(),
                     threshold,
                     sidecar_blobs.len() as u64,
                 );
@@ -2000,8 +2007,8 @@ mod tests {
         let mut coord = make_coordinator(dir.path());
 
         let mut ops = HashMap::new();
-        ops.insert("window-agg".into(), b"state-data".to_vec());
-        ops.insert("filter".into(), b"filter-state".to_vec());
+        ops.insert("window-agg".into(), bytes::Bytes::from_static(b"state-data"));
+        ops.insert("filter".into(), bytes::Bytes::from_static(b"filter-state"));
 
         let result = coord
             .checkpoint(CheckpointRequest {
@@ -2185,8 +2192,8 @@ mod tests {
 
         // Small state stays inline, large state goes to sidecar
         let mut ops = HashMap::new();
-        ops.insert("small".into(), vec![0xAAu8; 50]);
-        ops.insert("large".into(), vec![0xBBu8; 200]);
+        ops.insert("small".into(), bytes::Bytes::from(vec![0xAAu8; 50]));
+        ops.insert("large".into(), bytes::Bytes::from(vec![0xBBu8; 200]));
 
         let result = coord
             .checkpoint(CheckpointRequest {
@@ -2221,7 +2228,7 @@ mod tests {
         let mut coord = CheckpointCoordinator::new(config, store);
 
         let mut ops = HashMap::new();
-        ops.insert("op1".into(), b"small-state".to_vec());
+        ops.insert("op1".into(), bytes::Bytes::from_static(b"small-state"));
 
         let result = coord
             .checkpoint(CheckpointRequest {

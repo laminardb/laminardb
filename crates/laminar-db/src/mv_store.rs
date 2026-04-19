@@ -133,14 +133,14 @@ impl MvStore {
 
     /// Returns per-MV IPC-serialized bytes for checkpoint.
     /// Each entry is keyed `"mv:{name}"` for use in the `operator_states` map.
-    pub fn checkpoint_states(&self) -> Result<HashMap<String, Vec<u8>>, DbError> {
+    pub fn checkpoint_states(&self) -> Result<HashMap<String, bytes::Bytes>, DbError> {
         let mut out = HashMap::new();
         for (name, entry) in &self.entries {
             if entry.batches.is_empty() {
                 continue;
             }
             let bytes = batches_to_ipc(&entry.schema, &entry.batches)?;
-            out.insert(format!("mv:{name}"), bytes);
+            out.insert(format!("mv:{name}"), bytes::Bytes::from(bytes));
         }
         Ok(out)
     }
