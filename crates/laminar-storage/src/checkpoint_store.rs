@@ -74,15 +74,52 @@ pub enum CheckpointStoreError {
 // Checkpoint validation types
 // ---------------------------------------------------------------------------
 
+/// Classification of a single validation finding.
+///
+/// `ManifestWarning` is non-fatal — the checkpoint is still usable.
+/// `IntegrityFailure` is fatal — recovery must skip this checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationIssue {
+    /// Non-fatal manifest-level warning (e.g. vnode_count mismatch,
+    /// orphaned source offset).
+    ManifestWarning(String),
+    /// Fatal: manifest is missing/corrupt, or the sidecar integrity
+    /// check (checksum, presence) failed.
+    IntegrityFailure(String),
+}
+
+impl ValidationIssue {
+    /// True if this issue renders the checkpoint unusable for recovery.
+    #[must_use]
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, Self::IntegrityFailure(_))
+    }
+
+    /// Underlying human-readable message.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::ManifestWarning(s) | Self::IntegrityFailure(s) => s,
+        }
+    }
+}
+
+impl std::fmt::Display for ValidationIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
 /// Result of validating a single checkpoint.
 #[derive(Debug, Clone)]
 pub struct ValidationResult {
     /// Checkpoint ID that was validated.
     pub checkpoint_id: u64,
-    /// Whether the checkpoint is valid for recovery.
+    /// Whether the checkpoint is valid for recovery. A checkpoint is
+    /// valid iff it has no [`ValidationIssue::IntegrityFailure`] issues.
     pub valid: bool,
     /// Issues found during validation.
-    pub issues: Vec<String>,
+    pub issues: Vec<ValidationIssue>,
 }
 
 /// Report from a crash-safe recovery walk.
@@ -231,36 +268,44 @@ pub trait CheckpointStore: Send + Sync {
                 return Ok(ValidationResult {
                     checkpoint_id: id,
                     valid: false,
-                    issues: vec![format!("manifest not found for checkpoint {id}")],
+                    issues: vec![ValidationIssue::IntegrityFailure(format!(
+                        "manifest not found for checkpoint {id}"
+                    ))],
                 });
             }
             Err(CheckpointStoreError::Serde(e)) => {
                 return Ok(ValidationResult {
                     checkpoint_id: id,
                     valid: false,
-                    issues: vec![format!("corrupt manifest: {e}")],
+                    issues: vec![ValidationIssue::IntegrityFailure(format!(
+                        "corrupt manifest: {e}"
+                    ))],
                 });
             }
             Err(e) => return Err(e),
         };
 
         for err in manifest.validate(self.vnode_count()) {
-            issues.push(format!("manifest validation: {err}"));
+            issues.push(ValidationIssue::ManifestWarning(format!(
+                "manifest validation: {err}"
+            )));
         }
 
-        // Verify state sidecar checksum
+        // Verify state sidecar checksum.
         if let Some(expected) = &manifest.state_checksum {
             match self.load_state_data(id)? {
                 Some(data) => {
                     let actual = sha256_hex(&data);
                     if actual != *expected {
-                        issues.push(format!(
+                        issues.push(ValidationIssue::IntegrityFailure(format!(
                             "state.bin checksum mismatch: expected {expected}, got {actual}"
-                        ));
+                        )));
                     }
                 }
                 None => {
-                    issues.push("state.bin referenced by checksum but not found".into());
+                    issues.push(ValidationIssue::IntegrityFailure(
+                        "state.bin referenced by checksum but not found".into(),
+                    ));
                 }
             }
         }
@@ -268,16 +313,12 @@ pub trait CheckpointStore: Send + Sync {
         // epoch=0 or checkpoint_id=0 indicates a corrupted or nonsensical
         // manifest — reject as invalid regardless of other issues.
         if manifest.epoch == 0 || manifest.checkpoint_id == 0 {
-            issues.push("epoch or checkpoint_id is 0 — likely corrupted".into());
-            return Ok(ValidationResult {
-                checkpoint_id: id,
-                valid: false,
-                issues,
-            });
+            issues.push(ValidationIssue::IntegrityFailure(
+                "epoch or checkpoint_id is 0 — likely corrupted".into(),
+            ));
         }
 
-        let valid =
-            issues.is_empty() || issues.iter().all(|i| i.starts_with("manifest validation:"));
+        let valid = issues.iter().all(|i| !i.is_fatal());
         Ok(ValidationResult {
             checkpoint_id: id,
             valid,
@@ -316,7 +357,12 @@ pub trait CheckpointStore: Send + Sync {
                     elapsed: start.elapsed(),
                 });
             }
-            let reason = result.issues.join("; ");
+            let reason = result
+                .issues
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ");
             warn!(
                 checkpoint_id = id,
                 reason = %reason,
@@ -1632,7 +1678,7 @@ mod tests {
         let result = store.validate_checkpoint(1).unwrap();
         assert!(!result.valid, "epoch=0 should be invalid");
         assert!(
-            result.issues.iter().any(|i| i.contains("epoch")),
+            result.issues.iter().any(|i| i.message().contains("epoch")),
             "should mention epoch: {:?}",
             result.issues
         );
@@ -1645,7 +1691,7 @@ mod tests {
 
         let result = store.validate_checkpoint(99).unwrap();
         assert!(!result.valid);
-        assert!(result.issues[0].contains("not found"));
+        assert!(result.issues[0].message().contains("not found"));
     }
 
     #[test]
@@ -1662,7 +1708,7 @@ mod tests {
         let result = store.validate_checkpoint(1).unwrap();
         assert!(!result.valid);
         assert!(
-            result.issues[0].contains("corrupt manifest"),
+            result.issues[0].message().contains("corrupt manifest"),
             "expected corrupt manifest issue: {:?}",
             result.issues
         );
@@ -1701,7 +1747,7 @@ mod tests {
             result
                 .issues
                 .iter()
-                .any(|i| i.contains("checksum mismatch")),
+                .any(|i| i.message().contains("checksum mismatch")),
             "should report checksum mismatch: {:?}",
             result.issues
         );
@@ -1723,7 +1769,7 @@ mod tests {
         let result = store.validate_checkpoint(1).unwrap();
         assert!(!result.valid);
         assert!(
-            result.issues.iter().any(|i| i.contains("not found")),
+            result.issues.iter().any(|i| i.message().contains("not found")),
             "should report missing state: {:?}",
             result.issues
         );
