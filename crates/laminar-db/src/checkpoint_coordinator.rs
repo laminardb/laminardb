@@ -1577,6 +1577,27 @@ impl CheckpointCoordinator {
 
         self.adjust_interval();
 
+        // Garbage-collect state-backend partials / commit markers for
+        // epochs no longer needed for recovery. Without this the
+        // in-process backend grows per-checkpoint forever and the
+        // object-store backend leaks `epoch=N/…` objects indefinitely.
+        // `max_retained` is in terms of checkpoints which map 1:1 to
+        // epochs here, so prune everything older than
+        // `epoch - max_retained`.
+        if let Some(ref backend) = self.state_backend {
+            let horizon = epoch.saturating_sub(self.config.max_retained as u64);
+            if horizon > 0 {
+                if let Err(e) = backend.prune_before(horizon).await {
+                    warn!(
+                        epoch,
+                        horizon,
+                        error = %e,
+                        "[LDB-6026] state backend prune failed; old partials will linger"
+                    );
+                }
+            }
+        }
+
         let next_epoch = self.epoch;
         let begin_epoch_error = match self.begin_epoch_for_sinks(next_epoch).await {
             Ok(()) => None,

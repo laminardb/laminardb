@@ -83,6 +83,13 @@ impl StateBackend for InProcessBackend {
         }
         Ok(true)
     }
+
+    async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {
+        // Without this, every checkpoint leaks one Bytes per vnode
+        // forever.
+        self.partials.write().retain(|&(_, epoch), _| epoch >= before);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -126,5 +133,28 @@ mod tests {
     fn state_backend_is_object_safe() {
         let _: std::sync::Arc<dyn StateBackend> =
             std::sync::Arc::new(InProcessBackend::new(2));
+    }
+
+    #[tokio::test]
+    async fn prune_before_drops_old_epochs() {
+        let b = InProcessBackend::new(4);
+        for epoch in 1..=5 {
+            b.write_partial(0, epoch, 0, Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+            b.write_partial(1, epoch, 0, Bytes::from_static(b"y"))
+                .await
+                .unwrap();
+        }
+        // Retain epochs >= 4. Entries for 1,2,3 must go away.
+        b.prune_before(4).await.unwrap();
+        for epoch in 1..=3 {
+            assert!(b.read_partial(0, epoch).await.unwrap().is_none());
+            assert!(b.read_partial(1, epoch).await.unwrap().is_none());
+        }
+        for epoch in 4..=5 {
+            assert!(b.read_partial(0, epoch).await.unwrap().is_some());
+            assert!(b.read_partial(1, epoch).await.unwrap().is_some());
+        }
     }
 }

@@ -219,6 +219,49 @@ impl StateBackend for ObjectStoreBackend {
             Err(e) => Err(StateBackendError::Io(e.to_string())),
         }
     }
+
+    async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {
+        use tokio_stream::StreamExt;
+
+        // LIST without a prefix and filter — one call regardless of
+        // how many epochs exist, and we avoid pulling in `futures` as
+        // a non-cluster dep.
+        let root = OsPath::from("");
+        let mut entries = self.store.list(Some(&root));
+
+        let mut victims: Vec<OsPath> = Vec::new();
+        while let Some(entry) = entries.next().await {
+            let entry = entry.map_err(|e| StateBackendError::Io(e.to_string()))?;
+            let loc = entry.location.as_ref();
+            // Only objects whose top segment looks like `epoch=N` where
+            // N < before are candidates. Anything else is untouched.
+            let Some(first) = loc.split('/').next() else {
+                continue;
+            };
+            let Some(rest) = first.strip_prefix("epoch=") else {
+                continue;
+            };
+            let Ok(epoch) = rest.parse::<u64>() else {
+                continue;
+            };
+            if epoch < before {
+                victims.push(entry.location);
+            }
+        }
+
+        // Cold path: sequential deletes keep the implementation free of
+        // a `futures::stream` dep. For cluster deployments with many
+        // stale epochs, the prune horizon still advances one checkpoint
+        // at a time so each call deletes O(vnodes) objects.
+        for victim in victims {
+            match self.store.delete(&victim).await {
+                Ok(()) => {}
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => tracing::warn!(error = %e, "state backend prune: delete failed"),
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ObjectStoreBackend {
@@ -437,5 +480,34 @@ mod tests {
         let dir = tempdir().unwrap();
         let _: Arc<dyn StateBackend> =
             Arc::new(ObjectStoreBackend::new(make_store(dir.path()), "node-0", 2));
+    }
+
+    #[tokio::test]
+    async fn prune_before_deletes_old_epochs() {
+        let dir = tempdir().unwrap();
+        let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
+
+        // Seed epochs 1..=5 with one vnode each.
+        for epoch in 1..=5u64 {
+            backend
+                .write_partial(0, epoch, 0, Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+        }
+
+        backend.prune_before(4).await.unwrap();
+
+        for epoch in 1..=3 {
+            assert!(
+                backend.read_partial(0, epoch).await.unwrap().is_none(),
+                "epoch {epoch} should be pruned",
+            );
+        }
+        for epoch in 4..=5 {
+            assert!(
+                backend.read_partial(0, epoch).await.unwrap().is_some(),
+                "epoch {epoch} should be retained",
+            );
+        }
     }
 }
