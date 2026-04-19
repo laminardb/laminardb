@@ -283,8 +283,7 @@ impl StateBackend for ObjectStoreBackend {
         // at a time so each call deletes O(vnodes) objects.
         for victim in victims {
             match self.store.delete(&victim).await {
-                Ok(()) => {}
-                Err(object_store::Error::NotFound { .. }) => {}
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
                 Err(e) => tracing::warn!(error = %e, "state backend prune: delete failed"),
             }
         }

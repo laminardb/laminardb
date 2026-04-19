@@ -1576,12 +1576,10 @@ impl LaminarDB {
         let max_retained = cp_config.max_retained.unwrap_or(3);
         // Pass the runtime vnode count through so manifest validation
         // checks against the real invariant, not a hardcoded default.
-        let vnode_count = self
-            .vnode_registry
-            .lock()
-            .as_ref()
-            .map(|r| u16::try_from(r.vnode_count()).unwrap_or(u16::MAX))
-            .unwrap_or(laminar_storage::checkpoint_manifest::DEFAULT_VNODE_COUNT);
+        let vnode_count = self.vnode_registry.lock().as_ref().map_or(
+            laminar_storage::checkpoint_manifest::DEFAULT_VNODE_COUNT,
+            |r| u16::try_from(r.vnode_count()).unwrap_or(u16::MAX),
+        );
 
         if let Some(ref url) = self.config.object_store_url {
             let obj_store = laminar_storage::object_store_builder::build_object_store(

@@ -4744,12 +4744,10 @@ dependencies = [
 name = "laminar-storage"
 version = "0.20.2"
 dependencies = [
- "anyhow",
  "base64 0.22.1",
  "bytes",
  "futures",
  "object_store 0.13.2",
- "parquet",
  "serde",
  "serde_json",
  "sha2",

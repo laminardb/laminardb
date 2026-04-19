@@ -80,7 +80,7 @@ pub enum CheckpointStoreError {
 /// `IntegrityFailure` is fatal — recovery must skip this checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationIssue {
-    /// Non-fatal manifest-level warning (e.g. vnode_count mismatch,
+    /// Non-fatal manifest-level warning (e.g. `vnode_count` mismatch,
     /// orphaned source offset).
     ManifestWarning(String),
     /// Fatal: manifest is missing/corrupt, or the sidecar integrity
@@ -431,7 +431,7 @@ impl FileSystemCheckpointStore {
         }
     }
 
-    /// Override the vnode_count used during manifest validation.
+    /// Override the `vnode_count` used during manifest validation.
     #[must_use]
     pub fn with_vnode_count(mut self, vnode_count: u16) -> Self {
         self.vnode_count = vnode_count;
@@ -767,7 +767,7 @@ impl ObjectStoreCheckpointStore {
         })
     }
 
-    /// Override the vnode_count used during manifest validation.
+    /// Override the `vnode_count` used during manifest validation.
     #[must_use]
     pub fn with_vnode_count(mut self, vnode_count: u16) -> Self {
         self.vnode_count = vnode_count;
@@ -797,8 +797,8 @@ impl ObjectStoreCheckpointStore {
     fn put_with_retry(
         &self,
         path: &object_store::path::Path,
-        payload: bytes::Bytes,
-        opts: PutOptions,
+        payload: &bytes::Bytes,
+        opts: &PutOptions,
     ) -> Result<(), CheckpointStoreError> {
         const BACKOFFS_MS: &[u64] = &[100, 500, 2000];
         let mut attempt = 0usize;
@@ -963,7 +963,7 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         let pointer = serde_json::to_string(&LatestPointer {
             checkpoint_id: manifest.checkpoint_id,
         })?;
-        self.put_with_retry(&latest, bytes::Bytes::from(pointer), PutOptions::default())?;
+        self.put_with_retry(&latest, &bytes::Bytes::from(pointer), &PutOptions::default())?;
 
         // Auto-prune
         if self.max_retained > 0 {
@@ -1053,7 +1053,9 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
             // Surface the first real error so operators can notice.
             // Permission errors silently leak old checkpoints forever
             // otherwise.
-            for err in [manifest_res, state_res].into_iter().filter_map(|r| r.err())
+            for err in [manifest_res, state_res]
+                .into_iter()
+                .filter_map(Result::err)
             {
                 if matches!(err, object_store::Error::NotFound { .. }) {
                     continue;
@@ -1078,8 +1080,8 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         // Sidecar writes are idempotent — retry transients.
         self.put_with_retry(
             &path,
-            bytes::Bytes::copy_from_slice(data),
-            PutOptions::default(),
+            &bytes::Bytes::copy_from_slice(data),
+            &PutOptions::default(),
         )
     }
 
