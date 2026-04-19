@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use object_store::{GetOptions, ObjectStore, PutMode, PutOptions, PutPayload};
+use object_store::{GetOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
@@ -810,6 +810,48 @@ impl ObjectStoreCheckpointStore {
 
     // ── Helpers ──
 
+    /// Put a payload with bounded retry + jittered backoff for idempotent
+    /// writes (sidecar state, pointer update). Retries on
+    /// `object_store::Error::Generic` — which covers most transient
+    /// 5xx / connection failures across backends — and bubbles every
+    /// other error immediately. Non-idempotent writes (conditional
+    /// creates on the manifest path) MUST NOT use this helper.
+    fn put_with_retry(
+        &self,
+        path: &object_store::path::Path,
+        payload: bytes::Bytes,
+        opts: PutOptions,
+    ) -> Result<(), CheckpointStoreError> {
+        const BACKOFFS_MS: &[u64] = &[100, 500, 2000];
+        let mut attempt = 0usize;
+        loop {
+            let payload_clone = payload.clone();
+            let opts_clone = opts.clone();
+            let result = self.rt.block_on(async {
+                self.store
+                    .put_opts(path, PutPayload::from_bytes(payload_clone), opts_clone)
+                    .await
+            });
+            match result {
+                Ok(_) => return Ok(()),
+                Err(object_store::Error::Generic { .. })
+                    if attempt < BACKOFFS_MS.len() =>
+                {
+                    let delay = std::time::Duration::from_millis(BACKOFFS_MS[attempt]);
+                    tracing::warn!(
+                        path = %path,
+                        attempt = attempt + 1,
+                        delay_ms = delay.as_millis(),
+                        "transient put error, retrying"
+                    );
+                    self.rt.block_on(tokio::time::sleep(delay));
+                    attempt += 1;
+                }
+                Err(e) => return Err(CheckpointStoreError::ObjectStore(e)),
+            }
+        }
+    }
+
     /// GET an object, returning `Ok(None)` for `NotFound`.
     fn get_bytes(
         &self,
@@ -943,12 +985,7 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         let pointer = serde_json::to_string(&LatestPointer {
             checkpoint_id: manifest.checkpoint_id,
         })?;
-        let payload = PutPayload::from_bytes(bytes::Bytes::from(pointer));
-        self.rt.block_on(async {
-            self.store
-                .put_opts(&latest, payload, PutOptions::default())
-                .await
-        })?;
+        self.put_with_retry(&latest, bytes::Bytes::from(pointer), PutOptions::default())?;
 
         // Auto-prune
         if self.max_retained > 0 {
@@ -1017,19 +1054,42 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
 
         let to_remove = ids.len() - keep_count;
         let mut removed = 0;
+        let mut logged_error = false;
 
         for &id in &ids[..to_remove] {
-            let paths = vec![Ok(self.manifest_path(id)), Ok(self.state_path(id))];
+            let manifest = self.manifest_path(id);
+            let state = self.state_path(id);
+            let manifest_res = self.rt.block_on(self.store.delete(&manifest));
+            let state_res = self.rt.block_on(self.store.delete(&state));
 
-            self.rt.block_on(async {
-                use futures::StreamExt;
-                let stream = futures::stream::iter(paths).boxed();
-                let mut results = self.store.delete_stream(stream);
-                while let Some(_result) = results.next().await {
-                    // Ignore individual delete errors (file may not exist)
+            // Count the id as removed only if the manifest is gone
+            // (state.bin is optional — its absence is fine).
+            let manifest_ok = matches!(
+                manifest_res,
+                Ok(()) | Err(object_store::Error::NotFound { .. })
+            );
+            if manifest_ok {
+                removed += 1;
+            }
+
+            // Surface the first real error so operators can notice.
+            // Permission errors silently leak old checkpoints forever
+            // otherwise.
+            for err in [manifest_res, state_res].into_iter().filter_map(|r| r.err())
+            {
+                if matches!(err, object_store::Error::NotFound { .. }) {
+                    continue;
                 }
-            });
-            removed += 1;
+                if !logged_error {
+                    tracing::warn!(
+                        checkpoint_id = id,
+                        error = %err,
+                        "[LDB-6027] checkpoint prune: delete failed — \
+                         retained objects may accumulate"
+                    );
+                    logged_error = true;
+                }
+            }
         }
 
         Ok(removed)
@@ -1037,13 +1097,12 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
 
     fn save_state_data(&self, id: u64, data: &[u8]) -> Result<(), CheckpointStoreError> {
         let path = self.state_path(id);
-        let payload = PutPayload::from_bytes(bytes::Bytes::copy_from_slice(data));
-        self.rt.block_on(async {
-            self.store
-                .put_opts(&path, payload, PutOptions::default())
-                .await
-        })?;
-        Ok(())
+        // Sidecar writes are idempotent — retry transients.
+        self.put_with_retry(
+            &path,
+            bytes::Bytes::copy_from_slice(data),
+            PutOptions::default(),
+        )
     }
 
     fn load_state_data(&self, id: u64) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
