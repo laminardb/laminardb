@@ -160,93 +160,71 @@ pub trait CheckpointStore: Send + Sync {
         crate::checkpoint_manifest::DEFAULT_VNODE_COUNT
     }
 
-    /// Persists a checkpoint manifest atomically.
-    ///
-    /// The implementation writes to a temporary file and renames on success
-    /// to prevent partial writes from being visible.
+    /// Atomically persists a checkpoint manifest. Implementations must
+    /// guarantee readers never observe a partial manifest.
     ///
     /// # Errors
-    ///
     /// Returns [`CheckpointStoreError`] on I/O or serialization failure.
     fn save(&self, manifest: &CheckpointManifest) -> Result<(), CheckpointStoreError>;
 
-    /// Loads the most recent checkpoint manifest.
-    ///
-    /// Returns `Ok(None)` if no checkpoint exists yet.
+    /// Loads the most recent checkpoint manifest, or `Ok(None)` on a
+    /// fresh store.
     ///
     /// # Errors
-    ///
     /// Returns [`CheckpointStoreError`] on I/O or deserialization failure.
     fn load_latest(&self) -> Result<Option<CheckpointManifest>, CheckpointStoreError>;
 
-    /// Loads a specific checkpoint manifest by ID.
+    /// Loads a specific manifest, or `Ok(None)` if absent.
     ///
     /// # Errors
-    ///
-    /// Returns `Ok(None)` if the checkpoint does not exist.
+    /// Returns [`CheckpointStoreError`] on I/O or deserialization failure.
     fn load_by_id(&self, id: u64) -> Result<Option<CheckpointManifest>, CheckpointStoreError>;
 
-    /// Lists all available checkpoints as `(checkpoint_id, epoch)` pairs.
-    ///
-    /// Results are sorted by checkpoint ID ascending.
+    /// Lists all available checkpoints as `(id, epoch)` pairs, sorted
+    /// ascending by ID. May read every manifest; callers that only
+    /// need IDs should use [`Self::list_ids`].
     ///
     /// # Errors
-    ///
     /// Returns [`CheckpointStoreError`] on I/O failure.
     fn list(&self) -> Result<Vec<(u64, u64)>, CheckpointStoreError>;
 
-    /// Lists all checkpoint IDs without loading manifests.
-    ///
-    /// This is used by crash recovery to enumerate candidates including
-    /// those with corrupt manifests. Results are sorted ascending.
+    /// Lists all checkpoint IDs, sorted ascending. Unlike [`Self::list`]
+    /// this enumerates corrupt manifests too (used by crash recovery).
     ///
     /// # Errors
-    ///
     /// Returns [`CheckpointStoreError`] on I/O failure.
     fn list_ids(&self) -> Result<Vec<u64>, CheckpointStoreError> {
-        // Default implementation: extract IDs from list().
+        // O(N) manifest reads via list(). Backends should override.
         Ok(self.list()?.iter().map(|(id, _)| *id).collect())
     }
 
-    /// Prunes old checkpoints, keeping at most `keep_count` recent ones.
-    ///
-    /// Returns the number of checkpoints removed.
+    /// Prunes old checkpoints, keeping at most `keep_count` recent
+    /// ones. Returns the number of checkpoints removed.
     ///
     /// # Errors
-    ///
     /// Returns [`CheckpointStoreError`] on I/O failure.
     fn prune(&self, keep_count: usize) -> Result<usize, CheckpointStoreError>;
 
-    /// Overwrites an existing checkpoint manifest.
-    ///
-    /// Used by Step 6b of the checkpoint protocol to update sink commit
-    /// statuses after the initial `save()`. Unlike `save()`, this does NOT
-    /// use conditional PUT — it unconditionally overwrites the manifest.
-    ///
-    /// The default implementation delegates to `save()`, which is correct
-    /// for backends where `save()` is idempotent (e.g., filesystem with
-    /// write-to-temp + rename).
+    /// Overwrites an existing manifest, bypassing the conditional-PUT
+    /// fence used by [`Self::save`]. Used after a successful sink
+    /// commit to record per-sink status transitions.
     ///
     /// # Errors
-    ///
     /// Returns [`CheckpointStoreError`] on I/O or serialization failure.
     fn update_manifest(&self, manifest: &CheckpointManifest) -> Result<(), CheckpointStoreError> {
         self.save(manifest)
     }
 
-    /// Writes large operator state data to a sidecar file for a given checkpoint.
+    /// Writes operator state sidecar bytes for a checkpoint.
     ///
     /// # Errors
-    ///
     /// Returns [`CheckpointStoreError`] on I/O failure.
     fn save_state_data(&self, id: u64, data: &[u8]) -> Result<(), CheckpointStoreError>;
 
-    /// Loads large operator state data from a sidecar file.
-    ///
-    /// Returns `Ok(None)` if no sidecar file exists.
+    /// Loads operator state sidecar bytes for a checkpoint, or `Ok(None)`
+    /// if no sidecar was written.
     ///
     /// # Errors
-    ///
     /// Returns [`CheckpointStoreError`] on I/O failure.
     fn load_state_data(&self, id: u64) -> Result<Option<Vec<u8>>, CheckpointStoreError>;
 

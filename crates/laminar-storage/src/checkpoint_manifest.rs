@@ -25,12 +25,9 @@ pub enum SinkCommitStatus {
 /// Default virtual partition count for state key distribution.
 ///
 /// Manifests are written with this value unless the caller overrides via
-/// [`CheckpointManifest::new_with_vnode_count`]. On restore, the runtime's
-/// actual vnode count is supplied to [`CheckpointManifest::validate`] so
-/// that a pipeline configured with a different count sees a validation
-/// error. Before the `VnodeRegistry` was runtime-configurable this was a
-/// hard compile-time constant; keeping the default here preserves the old
-/// on-disk behavior until Phase B plumbs the runtime value through.
+/// [`CheckpointManifest::new_with_vnode_count`]. `CheckpointStore`
+/// impls pass the runtime value into [`CheckpointManifest::validate`]
+/// so a manifest written with a different count is flagged on restore.
 pub const DEFAULT_VNODE_COUNT: u16 = 256;
 
 /// A point-in-time snapshot of all pipeline state.
