@@ -660,13 +660,13 @@ struct LatestPointer {
     checkpoint_id: u64,
 }
 
-/// Object-store-backed checkpoint store with hierarchical layout.
+/// Object-store-backed checkpoint store.
 ///
 /// Bridges the sync [`CheckpointStore`] trait to the async [`ObjectStore`] API
 /// via a dedicated single-threaded Tokio runtime. Checkpoints run infrequently
 /// (every ~10s) and are not on the hot path.
 ///
-/// ## Object Layout (v2 — hierarchical)
+/// ## Object Layout
 ///
 /// ```text
 /// {prefix}/
@@ -679,19 +679,8 @@ struct LatestPointer {
 ///     state-000002.bin
 /// ```
 ///
-/// ## Legacy Layout (v1 — flat, read-only)
-///
-/// ```text
-/// {prefix}/checkpoints/
-///   checkpoint_000001/
-///     manifest.json
-///     state.bin
-///   latest.txt                # "checkpoint_000002"
-/// ```
-///
-/// Reads check v2 paths first, then fall back to v1 for backward compatibility.
-/// Writes always use v2 layout. Manifest writes use [`PutMode::Create`] for
-/// split-brain prevention (conditional PUT).
+/// Manifest writes use [`PutMode::Create`] for split-brain prevention
+/// (conditional PUT).
 pub struct ObjectStoreCheckpointStore {
     store: Arc<dyn ObjectStore>,
     prefix: String,
@@ -726,8 +715,6 @@ impl ObjectStoreCheckpointStore {
         })
     }
 
-    // ── v2 (hierarchical) paths ──
-
     fn manifest_path(&self, id: u64) -> object_store::path::Path {
         object_store::path::Path::from(format!("{}manifests/manifest-{id:06}.json", self.prefix))
     }
@@ -738,26 +725,6 @@ impl ObjectStoreCheckpointStore {
 
     fn state_path(&self, id: u64) -> object_store::path::Path {
         object_store::path::Path::from(format!("{}checkpoints/state-{id:06}.bin", self.prefix))
-    }
-
-    // ── v1 (legacy) paths — for backward-compat reads only ──
-
-    fn legacy_manifest_path(&self, id: u64) -> object_store::path::Path {
-        object_store::path::Path::from(format!(
-            "{}checkpoints/checkpoint_{id:06}/manifest.json",
-            self.prefix
-        ))
-    }
-
-    fn legacy_state_path(&self, id: u64) -> object_store::path::Path {
-        object_store::path::Path::from(format!(
-            "{}checkpoints/checkpoint_{id:06}/state.bin",
-            self.prefix
-        ))
-    }
-
-    fn legacy_latest_path(&self) -> object_store::path::Path {
-        object_store::path::Path::from(format!("{}checkpoints/latest.txt", self.prefix))
     }
 
     // ── Helpers ──
@@ -795,11 +762,10 @@ impl ObjectStoreCheckpointStore {
         }
     }
 
-    /// List checkpoint IDs by scanning both v2 and v1 layouts.
+    /// List checkpoint IDs by scanning `manifests/manifest-NNNNNN.json`.
     fn list_checkpoint_ids(&self) -> Result<Vec<u64>, CheckpointStoreError> {
         let mut ids = std::collections::BTreeSet::new();
 
-        // v2 layout: manifests/manifest-NNNNNN.json
         let manifests_prefix = object_store::path::Path::from(format!("{}manifests/", self.prefix));
         let entries: Vec<_> = self.rt.block_on(async {
             use futures::TryStreamExt;
@@ -816,30 +782,6 @@ impl ObjectStoreCheckpointStore {
                         if let Ok(id) = id_str.parse::<u64>() {
                             ids.insert(id);
                         }
-                    }
-                }
-            }
-        }
-
-        // v1 layout: checkpoints/checkpoint_NNNNNN/manifest.json
-        let checkpoints_prefix =
-            object_store::path::Path::from(format!("{}checkpoints/", self.prefix));
-        let entries: Vec<_> = self.rt.block_on(async {
-            use futures::TryStreamExt;
-            self.store
-                .list(Some(&checkpoints_prefix))
-                .try_collect::<Vec<_>>()
-                .await
-        })?;
-        for entry in &entries {
-            let path_str = entry.location.as_ref();
-            if !path_str.ends_with("manifest.json") {
-                continue;
-            }
-            for segment in path_str.split('/') {
-                if let Some(id_str) = segment.strip_prefix("checkpoint_") {
-                    if let Ok(id) = id_str.parse::<u64>() {
-                        ids.insert(id);
                     }
                 }
             }
@@ -935,38 +877,16 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
     }
 
     fn load_latest(&self) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
-        // Try v2 layout: manifests/latest.json
         if let Some(data) = self.get_bytes(&self.latest_pointer_path())? {
             let pointer: LatestPointer = serde_json::from_slice(&data)?;
             return self.load_by_id(pointer.checkpoint_id);
-        }
-
-        // Fall back to v1 layout: checkpoints/latest.txt
-        if let Some(data) = self.get_bytes(&self.legacy_latest_path())? {
-            let content = String::from_utf8_lossy(&data);
-            let dir_name = content.trim();
-            if dir_name.is_empty() {
-                return Ok(None);
-            }
-            let id = dir_name
-                .strip_prefix("checkpoint_")
-                .and_then(|s| s.parse::<u64>().ok());
-            return match id {
-                Some(id) => self.load_by_id(id),
-                None => Ok(None),
-            };
         }
 
         Ok(None)
     }
 
     fn load_by_id(&self, id: u64) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
-        // Try v2 layout first
-        if let Some(m) = self.load_manifest_at(&self.manifest_path(id))? {
-            return Ok(Some(m));
-        }
-        // Fall back to v1 layout
-        self.load_manifest_at(&self.legacy_manifest_path(id))
+        self.load_manifest_at(&self.manifest_path(id))
     }
 
     fn list_ids(&self) -> Result<Vec<u64>, CheckpointStoreError> {
@@ -996,13 +916,7 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         let mut removed = 0;
 
         for &id in &ids[..to_remove] {
-            // Delete from both v2 and v1 layouts (ignore NotFound).
-            let paths = vec![
-                Ok(self.manifest_path(id)),
-                Ok(self.state_path(id)),
-                Ok(self.legacy_manifest_path(id)),
-                Ok(self.legacy_state_path(id)),
-            ];
+            let paths = vec![Ok(self.manifest_path(id)), Ok(self.state_path(id))];
 
             self.rt.block_on(async {
                 use futures::StreamExt;
@@ -1030,14 +944,7 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
     }
 
     fn load_state_data(&self, id: u64) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
-        // Try v2 layout first
-        if let Some(data) = self.get_bytes(&self.state_path(id))? {
-            return Ok(Some(data.to_vec()));
-        }
-        // Fall back to v1 layout
-        Ok(self
-            .get_bytes(&self.legacy_state_path(id))?
-            .map(|d| d.to_vec()))
+        Ok(self.get_bytes(&self.state_path(id))?.map(|d| d.to_vec()))
     }
 
     fn cleanup_orphans(&self) -> Result<usize, CheckpointStoreError> {
@@ -1353,53 +1260,6 @@ mod tests {
         ObjectStoreCheckpointStore::new(store, String::new(), 3).unwrap()
     }
 
-    fn make_obj_store_shared(
-        store: Arc<object_store::memory::InMemory>,
-    ) -> ObjectStoreCheckpointStore {
-        ObjectStoreCheckpointStore::new(store, String::new(), 10).unwrap()
-    }
-
-    /// Write a manifest to the legacy (v1) layout for backward-compat testing.
-    fn write_legacy_manifest(
-        store: &Arc<object_store::memory::InMemory>,
-        prefix: &str,
-        manifest: &CheckpointManifest,
-    ) {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let json = serde_json::to_string_pretty(manifest).unwrap();
-
-        let path = object_store::path::Path::from(format!(
-            "{}checkpoints/checkpoint_{:06}/manifest.json",
-            prefix, manifest.checkpoint_id
-        ));
-        rt.block_on(async {
-            store
-                .put_opts(
-                    &path,
-                    PutPayload::from_bytes(bytes::Bytes::from(json)),
-                    PutOptions::default(),
-                )
-                .await
-                .unwrap();
-        });
-
-        let latest = object_store::path::Path::from(format!("{prefix}checkpoints/latest.txt"));
-        let content = format!("checkpoint_{:06}", manifest.checkpoint_id);
-        rt.block_on(async {
-            store
-                .put_opts(
-                    &latest,
-                    PutPayload::from_bytes(bytes::Bytes::from(content)),
-                    PutOptions::default(),
-                )
-                .await
-                .unwrap();
-        });
-    }
-
     #[test]
     fn test_obj_save_and_load_latest() {
         let store = make_obj_store();
@@ -1529,7 +1389,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_obj_v2_layout_paths() {
+    fn test_obj_layout_paths() {
         let inner = Arc::new(object_store::memory::InMemory::new());
         let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10).unwrap();
 
@@ -1540,7 +1400,6 @@ mod tests {
             .build()
             .unwrap();
 
-        // Manifest should be at v2 path
         let result = rt.block_on(async {
             inner
                 .get_opts(
@@ -1549,9 +1408,8 @@ mod tests {
                 )
                 .await
         });
-        assert!(result.is_ok(), "v2 manifest path should exist");
+        assert!(result.is_ok(), "manifest path should exist");
 
-        // latest.json should exist
         let result = rt.block_on(async {
             inner
                 .get_opts(
@@ -1560,57 +1418,7 @@ mod tests {
                 )
                 .await
         });
-        assert!(result.is_ok(), "v2 latest.json should exist");
-
-        // v1 path should NOT exist
-        let result = rt.block_on(async {
-            inner
-                .get_opts(
-                    &object_store::path::Path::from("checkpoints/checkpoint_000001/manifest.json"),
-                    GetOptions::default(),
-                )
-                .await
-        });
-        assert!(result.is_err(), "v1 manifest path should NOT exist");
-    }
-
-    #[test]
-    fn test_obj_v1_backward_compat_load() {
-        let inner = Arc::new(object_store::memory::InMemory::new());
-        write_legacy_manifest(&inner, "", &make_manifest(1, 42));
-
-        let store = make_obj_store_shared(inner);
-
-        let loaded = store.load_latest().unwrap().unwrap();
-        assert_eq!(loaded.checkpoint_id, 1);
-        assert_eq!(loaded.epoch, 42);
-
-        let loaded = store.load_by_id(1).unwrap().unwrap();
-        assert_eq!(loaded.epoch, 42);
-    }
-
-    #[test]
-    fn test_obj_v1_backward_compat_list() {
-        let inner = Arc::new(object_store::memory::InMemory::new());
-        write_legacy_manifest(&inner, "", &make_manifest(1, 10));
-        write_legacy_manifest(&inner, "", &make_manifest(2, 20));
-
-        let store = make_obj_store_shared(inner);
-        let list = store.list().unwrap();
-        assert_eq!(list, vec![(1, 10), (2, 20)]);
-    }
-
-    #[test]
-    fn test_obj_mixed_layout_list() {
-        let inner = Arc::new(object_store::memory::InMemory::new());
-        // Checkpoint 1 in v1 layout
-        write_legacy_manifest(&inner, "", &make_manifest(1, 10));
-        // Checkpoint 2 in v2 layout
-        let store = make_obj_store_shared(inner);
-        store.save(&make_manifest(2, 20)).unwrap();
-
-        let list = store.list().unwrap();
-        assert_eq!(list, vec![(1, 10), (2, 20)]);
+        assert!(result.is_ok(), "latest.json should exist");
     }
 
     #[test]
@@ -1709,46 +1517,18 @@ mod tests {
     }
 
     #[test]
-    fn test_obj_v1_state_backward_compat() {
-        let inner = Arc::new(object_store::memory::InMemory::new());
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        // Write state to v1 path
-        let path = object_store::path::Path::from("checkpoints/checkpoint_000001/state.bin");
-        let data = b"legacy-state-blob";
-        rt.block_on(async {
-            inner
-                .put_opts(
-                    &path,
-                    PutPayload::from_bytes(bytes::Bytes::from_static(data)),
-                    PutOptions::default(),
-                )
-                .await
-                .unwrap();
-        });
-
-        let store = make_obj_store_shared(inner);
-        let loaded = store.load_state_data(1).unwrap().unwrap();
-        assert_eq!(loaded, data);
-    }
-
-    #[test]
-    fn test_obj_v2_state_paths() {
+    fn test_obj_state_paths() {
         let inner = Arc::new(object_store::memory::InMemory::new());
         let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10).unwrap();
 
         store.save(&make_manifest(1, 1)).unwrap();
-        store.save_state_data(1, b"v2-state").unwrap();
+        store.save_state_data(1, b"state-blob").unwrap();
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
-        // State should be at v2 path
         let result = rt.block_on(async {
             inner
                 .get_opts(
@@ -1757,36 +1537,7 @@ mod tests {
                 )
                 .await
         });
-        assert!(result.is_ok(), "v2 state path should exist");
-
-        // v1 state path should NOT exist
-        let result = rt.block_on(async {
-            inner
-                .get_opts(
-                    &object_store::path::Path::from("checkpoints/checkpoint_000001/state.bin"),
-                    GetOptions::default(),
-                )
-                .await
-        });
-        assert!(result.is_err(), "v1 state path should NOT exist");
-    }
-
-    #[test]
-    fn test_obj_prune_cleans_both_layouts() {
-        let inner = Arc::new(object_store::memory::InMemory::new());
-        // Checkpoint 1 in v1 layout
-        write_legacy_manifest(&inner, "", &make_manifest(1, 10));
-        // Checkpoints 2-4 in v2 layout
-        let store = ObjectStoreCheckpointStore::new(inner, String::new(), 10).unwrap();
-        store.save(&make_manifest(2, 20)).unwrap();
-        store.save(&make_manifest(3, 30)).unwrap();
-        store.save(&make_manifest(4, 40)).unwrap();
-
-        let removed = store.prune(2).unwrap();
-        assert_eq!(removed, 2);
-
-        let list = store.list().unwrap();
-        assert_eq!(list, vec![(3, 30), (4, 40)]);
+        assert!(result.is_ok(), "state path should exist");
     }
 
     #[test]
