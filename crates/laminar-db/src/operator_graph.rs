@@ -922,6 +922,7 @@ impl OperatorGraph {
 
         let emit_changelog = emit_clause.is_some_and(|ec| matches!(ec, EmitClause::Changes));
 
+        #[cfg_attr(not(feature = "cluster-unstable"), allow(unused_mut))]
         let mut op = operator::sql_query::SqlQueryOperator::new(
             name,
             sql,

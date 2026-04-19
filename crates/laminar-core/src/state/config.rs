@@ -203,6 +203,29 @@ impl StateBackendConfig {
         }
     }
 
+    /// Build the underlying `object_store` handle (if any) so callers
+    /// that need to share the same store — e.g. an
+    /// `AssignmentSnapshotStore` alongside the state backend — can
+    /// avoid re-parsing the URL. `None` for `InProcess`.
+    ///
+    /// # Errors
+    /// Same failure modes as [`Self::build`].
+    pub fn build_object_store(
+        &self,
+    ) -> Result<Option<Arc<dyn ::object_store::ObjectStore>>, StateBackendBuildError> {
+        match self {
+            Self::InProcess { .. } => Ok(None),
+            Self::Local { path, .. } => {
+                std::fs::create_dir_all(path)
+                    .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
+                let fs = ::object_store::local::LocalFileSystem::new_with_prefix(path)
+                    .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
+                Ok(Some(Arc::new(fs)))
+            }
+            Self::ObjectStore { url, .. } => Ok(Some(build_object_store(url)?)),
+        }
+    }
+
     /// Returns true if this backend persists state across process
     /// restarts.
     #[must_use]

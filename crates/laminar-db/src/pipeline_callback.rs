@@ -110,12 +110,11 @@ impl ConnectorPipelineCallback {
         format!("{err}")
     }
 
-    /// Phase 1.3: cap each source's tracker-reported watermark by the
-    /// cluster-wide minimum, when one has been published. A `None`
-    /// `cluster_wm` (no controller, or atomic still at its `i64::MIN`
-    /// sentinel before the first committed checkpoint) leaves the map
-    /// untouched — blindly capping to MIN would freeze every downstream
-    /// event-time decision and hang the pipeline.
+    /// Cap each source's tracker-reported watermark by the cluster-wide
+    /// minimum, when one has been published. A `None` `cluster_wm`
+    /// leaves the map untouched — blindly capping to MIN would freeze
+    /// every downstream event-time decision and hang the pipeline.
+    #[cfg(feature = "cluster-unstable")]
     fn cap_source_watermarks_by_cluster_min(
         source_wms: &mut FxHashMap<Arc<str>, i64>,
         cluster_wm: Option<i64>,
@@ -352,6 +351,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         watermark: i64,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
+        #[cfg_attr(not(feature = "cluster-unstable"), allow(unused_mut))]
         let mut source_wms: FxHashMap<Arc<str>, i64> = if let Some(ref tracker) = self.tracker {
             self.source_ids
                 .iter()
@@ -1360,9 +1360,10 @@ mod tests {
         assert!(got.is_err(), "non-Fail errors must not trigger shutdown");
     }
 
-    /// Phase 1.3: the consumer-side cap is a no-op when the cluster has
-    /// not yet published a minimum watermark. Otherwise every event-time
+    /// Consumer-side cap is a no-op when the cluster has not yet
+    /// published a minimum watermark — otherwise every event-time
     /// decision would freeze behind the `i64::MIN` sentinel.
+    #[cfg(feature = "cluster-unstable")]
     #[test]
     fn cap_source_watermarks_none_cluster_wm_leaves_map_untouched() {
         let mut wms: FxHashMap<Arc<str>, i64> = FxHashMap::default();
@@ -1375,10 +1376,10 @@ mod tests {
         assert_eq!(wms.get(&Arc::<str>::from("b")).copied(), Some(500));
     }
 
-    /// Phase 1.3: when a cluster-wide minimum is published, sources that
-    /// have advanced past it get pulled back to it; sources already at or
-    /// below the cap are left alone (cap must not push watermarks
-    /// *forward*, only restrain them).
+    /// When a cluster-wide minimum is published, sources that have
+    /// advanced past it get pulled back to it; sources at or below
+    /// the cap are left alone (cap must not push watermarks forward).
+    #[cfg(feature = "cluster-unstable")]
     #[test]
     fn cap_source_watermarks_lowers_only_sources_above_cluster_min() {
         let mut wms: FxHashMap<Arc<str>, i64> = FxHashMap::default();

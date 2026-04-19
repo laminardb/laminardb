@@ -245,8 +245,7 @@ pub struct CheckpointCoordinator {
     /// Cumulative bytes written across all checkpoints (manifest + sidecar).
     total_bytes_written: u64,
     /// Optional state backend consulted between manifest persist and sink
-    /// commit to verify per-vnode durability. See
-    /// `docs/plans/two-phase-ordering.md`.
+    /// commit to verify per-vnode durability.
     state_backend: Option<Arc<dyn StateBackend>>,
     /// Authoritative assignment generation this coordinator writes with.
     /// Stamped into every `write_partial` so the backend's Phase 1.4
@@ -263,11 +262,10 @@ pub struct CheckpointCoordinator {
     /// [`set_local_watermark_ms`](Self::set_local_watermark_ms).
     local_watermark_ms: Option<i64>,
     /// Cluster-wide minimum watermark as of the last committed epoch.
-    /// Computed by the leader during `await_prepare_quorum` from the
-    /// leader's own local watermark + the min of every follower's
-    /// ack-reported watermark, and published in the subsequent
-    /// `Commit` announcement. `None` until a checkpoint has folded
-    /// real values in. Phase 1.3.
+    /// Leader-side only — computed during `await_prepare_quorum` from
+    /// the leader's own local watermark + follower acks, published in
+    /// the matching `Commit` announcement.
+    #[cfg(feature = "cluster-unstable")]
     cluster_min_watermark: Option<i64>,
     /// Vnodes this coordinator owns. Drives the per-vnode marker
     /// writes — each checkpoint publishes one marker per entry.
@@ -316,6 +314,7 @@ impl CheckpointCoordinator {
             state_backend: None,
             assignment_version: 0,
             local_watermark_ms: None,
+            #[cfg(feature = "cluster-unstable")]
             cluster_min_watermark: None,
             vnode_set: Vec::new(),
             gate_vnode_set: Vec::new(),
@@ -1408,7 +1407,7 @@ impl CheckpointCoordinator {
         }
 
         // Cluster 2PC phase 1: announce PREPARE and wait for followers
-        // to snapshot + ack. See docs/plans/checkpoint-2pc-sequencing.md.
+        // to snapshot + ack.
         #[cfg(feature = "cluster-unstable")]
         {
             if let Some(quorum_failure) =
@@ -1437,13 +1436,10 @@ impl CheckpointCoordinator {
         }
 
         // Durability gate: confirm every participating vnode has its
-        // partial persisted before sinks commit. See
-        // docs/plans/two-phase-ordering.md §"The ordering" step 5.
-        //
-        // `gate_vnode_set` is the FULL registry in cluster mode, so the
-        // leader verifies markers from every follower's shared-storage
-        // writes — not just its own. Single-instance defaults to
-        // `vnode_set` (the two sets match).
+        // partial persisted before sinks commit. `gate_vnode_set` is the
+        // FULL registry in cluster mode — the leader verifies markers
+        // from every follower's shared-storage writes, not just its own.
+        // Single-instance defaults to `vnode_set` (the two match).
         if let Some(ref backend) = self.state_backend {
             if !self.gate_vnode_set.is_empty() {
                 match backend.epoch_complete(epoch, &self.gate_vnode_set).await {
@@ -2202,7 +2198,7 @@ mod tests {
         assert!(coord.store().load_state_data(1).unwrap().is_none());
     }
 
-    // Durability gate — SB-08 / Phase B. See docs/plans/two-phase-ordering.md.
+    // Durability gate tests.
 
     #[tokio::test]
     async fn durability_gate_skipped_when_vnode_set_empty() {

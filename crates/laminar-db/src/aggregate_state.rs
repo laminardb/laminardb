@@ -205,8 +205,9 @@ pub(crate) struct IncrementalAggState {
 
 impl IncrementalAggState {
     /// Number of leading GROUP BY columns in this aggregate's pre-agg
-    /// output (and in `output_schema`). Used by the cluster row-shuffle
-    /// path to know which columns to hash.
+    /// output. Used by the cluster row-shuffle path to know which
+    /// columns to hash.
+    #[cfg(feature = "cluster-unstable")]
     #[must_use]
     pub(crate) fn num_group_cols(&self) -> usize {
         self.num_group_cols

@@ -308,16 +308,38 @@ pub async fn start_cluster(
         builder = builder.storage_dir(path);
     }
 
+    // Build state backend + its underlying object store. The object
+    // store is shared with `AssignmentSnapshotStore` below so a single
+    // cluster-wide bucket holds both per-epoch state and the vnode
+    // assignment snapshot.
+    let state_backend: Arc<dyn laminar_core::state::StateBackend> = config
+        .state
+        .build()
+        .await
+        .map_err(|e| ClusterStartupError::EngineConstruction(format!("state backend: {e}")))?;
+    let vnode_count = config.state.vnode_capacity();
+
+    // Build the vnode registry. If a shared `AssignmentSnapshot` already
+    // exists in the state backend's object store, every node adopts it.
+    // Otherwise the first peer to arrive CAS-creates the snapshot from
+    // its local round-robin split; losers of the CAS race re-load and
+    // adopt the winner.
+    let (vnode_registry, snapshot_store) =
+        resolve_vnode_assignment(node_id, &peers, &config.state).await?;
+
     // Construct the ClusterController if we have a chitchat handle
     // (gossip discovery only — static discovery has no KV tier).
-    // The controller is available to the CheckpointCoordinator for the
-    // leader / follower barrier protocol once the flow change lands.
     if let DiscoveryImpl::Gossip(ref gossip) = discovery {
         if let Some(handle) = gossip.chitchat_handle() {
             use laminar_core::cluster::control::{ChitchatKv, ClusterController, ClusterKv};
             let kv: Arc<dyn ClusterKv> = Arc::new(ChitchatKv::from_handle(handle));
             let members_rx = discovery.membership_watch();
-            let controller = Arc::new(ClusterController::new(node_id, kv, None, members_rx));
+            let controller = Arc::new(ClusterController::new(
+                node_id,
+                kv,
+                snapshot_store.clone(),
+                members_rx,
+            ));
             info!(
                 "ClusterController installed (leader={})",
                 controller.is_leader()
@@ -345,63 +367,35 @@ pub async fn start_cluster(
     };
     builder = server::apply_checkpoint_config(builder, &checkpoint_url, &config.checkpoint);
 
-    // Wire the state backend + vnode registry so the checkpoint
-    // coordinator's durability gate runs. The assignment is a static
-    // round-robin split across every peer visible at cluster start;
-    // dynamic rebalance on join/leave is deferred work.
-    let state_backend: Arc<dyn laminar_core::state::StateBackend> = config
-        .state
-        .build()
-        .await
-        .map_err(|e| ClusterStartupError::EngineConstruction(format!("state backend: {e}")))?;
-    let vnode_count = config.state.vnode_capacity();
-    let vnode_registry = {
-        use laminar_core::state::{round_robin_assignment, NodeId, VnodeRegistry};
-        let peer_ids: Vec<NodeId> = peers
-            .iter()
-            .map(|p| NodeId(p.id.0))
-            .chain(std::iter::once(NodeId(node_id.0)))
-            .collect();
-        let registry = VnodeRegistry::new(vnode_count);
-        registry.set_assignment(round_robin_assignment(vnode_count, &peer_ids));
-        Arc::new(registry)
-    };
     builder = builder
         .state_backend(Arc::clone(&state_backend))
         .vnode_registry(Arc::clone(&vnode_registry));
 
-    // Bind on all interfaces — peers connect in from wherever discovery
-    // puts them. A future iteration can read a configured internal
-    // address; today every `laminardb-cluster.toml` uses the same
-    // semantics.
-    let shuffle_receiver = Arc::new(
-        laminar_core::shuffle::ShuffleReceiver::bind(
-            node_id.0,
-            "0.0.0.0:0".parse().unwrap(),
-        )
-        .await
-        .map_err(|e| ClusterStartupError::EngineConstruction(format!("shuffle bind: {e}")))?,
-    );
+    // Shuffle fabric. ShuffleReceiver publishes its bound address into
+    // the gossip KV so peer ShuffleSenders discover it on first send.
+    // Without this wiring, streaming aggregates never cross node
+    // boundaries — Phase 0a in the plan.
+    let shuffle_receiver = build_shuffle_receiver(&discovery, node_id).await?;
     let shuffle_sender = Arc::new(build_shuffle_sender(
         node_id.0,
         &discovery,
         shuffle_receiver.local_addr(),
     ).await);
-    let distributed_rule = Arc::new(
-        laminar_sql::datafusion::distributed_aggregate_rule::DistributedAggregateRule::new(
-            Arc::clone(&vnode_registry),
-            Arc::clone(&shuffle_sender),
-            Arc::clone(&shuffle_receiver),
-            laminar_core::state::NodeId(node_id.0),
-        )
-        .with_state_backend(Arc::clone(&state_backend)),
-    );
+
+    // NOTE: `DistributedAggregateRule` is intentionally NOT installed
+    // here. It rewrites DataFusion aggregate plans into
+    // Partial → ClusterRepartitionExec → FinalPartitioned, but the
+    // rule fires during CREATE MATERIALIZED VIEW's schema-extraction
+    // `df.collect()` and the resulting `dispatch_inbound` task holds
+    // the ShuffleReceiver mutex for the engine's lifetime — which
+    // starves the row-shuffle drain that `IncrementalAggState` relies
+    // on. Streaming aggregates (the production workload) go through
+    // the row-shuffle bridge below, whose state recovery rides the
+    // existing operator-checkpoint mechanism. The rule stays in
+    // `laminar-sql` for a future non-streaming path, not enabled here.
     builder = builder
-        .physical_optimizer_rule(distributed_rule)
-        // DataFusion's `EnforceDistribution` only inserts a hash
-        // repartition (the shape we rewrite) when target_partitions > 1.
-        // Safe here because the rule we just registered replaces the
-        // stock RepartitionExec with our reusable ClusterRepartitionExec.
+        .shuffle_sender(Arc::clone(&shuffle_sender))
+        .shuffle_receiver(Arc::clone(&shuffle_receiver))
         .target_partitions(vnode_count as usize);
 
     let db = builder
@@ -459,6 +453,127 @@ fn num_cpus() -> u32 {
     std::thread::available_parallelism()
         .map(|n| n.get() as u32)
         .unwrap_or(1)
+}
+
+/// Boot-time vnode assignment. If an `AssignmentSnapshot` exists in
+/// shared storage (written by a prior cluster incarnation or a peer
+/// that raced here first), every node adopts it — the fresh node
+/// doesn't fight over vnodes that are already claimed. Otherwise we
+/// compute a round-robin split of this node's known peers and
+/// CAS-create the snapshot; losers of the CAS race re-load and adopt.
+///
+/// Returns the registry plus the snapshot store (when one is
+/// available) so the `ClusterController` can watch for future
+/// rotations. `None` store means the deployment is on a non-object-
+/// store state backend (in-process), where no snapshot is possible
+/// or needed.
+async fn resolve_vnode_assignment(
+    self_id: laminar_core::cluster::discovery::NodeId,
+    peers: &[laminar_core::cluster::discovery::NodeInfo],
+    state_cfg: &laminar_core::state::StateBackendConfig,
+) -> Result<
+    (
+        Arc<laminar_core::state::VnodeRegistry>,
+        Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>,
+    ),
+    ClusterStartupError,
+> {
+    use laminar_core::cluster::control::{AssignmentSnapshot, AssignmentSnapshotStore};
+    use laminar_core::state::{round_robin_assignment, NodeId, VnodeRegistry};
+
+    let vnode_count = state_cfg.vnode_capacity();
+    let peer_ids: Vec<NodeId> = peers
+        .iter()
+        .map(|p| NodeId(p.id.0))
+        .chain(std::iter::once(NodeId(self_id.0)))
+        .collect();
+    let assignment: Arc<[NodeId]> = round_robin_assignment(vnode_count, &peer_ids);
+
+    let maybe_store = state_cfg
+        .build_object_store()
+        .map_err(|e| ClusterStartupError::EngineConstruction(format!("state object store: {e}")))?;
+    let Some(store) = maybe_store else {
+        // Non-durable backend — fall back to node-local round-robin.
+        let registry = VnodeRegistry::new(vnode_count);
+        registry.set_assignment(Arc::clone(&assignment));
+        return Ok((Arc::new(registry), None));
+    };
+    let snapshot_store = Arc::new(AssignmentSnapshotStore::new(store));
+
+    // Try to adopt the durably-stored snapshot first.
+    if let Some(existing) = snapshot_store
+        .load()
+        .await
+        .map_err(|e| ClusterStartupError::EngineConstruction(format!("snapshot load: {e}")))?
+    {
+        let registry = VnodeRegistry::new(vnode_count);
+        registry.set_assignment(existing.to_vnode_vec(vnode_count).into());
+        info!("Adopted existing assignment snapshot v{}", existing.version);
+        return Ok((Arc::new(registry), Some(snapshot_store)));
+    }
+
+    // Nothing stored yet — propose ours and CAS-create. A racing peer
+    // may win; if so, re-load and adopt the winner.
+    let proposal = AssignmentSnapshot::empty()
+        .next(AssignmentSnapshot::vnodes_from_vec(&assignment));
+    let winner = match snapshot_store
+        .save_if_absent(&proposal)
+        .await
+        .map_err(|e| ClusterStartupError::EngineConstruction(format!("snapshot save: {e}")))?
+    {
+        Some(w) => {
+            info!("Created assignment snapshot v{}", w.version);
+            w
+        }
+        None => {
+            let w = snapshot_store
+                .load()
+                .await
+                .map_err(|e| {
+                    ClusterStartupError::EngineConstruction(format!("snapshot re-load: {e}"))
+                })?
+                .ok_or_else(|| {
+                    ClusterStartupError::EngineConstruction(
+                        "snapshot CAS lost but re-load returned None".into(),
+                    )
+                })?;
+            info!("Adopted snapshot v{} after CAS race", w.version);
+            w
+        }
+    };
+    let registry = VnodeRegistry::new(vnode_count);
+    registry.set_assignment(winner.to_vnode_vec(vnode_count).into());
+    Ok((Arc::new(registry), Some(snapshot_store)))
+}
+
+/// Bind the ShuffleReceiver. When gossip discovery is active, publish
+/// the bound address under `SHUFFLE_ADDR_KEY` so peer senders can
+/// discover it on first send.
+async fn build_shuffle_receiver(
+    discovery: &DiscoveryImpl,
+    node_id: NodeId,
+) -> Result<Arc<laminar_core::shuffle::ShuffleReceiver>, ClusterStartupError> {
+    use laminar_core::cluster::control::{ChitchatKv, ClusterKv};
+    use laminar_core::shuffle::ShuffleReceiver;
+
+    let bind: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+    let recv = if let DiscoveryImpl::Gossip(gossip) = discovery {
+        if let Some(handle) = gossip.chitchat_handle() {
+            let kv: Arc<dyn ClusterKv> = Arc::new(ChitchatKv::from_handle(handle));
+            ShuffleReceiver::bind_with_kv(node_id.0, bind, kv)
+                .await
+                .map_err(|e| ClusterStartupError::EngineConstruction(format!("shuffle bind: {e}")))?
+        } else {
+            ShuffleReceiver::bind(node_id.0, bind)
+                .await
+                .map_err(|e| ClusterStartupError::EngineConstruction(format!("shuffle bind: {e}")))?
+        }
+    } else {
+        ShuffleReceiver::bind(node_id.0, bind)
+            .await
+            .map_err(|e| ClusterStartupError::EngineConstruction(format!("shuffle bind: {e}")))?
+    };
+    Ok(Arc::new(recv))
 }
 
 /// Build an outbound shuffle sender. When gossip discovery is active,

@@ -67,14 +67,6 @@ impl ClusterController {
         }
     }
 
-    /// Shared handle to the cluster-min-watermark atomic. Operators
-    /// wanting a zero-overhead read can clone this Arc once and poll
-    /// it on the hot path.
-    #[must_use]
-    pub fn cluster_min_watermark_handle(&self) -> Arc<AtomicI64> {
-        Arc::clone(&self.cluster_min_watermark)
-    }
-
     /// Leader-side monotonic publish. The leader computes the
     /// cluster-wide minimum watermark in `await_prepare_quorum`
     /// (its own local watermark folded with every follower's ack)
