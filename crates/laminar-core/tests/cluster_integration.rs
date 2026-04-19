@@ -92,6 +92,7 @@ async fn barrier_announce_then_follower_observes_and_acks() {
         checkpoint_id: 101,
         phase: laminar_core::cluster::control::Phase::Prepare,
         flags: 0,
+        min_watermark_ms: None,
     };
 
     // Step 1: leader announces.
@@ -125,6 +126,7 @@ async fn barrier_announce_then_follower_observes_and_acks() {
                 epoch: 7,
                 ok: true,
                 error: None,
+                local_watermark_ms: None,
             })
             .await
             .expect("ack");
@@ -139,7 +141,7 @@ async fn barrier_announce_then_follower_observes_and_acks() {
         .wait_for_quorum(7, &follower_ids, Duration::from_secs(6))
         .await;
     match outcome {
-        QuorumOutcome::Reached { mut acks } => {
+        QuorumOutcome::Reached { mut acks, .. } => {
             acks.sort_by_key(|n| n.0);
             let mut expected = follower_ids.clone();
             expected.sort_by_key(|n| n.0);
@@ -525,6 +527,7 @@ async fn quorum_times_out_when_follower_silent() {
             checkpoint_id: 1,
             phase: laminar_core::cluster::control::Phase::Prepare,
             flags: 0,
+            min_watermark_ms: None,
         })
         .await
         .unwrap();
@@ -538,6 +541,7 @@ async fn quorum_times_out_when_follower_silent() {
             epoch: 42,
             ok: true,
             error: None,
+            local_watermark_ms: None,
         })
         .await
         .unwrap();

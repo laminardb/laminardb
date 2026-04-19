@@ -39,6 +39,21 @@ pub struct BarrierAnnouncement {
     pub phase: Phase,
     /// Reserved for unaligned/other flags.
     pub flags: u64,
+    /// Cluster-wide minimum watermark at announce time: the `min`
+    /// across every live node's local watermark, computed by the
+    /// leader from follower acks (see `BarrierAck.local_watermark_ms`)
+    /// plus the leader's own watermark. Populated on
+    /// [`Phase::Commit`] announcements. `None` on `Prepare`/`Abort`
+    /// (computed only after acks are in) and on pre-Phase-1.3 payloads
+    /// deserialised via the `#[serde(default)]` fallback.
+    ///
+    /// Consumers consult this value instead of their local watermark
+    /// when deciding whether an event-time window has closed
+    /// cluster-wide — local progress on one node is stale if another
+    /// node is still processing earlier events. See Phase 1.3 in
+    /// `docs/plans/cluster-production-readiness.md`.
+    #[serde(default)]
+    pub min_watermark_ms: Option<i64>,
 }
 
 /// Follower ack. `ok = false` forces the leader to abort instead of wait.
@@ -50,6 +65,16 @@ pub struct BarrierAck {
     pub ok: bool,
     /// Free-text error; populated when `ok = false`.
     pub error: Option<String>,
+    /// Follower's local watermark at ack time (ms since epoch or
+    /// arbitrary monotonic domain, matching the source's event-time
+    /// units). The leader folds this into the cluster-wide min
+    /// emitted in the matching `Commit` announcement.
+    ///
+    /// `None` means the follower's watermark is unset (fresh boot,
+    /// no source events yet) — treated as "infinity" by the leader:
+    /// it doesn't cap the cluster min downward.
+    #[serde(default)]
+    pub local_watermark_ms: Option<i64>,
 }
 
 /// Outcome of `wait_for_quorum`.
@@ -59,6 +84,12 @@ pub enum QuorumOutcome {
     Reached {
         /// Peers that acked successfully.
         acks: Vec<NodeId>,
+        /// The minimum watermark across every successful ack's
+        /// `local_watermark_ms` (ignoring `None` values). `None`
+        /// means no follower reported a watermark — the leader
+        /// falls back to its own local value for the Commit
+        /// announcement. See Phase 1.3.
+        min_follower_watermark_ms: Option<i64>,
     },
     /// Deadline expired with at least one peer silent.
     TimedOut {
@@ -190,10 +221,12 @@ impl BarrierCoordinator {
         let expected_set: FxHashSet<NodeId> = expected.iter().copied().collect();
         let mut successful: Vec<NodeId> = Vec::new();
         let mut failures: Vec<(NodeId, String)> = Vec::new();
+        let mut min_follower_wm: Option<i64>;
 
         loop {
             successful.clear();
             failures.clear();
+            min_follower_wm = None;
 
             for (from, json) in self.kv.scan(ACK_KEY).await {
                 if !expected_set.contains(&from) {
@@ -207,6 +240,12 @@ impl BarrierCoordinator {
                 }
                 if ack.ok {
                     successful.push(from);
+                    if let Some(wm) = ack.local_watermark_ms {
+                        min_follower_wm = Some(match min_follower_wm {
+                            Some(cur) => cur.min(wm),
+                            None => wm,
+                        });
+                    }
                 } else {
                     failures.push((from, ack.error.unwrap_or_default()));
                 }
@@ -216,7 +255,10 @@ impl BarrierCoordinator {
                 return QuorumOutcome::Failed { failures };
             }
             if successful.len() == expected.len() {
-                return QuorumOutcome::Reached { acks: successful };
+                return QuorumOutcome::Reached {
+                    acks: successful,
+                    min_follower_watermark_ms: min_follower_wm,
+                };
             }
             if start.elapsed() >= deadline {
                 let got: FxHashSet<NodeId> = successful.iter().copied().collect();
@@ -253,6 +295,7 @@ mod tests {
                 checkpoint_id: 42,
                 phase: Phase::Prepare,
                 flags: 0,
+                min_watermark_ms: None,
             })
             .await
             .unwrap();
@@ -276,6 +319,7 @@ mod tests {
             epoch: 7,
             ok: true,
             error: None,
+            local_watermark_ms: None,
         })
         .unwrap();
         k.seed(NodeId(2), ACK_KEY, ack_json.clone());
@@ -286,9 +330,16 @@ mod tests {
             .wait_for_quorum(7, &[NodeId(2), NodeId(3)], Duration::from_millis(200))
             .await;
         match outcome {
-            QuorumOutcome::Reached { mut acks } => {
+            QuorumOutcome::Reached {
+                mut acks,
+                min_follower_watermark_ms,
+            } => {
                 acks.sort_by_key(|n| n.0);
                 assert_eq!(acks, vec![NodeId(2), NodeId(3)]);
+                assert_eq!(
+                    min_follower_watermark_ms, None,
+                    "no follower reported a watermark — min is None"
+                );
             }
             other => panic!("expected Reached, got {other:?}"),
         }
@@ -301,6 +352,7 @@ mod tests {
             epoch: 8,
             ok: true,
             error: None,
+            local_watermark_ms: None,
         })
         .unwrap();
         k.seed(NodeId(2), ACK_KEY, ack_json);
@@ -326,12 +378,14 @@ mod tests {
             epoch: 9,
             ok: true,
             error: None,
+            local_watermark_ms: None,
         })
         .unwrap();
         let bad = serde_json::to_string(&BarrierAck {
             epoch: 9,
             ok: false,
             error: Some("state snapshot failed: disk full".into()),
+            local_watermark_ms: None,
         })
         .unwrap();
         k.seed(NodeId(2), ACK_KEY, good);
@@ -360,6 +414,7 @@ mod tests {
             epoch: 9,
             ok: true,
             error: None,
+            local_watermark_ms: None,
         })
         .unwrap();
         k.seed(NodeId(2), ACK_KEY, stale);

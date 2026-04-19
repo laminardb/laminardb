@@ -1,13 +1,14 @@
 //! Facade over `ClusterKv` + `BarrierCoordinator` + membership watch.
 //! `None` on `CheckpointCoordinator` means single-instance mode.
 
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
 
 use super::barrier::{
-    BarrierAck, BarrierAnnouncement, BarrierCoordinator, ClusterKv, QuorumOutcome,
+    BarrierAck, BarrierAnnouncement, BarrierCoordinator, ClusterKv, Phase, QuorumOutcome,
 };
 use super::leader::leader_of;
 use super::snapshot::AssignmentSnapshotStore;
@@ -19,6 +20,12 @@ pub struct ClusterController {
     barrier: BarrierCoordinator,
     snapshot: Option<Arc<AssignmentSnapshotStore>>,
     members_rx: watch::Receiver<Vec<NodeInfo>>,
+    /// Latest cluster-wide minimum watermark published by the leader
+    /// in a `Commit` announcement. `i64::MIN` means uninitialised
+    /// (no Commit observed yet). Operators consult this instead of
+    /// their local watermark so event-time decisions stay consistent
+    /// across the cluster. Phase 1.3.
+    cluster_min_watermark: Arc<AtomicI64>,
 }
 
 impl std::fmt::Debug for ClusterController {
@@ -43,7 +50,29 @@ impl ClusterController {
             barrier: BarrierCoordinator::new(kv),
             snapshot,
             members_rx,
+            cluster_min_watermark: Arc::new(AtomicI64::new(i64::MIN)),
         }
+    }
+
+    /// Latest cluster-wide minimum watermark seen by this instance.
+    /// `None` until the leader has published a `Commit` with a
+    /// populated `min_watermark_ms`. Phase 1.3.
+    #[must_use]
+    pub fn cluster_min_watermark(&self) -> Option<i64> {
+        let v = self.cluster_min_watermark.load(Ordering::Acquire);
+        if v == i64::MIN {
+            None
+        } else {
+            Some(v)
+        }
+    }
+
+    /// Shared handle to the cluster-min-watermark atomic. Operators
+    /// wanting a zero-overhead read can clone this Arc once and poll
+    /// it on the hot path.
+    #[must_use]
+    pub fn cluster_min_watermark_handle(&self) -> Arc<AtomicI64> {
+        Arc::clone(&self.cluster_min_watermark)
     }
 
     /// This instance's ID.
@@ -96,13 +125,39 @@ impl ClusterController {
 
     /// Follower-side observe; `Ok(None)` if no leader is visible.
     ///
+    /// As a side effect, a `Commit` announcement with a populated
+    /// `min_watermark_ms` updates the shared cluster-min-watermark
+    /// atomic so operators on this instance see the cluster-wide
+    /// minimum without a separate polling path. Phase 1.3.
+    ///
     /// # Errors
     /// Propagates [`BarrierCoordinator::observe`] errors.
     pub async fn observe_barrier(&self) -> Result<Option<BarrierAnnouncement>, String> {
         let Some(leader) = self.current_leader() else {
             return Ok(None);
         };
-        self.barrier.observe(leader).await
+        let observed = self.barrier.observe(leader).await?;
+        if let Some(ref ann) = observed {
+            if ann.phase == Phase::Commit {
+                if let Some(wm) = ann.min_watermark_ms {
+                    // Monotonic publish — never lower the watermark,
+                    // even if a stale announcement re-gossips.
+                    let mut cur = self.cluster_min_watermark.load(Ordering::Acquire);
+                    while wm > cur {
+                        match self.cluster_min_watermark.compare_exchange(
+                            cur,
+                            wm,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => break,
+                            Err(observed) => cur = observed,
+                        }
+                    }
+                }
+            }
+        }
+        Ok(observed)
     }
 
     /// Follower-side ack.
@@ -183,10 +238,63 @@ mod tests {
             checkpoint_id: 1,
             phase: crate::cluster::control::Phase::Prepare,
             flags: 0,
+            min_watermark_ms: None,
         })
         .await
         .unwrap();
         let got = c.observe_barrier().await.unwrap().unwrap();
         assert_eq!(got.epoch, 5);
+    }
+
+    #[tokio::test]
+    async fn observe_commit_publishes_cluster_min_watermark() {
+        // Phase 1.3: Commit announcements with `min_watermark_ms`
+        // populated propagate into the shared atomic so operators
+        // can read cluster-wide progress without a separate channel.
+        let c = ctl(1, vec![]);
+        assert_eq!(c.cluster_min_watermark(), None, "uninitialised");
+
+        c.announce_barrier(&BarrierAnnouncement {
+            epoch: 9,
+            checkpoint_id: 1,
+            phase: crate::cluster::control::Phase::Commit,
+            flags: 0,
+            min_watermark_ms: Some(12_345),
+        })
+        .await
+        .unwrap();
+        c.observe_barrier().await.unwrap();
+        assert_eq!(c.cluster_min_watermark(), Some(12_345));
+
+        // A later Commit with a lower value must NOT regress the atomic —
+        // event-time can only advance.
+        c.announce_barrier(&BarrierAnnouncement {
+            epoch: 10,
+            checkpoint_id: 2,
+            phase: crate::cluster::control::Phase::Commit,
+            flags: 0,
+            min_watermark_ms: Some(100), // stale re-gossip
+        })
+        .await
+        .unwrap();
+        c.observe_barrier().await.unwrap();
+        assert_eq!(
+            c.cluster_min_watermark(),
+            Some(12_345),
+            "stale Commit must not lower the published watermark",
+        );
+
+        // A Prepare announcement (no min_watermark_ms carried) is a no-op.
+        c.announce_barrier(&BarrierAnnouncement {
+            epoch: 11,
+            checkpoint_id: 3,
+            phase: crate::cluster::control::Phase::Prepare,
+            flags: 0,
+            min_watermark_ms: None,
+        })
+        .await
+        .unwrap();
+        c.observe_barrier().await.unwrap();
+        assert_eq!(c.cluster_min_watermark(), Some(12_345));
     }
 }

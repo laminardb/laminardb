@@ -164,6 +164,12 @@ impl ConnectorPipelineCallback {
                 "coordinator not initialized when force_capture_and_checkpoint ran".into(),
             )
         })?;
+        // Phase 1.3: seed leader-side local watermark so
+        // `await_prepare_quorum` can fold it into the cluster-wide min.
+        let wm = self
+            .pipeline_watermark
+            .load(std::sync::atomic::Ordering::Acquire);
+        coord.set_local_watermark_ms(if wm == i64::MIN { None } else { Some(wm) });
         let result = coord.checkpoint_with_offsets(request).await?;
         if result.success {
             self.last_checkpoint = std::time::Instant::now();
@@ -228,6 +234,12 @@ impl ConnectorPipelineCallback {
         let Some(ref mut coord) = *guard else {
             return false;
         };
+        // Phase 1.3: stamp this instance's current pipeline watermark
+        // into the coordinator so the next `BarrierAck` carries it.
+        // i64::MIN means unset; don't propagate — leader treats us as
+        // non-blocking.
+        let wm = self.pipeline_watermark.load(std::sync::atomic::Ordering::Acquire);
+        coord.set_local_watermark_ms(if wm == i64::MIN { None } else { Some(wm) });
         match coord
             .follower_checkpoint(request, ann, std::time::Duration::from_secs(30))
             .await

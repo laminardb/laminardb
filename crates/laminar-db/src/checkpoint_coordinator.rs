@@ -255,6 +255,20 @@ pub struct CheckpointCoordinator {
     /// as the current generation. Set via
     /// [`set_assignment_version`](Self::set_assignment_version).
     assignment_version: u64,
+    /// Follower-side local watermark. Phase 1.3: reported in each
+    /// `BarrierAck` so the leader can compute the cluster-wide
+    /// minimum for the matching `Commit` announcement. `None` means
+    /// the pipeline hasn't produced a watermark yet; the leader
+    /// treats this follower as non-blocking. Set via
+    /// [`set_local_watermark_ms`](Self::set_local_watermark_ms).
+    local_watermark_ms: Option<i64>,
+    /// Cluster-wide minimum watermark as of the last committed epoch.
+    /// Computed by the leader during `await_prepare_quorum` from the
+    /// leader's own local watermark + the min of every follower's
+    /// ack-reported watermark, and published in the subsequent
+    /// `Commit` announcement. `None` until a checkpoint has folded
+    /// real values in. Phase 1.3.
+    cluster_min_watermark: Option<i64>,
     /// Vnodes this coordinator owns. Drives the per-vnode marker
     /// writes — each checkpoint publishes one marker per entry.
     /// Empty disables marker writes.
@@ -301,6 +315,8 @@ impl CheckpointCoordinator {
             total_bytes_written: 0,
             state_backend: None,
             assignment_version: 0,
+            local_watermark_ms: None,
+            cluster_min_watermark: None,
             vnode_set: Vec::new(),
             gate_vnode_set: Vec::new(),
             #[cfg(feature = "cluster-unstable")]
@@ -340,6 +356,15 @@ impl CheckpointCoordinator {
     /// [`AssignmentSnapshot`]: laminar_core::cluster::control::AssignmentSnapshot
     pub fn set_assignment_version(&mut self, version: u64) {
         self.assignment_version = version;
+    }
+
+    /// Record this instance's current local watermark, reported in
+    /// every subsequent `BarrierAck` so the leader can compute the
+    /// cluster-wide minimum (Phase 1.3). `None` disables the
+    /// per-follower contribution — leader falls back to its own
+    /// watermark (and the other followers').
+    pub fn set_local_watermark_ms(&mut self, watermark: Option<i64>) {
+        self.local_watermark_ms = watermark;
     }
 
     /// Vnodes this instance owns; drives marker writes. Also the
@@ -687,6 +712,7 @@ impl CheckpointCoordinator {
             last.epoch,
             last.checkpoint_id,
             laminar_core::cluster::control::Phase::Abort,
+            None,
         )
         .await;
         // Small pause to let the announcement gossip before the next
@@ -696,12 +722,19 @@ impl CheckpointCoordinator {
 
     /// No-op when not the leader. Errors are logged — worst case is a
     /// longer follower timeout, not a correctness issue.
+    ///
+    /// `min_watermark_ms` is typically `None` on `Prepare`/`Abort` and
+    /// `Some(cluster_min)` on `Commit` (computed from follower acks +
+    /// local watermark). Downstream operators read the published
+    /// value from [`ClusterController`] so event-time decisions stay
+    /// consistent across the cluster. See Phase 1.3.
     #[cfg(feature = "cluster-unstable")]
     async fn announce_if_leader(
         &self,
         epoch: u64,
         checkpoint_id: u64,
         phase: laminar_core::cluster::control::Phase,
+        min_watermark_ms: Option<i64>,
     ) {
         let Some(cc) = self.cluster_controller.as_ref() else {
             return;
@@ -714,6 +747,7 @@ impl CheckpointCoordinator {
             checkpoint_id,
             phase,
             flags: 0,
+            min_watermark_ms,
         };
         if let Err(e) = cc.announce_barrier(&ann).await {
             warn!(
@@ -728,9 +762,13 @@ impl CheckpointCoordinator {
 
     /// Announce PREPARE and block for follower acks. Returns `None` on
     /// quorum or no-op (not leader); `Some(msg)` with the failure.
+    /// When quorum is reached, the `Ok` path writes the cluster-wide
+    /// minimum watermark (leader's local + min of follower acks) into
+    /// `self.cluster_min_watermark` so the subsequent `Commit`
+    /// announcement can fan it out (Phase 1.3).
     #[cfg(feature = "cluster-unstable")]
     async fn await_prepare_quorum(
-        &self,
+        &mut self,
         epoch: u64,
         checkpoint_id: u64,
     ) -> Option<String> {
@@ -739,12 +777,15 @@ impl CheckpointCoordinator {
         if !cc.is_leader() {
             return None;
         }
-        self.announce_if_leader(epoch, checkpoint_id, Phase::Prepare)
+        self.announce_if_leader(epoch, checkpoint_id, Phase::Prepare, None)
             .await;
 
         let mut followers = cc.live_instances();
         followers.retain(|id| *id != cc.instance_id());
         if followers.is_empty() {
+            // Leader-only cluster — cluster-wide min is just the
+            // leader's local watermark (if any).
+            self.cluster_min_watermark = self.local_watermark_ms;
             return None;
         }
 
@@ -752,9 +793,24 @@ impl CheckpointCoordinator {
             .wait_for_quorum(epoch, &followers, Duration::from_secs(30))
             .await;
         match outcome {
-            QuorumOutcome::Reached { .. } => None,
+            QuorumOutcome::Reached {
+                min_follower_watermark_ms,
+                ..
+            } => {
+                // Fold follower min with the leader's own watermark.
+                // Either may be `None` (unreported) — treated as
+                // "non-blocking" (ignored from the min computation).
+                let merged = match (self.local_watermark_ms, min_follower_watermark_ms) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                self.cluster_min_watermark = merged;
+                None
+            }
             QuorumOutcome::TimedOut { missing, .. } => {
-                self.announce_if_leader(epoch, checkpoint_id, Phase::Abort)
+                self.announce_if_leader(epoch, checkpoint_id, Phase::Abort, None)
                     .await;
                 Some(format!(
                     "quorum timeout: {} follower(s) did not ack",
@@ -762,7 +818,7 @@ impl CheckpointCoordinator {
                 ))
             }
             QuorumOutcome::Failed { failures } => {
-                self.announce_if_leader(epoch, checkpoint_id, Phase::Abort)
+                self.announce_if_leader(epoch, checkpoint_id, Phase::Abort, None)
                     .await;
                 let first = failures
                     .first()
@@ -1067,6 +1123,12 @@ impl CheckpointCoordinator {
             epoch,
             ok: prepare_err.is_none(),
             error: prepare_err.clone(),
+            // Phase 1.3: stamp this follower's current watermark so the
+            // leader can fold it into the cluster-wide min before
+            // announcing Commit. `None` means "no watermark reported"
+            // — the leader treats the follower as non-blocking (its
+            // watermark is effectively +infinity).
+            local_watermark_ms: self.local_watermark_ms,
         })
         .await
         .ok(); // best effort; leader's quorum wait tolerates missed acks
@@ -1384,7 +1446,7 @@ impl CheckpointCoordinator {
                              rolling back sinks",
                         );
                         #[cfg(feature = "cluster-unstable")]
-                        self.announce_if_leader(epoch, checkpoint_id, laminar_core::cluster::control::Phase::Abort).await;
+                        self.announce_if_leader(epoch, checkpoint_id, laminar_core::cluster::control::Phase::Abort, None).await;
                         self.checkpoints_failed += 1;
                         self.phase = CheckpointPhase::Idle;
                         let duration = start.elapsed();
@@ -1414,7 +1476,7 @@ impl CheckpointCoordinator {
                              treating as gate miss, rolling back sinks",
                         );
                         #[cfg(feature = "cluster-unstable")]
-                        self.announce_if_leader(epoch, checkpoint_id, laminar_core::cluster::control::Phase::Abort).await;
+                        self.announce_if_leader(epoch, checkpoint_id, laminar_core::cluster::control::Phase::Abort, None).await;
                         self.checkpoints_failed += 1;
                         self.phase = CheckpointPhase::Idle;
                         let duration = start.elapsed();
@@ -1440,7 +1502,16 @@ impl CheckpointCoordinator {
         }
 
         #[cfg(feature = "cluster-unstable")]
-        self.announce_if_leader(epoch, checkpoint_id, laminar_core::cluster::control::Phase::Commit).await;
+        // Phase 1.3: fan out the cluster-wide min watermark computed
+        // during `await_prepare_quorum`. Followers consume this from
+        // `observe_barrier` and update their consumer-side view.
+        self.announce_if_leader(
+            epoch,
+            checkpoint_id,
+            laminar_core::cluster::control::Phase::Commit,
+            self.cluster_min_watermark,
+        )
+        .await;
 
         self.phase = CheckpointPhase::Committing;
         let sink_statuses = self.commit_sinks_tracked(epoch).await;
@@ -2271,6 +2342,7 @@ mod tests {
             checkpoint_id: 1,
             phase: Phase::Prepare,
             flags: 0,
+            min_watermark_ms: None,
         })
         .unwrap();
         let commit_json = serde_json::to_string(&BarrierAnnouncement {
@@ -2278,6 +2350,7 @@ mod tests {
             checkpoint_id: 1,
             phase: Phase::Commit,
             flags: 0,
+            min_watermark_ms: None,
         })
         .unwrap();
         // Overwrite the prepare with commit — observe_barrier reads the
@@ -2291,6 +2364,7 @@ mod tests {
             checkpoint_id: 1,
             phase: Phase::Prepare,
             flags: 0,
+            min_watermark_ms: None,
         };
         let committed = coord
             .follower_checkpoint(CheckpointRequest::default(), ann, Duration::from_secs(2))
@@ -2343,6 +2417,7 @@ mod tests {
             checkpoint_id: 1,
             phase: Phase::Abort,
             flags: 0,
+            min_watermark_ms: None,
         })
         .unwrap();
         kv.seed(leader_id, ANNOUNCEMENT_KEY, abort_json);
@@ -2352,6 +2427,7 @@ mod tests {
             checkpoint_id: 1,
             phase: Phase::Prepare,
             flags: 0,
+            min_watermark_ms: None,
         };
         let committed = coord
             .follower_checkpoint(CheckpointRequest::default(), ann, Duration::from_secs(2))

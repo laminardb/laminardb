@@ -85,6 +85,7 @@ async fn two_node_leader_commits_follower_mirrors() {
         checkpoint_id: 1,
         phase: Phase::Prepare,
         flags: 0,
+        min_watermark_ms: None,
     };
 
     // Run both halves concurrently.
