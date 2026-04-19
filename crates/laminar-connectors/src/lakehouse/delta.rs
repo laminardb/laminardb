@@ -1034,6 +1034,26 @@ impl SinkConnector for DeltaLakeSink {
         let num_rows = batch.num_rows();
         let estimated_bytes = Self::estimate_batch_size(batch);
 
+        // Exactly-once cannot flush opportunistically from `write_batch`
+        // — a mid-epoch flush would leak rows on rollback. Before the
+        // fix the buffer grew without bound between checkpoints, so a
+        // coordinator stall could OOM the sink. Apply the configured
+        // target as a hard cap (×4 to tolerate normal checkpoint jitter)
+        // and signal backpressure so the upstream reactor slows down.
+        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+            let pending_rows = self.buffered_rows + self.staged_rows + num_rows;
+            let pending_bytes = self.buffered_bytes + self.staged_bytes + estimated_bytes;
+            let row_cap = self.config.max_buffer_records.saturating_mul(4);
+            let byte_cap = (self.config.target_file_size as u64).saturating_mul(4);
+            if pending_rows > row_cap || pending_bytes > byte_cap {
+                return Err(ConnectorError::WriteError(format!(
+                    "delta sink exactly-once buffer full ({pending_rows} rows, \
+                     {pending_bytes} bytes pending; cap {row_cap} rows, \
+                     {byte_cap} bytes) — waiting for next checkpoint"
+                )));
+            }
+        }
+
         // Buffer the batch.
         if self.buffer_start_time.is_none() {
             self.buffer_start_time = Some(Instant::now());
@@ -1588,6 +1608,32 @@ mod tests {
     fn test_should_flush_empty() {
         let sink = DeltaLakeSink::new(test_config(), None);
         assert!(!sink.should_flush());
+    }
+
+    #[tokio::test]
+    async fn test_exactly_once_buffer_backpressure() {
+        // Ensure exactly-once mode rejects writes when the pending buffer
+        // would exceed the hard cap (4× max_buffer_records). Without this
+        // guard, a coordinator stall would let the buffer grow until OOM.
+        let mut config = test_config();
+        config.delivery_guarantee = crate::connector::DeliveryGuarantee::ExactlyOnce;
+        config.max_buffer_records = 10;
+        let mut sink = DeltaLakeSink::new(config, None);
+        sink.state = ConnectorState::Running;
+
+        // Push enough rows to exceed 4× cap (10 × 4 = 40 → push 50).
+        let batch = test_batch(50);
+        let err = sink
+            .write_batch(&batch)
+            .await
+            .expect_err("should reject once buffer cap is exceeded");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("buffer full"),
+            "expected backpressure error, got: {msg}"
+        );
+        // Sink must NOT have buffered the rejected batch.
+        assert_eq!(sink.buffered_rows(), 0);
     }
 
     // ── Batch buffering tests ──
