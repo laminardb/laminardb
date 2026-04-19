@@ -5,6 +5,7 @@
 
 #![allow(clippy::disallowed_types)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -29,6 +30,15 @@ pub struct DistributedAggregateRule {
     receiver: Arc<ShuffleReceiver>,
     self_id: NodeId,
     state_backend: Option<Arc<dyn StateBackend>>,
+    /// Shared recovery-epoch handle cloned into every
+    /// `CheckpointedRepartitionExec` the rule mints. Publishing a
+    /// value here (e.g., from `db.start()` once
+    /// `last_committed_epoch` has been loaded) propagates to every
+    /// plan already compiled against this rule — which closes the
+    /// "DDL compiled before recovery completed" hole. Sentinel
+    /// [`u64::MIN`](u64) = `0` means "no recovery epoch yet", which
+    /// makes the exec's replay stream a no-op.
+    recovery_epoch: Arc<AtomicU64>,
 }
 
 impl DistributedAggregateRule {
@@ -46,6 +56,7 @@ impl DistributedAggregateRule {
             receiver,
             self_id,
             state_backend: None,
+            recovery_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -55,6 +66,36 @@ impl DistributedAggregateRule {
     pub fn with_state_backend(mut self, backend: Arc<dyn StateBackend>) -> Self {
         self.state_backend = Some(backend);
         self
+    }
+
+    /// Shared handle to the recovery-epoch atomic. The caller keeps a
+    /// clone and writes into it after loading `last_committed_epoch`
+    /// from the checkpoint store. Every exec previously (or
+    /// subsequently) produced by this rule reads through the same
+    /// atomic on `execute()`, so late publishes aren't lost.
+    #[must_use]
+    pub fn recovery_epoch_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.recovery_epoch)
+    }
+
+    /// Publish a recovery epoch into the shared handle. Cheap and
+    /// callable from any thread; the next `execute()` on every cached
+    /// plan picks it up. Phase 1.1 uses this after the checkpoint
+    /// store has loaded. Monotonic: a lower value won't regress the
+    /// handle (recovery only ever moves forward in wall-clock terms).
+    pub fn set_recovery_epoch(&self, epoch: u64) {
+        let mut cur = self.recovery_epoch.load(Ordering::Acquire);
+        while epoch > cur {
+            match self.recovery_epoch.compare_exchange(
+                cur,
+                epoch,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
     }
 }
 
@@ -105,11 +146,14 @@ impl PhysicalOptimizerRule for DistributedAggregateRule {
             )?);
 
             let replacement: Arc<dyn ExecutionPlan> = match &self.state_backend {
-                Some(backend) => Arc::new(CheckpointedRepartitionExec::new(
-                    Arc::clone(&cluster_exec),
-                    Arc::clone(backend),
-                    owned_vnodes(&self.registry, self.self_id),
-                )),
+                Some(backend) => Arc::new(
+                    CheckpointedRepartitionExec::new(
+                        Arc::clone(&cluster_exec),
+                        Arc::clone(backend),
+                        owned_vnodes(&self.registry, self.self_id),
+                    )
+                    .with_recovery_epoch_handle(Arc::clone(&self.recovery_epoch)),
+                ),
                 None => cluster_exec,
             };
             Ok(Transformed::yes(replacement))
@@ -255,6 +299,62 @@ mod tests {
             after.contains("CheckpointedRepartitionExec"),
             "rule must wrap ClusterRepartitionExec when a backend is attached; plan was:\n{after}",
         );
+    }
+
+    /// Covers the "recovery-epoch publish reaches cached plans" fix:
+    /// optimize a plan *before* the recovery epoch is known, then
+    /// publish into the rule's handle. The previously-minted exec
+    /// must observe the new value — otherwise cached plans would be
+    /// stuck at the at-construction epoch.
+    /// Walk the plan tree, find the `CheckpointedRepartitionExec`,
+    /// return its recovery-epoch handle. Used by the late-publish test.
+    fn find_recovery_epoch_handle(
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Option<Arc<std::sync::atomic::AtomicU64>> {
+        if let Some(c) = plan
+            .as_any()
+            .downcast_ref::<CheckpointedRepartitionExec>()
+        {
+            return Some(c.recovery_epoch_handle());
+        }
+        for child in plan.children() {
+            if let Some(h) = find_recovery_epoch_handle(child) {
+                return Some(h);
+            }
+        }
+        None
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_recovery_epoch_propagates_to_already_minted_exec() {
+        use laminar_core::state::InProcessBackend;
+
+        let rule = build_rule().await.with_state_backend(
+            Arc::new(InProcessBackend::new(4)) as Arc<dyn laminar_core::state::StateBackend>,
+        );
+        let plan = build_plan();
+        // Before recovery is known — optimize now (DDL path).
+        let optimized = rule.optimize(plan, &ConfigOptions::new()).unwrap();
+
+        let handle = find_recovery_epoch_handle(&optimized)
+            .expect("CheckpointedRepartitionExec must appear in optimized plan");
+
+        // Pre-publish: still the zero sentinel.
+        assert_eq!(handle.load(Ordering::Acquire), 0);
+
+        // Late publish through the rule — simulates `db.start()` handing
+        // the freshly-loaded `last_committed_epoch` to the rule after DDL.
+        rule.set_recovery_epoch(42);
+
+        assert_eq!(
+            handle.load(Ordering::Acquire),
+            42,
+            "rule's publish must reach the exec that was minted earlier",
+        );
+
+        // Monotonic: a stale publish must not regress.
+        rule.set_recovery_epoch(3);
+        assert_eq!(handle.load(Ordering::Acquire), 42);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

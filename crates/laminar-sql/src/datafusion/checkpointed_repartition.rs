@@ -12,6 +12,7 @@
 
 use std::any::Any;
 use std::fmt::{self, Debug, Formatter};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use arrow::compute::concat_batches;
@@ -32,6 +33,10 @@ use tokio::task::JoinHandle;
 
 use super::cluster_repartition::ClusterRepartitionExec;
 
+/// Sentinel stored in the recovery-epoch handle to mean "no recovery
+/// epoch yet known." Zero is safe: checkpoint epochs start at 1.
+const RECOVERY_EPOCH_UNSET: u64 = 0;
+
 /// Passes every partition's batches through unchanged and mirrors them
 /// into a per-partition buffer that's flushed to `state_backend` on
 /// each aligned checkpoint.
@@ -44,7 +49,14 @@ pub struct CheckpointedRepartitionExec {
     buffers: Arc<Mutex<Vec<Vec<RecordBatch>>>>,
     schema: SchemaRef,
     last_checkpoint: watch::Sender<u64>,
-    recovery_epoch: Option<u64>,
+    /// Shared recovery-epoch handle. Read lazily at every `execute()`
+    /// so a plan that was compiled (and cached) before recovery
+    /// completed still picks up the freshest value. A separate
+    /// `.recovery_epoch = Some(N)` field would have frozen the value
+    /// at construction time and left cached plans stale. The sentinel
+    /// [`RECOVERY_EPOCH_UNSET`] means "no recovery needed / not yet
+    /// known" and skips the replay stream.
+    recovery_epoch: Arc<AtomicU64>,
     runtime: OnceLock<Arc<RuntimeState>>,
 }
 
@@ -73,7 +85,7 @@ impl CheckpointedRepartitionExec {
             buffers,
             schema,
             last_checkpoint: tx,
-            recovery_epoch: None,
+            recovery_epoch: Arc::new(AtomicU64::new(RECOVERY_EPOCH_UNSET)),
             runtime: OnceLock::new(),
         }
     }
@@ -81,10 +93,36 @@ impl CheckpointedRepartitionExec {
     /// Pre-seed each partition from `read_partial(vnode, epoch)` on
     /// first `execute()`. One replay batch per partition, before live
     /// data.
+    ///
+    /// Takes `self` and stores into the exec's private handle. Use
+    /// [`with_recovery_epoch_handle`](Self::with_recovery_epoch_handle)
+    /// when the caller wants to set (or later update) the epoch from
+    /// outside the plan — e.g., `DistributedAggregateRule` sharing one
+    /// handle across every exec it mints so that a `load` from a
+    /// `CheckpointStore` that completes after DDL can still reach
+    /// already-constructed plans.
     #[must_use]
-    pub fn with_recovery_epoch(mut self, epoch: u64) -> Self {
-        self.recovery_epoch = Some(epoch);
+    pub fn with_recovery_epoch(self, epoch: u64) -> Self {
+        self.recovery_epoch.store(epoch, Ordering::Release);
         self
+    }
+
+    /// Swap the exec's recovery-epoch handle for a shared one. The
+    /// caller retains a clone and can publish the epoch at any time;
+    /// the exec picks up the current value on every `execute()` call.
+    #[must_use]
+    pub fn with_recovery_epoch_handle(mut self, handle: Arc<AtomicU64>) -> Self {
+        self.recovery_epoch = handle;
+        self
+    }
+
+    /// Shared handle to the recovery-epoch atomic. Lets callers writing
+    /// recovery-state orchestration (e.g., `db.start()` post-loading
+    /// `last_committed_epoch` from the checkpoint store) publish into
+    /// every cached plan that was compiled against the same rule.
+    #[must_use]
+    pub fn recovery_epoch_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.recovery_epoch)
     }
 
     /// Subscribe to checkpoint-completion events.
@@ -186,14 +224,19 @@ impl ExecutionPlan for CheckpointedRepartitionExec {
         let schema = Arc::clone(&self.schema);
 
         // Replay is prepended; not mirrored into the buffer — the data
-        // is already durable and would double-count next epoch.
+        // is already durable and would double-count next epoch. The
+        // recovery epoch is read from the shared atomic here, not
+        // captured at construction — so a plan compiled before
+        // recovery completed still picks up the freshest value.
         let recovery_fut = {
             let backend = Arc::clone(&self.state_backend);
             let vnode = self.owned_vnodes[partition];
-            let recovery_epoch = self.recovery_epoch;
+            let epoch_snapshot = self.recovery_epoch.load(Ordering::Acquire);
             async move {
-                let epoch = recovery_epoch?;
-                let bytes = backend.read_partial(vnode, epoch).await.ok()??;
+                if epoch_snapshot == RECOVERY_EPOCH_UNSET {
+                    return None;
+                }
+                let bytes = backend.read_partial(vnode, epoch_snapshot).await.ok()??;
                 deserialize_batch_stream(&bytes).ok()
             }
         };
@@ -214,11 +257,24 @@ impl ExecutionPlan for CheckpointedRepartitionExec {
     }
 }
 
+/// Bound on concurrent per-vnode `write_partial` calls during a single
+/// snapshot fire. Checkpoint time scales with `owned_vnodes.len() /
+/// SNAPSHOT_CONCURRENCY` instead of linearly: at 256 vnodes × 100ms
+/// S3 latency, serial was ~25s/epoch; with 32-way concurrency it's
+/// ~800ms. The cap also protects against flooding an object store
+/// whose throttle behavior gets nasty under a thundering herd.
+const SNAPSHOT_CONCURRENCY: usize = 32;
+
 /// On each aligned-epoch fire, serialise every partition's buffered
 /// batches and `write_partial(vnode, epoch, assignment_version, bytes)`.
 /// The assignment version is re-read from the registry at write time
 /// so the Phase 1.4 fence sees the freshest generation this instance
 /// believes it owns the vnode at.
+///
+/// Per-vnode work runs up to [`SNAPSHOT_CONCURRENCY`]-way in parallel
+/// via `buffer_unordered`. The previous serial loop put the state
+/// write I/O directly on the barrier critical path, so a 256-vnode
+/// deployment spent 25s/checkpoint awaiting S3 PUTs one at a time.
 async fn snapshot_loop(
     mut aligned_rx: watch::Receiver<u64>,
     buffers: Arc<Mutex<Vec<Vec<RecordBatch>>>>,
@@ -243,44 +299,63 @@ async fn snapshot_loop(
             std::mem::replace(&mut *guard, vec![Vec::new(); owned_vnodes.len()])
         };
 
-        for (idx, batches) in snapshots.into_iter().enumerate() {
-            if batches.is_empty() {
-                continue;
-            }
-            let vnode = owned_vnodes[idx];
-            let combined = match concat_batches(&schema, &batches) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(
-                        vnode, epoch, error = %e,
-                        "checkpointed repartition: concat_batches failed; \
-                         skipping partial write (state will lag by one epoch)",
-                    );
-                    continue;
+        // Build the concurrent work stream. Each future captures only
+        // cheap Arc clones — `schema`, `backend`, `registry` — so the
+        // fan-out is memory-light even with hundreds of vnodes.
+        stream::iter(snapshots.into_iter().enumerate())
+            .filter_map(|(idx, batches)| {
+                let vnode = owned_vnodes[idx];
+                async move {
+                    if batches.is_empty() {
+                        None
+                    } else {
+                        Some((vnode, batches))
+                    }
                 }
-            };
-            let bytes = match serialize_batch_stream(&combined) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::error!(
-                        vnode, epoch, error = %e,
-                        "checkpointed repartition: Arrow IPC encode failed",
-                    );
-                    continue;
+            })
+            .map(|(vnode, batches)| {
+                let schema = Arc::clone(&schema);
+                let backend = Arc::clone(&backend);
+                let registry = Arc::clone(&registry);
+                async move {
+                    let combined = match concat_batches(&schema, &batches) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::error!(
+                                vnode, epoch, error = %e,
+                                "checkpointed repartition: concat_batches failed; \
+                                 skipping partial write (state will lag by one epoch)",
+                            );
+                            return;
+                        }
+                    };
+                    let bytes = match serialize_batch_stream(&combined) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::error!(
+                                vnode, epoch, error = %e,
+                                "checkpointed repartition: Arrow IPC encode failed",
+                            );
+                            return;
+                        }
+                    };
+                    let caller_version = registry.assignment_version();
+                    if let Err(e) = backend
+                        .write_partial(vnode, epoch, caller_version, Bytes::from(bytes))
+                        .await
+                    {
+                        tracing::error!(
+                            vnode, epoch, caller_version, error = %e,
+                            "checkpointed repartition: write_partial failed — \
+                             peer's durability gate will reject this epoch",
+                        );
+                    }
                 }
-            };
-            let caller_version = registry.assignment_version();
-            if let Err(e) = backend
-                .write_partial(vnode, epoch, caller_version, Bytes::from(bytes))
-                .await
-            {
-                tracing::error!(
-                    vnode, epoch, caller_version, error = %e,
-                    "checkpointed repartition: write_partial failed — \
-                     peer's durability gate will reject this epoch",
-                );
-            }
-        }
+            })
+            .buffer_unordered(SNAPSHOT_CONCURRENCY)
+            .for_each(|()| async {})
+            .await;
+
         let _ = last_checkpoint.send(epoch);
     }
 }
@@ -500,5 +575,79 @@ mod tests {
             .values()
             .to_vec();
         assert_eq!(keys, vec![42, 43]);
+    }
+
+    /// Covers the "DDL compiled before recovery completed" bonus bug:
+    /// the exec is constructed with no recovery epoch known (sentinel
+    /// 0), and only later does the checkpoint store hand back the
+    /// `last_committed_epoch`. The publish into the shared handle
+    /// must reach the already-constructed exec — the previous
+    /// `Option<u64>` field would have frozen the value at construct
+    /// time and lost the late publish.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_epoch_published_after_construct_reaches_exec() {
+        use laminar_core::serialization::serialize_batch_stream;
+
+        let registry = Arc::new(VnodeRegistry::single_owner(1, NodeId(1)));
+        let recv = Arc::new(
+            ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        let sender = Arc::new(ShuffleSender::new(1));
+        let backend: Arc<dyn StateBackend> = Arc::new(InProcessBackend::new(1));
+
+        // Pre-seed (vnode=0, epoch=9) — the recovery target.
+        let seed = batch([(99, 990)]);
+        let seed_bytes = Bytes::from(serialize_batch_stream(&seed).unwrap());
+        backend.write_partial(0, 9, 0, seed_bytes).await.unwrap();
+
+        // Construct the exec WITHOUT knowing the recovery epoch (DDL
+        // compiles first, checkpoint-store load races alongside).
+        let inp: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(&[vec![]], schema(), None).unwrap();
+        let inner = Arc::new(
+            ClusterRepartitionExec::try_new(
+                inp,
+                vec![0],
+                Arc::clone(&registry),
+                sender,
+                recv,
+                NodeId(1),
+            )
+            .unwrap(),
+        );
+        let wrap = CheckpointedRepartitionExec::new(inner, backend, vec![0]);
+        // Stash a shared handle — stands in for the rule-side handle
+        // that `db.start()` would write to after loading the epoch.
+        let handle = wrap.recovery_epoch_handle();
+
+        // Publish the epoch AFTER construction — the key scenario.
+        handle.store(9, Ordering::Release);
+
+        let mut s = wrap.execute(0, ctx()).unwrap();
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            s.next(),
+        )
+        .await
+        .expect("deadline")
+        .expect("stream closed")
+        .expect("error in stream");
+
+        assert_eq!(first.num_rows(), 1, "recovery batch must have the seeded row");
+        let keys = first
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert_eq!(
+            keys,
+            vec![99],
+            "late publish into the handle must reach the already-\
+             constructed exec — otherwise the recovery stream is empty",
+        );
     }
 }
