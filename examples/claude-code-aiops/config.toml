@@ -9,7 +9,7 @@ mode = "embedded"
 bind = "127.0.0.1:8080"
 
 [state]
-backend = "memory"
+backend = "in_process"
 
 [checkpoint]
 interval = "30s"

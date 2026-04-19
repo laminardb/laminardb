@@ -16,8 +16,7 @@ workers = 0
 log_level = "info"
 
 [state]
-backend = "memory"
-path = "./data/state"
+backend = "in_process"
 
 [checkpoint]
 url = "file:///tmp/laminardb-server-demo/checkpoints"
