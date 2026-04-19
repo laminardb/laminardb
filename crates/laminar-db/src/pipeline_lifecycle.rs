@@ -230,8 +230,7 @@ impl LaminarDB {
 
             // Cluster recovery: if this instance is the new leader and
             // the last manifest was a prepared-not-committed epoch,
-            // announce Abort so surviving followers roll back. See
-            // `docs/plans/checkpoint-2pc-sequencing.md` §6.1.
+            // announce Abort so surviving followers roll back.
             #[cfg(feature = "cluster-unstable")]
             coord.reconcile_orphaned_prepare().await;
 

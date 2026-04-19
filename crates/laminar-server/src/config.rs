@@ -123,14 +123,12 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         if config.node_id.is_none() {
             errors.push("mode = \"cluster\" requires node_id to be set".to_string());
         }
-        // Distributed two-phase commit has a per-barrier cost of ~1–3s
-        // (manifest persist + durability gate + sink commit). Cadences
-        // tighter than 2s spend more than half their time on
-        // coordination. See docs/plans/two-phase-ordering.md.
+        // Distributed 2PC has a per-barrier cost of ~1-3s (manifest
+        // persist + durability gate + sink commit). Cadences tighter
+        // than 2s spend more than half their time on coordination.
         if config.checkpoint.interval < Duration::from_secs(2) {
             errors.push(format!(
-                "mode = \"cluster\": checkpoint.interval = {:?} is too tight; \
-                 minimum is 2s (see docs/plans/two-phase-ordering.md)",
+                "mode = \"cluster\": checkpoint.interval = {:?} is too tight; minimum is 2s",
                 config.checkpoint.interval,
             ));
         }
@@ -688,7 +686,7 @@ sql = "SELECT 2"
     #[test]
     fn test_cluster_mode_rejects_tight_checkpoint_interval() {
         // Two-phase commit in cluster mode can't keep up with sub-2s
-        // cadence. See docs/plans/two-phase-ordering.md.
+        // cadence.
         let toml = r#"
 node_id = "n1"
 

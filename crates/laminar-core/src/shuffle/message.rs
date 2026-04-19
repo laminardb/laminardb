@@ -6,8 +6,6 @@
 //! framing: a Data message's payload is itself an Arrow IPC single-
 //! batch stream (schema + batch), so a schema roll on one message
 //! doesn't poison the connection.
-//!
-//! See `docs/plans/shuffle-protocol.md` §"Message format".
 
 use std::io;
 
@@ -41,10 +39,8 @@ pub enum ShuffleMessage {
     Close(String),
 }
 
-/// Maximum payload size accepted by the codec: 64 MiB. Sized to match
-/// the per-batch cap suggested in `docs/plans/shuffle-protocol.md`
-/// ("Max batch size"). Receivers reject oversized frames instead of
-/// allocating unbounded memory.
+/// Maximum payload size accepted by the codec: 64 MiB. Receivers
+/// reject oversized frames instead of allocating unbounded memory.
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 
 /// Serialize `msg` and write it as one frame on `writer`.

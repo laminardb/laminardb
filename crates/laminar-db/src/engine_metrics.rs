@@ -63,20 +63,13 @@ pub struct EngineMetrics {
     /// Sink commit round-trip (2PC phase 2).
     pub sink_commit_duration: Histogram,
     /// Time an operator spent waiting for the slowest input to deliver
-    /// its checkpoint barrier (aligned-checkpoint alignment wait).
-    /// Label: `operator`. Zero for single-input operators.
-    /// Drives the unaligned-checkpoint decision — see Addendum A.2 of
-    /// `docs/plans/distributed-stateful-pipelines.md`. Written by
-    /// per-operator shuffle code in Phase C.
+    /// its checkpoint barrier. Label: `operator`. Zero for single-input.
     pub barrier_alignment_wait: HistogramVec,
-    /// Delay between local watermark advancement and the first peer's
-    /// observation via the cluster watermark bus. Drives the
-    /// watermark-transport decision — see Addendum A.3. Written by the
-    /// `ChitchatWatermarkBus` in Phase C.
+    /// Delay between local watermark advancement and its cluster-wide
+    /// observation. Written by the cluster watermark bus.
     pub watermark_propagation: Histogram,
     /// End-to-end event latency, source ingest to sink commit.
-    /// Label: `pipeline`. The primary SLA metric. Written by sink-side
-    /// timing in Phase C once cross-instance barriers land.
+    /// Label: `pipeline`. The primary SLA metric.
     pub pipeline_e2e_latency: HistogramVec,
 }
 

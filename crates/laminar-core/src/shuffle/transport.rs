@@ -1,7 +1,7 @@
 //! TCP shuffle: a per-peer connection pool for senders, an accept loop
 //! for receivers. Each frame carries a node id in its handshake so the
 //! receiver can attribute incoming traffic. See
-//! `docs/plans/shuffle-protocol.md` for the wire format.
+//! [`super::message`] for the wire format.
 
 use std::io;
 use std::net::SocketAddr;

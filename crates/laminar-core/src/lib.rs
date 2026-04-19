@@ -19,7 +19,6 @@ pub mod operator;
 /// Shared Arrow IPC serialization for `RecordBatch` ↔ bytes.
 pub mod serialization;
 /// Cross-instance shuffle: message codec, credit flow, wire protocol.
-/// See `docs/plans/shuffle-protocol.md`.
 pub mod shuffle;
 /// Pluggable state backend (`StateBackend` trait + impls).
 pub mod state;

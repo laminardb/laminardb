@@ -1,8 +1,7 @@
 //! Cross-instance hash repartition. Replaces DataFusion's in-process
 //! `RepartitionExec::Hash` between `AggregateExec::Partial` and
 //! `AggregateExec::FinalPartitioned`. One output partition per owned
-//! vnode; remote rows ship via `ShuffleSender`. See
-//! `docs/plans/sharded-operator.md`.
+//! vnode; remote rows ship via `ShuffleSender`.
 
 #![allow(clippy::disallowed_types)] // this is a cluster-only ExecutionPlan; not hot-path
 

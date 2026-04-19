@@ -506,9 +506,8 @@ async fn killed_node_can_rejoin() {
 async fn quorum_times_out_when_follower_silent() {
     // Negative-path regression for the barrier protocol: if a
     // follower never acks, the leader's wait_for_quorum times out.
-    // This is the failure mode the checkpoint coordinator will
-    // interpret as "abort the epoch, retry" — see
-    // docs/plans/two-phase-ordering.md §"Failure handling".
+    // The checkpoint coordinator interprets this as "abort the epoch,
+    // retry on the next tick".
     let cluster = MiniCluster::spawn(3).await;
     cluster
         .wait_for_convergence(CONVERGENCE_DEADLINE)

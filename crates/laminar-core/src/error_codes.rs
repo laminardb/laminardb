@@ -146,8 +146,7 @@ pub const SIDECAR_CORRUPTION: &str = "LDB-6010";
 pub const OFFSET_METADATA_MISSING: &str = "LDB-6011";
 /// State durability gate returned false before sink commit. One or more
 /// vnodes had not persisted their partials for the epoch. The coordinator
-/// rolls back sinks and retries on the next checkpoint. See
-/// `docs/plans/two-phase-ordering.md`.
+/// rolls back sinks and retries on the next checkpoint.
 pub const DURABILITY_GATE_MISS: &str = "LDB-6020";
 /// Sink rollback failed after a durability-gate miss. Sinks may be in an
 /// inconsistent state; recovery uses `sink_commit_statuses` to resolve.

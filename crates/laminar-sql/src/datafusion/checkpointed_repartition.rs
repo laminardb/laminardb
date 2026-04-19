@@ -2,11 +2,10 @@
 //! partial-state batch flowing to Final is mirrored into a per-partition
 //! buffer. On barrier alignment the buffer is concatenated, serialised
 //! as Arrow IPC, and written via `state_backend.write_partial`. Startup
-//! can pre-seed from a prior epoch via [`with_recovery_epoch`].
+//! can pre-seed from a prior epoch via [`CheckpointedRepartitionExec::with_recovery_epoch`].
 //!
-//! We checkpoint the shuffled partials rather than
-//! `GroupsAccumulator`'s internal state because DF doesn't expose it.
-//! See `docs/plans/sharded-operator.md` §3.5.
+//! We checkpoint the shuffled partials rather than `GroupsAccumulator`'s
+//! internal state because DataFusion doesn't expose the accumulator.
 
 #![allow(clippy::disallowed_types)]
 

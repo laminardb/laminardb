@@ -4,6 +4,36 @@
 **Chosen sequencing**: Option 1 — full sequence, no customer pressure.
 **Solo effort estimate**: 20-26 weeks. Parallel with 2 engineers: 14-18 weeks.
 
+## 2026-04-19 production wiring pass
+
+`laminar-server/src/cluster.rs` now wires row-shuffle + vnode snapshot
+end-to-end. Previously the server constructed `ShuffleSender`/
+`ShuffleReceiver` only to feed them into `DistributedAggregateRule`,
+while the actual streaming-aggregate path (`shuffle_pre_agg_batches`)
+got `None` — so cluster mode was tested-but-never-shipped. Changes:
+
+- Server now calls `.shuffle_sender()` + `.shuffle_receiver()` on the
+  builder. Row-shuffle actually runs in production.
+- Server now constructs `AssignmentSnapshotStore` on the state backend's
+  object store and hands it to `ClusterController::new`. Every node
+  adopts the same assignment; fresh clusters CAS-create on first boot,
+  late arrivals adopt the winner.
+- Server no longer installs `DistributedAggregateRule`. It conflicts
+  with row-shuffle (ADR 0003) and the row-shuffle path covers the
+  production workload with its own operator-checkpoint recovery. The
+  rule stays in `laminar-sql` for future non-streaming distributed
+  aggregation once the conflict is resolved.
+
+Deferred architectural decisions captured as ADRs:
+
+- [ADR 0001](adr-0001-control-plane-transport.md) — replace
+  chitchat-KV + JSON + 50ms polling with tonic RPC for the barrier
+  protocol (~2 weeks).
+- [ADR 0002](adr-0002-shuffle-transport.md) — evaluate
+  arrow-flight vs the custom TCP transport (needs benchmarks).
+- [ADR 0003](adr-0003-distributed-aggregate-rule.md) — multi-
+  subscriber `ShuffleReceiver` to let both drain paths coexist.
+
 ## Starting state
 
 What works (tested):

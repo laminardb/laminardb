@@ -1,5 +1,5 @@
 //! 2-node 2PC checkpoint over real `MiniCluster` gossip + shared
-//! `InProcessBackend`. See `docs/plans/checkpoint-2pc-sequencing.md`.
+//! `InProcessBackend`.
 
 #![cfg(feature = "cluster-unstable")]
 #![allow(clippy::disallowed_types)]
