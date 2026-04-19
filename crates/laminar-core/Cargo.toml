@@ -24,7 +24,6 @@ xorf = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
 foyer = { workspace = true }
-memmap2 = { workspace = true }
 object_store = { workspace = true }
 xxhash-rust = { workspace = true, features = ["xxh3"] }
 equivalent = "1"

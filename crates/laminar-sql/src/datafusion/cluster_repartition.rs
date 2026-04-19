@@ -24,7 +24,7 @@ use datafusion_common::DataFusionError;
 use futures::stream::{self, StreamExt};
 use laminar_core::checkpoint::barrier::CheckpointBarrier;
 use laminar_core::shuffle::{
-    fan_out_barrier, BarrierTracker, ShufflePeerId, ShuffleReceiver, ShuffleSender,
+    BarrierTracker, ShufflePeerId, ShuffleReceiver, ShuffleSender,
 };
 use laminar_core::state::{owned_vnodes, NodeId, VnodeRegistry};
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
@@ -311,7 +311,6 @@ impl ExecutionPlan for ClusterRepartitionExec {
         }
 
         let runtime = self.init_runtime(&context)?;
-        let schema = Arc::clone(&self.schema);
 
         // Claim this partition's receiver; subsequent calls for the
         // same partition yield an empty stream (DF calls once).
@@ -319,7 +318,6 @@ impl ExecutionPlan for ClusterRepartitionExec {
             let mut guard = runtime.receivers.lock().await;
             guard[partition].take()
         };
-        let _ = schema;
         let stream = stream::once(fut).flat_map(move |maybe_rx| match maybe_rx {
             Some(rx) => tokio_stream::wrappers::ReceiverStream::new(rx)
                 .map(Ok)
@@ -428,7 +426,7 @@ async fn route_input_stream(
             biased;
             // 1. External barrier trigger.
             Some(barrier) = inject_rx.recv() => {
-                let _ = fan_out_barrier(&sender, &peers, barrier).await;
+                let _ = sender.fan_out_barrier(&peers, barrier).await;
                 if let Some(aligned) = tracker.observe(0, barrier) {
                     let _ = aligned_tx.send(aligned.checkpoint_id);
                 }
@@ -519,13 +517,9 @@ async fn dispatch_inbound(
                     return; // downstream dropped
                 }
             }
-            ShuffleMessage::Barrier(b) if peer_barrier_tx.send((from, b)).is_err() => {
-                return;
-            }
-            // Legacy/unknown data without a vnode tag is ignored under
-            // the Phase C contract: all data frames are `VnodeData`.
-            // `Barrier`s that fail to forward fall through here too;
-            // that's fine, the router has already exited.
+            ShuffleMessage::Barrier(b) if peer_barrier_tx.send((from, b)).is_err() => return,
+            // Hello is consumed by per_peer_loop; Close closes the
+            // reader. Barriers that succeed fall through here.
             _ => {}
         }
     }

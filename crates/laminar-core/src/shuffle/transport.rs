@@ -18,30 +18,6 @@ use crate::checkpoint::barrier::CheckpointBarrier;
 #[cfg(feature = "cluster-unstable")]
 use crate::cluster::control::ClusterKv;
 
-/// Fan a checkpoint barrier out across every `peer` in order. Ships as
-/// `ShuffleMessage::Barrier` frames on each peer's established shuffle
-/// connection. The leader calls this alongside the gossip `Prepare`
-/// announcement so followers' sharded operators can align on in-band
-/// barriers instead of waiting purely on gossip propagation.
-///
-/// Short-circuits on the first failed peer — a partial fan-out is
-/// acceptable because the gossip side-channel still signals Prepare and
-/// follower drivers fall back to that.
-///
-/// # Errors
-/// Returns the first `io::Error` from any peer's `send_to`.
-pub async fn fan_out_barrier(
-    sender: &ShuffleSender,
-    peers: &[ShufflePeerId],
-    barrier: CheckpointBarrier,
-) -> io::Result<()> {
-    let msg = ShuffleMessage::Barrier(barrier);
-    for &peer in peers {
-        sender.send_to(peer, &msg).await?;
-    }
-    Ok(())
-}
-
 /// Gossip KV key used by [`ShuffleReceiver::bind_with_kv`] to publish
 /// the listener's socket address, and by [`ShuffleSender`] to discover
 /// peer addresses on first contact. Value: the bound socket address
@@ -133,6 +109,24 @@ impl ShuffleSender {
     pub async fn send_to(&self, peer: ShufflePeerId, msg: &ShuffleMessage) -> io::Result<()> {
         let conn = self.connection_for(peer).await?;
         conn.send(msg).await
+    }
+
+    /// Ship `barrier` to every peer in order. Short-circuits on the
+    /// first send failure; the gossip side-channel is the
+    /// authoritative announcement so a partial fan-out is tolerable.
+    ///
+    /// # Errors
+    /// Returns the first `io::Error` from any peer's `send_to`.
+    pub async fn fan_out_barrier(
+        &self,
+        peers: &[ShufflePeerId],
+        barrier: CheckpointBarrier,
+    ) -> io::Result<()> {
+        let msg = ShuffleMessage::Barrier(barrier);
+        for &peer in peers {
+            self.send_to(peer, &msg).await?;
+        }
+        Ok(())
     }
 
     /// Look up `peer`'s shuffle address from the cluster KV and
@@ -339,13 +333,13 @@ mod tests {
         let sender = ShuffleSender::new(1);
         sender.register_peer(2, recv_addr).await;
         sender
-            .send_to(2, &ShuffleMessage::Credit(1234))
+            .send_to(2, &ShuffleMessage::Hello(1234))
             .await
             .unwrap();
 
         let (from, msg) = recv.recv().await.unwrap();
         assert_eq!(from, 1, "receiver attributes frame to sender id");
-        assert_eq!(msg, ShuffleMessage::Credit(1234));
+        assert_eq!(msg, ShuffleMessage::Hello(1234));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -356,7 +350,7 @@ mod tests {
 
         for delta in [10u64, 20, 30, 40] {
             sender
-                .send_to(2, &ShuffleMessage::Credit(delta))
+                .send_to(2, &ShuffleMessage::Hello(delta))
                 .await
                 .unwrap();
         }
@@ -368,10 +362,10 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ShuffleMessage::Credit(10),
-                ShuffleMessage::Credit(20),
-                ShuffleMessage::Credit(30),
-                ShuffleMessage::Credit(40),
+                ShuffleMessage::Hello(10),
+                ShuffleMessage::Hello(20),
+                ShuffleMessage::Hello(30),
+                ShuffleMessage::Hello(40),
             ]
         );
         // Pool holds exactly one connection to peer 2.
@@ -401,7 +395,7 @@ mod tests {
     async fn send_to_unregistered_peer_errors() {
         let sender = ShuffleSender::new(1);
         let err = sender
-            .send_to(99, &ShuffleMessage::Credit(1))
+            .send_to(99, &ShuffleMessage::Hello(1))
             .await
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);

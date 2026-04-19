@@ -31,22 +31,23 @@ async fn two_nodes_exchange_data_bidirectionally() {
     send_a.register_peer(2, addr_b).await;
     send_b.register_peer(1, addr_a).await;
 
-    // A → B: three data batches.
+    // A → B: three pre-routed batches.
     send_a
-        .send_to(2, &ShuffleMessage::Data(batch(vec![1, 2, 3])))
+        .send_to(2, &ShuffleMessage::VnodeData(0, batch(vec![1, 2, 3])))
         .await
         .unwrap();
     send_a
-        .send_to(2, &ShuffleMessage::Data(batch(vec![4, 5, 6])))
+        .send_to(2, &ShuffleMessage::VnodeData(0, batch(vec![4, 5, 6])))
         .await
         .unwrap();
-    // B → A: one credit frame back.
+    // B → A: one Hello (handshake already happened — this is just a
+    // reachable frame in the reverse direction).
     send_b
-        .send_to(1, &ShuffleMessage::Credit(8192))
+        .send_to(1, &ShuffleMessage::Hello(2))
         .await
         .unwrap();
     send_a
-        .send_to(2, &ShuffleMessage::Data(batch(vec![7, 8, 9])))
+        .send_to(2, &ShuffleMessage::VnodeData(0, batch(vec![7, 8, 9])))
         .await
         .unwrap();
 
@@ -61,25 +62,25 @@ async fn two_nodes_exchange_data_bidirectionally() {
         assert_eq!(from, 1, "A's frames must carry peer=1");
         from_a_to_b.push(msg);
     }
-    let (from, credit) = tokio::time::timeout(Duration::from_secs(2), recv_a.recv())
+    let (from, hello) = tokio::time::timeout(Duration::from_secs(2), recv_a.recv())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(from, 2, "B's credit frame must carry peer=2");
-    assert_eq!(credit, ShuffleMessage::Credit(8192));
+    assert_eq!(from, 2, "B's frame must carry peer=2");
+    assert_eq!(hello, ShuffleMessage::Hello(2));
 
     // FIFO: the three A→B batches arrive in send order.
     let values: Vec<Vec<i64>> = from_a_to_b
         .into_iter()
         .map(|m| match m {
-            ShuffleMessage::Data(b) => b
+            ShuffleMessage::VnodeData(_, b) => b
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap()
                 .values()
                 .to_vec(),
-            other => panic!("expected Data, got {other:?}"),
+            other => panic!("expected VnodeData, got {other:?}"),
         })
         .collect();
     assert_eq!(values, vec![vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9]]);
@@ -89,7 +90,7 @@ async fn two_nodes_exchange_data_bidirectionally() {
 async fn unregistered_peer_returns_not_found() {
     let sender = ShuffleSender::new(1);
     let err = sender
-        .send_to(42, &ShuffleMessage::Credit(1))
+        .send_to(42, &ShuffleMessage::Hello(1))
         .await
         .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);

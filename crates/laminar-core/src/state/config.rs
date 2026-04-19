@@ -1,49 +1,6 @@
-//! [`StateBackendConfig`] — the single tagged enum that selects and
-//! configures the state backend.
-//!
-//! Five deployment shapes are expressible **in config alone**; application
-//! code holds `Arc<dyn StateBackend>` and does not need to know which
-//! concrete impl was chosen:
-//!
-//! ```toml
-//! # 1. Embedded library, single process (default).
-//! [state]
-//! backend = "in_process"
-//!
-//! # 2. Standalone server, single node.
-//! [state]
-//! backend = "local"
-//! path = "/var/laminar"
-//!
-//! # 3. Distributed-embedded, static assignment.
-//! [state]
-//! backend = "object_store"
-//! url = "s3://bucket/laminar"
-//! instance_id = "node-0"
-//! vnodes = [0, 1, 2, 3]
-//! merger_instance = "node-0"
-//!
-//! # 4. Distributed-embedded, dynamic (gossip + consensus).
-//! [state]
-//! backend = "object_store"
-//! url = "s3://bucket/laminar"
-//! instance_id = "node-0"
-//! discovery = "dynamic"
-//! seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
-//!
-//! # 5. Constellation — same object_store backend with a cluster
-//! #    manager wired up externally. See [`crate::cluster`].
-//! ```
-//!
-//! Embedded users can build programmatically:
-//!
-//! ```no_run
-//! use laminar_core::state::StateBackendConfig;
-//! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-//! let backend = StateBackendConfig::in_process().build().await?;
-//! # Ok(())
-//! # }
-//! ```
+//! [`StateBackendConfig`]: tagged enum selecting the runtime state
+//! backend. Three shapes: `in_process`, `local` (filesystem path),
+//! `object_store` (s3/gcs/file url).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -51,7 +8,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use super::{
-    backend::StateBackend, in_process::InProcessBackend, local::LocalBackend,
+    backend::StateBackend, in_process::InProcessBackend,
     object_store::ObjectStoreBackend,
 };
 
@@ -60,6 +17,10 @@ pub const DEFAULT_VNODE_CAPACITY: u32 = 256;
 
 fn default_vnode_capacity() -> u32 {
     DEFAULT_VNODE_CAPACITY
+}
+
+fn default_instance_id() -> String {
+    "local".to_string()
 }
 
 /// How nodes discover one another in `object_store` mode.
@@ -88,11 +49,14 @@ pub enum StateBackendConfig {
         vnode_capacity: u32,
     },
 
-    /// Durable single-node backend. Watermarks are `mmap`'d; partials
-    /// live under `<path>/partials/epoch={n}/vnode={v}/partial.bin`.
+    /// Durable single-node backend on a local filesystem path. Shorthand
+    /// for an `object_store` backend with a `file://` URL.
     Local {
         /// Filesystem root for state.
         path: PathBuf,
+        /// Node identity (written into epoch commit markers for audit).
+        #[serde(default = "default_instance_id")]
+        instance_id: String,
         /// Number of vnodes the backend should size for.
         #[serde(default = "default_vnode_capacity")]
         vnode_capacity: u32,
@@ -162,6 +126,7 @@ impl StateBackendConfig {
     pub fn local(path: impl Into<PathBuf>) -> Self {
         Self::Local {
             path: path.into(),
+            instance_id: default_instance_id(),
             vnode_capacity: DEFAULT_VNODE_CAPACITY,
         }
     }
@@ -188,12 +153,10 @@ impl StateBackendConfig {
     /// still `.await` for forward-compatibility.
     ///
     /// # Errors
-    /// - [`StateBackendBuildError::NotImplemented`] if the config selects
-    ///   a backend whose impl has not yet landed (currently `local` and
-    ///   `object_store`).
-    /// - [`StateBackendBuildError::Io`] if the backend's construction
-    ///   touches the filesystem / network and that fails.
-    #[allow(clippy::unused_async)] // async kept for forward compatibility
+    /// - [`StateBackendBuildError::NotImplemented`] for remote
+    ///   `object_store` schemes not yet wired (`s3://`, `gs://`, `az://`).
+    /// - [`StateBackendBuildError::Io`] on filesystem/network setup.
+    #[allow(clippy::unused_async)]
     pub async fn build(&self) -> Result<Arc<dyn StateBackend>, StateBackendBuildError> {
         match self {
             Self::InProcess { vnode_capacity } => {
@@ -201,11 +164,19 @@ impl StateBackendConfig {
             }
             Self::Local {
                 path,
+                instance_id,
                 vnode_capacity,
-            } => Ok(Arc::new(
-                LocalBackend::open(path, *vnode_capacity)
-                    .map_err(|e| StateBackendBuildError::Io(e.to_string()))?,
-            )),
+            } => {
+                std::fs::create_dir_all(path)
+                    .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
+                let fs = ::object_store::local::LocalFileSystem::new_with_prefix(path)
+                    .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
+                Ok(Arc::new(ObjectStoreBackend::new(
+                    Arc::new(fs),
+                    instance_id,
+                    *vnode_capacity,
+                )))
+            }
             Self::ObjectStore {
                 url,
                 instance_id,
@@ -355,11 +326,17 @@ seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
 
     #[tokio::test]
     async fn build_in_process_returns_backend() {
+        use bytes::Bytes;
         let c = StateBackendConfig::in_process();
         let backend = c.build().await.unwrap();
-        // Smoke test: publish a watermark, read it back.
-        backend.publish_watermark(0, 123).await.unwrap();
-        assert_eq!(backend.global_watermark(&[0]).await.unwrap(), 123);
+        backend
+            .write_partial(0, 1, Bytes::from_static(b"ok"))
+            .await
+            .unwrap();
+        assert_eq!(
+            &backend.read_partial(0, 1).await.unwrap().unwrap()[..],
+            b"ok",
+        );
     }
 
     #[tokio::test]
@@ -367,8 +344,14 @@ seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
         let dir = tempfile::tempdir().unwrap();
         let c = StateBackendConfig::local(dir.path());
         let backend = c.build().await.unwrap();
-        backend.publish_watermark(0, 42).await.unwrap();
-        assert_eq!(backend.global_watermark(&[0]).await.unwrap(), 42);
+        backend
+            .write_partial(0, 1, bytes::Bytes::from_static(b"z"))
+            .await
+            .unwrap();
+        assert_eq!(
+            &backend.read_partial(0, 1).await.unwrap().unwrap()[..],
+            b"z",
+        );
     }
 
     #[tokio::test]

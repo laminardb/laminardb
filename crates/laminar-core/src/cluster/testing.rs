@@ -24,7 +24,6 @@
 //! expect churn.
 
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -105,20 +104,17 @@ impl Default for NetworkRules {
     }
 }
 
-/// Fault mode for [`FaultyObjectStore`]. Safe to mutate at runtime
-/// from tests via the shared [`FaultyObjectStore::set_fault`] setter.
+/// Fault mode for [`FaultyObjectStore`], flippable at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum ObjectStoreFault {
     /// Pass through to the underlying store.
-    None = 0,
-    /// Every `put` / `put_opts` returns [`object_store::Error::Generic`].
-    FailWrites = 1,
-    /// Every `get` / `get_opts` / `head` returns
-    /// [`object_store::Error::NotFound`] even for existing paths.
-    FailReads = 2,
+    None,
+    /// Every write returns `Error::Generic`.
+    FailWrites,
+    /// Every read returns `Error::NotFound`.
+    FailReads,
     /// Both reads and writes fail.
-    FailAll = 3,
+    FailAll,
 }
 
 impl ObjectStoreFault {
@@ -128,26 +124,12 @@ impl ObjectStoreFault {
     fn fails_reads(self) -> bool {
         matches!(self, Self::FailReads | Self::FailAll)
     }
-    fn encode(self) -> u8 {
-        self as u8
-    }
-    fn decode(v: u8) -> Self {
-        match v {
-            1 => Self::FailWrites,
-            2 => Self::FailReads,
-            3 => Self::FailAll,
-            _ => Self::None,
-        }
-    }
 }
 
 /// Object store middleware with runtime-flippable fault injection.
-/// Wraps any [`ObjectStore`] and honors the current
-/// [`ObjectStoreFault`] mode — flipped by tests via
-/// [`Self::set_fault`].
 pub struct FaultyObjectStore {
     inner: Arc<dyn ObjectStore>,
-    fault: Arc<AtomicU8>,
+    fault: Mutex<ObjectStoreFault>,
 }
 
 impl std::fmt::Debug for FaultyObjectStore {
@@ -165,25 +147,24 @@ impl std::fmt::Display for FaultyObjectStore {
 }
 
 impl FaultyObjectStore {
-    /// Wrap `inner` with fault injection disabled. Tests flip it on
-    /// via [`Self::set_fault`].
+    /// Wrap `inner` with fault injection disabled.
     #[must_use]
     pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
         Self {
             inner,
-            fault: Arc::new(AtomicU8::new(ObjectStoreFault::None.encode())),
+            fault: Mutex::new(ObjectStoreFault::None),
         }
     }
 
     /// Current fault mode.
     #[must_use]
     pub fn fault(&self) -> ObjectStoreFault {
-        ObjectStoreFault::decode(self.fault.load(Ordering::Acquire))
+        *self.fault.lock()
     }
 
     /// Switch fault mode. Takes effect on the next operation.
     pub fn set_fault(&self, mode: ObjectStoreFault) {
-        self.fault.store(mode.encode(), Ordering::Release);
+        *self.fault.lock() = mode;
     }
 
     fn check_write(&self) -> object_store::Result<()> {

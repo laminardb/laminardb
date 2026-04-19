@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use laminar_core::checkpoint::barrier::{flags, CheckpointBarrier};
 use laminar_core::shuffle::{
-    fan_out_barrier, BarrierTracker, ShuffleMessage, ShuffleReceiver, ShuffleSender,
+    BarrierTracker, ShuffleMessage, ShuffleReceiver, ShuffleSender,
 };
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -39,7 +39,7 @@ async fn barrier_fan_out_aligns_on_both_receivers() {
     // Leader fans out across the shuffle. Both receivers should see
     // the frame, feed it to their trackers, and those trackers should
     // fire.
-    fan_out_barrier(&sender, &[10, 11], barrier).await.unwrap();
+    sender.fan_out_barrier(&[10, 11], barrier).await.unwrap();
 
     for (recv, tracker) in [(&recv_a, &tracker_a), (&recv_b, &tracker_b)] {
         let (_from, msg) = tokio::time::timeout(Duration::from_secs(2), recv.recv())
@@ -66,6 +66,6 @@ async fn fan_out_errors_on_unregistered_peer() {
         epoch: 1,
         flags: 0,
     };
-    let err = fan_out_barrier(&sender, &[99], barrier).await.unwrap_err();
+    let err = sender.fan_out_barrier(&[99], barrier).await.unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
 }

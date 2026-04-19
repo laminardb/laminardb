@@ -1,23 +1,6 @@
 //! The `StateBackend` trait: the single contract between streaming
-//! operators and the storage tier.
-//!
-//! Backends own two things per vnode:
-//!
-//! 1. **Partials** — opaque `Bytes` blobs written by operators at the
-//!    end of each epoch. The backend persists them under
-//!    `(vnode, epoch)` keys. Operators deserialize via
-//!    [`PartialAggregate`](super::PartialAggregate).
-//! 2. **Watermarks** — a per-vnode event-time frontier. Backends expose
-//!    a global watermark as the min over a caller-supplied vnode set.
-//!
-//! Each epoch is "complete" iff every participating vnode has committed
-//! its partial. [`StateBackend::epoch_complete`] is the durability
-//! barrier the checkpoint coordinator consults before releasing sinks.
-//!
-//! The trait is deliberately narrow. Backends are pluggable via
-//! [`StateBackendConfig`](super::config) so that `embedded`,
-//! `standalone`, `distributed-embedded`, and `constellation` modes
-//! differ only in which `Arc<dyn StateBackend>` the engine is holding.
+//! operators and the storage tier. Backends persist per-(vnode, epoch)
+//! partial-state blobs and expose an `epoch_complete` durability gate.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -25,19 +8,6 @@ use bytes::Bytes;
 /// Errors a [`StateBackend`] can raise.
 #[derive(Debug, thiserror::Error)]
 pub enum StateBackendError {
-    /// The write was rejected because the caller's assignment version
-    /// is older than the one the backend currently recognizes.
-    ///
-    /// Split-brain guard: a paused node that wakes up after a
-    /// rebalance must not overwrite state owned by the new assignee.
-    #[error("stale assignment: caller v{caller}, backend v{backend}")]
-    StaleAssignment {
-        /// Version the caller used.
-        caller: u64,
-        /// Version the backend has recorded.
-        backend: u64,
-    },
-
     /// Underlying I/O failure (filesystem, `object_store`, network).
     #[error("I/O error: {0}")]
     Io(String),
@@ -46,7 +16,7 @@ pub enum StateBackendError {
     #[error("serialization error: {0}")]
     Serialization(String),
 
-    /// The partial or watermark for `(vnode, epoch)` is not present.
+    /// The partial for `(vnode, epoch)` is not present.
     #[error("not found: vnode={vnode} epoch={epoch}")]
     NotFound {
         /// Virtual node ID.
@@ -97,20 +67,6 @@ pub trait StateBackend: Send + Sync + 'static {
         vnode: u32,
         epoch: u64,
     ) -> Result<Option<Bytes>, StateBackendError>;
-
-    /// Publish this node's event-time watermark for `vnode`.
-    ///
-    /// Idempotent and monotone: backends retain the max of observed
-    /// values per vnode.
-    async fn publish_watermark(
-        &self,
-        vnode: u32,
-        ts_ms: i64,
-    ) -> Result<(), StateBackendError>;
-
-    /// Read the global watermark — the minimum over the supplied vnode
-    /// set. Operators that consume across the full ring pass `&[0..N)`.
-    async fn global_watermark(&self, vnodes: &[u32]) -> Result<i64, StateBackendError>;
 
     /// Durability barrier: returns true iff every `vnode` in the set
     /// has a partial persisted for `epoch`.
