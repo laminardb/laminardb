@@ -920,8 +920,26 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
             Err(e) => return Err(CheckpointStoreError::ObjectStore(e)),
         }
 
-        // Update latest.json pointer (always overwrite).
+        // Monotonic pointer update. A stale writer must not regress the
+        // pointer from id N+1 back to id N. Read the current pointer; if
+        // it already references a newer id, skip the write. Same-writer
+        // races (not expected — one coordinator per store instance) can
+        // still race past this check, but cross-leader stomps from a
+        // delayed ex-leader are caught.
         let latest = self.latest_pointer_path();
+        if let Some(current) = self.get_bytes(&latest)? {
+            if let Ok(existing) = serde_json::from_slice::<LatestPointer>(&current) {
+                if existing.checkpoint_id > manifest.checkpoint_id {
+                    tracing::warn!(
+                        current = existing.checkpoint_id,
+                        ours = manifest.checkpoint_id,
+                        "[LDB-6010] latest.json already points at a newer checkpoint — \
+                         skipping pointer update (possible split-brain or delayed writer)"
+                    );
+                    return Ok(());
+                }
+            }
+        }
         let pointer = serde_json::to_string(&LatestPointer {
             checkpoint_id: manifest.checkpoint_id,
         })?;
@@ -1651,6 +1669,24 @@ mod tests {
 
         let pointer: super::LatestPointer = serde_json::from_slice(&data).unwrap();
         assert_eq!(pointer.checkpoint_id, 5);
+    }
+
+    #[test]
+    fn test_obj_latest_monotonic_guard_skips_regression() {
+        let inner = Arc::new(object_store::memory::InMemory::new());
+        let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10).unwrap();
+
+        store.save(&make_manifest(10, 10)).unwrap();
+        // A delayed writer (e.g., paused ex-leader) tries to write id=5
+        // after the current leader already advanced to id=10. The pointer
+        // must not regress.
+        store.save(&make_manifest(5, 5)).unwrap();
+
+        let loaded = store.load_latest().unwrap().unwrap();
+        assert_eq!(
+            loaded.checkpoint_id, 10,
+            "latest pointer should not regress to an older id"
+        );
     }
 
     #[test]
