@@ -114,6 +114,15 @@ fn sha256_hex(data: &[u8]) -> String {
 /// a partial manifest). The `latest.txt` pointer is updated only after the
 /// manifest is fully written and synced.
 pub trait CheckpointStore: Send + Sync {
+    /// Runtime vnode count that manifests written by this store are
+    /// expected to use. Consulted when validating loaded manifests —
+    /// a mismatch is reported as a manifest warning. Defaults to
+    /// [`crate::checkpoint_manifest::DEFAULT_VNODE_COUNT`] when the
+    /// implementation has no configured value.
+    fn vnode_count(&self) -> u16 {
+        crate::checkpoint_manifest::DEFAULT_VNODE_COUNT
+    }
+
     /// Persists a checkpoint manifest atomically.
     ///
     /// The implementation writes to a temporary file and renames on success
@@ -235,10 +244,7 @@ pub trait CheckpointStore: Send + Sync {
             Err(e) => return Err(e),
         };
 
-        // Basic manifest validation.
-        // `DEFAULT_VNODE_COUNT` holds until Phase B plumbs the runtime
-        // `VnodeRegistry` value through the restore path.
-        for err in manifest.validate(crate::checkpoint_manifest::DEFAULT_VNODE_COUNT) {
+        for err in manifest.validate(self.vnode_count()) {
             issues.push(format!("manifest validation: {err}"));
         }
 
@@ -379,6 +385,7 @@ pub trait CheckpointStore: Send + Sync {
 pub struct FileSystemCheckpointStore {
     base_dir: PathBuf,
     max_retained: usize,
+    vnode_count: u16,
 }
 
 impl FileSystemCheckpointStore {
@@ -386,12 +393,25 @@ impl FileSystemCheckpointStore {
     ///
     /// The `base_dir` is the parent directory; checkpoints are stored under
     /// `{base_dir}/checkpoints/`. The directory is created lazily on first save.
+    ///
+    /// The store's `vnode_count` defaults to
+    /// [`crate::checkpoint_manifest::DEFAULT_VNODE_COUNT`]. Hosts that run
+    /// with a non-default value should chain [`Self::with_vnode_count`] so
+    /// manifest validation checks the right invariant.
     #[must_use]
     pub fn new(base_dir: impl Into<PathBuf>, max_retained: usize) -> Self {
         Self {
             base_dir: base_dir.into(),
             max_retained,
+            vnode_count: crate::checkpoint_manifest::DEFAULT_VNODE_COUNT,
         }
+    }
+
+    /// Override the vnode_count used during manifest validation.
+    #[must_use]
+    pub fn with_vnode_count(mut self, vnode_count: u16) -> Self {
+        self.vnode_count = vnode_count;
+        self
     }
 
     /// Returns the checkpoints directory path.
@@ -470,6 +490,10 @@ impl FileSystemCheckpointStore {
 }
 
 impl CheckpointStore for FileSystemCheckpointStore {
+    fn vnode_count(&self) -> u16 {
+        self.vnode_count
+    }
+
     fn save(&self, manifest: &CheckpointManifest) -> Result<(), CheckpointStoreError> {
         let cp_dir = self.checkpoint_dir(manifest.checkpoint_id);
         std::fs::create_dir_all(&cp_dir)?;
@@ -544,9 +568,7 @@ impl CheckpointStore for FileSystemCheckpointStore {
         let json = std::fs::read_to_string(&path)?;
         let manifest: CheckpointManifest = serde_json::from_str(&json)?;
 
-        // Validate manifest consistency on load. See integrity-check site
-        // above for the note on `DEFAULT_VNODE_COUNT`.
-        let errors = manifest.validate(crate::checkpoint_manifest::DEFAULT_VNODE_COUNT);
+        let errors = manifest.validate(self.vnode_count());
         if !errors.is_empty() {
             tracing::warn!(
                 checkpoint_id = id,
@@ -685,6 +707,7 @@ pub struct ObjectStoreCheckpointStore {
     store: Arc<dyn ObjectStore>,
     prefix: String,
     max_retained: usize,
+    vnode_count: u16,
     /// Dedicated single-threaded runtime for async→sync bridging.
     /// Separate from the application runtime to avoid `block_on` reentrancy.
     rt: tokio::runtime::Runtime,
@@ -695,6 +718,10 @@ impl ObjectStoreCheckpointStore {
     ///
     /// `prefix` is prepended to all object paths (e.g., `"nodes/abc123/"`).
     /// It should end with `/` or be empty.
+    ///
+    /// The store's `vnode_count` defaults to
+    /// [`crate::checkpoint_manifest::DEFAULT_VNODE_COUNT`]. Hosts that run
+    /// with a non-default value should chain [`Self::with_vnode_count`].
     ///
     /// # Errors
     ///
@@ -711,8 +738,16 @@ impl ObjectStoreCheckpointStore {
             store,
             prefix,
             max_retained,
+            vnode_count: crate::checkpoint_manifest::DEFAULT_VNODE_COUNT,
             rt,
         })
+    }
+
+    /// Override the vnode_count used during manifest validation.
+    #[must_use]
+    pub fn with_vnode_count(mut self, vnode_count: u16) -> Self {
+        self.vnode_count = vnode_count;
+        self
     }
 
     fn manifest_path(&self, id: u64) -> object_store::path::Path {
@@ -792,6 +827,10 @@ impl ObjectStoreCheckpointStore {
 }
 
 impl CheckpointStore for ObjectStoreCheckpointStore {
+    fn vnode_count(&self) -> u16 {
+        self.vnode_count
+    }
+
     fn save(&self, manifest: &CheckpointManifest) -> Result<(), CheckpointStoreError> {
         let json = serde_json::to_string_pretty(manifest)?;
         let path = self.manifest_path(manifest.checkpoint_id);

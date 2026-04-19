@@ -145,6 +145,12 @@ impl LaminarDB {
             };
 
             let max_retained = cp_config.max_retained.unwrap_or(3);
+            let vnode_count = self
+                .vnode_registry
+                .lock()
+                .as_ref()
+                .map(|r| u16::try_from(r.vnode_count()).unwrap_or(u16::MAX))
+                .unwrap_or(laminar_storage::checkpoint_manifest::DEFAULT_VNODE_COUNT);
 
             let store: Box<dyn laminar_storage::CheckpointStore> =
                 if let Some(ref url) = self.config.object_store_url {
@@ -160,7 +166,8 @@ impl LaminarDB {
                             prefix,
                             max_retained,
                         )
-                        .map_err(|e| DbError::Config(format!("checkpoint store runtime: {e}")))?,
+                        .map_err(|e| DbError::Config(format!("checkpoint store runtime: {e}")))?
+                        .with_vnode_count(vnode_count),
                     )
                 } else {
                     let data_dir = cp_config
@@ -172,7 +179,8 @@ impl LaminarDB {
                         laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(
                             &data_dir,
                             max_retained,
-                        ),
+                        )
+                        .with_vnode_count(vnode_count),
                     )
                 };
 

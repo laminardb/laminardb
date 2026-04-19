@@ -137,6 +137,8 @@ fn build_checkpoint_store(
         }
     };
 
+    let vnode_count = u16::try_from(config.state.vnode_capacity()).unwrap_or(u16::MAX);
+
     // file:// URLs use the local FS path directly; cloud URLs need a prefix.
     if url.starts_with("file://") {
         let path = url.strip_prefix("file://").unwrap_or(url);
@@ -144,7 +146,8 @@ fn build_checkpoint_store(
             laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(
                 std::path::Path::new(path),
                 3,
-            ),
+            )
+            .with_vnode_count(vnode_count),
         ))
     } else {
         // Cloud URL: extract prefix from URL path (bucket is handled by object_store).
@@ -156,7 +159,7 @@ fn build_checkpoint_store(
         match laminar_storage::checkpoint_store::ObjectStoreCheckpointStore::new(
             obj_store, prefix, 3,
         ) {
-            Ok(s) => Some(Box::new(s)),
+            Ok(s) => Some(Box::new(s.with_vnode_count(vnode_count))),
             Err(e) => {
                 tracing::error!(error = %e, "failed to create checkpoint store runtime");
                 None
