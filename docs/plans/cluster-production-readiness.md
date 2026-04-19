@@ -42,7 +42,7 @@ These were found during the Phase 0 implementation attempt on 2026-04-19. The fi
 
 ## Bonus bugs surfaced (not yet fixed; track separately)
 
-- `ObjectStoreBackend::epoch_complete` swallows `AlreadyExists` as success (`object_store.rs:140`). Two leaders racing both report committed. Split-brain commit hole on the durable-write side.
+- ~~`ObjectStoreBackend::epoch_complete` swallows `AlreadyExists` as success (`object_store.rs:140`). Two leaders racing both report committed. Split-brain commit hole on the durable-write side.~~ **FIXED**: both the HEAD fast-path and the CAS-loser branch now read the `_COMMIT` marker and compare the audit body against `self.instance_id`; mismatch returns `StateBackendError::SplitBrainCommit` so the losing leader aborts instead of double-committing.
 - `CheckpointedRepartitionExec` snapshot loop has no backpressure on `state_backend.write_partial` (`checkpointed_repartition.rs:266`). Serial per-vnode awaits on the critical path; 256 vnodes × 100ms S3 = 25s/epoch. (Phase 3.4 mentions but doesn't sequence.)
 - Recovery-epoch plumbing must invalidate cached physical plans if DDL compiled before recovery completed. Phase 1.1 must handle the ordering.
 - *Note*: `server::start_cluster never calls set_gate_vnode_set(full)` from the original review was wrong — `pipeline_lifecycle.rs:224` does call it. Strike that finding.

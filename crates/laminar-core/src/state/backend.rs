@@ -40,6 +40,22 @@ pub enum StateBackendError {
         /// Authoritative version seen by the backend.
         authoritative: u64,
     },
+
+    /// Raised by [`StateBackend::epoch_complete`] when the caller
+    /// observes an existing commit marker whose audit body names a
+    /// different instance. Two leaders raced on the same epoch and
+    /// the other one won. The caller (losing leader) must NOT proceed
+    /// with its own sink-commit phase — its view of the state is not
+    /// the one durably sealed.
+    #[error(
+        "split-brain commit detected: epoch already committed by {committer:?}, we are {self_id:?}"
+    )]
+    SplitBrainCommit {
+        /// Instance id recorded in the existing commit marker.
+        committer: String,
+        /// This backend's own instance id.
+        self_id: String,
+    },
 }
 
 /// A pluggable state store used by streaming operators for partial

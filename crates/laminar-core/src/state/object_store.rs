@@ -182,8 +182,12 @@ impl StateBackend for ObjectStoreBackend {
         vnodes: &[u32],
     ) -> Result<bool, StateBackendError> {
         let commit = Self::commit_path(epoch);
+        // Fast path: a marker already exists. Previously we returned
+        // `Ok(true)` blindly — that swallowed split-brain (two leaders
+        // racing, the loser silently agreed it had committed). Now we
+        // read the audit body and reject if the committer isn't us.
         match self.store.head(&commit).await {
-            Ok(_) => return Ok(true),
+            Ok(_) => return self.verify_commit_marker(&commit).await,
             Err(object_store::Error::NotFound { .. }) => {}
             Err(e) => return Err(StateBackendError::Io(e.to_string())),
         }
@@ -205,8 +209,48 @@ impl StateBackend for ObjectStoreBackend {
             ..Default::default()
         };
         match self.store.put_opts(&commit, payload, opts).await {
-            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(true),
+            Ok(_) => Ok(true),
+            // AlreadyExists means a peer raced us to the CAS. Don't
+            // silently agree — verify who actually wrote the marker
+            // so a stale leader doesn't keep driving the commit phase.
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                self.verify_commit_marker(&commit).await
+            }
             Err(e) => Err(StateBackendError::Io(e.to_string())),
+        }
+    }
+}
+
+impl ObjectStoreBackend {
+    /// Read the epoch's `_COMMIT` marker and compare its audit body
+    /// against this backend's `instance_id`. Match → `Ok(true)` (we
+    /// committed, a retry or observation is fine). Mismatch →
+    /// [`StateBackendError::SplitBrainCommit`] so the caller aborts
+    /// rather than double-committing downstream. Phase 2 split-brain
+    /// hardening.
+    async fn verify_commit_marker(
+        &self,
+        commit: &OsPath,
+    ) -> Result<bool, StateBackendError> {
+        let res = self
+            .store
+            .get(commit)
+            .await
+            .map_err(|e| StateBackendError::Io(e.to_string()))?;
+        let bytes = res
+            .bytes()
+            .await
+            .map_err(|e| StateBackendError::Io(e.to_string()))?;
+        let committer = std::str::from_utf8(&bytes).map_err(|e| {
+            StateBackendError::Serialization(format!("commit marker not utf8: {e}"))
+        })?;
+        if committer == self.instance_id.as_str() {
+            Ok(true)
+        } else {
+            Err(StateBackendError::SplitBrainCommit {
+                committer: committer.to_string(),
+                self_id: self.instance_id.clone(),
+            })
         }
     }
 }
@@ -247,8 +291,82 @@ mod tests {
                 .unwrap();
         }
         assert!(backend.epoch_complete(1, &vnodes).await.unwrap());
-        // Idempotent.
+        // Idempotent — same committer id in the audit body.
         assert!(backend.epoch_complete(1, &vnodes).await.unwrap());
+    }
+
+    /// Split-brain commit protection. Previously the CAS-create's
+    /// `AlreadyExists` branch was folded into the success branch, so a
+    /// stale leader racing a fresh one would happily agree it had also
+    /// committed the epoch. Now the loser reads the marker, sees a
+    /// mismatched audit body, and fails loud.
+    #[tokio::test]
+    async fn epoch_complete_detects_split_brain_committer() {
+        let dir = tempdir().unwrap();
+        let store = make_store(dir.path());
+        let winner = ObjectStoreBackend::new(Arc::clone(&store), "winner", 4);
+        let loser = ObjectStoreBackend::new(Arc::clone(&store), "loser", 4);
+
+        let vnodes = [0u32, 1];
+        // Both "nodes" wrote partials for the epoch.
+        for v in &vnodes {
+            winner
+                .write_partial(*v, 7, 0, Bytes::from_static(b"w"))
+                .await
+                .unwrap();
+        }
+
+        // Winner CAS-creates the commit marker first.
+        assert!(winner.epoch_complete(7, &vnodes).await.unwrap());
+
+        // Loser finds the marker already there (HEAD fast-path) and
+        // must NOT agree it committed — that's the split-brain case.
+        let err = loser.epoch_complete(7, &vnodes).await.unwrap_err();
+        match err {
+            StateBackendError::SplitBrainCommit { committer, self_id } => {
+                assert_eq!(committer, "winner");
+                assert_eq!(self_id, "loser");
+            }
+            other => panic!("expected SplitBrainCommit, got {other:?}"),
+        }
+
+        // And the winner's repeated call is still idempotent Ok(true).
+        assert!(winner.epoch_complete(7, &vnodes).await.unwrap());
+    }
+
+    /// Same contract on the CAS-loser path: if the marker doesn't exist
+    /// at HEAD time but a peer sneaks in between our vnode-presence
+    /// check and our own PUT, our `put_opts` fails with `AlreadyExists`.
+    /// That branch must also compare committers, not silently succeed.
+    #[tokio::test]
+    async fn epoch_complete_detects_split_brain_on_cas_loser_path() {
+        let dir = tempdir().unwrap();
+        let store = make_store(dir.path());
+        let winner = ObjectStoreBackend::new(Arc::clone(&store), "winner", 4);
+        let loser = ObjectStoreBackend::new(Arc::clone(&store), "loser", 4);
+
+        let vnodes = [0u32, 1];
+        for v in &vnodes {
+            winner
+                .write_partial(*v, 3, 0, Bytes::from_static(b"w"))
+                .await
+                .unwrap();
+        }
+        // Manually pre-seed the commit marker under "winner" to
+        // simulate the TOCTOU race deterministically — the loser's
+        // put_opts will hit AlreadyExists on its own PUT attempt.
+        let commit = ObjectStoreBackend::commit_path(3);
+        store
+            .put(&commit, PutPayload::from(Bytes::from_static(b"winner")))
+            .await
+            .unwrap();
+
+        let err = loser.epoch_complete(3, &vnodes).await.unwrap_err();
+        assert!(matches!(
+            err,
+            StateBackendError::SplitBrainCommit { ref committer, .. }
+                if committer == "winner"
+        ));
     }
 
     #[tokio::test]

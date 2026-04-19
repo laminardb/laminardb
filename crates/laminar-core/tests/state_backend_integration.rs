@@ -34,9 +34,17 @@ async fn config_roundtrip_in_process_local_object_store() {
 }
 
 /// Two instances writing to a shared object store root: partials are
-/// visible cross-instance and the commit manifest is CAS-sealed.
+/// visible cross-instance and the commit marker is CAS-sealed so only
+/// one committer wins.
+///
+/// Before the split-brain commit fix, both nodes' `epoch_complete`
+/// calls returned `Ok(true)` — the second swallowed `AlreadyExists`
+/// as success and both leaders would have proceeded to commit sinks.
+/// Now the loser gets `SplitBrainCommit` and must abort.
 #[tokio::test]
 async fn distributed_embedded_static_two_instances_shared_store() {
+    use laminar_core::state::StateBackendError;
+
     let dir = tempdir().unwrap();
     let store: Arc<dyn ObjectStore> =
         Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
@@ -52,8 +60,21 @@ async fn distributed_embedded_static_two_instances_shared_store() {
     assert_eq!(&node_a.read_partial(2, 1).await.unwrap().unwrap()[..], b"B2");
     assert_eq!(&node_b.read_partial(0, 1).await.unwrap().unwrap()[..], b"A0");
 
+    // node_a wins the CAS — it committed the epoch.
     assert!(node_a.epoch_complete(1, &[0, 1, 2, 3]).await.unwrap());
-    assert!(node_b.epoch_complete(1, &[0, 1, 2, 3]).await.unwrap());
+    // node_a calling again is idempotent (same committer id in the
+    // audit body), so it still gets Ok(true).
+    assert!(node_a.epoch_complete(1, &[0, 1, 2, 3]).await.unwrap());
+
+    // node_b loses — it must not keep driving the commit phase.
+    let err = node_b.epoch_complete(1, &[0, 1, 2, 3]).await.unwrap_err();
+    match err {
+        StateBackendError::SplitBrainCommit { committer, self_id } => {
+            assert_eq!(committer, "node-a");
+            assert_eq!(self_id, "node-b");
+        }
+        other => panic!("expected SplitBrainCommit, got {other:?}"),
+    }
 
     node_a.write_partial(0, 2, 0, Bytes::from_static(b"A0@2")).await.unwrap();
     assert!(!node_a.epoch_complete(2, &[0, 1, 2, 3]).await.unwrap());
