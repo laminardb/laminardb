@@ -210,17 +210,14 @@ pub struct CheckpointCoordinator {
 }
 
 impl CheckpointCoordinator {
-    /// Creates a new checkpoint coordinator.
-    ///
-    /// Reads the latest stored checkpoint to seed `next_checkpoint_id`
-    /// and `epoch`. A transient load failure (e.g., S3 5xx, fs read
-    /// error) is surfaced as [`DbError::Checkpoint`] instead of
-    /// silently starting at `(1, 1)` — which would collide with
-    /// existing on-disk checkpoints once the store recovers.
+    /// Creates a new checkpoint coordinator, seeded from the latest
+    /// stored checkpoint.
     ///
     /// # Errors
-    /// Returns [`DbError::Checkpoint`] if [`CheckpointStore::load_latest`]
-    /// fails. `Ok(None)` is the fresh-start path and is not an error.
+    /// Returns [`DbError::Checkpoint`] if `store.load_latest()` fails.
+    /// A store read error is surfaced rather than silently starting at
+    /// `(1, 1)` and clobbering existing on-disk state. `Ok(None)` is
+    /// the fresh-start path and is not an error.
     pub async fn new(
         config: CheckpointConfig,
         store: Box<dyn CheckpointStore>,

@@ -519,10 +519,14 @@ async fn shuffle_pre_agg_batches(
                 local.push(slice);
             } else if !owner.is_unassigned() {
                 let msg = ShuffleMessage::VnodeData(v, slice);
-                // Drop on unreachable peer — source replay preserves
-                // at-least-once semantics. Logging each drop would
-                // swamp every cycle where a peer is down.
-                let _ = cfg.sender.send_to(owner.0, &msg).await;
+                // Fail the cycle on send error; dropping silently would
+                // let source offsets advance past un-delivered rows.
+                cfg.sender.send_to(owner.0, &msg).await.map_err(|e| {
+                    DbError::Pipeline(format!(
+                        "[{op_name}] row-shuffle send_to peer {}: {e}",
+                        owner.0
+                    ))
+                })?;
             }
         }
     }
