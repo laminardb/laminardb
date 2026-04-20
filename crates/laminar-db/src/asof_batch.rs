@@ -576,6 +576,10 @@ pub(crate) fn execute_asof_join_with_state(
 }
 
 /// Serializable checkpoint for `AsofRightBuffer`.
+///
+/// Row indices are `u32` because they index into a single `RecordBatch`
+/// whose row count is itself `u32`-bounded; using `u32` halves the
+/// in-memory footprint of the index-entries vec compared to `usize`.
 #[derive(
     serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
@@ -583,7 +587,7 @@ pub(crate) struct AsofBufferCheckpoint {
     #[serde(default)]
     pub right_buffer_ipc: Vec<u8>,
     #[serde(default)]
-    pub index_entries: Vec<(u64, i64, Vec<usize>)>,
+    pub index_entries: Vec<(u64, i64, Vec<u32>)>,
     #[serde(default = "default_evicted_watermark")]
     pub last_evicted_watermark: i64,
 }
@@ -614,7 +618,12 @@ impl AsofRightBuffer {
         let mut index_entries = Vec::new();
         for (&key_hash, btree) in &self.index {
             for (&ts, indices) in btree {
-                index_entries.push((key_hash, ts, indices.clone()));
+                // Compact via u32. `compact()` was just called above, so indices
+                // are bounded by the row count of `right_concat`, which is itself
+                // u32-bounded.
+                #[allow(clippy::cast_possible_truncation)]
+                let narrow: Vec<u32> = indices.iter().map(|&i| i as u32).collect();
+                index_entries.push((key_hash, ts, narrow));
             }
         }
 
@@ -640,11 +649,9 @@ impl AsofRightBuffer {
         };
 
         let mut index: RightIndex = FxHashMap::default();
-        for &(key_hash, ts, ref indices) in &cp.index_entries {
-            index
-                .entry(key_hash)
-                .or_default()
-                .insert(ts, indices.clone());
+        for (key_hash, ts, indices) in &cp.index_entries {
+            let widened: Vec<usize> = indices.iter().map(|&i| i as usize).collect();
+            index.entry(*key_hash).or_default().insert(*ts, widened);
         }
 
         Ok((
