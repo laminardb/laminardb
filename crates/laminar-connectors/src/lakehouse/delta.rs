@@ -1040,16 +1040,26 @@ impl SinkConnector for DeltaLakeSink {
         let estimated_bytes = Self::estimate_batch_size(batch);
 
         // Exactly-once cannot flush opportunistically from `write_batch`
-        // — a mid-epoch flush would leak rows on rollback. Before the
-        // fix the buffer grew without bound between checkpoints, so a
-        // coordinator stall could OOM the sink. Apply the configured
-        // target as a hard cap (×4 to tolerate normal checkpoint jitter)
-        // and signal backpressure so the upstream reactor slows down.
+        // — a mid-epoch flush would leak rows on rollback. Apply the
+        // configured target as a hard cap (×4 for checkpoint jitter) and
+        // signal backpressure so the upstream reactor slows down.
+        //
+        // A single incoming batch may itself exceed the cap; we cannot
+        // split or reject it (the rows would be lost), so we widen the
+        // cap to `num_rows`/`estimated_bytes` when a batch alone is
+        // larger. This still rejects the *next* batch if that one-shot
+        // admission left us bloated.
         if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             let pending_rows = self.buffered_rows + self.staged_rows + num_rows;
             let pending_bytes = self.buffered_bytes + self.staged_bytes + estimated_bytes;
-            let row_cap = self.config.max_buffer_records.saturating_mul(4);
-            let byte_cap = (self.config.target_file_size as u64).saturating_mul(4);
+            let row_cap = self
+                .config
+                .max_buffer_records
+                .saturating_mul(4)
+                .max(num_rows);
+            let byte_cap = (self.config.target_file_size as u64)
+                .saturating_mul(4)
+                .max(estimated_bytes);
             if pending_rows > row_cap || pending_bytes > byte_cap {
                 return Err(ConnectorError::WriteError(format!(
                     "delta sink exactly-once buffer full ({pending_rows} rows, \
@@ -1337,6 +1347,24 @@ impl SinkConnector for DeltaLakeSink {
     }
 }
 
+/// Safety-net: if the sink is dropped mid-lifecycle (panic, config error,
+/// shutdown without calling `close()`), cancel any background work so we
+/// don't leak a compaction loop or a stray table-reopen task.
+#[cfg(feature = "delta-lake")]
+impl Drop for DeltaLakeSink {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.compaction_cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(handle) = self.compaction_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.pending_reopen.take() {
+            handle.abort();
+        }
+    }
+}
+
 impl std::fmt::Debug for DeltaLakeSink {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeltaLakeSink")
@@ -1617,28 +1645,39 @@ mod tests {
 
     #[tokio::test]
     async fn test_exactly_once_buffer_backpressure() {
-        // Ensure exactly-once mode rejects writes when the pending buffer
-        // would exceed the hard cap (4× max_buffer_records). Without this
-        // guard, a coordinator stall would let the buffer grow until OOM.
+        // Exactly-once mode rejects writes once the cumulative pending
+        // buffer exceeds the hard cap (4× max_buffer_records). A single
+        // incoming batch that by itself exceeds the cap is admitted (we
+        // cannot split it without breaking exactly-once), but subsequent
+        // batches hit backpressure.
         let mut config = test_config();
         config.delivery_guarantee = crate::connector::DeliveryGuarantee::ExactlyOnce;
         config.max_buffer_records = 10;
         let mut sink = DeltaLakeSink::new(config, None);
         sink.state = ConnectorState::Running;
 
-        // Push enough rows to exceed 4× cap (10 × 4 = 40 → push 50).
-        let batch = test_batch(50);
-        let err = sink
-            .write_batch(&batch)
+        // First batch of 50 rows exceeds 4× cap (40) but we admit it —
+        // rejecting would wedge the pipeline with no way to split.
+        let first = test_batch(50);
+        sink.write_batch(&first)
             .await
-            .expect_err("should reject once buffer cap is exceeded");
+            .expect("single oversized batch must be admitted");
+        assert_eq!(sink.buffered_rows(), 50);
+
+        // A second normal batch must now be rejected: cumulative pending
+        // (50 + 5 = 55) exceeds the effective cap (max(40, 5) = 40).
+        let second = test_batch(5);
+        let err = sink
+            .write_batch(&second)
+            .await
+            .expect_err("should reject once cumulative buffer exceeds cap");
         let msg = err.to_string();
         assert!(
             msg.contains("buffer full"),
             "expected backpressure error, got: {msg}"
         );
-        // Sink must NOT have buffered the rejected batch.
-        assert_eq!(sink.buffered_rows(), 0);
+        // Rejected batch must NOT have been buffered.
+        assert_eq!(sink.buffered_rows(), 50);
     }
 
     // ── Batch buffering tests ──
@@ -1689,7 +1728,7 @@ mod tests {
         let batch = test_batch(5);
         sink.write_batch(&batch).await.unwrap();
         assert!(sink.schema.is_some());
-        assert_eq!(sink.schema.unwrap().fields().len(), 3);
+        assert_eq!(sink.schema.as_ref().unwrap().fields().len(), 3);
     }
 
     #[tokio::test]
