@@ -124,19 +124,15 @@ pub trait StateBackend: Send + Sync + 'static {
 
     /// Garbage-collect every partial and commit marker whose epoch is
     /// strictly less than `before`. Called by the checkpoint
-    /// coordinator after a successful checkpoint commit so that the
-    /// backend does not retain state for epochs that can never be
-    /// recovered again.
+    /// coordinator after a successful checkpoint commit so the backend
+    /// does not retain state for epochs that can never be recovered.
     ///
-    /// Without this, in-memory backends leak indefinitely (every
-    /// checkpoint adds one entry per vnode) and object-store backends
-    /// leave `epoch=N/…` artifacts forever.
-    ///
-    /// Default is a no-op so existing test backends compile. Production
-    /// backends should override it.
-    async fn prune_before(&self, _before: u64) -> Result<(), StateBackendError> {
-        Ok(())
-    }
+    /// Required — there is intentionally no default. Without it an
+    /// in-memory backend leaks a `Bytes` per vnode per checkpoint
+    /// forever, and an object-store backend leaves `epoch=N/…` objects
+    /// forever. Test backends that truly do not accumulate state should
+    /// implement `Ok(())` explicitly so the choice is visible.
+    async fn prune_before(&self, before: u64) -> Result<(), StateBackendError>;
 }
 
 const _: Option<&dyn StateBackend> = None;

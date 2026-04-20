@@ -236,13 +236,15 @@ pub trait CheckpointStore: Send + Sync {
     /// Returns [`CheckpointStoreError`] on I/O failure.
     async fn list(&self) -> Result<Vec<(u64, u64)>, CheckpointStoreError>;
 
-    /// Lists all checkpoint IDs, sorted ascending. Unlike [`Self::list`]
-    /// this enumerates corrupt manifests too (used by crash recovery).
+    /// Lists all checkpoint IDs, **sorted ascending**. Unlike
+    /// [`Self::list`] this enumerates corrupt manifests too (used by
+    /// crash recovery). Callers rely on the ascending invariant.
     ///
     /// # Errors
     /// Returns [`CheckpointStoreError`] on I/O failure.
     async fn list_ids(&self) -> Result<Vec<u64>, CheckpointStoreError> {
-        // O(N) manifest reads via list(). Backends should override.
+        // Default: O(N) manifest reads via list(). Production backends
+        // should override; list() already sorts ascending.
         Ok(self.list().await?.iter().map(|(id, _)| *id).collect())
     }
 
@@ -383,11 +385,9 @@ pub trait CheckpointStore: Send + Sync {
         let start = std::time::Instant::now();
         let mut skipped = Vec::new();
 
-        // Get all checkpoint IDs sorted descending (newest first).
-        // Uses list_ids() instead of list() so corrupt manifests are still
-        // enumerated (list() silently skips them).
+        // list_ids returns ascending per the trait contract; we iterate
+        // newest-first so the first valid checkpoint wins.
         let mut ids = self.list_ids().await?;
-        ids.sort_unstable();
         ids.reverse();
 
         let examined = ids.len();
