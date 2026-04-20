@@ -24,16 +24,6 @@ got `None` — so cluster mode was tested-but-never-shipped. Changes:
   rule stays in `laminar-sql` for future non-streaming distributed
   aggregation once the conflict is resolved.
 
-Deferred architectural decisions captured as ADRs:
-
-- [ADR 0001](adr-0001-control-plane-transport.md) — replace
-  chitchat-KV + JSON + 50ms polling with tonic RPC for the barrier
-  protocol (~2 weeks).
-- [ADR 0002](adr-0002-shuffle-transport.md) — evaluate
-  arrow-flight vs the custom TCP transport (needs benchmarks).
-- [ADR 0003](adr-0003-distributed-aggregate-rule.md) — multi-
-  subscriber `ShuffleReceiver` to let both drain paths coexist.
-
 ## Starting state
 
 What works (tested):
