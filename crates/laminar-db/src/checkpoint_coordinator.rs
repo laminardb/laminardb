@@ -75,48 +75,6 @@ pub struct CheckpointConfig {
     ///
     /// `None` means no limit (default). A warning is logged at 80% of the cap.
     pub max_checkpoint_bytes: Option<usize>,
-    /// Adaptive checkpoint interval configuration.
-    ///
-    /// When `Some`, the coordinator dynamically adjusts the checkpoint interval
-    /// based on observed checkpoint durations using an exponential moving average.
-    /// When `None` (default), the static `interval` is used unchanged.
-    pub adaptive: Option<AdaptiveCheckpointConfig>,
-}
-
-/// Configuration for adaptive checkpoint intervals.
-///
-/// Dynamically adjusts the checkpoint interval based on observed checkpoint
-/// durations: `interval = clamp(smoothed_duration / target_ratio, min, max)`.
-///
-/// This avoids checkpointing too frequently under light load (wasting I/O)
-/// or too infrequently under heavy load (increasing recovery time).
-#[derive(Debug, Clone)]
-pub struct AdaptiveCheckpointConfig {
-    /// Minimum checkpoint interval (floor). Default: 10s.
-    pub min_interval: Duration,
-    /// Maximum checkpoint interval (ceiling). Default: 300s.
-    pub max_interval: Duration,
-    /// Target ratio of checkpoint duration to interval.
-    ///
-    /// For example, 0.1 means checkpoints should take at most 10% of the
-    /// time between them. Default: 0.1.
-    pub target_overhead_ratio: f64,
-    /// EMA smoothing factor for checkpoint durations.
-    ///
-    /// Higher values give more weight to recent observations.
-    /// Range: 0.0–1.0. Default: 0.3.
-    pub smoothing_alpha: f64,
-}
-
-impl Default for AdaptiveCheckpointConfig {
-    fn default() -> Self {
-        Self {
-            min_interval: Duration::from_secs(10),
-            max_interval: Duration::from_secs(300),
-            target_overhead_ratio: 0.1,
-            smoothing_alpha: 0.3,
-        }
-    }
 }
 
 impl Default for CheckpointConfig {
@@ -132,7 +90,6 @@ impl Default for CheckpointConfig {
             serialization_timeout: Duration::from_secs(120),
             state_inline_threshold: 1_048_576,
             max_checkpoint_bytes: None,
-            adaptive: None,
         }
     }
 }
@@ -242,8 +199,6 @@ pub struct CheckpointCoordinator {
     duration_histogram: DurationHistogram,
     /// Prometheus engine metrics.
     prom: Option<Arc<crate::engine_metrics::EngineMetrics>>,
-    /// Exponential moving average of checkpoint durations (milliseconds).
-    smoothed_duration_ms: f64,
     /// Cumulative bytes written across all checkpoints (manifest + sidecar).
     total_bytes_written: u64,
     /// Optional state backend consulted between manifest persist and sink
@@ -318,7 +273,6 @@ impl CheckpointCoordinator {
             last_checkpoint_duration: None,
             duration_histogram: DurationHistogram::new(),
             prom: None,
-            smoothed_duration_ms: 0.0,
             total_bytes_written: 0,
             state_backend: None,
             assignment_version: 0,
@@ -1006,63 +960,6 @@ impl CheckpointCoordinator {
         &self.config
     }
 
-    /// Adjusts the checkpoint interval based on observed durations.
-    ///
-    /// Uses an exponential moving average (EMA) of checkpoint durations to
-    /// compute a new interval: `interval = smoothed_duration / target_ratio`,
-    /// clamped to `[min_interval, max_interval]`.
-    ///
-    /// No-op if adaptive checkpointing is not configured.
-    fn adjust_interval(&mut self) {
-        let adaptive = match &self.config.adaptive {
-            Some(a) => a.clone(),
-            None => return,
-        };
-
-        #[allow(clippy::cast_precision_loss)] // Checkpoint durations are << 2^52 ms
-        let last_ms = match self.last_checkpoint_duration {
-            Some(d) => d.as_millis() as f64,
-            None => return,
-        };
-
-        // Update EMA
-        if self.smoothed_duration_ms == 0.0 {
-            self.smoothed_duration_ms = last_ms;
-        } else {
-            self.smoothed_duration_ms = adaptive.smoothing_alpha * last_ms
-                + (1.0 - adaptive.smoothing_alpha) * self.smoothed_duration_ms;
-        }
-
-        // Compute target interval: smoothed_ms / (1000 * ratio)
-        let new_interval_secs =
-            self.smoothed_duration_ms / (1000.0 * adaptive.target_overhead_ratio);
-        let new_interval = Duration::from_secs_f64(new_interval_secs);
-
-        // Clamp to bounds
-        let clamped = new_interval.clamp(adaptive.min_interval, adaptive.max_interval);
-
-        let old_interval = self.config.interval;
-        self.config.interval = Some(clamped);
-
-        if old_interval != Some(clamped) {
-            debug!(
-                old_interval_ms = old_interval.map(|d| d.as_millis()),
-                new_interval_ms = clamped.as_millis(),
-                smoothed_duration_ms = self.smoothed_duration_ms,
-                "adaptive checkpoint interval adjusted"
-            );
-        }
-    }
-
-    /// Returns the current smoothed checkpoint duration (milliseconds).
-    ///
-    /// Returns 0.0 if no checkpoints have been completed or adaptive mode
-    /// is not enabled.
-    #[must_use]
-    pub fn smoothed_duration_ms(&self) -> f64 {
-        self.smoothed_duration_ms
-    }
-
     /// Returns checkpoint statistics.
     #[must_use]
     pub fn stats(&self) -> CheckpointStats {
@@ -1583,8 +1480,6 @@ impl CheckpointCoordinator {
             #[allow(clippy::cast_possible_wrap)]
             m.checkpoint_size_bytes.set(checkpoint_bytes as i64);
         }
-
-        self.adjust_interval();
 
         // Garbage-collect state-backend partials / commit markers for
         // epochs no longer needed for recovery. Without this the
@@ -2639,118 +2534,6 @@ mod tests {
         assert!(!result.success, "out-of-range vnode must fail the checkpoint");
         let err = result.error.expect("failure produces an error message");
         assert!(err.contains("vnode marker write failed"), "got: {err}");
-    }
-
-    #[tokio::test]
-    async fn test_adaptive_disabled_by_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let coord = make_coordinator(dir.path()).await;
-        assert!(coord.config().adaptive.is_none());
-        assert_eq!(coord.config().interval, Some(Duration::from_secs(60)));
-    }
-
-    #[tokio::test]
-    async fn test_adaptive_increases_interval_for_slow_checkpoints() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
-        let config = CheckpointConfig {
-            adaptive: Some(AdaptiveCheckpointConfig::default()),
-            ..CheckpointConfig::default()
-        };
-        let mut coord = CheckpointCoordinator::new(config, store).await;
-
-        // Simulate a 5-second checkpoint
-        coord.last_checkpoint_duration = Some(Duration::from_secs(5));
-        coord.adjust_interval();
-
-        // Expected: 5000ms / (1000 * 0.1) = 50s
-        let interval = coord.config().interval.unwrap();
-        assert!(
-            interval >= Duration::from_secs(49) && interval <= Duration::from_secs(51),
-            "expected ~50s, got {interval:?}",
-        );
-    }
-
-    #[tokio::test]
-    async fn test_adaptive_decreases_interval_for_fast_checkpoints() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
-        let config = CheckpointConfig {
-            adaptive: Some(AdaptiveCheckpointConfig::default()),
-            ..CheckpointConfig::default()
-        };
-        let mut coord = CheckpointCoordinator::new(config, store).await;
-
-        // Simulate a 100ms checkpoint → 100 / (1000 * 0.1) = 1s → clamped to 10s min
-        coord.last_checkpoint_duration = Some(Duration::from_millis(100));
-        coord.adjust_interval();
-
-        let interval = coord.config().interval.unwrap();
-        assert_eq!(
-            interval,
-            Duration::from_secs(10),
-            "should clamp to min_interval"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_adaptive_clamps_to_min_max() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
-        let config = CheckpointConfig {
-            adaptive: Some(AdaptiveCheckpointConfig {
-                min_interval: Duration::from_secs(20),
-                max_interval: Duration::from_secs(120),
-                target_overhead_ratio: 0.1,
-                smoothing_alpha: 1.0, // Full weight on latest
-            }),
-            ..CheckpointConfig::default()
-        };
-        let mut coord = CheckpointCoordinator::new(config, store).await;
-
-        // Very slow → clamp to max
-        coord.last_checkpoint_duration = Some(Duration::from_secs(60));
-        coord.adjust_interval();
-        let interval = coord.config().interval.unwrap();
-        assert_eq!(interval, Duration::from_secs(120), "should clamp to max");
-
-        // Very fast → clamp to min
-        coord.last_checkpoint_duration = Some(Duration::from_millis(10));
-        coord.smoothed_duration_ms = 0.0; // Reset EMA
-        coord.adjust_interval();
-        let interval = coord.config().interval.unwrap();
-        assert_eq!(interval, Duration::from_secs(20), "should clamp to min");
-    }
-
-    #[tokio::test]
-    async fn test_adaptive_ema_smoothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
-        let config = CheckpointConfig {
-            adaptive: Some(AdaptiveCheckpointConfig {
-                min_interval: Duration::from_secs(1),
-                max_interval: Duration::from_secs(600),
-                target_overhead_ratio: 0.1,
-                smoothing_alpha: 0.5,
-            }),
-            ..CheckpointConfig::default()
-        };
-        let mut coord = CheckpointCoordinator::new(config, store).await;
-
-        // First observation: 1000ms → EMA = 1000 (cold start)
-        coord.last_checkpoint_duration = Some(Duration::from_secs(1));
-        coord.adjust_interval();
-        assert!((coord.smoothed_duration_ms() - 1000.0).abs() < 1.0);
-
-        // Second observation: 2000ms → EMA = 0.5*2000 + 0.5*1000 = 1500
-        coord.last_checkpoint_duration = Some(Duration::from_secs(2));
-        coord.adjust_interval();
-        assert!((coord.smoothed_duration_ms() - 1500.0).abs() < 1.0);
-
-        // Third observation: 2000ms → EMA = 0.5*2000 + 0.5*1500 = 1750
-        coord.last_checkpoint_duration = Some(Duration::from_secs(2));
-        coord.adjust_interval();
-        assert!((coord.smoothed_duration_ms() - 1750.0).abs() < 1.0);
     }
 
     #[tokio::test]
