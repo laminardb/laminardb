@@ -452,12 +452,17 @@ pub fn pick_keys_per_owner(
 /// checkpoint exists yet. Reads through the engine's own
 /// `CheckpointStore` so the result reflects what would be loaded on
 /// restart — the right signal for per-node epoch-drift assertions.
-pub fn manifest_epoch(db: &LaminarDB) -> u64 {
+pub async fn manifest_epoch(db: &LaminarDB) -> u64 {
     let store = match db.checkpoint_store() {
         Some(s) => s,
         None => return 0,
     };
-    store.load_latest().ok().flatten().map_or(0, |m| m.epoch)
+    store
+        .load_latest()
+        .await
+        .ok()
+        .flatten()
+        .map_or(0, |m| m.epoch)
 }
 
 /// `SELECT key, total FROM <mv>` on a single engine, returning the

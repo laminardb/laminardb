@@ -65,7 +65,9 @@ async fn test_checkpoint_non_blocking() {
     let delay = Duration::from_millis(200);
     // Use the slow store to simulate slow I/O
     let store = Box::new(SlowCheckpointStore::new(delay));
-    let mut coordinator = CheckpointCoordinator::new(CheckpointConfig::default(), store).await;
+    let mut coordinator = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
 
     // Spawn a background task that measures tick intervals
     // If the runtime is blocked, these intervals will spike

@@ -23,7 +23,7 @@ use common::{minio_endpoint, minio_store};
 
 const CONVERGENCE: Duration = Duration::from_secs(5);
 
-fn make_coord(
+async fn make_coord(
     dir: &std::path::Path,
     backend: Arc<ObjectStoreBackend>,
     vnodes: Vec<u32>,
@@ -31,7 +31,9 @@ fn make_coord(
     controller: Arc<laminar_core::cluster::control::ClusterController>,
 ) -> CheckpointCoordinator {
     let store = Box::new(FileSystemCheckpointStore::new(dir, 3));
-    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store);
+    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
     coord.set_state_backend(backend);
     coord.set_vnode_set(vnodes);
     coord.set_gate_vnode_set(gate_vnodes);
@@ -101,14 +103,16 @@ async fn two_node_minio_leader_commits_follower_mirrors() {
         leader_owned,
         full.clone(),
         Arc::clone(&leader_node.controller),
-    );
+    )
+    .await;
     let mut follower_coord = make_coord(
         follower_dir.path(),
         follower_backend,
         follower_owned,
         full,
         Arc::clone(&follower_node.controller),
-    );
+    )
+    .await;
 
     let ann = BarrierAnnouncement {
         epoch: 1,

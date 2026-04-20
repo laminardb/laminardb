@@ -21,7 +21,9 @@ fn make_store(dir: &std::path::Path) -> FileSystemCheckpointStore {
 
 async fn make_coordinator(dir: &std::path::Path) -> CheckpointCoordinator {
     let store = Box::new(make_store(dir));
-    CheckpointCoordinator::new(CheckpointConfig::default(), store).await
+    CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap()
 }
 
 // ── Scenario 1: Happy path ──

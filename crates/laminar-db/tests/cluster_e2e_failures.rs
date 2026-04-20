@@ -435,8 +435,8 @@ async fn restart_recovers_sum_aggregate() {
 
     // Epoch drift check (review item H5): per-node `CheckpointStore`
     // counters can diverge across crashes. ≤1 is acceptable.
-    let leader_epoch = manifest_epoch(&harness2.nodes[harness2.leader_idx()].db);
-    let follower_epoch = manifest_epoch(&harness2.nodes[harness2.follower_idxs()[0]].db);
+    let leader_epoch = manifest_epoch(&harness2.nodes[harness2.leader_idx()].db).await;
+    let follower_epoch = manifest_epoch(&harness2.nodes[harness2.follower_idxs()[0]].db).await;
     assert!(
         leader_epoch.abs_diff(follower_epoch) <= 1,
         "epoch drift > 1 after restart: leader={leader_epoch} follower={follower_epoch}",

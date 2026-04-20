@@ -2,8 +2,8 @@
 //! tests.
 //!
 //! Spawns N chitchat instances on loopback UDP, each wrapped in a
-//! [`GossipDiscovery`](super::discovery::GossipDiscovery) +
-//! [`ClusterController`](super::control::ClusterController) pair.
+//! [`GossipDiscovery`](crate::cluster::discovery::GossipDiscovery) +
+//! [`ClusterController`](crate::cluster::control::ClusterController) pair.
 //! Shared by the integration test matrix in
 //! `tests/cluster_integration.rs`; designed to be reusable from
 //! downstream crates (laminar-db, laminar-server) as dev-dependency.

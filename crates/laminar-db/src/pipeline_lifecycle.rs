@@ -186,7 +186,7 @@ impl LaminarDB {
                 max_retained,
                 ..CkpConfig::default()
             };
-            let mut coord = CheckpointCoordinator::new(config, store).await;
+            let mut coord = CheckpointCoordinator::new(config, store).await?;
             if let Some(ref prom) = *self.engine_metrics.lock() {
                 coord.set_metrics(Arc::clone(prom));
             }

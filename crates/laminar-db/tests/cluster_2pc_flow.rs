@@ -17,14 +17,16 @@ use laminar_storage::checkpoint_store::FileSystemCheckpointStore;
 
 const CONVERGENCE: Duration = Duration::from_secs(5);
 
-fn make_coord(
+async fn make_coord(
     dir: &std::path::Path,
     backend: Arc<InProcessBackend>,
     vnodes: Vec<u32>,
     controller: Arc<laminar_core::cluster::control::ClusterController>,
 ) -> CheckpointCoordinator {
     let store = Box::new(FileSystemCheckpointStore::new(dir, 3));
-    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store);
+    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
     coord.set_state_backend(backend);
     coord.set_vnode_set(vnodes);
     coord.set_cluster_controller(controller);
@@ -68,13 +70,15 @@ async fn two_node_leader_commits_follower_mirrors() {
         backend.clone(),
         owned_vnodes(&registry, NodeId(leader_node.instance_id.0)),
         Arc::clone(&leader_node.controller),
-    );
+    )
+    .await;
     let mut follower_coord = make_coord(
         follower_dir.path(),
         backend.clone(),
         owned_vnodes(&registry, NodeId(follower_node.instance_id.0)),
         Arc::clone(&follower_node.controller),
-    );
+    )
+    .await;
 
     // The test drives the follower task manually with a synthetic
     // PREPARE announcement — in production the pipeline observes the

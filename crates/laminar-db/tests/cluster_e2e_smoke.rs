@@ -144,8 +144,8 @@ async fn happy_path_eight_keys_correct_sums() {
     // Cross-node epoch sanity: both nodes' persisted manifest should be
     // at the epoch the leader's checkpoint just committed, ±1 (review
     // item H5). Wider drift signals a 2PC-mirror miss.
-    let leader_epoch = manifest_epoch(&leader_node.db);
-    let follower_epoch = manifest_epoch(&follower_node.db);
+    let leader_epoch = manifest_epoch(&leader_node.db).await;
+    let follower_epoch = manifest_epoch(&follower_node.db).await;
     assert!(
         leader_epoch.abs_diff(follower_epoch) <= 1,
         "manifest epoch drift > 1: leader={leader_epoch} follower={follower_epoch}",

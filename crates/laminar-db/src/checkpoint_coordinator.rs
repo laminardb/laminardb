@@ -212,17 +212,33 @@ pub struct CheckpointCoordinator {
 impl CheckpointCoordinator {
     /// Creates a new checkpoint coordinator.
     ///
-    /// Reads the latest stored checkpoint to seed `next_checkpoint_id` and
-    /// `epoch`, so construction is async.
-    pub async fn new(config: CheckpointConfig, store: Box<dyn CheckpointStore>) -> Self {
+    /// Reads the latest stored checkpoint to seed `next_checkpoint_id`
+    /// and `epoch`. A transient load failure (e.g., S3 5xx, fs read
+    /// error) is surfaced as [`DbError::Checkpoint`] instead of
+    /// silently starting at `(1, 1)` — which would collide with
+    /// existing on-disk checkpoints once the store recovers.
+    ///
+    /// # Errors
+    /// Returns [`DbError::Checkpoint`] if [`CheckpointStore::load_latest`]
+    /// fails. `Ok(None)` is the fresh-start path and is not an error.
+    pub async fn new(
+        config: CheckpointConfig,
+        store: Box<dyn CheckpointStore>,
+    ) -> Result<Self, DbError> {
         let store: Arc<dyn CheckpointStore> = Arc::from(store);
-        // Determine starting epoch from stored checkpoints.
         let (next_id, epoch) = match store.load_latest().await {
             Ok(Some(m)) => (m.checkpoint_id + 1, m.epoch + 1),
-            _ => (1, 1),
+            Ok(None) => (1, 1),
+            Err(e) => {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6028] failed to load latest checkpoint at coordinator \
+                     construction: {e} — refusing to start at epoch 1 and \
+                     clobber existing on-disk state"
+                )));
+            }
         };
 
-        Self {
+        Ok(Self {
             config,
             store,
             sinks: Vec::new(),
@@ -245,7 +261,7 @@ impl CheckpointCoordinator {
             #[cfg(feature = "cluster-unstable")]
             cluster_controller: None,
             cached_sorted_sink_names: None,
-        }
+        })
     }
 
     /// Activates cluster-mode 2PC. Without this the coordinator runs
@@ -1724,7 +1740,9 @@ mod tests {
 
     async fn make_coordinator(dir: &std::path::Path) -> CheckpointCoordinator {
         let store = Box::new(FileSystemCheckpointStore::new(dir, 3));
-        CheckpointCoordinator::new(CheckpointConfig::default(), store).await
+        CheckpointCoordinator::new(CheckpointConfig::default(), store)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -2033,7 +2051,7 @@ mod tests {
             state_inline_threshold: 100, // 100 bytes threshold
             ..CheckpointConfig::default()
         };
-        let mut coord = CheckpointCoordinator::new(config, store).await;
+        let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
 
         // Small state stays inline, large state goes to sidecar
         let mut ops = HashMap::new();
@@ -2070,7 +2088,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
         let config = CheckpointConfig::default(); // 1MB threshold
-        let mut coord = CheckpointCoordinator::new(config, store).await;
+        let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
 
         let mut ops = HashMap::new();
         ops.insert("op1".into(), bytes::Bytes::from_static(b"small-state"));
@@ -2147,7 +2165,9 @@ mod tests {
             .insert("kafka_out".into(), SinkCommitStatus::Pending);
         store.save_with_state(&orphan, None).await.unwrap();
 
-        let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store).await;
+        let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+            .await
+            .unwrap();
         let self_id = NodeId(1);
         let kv = Arc::new(InMemoryKv::new(self_id));
         let kv_trait: Arc<dyn ClusterKv> = kv.clone();
@@ -2183,7 +2203,9 @@ mod tests {
             .insert("out".into(), SinkCommitStatus::Committed);
         store.save_with_state(&clean, None).await.unwrap();
 
-        let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store).await;
+        let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+            .await
+            .unwrap();
         let self_id = NodeId(1);
         let kv = Arc::new(InMemoryKv::new(self_id));
         let kv_trait: Arc<dyn ClusterKv> = kv.clone();
@@ -2707,7 +2729,7 @@ mod tests {
         let store = Box::new(
             laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(dir.path(), 3),
         );
-        let mut coord = CheckpointCoordinator::new(config, store).await;
+        let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let sink = StuckRollbackSink { schema };
