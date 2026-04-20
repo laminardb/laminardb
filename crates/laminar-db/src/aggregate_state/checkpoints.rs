@@ -1,11 +1,16 @@
 //! Serializable checkpoint shapes.
 //!
-//! **Wire format note:** each `Vec<u8>` / `Vec<Vec<u8>>` below is an
-//! Arrow IPC stream produced by
-//! [`scalars_to_ipc`](super::scalars_to_ipc). Historically these were
-//! `Vec<serde_json::Value>` and `Vec<Vec<serde_json::Value>>` — see
-//! [`scalar_ipc`](super::scalar_ipc) for the rationale and for the
-//! one-row-batch encoding of a scalar tuple.
+//! **Wire format note:** scalar aggregate fields (`GroupCheckpoint.key`,
+//! `GroupCheckpoint.acc_states`, `EmittedCheckpoint.key`,
+//! `EmittedCheckpoint.values`) are Arrow IPC streams produced by
+//! [`scalars_to_ipc`](super::scalars_to_ipc) — one-row batches encoding
+//! a tuple of `ScalarValue`s. Historically these were
+//! `Vec<serde_json::Value>` / `Vec<Vec<serde_json::Value>>`; see
+//! [`scalar_ipc`](super::scalar_ipc) for the rationale.
+//!
+//! `JoinStateCheckpoint.left_batches` / `right_batches` are a different
+//! shape: they hold Arrow IPC streams of full multi-row `RecordBatch`es
+//! and are *not* produced by `scalars_to_ipc`.
 
 use std::hash::{Hash, Hasher};
 

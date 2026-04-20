@@ -38,7 +38,7 @@ pub enum Profile {
     Embedded,
     /// Object-store checkpoints + rkyv snapshots.
     Durable,
-    /// Full distributed: Durable + gRPC + gossip + Raft.
+    /// Full distributed: Durable + gRPC + gossip + cluster primitives.
     Cluster,
 }
 
