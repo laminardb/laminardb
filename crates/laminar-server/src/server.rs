@@ -9,16 +9,16 @@ use tracing::info;
 use laminar_core::streaming::checkpoint::StreamCheckpointConfig;
 use laminar_db::{DbError, EngineMetrics, LaminarDB, Profile};
 
+#[cfg(feature = "cluster-unstable")]
+use crate::cluster_config::{ClusterConfig, ClusterConfigError};
 use crate::config::{
     ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
 };
-#[cfg(test)]
-use laminar_core::state::StateBackendConfig;
-#[cfg(feature = "cluster-unstable")]
-use crate::cluster_config::{ClusterConfig, ClusterConfigError};
 use crate::http;
 use crate::metrics::ServerMetrics;
 use crate::reload::ReloadGuard;
+#[cfg(test)]
+use laminar_core::state::StateBackendConfig;
 
 /// Handle to a running LaminarDB server. Call `wait_for_shutdown` to block until Ctrl-C.
 pub enum ServerHandle {

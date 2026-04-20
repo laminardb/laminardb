@@ -83,11 +83,11 @@ impl GraphOperator for TemporalProbeJoinOperator {
         let cp: TemporalProbeCheckpoint =
             rkyv::from_bytes::<TemporalProbeCheckpoint, rkyv::rancor::Error>(&checkpoint.data)
                 .map_err(|e| {
-                DbError::Pipeline(format!(
-                    "temporal probe [{}]: checkpoint deserialization: {e}",
-                    self.projection.op_name
-                ))
-            })?;
+                    DbError::Pipeline(format!(
+                        "temporal probe [{}]: checkpoint deserialization: {e}",
+                        self.projection.op_name
+                    ))
+                })?;
 
         self.state = TemporalProbeState::from_checkpoint(&cp)?;
         Ok(())

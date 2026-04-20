@@ -121,7 +121,10 @@ impl AssignmentSnapshotStore {
         let path = OsPath::from(SNAPSHOT_PATH);
         match self.store.get(&path).await {
             Ok(res) => {
-                let bytes = res.bytes().await.map_err(|e| SnapshotError::Io(e.to_string()))?;
+                let bytes = res
+                    .bytes()
+                    .await
+                    .map_err(|e| SnapshotError::Io(e.to_string()))?;
                 let snap = serde_json::from_slice(&bytes)?;
                 Ok(Some(snap))
             }
@@ -280,8 +283,7 @@ mod tests {
         let assignment = vec![NodeId(1), NodeId(2), NodeId(1), NodeId(2)];
         let map = AssignmentSnapshot::vnodes_from_vec(&assignment);
         let snap = AssignmentSnapshot::empty().next(map);
-        let back =
-            snap.to_vnode_vec(u32::try_from(assignment.len()).expect("test len fits u32"));
+        let back = snap.to_vnode_vec(u32::try_from(assignment.len()).expect("test len fits u32"));
         assert_eq!(back, assignment);
     }
 }

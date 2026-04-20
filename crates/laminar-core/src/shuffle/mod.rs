@@ -8,6 +8,6 @@ pub mod transport;
 
 pub use barrier_tracker::BarrierTracker;
 pub use message::ShuffleMessage;
-pub use transport::{ShufflePeerId, ShuffleReceiver, ShuffleSender};
 #[cfg(feature = "cluster-unstable")]
 pub use transport::SHUFFLE_ADDR_KEY;
+pub use transport::{ShufflePeerId, ShuffleReceiver, ShuffleSender};

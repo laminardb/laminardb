@@ -211,10 +211,12 @@ impl LaminarDB {
                 let owner = {
                     #[cfg(feature = "cluster-unstable")]
                     {
-                        self.cluster_controller.lock().as_ref().map_or(
-                            laminar_core::state::NodeId(0),
-                            |c| laminar_core::state::NodeId(c.instance_id().0),
-                        )
+                        self.cluster_controller
+                            .lock()
+                            .as_ref()
+                            .map_or(laminar_core::state::NodeId(0), |c| {
+                                laminar_core::state::NodeId(c.instance_id().0)
+                            })
                     }
                     #[cfg(not(feature = "cluster-unstable"))]
                     {
@@ -360,16 +362,13 @@ impl LaminarDB {
             if let (Some(sender), Some(receiver), Some(registry), Some(controller)) =
                 (sender, receiver, registry, controller)
             {
-                let self_id =
-                    laminar_core::state::NodeId(controller.instance_id().0);
-                graph.set_cluster_shuffle(
-                    crate::operator::sql_query::ClusterShuffleConfig {
-                        registry,
-                        sender,
-                        receiver,
-                        self_id,
-                    },
-                );
+                let self_id = laminar_core::state::NodeId(controller.instance_id().0);
+                graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
+                    registry,
+                    sender,
+                    receiver,
+                    self_id,
+                });
             }
         }
 

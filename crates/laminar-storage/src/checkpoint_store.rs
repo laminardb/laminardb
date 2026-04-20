@@ -29,10 +29,7 @@ use crate::checkpoint_manifest::CheckpointManifest;
 /// Fsync a file to ensure its contents are durable on disk.
 async fn sync_file(path: &Path) -> Result<(), std::io::Error> {
     // Must open with write access — Windows requires it for FlushFileBuffers.
-    let f = tokio::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .await?;
+    let f = tokio::fs::OpenOptions::new().write(true).open(path).await?;
     f.sync_all().await
 }
 
@@ -223,10 +220,8 @@ pub trait CheckpointStore: Send + Sync {
     ///
     /// # Errors
     /// Returns [`CheckpointStoreError`] on I/O or deserialization failure.
-    async fn load_by_id(
-        &self,
-        id: u64,
-    ) -> Result<Option<CheckpointManifest>, CheckpointStoreError>;
+    async fn load_by_id(&self, id: u64)
+        -> Result<Option<CheckpointManifest>, CheckpointStoreError>;
 
     /// Lists all available checkpoints as `(id, epoch)` pairs, sorted
     /// ascending by ID. May read every manifest; callers that only
@@ -289,8 +284,7 @@ pub trait CheckpointStore: Send + Sync {
     ///
     /// # Errors
     /// Returns [`CheckpointStoreError`] on I/O failure.
-    async fn load_state_data(&self, id: u64)
-        -> Result<Option<Vec<u8>>, CheckpointStoreError>;
+    async fn load_state_data(&self, id: u64) -> Result<Option<Vec<u8>>, CheckpointStoreError>;
 
     /// Validate a specific checkpoint's integrity.
     ///
@@ -300,10 +294,7 @@ pub trait CheckpointStore: Send + Sync {
     /// # Errors
     ///
     /// Returns [`CheckpointStoreError`] on I/O failure.
-    async fn validate_checkpoint(
-        &self,
-        id: u64,
-    ) -> Result<ValidationResult, CheckpointStoreError> {
+    async fn validate_checkpoint(&self, id: u64) -> Result<ValidationResult, CheckpointStoreError> {
         let mut issues = Vec::new();
 
         // Load manifest — corrupt JSON is a validation failure, not an I/O error.
@@ -379,9 +370,7 @@ pub trait CheckpointStore: Send + Sync {
     /// # Errors
     ///
     /// Returns [`CheckpointStoreError`] on I/O failure.
-    async fn recover_latest_validated(
-        &self,
-    ) -> Result<RecoveryReport, CheckpointStoreError> {
+    async fn recover_latest_validated(&self) -> Result<RecoveryReport, CheckpointStoreError> {
         let start = std::time::Instant::now();
         let mut skipped = Vec::new();
 
@@ -585,8 +574,9 @@ impl FileSystemCheckpointStore {
             }
             let path = entry.path();
             let has_state = tokio::fs::metadata(path.join("state.bin")).await.is_ok();
-            let has_manifest =
-                tokio::fs::metadata(path.join("manifest.json")).await.is_ok();
+            let has_manifest = tokio::fs::metadata(path.join("manifest.json"))
+                .await
+                .is_ok();
             if has_state && !has_manifest {
                 orphans.push(path);
             }
@@ -787,10 +777,7 @@ impl CheckpointStore for FileSystemCheckpointStore {
         Ok(cleaned)
     }
 
-    async fn load_state_data(
-        &self,
-        id: u64,
-    ) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
+    async fn load_state_data(&self, id: u64) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
         let path = self.state_path(id);
         match tokio::fs::read(&path).await {
             Ok(data) => Ok(Some(data)),
@@ -904,9 +891,7 @@ impl ObjectStoreCheckpointStore {
                 .await;
             match result {
                 Ok(_) => return Ok(()),
-                Err(object_store::Error::Generic { .. })
-                    if attempt < BACKOFFS_MS.len() =>
-                {
+                Err(object_store::Error::Generic { .. }) if attempt < BACKOFFS_MS.len() => {
                     let delay = std::time::Duration::from_millis(BACKOFFS_MS[attempt]);
                     tracing::warn!(
                         path = %path,
@@ -964,11 +949,9 @@ impl ObjectStoreCheckpointStore {
             .try_collect()
             .await?;
         for entry in &entries {
-            if let Some(id) = parse_checkpoint_id_from_path(
-                entry.location.as_ref(),
-                "manifest-",
-                ".json",
-            ) {
+            if let Some(id) =
+                parse_checkpoint_id_from_path(entry.location.as_ref(), "manifest-", ".json")
+            {
                 ids.insert(id);
             }
         }
@@ -1178,13 +1161,11 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         // bytes reach the object-store client untouched.
         let payload: PutPayload = chunks.iter().cloned().collect();
         // Sidecar writes are idempotent — retry transients.
-        self.put_with_retry(&path, payload, &PutOptions::default()).await
+        self.put_with_retry(&path, payload, &PutOptions::default())
+            .await
     }
 
-    async fn load_state_data(
-        &self,
-        id: u64,
-    ) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
+    async fn load_state_data(&self, id: u64) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
         Ok(self
             .get_bytes(&self.state_path(id))
             .await?
@@ -1615,8 +1596,7 @@ mod tests {
     #[tokio::test]
     async fn test_obj_with_prefix() {
         let inner = Arc::new(object_store::memory::InMemory::new());
-        let store =
-            ObjectStoreCheckpointStore::new(inner, "nodes/abc123/".to_string(), 10);
+        let store = ObjectStoreCheckpointStore::new(inner, "nodes/abc123/".to_string(), 10);
 
         store.save(&make_manifest(1, 42)).await.unwrap();
         let loaded = store.load_latest().await.unwrap().unwrap();
@@ -1931,7 +1911,10 @@ mod tests {
         let result = store.validate_checkpoint(1).await.unwrap();
         assert!(!result.valid);
         assert!(
-            result.issues.iter().any(|i| i.message().contains("not found")),
+            result
+                .issues
+                .iter()
+                .any(|i| i.message().contains("not found")),
             "should report missing state: {:?}",
             result.issues
         );

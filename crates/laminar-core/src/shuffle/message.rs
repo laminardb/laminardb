@@ -84,9 +84,8 @@ where
 
     // Frame: [u32 total_len BE][u8 tag][payload]
     // total_len = 1 (tag) + payload.len()
-    let total_len = u32::try_from(payload.len() + 1).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "frame length overflow")
-    })?;
+    let total_len = u32::try_from(payload.len() + 1)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame length overflow"))?;
     writer.write_all(&total_len.to_be_bytes()).await?;
     writer.write_all(&[tag]).await?;
     writer.write_all(&payload).await?;
@@ -209,7 +208,9 @@ mod tests {
             epoch: 42,
             flags: flags::FULL_SNAPSHOT,
         };
-        write_message(&mut a, &ShuffleMessage::Barrier(barrier)).await.unwrap();
+        write_message(&mut a, &ShuffleMessage::Barrier(barrier))
+            .await
+            .unwrap();
         let got = read_message(&mut b).await.unwrap();
         assert_eq!(got, ShuffleMessage::Barrier(barrier));
     }
@@ -233,7 +234,9 @@ mod tests {
     #[tokio::test]
     async fn hello_roundtrip() {
         let (mut a, mut b) = duplex(64);
-        write_message(&mut a, &ShuffleMessage::Hello(0xDEAD_BEEF)).await.unwrap();
+        write_message(&mut a, &ShuffleMessage::Hello(0xDEAD_BEEF))
+            .await
+            .unwrap();
         assert_eq!(
             read_message(&mut b).await.unwrap(),
             ShuffleMessage::Hello(0xDEAD_BEEF)
@@ -260,9 +263,15 @@ mod tests {
         let batch1 = sample_batch();
         let barrier = CheckpointBarrier::new(1, 1);
 
-        write_message(&mut a, &ShuffleMessage::VnodeData(0, batch1.clone())).await.unwrap();
-        write_message(&mut a, &ShuffleMessage::Barrier(barrier)).await.unwrap();
-        write_message(&mut a, &ShuffleMessage::Hello(9)).await.unwrap();
+        write_message(&mut a, &ShuffleMessage::VnodeData(0, batch1.clone()))
+            .await
+            .unwrap();
+        write_message(&mut a, &ShuffleMessage::Barrier(barrier))
+            .await
+            .unwrap();
+        write_message(&mut a, &ShuffleMessage::Hello(9))
+            .await
+            .unwrap();
 
         assert!(matches!(
             read_message(&mut b).await.unwrap(),
@@ -272,7 +281,10 @@ mod tests {
             read_message(&mut b).await.unwrap(),
             ShuffleMessage::Barrier(barrier)
         );
-        assert_eq!(read_message(&mut b).await.unwrap(), ShuffleMessage::Hello(9));
+        assert_eq!(
+            read_message(&mut b).await.unwrap(),
+            ShuffleMessage::Hello(9)
+        );
     }
 
     #[tokio::test]
@@ -280,7 +292,7 @@ mod tests {
         // Write a hand-rolled frame with a bogus tag.
         let (mut a, mut b) = duplex(64);
         a.write_all(&[0u8, 0, 0, 1]).await.unwrap(); // total_len = 1
-        a.write_all(&[0x7Fu8]).await.unwrap();       // unknown tag
+        a.write_all(&[0x7Fu8]).await.unwrap(); // unknown tag
         drop(a);
 
         let err = read_message(&mut b).await.unwrap_err();

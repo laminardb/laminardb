@@ -31,9 +31,7 @@ pub enum StateBackendError {
     /// attempts to persist state at a version that has since been
     /// superseded. The caller should abandon the write, refresh its
     /// assignment snapshot, and retry at the new version.
-    #[error(
-        "stale assignment version: caller={caller} < authoritative={authoritative}"
-    )]
+    #[error("stale assignment version: caller={caller} < authoritative={authoritative}")]
     StaleVersion {
         /// Version the writer believes is current.
         caller: u64,
@@ -116,11 +114,7 @@ pub trait StateBackend: Send + Sync + 'static {
     /// The checkpoint coordinator calls this after sinks precommit
     /// and before they commit. Sinks do not commit until this returns
     /// `Ok(true)`.
-    async fn epoch_complete(
-        &self,
-        epoch: u64,
-        vnodes: &[u32],
-    ) -> Result<bool, StateBackendError>;
+    async fn epoch_complete(&self, epoch: u64, vnodes: &[u32]) -> Result<bool, StateBackendError>;
 
     /// Garbage-collect every partial and commit marker whose epoch is
     /// strictly less than `before`. Called by the checkpoint

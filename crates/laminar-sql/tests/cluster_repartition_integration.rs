@@ -14,8 +14,8 @@ use datafusion::execution::{SessionStateBuilder, TaskContext};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionConfig;
 use futures::StreamExt;
-use laminar_core::state::{round_robin_assignment, NodeId, VnodeRegistry};
 use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+use laminar_core::state::{round_robin_assignment, NodeId, VnodeRegistry};
 use laminar_sql::datafusion::cluster_repartition::ClusterRepartitionExec;
 
 fn schema() -> Arc<Schema> {
@@ -72,12 +72,8 @@ async fn phase_a_routes_rows_to_owning_instance() {
     let input_batch = batch(input_rows.clone());
 
     // Wrap the batch as an in-memory exec with one partition.
-    let input: Arc<dyn ExecutionPlan> = MemorySourceConfig::try_new_exec(
-        &[vec![input_batch.clone()]],
-        schema(),
-        None,
-    )
-    .unwrap();
+    let input: Arc<dyn ExecutionPlan> =
+        MemorySourceConfig::try_new_exec(&[vec![input_batch.clone()]], schema(), None).unwrap();
 
     let exec = ClusterRepartitionExec::try_new(
         input,
@@ -101,14 +97,8 @@ async fn phase_a_routes_rows_to_owning_instance() {
         // it finishes the input stream, our bounded channel closes
         // and the output stream terminates.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while let Ok(Some(Ok(b))) =
-            tokio::time::timeout_at(deadline, stream.next()).await
-        {
-            let col = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap();
+        while let Ok(Some(Ok(b))) = tokio::time::timeout_at(deadline, stream.next()).await {
+            let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
             got_keys.extend(col.values().iter().copied());
         }
     }
@@ -118,9 +108,7 @@ async fn phase_a_routes_rows_to_owning_instance() {
     // Drain whatever B received through the shuffle.
     let mut b_keys: Vec<i64> = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    while let Ok(Some((_from, msg))) =
-        tokio::time::timeout_at(deadline, recv_b.recv()).await
-    {
+    while let Ok(Some((_from, msg))) = tokio::time::timeout_at(deadline, recv_b.recv()).await {
         if let laminar_core::shuffle::ShuffleMessage::VnodeData(_vnode, b) = msg {
             let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
             b_keys.extend(col.values().iter().copied());

@@ -84,9 +84,8 @@ pub struct LaminarDB {
     /// `None` in embedded / single-instance mode; `Some` activates the
     /// leader / follower checkpoint flow when the coordinator starts.
     #[cfg(feature = "cluster-unstable")]
-    pub(crate) cluster_controller: parking_lot::Mutex<
-        Option<Arc<laminar_core::cluster::control::ClusterController>>,
-    >,
+    pub(crate) cluster_controller:
+        parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::ClusterController>>>,
     /// State backend for durability-gate participation. Installed by
     /// `LaminarDbBuilder::state_backend`. When paired with a
     /// `vnode_registry` the coordinator writes per-vnode markers each
@@ -96,13 +95,11 @@ pub struct LaminarDB {
     /// Vnode topology + assignment. Installed by
     /// `LaminarDbBuilder::vnode_registry`. Needed for the coordinator to
     /// know which vnodes this instance owns.
-    pub(crate) vnode_registry:
-        parking_lot::Mutex<Option<Arc<laminar_core::state::VnodeRegistry>>>,
+    pub(crate) vnode_registry: parking_lot::Mutex<Option<Arc<laminar_core::state::VnodeRegistry>>>,
     /// Extra physical optimizer rules from the builder, applied to both
     /// `self.ctx` and the pipeline-side `OperatorGraph` context.
-    pub(crate) physical_optimizer_rules: Arc<
-        [Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>],
-    >,
+    pub(crate) physical_optimizer_rules:
+        Arc<[Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>]>,
     /// `target_partitions` override from the builder, mirrored into the
     /// pipeline-side `SessionContext`.
     pub(crate) pipeline_target_partitions: Option<usize>,
@@ -310,20 +307,14 @@ impl LaminarDB {
     /// [`LaminarDbBuilder::shuffle_sender`]. Must be set before `start()`
     /// to take effect.
     #[cfg(feature = "cluster-unstable")]
-    pub fn set_shuffle_sender(
-        &self,
-        sender: Arc<laminar_core::shuffle::ShuffleSender>,
-    ) {
+    pub fn set_shuffle_sender(&self, sender: Arc<laminar_core::shuffle::ShuffleSender>) {
         *self.shuffle_sender.lock() = Some(sender);
     }
 
     /// Install the inbound shuffle handle. Pair with
     /// [`Self::set_shuffle_sender`]; neither alone is a no-op.
     #[cfg(feature = "cluster-unstable")]
-    pub fn set_shuffle_receiver(
-        &self,
-        receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
-    ) {
+    pub fn set_shuffle_receiver(&self, receiver: Arc<laminar_core::shuffle::ShuffleReceiver>) {
         *self.shuffle_receiver.lock() = Some(receiver);
     }
 
@@ -1640,9 +1631,7 @@ impl LaminarDB {
                 )
             })?;
             return reply_rx.await.map_err(|_| {
-                DbError::Checkpoint(
-                    "pipeline callback dropped oneshot before replying".into(),
-                )
+                DbError::Checkpoint("pipeline callback dropped oneshot before replying".into())
             })?;
         }
 

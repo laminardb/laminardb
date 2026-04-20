@@ -12,12 +12,7 @@ use std::hash::{Hash, Hasher};
 use arrow::datatypes::Schema;
 
 #[derive(
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
+    Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub(crate) struct GroupCheckpoint {
     /// IPC bytes encoding the group key tuple (`Vec<ScalarValue>`).
@@ -34,12 +29,7 @@ fn default_last_updated() -> i64 {
 }
 
 #[derive(
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
+    Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub(crate) struct AggStateCheckpoint {
     pub fingerprint: u64,
@@ -49,12 +39,7 @@ pub(crate) struct AggStateCheckpoint {
 }
 
 #[derive(
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
+    Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub(crate) struct EmittedCheckpoint {
     /// IPC bytes for the key tuple.
@@ -64,12 +49,7 @@ pub(crate) struct EmittedCheckpoint {
 }
 
 #[derive(
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
+    Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub(crate) struct WindowCheckpoint {
     pub window_start: i64,
@@ -77,12 +57,7 @@ pub(crate) struct WindowCheckpoint {
 }
 
 #[derive(
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
+    Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub(crate) struct EowcStateCheckpoint {
     pub fingerprint: u64,
@@ -90,12 +65,7 @@ pub(crate) struct EowcStateCheckpoint {
 }
 
 #[derive(
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
+    Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub(crate) struct JoinStateCheckpoint {
     #[serde(default)]

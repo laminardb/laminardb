@@ -51,12 +51,7 @@ struct SessionGroupState {
 }
 
 #[derive(
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
+    Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub(crate) struct SessionCheckpoint {
     pub start: i64,
@@ -68,12 +63,7 @@ pub(crate) struct SessionCheckpoint {
 }
 
 #[derive(
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
+    Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub(crate) struct SessionGroupCheckpoint {
     /// Arrow IPC bytes for the group-key tuple.
@@ -82,12 +72,7 @@ pub(crate) struct SessionGroupCheckpoint {
 }
 
 #[derive(
-    Clone,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
+    Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub(crate) struct CoreWindowCheckpoint {
     pub fingerprint: u64,

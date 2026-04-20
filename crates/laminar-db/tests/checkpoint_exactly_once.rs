@@ -185,8 +185,7 @@ async fn test_barrier_checkpoint_recovery_round_trip() {
 
     // Phase 1: Run pipeline, trigger barrier checkpoint, persist.
     let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 5));
-    let mut coord =
-        CheckpointCoordinator::new(CheckpointConfig::default(), store).await;
+    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store).await;
 
     // Simulate barrier-aligned checkpoint: operator state captured at barrier.
     let mut operator_states = HashMap::new();

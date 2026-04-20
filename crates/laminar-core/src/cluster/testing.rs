@@ -303,11 +303,7 @@ struct PartitionableSocket {
 
 #[async_trait]
 impl Socket for PartitionableSocket {
-    async fn send(
-        &mut self,
-        to: SocketAddr,
-        msg: chitchat::ChitchatMessage,
-    ) -> anyhow::Result<()> {
+    async fn send(&mut self, to: SocketAddr, msg: chitchat::ChitchatMessage) -> anyhow::Result<()> {
         if self.rules.is_dropped(self.my_addr, to) {
             // Silently drop — simulates a network partition. Chitchat's
             // phi-accrual observes the absence, eventually marks the
@@ -436,10 +432,7 @@ impl MiniCluster {
     /// constructed with the same store, so a snapshot written by
     /// any node is visible to every other node and survives across
     /// a full cluster restart (provided the object store does).
-    pub async fn spawn_with_snapshot(
-        n: usize,
-        snapshot: Arc<AssignmentSnapshotStore>,
-    ) -> Self {
+    pub async fn spawn_with_snapshot(n: usize, snapshot: Arc<AssignmentSnapshotStore>) -> Self {
         Self::spawn_inner(n, None, Some(snapshot)).await
     }
 
@@ -456,11 +449,7 @@ impl MiniCluster {
         // Seed from every currently-present node so the rejoiner has
         // multiple contact points regardless of which one answers
         // first.
-        let seeds: Vec<String> = self
-            .nodes
-            .iter()
-            .map(|n| n.gossip_addr.clone())
-            .collect();
+        let seeds: Vec<String> = self.nodes.iter().map(|n| n.gossip_addr.clone()).collect();
         let port = grab_port();
         let gossip_addr = format!("127.0.0.1:{port}");
 
@@ -496,10 +485,7 @@ impl MiniCluster {
                     .await
                     .expect("partitionable chitchat start on rejoin");
             }
-            None => discovery
-                .start()
-                .await
-                .expect("chitchat start on rejoin"),
+            None => discovery.start().await.expect("chitchat start on rejoin"),
         }
 
         let handle = discovery
@@ -553,7 +539,11 @@ impl MiniCluster {
                 last_heartbeat_ms: 0,
             };
 
-            let seeds = if idx == 0 { Vec::new() } else { vec![seed.clone()] };
+            let seeds = if idx == 0 {
+                Vec::new()
+            } else {
+                vec![seed.clone()]
+            };
             // Aggressive timings: tests trade false-positive risk for
             // fast failover feedback. Production configs use the
             // chitchat defaults (phi=8.0, grace≈3s).
@@ -595,7 +585,11 @@ impl MiniCluster {
                 discovery,
             });
         }
-        Self { nodes, rules, snapshot }
+        Self {
+            nodes,
+            rules,
+            snapshot,
+        }
     }
 
     /// Parse and collect node gossip addresses — useful for building

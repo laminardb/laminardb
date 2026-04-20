@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
 use laminar_core::cluster::testing::MiniCluster;
-use laminar_core::state::{owned_vnodes, InProcessBackend, StateBackend, NodeId, VnodeRegistry};
+use laminar_core::state::{owned_vnodes, InProcessBackend, NodeId, StateBackend, VnodeRegistry};
 use laminar_db::checkpoint_coordinator::{
     CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
 };

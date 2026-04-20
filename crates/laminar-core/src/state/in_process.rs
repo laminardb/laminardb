@@ -69,11 +69,7 @@ impl StateBackend for InProcessBackend {
         Ok(self.partials.read().get(&(vnode, epoch)).cloned())
     }
 
-    async fn epoch_complete(
-        &self,
-        epoch: u64,
-        vnodes: &[u32],
-    ) -> Result<bool, StateBackendError> {
+    async fn epoch_complete(&self, epoch: u64, vnodes: &[u32]) -> Result<bool, StateBackendError> {
         let map = self.partials.read();
         for &v in vnodes {
             self.check_vnode(v)?;
@@ -87,7 +83,9 @@ impl StateBackend for InProcessBackend {
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {
         // Without this, every checkpoint leaks one Bytes per vnode
         // forever.
-        self.partials.write().retain(|&(_, epoch), _| epoch >= before);
+        self.partials
+            .write()
+            .retain(|&(_, epoch), _| epoch >= before);
         Ok(())
     }
 }
@@ -111,10 +109,16 @@ mod tests {
         let b = InProcessBackend::new(4);
         let vnodes = [0u32, 1, 2];
         assert!(!b.epoch_complete(1, &vnodes).await.unwrap());
-        b.write_partial(0, 1, 0, Bytes::from_static(b"a")).await.unwrap();
-        b.write_partial(1, 1, 0, Bytes::from_static(b"b")).await.unwrap();
+        b.write_partial(0, 1, 0, Bytes::from_static(b"a"))
+            .await
+            .unwrap();
+        b.write_partial(1, 1, 0, Bytes::from_static(b"b"))
+            .await
+            .unwrap();
         assert!(!b.epoch_complete(1, &vnodes).await.unwrap());
-        b.write_partial(2, 1, 0, Bytes::from_static(b"c")).await.unwrap();
+        b.write_partial(2, 1, 0, Bytes::from_static(b"c"))
+            .await
+            .unwrap();
         assert!(b.epoch_complete(1, &vnodes).await.unwrap());
         assert!(!b.epoch_complete(2, &vnodes).await.unwrap());
     }
@@ -131,8 +135,7 @@ mod tests {
 
     #[test]
     fn state_backend_is_object_safe() {
-        let _: std::sync::Arc<dyn StateBackend> =
-            std::sync::Arc::new(InProcessBackend::new(2));
+        let _: std::sync::Arc<dyn StateBackend> = std::sync::Arc::new(InProcessBackend::new(2));
     }
 
     #[tokio::test]

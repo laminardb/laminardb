@@ -26,9 +26,7 @@ use tokio::time::sleep;
 #[path = "common/cluster_harness.rs"]
 mod cluster_harness;
 
-use cluster_harness::{
-    input_batch, pick_keys_per_owner, read_mv_sums, ClusterEngineHarness,
-};
+use cluster_harness::{input_batch, pick_keys_per_owner, read_mv_sums, ClusterEngineHarness};
 // `manifest_epoch` is only used under `phase-1-recovery`; pulling it in
 // unconditionally trips `unused_imports` in the default build.
 #[cfg(feature = "phase-1-recovery")]
@@ -60,9 +58,8 @@ async fn split_brain_write_partial_rejected() {
     use object_store::ObjectStore;
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let store: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(
-        LocalFileSystem::new_with_prefix(dir.path()).expect("local fs"),
-    );
+    let store: std::sync::Arc<dyn ObjectStore> =
+        std::sync::Arc::new(LocalFileSystem::new_with_prefix(dir.path()).expect("local fs"));
 
     let fresh = ObjectStoreBackend::new(std::sync::Arc::clone(&store), "leader", 4);
     let stale = ObjectStoreBackend::new(std::sync::Arc::clone(&store), "ex-leader", 4);
@@ -270,8 +267,7 @@ async fn crash_mid_stream_loses_in_flight() {
     sleep(Duration::from_millis(500)).await;
 
     let post_crash_leader = read_mv_sums(&harness.nodes[0].db, "sums").await;
-    let post_crash_leader_keys: HashSet<i64> =
-        post_crash_leader.iter().map(|(k, _)| *k).collect();
+    let post_crash_leader_keys: HashSet<i64> = post_crash_leader.iter().map(|(k, _)| *k).collect();
 
     #[cfg(not(feature = "phase-2-rebalance"))]
     {
@@ -293,8 +289,7 @@ async fn crash_mid_stream_loses_in_flight() {
         // on the leader's MV. All 8 keys present on the leader, with
         // follower_keys' values doubled (phase_a + phase_c both
         // contributed, both at value = key * 10).
-        let all_keys: HashSet<i64> =
-            phase_a.iter().copied().collect::<HashSet<_>>();
+        let all_keys: HashSet<i64> = phase_a.iter().copied().collect::<HashSet<_>>();
         assert_eq!(
             post_crash_leader_keys, all_keys,
             "phase-2-rebalance: leader must hold all keys after rebalance",
@@ -358,8 +353,7 @@ async fn restart_recovers_sum_aggregate() {
         ),
     ];
     // 4 keys per owner = 8 total; first half = first 2 of each.
-    let key_buckets = pick_keys_per_owner(VNODE_COUNT, &owners, 4)
-        .expect("pick_keys_per_owner");
+    let key_buckets = pick_keys_per_owner(VNODE_COUNT, &owners, 4).expect("pick_keys_per_owner");
     let first_half: Vec<i64> = key_buckets[0].1[..2]
         .iter()
         .chain(key_buckets[1].1[..2].iter())
@@ -370,7 +364,11 @@ async fn restart_recovers_sum_aggregate() {
         .chain(key_buckets[1].1[2..4].iter())
         .copied()
         .collect();
-    let all_keys: Vec<i64> = first_half.iter().chain(second_half.iter()).copied().collect();
+    let all_keys: Vec<i64> = first_half
+        .iter()
+        .chain(second_half.iter())
+        .copied()
+        .collect();
 
     // Phase A: first half.
     let src = harness.nodes[leader_idx]
@@ -391,13 +389,9 @@ async fn restart_recovers_sum_aggregate() {
 
     // Phase B: shutdown, keep dirs, spawn fresh cluster pointing at them.
     let (shared_dir, checkpoint_dirs) = harness.shutdown_keep_dirs().await;
-    let harness2 = ClusterEngineHarness::spawn_with_dirs(
-        N_NODES,
-        VNODE_COUNT,
-        shared_dir,
-        checkpoint_dirs,
-    )
-    .await;
+    let harness2 =
+        ClusterEngineHarness::spawn_with_dirs(N_NODES, VNODE_COUNT, shared_dir, checkpoint_dirs)
+            .await;
 
     // Re-register DDL on each engine. OR REPLACE semantics aren't yet
     // supported; if the MV store restored the MV on startup, plain
@@ -442,8 +436,7 @@ async fn restart_recovers_sum_aggregate() {
     // Epoch drift check (review item H5): per-node `CheckpointStore`
     // counters can diverge across crashes. ≤1 is acceptable.
     let leader_epoch = manifest_epoch(&harness2.nodes[harness2.leader_idx()].db);
-    let follower_epoch =
-        manifest_epoch(&harness2.nodes[harness2.follower_idxs()[0]].db);
+    let follower_epoch = manifest_epoch(&harness2.nodes[harness2.follower_idxs()[0]].db);
     assert!(
         leader_epoch.abs_diff(follower_epoch) <= 1,
         "epoch drift > 1 after restart: leader={leader_epoch} follower={follower_epoch}",

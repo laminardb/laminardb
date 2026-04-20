@@ -129,8 +129,8 @@ fn spawn_membership_watcher(
 
 use laminar_db::{LaminarDB, Profile};
 
-use crate::config::ServerConfig;
 use crate::cluster_config::ClusterConfig;
+use crate::config::ServerConfig;
 use crate::server;
 
 #[derive(Debug, thiserror::Error)]
@@ -376,11 +376,8 @@ pub async fn start_cluster(
     // Without this wiring, streaming aggregates never cross node
     // boundaries — Phase 0a in the plan.
     let shuffle_receiver = build_shuffle_receiver(&discovery, node_id).await?;
-    let shuffle_sender = Arc::new(build_shuffle_sender(
-        node_id.0,
-        &discovery,
-        shuffle_receiver.local_addr(),
-    ).await);
+    let shuffle_sender =
+        Arc::new(build_shuffle_sender(node_id.0, &discovery, shuffle_receiver.local_addr()).await);
 
     // Streaming aggregates go through the row-shuffle bridge driven by
     // `IncrementalAggState`; the DataFusion-native aggregate-rewrite
@@ -506,8 +503,8 @@ async fn resolve_vnode_assignment(
 
     // Nothing stored yet — propose ours and CAS-create. A racing peer
     // may win; if so, re-load and adopt the winner.
-    let proposal = AssignmentSnapshot::empty()
-        .next(AssignmentSnapshot::vnodes_from_vec(&assignment));
+    let proposal =
+        AssignmentSnapshot::empty().next(AssignmentSnapshot::vnodes_from_vec(&assignment));
     let winner = match snapshot_store
         .save_if_absent(&proposal)
         .await
@@ -554,11 +551,13 @@ async fn build_shuffle_receiver(
             let kv: Arc<dyn ClusterKv> = Arc::new(ChitchatKv::from_handle(handle));
             ShuffleReceiver::bind_with_kv(node_id.0, bind, kv)
                 .await
-                .map_err(|e| ClusterStartupError::EngineConstruction(format!("shuffle bind: {e}")))?
+                .map_err(|e| {
+                    ClusterStartupError::EngineConstruction(format!("shuffle bind: {e}"))
+                })?
         } else {
-            ShuffleReceiver::bind(node_id.0, bind)
-                .await
-                .map_err(|e| ClusterStartupError::EngineConstruction(format!("shuffle bind: {e}")))?
+            ShuffleReceiver::bind(node_id.0, bind).await.map_err(|e| {
+                ClusterStartupError::EngineConstruction(format!("shuffle bind: {e}"))
+            })?
         }
     } else {
         ShuffleReceiver::bind(node_id.0, bind)

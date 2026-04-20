@@ -56,9 +56,7 @@ pub async fn delete_topic(brokers: &str, topic: &str) {
         .set("bootstrap.servers", brokers)
         .create()
         .expect("admin client");
-    let _ = admin
-        .delete_topics(&[topic], &AdminOptions::new())
-        .await;
+    let _ = admin.delete_topics(&[topic], &AdminOptions::new()).await;
 }
 
 /// Produce `count` JSON records shaped `{"id": i, "value": i * 10}`.
@@ -177,9 +175,7 @@ pub fn minio_endpoint() -> Option<&'static str> {
 ///
 /// # Panics
 /// Panics if MinIO isn't reachable, or bucket creation fails.
-pub async fn minio_store(
-    bucket: &str,
-) -> std::sync::Arc<dyn object_store::ObjectStore> {
+pub async fn minio_store(bucket: &str) -> std::sync::Arc<dyn object_store::ObjectStore> {
     use object_store::aws::AmazonS3Builder;
     use object_store::ObjectStore;
     let _ = minio_endpoint().expect("MinIO must be up; run `docker compose up -d minio`");
@@ -215,7 +211,14 @@ pub async fn minio_store(
             assert!(s.success(), "mc alias set failed");
         }
         let _ = Command::new("docker")
-            .args(["exec", "laminardb-minio", "mc", "--quiet", "mb", format!("local/{bucket}").as_str()])
+            .args([
+                "exec",
+                "laminardb-minio",
+                "mc",
+                "--quiet",
+                "mb",
+                format!("local/{bucket}").as_str(),
+            ])
             .status();
     }
     std::sync::Arc::new(root) as std::sync::Arc<dyn ObjectStore>

@@ -38,15 +38,7 @@ async fn barrier_fans_out_and_both_nodes_align() {
     // assignment (not round-robin) makes the test's expected state
     // explicit.
     let registry = Arc::new(VnodeRegistry::new(4));
-    registry.set_assignment(
-        vec![
-            NodeId(1),
-            NodeId(2),
-            NodeId(1),
-            NodeId(2),
-        ]
-        .into(),
-    );
+    registry.set_assignment(vec![NodeId(1), NodeId(2), NodeId(1), NodeId(2)].into());
 
     // Chicken-and-egg: each node needs the other's bound address to
     // register its sender. We bind B's receiver first, then build A

@@ -6,9 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use laminar_core::checkpoint::barrier::{flags, CheckpointBarrier};
-use laminar_core::shuffle::{
-    BarrierTracker, ShuffleMessage, ShuffleReceiver, ShuffleSender,
-};
+use laminar_core::shuffle::{BarrierTracker, ShuffleMessage, ShuffleReceiver, ShuffleSender};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn barrier_fan_out_aligns_on_both_receivers() {

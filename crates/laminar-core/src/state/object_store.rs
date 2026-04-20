@@ -82,12 +82,10 @@ impl ObjectStoreBackend {
     /// with a value less than or equal to the current one is a no-op.
     ///
     /// The host should call this whenever it adopts a newer
-    /// [`AssignmentSnapshot`] (on initial load and on each subsequent
+    /// `AssignmentSnapshot` (on initial load and on each subsequent
     /// rotation). After this call, any in-flight `write_partial` from
     /// a stale writer whose caller version is below `version` is
     /// rejected with [`StateBackendError::StaleVersion`].
-    ///
-    /// [`AssignmentSnapshot`]: crate::cluster::control::AssignmentSnapshot
     pub fn set_authoritative_version(&self, version: u64) {
         // CAS-like loop to avoid lowering the version on a late call.
         let mut cur = self.authoritative_version.load(Ordering::Acquire);
@@ -107,7 +105,7 @@ impl ObjectStoreBackend {
     /// Shared handle to the authoritative version counter. Callers that
     /// want to bump several objects (e.g. backend plus a future metric)
     /// from a single owner can clone this handle instead of relaying
-    /// through [`set_authoritative_version`].
+    /// through [`Self::set_authoritative_version`].
     #[must_use]
     pub fn authoritative_version_handle(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.authoritative_version)
@@ -183,11 +181,7 @@ impl StateBackend for ObjectStoreBackend {
         }
     }
 
-    async fn epoch_complete(
-        &self,
-        epoch: u64,
-        vnodes: &[u32],
-    ) -> Result<bool, StateBackendError> {
+    async fn epoch_complete(&self, epoch: u64, vnodes: &[u32]) -> Result<bool, StateBackendError> {
         let commit = Self::commit_path(epoch);
         // Fast path: a marker already exists. Previously we returned
         // `Ok(true)` blindly — that swallowed split-brain (two leaders
@@ -298,10 +292,7 @@ impl ObjectStoreBackend {
     /// [`StateBackendError::SplitBrainCommit`] so the caller aborts
     /// rather than double-committing downstream. Phase 2 split-brain
     /// hardening.
-    async fn verify_commit_marker(
-        &self,
-        commit: &OsPath,
-    ) -> Result<bool, StateBackendError> {
+    async fn verify_commit_marker(&self, commit: &OsPath) -> Result<bool, StateBackendError> {
         let res = self
             .store
             .get(commit)

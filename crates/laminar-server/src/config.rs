@@ -565,10 +565,7 @@ delivery = "exactly_once"
         let config: ServerConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.node_id.as_deref(), Some("star-1"));
         assert_eq!(config.server.mode, "cluster");
-        assert!(matches!(
-            config.state,
-            StateBackendConfig::Local { .. }
-        ));
+        assert!(matches!(config.state, StateBackendConfig::Local { .. }));
         assert!(config.discovery.is_some());
         assert!(config.coordination.is_some());
 
@@ -752,10 +749,7 @@ bind = "not-a-socket-addr"
         assert_eq!(config.server.mode, "embedded");
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert_eq!(config.server.workers, 0);
-        assert!(matches!(
-            config.state,
-            StateBackendConfig::InProcess { .. }
-        ));
+        assert!(matches!(config.state, StateBackendConfig::InProcess { .. }));
         assert_eq!(config.checkpoint.interval, Duration::from_secs(10));
     }
 

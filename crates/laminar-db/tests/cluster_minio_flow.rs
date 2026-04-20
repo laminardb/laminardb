@@ -8,15 +8,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
-use object_store::ObjectStoreExt;
 use laminar_core::cluster::testing::MiniCluster;
 use laminar_core::state::{
-    owned_vnodes, round_robin_assignment, ObjectStoreBackend, NodeId, VnodeRegistry,
+    owned_vnodes, round_robin_assignment, NodeId, ObjectStoreBackend, VnodeRegistry,
 };
 use laminar_db::checkpoint_coordinator::{
     CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
 };
 use laminar_storage::checkpoint_store::FileSystemCheckpointStore;
+use object_store::ObjectStoreExt;
 
 mod common;
 use common::{minio_endpoint, minio_store};

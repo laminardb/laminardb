@@ -22,9 +22,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use datafusion_common::DataFusionError;
 use futures::stream::{self, StreamExt};
 use laminar_core::checkpoint::barrier::CheckpointBarrier;
-use laminar_core::shuffle::{
-    BarrierTracker, ShufflePeerId, ShuffleReceiver, ShuffleSender,
-};
+use laminar_core::shuffle::{BarrierTracker, ShufflePeerId, ShuffleReceiver, ShuffleSender};
 use laminar_core::state::{owned_vnodes, NodeId, VnodeRegistry};
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
@@ -94,11 +92,7 @@ impl ClusterRepartitionExec {
                 self_id
             )));
         }
-        let vnode_to_partition = owned
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| (v, i))
-            .collect();
+        let vnode_to_partition = owned.iter().enumerate().map(|(i, &v)| (v, i)).collect();
 
         // Enumerate distinct peers from the registry (everyone who
         // owns at least one vnode and isn't us). Frozen at construction
@@ -191,8 +185,7 @@ impl ClusterRepartitionExec {
         //   - peer_barrier_(tx|rx):   dispatcher → router (after peer gossip)
         //   - aligned_(tx|rx):        router → subscribers (watch channel)
         let (inject_tx, inject_rx) = mpsc::unbounded_channel::<CheckpointBarrier>();
-        let (peer_tx, peer_rx) =
-            mpsc::unbounded_channel::<(ShufflePeerId, CheckpointBarrier)>();
+        let (peer_tx, peer_rx) = mpsc::unbounded_channel::<(ShufflePeerId, CheckpointBarrier)>();
         let (aligned_tx, aligned_rx) = watch::channel::<u64>(0);
 
         let router_txs = partition_txs.clone();
@@ -326,17 +319,17 @@ impl ExecutionPlan for ClusterRepartitionExec {
         let schema = Arc::clone(&self.schema);
         let fut = async move {
             let mut guard = runtime.receivers.lock().await;
-            guard[partition]
-                .take()
-                .ok_or_else(|| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "ClusterRepartitionExec::execute called twice for \
+            guard[partition].take().ok_or_else(|| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "ClusterRepartitionExec::execute called twice for \
                          partition {partition}; receivers are single-use"
-                    ))
-                })
+                ))
+            })
         };
         let stream = stream::once(fut).flat_map(move |maybe_rx| match maybe_rx {
-            Ok(rx) => tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok).boxed(),
+            Ok(rx) => tokio_stream::wrappers::ReceiverStream::new(rx)
+                .map(Ok)
+                .boxed(),
             Err(e) => stream::once(async move { Err(e) }).boxed(),
         });
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
@@ -345,11 +338,7 @@ impl ExecutionPlan for ClusterRepartitionExec {
 
 /// Per-row vnode, hashed via `arrow::row::RowConverter` on the key
 /// columns (works for any Arrow type).
-fn row_vnodes(
-    batch: &RecordBatch,
-    hash_columns: &[usize],
-    vnode_count: u32,
-) -> Vec<u32> {
+fn row_vnodes(batch: &RecordBatch, hash_columns: &[usize], vnode_count: u32) -> Vec<u32> {
     use arrow::row::{RowConverter, SortField};
     use laminar_core::state::key_hash;
 
@@ -373,11 +362,7 @@ fn row_vnodes(
         .collect()
 }
 
-fn slice_for_vnode(
-    batch: &RecordBatch,
-    vnodes: &[u32],
-    target_vnode: u32,
-) -> Option<RecordBatch> {
+fn slice_for_vnode(batch: &RecordBatch, vnodes: &[u32], target_vnode: u32) -> Option<RecordBatch> {
     let indices: UInt32Array = vnodes
         .iter()
         .enumerate()
@@ -420,11 +405,8 @@ async fn route_input_stream(
     let vnode_count = registry.vnode_count();
     let n_inputs = peers.len() + 1;
     let tracker = BarrierTracker::new(n_inputs);
-    let peer_port: HashMap<ShufflePeerId, usize> = peers
-        .iter()
-        .enumerate()
-        .map(|(i, &p)| (p, i + 1))
-        .collect();
+    let peer_port: HashMap<ShufflePeerId, usize> =
+        peers.iter().enumerate().map(|(i, &p)| (p, i + 1)).collect();
 
     // Once the local input stream ends we drop it so the select arm
     // becomes `pending` forever. Partition senders are also dropped

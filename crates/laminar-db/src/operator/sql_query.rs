@@ -492,13 +492,15 @@ async fn shuffle_pre_agg_batches(
             let indices: UInt32Array = row_vn
                 .iter()
                 .enumerate()
-                .filter_map(|(i, &rv)| {
-                    if rv == v {
-                        u32::try_from(i).ok()
-                    } else {
-                        None
-                    }
-                })
+                .filter_map(
+                    |(i, &rv)| {
+                        if rv == v {
+                            u32::try_from(i).ok()
+                        } else {
+                            None
+                        }
+                    },
+                )
                 .collect();
             if indices.is_empty() {
                 continue;
@@ -508,12 +510,9 @@ async fn shuffle_pre_agg_batches(
                 .iter()
                 .map(|c| take(c, &indices, None))
                 .collect::<Result<_, _>>()
-                .map_err(|e| {
-                    DbError::Pipeline(format!("[{op_name}] row-shuffle take: {e}"))
-                })?;
-            let slice = RecordBatch::try_new(batch.schema(), cols).map_err(|e| {
-                DbError::Pipeline(format!("[{op_name}] row-shuffle rebuild: {e}"))
-            })?;
+                .map_err(|e| DbError::Pipeline(format!("[{op_name}] row-shuffle take: {e}")))?;
+            let slice = RecordBatch::try_new(batch.schema(), cols)
+                .map_err(|e| DbError::Pipeline(format!("[{op_name}] row-shuffle rebuild: {e}")))?;
 
             let owner = cfg.registry.owner(v);
             if owner == cfg.self_id {
@@ -548,11 +547,7 @@ async fn shuffle_pre_agg_batches(
 /// collapses to a constant vnode (global aggregate — everyone hashes
 /// to 0 which round-robin assigns to the first peer).
 #[cfg(feature = "cluster-unstable")]
-fn hash_rows_to_vnodes(
-    batch: &RecordBatch,
-    num_group_cols: usize,
-    vnode_count: u32,
-) -> Vec<u32> {
+fn hash_rows_to_vnodes(batch: &RecordBatch, num_group_cols: usize, vnode_count: u32) -> Vec<u32> {
     if num_group_cols == 0 || batch.num_rows() == 0 {
         return vec![0; batch.num_rows()];
     }
@@ -691,9 +686,10 @@ impl GraphOperator for SqlQueryOperator {
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        let cp: AggStateCheckpoint =
-            rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(&checkpoint.data)
-                .map_err(|e| {
+        let cp: AggStateCheckpoint = rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(
+            &checkpoint.data,
+        )
+        .map_err(|e| {
             DbError::Pipeline(format!(
                 "checkpoint deserialization for '{}': {e}",
                 self.op_name

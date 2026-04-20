@@ -189,7 +189,9 @@ impl ClusterController {
         expected: &[NodeId],
         deadline: Duration,
     ) -> QuorumOutcome {
-        self.barrier.wait_for_quorum(epoch, expected, deadline).await
+        self.barrier
+            .wait_for_quorum(epoch, expected, deadline)
+            .await
     }
 
     /// Assignment snapshot store, if configured.

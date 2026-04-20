@@ -195,7 +195,9 @@ impl BarrierCoordinator {
     /// Returns a string on JSON decode failure.
     pub async fn observe(&self, leader: NodeId) -> Result<Option<BarrierAnnouncement>, String> {
         match self.kv.read_from(leader, ANNOUNCEMENT_KEY).await {
-            Some(json) => serde_json::from_str(&json).map(Some).map_err(|e| e.to_string()),
+            Some(json) => serde_json::from_str(&json)
+                .map(Some)
+                .map_err(|e| e.to_string()),
             None => Ok(None),
         }
     }

@@ -8,8 +8,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use super::{
-    backend::StateBackend, in_process::InProcessBackend,
-    object_store::ObjectStoreBackend,
+    backend::StateBackend, in_process::InProcessBackend, object_store::ObjectStoreBackend,
 };
 
 /// Default number of vnodes if the user does not override.
@@ -255,8 +254,7 @@ fn build_object_store(
 ) -> Result<Arc<dyn ::object_store::ObjectStore>, StateBackendBuildError> {
     if let Some(path) = url.strip_prefix("file://") {
         let path = path.trim_start_matches('/');
-        std::fs::create_dir_all(path)
-            .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
+        std::fs::create_dir_all(path).map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
         let fs = ::object_store::local::LocalFileSystem::new_with_prefix(path)
             .map_err(|e| StateBackendBuildError::Io(e.to_string()))?;
         Ok(Arc::new(fs))
@@ -273,7 +271,12 @@ mod tests {
     fn parse_in_process_minimal() {
         let toml = r#"backend = "in_process""#;
         let c: StateBackendConfig = toml::from_str(toml).unwrap();
-        assert!(matches!(c, StateBackendConfig::InProcess { vnode_capacity: 256 }));
+        assert!(matches!(
+            c,
+            StateBackendConfig::InProcess {
+                vnode_capacity: 256
+            }
+        ));
         assert!(!c.is_durable());
         assert!(c.local_storage_dir().is_none());
     }
@@ -286,7 +289,10 @@ path = "/var/laminar"
 vnode_capacity = 128
 "#;
         let c: StateBackendConfig = toml::from_str(toml).unwrap();
-        assert_eq!(c.local_storage_dir(), Some(std::path::Path::new("/var/laminar")));
+        assert_eq!(
+            c.local_storage_dir(),
+            Some(std::path::Path::new("/var/laminar"))
+        );
         assert!(c.is_durable());
         if let StateBackendConfig::Local { vnode_capacity, .. } = c {
             assert_eq!(vnode_capacity, 128);
@@ -380,7 +386,10 @@ seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
     #[tokio::test]
     async fn build_object_store_file_url_instantiates_backend() {
         let dir = tempfile::tempdir().unwrap();
-        let url = format!("file://{}", dir.path().display().to_string().replace('\\', "/"));
+        let url = format!(
+            "file://{}",
+            dir.path().display().to_string().replace('\\', "/")
+        );
         let c = StateBackendConfig::object_store(url, "node-0");
         let backend = c.build().await.unwrap();
         backend

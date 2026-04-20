@@ -39,8 +39,7 @@ pub struct LaminarDbBuilder {
     /// Cluster control facade installed at cluster-mode startup.
     /// Stays `None` in embedded / single-instance builds.
     #[cfg(feature = "cluster-unstable")]
-    cluster_controller:
-        Option<std::sync::Arc<laminar_core::cluster::control::ClusterController>>,
+    cluster_controller: Option<std::sync::Arc<laminar_core::cluster::control::ClusterController>>,
     /// Outbound shuffle handle for cluster-mode streaming aggregates.
     /// Pair with `shuffle_receiver`; without it, streaming aggregates
     /// run single-node even when the cluster controller is installed
@@ -59,9 +58,7 @@ pub struct LaminarDbBuilder {
     /// Extra physical optimizer rules installed on the `SessionState`
     /// at construction.
     physical_optimizer_rules: Vec<
-        std::sync::Arc<
-            dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync,
-        >,
+        std::sync::Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>,
     >,
     /// Override for `target_partitions`; cluster mode sets this to
     /// `vnode_count`. Default 1 for single-instance streaming.

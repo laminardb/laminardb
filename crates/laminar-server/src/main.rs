@@ -2,11 +2,11 @@
 
 #![allow(clippy::disallowed_types)] // cold path: server startup and config only
 
-mod config;
 #[cfg(feature = "cluster-unstable")]
 mod cluster;
 #[cfg(feature = "cluster-unstable")]
 mod cluster_config;
+mod config;
 mod http;
 mod metrics;
 mod reload;

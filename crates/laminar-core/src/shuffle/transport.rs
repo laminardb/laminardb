@@ -147,10 +147,7 @@ impl ShuffleSender {
     async fn discover_peer(&self, peer: ShufflePeerId) -> Option<SocketAddr> {
         let kv = self.kv.as_ref()?;
         let raw = kv
-            .read_from(
-                crate::cluster::discovery::NodeId(peer),
-                SHUFFLE_ADDR_KEY,
-            )
+            .read_from(crate::cluster::discovery::NodeId(peer), SHUFFLE_ADDR_KEY)
             .await?;
         let addr: SocketAddr = raw.parse().ok()?;
         self.peers.write().await.insert(peer, addr);
@@ -248,8 +245,7 @@ impl ShuffleSender {
 /// Inbound side of the shuffle fabric.
 ///
 /// Binds a `TcpListener` and surfaces every frame received from any
-/// peer — prefixed with that peer's id — on the channel returned by
-/// [`Self::subscribe`].
+/// peer — prefixed with that peer's id — on the `subscribe` channel.
 pub struct ShuffleReceiver {
     local_id: ShufflePeerId,
     local_addr: SocketAddr,
@@ -320,11 +316,7 @@ impl ShuffleReceiver {
 
         let peer_tasks: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let accept = tokio::spawn(Self::accept_loop(
-            listener,
-            tx,
-            Arc::clone(&peer_tasks),
-        ));
+        let accept = tokio::spawn(Self::accept_loop(listener, tx, Arc::clone(&peer_tasks)));
 
         Ok(Self {
             local_id,
@@ -371,7 +363,9 @@ impl ShuffleReceiver {
         peer_tasks: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
     ) {
         loop {
-            let Ok((stream, _peer_addr)) = listener.accept().await else { break };
+            let Ok((stream, _peer_addr)) = listener.accept().await else {
+                break;
+            };
             if stream.set_nodelay(true).is_err() {
                 continue;
             }

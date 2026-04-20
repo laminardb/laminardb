@@ -577,11 +577,7 @@ pub(crate) fn execute_asof_join_with_state(
 
 /// Serializable checkpoint for `AsofRightBuffer`.
 #[derive(
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
+    serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 pub(crate) struct AsofBufferCheckpoint {
     #[serde(default)]

@@ -20,8 +20,7 @@ use tokio::time::sleep;
 mod cluster_harness;
 
 use cluster_harness::{
-    input_batch, manifest_epoch, pick_keys_per_owner, read_mv_sums,
-    ClusterEngineHarness,
+    input_batch, manifest_epoch, pick_keys_per_owner, read_mv_sums, ClusterEngineHarness,
 };
 
 const VNODE_COUNT: u32 = 4;
@@ -91,7 +90,11 @@ async fn happy_path_eight_keys_correct_sums() {
     // a transient wrong state). Leader's `checkpoint()` returns once
     // 2PC commits, which requires the follower has also processed the
     // post-shuffle data.
-    let result = leader_node.db.checkpoint().await.expect("leader checkpoint");
+    let result = leader_node
+        .db
+        .checkpoint()
+        .await
+        .expect("leader checkpoint");
     assert!(
         result.success,
         "leader checkpoint failed: {:?}",
@@ -117,8 +120,7 @@ async fn happy_path_eight_keys_correct_sums() {
     );
 
     let leader_keys: HashSet<i64> = leader_rows.iter().map(|(k, _)| *k).collect();
-    let follower_keys: HashSet<i64> =
-        follower_rows.iter().map(|(k, _)| *k).collect();
+    let follower_keys: HashSet<i64> = follower_rows.iter().map(|(k, _)| *k).collect();
     assert!(
         leader_keys.is_disjoint(&follower_keys),
         "key appears on both nodes: leader={leader_keys:?} follower={follower_keys:?}",
@@ -131,8 +133,7 @@ async fn happy_path_eight_keys_correct_sums() {
         .collect();
     union.sort_by_key(|(k, _)| *k);
 
-    let mut expected: Vec<(i64, i64)> =
-        all_keys.iter().map(|&k| (k, k * 10)).collect();
+    let mut expected: Vec<(i64, i64)> = all_keys.iter().map(|&k| (k, k * 10)).collect();
     expected.sort_by_key(|(k, _)| *k);
 
     assert_eq!(

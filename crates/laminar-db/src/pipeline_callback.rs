@@ -85,8 +85,7 @@ pub(crate) struct ConnectorPipelineCallback {
     /// trigger on `is_leader()` and to run `follower_checkpoint` on
     /// non-leaders.
     #[cfg(feature = "cluster-unstable")]
-    pub(crate) cluster_controller:
-        Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    pub(crate) cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
     /// Highest epoch a non-leader has already prepared for. Prevents
     /// re-running `follower_checkpoint` on the same announcement.
     #[cfg(feature = "cluster-unstable")]
@@ -255,7 +254,9 @@ impl ConnectorPipelineCallback {
         // into the coordinator so the next `BarrierAck` carries it.
         // i64::MIN means unset; don't propagate — leader treats us as
         // non-blocking.
-        let wm = self.pipeline_watermark.load(std::sync::atomic::Ordering::Acquire);
+        let wm = self
+            .pipeline_watermark
+            .load(std::sync::atomic::Ordering::Acquire);
         coord.set_local_watermark_ms(if wm == i64::MIN { None } else { Some(wm) });
         match coord
             .follower_checkpoint(request, ann, std::time::Duration::from_secs(30))

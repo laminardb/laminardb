@@ -156,12 +156,9 @@ impl ClusterEngineHarness {
         // addresses on the senders below.
         let mut receivers: Vec<Arc<ShuffleReceiver>> = Vec::with_capacity(n);
         for nh in &cluster.nodes {
-            let recv = ShuffleReceiver::bind(
-                nh.instance_id.0,
-                "127.0.0.1:0".parse().unwrap(),
-            )
-            .await
-            .expect("ShuffleReceiver::bind");
+            let recv = ShuffleReceiver::bind(nh.instance_id.0, "127.0.0.1:0".parse().unwrap())
+                .await
+                .expect("ShuffleReceiver::bind");
             receivers.push(Arc::new(recv));
         }
 
@@ -337,8 +334,7 @@ async fn resolve_assignment(
     }
 
     let fresh = round_robin_assignment(vnode_count, peer_ids);
-    let snap = AssignmentSnapshot::empty()
-        .next(AssignmentSnapshot::vnodes_from_vec(&fresh));
+    let snap = AssignmentSnapshot::empty().next(AssignmentSnapshot::vnodes_from_vec(&fresh));
     match store.save_if_absent(&snap).await.expect("save_if_absent") {
         Some(winner) => (fresh, winner.version),
         None => {
@@ -411,8 +407,7 @@ pub fn vnode_for_key(key: i64, vnode_count: u32) -> u32 {
     use laminar_core::state::key_hash;
 
     let col: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::from(vec![key]));
-    let converter =
-        RowConverter::new(vec![SortField::new(DataType::Int64)]).expect("RowConverter");
+    let converter = RowConverter::new(vec![SortField::new(DataType::Int64)]).expect("RowConverter");
     let rows = converter.convert_columns(&[col]).expect("convert_columns");
     #[allow(clippy::cast_possible_truncation)]
     let v = (key_hash(rows.row(0).as_ref()) % u64::from(vnode_count)) as u32;
@@ -430,8 +425,7 @@ pub fn pick_keys_per_owner(
     owners: &[(NodeId, Vec<u32>)],
     per_owner: usize,
 ) -> Result<Vec<(NodeId, Vec<i64>)>, String> {
-    let mut out: Vec<(NodeId, Vec<i64>)> =
-        owners.iter().map(|(id, _)| (*id, Vec::new())).collect();
+    let mut out: Vec<(NodeId, Vec<i64>)> = owners.iter().map(|(id, _)| (*id, Vec::new())).collect();
     for k in 0i64..1000 {
         let v = vnode_for_key(k, vnode_count);
         for ((_, vnodes), (_, bucket)) in owners.iter().zip(out.iter_mut()) {
@@ -463,11 +457,7 @@ pub fn manifest_epoch(db: &LaminarDB) -> u64 {
         Some(s) => s,
         None => return 0,
     };
-    store
-        .load_latest()
-        .ok()
-        .flatten()
-        .map_or(0, |m| m.epoch)
+    store.load_latest().ok().flatten().map_or(0, |m| m.epoch)
 }
 
 /// `SELECT key, total FROM <mv>` on a single engine, returning the
@@ -480,11 +470,7 @@ pub fn manifest_epoch(db: &LaminarDB) -> u64 {
 /// path would require coordinating with cycle boundaries.
 pub async fn read_mv_sums(db: &LaminarDB, mv: &str) -> Vec<(i64, i64)> {
     let sql = format!("SELECT key, total FROM {mv}");
-    let df = db
-        .session_context()
-        .sql(&sql)
-        .await
-        .expect("plan SELECT");
+    let df = db.session_context().sql(&sql).await.expect("plan SELECT");
     let batches = df.collect().await.expect("collect SELECT");
     let mut rows: Vec<(i64, i64)> = Vec::new();
     for batch in batches {

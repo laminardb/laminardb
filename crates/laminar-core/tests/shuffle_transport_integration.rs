@@ -42,10 +42,7 @@ async fn two_nodes_exchange_data_bidirectionally() {
         .unwrap();
     // B → A: one Hello (handshake already happened — this is just a
     // reachable frame in the reverse direction).
-    send_b
-        .send_to(1, &ShuffleMessage::Hello(2))
-        .await
-        .unwrap();
+    send_b.send_to(1, &ShuffleMessage::Hello(2)).await.unwrap();
     send_a
         .send_to(2, &ShuffleMessage::VnodeData(0, batch(vec![7, 8, 9])))
         .await

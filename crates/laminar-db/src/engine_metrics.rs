@@ -1,8 +1,8 @@
 //! Prometheus metrics for the streaming engine.
 
 use prometheus::{
-    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
-    Opts, Registry,
+    Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry,
 };
 
 /// Pipeline metrics registered on an explicit prometheus `Registry`.

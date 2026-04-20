@@ -13,13 +13,17 @@ use tempfile::tempdir;
 async fn config_roundtrip_in_process_local_object_store() {
     let c = StateBackendConfig::in_process();
     let b = c.build().await.unwrap();
-    b.write_partial(0, 1, 0, Bytes::from_static(b"a")).await.unwrap();
+    b.write_partial(0, 1, 0, Bytes::from_static(b"a"))
+        .await
+        .unwrap();
     assert_eq!(&b.read_partial(0, 1).await.unwrap().unwrap()[..], b"a");
 
     let dir = tempdir().unwrap();
     let c = StateBackendConfig::local(dir.path());
     let b = c.build().await.unwrap();
-    b.write_partial(0, 1, 0, Bytes::from_static(b"b")).await.unwrap();
+    b.write_partial(0, 1, 0, Bytes::from_static(b"b"))
+        .await
+        .unwrap();
     assert_eq!(&b.read_partial(0, 1).await.unwrap().unwrap()[..], b"b");
 
     let dir = tempdir().unwrap();
@@ -29,7 +33,9 @@ async fn config_roundtrip_in_process_local_object_store() {
     );
     let c = StateBackendConfig::object_store(url, "node-0");
     let b = c.build().await.unwrap();
-    b.write_partial(0, 1, 0, Bytes::from_static(b"c")).await.unwrap();
+    b.write_partial(0, 1, 0, Bytes::from_static(b"c"))
+        .await
+        .unwrap();
     assert_eq!(&b.read_partial(0, 1).await.unwrap().unwrap()[..], b"c");
 }
 
@@ -52,13 +58,31 @@ async fn distributed_embedded_static_two_instances_shared_store() {
     let node_a = ObjectStoreBackend::new(Arc::clone(&store), "node-a", 4);
     let node_b = ObjectStoreBackend::new(Arc::clone(&store), "node-b", 4);
 
-    node_a.write_partial(0, 1, 0, Bytes::from_static(b"A0")).await.unwrap();
-    node_a.write_partial(1, 1, 0, Bytes::from_static(b"A1")).await.unwrap();
-    node_b.write_partial(2, 1, 0, Bytes::from_static(b"B2")).await.unwrap();
-    node_b.write_partial(3, 1, 0, Bytes::from_static(b"B3")).await.unwrap();
+    node_a
+        .write_partial(0, 1, 0, Bytes::from_static(b"A0"))
+        .await
+        .unwrap();
+    node_a
+        .write_partial(1, 1, 0, Bytes::from_static(b"A1"))
+        .await
+        .unwrap();
+    node_b
+        .write_partial(2, 1, 0, Bytes::from_static(b"B2"))
+        .await
+        .unwrap();
+    node_b
+        .write_partial(3, 1, 0, Bytes::from_static(b"B3"))
+        .await
+        .unwrap();
 
-    assert_eq!(&node_a.read_partial(2, 1).await.unwrap().unwrap()[..], b"B2");
-    assert_eq!(&node_b.read_partial(0, 1).await.unwrap().unwrap()[..], b"A0");
+    assert_eq!(
+        &node_a.read_partial(2, 1).await.unwrap().unwrap()[..],
+        b"B2"
+    );
+    assert_eq!(
+        &node_b.read_partial(0, 1).await.unwrap().unwrap()[..],
+        b"A0"
+    );
 
     // node_a wins the CAS — it committed the epoch.
     assert!(node_a.epoch_complete(1, &[0, 1, 2, 3]).await.unwrap());
@@ -76,6 +100,9 @@ async fn distributed_embedded_static_two_instances_shared_store() {
         other => panic!("expected SplitBrainCommit, got {other:?}"),
     }
 
-    node_a.write_partial(0, 2, 0, Bytes::from_static(b"A0@2")).await.unwrap();
+    node_a
+        .write_partial(0, 2, 0, Bytes::from_static(b"A0@2"))
+        .await
+        .unwrap();
     assert!(!node_a.epoch_complete(2, &[0, 1, 2, 3]).await.unwrap());
 }

@@ -80,9 +80,10 @@ impl VnodeRegistry {
     /// as [`NodeId::UNASSIGNED`]. The assignment version starts at 1.
     #[must_use]
     pub fn new(vnode_count: u32) -> Self {
-        let assignment: Arc<[NodeId]> = std::iter::repeat_n(NodeId::UNASSIGNED, vnode_count as usize)
-            .collect::<Vec<_>>()
-            .into();
+        let assignment: Arc<[NodeId]> =
+            std::iter::repeat_n(NodeId::UNASSIGNED, vnode_count as usize)
+                .collect::<Vec<_>>()
+                .into();
         Self {
             vnode_count,
             assignment: RwLock::new(assignment),
@@ -184,7 +185,10 @@ pub fn key_hash(key: &[u8]) -> u64 {
 /// Panics if `peers` is empty.
 #[must_use]
 pub fn round_robin_assignment(vnode_count: u32, peers: &[NodeId]) -> Arc<[NodeId]> {
-    assert!(!peers.is_empty(), "round_robin_assignment needs at least one peer");
+    assert!(
+        !peers.is_empty(),
+        "round_robin_assignment needs at least one peer"
+    );
     let mut sorted: Vec<NodeId> = peers.to_vec();
     sorted.sort_by_key(|n| n.0);
     (0..vnode_count)
@@ -290,9 +294,14 @@ mod tests {
         assert_eq!(
             &*assignment,
             &[
-                NodeId(3), NodeId(5), NodeId(7),
-                NodeId(3), NodeId(5), NodeId(7),
-                NodeId(3), NodeId(5),
+                NodeId(3),
+                NodeId(5),
+                NodeId(7),
+                NodeId(3),
+                NodeId(5),
+                NodeId(7),
+                NodeId(3),
+                NodeId(5),
             ][..]
         );
         // Input order doesn't matter.

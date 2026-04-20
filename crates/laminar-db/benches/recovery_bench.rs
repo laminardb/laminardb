@@ -122,8 +122,9 @@ fn bench_recovery_with_sidecar(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("load_manifest_and_state", &label), |b| {
             b.iter(|| {
                 let loaded = rt.block_on(store.load_latest()).unwrap().unwrap();
-                let state_data =
-                    rt.block_on(store.load_state_data(loaded.checkpoint_id)).unwrap();
+                let state_data = rt
+                    .block_on(store.load_state_data(loaded.checkpoint_id))
+                    .unwrap();
                 black_box(&loaded);
                 black_box(&state_data);
             })

@@ -103,11 +103,11 @@ impl GraphOperator for AsofJoinOperator {
         let cp: AsofBufferCheckpoint =
             rkyv::from_bytes::<AsofBufferCheckpoint, rkyv::rancor::Error>(&checkpoint.data)
                 .map_err(|e| {
-            DbError::Pipeline(format!(
-                "ASOF join [{}]: checkpoint deserialization: {e}",
-                self.projection.op_name
-            ))
-        })?;
+                    DbError::Pipeline(format!(
+                        "ASOF join [{}]: checkpoint deserialization: {e}",
+                        self.projection.op_name
+                    ))
+                })?;
 
         let (buffer, last_wm) = AsofRightBuffer::from_checkpoint(&cp)?;
         self.right_buffer = buffer;

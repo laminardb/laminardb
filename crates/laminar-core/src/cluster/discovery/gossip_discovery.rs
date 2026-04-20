@@ -224,10 +224,7 @@ impl GossipDiscovery {
     /// Panics via `unwrap` on an internal assertion if called twice
     /// concurrently from the same `GossipDiscovery` — the `started`
     /// flag check makes the second call a no-op.
-    pub async fn start_with_transport<T>(
-        &mut self,
-        transport: &T,
-    ) -> Result<(), DiscoveryError>
+    pub async fn start_with_transport<T>(&mut self, transport: &T) -> Result<(), DiscoveryError>
     where
         T: chitchat::transport::Transport,
     {
@@ -254,11 +251,7 @@ impl GossipDiscovery {
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
 
         let config = chitchat::ChitchatConfig {
-            chitchat_id: chitchat::ChitchatId::new(
-                node_id,
-                generation,
-                gossip_addr,
-            ),
+            chitchat_id: chitchat::ChitchatId::new(node_id, generation, gossip_addr),
             cluster_id: self.config.cluster_id.clone(),
             gossip_interval: self.config.gossip_interval,
             listen_addr: gossip_addr,
@@ -363,7 +356,8 @@ impl GossipDiscovery {
 
 impl Discovery for GossipDiscovery {
     async fn start(&mut self) -> Result<(), DiscoveryError> {
-        self.start_with_transport(&chitchat::transport::UdpTransport).await
+        self.start_with_transport(&chitchat::transport::UdpTransport)
+            .await
     }
 
     async fn peers(&self) -> Result<Vec<NodeInfo>, DiscoveryError> {

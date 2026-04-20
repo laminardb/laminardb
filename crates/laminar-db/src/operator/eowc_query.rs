@@ -35,11 +35,7 @@ const MAX_EOWC_ACCUMULATED_ROWS: usize = 1_000_000;
 
 /// Wrapper for checkpoint data that discriminates between state variants.
 #[derive(
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
+    serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
 enum EowcCheckpointEnvelope {
     /// Checkpoint from `CoreWindowState`.
@@ -521,16 +517,14 @@ impl GraphOperator for EowcQueryOperator {
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        let envelope: EowcCheckpointEnvelope = rkyv::from_bytes::<
-            EowcCheckpointEnvelope,
-            rkyv::rancor::Error,
-        >(&checkpoint.data)
-        .map_err(|e| {
-                DbError::Pipeline(format!(
-                    "EOWC checkpoint deserialization for '{}': {e}",
-                    self.op_name
-                ))
-            })?;
+        let envelope: EowcCheckpointEnvelope =
+            rkyv::from_bytes::<EowcCheckpointEnvelope, rkyv::rancor::Error>(&checkpoint.data)
+                .map_err(|e| {
+                    DbError::Pipeline(format!(
+                        "EOWC checkpoint deserialization for '{}': {e}",
+                        self.op_name
+                    ))
+                })?;
 
         match (&mut self.state, &envelope) {
             (EowcInnerState::CoreWindow(cw), EowcCheckpointEnvelope::CoreWindow(cp)) => {

@@ -1,6 +1,6 @@
 //! State backend abstraction. Two concrete backends:
-//! [`InProcessBackend`] for embedded single-process runs, and
-//! [`ObjectStoreBackend`] for anything durable (local filesystem via
+//! `InProcessBackend` for embedded single-process runs, and
+//! `ObjectStoreBackend` for anything durable (local filesystem via
 //! `file://`, or S3/GCS/Azure).
 
 pub mod backend;

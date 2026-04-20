@@ -434,7 +434,9 @@ impl DeltaLakeSink {
     /// fall through to the synchronous `reopen_table()` path.
     #[cfg(feature = "delta-lake")]
     async fn try_install_pending_reopen(&mut self, timeout: std::time::Duration) -> bool {
-        let Some(mut pending) = self.pending_reopen.take() else { return false };
+        let Some(mut pending) = self.pending_reopen.take() else {
+            return false;
+        };
         let table = match tokio::time::timeout(timeout, &mut pending).await {
             Ok(Ok(Ok(t))) => t,
             Ok(Ok(Err(e))) => {
@@ -446,7 +448,10 @@ impl DeltaLakeSink {
                 return false;
             }
             Err(_) => {
-                warn!(timeout_secs = timeout.as_secs(), "Delta background reopen timed out");
+                warn!(
+                    timeout_secs = timeout.as_secs(),
+                    "Delta background reopen timed out"
+                );
                 pending.abort();
                 return false;
             }

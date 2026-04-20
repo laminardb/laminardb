@@ -64,9 +64,19 @@ async fn leader_is_consistent_across_nodes() {
     }
 
     // Exactly one `is_leader() == true`.
-    let leader_count = cluster.nodes.iter().filter(|n| n.controller.is_leader()).count();
-    assert_eq!(leader_count, 1, "exactly one node must self-identify as leader");
-    assert!(cluster.nodes[0].controller.is_leader(), "node 0 (lowest id) is leader");
+    let leader_count = cluster
+        .nodes
+        .iter()
+        .filter(|n| n.controller.is_leader())
+        .count();
+    assert_eq!(
+        leader_count, 1,
+        "exactly one node must self-identify as leader"
+    );
+    assert!(
+        cluster.nodes[0].controller.is_leader(),
+        "node 0 (lowest id) is leader"
+    );
 
     cluster.shutdown().await;
 }
@@ -116,10 +126,12 @@ async fn barrier_announce_then_follower_observes_and_acks() {
                 _ => tokio::time::sleep(Duration::from_millis(50)).await,
             }
         }
-        observed.unwrap_or_else(|| panic!(
-            "follower {} never observed the barrier",
-            follower.instance_id.0
-        ));
+        observed.unwrap_or_else(|| {
+            panic!(
+                "follower {} never observed the barrier",
+                follower.instance_id.0
+            )
+        });
         follower
             .controller
             .ack_barrier(&BarrierAck {
@@ -184,8 +196,8 @@ async fn leader_failover_on_kill() {
             .map(|n| n.controller.current_leader())
             .collect();
         let all_agree = leaders.iter().all(|l| *l == Some(expected));
-        let correct_self_id = cluster.nodes[0].controller.is_leader()
-            && !cluster.nodes[1].controller.is_leader();
+        let correct_self_id =
+            cluster.nodes[0].controller.is_leader() && !cluster.nodes[1].controller.is_leader();
         if all_agree && correct_self_id {
             break;
         }
@@ -219,7 +231,10 @@ async fn network_partition_produces_two_leaders() {
     assert_eq!(pre, Some(cluster.nodes[0].instance_id));
 
     let addrs = cluster.addrs();
-    let rules = cluster.rules.as_ref().expect("partitionable cluster has rules");
+    let rules = cluster
+        .rules
+        .as_ref()
+        .expect("partitionable cluster has rules");
     rules.partition(&addrs[0..2], &addrs[2..4]);
 
     // Wait for each side to re-derive its local leader.
@@ -293,7 +308,7 @@ async fn snapshot_save_fails_under_object_store_fault_and_recovers() {
         Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
     let faulty = Arc::new(FaultyObjectStore::new(inner));
     let store = Arc::new(AssignmentSnapshotStore::new(
-        Arc::clone(&faulty) as Arc<dyn ObjectStore>,
+        Arc::clone(&faulty) as Arc<dyn ObjectStore>
     ));
 
     // Step 1: save baseline.
@@ -431,7 +446,10 @@ async fn fresh_node_can_join_running_cluster() {
 
     let start = Instant::now();
     loop {
-        let all_see_four = cluster.nodes.iter().all(|n| n.controller.live_instances().len() == 4);
+        let all_see_four = cluster
+            .nodes
+            .iter()
+            .all(|n| n.controller.live_instances().len() == 4);
         if all_see_four {
             break;
         }

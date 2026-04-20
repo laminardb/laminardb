@@ -40,7 +40,11 @@ fn encode_node_id(node_id: NodeId) -> String {
 }
 
 fn decode_chitchat_id(id: &chitchat::ChitchatId) -> Option<NodeId> {
-    id.node_id.strip_prefix("node-")?.parse::<u64>().ok().map(NodeId)
+    id.node_id
+        .strip_prefix("node-")?
+        .parse::<u64>()
+        .ok()
+        .map(NodeId)
 }
 
 #[async_trait]
@@ -96,21 +100,14 @@ mod tests {
 
     #[test]
     fn decode_rejects_unexpected_formats() {
-        let bad = chitchat::ChitchatId::new(
-            "foo".to_string(),
-            0,
-            "127.0.0.1:1".parse().unwrap(),
-        );
+        let bad = chitchat::ChitchatId::new("foo".to_string(), 0, "127.0.0.1:1".parse().unwrap());
         assert_eq!(decode_chitchat_id(&bad), None);
     }
 
     #[test]
     fn decode_accepts_valid_format() {
-        let good = chitchat::ChitchatId::new(
-            "node-42".to_string(),
-            0,
-            "127.0.0.1:1".parse().unwrap(),
-        );
+        let good =
+            chitchat::ChitchatId::new("node-42".to_string(), 0, "127.0.0.1:1".parse().unwrap());
         assert_eq!(decode_chitchat_id(&good), Some(NodeId(42)));
     }
 }
