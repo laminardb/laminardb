@@ -1079,8 +1079,8 @@ impl OperatorGraph {
         current_watermark: i64,
         results: &mut FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<(), DbError> {
-        let inputs = std::mem::take(&mut self.input_bufs[node_id]);
-        let input_bytes = std::mem::take(&mut self.input_buf_bytes[node_id]);
+        let mut inputs = std::mem::take(&mut self.input_bufs[node_id]);
+        let mut input_bytes = std::mem::take(&mut self.input_buf_bytes[node_id]);
 
         let port_count = self.nodes[node_id].input_port_count;
         let watermarks: smallvec::SmallVec<[i64; 2]> = (0..port_count)
@@ -1117,9 +1117,15 @@ impl OperatorGraph {
 
         let batches = match output_result {
             Ok(b) => {
-                let port_count = self.nodes[node_id].input_port_count;
-                self.input_bufs[node_id] = vec![Vec::new(); port_count];
-                self.input_buf_bytes[node_id] = vec![0; port_count];
+                // Reuse the existing outer Vecs and their inner capacities;
+                // the operator borrowed inputs, so the RecordBatches are
+                // still in place. clear() preserves capacity.
+                for v in &mut inputs {
+                    v.clear();
+                }
+                input_bytes.fill(0);
+                self.input_bufs[node_id] = inputs;
+                self.input_buf_bytes[node_id] = input_bytes;
                 b
             }
             Err(e) => {
@@ -1134,9 +1140,12 @@ impl OperatorGraph {
                     );
                     return Ok(());
                 }
-                let port_count = self.nodes[node_id].input_port_count;
-                self.input_bufs[node_id] = vec![Vec::new(); port_count];
-                self.input_buf_bytes[node_id] = vec![0; port_count];
+                for v in &mut inputs {
+                    v.clear();
+                }
+                input_bytes.fill(0);
+                self.input_bufs[node_id] = inputs;
+                self.input_buf_bytes[node_id] = input_bytes;
                 return Err(e);
             }
         };
@@ -1176,12 +1185,12 @@ impl OperatorGraph {
 
             // Register intermediate for downstream SQL queries (catalog lookup).
             if has_routes {
-                let name_str = node_name.to_string();
-                if !self.live_handles.contains_key(&name_str) {
+                let name_ref = node_name.as_ref();
+                if !self.live_handles.contains_key(name_ref) {
                     let schema = batches[0].schema();
-                    self.ensure_live_provider(&name_str, &schema);
+                    self.ensure_live_provider(name_ref, &schema);
                 }
-                if let Some(handle) = self.live_handles.get(name_str.as_str()) {
+                if let Some(handle) = self.live_handles.get(name_ref) {
                     handle.swap(batches.clone());
                 }
             }
@@ -1191,17 +1200,21 @@ impl OperatorGraph {
                 results.insert(node_name, batches.clone());
             }
 
-            let routes = self.nodes[node_id].output_routes.clone();
             let bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
-            if routes.len() == 1 {
-                let (target, port) = routes[0];
+            let route_count = self.nodes[node_id].output_routes.len();
+            if route_count == 1 {
+                let (target, port) = self.nodes[node_id].output_routes[0];
                 self.push_to_port(target, port, batches, bytes);
-            } else if routes.len() > 1 {
-                let last = routes.len() - 1;
-                for &(target, port) in &routes[..last] {
+            } else if route_count > 1 {
+                // Clone batches N-1 times (one for each non-final route);
+                // the final route takes ownership of the original. Reading
+                // routes via an indexed loop avoids cloning output_routes
+                // just to iterate it.
+                for i in 0..route_count - 1 {
+                    let (target, port) = self.nodes[node_id].output_routes[i];
                     self.push_to_port(target, port, batches.clone(), bytes);
                 }
-                let (target, port) = routes[last];
+                let (target, port) = self.nodes[node_id].output_routes[route_count - 1];
                 self.push_to_port(target, port, batches, bytes);
             }
         }
