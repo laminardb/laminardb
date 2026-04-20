@@ -318,22 +318,28 @@ impl ExecutionPlan for ClusterRepartitionExec {
 
         let runtime = self.init_runtime(&context)?;
 
-        // Claim this partition's receiver; subsequent calls for the
-        // same partition yield an empty stream (DF calls once).
+        // Claim this partition's receiver. DataFusion contracts execute
+        // each partition exactly once per plan execution; a second call
+        // would have previously returned an empty stream silently,
+        // masking plan-reuse bugs. Now we return a typed error so the
+        // caller sees something went wrong.
+        let schema = Arc::clone(&self.schema);
         let fut = async move {
             let mut guard = runtime.receivers.lock().await;
-            guard[partition].take()
+            guard[partition]
+                .take()
+                .ok_or_else(|| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "ClusterRepartitionExec::execute called twice for \
+                         partition {partition}; receivers are single-use"
+                    ))
+                })
         };
         let stream = stream::once(fut).flat_map(move |maybe_rx| match maybe_rx {
-            Some(rx) => tokio_stream::wrappers::ReceiverStream::new(rx)
-                .map(Ok)
-                .boxed(),
-            None => stream::empty().boxed(),
+            Ok(rx) => tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok).boxed(),
+            Err(e) => stream::once(async move { Err(e) }).boxed(),
         });
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&self.schema),
-            stream,
-        )))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
 

@@ -142,6 +142,32 @@ pub struct RecoveryReport {
     pub elapsed: std::time::Duration,
 }
 
+/// Parse a checkpoint id out of an object-store path segment shaped like
+/// `"{prefix}NNNNNN{suffix}"` (e.g. `"manifest-000042.json"`). Scans all
+/// '/'-separated segments so the helper works on prefixed stores. A
+/// segment with the right affixes but a non-numeric middle is logged at
+/// warn — operators need to notice manually-renamed files rather than
+/// see silent gaps in `prune`/`list_ids`.
+fn parse_checkpoint_id_from_path(path: &str, prefix: &str, suffix: &str) -> Option<u64> {
+    for segment in path.split('/') {
+        let Some(rest) = segment.strip_prefix(prefix) else {
+            continue;
+        };
+        let Some(id_str) = rest.strip_suffix(suffix) else {
+            continue;
+        };
+        if let Ok(id) = id_str.parse::<u64>() {
+            return Some(id);
+        }
+        warn!(
+            path,
+            prefix, suffix, "malformed checkpoint id in object path — skipped"
+        );
+        return None;
+    }
+    None
+}
+
 /// Compute SHA-256 hex digest of data.
 fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
@@ -938,15 +964,12 @@ impl ObjectStoreCheckpointStore {
             .try_collect()
             .await?;
         for entry in &entries {
-            let path_str = entry.location.as_ref();
-            for segment in path_str.split('/') {
-                if let Some(rest) = segment.strip_prefix("manifest-") {
-                    if let Some(id_str) = rest.strip_suffix(".json") {
-                        if let Ok(id) = id_str.parse::<u64>() {
-                            ids.insert(id);
-                        }
-                    }
-                }
+            if let Some(id) = parse_checkpoint_id_from_path(
+                entry.location.as_ref(),
+                "manifest-",
+                ".json",
+            ) {
+                ids.insert(id);
             }
         }
 
@@ -1181,16 +1204,11 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
 
         let mut orphan_paths = Vec::new();
         for entry in &entries {
-            let path_str = entry.location.as_ref();
-            for segment in path_str.split('/') {
-                if let Some(rest) = segment.strip_prefix("state-") {
-                    if let Some(id_str) = rest.strip_suffix(".bin") {
-                        if let Ok(id) = id_str.parse::<u64>() {
-                            if !manifest_ids.contains(&id) {
-                                orphan_paths.push(entry.location.clone());
-                            }
-                        }
-                    }
+            if let Some(id) =
+                parse_checkpoint_id_from_path(entry.location.as_ref(), "state-", ".bin")
+            {
+                if !manifest_ids.contains(&id) {
+                    orphan_paths.push(entry.location.clone());
                 }
             }
         }
