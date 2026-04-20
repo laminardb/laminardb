@@ -386,8 +386,9 @@ pub async fn start_cluster(
     // Without this wiring, streaming aggregates never cross node
     // boundaries — Phase 0a in the plan.
     let shuffle_receiver = build_shuffle_receiver(&discovery, node_id).await?;
+    let shuffle_advertise = shuffle_advertise_addr(shuffle_receiver.local_addr(), bind_host);
     let shuffle_sender =
-        Arc::new(build_shuffle_sender(node_id.0, &discovery, shuffle_receiver.local_addr()).await);
+        Arc::new(build_shuffle_sender(node_id.0, &discovery, shuffle_advertise).await);
 
     // Streaming aggregates go through the row-shuffle bridge driven by
     // `IncrementalAggState`; the DataFusion-native aggregate-rewrite
@@ -578,14 +579,14 @@ async fn build_shuffle_receiver(
 }
 
 /// Build an outbound shuffle sender. When gossip discovery is active,
-/// publish `local_addr` under `SHUFFLE_ADDR_KEY` so peers find us, and
+/// publish `advertise_addr` under `SHUFFLE_ADDR_KEY` so peers find us, and
 /// give the sender a KV handle for reverse lookup. Static discovery
 /// has no KV tier, so we hand back a bare sender — peers must be
 /// registered explicitly by whatever sets up the shuffle topology.
 async fn build_shuffle_sender(
     node_id: u64,
     discovery: &DiscoveryImpl,
-    local_addr: std::net::SocketAddr,
+    advertise_addr: String,
 ) -> laminar_core::shuffle::ShuffleSender {
     use laminar_core::cluster::control::{ChitchatKv, ClusterKv};
     use laminar_core::shuffle::{ShuffleSender, SHUFFLE_ADDR_KEY};
@@ -597,8 +598,31 @@ async fn build_shuffle_sender(
         return ShuffleSender::new(node_id);
     };
     let kv: Arc<dyn ClusterKv> = Arc::new(ChitchatKv::from_handle(handle));
-    kv.write(SHUFFLE_ADDR_KEY, local_addr.to_string()).await;
+    kv.write(SHUFFLE_ADDR_KEY, advertise_addr).await;
     ShuffleSender::with_kv(node_id, kv)
+}
+
+/// Compute the address peers should use to reach our `ShuffleReceiver`.
+///
+/// The receiver binds to `0.0.0.0:0` (any interface, ephemeral port), so
+/// `local_addr.ip()` is the wildcard — publishing it unchanged leaves
+/// remote senders unable to connect. Swap in the host portion of the
+/// configured server bind, falling back to `gethostname` when bind is
+/// itself a wildcard, keeping the port from the actual bound socket.
+fn shuffle_advertise_addr(local_addr: std::net::SocketAddr, bind_host: &str) -> String {
+    let port = local_addr.port();
+    let host = bind_host.trim_start_matches('[').trim_end_matches(']');
+    let ip_wildcard = host == "0.0.0.0" || host == "::" || host.is_empty();
+    if !ip_wildcard {
+        return format!("{bind_host}:{port}");
+    }
+    let hostname = gethostname::gethostname();
+    let hostname = hostname.to_string_lossy();
+    if hostname.is_empty() {
+        local_addr.to_string()
+    } else {
+        format!("{hostname}:{port}")
+    }
 }
 
 #[cfg(test)]
