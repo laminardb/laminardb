@@ -199,25 +199,11 @@ impl ClusterEngineHarness {
             let registry = Arc::new(VnodeRegistry::new(vnode_count));
             registry.set_assignment(Arc::clone(&assignment));
             // Bump the registry's local assignment version to match the
-            // snapshot's so fence-aware writers (CheckpointedRepartitionExec)
-            // stamp their writes with the correct caller version.
+            // persisted snapshot's so fence-aware writers stamp their
+            // writes with the correct caller version.
             while registry.assignment_version() < snapshot_version {
-                // `set_assignment` monotonically bumps by 1. Cheap loop
-                // to align with the persisted generation number.
                 registry.set_assignment(Arc::clone(&assignment));
             }
-
-            // NOTE: `DistributedAggregateRule` is intentionally NOT installed
-            // here. Row-shuffle (Phase 0a) handles cluster aggregates via
-            // `IncrementalAggState`, which bypasses DataFusion's physical
-            // plan — so the rule's `RepartitionExec::Hash` rewrite never
-            // fires for aggregate streaming queries. If the rule IS
-            // installed, it fires during `CREATE MATERIALIZED VIEW`'s
-            // schema-extraction `df.collect()` and the resulting
-            // `ClusterRepartitionExec::dispatch_inbound` task holds the
-            // receiver mutex for the engine's lifetime, starving the
-            // row-shuffle drain. The rule is still correct for
-            // non-aggregate cluster queries — Phase 5 will reconcile.
 
             let cp_cfg = StreamCheckpointConfig {
                 interval_ms: None, // manual only — tests drive checkpoint() explicitly

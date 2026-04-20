@@ -57,8 +57,7 @@ pub struct LaminarDbBuilder {
     /// Optional vnode topology. See `state_backend`.
     vnode_registry: Option<std::sync::Arc<laminar_core::state::VnodeRegistry>>,
     /// Extra physical optimizer rules installed on the `SessionState`
-    /// at construction. Used by cluster mode to register
-    /// `DistributedAggregateRule`.
+    /// at construction.
     physical_optimizer_rules: Vec<
         std::sync::Arc<
             dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync,
@@ -104,9 +103,7 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Register an additional `PhysicalOptimizerRule` on the session
-    /// state. Cluster mode uses this to install
-    /// `DistributedAggregateRule`.
+    /// Register an additional `PhysicalOptimizerRule` on the session state.
     #[must_use]
     pub fn physical_optimizer_rule(
         mut self,

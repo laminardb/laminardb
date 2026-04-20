@@ -33,16 +33,6 @@ pub mod lookup_join_exec;
 /// `cluster-unstable` because it pulls in the shuffle transport.
 #[cfg(feature = "cluster-unstable")]
 pub mod cluster_repartition;
-/// Physical optimizer rule that splices `ClusterRepartitionExec` into
-/// DataFusion plans. NOT currently installed by the production server
-/// (starves the row-shuffle drain); stays available for non-streaming
-/// distributed aggregation once that conflict is resolved.
-#[cfg(feature = "cluster-unstable")]
-pub mod distributed_aggregate_rule;
-/// Wraps `ClusterRepartitionExec` to persist per-partition partial
-/// state on each aligned checkpoint.
-#[cfg(feature = "cluster-unstable")]
-pub mod checkpointed_repartition;
 /// Processing-time UDF for `PROCTIME()` support
 pub mod proctime_udf;
 mod source;

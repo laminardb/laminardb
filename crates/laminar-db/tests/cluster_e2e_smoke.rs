@@ -1,13 +1,10 @@
-//! Phase 0 smoke test: 2 nodes, real planner, hash shuffle,
-//! materialized-view aggregate, no faults. Must pass on this branch
-//! with no feature gates or `#[ignore]`. See
-//! `docs/plans/cluster-production-readiness.md` Phase 0.
+//! Phase 0 smoke test: 2 nodes, real planner, row-shuffle pre-aggregate,
+//! materialized-view aggregate, no faults.
 //!
 //! What this proves:
-//! - The full SQL path through DataFusion is wired into cluster mode
-//!   (`DistributedAggregateRule` rewrites the plan).
-//! - Cross-instance shuffle delivers rows to the owning vnode.
-//! - The MV result store reflects the post-shuffle FinalAggregate state.
+//! - The streaming aggregate path (`IncrementalAggState` + row-shuffle
+//!   bridge) routes rows to the vnode owner.
+//! - The MV result store reflects the post-shuffle sums.
 //! - 2PC checkpoint completes end-to-end (leader Prepare → follower
 //!   `follower_checkpoint` → leader Commit).
 
@@ -62,12 +59,9 @@ async fn happy_path_eight_keys_correct_sums() {
         .collect();
     assert_eq!(all_keys.len(), 8, "want 4 keys per owner");
 
-    // DDL on every node so the planner has identical catalogs. The
-    // CREATE MATERIALIZED VIEW statement runs through the cluster-mode
-    // planner — `DistributedAggregateRule` rewrites the GROUP BY into
-    // Partial → ClusterRepartitionExec → FinalPartitioned. DDL precedes
-    // `start_all()` so the pipeline coordinator picks up the sources
-    // and MV at startup (pipeline_lifecycle.rs:237).
+    // DDL on every node so the planner has identical catalogs. DDL
+    // precedes start_all() so the pipeline coordinator picks up the
+    // sources and MV at startup (pipeline_lifecycle.rs:237).
     for node in &harness.nodes {
         node.db
             .execute("CREATE SOURCE src (key BIGINT, value BIGINT)")

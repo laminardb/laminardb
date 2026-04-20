@@ -296,11 +296,8 @@ impl LaminarDB {
         use crate::pipeline::{PipelineConfig, SourceRegistration};
         use laminar_connectors::reference::{ReferenceTableSource, RefreshMode};
 
-        // Build OperatorGraph context. Mirrors the rules + partition
-        // count installed on `LaminarDB::ctx` via the builder so that
-        // cluster-mode rules like `DistributedAggregateRule` actually
-        // fire each cycle inside the streaming pipeline (not just on
-        // `db.execute()` queries against the outer context).
+        // Build OperatorGraph context mirroring the rules + partition
+        // count installed on `LaminarDB::ctx` via the builder.
         let ctx = {
             use datafusion::execution::SessionStateBuilder;
             let mut session_config = laminar_sql::datafusion::base_session_config();

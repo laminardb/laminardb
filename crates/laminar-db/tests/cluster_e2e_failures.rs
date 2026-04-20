@@ -317,20 +317,16 @@ async fn crash_mid_stream_loses_in_flight() {
 
 /// Scenario 2 — restart preserves aggregate state.
 ///
-/// Feature-gated: only runs under `--features phase-1-recovery`. The
-/// scenario needs `CheckpointedRepartitionExec::with_recovery_epoch`
-/// to be wired (gap 1 in the plan) AND the MV catalog re-create path
-/// to handle already-existing MVs (CREATE OR REPLACE, or restore-first
-/// semantics).
+/// Feature-gated behind `phase-1-recovery`: needs the MV catalog
+/// re-create path to handle already-existing MVs (CREATE OR REPLACE, or
+/// restore-first semantics).
 ///
-/// Scope: `SUM` + `MvStorageMode::Aggregate` only. Window/Append MVs
-/// are tracked separately.
+/// Scope: `SUM` + `MvStorageMode::Aggregate` only.
 ///
-/// Includes an intermediate-snapshot assertion (review item C3):
-/// after restart, before the second push, the union MUST equal the
-/// pre-shutdown state. Without that check, a "restart dropped all
-/// state; second-half push repopulated by coincidence" bug would
-/// masquerade as recovery.
+/// Includes an intermediate-snapshot assertion: after restart, before
+/// the second push, the union MUST equal the pre-shutdown state.
+/// Without it a "restart dropped state; second push repopulated by
+/// coincidence" bug would masquerade as recovery.
 #[cfg(feature = "phase-1-recovery")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_recovers_sum_aggregate() {

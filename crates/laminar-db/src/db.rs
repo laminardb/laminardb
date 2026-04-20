@@ -98,20 +98,13 @@ pub struct LaminarDB {
     /// know which vnodes this instance owns.
     pub(crate) vnode_registry:
         parking_lot::Mutex<Option<Arc<laminar_core::state::VnodeRegistry>>>,
-    /// Extra physical optimizer rules registered via the builder.
-    /// Applied both to `self.ctx` (used by `db.execute()`) and to the
-    /// streaming pipeline's internal `OperatorGraph` context built in
-    /// `pipeline_lifecycle::start_connector_pipeline`. Without the
-    /// pipeline-side application, cluster-mode rules like
-    /// `DistributedAggregateRule` reach `db.execute()`-style queries but
-    /// never affect what runs each cycle inside the streaming engine.
+    /// Extra physical optimizer rules from the builder, applied to both
+    /// `self.ctx` and the pipeline-side `OperatorGraph` context.
     pub(crate) physical_optimizer_rules: Arc<
         [Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>],
     >,
-    /// `target_partitions` override from the builder. Mirrored into the
-    /// pipeline-side `SessionContext` so `DataFusion`'s
-    /// `EnforceDistribution` inserts the hash repartition that
-    /// `DistributedAggregateRule` rewrites.
+    /// `target_partitions` override from the builder, mirrored into the
+    /// pipeline-side `SessionContext`.
     pub(crate) pipeline_target_partitions: Option<usize>,
     /// Outbound shuffle handle. Installed via `LaminarDbBuilder::shuffle_sender`;
     /// used by `SqlQueryOperator` to row-shuffle pre-aggregate batches to vnode
@@ -222,7 +215,6 @@ impl LaminarDB {
 
     /// Same as [`Self::open_with_config_and_vars`] but also installs
     /// the given physical-optimizer rules on the `DataFusion` session.
-    /// Cluster mode uses this to register `DistributedAggregateRule`.
     #[allow(clippy::unnecessary_wraps)]
     pub(crate) fn open_with_config_and_vars_and_rules(
         config: LaminarConfig,

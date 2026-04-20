@@ -382,17 +382,9 @@ pub async fn start_cluster(
         shuffle_receiver.local_addr(),
     ).await);
 
-    // NOTE: `DistributedAggregateRule` is intentionally NOT installed
-    // here. It rewrites DataFusion aggregate plans into
-    // Partial → ClusterRepartitionExec → FinalPartitioned, but the
-    // rule fires during CREATE MATERIALIZED VIEW's schema-extraction
-    // `df.collect()` and the resulting `dispatch_inbound` task holds
-    // the ShuffleReceiver mutex for the engine's lifetime — which
-    // starves the row-shuffle drain that `IncrementalAggState` relies
-    // on. Streaming aggregates (the production workload) go through
-    // the row-shuffle bridge below, whose state recovery rides the
-    // existing operator-checkpoint mechanism. The rule stays in
-    // `laminar-sql` for a future non-streaming path, not enabled here.
+    // Streaming aggregates go through the row-shuffle bridge driven by
+    // `IncrementalAggState`; the DataFusion-native aggregate-rewrite
+    // path was removed — see commit history.
     builder = builder
         .shuffle_sender(Arc::clone(&shuffle_sender))
         .shuffle_receiver(Arc::clone(&shuffle_receiver))
