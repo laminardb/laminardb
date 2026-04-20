@@ -282,23 +282,33 @@ pub async fn start_cluster(
         .map_err(|e| ClusterStartupError::Discovery(e.to_string()))?;
     info!("Discovery layer started");
 
-    // 2. Wait for peers with formation timeout
-    let peers: Vec<NodeInfo> = tokio::time::timeout(cluster_cfg.formation_timeout, async {
-        loop {
-            if let Ok(p) = discovery.peers().await {
-                if !p.is_empty() {
-                    return p;
-                }
+    // 2. Wait for expected membership. `peers` excludes self, so target
+    // is seeds.len() - 1 (assumes every node lists the full cluster).
+    // A single-peer early return would let resolve_vnode_assignment
+    // CAS-create from a partial view.
+    let expected_peers = cluster_cfg.discovery.seeds.len().saturating_sub(1).max(1);
+    let deadline = std::time::Instant::now() + cluster_cfg.formation_timeout;
+    let mut last_seen = 0usize;
+    let peers: Vec<NodeInfo> = loop {
+        if let Ok(p) = discovery.peers().await {
+            last_seen = p.len();
+            if p.len() >= expected_peers {
+                break p;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
-    })
-    .await
-    .map_err(|_| ClusterStartupError::FormationTimeout {
-        found: 0,
-        needed: 1,
-    })?;
-    info!("Discovered {} peer(s)", peers.len());
+        if std::time::Instant::now() >= deadline {
+            return Err(ClusterStartupError::FormationTimeout {
+                found: last_seen,
+                needed: expected_peers,
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    };
+    info!(
+        "Discovered {} peer(s) (expected {})",
+        peers.len(),
+        expected_peers
+    );
 
     // Build LaminarDB with Profile::Cluster
     let mut builder = LaminarDB::builder();
