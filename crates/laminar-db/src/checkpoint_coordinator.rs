@@ -33,47 +33,33 @@ use tracing::{debug, error, info, warn};
 use crate::error::DbError;
 
 /// Unified checkpoint configuration.
+///
+/// Timeouts prevent a stuck sink or hung filesystem from stalling the
+/// runtime. `state_inline_threshold` decides per-operator whether state
+/// inlines as base64 in the JSON manifest or lands in a sidecar file.
+/// `max_checkpoint_bytes` caps total sidecar size; an oversized
+/// checkpoint is rejected with `[LDB-6014]`.
 #[derive(Debug, Clone)]
 pub struct CheckpointConfig {
     /// Interval between checkpoints. `None` = manual only.
     pub interval: Option<Duration>,
-    /// Maximum number of retained checkpoints.
+    /// Number of completed checkpoints retained on disk/in object store.
     pub max_retained: usize,
-    /// Maximum time to wait for barrier alignment at fan-in nodes.
+    /// Upper bound on barrier-alignment wait at fan-in operators.
     pub alignment_timeout: Duration,
-    /// Maximum time to wait for all sinks to pre-commit.
-    ///
-    /// A stuck sink will not block checkpointing indefinitely.
-    /// Defaults to 30 seconds.
+    /// Upper bound on sink pre-commit (phase 1).
     pub pre_commit_timeout: Duration,
-    /// Maximum time to wait for manifest persist (filesystem I/O).
-    ///
-    /// A hung or degraded filesystem will not stall the runtime indefinitely.
-    /// Defaults to 120 seconds.
+    /// Upper bound on manifest persist.
     pub persist_timeout: Duration,
-    /// Maximum time to wait for all sinks to commit (phase 2).
-    ///
-    /// Defaults to 60 seconds.
+    /// Upper bound on sink commit (phase 2).
     pub commit_timeout: Duration,
-    /// Maximum time to wait for all sinks to roll back. Defaults to 30s.
+    /// Upper bound on sink rollback.
     pub rollback_timeout: Duration,
-    /// Maximum operator state size (bytes) to inline in the JSON manifest.
-    ///
-    /// States larger than this threshold are written to a `state.bin` sidecar
-    /// file and referenced by offset/length in the manifest. This avoids
-    /// inflating the manifest with base64-encoded blobs (~33% overhead).
-    ///
-    /// Default: 1 MB (`1_048_576`). Set to `usize::MAX` to inline everything.
+    /// States larger than this go to a sidecar rather than base64 JSON.
     pub state_inline_threshold: usize,
-    /// Maximum time for operator state serialization. Defaults to 120 seconds.
+    /// Upper bound on operator state serialization.
     pub serialization_timeout: Duration,
-    /// Maximum total checkpoint size in bytes (manifest + sidecar).
-    ///
-    /// If the packed operator state exceeds this limit, the checkpoint is
-    /// rejected with `[LDB-6014]` and not persisted. This prevents
-    /// unbounded state from creating multi-GB sidecar files.
-    ///
-    /// `None` means no limit (default). A warning is logged at 80% of the cap.
+    /// Cap on total sidecar bytes; `None` = no limit. 80% warn threshold.
     pub max_checkpoint_bytes: Option<usize>,
 }
 
@@ -195,56 +181,32 @@ pub struct CheckpointCoordinator {
     checkpoints_completed: u64,
     checkpoints_failed: u64,
     last_checkpoint_duration: Option<Duration>,
-    /// Rolling histogram of checkpoint durations for percentile tracking.
     duration_histogram: DurationHistogram,
-    /// Prometheus engine metrics.
     prom: Option<Arc<crate::engine_metrics::EngineMetrics>>,
-    /// Cumulative bytes written across all checkpoints (manifest + sidecar).
     total_bytes_written: u64,
-    /// Optional state backend consulted between manifest persist and sink
-    /// commit to verify per-vnode durability.
+    /// Consulted between manifest persist and sink commit to verify
+    /// per-vnode durability.
     state_backend: Option<Arc<dyn StateBackend>>,
-    /// Authoritative assignment generation this coordinator writes with.
-    /// Stamped into every `write_partial` so the backend's Phase 1.4
-    /// fence can reject writes from stale peers. Zero = unconfigured
-    /// (pre-Phase-1.2 single-instance path); any non-zero is treated
-    /// as the current generation. Set via
-    /// [`set_assignment_version`](Self::set_assignment_version).
+    /// Stamped into every `write_partial` for the Phase 1.4 fence.
+    /// Zero = fence disabled.
     assignment_version: u64,
-    /// Follower-side local watermark. Phase 1.3: reported in each
-    /// `BarrierAck` so the leader can compute the cluster-wide
-    /// minimum for the matching `Commit` announcement. `None` means
-    /// the pipeline hasn't produced a watermark yet; the leader
-    /// treats this follower as non-blocking. Set via
-    /// [`set_local_watermark_ms`](Self::set_local_watermark_ms).
+    /// Reported in each `BarrierAck`; the leader folds these with its
+    /// own watermark to compute the cluster-wide min.
     local_watermark_ms: Option<i64>,
-    /// Cluster-wide minimum watermark as of the last committed epoch.
-    /// Leader-side only — computed during `await_prepare_quorum` from
-    /// the leader's own local watermark + follower acks, published in
-    /// the matching `Commit` announcement.
+    /// Cluster-wide min watermark as of the last committed epoch
+    /// (leader-side; fanned out in the Commit announcement).
     #[cfg(feature = "cluster-unstable")]
     cluster_min_watermark: Option<i64>,
-    /// Vnodes this coordinator owns. Drives the per-vnode marker
-    /// writes — each checkpoint publishes one marker per entry.
-    /// Empty disables marker writes.
+    /// Vnodes this coordinator owns; drives per-vnode marker writes.
     vnode_set: Vec<u32>,
-    /// Vnodes the leader's durability gate checks. In a cluster this is
-    /// the full registry (so the gate verifies markers from every
-    /// follower's shared-storage writes, not just the leader's). In
-    /// single-instance mode it's populated the same as `vnode_set`.
-    /// Empty disables the gate.
+    /// Vnodes the leader's durability gate checks. In cluster mode the
+    /// full registry; single-instance mirrors `vnode_set`.
     gate_vnode_set: Vec<u32>,
-    /// Cluster control facade. `Some` when running in cluster mode;
-    /// `None` in single-instance / embedded. The leader / follower
-    /// distinction and the quorum-wait flow consume this in the
-    /// C.5-final protocol change.
+    /// `Some` in cluster mode, `None` in single-instance / embedded.
     #[cfg(feature = "cluster-unstable")]
     cluster_controller:
         Option<Arc<laminar_core::cluster::control::ClusterController>>,
-    /// Sorted sink names cached from the last `register_sink` call.
-    /// Cleared (set to `None`) whenever a new sink is registered so
-    /// subsequent checkpoints re-compute, and populated lazily inside
-    /// `sorted_sink_names()`. Saves an O(N log N) sort per checkpoint.
+    /// Cached sorted sink names; invalidated on `register_sink`.
     cached_sorted_sink_names: Option<Vec<String>>,
 }
 
