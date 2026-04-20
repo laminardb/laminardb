@@ -113,7 +113,8 @@ fn bench_recovery_with_sidecar(c: &mut Criterion) {
 
         let manifest = realistic_manifest(1, 5, 3);
         let state = synthetic_state(size_bytes);
-        rt.block_on(store.save_with_state(&manifest, Some(&state)))
+        let chunks = [bytes::Bytes::from(state)];
+        rt.block_on(store.save_with_state(&manifest, Some(&chunks)))
             .unwrap();
 
         let label = humanize_bytes(size_bytes);
@@ -145,6 +146,10 @@ fn bench_checkpoint_save(c: &mut Criterion) {
         let store = FileSystemCheckpointStore::new(dir.path(), 100);
 
         let state = synthetic_state(size_bytes);
+        // Wrap once; cloning a Bytes is an Arc-bump so reusing this
+        // across iterations gives a fair measurement of the write path
+        // rather than the allocation of the test buffer.
+        let state_chunks = [bytes::Bytes::from(state)];
 
         let label = humanize_bytes(size_bytes);
         group.throughput(Throughput::Bytes(size_bytes as u64));
@@ -152,7 +157,7 @@ fn bench_checkpoint_save(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("save_with_state", &label), |b| {
             b.iter(|| {
                 let manifest = realistic_manifest(id, 5, 3);
-                rt.block_on(store.save_with_state(&manifest, Some(&state)))
+                rt.block_on(store.save_with_state(&manifest, Some(&state_chunks)))
                     .unwrap();
                 id += 1;
             })

@@ -891,7 +891,10 @@ mod tests {
             .insert("big-op".into(), OperatorCheckpoint::external(0, 2048));
 
         // Write sidecar first, then manifest
-        store.save_state_data(1, &large_data).await.unwrap();
+        store
+            .save_state_data(1, &[bytes::Bytes::copy_from_slice(&large_data)])
+            .await
+            .unwrap();
         store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
@@ -919,7 +922,10 @@ mod tests {
             .operator_states
             .insert("big-op".into(), OperatorCheckpoint::external(0, 4096));
 
-        store.save_state_data(1, &large_data).await.unwrap();
+        store
+            .save_state_data(1, &[bytes::Bytes::copy_from_slice(&large_data)])
+            .await
+            .unwrap();
         store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);

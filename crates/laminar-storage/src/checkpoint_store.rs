@@ -149,6 +149,20 @@ fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Compute SHA-256 hex digest across a chain of `Bytes` chunks.
+///
+/// Equivalent to hashing the concatenation of the chunks, but without
+/// materializing that concatenation in memory. Used by
+/// [`CheckpointStore::save_with_state`] to checksum the sidecar before
+/// the multi-chunk write.
+fn sha256_hex_chunks(chunks: &[bytes::Bytes]) -> String {
+    let mut hasher = Sha256::new();
+    for chunk in chunks {
+        hasher.update(chunk);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 /// Trait for checkpoint persistence backends.
 ///
 /// Implementations must guarantee atomic manifest writes (readers never see
@@ -228,9 +242,19 @@ pub trait CheckpointStore: Send + Sync {
 
     /// Writes operator state sidecar bytes for a checkpoint.
     ///
+    /// Accepts a chain of `Bytes` chunks (one per operator) rather than
+    /// a single concatenated slice. Backends that support native
+    /// multi-chunk writes (object-store `PutPayload`) avoid copying the
+    /// chunks into a contiguous buffer; backends without such support
+    /// write sequentially.
+    ///
     /// # Errors
     /// Returns [`CheckpointStoreError`] on I/O failure.
-    async fn save_state_data(&self, id: u64, data: &[u8]) -> Result<(), CheckpointStoreError>;
+    async fn save_state_data(
+        &self,
+        id: u64,
+        chunks: &[bytes::Bytes],
+    ) -> Result<(), CheckpointStoreError>;
 
     /// Loads operator state sidecar bytes for a checkpoint, or `Ok(None)`
     /// if no sidecar was written.
@@ -402,17 +426,18 @@ pub trait CheckpointStore: Send + Sync {
     async fn save_with_state(
         &self,
         manifest: &CheckpointManifest,
-        state_data: Option<&[u8]>,
+        state_data: Option<&[bytes::Bytes]>,
     ) -> Result<(), CheckpointStoreError> {
         let mut manifest = manifest.clone();
-        if let Some(data) = state_data {
-            // Compute checksum from in-memory bytes before writing. This is safe
-            // because: (1) save_state_data writes to a temp file then renames
-            // atomically, so the on-disk bytes match the in-memory data exactly;
-            // (2) if the sidecar write fails, save() is never called, so the
-            // manifest with the checksum is never persisted.
-            manifest.state_checksum = Some(sha256_hex(data));
-            self.save_state_data(manifest.checkpoint_id, data).await?;
+        if let Some(chunks) = state_data {
+            // Compute checksum across the chunks before writing. This is
+            // safe because: (1) save_state_data writes to a temp then
+            // renames atomically, so the on-disk bytes match the
+            // in-memory chain exactly; (2) if the sidecar write fails,
+            // save() is never called, so the manifest with the checksum
+            // is never persisted.
+            manifest.state_checksum = Some(sha256_hex_chunks(chunks));
+            self.save_state_data(manifest.checkpoint_id, chunks).await?;
         }
         self.save(&manifest).await
     }
@@ -680,15 +705,26 @@ impl CheckpointStore for FileSystemCheckpointStore {
     async fn save_state_data(
         &self,
         id: u64,
-        data: &[u8],
+        chunks: &[bytes::Bytes],
     ) -> Result<(), CheckpointStoreError> {
+        use tokio::io::AsyncWriteExt;
+
         let cp_dir = self.checkpoint_dir(id);
         tokio::fs::create_dir_all(&cp_dir).await?;
 
         let path = self.state_path(id);
         let tmp = path.with_extension("bin.tmp");
-        tokio::fs::write(&tmp, data).await?;
-        sync_file(&tmp).await?;
+
+        // Write chunks sequentially to the temp file — no concatenation
+        // into a contiguous buffer. Each chunk is already an owned Bytes;
+        // write_all borrows it.
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        for chunk in chunks {
+            file.write_all(chunk).await?;
+        }
+        file.sync_all().await?;
+        drop(file);
+
         tokio::fs::rename(&tmp, &path).await?;
         sync_dir(&cp_dir).await?;
 
@@ -698,14 +734,14 @@ impl CheckpointStore for FileSystemCheckpointStore {
     async fn save_with_state(
         &self,
         manifest: &CheckpointManifest,
-        state_data: Option<&[u8]>,
+        state_data: Option<&[bytes::Bytes]>,
     ) -> Result<(), CheckpointStoreError> {
         let mut manifest = manifest.clone();
         // Write sidecar FIRST — if this fails, manifest is never written
         // and latest.txt still points to the previous valid checkpoint.
-        if let Some(data) = state_data {
-            manifest.state_checksum = Some(sha256_hex(data));
-            self.save_state_data(manifest.checkpoint_id, data).await?;
+        if let Some(chunks) = state_data {
+            manifest.state_checksum = Some(sha256_hex_chunks(chunks));
+            self.save_state_data(manifest.checkpoint_id, chunks).await?;
         }
         self.save(&manifest).await
     }
@@ -822,10 +858,15 @@ impl ObjectStoreCheckpointStore {
     /// 5xx / connection failures across backends — and bubbles every
     /// other error immediately. Non-idempotent writes (conditional
     /// creates on the manifest path) MUST NOT use this helper.
+    ///
+    /// `payload` is consumed on the happy path and cloned on retry.
+    /// `PutPayload::clone` is cheap (Arc-bump on each underlying
+    /// `Bytes` chunk), so multi-chunk payloads cost nothing extra to
+    /// retry.
     async fn put_with_retry(
         &self,
         path: &object_store::path::Path,
-        payload: &bytes::Bytes,
+        payload: PutPayload,
         opts: &PutOptions,
     ) -> Result<(), CheckpointStoreError> {
         const BACKOFFS_MS: &[u64] = &[100, 500, 2000];
@@ -833,11 +874,7 @@ impl ObjectStoreCheckpointStore {
         loop {
             let result = self
                 .store
-                .put_opts(
-                    path,
-                    PutPayload::from_bytes(payload.clone()),
-                    opts.clone(),
-                )
+                .put_opts(path, payload.clone(), opts.clone())
                 .await;
             match result {
                 Ok(_) => return Ok(()),
@@ -986,8 +1023,12 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
         let pointer = serde_json::to_string(&LatestPointer {
             checkpoint_id: manifest.checkpoint_id,
         })?;
-        self.put_with_retry(&latest, &bytes::Bytes::from(pointer), &PutOptions::default())
-            .await?;
+        self.put_with_retry(
+            &latest,
+            PutPayload::from_bytes(bytes::Bytes::from(pointer)),
+            &PutOptions::default(),
+        )
+        .await?;
 
         // Auto-prune
         if self.max_retained > 0 {
@@ -1106,16 +1147,15 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
     async fn save_state_data(
         &self,
         id: u64,
-        data: &[u8],
+        chunks: &[bytes::Bytes],
     ) -> Result<(), CheckpointStoreError> {
         let path = self.state_path(id);
+        // PutPayload is a chain of Bytes — no concatenation into a
+        // contiguous buffer. Each Arc bump is ~nothing; the underlying
+        // bytes reach the object-store client untouched.
+        let payload: PutPayload = chunks.iter().cloned().collect();
         // Sidecar writes are idempotent — retry transients.
-        self.put_with_retry(
-            &path,
-            &bytes::Bytes::copy_from_slice(data),
-            &PutOptions::default(),
-        )
-        .await
+        self.put_with_retry(&path, payload, &PutOptions::default()).await
     }
 
     async fn load_state_data(
@@ -1291,7 +1331,10 @@ mod tests {
         store.save(&make_manifest(1, 1)).await.unwrap();
 
         let data = b"large operator state binary blob";
-        store.save_state_data(1, data).await.unwrap();
+        store
+            .save_state_data(1, &[bytes::Bytes::from_static(data)])
+            .await
+            .unwrap();
 
         let loaded = store.load_state_data(1).await.unwrap().unwrap();
         assert_eq!(loaded, data);
@@ -1386,7 +1429,10 @@ mod tests {
 
         let m = make_manifest(1, 1);
         let state = b"large-operator-state-blob";
-        store.save_with_state(&m, Some(state)).await.unwrap();
+        store
+            .save_with_state(&m, Some(&[bytes::Bytes::from_static(state)]))
+            .await
+            .unwrap();
 
         // Both manifest and state should be present.
         let loaded = store.load_latest().await.unwrap().unwrap();
@@ -1416,7 +1462,10 @@ mod tests {
 
         // Write only sidecar state, no manifest (simulates crash after
         // state write but before manifest write).
-        store.save_state_data(1, b"orphaned").await.unwrap();
+        store
+            .save_state_data(1, &[bytes::Bytes::from_static(b"orphaned")])
+            .await
+            .unwrap();
 
         // load_latest should return None — the orphan is not visible.
         assert!(store.load_latest().await.unwrap().is_none());
@@ -1530,7 +1579,10 @@ mod tests {
         store.save(&make_manifest(1, 1)).await.unwrap();
 
         let data = b"large operator state binary blob";
-        store.save_state_data(1, data).await.unwrap();
+        store
+            .save_state_data(1, &[bytes::Bytes::from_static(data)])
+            .await
+            .unwrap();
 
         let loaded = store.load_state_data(1).await.unwrap().unwrap();
         assert_eq!(loaded, data);
@@ -1682,7 +1734,10 @@ mod tests {
         let store = ObjectStoreCheckpointStore::new(inner.clone(), String::new(), 10);
 
         store.save(&make_manifest(1, 1)).await.unwrap();
-        store.save_state_data(1, b"state-blob").await.unwrap();
+        store
+            .save_state_data(1, &[bytes::Bytes::from_static(b"state-blob")])
+            .await
+            .unwrap();
 
         let result = inner
             .get_opts(
@@ -1801,7 +1856,10 @@ mod tests {
 
         let state = b"important operator state";
         let m = make_manifest(1, 1);
-        store.save_with_state(&m, Some(state)).await.unwrap();
+        store
+            .save_with_state(&m, Some(&[bytes::Bytes::from_static(state)]))
+            .await
+            .unwrap();
 
         let result = store.validate_checkpoint(1).await.unwrap();
         assert!(result.valid, "checksum should match: {:?}", result.issues);
@@ -1815,7 +1873,10 @@ mod tests {
         // Save with state to get a checksum.
         let state = b"original state";
         let m = make_manifest(1, 1);
-        store.save_with_state(&m, Some(state)).await.unwrap();
+        store
+            .save_with_state(&m, Some(&[bytes::Bytes::from_static(state)]))
+            .await
+            .unwrap();
 
         // Now corrupt the state.bin on disk.
         let state_path = dir.path().join("checkpoints/checkpoint_000001/state.bin");
@@ -1840,7 +1901,10 @@ mod tests {
 
         // Save with state.
         let m = make_manifest(1, 1);
-        store.save_with_state(&m, Some(b"state")).await.unwrap();
+        store
+            .save_with_state(&m, Some(&[bytes::Bytes::from_static(b"state")]))
+            .await
+            .unwrap();
 
         // Delete the state.bin file to simulate partial crash.
         let state_path = dir.path().join("checkpoints/checkpoint_000001/state.bin");
@@ -1946,7 +2010,10 @@ mod tests {
 
         let state = b"state-data-for-checksum";
         let m = make_manifest(1, 1);
-        store.save_with_state(&m, Some(state)).await.unwrap();
+        store
+            .save_with_state(&m, Some(&[bytes::Bytes::from_static(state)]))
+            .await
+            .unwrap();
 
         let loaded = store.load_latest().await.unwrap().unwrap();
         assert!(
@@ -1998,7 +2065,10 @@ mod tests {
 
         let state = b"obj-store-state-data";
         let m = make_manifest(1, 1);
-        store.save_with_state(&m, Some(state)).await.unwrap();
+        store
+            .save_with_state(&m, Some(&[bytes::Bytes::from_static(state)]))
+            .await
+            .unwrap();
 
         let result = store.validate_checkpoint(1).await.unwrap();
         assert!(result.valid, "checksum should match: {:?}", result.issues);
@@ -2028,7 +2098,10 @@ mod tests {
         // Save a checkpoint (creates manifest + state).
         let state = b"state-with-manifest";
         store
-            .save_with_state(&make_manifest(1, 1), Some(state))
+            .save_with_state(
+                &make_manifest(1, 1),
+                Some(&[bytes::Bytes::from_static(state)]),
+            )
             .await
             .unwrap();
 

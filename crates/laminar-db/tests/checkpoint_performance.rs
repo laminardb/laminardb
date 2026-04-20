@@ -49,7 +49,7 @@ impl CheckpointStore for SlowCheckpointStore {
     async fn save_state_data(
         &self,
         _id: u64,
-        _data: &[u8],
+        _chunks: &[bytes::Bytes],
     ) -> Result<(), CheckpointStoreError> {
         Ok(())
     }

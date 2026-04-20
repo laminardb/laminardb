@@ -631,7 +631,7 @@ impl CheckpointCoordinator {
     async fn save_manifest(
         &self,
         manifest: Arc<CheckpointManifest>,
-        state_data: Option<Vec<u8>>,
+        state_data: Option<Vec<bytes::Bytes>>,
     ) -> Result<(), DbError> {
         let timeout_dur = self.config.persist_timeout;
         let fut = self
@@ -871,38 +871,39 @@ impl CheckpointCoordinator {
             .collect()
     }
 
-    /// Packs operator states into a manifest with optional sidecar blob.
+    /// Packs operator states into a manifest with optional sidecar chunks.
     ///
     /// States larger than `threshold` are stored in a sidecar blob rather
-    /// than base64-inlined in the JSON manifest. The concatenation into
-    /// `sidecar_blobs` still costs one copy of the total external bytes
-    /// (the shared `CheckpointStore::save_with_state` API takes `&[u8]`);
-    /// the zero-copy path used in `from_bytes_shared` eliminates the
-    /// earlier per-operator copy that `from_bytes` incurred on the
-    /// external path.
+    /// than base64-inlined in the JSON manifest. The returned `Vec<Bytes>`
+    /// is handed to `save_with_state` as a chain — the object-store path
+    /// builds a multi-chunk `PutPayload` (no contiguous buffer), the FS
+    /// path writes chunks sequentially. Either way no full-state copy
+    /// happens here.
     fn pack_operator_states(
         manifest: &mut CheckpointManifest,
         operator_states: &HashMap<String, bytes::Bytes>,
         threshold: usize,
-    ) -> Option<Vec<u8>> {
-        let mut sidecar_blobs: Vec<u8> = Vec::new();
+    ) -> Option<Vec<bytes::Bytes>> {
+        let mut sidecar_chunks: Vec<bytes::Bytes> = Vec::new();
+        let mut offset: u64 = 0;
         for (name, data) in operator_states {
             let (op_ckpt, maybe_blob) =
                 laminar_storage::checkpoint_manifest::OperatorCheckpoint::from_bytes_shared(
                     data.clone(),
                     threshold,
-                    sidecar_blobs.len() as u64,
+                    offset,
                 );
             if let Some(blob) = maybe_blob {
-                sidecar_blobs.extend_from_slice(&blob);
+                offset += blob.len() as u64;
+                sidecar_chunks.push(blob);
             }
             manifest.operator_states.insert(name.clone(), op_ckpt);
         }
 
-        if sidecar_blobs.is_empty() {
+        if sidecar_chunks.is_empty() {
             None
         } else {
-            Some(sidecar_blobs)
+            Some(sidecar_chunks)
         }
     }
 
@@ -1319,7 +1320,9 @@ impl CheckpointCoordinator {
             &operator_states,
             self.config.state_inline_threshold,
         );
-        let sidecar_bytes = state_data.as_ref().map_or(0, Vec::len);
+        let sidecar_bytes = state_data
+            .as_ref()
+            .map_or(0, |chunks| chunks.iter().map(bytes::Bytes::len).sum());
         if sidecar_bytes > 0 {
             debug!(
                 checkpoint_id,
