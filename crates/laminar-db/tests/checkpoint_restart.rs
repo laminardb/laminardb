@@ -92,7 +92,7 @@ async fn test_checkpoint_survives_restart() {
     // ── Phase 2: Verify checkpoint exists on disk ──
     {
         let store = FileSystemCheckpointStore::new(&storage, 3);
-        let manifest = store.load_latest().unwrap();
+        let manifest = store.load_latest().await.unwrap();
         assert!(
             manifest.is_some(),
             "manifest must be loadable after restart"

@@ -825,7 +825,7 @@ impl LaminarDB {
                     ShowCommand::MaterializedViews => self.build_show_materialized_views(),
                     ShowCommand::Streams => self.build_show_streams(),
                     ShowCommand::Tables => self.build_show_tables(),
-                    ShowCommand::CheckpointStatus => self.build_show_checkpoint_status()?,
+                    ShowCommand::CheckpointStatus => self.build_show_checkpoint_status().await?,
                     ShowCommand::CreateSource { name } => {
                         self.build_show_create_source(&name.to_string())?
                     }
@@ -1594,7 +1594,6 @@ impl LaminarDB {
                     prefix,
                     max_retained,
                 )
-                .ok()?
                 .with_vnode_count(vnode_count),
             ))
         } else {

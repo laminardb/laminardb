@@ -19,9 +19,9 @@ fn make_store(dir: &std::path::Path) -> FileSystemCheckpointStore {
     FileSystemCheckpointStore::new(dir, 5)
 }
 
-fn make_coordinator(dir: &std::path::Path) -> CheckpointCoordinator {
+async fn make_coordinator(dir: &std::path::Path) -> CheckpointCoordinator {
     let store = Box::new(make_store(dir));
-    CheckpointCoordinator::new(CheckpointConfig::default(), store)
+    CheckpointCoordinator::new(CheckpointConfig::default(), store).await
 }
 
 // ── Scenario 1: Happy path ──
@@ -31,11 +31,14 @@ async fn test_happy_path_checkpoint_and_recovery() {
     let dir = tempfile::tempdir().unwrap();
 
     // Phase 1: Process and checkpoint
-    let mut coord = make_coordinator(dir.path());
+    let mut coord = make_coordinator(dir.path()).await;
 
     // Perform checkpoint with operator state
     let mut ops = HashMap::new();
-    ops.insert("window-agg".into(), b"accumulated-state".to_vec());
+    ops.insert(
+        "window-agg".into(),
+        bytes::Bytes::from_static(b"accumulated-state"),
+    );
 
     let result = coord
         .checkpoint(CheckpointRequest {
@@ -54,7 +57,7 @@ async fn test_happy_path_checkpoint_and_recovery() {
     let store = make_store(dir.path());
     let mgr = RecoveryManager::new(&store);
 
-    let manifest = mgr.load_latest().unwrap().unwrap();
+    let manifest = mgr.load_latest().await.unwrap().unwrap();
     assert_eq!(manifest.checkpoint_id, 1);
     assert_eq!(manifest.epoch, 1);
     assert_eq!(manifest.watermark, Some(5000));
@@ -66,20 +69,20 @@ async fn test_happy_path_checkpoint_and_recovery() {
 
 // ── Scenario 2: Recovery with no prior checkpoint (fresh start) ──
 
-#[test]
-fn test_recovery_fresh_start() {
+#[tokio::test]
+async fn test_recovery_fresh_start() {
     let dir = tempfile::tempdir().unwrap();
     let store = make_store(dir.path());
     let mgr = RecoveryManager::new(&store);
 
-    let result = mgr.load_latest().unwrap();
+    let result = mgr.load_latest().await.unwrap();
     assert!(result.is_none(), "fresh start should return None");
 }
 
 // ── Scenario 3: Multiple checkpoints, recover latest ──
 
-#[test]
-fn test_recover_latest_of_multiple_checkpoints() {
+#[tokio::test]
+async fn test_recover_latest_of_multiple_checkpoints() {
     let dir = tempfile::tempdir().unwrap();
     let store = make_store(dir.path());
 
@@ -87,11 +90,11 @@ fn test_recover_latest_of_multiple_checkpoints() {
     for i in 1..=3 {
         let mut m = CheckpointManifest::new(i, i);
         m.watermark = Some(i as i64 * 1000);
-        store.save(&m).unwrap();
+        store.save(&m).await.unwrap();
     }
 
     let mgr = RecoveryManager::new(&store);
-    let manifest = mgr.load_latest().unwrap().unwrap();
+    let manifest = mgr.load_latest().await.unwrap().unwrap();
 
     // Should recover the latest (checkpoint 3)
     assert_eq!(manifest.epoch, 3);
@@ -100,8 +103,8 @@ fn test_recover_latest_of_multiple_checkpoints() {
 
 // ── Scenario 4: Checkpoint with source offsets → recovery restores them ──
 
-#[test]
-fn test_checkpoint_source_offsets_round_trip() {
+#[tokio::test]
+async fn test_checkpoint_source_offsets_round_trip() {
     let dir = tempfile::tempdir().unwrap();
 
     // Create checkpoint with source offsets
@@ -126,11 +129,11 @@ fn test_checkpoint_source_offsets_round_trip() {
             metadata: HashMap::from([("slot".into(), "laminar_slot".into())]),
         },
     );
-    store.save(&manifest).unwrap();
+    store.save(&manifest).await.unwrap();
 
     // Recover and verify offsets
     let mgr = RecoveryManager::new(&store);
-    let manifest = mgr.load_latest().unwrap().unwrap();
+    let manifest = mgr.load_latest().await.unwrap().unwrap();
 
     let kafka = manifest.source_offsets.get("kafka-trades").unwrap();
     assert_eq!(kafka.offsets.get("partition-0"), Some(&"1234".into()));
@@ -143,8 +146,8 @@ fn test_checkpoint_source_offsets_round_trip() {
 
 // ── Scenario 5: Operator state recovery ──
 
-#[test]
-fn test_operator_state_round_trip() {
+#[tokio::test]
+async fn test_operator_state_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let store = make_store(dir.path());
 
@@ -160,11 +163,11 @@ fn test_operator_state_round_trip() {
     manifest
         .operator_states
         .insert("filter".into(), OperatorCheckpoint::inline(&filter_state));
-    store.save(&manifest).unwrap();
+    store.save(&manifest).await.unwrap();
 
     // Recover
     let mgr = RecoveryManager::new(&store);
-    let manifest = mgr.load_latest().unwrap().unwrap();
+    let manifest = mgr.load_latest().await.unwrap().unwrap();
 
     assert_eq!(manifest.operator_states.len(), 2);
 
@@ -181,7 +184,7 @@ fn test_operator_state_round_trip() {
 async fn test_table_store_checkpoint_path_recovery() {
     let dir = tempfile::tempdir().unwrap();
 
-    let mut coord = make_coordinator(dir.path());
+    let mut coord = make_coordinator(dir.path()).await;
     let result = coord
         .checkpoint(CheckpointRequest {
             table_store_checkpoint_path: Some("/data/rocksdb_cp_001".into()),
@@ -195,7 +198,7 @@ async fn test_table_store_checkpoint_path_recovery() {
     // Recover
     let store = make_store(dir.path());
     let mgr = RecoveryManager::new(&store);
-    let manifest = mgr.load_latest().unwrap().unwrap();
+    let manifest = mgr.load_latest().await.unwrap().unwrap();
 
     assert_eq!(
         manifest.table_store_checkpoint_path.as_deref(),
@@ -211,7 +214,7 @@ async fn test_coordinator_resumes_epoch_after_recovery() {
 
     // First run: create two checkpoints
     {
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
         coord
             .checkpoint(CheckpointRequest {
                 watermark: Some(1000),
@@ -232,15 +235,15 @@ async fn test_coordinator_resumes_epoch_after_recovery() {
     }
 
     // "Restart": new coordinator picks up from stored state
-    let coord2 = make_coordinator(dir.path());
+    let coord2 = make_coordinator(dir.path()).await;
     assert_eq!(coord2.epoch(), 3);
     assert_eq!(coord2.next_checkpoint_id(), 3);
 }
 
 // ── Scenario 10: Table offsets round-trip ──
 
-#[test]
-fn test_table_offsets_round_trip() {
+#[tokio::test]
+async fn test_table_offsets_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let store = make_store(dir.path());
 
@@ -253,10 +256,10 @@ fn test_table_offsets_round_trip() {
             metadata: HashMap::new(),
         },
     );
-    store.save(&manifest).unwrap();
+    store.save(&manifest).await.unwrap();
 
     let mgr = RecoveryManager::new(&store);
-    let manifest = mgr.load_latest().unwrap().unwrap();
+    let manifest = mgr.load_latest().await.unwrap().unwrap();
 
     let table_cp = manifest.table_offsets.get("exchange_rates").unwrap();
     assert_eq!(table_cp.offsets.get("lsn"), Some(&"0/FF00".into()));
@@ -264,29 +267,29 @@ fn test_table_offsets_round_trip() {
 
 // ── Scenario 11: Checkpoint store prune ──
 
-#[test]
-fn test_checkpoint_store_prune_keeps_latest() {
+#[tokio::test]
+async fn test_checkpoint_store_prune_keeps_latest() {
     let dir = tempfile::tempdir().unwrap();
     let store = make_store(dir.path());
 
     // Create 5 checkpoints
     for i in 1..=5 {
         let m = CheckpointManifest::new(i, i);
-        store.save(&m).unwrap();
+        store.save(&m).await.unwrap();
     }
 
-    let all = store.list().unwrap();
+    let all = store.list().await.unwrap();
     assert_eq!(all.len(), 5);
 
     // Prune to keep 2
-    let pruned = store.prune(2).unwrap();
+    let pruned = store.prune(2).await.unwrap();
     assert_eq!(pruned, 3);
 
-    let remaining = store.list().unwrap();
+    let remaining = store.list().await.unwrap();
     assert_eq!(remaining.len(), 2);
 
     // Latest should still be loadable
-    let latest = store.load_latest().unwrap().unwrap();
+    let latest = store.load_latest().await.unwrap().unwrap();
     assert_eq!(latest.checkpoint_id, 5);
 }
 

@@ -295,11 +295,13 @@ pub struct CheckpointCoordinator {
 
 impl CheckpointCoordinator {
     /// Creates a new checkpoint coordinator.
-    #[must_use]
-    pub fn new(config: CheckpointConfig, store: Box<dyn CheckpointStore>) -> Self {
+    ///
+    /// Reads the latest stored checkpoint to seed `next_checkpoint_id` and
+    /// `epoch`, so construction is async.
+    pub async fn new(config: CheckpointConfig, store: Box<dyn CheckpointStore>) -> Self {
         let store: Arc<dyn CheckpointStore> = Arc::from(store);
         // Determine starting epoch from stored checkpoints.
-        let (next_id, epoch) = match store.load_latest() {
+        let (next_id, epoch) = match store.load_latest().await {
             Ok(Some(m)) => (m.checkpoint_id + 1, m.epoch + 1),
             _ => (1, 1),
         };
@@ -617,38 +619,27 @@ impl CheckpointCoordinator {
         results.into_iter().collect()
     }
 
-    /// Saves a manifest to the checkpoint store (blocking I/O on a task).
+    /// Saves a manifest to the checkpoint store.
     ///
     /// Uses [`CheckpointStore::save_with_state`] to write optional sidecar
     /// data **before** the manifest, ensuring atomicity: if the sidecar write
     /// fails, the manifest is never persisted.
     ///
-    /// Takes `Arc<CheckpointManifest>` so the caller can retain its own
-    /// copy without a deep clone — the refcount bump is essentially
-    /// free. Callers that need to mutate the manifest after save use
-    /// `Arc::make_mut` (COW: no copy when the `spawn_blocking` task
-    /// has already returned and we're the sole owner).
-    ///
-    /// Bounded by [`CheckpointConfig::persist_timeout`] to prevent a hung
-    /// filesystem from stalling the runtime indefinitely.
+    /// Takes `Arc<CheckpointManifest>` so the caller can retain its own copy
+    /// without a deep clone. Bounded by [`CheckpointConfig::persist_timeout`]
+    /// to prevent a hung filesystem from stalling the runtime indefinitely.
     async fn save_manifest(
         &self,
         manifest: Arc<CheckpointManifest>,
         state_data: Option<Vec<u8>>,
     ) -> Result<(), DbError> {
-        let store = Arc::clone(&self.store);
         let timeout_dur = self.config.persist_timeout;
-
-        let task = tokio::task::spawn_blocking(move || {
-            store.save_with_state(&manifest, state_data.as_deref())
-        });
-
-        match tokio::time::timeout(timeout_dur, task).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(e))) => Err(DbError::from(e)),
-            Ok(Err(join_err)) => Err(DbError::Checkpoint(format!(
-                "manifest persist task failed: {join_err}"
-            ))),
+        let fut = self
+            .store
+            .save_with_state(&manifest, state_data.as_deref());
+        match tokio::time::timeout(timeout_dur, fut).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(DbError::from(e)),
             Err(_elapsed) => Err(DbError::Checkpoint(format!(
                 "[LDB-6011] manifest persist timed out after {}s — \
                  filesystem may be degraded",
@@ -704,7 +695,7 @@ impl CheckpointCoordinator {
         if !cc.is_leader() {
             return;
         }
-        let Ok(Some(last)) = self.store.load_latest() else { return };
+        let Ok(Some(last)) = self.store.load_latest().await else { return };
         let has_pending = last
             .sink_commit_statuses
             .values()
@@ -855,24 +846,15 @@ impl CheckpointCoordinator {
     /// Overwrites an existing manifest with updated fields (e.g., sink commit
     /// statuses after Step 6). Uses [`CheckpointStore::update_manifest`] which
     /// does NOT use conditional PUT, so the overwrite always succeeds.
-    ///
-    /// Takes `Arc<CheckpointManifest>` — the refcount bump into
-    /// `spawn_blocking` replaces the previous unconditional deep clone.
     async fn update_manifest_only(
         &self,
         manifest: Arc<CheckpointManifest>,
     ) -> Result<(), DbError> {
-        let store = Arc::clone(&self.store);
         let timeout_dur = self.config.persist_timeout;
-
-        let task = tokio::task::spawn_blocking(move || store.update_manifest(&manifest));
-
-        match tokio::time::timeout(timeout_dur, task).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(e))) => Err(DbError::from(e)),
-            Ok(Err(join_err)) => Err(DbError::Checkpoint(format!(
-                "manifest update task failed: {join_err}"
-            ))),
+        let fut = self.store.update_manifest(&manifest);
+        match tokio::time::timeout(timeout_dur, fut).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(DbError::from(e)),
             Err(_elapsed) => Err(DbError::Checkpoint(format!(
                 "manifest update timed out after {}s",
                 timeout_dur.as_secs()
@@ -1696,8 +1678,10 @@ impl CheckpointCoordinator {
     /// # Errors
     ///
     /// Returns `DbError::Checkpoint` on store errors.
-    pub fn load_latest_manifest(&self) -> Result<Option<CheckpointManifest>, DbError> {
-        self.store.load_latest().map_err(DbError::from)
+    pub async fn load_latest_manifest(
+        &self,
+    ) -> Result<Option<CheckpointManifest>, DbError> {
+        self.store.load_latest().await.map_err(DbError::from)
     }
 }
 
@@ -1880,32 +1864,32 @@ mod tests {
     use super::*;
     use laminar_storage::checkpoint_store::FileSystemCheckpointStore;
 
-    fn make_coordinator(dir: &std::path::Path) -> CheckpointCoordinator {
+    async fn make_coordinator(dir: &std::path::Path) -> CheckpointCoordinator {
         let store = Box::new(FileSystemCheckpointStore::new(dir, 3));
-        CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        CheckpointCoordinator::new(CheckpointConfig::default(), store).await
     }
 
-    #[test]
-    fn test_coordinator_new() {
+    #[tokio::test]
+    async fn test_coordinator_new() {
         let dir = tempfile::tempdir().unwrap();
-        let coord = make_coordinator(dir.path());
+        let coord = make_coordinator(dir.path()).await;
 
         assert_eq!(coord.epoch(), 1);
         assert_eq!(coord.next_checkpoint_id(), 1);
         assert_eq!(coord.phase(), CheckpointPhase::Idle);
     }
 
-    #[test]
-    fn test_coordinator_resumes_from_stored_checkpoint() {
+    #[tokio::test]
+    async fn test_coordinator_resumes_from_stored_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
 
         // Save a checkpoint manually
         let store = FileSystemCheckpointStore::new(dir.path(), 3);
         let m = CheckpointManifest::new(5, 10);
-        store.save(&m).unwrap();
+        store.save(&m).await.unwrap();
 
         // Coordinator should resume from epoch 11, checkpoint_id 6
-        let coord = make_coordinator(dir.path());
+        let coord = make_coordinator(dir.path()).await;
         assert_eq!(coord.epoch(), 11);
         assert_eq!(coord.next_checkpoint_id(), 6);
     }
@@ -1945,10 +1929,10 @@ mod tests {
         assert_eq!(cp.get_metadata("type"), Some("postgres"));
     }
 
-    #[test]
-    fn test_stats_initial() {
+    #[tokio::test]
+    async fn test_stats_initial() {
         let dir = tempfile::tempdir().unwrap();
-        let coord = make_coordinator(dir.path());
+        let coord = make_coordinator(dir.path()).await;
         let stats = coord.stats();
 
         assert_eq!(stats.completed, 0);
@@ -1963,7 +1947,7 @@ mod tests {
     #[tokio::test]
     async fn test_checkpoint_no_sources_no_sinks() {
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
 
         let result = coord
             .checkpoint(CheckpointRequest {
@@ -1978,7 +1962,7 @@ mod tests {
         assert_eq!(result.epoch, 1);
 
         // Verify manifest was persisted
-        let loaded = coord.store().load_latest().unwrap().unwrap();
+        let loaded = coord.store().load_latest().await.unwrap().unwrap();
         assert_eq!(loaded.checkpoint_id, 1);
         assert_eq!(loaded.epoch, 1);
         assert_eq!(loaded.watermark, Some(1000));
@@ -2004,7 +1988,7 @@ mod tests {
     #[tokio::test]
     async fn test_checkpoint_with_operator_states() {
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
 
         let mut ops = HashMap::new();
         ops.insert("window-agg".into(), bytes::Bytes::from_static(b"state-data"));
@@ -2020,7 +2004,7 @@ mod tests {
 
         assert!(result.success);
 
-        let loaded = coord.store().load_latest().unwrap().unwrap();
+        let loaded = coord.store().load_latest().await.unwrap().unwrap();
         assert_eq!(loaded.operator_states.len(), 2);
 
         let window_op = loaded.operator_states.get("window-agg").unwrap();
@@ -2030,7 +2014,7 @@ mod tests {
     #[tokio::test]
     async fn test_checkpoint_with_table_store_path() {
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
 
         let result = coord
             .checkpoint(CheckpointRequest {
@@ -2042,24 +2026,24 @@ mod tests {
 
         assert!(result.success);
 
-        let loaded = coord.store().load_latest().unwrap().unwrap();
+        let loaded = coord.store().load_latest().await.unwrap().unwrap();
         assert_eq!(
             loaded.table_store_checkpoint_path.as_deref(),
             Some("/tmp/rocksdb_cp")
         );
     }
 
-    #[test]
-    fn test_load_latest_manifest_empty() {
+    #[tokio::test]
+    async fn test_load_latest_manifest_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let coord = make_coordinator(dir.path());
-        assert!(coord.load_latest_manifest().unwrap().is_none());
+        let coord = make_coordinator(dir.path()).await;
+        assert!(coord.load_latest_manifest().await.unwrap().is_none());
     }
 
-    #[test]
-    fn test_coordinator_debug() {
+    #[tokio::test]
+    async fn test_coordinator_debug() {
         let dir = tempfile::tempdir().unwrap();
-        let coord = make_coordinator(dir.path());
+        let coord = make_coordinator(dir.path()).await;
         let debug = format!("{coord:?}");
         assert!(debug.contains("CheckpointCoordinator"));
         assert!(debug.contains("epoch: 1"));
@@ -2068,7 +2052,7 @@ mod tests {
     #[tokio::test]
     async fn test_checkpoint_emits_metrics_on_success() {
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
 
         let registry = prometheus::Registry::new();
         let prom = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
@@ -2105,7 +2089,7 @@ mod tests {
     async fn test_checkpoint_without_metrics() {
         // Verify checkpoint works fine without metrics set
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
 
         let result = coord
             .checkpoint(CheckpointRequest::default())
@@ -2188,7 +2172,7 @@ mod tests {
             state_inline_threshold: 100, // 100 bytes threshold
             ..CheckpointConfig::default()
         };
-        let mut coord = CheckpointCoordinator::new(config, store);
+        let mut coord = CheckpointCoordinator::new(config, store).await;
 
         // Small state stays inline, large state goes to sidecar
         let mut ops = HashMap::new();
@@ -2205,7 +2189,7 @@ mod tests {
         assert!(result.success);
 
         // Verify manifest
-        let loaded = coord.store().load_latest().unwrap().unwrap();
+        let loaded = coord.store().load_latest().await.unwrap().unwrap();
         let small_op = loaded.operator_states.get("small").unwrap();
         assert!(!small_op.external, "small state should be inline");
         assert_eq!(small_op.decode_inline().unwrap(), vec![0xAAu8; 50]);
@@ -2215,7 +2199,7 @@ mod tests {
         assert_eq!(large_op.external_length, 200);
 
         // Verify sidecar file exists and has correct data
-        let state_data = coord.store().load_state_data(1).unwrap().unwrap();
+        let state_data = coord.store().load_state_data(1).await.unwrap().unwrap();
         assert_eq!(state_data.len(), 200);
         assert!(state_data.iter().all(|&b| b == 0xBB));
     }
@@ -2225,7 +2209,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
         let config = CheckpointConfig::default(); // 1MB threshold
-        let mut coord = CheckpointCoordinator::new(config, store);
+        let mut coord = CheckpointCoordinator::new(config, store).await;
 
         let mut ops = HashMap::new();
         ops.insert("op1".into(), bytes::Bytes::from_static(b"small-state"));
@@ -2240,7 +2224,7 @@ mod tests {
         assert!(result.success);
 
         // No sidecar file
-        assert!(coord.store().load_state_data(1).unwrap().is_none());
+        assert!(coord.store().load_state_data(1).await.unwrap().is_none());
     }
 
     // Durability gate tests.
@@ -2251,7 +2235,7 @@ mod tests {
         // path behaves as before. Regression guard: Phase B must not change
         // single-instance semantics.
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
         let result = coord
             .checkpoint(CheckpointRequest::default())
             .await
@@ -2263,7 +2247,7 @@ mod tests {
     async fn bridge_writes_markers_and_gate_passes() {
         use laminar_core::state::InProcessBackend;
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
         let backend = Arc::new(InProcessBackend::new(4));
         coord.set_state_backend(backend.clone());
         coord.set_vnode_set(vec![0, 1, 2, 3]);
@@ -2300,9 +2284,9 @@ mod tests {
         orphan
             .sink_commit_statuses
             .insert("kafka_out".into(), SinkCommitStatus::Pending);
-        store.save_with_state(&orphan, None).unwrap();
+        store.save_with_state(&orphan, None).await.unwrap();
 
-        let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store);
+        let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store).await;
         let self_id = NodeId(1);
         let kv = Arc::new(InMemoryKv::new(self_id));
         let kv_trait: Arc<dyn ClusterKv> = kv.clone();
@@ -2336,9 +2320,9 @@ mod tests {
         clean
             .sink_commit_statuses
             .insert("out".into(), SinkCommitStatus::Committed);
-        store.save_with_state(&clean, None).unwrap();
+        store.save_with_state(&clean, None).await.unwrap();
 
-        let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store);
+        let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store).await;
         let self_id = NodeId(1);
         let kv = Arc::new(InMemoryKv::new(self_id));
         let kv_trait: Arc<dyn ClusterKv> = kv.clone();
@@ -2364,7 +2348,7 @@ mod tests {
         use tokio::sync::watch;
 
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
 
         let leader_id = NodeId(1);
         let follower_id = NodeId(7);
@@ -2431,7 +2415,7 @@ mod tests {
         assert!(ack.ok, "prepare succeeded, ack should be ok");
 
         // Follower's manifest is on disk at the leader's epoch.
-        let stored = coord.store().load_latest().unwrap().unwrap();
+        let stored = coord.store().load_latest().await.unwrap().unwrap();
         assert_eq!(stored.epoch, 1);
     }
 
@@ -2445,7 +2429,7 @@ mod tests {
         use tokio::sync::watch;
 
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
 
         let leader_id = NodeId(1);
         let follower_id = NodeId(9);
@@ -2503,7 +2487,7 @@ mod tests {
         use tokio::sync::watch;
 
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
 
         let self_id = NodeId(1);
         let kv = Arc::new(InMemoryKv::new(self_id));
@@ -2551,7 +2535,7 @@ mod tests {
         use tokio::sync::watch;
 
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
 
         let self_id = NodeId(1);
         let kv = Arc::new(InMemoryKv::new(self_id));
@@ -2583,7 +2567,7 @@ mod tests {
         // gate must fail even though the leader wrote its own.
         use laminar_core::state::InProcessBackend;
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
         let backend = Arc::new(InProcessBackend::new(4));
         coord.set_state_backend(backend.clone());
         coord.set_vnode_set(vec![0, 1]); // leader's owned subset
@@ -2612,7 +2596,7 @@ mod tests {
         use bytes::Bytes;
         use laminar_core::state::InProcessBackend;
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
         let backend = Arc::new(InProcessBackend::new(4));
         // Simulate the follower's prior write on vnodes {2, 3} for the
         // epoch the leader is about to use (fresh store starts at 1).
@@ -2639,7 +2623,7 @@ mod tests {
     async fn marker_write_failure_aborts_checkpoint() {
         use laminar_core::state::InProcessBackend;
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
         // Backend is sized for 2 vnodes, but we claim to own vnode 99 →
         // bridge fails its write, checkpoint aborts cleanly.
         coord.set_state_backend(Arc::new(InProcessBackend::new(2)));
@@ -2654,23 +2638,23 @@ mod tests {
         assert!(err.contains("vnode marker write failed"), "got: {err}");
     }
 
-    #[test]
-    fn test_adaptive_disabled_by_default() {
+    #[tokio::test]
+    async fn test_adaptive_disabled_by_default() {
         let dir = tempfile::tempdir().unwrap();
-        let coord = make_coordinator(dir.path());
+        let coord = make_coordinator(dir.path()).await;
         assert!(coord.config().adaptive.is_none());
         assert_eq!(coord.config().interval, Some(Duration::from_secs(60)));
     }
 
-    #[test]
-    fn test_adaptive_increases_interval_for_slow_checkpoints() {
+    #[tokio::test]
+    async fn test_adaptive_increases_interval_for_slow_checkpoints() {
         let dir = tempfile::tempdir().unwrap();
         let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
         let config = CheckpointConfig {
             adaptive: Some(AdaptiveCheckpointConfig::default()),
             ..CheckpointConfig::default()
         };
-        let mut coord = CheckpointCoordinator::new(config, store);
+        let mut coord = CheckpointCoordinator::new(config, store).await;
 
         // Simulate a 5-second checkpoint
         coord.last_checkpoint_duration = Some(Duration::from_secs(5));
@@ -2684,15 +2668,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_adaptive_decreases_interval_for_fast_checkpoints() {
+    #[tokio::test]
+    async fn test_adaptive_decreases_interval_for_fast_checkpoints() {
         let dir = tempfile::tempdir().unwrap();
         let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
         let config = CheckpointConfig {
             adaptive: Some(AdaptiveCheckpointConfig::default()),
             ..CheckpointConfig::default()
         };
-        let mut coord = CheckpointCoordinator::new(config, store);
+        let mut coord = CheckpointCoordinator::new(config, store).await;
 
         // Simulate a 100ms checkpoint → 100 / (1000 * 0.1) = 1s → clamped to 10s min
         coord.last_checkpoint_duration = Some(Duration::from_millis(100));
@@ -2706,8 +2690,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_adaptive_clamps_to_min_max() {
+    #[tokio::test]
+    async fn test_adaptive_clamps_to_min_max() {
         let dir = tempfile::tempdir().unwrap();
         let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
         let config = CheckpointConfig {
@@ -2719,7 +2703,7 @@ mod tests {
             }),
             ..CheckpointConfig::default()
         };
-        let mut coord = CheckpointCoordinator::new(config, store);
+        let mut coord = CheckpointCoordinator::new(config, store).await;
 
         // Very slow → clamp to max
         coord.last_checkpoint_duration = Some(Duration::from_secs(60));
@@ -2735,8 +2719,8 @@ mod tests {
         assert_eq!(interval, Duration::from_secs(20), "should clamp to min");
     }
 
-    #[test]
-    fn test_adaptive_ema_smoothing() {
+    #[tokio::test]
+    async fn test_adaptive_ema_smoothing() {
         let dir = tempfile::tempdir().unwrap();
         let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
         let config = CheckpointConfig {
@@ -2748,7 +2732,7 @@ mod tests {
             }),
             ..CheckpointConfig::default()
         };
-        let mut coord = CheckpointCoordinator::new(config, store);
+        let mut coord = CheckpointCoordinator::new(config, store).await;
 
         // First observation: 1000ms → EMA = 1000 (cold start)
         coord.last_checkpoint_duration = Some(Duration::from_secs(1));
@@ -2769,7 +2753,7 @@ mod tests {
     #[tokio::test]
     async fn test_stats_include_percentiles_after_checkpoints() {
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
 
         // Run 3 checkpoints.
         for _ in 0..3 {
@@ -2850,7 +2834,7 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema};
 
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
 
         let rollback_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
@@ -2965,7 +2949,7 @@ mod tests {
         let store = Box::new(
             laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(dir.path(), 3),
         );
-        let mut coord = CheckpointCoordinator::new(config, store);
+        let mut coord = CheckpointCoordinator::new(config, store).await;
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let sink = StuckRollbackSink { schema };

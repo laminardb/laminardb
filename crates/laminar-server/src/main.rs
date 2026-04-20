@@ -94,6 +94,7 @@ async fn validate_checkpoints_and_exit(config: &config::ServerConfig) -> Result<
     info!("Validating checkpoints...");
     let report = store
         .recover_latest_validated()
+        .await
         .map_err(|e| anyhow::anyhow!("validation failed: {e}"))?;
 
     info!(
@@ -112,6 +113,7 @@ async fn validate_checkpoints_and_exit(config: &config::ServerConfig) -> Result<
     // Also run orphan detection
     let orphans = store
         .cleanup_orphans()
+        .await
         .map_err(|e| anyhow::anyhow!("orphan cleanup failed: {e}"))?;
     if orphans > 0 {
         info!("Cleaned up {orphans} orphaned state file(s)");
@@ -156,14 +158,11 @@ fn build_checkpoint_store(
             .nth(1)
             .and_then(|rest| rest.split_once('/').map(|(_, p)| format!("{p}/")))
             .unwrap_or_default();
-        match laminar_storage::checkpoint_store::ObjectStoreCheckpointStore::new(
-            obj_store, prefix, 3,
-        ) {
-            Ok(s) => Some(Box::new(s.with_vnode_count(vnode_count))),
-            Err(e) => {
-                tracing::error!(error = %e, "failed to create checkpoint store runtime");
-                None
-            }
-        }
+        Some(Box::new(
+            laminar_storage::checkpoint_store::ObjectStoreCheckpointStore::new(
+                obj_store, prefix, 3,
+            )
+            .with_vnode_count(vnode_count),
+        ))
     }
 }

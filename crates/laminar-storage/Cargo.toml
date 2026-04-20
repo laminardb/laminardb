@@ -27,6 +27,7 @@ sha2 = { workspace = true }
 # Async
 tokio = { workspace = true }
 futures = { workspace = true }
+async-trait = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }

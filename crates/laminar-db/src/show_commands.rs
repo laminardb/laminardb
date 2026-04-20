@@ -12,10 +12,13 @@ use crate::error::DbError;
 
 impl LaminarDB {
     /// Build a SHOW CHECKPOINT STATUS metadata result.
-    pub(crate) fn build_show_checkpoint_status(&self) -> Result<RecordBatch, DbError> {
+    pub(crate) async fn build_show_checkpoint_status(&self) -> Result<RecordBatch, DbError> {
         let store = self.checkpoint_store();
         let (latest, list) = match &store {
-            Some(s) => (s.load_latest().ok().flatten(), s.list().unwrap_or_default()),
+            Some(s) => (
+                s.load_latest().await.ok().flatten(),
+                s.list().await.unwrap_or_default(),
+            ),
             None => (None, vec![]),
         };
 

@@ -185,13 +185,14 @@ async fn test_barrier_checkpoint_recovery_round_trip() {
 
     // Phase 1: Run pipeline, trigger barrier checkpoint, persist.
     let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 5));
-    let mut coord = CheckpointCoordinator::new(CheckpointConfig::default(), store);
+    let mut coord =
+        CheckpointCoordinator::new(CheckpointConfig::default(), store).await;
 
     // Simulate barrier-aligned checkpoint: operator state captured at barrier.
     let mut operator_states = HashMap::new();
     operator_states.insert(
         "stream_executor".to_string(),
-        b"barrier-consistent-state".to_vec(),
+        bytes::Bytes::from_static(b"barrier-consistent-state"),
     );
 
     // Simulate source offsets captured at barrier alignment.
@@ -240,7 +241,7 @@ async fn test_barrier_checkpoint_recovery_round_trip() {
     // Phase 3: Recovery — load from store.
     let store = FileSystemCheckpointStore::new(dir.path(), 5);
     let mgr = RecoveryManager::new(&store);
-    let manifest = mgr.load_latest().unwrap().unwrap();
+    let manifest = mgr.load_latest().await.unwrap().unwrap();
 
     // Verify epoch and watermark.
     assert_eq!(manifest.epoch, 1);

@@ -154,9 +154,9 @@ impl<'a> RecoveryManager<'a> {
         table_sources: &[RegisteredSource],
     ) -> Result<Option<RecoveredState>, DbError> {
         // Fast path: try load_latest() first.
-        match self.store.load_latest() {
+        match self.store.load_latest().await {
             Ok(Some(manifest)) => {
-                if self.is_checkpoint_corrupt(&manifest) {
+                if self.is_checkpoint_corrupt(&manifest).await {
                     warn!(
                         checkpoint_id = manifest.checkpoint_id,
                         "[LDB-6010] latest checkpoint corrupt, trying fallback"
@@ -193,7 +193,7 @@ impl<'a> RecoveryManager<'a> {
         }
 
         // Fallback: iterate through all checkpoints in reverse order.
-        let checkpoints = self.store.list().map_err(DbError::from)?;
+        let checkpoints = self.store.list().await.map_err(DbError::from)?;
 
         if checkpoints.is_empty() {
             warn!("no checkpoints available for fallback, starting fresh");
@@ -201,9 +201,9 @@ impl<'a> RecoveryManager<'a> {
         }
 
         for &(checkpoint_id, _epoch) in checkpoints.iter().rev() {
-            match self.store.load_by_id(checkpoint_id) {
+            match self.store.load_by_id(checkpoint_id).await {
                 Ok(Some(manifest)) => {
-                    if self.is_checkpoint_corrupt(&manifest) {
+                    if self.is_checkpoint_corrupt(&manifest).await {
                         warn!(
                             checkpoint_id,
                             "[LDB-6010] fallback checkpoint corrupt, skipping"
@@ -258,7 +258,7 @@ impl<'a> RecoveryManager<'a> {
     /// Returns `false` if any state could not be resolved (missing sidecar,
     /// truncated sidecar, or I/O error). In strict mode, the caller should
     /// treat a `false` return as a corrupt checkpoint and try fallback.
-    fn resolve_external_states(&self, manifest: &mut CheckpointManifest) -> bool {
+    async fn resolve_external_states(&self, manifest: &mut CheckpointManifest) -> bool {
         let external_ops: Vec<String> = manifest
             .operator_states
             .iter()
@@ -270,7 +270,7 @@ impl<'a> RecoveryManager<'a> {
             return true;
         }
 
-        let state_data = match self.store.load_state_data(manifest.checkpoint_id) {
+        let state_data = match self.store.load_state_data(manifest.checkpoint_id).await {
             Ok(Some(data)) => data,
             Ok(None) => {
                 error!(
@@ -355,7 +355,7 @@ impl<'a> RecoveryManager<'a> {
         // Resolve external operator states from sidecar before recovery.
         // In strict mode, unresolved sidecar state is recorded as a source
         // error so check_strict() will reject this checkpoint.
-        let sidecar_ok = self.resolve_external_states(&mut manifest);
+        let sidecar_ok = self.resolve_external_states(&mut manifest).await;
         if !sidecar_ok && self.strict {
             warn!(
                 checkpoint_id = manifest.checkpoint_id,
@@ -591,13 +591,13 @@ impl<'a> RecoveryManager<'a> {
     ///
     /// Only returns `false` (proceed) when validation passes OR when the
     /// checkpoint has no sidecar to validate.
-    fn is_checkpoint_corrupt(&self, manifest: &CheckpointManifest) -> bool {
+    async fn is_checkpoint_corrupt(&self, manifest: &CheckpointManifest) -> bool {
         // No sidecar and no state_checksum → nothing to validate beyond
         // manifest parsing (which already succeeded if we got here).
         if manifest.state_checksum.is_none() && manifest.operator_states.is_empty() {
             return false;
         }
-        match self.store.validate_checkpoint(manifest.checkpoint_id) {
+        match self.store.validate_checkpoint(manifest.checkpoint_id).await {
             Ok(ValidationResult {
                 valid: false,
                 ref issues,
@@ -664,8 +664,8 @@ impl<'a> RecoveryManager<'a> {
     /// # Errors
     ///
     /// Returns `DbError::Checkpoint` if the store fails.
-    pub fn load_latest(&self) -> Result<Option<CheckpointManifest>, DbError> {
-        self.store.load_latest().map_err(DbError::from)
+    pub async fn load_latest(&self) -> Result<Option<CheckpointManifest>, DbError> {
+        self.store.load_latest().await.map_err(DbError::from)
     }
 
     /// Loads a specific checkpoint by ID.
@@ -673,8 +673,14 @@ impl<'a> RecoveryManager<'a> {
     /// # Errors
     ///
     /// Returns `DbError::Checkpoint` if the store fails.
-    pub fn load_by_id(&self, checkpoint_id: u64) -> Result<Option<CheckpointManifest>, DbError> {
-        self.store.load_by_id(checkpoint_id).map_err(DbError::from)
+    pub async fn load_by_id(
+        &self,
+        checkpoint_id: u64,
+    ) -> Result<Option<CheckpointManifest>, DbError> {
+        self.store
+            .load_by_id(checkpoint_id)
+            .await
+            .map_err(DbError::from)
     }
 }
 
@@ -705,7 +711,7 @@ mod tests {
 
         // Save a basic checkpoint
         let manifest = CheckpointManifest::new(1, 5);
-        store.save(&manifest).unwrap();
+        store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
         let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
@@ -724,7 +730,7 @@ mod tests {
 
         let mut manifest = CheckpointManifest::new(1, 3);
         manifest.watermark = Some(42_000);
-        store.save(&manifest).unwrap();
+        store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
         let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
@@ -744,7 +750,7 @@ mod tests {
         manifest
             .operator_states
             .insert("3".to_string(), OperatorCheckpoint::inline(b"filter-state"));
-        store.save(&manifest).unwrap();
+        store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
         let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
@@ -761,7 +767,7 @@ mod tests {
 
         let mut manifest = CheckpointManifest::new(1, 1);
         manifest.table_store_checkpoint_path = Some("/data/rocksdb_cp_001".into());
-        store.save(&manifest).unwrap();
+        store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
         let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
@@ -772,31 +778,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_load_latest_no_checkpoint() {
+    #[tokio::test]
+    async fn test_load_latest_no_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());
         let mgr = RecoveryManager::new(&store);
 
-        assert!(mgr.load_latest().unwrap().is_none());
+        assert!(mgr.load_latest().await.unwrap().is_none());
     }
 
-    #[test]
-    fn test_load_by_id() {
+    #[tokio::test]
+    async fn test_load_by_id() {
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());
 
-        store.save(&CheckpointManifest::new(1, 1)).unwrap();
-        store.save(&CheckpointManifest::new(2, 2)).unwrap();
+        store.save(&CheckpointManifest::new(1, 1)).await.unwrap();
+        store.save(&CheckpointManifest::new(2, 2)).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
-        let m = mgr.load_by_id(1).unwrap().unwrap();
+        let m = mgr.load_by_id(1).await.unwrap().unwrap();
         assert_eq!(m.checkpoint_id, 1);
 
-        let m2 = mgr.load_by_id(2).unwrap().unwrap();
+        let m2 = mgr.load_by_id(2).await.unwrap().unwrap();
         assert_eq!(m2.checkpoint_id, 2);
 
-        assert!(mgr.load_by_id(999).unwrap().is_none());
+        assert!(mgr.load_by_id(999).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -807,11 +813,11 @@ mod tests {
         // Save two valid checkpoints
         let mut m1 = CheckpointManifest::new(1, 10);
         m1.watermark = Some(1000);
-        store.save(&m1).unwrap();
+        store.save(&m1).await.unwrap();
 
         let mut m2 = CheckpointManifest::new(2, 20);
         m2.watermark = Some(2000);
-        store.save(&m2).unwrap();
+        store.save(&m2).await.unwrap();
 
         // Corrupt the latest checkpoint by writing invalid JSON
         let latest_manifest_path = dir
@@ -840,7 +846,7 @@ mod tests {
         let store = FileSystemCheckpointStore::new(dir.path(), 10);
 
         // Save a checkpoint then corrupt it
-        store.save(&CheckpointManifest::new(1, 5)).unwrap();
+        store.save(&CheckpointManifest::new(1, 5)).await.unwrap();
 
         let manifest_path = dir
             .path()
@@ -861,8 +867,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = FileSystemCheckpointStore::new(dir.path(), 10);
 
-        store.save(&CheckpointManifest::new(1, 10)).unwrap();
-        store.save(&CheckpointManifest::new(2, 20)).unwrap();
+        store.save(&CheckpointManifest::new(1, 10)).await.unwrap();
+        store.save(&CheckpointManifest::new(2, 20)).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
         let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
@@ -885,8 +891,8 @@ mod tests {
             .insert("big-op".into(), OperatorCheckpoint::external(0, 2048));
 
         // Write sidecar first, then manifest
-        store.save_state_data(1, &large_data).unwrap();
-        store.save(&manifest).unwrap();
+        store.save_state_data(1, &large_data).await.unwrap();
+        store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
         let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
@@ -913,8 +919,8 @@ mod tests {
             .operator_states
             .insert("big-op".into(), OperatorCheckpoint::external(0, 4096));
 
-        store.save_state_data(1, &large_data).unwrap();
-        store.save(&manifest).unwrap();
+        store.save_state_data(1, &large_data).await.unwrap();
+        store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
         let result = mgr.recover(&[], &[], &[]).await.unwrap().unwrap();
@@ -936,7 +942,7 @@ mod tests {
         manifest
             .operator_states
             .insert("orphan".into(), OperatorCheckpoint::external(0, 100));
-        store.save(&manifest).unwrap();
+        store.save(&manifest).await.unwrap();
 
         // Use lenient mode — graceful degradation replaces missing
         // sidecar state with empty inline. Strict mode rejects this
@@ -990,7 +996,7 @@ mod tests {
         manifest
             .operator_states
             .insert("orphan".into(), OperatorCheckpoint::external(0, 100));
-        store.save(&manifest).unwrap();
+        store.save(&manifest).await.unwrap();
 
         // Strict mode: missing sidecar causes the checkpoint to be rejected
         // and recovery falls back. With only one checkpoint, this means
@@ -1012,13 +1018,13 @@ mod tests {
         let mut m1 = CheckpointManifest::new(1, 1);
         m1.sink_commit_statuses
             .insert("delta_sink".into(), SinkCommitStatus::Committed);
-        store.save(&m1).unwrap();
+        store.save(&m1).await.unwrap();
 
         // Epoch 2: crashed between manifest persist and sink commit (Pending).
         let mut m2 = CheckpointManifest::new(2, 2);
         m2.sink_commit_statuses
             .insert("delta_sink".into(), SinkCommitStatus::Pending);
-        store.save(&m2).unwrap();
+        store.save(&m2).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
         let result = mgr.recover(&[], &[], &[]).await.unwrap();
@@ -1042,7 +1048,7 @@ mod tests {
         let mut m = CheckpointManifest::new(1, 1);
         m.sink_commit_statuses
             .insert("sink".into(), SinkCommitStatus::Pending);
-        store.save(&m).unwrap();
+        store.save(&m).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
         let result = mgr.recover(&[], &[], &[]).await.unwrap();
