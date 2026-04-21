@@ -113,6 +113,14 @@ pub struct LaminarDB {
     #[cfg(feature = "cluster-unstable")]
     pub(crate) shuffle_receiver:
         parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleReceiver>>>,
+    /// Durable cluster 2PC decision store. Installed via
+    /// `LaminarDbBuilder::decision_store`. Read on startup and written
+    /// by the leader at the commit point — see
+    /// [`CheckpointCoordinator::set_decision_store`] for the protocol.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) decision_store: parking_lot::Mutex<
+        Option<Arc<laminar_core::cluster::control::CheckpointDecisionStore>>,
+    >,
     /// Forwards `db.checkpoint()` requests to the running pipeline so
     /// the callback captures operator state before the manifest is
     /// packed. `None` before `start()` or after `shutdown()`; when
@@ -298,6 +306,8 @@ impl LaminarDB {
             shuffle_sender: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster-unstable")]
             shuffle_receiver: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster-unstable")]
+            decision_store: parking_lot::Mutex::new(None),
             force_ckpt_tx: parking_lot::Mutex::new(None),
         })
     }
@@ -316,6 +326,17 @@ impl LaminarDB {
     #[cfg(feature = "cluster-unstable")]
     pub fn set_shuffle_receiver(&self, receiver: Arc<laminar_core::shuffle::ShuffleReceiver>) {
         *self.shuffle_receiver.lock() = Some(receiver);
+    }
+
+    /// Install the durable cluster 2PC decision store. Must be called
+    /// before `start()`; the coordinator picks it up when constructed
+    /// in `pipeline_lifecycle`.
+    #[cfg(feature = "cluster-unstable")]
+    pub fn set_decision_store(
+        &self,
+        store: Arc<laminar_core::cluster::control::CheckpointDecisionStore>,
+    ) {
+        *self.decision_store.lock() = Some(store);
     }
 
     /// Install the cluster control facade. Called by

@@ -152,6 +152,65 @@ async fn assignment_snapshot_unifies_cluster_view() {
     harness_b.shutdown().await;
 }
 
+/// Cluster 2PC durable decision — every successful leader checkpoint
+/// must record `Decision::Committed` for the epoch BEFORE the
+/// `Commit` announcement goes out. Without this marker a new leader
+/// elected mid-2PC can't distinguish "leader crashed before reaching
+/// the commit point" from "leader crashed after announcing Commit,
+/// some followers already committed", so it falls back to a blanket
+/// abort and splits state.
+///
+/// This test drives a real engine-level checkpoint through the
+/// harness and then reads the decision store directly. A regression
+/// where the leader skips recording — or records after announcing —
+/// trips this assertion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn checkpoint_records_durable_commit_decision() {
+    use laminar_core::cluster::control::Decision;
+
+    let harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+    for node in &harness.nodes {
+        setup_query(&node.db).await;
+    }
+    harness.start_all().await;
+
+    let leader_idx = harness.leader_idx();
+    let leader = &harness.nodes[leader_idx];
+
+    // Happy-path checkpoint — after this returns the decision store
+    // MUST carry the epoch's verdict.
+    let result = leader.db.checkpoint().await.expect("leader checkpoint");
+    assert!(result.success, "leader checkpoint: {:?}", result.error);
+
+    // Any node's handle points to the same shared store; reading via
+    // the leader is symmetric to reading via any follower.
+    let verdict = leader
+        .decision_store
+        .load(result.epoch)
+        .await
+        .expect("decision store load");
+    assert_eq!(
+        verdict,
+        Some(Decision::Committed),
+        "decision store must record Committed for the just-completed epoch \
+         (if None, the leader announced Commit without the durable write — \
+         that's the gap-1 correctness bug)",
+    );
+
+    // Same verdict observable from the follower's handle — proves the
+    // store is genuinely cluster-shared, not per-node.
+    for follower_idx in harness.follower_idxs() {
+        let v = harness.nodes[follower_idx]
+            .decision_store
+            .load(result.epoch)
+            .await
+            .expect("follower decision read");
+        assert_eq!(v, Some(Decision::Committed));
+    }
+
+    harness.shutdown().await;
+}
+
 /// Phase 1.4 — the boot path must hand the backend its fence generation.
 ///
 /// Before this wiring existed, `ObjectStoreBackend::authoritative_version`

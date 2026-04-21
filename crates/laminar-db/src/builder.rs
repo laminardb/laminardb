@@ -49,6 +49,14 @@ pub struct LaminarDbBuilder {
     /// Inbound shuffle handle for cluster-mode streaming aggregates.
     #[cfg(feature = "cluster-unstable")]
     shuffle_receiver: Option<std::sync::Arc<laminar_core::shuffle::ShuffleReceiver>>,
+    /// Durable cluster 2PC decision store. Written by the leader after
+    /// the prepare quorum but before announcing `Commit`, so a new
+    /// leader elected mid-2PC can recover the cluster vote. Required
+    /// for cross-instance sink 2PC correctness. Without it, recovery
+    /// falls back to blanket Abort on any Pending manifest.
+    #[cfg(feature = "cluster-unstable")]
+    decision_store:
+        Option<std::sync::Arc<laminar_core::cluster::control::CheckpointDecisionStore>>,
     /// Optional state backend. When paired with `vnode_registry`, the
     /// coordinator writes per-vnode durability markers each checkpoint
     /// and consults `epoch_complete` before committing sinks.
@@ -85,6 +93,8 @@ impl LaminarDbBuilder {
             shuffle_sender: None,
             #[cfg(feature = "cluster-unstable")]
             shuffle_receiver: None,
+            #[cfg(feature = "cluster-unstable")]
+            decision_store: None,
             state_backend: None,
             vnode_registry: None,
             physical_optimizer_rules: Vec::new(),
@@ -172,6 +182,22 @@ impl LaminarDbBuilder {
         receiver: std::sync::Arc<laminar_core::shuffle::ShuffleReceiver>,
     ) -> Self {
         self.shuffle_receiver = Some(receiver);
+        self
+    }
+
+    /// Install the durable cluster 2PC decision store. The leader
+    /// writes `Decision::Committed` here after the prepare quorum but
+    /// before announcing `Commit`, so a new leader elected mid-2PC
+    /// can read the cluster vote from shared storage instead of
+    /// defaulting to Abort (which could split state against
+    /// already-committed followers).
+    #[cfg(feature = "cluster-unstable")]
+    #[must_use]
+    pub fn decision_store(
+        mut self,
+        store: std::sync::Arc<laminar_core::cluster::control::CheckpointDecisionStore>,
+    ) -> Self {
+        self.decision_store = Some(store);
         self
     }
 
@@ -433,6 +459,10 @@ impl LaminarDbBuilder {
         #[cfg(feature = "cluster-unstable")]
         if let Some(receiver) = self.shuffle_receiver {
             db.set_shuffle_receiver(receiver);
+        }
+        #[cfg(feature = "cluster-unstable")]
+        if let Some(store) = self.decision_store {
+            db.set_decision_store(store);
         }
         if let Some(backend) = self.state_backend {
             db.set_state_backend(backend);

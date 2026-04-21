@@ -3,6 +3,7 @@
 
 pub mod barrier;
 pub mod controller;
+pub mod decision;
 pub mod leader;
 pub mod snapshot;
 
@@ -11,6 +12,7 @@ pub use barrier::{
     QuorumOutcome, ACK_KEY, ANNOUNCEMENT_KEY,
 };
 pub use controller::ClusterController;
+pub use decision::{CheckpointDecisionStore, Decision, DecisionError, RecordOutcome};
 pub use leader::leader_of;
 pub use snapshot::{AssignmentSnapshot, AssignmentSnapshotStore, SnapshotError};
 

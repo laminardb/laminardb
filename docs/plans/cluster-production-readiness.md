@@ -21,32 +21,33 @@ Honest state of cluster mode on `feat/phase-c5-cluster-primitives`.
 - Backend fence wired from the stored `AssignmentSnapshot` generation
   on `db.start()` — the authoritative version survives restart instead
   of resetting to 0.
+- Cross-instance sink 2PC via a durable `CheckpointDecisionStore`. The
+  leader CAS-writes `Decision::Committed` to shared storage before
+  announcing `Commit`, so a new leader elected mid-2PC recovers the
+  cluster vote from the marker instead of defaulting to Abort.
+  Every node consults the store on startup and drives local sinks to
+  the recorded verdict; a follower whose `Commit` announcement is
+  lost times out and consults the store rather than unconditionally
+  rolling back.
 
 ## Known gaps
 
-1. **Sink 2PC does not coordinate across instances.** Each node
-   commits its own sinks locally. A leader that crashes between
-   follower sink-prepare and follower sink-commit leaves sinks in
-   inconsistent state.
-2. **Dynamic rebalance not implemented.** Vnode assignment is frozen
+1. **Dynamic rebalance not implemented.** Vnode assignment is frozen
    at boot. Node join/leave does not re-shuffle.
-3. **No TLS / no peer auth** on shuffle.
-4. **Shuffle backpressure limited to local per-partition `mpsc(16)`.**
+2. **No TLS / no peer auth** on shuffle.
+3. **Shuffle backpressure limited to local per-partition `mpsc(16)`.**
    No cluster-wide credit flow.
-5. **Admin surface:** no `/cluster/ownership`, `/cluster/checkpoints`,
+4. **Admin surface:** no `/cluster/ownership`, `/cluster/checkpoints`,
    `/cluster/drain` endpoints.
-6. **Graceful drain:** `ClusterHandle::wait_for_shutdown` does not
+5. **Graceful drain:** `ClusterHandle::wait_for_shutdown` does not
    guarantee a final epoch before stopping discovery.
 
 ## Remaining work, grouped
 
-**Correctness.** Fix #1 (cross-instance sink 2PC). This is the last
-blocker; ship everything below behind flags.
+**Operational.** Fix #1 (dynamic rebalance) together with source
+replay for in-flight shuffle buffers. Add #4 (admin API).
 
-**Operational.** Fix #2 (dynamic rebalance) together with source
-replay for in-flight shuffle buffers. Add #5 (admin API).
-
-**Security / polish.** #3, #4, #6 — separate PRs, not blockers for a
+**Security / polish.** #2, #3, #5 — separate PRs, not blockers for a
 small-cluster rollout.
 
 ## What this PR closes
@@ -64,9 +65,9 @@ small-cluster rollout.
 
 ## Honest naming
 
-The commit message `Phase A+B+C.1–C.5 primitives, wiring, harness`
-on this branch is aspirational. A more accurate summary:
-**cluster foundations — shuffle bridge wired, cross-instance sink 2PC
-deferred.** The Phase 0a + 0b scope in earlier drafts of this doc is
-what actually landed; Phase 1 and Phase 2.1 remain open per the gaps
-above.
+The original commit message `Phase A+B+C.1–C.5 primitives, wiring,
+harness` on this branch was aspirational. With the `assignment_version`
+fence wiring (2026-04-21) and cross-instance sink 2PC (2026-04-21)
+landed, both correctness blockers are closed; what remains is
+operational and security work that can ship behind flags for a
+small-cluster rollout.

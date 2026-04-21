@@ -31,7 +31,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use laminar_core::cluster::control::{AssignmentSnapshot, AssignmentSnapshotStore};
+use laminar_core::cluster::control::{
+    AssignmentSnapshot, AssignmentSnapshotStore, CheckpointDecisionStore,
+};
 use laminar_core::cluster::testing::MiniCluster;
 use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
 use laminar_core::state::{
@@ -54,6 +56,10 @@ pub struct NodeRuntime {
     /// through. Exposed for tests that need to observe the Phase 1.4
     /// fence state after `start_all()` has wired it from the snapshot.
     pub state_backend: Arc<dyn StateBackend>,
+    /// Durable cluster 2PC decision store. Shared across all nodes in
+    /// the harness — the whole point is a cluster-wide verdict — but
+    /// owned per-node here so tests can read it through any handle.
+    pub decision_store: Arc<CheckpointDecisionStore>,
 }
 
 impl NodeRuntime {
@@ -222,6 +228,11 @@ impl ClusterEngineHarness {
             // feature gate plus the explicit `cluster_controller`,
             // `state_backend`, `vnode_registry`, and `physical_optimizer_rule`
             // wiring below, independent of the `Profile` enum.
+            // Cluster 2PC decision store rides on the same shared
+            // object store as state + assignment snapshot, matching
+            // production wiring (`server/cluster.rs::start_cluster`).
+            let decision_store = Arc::new(CheckpointDecisionStore::new(Arc::clone(&shared_store)));
+
             let db = LaminarDB::builder()
                 .storage_dir(checkpoint_dirs[idx].path().to_path_buf())
                 .checkpoint(cp_cfg)
@@ -230,6 +241,7 @@ impl ClusterEngineHarness {
                 .vnode_registry(Arc::clone(&registry))
                 .shuffle_sender(Arc::clone(&sender))
                 .shuffle_receiver(Arc::clone(&receivers[idx]))
+                .decision_store(Arc::clone(&decision_store))
                 // Mirror production: DataFusion partitions track vnode count.
                 .target_partitions(vnode_count as usize)
                 .build()
@@ -246,6 +258,7 @@ impl ClusterEngineHarness {
                 instance_id: self_id,
                 vnode_registry: Arc::clone(&registry),
                 state_backend: Arc::clone(&state_backend),
+                decision_store: Arc::clone(&decision_store),
             });
         }
 

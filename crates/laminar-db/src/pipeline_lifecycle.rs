@@ -242,11 +242,24 @@ impl LaminarDB {
                 coord.set_gate_vnode_set((0..registry.vnode_count()).collect());
             }
 
-            // Cluster recovery: if this instance is the new leader and
-            // the last manifest was a prepared-not-committed epoch,
-            // announce Abort so surviving followers roll back.
+            // Plug in the cluster 2PC decision store before the
+            // recovery sweep so `reconcile_prepared_on_init` can
+            // consult it. Writes land here before the leader's Commit
+            // announcement goes out, so a new leader mid-2PC reads
+            // the durable vote instead of guessing.
             #[cfg(feature = "cluster-unstable")]
-            coord.reconcile_orphaned_prepare().await;
+            if let Some(ds) = self.decision_store.lock().clone() {
+                coord.set_decision_store(ds);
+            }
+
+            // Cluster recovery: if this instance's last persisted
+            // manifest has any sink in Pending state, consult the
+            // durable 2PC decision store and drive local sinks to the
+            // recorded verdict. Committed → local commit + leader
+            // re-announces Commit for stragglers; Aborted or absent →
+            // rollback + leader announces Abort.
+            #[cfg(feature = "cluster-unstable")]
+            coord.reconcile_prepared_on_init().await;
 
             *self.coordinator.lock().await = Some(coord);
         }

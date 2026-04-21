@@ -388,6 +388,23 @@ pub async fn start_cluster(
         .state_backend(Arc::clone(&state_backend))
         .vnode_registry(Arc::clone(&vnode_registry));
 
+    // Durable cluster 2PC decision store. Shares the same underlying
+    // object store as the state backend so a single cluster-wide
+    // bucket holds per-epoch state, the assignment snapshot, and the
+    // commit decisions. Without this wiring the leader's `Commit`
+    // announcement is the only cluster-wide commit signal — ephemeral,
+    // so a mid-2PC leader crash produces split state.
+    if let Some(decision_os) = config
+        .state
+        .build_object_store()
+        .map_err(|e| ClusterStartupError::EngineConstruction(format!("decision store: {e}")))?
+    {
+        let decision_store = Arc::new(
+            laminar_core::cluster::control::CheckpointDecisionStore::new(decision_os),
+        );
+        builder = builder.decision_store(decision_store);
+    }
+
     // Shuffle fabric. ShuffleReceiver publishes its bound address into
     // the gossip KV so peer ShuffleSenders discover it on first send.
     // Without this wiring, streaming aggregates never cross node
