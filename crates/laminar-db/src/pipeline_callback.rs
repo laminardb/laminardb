@@ -198,16 +198,16 @@ impl ConnectorPipelineCallback {
         &mut self,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
         source_offsets: FxHashMap<String, SourceCheckpoint>,
-    ) -> bool {
+    ) -> Option<u64> {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
         use laminar_core::cluster::control::Phase;
 
         let ann = match controller.observe_barrier().await {
             Ok(Some(a)) if a.phase == Phase::Prepare => a,
-            _ => return false,
+            _ => return None,
         };
         if self.last_follower_epoch.is_some_and(|e| e >= ann.epoch) {
-            return false;
+            return None;
         }
         self.last_follower_epoch = Some(ann.epoch);
 
@@ -215,7 +215,7 @@ impl ConnectorPipelineCallback {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "follower state capture failed — skipping");
-                return false;
+                return None;
             }
         };
         let mut extra_tables = HashMap::with_capacity(self.table_sources.len());
@@ -248,7 +248,7 @@ impl ConnectorPipelineCallback {
 
         let mut guard = self.coordinator.lock().await;
         let Some(ref mut coord) = *guard else {
-            return false;
+            return None;
         };
         // Phase 1.3: stamp this instance's current pipeline watermark
         // into the coordinator so the next `BarrierAck` carries it.
@@ -258,22 +258,23 @@ impl ConnectorPipelineCallback {
             .pipeline_watermark
             .load(std::sync::atomic::Ordering::Acquire);
         coord.set_local_watermark_ms(if wm == i64::MIN { None } else { Some(wm) });
+        let follower_epoch = ann.epoch;
         match coord
             .follower_checkpoint(request, ann, std::time::Duration::from_secs(30))
             .await
         {
             Ok(true) => {
-                tracing::info!("follower checkpoint committed");
+                tracing::info!(epoch = follower_epoch, "follower checkpoint committed");
                 self.last_checkpoint = std::time::Instant::now();
-                true
+                Some(follower_epoch)
             }
             Ok(false) => {
                 tracing::warn!("follower checkpoint aborted (leader signalled Abort)");
-                false
+                None
             }
             Err(e) => {
                 tracing::warn!(error = %e, "follower checkpoint errored");
-                false
+                None
             }
         }
     }
@@ -632,7 +633,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         &mut self,
         force: bool,
         source_offsets: FxHashMap<String, SourceCheckpoint>,
-    ) -> bool {
+    ) -> Option<u64> {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
         let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
 
@@ -680,11 +681,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 == laminar_connectors::connector::DeliveryGuarantee::ExactlyOnce
         {
             tracing::debug!("skipping timer checkpoint under exactly-once (use barriers)");
-            return false;
+            return None;
         }
 
         if self.prom.cycles.get() == 0 {
-            return false;
+            return None;
         }
 
         // After a sink timeout, skip one checkpoint cycle so that source
@@ -694,15 +695,15 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         if !force && self.sink_timed_out {
             self.sink_timed_out = false;
             tracing::info!("skipping checkpoint after sink timeout to preserve replay window");
-            return false;
+            return None;
         }
 
         if !force {
             let Some(interval) = self.checkpoint_interval else {
-                return false; // no auto-checkpointing configured
+                return None; // no auto-checkpointing configured
             };
             if self.last_checkpoint.elapsed() < interval {
-                return false;
+                return None;
             }
         }
 
@@ -729,7 +730,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             Ok(states) => states,
             Err(e) => {
                 tracing::warn!(error = %e, "Stream executor checkpoint failed — skipping checkpoint");
-                return false;
+                return None;
             }
         };
 
@@ -752,38 +753,24 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             source_offset_overrides: source_overrides,
         };
 
-        if force {
-            // Blocking checkpoint at shutdown.
+        let committed_epoch: Option<u64> = {
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
                 match coord.checkpoint_with_offsets(request).await {
                     Ok(result) if result.success => {
-                        tracing::info!(epoch = result.epoch, "Final pipeline checkpoint saved");
-                    }
-                    Ok(result) => {
-                        tracing::warn!(
-                            epoch = result.epoch,
-                            error = ?result.error,
-                            "Final checkpoint failed"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Final checkpoint error");
-                    }
-                }
-            }
-        } else {
-            // Periodic checkpoint — run inline (single-threaded runtime, no
-            // parallelism to exploit with tokio::spawn).
-            let mut guard = self.coordinator.lock().await;
-            if let Some(ref mut coord) = *guard {
-                match coord.checkpoint_with_offsets(request).await {
-                    Ok(result) if result.success => {
-                        tracing::info!(
-                            epoch = result.epoch,
-                            duration_ms = result.duration.as_millis(),
-                            "Pipeline checkpoint completed"
-                        );
+                        if force {
+                            tracing::info!(
+                                epoch = result.epoch,
+                                "Final pipeline checkpoint saved"
+                            );
+                        } else {
+                            tracing::info!(
+                                epoch = result.epoch,
+                                duration_ms = result.duration.as_millis(),
+                                "Pipeline checkpoint completed"
+                            );
+                        }
+                        Some(result.epoch)
                     }
                     Ok(result) => {
                         tracing::warn!(
@@ -791,27 +778,31 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                             error = ?result.error,
                             "Pipeline checkpoint failed"
                         );
+                        None
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "Checkpoint error");
+                        None
                     }
                 }
+            } else {
+                None
             }
-        }
+        };
 
         self.last_checkpoint = std::time::Instant::now();
-        true
+        committed_epoch
     }
 
     async fn checkpoint_with_barrier(
         &mut self,
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
-    ) -> bool {
+    ) -> Option<u64> {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
         let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
 
         if self.prom.cycles.get() == 0 {
-            return false;
+            return None;
         }
 
         // Clear after one suppression — the timer-based path that also
@@ -821,7 +812,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             tracing::warn!(
                 "skipping barrier checkpoint after sink timeout to preserve replay window"
             );
-            return false;
+            return None;
         }
 
         // Capture table source offsets.
@@ -841,7 +832,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             Ok(states) => states,
             Err(e) => {
                 tracing::warn!(error = %e, "Stream executor barrier checkpoint failed — skipping");
-                return false;
+                return None;
             }
         };
 
@@ -883,7 +874,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         "Barrier-aligned checkpoint completed"
                     );
                     self.last_checkpoint = std::time::Instant::now();
-                    return true;
+                    return Some(result.epoch);
                 }
                 Ok(result) => {
                     tracing::warn!(
@@ -898,7 +889,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
 
-        false
+        None
     }
 
     fn record_cycle(&self, events_ingested: u64, _batches: u64, elapsed_ns: u64) {
