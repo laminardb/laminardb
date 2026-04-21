@@ -232,6 +232,13 @@ pub struct NatsSinkConfig {
     pub expected_stream: Option<String>,
     pub delivery_guarantee: DeliveryGuarantee,
     pub dedup_id_column: Option<String>,
+    /// Minimum `duplicate_window` the target stream must be configured
+    /// with when `delivery.guarantee=exactly_once`. Parsed from
+    /// `min.duplicate.window.ms`; defaults to 2 minutes. The sink
+    /// refuses to start if the stream's actual window is shorter, since
+    /// a short window means rollback redelivery can land outside the
+    /// dedup horizon and produce duplicates silently.
+    pub min_duplicate_window: Duration,
     pub max_pending: usize,
     pub ack_timeout: Duration,
     pub flush_batch_size: usize,
@@ -279,6 +286,11 @@ impl NatsSinkConfig {
             expected_stream: config.get("expected.stream").map(str::to_string),
             delivery_guarantee,
             dedup_id_column,
+            min_duplicate_window: parse_duration_ms(
+                config,
+                "min.duplicate.window.ms",
+                Duration::from_secs(120),
+            )?,
             max_pending: parse_usize(config, "max.pending", 4096)?,
             ack_timeout: parse_duration_ms(config, "ack.timeout.ms", Duration::from_secs(30))?,
             flush_batch_size: parse_usize(config, "flush.batch.size", 1000)?,
@@ -307,6 +319,12 @@ impl NatsSinkConfig {
                 "[LDB-5054] delivery.guarantee=exactly_once requires 'dedup.id.column' — \
                  msg-id dedup with epoch-row hashing is not supported (deterministic replay \
                  is too fragile; name a unique-per-row column)",
+            ));
+        }
+        if self.delivery_guarantee == DeliveryGuarantee::ExactlyOnce && self.stream.is_none() {
+            return Err(cfg_err(
+                "[LDB-5055] delivery.guarantee=exactly_once requires 'stream' so the sink \
+                 can validate its duplicate_window at startup",
             ));
         }
         Ok(())
@@ -540,6 +558,19 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("LDB-5053"), "got: {err}");
+    }
+
+    #[test]
+    fn sink_rejects_exactly_once_without_stream() {
+        let err = NatsSinkConfig::from_config(&cfg(&[
+            ("servers", "nats://a:4222"),
+            ("subject", "x"),
+            ("delivery.guarantee", "exactly_once"),
+            ("dedup.id.column", "event_id"),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("LDB-5055"), "got: {err}");
     }
 
     #[test]

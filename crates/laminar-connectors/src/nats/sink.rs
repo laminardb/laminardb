@@ -1,9 +1,11 @@
 //! NATS sink connector.
 //!
-//! At-least-once publishing in this milestone. Core-mode publishes are
-//! fire-and-forget; `JetStream` publishes collect `PublishAckFuture`s and
-//! drain them concurrently in `flush`/`pre_commit`. Exactly-once via
-//! `Nats-Msg-Id` dedup lands in a follow-up.
+//! Core-mode publishes are fire-and-forget. `JetStream` publishes collect
+//! `PublishAckFuture`s and drain them concurrently in `flush`/`pre_commit`.
+//! Exactly-once uses server-side `Nats-Msg-Id` dedup: the sink refuses to
+//! start unless the target stream's `duplicate_window` is at least
+//! `min.duplicate.window.ms`, so rollback redelivery always lands inside
+//! the dedup horizon.
 
 use std::collections::VecDeque;
 use std::future::IntoFuture;
@@ -74,12 +76,25 @@ impl SinkConnector for NatsSink {
             Mode::JetStream => {
                 let context = jetstream::new(client);
                 if let Some(stream_name) = cfg.stream.as_deref() {
-                    // Touch the stream now so a bad name fails open(), not
-                    // later on the first publish.
-                    context
+                    // Touch the stream now so a bad name fails open(),
+                    // not later on the first publish.
+                    let stream = context
                         .get_stream(stream_name)
                         .await
                         .map_err(|e| err(&format!("get_stream('{stream_name}') failed: {e}")))?;
+                    if cfg.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+                        let info = stream.cached_info();
+                        let actual = info.config.duplicate_window;
+                        if actual < cfg.min_duplicate_window {
+                            return Err(err(&format!(
+                                "[LDB-5056] stream '{stream_name}' has duplicate_window={actual:?}, \
+                                 below the configured minimum {:?}. Rollback redelivery could land \
+                                 outside the dedup horizon. Reconfigure the stream or lower \
+                                 'min.duplicate.window.ms'.",
+                                cfg.min_duplicate_window,
+                            )));
+                        }
+                    }
                 }
                 Runtime::JetStream { context }
             }
@@ -116,6 +131,11 @@ impl SinkConnector for NatsSink {
             .map(|n| resolve_utf8(batch, n).map(|arr| (n.as_str(), arr)))
             .collect::<Result<_, _>>()?;
         let expected_stream = cfg.expected_stream.as_deref();
+        let dedup_col = cfg
+            .dedup_id_column
+            .as_deref()
+            .map(|n| resolve_utf8(batch, n).map(|arr| (n, arr)))
+            .transpose()?;
 
         let records = ser
             .serialize(batch)
@@ -136,7 +156,18 @@ impl SinkConnector for NatsSink {
                 }
                 (SubjectSpec::Column(_), None) => unreachable!("resolved above"),
             };
-            let headers = build_headers(expected_stream, &header_cols, row);
+            let msg_id = match dedup_col {
+                Some((name, arr)) => {
+                    if arr.is_null(row) {
+                        return Err(err(&format!(
+                            "dedup.id.column '{name}' is null at row {row}"
+                        )));
+                    }
+                    Some(arr.value(row))
+                }
+                None => None,
+            };
+            let headers = build_headers(expected_stream, msg_id, &header_cols, row);
             let payload_len = payload.len() as u64;
             let payload = bytes::Bytes::from(payload);
             bytes_total += payload_len;
@@ -204,6 +235,17 @@ impl SinkConnector for NatsSink {
         drain_acks(&mut self.pending_acks, timeout).await
     }
 
+    async fn rollback_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
+        // Drop the pending futures. Any publish already on the wire will
+        // land on the server; on the next epoch's retry the same
+        // Nats-Msg-Id values dedup them out. Publishes that never landed
+        // simply get resent. Both paths are safe as long as the stream's
+        // duplicate_window covers the rollback-to-retry gap — validated
+        // at open() via LDB-5056.
+        self.pending_acks.clear();
+        Ok(())
+    }
+
     async fn close(&mut self) -> Result<(), ConnectorError> {
         let timeout = self
             .config
@@ -246,15 +288,19 @@ fn resolve_utf8<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArra
 
 fn build_headers(
     expected_stream: Option<&str>,
+    msg_id: Option<&str>,
     header_cols: &[(&str, &StringArray)],
     row: usize,
 ) -> Option<HeaderMap> {
-    if header_cols.is_empty() && expected_stream.is_none() {
+    if header_cols.is_empty() && expected_stream.is_none() && msg_id.is_none() {
         return None;
     }
     let mut h = HeaderMap::new();
     if let Some(s) = expected_stream {
         h.insert("Nats-Expected-Stream", s);
+    }
+    if let Some(id) = msg_id {
+        h.insert("Nats-Msg-Id", id);
     }
     for (name, arr) in header_cols {
         if !arr.is_null(row) {

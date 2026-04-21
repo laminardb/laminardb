@@ -160,6 +160,12 @@ fn sink_config_keys() -> Vec<ConfigKeySpec> {
             "Column used as Nats-Msg-Id (required for exactly-once)",
             "",
         ),
+        K::optional(
+            "min.duplicate.window.ms",
+            "Minimum stream duplicate_window required for exactly-once \
+             (the sink refuses to start if the stream is configured below this)",
+            "120000",
+        ),
         K::optional("max.pending", "Max outstanding PubAck futures", "4096"),
         K::optional("ack.timeout.ms", "Per-publish ack timeout", "30000"),
         K::optional(
