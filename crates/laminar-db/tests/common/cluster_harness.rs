@@ -238,6 +238,11 @@ impl ClusterEngineHarness {
             node.rebalance_tasks.push(watcher);
             node.rebalance_tasks.push(controller);
         }
+        // Give background tasks a moment to spin up before the test
+        // drives its first checkpoint. Without this there's a
+        // narrow race on slower hosts where the follower's pipeline
+        // isn't yet observing barrier announcements.
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     /// Index into `nodes` of the current leader. Always `0` under the
