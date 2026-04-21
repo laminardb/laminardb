@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::SourceConnector;
+use laminar_core::state::StateBackend;
 use laminar_storage::checkpoint_manifest::{
     CheckpointManifest, ConnectorCheckpoint, SinkCommitStatus,
 };
@@ -32,90 +33,34 @@ use tracing::{debug, error, info, warn};
 use crate::error::DbError;
 
 /// Unified checkpoint configuration.
+///
+/// Timeouts prevent a stuck sink or hung filesystem from stalling the
+/// runtime. `state_inline_threshold` decides per-operator whether state
+/// inlines as base64 in the JSON manifest or lands in a sidecar file.
+/// `max_checkpoint_bytes` caps total sidecar size; an oversized
+/// checkpoint is rejected with `[LDB-6014]`.
 #[derive(Debug, Clone)]
 pub struct CheckpointConfig {
     /// Interval between checkpoints. `None` = manual only.
     pub interval: Option<Duration>,
-    /// Maximum number of retained checkpoints.
+    /// Number of completed checkpoints retained on disk/in object store.
     pub max_retained: usize,
-    /// Maximum time to wait for barrier alignment at fan-in nodes.
+    /// Upper bound on barrier-alignment wait at fan-in operators.
     pub alignment_timeout: Duration,
-    /// Maximum time to wait for all sinks to pre-commit.
-    ///
-    /// A stuck sink will not block checkpointing indefinitely.
-    /// Defaults to 30 seconds.
+    /// Upper bound on sink pre-commit (phase 1).
     pub pre_commit_timeout: Duration,
-    /// Maximum time to wait for manifest persist (filesystem I/O).
-    ///
-    /// A hung or degraded filesystem will not stall the runtime indefinitely.
-    /// Defaults to 120 seconds.
+    /// Upper bound on manifest persist.
     pub persist_timeout: Duration,
-    /// Maximum time to wait for all sinks to commit (phase 2).
-    ///
-    /// Defaults to 60 seconds.
+    /// Upper bound on sink commit (phase 2).
     pub commit_timeout: Duration,
-    /// Maximum time to wait for all sinks to roll back. Defaults to 30s.
+    /// Upper bound on sink rollback.
     pub rollback_timeout: Duration,
-    /// Maximum operator state size (bytes) to inline in the JSON manifest.
-    ///
-    /// States larger than this threshold are written to a `state.bin` sidecar
-    /// file and referenced by offset/length in the manifest. This avoids
-    /// inflating the manifest with base64-encoded blobs (~33% overhead).
-    ///
-    /// Default: 1 MB (`1_048_576`). Set to `usize::MAX` to inline everything.
+    /// States larger than this go to a sidecar rather than base64 JSON.
     pub state_inline_threshold: usize,
-    /// Maximum time for operator state serialization. Defaults to 120 seconds.
+    /// Upper bound on operator state serialization.
     pub serialization_timeout: Duration,
-    /// Maximum total checkpoint size in bytes (manifest + sidecar).
-    ///
-    /// If the packed operator state exceeds this limit, the checkpoint is
-    /// rejected with `[LDB-6014]` and not persisted. This prevents
-    /// unbounded state from creating multi-GB sidecar files.
-    ///
-    /// `None` means no limit (default). A warning is logged at 80% of the cap.
+    /// Cap on total sidecar bytes; `None` = no limit. 80% warn threshold.
     pub max_checkpoint_bytes: Option<usize>,
-    /// Adaptive checkpoint interval configuration.
-    ///
-    /// When `Some`, the coordinator dynamically adjusts the checkpoint interval
-    /// based on observed checkpoint durations using an exponential moving average.
-    /// When `None` (default), the static `interval` is used unchanged.
-    pub adaptive: Option<AdaptiveCheckpointConfig>,
-}
-
-/// Configuration for adaptive checkpoint intervals.
-///
-/// Dynamically adjusts the checkpoint interval based on observed checkpoint
-/// durations: `interval = clamp(smoothed_duration / target_ratio, min, max)`.
-///
-/// This avoids checkpointing too frequently under light load (wasting I/O)
-/// or too infrequently under heavy load (increasing recovery time).
-#[derive(Debug, Clone)]
-pub struct AdaptiveCheckpointConfig {
-    /// Minimum checkpoint interval (floor). Default: 10s.
-    pub min_interval: Duration,
-    /// Maximum checkpoint interval (ceiling). Default: 300s.
-    pub max_interval: Duration,
-    /// Target ratio of checkpoint duration to interval.
-    ///
-    /// For example, 0.1 means checkpoints should take at most 10% of the
-    /// time between them. Default: 0.1.
-    pub target_overhead_ratio: f64,
-    /// EMA smoothing factor for checkpoint durations.
-    ///
-    /// Higher values give more weight to recent observations.
-    /// Range: 0.0–1.0. Default: 0.3.
-    pub smoothing_alpha: f64,
-}
-
-impl Default for AdaptiveCheckpointConfig {
-    fn default() -> Self {
-        Self {
-            min_interval: Duration::from_secs(10),
-            max_interval: Duration::from_secs(300),
-            target_overhead_ratio: 0.1,
-            smoothing_alpha: 0.3,
-        }
-    }
 }
 
 impl Default for CheckpointConfig {
@@ -131,7 +76,6 @@ impl Default for CheckpointConfig {
             serialization_timeout: Duration::from_secs(120),
             state_inline_threshold: 1_048_576,
             max_checkpoint_bytes: None,
-            adaptive: None,
         }
     }
 }
@@ -139,8 +83,10 @@ impl Default for CheckpointConfig {
 /// Parameters for a checkpoint operation.
 #[derive(Debug, Clone, Default)]
 pub struct CheckpointRequest {
-    /// Serialized operator states.
-    pub operator_states: HashMap<String, Vec<u8>>,
+    /// Serialized operator states. `Bytes` (not `Vec<u8>`) so producers
+    /// (rkyv output, MV IPC bytes) can hand off the buffer without an
+    /// extra copy at each stage of the checkpoint pipeline.
+    pub operator_states: HashMap<String, bytes::Bytes>,
     /// Current watermark timestamp.
     pub watermark: Option<i64>,
     /// Path for table store checkpoint data.
@@ -235,28 +181,66 @@ pub struct CheckpointCoordinator {
     checkpoints_completed: u64,
     checkpoints_failed: u64,
     last_checkpoint_duration: Option<Duration>,
-    /// Rolling histogram of checkpoint durations for percentile tracking.
     duration_histogram: DurationHistogram,
-    /// Prometheus engine metrics.
     prom: Option<Arc<crate::engine_metrics::EngineMetrics>>,
-    /// Exponential moving average of checkpoint durations (milliseconds).
-    smoothed_duration_ms: f64,
-    /// Cumulative bytes written across all checkpoints (manifest + sidecar).
     total_bytes_written: u64,
+    /// Consulted between manifest persist and sink commit to verify
+    /// per-vnode durability.
+    state_backend: Option<Arc<dyn StateBackend>>,
+    /// Stamped into every `write_partial` for the Phase 1.4 fence.
+    /// Zero = fence disabled.
+    assignment_version: u64,
+    /// Shared commit-marker store. Written before `Commit` is
+    /// announced; absence means "no quorum, safe to abort". `None`
+    /// in single-instance mode.
+    #[cfg(feature = "cluster-unstable")]
+    decision_store: Option<Arc<laminar_core::cluster::control::CheckpointDecisionStore>>,
+    /// Reported in each `BarrierAck`; the leader folds these with its
+    /// own watermark to compute the cluster-wide min.
+    local_watermark_ms: Option<i64>,
+    /// Cluster-wide min watermark as of the last committed epoch
+    /// (leader-side; fanned out in the Commit announcement).
+    #[cfg(feature = "cluster-unstable")]
+    cluster_min_watermark: Option<i64>,
+    /// Vnodes this coordinator owns; drives per-vnode marker writes.
+    vnode_set: Vec<u32>,
+    /// Vnodes the leader's durability gate checks. In cluster mode the
+    /// full registry; single-instance mirrors `vnode_set`.
+    gate_vnode_set: Vec<u32>,
+    /// `Some` in cluster mode, `None` in single-instance / embedded.
+    #[cfg(feature = "cluster-unstable")]
+    cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    /// Cached sorted sink names; invalidated on `register_sink`.
+    cached_sorted_sink_names: Option<Vec<String>>,
 }
 
 impl CheckpointCoordinator {
-    /// Creates a new checkpoint coordinator.
-    #[must_use]
-    pub fn new(config: CheckpointConfig, store: Box<dyn CheckpointStore>) -> Self {
+    /// Creates a new checkpoint coordinator, seeded from the latest
+    /// stored checkpoint.
+    ///
+    /// # Errors
+    /// Returns [`DbError::Checkpoint`] if `store.load_latest()` fails.
+    /// A store read error is surfaced rather than silently starting at
+    /// `(1, 1)` and clobbering existing on-disk state. `Ok(None)` is
+    /// the fresh-start path and is not an error.
+    pub async fn new(
+        config: CheckpointConfig,
+        store: Box<dyn CheckpointStore>,
+    ) -> Result<Self, DbError> {
         let store: Arc<dyn CheckpointStore> = Arc::from(store);
-        // Determine starting epoch from stored checkpoints.
-        let (next_id, epoch) = match store.load_latest() {
+        let (next_id, epoch) = match store.load_latest().await {
             Ok(Some(m)) => (m.checkpoint_id + 1, m.epoch + 1),
-            _ => (1, 1),
+            Ok(None) => (1, 1),
+            Err(e) => {
+                return Err(DbError::Checkpoint(format!(
+                    "[LDB-6028] failed to load latest checkpoint at coordinator \
+                     construction: {e} — refusing to start at epoch 1 and \
+                     clobber existing on-disk state"
+                )));
+            }
         };
 
-        Self {
+        Ok(Self {
             config,
             store,
             sinks: Vec::new(),
@@ -268,9 +252,85 @@ impl CheckpointCoordinator {
             last_checkpoint_duration: None,
             duration_histogram: DurationHistogram::new(),
             prom: None,
-            smoothed_duration_ms: 0.0,
             total_bytes_written: 0,
+            state_backend: None,
+            assignment_version: 0,
+            #[cfg(feature = "cluster-unstable")]
+            decision_store: None,
+            local_watermark_ms: None,
+            #[cfg(feature = "cluster-unstable")]
+            cluster_min_watermark: None,
+            vnode_set: Vec::new(),
+            gate_vnode_set: Vec::new(),
+            #[cfg(feature = "cluster-unstable")]
+            cluster_controller: None,
+            cached_sorted_sink_names: None,
+        })
+    }
+
+    /// Activates cluster-mode 2PC. Without this the coordinator runs
+    /// single-instance semantics.
+    #[cfg(feature = "cluster-unstable")]
+    pub fn set_cluster_controller(
+        &mut self,
+        controller: Arc<laminar_core::cluster::control::ClusterController>,
+    ) {
+        self.cluster_controller = Some(controller);
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    #[allow(dead_code)] // kept for future role-aware call sites
+    pub(crate) fn cluster_controller(
+        &self,
+    ) -> Option<&Arc<laminar_core::cluster::control::ClusterController>> {
+        self.cluster_controller.as_ref()
+    }
+
+    /// Wired with a non-empty `vnode_set` to enable per-vnode markers
+    /// and the `epoch_complete` durability gate.
+    pub fn set_state_backend(&mut self, backend: Arc<dyn StateBackend>) {
+        self.state_backend = Some(backend);
+    }
+
+    /// Install the shared commit-marker store.
+    #[cfg(feature = "cluster-unstable")]
+    pub fn set_decision_store(
+        &mut self,
+        store: Arc<laminar_core::cluster::control::CheckpointDecisionStore>,
+    ) {
+        self.decision_store = Some(store);
+    }
+
+    /// Record the assignment generation this coordinator is writing
+    /// with. Forwarded to `backend.write_partial` so the Phase 1.4
+    /// split-brain fence can reject stale writers. Host sets this
+    /// whenever a fresh `AssignmentSnapshot` rotates in.
+    pub fn set_assignment_version(&mut self, version: u64) {
+        self.assignment_version = version;
+    }
+
+    /// Record this instance's current local watermark, reported in
+    /// every subsequent `BarrierAck` so the leader can compute the
+    /// cluster-wide minimum (Phase 1.3). `None` disables the
+    /// per-follower contribution — leader falls back to its own
+    /// watermark (and the other followers').
+    pub fn set_local_watermark_ms(&mut self, watermark: Option<i64>) {
+        self.local_watermark_ms = watermark;
+    }
+
+    /// Vnodes this instance owns; drives marker writes. Also the
+    /// default gate set until [`Self::set_gate_vnode_set`] is called.
+    pub fn set_vnode_set(&mut self, vnodes: Vec<u32>) {
+        if self.gate_vnode_set.is_empty() {
+            self.gate_vnode_set.clone_from(&vnodes);
         }
+        self.vnode_set = vnodes;
+    }
+
+    /// Set the vnodes the leader's durability gate checks (the full
+    /// registry in cluster mode). Defaults to `vnode_set` when unset.
+    pub fn set_gate_vnode_set(&mut self, vnodes: Vec<u32>) {
+        self.gate_vnode_set = vnodes;
     }
 
     /// Registers a sink connector for checkpoint coordination.
@@ -285,6 +345,9 @@ impl CheckpointCoordinator {
             handle,
             exactly_once,
         });
+        // Invalidate the sorted-name cache; the next checkpoint will
+        // rebuild it.
+        self.cached_sorted_sink_names = None;
     }
 
     /// Begins the initial epoch on all exactly-once sinks.
@@ -396,16 +459,29 @@ impl CheckpointCoordinator {
     /// Only sinks with `exactly_once = true` participate in two-phase commit.
     /// At-most-once sinks are skipped — they receive no `pre_commit`/`commit`
     /// calls and provide no transactional guarantees.
+    ///
+    /// Fires every sink's `pre_commit` concurrently via `try_join_all` —
+    /// matching the rollback path's shape. The serial version was
+    /// `sum(per-sink pre-commit latency)`; with 4 Delta sinks at ~200ms
+    /// S3 write each, that was 800ms serial. Concurrent = 200ms.
     async fn pre_commit_sinks_inner(&self, epoch: u64) -> Result<(), DbError> {
-        for sink in &self.sinks {
-            if sink.exactly_once {
-                sink.handle.pre_commit(epoch).await.map_err(|e| {
-                    DbError::Checkpoint(format!("sink '{}' pre-commit failed: {e}", sink.name))
-                })?;
-                debug!(sink = %sink.name, epoch, "sink pre-committed");
+        let futures = self.sinks.iter().filter(|s| s.exactly_once).map(|sink| {
+            let handle = sink.handle.clone();
+            let name = sink.name.clone();
+            async move {
+                let result = handle.pre_commit(epoch).await;
+                match result {
+                    Ok(()) => {
+                        debug!(sink = %name, epoch, "sink pre-committed");
+                        Ok(())
+                    }
+                    Err(e) => Err(DbError::Checkpoint(format!(
+                        "sink '{name}' pre-commit failed: {e}"
+                    ))),
+                }
             }
-        }
-        Ok(())
+        });
+        futures::future::try_join_all(futures).await.map(|_| ())
     }
 
     /// Commits all exactly-once sinks with per-sink status tracking.
@@ -456,57 +532,54 @@ impl CheckpointCoordinator {
     }
 
     /// Inner commit loop (no timeout).
+    ///
+    /// Fires every sink's `commit_epoch` concurrently via `join_all`
+    /// (not `try_join_all` — one sink failing must not short-circuit
+    /// the others, because each sink's status is tracked independently
+    /// and callers inspect the map). Matches the rollback path's
+    /// pattern at `rollback_sinks_inner`.
     async fn commit_sinks_inner(&self, epoch: u64) -> HashMap<String, SinkCommitStatus> {
-        let mut statuses = HashMap::with_capacity(self.sinks.len());
-
-        for sink in &self.sinks {
-            if sink.exactly_once {
-                match sink.handle.commit_epoch(epoch).await {
+        let futures = self.sinks.iter().filter(|s| s.exactly_once).map(|sink| {
+            let handle = sink.handle.clone();
+            let name = sink.name.clone();
+            async move {
+                let status = match handle.commit_epoch(epoch).await {
                     Ok(()) => {
-                        statuses.insert(sink.name.clone(), SinkCommitStatus::Committed);
-                        debug!(sink = %sink.name, epoch, "sink committed");
+                        debug!(sink = %name, epoch, "sink committed");
+                        SinkCommitStatus::Committed
                     }
                     Err(e) => {
-                        let msg = format!("sink '{}' commit failed: {e}", sink.name);
-                        error!(sink = %sink.name, epoch, error = %e, "sink commit failed");
-                        statuses.insert(sink.name.clone(), SinkCommitStatus::Failed(msg));
+                        let msg = format!("sink '{name}' commit failed: {e}");
+                        error!(sink = %name, epoch, error = %e, "sink commit failed");
+                        SinkCommitStatus::Failed(msg)
                     }
-                }
+                };
+                (name, status)
             }
-        }
-
-        statuses
+        });
+        let results = futures::future::join_all(futures).await;
+        results.into_iter().collect()
     }
 
-    /// Saves a manifest to the checkpoint store (blocking I/O on a task).
+    /// Saves a manifest to the checkpoint store.
     ///
     /// Uses [`CheckpointStore::save_with_state`] to write optional sidecar
     /// data **before** the manifest, ensuring atomicity: if the sidecar write
     /// fails, the manifest is never persisted.
     ///
-    /// Takes `manifest` by value to avoid cloning on the common path.
-    /// Callers that need the manifest after save should clone before calling.
-    ///
-    /// Bounded by [`CheckpointConfig::persist_timeout`] to prevent a hung
-    /// filesystem from stalling the runtime indefinitely.
+    /// Takes `Arc<CheckpointManifest>` so the caller can retain its own copy
+    /// without a deep clone. Bounded by [`CheckpointConfig::persist_timeout`]
+    /// to prevent a hung filesystem from stalling the runtime indefinitely.
     async fn save_manifest(
         &self,
-        manifest: CheckpointManifest,
-        state_data: Option<Vec<u8>>,
+        manifest: Arc<CheckpointManifest>,
+        state_data: Option<Vec<bytes::Bytes>>,
     ) -> Result<(), DbError> {
-        let store = Arc::clone(&self.store);
         let timeout_dur = self.config.persist_timeout;
-
-        let task = tokio::task::spawn_blocking(move || {
-            store.save_with_state(&manifest, state_data.as_deref())
-        });
-
-        match tokio::time::timeout(timeout_dur, task).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(e))) => Err(DbError::from(e)),
-            Ok(Err(join_err)) => Err(DbError::Checkpoint(format!(
-                "manifest persist task failed: {join_err}"
-            ))),
+        let fut = self.store.save_with_state(&manifest, state_data.as_deref());
+        match tokio::time::timeout(timeout_dur, fut).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(DbError::from(e)),
             Err(_elapsed) => Err(DbError::Checkpoint(format!(
                 "[LDB-6011] manifest persist timed out after {}s — \
                  filesystem may be degraded",
@@ -515,22 +588,264 @@ impl CheckpointCoordinator {
         }
     }
 
+    /// Writes a per-vnode durability marker so the leader's
+    /// `epoch_complete` gate returns true and sinks can commit.
+    ///
+    /// Fires every vnode marker concurrently via `try_join_all`.
+    /// The serial version was O(`vnode_count` × per-write latency) —
+    /// ~256 awaits on a typical cluster, trivial CPU but each a
+    /// scheduling hop (and on remote object-store backends each
+    /// write is tens to hundreds of ms). Concurrent dispatch
+    /// collapses that to one round-trip's worth of wall time.
+    async fn write_vnode_markers(&self, epoch: u64, checkpoint_id: u64) -> Result<(), DbError> {
+        let Some(ref backend) = self.state_backend else {
+            return Ok(());
+        };
+        if self.vnode_set.is_empty() {
+            return Ok(());
+        }
+        let payload = bytes::Bytes::from(format!("ckpt:{checkpoint_id}").into_bytes());
+        // Phase 1.4: stamp every marker with the current assignment
+        // generation. Zero means the host hasn't wired a version (e.g.
+        // pre-Phase-1.2 single-instance path) and the fence is a no-op.
+        let caller_version = self.assignment_version;
+        let writes = self.vnode_set.iter().map(|&v| {
+            let backend = Arc::clone(backend);
+            let payload = payload.clone();
+            async move {
+                backend
+                    .write_partial(v, epoch, caller_version, payload)
+                    .await
+                    .map_err(|e| {
+                        DbError::Checkpoint(format!(
+                            "[LDB-6024] vnode marker write failed (vnode={v}, epoch={epoch}): {e}"
+                        ))
+                    })
+            }
+        });
+        futures::future::try_join_all(writes).await.map(|_| ())
+    }
+
+    /// On startup, reconcile any Pending sinks in the last manifest
+    /// against the durable commit marker. Marker present → drive
+    /// local commit (idempotent); marker absent → rollback. Runs on
+    /// every node; the leader additionally re-announces the decision.
+    #[cfg(feature = "cluster-unstable")]
+    pub async fn reconcile_prepared_on_init(&self) {
+        use laminar_core::cluster::control::Phase;
+
+        let Ok(Some(last)) = self.store.load_latest().await else {
+            return;
+        };
+        let has_pending = last
+            .sink_commit_statuses
+            .values()
+            .any(|s| matches!(s, SinkCommitStatus::Pending));
+        if !has_pending {
+            return;
+        }
+
+        let epoch = last.epoch;
+        let checkpoint_id = last.checkpoint_id;
+
+        let committed = match self.decision_store.as_ref() {
+            Some(ds) => ds.is_committed(epoch).await.unwrap_or_else(|e| {
+                warn!(
+                    epoch, checkpoint_id, error = %e,
+                    "[LDB-6040] decision store read failed — defaulting to Abort",
+                );
+                false
+            }),
+            None => false,
+        };
+
+        let is_leader = self
+            .cluster_controller
+            .as_ref()
+            .is_some_and(|cc| cc.is_leader());
+
+        if committed {
+            info!(
+                epoch,
+                checkpoint_id, "recovering Pending epoch as Committed"
+            );
+            let statuses = self.commit_sinks_tracked(epoch).await;
+            if let Err(e) = self
+                .persist_recovered_statuses(checkpoint_id, statuses)
+                .await
+            {
+                warn!(epoch, checkpoint_id, error = %e, "post-recovery manifest update failed");
+            }
+            if is_leader {
+                self.announce_if_leader(epoch, checkpoint_id, Phase::Commit, None)
+                    .await;
+            }
+        } else {
+            warn!(
+                epoch,
+                checkpoint_id, "[LDB-6035] Pending epoch with no commit marker — rolling back",
+            );
+            if let Err(e) = self.rollback_sinks(epoch).await {
+                error!(epoch, checkpoint_id, error = %e, "sink rollback failed during recovery");
+            }
+            if is_leader {
+                self.announce_if_leader(epoch, checkpoint_id, Phase::Abort, None)
+                    .await;
+            }
+        }
+
+        // Brief pause so the announcement gossips before the next checkpoint tick.
+        if is_leader {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Overwrite the Pending sink statuses on the last manifest with
+    /// the outcomes produced during recovery.
+    #[cfg(feature = "cluster-unstable")]
+    async fn persist_recovered_statuses(
+        &self,
+        checkpoint_id: u64,
+        statuses: HashMap<String, SinkCommitStatus>,
+    ) -> Result<(), DbError> {
+        if statuses.is_empty() {
+            return Ok(());
+        }
+        match self.store.load_by_id(checkpoint_id).await {
+            Ok(Some(mut m)) => {
+                m.sink_commit_statuses = statuses;
+                self.update_manifest_only(Arc::new(m)).await
+            }
+            Ok(None) => Ok(()),
+            Err(e) => Err(DbError::from(e)),
+        }
+    }
+
+    /// No-op when not the leader. Errors are logged — worst case is a
+    /// longer follower timeout, not a correctness issue.
+    ///
+    /// `min_watermark_ms` is typically `None` on `Prepare`/`Abort` and
+    /// `Some(cluster_min)` on `Commit` (computed from follower acks +
+    /// local watermark). Downstream operators read the published
+    /// value from [`ClusterController`] so event-time decisions stay
+    /// consistent across the cluster. See Phase 1.3.
+    #[cfg(feature = "cluster-unstable")]
+    async fn announce_if_leader(
+        &self,
+        epoch: u64,
+        checkpoint_id: u64,
+        phase: laminar_core::cluster::control::Phase,
+        min_watermark_ms: Option<i64>,
+    ) {
+        let Some(cc) = self.cluster_controller.as_ref() else {
+            return;
+        };
+        if !cc.is_leader() {
+            return;
+        }
+        let ann = laminar_core::cluster::control::BarrierAnnouncement {
+            epoch,
+            checkpoint_id,
+            phase,
+            flags: 0,
+            min_watermark_ms,
+        };
+        if let Err(e) = cc.announce_barrier(&ann).await {
+            warn!(
+                epoch,
+                checkpoint_id,
+                ?phase,
+                error = %e,
+                "[LDB-6031] barrier announcement failed",
+            );
+        }
+    }
+
+    /// Announce PREPARE and block for follower acks. Returns `None` on
+    /// quorum or no-op (not leader); `Some(msg)` with the failure.
+    /// When quorum is reached, the `Ok` path writes the cluster-wide
+    /// minimum watermark (leader's local + min of follower acks) into
+    /// `self.cluster_min_watermark` so the subsequent `Commit`
+    /// announcement can fan it out (Phase 1.3).
+    #[cfg(feature = "cluster-unstable")]
+    async fn await_prepare_quorum(&mut self, epoch: u64, checkpoint_id: u64) -> Option<String> {
+        use laminar_core::cluster::control::{Phase, QuorumOutcome};
+        let cc = self.cluster_controller.as_ref()?;
+        if !cc.is_leader() {
+            return None;
+        }
+        self.announce_if_leader(epoch, checkpoint_id, Phase::Prepare, None)
+            .await;
+
+        let mut followers = cc.live_instances();
+        followers.retain(|id| *id != cc.instance_id());
+        if followers.is_empty() {
+            // Leader-only cluster — cluster-wide min is just the
+            // leader's local watermark (if any).
+            self.cluster_min_watermark = self.local_watermark_ms;
+            if let Some(wm) = self.local_watermark_ms {
+                cc.publish_cluster_min_watermark(wm);
+            }
+            return None;
+        }
+
+        let outcome = cc
+            .wait_for_quorum(epoch, &followers, Duration::from_secs(30))
+            .await;
+        match outcome {
+            QuorumOutcome::Reached {
+                min_follower_watermark_ms,
+                ..
+            } => {
+                // Fold follower min with the leader's own watermark.
+                // Either may be `None` (unreported) — treated as
+                // "non-blocking" (ignored from the min computation).
+                let merged = match (self.local_watermark_ms, min_follower_watermark_ms) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b),
+                    (None, None) => None,
+                };
+                self.cluster_min_watermark = merged;
+                // Leader-side mirror: publish to the controller atomic
+                // so this instance's operators see the same value the
+                // followers will pick up via `observe_barrier(Commit)`.
+                // Without this, the leader's event-time decisions lag a
+                // full checkpoint behind its own announcements.
+                if let Some(wm) = merged {
+                    cc.publish_cluster_min_watermark(wm);
+                }
+                None
+            }
+            QuorumOutcome::TimedOut { missing, .. } => {
+                self.announce_if_leader(epoch, checkpoint_id, Phase::Abort, None)
+                    .await;
+                Some(format!(
+                    "quorum timeout: {} follower(s) did not ack",
+                    missing.len()
+                ))
+            }
+            QuorumOutcome::Failed { failures } => {
+                self.announce_if_leader(epoch, checkpoint_id, Phase::Abort, None)
+                    .await;
+                let first = failures.first().map_or("unknown", |(_, msg)| msg.as_str());
+                Some(format!(
+                    "follower snapshot failed on {} peer(s): {first}",
+                    failures.len()
+                ))
+            }
+        }
+    }
+
     /// Overwrites an existing manifest with updated fields (e.g., sink commit
     /// statuses after Step 6). Uses [`CheckpointStore::update_manifest`] which
     /// does NOT use conditional PUT, so the overwrite always succeeds.
-    async fn update_manifest_only(&self, manifest: &CheckpointManifest) -> Result<(), DbError> {
-        let store = Arc::clone(&self.store);
-        let manifest = manifest.clone();
+    async fn update_manifest_only(&self, manifest: Arc<CheckpointManifest>) -> Result<(), DbError> {
         let timeout_dur = self.config.persist_timeout;
-
-        let task = tokio::task::spawn_blocking(move || store.update_manifest(&manifest));
-
-        match tokio::time::timeout(timeout_dur, task).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(e))) => Err(DbError::from(e)),
-            Ok(Err(join_err)) => Err(DbError::Checkpoint(format!(
-                "manifest update task failed: {join_err}"
-            ))),
+        let fut = self.store.update_manifest(&manifest);
+        match tokio::time::timeout(timeout_dur, fut).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(DbError::from(e)),
             Err(_elapsed) => Err(DbError::Checkpoint(format!(
                 "manifest update timed out after {}s",
                 timeout_dur.as_secs()
@@ -547,33 +862,39 @@ impl CheckpointCoordinator {
             .collect()
     }
 
-    /// Packs operator states into a manifest with optional sidecar blob.
+    /// Packs operator states into a manifest with optional sidecar chunks.
     ///
     /// States larger than `threshold` are stored in a sidecar blob rather
-    /// than base64-inlined in the JSON manifest.
+    /// than base64-inlined in the JSON manifest. The returned `Vec<Bytes>`
+    /// is handed to `save_with_state` as a chain — the object-store path
+    /// builds a multi-chunk `PutPayload` (no contiguous buffer), the FS
+    /// path writes chunks sequentially. Either way no full-state copy
+    /// happens here.
     fn pack_operator_states(
         manifest: &mut CheckpointManifest,
-        operator_states: &HashMap<String, Vec<u8>>,
+        operator_states: &HashMap<String, bytes::Bytes>,
         threshold: usize,
-    ) -> Option<Vec<u8>> {
-        let mut sidecar_blobs: Vec<u8> = Vec::new();
+    ) -> Option<Vec<bytes::Bytes>> {
+        let mut sidecar_chunks: Vec<bytes::Bytes> = Vec::new();
+        let mut offset: u64 = 0;
         for (name, data) in operator_states {
             let (op_ckpt, maybe_blob) =
-                laminar_storage::checkpoint_manifest::OperatorCheckpoint::from_bytes(
-                    data,
+                laminar_storage::checkpoint_manifest::OperatorCheckpoint::from_bytes_shared(
+                    data.clone(),
                     threshold,
-                    sidecar_blobs.len() as u64,
+                    offset,
                 );
             if let Some(blob) = maybe_blob {
-                sidecar_blobs.extend_from_slice(&blob);
+                offset += blob.len() as u64;
+                sidecar_chunks.push(blob);
             }
             manifest.operator_states.insert(name.clone(), op_ckpt);
         }
 
-        if sidecar_blobs.is_empty() {
+        if sidecar_chunks.is_empty() {
             None
         } else {
-            Some(sidecar_blobs)
+            Some(sidecar_chunks)
         }
     }
 
@@ -638,10 +959,18 @@ impl CheckpointCoordinator {
     }
 
     /// Returns sorted sink names for topology tracking in the manifest.
-    fn sorted_sink_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.sinks.iter().map(|s| s.name.clone()).collect();
-        names.sort();
-        names
+    ///
+    /// Computed once per topology change (via `register_sink`) and
+    /// cached; subsequent checkpoints clone the cached Vec rather than
+    /// re-sorting the sinks list.
+    fn sorted_sink_names(&mut self) -> Vec<String> {
+        if self.cached_sorted_sink_names.is_none() {
+            let mut names: Vec<String> = self.sinks.iter().map(|s| s.name.clone()).collect();
+            names.sort();
+            self.cached_sorted_sink_names = Some(names);
+        }
+        // Invariant: set above.
+        self.cached_sorted_sink_names.as_ref().unwrap().clone()
     }
 
     /// Returns the current phase.
@@ -666,63 +995,6 @@ impl CheckpointCoordinator {
     #[must_use]
     pub fn config(&self) -> &CheckpointConfig {
         &self.config
-    }
-
-    /// Adjusts the checkpoint interval based on observed durations.
-    ///
-    /// Uses an exponential moving average (EMA) of checkpoint durations to
-    /// compute a new interval: `interval = smoothed_duration / target_ratio`,
-    /// clamped to `[min_interval, max_interval]`.
-    ///
-    /// No-op if adaptive checkpointing is not configured.
-    fn adjust_interval(&mut self) {
-        let adaptive = match &self.config.adaptive {
-            Some(a) => a.clone(),
-            None => return,
-        };
-
-        #[allow(clippy::cast_precision_loss)] // Checkpoint durations are << 2^52 ms
-        let last_ms = match self.last_checkpoint_duration {
-            Some(d) => d.as_millis() as f64,
-            None => return,
-        };
-
-        // Update EMA
-        if self.smoothed_duration_ms == 0.0 {
-            self.smoothed_duration_ms = last_ms;
-        } else {
-            self.smoothed_duration_ms = adaptive.smoothing_alpha * last_ms
-                + (1.0 - adaptive.smoothing_alpha) * self.smoothed_duration_ms;
-        }
-
-        // Compute target interval: smoothed_ms / (1000 * ratio)
-        let new_interval_secs =
-            self.smoothed_duration_ms / (1000.0 * adaptive.target_overhead_ratio);
-        let new_interval = Duration::from_secs_f64(new_interval_secs);
-
-        // Clamp to bounds
-        let clamped = new_interval.clamp(adaptive.min_interval, adaptive.max_interval);
-
-        let old_interval = self.config.interval;
-        self.config.interval = Some(clamped);
-
-        if old_interval != Some(clamped) {
-            debug!(
-                old_interval_ms = old_interval.map(|d| d.as_millis()),
-                new_interval_ms = clamped.as_millis(),
-                smoothed_duration_ms = self.smoothed_duration_ms,
-                "adaptive checkpoint interval adjusted"
-            );
-        }
-    }
-
-    /// Returns the current smoothed checkpoint duration (milliseconds).
-    ///
-    /// Returns 0.0 if no checkpoints have been completed or adaptive mode
-    /// is not enabled.
-    #[must_use]
-    pub fn smoothed_duration_ms(&self) -> f64 {
-        self.smoothed_duration_ms
     }
 
     /// Returns checkpoint statistics.
@@ -765,6 +1037,185 @@ impl CheckpointCoordinator {
         request: CheckpointRequest,
     ) -> Result<CheckpointResult, DbError> {
         self.checkpoint_inner(request).await
+    }
+
+    /// Follower half of a cluster checkpoint: pre-commit + save +
+    /// markers + ack, then wait for the leader's commit/abort.
+    /// `Ok(true)` = committed, `Ok(false)` = aborted/timed out.
+    ///
+    /// # Errors
+    /// Propagates sink pre-commit, manifest save, or marker-write failures.
+    #[cfg(feature = "cluster-unstable")]
+    pub async fn follower_checkpoint(
+        &mut self,
+        request: CheckpointRequest,
+        ann: laminar_core::cluster::control::BarrierAnnouncement,
+        decision_timeout: Duration,
+    ) -> Result<bool, DbError> {
+        use laminar_core::cluster::control::{BarrierAck, Phase};
+
+        let Some(cc) = self.cluster_controller.clone() else {
+            return Err(DbError::Checkpoint(
+                "[LDB-6033] follower_checkpoint called without cluster controller".into(),
+            ));
+        };
+
+        let epoch = ann.epoch;
+        let checkpoint_id = ann.checkpoint_id;
+        // Align with the leader so a later leader-mode call resumes correctly.
+        self.epoch = epoch;
+        self.next_checkpoint_id = checkpoint_id.saturating_add(1);
+
+        // Phase 1: local prepare.
+        let prepare_result = self.follower_prepare(request, epoch, checkpoint_id).await;
+        let prepare_err = prepare_result.as_ref().err().map(ToString::to_string);
+        cc.ack_barrier(&BarrierAck {
+            epoch,
+            ok: prepare_err.is_none(),
+            error: prepare_err.clone(),
+            // Leader folds this into the cluster-wide min before
+            // announcing Commit. `None` is non-blocking.
+            local_watermark_ms: self.local_watermark_ms,
+        })
+        .await
+        .ok(); // best effort; leader's quorum wait tolerates missed acks
+        if let Err(e) = prepare_result {
+            self.rollback_sinks(epoch).await.ok();
+            self.phase = CheckpointPhase::Idle;
+            return Err(e);
+        }
+
+        // Phase 2: wait for the leader's decision.
+        let deadline = Instant::now() + decision_timeout;
+        loop {
+            match cc.observe_barrier().await.ok().flatten() {
+                Some(a) if a.epoch == epoch && a.phase == Phase::Commit => {
+                    return Ok(self.drive_follower_commit(epoch, checkpoint_id).await);
+                }
+                Some(a) if a.epoch == epoch && a.phase == Phase::Abort => {
+                    self.rollback_sinks(epoch).await.ok();
+                    self.checkpoints_failed += 1;
+                    self.phase = CheckpointPhase::Idle;
+                    return Ok(false);
+                }
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                let committed = match self.decision_store.as_ref() {
+                    Some(ds) => ds.is_committed(epoch).await.unwrap_or_else(|e| {
+                        warn!(
+                            epoch, checkpoint_id, error = %e,
+                            "[LDB-6045] decision store read failed — defaulting to Abort",
+                        );
+                        false
+                    }),
+                    None => false,
+                };
+                if committed {
+                    warn!(
+                        epoch,
+                        checkpoint_id,
+                        "[LDB-6046] follower timeout but marker present — driving commit",
+                    );
+                    return Ok(self.drive_follower_commit(epoch, checkpoint_id).await);
+                }
+                warn!(
+                    epoch,
+                    checkpoint_id, "[LDB-6034] follower decision timeout; rolling back",
+                );
+                self.rollback_sinks(epoch).await.ok();
+                self.checkpoints_failed += 1;
+                self.phase = CheckpointPhase::Idle;
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Commit this follower's sinks for `epoch` and update its
+    /// manifest's Pending entries. Returns `true` on clean commit.
+    #[cfg(feature = "cluster-unstable")]
+    async fn drive_follower_commit(&mut self, epoch: u64, checkpoint_id: u64) -> bool {
+        let statuses = self.commit_sinks_tracked(epoch).await;
+        let has_failures = statuses
+            .values()
+            .any(|s| matches!(s, SinkCommitStatus::Failed(_)));
+        if has_failures {
+            error!(
+                epoch,
+                checkpoint_id, "follower sink commit partially failed — rolling back",
+            );
+            self.rollback_sinks(epoch).await.ok();
+            self.checkpoints_failed += 1;
+            self.phase = CheckpointPhase::Idle;
+            return false;
+        }
+        // Overwrite the follower's own manifest so the Pending sink
+        // entries stamped during prepare get replaced with the
+        // Committed statuses we just produced.
+        if let Err(e) = self
+            .persist_recovered_statuses(checkpoint_id, statuses)
+            .await
+        {
+            warn!(
+                checkpoint_id,
+                epoch,
+                error = %e,
+                "follower post-commit manifest update failed",
+            );
+        }
+        self.checkpoints_completed += 1;
+        self.epoch = epoch.saturating_add(1);
+        self.phase = CheckpointPhase::Idle;
+        true
+    }
+
+    /// Pre-commit + save manifest + write vnode markers.
+    #[cfg(feature = "cluster-unstable")]
+    async fn follower_prepare(
+        &mut self,
+        request: CheckpointRequest,
+        epoch: u64,
+        checkpoint_id: u64,
+    ) -> Result<(), DbError> {
+        let CheckpointRequest {
+            operator_states,
+            watermark,
+            table_store_checkpoint_path,
+            extra_table_offsets,
+            source_watermarks,
+            pipeline_hash,
+            source_offset_overrides,
+        } = request;
+
+        self.phase = CheckpointPhase::PreCommitting;
+        self.pre_commit_sinks(epoch).await?;
+
+        let mut manifest = CheckpointManifest::new(checkpoint_id, epoch);
+        manifest.source_offsets = source_offset_overrides;
+        manifest.table_offsets = extra_table_offsets;
+        manifest.sink_epochs = self.collect_sink_epochs();
+        manifest.sink_commit_statuses = self.initial_sink_commit_statuses();
+        manifest.watermark = watermark;
+        manifest.source_watermarks = source_watermarks;
+        manifest.table_store_checkpoint_path = table_store_checkpoint_path;
+        manifest.source_names = {
+            let mut names: Vec<String> = manifest.source_offsets.keys().cloned().collect();
+            names.sort();
+            names
+        };
+        manifest.sink_names = self.sorted_sink_names();
+        manifest.pipeline_hash = pipeline_hash;
+        let state_data = Self::pack_operator_states(
+            &mut manifest,
+            &operator_states,
+            self.config.state_inline_threshold,
+        );
+
+        self.phase = CheckpointPhase::Persisting;
+        self.save_manifest(Arc::new(manifest), state_data).await?;
+        self.write_vnode_markers(epoch, checkpoint_id).await?;
+        Ok(())
     }
 
     /// Shared checkpoint implementation for all checkpoint entry points.
@@ -852,7 +1303,9 @@ impl CheckpointCoordinator {
             &operator_states,
             self.config.state_inline_threshold,
         );
-        let sidecar_bytes = state_data.as_ref().map_or(0, Vec::len);
+        let sidecar_bytes = state_data
+            .as_ref()
+            .map_or(0, |chunks| chunks.iter().map(bytes::Bytes::len).sum());
         if sidecar_bytes > 0 {
             debug!(
                 checkpoint_id,
@@ -890,7 +1343,12 @@ impl CheckpointCoordinator {
         let checkpoint_bytes = sidecar_bytes as u64;
 
         self.phase = CheckpointPhase::Persisting;
-        if let Err(e) = self.save_manifest(manifest.clone(), state_data).await {
+        // Arc-wrap so the save task gets a cheap refcount bump instead of
+        // a deep clone. After `save_manifest.await` the task drops its
+        // Arc and we're the sole owner; `Arc::make_mut` below gets us a
+        // free mutable reference for the post-commit sink-status update.
+        let mut manifest = Arc::new(manifest);
+        if let Err(e) = self.save_manifest(Arc::clone(&manifest), state_data).await {
             self.phase = CheckpointPhase::Idle;
             self.checkpoints_failed += 1;
             let duration = start.elapsed();
@@ -914,6 +1372,201 @@ impl CheckpointCoordinator {
             });
         }
 
+        // Bridge: publish per-vnode durability markers so the gate below
+        // has something to check. Replace with real per-operator partial
+        // writes when operators adopt the state backend directly.
+        if let Err(e) = self.write_vnode_markers(epoch, checkpoint_id).await {
+            self.phase = CheckpointPhase::Idle;
+            self.checkpoints_failed += 1;
+            let duration = start.elapsed();
+            self.emit_checkpoint_metrics(false, epoch, duration);
+            if let Err(rollback_err) = self.rollback_sinks(epoch).await {
+                error!(
+                    checkpoint_id,
+                    epoch,
+                    error = %rollback_err,
+                    "[LDB-6025] sink rollback failed after marker write failure",
+                );
+            }
+            error!(checkpoint_id, epoch, error = %e, "vnode marker write failed");
+            return Ok(CheckpointResult {
+                success: false,
+                checkpoint_id,
+                epoch,
+                duration,
+                error: Some(format!("vnode marker write failed: {e}")),
+            });
+        }
+
+        // Cluster 2PC phase 1: announce PREPARE and wait for followers
+        // to snapshot + ack.
+        #[cfg(feature = "cluster-unstable")]
+        {
+            if let Some(quorum_failure) = self.await_prepare_quorum(epoch, checkpoint_id).await {
+                self.phase = CheckpointPhase::Idle;
+                self.checkpoints_failed += 1;
+                let duration = start.elapsed();
+                self.emit_checkpoint_metrics(false, epoch, duration);
+                if let Err(rollback_err) = self.rollback_sinks(epoch).await {
+                    error!(
+                        checkpoint_id,
+                        epoch,
+                        error = %rollback_err,
+                        "[LDB-6032] sink rollback failed after quorum miss",
+                    );
+                }
+                return Ok(CheckpointResult {
+                    success: false,
+                    checkpoint_id,
+                    epoch,
+                    duration,
+                    error: Some(quorum_failure),
+                });
+            }
+        }
+
+        // Durability gate: confirm every participating vnode has its
+        // partial persisted before sinks commit. `gate_vnode_set` is the
+        // FULL registry in cluster mode — the leader verifies markers
+        // from every follower's shared-storage writes, not just its own.
+        // Single-instance defaults to `vnode_set` (the two match).
+        if let Some(ref backend) = self.state_backend {
+            if !self.gate_vnode_set.is_empty() {
+                match backend.epoch_complete(epoch, &self.gate_vnode_set).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        warn!(
+                            checkpoint_id,
+                            epoch,
+                            vnodes = self.gate_vnode_set.len(),
+                            "[LDB-6020] state durability gate returned false — \
+                             rolling back sinks",
+                        );
+                        #[cfg(feature = "cluster-unstable")]
+                        self.announce_if_leader(
+                            epoch,
+                            checkpoint_id,
+                            laminar_core::cluster::control::Phase::Abort,
+                            None,
+                        )
+                        .await;
+                        self.checkpoints_failed += 1;
+                        self.phase = CheckpointPhase::Idle;
+                        let duration = start.elapsed();
+                        self.emit_checkpoint_metrics(false, epoch, duration);
+                        if let Err(rollback_err) = self.rollback_sinks(epoch).await {
+                            error!(
+                                checkpoint_id,
+                                epoch,
+                                error = %rollback_err,
+                                "[LDB-6021] sink rollback failed after durability gate miss",
+                            );
+                        }
+                        return Ok(CheckpointResult {
+                            success: false,
+                            checkpoint_id,
+                            epoch,
+                            duration,
+                            error: Some("state durability gate: not all vnodes persisted".into()),
+                        });
+                    }
+                    Err(e) => {
+                        warn!(
+                            checkpoint_id,
+                            epoch,
+                            error = %e,
+                            "[LDB-6022] state backend error during durability gate — \
+                             treating as gate miss, rolling back sinks",
+                        );
+                        #[cfg(feature = "cluster-unstable")]
+                        self.announce_if_leader(
+                            epoch,
+                            checkpoint_id,
+                            laminar_core::cluster::control::Phase::Abort,
+                            None,
+                        )
+                        .await;
+                        self.checkpoints_failed += 1;
+                        self.phase = CheckpointPhase::Idle;
+                        let duration = start.elapsed();
+                        self.emit_checkpoint_metrics(false, epoch, duration);
+                        if let Err(rollback_err) = self.rollback_sinks(epoch).await {
+                            error!(
+                                checkpoint_id,
+                                epoch,
+                                error = %rollback_err,
+                                "[LDB-6023] sink rollback failed after durability gate error",
+                            );
+                        }
+                        return Ok(CheckpointResult {
+                            success: false,
+                            checkpoint_id,
+                            epoch,
+                            duration,
+                            error: Some(format!("state durability gate: {e}")),
+                        });
+                    }
+                }
+            }
+        }
+
+        // Record the commit marker before announcing Commit so a new
+        // leader elected mid-2PC can recover the decision. A
+        // cluster leader without a decision store is a misconfig.
+        #[cfg(feature = "cluster-unstable")]
+        if self
+            .cluster_controller
+            .as_ref()
+            .is_some_and(|cc| cc.is_leader())
+        {
+            let marker_result = match self.decision_store.as_ref() {
+                Some(ds) => ds.record_committed(epoch).await.map_err(|e| e.to_string()),
+                None => Err("no decision store configured for cluster leader".to_string()),
+            };
+            if let Err(reason) = marker_result {
+                error!(
+                    checkpoint_id, epoch, error = %reason,
+                    "[LDB-6038] cannot record commit marker — aborting epoch",
+                );
+                self.announce_if_leader(
+                    epoch,
+                    checkpoint_id,
+                    laminar_core::cluster::control::Phase::Abort,
+                    None,
+                )
+                .await;
+                self.checkpoints_failed += 1;
+                self.phase = CheckpointPhase::Idle;
+                let duration = start.elapsed();
+                self.emit_checkpoint_metrics(false, epoch, duration);
+                if let Err(rollback_err) = self.rollback_sinks(epoch).await {
+                    error!(
+                        checkpoint_id, epoch, error = %rollback_err,
+                        "[LDB-6039] sink rollback failed after commit marker failure",
+                    );
+                }
+                return Ok(CheckpointResult {
+                    success: false,
+                    checkpoint_id,
+                    epoch,
+                    duration,
+                    error: Some(format!("commit marker: {reason}")),
+                });
+            }
+        }
+
+        #[cfg(feature = "cluster-unstable")]
+        // Phase 1.3: fan out the cluster-wide min watermark computed
+        // during `await_prepare_quorum`. Followers consume this from
+        // `observe_barrier` and update their consumer-side view.
+        self.announce_if_leader(
+            epoch,
+            checkpoint_id,
+            laminar_core::cluster::control::Phase::Commit,
+            self.cluster_min_watermark,
+        )
+        .await;
+
         self.phase = CheckpointPhase::Committing;
         let sink_statuses = self.commit_sinks_tracked(epoch).await;
         let has_failures = sink_statuses
@@ -921,8 +1574,11 @@ impl CheckpointCoordinator {
             .any(|s| matches!(s, SinkCommitStatus::Failed(_)));
 
         if !sink_statuses.is_empty() {
-            manifest.sink_commit_statuses = sink_statuses;
-            if let Err(e) = self.update_manifest_only(&manifest).await {
+            // `Arc::make_mut`: COW. Refcount is 1 here (spawn_blocking
+            // task in save_manifest has already returned and dropped its
+            // clone), so this is a zero-copy mutable borrow.
+            Arc::make_mut(&mut manifest).sink_commit_statuses = sink_statuses;
+            if let Err(e) = self.update_manifest_only(Arc::clone(&manifest)).await {
                 warn!(
                     checkpoint_id,
                     epoch,
@@ -966,7 +1622,32 @@ impl CheckpointCoordinator {
             m.checkpoint_size_bytes.set(checkpoint_bytes as i64);
         }
 
-        self.adjust_interval();
+        // Garbage-collect state-backend partials / commit markers for
+        // epochs no longer needed for recovery. Without this the
+        // in-process backend grows per-checkpoint forever and the
+        // object-store backend leaks `epoch=N/…` objects indefinitely.
+        // `max_retained` is in terms of checkpoints which map 1:1 to
+        // epochs here, so prune everything older than
+        // `epoch - max_retained`.
+        if let Some(ref backend) = self.state_backend {
+            let horizon = epoch.saturating_sub(self.config.max_retained as u64);
+            if horizon > 0 {
+                if let Err(e) = backend.prune_before(horizon).await {
+                    warn!(
+                        epoch,
+                        horizon,
+                        error = %e,
+                        "[LDB-6026] state backend prune failed; old partials will linger"
+                    );
+                }
+                #[cfg(feature = "cluster-unstable")]
+                if let Some(ref ds) = self.decision_store {
+                    if let Err(e) = ds.prune_before(horizon).await {
+                        warn!(epoch, horizon, error = %e, "decision prune failed");
+                    }
+                }
+            }
+        }
 
         let next_epoch = self.epoch;
         let begin_epoch_error = match self.begin_epoch_for_sinks(next_epoch).await {
@@ -1042,8 +1723,8 @@ impl CheckpointCoordinator {
     /// # Errors
     ///
     /// Returns `DbError::Checkpoint` on store errors.
-    pub fn load_latest_manifest(&self) -> Result<Option<CheckpointManifest>, DbError> {
-        self.store.load_latest().map_err(DbError::from)
+    pub async fn load_latest_manifest(&self) -> Result<Option<CheckpointManifest>, DbError> {
+        self.store.load_latest().await.map_err(DbError::from)
     }
 }
 
@@ -1226,32 +1907,34 @@ mod tests {
     use super::*;
     use laminar_storage::checkpoint_store::FileSystemCheckpointStore;
 
-    fn make_coordinator(dir: &std::path::Path) -> CheckpointCoordinator {
+    async fn make_coordinator(dir: &std::path::Path) -> CheckpointCoordinator {
         let store = Box::new(FileSystemCheckpointStore::new(dir, 3));
         CheckpointCoordinator::new(CheckpointConfig::default(), store)
+            .await
+            .unwrap()
     }
 
-    #[test]
-    fn test_coordinator_new() {
+    #[tokio::test]
+    async fn test_coordinator_new() {
         let dir = tempfile::tempdir().unwrap();
-        let coord = make_coordinator(dir.path());
+        let coord = make_coordinator(dir.path()).await;
 
         assert_eq!(coord.epoch(), 1);
         assert_eq!(coord.next_checkpoint_id(), 1);
         assert_eq!(coord.phase(), CheckpointPhase::Idle);
     }
 
-    #[test]
-    fn test_coordinator_resumes_from_stored_checkpoint() {
+    #[tokio::test]
+    async fn test_coordinator_resumes_from_stored_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
 
         // Save a checkpoint manually
         let store = FileSystemCheckpointStore::new(dir.path(), 3);
         let m = CheckpointManifest::new(5, 10);
-        store.save(&m).unwrap();
+        store.save(&m).await.unwrap();
 
         // Coordinator should resume from epoch 11, checkpoint_id 6
-        let coord = make_coordinator(dir.path());
+        let coord = make_coordinator(dir.path()).await;
         assert_eq!(coord.epoch(), 11);
         assert_eq!(coord.next_checkpoint_id(), 6);
     }
@@ -1291,10 +1974,10 @@ mod tests {
         assert_eq!(cp.get_metadata("type"), Some("postgres"));
     }
 
-    #[test]
-    fn test_stats_initial() {
+    #[tokio::test]
+    async fn test_stats_initial() {
         let dir = tempfile::tempdir().unwrap();
-        let coord = make_coordinator(dir.path());
+        let coord = make_coordinator(dir.path()).await;
         let stats = coord.stats();
 
         assert_eq!(stats.completed, 0);
@@ -1309,7 +1992,7 @@ mod tests {
     #[tokio::test]
     async fn test_checkpoint_no_sources_no_sinks() {
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
 
         let result = coord
             .checkpoint(CheckpointRequest {
@@ -1324,7 +2007,7 @@ mod tests {
         assert_eq!(result.epoch, 1);
 
         // Verify manifest was persisted
-        let loaded = coord.store().load_latest().unwrap().unwrap();
+        let loaded = coord.store().load_latest().await.unwrap().unwrap();
         assert_eq!(loaded.checkpoint_id, 1);
         assert_eq!(loaded.epoch, 1);
         assert_eq!(loaded.watermark, Some(1000));
@@ -1350,11 +2033,14 @@ mod tests {
     #[tokio::test]
     async fn test_checkpoint_with_operator_states() {
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
 
         let mut ops = HashMap::new();
-        ops.insert("window-agg".into(), b"state-data".to_vec());
-        ops.insert("filter".into(), b"filter-state".to_vec());
+        ops.insert(
+            "window-agg".into(),
+            bytes::Bytes::from_static(b"state-data"),
+        );
+        ops.insert("filter".into(), bytes::Bytes::from_static(b"filter-state"));
 
         let result = coord
             .checkpoint(CheckpointRequest {
@@ -1366,7 +2052,7 @@ mod tests {
 
         assert!(result.success);
 
-        let loaded = coord.store().load_latest().unwrap().unwrap();
+        let loaded = coord.store().load_latest().await.unwrap().unwrap();
         assert_eq!(loaded.operator_states.len(), 2);
 
         let window_op = loaded.operator_states.get("window-agg").unwrap();
@@ -1376,7 +2062,7 @@ mod tests {
     #[tokio::test]
     async fn test_checkpoint_with_table_store_path() {
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
 
         let result = coord
             .checkpoint(CheckpointRequest {
@@ -1388,24 +2074,24 @@ mod tests {
 
         assert!(result.success);
 
-        let loaded = coord.store().load_latest().unwrap().unwrap();
+        let loaded = coord.store().load_latest().await.unwrap().unwrap();
         assert_eq!(
             loaded.table_store_checkpoint_path.as_deref(),
             Some("/tmp/rocksdb_cp")
         );
     }
 
-    #[test]
-    fn test_load_latest_manifest_empty() {
+    #[tokio::test]
+    async fn test_load_latest_manifest_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let coord = make_coordinator(dir.path());
-        assert!(coord.load_latest_manifest().unwrap().is_none());
+        let coord = make_coordinator(dir.path()).await;
+        assert!(coord.load_latest_manifest().await.unwrap().is_none());
     }
 
-    #[test]
-    fn test_coordinator_debug() {
+    #[tokio::test]
+    async fn test_coordinator_debug() {
         let dir = tempfile::tempdir().unwrap();
-        let coord = make_coordinator(dir.path());
+        let coord = make_coordinator(dir.path()).await;
         let debug = format!("{coord:?}");
         assert!(debug.contains("CheckpointCoordinator"));
         assert!(debug.contains("epoch: 1"));
@@ -1414,7 +2100,7 @@ mod tests {
     #[tokio::test]
     async fn test_checkpoint_emits_metrics_on_success() {
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
 
         let registry = prometheus::Registry::new();
         let prom = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
@@ -1451,7 +2137,7 @@ mod tests {
     async fn test_checkpoint_without_metrics() {
         // Verify checkpoint works fine without metrics set
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
 
         let result = coord
             .checkpoint(CheckpointRequest::default())
@@ -1534,12 +2220,12 @@ mod tests {
             state_inline_threshold: 100, // 100 bytes threshold
             ..CheckpointConfig::default()
         };
-        let mut coord = CheckpointCoordinator::new(config, store);
+        let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
 
         // Small state stays inline, large state goes to sidecar
         let mut ops = HashMap::new();
-        ops.insert("small".into(), vec![0xAAu8; 50]);
-        ops.insert("large".into(), vec![0xBBu8; 200]);
+        ops.insert("small".into(), bytes::Bytes::from(vec![0xAAu8; 50]));
+        ops.insert("large".into(), bytes::Bytes::from(vec![0xBBu8; 200]));
 
         let result = coord
             .checkpoint(CheckpointRequest {
@@ -1551,7 +2237,7 @@ mod tests {
         assert!(result.success);
 
         // Verify manifest
-        let loaded = coord.store().load_latest().unwrap().unwrap();
+        let loaded = coord.store().load_latest().await.unwrap().unwrap();
         let small_op = loaded.operator_states.get("small").unwrap();
         assert!(!small_op.external, "small state should be inline");
         assert_eq!(small_op.decode_inline().unwrap(), vec![0xAAu8; 50]);
@@ -1561,7 +2247,7 @@ mod tests {
         assert_eq!(large_op.external_length, 200);
 
         // Verify sidecar file exists and has correct data
-        let state_data = coord.store().load_state_data(1).unwrap().unwrap();
+        let state_data = coord.store().load_state_data(1).await.unwrap().unwrap();
         assert_eq!(state_data.len(), 200);
         assert!(state_data.iter().all(|&b| b == 0xBB));
     }
@@ -1571,10 +2257,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
         let config = CheckpointConfig::default(); // 1MB threshold
-        let mut coord = CheckpointCoordinator::new(config, store);
+        let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
 
         let mut ops = HashMap::new();
-        ops.insert("op1".into(), b"small-state".to_vec());
+        ops.insert("op1".into(), bytes::Bytes::from_static(b"small-state"));
 
         let result = coord
             .checkpoint(CheckpointRequest {
@@ -1586,125 +2272,547 @@ mod tests {
         assert!(result.success);
 
         // No sidecar file
-        assert!(coord.store().load_state_data(1).unwrap().is_none());
+        assert!(coord.store().load_state_data(1).await.unwrap().is_none());
     }
 
-    #[test]
-    fn test_adaptive_disabled_by_default() {
+    // Durability gate tests.
+
+    #[tokio::test]
+    async fn durability_gate_skipped_when_vnode_set_empty() {
+        // With no state backend installed AND empty vnode set, the commit
+        // path behaves as before. Regression guard: Phase B must not change
+        // single-instance semantics.
         let dir = tempfile::tempdir().unwrap();
-        let coord = make_coordinator(dir.path());
-        assert!(coord.config().adaptive.is_none());
-        assert_eq!(coord.config().interval, Some(Duration::from_secs(60)));
+        let mut coord = make_coordinator(dir.path()).await;
+        let result = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(result.success, "baseline checkpoint must succeed");
     }
 
-    #[test]
-    fn test_adaptive_increases_interval_for_slow_checkpoints() {
+    #[tokio::test]
+    async fn bridge_writes_markers_and_gate_passes() {
+        use laminar_core::state::InProcessBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path()).await;
+        let backend = Arc::new(InProcessBackend::new(4));
+        coord.set_state_backend(backend.clone());
+        coord.set_vnode_set(vec![0, 1, 2, 3]);
+
+        let result = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(result.success, "bridge writes markers → gate passes");
+        // Every owned vnode has a marker for the completed epoch.
+        for v in 0..4 {
+            assert!(
+                backend.read_partial(v, 1).await.unwrap().is_some(),
+                "bridge should have written marker for vnode {v}",
+            );
+        }
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    #[tokio::test]
+    async fn reconcile_announces_abort_when_no_decision_store() {
+        // Fallback path: if no decision store is wired (e.g. legacy
+        // deployments), absence of a marker == Abort. This is the
+        // pre-decision-store behavior preserved for compatibility.
+        use laminar_core::cluster::control::{
+            BarrierAnnouncement, ClusterController, ClusterKv, InMemoryKv, Phase, ANNOUNCEMENT_KEY,
+        };
+        use laminar_core::cluster::discovery::NodeId;
+        use laminar_storage::checkpoint_manifest::SinkCommitStatus;
+        use tokio::sync::watch;
+
         let dir = tempfile::tempdir().unwrap();
         let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
-        let config = CheckpointConfig {
-            adaptive: Some(AdaptiveCheckpointConfig::default()),
-            ..CheckpointConfig::default()
-        };
-        let mut coord = CheckpointCoordinator::new(config, store);
+        let mut orphan = CheckpointManifest::new(42, 7);
+        orphan
+            .sink_commit_statuses
+            .insert("kafka_out".into(), SinkCommitStatus::Pending);
+        store.save_with_state(&orphan, None).await.unwrap();
 
-        // Simulate a 5-second checkpoint
-        coord.last_checkpoint_duration = Some(Duration::from_secs(5));
-        coord.adjust_interval();
+        let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+            .await
+            .unwrap();
+        let self_id = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(self_id));
+        let kv_trait: Arc<dyn ClusterKv> = kv.clone();
+        let (_tx, rx) = watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, rx));
+        let mut coord = coord;
+        coord.set_cluster_controller(controller);
 
-        // Expected: 5000ms / (1000 * 0.1) = 50s
-        let interval = coord.config().interval.unwrap();
-        assert!(
-            interval >= Duration::from_secs(49) && interval <= Duration::from_secs(51),
-            "expected ~50s, got {interval:?}",
-        );
+        coord.reconcile_prepared_on_init().await;
+
+        let raw = kv.read_from(self_id, ANNOUNCEMENT_KEY).await.unwrap();
+        let ann: BarrierAnnouncement = serde_json::from_str(&raw).unwrap();
+        assert_eq!(ann.phase, Phase::Abort);
+        assert_eq!(ann.epoch, 7);
+        assert_eq!(ann.checkpoint_id, 42);
     }
 
-    #[test]
-    fn test_adaptive_decreases_interval_for_fast_checkpoints() {
+    #[cfg(feature = "cluster-unstable")]
+    #[tokio::test]
+    async fn reconcile_announces_commit_when_marker_present() {
+        use laminar_core::cluster::control::{
+            BarrierAnnouncement, CheckpointDecisionStore, ClusterController, ClusterKv, InMemoryKv,
+            Phase, ANNOUNCEMENT_KEY,
+        };
+        use laminar_core::cluster::discovery::NodeId;
+        use laminar_storage::checkpoint_manifest::SinkCommitStatus;
+        use object_store::local::LocalFileSystem;
+        use tokio::sync::watch;
+
+        let ckpt_dir = tempfile::tempdir().unwrap();
+        let decision_dir = tempfile::tempdir().unwrap();
+        let store = Box::new(FileSystemCheckpointStore::new(ckpt_dir.path(), 3));
+        let mut orphan = CheckpointManifest::new(42, 7);
+        orphan
+            .sink_commit_statuses
+            .insert("kafka_out".into(), SinkCommitStatus::Pending);
+        store.save_with_state(&orphan, None).await.unwrap();
+
+        let decision_os: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
+        let decision_store = Arc::new(CheckpointDecisionStore::new(decision_os));
+        decision_store.record_committed(7).await.unwrap();
+
+        let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+            .await
+            .unwrap();
+        let self_id = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(self_id));
+        let kv_trait: Arc<dyn ClusterKv> = kv.clone();
+        let (_tx, rx) = watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, rx));
+        let mut coord = coord;
+        coord.set_cluster_controller(controller);
+        coord.set_decision_store(decision_store);
+
+        coord.reconcile_prepared_on_init().await;
+
+        let raw = kv.read_from(self_id, ANNOUNCEMENT_KEY).await.unwrap();
+        let ann: BarrierAnnouncement = serde_json::from_str(&raw).unwrap();
+        assert_eq!(ann.phase, Phase::Commit);
+        assert_eq!(ann.epoch, 7);
+        assert_eq!(ann.checkpoint_id, 42);
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    #[tokio::test]
+    async fn reconcile_announces_abort_when_marker_missing() {
+        // Decision store is wired but has no marker for this epoch —
+        // the "leader crashed before commit point" case.
+        use laminar_core::cluster::control::{
+            BarrierAnnouncement, CheckpointDecisionStore, ClusterController, ClusterKv, InMemoryKv,
+            Phase, ANNOUNCEMENT_KEY,
+        };
+        use laminar_core::cluster::discovery::NodeId;
+        use laminar_storage::checkpoint_manifest::SinkCommitStatus;
+        use object_store::local::LocalFileSystem;
+        use tokio::sync::watch;
+
+        let ckpt_dir = tempfile::tempdir().unwrap();
+        let decision_dir = tempfile::tempdir().unwrap();
+        let store = Box::new(FileSystemCheckpointStore::new(ckpt_dir.path(), 3));
+        let mut orphan = CheckpointManifest::new(11, 3);
+        orphan
+            .sink_commit_statuses
+            .insert("out".into(), SinkCommitStatus::Pending);
+        store.save_with_state(&orphan, None).await.unwrap();
+
+        let decision_os: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
+        let decision_store = Arc::new(CheckpointDecisionStore::new(decision_os));
+
+        let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+            .await
+            .unwrap();
+        let self_id = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(self_id));
+        let kv_trait: Arc<dyn ClusterKv> = kv.clone();
+        let (_tx, rx) = watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, rx));
+        let mut coord = coord;
+        coord.set_cluster_controller(controller);
+        coord.set_decision_store(decision_store);
+
+        coord.reconcile_prepared_on_init().await;
+
+        let raw = kv.read_from(self_id, ANNOUNCEMENT_KEY).await.unwrap();
+        let ann: BarrierAnnouncement = serde_json::from_str(&raw).unwrap();
+        assert_eq!(ann.phase, Phase::Abort);
+        assert_eq!(ann.epoch, 3);
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    #[tokio::test]
+    async fn reconcile_silent_when_manifest_clean() {
+        use laminar_core::cluster::control::{
+            ClusterController, ClusterKv, InMemoryKv, ANNOUNCEMENT_KEY,
+        };
+        use laminar_core::cluster::discovery::NodeId;
+        use laminar_storage::checkpoint_manifest::SinkCommitStatus;
+        use tokio::sync::watch;
+
         let dir = tempfile::tempdir().unwrap();
         let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
-        let config = CheckpointConfig {
-            adaptive: Some(AdaptiveCheckpointConfig::default()),
-            ..CheckpointConfig::default()
+        let mut clean = CheckpointManifest::new(5, 3);
+        clean
+            .sink_commit_statuses
+            .insert("out".into(), SinkCommitStatus::Committed);
+        store.save_with_state(&clean, None).await.unwrap();
+
+        let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+            .await
+            .unwrap();
+        let self_id = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(self_id));
+        let kv_trait: Arc<dyn ClusterKv> = kv.clone();
+        let (_tx, rx) = watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, rx));
+        let mut coord = coord;
+        coord.set_cluster_controller(controller);
+
+        coord.reconcile_prepared_on_init().await;
+
+        // No announcement emitted.
+        assert!(kv.read_from(self_id, ANNOUNCEMENT_KEY).await.is_none());
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    #[tokio::test]
+    async fn follower_checkpoint_commits_on_leader_commit() {
+        use laminar_core::cluster::control::{
+            BarrierAck, BarrierAnnouncement, ClusterController, ClusterKv, InMemoryKv, Phase,
+            ACK_KEY, ANNOUNCEMENT_KEY,
         };
-        let mut coord = CheckpointCoordinator::new(config, store);
+        use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
+        use tokio::sync::watch;
 
-        // Simulate a 100ms checkpoint → 100 / (1000 * 0.1) = 1s → clamped to 10s min
-        coord.last_checkpoint_duration = Some(Duration::from_millis(100));
-        coord.adjust_interval();
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path()).await;
 
-        let interval = coord.config().interval.unwrap();
+        let leader_id = NodeId(1);
+        let follower_id = NodeId(7);
+
+        // Follower's KV sees both its own writes and a seeded view of the
+        // leader's announcements. `members_rx` includes the leader so
+        // `current_leader()` picks the lowest id (the leader, not self).
+        let kv = Arc::new(InMemoryKv::new(follower_id));
+        let kv_trait: Arc<dyn ClusterKv> = kv.clone();
+        let leader_info = NodeInfo {
+            id: leader_id,
+            name: "leader".into(),
+            rpc_address: String::new(),
+            raft_address: String::new(),
+            state: NodeState::Active,
+            metadata: NodeMetadata::default(),
+            last_heartbeat_ms: 0,
+        };
+        let (_tx, rx) = watch::channel(vec![leader_info]);
+        let controller = Arc::new(ClusterController::new(follower_id, kv_trait, None, rx));
+        coord.set_cluster_controller(controller);
+
+        // Leader has already announced PREPARE and COMMIT (simulates
+        // a fast-gossip scenario; follower sees both on its first poll).
+        let prepare_json = serde_json::to_string(&BarrierAnnouncement {
+            epoch: 1,
+            checkpoint_id: 1,
+            phase: Phase::Prepare,
+            flags: 0,
+            min_watermark_ms: None,
+        })
+        .unwrap();
+        let commit_json = serde_json::to_string(&BarrierAnnouncement {
+            epoch: 1,
+            checkpoint_id: 1,
+            phase: Phase::Commit,
+            flags: 0,
+            min_watermark_ms: None,
+        })
+        .unwrap();
+        // Overwrite the prepare with commit — observe_barrier reads the
+        // latest value. Real gossip shows both in order; for the unit
+        // test, landing on Commit is enough for the decision loop.
+        kv.seed(leader_id, ANNOUNCEMENT_KEY, prepare_json);
+        kv.seed(leader_id, ANNOUNCEMENT_KEY, commit_json);
+
+        let ann = BarrierAnnouncement {
+            epoch: 1,
+            checkpoint_id: 1,
+            phase: Phase::Prepare,
+            flags: 0,
+            min_watermark_ms: None,
+        };
+        let committed = coord
+            .follower_checkpoint(CheckpointRequest::default(), ann, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(committed, "follower should commit on leader's Commit");
+
+        // Follower's ack landed in its own KV.
+        let ack_raw = kv.read_from(follower_id, ACK_KEY).await.unwrap();
+        let ack: BarrierAck = serde_json::from_str(&ack_raw).unwrap();
+        assert_eq!(ack.epoch, 1);
+        assert!(ack.ok, "prepare succeeded, ack should be ok");
+
+        // Follower's manifest is on disk at the leader's epoch.
+        let stored = coord.store().load_latest().await.unwrap().unwrap();
+        assert_eq!(stored.epoch, 1);
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    #[tokio::test]
+    async fn follower_checkpoint_rolls_back_on_leader_abort() {
+        use laminar_core::cluster::control::{
+            BarrierAnnouncement, ClusterController, ClusterKv, InMemoryKv, Phase, ANNOUNCEMENT_KEY,
+        };
+        use laminar_core::cluster::discovery::{NodeId, NodeInfo, NodeMetadata, NodeState};
+        use tokio::sync::watch;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path()).await;
+
+        let leader_id = NodeId(1);
+        let follower_id = NodeId(9);
+        let kv = Arc::new(InMemoryKv::new(follower_id));
+        let kv_trait: Arc<dyn ClusterKv> = kv.clone();
+        let leader_info = NodeInfo {
+            id: leader_id,
+            name: "leader".into(),
+            rpc_address: String::new(),
+            raft_address: String::new(),
+            state: NodeState::Active,
+            metadata: NodeMetadata::default(),
+            last_heartbeat_ms: 0,
+        };
+        let (_tx, rx) = watch::channel(vec![leader_info]);
+        let controller = Arc::new(ClusterController::new(follower_id, kv_trait, None, rx));
+        coord.set_cluster_controller(controller);
+
+        let abort_json = serde_json::to_string(&BarrierAnnouncement {
+            epoch: 1,
+            checkpoint_id: 1,
+            phase: Phase::Abort,
+            flags: 0,
+            min_watermark_ms: None,
+        })
+        .unwrap();
+        kv.seed(leader_id, ANNOUNCEMENT_KEY, abort_json);
+
+        let ann = BarrierAnnouncement {
+            epoch: 1,
+            checkpoint_id: 1,
+            phase: Phase::Prepare,
+            flags: 0,
+            min_watermark_ms: None,
+        };
+        let committed = coord
+            .follower_checkpoint(CheckpointRequest::default(), ann, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(!committed, "follower should roll back on leader's Abort");
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    #[tokio::test]
+    async fn leader_publishes_cluster_min_watermark_to_controller() {
+        // Phase 1.3b: on a solo cluster, `await_prepare_quorum` computes
+        // the cluster-wide min as "leader's local watermark" (no followers
+        // to fold). This must be mirrored into the controller atomic so
+        // the leader's own operators consume the same value that
+        // followers pick up via `observe_barrier(Commit)` — otherwise
+        // the leader would drive event-time decisions off a watermark
+        // that none of its peers have acked yet.
+        use laminar_core::cluster::control::{
+            CheckpointDecisionStore, ClusterController, ClusterKv, InMemoryKv,
+        };
+        use laminar_core::cluster::discovery::NodeId;
+        use object_store::local::LocalFileSystem;
+        use tokio::sync::watch;
+
+        let dir = tempfile::tempdir().unwrap();
+        let decision_dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path()).await;
+
+        let decision_os: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
+        coord.set_decision_store(Arc::new(CheckpointDecisionStore::new(decision_os)));
+
+        let self_id = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(self_id));
+        let kv_trait: Arc<dyn ClusterKv> = kv.clone();
+        let (_tx, rx) = watch::channel(Vec::new());
+        let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, rx));
+        coord.set_cluster_controller(Arc::clone(&controller));
+
+        // Pre-condition: controller atomic is at its "unset" sentinel.
+        assert_eq!(controller.cluster_min_watermark(), None);
+
+        // Seed a local watermark on the coordinator and drive a full
+        // checkpoint. Solo cluster → leader's local value *is* the
+        // cluster-wide min.
+        coord.set_local_watermark_ms(Some(12_345));
+        let result = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(result.success, "solo-cluster checkpoint should succeed");
+
         assert_eq!(
-            interval,
-            Duration::from_secs(10),
-            "should clamp to min_interval"
+            controller.cluster_min_watermark(),
+            Some(12_345),
+            "leader must mirror the cluster-wide min into its controller",
+        );
+
+        // A subsequent checkpoint with a lower local watermark must
+        // NOT regress the published value — event-time progress is
+        // monotonic (same invariant the follower path already enforces).
+        coord.set_local_watermark_ms(Some(42));
+        let result = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert_eq!(
+            controller.cluster_min_watermark(),
+            Some(12_345),
+            "stale local watermark must not lower the published cluster min",
         );
     }
 
-    #[test]
-    fn test_adaptive_clamps_to_min_max() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
-        let config = CheckpointConfig {
-            adaptive: Some(AdaptiveCheckpointConfig {
-                min_interval: Duration::from_secs(20),
-                max_interval: Duration::from_secs(120),
-                target_overhead_ratio: 0.1,
-                smoothing_alpha: 1.0, // Full weight on latest
-            }),
-            ..CheckpointConfig::default()
+    #[cfg(feature = "cluster-unstable")]
+    #[tokio::test]
+    async fn leader_announces_prepare_and_commit_on_solo_cluster() {
+        use laminar_core::cluster::control::{
+            CheckpointDecisionStore, ClusterController, ClusterKv, InMemoryKv, Phase,
+            ANNOUNCEMENT_KEY,
         };
-        let mut coord = CheckpointCoordinator::new(config, store);
+        use laminar_core::cluster::discovery::NodeId;
+        use object_store::local::LocalFileSystem;
+        use tokio::sync::watch;
 
-        // Very slow → clamp to max
-        coord.last_checkpoint_duration = Some(Duration::from_secs(60));
-        coord.adjust_interval();
-        let interval = coord.config().interval.unwrap();
-        assert_eq!(interval, Duration::from_secs(120), "should clamp to max");
+        let dir = tempfile::tempdir().unwrap();
+        let decision_dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path()).await;
 
-        // Very fast → clamp to min
-        coord.last_checkpoint_duration = Some(Duration::from_millis(10));
-        coord.smoothed_duration_ms = 0.0; // Reset EMA
-        coord.adjust_interval();
-        let interval = coord.config().interval.unwrap();
-        assert_eq!(interval, Duration::from_secs(20), "should clamp to min");
+        let decision_os: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
+        coord.set_decision_store(Arc::new(CheckpointDecisionStore::new(decision_os)));
+
+        let self_id = NodeId(1);
+        let kv = Arc::new(InMemoryKv::new(self_id));
+        let kv_trait: Arc<dyn ClusterKv> = kv.clone();
+        let (_tx, rx) = watch::channel(Vec::new()); // solo — no peers
+        let controller = Arc::new(ClusterController::new(self_id, kv_trait, None, rx));
+        coord.set_cluster_controller(controller);
+
+        let result = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(result.success, "solo-cluster checkpoint should succeed");
+
+        // The last announce on the leader's KV is COMMIT (PREPARE was
+        // overwritten in the same slot).
+        let raw = kv.read_from(self_id, ANNOUNCEMENT_KEY).await.unwrap();
+        let ann: laminar_core::cluster::control::BarrierAnnouncement =
+            serde_json::from_str(&raw).unwrap();
+        assert_eq!(ann.phase, Phase::Commit);
+        assert_eq!(ann.epoch, result.epoch);
     }
 
-    #[test]
-    fn test_adaptive_ema_smoothing() {
+    #[tokio::test]
+    async fn gate_checks_full_registry_not_just_owned() {
+        // Leader owns vnodes {0, 1}. Cluster has 4 vnodes total; a
+        // follower (simulated by pre-populating half the backend) owns
+        // {2, 3}. If the follower's markers are missing, the leader's
+        // gate must fail even though the leader wrote its own.
+        use laminar_core::state::InProcessBackend;
         let dir = tempfile::tempdir().unwrap();
-        let store = Box::new(FileSystemCheckpointStore::new(dir.path(), 3));
-        let config = CheckpointConfig {
-            adaptive: Some(AdaptiveCheckpointConfig {
-                min_interval: Duration::from_secs(1),
-                max_interval: Duration::from_secs(600),
-                target_overhead_ratio: 0.1,
-                smoothing_alpha: 0.5,
-            }),
-            ..CheckpointConfig::default()
-        };
-        let mut coord = CheckpointCoordinator::new(config, store);
+        let mut coord = make_coordinator(dir.path()).await;
+        let backend = Arc::new(InProcessBackend::new(4));
+        coord.set_state_backend(backend.clone());
+        coord.set_vnode_set(vec![0, 1]); // leader's owned subset
+        coord.set_gate_vnode_set(vec![0, 1, 2, 3]); // full cluster registry
 
-        // First observation: 1000ms → EMA = 1000 (cold start)
-        coord.last_checkpoint_duration = Some(Duration::from_secs(1));
-        coord.adjust_interval();
-        assert!((coord.smoothed_duration_ms() - 1000.0).abs() < 1.0);
+        let result = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "gate must fail when follower markers are missing",
+        );
+        let err = result.error.expect("failure produces an error message");
+        assert!(
+            err.contains("not all vnodes persisted"),
+            "expected full-registry gate miss, got: {err}",
+        );
+    }
 
-        // Second observation: 2000ms → EMA = 0.5*2000 + 0.5*1000 = 1500
-        coord.last_checkpoint_duration = Some(Duration::from_secs(2));
-        coord.adjust_interval();
-        assert!((coord.smoothed_duration_ms() - 1500.0).abs() < 1.0);
+    #[tokio::test]
+    async fn gate_passes_when_all_registry_markers_present() {
+        // Same topology as the previous test, but now the follower's
+        // markers are pre-populated — the gate sees a complete set
+        // across the full registry and the checkpoint succeeds.
+        use bytes::Bytes;
+        use laminar_core::state::InProcessBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path()).await;
+        let backend = Arc::new(InProcessBackend::new(4));
+        // Simulate the follower's prior write on vnodes {2, 3} for the
+        // epoch the leader is about to use (fresh store starts at 1).
+        backend
+            .write_partial(2, 1, 0, Bytes::from_static(b"follower"))
+            .await
+            .unwrap();
+        backend
+            .write_partial(3, 1, 0, Bytes::from_static(b"follower"))
+            .await
+            .unwrap();
+        coord.set_state_backend(backend);
+        coord.set_vnode_set(vec![0, 1]);
+        coord.set_gate_vnode_set(vec![0, 1, 2, 3]);
 
-        // Third observation: 2000ms → EMA = 0.5*2000 + 0.5*1500 = 1750
-        coord.last_checkpoint_duration = Some(Duration::from_secs(2));
-        coord.adjust_interval();
-        assert!((coord.smoothed_duration_ms() - 1750.0).abs() < 1.0);
+        let result = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(result.success, "gate should pass: every vnode has a marker");
+    }
+
+    #[tokio::test]
+    async fn marker_write_failure_aborts_checkpoint() {
+        use laminar_core::state::InProcessBackend;
+        let dir = tempfile::tempdir().unwrap();
+        let mut coord = make_coordinator(dir.path()).await;
+        // Backend is sized for 2 vnodes, but we claim to own vnode 99 →
+        // bridge fails its write, checkpoint aborts cleanly.
+        coord.set_state_backend(Arc::new(InProcessBackend::new(2)));
+        coord.set_vnode_set(vec![0, 99]);
+
+        let result = coord
+            .checkpoint(CheckpointRequest::default())
+            .await
+            .unwrap();
+        assert!(
+            !result.success,
+            "out-of-range vnode must fail the checkpoint"
+        );
+        let err = result.error.expect("failure produces an error message");
+        assert!(err.contains("vnode marker write failed"), "got: {err}");
     }
 
     #[tokio::test]
     async fn test_stats_include_percentiles_after_checkpoints() {
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
 
         // Run 3 checkpoints.
         for _ in 0..3 {
@@ -1785,7 +2893,7 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema};
 
         let dir = tempfile::tempdir().unwrap();
-        let mut coord = make_coordinator(dir.path());
+        let mut coord = make_coordinator(dir.path()).await;
 
         let rollback_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
@@ -1900,7 +3008,7 @@ mod tests {
         let store = Box::new(
             laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(dir.path(), 3),
         );
-        let mut coord = CheckpointCoordinator::new(config, store);
+        let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let sink = StuckRollbackSink { schema };

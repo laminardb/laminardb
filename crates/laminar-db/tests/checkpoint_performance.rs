@@ -1,4 +1,5 @@
 #![allow(clippy::disallowed_types)]
+use async_trait::async_trait;
 use laminar_db::checkpoint_coordinator::{
     CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
 };
@@ -6,44 +7,54 @@ use laminar_storage::checkpoint_manifest::CheckpointManifest;
 use laminar_storage::checkpoint_store::{CheckpointStore, CheckpointStoreError};
 use std::time::{Duration, Instant};
 
-struct BlockingCheckpointStore {
+/// Simulates a slow I/O store. With the async trait this is a
+/// cooperative delay via `tokio::time::sleep`, not a thread-block — the
+/// runtime stays responsive while the checkpoint is in flight.
+struct SlowCheckpointStore {
     delay: Duration,
 }
 
-impl BlockingCheckpointStore {
+impl SlowCheckpointStore {
     fn new(delay: Duration) -> Self {
         Self { delay }
     }
 }
 
-impl CheckpointStore for BlockingCheckpointStore {
-    fn save(&self, _manifest: &CheckpointManifest) -> Result<(), CheckpointStoreError> {
-        // Block the thread to simulate synchronous I/O
-        std::thread::sleep(self.delay);
+#[async_trait]
+impl CheckpointStore for SlowCheckpointStore {
+    async fn save(&self, _manifest: &CheckpointManifest) -> Result<(), CheckpointStoreError> {
+        tokio::time::sleep(self.delay).await;
         Ok(())
     }
 
-    fn load_latest(&self) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
+    async fn load_latest(&self) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
         Ok(None)
     }
 
-    fn load_by_id(&self, _id: u64) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
+    async fn load_by_id(
+        &self,
+        _id: u64,
+    ) -> Result<Option<CheckpointManifest>, CheckpointStoreError> {
         Ok(None)
     }
 
-    fn list(&self) -> Result<Vec<(u64, u64)>, CheckpointStoreError> {
+    async fn list(&self) -> Result<Vec<(u64, u64)>, CheckpointStoreError> {
         Ok(vec![])
     }
 
-    fn prune(&self, _keep_count: usize) -> Result<usize, CheckpointStoreError> {
+    async fn prune(&self, _keep_count: usize) -> Result<usize, CheckpointStoreError> {
         Ok(0)
     }
 
-    fn save_state_data(&self, _id: u64, _data: &[u8]) -> Result<(), CheckpointStoreError> {
+    async fn save_state_data(
+        &self,
+        _id: u64,
+        _chunks: &[bytes::Bytes],
+    ) -> Result<(), CheckpointStoreError> {
         Ok(())
     }
 
-    fn load_state_data(&self, _id: u64) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
+    async fn load_state_data(&self, _id: u64) -> Result<Option<Vec<u8>>, CheckpointStoreError> {
         Ok(None)
     }
 }
@@ -52,9 +63,11 @@ impl CheckpointStore for BlockingCheckpointStore {
 #[ignore]
 async fn test_checkpoint_non_blocking() {
     let delay = Duration::from_millis(200);
-    // Use the blocking store to simulate slow I/O
-    let store = Box::new(BlockingCheckpointStore::new(delay));
-    let mut coordinator = CheckpointCoordinator::new(CheckpointConfig::default(), store);
+    // Use the slow store to simulate slow I/O
+    let store = Box::new(SlowCheckpointStore::new(delay));
+    let mut coordinator = CheckpointCoordinator::new(CheckpointConfig::default(), store)
+        .await
+        .unwrap();
 
     // Spawn a background task that measures tick intervals
     // If the runtime is blocked, these intervals will spike

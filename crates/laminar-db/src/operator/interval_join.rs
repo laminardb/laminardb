@@ -73,23 +73,27 @@ impl GraphOperator for IntervalJoinOperator {
             &self.config.right_time_column,
         )?;
 
-        let data = serde_json::to_vec(&cp).map_err(|e| {
-            DbError::Pipeline(format!(
-                "interval join [{}]: checkpoint serialization: {e}",
-                self.projection.op_name
-            ))
-        })?;
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&cp)
+            .map(|v| v.to_vec())
+            .map_err(|e| {
+                DbError::Pipeline(format!(
+                    "interval join [{}]: checkpoint serialization: {e}",
+                    self.projection.op_name
+                ))
+            })?;
 
         Ok(Some(OperatorCheckpoint { data }))
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        let cp: JoinStateCheckpoint = serde_json::from_slice(&checkpoint.data).map_err(|e| {
-            DbError::Pipeline(format!(
-                "interval join [{}]: checkpoint deserialization: {e}",
-                self.projection.op_name
-            ))
-        })?;
+        let cp: JoinStateCheckpoint =
+            rkyv::from_bytes::<JoinStateCheckpoint, rkyv::rancor::Error>(&checkpoint.data)
+                .map_err(|e| {
+                    DbError::Pipeline(format!(
+                        "interval join [{}]: checkpoint deserialization: {e}",
+                        self.projection.op_name
+                    ))
+                })?;
 
         self.state = IntervalJoinState::from_checkpoint(
             &cp,

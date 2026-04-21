@@ -75,18 +75,19 @@ fn realistic_manifest(id: u64, num_sources: usize, num_operators: usize) -> Chec
 /// path when operator state is small enough to be stored inline.
 fn bench_recovery_manifest_only(c: &mut Criterion) {
     let mut group = c.benchmark_group("recovery_manifest_only");
+    let rt = tokio::runtime::Runtime::new().unwrap();
 
     for &(sources, operators) in &[(2, 2), (10, 10), (50, 20)] {
         let dir = tempfile::tempdir().unwrap();
         let store = FileSystemCheckpointStore::new(dir.path(), 5);
 
         let manifest = realistic_manifest(1, sources, operators);
-        store.save(&manifest).unwrap();
+        rt.block_on(store.save(&manifest)).unwrap();
 
         let label = format!("{sources}src_{operators}op");
         group.bench_function(BenchmarkId::new("load_latest", &label), |b| {
             b.iter(|| {
-                let loaded = store.load_latest().unwrap().unwrap();
+                let loaded = rt.block_on(store.load_latest()).unwrap().unwrap();
                 black_box(&loaded);
             })
         });
@@ -102,6 +103,7 @@ fn bench_recovery_manifest_only(c: &mut Criterion) {
 fn bench_recovery_with_sidecar(c: &mut Criterion) {
     let mut group = c.benchmark_group("recovery_with_sidecar");
     group.sample_size(10); // Fewer samples for large state sizes.
+    let rt = tokio::runtime::Runtime::new().unwrap();
 
     // Sizes: 1KB, 1MB, 10MB, 100MB.
     // 1GB is too slow for default CI runs; test via #[ignore] integration test.
@@ -111,14 +113,18 @@ fn bench_recovery_with_sidecar(c: &mut Criterion) {
 
         let manifest = realistic_manifest(1, 5, 3);
         let state = synthetic_state(size_bytes);
-        store.save_with_state(&manifest, Some(&state)).unwrap();
+        let chunks = [bytes::Bytes::from(state)];
+        rt.block_on(store.save_with_state(&manifest, Some(&chunks)))
+            .unwrap();
 
         let label = humanize_bytes(size_bytes);
         group.throughput(Throughput::Bytes(size_bytes as u64));
         group.bench_function(BenchmarkId::new("load_manifest_and_state", &label), |b| {
             b.iter(|| {
-                let loaded = store.load_latest().unwrap().unwrap();
-                let state_data = store.load_state_data(loaded.checkpoint_id).unwrap();
+                let loaded = rt.block_on(store.load_latest()).unwrap().unwrap();
+                let state_data = rt
+                    .block_on(store.load_state_data(loaded.checkpoint_id))
+                    .unwrap();
                 black_box(&loaded);
                 black_box(&state_data);
             })
@@ -134,12 +140,17 @@ fn bench_recovery_with_sidecar(c: &mut Criterion) {
 fn bench_checkpoint_save(c: &mut Criterion) {
     let mut group = c.benchmark_group("checkpoint_save");
     group.sample_size(10);
+    let rt = tokio::runtime::Runtime::new().unwrap();
 
     for &size_bytes in &[1_024, 1_048_576, 10_485_760] {
         let dir = tempfile::tempdir().unwrap();
         let store = FileSystemCheckpointStore::new(dir.path(), 100);
 
         let state = synthetic_state(size_bytes);
+        // Wrap once; cloning a Bytes is an Arc-bump so reusing this
+        // across iterations gives a fair measurement of the write path
+        // rather than the allocation of the test buffer.
+        let state_chunks = [bytes::Bytes::from(state)];
 
         let label = humanize_bytes(size_bytes);
         group.throughput(Throughput::Bytes(size_bytes as u64));
@@ -147,7 +158,8 @@ fn bench_checkpoint_save(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("save_with_state", &label), |b| {
             b.iter(|| {
                 let manifest = realistic_manifest(id, 5, 3);
-                store.save_with_state(&manifest, Some(&state)).unwrap();
+                rt.block_on(store.save_with_state(&manifest, Some(&state_chunks)))
+                    .unwrap();
                 id += 1;
             })
         });

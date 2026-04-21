@@ -34,7 +34,9 @@ use laminar_sql::translator::WindowOperatorConfig;
 const MAX_EOWC_ACCUMULATED_ROWS: usize = 1_000_000;
 
 /// Wrapper for checkpoint data that discriminates between state variants.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(
+    serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
 enum EowcCheckpointEnvelope {
     /// Checkpoint from `CoreWindowState`.
     CoreWindow(CoreWindowCheckpoint),
@@ -475,12 +477,14 @@ impl GraphOperator for EowcQueryOperator {
                 // If we have a pending restore, re-serialize it so a
                 // restore->checkpoint cycle before first process() preserves data.
                 if let Some(ref env) = self.pending_restore {
-                    let data = serde_json::to_vec(env).map_err(|e| {
-                        DbError::Pipeline(format!(
-                            "EOWC checkpoint serialization of pending restore for '{}': {e}",
-                            self.op_name
-                        ))
-                    })?;
+                    let data = rkyv::to_bytes::<rkyv::rancor::Error>(env)
+                        .map(|v| v.to_vec())
+                        .map_err(|e| {
+                            DbError::Pipeline(format!(
+                                "EOWC checkpoint serialization of pending restore for '{}': {e}",
+                                self.op_name
+                            ))
+                        })?;
                     return Ok(Some(OperatorCheckpoint { data }));
                 }
                 return Ok(None);
@@ -500,24 +504,27 @@ impl GraphOperator for EowcQueryOperator {
             }
         };
 
-        let data = serde_json::to_vec(&envelope).map_err(|e| {
-            DbError::Pipeline(format!(
-                "EOWC checkpoint serialization for '{}': {e}",
-                self.op_name
-            ))
-        })?;
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&envelope)
+            .map(|v| v.to_vec())
+            .map_err(|e| {
+                DbError::Pipeline(format!(
+                    "EOWC checkpoint serialization for '{}': {e}",
+                    self.op_name
+                ))
+            })?;
 
         Ok(Some(OperatorCheckpoint { data }))
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
         let envelope: EowcCheckpointEnvelope =
-            serde_json::from_slice(&checkpoint.data).map_err(|e| {
-                DbError::Pipeline(format!(
-                    "EOWC checkpoint deserialization for '{}': {e}",
-                    self.op_name
-                ))
-            })?;
+            rkyv::from_bytes::<EowcCheckpointEnvelope, rkyv::rancor::Error>(&checkpoint.data)
+                .map_err(|e| {
+                    DbError::Pipeline(format!(
+                        "EOWC checkpoint deserialization for '{}': {e}",
+                        self.op_name
+                    ))
+                })?;
 
         match (&mut self.state, &envelope) {
             (EowcInnerState::CoreWindow(cw), EowcCheckpointEnvelope::CoreWindow(cp)) => {

@@ -1,0 +1,465 @@
+//! Shared cluster harness for `cluster_e2e_*` tests. Each node gets
+//! its own checkpoint dir; all nodes share one state backend dir
+//! (matching production's single-bucket layout). Tests should issue
+//! DDL before [`ClusterEngineHarness::start_all`] so the pipeline
+//! activates with sources and MVs already registered.
+
+#![cfg(feature = "cluster-unstable")]
+#![allow(clippy::disallowed_types)]
+#![allow(dead_code)] // not every test binary uses every helper
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use laminar_core::cluster::control::{
+    AssignmentSnapshot, AssignmentSnapshotStore, CheckpointDecisionStore,
+};
+use laminar_core::cluster::testing::MiniCluster;
+use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
+use laminar_core::state::{
+    round_robin_assignment, NodeId, ObjectStoreBackend, StateBackend, VnodeRegistry,
+};
+use laminar_core::streaming::StreamCheckpointConfig;
+use laminar_db::LaminarDB;
+use object_store::local::LocalFileSystem;
+use object_store::ObjectStore;
+use tempfile::TempDir;
+
+const CONVERGENCE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Per-node engine state. Owned by [`ClusterEngineHarness`].
+pub struct NodeRuntime {
+    pub db: Arc<LaminarDB>,
+    pub instance_id: NodeId,
+    pub vnode_registry: Arc<VnodeRegistry>,
+    pub state_backend: Arc<dyn StateBackend>,
+    /// Shared across all nodes — the point of a cluster-wide marker.
+    pub decision_store: Arc<CheckpointDecisionStore>,
+    pub assignment_snapshot_store: Arc<AssignmentSnapshotStore>,
+    pub rebalance_shutdown: Arc<tokio::sync::Notify>,
+    pub rebalance_tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl NodeRuntime {
+    /// Vnodes this node currently owns.
+    #[must_use]
+    pub fn owned_vnodes(&self) -> Vec<u32> {
+        laminar_core::state::owned_vnodes(&self.vnode_registry, self.instance_id)
+    }
+}
+
+/// Two-or-more-node cluster of real LaminarDB engines glued to a
+/// `MiniCluster` for gossip + control.
+pub struct ClusterEngineHarness {
+    /// Gossip + ClusterController layer.
+    pub cluster: MiniCluster,
+    /// Per-node engine state, in `cluster.nodes` order.
+    pub nodes: Vec<NodeRuntime>,
+    /// Shared state backend dir. Survives `shutdown_keep_dirs`.
+    pub shared_state_dir: TempDir,
+    /// Per-node checkpoint dirs. Survives `shutdown_keep_dirs`.
+    pub checkpoint_dirs: Vec<TempDir>,
+}
+
+impl ClusterEngineHarness {
+    /// Spawn `n` nodes with `vnode_count` vnodes round-robin across
+    /// them. Returns after gossip converges; `db.start()` is
+    /// deferred to `start_all`.
+    ///
+    /// # Panics
+    /// On convergence timeout, leader-election mismatch, or engine
+    /// build failure.
+    pub async fn spawn(n: usize, vnode_count: u32) -> Self {
+        let shared_state_dir = tempfile::tempdir().expect("shared state tempdir");
+        let checkpoint_dirs: Vec<TempDir> = (0..n)
+            .map(|_| tempfile::tempdir().expect("checkpoint tempdir"))
+            .collect();
+        Self::spawn_with_dirs(n, vnode_count, shared_state_dir, checkpoint_dirs).await
+    }
+
+    /// Like `spawn`, but reuse existing dirs from `shutdown_keep_dirs`.
+    pub async fn spawn_with_dirs(
+        n: usize,
+        vnode_count: u32,
+        shared_state_dir: TempDir,
+        checkpoint_dirs: Vec<TempDir>,
+    ) -> Self {
+        assert_eq!(checkpoint_dirs.len(), n, "one checkpoint dir per node");
+
+        // Shared snapshot store — one CAS-creator wins, peers adopt.
+        let snapshot_store: Arc<AssignmentSnapshotStore> = {
+            let fs: Arc<dyn ObjectStore> = Arc::new(
+                LocalFileSystem::new_with_prefix(shared_state_dir.path())
+                    .expect("LocalFileSystem over shared state dir for snapshot"),
+            );
+            Arc::new(AssignmentSnapshotStore::new(fs))
+        };
+
+        let cluster = MiniCluster::spawn_with_snapshot(n, Arc::clone(&snapshot_store)).await;
+        cluster
+            .wait_for_convergence(CONVERGENCE_DEADLINE)
+            .await
+            .expect("gossip convergence");
+
+        // Lowest id wins leader election; tests rely on nodes[0].
+        assert!(cluster.nodes[0].controller.is_leader());
+
+        let shared_store: Arc<dyn ObjectStore> = Arc::new(
+            LocalFileSystem::new_with_prefix(shared_state_dir.path())
+                .expect("LocalFileSystem over shared state dir"),
+        );
+
+        let peer_ids: Vec<NodeId> = cluster
+            .nodes
+            .iter()
+            .map(|nh| NodeId(nh.instance_id.0))
+            .collect();
+
+        // Resolve the cluster-wide vnode assignment once; every node
+        // shares the same assignment and version.
+        let (assignment, snapshot_version) =
+            resolve_assignment(&snapshot_store, vnode_count, &peer_ids).await;
+
+        // Bind every node's receiver up front so we can cross-register
+        // addresses on the senders below.
+        let mut receivers: Vec<Arc<ShuffleReceiver>> = Vec::with_capacity(n);
+        for nh in &cluster.nodes {
+            let recv = ShuffleReceiver::bind(nh.instance_id.0, "127.0.0.1:0".parse().unwrap())
+                .await
+                .expect("ShuffleReceiver::bind");
+            receivers.push(Arc::new(recv));
+        }
+
+        let mut node_runtimes = Vec::with_capacity(n);
+        for (idx, nh) in cluster.nodes.iter().enumerate() {
+            let self_id = nh.instance_id;
+
+            let sender = ShuffleSender::new(self_id.0);
+            for (p_idx, p_nh) in cluster.nodes.iter().enumerate() {
+                if p_idx == idx {
+                    continue;
+                }
+                sender
+                    .register_peer(p_nh.instance_id.0, receivers[p_idx].local_addr())
+                    .await;
+            }
+            let sender = Arc::new(sender);
+
+            // No pre-call to `set_authoritative_version` — exercise
+            // the real production wiring that lifts the snapshot
+            // version into the fence on `db.start()`.
+            let state_backend: Arc<dyn StateBackend> = Arc::new(ObjectStoreBackend::new(
+                Arc::clone(&shared_store),
+                self_id.0.to_string(),
+                vnode_count,
+            ));
+
+            let registry = Arc::new(VnodeRegistry::new(vnode_count));
+            registry.set_assignment_and_version(Arc::clone(&assignment), snapshot_version);
+
+            let cp_cfg = StreamCheckpointConfig {
+                interval_ms: None, // manual only — tests drive checkpoint() explicitly
+                data_dir: Some(checkpoint_dirs[idx].path().to_path_buf()),
+                max_retained: Some(3),
+            };
+
+            // Skip `.profile(Cluster)` — `ObjectStoreCheckpointStore`
+            // `block_on`s internally and panics inside a tokio runtime.
+            let decision_store = Arc::new(CheckpointDecisionStore::new(Arc::clone(&shared_store)));
+
+            let db = LaminarDB::builder()
+                .storage_dir(checkpoint_dirs[idx].path().to_path_buf())
+                .checkpoint(cp_cfg)
+                .cluster_controller(Arc::clone(&nh.controller))
+                .state_backend(Arc::clone(&state_backend))
+                .vnode_registry(Arc::clone(&registry))
+                .shuffle_sender(Arc::clone(&sender))
+                .shuffle_receiver(Arc::clone(&receivers[idx]))
+                .decision_store(Arc::clone(&decision_store))
+                .assignment_snapshot_store(Arc::clone(&snapshot_store))
+                // Mirror production: DataFusion partitions track vnode count.
+                .target_partitions(vnode_count as usize)
+                .build()
+                .await
+                .expect("LaminarDB::builder().build()");
+            let db = Arc::new(db);
+
+            node_runtimes.push(NodeRuntime {
+                db,
+                instance_id: self_id,
+                vnode_registry: Arc::clone(&registry),
+                state_backend: Arc::clone(&state_backend),
+                decision_store: Arc::clone(&decision_store),
+                assignment_snapshot_store: Arc::clone(&snapshot_store),
+                rebalance_shutdown: Arc::new(tokio::sync::Notify::new()),
+                rebalance_tasks: Vec::new(),
+            });
+        }
+
+        Self {
+            cluster,
+            nodes: node_runtimes,
+            shared_state_dir,
+            checkpoint_dirs,
+        }
+    }
+
+    /// `db.start()` every node, then spawn the rebalance tasks.
+    pub async fn start_all(&mut self) {
+        for node in &self.nodes {
+            node.db.start().await.expect("db.start()");
+        }
+        // Fast timings so tests don't wait the 5s production debounce.
+        let cfg = laminar_db::rebalance::RebalanceConfig::test_defaults();
+        for (idx, nh) in self.cluster.nodes.iter().enumerate() {
+            let node = &mut self.nodes[idx];
+            let watcher = laminar_db::rebalance::spawn_snapshot_watcher(
+                Arc::clone(&node.db),
+                Arc::clone(&node.assignment_snapshot_store),
+                Arc::clone(&node.vnode_registry),
+                Arc::clone(&node.rebalance_shutdown),
+                cfg,
+            );
+            let controller = laminar_db::rebalance::spawn_rebalance_controller(
+                Arc::clone(&node.db),
+                Arc::clone(&nh.controller),
+                Arc::clone(&node.assignment_snapshot_store),
+                Arc::clone(&node.vnode_registry),
+                Arc::clone(&node.rebalance_shutdown),
+                cfg,
+            );
+            node.rebalance_tasks.push(watcher);
+            node.rebalance_tasks.push(controller);
+        }
+        // Wait until every controller's `live_instances` reports the
+        // full cluster. Discovery polls chitchat on its own cadence,
+        // so without this gate a coverage-instrumented run can fire
+        // a checkpoint before `members_rx` is populated and the
+        // leader skips the prepare quorum.
+        let expected = self.cluster.nodes.len();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if self
+                .cluster
+                .nodes
+                .iter()
+                .all(|n| n.controller.live_instances().len() == expected)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "controllers never converged on full membership",
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Index of the current leader in `nodes` (always 0 today).
+    #[must_use]
+    pub fn leader_idx(&self) -> usize {
+        self.cluster
+            .nodes
+            .iter()
+            .position(|n| n.controller.is_leader())
+            .expect("at least one leader after convergence")
+    }
+
+    /// Convenience: every non-leader index.
+    pub fn follower_idxs(&self) -> Vec<usize> {
+        let leader = self.leader_idx();
+        (0..self.cluster.nodes.len())
+            .filter(|i| *i != leader)
+            .collect()
+    }
+
+    /// Shut down and return the durable dirs for a restart scenario.
+    pub async fn shutdown_keep_dirs(self) -> (TempDir, Vec<TempDir>) {
+        let Self {
+            cluster,
+            nodes,
+            shared_state_dir,
+            checkpoint_dirs,
+        } = self;
+        for mut node in nodes {
+            node.rebalance_shutdown.notify_waiters();
+            for task in &node.rebalance_tasks {
+                task.abort();
+            }
+            for task in node.rebalance_tasks.drain(..) {
+                let _ = task.await;
+            }
+            let _ = node.db.shutdown().await;
+        }
+        cluster.shutdown().await;
+        (shared_state_dir, checkpoint_dirs)
+    }
+
+    /// Drop the cluster cleanly. Tempdirs are removed.
+    pub async fn shutdown(self) {
+        let _ = self.shutdown_keep_dirs().await;
+    }
+}
+
+/// Load the shared assignment, or CAS-create one on first boot.
+/// Returns the assignment and its version.
+async fn resolve_assignment(
+    store: &AssignmentSnapshotStore,
+    vnode_count: u32,
+    peer_ids: &[NodeId],
+) -> (Arc<[NodeId]>, u64) {
+    if let Some(snap) = store.load().await.expect("load snapshot") {
+        return (snap.to_vnode_vec(vnode_count).into(), snap.version);
+    }
+
+    let fresh = round_robin_assignment(vnode_count, peer_ids);
+    let snap = AssignmentSnapshot::empty().next(AssignmentSnapshot::vnodes_from_vec(&fresh));
+    match store.save_if_absent(&snap).await.expect("save_if_absent") {
+        Some(winner) => (fresh, winner.version),
+        None => {
+            let loaded = store
+                .load()
+                .await
+                .expect("load after CAS loss")
+                .expect("snapshot present after CAS loss");
+            (loaded.to_vnode_vec(vnode_count).into(), loaded.version)
+        }
+    }
+}
+
+/// Build a `file:///` URL from an absolute filesystem path.
+fn file_url_from_path(path: &std::path::Path) -> String {
+    let abs = path.to_string_lossy().into_owned();
+    let normalized = abs.replace('\\', "/");
+    if normalized.starts_with('/') {
+        format!("file://{normalized}")
+    } else {
+        format!("file:///{normalized}")
+    }
+}
+
+/// Diagnostic tuple `(instance_id, owned_vnodes)`.
+pub type NodeIdView = (NodeId, Vec<u32>);
+
+use arrow_array::{Int64Array, RecordBatch};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+
+/// `(key BIGINT, value BIGINT)` schema.
+#[must_use]
+pub fn input_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Int64, false),
+        Field::new("value", DataType::Int64, false),
+    ]))
+}
+
+/// Build a `(key, value)` batch where `value = key * 10`.
+#[must_use]
+pub fn input_batch(keys: &[i64]) -> RecordBatch {
+    let values: Vec<i64> = keys.iter().map(|k| k * 10).collect();
+    RecordBatch::try_new(
+        input_schema(),
+        vec![
+            Arc::new(Int64Array::from(keys.to_vec())),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )
+    .expect("input_batch")
+}
+
+/// Compute the vnode a `key` lands on under the same hashing used by
+/// `ClusterRepartitionExec`.
+#[must_use]
+pub fn vnode_for_key(key: i64, vnode_count: u32) -> u32 {
+    use arrow::row::{RowConverter, SortField};
+    use laminar_core::state::key_hash;
+
+    let col: Arc<dyn arrow_array::Array> = Arc::new(Int64Array::from(vec![key]));
+    let converter = RowConverter::new(vec![SortField::new(DataType::Int64)]).expect("RowConverter");
+    let rows = converter.convert_columns(&[col]).expect("convert_columns");
+    #[allow(clippy::cast_possible_truncation)]
+    let v = (key_hash(rows.row(0).as_ref()) % u64::from(vnode_count)) as u32;
+    v
+}
+
+/// Pick `per_owner` keys from `0..1000` that land on each owner's
+/// vnodes.
+///
+/// # Errors
+/// Returns `Err` when 1000 candidates aren't enough.
+pub fn pick_keys_per_owner(
+    vnode_count: u32,
+    owners: &[(NodeId, Vec<u32>)],
+    per_owner: usize,
+) -> Result<Vec<(NodeId, Vec<i64>)>, String> {
+    let mut out: Vec<(NodeId, Vec<i64>)> = owners.iter().map(|(id, _)| (*id, Vec::new())).collect();
+    for k in 0i64..1000 {
+        let v = vnode_for_key(k, vnode_count);
+        for ((_, vnodes), (_, bucket)) in owners.iter().zip(out.iter_mut()) {
+            if vnodes.contains(&v) && bucket.len() < per_owner {
+                bucket.push(k);
+                break;
+            }
+        }
+        if out.iter().all(|(_, b)| b.len() >= per_owner) {
+            return Ok(out);
+        }
+    }
+    let summary: Vec<String> = out
+        .iter()
+        .map(|(id, b)| format!("{:?}={}", id, b.len()))
+        .collect();
+    Err(format!(
+        "ran out of candidates in 0..1000 wanting {per_owner}/owner: {}",
+        summary.join(", ")
+    ))
+}
+
+/// Latest persisted manifest epoch on this engine, or `0` when no
+/// checkpoint exists yet. Reads through the engine's own
+/// `CheckpointStore` so the result reflects what would be loaded on
+/// restart — the right signal for per-node epoch-drift assertions.
+pub async fn manifest_epoch(db: &LaminarDB) -> u64 {
+    let store = match db.checkpoint_store() {
+        Some(s) => s,
+        None => return 0,
+    };
+    store
+        .load_latest()
+        .await
+        .ok()
+        .flatten()
+        .map_or(0, |m| m.epoch)
+}
+
+/// `SELECT key, total FROM <mv>` on a single engine, returning the
+/// materialized rows as `(key, total)` tuples sorted by key.
+///
+/// Reads via the engine's `SessionContext` directly — same path
+/// DataFusion uses internally — so the call hits `MvTableProvider::scan`
+/// (a one-shot snapshot) instead of subscribing to the per-cycle stream.
+/// Snapshot reads are what the assertions want; the streaming-subscription
+/// path would require coordinating with cycle boundaries.
+pub async fn read_mv_sums(db: &LaminarDB, mv: &str) -> Vec<(i64, i64)> {
+    let sql = format!("SELECT key, total FROM {mv}");
+    let df = db.session_context().sql(&sql).await.expect("plan SELECT");
+    let batches = df.collect().await.expect("collect SELECT");
+    let mut rows: Vec<(i64, i64)> = Vec::new();
+    for batch in batches {
+        let key = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("key Int64");
+        let total = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("total Int64");
+        for i in 0..batch.num_rows() {
+            rows.push((key.value(i), total.value(i)));
+        }
+    }
+    rows.sort_by_key(|(k, _)| *k);
+    rows
+}

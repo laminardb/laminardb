@@ -236,7 +236,7 @@ impl TemporalProbeState {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct TemporalProbeCheckpoint {
     ref_buffer_ipc: Vec<u8>,
     ref_index: Vec<(u64, i64, Vec<usize>)>,
@@ -244,7 +244,7 @@ pub(crate) struct TemporalProbeCheckpoint {
     last_watermark: i64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct PendingProbeCheckpointEntry {
     left_row_ipc: Vec<u8>,
     key_hash: u64,

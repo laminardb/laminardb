@@ -1,0 +1,48 @@
+# Docker Compose for integration tests that require external systems.
+#
+# Bring up:   docker compose -f tests/docker/compose.yml up -d
+# Tear down:  docker compose -f tests/docker/compose.yml down
+#
+# Tests that use this compose file gate on a TCP probe of
+# `127.0.0.1:19092`; they skip gracefully when the daemon is down.
+#
+# Port 19092 is the host-side Kafka advertisement. Keep it in sync with
+# the `KAFKA_BROKERS` constant in `crates/laminar-db/tests/common/mod.rs`.
+
+services:
+  minio:
+    image: minio/minio:RELEASE.2024-11-07T00-52-20Z
+    container_name: laminardb-minio
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    environment:
+      MINIO_ROOT_USER: laminar
+      MINIO_ROOT_PASSWORD: laminar-test-secret
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  redpanda:
+    image: redpandadata/redpanda:v24.3.1
+    container_name: laminardb-redpanda
+    ports:
+      - "19092:19092"
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=256M
+      - --overprovisioned
+      - --kafka-addr=PLAINTEXT://0.0.0.0:19092
+      - --advertise-kafka-addr=PLAINTEXT://127.0.0.1:19092
+      - --node-id=0
+      - --check=false
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health", "-x", "all_nodes_healthy=true"]
+      interval: 2s
+      timeout: 3s
+      retries: 20

@@ -36,6 +36,40 @@ pub struct LaminarDbBuilder {
     object_store_options: HashMap<String, String>,
     custom_udfs: Vec<ScalarUDF>,
     custom_udafs: Vec<AggregateUDF>,
+    /// Cluster control facade installed at cluster-mode startup.
+    /// Stays `None` in embedded / single-instance builds.
+    #[cfg(feature = "cluster-unstable")]
+    cluster_controller: Option<std::sync::Arc<laminar_core::cluster::control::ClusterController>>,
+    /// Outbound shuffle handle for cluster-mode streaming aggregates.
+    /// Pair with `shuffle_receiver`; without it, streaming aggregates
+    /// run single-node even when the cluster controller is installed
+    /// (see Phase 0a in `docs/plans/cluster-production-readiness.md`).
+    #[cfg(feature = "cluster-unstable")]
+    shuffle_sender: Option<std::sync::Arc<laminar_core::shuffle::ShuffleSender>>,
+    /// Inbound shuffle handle for cluster-mode streaming aggregates.
+    #[cfg(feature = "cluster-unstable")]
+    shuffle_receiver: Option<std::sync::Arc<laminar_core::shuffle::ShuffleReceiver>>,
+    /// Commit-marker store for cross-instance 2PC.
+    #[cfg(feature = "cluster-unstable")]
+    decision_store: Option<std::sync::Arc<laminar_core::cluster::control::CheckpointDecisionStore>>,
+    /// Assignment-snapshot store for dynamic rebalance.
+    #[cfg(feature = "cluster-unstable")]
+    assignment_snapshot_store:
+        Option<std::sync::Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>,
+    /// Optional state backend. When paired with `vnode_registry`, the
+    /// coordinator writes per-vnode durability markers each checkpoint
+    /// and consults `epoch_complete` before committing sinks.
+    state_backend: Option<std::sync::Arc<dyn laminar_core::state::StateBackend>>,
+    /// Optional vnode topology. See `state_backend`.
+    vnode_registry: Option<std::sync::Arc<laminar_core::state::VnodeRegistry>>,
+    /// Extra physical optimizer rules installed on the `SessionState`
+    /// at construction.
+    physical_optimizer_rules: Vec<
+        std::sync::Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>,
+    >,
+    /// Override for `target_partitions`; cluster mode sets this to
+    /// `vnode_count`. Default 1 for single-instance streaming.
+    target_partitions: Option<usize>,
 }
 
 impl LaminarDbBuilder {
@@ -52,7 +86,128 @@ impl LaminarDbBuilder {
             object_store_options: HashMap::new(),
             custom_udfs: Vec::new(),
             custom_udafs: Vec::new(),
+            #[cfg(feature = "cluster-unstable")]
+            cluster_controller: None,
+            #[cfg(feature = "cluster-unstable")]
+            shuffle_sender: None,
+            #[cfg(feature = "cluster-unstable")]
+            shuffle_receiver: None,
+            #[cfg(feature = "cluster-unstable")]
+            decision_store: None,
+            #[cfg(feature = "cluster-unstable")]
+            assignment_snapshot_store: None,
+            state_backend: None,
+            vnode_registry: None,
+            physical_optimizer_rules: Vec::new(),
+            target_partitions: None,
         }
+    }
+
+    /// Override `target_partitions`; requires a distributed-aware
+    /// physical optimizer rule to replace `RepartitionExec`.
+    #[must_use]
+    pub fn target_partitions(mut self, n: usize) -> Self {
+        self.target_partitions = Some(n);
+        self
+    }
+
+    /// Register an additional `PhysicalOptimizerRule` on the session state.
+    #[must_use]
+    pub fn physical_optimizer_rule(
+        mut self,
+        rule: std::sync::Arc<
+            dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync,
+        >,
+    ) -> Self {
+        self.physical_optimizer_rules.push(rule);
+        self
+    }
+
+    /// Install a state backend. Must be paired with
+    /// [`Self::vnode_registry`] — `build()` rejects a half-set
+    /// configuration.
+    #[must_use]
+    pub fn state_backend(
+        mut self,
+        backend: std::sync::Arc<dyn laminar_core::state::StateBackend>,
+    ) -> Self {
+        self.state_backend = Some(backend);
+        self
+    }
+
+    /// Install a vnode registry. Must be paired with
+    /// [`Self::state_backend`] — `build()` rejects a half-set
+    /// configuration.
+    #[must_use]
+    pub fn vnode_registry(
+        mut self,
+        registry: std::sync::Arc<laminar_core::state::VnodeRegistry>,
+    ) -> Self {
+        self.vnode_registry = Some(registry);
+        self
+    }
+
+    /// Install a cluster control facade. Activates cluster-mode
+    /// checkpoint / shuffle semantics inside the engine. Called from
+    /// `laminar-server`'s cluster startup path after discovery has
+    /// converged.
+    #[cfg(feature = "cluster-unstable")]
+    #[must_use]
+    pub fn cluster_controller(
+        mut self,
+        controller: std::sync::Arc<laminar_core::cluster::control::ClusterController>,
+    ) -> Self {
+        self.cluster_controller = Some(controller);
+        self
+    }
+
+    /// Install the outbound shuffle handle used by cluster-mode streaming
+    /// aggregates. Rows whose group key hashes to a remote vnode are
+    /// shipped through this sender. Pair with [`Self::shuffle_receiver`];
+    /// either alone is a no-op.
+    #[cfg(feature = "cluster-unstable")]
+    #[must_use]
+    pub fn shuffle_sender(
+        mut self,
+        sender: std::sync::Arc<laminar_core::shuffle::ShuffleSender>,
+    ) -> Self {
+        self.shuffle_sender = Some(sender);
+        self
+    }
+
+    /// Install the inbound shuffle handle used by cluster-mode streaming
+    /// aggregates. Remote partial-aggregate rows arrive here and are
+    /// drained into the local accumulator each cycle.
+    #[cfg(feature = "cluster-unstable")]
+    #[must_use]
+    pub fn shuffle_receiver(
+        mut self,
+        receiver: std::sync::Arc<laminar_core::shuffle::ShuffleReceiver>,
+    ) -> Self {
+        self.shuffle_receiver = Some(receiver);
+        self
+    }
+
+    /// Install the commit-marker store for cross-instance 2PC.
+    #[cfg(feature = "cluster-unstable")]
+    #[must_use]
+    pub fn decision_store(
+        mut self,
+        store: std::sync::Arc<laminar_core::cluster::control::CheckpointDecisionStore>,
+    ) -> Self {
+        self.decision_store = Some(store);
+        self
+    }
+
+    /// Install the assignment-snapshot store for dynamic rebalance.
+    #[cfg(feature = "cluster-unstable")]
+    #[must_use]
+    pub fn assignment_snapshot_store(
+        mut self,
+        store: std::sync::Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
+    ) -> Self {
+        self.assignment_snapshot_store = Some(store);
+        self
     }
 
     /// Set a config variable for `${VAR}` substitution in SQL.
@@ -103,7 +258,7 @@ impl LaminarDbBuilder {
     /// Set the object-store URL for durable checkpoints.
     ///
     /// Required when using [`Profile::Durable`] or
-    /// [`Profile::Delta`].
+    /// [`Profile::Cluster`].
     #[must_use]
     pub fn object_store_url(mut self, url: impl Into<String>) -> Self {
         self.object_store_url = Some(url.into());
@@ -284,10 +439,31 @@ impl LaminarDbBuilder {
 
         Self::validate_backpressure(&self.config)?;
 
+        // State backend and vnode registry must be paired — half-set
+        // would leave the durability gate silently disabled.
+        match (&self.state_backend, &self.vnode_registry) {
+            (Some(_), None) => {
+                return Err(DbError::Config(
+                    "state_backend is set but vnode_registry is missing".into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(DbError::Config(
+                    "vnode_registry is set but state_backend is missing".into(),
+                ));
+            }
+            _ => {}
+        }
+
         // Apply profile defaults for fields the user hasn't set.
         self.profile.apply_defaults(&mut self.config);
 
-        let db = LaminarDB::open_with_config_and_vars(self.config, self.config_vars)?;
+        let db = LaminarDB::open_with_config_and_vars_and_rules(
+            self.config,
+            self.config_vars,
+            &self.physical_optimizer_rules,
+            self.target_partitions,
+        )?;
         for callback in self.connector_callbacks {
             callback(db.connector_registry());
         }
@@ -296,6 +472,32 @@ impl LaminarDbBuilder {
         }
         for udaf in self.custom_udafs {
             db.register_custom_udaf(udaf);
+        }
+        #[cfg(feature = "cluster-unstable")]
+        if let Some(controller) = self.cluster_controller {
+            db.set_cluster_controller(controller);
+        }
+        #[cfg(feature = "cluster-unstable")]
+        if let Some(sender) = self.shuffle_sender {
+            db.set_shuffle_sender(sender);
+        }
+        #[cfg(feature = "cluster-unstable")]
+        if let Some(receiver) = self.shuffle_receiver {
+            db.set_shuffle_receiver(receiver);
+        }
+        #[cfg(feature = "cluster-unstable")]
+        if let Some(store) = self.decision_store {
+            db.set_decision_store(store);
+        }
+        #[cfg(feature = "cluster-unstable")]
+        if let Some(store) = self.assignment_snapshot_store {
+            db.set_assignment_snapshot_store(store);
+        }
+        if let Some(backend) = self.state_backend {
+            db.set_state_backend(backend);
+        }
+        if let Some(registry) = self.vnode_registry {
+            db.set_vnode_registry(registry);
         }
         Ok(db)
     }
@@ -353,7 +555,7 @@ impl std::fmt::Debug for LaminarDbBuilder {
             .field("connector_callbacks", &self.connector_callbacks.len())
             .field("custom_udfs", &self.custom_udfs.len())
             .field("custom_udafs", &self.custom_udafs.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

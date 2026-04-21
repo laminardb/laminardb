@@ -2,6 +2,10 @@
 
 mod bridge;
 mod channel_source;
+/// Cross-instance hash repartition for distributed GROUP BY. Gated on
+/// `cluster-unstable` because it pulls in the shuffle transport.
+#[cfg(feature = "cluster-unstable")]
+pub mod cluster_repartition;
 /// Lambda higher-order functions for arrays and maps (F-SCHEMA-015 Tier 3)
 pub mod complex_type_lambda;
 /// Array, Struct, and Map scalar UDFs (F-SCHEMA-015)

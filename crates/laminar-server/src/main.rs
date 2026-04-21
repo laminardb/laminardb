@@ -2,11 +2,11 @@
 
 #![allow(clippy::disallowed_types)] // cold path: server startup and config only
 
+#[cfg(feature = "cluster-unstable")]
+mod cluster;
+#[cfg(feature = "cluster-unstable")]
+mod cluster_config;
 mod config;
-#[cfg(feature = "cluster-unstable")]
-mod delta;
-#[cfg(feature = "cluster-unstable")]
-mod delta_config;
 mod http;
 mod metrics;
 mod reload;
@@ -94,6 +94,7 @@ async fn validate_checkpoints_and_exit(config: &config::ServerConfig) -> Result<
     info!("Validating checkpoints...");
     let report = store
         .recover_latest_validated()
+        .await
         .map_err(|e| anyhow::anyhow!("validation failed: {e}"))?;
 
     info!(
@@ -112,6 +113,7 @@ async fn validate_checkpoints_and_exit(config: &config::ServerConfig) -> Result<
     // Also run orphan detection
     let orphans = store
         .cleanup_orphans()
+        .await
         .map_err(|e| anyhow::anyhow!("orphan cleanup failed: {e}"))?;
     if orphans > 0 {
         info!("Cleaned up {orphans} orphaned state file(s)");
@@ -137,6 +139,8 @@ fn build_checkpoint_store(
         }
     };
 
+    let vnode_count = u16::try_from(config.state.vnode_capacity()).unwrap_or(u16::MAX);
+
     // file:// URLs use the local FS path directly; cloud URLs need a prefix.
     if url.starts_with("file://") {
         let path = url.strip_prefix("file://").unwrap_or(url);
@@ -144,7 +148,8 @@ fn build_checkpoint_store(
             laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(
                 std::path::Path::new(path),
                 3,
-            ),
+            )
+            .with_vnode_count(vnode_count),
         ))
     } else {
         // Cloud URL: extract prefix from URL path (bucket is handled by object_store).
@@ -153,14 +158,11 @@ fn build_checkpoint_store(
             .nth(1)
             .and_then(|rest| rest.split_once('/').map(|(_, p)| format!("{p}/")))
             .unwrap_or_default();
-        match laminar_storage::checkpoint_store::ObjectStoreCheckpointStore::new(
-            obj_store, prefix, 3,
-        ) {
-            Ok(s) => Some(Box::new(s)),
-            Err(e) => {
-                tracing::error!(error = %e, "failed to create checkpoint store runtime");
-                None
-            }
-        }
+        Some(Box::new(
+            laminar_storage::checkpoint_store::ObjectStoreCheckpointStore::new(
+                obj_store, prefix, 3,
+            )
+            .with_vnode_count(vnode_count),
+        ))
     }
 }

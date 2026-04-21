@@ -107,6 +107,15 @@ impl GossipDiscovery {
         }
     }
 
+    /// Borrow the underlying chitchat handle, if the discovery has
+    /// been started. Enables other cluster components (barrier
+    /// coordinator, shuffle peer registry) to share the same chitchat
+    /// instance rather than spawning their own.
+    #[must_use]
+    pub fn chitchat_handle(&self) -> Option<&chitchat::ChitchatHandle> {
+        self.chitchat_handle.as_ref()
+    }
+
     /// Parse a `NodeInfo` from chitchat key-value pairs.
     fn parse_node_info(node_id_str: &str, kvs: &HashMap<String, String>) -> Option<NodeInfo> {
         let id: u64 = node_id_str.strip_prefix("node-")?.parse().ok()?;
@@ -200,8 +209,25 @@ impl std::fmt::Debug for GossipDiscovery {
     }
 }
 
-impl Discovery for GossipDiscovery {
-    async fn start(&mut self) -> Result<(), DiscoveryError> {
+impl GossipDiscovery {
+    /// Start with a caller-provided chitchat transport. Test harnesses
+    /// use this to inject a filtering / fault-injecting transport
+    /// wrapper (see
+    /// [`cluster::testing::PartitionableTransport`](crate::cluster::testing::PartitionableTransport)).
+    /// The regular [`Discovery::start`] just delegates here with a
+    /// default [`UdpTransport`](chitchat::transport::UdpTransport).
+    ///
+    /// # Errors
+    /// Same as [`Discovery::start`].
+    ///
+    /// # Panics
+    /// Panics via `unwrap` on an internal assertion if called twice
+    /// concurrently from the same `GossipDiscovery` — the `started`
+    /// flag check makes the second call a no-op.
+    pub async fn start_with_transport<T>(&mut self, transport: &T) -> Result<(), DiscoveryError>
+    where
+        T: chitchat::transport::Transport,
+    {
         if self.started {
             return Ok(());
         }
@@ -215,12 +241,17 @@ impl Discovery for GossipDiscovery {
 
         let seed_addrs: Vec<String> = self.config.seed_nodes.clone();
 
+        // Generation: wall-clock millis. A node that was previously
+        // known (same `node_id`) rejoining under the same string
+        // needs a strictly-greater generation so chitchat supersedes
+        // the stale entry rather than treating it as the same
+        // instance.
+        let generation = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+
         let config = chitchat::ChitchatConfig {
-            chitchat_id: chitchat::ChitchatId::new(
-                node_id,
-                0, // generation
-                gossip_addr,
-            ),
+            chitchat_id: chitchat::ChitchatId::new(node_id, generation, gossip_addr),
             cluster_id: self.config.cluster_id.clone(),
             gossip_interval: self.config.gossip_interval,
             listen_addr: gossip_addr,
@@ -239,8 +270,7 @@ impl Discovery for GossipDiscovery {
         };
 
         let initial_kvs = Self::local_kvs(&self.config.local_node);
-        let transport = chitchat::transport::UdpTransport;
-        let chitchat_handle = chitchat::spawn_chitchat(config, initial_kvs, &transport)
+        let chitchat_handle = chitchat::spawn_chitchat(config, initial_kvs, transport)
             .await
             .map_err(|e| DiscoveryError::Bind(e.to_string()))?;
 
@@ -260,7 +290,7 @@ impl Discovery for GossipDiscovery {
                     () = cancel.cancelled() => break,
                     _ = interval.tick() => {
                         let chitchat_guard = chitchat.lock().await;
-                        let mut new_peers = HashMap::new();
+                        let mut new_peers: HashMap<u64, NodeInfo> = HashMap::new();
 
                         // Collect the set of live node IDs from the failure
                         // detector so we only include reachable peers (C3 fix).
@@ -290,7 +320,23 @@ impl Discovery for GossipDiscovery {
                                     info.state = NodeState::Suspected;
                                 }
 
-                                new_peers.insert(info.id.0, info);
+                                // A node id can appear twice across a
+                                // rejoin — once as the old entry
+                                // (Suspected or Left) and once as the
+                                // freshly-started entry (Active). Prefer
+                                // the Active record so `current_leader()`
+                                // sees the rejoined instance.
+                                match new_peers.get(&info.id.0) {
+                                    Some(existing)
+                                        if !matches!(info.state, NodeState::Active)
+                                            && matches!(existing.state, NodeState::Active) =>
+                                    {
+                                        // Keep the already-recorded Active entry.
+                                    }
+                                    _ => {
+                                        new_peers.insert(info.id.0, info);
+                                    }
+                                }
                             }
                         }
 
@@ -305,6 +351,13 @@ impl Discovery for GossipDiscovery {
 
         self.started = true;
         Ok(())
+    }
+}
+
+impl Discovery for GossipDiscovery {
+    async fn start(&mut self) -> Result<(), DiscoveryError> {
+        self.start_with_transport(&chitchat::transport::UdpTransport)
+            .await
     }
 
     async fn peers(&self) -> Result<Vec<NodeInfo>, DiscoveryError> {

@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use laminar_core::state::StateBackendConfig;
 use regex::Regex;
 use serde::Deserialize;
 
@@ -111,16 +112,25 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         ));
     }
 
-    // Validate: delta mode requires discovery and coordination
-    if config.server.mode == "delta" {
+    // Validate: cluster mode requires discovery and coordination
+    if config.server.mode == "cluster" {
         if config.discovery.is_none() {
-            errors.push("mode = \"delta\" requires a [discovery] section".to_string());
+            errors.push("mode = \"cluster\" requires a [discovery] section".to_string());
         }
         if config.coordination.is_none() {
-            errors.push("mode = \"delta\" requires a [coordination] section".to_string());
+            errors.push("mode = \"cluster\" requires a [coordination] section".to_string());
         }
         if config.node_id.is_none() {
-            errors.push("mode = \"delta\" requires node_id to be set".to_string());
+            errors.push("mode = \"cluster\" requires node_id to be set".to_string());
+        }
+        // Distributed 2PC has a per-barrier cost of ~1-3s (manifest
+        // persist + durability gate + sink commit). Cadences tighter
+        // than 2s spend more than half their time on coordination.
+        if config.checkpoint.interval < Duration::from_secs(2) {
+            errors.push(format!(
+                "mode = \"cluster\": checkpoint.interval = {:?} is too tight; minimum is 2s",
+                config.checkpoint.interval,
+            ));
         }
     }
 
@@ -137,7 +147,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub server: ServerSection,
     #[serde(default)]
-    pub state: StateSection,
+    pub state: StateBackendConfig,
     #[serde(default)]
     pub checkpoint: CheckpointSection,
     #[serde(default, rename = "source")]
@@ -174,25 +184,6 @@ impl Default for ServerSection {
             mode: default_mode(),
             bind: default_bind(),
             workers: 0,
-        }
-    }
-}
-
-/// `[state]` section.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct StateSection {
-    /// Backend type: "memory" or "mmap".
-    #[serde(default = "default_state_backend")]
-    pub backend: String,
-    #[serde(default = "default_state_path")]
-    pub path: String,
-}
-
-impl Default for StateSection {
-    fn default() -> Self {
-        Self {
-            backend: default_state_backend(),
-            path: default_state_path(),
         }
     }
 }
@@ -379,12 +370,6 @@ fn default_mode() -> String {
 fn default_bind() -> String {
     "127.0.0.1:8080".to_string()
 }
-fn default_state_backend() -> String {
-    "memory".to_string()
-}
-fn default_state_path() -> String {
-    "./data/state".to_string()
-}
 fn default_checkpoint_url() -> String {
     let base = std::env::temp_dir();
     let path = base.join("laminardb");
@@ -478,7 +463,7 @@ bind = "127.0.0.1:8080"
 workers = 4
 
 [state]
-backend = "memory"
+backend = "in_process"
 
 [checkpoint]
 url = "file:///tmp/checkpoints"
@@ -535,14 +520,14 @@ topic = "vwap_output"
 node_id = "star-1"
 
 [server]
-mode = "delta"
+mode = "cluster"
 bind = "0.0.0.0:8080"
 workers = 8
 
 [state]
-backend = "mmap"
+backend = "local"
 path = "/data/state"
-max_size_bytes = 10737418240
+vnode_capacity = 256
 
 [checkpoint]
 url = "s3://bucket/checkpoints"
@@ -579,8 +564,8 @@ delivery = "exactly_once"
 
         let config: ServerConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.node_id.as_deref(), Some("star-1"));
-        assert_eq!(config.server.mode, "delta");
-        assert_eq!(config.state.backend, "mmap");
+        assert_eq!(config.server.mode, "cluster");
+        assert!(matches!(config.state, StateBackendConfig::Local { .. }));
         assert!(config.discovery.is_some());
         assert!(config.coordination.is_some());
 
@@ -696,6 +681,39 @@ sql = "SELECT 2"
     }
 
     #[test]
+    fn test_cluster_mode_rejects_tight_checkpoint_interval() {
+        // Two-phase commit in cluster mode can't keep up with sub-2s
+        // cadence.
+        let toml = r#"
+node_id = "n1"
+
+[server]
+mode = "cluster"
+
+[checkpoint]
+interval = "500ms"
+
+[discovery]
+strategy = "static"
+seeds = ["x:1"]
+
+[coordination]
+strategy = "raft"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        let err = validate_config(&config).unwrap_err();
+        match err {
+            ConfigError::ValidationErrors { errors } => {
+                assert!(
+                    errors.iter().any(|e| e.contains("too tight")),
+                    "expected tight-interval error, got: {errors:?}",
+                );
+            }
+            _ => panic!("expected ValidationErrors"),
+        }
+    }
+
+    #[test]
     fn test_validate_invalid_bind_address() {
         let toml = r#"
 [server]
@@ -716,7 +734,7 @@ bind = "not-a-socket-addr"
     fn test_default_values_applied() {
         let config = ServerConfig {
             server: ServerSection::default(),
-            state: StateSection::default(),
+            state: StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
             sources: vec![],
             lookups: vec![],
@@ -731,7 +749,7 @@ bind = "not-a-socket-addr"
         assert_eq!(config.server.mode, "embedded");
         assert_eq!(config.server.bind, "127.0.0.1:8080");
         assert_eq!(config.server.workers, 0);
-        assert_eq!(config.state.backend, "memory");
+        assert!(matches!(config.state, StateBackendConfig::InProcess { .. }));
         assert_eq!(config.checkpoint.interval, Duration::from_secs(10));
     }
 
@@ -783,10 +801,13 @@ max_out_of_orderness = "10s"
     }
 
     #[test]
-    fn test_delta_mode_requires_discovery() {
+    fn test_cluster_mode_requires_discovery() {
         let toml = r#"
 [server]
-mode = "delta"
+mode = "cluster"
+
+[checkpoint]
+interval = "10s"
 "#;
         let config: ServerConfig = toml::from_str(toml).unwrap();
         let err = validate_config(&config).unwrap_err();

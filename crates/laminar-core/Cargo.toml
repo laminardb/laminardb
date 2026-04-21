@@ -15,7 +15,7 @@ default = []
 # work, but Raft consensus, inter-node RPC, and rebalance-on-membership are
 # not yet implemented. Do not enable in production.
 cluster-unstable = [
-    "dep:chitchat", "dep:tokio-util", "dep:xxhash-rust",
+    "dep:chitchat", "dep:tokio-util", "dep:anyhow", "dep:futures",
 ]
 [dependencies]
 # Performance critical - no allocations on hot path
@@ -24,6 +24,8 @@ xorf = { workspace = true }
 parking_lot = { workspace = true }
 bytes = { workspace = true }
 foyer = { workspace = true }
+object_store = { workspace = true }
+xxhash-rust = { workspace = true, features = ["xxh3"] }
 equivalent = "1"
 uuid = { workspace = true }
 smallvec = { workspace = true }
@@ -57,7 +59,12 @@ sqlparser = { workspace = true }
 # Delta (optional, multi-node distributed mode — server-only)
 chitchat = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
-xxhash-rust = { workspace = true, optional = true }
+# anyhow is needed for the chitchat Transport trait impls in the
+# testing module; activated by the cluster-unstable feature.
+anyhow = { workspace = true, optional = true }
+# futures is needed for the object_store::ObjectStore impl on
+# FaultyObjectStore (BoxStream type). Cluster-unstable only.
+futures = { workspace = true, optional = true }
 
 # Observability
 tracing = { workspace = true }
@@ -68,6 +75,8 @@ crossfire = { workspace = true }
 criterion = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
+toml = "0.9"
+tempfile = { workspace = true }
 
 [[bench]]
 name = "window_bench"

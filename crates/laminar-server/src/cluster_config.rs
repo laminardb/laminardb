@@ -1,20 +1,20 @@
-//! Delta mode configuration extraction and validation.
+//! Cluster mode configuration extraction and validation.
 
 use std::fmt;
 use std::time::Duration;
 
 use crate::config::{CoordinationSection, DiscoverySection, ServerConfig};
 
-/// Node identity for delta mode (non-empty, max 64 chars).
+/// Node identity for cluster mode (non-empty, max 64 chars).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeltaNodeId(String);
+pub struct ClusterNodeId(String);
 
-impl DeltaNodeId {
+impl ClusterNodeId {
     const MAX_LEN: usize = 64;
 
-    pub fn from_config(id: String) -> Result<Self, DeltaConfigError> {
+    pub fn from_config(id: String) -> Result<Self, ClusterConfigError> {
         if id.is_empty() {
-            return Err(DeltaConfigError::InvalidNodeId(
+            return Err(ClusterConfigError::InvalidNodeId(
                 "node_id must not be empty".to_string(),
             ));
         }
@@ -53,46 +53,46 @@ impl DeltaNodeId {
     }
 }
 
-impl fmt::Display for DeltaNodeId {
+impl fmt::Display for ClusterNodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-/// Extracted and validated delta configuration.
+/// Extracted and validated cluster configuration.
 #[derive(Debug, Clone)]
-pub struct DeltaConfig {
-    pub node_id: DeltaNodeId,
+pub struct ClusterConfig {
+    pub node_id: ClusterNodeId,
     pub discovery: DiscoverySection,
     pub coordination: CoordinationSection,
     pub formation_timeout: Duration,
 }
 
-impl DeltaConfig {
+impl ClusterConfig {
     const DEFAULT_FORMATION_TIMEOUT: Duration = Duration::from_secs(60);
 
-    pub fn from_server_config(config: &ServerConfig) -> Result<Option<Self>, DeltaConfigError> {
-        if config.server.mode != "delta" {
+    pub fn from_server_config(config: &ServerConfig) -> Result<Option<Self>, ClusterConfigError> {
+        if config.server.mode != "cluster" {
             return Ok(None);
         }
 
         let discovery = config
             .discovery
             .clone()
-            .ok_or_else(|| DeltaConfigError::MissingSection("[discovery]".to_string()))?;
+            .ok_or_else(|| ClusterConfigError::MissingSection("[discovery]".to_string()))?;
 
         let coordination = config
             .coordination
             .clone()
-            .ok_or_else(|| DeltaConfigError::MissingSection("[coordination]".to_string()))?;
+            .ok_or_else(|| ClusterConfigError::MissingSection("[coordination]".to_string()))?;
 
         if discovery.seeds.is_empty() && discovery.strategy == "static" {
-            return Err(DeltaConfigError::EmptySeeds);
+            return Err(ClusterConfigError::EmptySeeds);
         }
 
         let node_id = match &config.node_id {
-            Some(id) => DeltaNodeId::from_config(id.clone())?,
-            None => DeltaNodeId::auto_generate(&config.server.bind),
+            Some(id) => ClusterNodeId::from_config(id.clone())?,
+            None => ClusterNodeId::auto_generate(&config.server.bind),
         };
 
         Ok(Some(Self {
@@ -105,8 +105,8 @@ impl DeltaConfig {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum DeltaConfigError {
-    #[error("delta mode requires {0} section in config")]
+pub enum ClusterConfigError {
+    #[error("cluster mode requires {0} section in config")]
     MissingSection(String),
     #[error("invalid node_id: {0}")]
     InvalidNodeId(String),
@@ -122,7 +122,7 @@ mod tests {
     fn base_config() -> ServerConfig {
         ServerConfig {
             server: ServerSection::default(),
-            state: StateSection::default(),
+            state: laminar_core::state::StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
             sources: vec![],
             lookups: vec![],
@@ -135,9 +135,9 @@ mod tests {
         }
     }
 
-    fn delta_config() -> ServerConfig {
+    fn cluster_config() -> ServerConfig {
         let mut config = base_config();
-        config.server.mode = "delta".to_string();
+        config.server.mode = "cluster".to_string();
         config.node_id = Some("test-node-1".to_string());
         config.discovery = Some(DiscoverySection {
             strategy: "static".to_string(),
@@ -154,48 +154,48 @@ mod tests {
     }
 
     #[test]
-    fn test_delta_config_from_server_config_valid() {
-        let config = delta_config();
-        let result = DeltaConfig::from_server_config(&config).unwrap();
-        let delta_cfg = result.expect("should return Some for delta mode");
-        assert_eq!(delta_cfg.node_id.as_str(), "test-node-1");
-        assert_eq!(delta_cfg.discovery.strategy, "static");
-        assert_eq!(delta_cfg.coordination.raft_port, 7947);
-        assert_eq!(delta_cfg.formation_timeout, Duration::from_secs(60));
+    fn test_cluster_config_from_server_config_valid() {
+        let config = cluster_config();
+        let result = ClusterConfig::from_server_config(&config).unwrap();
+        let cluster_cfg = result.expect("should return Some for cluster mode");
+        assert_eq!(cluster_cfg.node_id.as_str(), "test-node-1");
+        assert_eq!(cluster_cfg.discovery.strategy, "static");
+        assert_eq!(cluster_cfg.coordination.raft_port, 7947);
+        assert_eq!(cluster_cfg.formation_timeout, Duration::from_secs(60));
     }
 
     #[test]
-    fn test_delta_config_embedded_mode_returns_none() {
+    fn test_cluster_config_embedded_mode_returns_none() {
         let config = base_config();
-        let result = DeltaConfig::from_server_config(&config).unwrap();
+        let result = ClusterConfig::from_server_config(&config).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
-    fn test_delta_config_missing_discovery() {
-        let mut config = delta_config();
+    fn test_cluster_config_missing_discovery() {
+        let mut config = cluster_config();
         config.discovery = None;
-        let err = DeltaConfig::from_server_config(&config).unwrap_err();
+        let err = ClusterConfig::from_server_config(&config).unwrap_err();
         assert!(err.to_string().contains("[discovery]"));
     }
 
     #[test]
-    fn test_delta_config_missing_coordination() {
-        let mut config = delta_config();
+    fn test_cluster_config_missing_coordination() {
+        let mut config = cluster_config();
         config.coordination = None;
-        let err = DeltaConfig::from_server_config(&config).unwrap_err();
+        let err = ClusterConfig::from_server_config(&config).unwrap_err();
         assert!(err.to_string().contains("[coordination]"));
     }
 
     #[test]
     fn test_node_id_from_config() {
-        let node_id = DeltaNodeId::from_config("star-1".to_string()).unwrap();
+        let node_id = ClusterNodeId::from_config("star-1".to_string()).unwrap();
         assert_eq!(node_id.as_str(), "star-1");
     }
 
     #[test]
     fn test_node_id_auto_generate() {
-        let node_id = DeltaNodeId::auto_generate("0.0.0.0:8080");
+        let node_id = ClusterNodeId::auto_generate("0.0.0.0:8080");
         let s = node_id.as_str();
         assert!(!s.is_empty());
         assert!(s.ends_with("-8080"), "expected suffix -8080, got: {s}");
@@ -204,27 +204,27 @@ mod tests {
     #[test]
     fn test_node_id_auto_generate_truncation() {
         // A very long hostname won't exceed 64 chars
-        let node_id = DeltaNodeId::from_config("a".repeat(100)).unwrap();
+        let node_id = ClusterNodeId::from_config("a".repeat(100)).unwrap();
         assert_eq!(node_id.as_str().len(), 64);
     }
 
     #[test]
-    fn test_delta_config_error_display() {
-        assert!(DeltaConfigError::MissingSection("[discovery]".into())
+    fn test_cluster_config_error_display() {
+        assert!(ClusterConfigError::MissingSection("[discovery]".into())
             .to_string()
             .contains("[discovery]"));
-        assert!(DeltaConfigError::EmptySeeds
+        assert!(ClusterConfigError::EmptySeeds
             .to_string()
             .contains("at least one seed"));
     }
 
     #[test]
     fn test_empty_seeds_with_static_strategy() {
-        let mut config = delta_config();
+        let mut config = cluster_config();
         config.discovery.as_mut().unwrap().seeds.clear();
-        let err = DeltaConfig::from_server_config(&config).unwrap_err();
+        let err = ClusterConfig::from_server_config(&config).unwrap_err();
         match err {
-            DeltaConfigError::EmptySeeds => {}
+            ClusterConfigError::EmptySeeds => {}
             other => panic!("expected EmptySeeds, got: {other}"),
         }
     }

@@ -9,9 +9,19 @@
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+#[cfg(feature = "cluster-unstable")]
+use arrow::compute::take;
+#[cfg(feature = "cluster-unstable")]
+use arrow::row::{RowConverter, SortField};
+#[cfg(feature = "cluster-unstable")]
+use arrow_array::UInt32Array;
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
 use datafusion_expr::LogicalPlan;
+#[cfg(feature = "cluster-unstable")]
+use laminar_core::shuffle::ShuffleMessage;
+#[cfg(feature = "cluster-unstable")]
+use laminar_core::state::key_hash;
 
 use crate::aggregate_state::{
     apply_compiled_having, AggStateCheckpoint, CompiledProjection, IncrementalAggState,
@@ -40,6 +50,33 @@ enum QueryState {
     CachedLogical(Box<LogicalPlan>),
 }
 
+/// Row-shuffle config threaded in cluster mode. Pre-aggregate rows are
+/// hashed by their GROUP BY columns; local rows feed `IncrementalAggState`,
+/// remote rows are serialised and shipped via [`ShuffleSender`]. Remote
+/// rows arriving on [`ShuffleReceiver`] are drained at the start of
+/// every cycle and fed into the same accumulator.
+///
+/// Row-shuffle (γ in Phase 0a) ships raw rows, not partial-aggregate
+/// state. Cheaper to implement than two-stage partial aggregation,
+/// linearly more bandwidth-hungry. Phase 5 upgrades this path.
+#[cfg(feature = "cluster-unstable")]
+#[derive(Clone)]
+pub struct ClusterShuffleConfig {
+    pub registry: Arc<laminar_core::state::VnodeRegistry>,
+    pub sender: Arc<laminar_core::shuffle::ShuffleSender>,
+    pub receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
+    pub self_id: laminar_core::state::NodeId,
+}
+
+#[cfg(feature = "cluster-unstable")]
+impl std::fmt::Debug for ClusterShuffleConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClusterShuffleConfig")
+            .field("self_id", &self.self_id)
+            .finish_non_exhaustive()
+    }
+}
+
 pub(crate) struct SqlQueryOperator {
     op_name: Arc<str>,
     sql: String,
@@ -51,6 +88,8 @@ pub(crate) struct SqlQueryOperator {
     cached_having_plan: Option<LogicalPlan>,
     emit_changelog: bool,
     idle_ttl_ms: Option<u64>,
+    #[cfg(feature = "cluster-unstable")]
+    cluster_shuffle: Option<ClusterShuffleConfig>,
 }
 
 impl SqlQueryOperator {
@@ -73,7 +112,18 @@ impl SqlQueryOperator {
             cached_having_plan: None,
             emit_changelog,
             idle_ttl_ms,
+            #[cfg(feature = "cluster-unstable")]
+            cluster_shuffle: None,
         }
+    }
+
+    /// Install the row-shuffle config. When present and the query
+    /// resolves to the aggregate fast-path, each cycle's pre-aggregate
+    /// rows are hash-routed across the cluster before reaching
+    /// `IncrementalAggState`. See Phase 0a.
+    #[cfg(feature = "cluster-unstable")]
+    pub fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
+        self.cluster_shuffle = Some(config);
     }
 
     async fn lazy_init(&mut self) -> Result<(), DbError> {
@@ -278,6 +328,22 @@ impl SqlQueryOperator {
             unreachable!();
         };
 
+        // Step 1.5: cluster row-shuffle. Hash pre-agg rows by their
+        // group columns, keep local, ship remote via `ShuffleSender`.
+        // Drain inbound remote rows from `ShuffleReceiver` and merge
+        // into this cycle's input. Single-node path is a no-op.
+        #[cfg(feature = "cluster-unstable")]
+        let pre_agg_batches = {
+            let num_group_cols = agg_state.num_group_cols();
+            shuffle_pre_agg_batches(
+                self.cluster_shuffle.as_ref(),
+                &self.op_name,
+                num_group_cols,
+                pre_agg_batches,
+            )
+            .await?
+        };
+
         // Step 2: Feed pre-agg batches to incremental accumulators.
         for batch in &pre_agg_batches {
             agg_state.process_batch(batch, watermark)?;
@@ -379,6 +445,150 @@ impl SqlQueryOperator {
     }
 }
 
+/// Cluster row-shuffle step applied between pre-aggregate compilation
+/// and `IncrementalAggState::process_batch`.
+///
+/// For each pre-aggregate row:
+/// - hash the leading `num_group_cols` columns to a vnode
+/// - if `registry.owner(vnode) == self_id`, keep the row local
+/// - otherwise serialise the row-slice and ship via [`ShuffleSender`]
+///
+/// Inbound rows already on [`ShuffleReceiver`] are drained (non-blocking)
+/// and appended to the local batch set. The returned vector carries
+/// every row that should feed into the local `IncrementalAggState` this
+/// cycle — a mix of originally-local rows and remote rows routed here
+/// by peers.
+///
+/// `num_group_cols == 0` is treated as "hash by all columns" — a degenerate
+/// global aggregate; all rows land on the same vnode deterministically.
+/// Acceptable for `SELECT SUM(x) FROM src`-shape queries: the cluster
+/// agrees on one owner, only that owner produces output.
+///
+/// Single-node fallback: if `config` is `None` the function is a pass-through.
+#[cfg(feature = "cluster-unstable")]
+async fn shuffle_pre_agg_batches(
+    config: Option<&ClusterShuffleConfig>,
+    op_name: &str,
+    num_group_cols: usize,
+    batches: Vec<RecordBatch>,
+) -> Result<Vec<RecordBatch>, DbError> {
+    let Some(cfg) = config else {
+        return Ok(batches);
+    };
+
+    let vnode_count = cfg.registry.vnode_count();
+    let mut local: Vec<RecordBatch> = Vec::new();
+
+    for batch in batches {
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let row_vn = hash_rows_to_vnodes(&batch, num_group_cols, vnode_count);
+        let mut seen = row_vn.clone();
+        seen.sort_unstable();
+        seen.dedup();
+
+        for v in seen {
+            let indices: UInt32Array = row_vn
+                .iter()
+                .enumerate()
+                .filter_map(
+                    |(i, &rv)| {
+                        if rv == v {
+                            u32::try_from(i).ok()
+                        } else {
+                            None
+                        }
+                    },
+                )
+                .collect();
+            if indices.is_empty() {
+                continue;
+            }
+            let cols: Vec<arrow_array::ArrayRef> = batch
+                .columns()
+                .iter()
+                .map(|c| take(c, &indices, None))
+                .collect::<Result<_, _>>()
+                .map_err(|e| DbError::Pipeline(format!("[{op_name}] row-shuffle take: {e}")))?;
+            let slice = RecordBatch::try_new(batch.schema(), cols)
+                .map_err(|e| DbError::Pipeline(format!("[{op_name}] row-shuffle rebuild: {e}")))?;
+
+            let owner = cfg.registry.owner(v);
+            if owner == cfg.self_id {
+                local.push(slice);
+            } else if owner.is_unassigned() {
+                // Fail the cycle rather than drop the slice. Silently
+                // discarding leaves source offsets to advance past rows
+                // that never reached a peer, producing phantom loss at
+                // the checkpoint boundary.
+                return Err(DbError::Pipeline(format!(
+                    "[{op_name}] row-shuffle: vnode {v} is unassigned — \
+                     refusing to drop {} rows",
+                    slice.num_rows()
+                )));
+            } else {
+                let msg = ShuffleMessage::VnodeData(v, slice);
+                // Fail the cycle on send error; dropping silently would
+                // let source offsets advance past un-delivered rows.
+                cfg.sender.send_to(owner.0, &msg).await.map_err(|e| {
+                    DbError::Pipeline(format!(
+                        "[{op_name}] row-shuffle send_to peer {}: {e}",
+                        owner.0
+                    ))
+                })?;
+            }
+        }
+    }
+
+    // Drain every currently-available remote row into this cycle. Bound
+    // by channel depth; never blocks. Messages that arrive after we
+    // drain land in the next cycle.
+    for (_from, msg) in cfg.receiver.drain_available() {
+        if let ShuffleMessage::VnodeData(_vnode, batch) = msg {
+            if batch.num_rows() > 0 {
+                local.push(batch);
+            }
+        }
+    }
+
+    Ok(local)
+}
+
+/// Compute the vnode id for each row by hashing the leading
+/// `num_group_cols` columns with the same `arrow::row` + `key_hash`
+/// encoding [`ClusterRepartitionExec`] uses. `num_group_cols == 0`
+/// collapses to a constant vnode (global aggregate — everyone hashes
+/// to 0 which round-robin assigns to the first peer).
+#[cfg(feature = "cluster-unstable")]
+fn hash_rows_to_vnodes(batch: &RecordBatch, num_group_cols: usize, vnode_count: u32) -> Vec<u32> {
+    if num_group_cols == 0 || batch.num_rows() == 0 {
+        return vec![0; batch.num_rows()];
+    }
+    let cols: Vec<arrow_array::ArrayRef> = (0..num_group_cols)
+        .map(|i| arrow_array::Array::slice(batch.column(i).as_ref(), 0, batch.num_rows()))
+        .collect();
+    // `Array::slice` above returns `Arc<dyn Array>` — turn it into the
+    // `Vec<ArrayRef>` RowConverter expects. (Defensive copy-free clone.)
+    let cols: Vec<arrow_array::ArrayRef> = cols.into_iter().collect();
+    let fields: Vec<SortField> = cols
+        .iter()
+        .map(|c| SortField::new(c.data_type().clone()))
+        .collect();
+    let converter = RowConverter::new(fields).expect("RowConverter for hash key");
+    let rows = converter
+        .convert_columns(&cols)
+        .expect("convert_columns for hash key");
+
+    (0..batch.num_rows())
+        .map(|row| {
+            #[allow(clippy::cast_possible_truncation)]
+            let v = (key_hash(rows.row(row).as_ref()) % u64::from(vnode_count)) as u32;
+            v
+        })
+        .collect()
+}
+
 #[async_trait]
 impl GraphOperator for SqlQueryOperator {
     async fn process(
@@ -396,7 +606,19 @@ impl GraphOperator for SqlQueryOperator {
 
         if input_batches.is_empty() || input_batches.iter().all(|b| b.num_rows() == 0) {
             if matches!(self.state, QueryState::Agg(_)) {
-                // No new input — still emit running state (and evict if changelog).
+                // In cluster mode, `execute_agg` also drains the shuffle
+                // receiver for remote rows — skipping it here would
+                // strand rows shipped from the leader when the follower
+                // has no local input. `execute_agg` handles empty local
+                // input gracefully (pre-agg on empty → empty pre-agg,
+                // shuffle drain supplies any remote rows).
+                #[cfg(feature = "cluster-unstable")]
+                {
+                    if self.cluster_shuffle.is_some() {
+                        return self.execute_agg(input_batches, watermark).await;
+                    }
+                }
+                // Single-node: no shuffle to drain — just emit current state.
                 return self.emit_agg_output(watermark).await;
             }
             return Ok(Vec::new());
@@ -448,12 +670,14 @@ impl GraphOperator for SqlQueryOperator {
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
         if matches!(self.state, QueryState::Uninit) {
             if let Some(ref cp) = self.pending_restore {
-                let data = serde_json::to_vec(cp).map_err(|e| {
-                    DbError::Pipeline(format!(
-                        "checkpoint serialization of pending restore for '{}': {e}",
-                        self.op_name
-                    ))
-                })?;
+                let data = rkyv::to_bytes::<rkyv::rancor::Error>(cp)
+                    .map(|v| v.to_vec())
+                    .map_err(|e| {
+                        DbError::Pipeline(format!(
+                            "checkpoint serialization of pending restore for '{}': {e}",
+                            self.op_name
+                        ))
+                    })?;
                 return Ok(Some(OperatorCheckpoint { data }));
             }
             return Ok(None);
@@ -464,17 +688,22 @@ impl GraphOperator for SqlQueryOperator {
         };
 
         let cp = agg_state.checkpoint_groups()?;
-        let data = serde_json::to_vec(&cp).map_err(|e| {
-            DbError::Pipeline(format!(
-                "checkpoint serialization for '{}': {e}",
-                self.op_name
-            ))
-        })?;
+        let data = rkyv::to_bytes::<rkyv::rancor::Error>(&cp)
+            .map(|v| v.to_vec())
+            .map_err(|e| {
+                DbError::Pipeline(format!(
+                    "checkpoint serialization for '{}': {e}",
+                    self.op_name
+                ))
+            })?;
         Ok(Some(OperatorCheckpoint { data }))
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        let cp: AggStateCheckpoint = serde_json::from_slice(&checkpoint.data).map_err(|e| {
+        let cp: AggStateCheckpoint = rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(
+            &checkpoint.data,
+        )
+        .map_err(|e| {
             DbError::Pipeline(format!(
                 "checkpoint deserialization for '{}': {e}",
                 self.op_name

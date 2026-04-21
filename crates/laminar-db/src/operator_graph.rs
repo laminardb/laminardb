@@ -54,10 +54,19 @@ enum GateDecision {
 
 const STATS_SAMPLE_INTERVAL: u64 = 32;
 
-#[derive(Serialize, Deserialize)]
+/// `operators` uses std `HashMap` so rkyv's stock `Archive`/`Serialize`/
+/// `Deserialize` impls apply (it supports `HashMap<K, V>` natively but
+/// not `HashMap<K, V, FxHasher>`). Cold path — written once per
+/// checkpoint interval, not on the hot query path. The `clippy::disallowed_types`
+/// allow is scoped to the single file-level type alias below rather
+/// than `#![allow]`-ing the whole module.
+#[allow(clippy::disallowed_types)]
+pub(crate) type OperatorStateMap = std::collections::HashMap<String, Vec<u8>>;
+
+#[derive(Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub(crate) struct GraphCheckpoint {
     pub version: u32,
-    pub operators: FxHashMap<String, Vec<u8>>,
+    pub operators: OperatorStateMap,
 }
 
 struct GraphNode {
@@ -217,6 +226,12 @@ pub(crate) struct OperatorGraph {
     /// Covers both source tables (from `register_source_schema`) and
     /// intermediate tables (created lazily on first operator output).
     live_handles: FxHashMap<String, LiveSourceHandle>,
+    /// Cluster-mode row-shuffle config for streaming aggregates.
+    /// `None` outside cluster mode; threaded to `SqlQueryOperator` so
+    /// pre-aggregate rows can be hash-routed to vnode owners. See
+    /// Phase 0a in `docs/plans/cluster-production-readiness.md`.
+    #[cfg(feature = "cluster-unstable")]
+    cluster_shuffle: Option<crate::operator::sql_query::ClusterShuffleConfig>,
 }
 
 impl OperatorGraph {
@@ -241,6 +256,8 @@ impl OperatorGraph {
             deferred_scan_offset: 0,
             stats_tick: 0,
             max_state_bytes: None,
+            #[cfg(feature = "cluster-unstable")]
+            cluster_shuffle: None,
             ctx,
             prom: None,
             lookup_registry: None,
@@ -321,6 +338,17 @@ impl OperatorGraph {
         registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
     ) {
         self.lookup_registry = Some(registry);
+    }
+
+    /// Install the row-shuffle config used by streaming aggregates in
+    /// cluster mode. See Phase 0a in
+    /// `docs/plans/cluster-production-readiness.md`.
+    #[cfg(feature = "cluster-unstable")]
+    pub fn set_cluster_shuffle(
+        &mut self,
+        config: crate::operator::sql_query::ClusterShuffleConfig,
+    ) {
+        self.cluster_shuffle = Some(config);
     }
 
     fn is_downstream_at_capacity(&self, node_id: usize) -> bool {
@@ -894,14 +922,20 @@ impl OperatorGraph {
 
         let emit_changelog = emit_clause.is_some_and(|ec| matches!(ec, EmitClause::Changes));
 
-        Box::new(operator::sql_query::SqlQueryOperator::new(
+        #[cfg_attr(not(feature = "cluster-unstable"), allow(unused_mut))]
+        let mut op = operator::sql_query::SqlQueryOperator::new(
             name,
             sql,
             self.ctx.clone(),
             self.prom.clone(),
             emit_changelog,
             idle_ttl_ms,
-        ))
+        );
+        #[cfg(feature = "cluster-unstable")]
+        if let Some(ref cfg) = self.cluster_shuffle {
+            op.attach_cluster_shuffle(cfg.clone());
+        }
+        Box::new(op)
     }
 
     pub fn remove_query(&mut self, name: &str) {
@@ -1045,8 +1079,8 @@ impl OperatorGraph {
         current_watermark: i64,
         results: &mut FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<(), DbError> {
-        let inputs = std::mem::take(&mut self.input_bufs[node_id]);
-        let input_bytes = std::mem::take(&mut self.input_buf_bytes[node_id]);
+        let mut inputs = std::mem::take(&mut self.input_bufs[node_id]);
+        let mut input_bytes = std::mem::take(&mut self.input_buf_bytes[node_id]);
 
         let port_count = self.nodes[node_id].input_port_count;
         let watermarks: smallvec::SmallVec<[i64; 2]> = (0..port_count)
@@ -1083,9 +1117,15 @@ impl OperatorGraph {
 
         let batches = match output_result {
             Ok(b) => {
-                let port_count = self.nodes[node_id].input_port_count;
-                self.input_bufs[node_id] = vec![Vec::new(); port_count];
-                self.input_buf_bytes[node_id] = vec![0; port_count];
+                // Reuse the existing outer Vecs and their inner capacities;
+                // the operator borrowed inputs, so the RecordBatches are
+                // still in place. clear() preserves capacity.
+                for v in &mut inputs {
+                    v.clear();
+                }
+                input_bytes.fill(0);
+                self.input_bufs[node_id] = inputs;
+                self.input_buf_bytes[node_id] = input_bytes;
                 b
             }
             Err(e) => {
@@ -1100,9 +1140,12 @@ impl OperatorGraph {
                     );
                     return Ok(());
                 }
-                let port_count = self.nodes[node_id].input_port_count;
-                self.input_bufs[node_id] = vec![Vec::new(); port_count];
-                self.input_buf_bytes[node_id] = vec![0; port_count];
+                for v in &mut inputs {
+                    v.clear();
+                }
+                input_bytes.fill(0);
+                self.input_bufs[node_id] = inputs;
+                self.input_buf_bytes[node_id] = input_bytes;
                 return Err(e);
             }
         };
@@ -1142,12 +1185,12 @@ impl OperatorGraph {
 
             // Register intermediate for downstream SQL queries (catalog lookup).
             if has_routes {
-                let name_str = node_name.to_string();
-                if !self.live_handles.contains_key(&name_str) {
+                let name_ref = node_name.as_ref();
+                if !self.live_handles.contains_key(name_ref) {
                     let schema = batches[0].schema();
-                    self.ensure_live_provider(&name_str, &schema);
+                    self.ensure_live_provider(name_ref, &schema);
                 }
-                if let Some(handle) = self.live_handles.get(name_str.as_str()) {
+                if let Some(handle) = self.live_handles.get(name_ref) {
                     handle.swap(batches.clone());
                 }
             }
@@ -1157,17 +1200,21 @@ impl OperatorGraph {
                 results.insert(node_name, batches.clone());
             }
 
-            let routes = self.nodes[node_id].output_routes.clone();
             let bytes: usize = batches.iter().map(RecordBatch::get_array_memory_size).sum();
-            if routes.len() == 1 {
-                let (target, port) = routes[0];
+            let route_count = self.nodes[node_id].output_routes.len();
+            if route_count == 1 {
+                let (target, port) = self.nodes[node_id].output_routes[0];
                 self.push_to_port(target, port, batches, bytes);
-            } else if routes.len() > 1 {
-                let last = routes.len() - 1;
-                for &(target, port) in &routes[..last] {
+            } else if route_count > 1 {
+                // Clone batches N-1 times (one for each non-final route);
+                // the final route takes ownership of the original. Reading
+                // routes via an indexed loop avoids cloning output_routes
+                // just to iterate it.
+                for i in 0..route_count - 1 {
+                    let (target, port) = self.nodes[node_id].output_routes[i];
                     self.push_to_port(target, port, batches.clone(), bytes);
                 }
-                let (target, port) = routes[last];
+                let (target, port) = self.nodes[node_id].output_routes[route_count - 1];
                 self.push_to_port(target, port, batches, bytes);
             }
         }
@@ -1316,7 +1363,7 @@ impl OperatorGraph {
 
     // &mut self: some accumulators need &mut for state()
     pub fn snapshot_state(&mut self) -> Result<Option<GraphCheckpoint>, DbError> {
-        let mut operators = FxHashMap::default();
+        let mut operators = OperatorStateMap::new();
         for node in &mut self.nodes {
             if node.removed {
                 continue;
@@ -1351,14 +1398,16 @@ impl OperatorGraph {
     }
 
     pub fn serialize_checkpoint(cp: &GraphCheckpoint) -> Result<Vec<u8>, DbError> {
-        serde_json::to_vec(cp)
+        rkyv::to_bytes::<rkyv::rancor::Error>(cp)
+            .map(|v| v.to_vec())
             .map_err(|e| DbError::Pipeline(format!("operator graph checkpoint serialization: {e}")))
     }
 
     pub fn restore_from_bytes(&mut self, bytes: &[u8]) -> Result<usize, DbError> {
-        let checkpoint: GraphCheckpoint = serde_json::from_slice(bytes).map_err(|e| {
-            DbError::Pipeline(format!("operator graph checkpoint deserialization: {e}"))
-        })?;
+        let checkpoint: GraphCheckpoint =
+            rkyv::from_bytes::<GraphCheckpoint, rkyv::rancor::Error>(bytes).map_err(|e| {
+                DbError::Pipeline(format!("operator graph checkpoint deserialization: {e}"))
+            })?;
         self.restore_state(&checkpoint)
     }
 }

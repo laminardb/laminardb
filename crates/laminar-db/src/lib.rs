@@ -68,6 +68,9 @@ mod pipeline_callback;
 mod pipeline_lifecycle;
 /// Deployment profiles.
 pub mod profile;
+/// Dynamic vnode rebalance control plane.
+#[cfg(feature = "cluster-unstable")]
+pub mod rebalance;
 /// Unified recovery manager.
 pub mod recovery_manager;
 mod retractable_accumulator;

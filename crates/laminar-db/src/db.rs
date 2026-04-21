@@ -80,7 +80,68 @@ pub struct LaminarDB {
     pub(crate) control_tx: parking_lot::Mutex<Option<ControlMsgTx>>,
     /// Materialized view result store (shared with compute thread and query threads).
     pub(crate) mv_store: Arc<parking_lot::RwLock<crate::mv_store::MvStore>>,
+    /// Cluster control facade, installed by `LaminarDbBuilder::cluster_controller`.
+    /// `None` in embedded / single-instance mode; `Some` activates the
+    /// leader / follower checkpoint flow when the coordinator starts.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) cluster_controller:
+        parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::ClusterController>>>,
+    /// State backend for durability-gate participation. Installed by
+    /// `LaminarDbBuilder::state_backend`. When paired with a
+    /// `vnode_registry` the coordinator writes per-vnode markers each
+    /// checkpoint and the gate runs.
+    pub(crate) state_backend:
+        parking_lot::Mutex<Option<Arc<dyn laminar_core::state::StateBackend>>>,
+    /// Vnode topology + assignment. Installed by
+    /// `LaminarDbBuilder::vnode_registry`. Needed for the coordinator to
+    /// know which vnodes this instance owns.
+    pub(crate) vnode_registry: parking_lot::Mutex<Option<Arc<laminar_core::state::VnodeRegistry>>>,
+    /// Extra physical optimizer rules from the builder, applied to both
+    /// `self.ctx` and the pipeline-side `OperatorGraph` context.
+    pub(crate) physical_optimizer_rules:
+        Arc<[Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>]>,
+    /// `target_partitions` override from the builder, mirrored into the
+    /// pipeline-side `SessionContext`.
+    pub(crate) pipeline_target_partitions: Option<usize>,
+    /// Outbound shuffle handle. Installed via `LaminarDbBuilder::shuffle_sender`;
+    /// used by `SqlQueryOperator` to row-shuffle pre-aggregate batches to vnode
+    /// owners. See Phase 0a in `docs/plans/cluster-production-readiness.md`.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) shuffle_sender:
+        parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleSender>>>,
+    /// Inbound shuffle handle. Installed via `LaminarDbBuilder::shuffle_receiver`.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) shuffle_receiver:
+        parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleReceiver>>>,
+    /// Shared commit-marker store. Installed via the builder.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) decision_store:
+        parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::CheckpointDecisionStore>>>,
+    /// Shared vnode-assignment snapshot store. Installed via the
+    /// builder; the rebalance tasks (spawned by the caller) watch it.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) assignment_snapshot_store:
+        parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>>,
+    /// Forwards `db.checkpoint()` requests to the running pipeline so
+    /// the callback captures operator state before the manifest is
+    /// packed. `None` before `start()` or after `shutdown()`; when
+    /// `None`, `db.checkpoint()` falls back to the direct coordinator
+    /// path (only valid when the engine has no stateful operators).
+    pub(crate) force_ckpt_tx: parking_lot::Mutex<Option<ForceCheckpointTx>>,
 }
+
+/// Oneshot reply carrying the full `CheckpointResult` back to the
+/// caller of `db.checkpoint()`. Created per-request.
+pub(crate) type ForceCheckpointReply =
+    tokio::sync::oneshot::Sender<Result<crate::checkpoint_coordinator::CheckpointResult, DbError>>;
+
+/// Channel used by `db.checkpoint()` to hand a reply sender to the
+/// running pipeline callback.
+pub(crate) type ForceCheckpointTx = tokio::sync::mpsc::UnboundedSender<ForceCheckpointReply>;
+
+/// Paired receive-side of [`ForceCheckpointTx`], held by
+/// `ConnectorPipelineCallback`.
+pub(crate) type ForceCheckpointRx = tokio::sync::mpsc::UnboundedReceiver<ForceCheckpointReply>;
 
 pub(crate) struct SourceWatermarkState {
     pub(crate) extractor: laminar_core::time::EventTimeExtractor,
@@ -155,6 +216,20 @@ impl LaminarDB {
         config: LaminarConfig,
         config_vars: HashMap<String, String>,
     ) -> Result<Self, DbError> {
+        Self::open_with_config_and_vars_and_rules(config, config_vars, &[], None)
+    }
+
+    /// Same as [`Self::open_with_config_and_vars`] but also installs
+    /// the given physical-optimizer rules on the `DataFusion` session.
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn open_with_config_and_vars_and_rules(
+        config: LaminarConfig,
+        config_vars: HashMap<String, String>,
+        extra_optimizer_rules: &[Arc<
+            dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync,
+        >],
+        target_partitions: Option<usize>,
+    ) -> Result<Self, DbError> {
         // One-time crossfire backoff tuning. No-op on multi-core; on single-core
         // VMs this swaps spin-loops for yields (~2x channel throughput).
         // Idempotent via an internal atomic — safe to call on every instance.
@@ -165,7 +240,10 @@ impl LaminarDB {
         // Build a SessionContext with the LookupJoinExtensionPlanner wired
         // into the physical planner so LookupJoinNode → LookupJoinExec works.
         let ctx = {
-            let session_config = laminar_sql::datafusion::base_session_config();
+            let mut session_config = laminar_sql::datafusion::base_session_config();
+            if let Some(n) = target_partitions {
+                session_config = session_config.with_target_partitions(n);
+            }
             let extension_planner: Arc<
                 dyn datafusion::physical_planner::ExtensionPlanner + Send + Sync,
             > = Arc::new(laminar_sql::datafusion::LookupJoinExtensionPlanner::new(
@@ -173,12 +251,14 @@ impl LaminarDB {
             ));
             let query_planner: Arc<dyn datafusion::execution::context::QueryPlanner + Send + Sync> =
                 Arc::new(LookupQueryPlanner { extension_planner });
-            let state = datafusion::execution::SessionStateBuilder::new()
+            let mut state_builder = datafusion::execution::SessionStateBuilder::new()
                 .with_config(session_config)
                 .with_default_features()
-                .with_query_planner(query_planner)
-                .build();
-            SessionContext::new_with_state(state)
+                .with_query_planner(query_planner);
+            for rule in extra_optimizer_rules {
+                state_builder = state_builder.with_physical_optimizer_rule(Arc::clone(rule));
+            }
+            SessionContext::new_with_state(state_builder.build())
         };
         register_streaming_functions(&ctx);
 
@@ -217,7 +297,133 @@ impl LaminarDB {
             lookup_registry,
             control_tx: parking_lot::Mutex::new(None),
             mv_store: Arc::new(parking_lot::RwLock::new(crate::mv_store::MvStore::new())),
+            #[cfg(feature = "cluster-unstable")]
+            cluster_controller: parking_lot::Mutex::new(None),
+            state_backend: parking_lot::Mutex::new(None),
+            vnode_registry: parking_lot::Mutex::new(None),
+            physical_optimizer_rules: extra_optimizer_rules.to_vec().into(),
+            pipeline_target_partitions: target_partitions,
+            #[cfg(feature = "cluster-unstable")]
+            shuffle_sender: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster-unstable")]
+            shuffle_receiver: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster-unstable")]
+            decision_store: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster-unstable")]
+            assignment_snapshot_store: parking_lot::Mutex::new(None),
+            force_ckpt_tx: parking_lot::Mutex::new(None),
         })
+    }
+
+    /// Install the outbound shuffle handle used by cluster-mode streaming
+    /// aggregates to route pre-aggregate rows to vnode owners. Called by
+    /// [`LaminarDbBuilder::shuffle_sender`]. Must be set before `start()`
+    /// to take effect.
+    #[cfg(feature = "cluster-unstable")]
+    pub fn set_shuffle_sender(&self, sender: Arc<laminar_core::shuffle::ShuffleSender>) {
+        *self.shuffle_sender.lock() = Some(sender);
+    }
+
+    /// Install the inbound shuffle handle. Pair with
+    /// [`Self::set_shuffle_sender`]; neither alone is a no-op.
+    #[cfg(feature = "cluster-unstable")]
+    pub fn set_shuffle_receiver(&self, receiver: Arc<laminar_core::shuffle::ShuffleReceiver>) {
+        *self.shuffle_receiver.lock() = Some(receiver);
+    }
+
+    /// Install the commit-marker store. Must be called before `start()`.
+    #[cfg(feature = "cluster-unstable")]
+    pub fn set_decision_store(
+        &self,
+        store: Arc<laminar_core::cluster::control::CheckpointDecisionStore>,
+    ) {
+        *self.decision_store.lock() = Some(store);
+    }
+
+    /// Install the assignment snapshot store. Must be called before `start()`.
+    #[cfg(feature = "cluster-unstable")]
+    pub fn set_assignment_snapshot_store(
+        &self,
+        store: Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
+    ) {
+        *self.assignment_snapshot_store.lock() = Some(store);
+    }
+
+    /// Adopt a new assignment snapshot: update the registry, backend
+    /// fence, and coordinator under the coordinator mutex so the
+    /// change lands strictly between checkpoints. Idempotent for
+    /// versions at or below the current registry version.
+    #[cfg(feature = "cluster-unstable")]
+    pub async fn adopt_assignment_snapshot(
+        &self,
+        snapshot: laminar_core::cluster::control::AssignmentSnapshot,
+    ) {
+        let Some(registry) = self.vnode_registry.lock().clone() else {
+            return;
+        };
+        if snapshot.version <= registry.assignment_version() {
+            return;
+        }
+        let vnode_count = registry.vnode_count();
+        let new_assignment: Arc<[laminar_core::state::NodeId]> =
+            snapshot.to_vnode_vec(vnode_count).into();
+
+        // Hold the coord mutex so the registry and fence update land
+        // between epochs from the coordinator's perspective.
+        let mut guard = self.coordinator.lock().await;
+        registry.set_assignment_and_version(new_assignment, snapshot.version);
+        if let Some(backend) = self.state_backend.lock().clone() {
+            backend.set_authoritative_version(snapshot.version);
+        }
+        if let Some(coord) = guard.as_mut() {
+            coord.set_assignment_version(snapshot.version);
+            let self_id = self
+                .cluster_controller
+                .lock()
+                .as_ref()
+                .map_or(laminar_core::state::NodeId(0), |c| {
+                    laminar_core::state::NodeId(c.instance_id().0)
+                });
+            coord.set_vnode_set(laminar_core::state::owned_vnodes(&registry, self_id));
+            coord.set_gate_vnode_set((0..vnode_count).collect());
+        }
+        drop(guard);
+
+        tracing::info!(version = snapshot.version, "adopted assignment snapshot",);
+    }
+
+    /// Install the cluster control facade. Called by
+    /// [`LaminarDbBuilder::cluster_controller`](crate::LaminarDbBuilder::cluster_controller)
+    /// before the pipeline starts; the `CheckpointCoordinator` picks
+    /// it up when constructed in `pipeline_lifecycle`.
+    #[cfg(feature = "cluster-unstable")]
+    pub fn set_cluster_controller(
+        &self,
+        controller: Arc<laminar_core::cluster::control::ClusterController>,
+    ) {
+        *self.cluster_controller.lock() = Some(controller);
+    }
+
+    /// Install a state backend so the checkpoint coordinator publishes
+    /// per-vnode durability markers and the gate runs. Pair with
+    /// [`Self::set_vnode_registry`]; either alone is a no-op.
+    pub fn set_state_backend(&self, backend: Arc<dyn laminar_core::state::StateBackend>) {
+        *self.state_backend.lock() = Some(backend);
+    }
+
+    /// Install a vnode registry so the checkpoint coordinator knows
+    /// which vnodes this instance owns. Pair with
+    /// [`Self::set_state_backend`]; either alone is a no-op.
+    pub fn set_vnode_registry(&self, registry: Arc<laminar_core::state::VnodeRegistry>) {
+        *self.vnode_registry.lock() = Some(registry);
+    }
+
+    /// Underlying `DataFusion` `SessionContext`. Primarily for tests
+    /// that need to compile SQL through the same session the engine
+    /// uses.
+    #[must_use]
+    pub fn session_context(&self) -> &SessionContext {
+        &self.ctx
     }
 
     /// Get a fluent builder for constructing a `LaminarDB`.
@@ -676,7 +882,7 @@ impl LaminarDB {
                     ShowCommand::MaterializedViews => self.build_show_materialized_views(),
                     ShowCommand::Streams => self.build_show_streams(),
                     ShowCommand::Tables => self.build_show_tables(),
-                    ShowCommand::CheckpointStatus => self.build_show_checkpoint_status()?,
+                    ShowCommand::CheckpointStatus => self.build_show_checkpoint_status().await?,
                     ShowCommand::CreateSource { name } => {
                         self.build_show_create_source(&name.to_string())?
                     }
@@ -1425,6 +1631,12 @@ impl LaminarDB {
     pub fn checkpoint_store(&self) -> Option<Box<dyn laminar_storage::CheckpointStore>> {
         let cp_config = self.config.checkpoint.as_ref()?;
         let max_retained = cp_config.max_retained.unwrap_or(3);
+        // Pass the runtime vnode count through so manifest validation
+        // checks against the real invariant, not a hardcoded default.
+        let vnode_count = self.vnode_registry.lock().as_ref().map_or(
+            laminar_storage::checkpoint_manifest::DEFAULT_VNODE_COUNT,
+            |r| u16::try_from(r.vnode_count()).unwrap_or(u16::MAX),
+        );
 
         if let Some(ref url) = self.config.object_store_url {
             let obj_store = laminar_storage::object_store_builder::build_object_store(
@@ -1439,7 +1651,7 @@ impl LaminarDB {
                     prefix,
                     max_retained,
                 )
-                .ok()?,
+                .with_vnode_count(vnode_count),
             ))
         } else {
             let data_dir = cp_config
@@ -1451,7 +1663,8 @@ impl LaminarDB {
                 laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(
                     &data_dir,
                     max_retained,
-                ),
+                )
+                .with_vnode_count(vnode_count),
             ))
         }
     }
@@ -1476,6 +1689,30 @@ impl LaminarDB {
                 "checkpointing is not enabled".to_string(),
             ));
         }
+
+        // When the streaming pipeline is live, route through the
+        // pipeline callback so it captures operator state (via the same
+        // path that the periodic checkpoint timer uses). Without this,
+        // the manifest has an empty `operator_states` map and restart
+        // loses everything the `IncrementalAggState` accumulators
+        // held. See Phase 1.1 in docs/plans/cluster-production-readiness.md.
+        let tx = self.force_ckpt_tx.lock().clone();
+        if let Some(tx) = tx {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            tx.send(reply_tx).map_err(|_| {
+                DbError::Checkpoint(
+                    "pipeline callback receiver closed — engine may be shutting down".into(),
+                )
+            })?;
+            return reply_rx.await.map_err(|_| {
+                DbError::Checkpoint("pipeline callback dropped oneshot before replying".into())
+            })?;
+        }
+
+        // Fallback: no running pipeline (e.g., engine built but not yet
+        // started). Drive the coordinator directly. Operator state will
+        // be empty, but restart from this manifest is still well-defined
+        // because there's nothing to restore anyway.
         let mut guard = self.coordinator.lock().await;
         let coord = guard.as_mut().ok_or_else(|| {
             DbError::Checkpoint("coordinator not initialized — call start() first".to_string())

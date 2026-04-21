@@ -5,7 +5,7 @@
 //! the tiers below it.
 //!
 //! ```text
-//! BareMetal ⊂ Embedded ⊂ Durable ⊂ Delta
+//! BareMetal ⊂ Embedded ⊂ Durable ⊂ Cluster
 //! ```
 //!
 //! ## Usage
@@ -38,8 +38,8 @@ pub enum Profile {
     Embedded,
     /// Object-store checkpoints + rkyv snapshots.
     Durable,
-    /// Full distributed: Durable + gRPC + gossip + Raft.
-    Delta,
+    /// Full distributed: Durable + gRPC + gossip + cluster primitives.
+    Cluster,
 }
 
 impl Profile {
@@ -50,14 +50,14 @@ impl Profile {
     ///
     /// | Signal | Detected Profile |
     /// |--------|-----------------|
-    /// | `has_discovery` = true | `Delta` |
+    /// | `has_discovery` = true | `Cluster` |
     /// | `object_store_url` is `s3://`/`gs://`/`az://` | `Durable` |
     /// | `object_store_url` is `file://` or `storage_dir` set | `Embedded` |
     /// | None of the above | `BareMetal` |
     #[must_use]
     pub fn from_config(config: &LaminarConfig, has_discovery: bool) -> Self {
         if has_discovery {
-            return Self::Delta;
+            return Self::Cluster;
         }
         if let Some(url) = &config.object_store_url {
             if url.starts_with("s3://")
@@ -86,13 +86,13 @@ impl Profile {
     /// Returns [`ProfileError::FeatureNotCompiled`] if a required Cargo
     /// feature is missing.
     pub fn validate_features(self) -> Result<(), ProfileError> {
-        // Feature gates for durable/delta were removed — all profiles are
+        // Feature gates for durable/cluster were removed — all profiles are
         // always available. Heavy distributed deps (tonic, openraft, chitchat)
-        // are gated on laminar-core's `delta` feature, which the server binary
-        // enables unconditionally. Library users of laminar-db get lightweight
-        // builds without distributed infrastructure.
+        // are gated on laminar-core's `cluster-unstable` feature, which the
+        // server binary enables unconditionally. Library users of laminar-db
+        // get lightweight builds without distributed infrastructure.
         match self {
-            Self::BareMetal | Self::Embedded | Self::Durable | Self::Delta => Ok(()),
+            Self::BareMetal | Self::Embedded | Self::Durable | Self::Cluster => Ok(()),
         }
     }
 
@@ -119,10 +119,10 @@ impl Profile {
                 }
                 Ok(())
             }
-            Self::Durable | Self::Delta => {
+            Self::Durable | Self::Cluster => {
                 if object_store_url.is_none() {
                     return Err(ProfileError::RequirementNotMet(
-                        "Durable/Delta profile requires an \
+                        "Durable/Cluster profile requires an \
                          object_store_url"
                             .into(),
                     ));
@@ -152,7 +152,7 @@ impl Profile {
                     config.default_buffer_size = 131_072;
                 }
             }
-            Self::Delta => {
+            Self::Cluster => {
                 // Largest buffers for distributed workloads.
                 if config.default_buffer_size == LaminarConfig::default().default_buffer_size {
                     config.default_buffer_size = 262_144;
@@ -170,7 +170,7 @@ impl FromStr for Profile {
             "bare_metal" | "baremetal" | "bare-metal" => Ok(Self::BareMetal),
             "embedded" => Ok(Self::Embedded),
             "durable" => Ok(Self::Durable),
-            "delta" => Ok(Self::Delta),
+            "cluster" => Ok(Self::Cluster),
             _ => Err(ProfileError::UnknownProfileName(s.into())),
         }
     }
@@ -182,7 +182,7 @@ impl fmt::Display for Profile {
             Self::BareMetal => write!(f, "bare_metal"),
             Self::Embedded => write!(f, "embedded"),
             Self::Durable => write!(f, "durable"),
-            Self::Delta => write!(f, "delta"),
+            Self::Cluster => write!(f, "cluster"),
         }
     }
 }
@@ -246,7 +246,7 @@ mod tests {
         assert_eq!(Profile::from_str("bare-metal").unwrap(), Profile::BareMetal);
         assert_eq!(Profile::from_str("embedded").unwrap(), Profile::Embedded);
         assert_eq!(Profile::from_str("durable").unwrap(), Profile::Durable);
-        assert_eq!(Profile::from_str("delta").unwrap(), Profile::Delta);
+        assert_eq!(Profile::from_str("cluster").unwrap(), Profile::Cluster);
         // Case insensitive
         assert_eq!(Profile::from_str("DURABLE").unwrap(), Profile::Durable);
         // Unknown name
@@ -263,7 +263,7 @@ mod tests {
         assert!(Profile::BareMetal.validate_features().is_ok());
         assert!(Profile::Embedded.validate_features().is_ok());
         assert!(Profile::Durable.validate_features().is_ok());
-        assert!(Profile::Delta.validate_features().is_ok());
+        assert!(Profile::Cluster.validate_features().is_ok());
     }
 
     #[test]
@@ -271,7 +271,7 @@ mod tests {
         assert_eq!(Profile::BareMetal.to_string(), "bare_metal");
         assert_eq!(Profile::Embedded.to_string(), "embedded");
         assert_eq!(Profile::Durable.to_string(), "durable");
-        assert_eq!(Profile::Delta.to_string(), "delta");
+        assert_eq!(Profile::Cluster.to_string(), "cluster");
     }
 
     #[test]
@@ -359,18 +359,18 @@ mod tests {
     }
 
     #[test]
-    fn test_from_config_delta() {
+    fn test_from_config_cluster() {
         let config = LaminarConfig::default();
-        assert_eq!(Profile::from_config(&config, true), Profile::Delta);
+        assert_eq!(Profile::from_config(&config, true), Profile::Cluster);
     }
 
     #[test]
-    fn test_from_config_delta_overrides_url() {
+    fn test_from_config_cluster_overrides_url() {
         let config = LaminarConfig {
             object_store_url: Some("s3://bucket/prefix".to_string()),
             ..LaminarConfig::default()
         };
         // Discovery takes priority over URL-based detection
-        assert_eq!(Profile::from_config(&config, true), Profile::Delta);
+        assert_eq!(Profile::from_config(&config, true), Profile::Cluster);
     }
 }

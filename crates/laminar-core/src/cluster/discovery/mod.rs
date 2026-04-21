@@ -1,12 +1,5 @@
-//! # Node Discovery
-//!
-//! Traits and implementations for discovering peer nodes in a LaminarDB
-//! delta.
-//!
-//! ## Implementations
-//!
-//! - `StaticDiscovery`: Pre-configured seed list with TCP heartbeats
-//! - `GossipDiscovery`: Chitchat-based gossip protocol
+//! Peer discovery: `StaticDiscovery` (seed list) and `GossipDiscovery`
+//! (chitchat).
 #![allow(clippy::disallowed_types)] // cold path: discovery metadata (serde + rkyv)
 
 mod static_discovery;
@@ -21,38 +14,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-/// Unique identifier for a node in the delta.
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    Serialize,
-    Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
-pub struct NodeId(pub u64);
-
-impl NodeId {
-    /// Sentinel value representing "unassigned" (no owner).
-    pub const UNASSIGNED: Self = Self(0);
-
-    /// Returns `true` if this is the unassigned sentinel.
-    #[must_use]
-    pub const fn is_unassigned(&self) -> bool {
-        self.0 == 0
-    }
-}
-
-impl fmt::Display for NodeId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "node-{}", self.0)
-    }
-}
+pub use crate::state::NodeId;
 
 /// Current lifecycle state of a node.
 #[derive(

@@ -16,6 +16,11 @@ use crate::error::DbError;
 use crate::operator::ProjectingJoinState;
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
 
+/// Version byte prefixed to the rkyv payload so bad/old checkpoints fail
+/// loudly instead of corrupting state. Bump on any wire-format change to
+/// `AsofBufferCheckpoint`.
+const ASOF_CHECKPOINT_VERSION: u8 = 1;
+
 pub(crate) struct AsofJoinOperator {
     config: AsofJoinTranslatorConfig,
     projection: ProjectingJoinState,
@@ -87,23 +92,43 @@ impl GraphOperator for AsofJoinOperator {
             .right_buffer
             .snapshot_checkpoint(self.last_evicted_watermark)?;
 
-        let data = serde_json::to_vec(&cp).map_err(|e| {
+        let body = rkyv::to_bytes::<rkyv::rancor::Error>(&cp).map_err(|e| {
             DbError::Pipeline(format!(
                 "ASOF join [{}]: checkpoint serialization: {e}",
                 self.projection.op_name
             ))
         })?;
 
+        // Version goes in the trailer so rkyv body stays at offset 0
+        // (preserves the alignment invariant `from_bytes` requires).
+        let mut data = Vec::with_capacity(body.len() + 1);
+        data.extend_from_slice(&body);
+        data.push(ASOF_CHECKPOINT_VERSION);
+
         Ok(Some(OperatorCheckpoint { data }))
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        let cp: AsofBufferCheckpoint = serde_json::from_slice(&checkpoint.data).map_err(|e| {
-            DbError::Pipeline(format!(
-                "ASOF join [{}]: checkpoint deserialization: {e}",
+        let Some((&version, body)) = checkpoint.data.split_last() else {
+            return Err(DbError::Pipeline(format!(
+                "ASOF join [{}]: checkpoint empty (missing version trailer)",
                 self.projection.op_name
-            ))
-        })?;
+            )));
+        };
+        if version != ASOF_CHECKPOINT_VERSION {
+            return Err(DbError::Pipeline(format!(
+                "ASOF join [{}]: unsupported checkpoint version {version} (expected {ASOF_CHECKPOINT_VERSION})",
+                self.projection.op_name
+            )));
+        }
+
+        let cp: AsofBufferCheckpoint =
+            rkyv::from_bytes::<AsofBufferCheckpoint, rkyv::rancor::Error>(body).map_err(|e| {
+                DbError::Pipeline(format!(
+                    "ASOF join [{}]: checkpoint deserialization: {e}",
+                    self.projection.op_name
+                ))
+            })?;
 
         let (buffer, last_wm) = AsofRightBuffer::from_checkpoint(&cp)?;
         self.right_buffer = buffer;

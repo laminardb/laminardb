@@ -12,7 +12,6 @@ description = "Storage layer for LaminarDB - checkpoint persistence and object s
 [dependencies]
 # Storage
 object_store = "0.13"  # For cloud storage
-parquet = "57.2"  # For lakehouse formats
 
 # Serialization
 serde = { workspace = true }
@@ -28,10 +27,10 @@ sha2 = { workspace = true }
 # Async
 tokio = { workspace = true }
 futures = { workspace = true }
+async-trait = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 
 # Observability
 tracing = { workspace = true }

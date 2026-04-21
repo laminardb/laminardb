@@ -18,5 +18,5 @@ pub mod object_store_builder;
 pub use checkpoint_manifest::{CheckpointManifest, ConnectorCheckpoint, OperatorCheckpoint};
 pub use checkpoint_store::{
     CheckpointStore, CheckpointStoreError, FileSystemCheckpointStore, ObjectStoreCheckpointStore,
-    RecoveryReport, ValidationResult,
+    RecoveryReport, ValidationIssue, ValidationResult,
 };

@@ -145,6 +145,10 @@ impl LaminarDB {
             };
 
             let max_retained = cp_config.max_retained.unwrap_or(3);
+            let vnode_count = self.vnode_registry.lock().as_ref().map_or(
+                laminar_storage::checkpoint_manifest::DEFAULT_VNODE_COUNT,
+                |r| u16::try_from(r.vnode_count()).unwrap_or(u16::MAX),
+            );
 
             let store: Box<dyn laminar_storage::CheckpointStore> =
                 if let Some(ref url) = self.config.object_store_url {
@@ -160,7 +164,7 @@ impl LaminarDB {
                             prefix,
                             max_retained,
                         )
-                        .map_err(|e| DbError::Config(format!("checkpoint store runtime: {e}")))?,
+                        .with_vnode_count(vnode_count),
                     )
                 } else {
                     let data_dir = cp_config
@@ -172,7 +176,8 @@ impl LaminarDB {
                         laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(
                             &data_dir,
                             max_retained,
-                        ),
+                        )
+                        .with_vnode_count(vnode_count),
                     )
                 };
 
@@ -181,10 +186,80 @@ impl LaminarDB {
                 max_retained,
                 ..CkpConfig::default()
             };
-            let mut coord = CheckpointCoordinator::new(config, store);
+            let mut coord = CheckpointCoordinator::new(config, store).await?;
             if let Some(ref prom) = *self.engine_metrics.lock() {
                 coord.set_metrics(Arc::clone(prom));
             }
+
+            // Cluster mode: install the controller so the coordinator
+            // can consult it for leader / follower role once the
+            // barrier-protocol flow change lands.
+            #[cfg(feature = "cluster-unstable")]
+            if let Some(controller) = self.cluster_controller.lock().clone() {
+                coord.set_cluster_controller(controller);
+            }
+
+            // Durability gate wiring: if both the state backend and vnode
+            // registry are installed, tell the coordinator which vnodes
+            // this instance owns. In cluster mode the owner id comes from
+            // the cluster controller; in single-instance mode we assume
+            // a `single_owner` registry and pass `NodeId(0)`.
+            if let (Some(backend), Some(registry)) = (
+                self.state_backend.lock().clone(),
+                self.vnode_registry.lock().clone(),
+            ) {
+                let owner = {
+                    #[cfg(feature = "cluster-unstable")]
+                    {
+                        self.cluster_controller
+                            .lock()
+                            .as_ref()
+                            .map_or(laminar_core::state::NodeId(0), |c| {
+                                laminar_core::state::NodeId(c.instance_id().0)
+                            })
+                    }
+                    #[cfg(not(feature = "cluster-unstable"))]
+                    {
+                        laminar_core::state::NodeId(0)
+                    }
+                };
+                // Phase 1.4 fence: both sides of the split-brain guard
+                // must see the same generation. The coordinator stamps
+                // outgoing writes with it (caller side), and the backend
+                // rejects incoming writes below it (authority side).
+                // Without the backend call the authoritative version
+                // stays at 0 and the fence is a silent no-op — the
+                // registry's version carries the snapshot generation
+                // across a restart, but only in-memory.
+                let version = registry.assignment_version();
+                backend.set_authoritative_version(version);
+                coord.set_state_backend(backend);
+                coord.set_assignment_version(version);
+                coord.set_vnode_set(laminar_core::state::owned_vnodes(&registry, owner));
+                // Leader's gate checks the full registry — across all
+                // instances — so the 2PC commit only fires when every
+                // follower has also persisted its markers.
+                coord.set_gate_vnode_set((0..registry.vnode_count()).collect());
+            }
+
+            // Plug in the cluster 2PC decision store before the
+            // recovery sweep so `reconcile_prepared_on_init` can
+            // consult it. Writes land here before the leader's Commit
+            // announcement goes out, so a new leader mid-2PC reads
+            // the durable vote instead of guessing.
+            #[cfg(feature = "cluster-unstable")]
+            if let Some(ds) = self.decision_store.lock().clone() {
+                coord.set_decision_store(ds);
+            }
+
+            // Cluster recovery: if this instance's last persisted
+            // manifest has any sink in Pending state, consult the
+            // durable 2PC decision store and drive local sinks to the
+            // recorded verdict. Committed → local commit + leader
+            // re-announces Commit for stragglers; Aborted or absent →
+            // rollback + leader announces Abort.
+            #[cfg(feature = "cluster-unstable")]
+            coord.reconcile_prepared_on_init().await;
 
             *self.coordinator.lock().await = Some(coord);
         }
@@ -243,8 +318,22 @@ impl LaminarDB {
         use crate::pipeline::{PipelineConfig, SourceRegistration};
         use laminar_connectors::reference::{ReferenceTableSource, RefreshMode};
 
-        // Build OperatorGraph
-        let ctx = laminar_sql::create_session_context();
+        // Build OperatorGraph context mirroring the rules + partition
+        // count installed on `LaminarDB::ctx` via the builder.
+        let ctx = {
+            use datafusion::execution::SessionStateBuilder;
+            let mut session_config = laminar_sql::datafusion::base_session_config();
+            if let Some(n) = self.pipeline_target_partitions {
+                session_config = session_config.with_target_partitions(n);
+            }
+            let mut state_builder = SessionStateBuilder::new()
+                .with_config(session_config)
+                .with_default_features();
+            for rule in self.physical_optimizer_rules.iter() {
+                state_builder = state_builder.with_physical_optimizer_rule(Arc::clone(rule));
+            }
+            datafusion::prelude::SessionContext::new_with_state(state_builder.build())
+        };
         laminar_sql::register_streaming_functions(&ctx);
 
         // Register lookup/reference tables in the operator graph's
@@ -279,6 +368,28 @@ impl LaminarDB {
         graph.set_lookup_registry(Arc::clone(&self.lookup_registry));
         if let Some(ref prom) = *self.engine_metrics.lock() {
             graph.set_metrics(Arc::clone(prom));
+        }
+
+        // Install the cluster row-shuffle config if all the pieces are
+        // present (registry, sender, receiver, controller). Without any
+        // one of them, aggregate queries run single-node.
+        #[cfg(feature = "cluster-unstable")]
+        {
+            let sender = self.shuffle_sender.lock().clone();
+            let receiver = self.shuffle_receiver.lock().clone();
+            let registry = self.vnode_registry.lock().clone();
+            let controller = self.cluster_controller.lock().clone();
+            if let (Some(sender), Some(receiver), Some(registry), Some(controller)) =
+                (sender, receiver, registry, controller)
+            {
+                let self_id = laminar_core::state::NodeId(controller.instance_id().0);
+                graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
+                    registry,
+                    sender,
+                    receiver,
+                    self_id,
+                });
+            }
         }
 
         // Register source schemas for ALL sources (both external connectors
@@ -689,6 +800,27 @@ impl LaminarDB {
                             }
                         }
                         let mut graph_restore_failed = false;
+                        let op_keys: Vec<&String> =
+                            recovered.manifest.operator_states.keys().collect();
+                        let instance_hint = {
+                            #[cfg(feature = "cluster-unstable")]
+                            {
+                                self.cluster_controller
+                                    .lock()
+                                    .as_ref()
+                                    .map_or(0, |c| c.instance_id().0)
+                            }
+                            #[cfg(not(feature = "cluster-unstable"))]
+                            {
+                                0u64
+                            }
+                        };
+                        tracing::info!(
+                            instance = instance_hint,
+                            count = op_keys.len(),
+                            keys = ?op_keys,
+                            "manifest operator_states summary"
+                        );
                         if let Some(op) = recovered.manifest.operator_states.get("operator_graph") {
                             if let Some(bytes) = op.decode_inline() {
                                 match graph.restore_from_bytes(&bytes) {
@@ -706,6 +838,10 @@ impl LaminarDB {
                                         );
                                     }
                                 }
+                            } else {
+                                tracing::warn!(
+                                    "manifest has 'operator_graph' but decode_inline returned None"
+                                );
                             }
                         } else if recovered
                             .manifest
@@ -1119,6 +1255,14 @@ impl LaminarDB {
             .lock()
             .clone()
             .expect("EngineMetrics must be set before start()");
+
+        // Force-checkpoint channel: `db.checkpoint()` on the caller side
+        // hands a oneshot sender across to the callback, which captures
+        // operator state and replies. Installed here so both ends exist
+        // before the compute thread spawns.
+        let (force_ckpt_tx, force_ckpt_rx) = tokio::sync::mpsc::unbounded_channel();
+        *self.force_ckpt_tx.lock() = Some(force_ckpt_tx);
+
         let callback = crate::pipeline_callback::ConnectorPipelineCallback {
             graph,
             stream_sources,
@@ -1149,6 +1293,11 @@ impl LaminarDB {
             sink_event_rx,
             sink_timed_out: false,
             shutdown_signal: Arc::clone(&self.shutdown_signal),
+            #[cfg(feature = "cluster-unstable")]
+            cluster_controller: self.cluster_controller.lock().clone(),
+            #[cfg(feature = "cluster-unstable")]
+            last_follower_epoch: None,
+            force_ckpt_rx: Some(force_ckpt_rx),
         };
 
         // Start the streaming coordinator on a dedicated compute thread.
@@ -1255,6 +1404,12 @@ impl LaminarDB {
 
         self.state
             .store(STATE_SHUTTING_DOWN, std::sync::atomic::Ordering::Release);
+
+        // Drop the force-checkpoint sender before signalling shutdown.
+        // Any subsequent `db.checkpoint()` call falls through to the
+        // (now-defunct) coordinator path, which errors cleanly instead
+        // of hanging on a oneshot that will never be answered.
+        *self.force_ckpt_tx.lock() = None;
 
         // Signal the runtime loop to stop
         self.shutdown_signal.notify_one();

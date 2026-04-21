@@ -1,4 +1,21 @@
 //! Incremental aggregation state for streaming GROUP BY queries.
+//!
+//! ## Scope
+//!
+//! This module owns the **single-process** aggregate operator: one
+//! `IncrementalAggState` per pipeline, one `DataFusion` `Accumulator`
+//! per aggregate per group. State is captured for checkpointing via
+//! the DataFusion-canonical `Accumulator::state() -> Vec<ScalarValue>`
+//! / `merge_batch(&arrays)` pair (see `checkpoint_groups` /
+//! `restore_groups`), serialized through Arrow IPC.
+//!
+//! The cross-vnode fan-in path — where the same aggregate runs on many
+//! vnodes and a merger instance combines their partials — lives in
+//! [`laminar_core::state::partial_aggregate`] and is a distinct tool
+//! solving a distinct problem (monoid `merge`, not format round-trip).
+//! Do not try to unify the two contracts: `DataFusion` already covers
+//! DISTINCT / FILTER / HAVING / UDAs on the single-process path, which
+//! `PartialAggregate` deliberately does not attempt.
 
 use std::sync::Arc;
 
@@ -20,7 +37,7 @@ use crate::error::DbError;
 mod checkpoints;
 mod compile;
 mod keys;
-mod scalar_json;
+mod scalar_ipc;
 pub(crate) use checkpoints::{
     query_fingerprint, AggStateCheckpoint, EmittedCheckpoint, EowcStateCheckpoint, GroupCheckpoint,
     JoinStateCheckpoint, WindowCheckpoint,
@@ -32,7 +49,7 @@ pub(crate) use compile::{
 pub(crate) use keys::{
     global_aggregate_key, row_to_scalar_key_with_types, scalar_key_to_owned_row,
 };
-pub(crate) use scalar_json::{json_to_scalar, scalar_to_json};
+pub(crate) use scalar_ipc::{ipc_to_scalars, scalars_to_ipc};
 
 pub(crate) fn emit_window_batch(
     window_start: i64,
@@ -184,6 +201,17 @@ pub(crate) struct IncrementalAggState {
     last_emitted: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>>,
     pub(crate) idle_ttl_ms: Option<u64>,
     weight_col_idx: Option<usize>,
+}
+
+impl IncrementalAggState {
+    /// Number of leading GROUP BY columns in this aggregate's pre-agg
+    /// output. Used by the cluster row-shuffle path to know which
+    /// columns to hash.
+    #[cfg(feature = "cluster-unstable")]
+    #[must_use]
+    pub(crate) fn num_group_cols(&self) -> usize {
+        self.num_group_cols
+    }
 }
 
 /// Name of the Z-set weight column appended to changelog output.
@@ -1082,16 +1110,16 @@ impl IncrementalAggState {
         for (row_key, entry) in &mut self.groups {
             let sv_key =
                 row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
-            let key_json: Vec<serde_json::Value> = sv_key.iter().map(scalar_to_json).collect();
+            let key_ipc = scalars_to_ipc(&sv_key)?;
             let mut acc_states = Vec::with_capacity(entry.accs.len());
             for acc in &mut entry.accs {
                 let state = acc
                     .state()
                     .map_err(|e| DbError::Pipeline(format!("accumulator state: {e}")))?;
-                acc_states.push(state.iter().map(scalar_to_json).collect());
+                acc_states.push(scalars_to_ipc(&state)?);
             }
             groups.push(GroupCheckpoint {
-                key: key_json,
+                key: key_ipc,
                 acc_states,
                 last_updated_ms: entry.last_updated_ms,
             });
@@ -1103,8 +1131,8 @@ impl IncrementalAggState {
                 let sv_key =
                     row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
                 last_emitted_cp.push(EmittedCheckpoint {
-                    key: sv_key.iter().map(scalar_to_json).collect(),
-                    values: vals.iter().map(scalar_to_json).collect(),
+                    key: scalars_to_ipc(&sv_key)?,
+                    values: scalars_to_ipc(vals)?,
                 });
             }
         }
@@ -1129,9 +1157,8 @@ impl IncrementalAggState {
         }
         self.groups.clear();
         for gc in &checkpoint.groups {
-            // Decode JSON → ScalarValue → Array → OwnedRow.
-            let sv_key: Result<Vec<ScalarValue>, _> = gc.key.iter().map(json_to_scalar).collect();
-            let sv_key = sv_key?;
+            // Decode IPC bytes → ScalarValue → Array → OwnedRow.
+            let sv_key = ipc_to_scalars(&gc.key)?;
             let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key, &self.group_types)?;
 
             let mut accs = Vec::with_capacity(self.agg_specs.len());
@@ -1142,9 +1169,7 @@ impl IncrementalAggState {
                     spec.create_accumulator()?
                 };
                 if i < gc.acc_states.len() {
-                    let state_scalars: Result<Vec<ScalarValue>, _> =
-                        gc.acc_states[i].iter().map(json_to_scalar).collect();
-                    let state_scalars = state_scalars?;
+                    let state_scalars = ipc_to_scalars(&gc.acc_states[i])?;
                     let arrays: Vec<ArrayRef> = state_scalars
                         .iter()
                         .map(|sv| {
@@ -1169,11 +1194,10 @@ impl IncrementalAggState {
         // Restore last_emitted for changelog recovery.
         self.last_emitted.clear();
         for ec in &checkpoint.last_emitted {
-            let sv_key: Result<Vec<ScalarValue>, _> = ec.key.iter().map(json_to_scalar).collect();
-            let sv_key = sv_key?;
+            let sv_key = ipc_to_scalars(&ec.key)?;
             let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key, &self.group_types)?;
-            let vals: Result<Vec<ScalarValue>, _> = ec.values.iter().map(json_to_scalar).collect();
-            self.last_emitted.insert(row_key, vals?);
+            let vals = ipc_to_scalars(&ec.values)?;
+            self.last_emitted.insert(row_key, vals);
         }
 
         Ok(checkpoint.groups.len())
@@ -2188,153 +2212,6 @@ mod tests {
         );
     }
 
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn test_scalar_to_json_roundtrip() {
-        let cases: Vec<ScalarValue> = vec![
-            ScalarValue::Null,
-            ScalarValue::Boolean(Some(true)),
-            ScalarValue::Boolean(None),
-            ScalarValue::Int8(Some(42)),
-            ScalarValue::Int16(Some(-100)),
-            ScalarValue::Int32(Some(999)),
-            ScalarValue::Int64(Some(123_456_789)),
-            ScalarValue::Int64(None),
-            ScalarValue::UInt8(Some(255)),
-            ScalarValue::UInt16(Some(65535)),
-            ScalarValue::UInt32(Some(1_000_000)),
-            ScalarValue::UInt64(Some(9_999_999_999)),
-            ScalarValue::UInt64(None),
-            ScalarValue::Float32(Some(1.5)),
-            ScalarValue::Float64(Some(9.876_54)),
-            ScalarValue::Float64(None),
-            ScalarValue::Utf8(Some("hello world".to_string())),
-            ScalarValue::Utf8(None),
-        ];
-
-        for original in &cases {
-            let json_val = scalar_to_json(original);
-            let restored = json_to_scalar(&json_val).unwrap();
-            // Compare by evaluate — widened types match on value
-            let orig_str = format!("{original:?}");
-            let rest_str = format!("{restored:?}");
-            match original {
-                ScalarValue::Null => {
-                    assert!(
-                        matches!(restored, ScalarValue::Null),
-                        "{orig_str} != {rest_str}"
-                    );
-                }
-                ScalarValue::Boolean(v) => {
-                    assert_eq!(
-                        *v,
-                        match restored {
-                            ScalarValue::Boolean(r) => r,
-                            _ => panic!("type mismatch: {rest_str}"),
-                        }
-                    );
-                }
-                ScalarValue::Int8(Some(n)) => {
-                    assert_eq!(
-                        Some(i64::from(*n)),
-                        match restored {
-                            ScalarValue::Int64(r) => r,
-                            _ => panic!("type mismatch: {rest_str}"),
-                        }
-                    );
-                }
-                ScalarValue::Int16(Some(n)) => {
-                    assert_eq!(
-                        Some(i64::from(*n)),
-                        match restored {
-                            ScalarValue::Int64(r) => r,
-                            _ => panic!("type mismatch: {rest_str}"),
-                        }
-                    );
-                }
-                ScalarValue::Int32(Some(n)) => {
-                    assert_eq!(
-                        Some(i64::from(*n)),
-                        match restored {
-                            ScalarValue::Int64(r) => r,
-                            _ => panic!("type mismatch: {rest_str}"),
-                        }
-                    );
-                }
-                ScalarValue::Int64(v) => {
-                    assert_eq!(
-                        *v,
-                        match restored {
-                            ScalarValue::Int64(r) => r,
-                            _ => panic!("type mismatch: {rest_str}"),
-                        }
-                    );
-                }
-                ScalarValue::UInt8(Some(n)) => {
-                    assert_eq!(
-                        Some(u64::from(*n)),
-                        match restored {
-                            ScalarValue::UInt64(r) => r,
-                            _ => panic!("type mismatch: {rest_str}"),
-                        }
-                    );
-                }
-                ScalarValue::UInt16(Some(n)) => {
-                    assert_eq!(
-                        Some(u64::from(*n)),
-                        match restored {
-                            ScalarValue::UInt64(r) => r,
-                            _ => panic!("type mismatch: {rest_str}"),
-                        }
-                    );
-                }
-                ScalarValue::UInt32(Some(n)) => {
-                    assert_eq!(
-                        Some(u64::from(*n)),
-                        match restored {
-                            ScalarValue::UInt64(r) => r,
-                            _ => panic!("type mismatch: {rest_str}"),
-                        }
-                    );
-                }
-                ScalarValue::UInt64(v) => {
-                    assert_eq!(
-                        *v,
-                        match restored {
-                            ScalarValue::UInt64(r) => r,
-                            _ => panic!("type mismatch: {rest_str}"),
-                        }
-                    );
-                }
-                ScalarValue::Float32(Some(f)) => {
-                    let ScalarValue::Float64(restored_f) = restored else {
-                        panic!("type mismatch: {rest_str}")
-                    };
-                    assert!(
-                        (f64::from(*f) - restored_f.unwrap()).abs() < 1e-6,
-                        "{orig_str} != {rest_str}"
-                    );
-                }
-                ScalarValue::Float64(v) => {
-                    let ScalarValue::Float64(restored_f) = restored else {
-                        panic!("type mismatch: {rest_str}")
-                    };
-                    assert_eq!(*v, restored_f, "{orig_str} != {rest_str}");
-                }
-                ScalarValue::Utf8(v) => {
-                    assert_eq!(
-                        *v,
-                        match restored {
-                            ScalarValue::Utf8(r) => r,
-                            _ => panic!("type mismatch: {rest_str}"),
-                        }
-                    );
-                }
-                _ => {}
-            }
-        }
-    }
-
     #[tokio::test]
     async fn test_agg_checkpoint_roundtrip_single_group() {
         let (_, mut state) =
@@ -3157,12 +3034,15 @@ mod tests {
     }
 
     fn round_trip(sv: &ScalarValue) -> ScalarValue {
-        let json = scalar_to_json(sv);
-        json_to_scalar(&json).unwrap()
+        let bytes = scalars_to_ipc(std::slice::from_ref(sv)).unwrap();
+        let back = ipc_to_scalars(&bytes).unwrap();
+        assert_eq!(back.len(), 1);
+        back.into_iter().next().unwrap()
     }
 
     #[test]
-    fn scalar_json_round_trip() {
+    fn scalar_ipc_round_trip() {
+        // Arrow IPC preserves exact type — no widening, unlike the old JSON path.
         assert_eq!(round_trip(&ScalarValue::Null), ScalarValue::Null);
         assert_eq!(
             round_trip(&ScalarValue::Boolean(Some(true))),
@@ -3189,10 +3069,6 @@ mod tests {
             ScalarValue::TimestampNanosecond(Some(1_000_000), tz),
         );
         assert_eq!(
-            round_trip(&ScalarValue::TimestampMillisecond(None, None)),
-            ScalarValue::TimestampMillisecond(None, None),
-        );
-        assert_eq!(
             round_trip(&ScalarValue::Date32(Some(19000))),
             ScalarValue::Date32(Some(19000)),
         );
@@ -3203,11 +3079,10 @@ mod tests {
     }
 
     #[test]
-    fn str_fallback_restores_as_utf8() {
+    fn binary_scalar_roundtrips_exactly() {
+        // Under the old serde_json path, Binary was string-coerced via the
+        // "STR" fallback. Arrow IPC preserves Binary natively.
         let sv = ScalarValue::Binary(Some(vec![1, 2, 3]));
-        let json = scalar_to_json(&sv);
-        assert_eq!(json["t"], "STR");
-        let restored = json_to_scalar(&json).unwrap();
-        assert!(matches!(restored, ScalarValue::Utf8(Some(_))));
+        assert_eq!(round_trip(&sv), sv);
     }
 }

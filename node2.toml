@@ -1,11 +1,11 @@
 node_id = "node-2"
 
 [server]
-mode = "delta"
+mode = "cluster"
 bind = "127.0.0.1:8082"
 
 [state]
-backend = "memory"
+backend = "in_process"
 
 [checkpoint]
 url = "file:///tmp/laminardb/ckpt2"

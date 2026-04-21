@@ -126,6 +126,10 @@ pub struct DeltaLakeSink {
     /// configured but the pipeline schema is not yet available at `open()` time.
     #[cfg(feature = "delta-lake")]
     needs_deferred_delta_init: bool,
+    /// Background reopen kicked off after a checkpoint-boundary drop, so
+    /// the next flush doesn't pay the table-load cost on the commit path.
+    #[cfg(feature = "delta-lake")]
+    pending_reopen: Option<tokio::task::JoinHandle<Result<DeltaTable, ConnectorError>>>,
 }
 
 impl DeltaLakeSink {
@@ -160,6 +164,8 @@ impl DeltaLakeSink {
             compaction_handle: None,
             #[cfg(feature = "delta-lake")]
             needs_deferred_delta_init: false,
+            #[cfg(feature = "delta-lake")]
+            pending_reopen: None,
         }
     }
 
@@ -407,6 +413,57 @@ impl DeltaLakeSink {
         Ok(())
     }
 
+    /// Spawn a background reopen of the Delta table so the next flush
+    /// doesn't pay the load cost on its hot path. An already-in-flight
+    /// reopen is aborted — the fresher one supersedes it.
+    #[cfg(feature = "delta-lake")]
+    fn schedule_background_reopen(&mut self) {
+        if let Some(prev) = self.pending_reopen.take() {
+            prev.abort();
+        }
+        let path = self.resolved_table_path.clone();
+        let opts = self.resolved_storage_options.clone();
+        let schema = self.schema.clone();
+        self.pending_reopen = Some(tokio::spawn(async move {
+            super::delta_io::open_or_create_table(&path, opts, schema.as_ref()).await
+        }));
+    }
+
+    /// Install a previously-scheduled background reopen. Returns `false`
+    /// on miss — no pending reopen, task failure, or timeout — so callers
+    /// fall through to the synchronous `reopen_table()` path.
+    #[cfg(feature = "delta-lake")]
+    async fn try_install_pending_reopen(&mut self, timeout: std::time::Duration) -> bool {
+        let Some(mut pending) = self.pending_reopen.take() else {
+            return false;
+        };
+        let table = match tokio::time::timeout(timeout, &mut pending).await {
+            Ok(Ok(Ok(t))) => t,
+            Ok(Ok(Err(e))) => {
+                warn!(error = %e, "Delta background reopen failed");
+                return false;
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "Delta background reopen task ended unexpectedly");
+                return false;
+            }
+            Err(_) => {
+                warn!(
+                    timeout_secs = timeout.as_secs(),
+                    "Delta background reopen timed out"
+                );
+                pending.abort();
+                return false;
+            }
+        };
+        #[allow(clippy::cast_sign_loss)]
+        {
+            self.delta_version = table.version().unwrap_or(0) as u64;
+        }
+        self.table = Some(table);
+        true
+    }
+
     /// Attempts a single Delta write/merge and returns the updated table on success.
     #[cfg(feature = "delta-lake")]
     async fn attempt_delta_write(
@@ -503,18 +560,21 @@ impl DeltaLakeSink {
         let mut last_error: Option<ConnectorError> = None;
 
         for attempt in 0..max_attempts {
-            // delta-rs write/merge APIs consume DeltaTable by value.
-            // If self.table is None (from a previous failed attempt), re-open it.
+            // delta-rs consumes DeltaTable by value. If self.table is None
+            // (prior failure or checkpoint-boundary drop) reinstall it —
+            // prefer a scheduled background reopen, fall back to sync.
             if self.table.is_none() {
                 let reopen_timeout = self.config.write_timeout;
-                tokio::time::timeout(reopen_timeout, self.reopen_table())
-                    .await
-                    .map_err(|_| {
-                        ConnectorError::ConnectionFailed(format!(
-                            "Delta table reopen timed out after {}s",
-                            reopen_timeout.as_secs()
-                        ))
-                    })??;
+                if !self.try_install_pending_reopen(reopen_timeout).await {
+                    tokio::time::timeout(reopen_timeout, self.reopen_table())
+                        .await
+                        .map_err(|_| {
+                            ConnectorError::ConnectionFailed(format!(
+                                "Delta table reopen timed out after {}s",
+                                reopen_timeout.as_secs()
+                            ))
+                        })??;
+                }
             }
 
             let table = self
@@ -551,17 +611,19 @@ impl DeltaLakeSink {
 
                     // delta-rs' in-memory Snapshot grows per commit and is not
                     // compacted in place; drop on checkpoint boundaries so the
-                    // next flush re-opens from the checkpoint file.
+                    // next flush re-opens from the checkpoint file. Pre-open
+                    // in the background so the next commit doesn't block.
                     let crossed_checkpoint = self.config.checkpoint_interval > 0
                         && self.delta_version > 0
                         && self
                             .delta_version
                             .is_multiple_of(self.config.checkpoint_interval);
-                    self.table = if crossed_checkpoint {
-                        None
+                    if crossed_checkpoint {
+                        self.table = None;
+                        self.schedule_background_reopen();
                     } else {
-                        Some(table)
-                    };
+                        self.table = Some(table);
+                    }
 
                     self.staged_batches.clear();
                     self.staged_rows = 0;
@@ -977,6 +1039,36 @@ impl SinkConnector for DeltaLakeSink {
         let num_rows = batch.num_rows();
         let estimated_bytes = Self::estimate_batch_size(batch);
 
+        // Exactly-once cannot flush opportunistically from `write_batch`
+        // — a mid-epoch flush would leak rows on rollback. Apply the
+        // configured target as a hard cap (×4 for checkpoint jitter) and
+        // signal backpressure so the upstream reactor slows down.
+        //
+        // A single incoming batch may itself exceed the cap; we cannot
+        // split or reject it (the rows would be lost), so we widen the
+        // cap to `num_rows`/`estimated_bytes` when a batch alone is
+        // larger. This still rejects the *next* batch if that one-shot
+        // admission left us bloated.
+        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+            let pending_rows = self.buffered_rows + self.staged_rows + num_rows;
+            let pending_bytes = self.buffered_bytes + self.staged_bytes + estimated_bytes;
+            let row_cap = self
+                .config
+                .max_buffer_records
+                .saturating_mul(4)
+                .max(num_rows);
+            let byte_cap = (self.config.target_file_size as u64)
+                .saturating_mul(4)
+                .max(estimated_bytes);
+            if pending_rows > row_cap || pending_bytes > byte_cap {
+                return Err(ConnectorError::WriteError(format!(
+                    "delta sink exactly-once buffer full ({pending_rows} rows, \
+                     {pending_bytes} bytes pending; cap {row_cap} rows, \
+                     {byte_cap} bytes) — waiting for next checkpoint"
+                )));
+            }
+        }
+
         // Buffer the batch.
         if self.buffer_start_time.is_none() {
             self.buffer_start_time = Some(Instant::now());
@@ -1232,6 +1324,11 @@ impl SinkConnector for DeltaLakeSink {
             }
         }
 
+        #[cfg(feature = "delta-lake")]
+        if let Some(pending) = self.pending_reopen.take() {
+            pending.abort();
+        }
+
         // Drop the table handle when closing.
         #[cfg(feature = "delta-lake")]
         {
@@ -1247,6 +1344,24 @@ impl SinkConnector for DeltaLakeSink {
         );
 
         Ok(())
+    }
+}
+
+/// Safety-net: if the sink is dropped mid-lifecycle (panic, config error,
+/// shutdown without calling `close()`), cancel any background work so we
+/// don't leak a compaction loop or a stray table-reopen task.
+#[cfg(feature = "delta-lake")]
+impl Drop for DeltaLakeSink {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.compaction_cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(handle) = self.compaction_handle.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.pending_reopen.take() {
+            handle.abort();
+        }
     }
 }
 
@@ -1528,6 +1643,43 @@ mod tests {
         assert!(!sink.should_flush());
     }
 
+    #[tokio::test]
+    async fn test_exactly_once_buffer_backpressure() {
+        // Exactly-once mode rejects writes once the cumulative pending
+        // buffer exceeds the hard cap (4× max_buffer_records). A single
+        // incoming batch that by itself exceeds the cap is admitted (we
+        // cannot split it without breaking exactly-once), but subsequent
+        // batches hit backpressure.
+        let mut config = test_config();
+        config.delivery_guarantee = crate::connector::DeliveryGuarantee::ExactlyOnce;
+        config.max_buffer_records = 10;
+        let mut sink = DeltaLakeSink::new(config, None);
+        sink.state = ConnectorState::Running;
+
+        // First batch of 50 rows exceeds 4× cap (40) but we admit it —
+        // rejecting would wedge the pipeline with no way to split.
+        let first = test_batch(50);
+        sink.write_batch(&first)
+            .await
+            .expect("single oversized batch must be admitted");
+        assert_eq!(sink.buffered_rows(), 50);
+
+        // A second normal batch must now be rejected: cumulative pending
+        // (50 + 5 = 55) exceeds the effective cap (max(40, 5) = 40).
+        let second = test_batch(5);
+        let err = sink
+            .write_batch(&second)
+            .await
+            .expect_err("should reject once cumulative buffer exceeds cap");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("buffer full"),
+            "expected backpressure error, got: {msg}"
+        );
+        // Rejected batch must NOT have been buffered.
+        assert_eq!(sink.buffered_rows(), 50);
+    }
+
     // ── Batch buffering tests ──
 
     #[tokio::test]
@@ -1576,7 +1728,7 @@ mod tests {
         let batch = test_batch(5);
         sink.write_batch(&batch).await.unwrap();
         assert!(sink.schema.is_some());
-        assert_eq!(sink.schema.unwrap().fields().len(), 3);
+        assert_eq!(sink.schema.as_ref().unwrap().fields().len(), 3);
     }
 
     #[tokio::test]

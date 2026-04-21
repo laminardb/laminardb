@@ -770,7 +770,7 @@ impl IncrementalEowcState {
 
     /// Checkpoint all per-window group states into a serializable struct.
     pub(crate) fn checkpoint_windows(&mut self) -> Result<EowcStateCheckpoint, DbError> {
-        use crate::aggregate_state::{scalar_to_json, GroupCheckpoint, WindowCheckpoint};
+        use crate::aggregate_state::{scalars_to_ipc, GroupCheckpoint, WindowCheckpoint};
 
         let fingerprint = self.query_fingerprint();
         let mut windows = Vec::with_capacity(self.windows.len());
@@ -782,16 +782,16 @@ impl IncrementalEowcState {
                     key,
                     &self.group_types,
                 )?;
-                let key_json: Vec<serde_json::Value> = sv_key.iter().map(scalar_to_json).collect();
+                let key_ipc = scalars_to_ipc(&sv_key)?;
                 let mut acc_states = Vec::with_capacity(accs.len());
                 for acc in accs {
                     let state = acc
                         .state()
                         .map_err(|e| DbError::Pipeline(format!("accumulator state: {e}")))?;
-                    acc_states.push(state.iter().map(scalar_to_json).collect());
+                    acc_states.push(scalars_to_ipc(&state)?);
                 }
                 group_checkpoints.push(GroupCheckpoint {
-                    key: key_json,
+                    key: key_ipc,
                     acc_states,
                     last_updated_ms: i64::MIN,
                 });
@@ -812,7 +812,7 @@ impl IncrementalEowcState {
         &mut self,
         checkpoint: &EowcStateCheckpoint,
     ) -> Result<usize, DbError> {
-        use crate::aggregate_state::json_to_scalar;
+        use crate::aggregate_state::ipc_to_scalars;
 
         let current_fp = self.query_fingerprint();
         if checkpoint.fingerprint != current_fp {
@@ -826,9 +826,7 @@ impl IncrementalEowcState {
         for wc in &checkpoint.windows {
             let mut groups = AHashMap::new();
             for gc in &wc.groups {
-                let sv_key: Result<Vec<ScalarValue>, _> =
-                    gc.key.iter().map(json_to_scalar).collect();
-                let sv_key = sv_key?;
+                let sv_key = ipc_to_scalars(&gc.key)?;
                 let row_key = crate::aggregate_state::scalar_key_to_owned_row(
                     &self.row_converter,
                     &sv_key,
@@ -838,9 +836,7 @@ impl IncrementalEowcState {
                 for (i, spec) in self.agg_specs.iter().enumerate() {
                     let mut acc = spec.create_accumulator()?;
                     if i < gc.acc_states.len() {
-                        let state_scalars: Result<Vec<ScalarValue>, _> =
-                            gc.acc_states[i].iter().map(json_to_scalar).collect();
-                        let state_scalars = state_scalars?;
+                        let state_scalars = ipc_to_scalars(&gc.acc_states[i])?;
                         let arrays: Vec<arrow::array::ArrayRef> = state_scalars
                             .iter()
                             .map(|sv| {

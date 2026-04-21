@@ -80,6 +80,23 @@ pub(crate) struct ConnectorPipelineCallback {
     /// checkpoint to preserve the replay window.
     pub(crate) sink_timed_out: bool,
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
+    /// Cluster control facade. Present only when this instance was
+    /// built with a controller. Used to gate the periodic checkpoint
+    /// trigger on `is_leader()` and to run `follower_checkpoint` on
+    /// non-leaders.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    /// Highest epoch a non-leader has already prepared for. Prevents
+    /// re-running `follower_checkpoint` on the same announcement.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) last_follower_epoch: Option<u64>,
+    /// Inbound channel for `db.checkpoint()` requests. The db sends a
+    /// oneshot sender here; on the next cycle the callback captures
+    /// operator state (via `checkpoint_with_barrier`-style path) and
+    /// replies on that sender. Without this, `db.checkpoint()` reaches
+    /// the coordinator with an empty `CheckpointRequest` and the
+    /// leader's manifest is useless for restart recovery.
+    pub(crate) force_ckpt_rx: Option<crate::db::ForceCheckpointRx>,
 }
 
 impl ConnectorPipelineCallback {
@@ -92,9 +109,178 @@ impl ConnectorPipelineCallback {
         format!("{err}")
     }
 
+    /// Cap each source's tracker-reported watermark by the cluster-wide
+    /// minimum, when one has been published. A `None` `cluster_wm`
+    /// leaves the map untouched — blindly capping to MIN would freeze
+    /// every downstream event-time decision and hang the pipeline.
+    #[cfg(feature = "cluster-unstable")]
+    fn cap_source_watermarks_by_cluster_min(
+        source_wms: &mut FxHashMap<Arc<str>, i64>,
+        cluster_wm: Option<i64>,
+    ) {
+        let Some(cluster_wm) = cluster_wm else { return };
+        for wm in source_wms.values_mut() {
+            if cluster_wm < *wm {
+                *wm = cluster_wm;
+            }
+        }
+    }
+
+    /// Follower-side dispatch: poll the leader's announcement, and
+    /// if a fresh PREPARE is visible, capture local state and run
+    /// `CheckpointCoordinator::follower_checkpoint`. Returns `true`
+    /// when a checkpoint was driven this tick.
+    /// Driven by `db.checkpoint()` via the `force_ckpt_rx` channel.
+    /// Captures operator state (plus table/watermark metadata) and
+    /// commits the manifest through the coordinator, returning the
+    /// full `CheckpointResult` for the caller. Mirrors
+    /// `checkpoint_with_barrier` but without the barrier-alignment
+    /// gate — the caller has chosen to take a consistent snapshot
+    /// of whatever state is currently in the accumulators.
+    async fn force_capture_and_checkpoint(
+        &mut self,
+    ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
+        use crate::checkpoint_coordinator::source_to_connector_checkpoint;
+        let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
+
+        let operator_states = self
+            .capture_and_serialize_operator_state()
+            .await
+            .map_err(DbError::Checkpoint)?;
+
+        let mut extra_tables = HashMap::with_capacity(self.table_sources.len());
+        for (name, source, _) in &self.table_sources {
+            extra_tables.insert(
+                name.clone(),
+                source_to_connector_checkpoint(&source.checkpoint()),
+            );
+        }
+
+        let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
+        for (name, wm_state) in &self.watermark_states {
+            let wm = wm_state.generator.current_watermark();
+            if wm > i64::MIN {
+                per_source_watermarks.insert(name.clone(), wm);
+            }
+        }
+
+        let request = crate::checkpoint_coordinator::CheckpointRequest {
+            operator_states,
+            watermark: None,
+            table_store_checkpoint_path: None,
+            extra_table_offsets: extra_tables,
+            source_watermarks: per_source_watermarks,
+            pipeline_hash: self.pipeline_hash,
+            source_offset_overrides: HashMap::new(),
+        };
+
+        let mut guard = self.coordinator.lock().await;
+        let coord = guard.as_mut().ok_or_else(|| {
+            DbError::Checkpoint(
+                "coordinator not initialized when force_capture_and_checkpoint ran".into(),
+            )
+        })?;
+        // Phase 1.3: seed leader-side local watermark so
+        // `await_prepare_quorum` can fold it into the cluster-wide min.
+        let wm = self
+            .pipeline_watermark
+            .load(std::sync::atomic::Ordering::Acquire);
+        coord.set_local_watermark_ms(if wm == i64::MIN { None } else { Some(wm) });
+        let result = coord.checkpoint_with_offsets(request).await?;
+        if result.success {
+            self.last_checkpoint = std::time::Instant::now();
+        }
+        Ok(result)
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    async fn maybe_follower_checkpoint(
+        &mut self,
+        controller: Arc<laminar_core::cluster::control::ClusterController>,
+        source_offsets: FxHashMap<String, SourceCheckpoint>,
+    ) -> bool {
+        use crate::checkpoint_coordinator::source_to_connector_checkpoint;
+        use laminar_core::cluster::control::Phase;
+
+        let ann = match controller.observe_barrier().await {
+            Ok(Some(a)) if a.phase == Phase::Prepare => a,
+            _ => return false,
+        };
+        if self.last_follower_epoch.is_some_and(|e| e >= ann.epoch) {
+            return false;
+        }
+        self.last_follower_epoch = Some(ann.epoch);
+
+        let operator_states = match self.capture_and_serialize_operator_state().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "follower state capture failed — skipping");
+                return false;
+            }
+        };
+        let mut extra_tables = HashMap::with_capacity(self.table_sources.len());
+        for (name, source, _) in &self.table_sources {
+            extra_tables.insert(
+                name.clone(),
+                source_to_connector_checkpoint(&source.checkpoint()),
+            );
+        }
+        let source_overrides: HashMap<String, _> = source_offsets
+            .iter()
+            .map(|(name, cp)| (name.clone(), source_to_connector_checkpoint(cp)))
+            .collect();
+        let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
+        for (name, wm_state) in &self.watermark_states {
+            let wm = wm_state.generator.current_watermark();
+            if wm > i64::MIN {
+                per_source_watermarks.insert(name.clone(), wm);
+            }
+        }
+        let request = crate::checkpoint_coordinator::CheckpointRequest {
+            operator_states,
+            watermark: None,
+            table_store_checkpoint_path: None,
+            extra_table_offsets: extra_tables,
+            source_watermarks: per_source_watermarks,
+            pipeline_hash: self.pipeline_hash,
+            source_offset_overrides: source_overrides,
+        };
+
+        let mut guard = self.coordinator.lock().await;
+        let Some(ref mut coord) = *guard else {
+            return false;
+        };
+        // Phase 1.3: stamp this instance's current pipeline watermark
+        // into the coordinator so the next `BarrierAck` carries it.
+        // i64::MIN means unset; don't propagate — leader treats us as
+        // non-blocking.
+        let wm = self
+            .pipeline_watermark
+            .load(std::sync::atomic::Ordering::Acquire);
+        coord.set_local_watermark_ms(if wm == i64::MIN { None } else { Some(wm) });
+        match coord
+            .follower_checkpoint(request, ann, std::time::Duration::from_secs(30))
+            .await
+        {
+            Ok(true) => {
+                tracing::info!("follower checkpoint committed");
+                self.last_checkpoint = std::time::Instant::now();
+                true
+            }
+            Ok(false) => {
+                tracing::warn!("follower checkpoint aborted (leader signalled Abort)");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "follower checkpoint errored");
+                false
+            }
+        }
+    }
+
     async fn capture_and_serialize_operator_state(
         &mut self,
-    ) -> Result<std::collections::HashMap<String, Vec<u8>>, String> {
+    ) -> Result<std::collections::HashMap<String, bytes::Bytes>, String> {
         let mut operator_states = HashMap::with_capacity(2);
         let cp = match self.graph.snapshot_state() {
             Ok(Some(cp)) => cp,
@@ -113,7 +299,7 @@ impl ConnectorPipelineCallback {
         .map_err(|_| format!("[LDB-6017] operator state serialization timed out ({timeout:?})"))?
         .map_err(|e| format!("serialize join error: {e}"))?
         .map_err(|e| format!("serialize error: {e}"))?;
-        operator_states.insert("operator_graph".to_string(), bytes);
+        operator_states.insert("operator_graph".to_string(), bytes::Bytes::from(bytes));
 
         // Serialize MV result store — each MV gets its own entry keyed "mv:{name}".
         let mv_states = self
@@ -166,7 +352,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         watermark: i64,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
-        let source_wms: FxHashMap<Arc<str>, i64> = if let Some(ref tracker) = self.tracker {
+        #[cfg_attr(not(feature = "cluster-unstable"), allow(unused_mut))]
+        let mut source_wms: FxHashMap<Arc<str>, i64> = if let Some(ref tracker) = self.tracker {
             self.source_ids
                 .iter()
                 .filter_map(|(name, &sid)| {
@@ -178,6 +365,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         } else {
             FxHashMap::default()
         };
+
+        #[cfg(feature = "cluster-unstable")]
+        {
+            let cluster_wm = self
+                .cluster_controller
+                .as_ref()
+                .and_then(|cc| cc.cluster_min_watermark());
+            Self::cap_source_watermarks_by_cluster_min(&mut source_wms, cluster_wm);
+        }
+
         let swm_ref = if source_wms.is_empty() {
             None
         } else {
@@ -438,6 +635,43 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     ) -> bool {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
         let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
+
+        // Drain any pending `db.checkpoint()` requests first. Each
+        // request gets a capture of operator state (the same path the
+        // periodic barrier-aligned checkpoint uses), committed through
+        // the coordinator, and the full `CheckpointResult` returned on
+        // the oneshot. Without this, `db.checkpoint()` reaches the
+        // coordinator with an empty `CheckpointRequest` and the
+        // manifest has no operator state — restart loses every
+        // `IncrementalAggState` accumulator on the invoking node. See
+        // Phase 1.1 in docs/plans/cluster-production-readiness.md.
+        let mut force_reqs: Vec<
+            tokio::sync::oneshot::Sender<
+                Result<crate::checkpoint_coordinator::CheckpointResult, DbError>,
+            >,
+        > = Vec::new();
+        if let Some(rx) = self.force_ckpt_rx.as_mut() {
+            while let Ok(reply) = rx.try_recv() {
+                force_reqs.push(reply);
+            }
+        }
+        for reply_tx in force_reqs {
+            let result = self.force_capture_and_checkpoint().await;
+            let _ = reply_tx.send(result);
+        }
+
+        // Cluster mode: only the leader fires periodic checkpoints.
+        // Followers mirror the leader's epoch via `follower_checkpoint`
+        // on observed PREPARE announcements. Forced checkpoints
+        // (shutdown) run on whatever instance is shutting down.
+        #[cfg(feature = "cluster-unstable")]
+        if !force {
+            if let Some(cc) = self.cluster_controller.clone() {
+                if !cc.is_leader() {
+                    return self.maybe_follower_checkpoint(cc, source_offsets).await;
+                }
+            }
+        }
 
         // Under exactly-once, only barrier-aligned checkpoints are consistent.
         // Timer-based checkpoints are skipped (barrier path handles exactly-once).
@@ -714,6 +948,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn has_deferred_input(&self) -> bool {
+        // In cluster mode, always claim pending input so the coordinator
+        // runs `execute_cycle` each idle tick — otherwise a follower with
+        // no local source events never drains the shuffle receiver and
+        // remote rows sit stranded. Non-cluster path unchanged.
+        #[cfg(feature = "cluster-unstable")]
+        {
+            if self.cluster_controller.is_some() {
+                return true;
+            }
+        }
         self.graph.has_pending_input()
     }
 
@@ -1115,5 +1359,51 @@ mod tests {
 
         let got = tokio::time::timeout(Duration::from_millis(50), notify.notified()).await;
         assert!(got.is_err(), "non-Fail errors must not trigger shutdown");
+    }
+
+    /// Consumer-side cap is a no-op when the cluster has not yet
+    /// published a minimum watermark — otherwise every event-time
+    /// decision would freeze behind the `i64::MIN` sentinel.
+    #[cfg(feature = "cluster-unstable")]
+    #[test]
+    fn cap_source_watermarks_none_cluster_wm_leaves_map_untouched() {
+        let mut wms: FxHashMap<Arc<str>, i64> = FxHashMap::default();
+        wms.insert(Arc::from("a"), 1_000);
+        wms.insert(Arc::from("b"), 500);
+
+        ConnectorPipelineCallback::cap_source_watermarks_by_cluster_min(&mut wms, None);
+
+        assert_eq!(wms.get(&Arc::<str>::from("a")).copied(), Some(1_000));
+        assert_eq!(wms.get(&Arc::<str>::from("b")).copied(), Some(500));
+    }
+
+    /// When a cluster-wide minimum is published, sources that have
+    /// advanced past it get pulled back to it; sources at or below
+    /// the cap are left alone (cap must not push watermarks forward).
+    #[cfg(feature = "cluster-unstable")]
+    #[test]
+    fn cap_source_watermarks_lowers_only_sources_above_cluster_min() {
+        let mut wms: FxHashMap<Arc<str>, i64> = FxHashMap::default();
+        wms.insert(Arc::from("ahead"), 2_000);
+        wms.insert(Arc::from("at"), 1_500);
+        wms.insert(Arc::from("behind"), 800);
+
+        ConnectorPipelineCallback::cap_source_watermarks_by_cluster_min(&mut wms, Some(1_500));
+
+        assert_eq!(
+            wms.get(&Arc::<str>::from("ahead")).copied(),
+            Some(1_500),
+            "source above cluster min must be capped down",
+        );
+        assert_eq!(
+            wms.get(&Arc::<str>::from("at")).copied(),
+            Some(1_500),
+            "source at cluster min unchanged",
+        );
+        assert_eq!(
+            wms.get(&Arc::<str>::from("behind")).copied(),
+            Some(800),
+            "source below cluster min must NOT be advanced by the cap",
+        );
     }
 }

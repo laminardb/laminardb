@@ -407,7 +407,7 @@ mod tests {
     fn empty_config() -> ServerConfig {
         ServerConfig {
             server: ServerSection::default(),
-            state: StateSection::default(),
+            state: laminar_core::state::StateBackendConfig::default(),
             checkpoint: CheckpointSection::default(),
             sources: vec![],
             lookups: vec![],
@@ -559,7 +559,7 @@ mod tests {
         let old = empty_config();
         let mut new = empty_config();
         new.server.bind = "0.0.0.0:9999".to_string();
-        new.state.backend = "mmap".to_string();
+        new.state = laminar_core::state::StateBackendConfig::local("./data/state");
         let diff = diff_configs(&old, &new);
         assert!(diff.is_empty()); // no reloadable changes
         assert!(diff.warnings.iter().any(|w| w.contains("[server]")));

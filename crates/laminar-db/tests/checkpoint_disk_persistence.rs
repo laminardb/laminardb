@@ -67,7 +67,7 @@ async fn test_manual_checkpoint_writes_to_disk() {
 
     // Verify the store can load the manifest
     let store = FileSystemCheckpointStore::new(&storage, 3);
-    let manifest = store.load_latest().unwrap();
+    let manifest = store.load_latest().await.unwrap();
     assert!(manifest.is_some(), "manifest should be loadable from disk");
 
     let manifest = manifest.unwrap();

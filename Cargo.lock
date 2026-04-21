@@ -4511,7 +4511,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-connectors"
-version = "0.20.2"
+version = "0.21.0"
 dependencies = [
  "arrow-array",
  "arrow-avro",
@@ -4579,8 +4579,9 @@ dependencies = [
 
 [[package]]
 name = "laminar-core"
-version = "0.20.2"
+version = "0.21.0"
 dependencies = [
+ "anyhow",
  "arrayvec",
  "arrow",
  "arrow-array",
@@ -4595,6 +4596,8 @@ dependencies = [
  "crossfire",
  "equivalent",
  "foyer",
+ "futures",
+ "object_store 0.13.2",
  "parking_lot 0.12.5",
  "rand 0.10.0",
  "rkyv",
@@ -4603,10 +4606,12 @@ dependencies = [
  "serde_json",
  "smallvec",
  "sqlparser",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
  "tracing",
  "uuid",
  "xorf",
@@ -4615,7 +4620,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-db"
-version = "0.20.2"
+version = "0.21.0"
 dependencies = [
  "ahash",
  "arrow",
@@ -4623,6 +4628,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "async-trait",
+ "bytes",
  "criterion",
  "crossfire",
  "datafusion",
@@ -4634,8 +4640,11 @@ dependencies = [
  "laminar-derive",
  "laminar-sql",
  "laminar-storage",
+ "object_store 0.13.2",
  "parking_lot 0.12.5",
  "prometheus",
+ "rdkafka",
+ "rkyv",
  "rustc-hash",
  "serde",
  "serde_json",
@@ -4646,11 +4655,12 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "laminar-derive"
-version = "0.20.2"
+version = "0.21.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4664,7 +4674,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-server"
-version = "0.20.2"
+version = "0.21.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -4692,7 +4702,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tikv-jemallocator",
  "tokio",
- "toml",
+ "toml 1.1.2+spec-1.1.0",
  "tower",
  "tower-http",
  "tracing",
@@ -4703,12 +4713,13 @@ dependencies = [
 
 [[package]]
 name = "laminar-sql"
-version = "0.20.2"
+version = "0.21.0"
 dependencies = [
  "arrow",
  "arrow-array",
  "arrow-schema",
  "async-trait",
+ "bytes",
  "chrono",
  "criterion",
  "crossfire",
@@ -4725,19 +4736,19 @@ dependencies = [
  "sqlparser",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tracing",
 ]
 
 [[package]]
 name = "laminar-storage"
-version = "0.20.2"
+version = "0.21.0"
 dependencies = [
- "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "bytes",
  "futures",
  "object_store 0.13.2",
- "parquet",
  "serde",
  "serde_json",
  "sha2",
@@ -7902,6 +7913,21 @@ dependencies = [
  "futures-util",
  "pin-project-lite",
  "tokio",
+]
+
+[[package]]
+name = "toml"
+version = "0.9.12+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
+dependencies = [
+ "indexmap 2.13.0",
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime 0.7.5+spec-1.1.0",
+ "toml_parser",
+ "toml_writer",
+ "winnow 0.7.14",
 ]
 
 [[package]]

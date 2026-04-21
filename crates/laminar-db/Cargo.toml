@@ -30,16 +30,23 @@ delta-lake-all = ["delta-lake", "delta-lake-s3", "delta-lake-azure", "delta-lake
 parquet-lookup = ["laminar-connectors/parquet-lookup"]
 files = ["laminar-connectors/files"]
 otel = ["laminar-connectors/otel"]
-cluster-unstable = ["laminar-core/cluster-unstable"]
+cluster-unstable = ["laminar-core/cluster-unstable", "laminar-sql/cluster-unstable"]
+# Phase 0 failure-scenario gates. Each flips on when the corresponding
+# phase of `docs/plans/cluster-production-readiness.md` lands; the
+# cluster_e2e_failures.rs test switches its assertions from "demonstrates
+# the bug" to "demonstrates the fix" when its gate is enabled. Preferred
+# over `#[ignore]` so flipping the feature is what un-gates the test.
+phase-1-recovery = ["cluster-unstable"]
+phase-2-rebalance = ["cluster-unstable"]
 aws = ["laminar-storage/aws"]
 gcs = ["laminar-storage/gcs"]
 azure = ["laminar-storage/azure"]
 
 [dependencies]
-laminar-core = { path = "../laminar-core", version = "0.20.2" }
-laminar-sql = { path = "../laminar-sql", version = "0.20.2" }
-laminar-storage = { path = "../laminar-storage", version = "0.20.2" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.20.2" }
+laminar-core = { path = "../laminar-core", version = "0.21.0" }
+laminar-sql = { path = "../laminar-sql", version = "0.21.0" }
+laminar-storage = { path = "../laminar-storage", version = "0.21.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.21.0" }
 
 # Arrow
 arrow = { workspace = true }
@@ -55,6 +62,12 @@ datafusion-expr = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+# rkyv for operator checkpoint state. Hot-path structs (GroupCheckpoint,
+# JoinStateCheckpoint, etc.) carry Arrow IPC `Vec<u8>` blobs — serde_json
+# encoded each byte as a JSON decimal (3-4× size + per-byte format cost).
+# rkyv walks bytes raw and produces aligned archives; matches existing
+# convention (laminar-core uses it for NodeId, NodeInfo).
+rkyv = { workspace = true }
 
 # Error handling
 thiserror = { workspace = true }
@@ -87,12 +100,33 @@ tracing = { workspace = true }
 # Metrics
 prometheus = { workspace = true }
 
+# Zero-copy byte buffers (used by state backend payloads).
+bytes = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
-laminar-derive = { path = "../laminar-derive", version = "0.20.2" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.20.2", features = ["testing"] }
+laminar-derive = { path = "../laminar-derive", version = "0.21.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.21.0", features = ["testing"] }
 criterion = { workspace = true }
+bytes = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Kafka producer/admin client used by `kafka_docker_scenarios.rs` integration tests.
+# Tests skip gracefully when the Redpanda broker started by
+# `tests/docker/compose.yml` is not reachable on `localhost:19092`.
+# On Windows the build picks up OpenSSL via `OPENSSL_DIR`
+# (`C:\Program Files\OpenSSL-Win64` by default).
+
+[target.'cfg(not(target_os = "windows"))'.dev-dependencies]
+rdkafka = { version = "0.39", features = ["cmake-build", "ssl-vendored"] }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+rdkafka = { version = "0.39", features = ["cmake-build"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# S3-compatible object store client used by the MinIO-backed integration
+# test. Workspace feature set + aws for the AmazonS3 builder.
+object_store = { workspace = true, features = ["aws"] }
 
 [[bench]]
 name = "recovery_bench"
