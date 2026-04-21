@@ -176,12 +176,13 @@ impl ClusterHandle {
         info!("Received shutdown signal, shutting down cluster node...");
 
         // Tell rebalance tasks to exit at their next select point.
-        // Notifying before the abort gives them a chance to finish
-        // an in-flight `adopt_assignment_snapshot` cleanly instead
-        // of dropping the coordinator mutex mid-write.
+        // Fire all aborts before awaiting any so a slow responder
+        // doesn't serialise the others.
         self.rebalance_shutdown.notify_waiters();
-        for task in self.rebalance_tasks.drain(..) {
+        for task in &self.rebalance_tasks {
             task.abort();
+        }
+        for task in self.rebalance_tasks.drain(..) {
             let _ = task.await;
         }
 
@@ -364,30 +365,35 @@ pub async fn start_cluster(
 
     // Construct the ClusterController if we have a chitchat handle
     // (gossip discovery only — static discovery has no KV tier).
-    if let DiscoveryImpl::Gossip(ref gossip) = discovery {
-        if let Some(handle) = gossip.chitchat_handle() {
-            use laminar_core::cluster::control::{ChitchatKv, ClusterController, ClusterKv};
-            let kv: Arc<dyn ClusterKv> = Arc::new(ChitchatKv::from_handle(handle));
-            let members_rx = discovery.membership_watch();
-            let controller = Arc::new(ClusterController::new(
-                node_id,
-                kv,
-                snapshot_store.clone(),
-                members_rx,
-            ));
+    let cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>> =
+        if let DiscoveryImpl::Gossip(ref gossip) = discovery {
+            if let Some(handle) = gossip.chitchat_handle() {
+                use laminar_core::cluster::control::{ChitchatKv, ClusterController, ClusterKv};
+                let kv: Arc<dyn ClusterKv> = Arc::new(ChitchatKv::from_handle(handle));
+                let members_rx = discovery.membership_watch();
+                let controller = Arc::new(ClusterController::new(
+                    node_id,
+                    kv,
+                    snapshot_store.clone(),
+                    members_rx,
+                ));
+                info!(
+                    "ClusterController installed (leader={})",
+                    controller.is_leader()
+                );
+                builder = builder.cluster_controller(Arc::clone(&controller));
+                Some(controller)
+            } else {
+                None
+            }
+        } else {
             info!(
-                "ClusterController installed (leader={})",
-                controller.is_leader()
-            );
-            builder = builder.cluster_controller(controller);
-        }
-    } else {
-        info!(
-            "Static discovery — cluster control plane skipped \
+                "Static discovery — cluster control plane skipped \
              (no chitchat KV). Leader/follower barrier protocol \
              inactive in this mode."
-        );
-    }
+            );
+            None
+        };
 
     // Namespace checkpoints per node for partition migration reads.
     let checkpoint_url = {
@@ -417,9 +423,8 @@ pub async fn start_cluster(
         .build_object_store()
         .map_err(|e| ClusterStartupError::EngineConstruction(format!("decision store: {e}")))?
     {
-        let decision_store = Arc::new(
-            laminar_core::cluster::control::CheckpointDecisionStore::new(decision_os),
-        );
+        let decision_store =
+            Arc::new(laminar_core::cluster::control::CheckpointDecisionStore::new(decision_os));
         builder = builder.decision_store(decision_store);
     }
 
@@ -480,41 +485,31 @@ pub async fn start_cluster(
         .map_err(|e| ClusterStartupError::EngineConstruction(format!("pipeline start: {e}")))?;
     info!("Pipeline started");
 
-    // Rebalance control plane: snapshot watcher on every node,
-    // leader-gated rebalance controller on every node. Both spawn
-    // only when a snapshot store AND a chitchat-backed cluster
-    // controller are available — static-discovery deployments don't
-    // have a KV tier so the leader-rotation path can't run.
+    // Rebalance control plane. Runs only when a snapshot store AND
+    // a chitchat-backed controller are available; static discovery
+    // has no KV tier.
     let rebalance_shutdown = Arc::new(tokio::sync::Notify::new());
     let mut rebalance_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    if let Some(snap_store) = snapshot_store.clone() {
-        if let DiscoveryImpl::Gossip(ref gossip) = discovery {
-            if let Some(handle) = gossip.chitchat_handle() {
-                use laminar_core::cluster::control::{ChitchatKv, ClusterController, ClusterKv};
-                let kv: Arc<dyn ClusterKv> = Arc::new(ChitchatKv::from_handle(handle));
-                let members_rx = discovery.membership_watch();
-                let controller = Arc::new(ClusterController::new(
-                    node_id,
-                    kv,
-                    Some(Arc::clone(&snap_store)),
-                    members_rx,
-                ));
-                rebalance_tasks.push(laminar_db::rebalance::spawn_snapshot_watcher(
-                    Arc::clone(&db),
-                    Arc::clone(&snap_store),
-                    Arc::clone(&vnode_registry),
-                    Arc::clone(&rebalance_shutdown),
-                ));
-                rebalance_tasks.push(laminar_db::rebalance::spawn_rebalance_controller(
-                    Arc::clone(&db),
-                    controller,
-                    snap_store,
-                    Arc::clone(&vnode_registry),
-                    Arc::clone(&rebalance_shutdown),
-                ));
-                info!("Rebalance control plane started");
-            }
-        }
+    if let (Some(snap_store), Some(controller)) =
+        (snapshot_store.clone(), cluster_controller.as_ref())
+    {
+        let cfg = laminar_db::rebalance::RebalanceConfig::default();
+        rebalance_tasks.push(laminar_db::rebalance::spawn_snapshot_watcher(
+            Arc::clone(&db),
+            Arc::clone(&snap_store),
+            Arc::clone(&vnode_registry),
+            Arc::clone(&rebalance_shutdown),
+            cfg,
+        ));
+        rebalance_tasks.push(laminar_db::rebalance::spawn_rebalance_controller(
+            Arc::clone(&db),
+            Arc::clone(controller),
+            snap_store,
+            Arc::clone(&vnode_registry),
+            Arc::clone(&rebalance_shutdown),
+            cfg,
+        ));
+        info!("Rebalance control plane started");
     }
 
     let (app_state, api_handle) =

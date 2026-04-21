@@ -49,19 +49,10 @@ pub struct LaminarDbBuilder {
     /// Inbound shuffle handle for cluster-mode streaming aggregates.
     #[cfg(feature = "cluster-unstable")]
     shuffle_receiver: Option<std::sync::Arc<laminar_core::shuffle::ShuffleReceiver>>,
-    /// Durable cluster 2PC decision store. Written by the leader after
-    /// the prepare quorum but before announcing `Commit`, so a new
-    /// leader elected mid-2PC can recover the cluster vote. Required
-    /// for cross-instance sink 2PC correctness. Without it, recovery
-    /// falls back to blanket Abort on any Pending manifest.
+    /// Commit-marker store for cross-instance 2PC.
     #[cfg(feature = "cluster-unstable")]
-    decision_store:
-        Option<std::sync::Arc<laminar_core::cluster::control::CheckpointDecisionStore>>,
-    /// Durable assignment snapshot store. `start()` spawns a snapshot
-    /// watcher on every node and (on the current leader) a rebalance
-    /// controller that rotates snapshots when membership changes.
-    /// Without this, dynamic rebalance is inert — assignment stays
-    /// frozen at whatever was resolved at boot.
+    decision_store: Option<std::sync::Arc<laminar_core::cluster::control::CheckpointDecisionStore>>,
+    /// Assignment-snapshot store for dynamic rebalance.
     #[cfg(feature = "cluster-unstable")]
     assignment_snapshot_store:
         Option<std::sync::Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>,
@@ -195,12 +186,7 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Install the durable cluster 2PC decision store. The leader
-    /// writes `Decision::Committed` here after the prepare quorum but
-    /// before announcing `Commit`, so a new leader elected mid-2PC
-    /// can read the cluster vote from shared storage instead of
-    /// defaulting to Abort (which could split state against
-    /// already-committed followers).
+    /// Install the commit-marker store for cross-instance 2PC.
     #[cfg(feature = "cluster-unstable")]
     #[must_use]
     pub fn decision_store(
@@ -211,10 +197,7 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Install the durable assignment snapshot store. `start()` spawns
-    /// a snapshot watcher on every node and — on the current leader —
-    /// a rebalance controller that rotates the snapshot on membership
-    /// change. Without this, vnode assignment is frozen at boot.
+    /// Install the assignment-snapshot store for dynamic rebalance.
     #[cfg(feature = "cluster-unstable")]
     #[must_use]
     pub fn assignment_snapshot_store(

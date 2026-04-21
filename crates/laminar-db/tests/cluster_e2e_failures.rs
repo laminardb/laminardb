@@ -1,19 +1,5 @@
-//! Phase 0b failure-mode scenarios for the cluster acceptance suite.
-//! See `docs/plans/cluster-production-readiness.md` Phase 0b.
-//!
-//! Each scenario has two expected outcomes:
-//! - **Default build** (no phase-N feature): asserts the CURRENT buggy
-//!   behavior. Test passes on this branch today, documenting what's
-//!   broken and proving the test itself runs end-to-end.
-//! - **Feature build** (`--features phase-1-recovery` / `phase-2-rebalance`):
-//!   flipping the gate on in CI once the matching phase lands should
-//!   flip these tests to asserting CORRECT behavior. If it doesn't,
-//!   the engineer landing the fix must also flip the assertion — which
-//!   is a one-line PR change, unlike `#[ignore]` which rots silently.
-//!
-//! Using feature gates instead of `#[ignore]` is deliberate (review
-//! item H1): ignored tests go untouched for months; a feature flip in
-//! CI is impossible to forget.
+//! Cluster failure-mode acceptance tests. Scenarios are feature-gated
+//! per phase so CI flips assertions when the matching fix lands.
 
 #![cfg(feature = "cluster-unstable")]
 #![allow(clippy::disallowed_types)]
@@ -35,20 +21,8 @@ use cluster_harness::manifest_epoch;
 const VNODE_COUNT: u32 = 4;
 const N_NODES: usize = 2;
 
-/// Phase 1.4 — split-brain fence on `write_partial`.
-///
-/// Plan AC: "force two nodes to claim same vnode; one is rejected."
-/// Here the "two nodes" are modelled as two `ObjectStoreBackend`
-/// instances over the same shared-state dir — exactly what a
-/// split-brained cluster would look like from the object-store's
-/// point of view. One side has advanced its authoritative generation
-/// (via a fresh snapshot); the stale side tries to write at the old
-/// version and must be rejected.
-///
-/// This test operates directly on the backend type — the
-/// pre-write fence behavior is the contract. End-to-end wiring
-/// (pipeline_lifecycle → backend on `start()`) is covered by
-/// `start_wires_backend_fence_from_snapshot` below.
+/// Two backends over the same shared-state dir; the stale writer's
+/// `write_partial` at an older assignment version must be rejected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn split_brain_write_partial_rejected() {
     use bytes::Bytes;
@@ -91,30 +65,14 @@ async fn split_brain_write_partial_rejected() {
         other => panic!("expected StaleVersion, got {other:?}"),
     }
 
-    // Final correctness: the only bytes on disk at the shared path
-    // are the fresh side's. The stale attempt never touched storage.
-    let got = fresh
-        .read_partial(0, 1)
-        .await
-        .expect("read_partial")
-        .expect("present");
+    let got = fresh.read_partial(0, 1).await.unwrap().unwrap();
     assert_eq!(&got[..], b"fresh");
 }
 
-/// Phase 1.2 — coordinated assignment via stored snapshot.
-///
-/// The plan's AC: "partition cluster, both halves independently arrive
-/// at the same assignment from the stored snapshot." We stand in for
-/// the partition by spawning two harnesses sequentially against the
-/// same backing store. The first writes the initial snapshot via
-/// CAS-create; the second reads the snapshot back rather than
-/// recomputing. Without coordination both halves would compute
-/// `round_robin_assignment` independently against whatever peers each
-/// half could see — which during a partition is a subset, producing
-/// disjoint vnode ownership and silently split state.
+/// Post-restart cluster must adopt the stored assignment instead of
+/// recomputing from its (possibly partitioned) peer view.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn assignment_snapshot_unifies_cluster_view() {
-    // First cluster: creates the snapshot.
     let harness_a = cluster_harness::ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
     let assignment_a: Vec<cluster_harness::NodeIdView> = harness_a
         .nodes
@@ -123,12 +81,7 @@ async fn assignment_snapshot_unifies_cluster_view() {
         .collect();
     let (shared_dir, _cp_dirs) = harness_a.shutdown_keep_dirs().await;
 
-    // Second cluster pointing at the same state dir (and therefore the
-    // same `control/assignment-snapshot.json`). The boot-time resolve
-    // path must load the existing snapshot instead of re-computing.
-    let cp_dirs2: Vec<_> = (0..N_NODES)
-        .map(|_| tempfile::tempdir().expect("cp dir"))
-        .collect();
+    let cp_dirs2: Vec<_> = (0..N_NODES).map(|_| tempfile::tempdir().unwrap()).collect();
     let harness_b = cluster_harness::ClusterEngineHarness::spawn_with_dirs(
         N_NODES,
         VNODE_COUNT,
@@ -142,134 +95,70 @@ async fn assignment_snapshot_unifies_cluster_view() {
         .map(|n| (n.instance_id, n.owned_vnodes()))
         .collect();
 
-    assert_eq!(
-        assignment_a, assignment_b,
-        "post-restart cluster must adopt the stored assignment \
-         (independent round-robin recompute would disagree here if, \
-         say, the sort order of peer ids ever changed or a new peer \
-         joined)",
-    );
+    assert_eq!(assignment_a, assignment_b);
     harness_b.shutdown().await;
 }
 
-/// Cluster 2PC durable decision — every successful leader checkpoint
-/// must record `Decision::Committed` for the epoch BEFORE the
-/// `Commit` announcement goes out. Without this marker a new leader
-/// elected mid-2PC can't distinguish "leader crashed before reaching
-/// the commit point" from "leader crashed after announcing Commit,
-/// some followers already committed", so it falls back to a blanket
-/// abort and splits state.
-///
-/// This test drives a real engine-level checkpoint through the
-/// harness and then reads the decision store directly. A regression
-/// where the leader skips recording — or records after announcing —
-/// trips this assertion.
+/// A successful leader checkpoint must leave a durable commit marker
+/// for the epoch. Without it, a new leader elected mid-2PC defaults
+/// to Abort and splits state against followers that already
+/// committed on the old leader's Commit announcement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn checkpoint_records_durable_commit_decision() {
-    use laminar_core::cluster::control::Decision;
-
-    let harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+async fn checkpoint_records_durable_commit_marker() {
+    let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
     for node in &harness.nodes {
         setup_query(&node.db).await;
     }
     harness.start_all().await;
 
-    let leader_idx = harness.leader_idx();
-    let leader = &harness.nodes[leader_idx];
-
-    // Happy-path checkpoint — after this returns the decision store
-    // MUST carry the epoch's verdict.
+    let leader = &harness.nodes[harness.leader_idx()];
     let result = leader.db.checkpoint().await.expect("leader checkpoint");
     assert!(result.success, "leader checkpoint: {:?}", result.error);
 
-    // Any node's handle points to the same shared store; reading via
-    // the leader is symmetric to reading via any follower.
-    let verdict = leader
-        .decision_store
-        .load(result.epoch)
-        .await
-        .expect("decision store load");
-    assert_eq!(
-        verdict,
-        Some(Decision::Committed),
-        "decision store must record Committed for the just-completed epoch \
-         (if None, the leader announced Commit without the durable write — \
-         that's the gap-1 correctness bug)",
-    );
-
-    // Same verdict observable from the follower's handle — proves the
-    // store is genuinely cluster-shared, not per-node.
-    for follower_idx in harness.follower_idxs() {
-        let v = harness.nodes[follower_idx]
+    assert!(
+        leader
             .decision_store
-            .load(result.epoch)
+            .is_committed(result.epoch)
             .await
-            .expect("follower decision read");
-        assert_eq!(v, Some(Decision::Committed));
+            .expect("marker read"),
+        "commit marker must exist for the just-completed epoch",
+    );
+    // The store is cluster-shared: every follower sees the same marker.
+    for idx in harness.follower_idxs() {
+        assert!(harness.nodes[idx]
+            .decision_store
+            .is_committed(result.epoch)
+            .await
+            .unwrap());
     }
 
     harness.shutdown().await;
 }
 
-/// Phase 1.4 — the boot path must hand the backend its fence generation.
-///
-/// Before this wiring existed, `ObjectStoreBackend::authoritative_version`
-/// stayed at 0 in production forever (the harness hid the bug by calling
-/// `set_authoritative_version` manually before the builder saw the
-/// backend). A stale writer that reconnected after a snapshot rotation
-/// could then plant writes at the old generation with no rejection.
-///
-/// The harness now constructs the backend unconfigured and relies on
-/// `pipeline_lifecycle::start` to lift the registry's snapshot version
-/// into it. This test pins that contract: pre-start every backend
-/// reports 0, post-start every backend matches its node's registry.
+/// Boot path lifts the registry's snapshot version into the backend
+/// fence so the Phase 1.4 guard fires in production.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn start_wires_backend_fence_from_snapshot() {
-    let harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+    let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
 
-    // Pre-start: the harness no longer pre-sets the fence. Every
-    // backend is unconfigured — if this ever flips to non-zero the
-    // harness has silently regained the short-circuit.
     for node in &harness.nodes {
-        assert_eq!(
-            node.state_backend.authoritative_version(),
-            0,
-            "backend pre-start authoritative_version should be 0 \
-             (harness must not short-circuit the boot-time wiring)",
-        );
+        assert_eq!(node.state_backend.authoritative_version(), 0);
     }
 
-    // Some DDL is required so `start()` takes the pipeline-lifecycle
-    // branch that installs the fence (the embedded branch returns
-    // before touching the coordinator/backend).
+    // DDL is required so `start()` takes the branch that installs
+    // the fence; the embedded branch returns before touching it.
     for node in &harness.nodes {
         setup_query(&node.db).await;
     }
     harness.start_all().await;
 
-    // Post-start: every node's backend carries the snapshot generation
-    // its registry was seeded with. If the two diverge, one of the
-    // wiring paths (registry side or backend side) has dropped the
-    // snapshot and the fence is either off or stamping the wrong
-    // version.
     for node in &harness.nodes {
-        let registry_version = node.vnode_registry.assignment_version();
-        let backend_version = node.state_backend.authoritative_version();
-        assert!(
-            registry_version > 0,
-            "registry version must be >0 after snapshot load; got {registry_version}",
-        );
-        assert_eq!(
-            backend_version, registry_version,
-            "backend authoritative_version did not track snapshot generation \
-             for node {:?}: backend={backend_version}, registry={registry_version}",
-            node.instance_id,
-        );
+        let registry_v = node.vnode_registry.assignment_version();
+        let backend_v = node.state_backend.authoritative_version();
+        assert!(registry_v > 0);
+        assert_eq!(backend_v, registry_v);
     }
 
-    // And the fence actually fires: a write stamped below the
-    // authoritative version is rejected. Proves the version isn't just
-    // stored-but-ignored.
     use bytes::Bytes;
     use laminar_core::state::StateBackendError;
     let node = &harness.nodes[0];
@@ -294,10 +183,6 @@ async fn start_wires_backend_fence_from_snapshot() {
     harness.shutdown().await;
 }
 
-/// Install `CREATE SOURCE` + `CREATE MATERIALIZED VIEW sums` on a single
-/// engine. Idempotent-ish: succeeds the first time; on a post-restart
-/// engine the MV may already exist from restored state (tracked under
-/// Phase 1.1 — OR REPLACE semantics).
 async fn setup_query(db: &laminar_db::LaminarDB) {
     db.execute("CREATE SOURCE src (key BIGINT, value BIGINT)")
         .await
@@ -310,9 +195,8 @@ async fn setup_query(db: &laminar_db::LaminarDB) {
     .expect("CREATE MATERIALIZED VIEW");
 }
 
-/// Snapshot the `sums` MV across every node in a harness and union the
-/// rows. With row-shuffle, each node only holds its locally-owned keys,
-/// so the cluster's observable state is always the union.
+/// Union the `sums` MV rows across every node — with row-shuffle each
+/// node holds only its owned keys.
 async fn union_sums(harness: &ClusterEngineHarness) -> HashSet<(i64, i64)> {
     let mut out = HashSet::new();
     for node in &harness.nodes {
@@ -323,21 +207,10 @@ async fn union_sums(harness: &ClusterEngineHarness) -> HashSet<(i64, i64)> {
     out
 }
 
-/// Scenario 1 — crash mid-stream.
-///
-/// The follower is killed without a clean `Left` announcement, exercising
-/// phi-accrual detection rather than the gossip-primitive graceful-leave
-/// path (review item C5: `kill()` would mask the production failure
-/// mode). Phi-accrual at `phi=3.0, gossip=50ms, grace=1s` detects loss
-/// in 1-3 seconds; the scenario budgets 4s of slack.
-///
-/// Default build asserts the CURRENT bug: rows hashed to the dead node's
-/// vnodes are silently dropped (the `send_to` write to a broken socket
-/// returns `Err` and the row-shuffle path intentionally drops rather
-/// than retrying — at-least-once is the source's responsibility). Phase
-/// 2.3 (dynamic rebalance) flips this to "leader picks up the dead
-/// node's vnodes; totals remain correct"; the `phase-2-rebalance`
-/// feature gate reconciles.
+/// Follower crashes mid-stream via phi-accrual (no graceful Left).
+/// Default build asserts current behavior: rows for the dead node's
+/// vnodes are dropped. `phase-2-rebalance` flips to "leader picks up
+/// the dead node's vnodes; totals remain correct".
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn crash_mid_stream_loses_in_flight() {
     let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
@@ -383,22 +256,14 @@ async fn crash_mid_stream_loses_in_flight() {
     let pre_crash = union_sums(&harness).await;
     assert_eq!(pre_crash.len(), 8, "all 8 keys present before crash");
 
-    // Phase B: CRASH follower (no graceful Left). Both the gossip handle
-    // and the engine runtime go: the former so phi-accrual fires, the
-    // latter so the shuffle receiver stops reading. We drop both and let
-    // the tokio runtime behind the engine wind down on its own; a real
-    // crash wouldn't unwind gracefully either.
+    // Crash the follower — drop both the engine and the gossip
+    // handle so phi-accrual fires.
     let crashed_runtime = harness.nodes.swap_remove(follower_idx);
     let crashed_node = harness.cluster.nodes.swap_remove(follower_idx);
     drop(crashed_runtime);
     crashed_node.crash().await;
-
-    // Phi-accrual convergence window.
     sleep(Duration::from_secs(4)).await;
 
-    // Phase C: push rows targeting follower's vnodes. Without Phase 2.3,
-    // these row-shuffle sends hit a dead TCP peer and drop. With it,
-    // the leader rebalances and accepts them locally.
     let phase_c = input_batch(&follower_keys);
     let src = harness.nodes[0]
         .db
@@ -412,57 +277,32 @@ async fn crash_mid_stream_loses_in_flight() {
 
     #[cfg(not(feature = "phase-2-rebalance"))]
     {
-        // Current behavior: leader's MV has ONLY the keys it originally
-        // owned (phase_a). Follower's keys from phase_a died with the
-        // follower; phase_c rows are lost on ship.
+        // Default build: leader holds only its originally-owned keys.
         let expected_keys: HashSet<i64> = key_buckets[0].1.iter().copied().collect();
-        assert_eq!(
-            post_crash_leader_keys, expected_keys,
-            "default build asserts row-loss for crashed-vnode shipments; \
-             leader should hold ONLY its originally-owned keys. \
-             post_crash_leader={post_crash_leader:?}",
-        );
+        assert_eq!(post_crash_leader_keys, expected_keys);
     }
     #[cfg(feature = "phase-2-rebalance")]
     {
-        // Phase 2.3 contract: leader takes over follower's vnodes;
-        // pre-crash follower-bound rows survive AND phase_c rows land
-        // on the leader's MV. All 8 keys present on the leader, with
-        // follower_keys' values doubled (phase_a + phase_c both
-        // contributed, both at value = key * 10).
+        // After rebalance the leader inherits the follower's vnodes;
+        // follower_keys pick up phase_a + phase_c contributions.
         let all_keys: HashSet<i64> = phase_a.iter().copied().collect::<HashSet<_>>();
-        assert_eq!(
-            post_crash_leader_keys, all_keys,
-            "phase-2-rebalance: leader must hold all keys after rebalance",
-        );
+        assert_eq!(post_crash_leader_keys, all_keys);
         for (k, total) in &post_crash_leader {
             let expected = if follower_keys.contains(k) {
-                k * 10 + k * 10 // phase_a + phase_c contributions
+                k * 10 + k * 10
             } else {
                 k * 10
             };
-            assert_eq!(
-                *total, expected,
-                "key {k} total should be {expected}, got {total}",
-            );
+            assert_eq!(*total, expected);
         }
     }
 
     harness.shutdown().await;
 }
 
-/// Scenario 2 — restart preserves aggregate state.
-///
-/// Feature-gated behind `phase-1-recovery`: needs the MV catalog
-/// re-create path to handle already-existing MVs (CREATE OR REPLACE, or
-/// restore-first semantics).
-///
-/// Scope: `SUM` + `MvStorageMode::Aggregate` only.
-///
-/// Includes an intermediate-snapshot assertion: after restart, before
-/// the second push, the union MUST equal the pre-shutdown state.
-/// Without it a "restart dropped state; second push repopulated by
-/// coincidence" bug would masquerade as recovery.
+/// Restart preserves SUM aggregate state. Includes an
+/// intermediate-snapshot assertion so a "restart dropped state; second
+/// push repopulated" regression doesn't masquerade as recovery.
 #[cfg(feature = "phase-1-recovery")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restart_recovers_sum_aggregate() {
@@ -474,7 +314,7 @@ async fn restart_recovers_sum_aggregate() {
         .with_test_writer()
         .try_init();
 
-    let harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+    let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
     let leader_idx = harness.leader_idx();
     let follower_idx = harness.follower_idxs()[0];
 

@@ -113,25 +113,15 @@ pub struct LaminarDB {
     #[cfg(feature = "cluster-unstable")]
     pub(crate) shuffle_receiver:
         parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleReceiver>>>,
-    /// Durable cluster 2PC decision store. Installed via
-    /// `LaminarDbBuilder::decision_store`. Read on startup and written
-    /// by the leader at the commit point — see
-    /// [`CheckpointCoordinator::set_decision_store`] for the protocol.
+    /// Shared commit-marker store. Installed via the builder.
     #[cfg(feature = "cluster-unstable")]
-    pub(crate) decision_store: parking_lot::Mutex<
-        Option<Arc<laminar_core::cluster::control::CheckpointDecisionStore>>,
-    >,
-    /// Durable assignment snapshot store. Read on startup (leader
-    /// seeds via CAS-create, followers adopt); watched post-boot by
-    /// the snapshot watcher task for rotations produced by the
-    /// rebalance controller. The rebalance background tasks
-    /// themselves are spawned externally by the caller
-    /// (`server/cluster.rs` and the test harness) via
-    /// [`crate::rebalance`], which owns their lifecycle.
+    pub(crate) decision_store:
+        parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::CheckpointDecisionStore>>>,
+    /// Shared vnode-assignment snapshot store. Installed via the
+    /// builder; the rebalance tasks (spawned by the caller) watch it.
     #[cfg(feature = "cluster-unstable")]
-    pub(crate) assignment_snapshot_store: parking_lot::Mutex<
-        Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>,
-    >,
+    pub(crate) assignment_snapshot_store:
+        parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>>,
     /// Forwards `db.checkpoint()` requests to the running pipeline so
     /// the callback captures operator state before the manifest is
     /// packed. `None` before `start()` or after `shutdown()`; when
@@ -341,9 +331,7 @@ impl LaminarDB {
         *self.shuffle_receiver.lock() = Some(receiver);
     }
 
-    /// Install the durable cluster 2PC decision store. Must be called
-    /// before `start()`; the coordinator picks it up when constructed
-    /// in `pipeline_lifecycle`.
+    /// Install the commit-marker store. Must be called before `start()`.
     #[cfg(feature = "cluster-unstable")]
     pub fn set_decision_store(
         &self,
@@ -352,9 +340,7 @@ impl LaminarDB {
         *self.decision_store.lock() = Some(store);
     }
 
-    /// Install the durable assignment snapshot store. Must be called
-    /// before `start()`; `start()` spawns the snapshot watcher and —
-    /// on the leader — the rebalance controller.
+    /// Install the assignment snapshot store. Must be called before `start()`.
     #[cfg(feature = "cluster-unstable")]
     pub fn set_assignment_snapshot_store(
         &self,
@@ -363,23 +349,10 @@ impl LaminarDB {
         *self.assignment_snapshot_store.lock() = Some(store);
     }
 
-    /// Adopt a new [`AssignmentSnapshot`] durably produced by a
-    /// rebalance. Atomically updates the `VnodeRegistry`, the state
-    /// backend's authoritative fence version, and the
-    /// `CheckpointCoordinator`'s per-write caller version. Takes the
-    /// coordinator's async mutex so it serializes with any
-    /// in-progress checkpoint — the adopting node observes the
-    /// snapshot strictly between epochs.
-    ///
-    /// Idempotent: snapshots at or below the current registry version
-    /// are a no-op.
-    ///
-    /// # Errors
-    /// Infallible today — returns `()` so a future version that
-    /// notifies connectors about ownership changes can surface
-    /// failures.
-    ///
-    /// [`AssignmentSnapshot`]: laminar_core::cluster::control::AssignmentSnapshot
+    /// Adopt a new assignment snapshot: update the registry, backend
+    /// fence, and coordinator under the coordinator mutex so the
+    /// change lands strictly between checkpoints. Idempotent for
+    /// versions at or below the current registry version.
     #[cfg(feature = "cluster-unstable")]
     pub async fn adopt_assignment_snapshot(
         &self,
@@ -395,9 +368,8 @@ impl LaminarDB {
         let new_assignment: Arc<[laminar_core::state::NodeId]> =
             snapshot.to_vnode_vec(vnode_count).into();
 
-        // Serialize with any in-flight checkpoint so the registry
-        // swap and the coordinator's cached caller version move as
-        // a single atomic step from the coordinator's perspective.
+        // Hold the coord mutex so the registry and fence update land
+        // between epochs from the coordinator's perspective.
         let mut guard = self.coordinator.lock().await;
         registry.set_assignment_and_version(new_assignment, snapshot.version);
         if let Some(backend) = self.state_backend.lock().clone() {
@@ -417,10 +389,7 @@ impl LaminarDB {
         }
         drop(guard);
 
-        tracing::info!(
-            version = snapshot.version,
-            "adopted assignment snapshot",
-        );
+        tracing::info!(version = snapshot.version, "adopted assignment snapshot",);
     }
 
     /// Install the cluster control facade. Called by

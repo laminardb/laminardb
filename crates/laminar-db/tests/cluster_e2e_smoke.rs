@@ -1,12 +1,4 @@
-//! Phase 0 smoke test: 2 nodes, real planner, row-shuffle pre-aggregate,
-//! materialized-view aggregate, no faults.
-//!
-//! What this proves:
-//! - The streaming aggregate path (`IncrementalAggState` + row-shuffle
-//!   bridge) routes rows to the vnode owner.
-//! - The MV result store reflects the post-shuffle sums.
-//! - 2PC checkpoint completes end-to-end (leader Prepare → follower
-//!   `follower_checkpoint` → leader Commit).
+//! Happy-path cluster smoke: 2 nodes, row-shuffle, MV, 2PC checkpoint.
 
 #![cfg(feature = "cluster-unstable")]
 #![allow(clippy::disallowed_types)]
@@ -36,31 +28,28 @@ async fn happy_path_eight_keys_correct_sums() {
         .with_test_writer()
         .try_init();
 
-    let harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+    let mut harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
     let leader_idx = harness.leader_idx();
     let follower_idx = harness.follower_idxs()[0];
-    let leader_node = &harness.nodes[leader_idx];
-    let follower_node = &harness.nodes[follower_idx];
 
-    // Pre-compute keys whose hashes split across both owners.
-    // Without this, target_partitions=4 + 4 vnodes could let every key
-    // land on the leader and the test would pass without exercising the
-    // cross-node shuffle (review item H4: "gate test that hides bugs").
-    let owners = vec![
-        (leader_node.instance_id, leader_node.owned_vnodes()),
-        (follower_node.instance_id, follower_node.owned_vnodes()),
-    ];
-    let key_buckets = pick_keys_per_owner(VNODE_COUNT, &owners, 4)
-        .expect("pick_keys_per_owner: search range too small");
+    // Pick keys whose hashes split across both owners so the test
+    // actually exercises the cross-node shuffle.
+    let key_buckets = {
+        let leader = &harness.nodes[leader_idx];
+        let follower = &harness.nodes[follower_idx];
+        let owners = vec![
+            (leader.instance_id, leader.owned_vnodes()),
+            (follower.instance_id, follower.owned_vnodes()),
+        ];
+        pick_keys_per_owner(VNODE_COUNT, &owners, 4)
+            .expect("pick_keys_per_owner: search range too small")
+    };
     let all_keys: Vec<i64> = key_buckets
         .iter()
         .flat_map(|(_, ks)| ks.iter().copied())
         .collect();
     assert_eq!(all_keys.len(), 8, "want 4 keys per owner");
 
-    // DDL on every node so the planner has identical catalogs. DDL
-    // precedes start_all() so the pipeline coordinator picks up the
-    // sources and MV at startup (pipeline_lifecycle.rs:237).
     for node in &harness.nodes {
         node.db
             .execute("CREATE SOURCE src (key BIGINT, value BIGINT)")
@@ -76,19 +65,16 @@ async fn happy_path_eight_keys_correct_sums() {
     }
     harness.start_all().await;
 
-    // Push all 8 rows to the leader. Rows hashed to follower's vnodes
-    // travel via `ShuffleSender` -> follower's `ShuffleReceiver` ->
-    // FinalPartitioned on the follower.
+    let leader_node = &harness.nodes[leader_idx];
+    let follower_node = &harness.nodes[follower_idx];
     let src = leader_node
         .db
         .source_untyped("src")
         .expect("source_untyped on leader");
     src.push_arrow(input_batch(&all_keys)).expect("push_arrow");
 
-    // Trigger a manual checkpoint — this acts as a synchronization
-    // barrier (review item H2: never poll for row count, can lock onto
-    // a transient wrong state). Leader's `checkpoint()` returns once
-    // 2PC commits, which requires the follower has also processed the
+    // Manual checkpoint acts as a synchronization barrier — returns
+    // once 2PC commits, which requires the follower has processed the
     // post-shuffle data.
     let result = leader_node
         .db
@@ -101,18 +87,15 @@ async fn happy_path_eight_keys_correct_sums() {
         result.error,
     );
 
-    // The barrier guarantees state-backend partials are durable, but
-    // the per-cycle MV emit lags one streaming-coordinator step behind
-    // the FinalAggregate output. A short settle window covers that gap.
+    // The MV emit lags one coordinator step behind FinalAggregate —
+    // short settle window covers that gap.
     sleep(Duration::from_millis(500)).await;
 
     let leader_rows = read_mv_sums(&leader_node.db, "sums").await;
     let follower_rows = read_mv_sums(&follower_node.db, "sums").await;
 
-    // Implementation-agnostic assertions:
-    //   1. Follower has at least one row → cross-node shuffle ran.
-    //   2. Keys are disjoint across nodes (vnode ownership is disjoint).
-    //   3. Union exactly equals the input keys with `total = key * 10`.
+    // Follower row count proves shuffle ran; key sets are disjoint;
+    // union matches input with total = key * 10.
     assert!(
         !follower_rows.is_empty(),
         "follower MV is empty — shuffle didn't deliver any partials. \
@@ -141,9 +124,8 @@ async fn happy_path_eight_keys_correct_sums() {
         "union of MVs does not match input:\n got  {union:?}\n want {expected:?}",
     );
 
-    // Cross-node epoch sanity: both nodes' persisted manifest should be
-    // at the epoch the leader's checkpoint just committed, ±1 (review
-    // item H5). Wider drift signals a 2PC-mirror miss.
+    // Both nodes' manifest epoch should track the committed epoch ±1;
+    // wider drift signals a 2PC-mirror miss.
     let leader_epoch = manifest_epoch(&leader_node.db).await;
     let follower_epoch = manifest_epoch(&follower_node.db).await;
     assert!(

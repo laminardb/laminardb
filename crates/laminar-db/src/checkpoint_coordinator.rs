@@ -190,11 +190,9 @@ pub struct CheckpointCoordinator {
     /// Stamped into every `write_partial` for the Phase 1.4 fence.
     /// Zero = fence disabled.
     assignment_version: u64,
-    /// Durable cluster-wide 2PC decision store. Written by the leader
-    /// after the prepare quorum but before the `Commit` announcement,
-    /// so a new leader elected mid-2PC can recover the cluster vote
-    /// from shared storage instead of guessing. `None` disables the
-    /// durable-decision path (single-instance).
+    /// Shared commit-marker store. Written before `Commit` is
+    /// announced; absence means "no quorum, safe to abort". `None`
+    /// in single-instance mode.
     #[cfg(feature = "cluster-unstable")]
     decision_store: Option<Arc<laminar_core::cluster::control::CheckpointDecisionStore>>,
     /// Reported in each `BarrierAck`; the leader folds these with its
@@ -294,12 +292,7 @@ impl CheckpointCoordinator {
         self.state_backend = Some(backend);
     }
 
-    /// Plug in the shared 2PC decision store. In cluster mode the
-    /// leader writes `Committed` here after the prepare quorum but
-    /// before announcing `Commit`, so a new leader elected mid-2PC
-    /// can recover the cluster's verdict from shared storage. On
-    /// startup, every node consults this store for any Pending epoch
-    /// in its local manifest (see [`Self::reconcile_prepared_on_init`]).
+    /// Install the shared commit-marker store.
     #[cfg(feature = "cluster-unstable")]
     pub fn set_decision_store(
         &mut self,
@@ -633,31 +626,13 @@ impl CheckpointCoordinator {
         futures::future::try_join_all(writes).await.map(|_| ())
     }
 
-    /// At startup: if the last persisted manifest on this node has
-    /// any `Pending` sink, consult the shared 2PC decision store for
-    /// the authoritative verdict and drive local sinks to match.
-    /// Called on both leaders and followers, so a crashed node coming
-    /// back can heal its own half-committed state without waiting for
-    /// leader coordination.
-    ///
-    /// Protocol:
-    /// - `Decision::Committed` → drive local sinks commit (idempotent —
-    ///   Kafka `commit_transaction` on an already-committed txid is a
-    ///   fast-path no-op), rewrite the manifest's Pending entries with
-    ///   the commit statuses we produced. If this node is currently
-    ///   leader, also re-announce `Commit` so any still-Prepared
-    ///   followers finish committing.
-    /// - `Decision::Aborted` or no decision recorded → roll back local
-    ///   sinks and (if leader) announce `Abort`.
-    ///
-    /// Absence of a decision marker is the "no quorum ever achieved"
-    /// case — a leader that crashed before the commit-point write
-    /// leaves followers in Prepared state, and the safe default is
-    /// to release them. The decision store is the pivot: with it the
-    /// protocol is always consistent.
+    /// On startup, reconcile any Pending sinks in the last manifest
+    /// against the durable commit marker. Marker present → drive
+    /// local commit (idempotent); marker absent → rollback. Runs on
+    /// every node; the leader additionally re-announces the decision.
     #[cfg(feature = "cluster-unstable")]
     pub async fn reconcile_prepared_on_init(&self) {
-        use laminar_core::cluster::control::{Decision, Phase};
+        use laminar_core::cluster::control::Phase;
 
         let Ok(Some(last)) = self.store.load_latest().await else {
             return;
@@ -673,21 +648,15 @@ impl CheckpointCoordinator {
         let epoch = last.epoch;
         let checkpoint_id = last.checkpoint_id;
 
-        let decision = match self.decision_store.as_ref() {
-            Some(ds) => match ds.load(epoch).await {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(
-                        epoch,
-                        checkpoint_id,
-                        error = %e,
-                        "[LDB-6040] failed to read decision store during recovery — \
-                         defaulting to Abort",
-                    );
-                    None
-                }
-            },
-            None => None,
+        let committed = match self.decision_store.as_ref() {
+            Some(ds) => ds.is_committed(epoch).await.unwrap_or_else(|e| {
+                warn!(
+                    epoch, checkpoint_id, error = %e,
+                    "[LDB-6040] decision store read failed — defaulting to Abort",
+                );
+                false
+            }),
+            None => false,
         };
 
         let is_leader = self
@@ -695,69 +664,44 @@ impl CheckpointCoordinator {
             .as_ref()
             .is_some_and(|cc| cc.is_leader());
 
-        match decision {
-            Some(Decision::Committed) => {
-                info!(
-                    epoch,
-                    checkpoint_id,
-                    "[LDB-6041] decision=Committed — driving local sinks to commit on startup",
-                );
-                let statuses = self.commit_sinks_tracked(epoch).await;
-                if let Err(e) = self.persist_recovered_statuses(checkpoint_id, statuses).await {
-                    warn!(
-                        epoch,
-                        checkpoint_id,
-                        error = %e,
-                        "[LDB-6042] post-recovery manifest update failed",
-                    );
-                }
-                if is_leader {
-                    self.announce_if_leader(epoch, checkpoint_id, Phase::Commit, None)
-                        .await;
-                }
+        if committed {
+            info!(
+                epoch,
+                checkpoint_id, "recovering Pending epoch as Committed"
+            );
+            let statuses = self.commit_sinks_tracked(epoch).await;
+            if let Err(e) = self
+                .persist_recovered_statuses(checkpoint_id, statuses)
+                .await
+            {
+                warn!(epoch, checkpoint_id, error = %e, "post-recovery manifest update failed");
             }
-            Some(Decision::Aborted) | None => {
-                if decision.is_some() {
-                    info!(
-                        epoch,
-                        checkpoint_id,
-                        "[LDB-6043] decision=Aborted — rolling back local sinks on startup",
-                    );
-                } else {
-                    warn!(
-                        epoch,
-                        checkpoint_id,
-                        "[LDB-6035] orphaned prepared epoch and no commit decision — \
-                         rolling back local sinks",
-                    );
-                }
-                if let Err(e) = self.rollback_sinks(epoch).await {
-                    error!(
-                        epoch,
-                        checkpoint_id,
-                        error = %e,
-                        "[LDB-6044] sink rollback failed during recovery",
-                    );
-                }
-                if is_leader {
-                    self.announce_if_leader(epoch, checkpoint_id, Phase::Abort, None)
-                        .await;
-                }
+            if is_leader {
+                self.announce_if_leader(epoch, checkpoint_id, Phase::Commit, None)
+                    .await;
+            }
+        } else {
+            warn!(
+                epoch,
+                checkpoint_id, "[LDB-6035] Pending epoch with no commit marker — rolling back",
+            );
+            if let Err(e) = self.rollback_sinks(epoch).await {
+                error!(epoch, checkpoint_id, error = %e, "sink rollback failed during recovery");
+            }
+            if is_leader {
+                self.announce_if_leader(epoch, checkpoint_id, Phase::Abort, None)
+                    .await;
             }
         }
 
-        // Small pause lets the leader's announcement gossip out
-        // before the next tick triggers a fresh Prepare. No-op on
-        // followers.
+        // Brief pause so the announcement gossips before the next checkpoint tick.
         if is_leader {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 
-    /// Overwrite the Pending sink statuses on the last persisted
-    /// manifest with the outcomes we produced during recovery. Called
-    /// by [`Self::reconcile_prepared_on_init`] after it drives local
-    /// sinks to the decision-store verdict.
+    /// Overwrite the Pending sink statuses on the last manifest with
+    /// the outcomes produced during recovery.
     #[cfg(feature = "cluster-unstable")]
     async fn persist_recovered_statuses(
         &self,
@@ -1161,48 +1105,35 @@ impl CheckpointCoordinator {
                 _ => {}
             }
             if Instant::now() >= deadline {
-                // Announcement never arrived. Before rolling back —
-                // which used to be unconditional and could violate the
-                // cluster's 2PC if the leader already recorded a
-                // `Committed` decision and then crashed — consult the
-                // durable decision store. Recorded=Committed means the
-                // leader got past the commit point; this follower must
-                // drive the commit itself (idempotent). Aborted or
-                // absent → safe rollback.
-                let verdict = match self.decision_store.as_ref() {
-                    Some(ds) => ds.load(epoch).await.unwrap_or_else(|e| {
+                // No announcement arrived. Consult the commit marker:
+                // if present, the leader got past the commit point
+                // and we must drive our local commit to match.
+                let committed = match self.decision_store.as_ref() {
+                    Some(ds) => ds.is_committed(epoch).await.unwrap_or_else(|e| {
                         warn!(
-                            epoch,
-                            checkpoint_id,
-                            error = %e,
-                            "[LDB-6045] decision store read failed on follower timeout \
-                             — defaulting to Abort",
+                            epoch, checkpoint_id, error = %e,
+                            "[LDB-6045] decision store read failed — defaulting to Abort",
                         );
-                        None
+                        false
                     }),
-                    None => None,
+                    None => false,
                 };
-                match verdict {
-                    Some(laminar_core::cluster::control::Decision::Committed) => {
-                        warn!(
-                            epoch,
-                            checkpoint_id,
-                            "[LDB-6046] follower decision timeout but decision=Committed \
-                             — driving local commit to match cluster vote",
-                        );
-                        return Ok(self.drive_follower_commit(epoch, checkpoint_id).await);
-                    }
-                    Some(laminar_core::cluster::control::Decision::Aborted) | None => {
-                        warn!(
-                            epoch,
-                            checkpoint_id,
-                            "[LDB-6034] follower decision timeout; rolling back local prepare",
-                        );
-                        self.rollback_sinks(epoch).await.ok();
-                        self.checkpoints_failed += 1;
-                        return Ok(false);
-                    }
+                if committed {
+                    warn!(
+                        epoch,
+                        checkpoint_id,
+                        "[LDB-6046] follower timeout but marker present — driving commit",
+                    );
+                    return Ok(self.drive_follower_commit(epoch, checkpoint_id).await);
                 }
+                warn!(
+                    epoch,
+                    checkpoint_id,
+                    "[LDB-6034] follower decision timeout; rolling back local prepare",
+                );
+                self.rollback_sinks(epoch).await.ok();
+                self.checkpoints_failed += 1;
+                return Ok(false);
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -1233,7 +1164,10 @@ impl CheckpointCoordinator {
         // Committed statuses we just produced. Recovery inspects
         // these; leaving them Pending makes the follower look as if
         // sinks were still in flight.
-        if let Err(e) = self.persist_recovered_statuses(checkpoint_id, statuses).await {
+        if let Err(e) = self
+            .persist_recovered_statuses(checkpoint_id, statuses)
+            .await
+        {
             warn!(
                 checkpoint_id,
                 epoch,
@@ -1585,98 +1519,47 @@ impl CheckpointCoordinator {
             }
         }
 
-        // Cluster 2PC commit point. Durable `Decision::Committed`
-        // must land on shared storage BEFORE the `Commit`
-        // announcement goes out, so a new leader elected between
-        // here and any follower's local commit can recover the
-        // cluster vote from object storage instead of defaulting to
-        // Abort. If the CAS reveals a prior `Aborted` verdict (e.g.
-        // a racing leader aborted first on its own path), we honor
-        // it and fall through to the abort handling below.
+        // Record the commit marker on shared storage BEFORE announcing
+        // Commit. A new leader elected between here and any follower's
+        // local commit will read the marker on recovery and re-drive
+        // commit instead of defaulting to Abort. If recording fails
+        // we abort rather than commit without durability.
         #[cfg(feature = "cluster-unstable")]
-        if self.cluster_controller.as_ref().is_some_and(|cc| cc.is_leader()) {
+        if self
+            .cluster_controller
+            .as_ref()
+            .is_some_and(|cc| cc.is_leader())
+        {
             if let Some(ref ds) = self.decision_store {
-                use laminar_core::cluster::control::{Decision, RecordOutcome};
-                match ds.record(epoch, Decision::Committed).await {
-                    Ok(
-                        RecordOutcome::Recorded
-                        | RecordOutcome::AlreadyRecorded(Decision::Committed),
-                    ) => {}
-                    Ok(RecordOutcome::AlreadyRecorded(Decision::Aborted)) => {
-                        warn!(
-                            checkpoint_id,
-                            epoch,
-                            "[LDB-6036] decision store already records Aborted for \
-                             this epoch — honoring the persisted verdict and \
-                             rolling back",
-                        );
-                        self.announce_if_leader(
-                            epoch,
-                            checkpoint_id,
-                            laminar_core::cluster::control::Phase::Abort,
-                            None,
-                        )
-                        .await;
-                        self.checkpoints_failed += 1;
-                        self.phase = CheckpointPhase::Idle;
-                        let duration = start.elapsed();
-                        self.emit_checkpoint_metrics(false, epoch, duration);
-                        if let Err(rollback_err) = self.rollback_sinks(epoch).await {
-                            error!(
-                                checkpoint_id,
-                                epoch,
-                                error = %rollback_err,
-                                "[LDB-6037] sink rollback failed after decision=Aborted",
-                            );
-                        }
-                        return Ok(CheckpointResult {
-                            success: false,
-                            checkpoint_id,
-                            epoch,
-                            duration,
-                            error: Some(
-                                "decision store already records Aborted for this epoch"
-                                    .into(),
-                            ),
-                        });
-                    }
-                    Err(e) => {
-                        // Can't achieve durability on the decision —
-                        // safer to abort than to commit and potentially
-                        // leave followers in disagreement on recovery.
+                if let Err(e) = ds.record_committed(epoch).await {
+                    error!(
+                        checkpoint_id, epoch, error = %e,
+                        "[LDB-6038] commit marker write failed — aborting epoch",
+                    );
+                    self.announce_if_leader(
+                        epoch,
+                        checkpoint_id,
+                        laminar_core::cluster::control::Phase::Abort,
+                        None,
+                    )
+                    .await;
+                    self.checkpoints_failed += 1;
+                    self.phase = CheckpointPhase::Idle;
+                    let duration = start.elapsed();
+                    self.emit_checkpoint_metrics(false, epoch, duration);
+                    if let Err(rollback_err) = self.rollback_sinks(epoch).await {
                         error!(
-                            checkpoint_id,
-                            epoch,
-                            error = %e,
-                            "[LDB-6038] failed to record commit decision — aborting epoch",
+                            checkpoint_id, epoch, error = %rollback_err,
+                            "[LDB-6039] sink rollback failed after commit marker write error",
                         );
-                        self.announce_if_leader(
-                            epoch,
-                            checkpoint_id,
-                            laminar_core::cluster::control::Phase::Abort,
-                            None,
-                        )
-                        .await;
-                        self.checkpoints_failed += 1;
-                        self.phase = CheckpointPhase::Idle;
-                        let duration = start.elapsed();
-                        self.emit_checkpoint_metrics(false, epoch, duration);
-                        if let Err(rollback_err) = self.rollback_sinks(epoch).await {
-                            error!(
-                                checkpoint_id,
-                                epoch,
-                                error = %rollback_err,
-                                "[LDB-6039] sink rollback failed after decision write error",
-                            );
-                        }
-                        return Ok(CheckpointResult {
-                            success: false,
-                            checkpoint_id,
-                            epoch,
-                            duration,
-                            error: Some(format!("decision record failed: {e}")),
-                        });
                     }
+                    return Ok(CheckpointResult {
+                        success: false,
+                        checkpoint_id,
+                        epoch,
+                        duration,
+                        error: Some(format!("commit marker write failed: {e}")),
+                    });
                 }
             }
         }
@@ -1765,6 +1648,12 @@ impl CheckpointCoordinator {
                         error = %e,
                         "[LDB-6026] state backend prune failed; old partials will linger"
                     );
+                }
+                #[cfg(feature = "cluster-unstable")]
+                if let Some(ref ds) = self.decision_store {
+                    if let Err(e) = ds.prune_before(horizon).await {
+                        warn!(epoch, horizon, error = %e, "decision prune failed");
+                    }
                 }
             }
         }
@@ -2477,15 +2366,10 @@ mod tests {
 
     #[cfg(feature = "cluster-unstable")]
     #[tokio::test]
-    async fn reconcile_announces_commit_when_decision_committed() {
-        // Durable decision=Committed means a prior leader got past the
-        // quorum and recorded the cluster vote. Even if the current
-        // local manifest still shows Pending (because the old leader
-        // crashed before updating), this node must drive local sinks
-        // to commit and (if leader) re-announce Commit for stragglers.
+    async fn reconcile_announces_commit_when_marker_present() {
         use laminar_core::cluster::control::{
-            BarrierAnnouncement, CheckpointDecisionStore, ClusterController, ClusterKv, Decision,
-            InMemoryKv, Phase, ANNOUNCEMENT_KEY,
+            BarrierAnnouncement, CheckpointDecisionStore, ClusterController, ClusterKv, InMemoryKv,
+            Phase, ANNOUNCEMENT_KEY,
         };
         use laminar_core::cluster::discovery::NodeId;
         use laminar_storage::checkpoint_manifest::SinkCommitStatus;
@@ -2501,14 +2385,10 @@ mod tests {
             .insert("kafka_out".into(), SinkCommitStatus::Pending);
         store.save_with_state(&orphan, None).await.unwrap();
 
-        let decision_os: Arc<dyn object_store::ObjectStore> = Arc::new(
-            LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap(),
-        );
+        let decision_os: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
         let decision_store = Arc::new(CheckpointDecisionStore::new(decision_os));
-        decision_store
-            .record(7, Decision::Committed)
-            .await
-            .unwrap();
+        decision_store.record_committed(7).await.unwrap();
 
         let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
             .await
@@ -2526,20 +2406,19 @@ mod tests {
 
         let raw = kv.read_from(self_id, ANNOUNCEMENT_KEY).await.unwrap();
         let ann: BarrierAnnouncement = serde_json::from_str(&raw).unwrap();
-        assert_eq!(
-            ann.phase, Phase::Commit,
-            "decision=Committed must lead to Commit re-announcement",
-        );
+        assert_eq!(ann.phase, Phase::Commit);
         assert_eq!(ann.epoch, 7);
         assert_eq!(ann.checkpoint_id, 42);
     }
 
     #[cfg(feature = "cluster-unstable")]
     #[tokio::test]
-    async fn reconcile_announces_abort_when_decision_aborted() {
+    async fn reconcile_announces_abort_when_marker_missing() {
+        // Decision store is wired but has no marker for this epoch —
+        // the "leader crashed before commit point" case.
         use laminar_core::cluster::control::{
-            BarrierAnnouncement, CheckpointDecisionStore, ClusterController, ClusterKv, Decision,
-            InMemoryKv, Phase, ANNOUNCEMENT_KEY,
+            BarrierAnnouncement, CheckpointDecisionStore, ClusterController, ClusterKv, InMemoryKv,
+            Phase, ANNOUNCEMENT_KEY,
         };
         use laminar_core::cluster::discovery::NodeId;
         use laminar_storage::checkpoint_manifest::SinkCommitStatus;
@@ -2555,11 +2434,9 @@ mod tests {
             .insert("out".into(), SinkCommitStatus::Pending);
         store.save_with_state(&orphan, None).await.unwrap();
 
-        let decision_os: Arc<dyn object_store::ObjectStore> = Arc::new(
-            LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap(),
-        );
+        let decision_os: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
         let decision_store = Arc::new(CheckpointDecisionStore::new(decision_os));
-        decision_store.record(3, Decision::Aborted).await.unwrap();
 
         let coord = CheckpointCoordinator::new(CheckpointConfig::default(), store)
             .await

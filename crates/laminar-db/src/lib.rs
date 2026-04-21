@@ -66,14 +66,11 @@ mod operator_graph;
 pub mod pipeline;
 mod pipeline_callback;
 mod pipeline_lifecycle;
-/// Dynamic vnode rebalance control plane. Exposes the per-node
-/// snapshot watcher and leader rebalance controller tasks. Callers
-/// (server, harness) spawn these with an `Arc<LaminarDB>` after
-/// `db.start()` and notify `shutdown` on engine shutdown.
-#[cfg(feature = "cluster-unstable")]
-pub mod rebalance;
 /// Deployment profiles.
 pub mod profile;
+/// Dynamic vnode rebalance control plane.
+#[cfg(feature = "cluster-unstable")]
+pub mod rebalance;
 /// Unified recovery manager.
 pub mod recovery_manager;
 mod retractable_accumulator;

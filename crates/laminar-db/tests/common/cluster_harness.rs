@@ -1,28 +1,8 @@
-//! Shared 2-node cluster harness for `cluster_e2e_*` tests. See
-//! `docs/plans/cluster-production-readiness.md` Phase 0.
-//!
-//! Included via `#[path = "common/cluster_harness.rs"]` from each test
-//! binary so the rdkafka-heavy `common/mod.rs` doesn't leak in.
-//!
-//! Mirrors `crates/laminar-server/src/cluster.rs::start_cluster`
-//! (lines 303-432) for the engine-wiring portion, but inlines a few
-//! choices the principal-engineer review of the Phase 0 plan made
-//! explicit:
-//!
-//! - **State backend (shared)**: a single `LocalFileSystem` over one
-//!   `TempDir`. Both nodes' `ObjectStoreBackend`s wrap it with distinct
-//!   `instance_id`. The path layout (`epoch=N/vnode=V/partial.bin`) is
-//!   intentionally shared — `instance_id` lives only in the `_COMMIT`
-//!   audit body, not as a path prefix.
-//! - **Checkpoint store (per-node)**: each node owns its own `TempDir`
-//!   and `object_store_url`. Mirrors production's `nodes/{id}/`
-//!   namespace.
-//! - **DDL before `db.start()`**: the pipeline only activates when
-//!   `start()` is called with at least one source/sink/stream registered
-//!   (see `pipeline_lifecycle.rs:237`). The harness returns the engines
-//!   built-but-unstarted via [`ClusterEngineHarness::spawn`]; tests run
-//!   DDL on every node and then call [`ClusterEngineHarness::start_all`]
-//!   to light the pipeline on all engines simultaneously.
+//! Shared cluster harness for `cluster_e2e_*` tests. Each node gets
+//! its own checkpoint dir; all nodes share one state backend dir
+//! (matching production's single-bucket layout). Tests should issue
+//! DDL before [`ClusterEngineHarness::start_all`] so the pipeline
+//! activates with sources and MVs already registered.
 
 #![cfg(feature = "cluster-unstable")]
 #![allow(clippy::disallowed_types)]
@@ -52,25 +32,12 @@ pub struct NodeRuntime {
     pub db: Arc<LaminarDB>,
     pub instance_id: NodeId,
     pub vnode_registry: Arc<VnodeRegistry>,
-    /// The shared object-store-backed [`StateBackend`] this node writes
-    /// through. Exposed for tests that need to observe the Phase 1.4
-    /// fence state after `start_all()` has wired it from the snapshot.
     pub state_backend: Arc<dyn StateBackend>,
-    /// Durable cluster 2PC decision store. Shared across all nodes in
-    /// the harness — the whole point is a cluster-wide verdict — but
-    /// owned per-node here so tests can read it through any handle.
+    /// Shared across all nodes — the point of a cluster-wide marker.
     pub decision_store: Arc<CheckpointDecisionStore>,
-    /// Durable assignment snapshot store. Shared; the rebalance
-    /// controller writes versioned entries here and the watcher on
-    /// every node reads from it.
     pub assignment_snapshot_store: Arc<AssignmentSnapshotStore>,
-    /// Shutdown signal for this node's rebalance tasks.
     pub rebalance_shutdown: Arc<tokio::sync::Notify>,
-    /// `JoinHandle`s for the snapshot watcher + rebalance controller
-    /// tasks spawned in [`ClusterEngineHarness::start_all`]. Drained
-    /// on shutdown. Interior mutability so `start_all(&self)` can
-    /// push without threading `&mut` through every test call site.
-    pub rebalance_tasks: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    pub rebalance_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl NodeRuntime {
@@ -123,13 +90,7 @@ impl ClusterEngineHarness {
     ) -> Self {
         assert_eq!(checkpoint_dirs.len(), n, "one checkpoint dir per node");
 
-        // Coordinated assignment snapshot store (Phase 1.2). Every
-        // node's ClusterController sees the same store, so the vnode
-        // assignment becomes the cluster's source of truth rather than
-        // each node independently computing round-robin at boot. On
-        // first boot the store is empty; whichever node CAS-creates
-        // the initial snapshot wins, every other node reads that
-        // snapshot back via `load`.
+        // Shared snapshot store — one CAS-creator wins, peers adopt.
         let snapshot_store: Arc<AssignmentSnapshotStore> = {
             let fs: Arc<dyn ObjectStore> = Arc::new(
                 LocalFileSystem::new_with_prefix(shared_state_dir.path())
@@ -144,14 +105,8 @@ impl ClusterEngineHarness {
             .await
             .expect("gossip convergence");
 
-        // Lowest numeric instance_id wins leader election in the
-        // current ClusterController. Nodes are in id order; assert the
-        // expected leader so a controller change doesn't silently
-        // invalidate every test that relies on `nodes[0]` being it.
-        assert!(
-            cluster.nodes[0].controller.is_leader(),
-            "harness assumes nodes[0] is leader; check ClusterController election rule",
-        );
+        // Lowest id wins leader election; tests rely on nodes[0].
+        assert!(cluster.nodes[0].controller.is_leader());
 
         let shared_store: Arc<dyn ObjectStore> = Arc::new(
             LocalFileSystem::new_with_prefix(shared_state_dir.path())
@@ -164,12 +119,8 @@ impl ClusterEngineHarness {
             .map(|nh| NodeId(nh.instance_id.0))
             .collect();
 
-        // Resolve the cluster's vnode assignment ONCE, before per-node
-        // wiring. Load the stored snapshot; if absent, compute the
-        // initial round-robin and CAS-create. All nodes end up with the
-        // identical assignment AND the same `assignment_version`
-        // whether they read or wrote — Phase 1.2 AC plus the Phase 1.4
-        // fence-generation source of truth.
+        // Resolve the cluster-wide vnode assignment once; every node
+        // shares the same assignment and version.
         let (assignment, snapshot_version) =
             resolve_assignment(&snapshot_store, vnode_count, &peer_ids).await;
 
@@ -187,8 +138,6 @@ impl ClusterEngineHarness {
         for (idx, nh) in cluster.nodes.iter().enumerate() {
             let self_id = nh.instance_id;
 
-            // Outbound shuffle sender: register every other peer's
-            // receiver address so `send_to(peer_id, ..)` resolves.
             let sender = ShuffleSender::new(self_id.0);
             for (p_idx, p_nh) in cluster.nodes.iter().enumerate() {
                 if p_idx == idx {
@@ -200,21 +149,15 @@ impl ClusterEngineHarness {
             }
             let sender = Arc::new(sender);
 
-            // Plain construction — no pre-call to `set_authoritative_version`.
-            // Production (`pipeline_lifecycle.rs`) lifts the snapshot's
-            // generation into the backend's fence when `db.start()`
-            // runs, and the harness must exercise that same path rather
-            // than short-circuit it here.
+            // No pre-call to `set_authoritative_version` — exercise
+            // the real production wiring that lifts the snapshot
+            // version into the fence on `db.start()`.
             let state_backend: Arc<dyn StateBackend> = Arc::new(ObjectStoreBackend::new(
                 Arc::clone(&shared_store),
                 self_id.0.to_string(),
                 vnode_count,
             ));
 
-            // Install the assignment and set the registry's local version
-            // to match the persisted snapshot's in a single atomic step —
-            // fence-aware writers then stamp writes with the correct
-            // caller version without paying an O(snapshot_version) loop.
             let registry = Arc::new(VnodeRegistry::new(vnode_count));
             registry.set_assignment_and_version(Arc::clone(&assignment), snapshot_version);
 
@@ -224,24 +167,11 @@ impl ClusterEngineHarness {
                 max_retained: Some(3),
             };
 
-            // Profile::Cluster requires `object_store_url` to be set,
-            // but when it IS set the engine picks `ObjectStoreCheckpointStore`,
-            // whose sync API uses `block_on` and panics from inside a tokio
-            // runtime (`checkpoint_store.rs:772`). The production cluster
-            // path avoids this because its server `apply_checkpoint_config`
-            // routes `file://` URLs to `FileSystemCheckpointStore` and only
-            // sets `object_store_url` for remote stores.
-            //
-            // For the test harness we skip `.profile(Cluster)` so the
-            // builder auto-detects `Profile::Embedded` from the `storage_dir`,
-            // which has no `object_store_url` requirement. All cluster
-            // semantics still activate — they flow from the `cluster-unstable`
-            // feature gate plus the explicit `cluster_controller`,
-            // `state_backend`, `vnode_registry`, and `physical_optimizer_rule`
-            // wiring below, independent of the `Profile` enum.
-            // Cluster 2PC decision store rides on the same shared
-            // object store as state + assignment snapshot, matching
-            // production wiring (`server/cluster.rs::start_cluster`).
+            // Skip `.profile(Cluster)` so the builder picks the
+            // file-backed checkpoint store. `ObjectStoreCheckpointStore`
+            // uses `block_on` internally and panics from inside a
+            // tokio runtime; production avoids this by routing
+            // `file://` URLs to `FileSystemCheckpointStore`.
             let decision_store = Arc::new(CheckpointDecisionStore::new(Arc::clone(&shared_store)));
 
             let db = LaminarDB::builder()
@@ -260,10 +190,6 @@ impl ClusterEngineHarness {
                 .await
                 .expect("LaminarDB::builder().build()");
             let db = Arc::new(db);
-            // NOTE: `db.start()` is intentionally deferred — see
-            // [`ClusterEngineHarness::start_all`]. Running DDL first
-            // lets start() activate the streaming coordinator with
-            // the sources/MVs already registered.
 
             node_runtimes.push(NodeRuntime {
                 db,
@@ -273,7 +199,7 @@ impl ClusterEngineHarness {
                 decision_store: Arc::clone(&decision_store),
                 assignment_snapshot_store: Arc::clone(&snapshot_store),
                 rebalance_shutdown: Arc::new(tokio::sync::Notify::new()),
-                rebalance_tasks: parking_lot::Mutex::new(Vec::new()),
+                rebalance_tasks: Vec::new(),
             });
         }
 
@@ -285,30 +211,23 @@ impl ClusterEngineHarness {
         }
     }
 
-    /// `db.start()` every node. Call AFTER issuing DDL on each engine —
-    /// the streaming coordinator only activates when start() is called
-    /// with at least one registered stream (`pipeline_lifecycle.rs:237`).
-    pub async fn start_all(&self) {
+    /// `db.start()` every node, then spawn the rebalance tasks.
+    pub async fn start_all(&mut self) {
         for node in &self.nodes {
             node.db.start().await.expect("db.start()");
         }
-        // Spawn the rebalance control plane — snapshot watcher on
-        // every node, leader-gated rebalance controller on every
-        // node. Mirrors production's `server/cluster.rs` wiring so
-        // the harness exercises the real tasks rather than a stub.
-        // Tests use fast-defaults so integration tests don't wait
-        // the 5s production debounce before observing rotations.
+        // Fast timings so tests don't wait the 5s production debounce.
         let cfg = laminar_db::rebalance::RebalanceConfig::test_defaults();
         for (idx, nh) in self.cluster.nodes.iter().enumerate() {
-            let node = &self.nodes[idx];
-            let watcher = laminar_db::rebalance::spawn_snapshot_watcher_with(
+            let node = &mut self.nodes[idx];
+            let watcher = laminar_db::rebalance::spawn_snapshot_watcher(
                 Arc::clone(&node.db),
                 Arc::clone(&node.assignment_snapshot_store),
                 Arc::clone(&node.vnode_registry),
                 Arc::clone(&node.rebalance_shutdown),
                 cfg,
             );
-            let controller = laminar_db::rebalance::spawn_rebalance_controller_with(
+            let controller = laminar_db::rebalance::spawn_rebalance_controller(
                 Arc::clone(&node.db),
                 Arc::clone(&nh.controller),
                 Arc::clone(&node.assignment_snapshot_store),
@@ -316,9 +235,8 @@ impl ClusterEngineHarness {
                 Arc::clone(&node.rebalance_shutdown),
                 cfg,
             );
-            let mut handles = node.rebalance_tasks.lock();
-            handles.push(watcher);
-            handles.push(controller);
+            node.rebalance_tasks.push(watcher);
+            node.rebalance_tasks.push(controller);
         }
     }
 
@@ -351,12 +269,12 @@ impl ClusterEngineHarness {
             shared_state_dir,
             checkpoint_dirs,
         } = self;
-        for node in nodes {
-            // Wake rebalance tasks so they observe shutdown and exit.
+        for mut node in nodes {
             node.rebalance_shutdown.notify_waiters();
-            let handles: Vec<_> = node.rebalance_tasks.lock().drain(..).collect();
-            for task in handles {
+            for task in &node.rebalance_tasks {
                 task.abort();
+            }
+            for task in node.rebalance_tasks.drain(..) {
                 let _ = task.await;
             }
             let _ = node.db.shutdown().await;
@@ -371,24 +289,8 @@ impl ClusterEngineHarness {
     }
 }
 
-/// Load the cluster-wide vnode assignment from `store`, falling back to
-/// computing a fresh round-robin and CAS-creating it. Returns the
-/// assignment ready to hand to [`VnodeRegistry::set_assignment`] AND
-/// the snapshot's `version` — used by Phase 1.4's split-brain fence to
-/// seed each backend's authoritative generation.
-///
-/// Implements the Phase 1.2 boot-time contract:
-/// - If a snapshot is already stored, every caller loads and uses it
-///   unchanged — even partitioned halves of a running cluster arrive
-///   at the same assignment.
-/// - If no snapshot exists, the first caller to reach
-///   [`AssignmentSnapshotStore::save_if_absent`] wins; every losing
-///   caller loads the winner. No caller writes a snapshot that would
-///   disagree with another.
-///
-/// Out of scope here (covered by Phase 2.3): dynamic rebalancing when
-/// membership changes, version bumping on leader promotion. The stored
-/// snapshot is written once at first boot and then left alone.
+/// Load the shared assignment, or CAS-create one on first boot.
+/// Returns the assignment and its version.
 async fn resolve_assignment(
     store: &AssignmentSnapshotStore,
     vnode_count: u32,
@@ -414,10 +316,6 @@ async fn resolve_assignment(
 }
 
 /// Build a `file:///` URL from an absolute filesystem path.
-///
-/// On Windows this produces `file:///C:/path/with/forward/slashes`;
-/// on Unix `file:///abs/path`. Matches the syntax accepted by
-/// `laminar_storage::object_store_builder::build_object_store`.
 fn file_url_from_path(path: &std::path::Path) -> String {
     let abs = path.to_string_lossy().into_owned();
     let normalized = abs.replace('\\', "/");
@@ -428,16 +326,13 @@ fn file_url_from_path(path: &std::path::Path) -> String {
     }
 }
 
-/// Diagnostic tuple `(instance_id, owned_vnodes)` — used by tests that
-/// compare the per-node view of the cluster's vnode assignment.
+/// Diagnostic tuple `(instance_id, owned_vnodes)`.
 pub type NodeIdView = (NodeId, Vec<u32>);
-
-// ── Test-side helpers shared between smoke and failures suites ────
 
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 
-/// `(key BIGINT, value BIGINT)` schema used by every Phase 0 test.
+/// `(key BIGINT, value BIGINT)` schema.
 #[must_use]
 pub fn input_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -460,12 +355,8 @@ pub fn input_batch(keys: &[i64]) -> RecordBatch {
     .expect("input_batch")
 }
 
-/// Compute the vnode a single `key` value lands on under the same
-/// `arrow::row` + `key_hash` machinery [`ClusterRepartitionExec`] uses.
-/// Used by the smoke test to pre-compute keys whose hashes split
-/// across both owners (otherwise `target_partitions=4` plus 4 vnodes
-/// could let everything pile on the leader and the test would pass
-/// without ever exercising the cross-node shuffle).
+/// Compute the vnode a `key` lands on under the same hashing used by
+/// `ClusterRepartitionExec`.
 #[must_use]
 pub fn vnode_for_key(key: i64, vnode_count: u32) -> u32 {
     use arrow::row::{RowConverter, SortField};
@@ -479,12 +370,11 @@ pub fn vnode_for_key(key: i64, vnode_count: u32) -> u32 {
     v
 }
 
-/// Pick `per_owner` keys from `0..1000` whose `vnode_for_key % vnode_count`
-/// lands on each `owned` partition. Returns an error string when the
-/// search range is too small (raise the upper bound).
+/// Pick `per_owner` keys from `0..1000` that land on each owner's
+/// vnodes.
 ///
 /// # Errors
-/// Returns `Err` when 1000 candidates aren't enough to fill every owner.
+/// Returns `Err` when 1000 candidates aren't enough.
 pub fn pick_keys_per_owner(
     vnode_count: u32,
     owners: &[(NodeId, Vec<u32>)],

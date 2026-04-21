@@ -3,22 +3,9 @@
 //! carries the ephemeral copy; these files survive full-cluster
 //! restart.
 //!
-//! Serialises the `VnodeRegistry`'s assignment so every node reaches
-//! the same vnode topology from the same source of truth — critical for
-//! split-brain correctness: both partitioned halves observe the same
-//! stored snapshot instead of each independently computing a fresh
-//! round-robin that would have disjoint vnode owners. See Phase 1.2
-//! in `docs/plans/cluster-production-readiness.md`.
-//!
-//! ## CAS protocol
-//!
-//! Rotation uses `PutMode::Create` on a per-version path — the first
-//! writer to land `v{N}.json` wins that version; later writers see
-//! `AlreadyExists` and must reload. Backend-agnostic: every object
-//! store in the `object_store` crate supports `PutMode::Create`,
-//! including `LocalFileSystem` (the harness's backend) which does not
-//! yet support `PutMode::Update`. Older etag-based schemes require
-//! conditional PUTs that `LocalFileSystem` can't provide.
+//! Rotation uses `PutMode::Create` on a per-version path so the CAS
+//! works on every backend (`LocalFileSystem` included, which doesn't
+//! yet implement `PutMode::Update`).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -193,19 +180,12 @@ impl AssignmentSnapshotStore {
         }
     }
 
-    /// CAS-create a snapshot at `snapshot.version`. Each version is
-    /// its own object, so the first writer to land the `v{N}.json`
-    /// path for that version wins. Use this for the initial seed
-    /// (`snapshot.version == 1`) AND for every rotation.
-    ///
-    /// Returns:
-    /// - `Ok(Some(snapshot))` if our write landed,
-    /// - `Ok(None)` on CAS conflict (another writer got there first),
-    /// - `Err` on any non-CAS I/O or JSON error.
+    /// CAS-create the object for `snapshot.version`. `Ok(None)` means
+    /// another writer landed there first. Used for both the initial
+    /// seed and for rotations (via [`Self::save_if_version`]).
     ///
     /// # Errors
-    /// Object-store I/O or JSON encode failure (conflict is
-    /// `Ok(None)`).
+    /// Object-store I/O or JSON encode failure.
     pub async fn save_if_absent(
         &self,
         snapshot: &AssignmentSnapshot,
@@ -227,23 +207,14 @@ impl AssignmentSnapshotStore {
         }
     }
 
-    /// Rotate: propose `snapshot` as the next canonical version,
-    /// assuming the current durable version is `prior_version`. The
-    /// CAS lands iff no other writer has already produced
-    /// `prior_version + 1`. Enforces `snapshot.version ==
-    /// prior_version + 1` so callers can't accidentally skip a
-    /// generation.
-    ///
-    /// Returns:
-    /// - [`RotateOutcome::Rotated`] if our write landed,
-    /// - [`RotateOutcome::Conflict`] carrying the canonical snapshot
-    ///   a racing writer produced (caller must adopt it rather than
-    ///   retry),
-    /// - `Err` on any non-CAS I/O or JSON error.
+    /// Rotate to `snapshot` assuming the current durable version is
+    /// `prior_version`. Returns [`RotateOutcome::Conflict`] carrying
+    /// the winner's snapshot if a racer produced `prior_version + 1`
+    /// first.
     ///
     /// # Errors
-    /// Object-store I/O, JSON encode, or a version-mismatch bug in
-    /// the caller.
+    /// Object-store I/O, JSON encode, or a non-monotonic version bump
+    /// (caller bug).
     pub async fn save_if_version(
         &self,
         snapshot: &AssignmentSnapshot,
@@ -259,30 +230,21 @@ impl AssignmentSnapshotStore {
         if self.save_if_absent(snapshot).await?.is_some() {
             return Ok(RotateOutcome::Rotated);
         }
-        // Someone else produced `prior_version + 1`. Load the
-        // canonical successor (which is necessarily the
-        // highest-versioned object at this point, because versions
-        // are monotonic and CAS is exclusive).
-        let winner = self
-            .load_version(snapshot.version)
-            .await?
-            .ok_or_else(|| {
-                SnapshotError::Io(
-                    "CAS conflict on save_if_absent but subsequent load returned None"
-                        .into(),
-                )
-            })?;
+        let winner = self.load_version(snapshot.version).await?.ok_or_else(|| {
+            SnapshotError::Io("CAS conflict but load of winner returned None".into())
+        })?;
         Ok(RotateOutcome::Conflict(winner))
     }
 
-    /// Delete every snapshot object with `version < before`. Called
-    /// after leadership confirms every live node has adopted a
-    /// newer version, so old ones are no longer reachable. Missing
-    /// objects are tolerated (idempotent retry).
+    /// Delete every snapshot object with `version < before`.
+    /// Idempotent — missing objects are tolerated.
     ///
     /// # Errors
     /// Object-store I/O.
     pub async fn prune_before(&self, before: u64) -> Result<(), SnapshotError> {
+        if before == 0 {
+            return Ok(());
+        }
         let versions = self.list_versions().await?;
         for v in versions {
             if v >= before {
@@ -339,10 +301,7 @@ mod tests {
         vnodes.insert(1, NodeId(2));
         let snap = AssignmentSnapshot::empty().next(vnodes);
 
-        assert_eq!(
-            s.save_if_absent(&snap).await.unwrap().as_ref(),
-            Some(&snap),
-        );
+        assert_eq!(s.save_if_absent(&snap).await.unwrap().as_ref(), Some(&snap),);
         let loaded = s.load().await.unwrap().unwrap();
         assert_eq!(loaded, snap);
     }

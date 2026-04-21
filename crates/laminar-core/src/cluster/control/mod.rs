@@ -12,11 +12,9 @@ pub use barrier::{
     QuorumOutcome, ACK_KEY, ANNOUNCEMENT_KEY,
 };
 pub use controller::ClusterController;
-pub use decision::{CheckpointDecisionStore, Decision, DecisionError, RecordOutcome};
+pub use decision::{CheckpointDecisionStore, DecisionError};
 pub use leader::leader_of;
-pub use snapshot::{
-    AssignmentSnapshot, AssignmentSnapshotStore, RotateOutcome, SnapshotError,
-};
+pub use snapshot::{AssignmentSnapshot, AssignmentSnapshotStore, RotateOutcome, SnapshotError};
 
 #[cfg(feature = "cluster-unstable")]
 pub mod chitchat_kv;
