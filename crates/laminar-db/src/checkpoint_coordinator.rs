@@ -2641,12 +2641,20 @@ mod tests {
         // followers pick up via `observe_barrier(Commit)` — otherwise
         // the leader would drive event-time decisions off a watermark
         // that none of its peers have acked yet.
-        use laminar_core::cluster::control::{ClusterController, ClusterKv, InMemoryKv};
+        use laminar_core::cluster::control::{
+            CheckpointDecisionStore, ClusterController, ClusterKv, InMemoryKv,
+        };
         use laminar_core::cluster::discovery::NodeId;
+        use object_store::local::LocalFileSystem;
         use tokio::sync::watch;
 
         let dir = tempfile::tempdir().unwrap();
+        let decision_dir = tempfile::tempdir().unwrap();
         let mut coord = make_coordinator(dir.path()).await;
+
+        let decision_os: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
+        coord.set_decision_store(Arc::new(CheckpointDecisionStore::new(decision_os)));
 
         let self_id = NodeId(1);
         let kv = Arc::new(InMemoryKv::new(self_id));
@@ -2694,13 +2702,20 @@ mod tests {
     #[tokio::test]
     async fn leader_announces_prepare_and_commit_on_solo_cluster() {
         use laminar_core::cluster::control::{
-            ClusterController, ClusterKv, InMemoryKv, Phase, ANNOUNCEMENT_KEY,
+            CheckpointDecisionStore, ClusterController, ClusterKv, InMemoryKv, Phase,
+            ANNOUNCEMENT_KEY,
         };
         use laminar_core::cluster::discovery::NodeId;
+        use object_store::local::LocalFileSystem;
         use tokio::sync::watch;
 
         let dir = tempfile::tempdir().unwrap();
+        let decision_dir = tempfile::tempdir().unwrap();
         let mut coord = make_coordinator(dir.path()).await;
+
+        let decision_os: Arc<dyn object_store::ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(decision_dir.path()).unwrap());
+        coord.set_decision_store(Arc::new(CheckpointDecisionStore::new(decision_os)));
 
         let self_id = NodeId(1);
         let kv = Arc::new(InMemoryKv::new(self_id));
