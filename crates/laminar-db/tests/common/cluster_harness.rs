@@ -229,6 +229,8 @@ impl ClusterEngineHarness {
                 .vnode_registry(Arc::clone(&registry))
                 .shuffle_sender(Arc::clone(&sender))
                 .shuffle_receiver(Arc::clone(&receivers[idx]))
+                // Mirror production: DataFusion partitions track vnode count.
+                .target_partitions(vnode_count as usize)
                 .build()
                 .await
                 .expect("LaminarDB::builder().build()");
