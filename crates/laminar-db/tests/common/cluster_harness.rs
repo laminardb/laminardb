@@ -193,14 +193,12 @@ impl ClusterEngineHarness {
             concrete_backend.set_authoritative_version(snapshot_version);
             let state_backend: Arc<dyn StateBackend> = Arc::new(concrete_backend);
 
+            // Install the assignment and set the registry's local version
+            // to match the persisted snapshot's in a single atomic step —
+            // fence-aware writers then stamp writes with the correct
+            // caller version without paying an O(snapshot_version) loop.
             let registry = Arc::new(VnodeRegistry::new(vnode_count));
-            registry.set_assignment(Arc::clone(&assignment));
-            // Bump the registry's local assignment version to match the
-            // persisted snapshot's so fence-aware writers stamp their
-            // writes with the correct caller version.
-            while registry.assignment_version() < snapshot_version {
-                registry.set_assignment(Arc::clone(&assignment));
-            }
+            registry.set_assignment_and_version(Arc::clone(&assignment), snapshot_version);
 
             let cp_cfg = StreamCheckpointConfig {
                 interval_ms: None, // manual only — tests drive checkpoint() explicitly

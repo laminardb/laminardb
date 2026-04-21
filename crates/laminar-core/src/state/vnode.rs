@@ -151,6 +151,34 @@ impl VnodeRegistry {
         self.assignment_version.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Replace the full assignment and set the version to `version`
+    /// exactly, atomically. Intended for recovery paths that must
+    /// restore the registry to an authoritative fence version persisted
+    /// elsewhere (e.g., a loaded checkpoint snapshot) instead of
+    /// bumping from zero.
+    ///
+    /// # Panics
+    /// Panics if `new_assignment.len() != self.vnode_count`, or if
+    /// `version` is less than the current assignment version
+    /// (assignment versions are monotonic).
+    pub fn set_assignment_and_version(&self, new_assignment: Arc<[NodeId]>, version: u64) {
+        assert_eq!(
+            new_assignment.len(),
+            self.vnode_count as usize,
+            "assignment length mismatch: got {}, expected {}",
+            new_assignment.len(),
+            self.vnode_count,
+        );
+        let mut guard = self.assignment.write();
+        let current = self.assignment_version.load(Ordering::Acquire);
+        assert!(
+            version >= current,
+            "assignment version must be monotonic: got {version}, current {current}",
+        );
+        *guard = new_assignment;
+        self.assignment_version.store(version, Ordering::Release);
+    }
+
     /// Map a primary key to a vnode.
     #[must_use]
     pub fn vnode_for_key(&self, key: &[u8]) -> u32 {
