@@ -363,12 +363,20 @@ impl NodeHandle {
         let _ = self.discovery.stop().await;
     }
 
-    /// Simulate a crash: drop the node without announcing. Peers rely
-    /// on phi-accrual to eventually detect the failure, which in the
-    /// default chitchat config can take tens of seconds. Use
-    /// [`Self::kill`] for test scenarios that expect prompt failover.
-    pub fn crash(self) {
-        drop(self);
+    /// Simulate a crash: shut down this node *without* announcing a
+    /// `Left` state. Peers rely on phi-accrual to eventually detect the
+    /// failure, which in the default chitchat config can take tens of
+    /// seconds — exactly the behavior a real crash produces. Use
+    /// [`Self::kill`] for scenarios that expect prompt failover.
+    ///
+    /// Unlike a plain `drop`, this calls `discovery.stop().await` to
+    /// shut down the chitchat background task and release the UDP
+    /// socket. Skipping that was previously leaking tasks and ports
+    /// between crash-based tests; the *protocol-visible* behavior
+    /// matches a real crash either way because `stop` does not emit
+    /// any Left announcement (that's `kill`'s job).
+    pub async fn crash(mut self) {
+        let _ = self.discovery.stop().await;
     }
 }
 

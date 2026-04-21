@@ -250,7 +250,7 @@ async fn crash_mid_stream_loses_in_flight() {
     let crashed_runtime = harness.nodes.swap_remove(follower_idx);
     let crashed_node = harness.cluster.nodes.swap_remove(follower_idx);
     drop(crashed_runtime);
-    crashed_node.crash();
+    crashed_node.crash().await;
 
     // Phi-accrual convergence window.
     sleep(Duration::from_secs(4)).await;
