@@ -1,6 +1,7 @@
-//! Durable vnode→instance assignment snapshot at
-//! `control/assignment-snapshot.json`. Chitchat carries the ephemeral
-//! copy; this file survives full-cluster restart.
+//! Durable vnode→instance assignment snapshots. One object per
+//! version at `control/assignment-snapshots/v{N:016}.json`. Chitchat
+//! carries the ephemeral copy; these files survive full-cluster
+//! restart.
 //!
 //! Serialises the `VnodeRegistry`'s assignment so every node reaches
 //! the same vnode topology from the same source of truth — critical for
@@ -8,6 +9,16 @@
 //! stored snapshot instead of each independently computing a fresh
 //! round-robin that would have disjoint vnode owners. See Phase 1.2
 //! in `docs/plans/cluster-production-readiness.md`.
+//!
+//! ## CAS protocol
+//!
+//! Rotation uses `PutMode::Create` on a per-version path — the first
+//! writer to land `v{N}.json` wins that version; later writers see
+//! `AlreadyExists` and must reload. Backend-agnostic: every object
+//! store in the `object_store` crate supports `PutMode::Create`,
+//! including `LocalFileSystem` (the harness's backend) which does not
+//! yet support `PutMode::Update`. Older etag-based schemes require
+//! conditional PUTs that `LocalFileSystem` can't provide.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -16,10 +27,16 @@ use bytes::Bytes;
 use object_store::path::Path as OsPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use serde::{Deserialize, Serialize};
+use tokio_stream::StreamExt;
 
 use crate::cluster::discovery::NodeId;
 
-const SNAPSHOT_PATH: &str = "control/assignment-snapshot.json";
+const SNAPSHOT_PREFIX: &str = "control/assignment-snapshots/";
+
+fn snapshot_path(version: u64) -> OsPath {
+    // Fixed-width so lexicographic list order matches numeric order.
+    OsPath::from(format!("{SNAPSHOT_PREFIX}v{version:016}.json"))
+}
 
 /// Durable vnode-to-instance assignment snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,12 +130,55 @@ impl AssignmentSnapshotStore {
         Self { store }
     }
 
-    /// Load the current snapshot; `Ok(None)` on fresh cluster.
+    /// Scan the snapshot prefix and return every stored version in
+    /// ascending order. Cheap on small clusters (rotations are rare);
+    /// the list operation is one round trip on every backend.
+    async fn list_versions(&self) -> Result<Vec<u64>, SnapshotError> {
+        let prefix = OsPath::from(SNAPSHOT_PREFIX);
+        let mut entries = self.store.list(Some(&prefix));
+        let mut versions: Vec<u64> = Vec::new();
+        while let Some(entry) = entries.next().await {
+            let entry = entry.map_err(|e| SnapshotError::Io(e.to_string()))?;
+            let loc = entry.location.as_ref();
+            // Accept only `v{N:016}.json` entries so unrelated
+            // siblings in the bucket can't shift the CAS token.
+            let Some(rest) = loc.strip_prefix(SNAPSHOT_PREFIX) else {
+                continue;
+            };
+            let Some(num) = rest.strip_prefix('v').and_then(|s| s.strip_suffix(".json")) else {
+                continue;
+            };
+            if let Ok(v) = num.parse::<u64>() {
+                versions.push(v);
+            }
+        }
+        versions.sort_unstable();
+        Ok(versions)
+    }
+
+    /// Load the current (highest-versioned) snapshot; `Ok(None)` on
+    /// fresh cluster.
     ///
     /// # Errors
     /// Object-store I/O or JSON decode failure.
     pub async fn load(&self) -> Result<Option<AssignmentSnapshot>, SnapshotError> {
-        let path = OsPath::from(SNAPSHOT_PATH);
+        let versions = self.list_versions().await?;
+        let Some(&latest) = versions.last() else {
+            return Ok(None);
+        };
+        self.load_version(latest).await
+    }
+
+    /// Load a specific version's snapshot. `Ok(None)` if that version
+    /// was never written or has been pruned.
+    ///
+    /// # Errors
+    /// Object-store I/O or JSON decode failure.
+    pub async fn load_version(
+        &self,
+        version: u64,
+    ) -> Result<Option<AssignmentSnapshot>, SnapshotError> {
+        let path = snapshot_path(version);
         match self.store.get(&path).await {
             Ok(res) => {
                 let bytes = res
@@ -133,41 +193,24 @@ impl AssignmentSnapshotStore {
         }
     }
 
-    /// Save `snapshot`, last-write-wins. Leader serializes writes.
+    /// CAS-create a snapshot at `snapshot.version`. Each version is
+    /// its own object, so the first writer to land the `v{N}.json`
+    /// path for that version wins. Use this for the initial seed
+    /// (`snapshot.version == 1`) AND for every rotation.
     ///
-    /// # Errors
-    /// Object-store I/O or JSON encode failure.
-    pub async fn save(&self, snapshot: &AssignmentSnapshot) -> Result<(), SnapshotError> {
-        let path = OsPath::from(SNAPSHOT_PATH);
-        let bytes = serde_json::to_vec_pretty(snapshot)?;
-        self.store
-            .put(&path, PutPayload::from(Bytes::from(bytes)))
-            .await
-            .map_err(|e| SnapshotError::Io(e.to_string()))?;
-        Ok(())
-    }
-
-    /// CAS-create: write `snapshot` only if no snapshot exists yet.
     /// Returns:
-    /// - `Ok(Some(snapshot))` on successful create; snapshot is now the
-    ///   canonical version,
-    /// - `Ok(None)` on conflict (someone else created one first) — the
-    ///   caller should [`load`](Self::load) the winner and adopt it,
-    /// - `Err` on other I/O errors.
-    ///
-    /// Used by boot-time assignment coordination so split-brained halves
-    /// don't each overwrite the other's initial assignment: the first
-    /// writer wins, losers fall back to whatever's durably stored. See
-    /// Phase 1.2 in `docs/plans/cluster-production-readiness.md`.
+    /// - `Ok(Some(snapshot))` if our write landed,
+    /// - `Ok(None)` on CAS conflict (another writer got there first),
+    /// - `Err` on any non-CAS I/O or JSON error.
     ///
     /// # Errors
-    /// Object-store I/O or JSON encode failure (distinct from conflict,
-    /// which is `Ok(None)`).
+    /// Object-store I/O or JSON encode failure (conflict is
+    /// `Ok(None)`).
     pub async fn save_if_absent(
         &self,
         snapshot: &AssignmentSnapshot,
     ) -> Result<Option<AssignmentSnapshot>, SnapshotError> {
-        let path = OsPath::from(SNAPSHOT_PATH);
+        let path = snapshot_path(snapshot.version);
         let bytes = serde_json::to_vec_pretty(snapshot)?;
         let opts = PutOptions {
             mode: PutMode::Create,
@@ -183,6 +226,89 @@ impl AssignmentSnapshotStore {
             Err(e) => Err(SnapshotError::Io(e.to_string())),
         }
     }
+
+    /// Rotate: propose `snapshot` as the next canonical version,
+    /// assuming the current durable version is `prior_version`. The
+    /// CAS lands iff no other writer has already produced
+    /// `prior_version + 1`. Enforces `snapshot.version ==
+    /// prior_version + 1` so callers can't accidentally skip a
+    /// generation.
+    ///
+    /// Returns:
+    /// - [`RotateOutcome::Rotated`] if our write landed,
+    /// - [`RotateOutcome::Conflict`] carrying the canonical snapshot
+    ///   a racing writer produced (caller must adopt it rather than
+    ///   retry),
+    /// - `Err` on any non-CAS I/O or JSON error.
+    ///
+    /// # Errors
+    /// Object-store I/O, JSON encode, or a version-mismatch bug in
+    /// the caller.
+    pub async fn save_if_version(
+        &self,
+        snapshot: &AssignmentSnapshot,
+        prior_version: u64,
+    ) -> Result<RotateOutcome, SnapshotError> {
+        if snapshot.version != prior_version + 1 {
+            return Err(SnapshotError::Io(format!(
+                "save_if_version requires monotonic +1 bump: prior={prior_version}, \
+                 proposed={}",
+                snapshot.version,
+            )));
+        }
+        if self.save_if_absent(snapshot).await?.is_some() {
+            return Ok(RotateOutcome::Rotated);
+        }
+        // Someone else produced `prior_version + 1`. Load the
+        // canonical successor (which is necessarily the
+        // highest-versioned object at this point, because versions
+        // are monotonic and CAS is exclusive).
+        let winner = self
+            .load_version(snapshot.version)
+            .await?
+            .ok_or_else(|| {
+                SnapshotError::Io(
+                    "CAS conflict on save_if_absent but subsequent load returned None"
+                        .into(),
+                )
+            })?;
+        Ok(RotateOutcome::Conflict(winner))
+    }
+
+    /// Delete every snapshot object with `version < before`. Called
+    /// after leadership confirms every live node has adopted a
+    /// newer version, so old ones are no longer reachable. Missing
+    /// objects are tolerated (idempotent retry).
+    ///
+    /// # Errors
+    /// Object-store I/O.
+    pub async fn prune_before(&self, before: u64) -> Result<(), SnapshotError> {
+        let versions = self.list_versions().await?;
+        for v in versions {
+            if v >= before {
+                break;
+            }
+            let path = snapshot_path(v);
+            match self.store.delete(&path).await {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => {
+                    tracing::warn!(version = v, error = %e, "snapshot prune: delete failed");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Outcome of [`AssignmentSnapshotStore::save_if_version`].
+#[derive(Debug, Clone)]
+pub enum RotateOutcome {
+    /// Our write landed. The snapshot we passed in is now canonical.
+    Rotated,
+    /// Another writer (a racing leader) won the CAS. The attached
+    /// snapshot is what's currently durable; the caller must adopt it
+    /// rather than retry with a stale view.
+    Conflict(AssignmentSnapshot),
 }
 
 #[cfg(test)]
@@ -204,7 +330,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_and_load_roundtrip() {
+    async fn save_if_absent_then_load_roundtrip() {
         let dir = tempdir().unwrap();
         let s = store_in(dir.path());
 
@@ -213,29 +339,40 @@ mod tests {
         vnodes.insert(1, NodeId(2));
         let snap = AssignmentSnapshot::empty().next(vnodes);
 
-        s.save(&snap).await.unwrap();
+        assert_eq!(
+            s.save_if_absent(&snap).await.unwrap().as_ref(),
+            Some(&snap),
+        );
         let loaded = s.load().await.unwrap().unwrap();
         assert_eq!(loaded, snap);
     }
 
     #[tokio::test]
-    async fn overwrite_wins() {
+    async fn load_returns_highest_version() {
         let dir = tempdir().unwrap();
         let s = store_in(dir.path());
 
         let mut v1_map = BTreeMap::new();
         v1_map.insert(0, NodeId(1));
         let v1 = AssignmentSnapshot::empty().next(v1_map);
-        s.save(&v1).await.unwrap();
+        s.save_if_absent(&v1).await.unwrap();
 
         let mut v2_map = BTreeMap::new();
         v2_map.insert(0, NodeId(2));
         let v2 = v1.next(v2_map);
-        s.save(&v2).await.unwrap();
+        // Rotate via save_if_version — the canonical post-boot path.
+        assert!(matches!(
+            s.save_if_version(&v2, v1.version).await.unwrap(),
+            RotateOutcome::Rotated,
+        ));
 
         let loaded = s.load().await.unwrap().unwrap();
         assert_eq!(loaded.version, 2);
         assert_eq!(loaded.vnodes.get(&0), Some(&NodeId(2)));
+
+        // Older version is still readable directly until pruned.
+        let v1_loaded = s.load_version(1).await.unwrap().unwrap();
+        assert_eq!(v1_loaded, v1);
     }
 
     #[tokio::test]
@@ -261,6 +398,118 @@ mod tests {
 
         let loaded = s.load().await.unwrap().unwrap();
         assert_eq!(loaded, first, "stored snapshot is the first writer's");
+    }
+
+    #[tokio::test]
+    async fn save_if_version_rejects_non_monotonic_bump() {
+        let dir = tempdir().unwrap();
+        let s = store_in(dir.path());
+
+        let mut m = BTreeMap::new();
+        m.insert(0, NodeId(1));
+        let v1 = AssignmentSnapshot::empty().next(m);
+        s.save_if_absent(&v1).await.unwrap();
+
+        // Caller builds v3 but claims prior=1 — enforcing monotonic +1
+        // catches accidental gap-skipping bugs before they land on
+        // durable storage.
+        let mut m2 = BTreeMap::new();
+        m2.insert(0, NodeId(2));
+        let v2 = v1.next(m2);
+        let mut m3 = BTreeMap::new();
+        m3.insert(0, NodeId(3));
+        let v3 = v2.next(m3);
+        let err = s.save_if_version(&v3, 1).await.unwrap_err();
+        assert!(
+            matches!(err, SnapshotError::Io(msg) if msg.contains("monotonic")),
+            "non-monotonic bump must surface a clear error",
+        );
+    }
+
+    #[tokio::test]
+    async fn save_if_version_succeeds_on_match() {
+        let dir = tempdir().unwrap();
+        let s = store_in(dir.path());
+
+        let mut v1_map = BTreeMap::new();
+        v1_map.insert(0, NodeId(1));
+        let first = AssignmentSnapshot::empty().next(v1_map);
+        s.save_if_absent(&first).await.unwrap();
+
+        let mut v2_map = BTreeMap::new();
+        v2_map.insert(0, NodeId(2));
+        let second = first.next(v2_map);
+        let outcome = s.save_if_version(&second, first.version).await.unwrap();
+        assert!(matches!(outcome, RotateOutcome::Rotated));
+
+        let loaded = s.load().await.unwrap().unwrap();
+        assert_eq!(loaded, second);
+    }
+
+    #[tokio::test]
+    async fn save_if_version_conflict_surfaces_winner() {
+        // Two racing rotations both propose v2 from v1. CAS at
+        // `v{2}.json` picks one; the loser reloads and finds the
+        // winner's canonical snapshot.
+        let dir = tempdir().unwrap();
+        let s = store_in(dir.path());
+
+        let mut seed = BTreeMap::new();
+        seed.insert(0, NodeId(1));
+        let v1 = AssignmentSnapshot::empty().next(seed);
+        s.save_if_absent(&v1).await.unwrap();
+
+        let mut winner_map = BTreeMap::new();
+        winner_map.insert(0, NodeId(10));
+        let winner = v1.next(winner_map);
+        assert!(matches!(
+            s.save_if_version(&winner, v1.version).await.unwrap(),
+            RotateOutcome::Rotated,
+        ));
+
+        let mut loser_map = BTreeMap::new();
+        loser_map.insert(0, NodeId(20));
+        let loser = v1.next(loser_map);
+        match s.save_if_version(&loser, v1.version).await.unwrap() {
+            RotateOutcome::Conflict(current) => {
+                assert_eq!(
+                    current, winner,
+                    "conflict must surface the winner's snapshot",
+                );
+            }
+            RotateOutcome::Rotated => {
+                panic!("stale-token update must not win the CAS");
+            }
+        }
+
+        let loaded = s.load().await.unwrap().unwrap();
+        assert_eq!(loaded, winner, "stored snapshot is the CAS winner's");
+    }
+
+    #[tokio::test]
+    async fn prune_before_drops_old_versions() {
+        let dir = tempdir().unwrap();
+        let s = store_in(dir.path());
+
+        // Seed v1..=v4 by repeatedly rotating.
+        let mut m = BTreeMap::new();
+        m.insert(0, NodeId(1));
+        let mut current = AssignmentSnapshot::empty().next(m);
+        s.save_if_absent(&current).await.unwrap();
+        for _ in 0..3 {
+            let next = current.next(current.vnodes.clone());
+            s.save_if_version(&next, current.version).await.unwrap();
+            current = next;
+        }
+
+        s.prune_before(3).await.unwrap();
+
+        assert!(s.load_version(1).await.unwrap().is_none());
+        assert!(s.load_version(2).await.unwrap().is_none());
+        assert!(s.load_version(3).await.unwrap().is_some());
+        assert!(s.load_version(4).await.unwrap().is_some());
+        // `load()` still returns the most recent surviving snapshot.
+        assert_eq!(s.load().await.unwrap().unwrap().version, 4);
     }
 
     #[test]

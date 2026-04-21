@@ -157,6 +157,14 @@ pub struct ClusterHandle {
     api_handle: tokio::task::JoinHandle<()>,
     watcher_handle: Option<tokio::task::JoinHandle<()>>,
     membership_handle: tokio::task::JoinHandle<()>,
+    /// Snapshot watcher + leader rebalance controller tasks. Empty
+    /// if the deployment has no `AssignmentSnapshotStore` (non-cluster
+    /// or pre-configured legacy).
+    rebalance_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Shutdown signal shared with [`Self::rebalance_tasks`]. Notified
+    /// on [`Self::wait_for_shutdown`] so those loops observe the
+    /// request and exit cleanly before we abort.
+    rebalance_shutdown: Arc<tokio::sync::Notify>,
 }
 
 impl ClusterHandle {
@@ -166,6 +174,16 @@ impl ClusterHandle {
             .map_err(|e| ClusterStartupError::Discovery(format!("signal handler: {e}")))?;
 
         info!("Received shutdown signal, shutting down cluster node...");
+
+        // Tell rebalance tasks to exit at their next select point.
+        // Notifying before the abort gives them a chance to finish
+        // an in-flight `adopt_assignment_snapshot` cleanly instead
+        // of dropping the coordinator mutex mid-write.
+        self.rebalance_shutdown.notify_waiters();
+        for task in self.rebalance_tasks.drain(..) {
+            task.abort();
+            let _ = task.await;
+        }
 
         // Stop membership watcher
         self.membership_handle.abort();
@@ -405,6 +423,16 @@ pub async fn start_cluster(
         builder = builder.decision_store(decision_store);
     }
 
+    // Install the assignment snapshot store so the rebalance
+    // control plane can rotate it when membership changes. Snapshot
+    // store resolution happened earlier inside
+    // `resolve_vnode_assignment`; hand the same instance to the
+    // builder here so snapshot watcher + rebalance controller use
+    // the identical backing object.
+    if let Some(snap_store) = snapshot_store.clone() {
+        builder = builder.assignment_snapshot_store(snap_store);
+    }
+
     // Shuffle fabric. ShuffleReceiver publishes its bound address into
     // the gossip KV so peer ShuffleSenders discover it on first send.
     // Without this wiring, streaming aggregates never cross node
@@ -452,6 +480,43 @@ pub async fn start_cluster(
         .map_err(|e| ClusterStartupError::EngineConstruction(format!("pipeline start: {e}")))?;
     info!("Pipeline started");
 
+    // Rebalance control plane: snapshot watcher on every node,
+    // leader-gated rebalance controller on every node. Both spawn
+    // only when a snapshot store AND a chitchat-backed cluster
+    // controller are available — static-discovery deployments don't
+    // have a KV tier so the leader-rotation path can't run.
+    let rebalance_shutdown = Arc::new(tokio::sync::Notify::new());
+    let mut rebalance_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    if let Some(snap_store) = snapshot_store.clone() {
+        if let DiscoveryImpl::Gossip(ref gossip) = discovery {
+            if let Some(handle) = gossip.chitchat_handle() {
+                use laminar_core::cluster::control::{ChitchatKv, ClusterController, ClusterKv};
+                let kv: Arc<dyn ClusterKv> = Arc::new(ChitchatKv::from_handle(handle));
+                let members_rx = discovery.membership_watch();
+                let controller = Arc::new(ClusterController::new(
+                    node_id,
+                    kv,
+                    Some(Arc::clone(&snap_store)),
+                    members_rx,
+                ));
+                rebalance_tasks.push(laminar_db::rebalance::spawn_snapshot_watcher(
+                    Arc::clone(&db),
+                    Arc::clone(&snap_store),
+                    Arc::clone(&vnode_registry),
+                    Arc::clone(&rebalance_shutdown),
+                ));
+                rebalance_tasks.push(laminar_db::rebalance::spawn_rebalance_controller(
+                    Arc::clone(&db),
+                    controller,
+                    snap_store,
+                    Arc::clone(&vnode_registry),
+                    Arc::clone(&rebalance_shutdown),
+                ));
+                info!("Rebalance control plane started");
+            }
+        }
+    }
+
     let (app_state, api_handle) =
         server::start_http_api(Arc::clone(&db), registry, config_path.clone(), config)
             .await
@@ -470,6 +535,8 @@ pub async fn start_cluster(
         api_handle,
         watcher_handle,
         membership_handle,
+        rebalance_tasks,
+        rebalance_shutdown,
     })
 }
 

@@ -14,7 +14,9 @@ pub use barrier::{
 pub use controller::ClusterController;
 pub use decision::{CheckpointDecisionStore, Decision, DecisionError, RecordOutcome};
 pub use leader::leader_of;
-pub use snapshot::{AssignmentSnapshot, AssignmentSnapshotStore, SnapshotError};
+pub use snapshot::{
+    AssignmentSnapshot, AssignmentSnapshotStore, RotateOutcome, SnapshotError,
+};
 
 #[cfg(feature = "cluster-unstable")]
 pub mod chitchat_kv;

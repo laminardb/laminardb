@@ -129,6 +129,14 @@ impl ClusterController {
         ids
     }
 
+    /// Cloneable membership watch. Background tasks subscribe to
+    /// this to react to join/leave events (`changed().await`) without
+    /// polling [`Self::live_instances`] on a timer.
+    #[must_use]
+    pub fn members_watch(&self) -> watch::Receiver<Vec<NodeInfo>> {
+        self.members_rx.clone()
+    }
+
     /// Leader-side announce.
     ///
     /// # Errors

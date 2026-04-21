@@ -57,6 +57,14 @@ pub struct LaminarDbBuilder {
     #[cfg(feature = "cluster-unstable")]
     decision_store:
         Option<std::sync::Arc<laminar_core::cluster::control::CheckpointDecisionStore>>,
+    /// Durable assignment snapshot store. `start()` spawns a snapshot
+    /// watcher on every node and (on the current leader) a rebalance
+    /// controller that rotates snapshots when membership changes.
+    /// Without this, dynamic rebalance is inert — assignment stays
+    /// frozen at whatever was resolved at boot.
+    #[cfg(feature = "cluster-unstable")]
+    assignment_snapshot_store:
+        Option<std::sync::Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>,
     /// Optional state backend. When paired with `vnode_registry`, the
     /// coordinator writes per-vnode durability markers each checkpoint
     /// and consults `epoch_complete` before committing sinks.
@@ -95,6 +103,8 @@ impl LaminarDbBuilder {
             shuffle_receiver: None,
             #[cfg(feature = "cluster-unstable")]
             decision_store: None,
+            #[cfg(feature = "cluster-unstable")]
+            assignment_snapshot_store: None,
             state_backend: None,
             vnode_registry: None,
             physical_optimizer_rules: Vec::new(),
@@ -198,6 +208,20 @@ impl LaminarDbBuilder {
         store: std::sync::Arc<laminar_core::cluster::control::CheckpointDecisionStore>,
     ) -> Self {
         self.decision_store = Some(store);
+        self
+    }
+
+    /// Install the durable assignment snapshot store. `start()` spawns
+    /// a snapshot watcher on every node and — on the current leader —
+    /// a rebalance controller that rotates the snapshot on membership
+    /// change. Without this, vnode assignment is frozen at boot.
+    #[cfg(feature = "cluster-unstable")]
+    #[must_use]
+    pub fn assignment_snapshot_store(
+        mut self,
+        store: std::sync::Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
+    ) -> Self {
+        self.assignment_snapshot_store = Some(store);
         self
     }
 
@@ -463,6 +487,10 @@ impl LaminarDbBuilder {
         #[cfg(feature = "cluster-unstable")]
         if let Some(store) = self.decision_store {
             db.set_decision_store(store);
+        }
+        #[cfg(feature = "cluster-unstable")]
+        if let Some(store) = self.assignment_snapshot_store {
+            db.set_assignment_snapshot_store(store);
         }
         if let Some(backend) = self.state_backend {
             db.set_state_backend(backend);

@@ -311,18 +311,21 @@ async fn snapshot_save_fails_under_object_store_fault_and_recovers() {
         Arc::clone(&faulty) as Arc<dyn ObjectStore>
     ));
 
-    // Step 1: save baseline.
+    // Step 1: save baseline via CAS-create.
     let mut v1_map = BTreeMap::new();
     v1_map.insert(0u32, NodeId(1));
     let v1 = AssignmentSnapshot::empty().next(v1_map);
-    store.save(&v1).await.expect("baseline save");
+    store.save_if_absent(&v1).await.expect("baseline save");
 
-    // Step 2: turn writes off; the next save must fail.
+    // Step 2: turn writes off; the next rotate must fail.
     faulty.set_fault(ObjectStoreFault::FailWrites);
     let mut v2_map = BTreeMap::new();
     v2_map.insert(0u32, NodeId(2));
     let v2 = v1.next(v2_map);
-    let write_err = store.save(&v2).await.expect_err("write should fail");
+    let write_err = store
+        .save_if_version(&v2, v1.version)
+        .await
+        .expect_err("write should fail");
     assert!(
         format!("{write_err}").to_lowercase().contains("injected")
             || matches!(
@@ -337,22 +340,27 @@ async fn snapshot_save_fails_under_object_store_fault_and_recovers() {
     let still_v1 = store.load().await.expect("load ok").expect("present");
     assert_eq!(still_v1.version, 1);
 
-    // Step 4: fail reads; load errors.
+    // Step 4: fail reads; load surfaces either Err or Ok(None).
+    // Under the versioned layout, `load` uses `list` first and
+    // tolerates a missing listing as "empty store"; backends that
+    // model FailReads as a failed get (without failing list) return
+    // Ok(None), while backends that fail the list stream return Err.
+    // Both are legitimate read-fault behaviors.
     faulty.set_fault(ObjectStoreFault::FailReads);
-    let read_err = store.load().await;
-    match read_err {
-        // `object_store::Error::NotFound` is mapped by
-        // AssignmentSnapshotStore::load to `Ok(None)`, so a FailReads
-        // mode returns None rather than erroring. That's the right
-        // behavior for "file absent" semantics — document the shape
-        // by asserting None here.
-        Ok(None) => {}
-        other => panic!("expected Ok(None) under FailReads, got {other:?}"),
+    match store.load().await {
+        Err(_) | Ok(None) => {}
+        Ok(Some(s)) => panic!("expected read fault, got Ok(Some({s:?}))"),
     }
 
-    // Step 5: heal; save v2, verify visible.
+    // Step 5: heal; rotate v1 → v2, verify visible.
     faulty.set_fault(ObjectStoreFault::None);
-    store.save(&v2).await.expect("save after heal");
+    assert!(matches!(
+        store
+            .save_if_version(&v2, v1.version)
+            .await
+            .expect("rotate after heal"),
+        laminar_core::cluster::control::RotateOutcome::Rotated,
+    ));
     let loaded = store.load().await.unwrap().unwrap();
     assert_eq!(loaded.version, 2);
     assert_eq!(loaded.vnodes.get(&0), Some(&NodeId(2)));
@@ -395,7 +403,7 @@ async fn assignment_snapshot_survives_full_cluster_restart() {
         .controller
         .snapshot_store()
         .expect("snapshot store installed")
-        .save(&snapshot)
+        .save_if_absent(&snapshot)
         .await
         .expect("save");
 

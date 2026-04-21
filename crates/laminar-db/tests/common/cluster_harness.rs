@@ -60,6 +60,17 @@ pub struct NodeRuntime {
     /// the harness — the whole point is a cluster-wide verdict — but
     /// owned per-node here so tests can read it through any handle.
     pub decision_store: Arc<CheckpointDecisionStore>,
+    /// Durable assignment snapshot store. Shared; the rebalance
+    /// controller writes versioned entries here and the watcher on
+    /// every node reads from it.
+    pub assignment_snapshot_store: Arc<AssignmentSnapshotStore>,
+    /// Shutdown signal for this node's rebalance tasks.
+    pub rebalance_shutdown: Arc<tokio::sync::Notify>,
+    /// `JoinHandle`s for the snapshot watcher + rebalance controller
+    /// tasks spawned in [`ClusterEngineHarness::start_all`]. Drained
+    /// on shutdown. Interior mutability so `start_all(&self)` can
+    /// push without threading `&mut` through every test call site.
+    pub rebalance_tasks: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl NodeRuntime {
@@ -242,6 +253,7 @@ impl ClusterEngineHarness {
                 .shuffle_sender(Arc::clone(&sender))
                 .shuffle_receiver(Arc::clone(&receivers[idx]))
                 .decision_store(Arc::clone(&decision_store))
+                .assignment_snapshot_store(Arc::clone(&snapshot_store))
                 // Mirror production: DataFusion partitions track vnode count.
                 .target_partitions(vnode_count as usize)
                 .build()
@@ -259,6 +271,9 @@ impl ClusterEngineHarness {
                 vnode_registry: Arc::clone(&registry),
                 state_backend: Arc::clone(&state_backend),
                 decision_store: Arc::clone(&decision_store),
+                assignment_snapshot_store: Arc::clone(&snapshot_store),
+                rebalance_shutdown: Arc::new(tokio::sync::Notify::new()),
+                rebalance_tasks: parking_lot::Mutex::new(Vec::new()),
             });
         }
 
@@ -276,6 +291,34 @@ impl ClusterEngineHarness {
     pub async fn start_all(&self) {
         for node in &self.nodes {
             node.db.start().await.expect("db.start()");
+        }
+        // Spawn the rebalance control plane — snapshot watcher on
+        // every node, leader-gated rebalance controller on every
+        // node. Mirrors production's `server/cluster.rs` wiring so
+        // the harness exercises the real tasks rather than a stub.
+        // Tests use fast-defaults so integration tests don't wait
+        // the 5s production debounce before observing rotations.
+        let cfg = laminar_db::rebalance::RebalanceConfig::test_defaults();
+        for (idx, nh) in self.cluster.nodes.iter().enumerate() {
+            let node = &self.nodes[idx];
+            let watcher = laminar_db::rebalance::spawn_snapshot_watcher_with(
+                Arc::clone(&node.db),
+                Arc::clone(&node.assignment_snapshot_store),
+                Arc::clone(&node.vnode_registry),
+                Arc::clone(&node.rebalance_shutdown),
+                cfg,
+            );
+            let controller = laminar_db::rebalance::spawn_rebalance_controller_with(
+                Arc::clone(&node.db),
+                Arc::clone(&nh.controller),
+                Arc::clone(&node.assignment_snapshot_store),
+                Arc::clone(&node.vnode_registry),
+                Arc::clone(&node.rebalance_shutdown),
+                cfg,
+            );
+            let mut handles = node.rebalance_tasks.lock();
+            handles.push(watcher);
+            handles.push(controller);
         }
     }
 
@@ -309,6 +352,13 @@ impl ClusterEngineHarness {
             checkpoint_dirs,
         } = self;
         for node in nodes {
+            // Wake rebalance tasks so they observe shutdown and exit.
+            node.rebalance_shutdown.notify_waiters();
+            let handles: Vec<_> = node.rebalance_tasks.lock().drain(..).collect();
+            for task in handles {
+                task.abort();
+                let _ = task.await;
+            }
             let _ = node.db.shutdown().await;
         }
         cluster.shutdown().await;
