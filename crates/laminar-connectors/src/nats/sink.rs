@@ -131,11 +131,18 @@ impl SinkConnector for NatsSink {
             .map(|n| resolve_utf8(batch, n).map(|arr| (n.as_str(), arr)))
             .collect::<Result<_, _>>()?;
         let expected_stream = cfg.expected_stream.as_deref();
-        let dedup_col = cfg
-            .dedup_id_column
-            .as_deref()
-            .map(|n| resolve_utf8(batch, n).map(|arr| (n, arr)))
-            .transpose()?;
+        // Only emit Nats-Msg-Id under exactly-once — that's the delivery
+        // mode whose duplicate_window we validate at open(). Honoring
+        // the column under at-least-once would give silent dedup without
+        // the safety check, which is the worst of both worlds.
+        let dedup_col = if cfg.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
+            cfg.dedup_id_column
+                .as_deref()
+                .map(|n| resolve_utf8(batch, n).map(|arr| (n, arr)))
+                .transpose()?
+        } else {
+            None
+        };
 
         let records = ser
             .serialize(batch)
@@ -147,26 +154,13 @@ impl SinkConnector for NatsSink {
             let subject: &str = match (&cfg.subject, subject_col) {
                 (SubjectSpec::Literal(s), _) => s.as_str(),
                 (SubjectSpec::Column(name), Some(arr)) => {
-                    if arr.is_null(row) {
-                        return Err(err(&format!(
-                            "subject.column '{name}' is null at row {row}"
-                        )));
-                    }
-                    arr.value(row)
+                    non_null(arr, row, "subject.column", name)?
                 }
                 (SubjectSpec::Column(_), None) => unreachable!("resolved above"),
             };
-            let msg_id = match dedup_col {
-                Some((name, arr)) => {
-                    if arr.is_null(row) {
-                        return Err(err(&format!(
-                            "dedup.id.column '{name}' is null at row {row}"
-                        )));
-                    }
-                    Some(arr.value(row))
-                }
-                None => None,
-            };
+            let msg_id = dedup_col
+                .map(|(name, arr)| non_null(arr, row, "dedup.id.column", name))
+                .transpose()?;
             let headers = build_headers(expected_stream, msg_id, &header_cols, row);
             let payload_len = payload.len() as u64;
             let payload = bytes::Bytes::from(payload);
@@ -221,9 +215,15 @@ impl SinkConnector for NatsSink {
     }
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
-        // Drain whatever has landed, bounded by 1s so a slow round-trip
-        // doesn't stall the periodic flush timer. pre_commit uses the
-        // user-configured ack timeout for the strict drain.
+        // Push buffered core publishes to the wire; drain landed JS acks
+        // (bounded so a slow round-trip doesn't stall the flush timer).
+        match self.runtime.as_ref() {
+            Some(Runtime::Core { client }) => client
+                .flush()
+                .await
+                .map_err(|e| err(&format!("core flush: {e}")))?,
+            Some(Runtime::JetStream { .. }) | None => {}
+        }
         drain_acks(&mut self.pending_acks, Duration::from_secs(1)).await
     }
 
@@ -236,12 +236,7 @@ impl SinkConnector for NatsSink {
     }
 
     async fn rollback_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
-        // Drop the pending futures. Any publish already on the wire will
-        // land on the server; on the next epoch's retry the same
-        // Nats-Msg-Id values dedup them out. Publishes that never landed
-        // simply get resent. Both paths are safe as long as the stream's
-        // duplicate_window covers the rollback-to-retry gap — validated
-        // at open() via LDB-5056.
+        // Dedup handles any landed publishes on retry (see LDB-5056).
         self.pending_acks.clear();
         Ok(())
     }
@@ -251,6 +246,12 @@ impl SinkConnector for NatsSink {
             .config
             .as_ref()
             .map_or(Duration::from_secs(5), |c| c.ack_timeout);
+        // Flush any buffered core publishes before dropping the client —
+        // async-nats queues publishes locally and they'd be lost on a
+        // bare drop.
+        if let Some(Runtime::Core { client }) = self.runtime.as_ref() {
+            let _ = client.flush().await;
+        }
         let _ = drain_acks(&mut self.pending_acks, timeout).await;
         self.runtime = None;
         Ok(())
@@ -284,6 +285,19 @@ fn resolve_utf8<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArra
         .ok_or_else(|| err(&format!("column '{name}' not in batch schema")))?;
     col.as_string_opt::<i32>()
         .ok_or_else(|| err(&format!("column '{name}' must be Utf8")))
+}
+
+fn non_null<'a>(
+    arr: &'a StringArray,
+    row: usize,
+    kind: &str,
+    name: &str,
+) -> Result<&'a str, ConnectorError> {
+    if arr.is_null(row) {
+        Err(err(&format!("{kind} '{name}' is null at row {row}")))
+    } else {
+        Ok(arr.value(row))
+    }
 }
 
 fn build_headers(
