@@ -517,7 +517,17 @@ async fn shuffle_pre_agg_batches(
             let owner = cfg.registry.owner(v);
             if owner == cfg.self_id {
                 local.push(slice);
-            } else if !owner.is_unassigned() {
+            } else if owner.is_unassigned() {
+                // Fail the cycle rather than drop the slice. Silently
+                // discarding leaves source offsets to advance past rows
+                // that never reached a peer, producing phantom loss at
+                // the checkpoint boundary.
+                return Err(DbError::Pipeline(format!(
+                    "[{op_name}] row-shuffle: vnode {v} is unassigned — \
+                     refusing to drop {} rows",
+                    slice.num_rows()
+                )));
+            } else {
                 let msg = ShuffleMessage::VnodeData(v, slice);
                 // Fail the cycle on send error; dropping silently would
                 // let source offsets advance past un-delivered rows.
