@@ -26,7 +26,8 @@ use std::time::{Duration, Instant};
 use arrow_array::RecordBatch;
 use crossfire::{mpsc, AsyncRx};
 use laminar_connectors::checkpoint::SourceCheckpoint;
-use laminar_connectors::connector::DeliveryGuarantee;
+use laminar_connectors::connector::{DeliveryGuarantee, SourceBatch};
+use laminar_connectors::error::ConnectorError;
 use laminar_core::alloc::{PriorityClass, PriorityGuard};
 use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -72,14 +73,9 @@ struct SourceHandle {
     join: tokio::task::JoinHandle<()>,
     /// Injector for Chandy-Lamport checkpoint barriers.
     barrier_injector: CheckpointBarrierInjector,
-    /// Pushes the most-recently-committed epoch to the source task so the
-    /// connector can release external state tied to that epoch (e.g.,
-    /// `JetStream` acks, Kafka committed offsets). `watch` gives
-    /// latest-wins semantics: because epochs are monotonic and a commit
-    /// at `N` subsumes all `< N`, a source that misses intermediate
-    /// values is still correct. Value `0` is the sentinel for "no epoch
-    /// committed yet".
-    epoch_committed_tx: tokio::sync::watch::Sender<u64>,
+    /// Latest committed epoch; source acks on pickup. Monotonic, so
+    /// watch's skip-latest semantics are safe.
+    epoch_committed_tx: tokio::sync::watch::Sender<Option<u64>>,
 }
 
 /// Simplified pipeline coordinator — single tokio task, no core threads.
@@ -161,15 +157,18 @@ impl PendingBarrier {
 /// Fallback timeout for idle wake.
 const IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// What woke a source task's select loop.
+enum SourceWake {
+    Shutdown,
+    EpochCommitted(u64),
+    Polled(Result<Option<SourceBatch>, ConnectorError>),
+}
+
 impl StreamingCoordinator {
-    /// Publish a committed-epoch number to every source task. Called
-    /// after a successful checkpoint so connectors that tie external
-    /// state to epoch commits (e.g., `JetStream` ack-on-commit) can
-    /// release that state. Send errors — a task whose receiver has been
-    /// dropped — are ignored; the task is shutting down anyway.
+    /// Fan out a committed epoch to every source so they can ack.
     fn broadcast_epoch_committed(&self, epoch: u64) {
         for handle in &self.source_handles {
-            let _ = handle.epoch_committed_tx.send(epoch);
+            let _ = handle.epoch_committed_tx.send(Some(epoch));
         }
     }
 
@@ -259,49 +258,42 @@ impl StreamingCoordinator {
             let barrier_injector = CheckpointBarrierInjector::new();
             let barrier_handle = barrier_injector.handle();
 
-            // Epoch-committed channel: coordinator publishes the most
-            // recently committed epoch; task dispatches to
-            // `connector.notify_epoch_committed`. Initial value `0` is
-            // the "no commit yet" sentinel and is skipped.
             let (epoch_committed_tx, mut epoch_committed_rx) =
-                tokio::sync::watch::channel::<u64>(0);
+                tokio::sync::watch::channel::<Option<u64>>(None);
 
             let join = tokio::spawn(async move {
                 let mut epoch: u64 = 0;
 
-                // Poll loop — tokio::select! ensures shutdown cancels a
-                // long-running poll_batch or notify_epoch_committed without
-                // waiting for it to return.
+                // Ack a fresh commit before polling more — keeps
+                // max_ack_pending headroom for the broker.
                 loop {
-                    let poll_result = tokio::select! {
+                    let wake = tokio::select! {
                         biased;
-                        () = task_shutdown_clone.notified() => break,
-                        // A new committed epoch takes priority over more
-                        // polling — releasing external state (e.g.,
-                        // JetStream acks) frees up pending-ack budget so
-                        // the broker can keep delivering.
-                        changed = epoch_committed_rx.changed() => {
-                            if changed.is_err() {
-                                // Sender dropped; coordinator is shutting
-                                // down. Shutdown notify will fire next.
-                                continue;
-                            }
-                            let committed = *epoch_committed_rx.borrow_and_update();
-                            if committed > 0 {
-                                if let Err(err) =
-                                    connector.notify_epoch_committed(committed).await
-                                {
-                                    tracing::warn!(
-                                        source = %src_name,
-                                        error = %err,
-                                        epoch = committed,
-                                        "notify_epoch_committed failed",
-                                    );
-                                }
+                        () = task_shutdown_clone.notified() => SourceWake::Shutdown,
+                        r = epoch_committed_rx.changed() => match r {
+                            Ok(()) => match *epoch_committed_rx.borrow_and_update() {
+                                Some(e) => SourceWake::EpochCommitted(e),
+                                None => continue,
+                            },
+                            Err(_) => SourceWake::Shutdown,
+                        },
+                        r = connector.poll_batch(max_poll) => SourceWake::Polled(r),
+                    };
+
+                    let poll_result = match wake {
+                        SourceWake::Shutdown => break,
+                        SourceWake::EpochCommitted(e) => {
+                            if let Err(err) = connector.notify_epoch_committed(e).await {
+                                tracing::warn!(
+                                    source = %src_name,
+                                    error = %err,
+                                    epoch = e,
+                                    "notify_epoch_committed failed",
+                                );
                             }
                             continue;
                         }
-                        result = connector.poll_batch(max_poll) => result,
+                        SourceWake::Polled(r) => r,
                     };
 
                     match poll_result {

@@ -183,17 +183,10 @@ async fn test_barrier_aligned_checkpoint_fires() {
     );
 }
 
-/// Verifies that after a barrier-aligned checkpoint commits, every
-/// registered source's `SourceConnector::notify_epoch_committed` is
-/// called with the committed epoch number.
-///
-/// Regression guard for PR: `notify_epoch_committed` SDK hook. Without
-/// the wiring, JetStream-style sources would never release pending acks
-/// and `max_ack_pending` would saturate.
+/// After a barrier checkpoint commits, each source's
+/// `notify_epoch_committed` should fire with a monotonic epoch.
 #[tokio::test]
 async fn test_notify_epoch_committed_propagates_to_sources() {
-    use parking_lot::Mutex;
-
     let src_a = laminar_connectors::testing::MockSourceConnector::with_batches(50, 10);
     let src_b = laminar_connectors::testing::MockSourceConnector::with_batches(50, 10);
     let epochs_a = src_a.committed_epochs_handle();
@@ -246,35 +239,15 @@ async fn test_notify_epoch_committed_propagates_to_sources() {
     shutdown_clone.notify_one();
     handle.await.unwrap();
 
-    fn observed(handle: &Arc<Mutex<Vec<u64>>>) -> Vec<u64> {
-        handle.lock().clone()
-    }
-
-    let a = observed(&epochs_a);
-    let b = observed(&epochs_b);
-
-    assert!(
-        !a.is_empty(),
-        "src_a should have received at least one notify_epoch_committed call, got {a:?}"
-    );
-    assert!(
-        !b.is_empty(),
-        "src_b should have received at least one notify_epoch_committed call, got {b:?}"
-    );
-
-    // Epochs must be monotonically non-decreasing. `watch` has
-    // latest-wins semantics so intermediate values may be skipped —
-    // that is correct behavior and the assertion tolerates it.
-    for window in a.windows(2) {
+    for (label, epochs) in [("src_a", &epochs_a), ("src_b", &epochs_b)] {
+        let observed = epochs.lock().clone();
         assert!(
-            window[0] <= window[1],
-            "src_a epochs must be non-decreasing, got {a:?}"
+            !observed.is_empty(),
+            "{label}: expected at least one notify_epoch_committed call, got {observed:?}"
         );
-    }
-    for window in b.windows(2) {
         assert!(
-            window[0] <= window[1],
-            "src_b epochs must be non-decreasing, got {b:?}"
+            observed.windows(2).all(|w| w[0] <= w[1]),
+            "{label}: epochs must be non-decreasing, got {observed:?}"
         );
     }
 }

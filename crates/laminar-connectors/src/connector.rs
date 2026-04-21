@@ -442,32 +442,15 @@ pub trait SourceConnector: Send {
         None
     }
 
-    /// Notifies the source that epoch `epoch` has been durably committed.
+    /// Acknowledge that `epoch` has been durably committed.
     ///
-    /// Called by the pipeline after the checkpoint manifest has been
-    /// persisted and every exactly-once sink's `commit_epoch` has returned
-    /// successfully. Sources that tie external acknowledgements to
-    /// checkpoint-commit boundaries (e.g., `JetStream` ack-on-commit)
-    /// release their pending-ack set for `epoch` here.
-    ///
-    /// Epoch numbers are monotonic. A successful notification for epoch
-    /// `N` implies epochs `< N` are also committed; implementations
-    /// may opportunistically release any state bound to `≤ N`.
-    ///
-    /// This call is cancellable — on pipeline shutdown the runtime may
-    /// drop it mid-flight. Implementations must tolerate that (external
-    /// systems will redeliver unacknowledged messages on reconnect) and
-    /// must be idempotent across retries on the same epoch.
-    ///
-    /// The default implementation is a no-op. Sources that commit offsets
-    /// independently (Kafka with timer-based commit, CDC sources writing
-    /// to replication slots, file sources) need no override.
+    /// Called after the manifest is persisted and every exactly-once sink
+    /// committed the epoch. Idempotent — a retry after cancellation is
+    /// legal.
     ///
     /// # Errors
     ///
-    /// Returns [`ConnectorError`] if the acknowledgement round-trip fails.
-    /// Errors are logged by the runtime; they do not roll back the
-    /// committed epoch.
+    /// Errors are logged; they do not roll back the committed epoch.
     async fn notify_epoch_committed(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
         Ok(())
     }

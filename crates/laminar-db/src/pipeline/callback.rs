@@ -65,7 +65,7 @@ pub trait PipelineCallback: Send + 'static {
     fn current_watermark(&self) -> i64;
 
     /// Perform a periodic (timer-based) checkpoint. Returns `Some(epoch)`
-    /// on successful commit, `None` if skipped or failed.
+    /// on successful commit, `None` otherwise.
     ///
     /// **Semantics: at-least-once.** Timer-based checkpoints capture source
     /// offsets *before* operator state. On recovery the consumer replays
@@ -76,26 +76,16 @@ pub trait PipelineCallback: Send + 'static {
     /// which captures offsets and operator state at a consistent cut across
     /// all sources.
     ///
-    /// The returned epoch is the monotonic checkpoint epoch number that
-    /// was just committed. The coordinator propagates it to each source's
-    /// [`SourceConnector::notify_epoch_committed`] so sources can release
-    /// external state bound to the epoch (e.g., ack messages).
-    ///
     /// [`checkpoint_with_barrier`]: PipelineCallback::checkpoint_with_barrier
-    /// [`SourceConnector::notify_epoch_committed`]: laminar_connectors::connector::SourceConnector::notify_epoch_committed
     async fn maybe_checkpoint(
         &mut self,
         force: bool,
         source_offsets: FxHashMap<String, SourceCheckpoint>,
     ) -> Option<u64>;
 
-    /// Called when all sources have aligned on a barrier.
-    ///
-    /// Receives source checkpoints captured at the barrier point
-    /// (consistent). The callback snapshots operator state and persists
-    /// the checkpoint. Returns `Some(epoch)` on successful commit, `None`
-    /// on failure — the caller re-drives via the periodic path on
-    /// failure.
+    /// Called when all sources have aligned on a barrier. Returns
+    /// `Some(epoch)` on successful commit, `None` on failure — the
+    /// caller retries on the next interval.
     async fn checkpoint_with_barrier(
         &mut self,
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,

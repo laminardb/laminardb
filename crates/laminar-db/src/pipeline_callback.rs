@@ -753,24 +753,41 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             source_offset_overrides: source_overrides,
         };
 
-        let committed_epoch: Option<u64> = {
+        let mut committed = None;
+        if force {
+            // Blocking checkpoint at shutdown.
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
                 match coord.checkpoint_with_offsets(request).await {
                     Ok(result) if result.success => {
-                        if force {
-                            tracing::info!(
-                                epoch = result.epoch,
-                                "Final pipeline checkpoint saved"
-                            );
-                        } else {
-                            tracing::info!(
-                                epoch = result.epoch,
-                                duration_ms = result.duration.as_millis(),
-                                "Pipeline checkpoint completed"
-                            );
-                        }
-                        Some(result.epoch)
+                        tracing::info!(epoch = result.epoch, "Final pipeline checkpoint saved");
+                        committed = Some(result.epoch);
+                    }
+                    Ok(result) => {
+                        tracing::warn!(
+                            epoch = result.epoch,
+                            error = ?result.error,
+                            "Final checkpoint failed"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Final checkpoint error");
+                    }
+                }
+            }
+        } else {
+            // Periodic checkpoint — run inline (single-threaded runtime, no
+            // parallelism to exploit with tokio::spawn).
+            let mut guard = self.coordinator.lock().await;
+            if let Some(ref mut coord) = *guard {
+                match coord.checkpoint_with_offsets(request).await {
+                    Ok(result) if result.success => {
+                        tracing::info!(
+                            epoch = result.epoch,
+                            duration_ms = result.duration.as_millis(),
+                            "Pipeline checkpoint completed"
+                        );
+                        committed = Some(result.epoch);
                     }
                     Ok(result) => {
                         tracing::warn!(
@@ -778,20 +795,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                             error = ?result.error,
                             "Pipeline checkpoint failed"
                         );
-                        None
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "Checkpoint error");
-                        None
                     }
                 }
-            } else {
-                None
             }
-        };
+        }
 
         self.last_checkpoint = std::time::Instant::now();
-        committed_epoch
+        committed
     }
 
     async fn checkpoint_with_barrier(
