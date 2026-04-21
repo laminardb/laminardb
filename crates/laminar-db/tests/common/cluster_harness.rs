@@ -55,23 +55,20 @@ pub struct ClusterEngineHarness {
     pub cluster: MiniCluster,
     /// Per-node engine state, in `cluster.nodes` order.
     pub nodes: Vec<NodeRuntime>,
-    /// Backing dir for the cluster-wide state backend. Kept here so its
-    /// lifetime outlives the engines. Survives across [`shutdown_keep_dirs`]
-    /// for the restart scenario.
+    /// Shared state backend dir. Survives `shutdown_keep_dirs`.
     pub shared_state_dir: TempDir,
-    /// One per node, in `nodes` order. Same survive-across-restart
-    /// contract as `shared_state_dir`.
+    /// Per-node checkpoint dirs. Survives `shutdown_keep_dirs`.
     pub checkpoint_dirs: Vec<TempDir>,
 }
 
 impl ClusterEngineHarness {
-    /// Spawn `n` nodes with `vnode_count` vnodes round-robin distributed
-    /// across them. Returns when every engine has completed `db.start()`
-    /// and gossip has converged.
+    /// Spawn `n` nodes with `vnode_count` vnodes round-robin across
+    /// them. Returns after gossip converges; `db.start()` is
+    /// deferred to `start_all`.
     ///
     /// # Panics
-    /// Panics if convergence times out, the lowest-id node fails to win
-    /// leader election, or any engine fails to build/start.
+    /// On convergence timeout, leader-election mismatch, or engine
+    /// build failure.
     pub async fn spawn(n: usize, vnode_count: u32) -> Self {
         let shared_state_dir = tempfile::tempdir().expect("shared state tempdir");
         let checkpoint_dirs: Vec<TempDir> = (0..n)
@@ -80,8 +77,7 @@ impl ClusterEngineHarness {
         Self::spawn_with_dirs(n, vnode_count, shared_state_dir, checkpoint_dirs).await
     }
 
-    /// Like [`spawn`], but reuse pre-existing dirs (the restart scenario
-    /// hands these back through [`shutdown_keep_dirs`]).
+    /// Like `spawn`, but reuse existing dirs from `shutdown_keep_dirs`.
     pub async fn spawn_with_dirs(
         n: usize,
         vnode_count: u32,
@@ -167,11 +163,8 @@ impl ClusterEngineHarness {
                 max_retained: Some(3),
             };
 
-            // Skip `.profile(Cluster)` so the builder picks the
-            // file-backed checkpoint store. `ObjectStoreCheckpointStore`
-            // uses `block_on` internally and panics from inside a
-            // tokio runtime; production avoids this by routing
-            // `file://` URLs to `FileSystemCheckpointStore`.
+            // Skip `.profile(Cluster)` — `ObjectStoreCheckpointStore`
+            // `block_on`s internally and panics inside a tokio runtime.
             let decision_store = Arc::new(CheckpointDecisionStore::new(Arc::clone(&shared_store)));
 
             let db = LaminarDB::builder()
@@ -238,15 +231,31 @@ impl ClusterEngineHarness {
             node.rebalance_tasks.push(watcher);
             node.rebalance_tasks.push(controller);
         }
-        // Give background tasks a moment to spin up before the test
-        // drives its first checkpoint. Without this there's a
-        // narrow race on slower hosts where the follower's pipeline
-        // isn't yet observing barrier announcements.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Wait until every controller's `live_instances` reports the
+        // full cluster. Discovery polls chitchat on its own cadence,
+        // so without this gate a coverage-instrumented run can fire
+        // a checkpoint before `members_rx` is populated and the
+        // leader skips the prepare quorum.
+        let expected = self.cluster.nodes.len();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if self
+                .cluster
+                .nodes
+                .iter()
+                .all(|n| n.controller.live_instances().len() == expected)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "controllers never converged on full membership",
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
-    /// Index into `nodes` of the current leader. Always `0` under the
-    /// "lowest-id wins" rule asserted in [`spawn_with_dirs`].
+    /// Index of the current leader in `nodes` (always 0 today).
     #[must_use]
     pub fn leader_idx(&self) -> usize {
         self.cluster
@@ -264,9 +273,7 @@ impl ClusterEngineHarness {
             .collect()
     }
 
-    /// Drop the cluster cleanly, returning the durable dirs so the
-    /// caller can hand them to a fresh [`spawn_with_dirs`] for a
-    /// restart-scenario test.
+    /// Shut down and return the durable dirs for a restart scenario.
     pub async fn shutdown_keep_dirs(self) -> (TempDir, Vec<TempDir>) {
         let Self {
             cluster,

@@ -1510,12 +1510,9 @@ impl CheckpointCoordinator {
             }
         }
 
-        // Record the commit marker on shared storage BEFORE announcing
-        // Commit. A new leader elected between here and any follower's
-        // local commit will read the marker on recovery and re-drive
-        // commit instead of defaulting to Abort. A cluster-mode leader
-        // with no decision store means we can't make that recovery
-        // guarantee — treat it as a misconfiguration and abort.
+        // Record the commit marker before announcing Commit so a new
+        // leader elected mid-2PC can recover the decision. A
+        // cluster leader without a decision store is a misconfig.
         #[cfg(feature = "cluster-unstable")]
         if self
             .cluster_controller

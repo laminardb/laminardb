@@ -18,19 +18,16 @@ use tracing::{debug, info, warn};
 
 use crate::db::LaminarDB;
 
-/// Tunables for the rebalance control plane. Production defaults; the
-/// test harness overrides via [`Self::test_defaults`].
+/// Tunables for the rebalance control plane.
 #[derive(Debug, Clone, Copy)]
 pub struct RebalanceConfig {
     /// Interval between snapshot-store polls.
     pub watcher_poll: Duration,
-    /// Quiet-period before a membership change triggers rotation.
+    /// Quiet period before a membership change triggers rotation.
     pub rebalance_debounce: Duration,
     /// Upper bound on the pre-rotation forced checkpoint.
     pub checkpoint_timeout: Duration,
-    /// Delay before retrying a failed rotation. Without a retry a
-    /// single transient I/O error leaves the cluster on a stale
-    /// assignment until the next membership event.
+    /// Delay before retrying a failed rotation.
     pub retry_delay: Duration,
 }
 
@@ -46,8 +43,7 @@ impl Default for RebalanceConfig {
 }
 
 impl RebalanceConfig {
-    /// Fast timings for integration tests. Not safe for production —
-    /// 500ms debounce thrashes under gossip churn.
+    /// Fast timings for tests — 500ms debounce thrashes in production.
     #[doc(hidden)]
     #[must_use]
     pub fn test_defaults() -> Self {
@@ -92,8 +88,7 @@ pub fn spawn_snapshot_watcher(
 }
 
 /// Spawn the leader-gated rebalance controller. Runs on every node;
-/// leadership is re-checked after the debounce so followers can take
-/// over without restart.
+/// leadership is re-checked after the debounce.
 pub fn spawn_rebalance_controller(
     db: Arc<LaminarDB>,
     controller: Arc<ClusterController>,
