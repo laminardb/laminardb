@@ -78,8 +78,12 @@ impl std::fmt::Debug for VnodeRegistry {
 impl VnodeRegistry {
     /// Create a registry sized for `vnode_count` vnodes, all marked
     /// as [`NodeId::UNASSIGNED`]. The assignment version starts at 1.
+    ///
+    /// # Panics
+    /// Panics if `vnode_count == 0`.
     #[must_use]
     pub fn new(vnode_count: u32) -> Self {
+        assert!(vnode_count > 0, "vnode_count must be > 0");
         let assignment: Arc<[NodeId]> =
             std::iter::repeat_n(NodeId::UNASSIGNED, vnode_count as usize)
                 .collect::<Vec<_>>()
@@ -94,8 +98,12 @@ impl VnodeRegistry {
     /// Create a registry where every vnode is owned by the same node.
     ///
     /// Used by single-instance / embedded deployments.
+    ///
+    /// # Panics
+    /// Panics if `vnode_count == 0`.
     #[must_use]
     pub fn single_owner(vnode_count: u32, owner: NodeId) -> Self {
+        assert!(vnode_count > 0, "vnode_count must be > 0");
         let assignment: Arc<[NodeId]> = std::iter::repeat_n(owner, vnode_count as usize)
             .collect::<Vec<_>>()
             .into();
@@ -152,15 +160,12 @@ impl VnodeRegistry {
     }
 
     /// Replace the full assignment and set the version to `version`
-    /// exactly, atomically. Intended for recovery paths that must
-    /// restore the registry to an authoritative fence version persisted
-    /// elsewhere (e.g., a loaded checkpoint snapshot) instead of
-    /// bumping from zero.
+    /// atomically. For recovery paths that must restore the registry to
+    /// a persisted fence generation, not a fresh bump.
     ///
     /// # Panics
-    /// Panics if `new_assignment.len() != self.vnode_count`, or if
-    /// `version` is less than the current assignment version
-    /// (assignment versions are monotonic).
+    /// Panics on length mismatch, or if `version` is less than the
+    /// current one (assignment versions are monotonic).
     pub fn set_assignment_and_version(&self, new_assignment: Arc<[NodeId]>, version: u64) {
         assert_eq!(
             new_assignment.len(),
