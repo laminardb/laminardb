@@ -308,11 +308,16 @@ pub async fn start_cluster(
         .map_err(|e| ClusterStartupError::Discovery(e.to_string()))?;
     info!("Discovery layer started");
 
-    // 2. Wait for expected membership. `peers` excludes self, so target
-    // is seeds.len() - 1 (assumes every node lists the full cluster).
-    // A single-peer early return would let resolve_vnode_assignment
-    // CAS-create from a partial view.
-    let expected_peers = cluster_cfg.discovery.seeds.len().saturating_sub(1).max(1);
+    // 2. Wait for expected membership. Seeds include self by
+    // convention (every node lists the full cluster), so the target
+    // is `seeds.len() - 1`. An empty seed list is always a config
+    // error in cluster mode — fail fast instead of hanging.
+    if cluster_cfg.discovery.seeds.is_empty() {
+        return Err(ClusterStartupError::Discovery(
+            "cluster mode requires at least one seed address".into(),
+        ));
+    }
+    let expected_peers = cluster_cfg.discovery.seeds.len().saturating_sub(1);
     let deadline = std::time::Instant::now() + cluster_cfg.formation_timeout;
     let mut last_seen = 0usize;
     let peers: Vec<NodeInfo> = loop {

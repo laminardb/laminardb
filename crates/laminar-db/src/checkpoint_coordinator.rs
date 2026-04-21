@@ -1522,45 +1522,48 @@ impl CheckpointCoordinator {
         // Record the commit marker on shared storage BEFORE announcing
         // Commit. A new leader elected between here and any follower's
         // local commit will read the marker on recovery and re-drive
-        // commit instead of defaulting to Abort. If recording fails
-        // we abort rather than commit without durability.
+        // commit instead of defaulting to Abort. A cluster-mode leader
+        // with no decision store means we can't make that recovery
+        // guarantee — treat it as a misconfiguration and abort.
         #[cfg(feature = "cluster-unstable")]
         if self
             .cluster_controller
             .as_ref()
             .is_some_and(|cc| cc.is_leader())
         {
-            if let Some(ref ds) = self.decision_store {
-                if let Err(e) = ds.record_committed(epoch).await {
+            let marker_result = match self.decision_store.as_ref() {
+                Some(ds) => ds.record_committed(epoch).await.map_err(|e| e.to_string()),
+                None => Err("no decision store configured for cluster leader".to_string()),
+            };
+            if let Err(reason) = marker_result {
+                error!(
+                    checkpoint_id, epoch, error = %reason,
+                    "[LDB-6038] cannot record commit marker — aborting epoch",
+                );
+                self.announce_if_leader(
+                    epoch,
+                    checkpoint_id,
+                    laminar_core::cluster::control::Phase::Abort,
+                    None,
+                )
+                .await;
+                self.checkpoints_failed += 1;
+                self.phase = CheckpointPhase::Idle;
+                let duration = start.elapsed();
+                self.emit_checkpoint_metrics(false, epoch, duration);
+                if let Err(rollback_err) = self.rollback_sinks(epoch).await {
                     error!(
-                        checkpoint_id, epoch, error = %e,
-                        "[LDB-6038] commit marker write failed — aborting epoch",
+                        checkpoint_id, epoch, error = %rollback_err,
+                        "[LDB-6039] sink rollback failed after commit marker failure",
                     );
-                    self.announce_if_leader(
-                        epoch,
-                        checkpoint_id,
-                        laminar_core::cluster::control::Phase::Abort,
-                        None,
-                    )
-                    .await;
-                    self.checkpoints_failed += 1;
-                    self.phase = CheckpointPhase::Idle;
-                    let duration = start.elapsed();
-                    self.emit_checkpoint_metrics(false, epoch, duration);
-                    if let Err(rollback_err) = self.rollback_sinks(epoch).await {
-                        error!(
-                            checkpoint_id, epoch, error = %rollback_err,
-                            "[LDB-6039] sink rollback failed after commit marker write error",
-                        );
-                    }
-                    return Ok(CheckpointResult {
-                        success: false,
-                        checkpoint_id,
-                        epoch,
-                        duration,
-                        error: Some(format!("commit marker write failed: {e}")),
-                    });
                 }
+                return Ok(CheckpointResult {
+                    success: false,
+                    checkpoint_id,
+                    epoch,
+                    duration,
+                    error: Some(format!("commit marker: {reason}")),
+                });
             }
         }
 

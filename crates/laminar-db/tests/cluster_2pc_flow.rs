@@ -71,6 +71,9 @@ async fn two_node_leader_commits_follower_mirrors() {
 
     let leader_dir = tempfile::tempdir().unwrap();
     let follower_dir = tempfile::tempdir().unwrap();
+    let decision_dir = tempfile::tempdir().unwrap();
+    let decision_store = make_decision_store(&decision_dir);
+
     let mut leader_coord = make_coord(
         leader_dir.path(),
         backend.clone(),
@@ -78,6 +81,7 @@ async fn two_node_leader_commits_follower_mirrors() {
         Arc::clone(&leader_node.controller),
     )
     .await;
+    leader_coord.set_decision_store(Arc::clone(&decision_store));
     let mut follower_coord = make_coord(
         follower_dir.path(),
         backend.clone(),
@@ -85,6 +89,7 @@ async fn two_node_leader_commits_follower_mirrors() {
         Arc::clone(&follower_node.controller),
     )
     .await;
+    follower_coord.set_decision_store(Arc::clone(&decision_store));
 
     // Synthetic PREPARE — production's pipeline observes the leader's
     // announcement off the KV. Fresh store starts at epoch/id = 1.

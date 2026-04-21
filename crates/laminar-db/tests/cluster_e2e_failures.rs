@@ -195,16 +195,22 @@ async fn setup_query(db: &laminar_db::LaminarDB) {
     .expect("CREATE MATERIALIZED VIEW");
 }
 
-/// Union the `sums` MV rows across every node — with row-shuffle each
-/// node holds only its owned keys.
-async fn union_sums(harness: &ClusterEngineHarness) -> HashSet<(i64, i64)> {
-    let mut out = HashSet::new();
+/// Concatenate the `sums` MV rows from every node — preserves
+/// duplicates so tests catch the invariant violation where a key
+/// shows up on more than one node.
+async fn union_sums(harness: &ClusterEngineHarness) -> Vec<(i64, i64)> {
+    let mut out = Vec::new();
     for node in &harness.nodes {
-        for row in read_mv_sums(&node.db, "sums").await {
-            out.insert(row);
-        }
+        out.extend(read_mv_sums(&node.db, "sums").await);
     }
     out
+}
+
+/// Sorted copy for set-equality comparisons across restarts.
+#[cfg(feature = "phase-1-recovery")]
+fn sorted(mut rows: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+    rows.sort_unstable();
+    rows
 }
 
 /// Follower crashes mid-stream via phi-accrual (no graceful Left).
@@ -254,7 +260,11 @@ async fn crash_mid_stream_loses_in_flight() {
     sleep(Duration::from_millis(500)).await;
 
     let pre_crash = union_sums(&harness).await;
-    assert_eq!(pre_crash.len(), 8, "all 8 keys present before crash");
+    assert_eq!(
+        pre_crash.len(),
+        8,
+        "want 8 rows total; duplicates here would signal a key on >1 node",
+    );
 
     // Crash the follower — drop both the engine and the gossip
     // handle so phi-accrual fires.
@@ -370,27 +380,24 @@ async fn restart_recovers_sum_aggregate() {
 
     // Phase B: shutdown, keep dirs, spawn fresh cluster pointing at them.
     let (shared_dir, checkpoint_dirs) = harness.shutdown_keep_dirs().await;
-    let harness2 =
+    let mut harness2 =
         ClusterEngineHarness::spawn_with_dirs(N_NODES, VNODE_COUNT, shared_dir, checkpoint_dirs)
             .await;
 
-    // Re-register DDL on each engine. OR REPLACE semantics aren't yet
-    // supported; if the MV store restored the MV on startup, plain
-    // CREATE will error. Phase 1.1 owns reconciling this path.
     for node in &harness2.nodes {
         setup_query(&node.db).await;
     }
     harness2.start_all().await;
     sleep(Duration::from_millis(1000)).await;
 
-    // Intermediate snapshot: state must survive restart, BEFORE the
+    // Intermediate snapshot: state must survive restart before the
     // second-half push. A broken recovery that drops state and lets
-    // the second push repopulate would silently pass without this check.
+    // the second push repopulate would otherwise pass silently.
     let post_restart = union_sums(&harness2).await;
     assert_eq!(
-        post_restart, pre_shutdown,
-        "recovered aggregate state must equal pre-shutdown state \
-         (intermediate assertion — no second-half push yet)",
+        sorted(post_restart),
+        sorted(pre_shutdown),
+        "recovered aggregate state must equal pre-shutdown state",
     );
 
     // Phase C: second half. Totals must equal the unbroken-stream case.
@@ -408,9 +415,11 @@ async fn restart_recovers_sum_aggregate() {
     sleep(Duration::from_millis(500)).await;
 
     let final_state = union_sums(&harness2).await;
-    let expected: HashSet<(i64, i64)> = all_keys.iter().map(|&k| (k, k * 10)).collect();
+    let mut expected: Vec<(i64, i64)> = all_keys.iter().map(|&k| (k, k * 10)).collect();
+    expected.sort_unstable();
     assert_eq!(
-        final_state, expected,
+        sorted(final_state),
+        expected,
         "final state must equal uninterrupted-stream totals",
     );
 
