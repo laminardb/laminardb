@@ -22,6 +22,7 @@ use std::time::Duration;
 use arrow_schema::SchemaRef;
 use async_nats::jetstream::{self, consumer::pull};
 use async_trait::async_trait;
+use bytes::Bytes;
 use crossfire::{mpsc, AsyncRx};
 use futures_util::StreamExt;
 use rustc_hash::FxHashMap;
@@ -41,22 +42,27 @@ use crate::serde::{self, RecordDeserializer};
 /// (at-most-once, no server-side ack protocol).
 struct Incoming {
     subject: String,
-    payload: Vec<u8>,
-    stream_seq: u64,
+    payload: Bytes,
+    stream_seq: Option<u64>,
     ack: Option<jetstream::Message>,
+}
+
+/// Runtime state created by [`SourceConnector::open`] and torn down in
+/// [`SourceConnector::close`]. Keeping these together avoids a handful of
+/// parallel `Option<>` fields on `NatsSource`.
+struct Running {
+    deserializer: Box<dyn RecordDeserializer>,
+    rx: AsyncRx<mpsc::Array<Incoming>>,
+    shutdown: Arc<AtomicBool>,
+    handle: JoinHandle<()>,
 }
 
 /// NATS source — core and `JetStream` modes behind a single type.
 pub struct NatsSource {
     schema: SchemaRef,
     config: Option<NatsSourceConfig>,
-
-    // Runtime state — populated by open().
-    deserializer: Option<Box<dyn RecordDeserializer>>,
-    rx: Option<AsyncRx<mpsc::Array<Incoming>>>,
-    reader_shutdown: Option<Arc<AtomicBool>>,
-    reader_handle: Option<JoinHandle<()>>,
     data_ready: Arc<Notify>,
+    running: Option<Running>,
 
     // Ack-on-commit bookkeeping.
     pending: Vec<jetstream::Message>,
@@ -73,11 +79,8 @@ impl NatsSource {
         Self {
             schema,
             config: None,
-            deserializer: None,
-            rx: None,
-            reader_shutdown: None,
-            reader_handle: None,
             data_ready: Arc::new(Notify::new()),
+            running: None,
             pending: Vec::new(),
             sealed: VecDeque::new(),
             offsets: FxHashMap::default(),
@@ -90,7 +93,11 @@ impl NatsSource {
         self.config.as_ref()
     }
 
-    async fn open_jetstream(&mut self, cfg: &NatsSourceConfig) -> Result<(), ConnectorError> {
+    async fn open_jetstream(
+        &mut self,
+        cfg: &NatsSourceConfig,
+        deserializer: Box<dyn RecordDeserializer>,
+    ) -> Result<(), ConnectorError> {
         let client = connect(&cfg.servers).await?;
         let js = jetstream::new(client);
 
@@ -113,7 +120,6 @@ impl NatsSource {
             .await
             .map_err(|e| err(&format!("create_consumer('{consumer_name}') failed: {e}")))?;
 
-        // Spawn the reader task. `rx` is drained by poll_batch.
         let (tx, rx) = mpsc::bounded_async::<Incoming>(cfg.fetch_batch * 2);
         let shutdown = Arc::new(AtomicBool::new(false));
         let reader_shutdown = Arc::clone(&shutdown);
@@ -152,9 +158,9 @@ impl NatsSource {
                             continue;
                         }
                     };
-                    let stream_seq = msg.info().ok().map_or(0, |i| i.stream_sequence);
+                    let stream_seq = msg.info().ok().map(|i| i.stream_sequence);
                     let subject = msg.subject.to_string();
-                    let payload = msg.payload.to_vec();
+                    let payload = msg.payload.clone();
                     let incoming = Incoming {
                         subject,
                         payload,
@@ -173,13 +179,20 @@ impl NatsSource {
             }
         });
 
-        self.rx = Some(rx);
-        self.reader_shutdown = Some(shutdown);
-        self.reader_handle = Some(handle);
+        self.running = Some(Running {
+            deserializer,
+            rx,
+            shutdown,
+            handle,
+        });
         Ok(())
     }
 
-    async fn open_core(&mut self, cfg: &NatsSourceConfig) -> Result<(), ConnectorError> {
+    async fn open_core(
+        &mut self,
+        cfg: &NatsSourceConfig,
+        deserializer: Box<dyn RecordDeserializer>,
+    ) -> Result<(), ConnectorError> {
         let client = connect(&cfg.servers).await?;
         let subject = cfg
             .subject
@@ -209,8 +222,8 @@ impl NatsSource {
                 }
                 let incoming = Incoming {
                     subject: msg.subject.to_string(),
-                    payload: msg.payload.to_vec(),
-                    stream_seq: 0,
+                    payload: msg.payload,
+                    stream_seq: None,
                     ack: None,
                 };
                 if tx.send(incoming).await.is_err() {
@@ -220,9 +233,12 @@ impl NatsSource {
             }
         });
 
-        self.rx = Some(rx);
-        self.reader_shutdown = Some(shutdown);
-        self.reader_handle = Some(handle);
+        self.running = Some(Running {
+            deserializer,
+            rx,
+            shutdown,
+            handle,
+        });
         Ok(())
     }
 
@@ -238,13 +254,11 @@ impl NatsSource {
 impl SourceConnector for NatsSource {
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         let cfg = NatsSourceConfig::from_config(config)?;
-        self.deserializer = Some(
-            serde::create_deserializer(cfg.format)
-                .map_err(|e| err(&format!("deserializer for format {:?}: {e}", cfg.format)))?,
-        );
+        let deserializer = serde::create_deserializer(cfg.format)
+            .map_err(|e| err(&format!("deserializer for format {:?}: {e}", cfg.format)))?;
         match cfg.mode {
-            Mode::JetStream => self.open_jetstream(&cfg).await?,
-            Mode::Core => self.open_core(&cfg).await?,
+            Mode::JetStream => self.open_jetstream(&cfg, deserializer).await?,
+            Mode::Core => self.open_core(&cfg, deserializer).await?,
         }
         self.config = Some(cfg);
         Ok(())
@@ -254,24 +268,26 @@ impl SourceConnector for NatsSource {
         &mut self,
         max_records: usize,
     ) -> Result<Option<SourceBatch>, ConnectorError> {
-        let Some(rx) = self.rx.as_ref() else {
+        let Some(running) = self.running.as_mut() else {
             return Ok(None);
         };
 
-        let mut payloads: Vec<Vec<u8>> = Vec::new();
-        let mut first_subject: Option<String> = None;
-        let mut first_seq: Option<u64> = None;
+        let mut payloads: Vec<Bytes> = Vec::new();
+        let mut partition: Option<PartitionInfo> = None;
 
         while payloads.len() < max_records {
-            let Ok(incoming) = rx.try_recv() else { break };
-            if first_subject.is_none() {
-                first_subject = Some(incoming.subject.clone());
-                first_seq = Some(incoming.stream_seq);
+            let Ok(incoming) = running.rx.try_recv() else {
+                break;
+            };
+            if let Some(seq) = incoming.stream_seq {
+                self.offsets
+                    .entry(incoming.subject.clone())
+                    .and_modify(|s| *s = (*s).max(seq))
+                    .or_insert(seq);
+                if partition.is_none() {
+                    partition = Some(PartitionInfo::new(&incoming.subject, seq.to_string()));
+                }
             }
-            self.offsets
-                .entry(incoming.subject.clone())
-                .and_modify(|s| *s = (*s).max(incoming.stream_seq))
-                .or_insert(incoming.stream_seq);
             payloads.push(incoming.payload);
             if let Some(msg) = incoming.ack {
                 self.pending.push(msg);
@@ -282,17 +298,12 @@ impl SourceConnector for NatsSource {
             return Ok(None);
         }
 
-        let deser = self
+        let records: Vec<&[u8]> = payloads.iter().map(Bytes::as_ref).collect();
+        let batch = running
             .deserializer
-            .as_ref()
-            .ok_or_else(|| err("deserializer not initialized"))?;
-        let records: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
-        let batch = deser
             .deserialize_batch(&records, &self.schema)
             .map_err(|e| err(&format!("deserialize batch: {e}")))?;
 
-        let partition =
-            first_subject.map(|s| PartitionInfo::new(s, first_seq.unwrap_or(0).to_string()));
         Ok(Some(SourceBatch {
             records: batch,
             partition,
@@ -313,21 +324,18 @@ impl SourceConnector for NatsSource {
 
     async fn restore(&mut self, _checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
         // The durable consumer remembers its ack floor on the server; on
-        // reconnect it resumes from there. We log loudly if the manifest
-        // is ahead of the floor (out-of-band surgery), but don't try to
-        // rewrite the consumer.
+        // reconnect it resumes from there. If the manifest is ahead of
+        // the floor (out-of-band surgery), we'd just log and proceed —
+        // rewriting the consumer is destructive and not worth it.
         Ok(())
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {
-        if let Some(flag) = self.reader_shutdown.take() {
-            flag.store(true, Ordering::Release);
-        }
-        if let Some(handle) = self.reader_handle.take() {
-            // Give the reader a brief window to finish in-flight fetch.
-            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
-        }
-        self.rx = None;
+        let Some(running) = self.running.take() else {
+            return Ok(());
+        };
+        running.shutdown.store(true, Ordering::Release);
+        let _ = tokio::time::timeout(Duration::from_secs(5), running.handle).await;
         Ok(())
     }
 
