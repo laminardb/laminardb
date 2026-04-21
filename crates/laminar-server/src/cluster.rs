@@ -143,6 +143,12 @@ pub enum ClusterStartupError {
     EngineConstruction(String),
     #[error("HTTP startup failed: {0}")]
     HttpStartup(String),
+    #[error(
+        "invalid coordination.raft_port={0}: RPC port = raft_port + 1 would \
+         overflow u16; choose a raft_port below {max}",
+        max = u16::MAX
+    )]
+    InvalidRaftPort(u16),
 }
 
 pub struct ClusterHandle {
@@ -210,8 +216,9 @@ pub async fn start_cluster(
     let bind_addr = &config.server.bind;
     let coordination = &cluster_cfg.coordination;
     let raft_port = coordination.raft_port;
-    // RPC port = raft_port + 1. Guard against u16 overflow (W17 fix).
-    let rpc_port = raft_port.checked_add(1).unwrap_or(raft_port);
+    let rpc_port = raft_port
+        .checked_add(1)
+        .ok_or(ClusterStartupError::InvalidRaftPort(raft_port))?;
 
     // Extract the host part from bind address, handling IPv6 (W16 fix).
     // Examples: "127.0.0.1:8080" → "127.0.0.1", "[::1]:8080" → "[::1]"
@@ -500,14 +507,18 @@ async fn resolve_vnode_assignment(
     };
     let snapshot_store = Arc::new(AssignmentSnapshotStore::new(store));
 
-    // Try to adopt the durably-stored snapshot first.
+    // Try to adopt the durably-stored snapshot first. Registry version
+    // must track the persisted fence generation, not restart from 1.
     if let Some(existing) = snapshot_store
         .load()
         .await
         .map_err(|e| ClusterStartupError::EngineConstruction(format!("snapshot load: {e}")))?
     {
         let registry = VnodeRegistry::new(vnode_count);
-        registry.set_assignment(existing.to_vnode_vec(vnode_count).into());
+        registry.set_assignment_and_version(
+            existing.to_vnode_vec(vnode_count).into(),
+            existing.version,
+        );
         info!("Adopted existing assignment snapshot v{}", existing.version);
         return Ok((Arc::new(registry), Some(snapshot_store)));
     }
@@ -542,7 +553,7 @@ async fn resolve_vnode_assignment(
         }
     };
     let registry = VnodeRegistry::new(vnode_count);
-    registry.set_assignment(winner.to_vnode_vec(vnode_count).into());
+    registry.set_assignment_and_version(winner.to_vnode_vec(vnode_count).into(), winner.version);
     Ok((Arc::new(registry), Some(snapshot_store)))
 }
 
