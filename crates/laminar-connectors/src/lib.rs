@@ -99,6 +99,10 @@ pub mod mongodb;
 #[cfg(feature = "otel")]
 pub mod otel;
 
+/// NATS core and JetStream source and sink connectors.
+#[cfg(feature = "nats")]
+pub mod nats;
+
 /// AutoLoader-style file source and sink connectors.
 #[cfg(feature = "files")]
 #[allow(

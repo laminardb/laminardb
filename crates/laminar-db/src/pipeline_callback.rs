@@ -247,9 +247,7 @@ impl ConnectorPipelineCallback {
         };
 
         let mut guard = self.coordinator.lock().await;
-        let Some(ref mut coord) = *guard else {
-            return None;
-        };
+        let coord = (*guard).as_mut()?;
         // Phase 1.3: stamp this instance's current pipeline watermark
         // into the coordinator so the next `BarrierAck` carries it.
         // i64::MIN means unset; don't propagate — leader treats us as

@@ -481,6 +481,11 @@ impl LaminarDB {
         {
             laminar_connectors::otel::register_otel_source(registry);
         }
+        #[cfg(feature = "nats")]
+        {
+            laminar_connectors::nats::register_nats_source(registry);
+            laminar_connectors::nats::register_nats_sink(registry);
+        }
     }
 
     /// Handle `CREATE LOOKUP TABLE` by registering the table in the
@@ -2494,6 +2499,11 @@ mod tests {
         #[cfg(feature = "otel")]
         {
             expected_sources += 1; // otel source
+        }
+        #[cfg(feature = "nats")]
+        {
+            expected_sources += 1; // nats source
+            expected_sinks += 1; // nats sink
         }
 
         assert_eq!(registry.list_sources().len(), expected_sources);
