@@ -1024,8 +1024,50 @@ impl CheckpointCoordinator {
             match cc.observe_barrier().await.ok().flatten() {
                 Some(a) if a.epoch == epoch && a.phase == Phase::Commit => {
                     let statuses = self.commit_sinks_tracked(epoch).await;
+                    let has_failures = statuses
+                        .values()
+                        .any(|s| matches!(s, SinkCommitStatus::Failed(_)));
+                    if has_failures {
+                        error!(
+                            epoch,
+                            checkpoint_id, "follower sink commit partially failed — rolling back",
+                        );
+                        self.rollback_sinks(epoch).await.ok();
+                        self.checkpoints_failed += 1;
+                        return Ok(false);
+                    }
+                    // Overwrite the follower's own manifest so the Pending
+                    // sink entries it stamped during prepare get replaced
+                    // with the Committed statuses we just produced.
+                    // Recovery later inspects these; leaving them Pending
+                    // makes the follower appear as "sinks still in flight"
+                    // even though they committed cleanly.
+                    if !statuses.is_empty() {
+                        match self.store.load_by_id(checkpoint_id).await {
+                            Ok(Some(mut m)) => {
+                                m.sink_commit_statuses = statuses;
+                                if let Err(e) = self.update_manifest_only(Arc::new(m)).await {
+                                    warn!(
+                                        checkpoint_id,
+                                        epoch,
+                                        error = %e,
+                                        "follower post-commit manifest update failed",
+                                    );
+                                }
+                            }
+                            Ok(None) => warn!(
+                                checkpoint_id,
+                                epoch, "follower manifest missing on post-commit update — skipping",
+                            ),
+                            Err(e) => warn!(
+                                checkpoint_id,
+                                epoch,
+                                error = %e,
+                                "follower manifest reload failed on post-commit update",
+                            ),
+                        }
+                    }
                     self.checkpoints_completed += 1;
-                    let _ = statuses; // persisted in the leader's manifest; follower's local sinks may have their own status
                     return Ok(true);
                 }
                 Some(a) if a.epoch == epoch && a.phase == Phase::Abort => {
