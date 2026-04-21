@@ -127,6 +127,27 @@ pub trait StateBackend: Send + Sync + 'static {
     /// forever. Test backends that truly do not accumulate state should
     /// implement `Ok(())` explicitly so the choice is visible.
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError>;
+
+    /// Raise the backend's authoritative assignment version — the
+    /// minimum [`VnodeRegistry::assignment_version`] it will accept on
+    /// [`write_partial`](Self::write_partial). Hosts call this on boot
+    /// after adopting an `AssignmentSnapshot` and on each subsequent
+    /// rotation so stale writers from a deposed leader are fenced out.
+    ///
+    /// Default is a no-op — backends that opt out of fencing (e.g. the
+    /// in-process backend used for single-node deployments) inherit it
+    /// unchanged. Monotonic on implementations that do fence: a call
+    /// with `version <= current` is a no-op.
+    ///
+    /// [`VnodeRegistry::assignment_version`]: crate::state::VnodeRegistry::assignment_version
+    fn set_authoritative_version(&self, _version: u64) {}
+
+    /// Current authoritative assignment version. `0` means the fence is
+    /// disabled — every caller version is accepted. Backends that do
+    /// not fence return `0` unconditionally.
+    fn authoritative_version(&self) -> u64 {
+        0
+    }
 }
 
 const _: Option<&dyn StateBackend> = None;

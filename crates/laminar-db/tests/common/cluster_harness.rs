@@ -50,6 +50,10 @@ pub struct NodeRuntime {
     pub db: Arc<LaminarDB>,
     pub instance_id: NodeId,
     pub vnode_registry: Arc<VnodeRegistry>,
+    /// The shared object-store-backed [`StateBackend`] this node writes
+    /// through. Exposed for tests that need to observe the Phase 1.4
+    /// fence state after `start_all()` has wired it from the snapshot.
+    pub state_backend: Arc<dyn StateBackend>,
 }
 
 impl NodeRuntime {
@@ -179,19 +183,16 @@ impl ClusterEngineHarness {
             }
             let sender = Arc::new(sender);
 
-            // Concrete backend first, so we can call the Phase 1.4
-            // fence setter before erasing to `dyn StateBackend`.
-            let concrete_backend = ObjectStoreBackend::new(
+            // Plain construction — no pre-call to `set_authoritative_version`.
+            // Production (`pipeline_lifecycle.rs`) lifts the snapshot's
+            // generation into the backend's fence when `db.start()`
+            // runs, and the harness must exercise that same path rather
+            // than short-circuit it here.
+            let state_backend: Arc<dyn StateBackend> = Arc::new(ObjectStoreBackend::new(
                 Arc::clone(&shared_store),
                 self_id.0.to_string(),
                 vnode_count,
-            );
-            // Every node starts with the same authoritative version —
-            // the one that rode into the stored snapshot. Stale peers
-            // bringing a smaller version will be rejected at
-            // `write_partial`.
-            concrete_backend.set_authoritative_version(snapshot_version);
-            let state_backend: Arc<dyn StateBackend> = Arc::new(concrete_backend);
+            ));
 
             // Install the assignment and set the registry's local version
             // to match the persisted snapshot's in a single atomic step —
@@ -244,6 +245,7 @@ impl ClusterEngineHarness {
                 db,
                 instance_id: self_id,
                 vnode_registry: Arc::clone(&registry),
+                state_backend: Arc::clone(&state_backend),
             });
         }
 

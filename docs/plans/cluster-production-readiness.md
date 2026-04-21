@@ -18,6 +18,9 @@ Honest state of cluster mode on `feat/phase-c5-cluster-primitives`.
   in shared object storage (leader-only writer, CAS loser reloads).
 - Cross-instance watermark fan-out over the barrier protocol.
 - `assignment_version` fence on `write_partial` (split-brain guard).
+- Backend fence wired from the stored `AssignmentSnapshot` generation
+  on `db.start()` — the authoritative version survives restart instead
+  of resetting to 0.
 
 ## Known gaps
 
@@ -25,29 +28,25 @@ Honest state of cluster mode on `feat/phase-c5-cluster-primitives`.
    commits its own sinks locally. A leader that crashes between
    follower sink-prepare and follower sink-commit leaves sinks in
    inconsistent state.
-2. **Assignment version does not persist across restarts.** On boot
-   the coordinator's `assignment_version` resets to 0, defeating the
-   Phase 1.4 fence until the first `AssignmentSnapshot` reload.
-3. **Dynamic rebalance not implemented.** Vnode assignment is frozen
+2. **Dynamic rebalance not implemented.** Vnode assignment is frozen
    at boot. Node join/leave does not re-shuffle.
-4. **No TLS / no peer auth** on shuffle.
-5. **Shuffle backpressure limited to local per-partition `mpsc(16)`.**
+3. **No TLS / no peer auth** on shuffle.
+4. **Shuffle backpressure limited to local per-partition `mpsc(16)`.**
    No cluster-wide credit flow.
-6. **Admin surface:** no `/cluster/ownership`, `/cluster/checkpoints`,
+5. **Admin surface:** no `/cluster/ownership`, `/cluster/checkpoints`,
    `/cluster/drain` endpoints.
-7. **Graceful drain:** `ClusterHandle::wait_for_shutdown` does not
+6. **Graceful drain:** `ClusterHandle::wait_for_shutdown` does not
    guarantee a final epoch before stopping discovery.
 
 ## Remaining work, grouped
 
-**Correctness.** Fix #1 (cross-instance sink 2PC) and #2 (persist
-`assignment_version` across restarts). Everything else can ship
-behind flags; these two cannot.
+**Correctness.** Fix #1 (cross-instance sink 2PC). This is the last
+blocker; ship everything below behind flags.
 
-**Operational.** Fix #3 (dynamic rebalance) together with source
-replay for in-flight shuffle buffers. Add #6 (admin API).
+**Operational.** Fix #2 (dynamic rebalance) together with source
+replay for in-flight shuffle buffers. Add #5 (admin API).
 
-**Security / polish.** #4, #5, #7 — separate PRs, not blockers for a
+**Security / polish.** #3, #4, #6 — separate PRs, not blockers for a
 small-cluster rollout.
 
 ## What this PR closes

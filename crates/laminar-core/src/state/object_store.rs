@@ -71,41 +71,10 @@ impl ObjectStoreBackend {
         self.vnode_capacity
     }
 
-    /// Current authoritative assignment version known to this backend.
-    /// Zero means the fence is disabled (accepting any caller version).
-    #[must_use]
-    pub fn authoritative_version(&self) -> u64 {
-        self.authoritative_version.load(Ordering::Acquire)
-    }
-
-    /// Raise the authoritative version to `version`. Monotonic: a call
-    /// with a value less than or equal to the current one is a no-op.
-    ///
-    /// The host should call this whenever it adopts a newer
-    /// `AssignmentSnapshot` (on initial load and on each subsequent
-    /// rotation). After this call, any in-flight `write_partial` from
-    /// a stale writer whose caller version is below `version` is
-    /// rejected with [`StateBackendError::StaleVersion`].
-    pub fn set_authoritative_version(&self, version: u64) {
-        // CAS-like loop to avoid lowering the version on a late call.
-        let mut cur = self.authoritative_version.load(Ordering::Acquire);
-        while version > cur {
-            match self.authoritative_version.compare_exchange(
-                cur,
-                version,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return,
-                Err(observed) => cur = observed,
-            }
-        }
-    }
-
     /// Shared handle to the authoritative version counter. Callers that
     /// want to bump several objects (e.g. backend plus a future metric)
     /// from a single owner can clone this handle instead of relaying
-    /// through [`Self::set_authoritative_version`].
+    /// through [`StateBackend::set_authoritative_version`].
     #[must_use]
     pub fn authoritative_version_handle(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.authoritative_version)
@@ -282,6 +251,26 @@ impl StateBackend for ObjectStoreBackend {
             }
         }
         Ok(())
+    }
+
+    fn set_authoritative_version(&self, version: u64) {
+        // CAS loop avoids lowering the version on a late call.
+        let mut cur = self.authoritative_version.load(Ordering::Acquire);
+        while version > cur {
+            match self.authoritative_version.compare_exchange(
+                cur,
+                version,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    fn authoritative_version(&self) -> u64 {
+        self.authoritative_version.load(Ordering::Acquire)
     }
 }
 

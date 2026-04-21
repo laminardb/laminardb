@@ -223,11 +223,18 @@ impl LaminarDB {
                         laminar_core::state::NodeId(0)
                     }
                 };
+                // Phase 1.4 fence: both sides of the split-brain guard
+                // must see the same generation. The coordinator stamps
+                // outgoing writes with it (caller side), and the backend
+                // rejects incoming writes below it (authority side).
+                // Without the backend call the authoritative version
+                // stays at 0 and the fence is a silent no-op — the
+                // registry's version carries the snapshot generation
+                // across a restart, but only in-memory.
+                let version = registry.assignment_version();
+                backend.set_authoritative_version(version);
                 coord.set_state_backend(backend);
-                // Phase 1.4 fence: stamp marker writes with the live
-                // registry generation. Zero until a snapshot rotates
-                // in; harmless no-op on the backend side.
-                coord.set_assignment_version(registry.assignment_version());
+                coord.set_assignment_version(version);
                 coord.set_vnode_set(laminar_core::state::owned_vnodes(&registry, owner));
                 // Leader's gate checks the full registry — across all
                 // instances — so the 2PC commit only fires when every

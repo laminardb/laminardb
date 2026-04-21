@@ -45,11 +45,10 @@ const N_NODES: usize = 2;
 /// (via a fresh snapshot); the stale side tries to write at the old
 /// version and must be rejected.
 ///
-/// The harness already wires `set_authoritative_version` from the
-/// loaded snapshot, so this test operates directly on the underlying
-/// backend type — end-to-end fence-through-checkpoint is covered by
-/// the smoke test (which passes `registry.assignment_version()`
-/// through the full write path).
+/// This test operates directly on the backend type — the
+/// pre-write fence behavior is the contract. End-to-end wiring
+/// (pipeline_lifecycle → backend on `start()`) is covered by
+/// `start_wires_backend_fence_from_snapshot` below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn split_brain_write_partial_rejected() {
     use bytes::Bytes;
@@ -151,6 +150,89 @@ async fn assignment_snapshot_unifies_cluster_view() {
          joined)",
     );
     harness_b.shutdown().await;
+}
+
+/// Phase 1.4 — the boot path must hand the backend its fence generation.
+///
+/// Before this wiring existed, `ObjectStoreBackend::authoritative_version`
+/// stayed at 0 in production forever (the harness hid the bug by calling
+/// `set_authoritative_version` manually before the builder saw the
+/// backend). A stale writer that reconnected after a snapshot rotation
+/// could then plant writes at the old generation with no rejection.
+///
+/// The harness now constructs the backend unconfigured and relies on
+/// `pipeline_lifecycle::start` to lift the registry's snapshot version
+/// into it. This test pins that contract: pre-start every backend
+/// reports 0, post-start every backend matches its node's registry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn start_wires_backend_fence_from_snapshot() {
+    let harness = ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+
+    // Pre-start: the harness no longer pre-sets the fence. Every
+    // backend is unconfigured — if this ever flips to non-zero the
+    // harness has silently regained the short-circuit.
+    for node in &harness.nodes {
+        assert_eq!(
+            node.state_backend.authoritative_version(),
+            0,
+            "backend pre-start authoritative_version should be 0 \
+             (harness must not short-circuit the boot-time wiring)",
+        );
+    }
+
+    // Some DDL is required so `start()` takes the pipeline-lifecycle
+    // branch that installs the fence (the embedded branch returns
+    // before touching the coordinator/backend).
+    for node in &harness.nodes {
+        setup_query(&node.db).await;
+    }
+    harness.start_all().await;
+
+    // Post-start: every node's backend carries the snapshot generation
+    // its registry was seeded with. If the two diverge, one of the
+    // wiring paths (registry side or backend side) has dropped the
+    // snapshot and the fence is either off or stamping the wrong
+    // version.
+    for node in &harness.nodes {
+        let registry_version = node.vnode_registry.assignment_version();
+        let backend_version = node.state_backend.authoritative_version();
+        assert!(
+            registry_version > 0,
+            "registry version must be >0 after snapshot load; got {registry_version}",
+        );
+        assert_eq!(
+            backend_version, registry_version,
+            "backend authoritative_version did not track snapshot generation \
+             for node {:?}: backend={backend_version}, registry={registry_version}",
+            node.instance_id,
+        );
+    }
+
+    // And the fence actually fires: a write stamped below the
+    // authoritative version is rejected. Proves the version isn't just
+    // stored-but-ignored.
+    use bytes::Bytes;
+    use laminar_core::state::StateBackendError;
+    let node = &harness.nodes[0];
+    let authoritative = node.state_backend.authoritative_version();
+    let stale_caller = authoritative - 1;
+    let err = node
+        .state_backend
+        .write_partial(0, 9_999, stale_caller, Bytes::from_static(b"stale"))
+        .await
+        .expect_err("stale write must be rejected by the live fence");
+    match err {
+        StateBackendError::StaleVersion {
+            caller,
+            authoritative: got,
+        } => {
+            assert_eq!(caller, stale_caller);
+            assert_eq!(got, authoritative);
+        }
+        other => panic!("expected StaleVersion, got {other:?}"),
+    }
+
+    harness.shutdown().await;
 }
 
 /// Install `CREATE SOURCE` + `CREATE MATERIALIZED VIEW sums` on a single
