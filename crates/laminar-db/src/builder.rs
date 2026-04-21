@@ -123,8 +123,9 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Install a state backend. Pair with [`Self::vnode_registry`];
-    /// without the registry this call has no effect.
+    /// Install a state backend. Must be paired with
+    /// [`Self::vnode_registry`] — `build()` rejects a half-set
+    /// configuration.
     #[must_use]
     pub fn state_backend(
         mut self,
@@ -134,8 +135,9 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Install a vnode registry. Pair with [`Self::state_backend`];
-    /// without the backend this call has no effect.
+    /// Install a vnode registry. Must be paired with
+    /// [`Self::state_backend`] — `build()` rejects a half-set
+    /// configuration.
     #[must_use]
     pub fn vnode_registry(
         mut self,
@@ -436,6 +438,22 @@ impl LaminarDbBuilder {
             .map_err(|e| DbError::Config(e.to_string()))?;
 
         Self::validate_backpressure(&self.config)?;
+
+        // State backend and vnode registry must be paired — half-set
+        // would leave the durability gate silently disabled.
+        match (&self.state_backend, &self.vnode_registry) {
+            (Some(_), None) => {
+                return Err(DbError::Config(
+                    "state_backend is set but vnode_registry is missing".into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(DbError::Config(
+                    "vnode_registry is set but state_backend is missing".into(),
+                ));
+            }
+            _ => {}
+        }
 
         // Apply profile defaults for fields the user hasn't set.
         self.profile.apply_defaults(&mut self.config);

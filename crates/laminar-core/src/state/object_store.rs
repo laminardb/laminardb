@@ -214,21 +214,14 @@ impl StateBackend for ObjectStoreBackend {
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {
         use tokio_stream::StreamExt;
 
-        // LIST without a prefix and filter — one call regardless of
-        // how many epochs exist, and we avoid pulling in `futures` as
-        // a non-cluster dep.
-        let root = OsPath::from("");
-        let mut entries = self.store.list(Some(&root));
-
+        let mut entries = self.store.list(None);
         let mut victims: Vec<OsPath> = Vec::new();
         while let Some(entry) = entries.next().await {
             let entry = entry.map_err(|e| StateBackendError::Io(e.to_string()))?;
             let loc = entry.location.as_ref();
-            // Only objects whose top segment looks like `epoch=N` where
-            // N < before are candidates. Anything else is untouched.
-            let Some(first) = loc.split('/').next() else {
-                continue;
-            };
+            // Only `epoch=N/...` entries with N < before are candidates.
+            // `str::split` always yields at least one segment.
+            let first = loc.split('/').next().unwrap_or("");
             let Some(rest) = first.strip_prefix("epoch=") else {
                 continue;
             };

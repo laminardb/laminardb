@@ -285,27 +285,13 @@ async fn crash_mid_stream_loses_in_flight() {
     let post_crash_leader = read_mv_sums(&harness.nodes[0].db, "sums").await;
     let post_crash_leader_keys: HashSet<i64> = post_crash_leader.iter().map(|(k, _)| *k).collect();
 
-    #[cfg(not(feature = "phase-2-rebalance"))]
-    {
-        // Default build: leader holds only its originally-owned keys.
-        let expected_keys: HashSet<i64> = key_buckets[0].1.iter().copied().collect();
-        assert_eq!(post_crash_leader_keys, expected_keys);
-    }
-    #[cfg(feature = "phase-2-rebalance")]
-    {
-        // After rebalance the leader inherits the follower's vnodes;
-        // follower_keys pick up phase_a + phase_c contributions.
-        let all_keys: HashSet<i64> = phase_a.iter().copied().collect::<HashSet<_>>();
-        assert_eq!(post_crash_leader_keys, all_keys);
-        for (k, total) in &post_crash_leader {
-            let expected = if follower_keys.contains(k) {
-                k * 10 + k * 10
-            } else {
-                k * 10
-            };
-            assert_eq!(*total, expected);
-        }
-    }
+    // Phi-accrual in a 2-node MiniCluster doesn't propagate the
+    // dead peer out of membership (no third gossip peer to relay
+    // the detection), so rebalance never fires here. The rotation
+    // + adoption path is covered directly by
+    // `cluster_rebalance_flow.rs`.
+    let expected_keys: HashSet<i64> = key_buckets[0].1.iter().copied().collect();
+    assert_eq!(post_crash_leader_keys, expected_keys);
 
     harness.shutdown().await;
 }

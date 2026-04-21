@@ -1062,8 +1062,7 @@ impl CheckpointCoordinator {
 
         let epoch = ann.epoch;
         let checkpoint_id = ann.checkpoint_id;
-        // Align our local counters with the leader's so any subsequent
-        // leader-mode call on this coordinator resumes correctly.
+        // Align with the leader so a later leader-mode call resumes correctly.
         self.epoch = epoch;
         self.next_checkpoint_id = checkpoint_id.saturating_add(1);
 
@@ -1074,23 +1073,19 @@ impl CheckpointCoordinator {
             epoch,
             ok: prepare_err.is_none(),
             error: prepare_err.clone(),
-            // Phase 1.3: stamp this follower's current watermark so the
-            // leader can fold it into the cluster-wide min before
-            // announcing Commit. `None` means "no watermark reported"
-            // — the leader treats the follower as non-blocking (its
-            // watermark is effectively +infinity).
+            // Leader folds this into the cluster-wide min before
+            // announcing Commit. `None` is non-blocking.
             local_watermark_ms: self.local_watermark_ms,
         })
         .await
         .ok(); // best effort; leader's quorum wait tolerates missed acks
         if let Err(e) = prepare_result {
             self.rollback_sinks(epoch).await.ok();
+            self.phase = CheckpointPhase::Idle;
             return Err(e);
         }
 
-        // Phase 2: wait for the leader's decision. Poll the same KV the
-        // leader writes to; `observe_barrier` already filters on current
-        // leader and returns the freshest announcement.
+        // Phase 2: wait for the leader's decision.
         let deadline = Instant::now() + decision_timeout;
         loop {
             match cc.observe_barrier().await.ok().flatten() {
@@ -1100,14 +1095,12 @@ impl CheckpointCoordinator {
                 Some(a) if a.epoch == epoch && a.phase == Phase::Abort => {
                     self.rollback_sinks(epoch).await.ok();
                     self.checkpoints_failed += 1;
+                    self.phase = CheckpointPhase::Idle;
                     return Ok(false);
                 }
                 _ => {}
             }
             if Instant::now() >= deadline {
-                // No announcement arrived. Consult the commit marker:
-                // if present, the leader got past the commit point
-                // and we must drive our local commit to match.
                 let committed = match self.decision_store.as_ref() {
                     Some(ds) => ds.is_committed(epoch).await.unwrap_or_else(|e| {
                         warn!(
@@ -1128,22 +1121,19 @@ impl CheckpointCoordinator {
                 }
                 warn!(
                     epoch,
-                    checkpoint_id,
-                    "[LDB-6034] follower decision timeout; rolling back local prepare",
+                    checkpoint_id, "[LDB-6034] follower decision timeout; rolling back",
                 );
                 self.rollback_sinks(epoch).await.ok();
                 self.checkpoints_failed += 1;
+                self.phase = CheckpointPhase::Idle;
                 return Ok(false);
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
-    /// Commit this follower's sinks for `epoch`, update the local
-    /// manifest's Pending entries, and return `true` on clean commit.
-    /// Extracted so the happy-path (observed `Phase::Commit`) and the
-    /// decision-store recovery path (timeout + durable vote says
-    /// Committed) share the exact same semantics.
+    /// Commit this follower's sinks for `epoch` and update its
+    /// manifest's Pending entries. Returns `true` on clean commit.
     #[cfg(feature = "cluster-unstable")]
     async fn drive_follower_commit(&mut self, epoch: u64, checkpoint_id: u64) -> bool {
         let statuses = self.commit_sinks_tracked(epoch).await;
@@ -1157,13 +1147,12 @@ impl CheckpointCoordinator {
             );
             self.rollback_sinks(epoch).await.ok();
             self.checkpoints_failed += 1;
+            self.phase = CheckpointPhase::Idle;
             return false;
         }
         // Overwrite the follower's own manifest so the Pending sink
         // entries stamped during prepare get replaced with the
-        // Committed statuses we just produced. Recovery inspects
-        // these; leaving them Pending makes the follower look as if
-        // sinks were still in flight.
+        // Committed statuses we just produced.
         if let Err(e) = self
             .persist_recovered_statuses(checkpoint_id, statuses)
             .await
@@ -1176,6 +1165,8 @@ impl CheckpointCoordinator {
             );
         }
         self.checkpoints_completed += 1;
+        self.epoch = epoch.saturating_add(1);
+        self.phase = CheckpointPhase::Idle;
         true
     }
 

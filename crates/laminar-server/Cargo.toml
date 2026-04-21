@@ -16,11 +16,11 @@ path = "src/main.rs"
 
 [dependencies]
 # All LaminarDB crates
-laminar-core = { path = "../laminar-core", version = "0.20.2" }
-laminar-sql = { path = "../laminar-sql", version = "0.20.2" }
-laminar-storage = { path = "../laminar-storage", version = "0.20.2" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.20.2" }
-laminar-db = { path = "../laminar-db", version = "0.20.2", features = ["api"] }
+laminar-core = { path = "../laminar-core", version = "0.21.0" }
+laminar-sql = { path = "../laminar-sql", version = "0.21.0" }
+laminar-storage = { path = "../laminar-storage", version = "0.21.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.21.0" }
+laminar-db = { path = "../laminar-db", version = "0.21.0", features = ["api"] }
 
 # Arrow (for WS JSON serialization)
 arrow-array = { workspace = true }
