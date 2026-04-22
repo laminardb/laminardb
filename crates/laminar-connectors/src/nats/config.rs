@@ -130,7 +130,6 @@ pub struct NatsSourceConfig {
     pub max_ack_pending: i64,
     pub fetch_batch: usize,
     pub fetch_max_wait: Duration,
-    pub fetch_max_bytes: usize,
     /// Consecutive fetch errors before `health_check` reports
     /// `Unhealthy`. Zero disables the flip.
     pub fetch_error_threshold: u32,
@@ -141,14 +140,7 @@ pub struct NatsSourceConfig {
     // Core
     pub queue_group: Option<String>,
 
-    // Format / metadata
     pub format: Format,
-    pub include_metadata: bool,
-    pub include_headers: bool,
-    pub event_time_column: Option<String>,
-
-    // Error handling
-    pub poison_dlq_subject: Option<String>,
 }
 
 impl NatsSourceConfig {
@@ -178,16 +170,11 @@ impl NatsSourceConfig {
         let fetch_batch = require_positive_usize(config, "fetch.batch", 500)?;
         let fetch_max_wait =
             require_positive_duration(config, "fetch.max.wait.ms", Duration::from_millis(500))?;
-        let fetch_max_bytes = require_positive_usize(config, "fetch.max.bytes", 1 << 20)?;
         let fetch_error_threshold = parse_u32(config, "fetch.error.threshold", 10)?;
         let lag_poll_interval =
             parse_duration_ms(config, "lag.poll.interval.ms", Duration::from_secs(10))?;
         let queue_group = config.get("queue.group").map(str::to_string);
         let format = parse_format(config)?;
-        let include_metadata = parse_bool(config, "include.metadata", false)?;
-        let include_headers = parse_bool(config, "include.headers", false)?;
-        let event_time_column = config.get("event.time.column").map(str::to_string);
-        let poison_dlq_subject = config.get("poison.dlq.subject").map(str::to_string);
 
         let cfg = Self {
             servers,
@@ -207,15 +194,10 @@ impl NatsSourceConfig {
             max_ack_pending,
             fetch_batch,
             fetch_max_wait,
-            fetch_max_bytes,
             fetch_error_threshold,
             lag_poll_interval,
             queue_group,
             format,
-            include_metadata,
-            include_headers,
-            event_time_column,
-            poison_dlq_subject,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -288,10 +270,8 @@ pub struct NatsSinkConfig {
     pub min_duplicate_window: Duration,
     pub max_pending: usize,
     pub ack_timeout: Duration,
-    pub flush_batch_size: usize,
     pub format: Format,
     pub header_columns: Vec<String>,
-    pub poison_dlq_subject: Option<String>,
 }
 
 impl NatsSinkConfig {
@@ -345,13 +325,11 @@ impl NatsSinkConfig {
                 "ack.timeout.ms",
                 Duration::from_secs(30),
             )?,
-            flush_batch_size: require_positive_usize(config, "flush.batch.size", 1000)?,
             format: parse_format(config)?,
             header_columns: config
                 .get("header.columns")
                 .map(split_csv)
                 .unwrap_or_default(),
-            poison_dlq_subject: config.get("poison.dlq.subject").map(str::to_string),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -379,8 +357,23 @@ impl NatsSinkConfig {
                  can validate its duplicate_window at startup",
             ));
         }
+        for h in &self.header_columns {
+            if is_reserved_header(h) {
+                return Err(cfg_err(&format!(
+                    "[LDB-5065] header.columns entry '{h}' collides with a reserved NATS \
+                     header (Nats-Msg-Id / Nats-Expected-Stream); rename the column",
+                )));
+            }
+        }
         Ok(())
     }
+}
+
+/// Header names the sink manages itself; a user header with the same
+/// name would otherwise silently clobber exactly-once semantics.
+fn is_reserved_header(name: &str) -> bool {
+    const RESERVED: &[&str] = &["Nats-Msg-Id", "Nats-Expected-Stream"];
+    RESERVED.iter().any(|r| r.eq_ignore_ascii_case(name))
 }
 
 // ── helpers ──
@@ -697,7 +690,6 @@ mod tests {
             ("subject.filters", "orders.us.*,orders.eu.*"),
             ("ack.wait.ms", "45000"),
             ("max.deliver", "3"),
-            ("include.metadata", "true"),
         ]))
         .unwrap();
         assert_eq!(parsed.servers.len(), 2);
@@ -705,7 +697,6 @@ mod tests {
         assert_eq!(parsed.subject_filters, vec!["orders.us.*", "orders.eu.*"]);
         assert_eq!(parsed.ack_wait, Duration::from_secs(45));
         assert_eq!(parsed.max_deliver, 3);
-        assert!(parsed.include_metadata);
     }
 
     #[test]
@@ -742,6 +733,18 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("LDB-5051"), "got: {err}");
+    }
+
+    #[test]
+    fn sink_rejects_header_column_colliding_with_reserved() {
+        let err = NatsSinkConfig::from_config(&cfg(&[
+            ("servers", "nats://a:4222"),
+            ("subject", "x"),
+            ("header.columns", "trace_id,nats-msg-id"),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("LDB-5065"), "got: {err}");
     }
 
     #[test]

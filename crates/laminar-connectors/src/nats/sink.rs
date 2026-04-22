@@ -1,7 +1,6 @@
-//! NATS sink connector. Core-mode publishes are fire-and-forget;
-//! `JetStream` collects `PublishAckFuture`s and drains them in
-//! `flush`/`pre_commit`. Exactly-once uses server-side `Nats-Msg-Id`
-//! dedup (see `LDB-5056`).
+//! NATS sink. Core publishes are fire-and-forget; `JetStream` collects
+//! `PublishAckFuture`s and drains them in `flush` / `pre_commit`.
+//! Exactly-once uses server-side `Nats-Msg-Id` dedup (see `LDB-5056`).
 
 use std::collections::VecDeque;
 use std::future::IntoFuture;
@@ -12,7 +11,7 @@ use arrow_schema::SchemaRef;
 use async_nats::jetstream::{self, context::PublishAckFuture};
 use async_nats::{Client, HeaderMap};
 use async_trait::async_trait;
-use futures_util::future::try_join_all;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 
 use super::config::{build_connect_options, Mode, NatsSinkConfig, SubjectSpec};
 use super::metrics::NatsSinkMetrics;
@@ -23,14 +22,14 @@ use crate::health::HealthStatus;
 use crate::metrics::ConnectorMetrics;
 use crate::serde::{self, RecordSerializer};
 
-/// NATS sink — core and `JetStream` modes behind a single type.
+/// NATS sink — core and `JetStream` modes.
 pub struct NatsSink {
     schema: SchemaRef,
     config: Option<NatsSinkConfig>,
     serializer: Option<Box<dyn RecordSerializer>>,
     runtime: Option<Runtime>,
     metrics: NatsSinkMetrics,
-    /// Publish acks from the in-flight epoch, drained in `flush`/`pre_commit`.
+    /// Drained in `flush` / `pre_commit`.
     pending_acks: VecDeque<PublishAckFuture>,
 }
 
@@ -40,8 +39,7 @@ enum Runtime {
 }
 
 impl NatsSink {
-    /// Creates a new NATS sink. Metrics register on `registry` if
-    /// provided.
+    /// Metrics register on `registry` if provided.
     #[must_use]
     pub fn new(schema: SchemaRef, registry: Option<&prometheus::Registry>) -> Self {
         Self {
@@ -54,7 +52,7 @@ impl NatsSink {
         }
     }
 
-    /// Parsed config — available after [`SinkConnector::open`].
+    /// Available after [`SinkConnector::open`].
     #[must_use]
     pub fn config(&self) -> Option<&NatsSinkConfig> {
         self.config.as_ref()
@@ -105,7 +103,7 @@ impl SinkConnector for NatsSink {
     }
 
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
-        // Split-borrow so `runtime` is &mut while config/serializer stay &.
+        // Split-borrow: `runtime` &mut, config/serializer &.
         let Self {
             config,
             serializer,
@@ -120,7 +118,6 @@ impl SinkConnector for NatsSink {
             .ok_or_else(|| err("sink: open() first"))?;
         let rt = runtime.as_mut().ok_or_else(|| err("sink: open() first"))?;
 
-        // Resolve columns once per batch (not per row).
         let subject_col = match &cfg.subject {
             SubjectSpec::Column(name) => Some(resolve_utf8(batch, name)?),
             SubjectSpec::Literal(_) => None,
@@ -131,8 +128,8 @@ impl SinkConnector for NatsSink {
             .map(|n| resolve_utf8(batch, n).map(|arr| (n.as_str(), arr)))
             .collect::<Result<_, _>>()?;
         let expected_stream = cfg.expected_stream.as_deref();
-        // Nats-Msg-Id only under exactly-once; otherwise dedup would
-        // fire without the LDB-5056 safety check.
+        // `Nats-Msg-Id` only under exactly-once — LDB-5056 validates the
+        // stream's `duplicate_window` at open, and isn't checked otherwise.
         let dedup_col = if cfg.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             cfg.dedup_id_column
                 .as_deref()
@@ -178,7 +175,6 @@ impl SinkConnector for NatsSink {
                     }
                 }
                 Runtime::JetStream { context } => {
-                    // Mid-batch backpressure.
                     if pending_acks.len() >= cfg.max_pending {
                         drain_acks(pending_acks, metrics, cfg.ack_timeout).await?;
                     }
@@ -227,7 +223,6 @@ impl SinkConnector for NatsSink {
     }
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
-        // Flush core (to the wire), drain JS acks (bounded).
         match self.runtime.as_ref() {
             Some(Runtime::Core { client }) => client
                 .flush()
@@ -252,7 +247,7 @@ impl SinkConnector for NatsSink {
     }
 
     async fn rollback_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
-        // Dedup handles any landed publishes on retry (see LDB-5056).
+        // Retry safely: LDB-5056 ensures the dedup window covers this gap.
         self.pending_acks.clear();
         self.metrics.set_pending_futures(0);
         self.metrics.record_rollback();
@@ -264,7 +259,7 @@ impl SinkConnector for NatsSink {
             .config
             .as_ref()
             .map_or(Duration::from_secs(5), |c| c.ack_timeout);
-        // async-nats buffers core publishes locally; flush before drop.
+        // async-nats buffers core publishes client-side; flush before drop.
         if let Some(Runtime::Core { client }) = self.runtime.as_ref() {
             let _ = client.flush().await;
         }
@@ -296,8 +291,10 @@ impl SinkConnector for NatsSink {
     }
 }
 
-/// Concurrently drain `pending`, bounded by `timeout`. Counts
-/// server-identified duplicates via `PubAck.duplicate`.
+/// Drain `pending` concurrently, bounded by `timeout`. On deadline,
+/// each still-unresolved ack bumps `record_ack_error` once; the publish
+/// may have landed server-side, so exactly-once depends on dedup to
+/// swallow the retry.
 async fn drain_acks(
     pending: &mut VecDeque<PublishAckFuture>,
     metrics: &NatsSinkMetrics,
@@ -306,29 +303,42 @@ async fn drain_acks(
     if pending.is_empty() {
         return Ok(());
     }
-    let futures: Vec<_> = pending.drain(..).map(IntoFuture::into_future).collect();
-    let result = match tokio::time::timeout(timeout, try_join_all(futures)).await {
-        Ok(Ok(acks)) => {
-            for ack in acks {
+    let mut set: FuturesUnordered<_> = pending.drain(..).map(IntoFuture::into_future).collect();
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut first_err: Option<ConnectorError> = None;
+
+    loop {
+        if set.is_empty() {
+            break;
+        }
+        match tokio::time::timeout_at(deadline, set.next()).await {
+            Ok(Some(Ok(ack))) => {
                 if ack.duplicate {
                     metrics.record_dedup();
                 }
             }
-            Ok(())
+            Ok(Some(Err(e))) => {
+                metrics.record_ack_error();
+                if first_err.is_none() {
+                    first_err = Some(err(&format!("jetstream publish ack: {e}")));
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                let lost = set.len();
+                for _ in 0..lost {
+                    metrics.record_ack_error();
+                }
+                metrics.set_pending_futures(pending.len());
+                return Err(err(&format!(
+                    "jetstream publish ack: timed out with {lost} still in flight"
+                )));
+            }
         }
-        Ok(Err(e)) => {
-            metrics.record_ack_error();
-            Err(err(&format!("jetstream publish ack: {e}")))
-        }
-        Err(_) => {
-            metrics.record_ack_error();
-            Err(err(&format!(
-                "jetstream publish ack: timed out after {timeout:?}"
-            )))
-        }
-    };
+    }
+
     metrics.set_pending_futures(pending.len());
-    result
+    first_err.map_or(Ok(()), Err)
 }
 
 fn resolve_utf8<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray, ConnectorError> {

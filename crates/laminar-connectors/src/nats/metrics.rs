@@ -1,5 +1,5 @@
-//! NATS connector metrics. No per-subject labels — NATS subjects are
-//! wildcard-addressable and often unbounded-cardinality.
+//! NATS connector metrics. No per-subject labels — subjects are
+//! wildcard-addressable and unbounded-cardinality.
 
 use prometheus::core::Collector;
 use prometheus::{Error as PromError, IntCounter, IntGauge, Registry};
@@ -7,16 +7,17 @@ use tracing::warn;
 
 use crate::metrics::ConnectorMetrics;
 
-/// Register on `reg` — warn rather than silently drop on error.
 fn register_collector<C: Collector + Clone + 'static>(reg: &Registry, name: &str, c: &C) {
     match reg.register(Box::new(c.clone())) {
         Ok(()) => {}
-        Err(PromError::AlreadyReg) => warn!(
-            metric = name,
-            "metric already registered on this registry; this instance's \
-             counts will not appear in scrape output — instantiate NATS \
-             connectors on separate registries",
-        ),
+        // Multiple connectors on a shared registry can collide; the
+        // second registration silently drops so its counts won't scrape.
+        Err(PromError::AlreadyReg) => {
+            warn!(
+                metric = name,
+                "metric already registered; use separate registries per connector"
+            );
+        }
         Err(e) => warn!(metric = name, error = ?e, "failed to register metric"),
     }
 }
@@ -31,12 +32,12 @@ pub struct NatsSourceMetrics {
     pub acks_total: IntCounter,
     pub ack_errors_total: IntCounter,
     pub pending_acks: IntGauge,
-    /// Broker-side lag: stream messages not yet delivered to this consumer.
+    /// Stream messages not yet delivered to the consumer.
     pub consumer_lag: IntGauge,
 }
 
 impl NatsSourceMetrics {
-    /// Registers the metrics on `registry` if provided.
+    /// Registers on `registry` if provided; otherwise on a local one.
     #[must_use]
     #[allow(clippy::missing_panics_doc)]
     pub fn new(registry: Option<&Registry>) -> Self {
@@ -66,57 +67,48 @@ impl NatsSourceMetrics {
         register_collector(reg, "nats_source_consumer_lag", &consumer_lag);
 
         Self {
-            records_total: reg_c!(
-                "nats_source_records_total",
-                "Records delivered to poll_batch"
-            ),
+            records_total: reg_c!("nats_source_records_total", "Records delivered"),
             bytes_total: reg_c!("nats_source_bytes_total", "Payload bytes delivered"),
-            fetch_errors_total: reg_c!(
-                "nats_source_fetch_errors_total",
-                "Errors from consumer.fetch()"
-            ),
-            acks_total: reg_c!("nats_source_acks_total", "Successful JetStream acks"),
+            fetch_errors_total: reg_c!("nats_source_fetch_errors_total", "Fetch errors"),
+            acks_total: reg_c!("nats_source_acks_total", "Successful acks"),
             ack_errors_total: reg_c!("nats_source_ack_errors_total", "Failed acks"),
             pending_acks,
             consumer_lag,
         }
     }
 
-    /// Record a poll batch.
+    #[allow(missing_docs)]
     pub fn record_poll(&self, records: u64, bytes: u64) {
         self.records_total.inc_by(records);
         self.bytes_total.inc_by(bytes);
     }
 
-    /// Record a fetch-loop error.
+    #[allow(missing_docs)]
     pub fn record_fetch_error(&self) {
         self.fetch_errors_total.inc();
     }
 
-    /// Record one successful ack.
+    #[allow(missing_docs)]
     pub fn record_ack(&self) {
         self.acks_total.inc();
     }
 
-    /// Record one failed ack.
+    #[allow(missing_docs)]
     pub fn record_ack_error(&self) {
         self.ack_errors_total.inc();
     }
 
-    /// Set the pending-ack gauge.
-    #[allow(clippy::cast_possible_wrap)]
+    #[allow(missing_docs, clippy::cast_possible_wrap)]
     pub fn set_pending_acks(&self, n: usize) {
         self.pending_acks.set(n as i64);
     }
 
-    /// Set the broker-side lag gauge.
-    #[allow(clippy::cast_possible_wrap)]
+    #[allow(missing_docs, clippy::cast_possible_wrap)]
     pub fn set_consumer_lag(&self, n: u64) {
         self.consumer_lag.set(n as i64);
     }
 
-    /// Folds to the SDK's [`ConnectorMetrics`]. `lag` is the broker-
-    /// side pending count from the latest `consumer.info()` poll.
+    /// `lag` comes from the most recent `consumer.info()` poll.
     #[must_use]
     #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
     pub fn to_connector_metrics(&self) -> ConnectorMetrics {
@@ -142,14 +134,14 @@ pub struct NatsSinkMetrics {
     pub bytes_total: IntCounter,
     pub publish_errors_total: IntCounter,
     pub ack_errors_total: IntCounter,
-    /// Publishes the server dropped as `Nats-Msg-Id` duplicates.
+    /// Publishes the broker dropped as `Nats-Msg-Id` duplicates.
     pub dedup_total: IntCounter,
     pub epochs_rolled_back: IntCounter,
     pub pending_futures: IntGauge,
 }
 
 impl NatsSinkMetrics {
-    /// Registers the metrics on `registry` if provided.
+    /// Registers on `registry` if provided; otherwise on a local one.
     #[must_use]
     #[allow(clippy::missing_panics_doc)]
     pub fn new(registry: Option<&Registry>) -> Self {
@@ -177,50 +169,45 @@ impl NatsSinkMetrics {
             bytes_total: reg_c!("nats_sink_bytes_total", "Payload bytes published"),
             publish_errors_total: reg_c!("nats_sink_publish_errors_total", "Publish errors"),
             ack_errors_total: reg_c!("nats_sink_ack_errors_total", "Publish-ack errors"),
-            dedup_total: reg_c!(
-                "nats_sink_dedup_total",
-                "Publishes identified by the server as duplicates"
-            ),
+            dedup_total: reg_c!("nats_sink_dedup_total", "Broker-dropped duplicates"),
             epochs_rolled_back: reg_c!("nats_sink_epochs_rolled_back_total", "Epochs rolled back"),
             pending_futures,
         }
     }
 
-    /// Record one successful publish of `bytes`.
+    #[allow(missing_docs)]
     pub fn record_published_row(&self, bytes: u64) {
         self.records_total.inc();
         self.bytes_total.inc_by(bytes);
     }
 
-    /// Record one publish error.
+    #[allow(missing_docs)]
     pub fn record_publish_error(&self) {
         self.publish_errors_total.inc();
     }
 
-    /// Record one ack error.
+    #[allow(missing_docs)]
     pub fn record_ack_error(&self) {
         self.ack_errors_total.inc();
     }
 
-    /// Record one server-identified duplicate.
+    #[allow(missing_docs)]
     pub fn record_dedup(&self) {
         self.dedup_total.inc();
     }
 
-    /// Record one epoch rollback.
+    #[allow(missing_docs)]
     pub fn record_rollback(&self) {
         self.epochs_rolled_back.inc();
     }
 
-    /// Set the pending-futures gauge.
-    #[allow(clippy::cast_possible_wrap)]
+    #[allow(missing_docs, clippy::cast_possible_wrap)]
     pub fn set_pending_futures(&self, n: usize) {
         self.pending_futures.set(n as i64);
     }
 
-    /// Folds to the SDK's [`ConnectorMetrics`].
     #[must_use]
-    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
+    #[allow(missing_docs, clippy::cast_precision_loss, clippy::cast_sign_loss)]
     pub fn to_connector_metrics(&self) -> ConnectorMetrics {
         let mut m = ConnectorMetrics {
             records_total: self.records_total.get(),

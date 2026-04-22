@@ -1,9 +1,6 @@
-//! NATS source and sink connectors.
-//!
-//! Supports two modes:
-//! - `core`: plain NATS pub/sub, non-durable, non-replayable, at-most-once.
-//! - `jetstream` (default): durable streams with pull consumers, replayable,
-//!   at-least-once by default and exactly-once with `Nats-Msg-Id` dedup.
+//! NATS source and sink — `core` (non-durable, at-most-once) or
+//! `jetstream` (default; replayable; at-least-once, or exactly-once
+//! with `Nats-Msg-Id` dedup).
 
 pub mod config;
 pub mod metrics;
@@ -133,7 +130,6 @@ fn source_config_keys() -> Vec<ConfigKeySpec> {
         ),
         K::optional("fetch.batch", "Messages per pull fetch", "500"),
         K::optional("fetch.max.wait.ms", "Max wait per fetch", "500"),
-        K::optional("fetch.max.bytes", "Max bytes per fetch", "1048576"),
         K::optional(
             "fetch.error.threshold",
             "Consecutive fetch errors before the source reports Unhealthy",
@@ -144,31 +140,12 @@ fn source_config_keys() -> Vec<ConfigKeySpec> {
             "Interval between consumer.info() polls for the lag gauge (0 disables)",
             "10000",
         ),
-        // Core
         K::optional(
             "queue.group",
             "Queue group for load balancing (core mode only)",
             "",
         ),
-        // Format / metadata
         K::optional("format", "json | csv | raw", "json"),
-        K::optional(
-            "include.metadata",
-            "Emit _subject, _stream_seq, _timestamp columns",
-            "false",
-        ),
-        K::optional("include.headers", "Emit _headers column (JSON)", "false"),
-        K::optional(
-            "event.time.column",
-            "Column name for event time extraction",
-            "",
-        ),
-        // Error handling
-        K::optional(
-            "poison.dlq.subject",
-            "Republish Term'd messages to this subject",
-            "",
-        ),
     ];
     keys.extend(auth_and_tls_keys());
     keys
@@ -208,20 +185,10 @@ fn sink_config_keys() -> Vec<ConfigKeySpec> {
         ),
         K::optional("max.pending", "Max outstanding PubAck futures", "4096"),
         K::optional("ack.timeout.ms", "Per-publish ack timeout", "30000"),
-        K::optional(
-            "flush.batch.size",
-            "Records buffered before publish flush",
-            "1000",
-        ),
         K::optional("format", "json | csv | raw", "json"),
         K::optional(
             "header.columns",
             "Comma-separated columns projected to NATS headers",
-            "",
-        ),
-        K::optional(
-            "poison.dlq.subject",
-            "Subject for failed-after-retry publishes",
             "",
         ),
     ];

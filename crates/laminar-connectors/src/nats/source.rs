@@ -1,8 +1,7 @@
-//! NATS source connector — `JetStream` pull consumer with
-//! ack-on-commit, or core subscribe (at-most-once). A background reader
-//! task forwards messages to `poll_batch` through an `mpsc` channel;
-//! `JetStream` message handles are retained until `notify_epoch_committed`
-//! fires, then acked in bulk.
+//! NATS source: `JetStream` pull consumer with ack-on-commit, or core
+//! subscribe (at-most-once). A background task forwards messages through
+//! an `mpsc` channel; JS message handles are retained until
+//! `notify_epoch_committed` fires, then acked in bulk.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -29,7 +28,7 @@ use crate::health::HealthStatus;
 use crate::metrics::ConnectorMetrics;
 use crate::serde::{self, RecordDeserializer};
 
-/// One inbound message. `ack` is `Some` only on the `JetStream` path.
+/// `ack` is `Some` only on the `JetStream` path.
 struct Incoming {
     subject: String,
     payload: Bytes,
@@ -37,18 +36,16 @@ struct Incoming {
     ack: Option<jetstream::Message>,
 }
 
-/// Runtime state populated by `open()` and torn down by `close()`.
 struct Running {
     deserializer: Box<dyn RecordDeserializer>,
     rx: mpsc::Receiver<Incoming>,
-    /// Wakes the reader out of a blocking fetch.
     shutdown: Arc<Notify>,
     /// `Some` on `JetStream`; `None` on core.
     consecutive_errors: Option<Arc<AtomicU32>>,
     handle: JoinHandle<()>,
 }
 
-/// NATS source — core and `JetStream` modes behind a single type.
+/// NATS source — core and `JetStream` modes.
 pub struct NatsSource {
     schema: SchemaRef,
     config: Option<NatsSourceConfig>,
@@ -56,17 +53,15 @@ pub struct NatsSource {
     metrics: NatsSourceMetrics,
     running: Option<Running>,
 
-    // Ack-on-commit bookkeeping.
-    pending: Vec<jetstream::Message>,
-    sealed: VecDeque<Vec<jetstream::Message>>,
-
-    // Per-subject last-observed stream sequence, for checkpointing.
-    offsets: FxHashMap<String, u64>,
+    // Interior mutability so `checkpoint()` (takes `&self`) can seal
+    // `pending` into `sealed` atomically with offset capture.
+    pending: parking_lot::Mutex<Vec<jetstream::Message>>,
+    sealed: parking_lot::Mutex<VecDeque<Vec<jetstream::Message>>>,
+    offsets: parking_lot::Mutex<FxHashMap<String, u64>>,
 }
 
 impl NatsSource {
-    /// Creates a new NATS source. Metrics register on `registry` if
-    /// provided.
+    /// Metrics register on `registry` if provided.
     #[must_use]
     pub fn new(schema: SchemaRef, registry: Option<&prometheus::Registry>) -> Self {
         Self {
@@ -75,19 +70,19 @@ impl NatsSource {
             data_ready: Arc::new(Notify::new()),
             metrics: NatsSourceMetrics::new(registry),
             running: None,
-            pending: Vec::new(),
-            sealed: VecDeque::new(),
-            offsets: FxHashMap::default(),
+            pending: parking_lot::Mutex::new(Vec::new()),
+            sealed: parking_lot::Mutex::new(VecDeque::new()),
+            offsets: parking_lot::Mutex::new(FxHashMap::default()),
         }
     }
 
     fn update_pending_gauge(&self) {
-        let sealed_total: usize = self.sealed.iter().map(Vec::len).sum();
-        self.metrics
-            .set_pending_acks(self.pending.len() + sealed_total);
+        let pending_len = self.pending.lock().len();
+        let sealed_total: usize = self.sealed.lock().iter().map(Vec::len).sum();
+        self.metrics.set_pending_acks(pending_len + sealed_total);
     }
 
-    /// Parsed config — available after [`SourceConnector::open`].
+    /// Available after [`SourceConnector::open`].
     #[must_use]
     pub fn config(&self) -> Option<&NatsSourceConfig> {
         self.config.as_ref()
@@ -189,13 +184,6 @@ impl NatsSource {
         });
         Ok(())
     }
-
-    fn seal_pending(&mut self) {
-        if !self.pending.is_empty() {
-            let batch = std::mem::take(&mut self.pending);
-            self.sealed.push_back(batch);
-        }
-    }
 }
 
 #[async_trait]
@@ -222,24 +210,36 @@ impl SourceConnector for NatsSource {
 
         let mut payloads: Vec<Bytes> = Vec::new();
         let mut partition: Option<PartitionInfo> = None;
+        let mut new_acks: Vec<jetstream::Message> = Vec::new();
+        let mut offset_updates: Vec<(String, u64)> = Vec::new();
 
         while payloads.len() < max_records {
             let Ok(incoming) = running.rx.try_recv() else {
                 break;
             };
             if let Some(seq) = incoming.stream_seq {
-                self.offsets
-                    .entry(incoming.subject.clone())
-                    .and_modify(|s| *s = (*s).max(seq))
-                    .or_insert(seq);
+                offset_updates.push((incoming.subject.clone(), seq));
                 if partition.is_none() {
                     partition = Some(PartitionInfo::new(&incoming.subject, seq.to_string()));
                 }
             }
             payloads.push(incoming.payload);
             if let Some(msg) = incoming.ack {
-                self.pending.push(msg);
+                new_acks.push(msg);
             }
+        }
+
+        if !offset_updates.is_empty() {
+            let mut offsets = self.offsets.lock();
+            for (subject, seq) in offset_updates {
+                offsets
+                    .entry(subject)
+                    .and_modify(|s| *s = (*s).max(seq))
+                    .or_insert(seq);
+            }
+        }
+        if !new_acks.is_empty() {
+            self.pending.lock().extend(new_acks);
         }
 
         if payloads.is_empty() {
@@ -268,15 +268,25 @@ impl SourceConnector for NatsSource {
     }
 
     fn checkpoint(&self) -> SourceCheckpoint {
+        // Seal now-pending acks into this epoch; anything arriving after
+        // goes into a fresh batch committed with a later epoch. Without
+        // this split, an ack could fire before its manifest record lands.
+        {
+            let mut pending = self.pending.lock();
+            if !pending.is_empty() {
+                let batch = std::mem::take(&mut *pending);
+                self.sealed.lock().push_back(batch);
+            }
+        }
         let mut cp = SourceCheckpoint::default();
-        for (subject, seq) in &self.offsets {
+        for (subject, seq) in &*self.offsets.lock() {
             cp.set_offset(subject.as_str(), seq.to_string());
         }
         cp
     }
 
     async fn restore(&mut self, _checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        // Durable consumer's ack floor on the server is authoritative.
+        // Durable consumer ack floor on the server is authoritative.
         Ok(())
     }
 
@@ -299,10 +309,12 @@ impl SourceConnector for NatsSource {
     }
 
     async fn notify_epoch_committed(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
-        // Ack everything sealed so far. Per-msg ack errors don't roll
-        // the epoch back — the broker redelivers on ack_wait.
-        self.seal_pending();
-        while let Some(batch) = self.sealed.pop_front() {
+        // Per-msg ack errors don't roll the epoch back; the broker
+        // redelivers on ack_wait.
+        loop {
+            let Some(batch) = self.sealed.lock().pop_front() else {
+                break;
+            };
             for msg in batch {
                 match msg.ack().await {
                     Ok(()) => self.metrics.record_ack(),
@@ -322,7 +334,7 @@ impl SourceConnector for NatsSource {
             return HealthStatus::Unknown;
         };
 
-        // Unhealthy beats Degraded. Threshold of zero disables the flip.
+        // Threshold of zero disables the flip.
         if cfg.fetch_error_threshold > 0 {
             if let Some(errors) = self
                 .running
@@ -339,8 +351,7 @@ impl SourceConnector for NatsSource {
             }
         }
 
-        // Degraded: pending acks saturate half of `max_ack_pending`. The
-        // broker pauses delivery at 100%; yellow-light before that.
+        // Broker pauses delivery at 100% `max_ack_pending`; flag at 50%.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let cap = cfg.max_ack_pending.max(1) as u64;
         #[allow(clippy::cast_sign_loss)]
@@ -425,14 +436,14 @@ fn map_ack_policy(p: AckPolicy) -> async_nats::jetstream::consumer::AckPolicy {
     }
 }
 
-/// 500ms, 1s, 2s, 4s, 5s-cap.
+/// 500ms, 1s, 2s, 4s, cap 5s.
 fn fetch_backoff_base(consecutive_errors: u32) -> Duration {
     let exp = consecutive_errors.saturating_sub(1).min(4);
     let ms = 500u64.saturating_mul(1u64 << exp);
     Duration::from_millis(ms.min(5000))
 }
 
-/// `base ± 20%`; `entropy` is any `u64` (tests pass a fixed seed).
+/// `base ± 20%`. Tests pass a fixed `entropy` seed.
 fn with_jitter(base: Duration, entropy: u64) -> Duration {
     let base_ms = u64::try_from(base.as_millis()).unwrap_or(u64::MAX);
     let range = (base_ms / 5).max(1); // 20%
@@ -446,8 +457,8 @@ fn fetch_backoff(consecutive_errors: u32, entropy: u64) -> Duration {
     with_jitter(fetch_backoff_base(consecutive_errors), entropy)
 }
 
-/// Server error 10148 / 10013 means the consumer exists with a
-/// conflicting config — raise LDB-5070 with an operator fix-up.
+/// Server 10148 / 10013 → consumer exists with a conflicting config;
+/// raise LDB-5070 with an operator fix-up.
 fn classify_create_consumer_error(
     e: &async_nats::jetstream::stream::ConsumerError,
     consumer_name: &str,
@@ -473,7 +484,6 @@ fn classify_create_consumer_error(
     }
 }
 
-/// Jitter seed; not cryptographic.
 #[allow(clippy::cast_possible_truncation)]
 fn entropy_now() -> u64 {
     Instant::now().elapsed().as_nanos() as u64
@@ -569,8 +579,8 @@ impl JsReader {
                 forwarded += 1;
             }
 
-            // Reset on any forwarded message; count an all-error
-            // iteration as one failure; leave idle iterations alone.
+            // Reset on progress; an iteration with only errors counts
+            // as one failure; idle iterations don't bump.
             if forwarded > 0 {
                 consecutive_errors.store(0, Ordering::Release);
                 data_ready.notify_one();
@@ -640,12 +650,13 @@ mod tests {
     use arrow_schema::Schema;
 
     #[test]
-    fn seal_pending_moves_to_sealed() {
-        let mut src = NatsSource::new(Arc::new(Schema::empty()), None);
-        // We can't easily construct jetstream::Message without a real
-        // server, so we just test the empty-pending no-op path.
-        src.seal_pending();
-        assert!(src.sealed.is_empty());
+    fn checkpoint_empty_pending_is_noop() {
+        // `jetstream::Message` can't be constructed without a server,
+        // so we only cover the empty path here; non-empty sealing is
+        // exercised in `tests/nats_integration.rs`.
+        let src = NatsSource::new(Arc::new(Schema::empty()), None);
+        let _ = src.checkpoint();
+        assert!(src.sealed.lock().is_empty());
     }
 
     #[test]
