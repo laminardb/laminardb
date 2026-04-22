@@ -129,6 +129,10 @@ pub struct NatsSourceConfig {
     pub fetch_batch: usize,
     pub fetch_max_wait: Duration,
     pub fetch_max_bytes: usize,
+    /// Consecutive fetch errors before the source is reported
+    /// `Unhealthy`. Zero means "never flip to unhealthy from error
+    /// counts alone" — useful in tests.
+    pub fetch_error_threshold: u32,
 
     // Core
     pub queue_group: Option<String>,
@@ -175,6 +179,7 @@ impl NatsSourceConfig {
         let fetch_max_wait =
             parse_duration_ms(config, "fetch.max.wait.ms", Duration::from_millis(500))?;
         let fetch_max_bytes = parse_usize(config, "fetch.max.bytes", 1 << 20)?;
+        let fetch_error_threshold = parse_u32(config, "fetch.error.threshold", 10)?;
         let queue_group = config.get("queue.group").map(str::to_string);
         let format = parse_format(config)?;
         let include_metadata = parse_bool(config, "include.metadata", false)?;
@@ -201,6 +206,7 @@ impl NatsSourceConfig {
             fetch_batch,
             fetch_max_wait,
             fetch_max_bytes,
+            fetch_error_threshold,
             queue_group,
             format,
             include_metadata,
@@ -443,6 +449,10 @@ fn parse_usize(
     key: &str,
     default: usize,
 ) -> Result<usize, ConnectorError> {
+    config.get(key).map_or(Ok(default), |s| parse_int(key, s))
+}
+
+fn parse_u32(config: &ConnectorConfig, key: &str, default: u32) -> Result<u32, ConnectorError> {
     config.get(key).map_or(Ok(default), |s| parse_int(key, s))
 }
 

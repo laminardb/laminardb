@@ -15,7 +15,7 @@
 //! the queue in full is both simple and correct.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,7 +56,14 @@ struct Incoming {
 struct Running {
     deserializer: Box<dyn RecordDeserializer>,
     rx: AsyncRx<mpsc::Array<Incoming>>,
-    shutdown: Arc<AtomicBool>,
+    /// Wakes the reader task out of a blocking `fetch()`. Using `Notify`
+    /// instead of an `AtomicBool` drops shutdown lag from the fetch
+    /// timeout (default 500ms) to sub-ms.
+    shutdown: Arc<Notify>,
+    /// Consecutive fetch errors on the reader task. Surfaced through
+    /// `health_check` — flips the connector to `Unhealthy` once the
+    /// configured threshold is exceeded.
+    consecutive_errors: Arc<AtomicU32>,
     handle: JoinHandle<()>,
 }
 
@@ -107,6 +114,7 @@ impl NatsSource {
         self.config.as_ref()
     }
 
+    #[allow(clippy::too_many_lines)] // reader-task body is easier to read inline
     async fn open_jetstream(
         &mut self,
         cfg: &NatsSourceConfig,
@@ -132,11 +140,13 @@ impl NatsSource {
         let consumer = stream
             .create_consumer(pull_cfg)
             .await
-            .map_err(|e| err(&format!("create_consumer('{consumer_name}') failed: {e}")))?;
+            .map_err(|e| classify_create_consumer_error(&e.to_string(), consumer_name))?;
 
         let (tx, rx) = mpsc::bounded_async::<Incoming>(cfg.fetch_batch * 2);
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(Notify::new());
         let reader_shutdown = Arc::clone(&shutdown);
+        let consecutive_errors = Arc::new(AtomicU32::new(0));
+        let reader_errors = Arc::clone(&consecutive_errors);
         let data_ready = Arc::clone(&self.data_ready);
         let metrics = self.metrics.clone();
         let batch_size = cfg.fetch_batch;
@@ -144,29 +154,49 @@ impl NatsSource {
 
         let handle = tokio::spawn(async move {
             loop {
-                if reader_shutdown.load(Ordering::Acquire) {
-                    break;
-                }
+                let fetch_result = tokio::select! {
+                    biased;
+                    () = reader_shutdown.notified() => break,
+                    r = consumer
+                        .fetch()
+                        .max_messages(batch_size)
+                        .expires(max_wait)
+                        .messages() => r,
+                };
 
-                let fetch = consumer
-                    .fetch()
-                    .max_messages(batch_size)
-                    .expires(max_wait)
-                    .messages()
-                    .await;
-
-                let mut stream = match fetch {
-                    Ok(s) => s,
+                let mut stream = match fetch_result {
+                    Ok(s) => {
+                        reader_errors.store(0, Ordering::Release);
+                        s
+                    }
                     Err(e) => {
+                        let errs = reader_errors.fetch_add(1, Ordering::AcqRel) + 1;
                         metrics.record_fetch_error();
-                        warn!(error = %e, "nats fetch() errored; backing off");
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        warn!(
+                            error = %e,
+                            consecutive_errors = errs,
+                            "nats fetch() errored; backing off",
+                        );
+                        let backoff = fetch_backoff(errs);
+                        tokio::select! {
+                            biased;
+                            () = reader_shutdown.notified() => break,
+                            () = tokio::time::sleep(backoff) => {}
+                        }
                         continue;
                     }
                 };
 
                 let mut forwarded = 0usize;
-                while let Some(msg_result) = stream.next().await {
+                loop {
+                    let msg_result = tokio::select! {
+                        biased;
+                        () = reader_shutdown.notified() => return,
+                        r = stream.next() => match r {
+                            Some(r) => r,
+                            None => break,
+                        },
+                    };
                     let msg = match msg_result {
                         Ok(m) => m,
                         Err(e) => {
@@ -200,6 +230,7 @@ impl NatsSource {
             deserializer,
             rx,
             shutdown,
+            consecutive_errors,
             handle,
         });
         Ok(())
@@ -229,17 +260,23 @@ impl NatsSource {
 
         // Core deliveries land on the poll_batch side's `record_poll`;
         // the subscriber itself doesn't surface fetch errors the way a
-        // JS pull loop does, so the reader task has no metrics to bump.
+        // JS pull loop does. async-nats handles reconnect transparently.
         let (tx, rx) = mpsc::bounded_async::<Incoming>(cfg.fetch_batch * 2);
-        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(Notify::new());
         let reader_shutdown = Arc::clone(&shutdown);
+        let consecutive_errors = Arc::new(AtomicU32::new(0));
         let data_ready = Arc::clone(&self.data_ready);
 
         let handle = tokio::spawn(async move {
-            while let Some(msg) = subscriber.next().await {
-                if reader_shutdown.load(Ordering::Acquire) {
-                    break;
-                }
+            loop {
+                let msg = tokio::select! {
+                    biased;
+                    () = reader_shutdown.notified() => break,
+                    m = subscriber.next() => match m {
+                        Some(m) => m,
+                        None => break,
+                    },
+                };
                 let incoming = Incoming {
                     subject: msg.subject.to_string(),
                     payload: msg.payload,
@@ -257,6 +294,7 @@ impl NatsSource {
             deserializer,
             rx,
             shutdown,
+            consecutive_errors,
             handle,
         });
         Ok(())
@@ -359,7 +397,7 @@ impl SourceConnector for NatsSource {
         let Some(running) = self.running.take() else {
             return Ok(());
         };
-        running.shutdown.store(true, Ordering::Release);
+        running.shutdown.notify_one();
         let _ = tokio::time::timeout(Duration::from_secs(5), running.handle).await;
         Ok(())
     }
@@ -395,24 +433,34 @@ impl SourceConnector for NatsSource {
     }
 
     fn health_check(&self) -> HealthStatus {
-        match self.config.as_ref() {
-            None => HealthStatus::Unknown,
-            Some(cfg) => {
-                // Warn when pending acks saturate half of `max_ack_pending`;
-                // the broker pauses delivery at 100% and we want a
-                // yellow-light before that.
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let cap = cfg.max_ack_pending.max(1) as u64;
-                #[allow(clippy::cast_sign_loss)]
-                let pending = self.metrics.pending_acks.get().max(0) as u64;
-                if pending * 2 >= cap {
-                    HealthStatus::Degraded(format!(
-                        "pending acks {pending}/{cap} — broker may throttle delivery"
-                    ))
-                } else {
-                    HealthStatus::Healthy
-                }
+        let Some(cfg) = self.config.as_ref() else {
+            return HealthStatus::Unknown;
+        };
+
+        // Unhealthy first: fetch-loop errors indicate a problem even if
+        // `max_ack_pending` happens to be low.
+        if let Some(running) = self.running.as_ref() {
+            let errs = running.consecutive_errors.load(Ordering::Acquire);
+            if errs >= cfg.fetch_error_threshold {
+                return HealthStatus::Unhealthy(format!(
+                    "{errs} consecutive fetch errors (threshold {})",
+                    cfg.fetch_error_threshold
+                ));
             }
+        }
+
+        // Degraded: pending acks saturate half of `max_ack_pending`. The
+        // broker pauses delivery at 100%; yellow-light before that.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let cap = cfg.max_ack_pending.max(1) as u64;
+        #[allow(clippy::cast_sign_loss)]
+        let pending = self.metrics.pending_acks.get().max(0) as u64;
+        if pending * 2 >= cap {
+            HealthStatus::Degraded(format!(
+                "pending acks {pending}/{cap} — broker may throttle delivery"
+            ))
+        } else {
+            HealthStatus::Healthy
         }
     }
 
@@ -482,6 +530,36 @@ fn map_ack_policy(p: AckPolicy) -> async_nats::jetstream::consumer::AckPolicy {
     }
 }
 
+/// Exponential backoff for fetch errors: 500ms, 1s, 2s, 4s, 5s cap.
+fn fetch_backoff(consecutive_errors: u32) -> Duration {
+    let exp = consecutive_errors.saturating_sub(1).min(4);
+    let ms = 500u64.saturating_mul(1u64 << exp);
+    Duration::from_millis(ms.min(5000))
+}
+
+/// Translate a `create_consumer` error into something operator-readable.
+/// NATS server error 10148 (or similar text like "consumer config" /
+/// "already exists") means the durable consumer exists with a different
+/// config. Re-creating with a conflicting config is a footgun; surface
+/// a fix-it message instead of the raw server text.
+fn classify_create_consumer_error(err_msg: &str, consumer_name: &str) -> ConnectorError {
+    let lower = err_msg.to_ascii_lowercase();
+    if lower.contains("10148")
+        || lower.contains("consumer config")
+        || lower.contains("already exists")
+    {
+        err(&format!(
+            "[LDB-5070] consumer '{consumer_name}' exists with incompatible config; \
+             rotate the durable name or delete the consumer out-of-band. \
+             Server said: {err_msg}"
+        ))
+    } else {
+        err(&format!(
+            "create_consumer('{consumer_name}') failed: {err_msg}"
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,5 +572,35 @@ mod tests {
         // server, so we just test the empty-pending no-op path.
         src.seal_pending();
         assert!(src.sealed.is_empty());
+    }
+
+    #[test]
+    fn fetch_backoff_grows_then_caps_at_5s() {
+        assert_eq!(fetch_backoff(1), Duration::from_millis(500));
+        assert_eq!(fetch_backoff(2), Duration::from_millis(1000));
+        assert_eq!(fetch_backoff(3), Duration::from_millis(2000));
+        assert_eq!(fetch_backoff(4), Duration::from_millis(4000));
+        assert_eq!(fetch_backoff(5), Duration::from_millis(5000));
+        assert_eq!(fetch_backoff(100), Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn drift_error_contains_ldb_5070() {
+        let e =
+            classify_create_consumer_error("consumer config already exists (10148)", "my-consumer");
+        assert!(e.to_string().contains("LDB-5070"), "got: {e}");
+        assert!(e.to_string().contains("my-consumer"));
+    }
+
+    #[test]
+    fn drift_error_matches_on_server_code_10148() {
+        let e = classify_create_consumer_error("err 10148", "c");
+        assert!(e.to_string().contains("LDB-5070"));
+    }
+
+    #[test]
+    fn generic_create_error_is_not_drift() {
+        let e = classify_create_consumer_error("network timeout", "c");
+        assert!(!e.to_string().contains("LDB-5070"), "got: {e}");
     }
 }

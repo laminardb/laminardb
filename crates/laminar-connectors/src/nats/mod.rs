@@ -129,6 +129,11 @@ fn source_config_keys() -> Vec<ConfigKeySpec> {
         K::optional("fetch.batch", "Messages per pull fetch", "500"),
         K::optional("fetch.max.wait.ms", "Max wait per fetch", "500"),
         K::optional("fetch.max.bytes", "Max bytes per fetch", "1048576"),
+        K::optional(
+            "fetch.error.threshold",
+            "Consecutive fetch errors before the source reports Unhealthy",
+            "10",
+        ),
         // Core
         K::optional(
             "queue.group",
