@@ -43,8 +43,7 @@ struct Running {
     rx: mpsc::Receiver<Incoming>,
     /// Wakes the reader out of a blocking fetch.
     shutdown: Arc<Notify>,
-    /// `Some` on `JetStream`, `None` on core (async-nats reconnects
-    /// transparently — nothing to count).
+    /// `Some` on `JetStream`; `None` on core.
     consecutive_errors: Option<Arc<AtomicU32>>,
     handle: JoinHandle<()>,
 }

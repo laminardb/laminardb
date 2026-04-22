@@ -395,8 +395,7 @@ async fn source_flips_unhealthy_after_stream_deleted() {
 
 // ── observability ──
 
-/// `nats_source_consumer_lag` is populated by the periodic
-/// `consumer.info()` poll and reaches zero after a full drain + ack.
+/// Lag gauge settles to 0 after a full drain + ack.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker compose -f docker-compose.nats.yml up"]
 async fn consumer_lag_settles_to_zero_after_drain() {
@@ -463,7 +462,6 @@ async fn by_start_time_replays_from_cutoff() {
     )
     .await;
 
-    // Publish 3 before the cutoff, wait, remember the cutoff, publish 3 after.
     for i in 0..3i64 {
         let payload = format!(r#"{{"id": {i}, "name": "row-{i}"}}"#);
         ctx.publish("bytime.events".to_string(), payload.into())
@@ -524,7 +522,6 @@ async fn poll_gauge_until(
             .iter()
             .find_map(|(k, v)| (k == &format!("nats.{custom_key}")).then_some(*v as u64))
             .unwrap_or_else(|| {
-                // `lag` is exposed directly, not via custom — read it there.
                 if custom_key == "consumer_lag" {
                     cm.lag
                 } else {
@@ -572,10 +569,8 @@ fn dedup_batch(ids: std::ops::Range<i64>) -> RecordBatch {
     .unwrap()
 }
 
-/// Exactly-once sink survives a broker restart. Publish 50 rows →
-/// `docker compose restart nats` → publish 0..100 (first 50 collide
-/// with the pre-restart dedup ids). Final stream must hold exactly
-/// 100 unique messages.
+/// Exactly-once survives a broker restart: replay after restart is
+/// deduped by persisted `duplicate_window` state.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker compose available on host; chaos test restarts the broker"]
 async fn exactly_once_survives_broker_restart() {
@@ -640,9 +635,8 @@ async fn exactly_once_survives_broker_restart() {
     );
 }
 
-/// A source that never commits the epoch must not ack. After
-/// `ack_wait`, a fresh consumer on the same durable replays;
-/// committing that one drains the queue for good.
+/// A source that never commits the epoch must not ack; the server
+/// replays on the next consumer.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker compose -f docker-compose.nats.yml up"]
 async fn source_redelivers_when_epoch_not_committed() {

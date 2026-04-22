@@ -12,7 +12,7 @@ use crate::serde::Format;
 pub enum Mode {
     /// Plain NATS pub/sub. No durability, no replay, at-most-once.
     Core,
-    /// `JetStream` with durable pull consumers. Default.
+    /// `JetStream` with durable pull consumers.
     #[default]
     JetStream,
 }
@@ -25,10 +25,10 @@ str_enum!(fromstr Mode, lowercase, ConnectorError, "invalid nats mode",
 /// `JetStream` consumer ack policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AckPolicy {
-    /// Each message acked individually. Default.
+    /// Each message acked individually.
     #[default]
     Explicit,
-    /// No ack required (fire-and-forget within JS).
+    /// No ack required.
     None,
 }
 
@@ -40,7 +40,7 @@ str_enum!(fromstr AckPolicy, lowercase, ConnectorError, "invalid ack.policy",
 /// `JetStream` consumer delivery policy — where to start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DeliverPolicy {
-    /// Replay every message retained by the stream. Default.
+    /// Every message retained by the stream.
     #[default]
     All,
     /// Only messages published after consumer creation.
@@ -67,28 +67,18 @@ pub enum SubjectSpec {
     Column(String),
 }
 
-/// NATS user-authentication mode.
-///
-/// `Debug` is implemented manually to redact passwords and tokens —
-/// `NatsSourceConfig` / `NatsSinkConfig` both derive `Debug` and carry
-/// an `AuthMode`, so any `debug!("{cfg:?}")` or panic backtrace would
-/// otherwise log secrets.
+/// NATS user-authentication mode. Custom `Debug` redacts secrets
+/// because the parent config structs derive `Debug`.
 #[derive(Clone, Default, PartialEq, Eq)]
+#[allow(missing_docs)]
 pub enum AuthMode {
-    /// No authentication.
     #[default]
     None,
-    /// Username + password (one of the most common NATS auth shapes).
     UserPass {
-        /// Username.
         user: String,
-        /// Password.
         password: String,
     },
-    /// Plain-text bearer token.
     Token(String),
-    /// Path to a NATS credentials file (typically `.creds` from
-    /// NATS Cloud / NSC).
     CredsFile(String),
 }
 
@@ -102,14 +92,12 @@ impl std::fmt::Debug for AuthMode {
                 .field("password", &"<redacted>")
                 .finish(),
             Self::Token(_) => f.debug_tuple("Token").field(&"<redacted>").finish(),
-            // File paths aren't secrets themselves — the file contents are,
-            // and we don't store them in this enum.
             Self::CredsFile(path) => f.debug_tuple("CredsFile").field(path).finish(),
         }
     }
 }
 
-/// TLS transport configuration. Independent of [`AuthMode`].
+/// TLS transport configuration.
 #[derive(Debug, Clone, Default)]
 #[allow(missing_docs)]
 pub struct TlsConfig {
@@ -164,13 +152,9 @@ pub struct NatsSourceConfig {
 }
 
 impl NatsSourceConfig {
-    /// Parse the source config from a `ConnectorConfig`.
-    ///
     /// # Errors
     ///
-    /// Returns `ConnectorError::ConfigurationError` on missing required keys,
-    /// unparseable values, or violations of the startup-validation rules
-    /// that don't need server metadata.
+    /// `ConfigurationError` on any parse or validation failure.
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
         let servers = parse_servers(config)?;
         let mode = parse_or_default::<Mode>(config, "mode")?;
@@ -311,12 +295,9 @@ pub struct NatsSinkConfig {
 }
 
 impl NatsSinkConfig {
-    /// Parse the sink config from a `ConnectorConfig`.
-    ///
     /// # Errors
     ///
-    /// Returns `ConnectorError::ConfigurationError` on missing required keys,
-    /// unparseable values, or violations of startup-validation rules.
+    /// `ConfigurationError` on any parse or validation failure.
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
         let servers = parse_servers(config)?;
         let mode = parse_or_default::<Mode>(config, "mode")?;
@@ -533,8 +514,6 @@ fn parse_auth(config: &ConnectorConfig) -> Result<AuthMode, ConnectorError> {
     let mode = config.get("auth.mode").unwrap_or("none");
     match mode {
         "none" | "" => {
-            // Leftover credentials with auth.mode=none is a muddle. Fail
-            // loudly so the operator chooses one.
             if config.get("user").is_some()
                 || config.get("password").is_some()
                 || config.get("token").is_some()
@@ -595,13 +574,12 @@ fn parse_tls(config: &ConnectorConfig) -> Result<TlsConfig, ConnectorError> {
     })
 }
 
-/// Build `ConnectOptions` from parsed auth + TLS config. Shared by the
-/// source and the sink so they don't drift in how they apply these.
+/// Build `ConnectOptions` from parsed auth + TLS. Shared between
+/// source and sink.
 ///
 /// # Errors
 ///
-/// Returns `ConnectorError` if `auth.mode=creds_file` points at a file
-/// we can't read or that doesn't parse as a NATS credentials bundle.
+/// Returns `ConnectorError` if the creds file can't be read or parsed.
 pub(super) fn build_connect_options(
     auth: &AuthMode,
     tls: &TlsConfig,
@@ -622,8 +600,6 @@ pub(super) fn build_connect_options(
                 .map_err(|e| cfg_err(&format!("creds.file '{path}' invalid: {e}")))?;
         }
     }
-    // Any TLS-related key turns on the requirement. Operators who want
-    // plain TCP just leave the TLS keys unset.
     let tls_touched = tls.enabled || tls.ca_location.is_some() || tls.cert_location.is_some();
     if tls_touched {
         opts = opts.require_tls(true);

@@ -7,10 +7,7 @@ use tracing::warn;
 
 use crate::metrics::ConnectorMetrics;
 
-/// Register a collector on `reg`, logging a warning on failure rather
-/// than silently dropping. `AlreadyReg` means another connector
-/// instance is sharing this registry; the caller's collector is
-/// detached from scrape output and the operator needs to know.
+/// Register on `reg` — warn rather than silently drop on error.
 fn register_collector<C: Collector + Clone + 'static>(reg: &Registry, name: &str, c: &C) {
     match reg.register(Box::new(c.clone())) {
         Ok(()) => {}
