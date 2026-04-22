@@ -1,9 +1,28 @@
 //! NATS connector metrics. No per-subject labels — NATS subjects are
 //! wildcard-addressable and often unbounded-cardinality.
 
-use prometheus::{IntCounter, IntGauge, Registry};
+use prometheus::core::Collector;
+use prometheus::{Error as PromError, IntCounter, IntGauge, Registry};
+use tracing::warn;
 
 use crate::metrics::ConnectorMetrics;
+
+/// Register a collector on `reg`, logging a warning on failure rather
+/// than silently dropping. `AlreadyReg` means another connector
+/// instance is sharing this registry; the caller's collector is
+/// detached from scrape output and the operator needs to know.
+fn register_collector<C: Collector + Clone + 'static>(reg: &Registry, name: &str, c: &C) {
+    match reg.register(Box::new(c.clone())) {
+        Ok(()) => {}
+        Err(PromError::AlreadyReg) => warn!(
+            metric = name,
+            "metric already registered on this registry; this instance's \
+             counts will not appear in scrape output — instantiate NATS \
+             connectors on separate registries",
+        ),
+        Err(e) => warn!(metric = name, error = ?e, "failed to register metric"),
+    }
+}
 
 /// Prometheus counters for the NATS source.
 #[derive(Debug, Clone)]
@@ -35,19 +54,19 @@ impl NatsSourceMetrics {
         macro_rules! reg_c {
             ($name:expr, $help:expr) => {{
                 let c = IntCounter::new($name, $help).unwrap();
-                let _ = reg.register(Box::new(c.clone()));
+                register_collector(reg, $name, &c);
                 c
             }};
         }
         let pending_acks =
             IntGauge::new("nats_source_pending_acks", "Unacked JetStream messages").unwrap();
-        let _ = reg.register(Box::new(pending_acks.clone()));
+        register_collector(reg, "nats_source_pending_acks", &pending_acks);
         let consumer_lag = IntGauge::new(
             "nats_source_consumer_lag",
             "Stream messages not yet delivered to the consumer",
         )
         .unwrap();
-        let _ = reg.register(Box::new(consumer_lag.clone()));
+        register_collector(reg, "nats_source_consumer_lag", &consumer_lag);
 
         Self {
             records_total: reg_c!(
@@ -148,13 +167,13 @@ impl NatsSinkMetrics {
         macro_rules! reg_c {
             ($name:expr, $help:expr) => {{
                 let c = IntCounter::new($name, $help).unwrap();
-                let _ = reg.register(Box::new(c.clone()));
+                register_collector(reg, $name, &c);
                 c
             }};
         }
         let pending_futures =
             IntGauge::new("nats_sink_pending_futures", "Outstanding PublishAckFutures").unwrap();
-        let _ = reg.register(Box::new(pending_futures.clone()));
+        register_collector(reg, "nats_sink_pending_futures", &pending_futures);
 
         Self {
             records_total: reg_c!("nats_sink_records_total", "Records published"),

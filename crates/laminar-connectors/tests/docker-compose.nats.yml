@@ -8,10 +8,13 @@ services:
     volumes:
       - nats-data:/data
     healthcheck:
-      test: ["CMD", "nats-server", "--help"]
+      # `nats-server --help` would just prove the binary is present.
+      # Probe the client port so health reflects readiness to accept
+      # connections. `nc` is provided by BusyBox in nats:2.10-alpine.
+      test: ["CMD", "nc", "-z", "127.0.0.1", "4222"]
       interval: 2s
       timeout: 1s
-      retries: 5
+      retries: 10
 
   # Secured NATS with user/password. Started only with the `secure`
   # profile: `docker compose -f docker-compose.nats.yml --profile secure up`.
@@ -25,10 +28,10 @@ services:
       - nats-secure-data:/data
     profiles: ["secure"]
     healthcheck:
-      test: ["CMD", "nats-server", "--help"]
+      test: ["CMD", "nc", "-z", "127.0.0.1", "4222"]
       interval: 2s
       timeout: 1s
-      retries: 5
+      retries: 10
 
 volumes:
   nats-data:

@@ -68,7 +68,12 @@ pub enum SubjectSpec {
 }
 
 /// NATS user-authentication mode.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// `Debug` is implemented manually to redact passwords and tokens —
+/// `NatsSourceConfig` / `NatsSinkConfig` both derive `Debug` and carry
+/// an `AuthMode`, so any `debug!("{cfg:?}")` or panic backtrace would
+/// otherwise log secrets.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub enum AuthMode {
     /// No authentication.
     #[default]
@@ -85,6 +90,23 @@ pub enum AuthMode {
     /// Path to a NATS credentials file (typically `.creds` from
     /// NATS Cloud / NSC).
     CredsFile(String),
+}
+
+impl std::fmt::Debug for AuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::UserPass { user, .. } => f
+                .debug_struct("UserPass")
+                .field("user", user)
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::Token(_) => f.debug_tuple("Token").field(&"<redacted>").finish(),
+            // File paths aren't secrets themselves — the file contents are,
+            // and we don't store them in this enum.
+            Self::CredsFile(path) => f.debug_tuple("CredsFile").field(path).finish(),
+        }
+    }
 }
 
 /// TLS transport configuration. Independent of [`AuthMode`].
@@ -166,13 +188,13 @@ impl NatsSourceConfig {
         let start_sequence = parse_opt_u64(config, "start.sequence")?;
         let start_time = config.get("start.time").map(str::to_string);
         let ack_policy = parse_or_default::<AckPolicy>(config, "ack.policy")?;
-        let ack_wait = parse_duration_ms(config, "ack.wait.ms", Duration::from_secs(60))?;
-        let max_deliver = parse_i64(config, "max.deliver", 5)?;
-        let max_ack_pending = parse_i64(config, "max.ack.pending", 10_000)?;
-        let fetch_batch = parse_usize(config, "fetch.batch", 500)?;
+        let ack_wait = require_positive_duration(config, "ack.wait.ms", Duration::from_secs(60))?;
+        let max_deliver = require_positive_or_unlimited_i64(config, "max.deliver", 5)?;
+        let max_ack_pending = require_positive_or_unlimited_i64(config, "max.ack.pending", 10_000)?;
+        let fetch_batch = require_positive_usize(config, "fetch.batch", 500)?;
         let fetch_max_wait =
-            parse_duration_ms(config, "fetch.max.wait.ms", Duration::from_millis(500))?;
-        let fetch_max_bytes = parse_usize(config, "fetch.max.bytes", 1 << 20)?;
+            require_positive_duration(config, "fetch.max.wait.ms", Duration::from_millis(500))?;
+        let fetch_max_bytes = require_positive_usize(config, "fetch.max.bytes", 1 << 20)?;
         let fetch_error_threshold = parse_u32(config, "fetch.error.threshold", 10)?;
         let lag_poll_interval =
             parse_duration_ms(config, "lag.poll.interval.ms", Duration::from_secs(10))?;
@@ -336,9 +358,13 @@ impl NatsSinkConfig {
                 "min.duplicate.window.ms",
                 Duration::from_secs(120),
             )?,
-            max_pending: parse_usize(config, "max.pending", 4096)?,
-            ack_timeout: parse_duration_ms(config, "ack.timeout.ms", Duration::from_secs(30))?,
-            flush_batch_size: parse_usize(config, "flush.batch.size", 1000)?,
+            max_pending: require_positive_usize(config, "max.pending", 4096)?,
+            ack_timeout: require_positive_duration(
+                config,
+                "ack.timeout.ms",
+                Duration::from_secs(30),
+            )?,
+            flush_batch_size: require_positive_usize(config, "flush.batch.size", 1000)?,
             format: parse_format(config)?,
             header_columns: config
                 .get("header.columns")
@@ -448,6 +474,44 @@ fn parse_usize(
 
 fn parse_u32(config: &ConnectorConfig, key: &str, default: u32) -> Result<u32, ConnectorError> {
     config.get(key).map_or(Ok(default), |s| parse_int(key, s))
+}
+
+fn require_positive_duration(
+    config: &ConnectorConfig,
+    key: &str,
+    default: Duration,
+) -> Result<Duration, ConnectorError> {
+    let v = parse_duration_ms(config, key, default)?;
+    if v.is_zero() {
+        return Err(cfg_err(&format!("{key} must be > 0")));
+    }
+    Ok(v)
+}
+
+fn require_positive_usize(
+    config: &ConnectorConfig,
+    key: &str,
+    default: usize,
+) -> Result<usize, ConnectorError> {
+    let v = parse_usize(config, key, default)?;
+    if v == 0 {
+        return Err(cfg_err(&format!("{key} must be > 0")));
+    }
+    Ok(v)
+}
+
+/// NATS allows `-1` for "unlimited" in `max_deliver` / `max_ack_pending`.
+/// Reject 0 (undefined) and negative values other than -1.
+fn require_positive_or_unlimited_i64(
+    config: &ConnectorConfig,
+    key: &str,
+    default: i64,
+) -> Result<i64, ConnectorError> {
+    let v = parse_i64(config, key, default)?;
+    if v == 0 || v < -1 {
+        return Err(cfg_err(&format!("{key} must be > 0, or -1 for unlimited")));
+    }
+    Ok(v)
 }
 
 fn parse_duration_ms(
@@ -768,6 +832,49 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("servers"), "got: {err}");
+    }
+
+    #[test]
+    fn zero_fetch_batch_rejected() {
+        let err = NatsSourceConfig::from_config(&jetstream_happy(&[("fetch.batch", "0")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fetch.batch must be > 0"), "got: {err}");
+    }
+
+    #[test]
+    fn zero_ack_wait_rejected() {
+        let err = NatsSourceConfig::from_config(&jetstream_happy(&[("ack.wait.ms", "0")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ack.wait.ms must be > 0"), "got: {err}");
+    }
+
+    #[test]
+    fn max_deliver_unlimited_accepted() {
+        let parsed =
+            NatsSourceConfig::from_config(&jetstream_happy(&[("max.deliver", "-1")])).unwrap();
+        assert_eq!(parsed.max_deliver, -1);
+    }
+
+    #[test]
+    fn max_deliver_negative_other_than_minus_one_rejected() {
+        let err = NatsSourceConfig::from_config(&jetstream_happy(&[("max.deliver", "-5")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max.deliver"), "got: {err}");
+    }
+
+    #[test]
+    fn sink_zero_max_pending_rejected() {
+        let err = NatsSinkConfig::from_config(&cfg(&[
+            ("servers", "nats://a:4222"),
+            ("subject", "x"),
+            ("max.pending", "0"),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("max.pending must be > 0"), "got: {err}");
     }
 
     #[test]

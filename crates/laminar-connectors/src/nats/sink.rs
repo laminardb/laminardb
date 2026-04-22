@@ -178,6 +178,13 @@ impl SinkConnector for NatsSink {
                     }
                 }
                 Runtime::JetStream { context } => {
+                    // Mid-batch backpressure: if we're at max_pending,
+                    // drain before publishing more. Prevents unbounded
+                    // memory growth on large batches and keeps acks
+                    // close to publishes.
+                    if pending_acks.len() >= cfg.max_pending {
+                        drain_acks(pending_acks, metrics, cfg.ack_timeout).await?;
+                    }
                     let publish_result = if let Some(h) = headers {
                         context
                             .publish_with_headers(subject.to_string(), h, payload)
