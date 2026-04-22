@@ -17,16 +17,15 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arrow_schema::SchemaRef;
 use async_nats::jetstream::{self, consumer::pull};
 use async_trait::async_trait;
 use bytes::Bytes;
-use crossfire::{mpsc, AsyncRx};
 use futures_util::StreamExt;
 use rustc_hash::FxHashMap;
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -55,15 +54,16 @@ struct Incoming {
 /// parallel `Option<>` fields on `NatsSource`.
 struct Running {
     deserializer: Box<dyn RecordDeserializer>,
-    rx: AsyncRx<mpsc::Array<Incoming>>,
+    rx: mpsc::Receiver<Incoming>,
     /// Wakes the reader task out of a blocking `fetch()`. Using `Notify`
     /// instead of an `AtomicBool` drops shutdown lag from the fetch
     /// timeout (default 500ms) to sub-ms.
     shutdown: Arc<Notify>,
-    /// Consecutive fetch errors on the reader task. Surfaced through
-    /// `health_check` — flips the connector to `Unhealthy` once the
-    /// configured threshold is exceeded.
-    consecutive_errors: Arc<AtomicU32>,
+    /// Consecutive fetch errors, `Some` for `JetStream` pull (which
+    /// surfaces fetch errors we can count) and `None` for core
+    /// subscribe (async-nats reconnects transparently, nothing to
+    /// count). Surfaced through `health_check`.
+    consecutive_errors: Option<Arc<AtomicU32>>,
     handle: JoinHandle<()>,
 }
 
@@ -114,7 +114,6 @@ impl NatsSource {
         self.config.as_ref()
     }
 
-    #[allow(clippy::too_many_lines)] // reader-task body is easier to read inline
     async fn open_jetstream(
         &mut self,
         cfg: &NatsSourceConfig,
@@ -140,97 +139,29 @@ impl NatsSource {
         let consumer = stream
             .create_consumer(pull_cfg)
             .await
-            .map_err(|e| classify_create_consumer_error(&e.to_string(), consumer_name))?;
+            .map_err(|e| classify_create_consumer_error(&e, consumer_name))?;
 
-        let (tx, rx) = mpsc::bounded_async::<Incoming>(cfg.fetch_batch * 2);
+        let (tx, rx) = mpsc::channel::<Incoming>(cfg.fetch_batch * 2);
         let shutdown = Arc::new(Notify::new());
-        let reader_shutdown = Arc::clone(&shutdown);
         let consecutive_errors = Arc::new(AtomicU32::new(0));
-        let reader_errors = Arc::clone(&consecutive_errors);
-        let data_ready = Arc::clone(&self.data_ready);
-        let metrics = self.metrics.clone();
-        let batch_size = cfg.fetch_batch;
-        let max_wait = cfg.fetch_max_wait;
 
-        let handle = tokio::spawn(async move {
-            loop {
-                let fetch_result = tokio::select! {
-                    biased;
-                    () = reader_shutdown.notified() => break,
-                    r = consumer
-                        .fetch()
-                        .max_messages(batch_size)
-                        .expires(max_wait)
-                        .messages() => r,
-                };
-
-                let mut stream = match fetch_result {
-                    Ok(s) => {
-                        reader_errors.store(0, Ordering::Release);
-                        s
-                    }
-                    Err(e) => {
-                        let errs = reader_errors.fetch_add(1, Ordering::AcqRel) + 1;
-                        metrics.record_fetch_error();
-                        warn!(
-                            error = %e,
-                            consecutive_errors = errs,
-                            "nats fetch() errored; backing off",
-                        );
-                        let backoff = fetch_backoff(errs);
-                        tokio::select! {
-                            biased;
-                            () = reader_shutdown.notified() => break,
-                            () = tokio::time::sleep(backoff) => {}
-                        }
-                        continue;
-                    }
-                };
-
-                let mut forwarded = 0usize;
-                loop {
-                    let msg_result = tokio::select! {
-                        biased;
-                        () = reader_shutdown.notified() => return,
-                        r = stream.next() => match r {
-                            Some(r) => r,
-                            None => break,
-                        },
-                    };
-                    let msg = match msg_result {
-                        Ok(m) => m,
-                        Err(e) => {
-                            metrics.record_fetch_error();
-                            warn!(error = %e, "nats message error");
-                            continue;
-                        }
-                    };
-                    let stream_seq = msg.info().ok().map(|i| i.stream_sequence);
-                    let subject = msg.subject.to_string();
-                    let payload = msg.payload.clone();
-                    let incoming = Incoming {
-                        subject,
-                        payload,
-                        stream_seq,
-                        ack: Some(msg),
-                    };
-                    if tx.send(incoming).await.is_err() {
-                        debug!("nats reader: downstream channel closed");
-                        return;
-                    }
-                    forwarded += 1;
-                }
-                if forwarded > 0 {
-                    data_ready.notify_one();
-                }
-            }
-        });
+        let reader = JsReader {
+            consumer,
+            tx,
+            shutdown: Arc::clone(&shutdown),
+            consecutive_errors: Arc::clone(&consecutive_errors),
+            data_ready: Arc::clone(&self.data_ready),
+            metrics: self.metrics.clone(),
+            batch_size: cfg.fetch_batch,
+            max_wait: cfg.fetch_max_wait,
+        };
+        let handle = tokio::spawn(reader.run());
 
         self.running = Some(Running {
             deserializer,
             rx,
             shutdown,
-            consecutive_errors,
+            consecutive_errors: Some(consecutive_errors),
             handle,
         });
         Ok(())
@@ -246,7 +177,7 @@ impl NatsSource {
             .subject
             .clone()
             .ok_or_else(|| err("subject missing after validation"))?;
-        let mut subscriber = if let Some(group) = cfg.queue_group.as_deref() {
+        let subscriber = if let Some(group) = cfg.queue_group.as_deref() {
             client
                 .queue_subscribe(subject, group.to_string())
                 .await
@@ -258,43 +189,25 @@ impl NatsSource {
                 .map_err(|e| err(&format!("subscribe: {e}")))?
         };
 
-        // Core deliveries land on the poll_batch side's `record_poll`;
-        // the subscriber itself doesn't surface fetch errors the way a
-        // JS pull loop does. async-nats handles reconnect transparently.
-        let (tx, rx) = mpsc::bounded_async::<Incoming>(cfg.fetch_batch * 2);
+        let (tx, rx) = mpsc::channel::<Incoming>(cfg.fetch_batch * 2);
         let shutdown = Arc::new(Notify::new());
-        let reader_shutdown = Arc::clone(&shutdown);
-        let consecutive_errors = Arc::new(AtomicU32::new(0));
-        let data_ready = Arc::clone(&self.data_ready);
 
-        let handle = tokio::spawn(async move {
-            loop {
-                let msg = tokio::select! {
-                    biased;
-                    () = reader_shutdown.notified() => break,
-                    m = subscriber.next() => match m {
-                        Some(m) => m,
-                        None => break,
-                    },
-                };
-                let incoming = Incoming {
-                    subject: msg.subject.to_string(),
-                    payload: msg.payload,
-                    stream_seq: None,
-                    ack: None,
-                };
-                if tx.send(incoming).await.is_err() {
-                    return;
-                }
-                data_ready.notify_one();
-            }
-        });
+        let reader = CoreReader {
+            subscriber,
+            tx,
+            shutdown: Arc::clone(&shutdown),
+            data_ready: Arc::clone(&self.data_ready),
+        };
+        let handle = tokio::spawn(reader.run());
 
         self.running = Some(Running {
             deserializer,
             rx,
             shutdown,
-            consecutive_errors,
+            // Core deliveries land on poll_batch's `record_poll`; the
+            // subscriber doesn't surface fetch errors (async-nats
+            // reconnects transparently), so there's nothing to count.
+            consecutive_errors: None,
             handle,
         });
         Ok(())
@@ -438,14 +351,22 @@ impl SourceConnector for NatsSource {
         };
 
         // Unhealthy first: fetch-loop errors indicate a problem even if
-        // `max_ack_pending` happens to be low.
-        if let Some(running) = self.running.as_ref() {
-            let errs = running.consecutive_errors.load(Ordering::Acquire);
-            if errs >= cfg.fetch_error_threshold {
-                return HealthStatus::Unhealthy(format!(
-                    "{errs} consecutive fetch errors (threshold {})",
-                    cfg.fetch_error_threshold
-                ));
+        // `max_ack_pending` happens to be low. Threshold of zero is
+        // treated as "don't flip from error counts" (an escape hatch
+        // for tests); real deployments use the >= 1 default.
+        if cfg.fetch_error_threshold > 0 {
+            if let Some(errors) = self
+                .running
+                .as_ref()
+                .and_then(|r| r.consecutive_errors.as_ref())
+            {
+                let errs = errors.load(Ordering::Acquire);
+                if errs >= cfg.fetch_error_threshold {
+                    return HealthStatus::Unhealthy(format!(
+                        "{errs} consecutive fetch errors (threshold {})",
+                        cfg.fetch_error_threshold
+                    ));
+                }
             }
         }
 
@@ -530,33 +451,209 @@ fn map_ack_policy(p: AckPolicy) -> async_nats::jetstream::consumer::AckPolicy {
     }
 }
 
-/// Exponential backoff for fetch errors: 500ms, 1s, 2s, 4s, 5s cap.
-fn fetch_backoff(consecutive_errors: u32) -> Duration {
+/// Base exponential backoff for fetch errors: 500ms, 1s, 2s, 4s, 5s cap.
+fn fetch_backoff_base(consecutive_errors: u32) -> Duration {
     let exp = consecutive_errors.saturating_sub(1).min(4);
     let ms = 500u64.saturating_mul(1u64 << exp);
     Duration::from_millis(ms.min(5000))
 }
 
+/// `base ± 20%`. `entropy` is any `u64` — we modulo it into the jitter
+/// window, so callers can pass `Instant::now()` nanos at runtime or a
+/// fixed seed in tests.
+fn with_jitter(base: Duration, entropy: u64) -> Duration {
+    let base_ms = u64::try_from(base.as_millis()).unwrap_or(u64::MAX);
+    let range = (base_ms / 5).max(1); // 20%
+    let window = range * 2 + 1;
+    let offset = entropy % window;
+    let jittered = base_ms.saturating_add(offset).saturating_sub(range);
+    Duration::from_millis(jittered)
+}
+
+fn fetch_backoff(consecutive_errors: u32, entropy: u64) -> Duration {
+    with_jitter(fetch_backoff_base(consecutive_errors), entropy)
+}
+
 /// Translate a `create_consumer` error into something operator-readable.
-/// NATS server error 10148 (or similar text like "consumer config" /
-/// "already exists") means the durable consumer exists with a different
-/// config. Re-creating with a conflicting config is a footgun; surface
-/// a fix-it message instead of the raw server text.
-fn classify_create_consumer_error(err_msg: &str, consumer_name: &str) -> ConnectorError {
-    let lower = err_msg.to_ascii_lowercase();
-    if lower.contains("10148")
-        || lower.contains("consumer config")
-        || lower.contains("already exists")
-    {
+/// A server-side `JetStream` error with code `CONSUMER_ALREADY_EXISTS`
+/// (10148) or `CONSUMER_NAME_EXIST` (10013) means the durable consumer
+/// exists with a different config. We surface a fix-it message instead
+/// of the raw server text.
+fn classify_create_consumer_error(
+    e: &async_nats::jetstream::stream::ConsumerError,
+    consumer_name: &str,
+) -> ConnectorError {
+    use async_nats::jetstream::stream::ConsumerErrorKind;
+    use async_nats::jetstream::ErrorCode;
+
+    let drift_code = match e.kind() {
+        ConsumerErrorKind::JetStream(server_err) => matches!(
+            server_err.error_code(),
+            ErrorCode::CONSUMER_ALREADY_EXISTS | ErrorCode::CONSUMER_NAME_EXIST
+        ),
+        _ => false,
+    };
+    if drift_code {
         err(&format!(
             "[LDB-5070] consumer '{consumer_name}' exists with incompatible config; \
              rotate the durable name or delete the consumer out-of-band. \
-             Server said: {err_msg}"
+             Server said: {e}"
         ))
     } else {
-        err(&format!(
-            "create_consumer('{consumer_name}') failed: {err_msg}"
-        ))
+        err(&format!("create_consumer('{consumer_name}') failed: {e}"))
+    }
+}
+
+/// Nanos from the system clock, for jitter-seed entropy. Not
+/// cryptographic — just enough to desync siblings.
+#[allow(clippy::cast_possible_truncation)]
+fn entropy_now() -> u64 {
+    Instant::now().elapsed().as_nanos() as u64
+}
+
+/// `JetStream` pull-consumer reader task.
+struct JsReader {
+    consumer: jetstream::consumer::Consumer<pull::Config>,
+    tx: mpsc::Sender<Incoming>,
+    shutdown: Arc<Notify>,
+    consecutive_errors: Arc<AtomicU32>,
+    data_ready: Arc<Notify>,
+    metrics: NatsSourceMetrics,
+    batch_size: usize,
+    max_wait: Duration,
+}
+
+impl JsReader {
+    async fn run(self) {
+        let Self {
+            consumer,
+            tx,
+            shutdown,
+            consecutive_errors,
+            data_ready,
+            metrics,
+            batch_size,
+            max_wait,
+        } = self;
+
+        loop {
+            let fetch_result = tokio::select! {
+                biased;
+                () = shutdown.notified() => break,
+                r = consumer.fetch().max_messages(batch_size).expires(max_wait).messages() => r,
+            };
+
+            let mut stream = match fetch_result {
+                Ok(s) => s,
+                Err(e) => {
+                    let errs = consecutive_errors.fetch_add(1, Ordering::AcqRel) + 1;
+                    metrics.record_fetch_error();
+                    warn!(
+                        error = %e,
+                        consecutive_errors = errs,
+                        "nats fetch() errored; backing off",
+                    );
+                    let backoff = fetch_backoff(errs, entropy_now());
+                    tokio::select! {
+                        biased;
+                        () = shutdown.notified() => break,
+                        () = tokio::time::sleep(backoff) => {}
+                    }
+                    continue;
+                }
+            };
+
+            let mut forwarded = 0usize;
+            let mut stream_errors = 0usize;
+            loop {
+                let msg_result = tokio::select! {
+                    biased;
+                    () = shutdown.notified() => return,
+                    r = stream.next() => match r {
+                        Some(r) => r,
+                        None => break,
+                    },
+                };
+                let msg = match msg_result {
+                    Ok(m) => m,
+                    Err(e) => {
+                        metrics.record_fetch_error();
+                        stream_errors += 1;
+                        warn!(error = %e, "nats message error");
+                        continue;
+                    }
+                };
+                let incoming = Incoming {
+                    subject: msg.subject.to_string(),
+                    payload: msg.payload.clone(),
+                    stream_seq: msg.info().ok().map(|i| i.stream_sequence),
+                    ack: Some(msg),
+                };
+                if tx.send(incoming).await.is_err() {
+                    debug!("nats reader: downstream channel closed");
+                    return;
+                }
+                forwarded += 1;
+            }
+
+            // Counter accounting for this iteration:
+            //   - any forwarded message → reset (we're delivering data)
+            //   - no messages but errors → count as one failed iteration
+            //   - idle (no messages, no errors) → leave counter alone
+            if forwarded > 0 {
+                consecutive_errors.store(0, Ordering::Release);
+                data_ready.notify_one();
+            } else if stream_errors > 0 {
+                let errs = consecutive_errors.fetch_add(1, Ordering::AcqRel) + 1;
+                let backoff = fetch_backoff(errs, entropy_now());
+                tokio::select! {
+                    biased;
+                    () = shutdown.notified() => break,
+                    () = tokio::time::sleep(backoff) => {}
+                }
+            }
+        }
+    }
+}
+
+/// Core subscribe reader task. No fetch-error surface (async-nats
+/// reconnects transparently); shutdown works the same way.
+struct CoreReader {
+    subscriber: async_nats::Subscriber,
+    tx: mpsc::Sender<Incoming>,
+    shutdown: Arc<Notify>,
+    data_ready: Arc<Notify>,
+}
+
+impl CoreReader {
+    async fn run(self) {
+        let Self {
+            mut subscriber,
+            tx,
+            shutdown,
+            data_ready,
+        } = self;
+
+        loop {
+            let msg = tokio::select! {
+                biased;
+                () = shutdown.notified() => break,
+                m = subscriber.next() => match m {
+                    Some(m) => m,
+                    None => break,
+                },
+            };
+            let incoming = Incoming {
+                subject: msg.subject.to_string(),
+                payload: msg.payload,
+                stream_seq: None,
+                ack: None,
+            };
+            if tx.send(incoming).await.is_err() {
+                return;
+            }
+            data_ready.notify_one();
+        }
     }
 }
 
@@ -575,32 +672,24 @@ mod tests {
     }
 
     #[test]
-    fn fetch_backoff_grows_then_caps_at_5s() {
-        assert_eq!(fetch_backoff(1), Duration::from_millis(500));
-        assert_eq!(fetch_backoff(2), Duration::from_millis(1000));
-        assert_eq!(fetch_backoff(3), Duration::from_millis(2000));
-        assert_eq!(fetch_backoff(4), Duration::from_millis(4000));
-        assert_eq!(fetch_backoff(5), Duration::from_millis(5000));
-        assert_eq!(fetch_backoff(100), Duration::from_millis(5000));
+    fn backoff_base_grows_then_caps_at_5s() {
+        assert_eq!(fetch_backoff_base(1), Duration::from_millis(500));
+        assert_eq!(fetch_backoff_base(2), Duration::from_millis(1000));
+        assert_eq!(fetch_backoff_base(3), Duration::from_millis(2000));
+        assert_eq!(fetch_backoff_base(4), Duration::from_millis(4000));
+        assert_eq!(fetch_backoff_base(5), Duration::from_millis(5000));
+        assert_eq!(fetch_backoff_base(100), Duration::from_millis(5000));
     }
 
     #[test]
-    fn drift_error_contains_ldb_5070() {
-        let e =
-            classify_create_consumer_error("consumer config already exists (10148)", "my-consumer");
-        assert!(e.to_string().contains("LDB-5070"), "got: {e}");
-        assert!(e.to_string().contains("my-consumer"));
-    }
-
-    #[test]
-    fn drift_error_matches_on_server_code_10148() {
-        let e = classify_create_consumer_error("err 10148", "c");
-        assert!(e.to_string().contains("LDB-5070"));
-    }
-
-    #[test]
-    fn generic_create_error_is_not_drift() {
-        let e = classify_create_consumer_error("network timeout", "c");
-        assert!(!e.to_string().contains("LDB-5070"), "got: {e}");
+    fn jitter_stays_within_plus_minus_20_percent() {
+        let base = Duration::from_millis(1000);
+        for entropy in [0u64, 1, 99, 12345, u64::MAX] {
+            let j = with_jitter(base, entropy);
+            assert!(
+                j >= Duration::from_millis(800) && j <= Duration::from_millis(1200),
+                "entropy {entropy}: jittered = {j:?} outside ±20% of {base:?}"
+            );
+        }
     }
 }

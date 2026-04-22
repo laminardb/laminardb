@@ -130,8 +130,8 @@ pub struct NatsSourceConfig {
     pub fetch_max_wait: Duration,
     pub fetch_max_bytes: usize,
     /// Consecutive fetch errors before the source is reported
-    /// `Unhealthy`. Zero means "never flip to unhealthy from error
-    /// counts alone" — useful in tests.
+    /// `Unhealthy`. Zero disables the health flip (an escape hatch for
+    /// tests that need to decouple health from error counts).
     pub fetch_error_threshold: u32,
 
     // Core
