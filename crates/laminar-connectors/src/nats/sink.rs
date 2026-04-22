@@ -18,7 +18,7 @@ use async_nats::{Client, HeaderMap};
 use async_trait::async_trait;
 use futures_util::future::try_join_all;
 
-use super::config::{Mode, NatsSinkConfig, SubjectSpec};
+use super::config::{build_connect_options, Mode, NatsSinkConfig, SubjectSpec};
 use super::metrics::NatsSinkMetrics;
 use crate::config::ConnectorConfig;
 use crate::connector::{DeliveryGuarantee, SinkConnector, SinkConnectorCapabilities, WriteResult};
@@ -74,7 +74,7 @@ impl SinkConnector for NatsSink {
             serde::create_serializer(cfg.format)
                 .map_err(|e| err(&format!("serializer for format {:?}: {e}", cfg.format)))?,
         );
-        let client = async_nats::ConnectOptions::new()
+        let client = build_connect_options(&cfg.auth, &cfg.tls)
             .connect(&cfg.servers)
             .await
             .map_err(|e| err(&format!("nats connect({:?}): {e}", cfg.servers)))?;

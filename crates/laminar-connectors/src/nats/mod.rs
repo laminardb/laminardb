@@ -55,9 +55,31 @@ pub fn register_nats_sink(registry: &ConnectorRegistry) {
     );
 }
 
-fn source_config_keys() -> Vec<ConfigKeySpec> {
+fn auth_and_tls_keys() -> Vec<ConfigKeySpec> {
     use ConfigKeySpec as K;
     vec![
+        K::optional("auth.mode", "none | user_pass | token", "none"),
+        K::optional("user", "Username (auth.mode=user_pass)", ""),
+        K::optional("password", "Password (auth.mode=user_pass)", ""),
+        K::optional("token", "Bearer token (auth.mode=token)", ""),
+        K::optional("tls.enabled", "Require TLS on the connection", "false"),
+        K::optional(
+            "tls.ca.location",
+            "PEM CA certificate for server verification",
+            "",
+        ),
+        K::optional(
+            "tls.cert.location",
+            "Client certificate for mutual TLS (pairs with tls.key.location)",
+            "",
+        ),
+        K::optional("tls.key.location", "Client private key for mutual TLS", ""),
+    ]
+}
+
+fn source_config_keys() -> Vec<ConfigKeySpec> {
+    use ConfigKeySpec as K;
+    let mut keys = vec![
         K::required("servers", "NATS server URLs, comma-separated"),
         K::optional("mode", "core | jetstream", "jetstream"),
         // JetStream
@@ -132,12 +154,14 @@ fn source_config_keys() -> Vec<ConfigKeySpec> {
             "Republish Term'd messages to this subject",
             "",
         ),
-    ]
+    ];
+    keys.extend(auth_and_tls_keys());
+    keys
 }
 
 fn sink_config_keys() -> Vec<ConfigKeySpec> {
     use ConfigKeySpec as K;
-    vec![
+    let mut keys = vec![
         K::required("servers", "NATS server URLs, comma-separated"),
         K::optional("mode", "core | jetstream", "jetstream"),
         K::optional("stream", "Target stream (used for validation only)", ""),
@@ -186,7 +210,9 @@ fn sink_config_keys() -> Vec<ConfigKeySpec> {
             "Subject for failed-after-retry publishes",
             "",
         ),
-    ]
+    ];
+    keys.extend(auth_and_tls_keys());
+    keys
 }
 
 #[cfg(test)]

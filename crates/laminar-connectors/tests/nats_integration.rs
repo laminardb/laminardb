@@ -1,11 +1,12 @@
 //! Integration tests for the NATS source and sink connectors.
 //!
-//! These talk to a real `nats-server` on `localhost:4222`. Stand one up
-//! with the sibling compose file, then run:
+//! Most tests talk to a plain `nats-server` on `localhost:4222`. Auth
+//! tests use the `secure` profile (user/pass) on `localhost:4223`.
+//! Stand servers up with the sibling compose file and run:
 //!
 //! ```text
 //! cd crates/laminar-connectors/tests
-//! docker compose -f docker-compose.nats.yml up -d
+//! docker compose -f docker-compose.nats.yml --profile secure up -d
 //! cargo test --test nats_integration --features nats -- --ignored
 //! ```
 //!
@@ -343,4 +344,86 @@ fn extract_rows(batch: &RecordBatch) -> Vec<(i64, String)> {
     (0..batch.num_rows())
         .map(|i| (ids.value(i), names.value(i).to_string()))
         .collect()
+}
+
+// ── auth ──
+
+const SECURE_NATS_URL: &str = "nats://127.0.0.1:4223";
+
+/// Core-mode round-trip against a server that requires user/password
+/// auth. The plain-auth NATS on :4222 would reject credentials; the
+/// secure server on :4223 requires them.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs `docker compose -f docker-compose.nats.yml --profile secure up`"]
+async fn user_pass_roundtrip_core() {
+    let mut source = NatsSource::new(payload_schema(), None);
+    source
+        .open(&ConnectorConfig::with_properties(
+            "nats",
+            source_props(&[
+                ("servers", SECURE_NATS_URL),
+                ("mode", "core"),
+                ("subject", "auth.events"),
+                ("format", "json"),
+                ("auth.mode", "user_pass"),
+                ("user", "alice"),
+                ("password", "wonderland"),
+            ]),
+        ))
+        .await
+        .expect("source open with user_pass");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut sink = NatsSink::new(payload_schema(), None);
+    sink.open(&ConnectorConfig::with_properties(
+        "nats",
+        source_props(&[
+            ("servers", SECURE_NATS_URL),
+            ("mode", "core"),
+            ("subject", "auth.events"),
+            ("format", "json"),
+            ("auth.mode", "user_pass"),
+            ("user", "alice"),
+            ("password", "wonderland"),
+        ]),
+    ))
+    .await
+    .expect("sink open with user_pass");
+    sink.write_batch(&test_batch(&[100, 101]))
+        .await
+        .expect("publish");
+    sink.close().await.expect("sink close");
+
+    let received = drain_rows(&mut source, 2, Duration::from_secs(3)).await;
+    source.close().await.expect("source close");
+    assert_eq!(
+        received,
+        vec![(100, "row-100".to_string()), (101, "row-101".to_string())]
+    );
+}
+
+/// Connecting to an auth-required server without credentials must fail.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs `docker compose -f docker-compose.nats.yml --profile secure up`"]
+async fn user_pass_missing_credentials_rejected_by_server() {
+    let mut sink = NatsSink::new(payload_schema(), None);
+    let result = sink
+        .open(&ConnectorConfig::with_properties(
+            "nats",
+            source_props(&[
+                ("servers", SECURE_NATS_URL),
+                ("mode", "core"),
+                ("subject", "auth.events"),
+                ("format", "json"),
+                // no auth.mode
+            ]),
+        ))
+        .await;
+    // Whichever of "connect refused" or "authorization violation" the
+    // server returns, the open() must fail.
+    assert!(
+        result.is_err(),
+        "expected unauthenticated open to fail, got Ok"
+    );
 }

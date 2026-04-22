@@ -72,12 +72,47 @@ pub enum SubjectSpec {
     Column(String),
 }
 
+/// NATS user-authentication mode.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum AuthMode {
+    /// No authentication.
+    #[default]
+    None,
+    /// Username + password (one of the most common NATS auth shapes).
+    UserPass {
+        /// Username.
+        user: String,
+        /// Password.
+        password: String,
+    },
+    /// Plain-text bearer token.
+    Token(String),
+}
+
+/// TLS transport configuration.
+///
+/// Independent of [`AuthMode`] — real deployments usually pair TLS with
+/// user/password or token auth on top.
+#[derive(Debug, Clone, Default)]
+pub struct TlsConfig {
+    /// Require the connection to upgrade to TLS.
+    pub enabled: bool,
+    /// PEM-encoded CA certificate used to verify the server.
+    pub ca_location: Option<String>,
+    /// Client certificate for mutual TLS (paired with `key_location`).
+    pub cert_location: Option<String>,
+    /// Client private key for mutual TLS (paired with `cert_location`).
+    pub key_location: Option<String>,
+}
+
 /// NATS source configuration.
 #[derive(Debug, Clone)]
 #[allow(missing_docs)] // one-line `///` per field noises up the config struct
 pub struct NatsSourceConfig {
     pub servers: Vec<String>,
     pub mode: Mode,
+    pub auth: AuthMode,
+    pub tls: TlsConfig,
 
     // JetStream
     pub stream: Option<String>,
@@ -119,6 +154,8 @@ impl NatsSourceConfig {
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
         let servers = parse_servers(config)?;
         let mode = parse_or_default::<Mode>(config, "mode")?;
+        let auth = parse_auth(config)?;
+        let tls = parse_tls(config)?;
 
         let stream = config.get("stream").map(str::to_string);
         let subject = config.get("subject").map(str::to_string);
@@ -148,6 +185,8 @@ impl NatsSourceConfig {
         let cfg = Self {
             servers,
             mode,
+            auth,
+            tls,
             stream,
             subject,
             subject_filters,
@@ -227,6 +266,8 @@ impl NatsSourceConfig {
 pub struct NatsSinkConfig {
     pub servers: Vec<String>,
     pub mode: Mode,
+    pub auth: AuthMode,
+    pub tls: TlsConfig,
     pub stream: Option<String>,
     pub subject: SubjectSpec,
     pub expected_stream: Option<String>,
@@ -257,6 +298,8 @@ impl NatsSinkConfig {
     pub fn from_config(config: &ConnectorConfig) -> Result<Self, ConnectorError> {
         let servers = parse_servers(config)?;
         let mode = parse_or_default::<Mode>(config, "mode")?;
+        let auth = parse_auth(config)?;
+        let tls = parse_tls(config)?;
 
         let subject = match (config.get("subject"), config.get("subject.column")) {
             (Some(s), None) => SubjectSpec::Literal(s.to_string()),
@@ -281,6 +324,8 @@ impl NatsSinkConfig {
         let cfg = Self {
             servers,
             mode,
+            auth,
+            tls,
             stream: config.get("stream").map(str::to_string),
             subject,
             expected_stream: config.get("expected.stream").map(str::to_string),
@@ -414,6 +459,95 @@ fn parse_duration_ms(
 fn parse_int<T: std::str::FromStr>(key: &str, raw: &str) -> Result<T, ConnectorError> {
     raw.parse::<T>()
         .map_err(|_| cfg_err(&format!("{key} must be an integer, got '{raw}'")))
+}
+
+fn parse_auth(config: &ConnectorConfig) -> Result<AuthMode, ConnectorError> {
+    let mode = config.get("auth.mode").unwrap_or("none");
+    match mode {
+        "none" | "" => {
+            // Leftover credentials with auth.mode=none is a muddle. Fail
+            // loudly so the operator chooses one.
+            if config.get("user").is_some()
+                || config.get("password").is_some()
+                || config.get("token").is_some()
+            {
+                return Err(cfg_err(
+                    "[LDB-5063] credentials set but auth.mode=none; \
+                     set auth.mode explicitly or remove the credentials",
+                ));
+            }
+            Ok(AuthMode::None)
+        }
+        "user_pass" => {
+            let user = config
+                .get("user")
+                .ok_or_else(|| cfg_err("[LDB-5060] auth.mode=user_pass requires 'user'"))?
+                .to_string();
+            let password = config
+                .get("password")
+                .ok_or_else(|| cfg_err("[LDB-5060] auth.mode=user_pass requires 'password'"))?
+                .to_string();
+            Ok(AuthMode::UserPass { user, password })
+        }
+        "token" => {
+            let token = config
+                .get("token")
+                .ok_or_else(|| cfg_err("[LDB-5061] auth.mode=token requires 'token'"))?
+                .to_string();
+            Ok(AuthMode::Token(token))
+        }
+        other => Err(cfg_err(&format!(
+            "invalid auth.mode '{other}'; expected none | user_pass | token"
+        ))),
+    }
+}
+
+fn parse_tls(config: &ConnectorConfig) -> Result<TlsConfig, ConnectorError> {
+    let cert_location = config.get("tls.cert.location").map(str::to_string);
+    let key_location = config.get("tls.key.location").map(str::to_string);
+    if cert_location.is_some() != key_location.is_some() {
+        return Err(cfg_err(
+            "[LDB-5062] tls.cert.location and tls.key.location must both be set \
+             (mutual-TLS client cert) or both be unset",
+        ));
+    }
+    Ok(TlsConfig {
+        enabled: parse_bool(config, "tls.enabled", false)?,
+        ca_location: config.get("tls.ca.location").map(str::to_string),
+        cert_location,
+        key_location,
+    })
+}
+
+/// Build `ConnectOptions` from parsed auth + TLS config. Shared by the
+/// source and the sink so they don't drift in how they apply these.
+pub(super) fn build_connect_options(
+    auth: &AuthMode,
+    tls: &TlsConfig,
+) -> async_nats::ConnectOptions {
+    let mut opts = async_nats::ConnectOptions::new();
+    match auth {
+        AuthMode::None => {}
+        AuthMode::UserPass { user, password } => {
+            opts = opts.user_and_password(user.clone(), password.clone());
+        }
+        AuthMode::Token(token) => {
+            opts = opts.token(token.clone());
+        }
+    }
+    // Any TLS-related key turns on the requirement. Operators who want
+    // plain TCP just leave the TLS keys unset.
+    let tls_touched = tls.enabled || tls.ca_location.is_some() || tls.cert_location.is_some();
+    if tls_touched {
+        opts = opts.require_tls(true);
+    }
+    if let Some(ca) = &tls.ca_location {
+        opts = opts.add_root_certificates(ca.into());
+    }
+    if let (Some(cert), Some(key)) = (&tls.cert_location, &tls.key_location) {
+        opts = opts.add_client_certificate(cert.into(), key.into());
+    }
+    opts
 }
 
 #[cfg(test)]
@@ -619,5 +753,147 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("LDB-5030"), "got: {err}");
+    }
+
+    // ── auth ──
+
+    fn jetstream_happy(pairs: &[(&str, &str)]) -> ConnectorConfig {
+        let mut base = vec![
+            ("servers", "nats://a:4222"),
+            ("stream", "S"),
+            ("consumer", "c"),
+            ("subject", "x.>"),
+        ];
+        base.extend_from_slice(pairs);
+        cfg(&base)
+    }
+
+    #[test]
+    fn auth_user_pass_requires_user() {
+        let err = NatsSourceConfig::from_config(&jetstream_happy(&[
+            ("auth.mode", "user_pass"),
+            ("password", "secret"),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("LDB-5060"), "got: {err}");
+    }
+
+    #[test]
+    fn auth_user_pass_requires_password() {
+        let err = NatsSourceConfig::from_config(&jetstream_happy(&[
+            ("auth.mode", "user_pass"),
+            ("user", "alice"),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("LDB-5060"), "got: {err}");
+    }
+
+    #[test]
+    fn auth_user_pass_happy_path() {
+        let parsed = NatsSourceConfig::from_config(&jetstream_happy(&[
+            ("auth.mode", "user_pass"),
+            ("user", "alice"),
+            ("password", "wonderland"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.auth,
+            AuthMode::UserPass {
+                user: "alice".into(),
+                password: "wonderland".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn auth_token_requires_token() {
+        let err = NatsSourceConfig::from_config(&jetstream_happy(&[("auth.mode", "token")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("LDB-5061"), "got: {err}");
+    }
+
+    #[test]
+    fn auth_token_happy_path() {
+        let parsed = NatsSourceConfig::from_config(&jetstream_happy(&[
+            ("auth.mode", "token"),
+            ("token", "abc123"),
+        ]))
+        .unwrap();
+        assert_eq!(parsed.auth, AuthMode::Token("abc123".into()));
+    }
+
+    #[test]
+    fn auth_none_with_stray_credentials_rejected() {
+        let err = NatsSourceConfig::from_config(&jetstream_happy(&[("user", "alice")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("LDB-5063"), "got: {err}");
+    }
+
+    #[test]
+    fn auth_unknown_mode_rejected() {
+        let err = NatsSourceConfig::from_config(&jetstream_happy(&[("auth.mode", "banana")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid auth.mode"), "got: {err}");
+    }
+
+    // ── tls ──
+
+    #[test]
+    fn tls_cert_without_key_rejected() {
+        let err = NatsSourceConfig::from_config(&jetstream_happy(&[(
+            "tls.cert.location",
+            "/certs/client.pem",
+        )]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("LDB-5062"), "got: {err}");
+    }
+
+    #[test]
+    fn tls_key_without_cert_rejected() {
+        let err = NatsSourceConfig::from_config(&jetstream_happy(&[(
+            "tls.key.location",
+            "/certs/client.key",
+        )]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("LDB-5062"), "got: {err}");
+    }
+
+    #[test]
+    fn tls_happy_path() {
+        let parsed = NatsSourceConfig::from_config(&jetstream_happy(&[
+            ("tls.enabled", "true"),
+            ("tls.ca.location", "/certs/ca.pem"),
+            ("tls.cert.location", "/certs/client.pem"),
+            ("tls.key.location", "/certs/client.key"),
+        ]))
+        .unwrap();
+        assert!(parsed.tls.enabled);
+        assert_eq!(parsed.tls.ca_location.as_deref(), Some("/certs/ca.pem"));
+        assert_eq!(
+            parsed.tls.cert_location.as_deref(),
+            Some("/certs/client.pem")
+        );
+    }
+
+    #[test]
+    fn auth_and_tls_on_sink() {
+        let parsed = NatsSinkConfig::from_config(&cfg(&[
+            ("servers", "nats://a:4222"),
+            ("subject", "x"),
+            ("auth.mode", "user_pass"),
+            ("user", "alice"),
+            ("password", "wonderland"),
+            ("tls.enabled", "true"),
+        ]))
+        .unwrap();
+        assert!(matches!(parsed.auth, AuthMode::UserPass { .. }));
+        assert!(parsed.tls.enabled);
     }
 }

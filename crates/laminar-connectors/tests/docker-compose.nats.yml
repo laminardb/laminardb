@@ -13,5 +13,23 @@ services:
       timeout: 1s
       retries: 5
 
+  # Secured NATS with user/password. Started only with the `secure`
+  # profile: `docker compose -f docker-compose.nats.yml --profile secure up`.
+  nats-secure:
+    image: nats:2.10-alpine
+    command:
+      ["-js", "-sd", "/data", "-m", "8223", "--user", "alice", "--pass", "wonderland"]
+    ports:
+      - "4223:4222"
+    volumes:
+      - nats-secure-data:/data
+    profiles: ["secure"]
+    healthcheck:
+      test: ["CMD", "nats-server", "--help"]
+      interval: 2s
+      timeout: 1s
+      retries: 5
+
 volumes:
   nats-data:
+  nats-secure-data:

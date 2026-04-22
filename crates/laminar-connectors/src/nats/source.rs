@@ -30,7 +30,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-use super::config::{AckPolicy, DeliverPolicy, Mode, NatsSourceConfig};
+use super::config::{build_connect_options, AckPolicy, DeliverPolicy, Mode, NatsSourceConfig};
 use super::metrics::NatsSourceMetrics;
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
@@ -112,7 +112,7 @@ impl NatsSource {
         cfg: &NatsSourceConfig,
         deserializer: Box<dyn RecordDeserializer>,
     ) -> Result<(), ConnectorError> {
-        let client = connect(&cfg.servers).await?;
+        let client = connect(cfg).await?;
         let js = jetstream::new(client);
 
         let stream_name = cfg
@@ -210,7 +210,7 @@ impl NatsSource {
         cfg: &NatsSourceConfig,
         deserializer: Box<dyn RecordDeserializer>,
     ) -> Result<(), ConnectorError> {
-        let client = connect(&cfg.servers).await?;
+        let client = connect(cfg).await?;
         let subject = cfg
             .subject
             .clone()
@@ -427,11 +427,11 @@ fn err(msg: &str) -> ConnectorError {
     ConnectorError::ConfigurationError(msg.to_string())
 }
 
-async fn connect(servers: &[String]) -> Result<async_nats::Client, ConnectorError> {
-    async_nats::ConnectOptions::new()
-        .connect(servers)
+async fn connect(cfg: &NatsSourceConfig) -> Result<async_nats::Client, ConnectorError> {
+    build_connect_options(&cfg.auth, &cfg.tls)
+        .connect(&cfg.servers)
         .await
-        .map_err(|e| err(&format!("nats connect({servers:?}): {e}")))
+        .map_err(|e| err(&format!("nats connect({:?}): {e}", cfg.servers)))
 }
 
 fn build_pull_config(
