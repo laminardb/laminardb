@@ -1,11 +1,7 @@
-//! NATS sink connector.
-//!
-//! Core-mode publishes are fire-and-forget. `JetStream` publishes collect
-//! `PublishAckFuture`s and drain them concurrently in `flush`/`pre_commit`.
-//! Exactly-once uses server-side `Nats-Msg-Id` dedup: the sink refuses to
-//! start unless the target stream's `duplicate_window` is at least
-//! `min.duplicate.window.ms`, so rollback redelivery always lands inside
-//! the dedup horizon.
+//! NATS sink connector. Core-mode publishes are fire-and-forget;
+//! `JetStream` collects `PublishAckFuture`s and drains them in
+//! `flush`/`pre_commit`. Exactly-once uses server-side `Nats-Msg-Id`
+//! dedup (see `LDB-5056`).
 
 use std::collections::VecDeque;
 use std::future::IntoFuture;
@@ -44,9 +40,8 @@ enum Runtime {
 }
 
 impl NatsSink {
-    /// Creates a new NATS sink with the given input schema.
-    ///
-    /// If `registry` is `Some`, metrics register on it.
+    /// Creates a new NATS sink. Metrics register on `registry` if
+    /// provided.
     #[must_use]
     pub fn new(schema: SchemaRef, registry: Option<&prometheus::Registry>) -> Self {
         Self {
@@ -83,8 +78,7 @@ impl SinkConnector for NatsSink {
             Mode::JetStream => {
                 let context = jetstream::new(client);
                 if let Some(stream_name) = cfg.stream.as_deref() {
-                    // Touch the stream now so a bad name fails open(),
-                    // not later on the first publish.
+                    // Fail fast on a bad name.
                     let stream = context
                         .get_stream(stream_name)
                         .await
@@ -111,8 +105,7 @@ impl SinkConnector for NatsSink {
     }
 
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
-        // Split-borrow `self` so the runtime can be &mut while we keep
-        // immutable refs to config + serializer.
+        // Split-borrow so `runtime` is &mut while config/serializer stay &.
         let Self {
             config,
             serializer,
@@ -127,8 +120,7 @@ impl SinkConnector for NatsSink {
             .ok_or_else(|| err("sink: open() first"))?;
         let rt = runtime.as_mut().ok_or_else(|| err("sink: open() first"))?;
 
-        // Resolve column references once per batch so the per-row loop
-        // does no hashmap lookups.
+        // Resolve columns once per batch (not per row).
         let subject_col = match &cfg.subject {
             SubjectSpec::Column(name) => Some(resolve_utf8(batch, name)?),
             SubjectSpec::Literal(_) => None,
@@ -139,10 +131,8 @@ impl SinkConnector for NatsSink {
             .map(|n| resolve_utf8(batch, n).map(|arr| (n.as_str(), arr)))
             .collect::<Result<_, _>>()?;
         let expected_stream = cfg.expected_stream.as_deref();
-        // Only emit Nats-Msg-Id under exactly-once — that's the delivery
-        // mode whose duplicate_window we validate at open(). Honoring
-        // the column under at-least-once would give silent dedup without
-        // the safety check, which is the worst of both worlds.
+        // Nats-Msg-Id only under exactly-once; otherwise dedup would
+        // fire without the LDB-5056 safety check.
         let dedup_col = if cfg.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
             cfg.dedup_id_column
                 .as_deref()
@@ -205,8 +195,7 @@ impl SinkConnector for NatsSink {
                 }
             }
 
-            // Record per-row so partial-failure batches don't vanish
-            // from the success counter.
+            // Per-row so partial failures still credit successes.
             metrics.record_published_row(payload_len);
             rows_written += 1;
             bytes_total += payload_len;
@@ -234,8 +223,7 @@ impl SinkConnector for NatsSink {
     }
 
     async fn flush(&mut self) -> Result<(), ConnectorError> {
-        // Push buffered core publishes to the wire; drain landed JS acks
-        // (bounded so a slow round-trip doesn't stall the flush timer).
+        // Flush core (to the wire), drain JS acks (bounded).
         match self.runtime.as_ref() {
             Some(Runtime::Core { client }) => client
                 .flush()
@@ -272,9 +260,7 @@ impl SinkConnector for NatsSink {
             .config
             .as_ref()
             .map_or(Duration::from_secs(5), |c| c.ack_timeout);
-        // Flush any buffered core publishes before dropping the client —
-        // async-nats queues publishes locally and they'd be lost on a
-        // bare drop.
+        // async-nats buffers core publishes locally; flush before drop.
         if let Some(Runtime::Core { client }) = self.runtime.as_ref() {
             let _ = client.flush().await;
         }
@@ -306,11 +292,8 @@ impl SinkConnector for NatsSink {
     }
 }
 
-/// Concurrently drain every `PublishAckFuture` in `pending`, bounded by
-/// `timeout`. Matches the Kafka sink's rollback shape — serial drains
-/// killed throughput. `PublishAckFuture` only implements `IntoFuture`,
-/// hence the explicit conversion. Counts server-identified duplicates
-/// via `PubAck.duplicate`.
+/// Concurrently drain `pending`, bounded by `timeout`. Counts
+/// server-identified duplicates via `PubAck.duplicate`.
 async fn drain_acks(
     pending: &mut VecDeque<PublishAckFuture>,
     metrics: &NatsSinkMetrics,

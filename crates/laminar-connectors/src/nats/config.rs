@@ -1,9 +1,4 @@
 //! NATS source and sink configuration.
-//!
-//! Parsing + startup validation for the six hard-fail rules from the plan
-//! that can be checked without a live NATS connection. The remaining two
-//! rules (ack-wait vs checkpoint interval, duplicate-window vs max-deliver)
-//! need server-side metadata and run in `open()` — not here.
 
 use std::time::Duration;
 
@@ -89,19 +84,13 @@ pub enum AuthMode {
     Token(String),
 }
 
-/// TLS transport configuration.
-///
-/// Independent of [`AuthMode`] — real deployments usually pair TLS with
-/// user/password or token auth on top.
+/// TLS transport configuration. Independent of [`AuthMode`].
 #[derive(Debug, Clone, Default)]
+#[allow(missing_docs)]
 pub struct TlsConfig {
-    /// Require the connection to upgrade to TLS.
     pub enabled: bool,
-    /// PEM-encoded CA certificate used to verify the server.
     pub ca_location: Option<String>,
-    /// Client certificate for mutual TLS (paired with `key_location`).
     pub cert_location: Option<String>,
-    /// Client private key for mutual TLS (paired with `cert_location`).
     pub key_location: Option<String>,
 }
 
@@ -129,9 +118,8 @@ pub struct NatsSourceConfig {
     pub fetch_batch: usize,
     pub fetch_max_wait: Duration,
     pub fetch_max_bytes: usize,
-    /// Consecutive fetch errors before the source is reported
-    /// `Unhealthy`. Zero disables the health flip (an escape hatch for
-    /// tests that need to decouple health from error counts).
+    /// Consecutive fetch errors before `health_check` reports
+    /// `Unhealthy`. Zero disables the flip.
     pub fetch_error_threshold: u32,
 
     // Core
@@ -279,12 +267,9 @@ pub struct NatsSinkConfig {
     pub expected_stream: Option<String>,
     pub delivery_guarantee: DeliveryGuarantee,
     pub dedup_id_column: Option<String>,
-    /// Minimum `duplicate_window` the target stream must be configured
-    /// with when `delivery.guarantee=exactly_once`. Parsed from
-    /// `min.duplicate.window.ms`; defaults to 2 minutes. The sink
-    /// refuses to start if the stream's actual window is shorter, since
-    /// a short window means rollback redelivery can land outside the
-    /// dedup horizon and produce duplicates silently.
+    /// Stream's `duplicate_window` must be at least this long under
+    /// exactly-once — else rollback redelivery can land outside the
+    /// dedup horizon.
     pub min_duplicate_window: Duration,
     pub max_pending: usize,
     pub ack_timeout: Duration,

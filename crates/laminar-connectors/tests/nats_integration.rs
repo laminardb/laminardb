@@ -1,20 +1,12 @@
-//! Integration tests for the NATS source and sink connectors.
-//!
-//! Most tests talk to a plain `nats-server` on `localhost:4222`. Auth
-//! tests use the `secure` profile (user/pass) on `localhost:4223`.
-//! Stand servers up with the sibling compose file and run:
+//! Integration tests against a real `nats-server` — see the sibling
+//! `docker-compose.nats.yml`. Plain server on :4222, `secure` profile
+//! on :4223. Run with:
 //!
 //! ```text
-//! cd crates/laminar-connectors/tests
-//! docker compose -f docker-compose.nats.yml --profile secure up -d
+//! docker compose -f crates/laminar-connectors/tests/docker-compose.nats.yml \
+//!   --profile secure up -d
 //! cargo test --test nats_integration --features nats -- --ignored
 //! ```
-//!
-//! Every test is `#[ignore]`d so the regular `cargo test` run is unaffected.
-//!
-//! Tests are serial (`#[tokio::test(flavor = "multi_thread")]` with
-//! distinct stream/consumer/subject names per test) so a single running
-//! NATS server is enough.
 
 #![cfg(feature = "nats")]
 #![allow(clippy::disallowed_types)] // test code: std::HashMap is fine
@@ -41,7 +33,6 @@ fn payload_schema() -> SchemaRef {
     ]))
 }
 
-/// JSON-serializable test batch.
 fn test_batch(ids: &[i64]) -> RecordBatch {
     let names: Vec<String> = ids.iter().map(|i| format!("row-{i}")).collect();
     RecordBatch::try_new(
@@ -56,8 +47,6 @@ fn test_batch(ids: &[i64]) -> RecordBatch {
     .unwrap()
 }
 
-/// Reset a stream between tests: delete if present, then recreate with
-/// the given config.
 async fn reset_stream(ctx: &jetstream::Context, cfg: StreamConfig) {
     let name = cfg.name.clone();
     let _ = ctx.delete_stream(&name).await;
@@ -80,8 +69,6 @@ async fn connect() -> jetstream::Context {
 
 // ── roundtrip ──
 
-/// Publish through the sink, consume through the source, verify the
-/// payload comes back unchanged.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker compose -f docker-compose.nats.yml up"]
 async fn roundtrip_jetstream() {
@@ -145,7 +132,6 @@ async fn roundtrip_jetstream() {
     );
 }
 
-/// Core NATS pub/sub round-trip — non-durable, no stream, no ack.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker compose -f docker-compose.nats.yml up"]
 async fn roundtrip_core() {
@@ -193,9 +179,8 @@ async fn roundtrip_core() {
 
 // ── exactly-once ──
 
-/// Publish the same row twice with an identical `Nats-Msg-Id`. The
-/// second publish lands inside the stream's duplicate_window and is
-/// silently dropped by the server — so the source sees it once.
+/// Publishing the same `Nats-Msg-Id` twice inside `duplicate_window`:
+/// server drops the repeat, stream holds one message.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker compose -f docker-compose.nats.yml up"]
 async fn exactly_once_dedup_drops_duplicate() {
@@ -211,8 +196,6 @@ async fn exactly_once_dedup_drops_duplicate() {
     )
     .await;
 
-    // Batch with a dedup column. We'll publish it twice with the same
-    // event_id; server-side dedup should drop the second.
     let schema = Arc::new(Schema::new(vec![
         Field::new("event_id", DataType::Utf8, false),
         Field::new("value", DataType::Int64, false),
@@ -256,9 +239,7 @@ async fn exactly_once_dedup_drops_duplicate() {
         "expected dedup to drop the second publish"
     );
 
-    // Client side: dedup counter should reflect the server's decision.
-    // Read through `SinkConnector::metrics()` — exercises the public
-    // surface operators see.
+    // Client-side counter via the public `SinkConnector::metrics`.
     let cm = sink.metrics();
     let dedup = cm
         .custom
@@ -268,9 +249,8 @@ async fn exactly_once_dedup_drops_duplicate() {
     assert_eq!(dedup, 1, "expected nats.dedup = 1, got {dedup}");
 }
 
-/// A stream with duplicate_window below the sink's minimum makes
-/// exactly-once unsafe. `open()` must refuse with LDB-5056 rather than
-/// silently publishing without dedup coverage.
+/// `open()` refuses a stream with `duplicate_window` below the
+/// configured minimum (LDB-5056).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker compose -f docker-compose.nats.yml up"]
 async fn exactly_once_rejects_short_duplicate_window() {
@@ -349,9 +329,7 @@ fn extract_rows(batch: &RecordBatch) -> Vec<(i64, String)> {
 
 // ── health escalation ──
 
-/// Delete the stream behind a running source and verify the health
-/// check flips to `Unhealthy` within bounded time. Threshold set low
-/// (2) so the test doesn't have to wait 10 fetch errors.
+/// Delete the stream behind a running source; health flips to Unhealthy.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker compose -f docker-compose.nats.yml up"]
 async fn source_flips_unhealthy_after_stream_deleted() {
@@ -417,8 +395,6 @@ async fn source_flips_unhealthy_after_stream_deleted() {
 
 // ── chaos ──
 
-/// Shell out to `docker compose restart nats`. Synchronous; the command
-/// returns when the new container is up.
 fn restart_nats() {
     let compose_file = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/docker-compose.nats.yml");
     let status = std::process::Command::new("docker")
@@ -450,12 +426,10 @@ fn dedup_batch(ids: std::ops::Range<i64>) -> RecordBatch {
     .unwrap()
 }
 
-/// Exactly-once sink survives a broker restart. Publishes 50 rows,
-/// restarts the broker, re-publishes those same 50 plus 50 new ones
-/// (simulating a rollback + retry). The stream must end up with
-/// exactly 100 unique rows — no duplicates, no loss. This is the
-/// guarantee `duplicate_window` + `Nats-Msg-Id` buy us, and the one
-/// place we get to exercise it end-to-end.
+/// Exactly-once sink survives a broker restart. Publish 50 rows →
+/// `docker compose restart nats` → publish 0..100 (first 50 collide
+/// with the pre-restart dedup ids). Final stream must hold exactly
+/// 100 unique messages.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker compose available on host; chaos test restarts the broker"]
 async fn exactly_once_survives_broker_restart() {
@@ -493,29 +467,24 @@ async fn exactly_once_survives_broker_restart() {
         .expect("first batch publish");
     sink.pre_commit(1).await.expect("first epoch drain");
 
-    // Restart the broker while the sink's client is idle between
-    // epochs. JetStream persists stream + dedup state to disk, so the
-    // window survives the restart.
+    // JetStream persists dedup state across restart.
     restart_nats();
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // The sink's TCP connection went with the broker. Close and reopen
-    // rather than wait for transparent reconnect — operators in the
-    // real pipeline loop do the same on hard failures.
+    // Client connection is gone — reopen.
     let _ = sink.close().await;
     let mut sink = NatsSink::new(schema, None);
     sink.open(&ConnectorConfig::with_properties("nats", props))
         .await
         .expect("sink reopen after restart");
 
-    // Second epoch: replay rows 0..50 (server dedups) + publish 50..100.
+    // Re-publish 0..50 (server dedups) + publish 50..100.
     sink.write_batch(&dedup_batch(0..100))
         .await
         .expect("second batch publish");
     sink.pre_commit(2).await.expect("second epoch drain");
     sink.close().await.expect("sink close");
 
-    // The stream must hold exactly 100 rows — dedup caught the replay.
     let mut stream = ctx.get_stream("RESTART").await.expect("get_stream");
     let info = stream.info().await.expect("info");
     assert_eq!(
@@ -525,10 +494,9 @@ async fn exactly_once_survives_broker_restart() {
     );
 }
 
-/// Source that never calls `notify_epoch_committed` must not ack.
-/// Re-opening the same durable consumer after `ack_wait` expires
-/// replays the messages; once the second instance commits, a third
-/// instance sees nothing.
+/// A source that never commits the epoch must not ack. After
+/// `ack_wait`, a fresh consumer on the same durable replays;
+/// committing that one drains the queue for good.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker compose -f docker-compose.nats.yml up"]
 async fn source_redelivers_when_epoch_not_committed() {
@@ -543,8 +511,6 @@ async fn source_redelivers_when_epoch_not_committed() {
     )
     .await;
 
-    // Seed: publish 3 rows directly via the server-side context so the
-    // source has something to consume.
     for i in 0..3i64 {
         let payload = format!(r#"{{"id": {i}, "name": "row-{i}"}}"#);
         ctx.publish("acktest.events".to_string(), payload.into())
@@ -564,7 +530,6 @@ async fn source_redelivers_when_epoch_not_committed() {
         ("fetch.max.wait.ms", "250"),
     ]);
 
-    // First source: poll, do NOT commit.
     let mut source = NatsSource::new(payload_schema(), None);
     source
         .open(&ConnectorConfig::with_properties("nats", props.clone()))
@@ -573,11 +538,9 @@ async fn source_redelivers_when_epoch_not_committed() {
     let first = drain_rows(&mut source, 3, Duration::from_secs(5)).await;
     source.close().await.expect("source 1 close");
 
-    // Wait longer than ack_wait so the server unparks the unacked set
-    // and lets a fresh consumer receive them.
+    // Wait past ack_wait so the server unparks the unacked set.
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // Second source: poll, commit this time.
     let mut source = NatsSource::new(payload_schema(), None);
     source
         .open(&ConnectorConfig::with_properties("nats", props.clone()))
@@ -594,7 +557,6 @@ async fn source_redelivers_when_epoch_not_committed() {
         .expect("epoch commit acks");
     source.close().await.expect("source 2 close");
 
-    // Third source: now the acks have landed, nothing should remain.
     let mut source = NatsSource::new(payload_schema(), None);
     source
         .open(&ConnectorConfig::with_properties("nats", props))
@@ -622,9 +584,7 @@ async fn source_redelivers_when_epoch_not_committed() {
 
 const SECURE_NATS_URL: &str = "nats://127.0.0.1:4223";
 
-/// Core-mode round-trip against a server that requires user/password
-/// auth. The plain-auth NATS on :4222 would reject credentials; the
-/// secure server on :4223 requires them.
+/// Core-mode round-trip against a user/password-protected server.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs `docker compose -f docker-compose.nats.yml --profile secure up`"]
 async fn user_pass_roundtrip_core() {
@@ -692,8 +652,6 @@ async fn user_pass_missing_credentials_rejected_by_server() {
             ]),
         ))
         .await;
-    // Whichever of "connect refused" or "authorization violation" the
-    // server returns, the open() must fail.
     assert!(
         result.is_err(),
         "expected unauthenticated open to fail, got Ok"

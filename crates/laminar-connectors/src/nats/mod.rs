@@ -193,8 +193,7 @@ fn sink_config_keys() -> Vec<ConfigKeySpec> {
         ),
         K::optional(
             "min.duplicate.window.ms",
-            "Minimum stream duplicate_window required for exactly-once \
-             (the sink refuses to start if the stream is configured below this)",
+            "Minimum stream duplicate_window accepted under exactly-once",
             "120000",
         ),
         K::optional("max.pending", "Max outstanding PubAck futures", "4096"),

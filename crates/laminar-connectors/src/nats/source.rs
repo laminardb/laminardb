@@ -1,18 +1,8 @@
-//! NATS source connector.
-//!
-//! `JetStream` pull consumer with ack-on-commit:
-//! - A background task pulls messages and forwards them through a bounded
-//!   channel.
-//! - `poll_batch` drains the channel, deserializes to Arrow, and stashes
-//!   the underlying `jetstream::Message` handles in `pending` so we can
-//!   ack them later.
-//! - `checkpoint()` seals the current `pending` batch into `sealed`.
-//! - `notify_epoch_committed` drains `sealed` and acks every retained
-//!   message.
-//!
-//! We don't try to map coordinator-epoch numbers to source-barrier
-//! numbers. Each commit subsumes every earlier sealed batch, so draining
-//! the queue in full is both simple and correct.
+//! NATS source connector — `JetStream` pull consumer with
+//! ack-on-commit, or core subscribe (at-most-once). A background reader
+//! task forwards messages to `poll_batch` through an `mpsc` channel;
+//! `JetStream` message handles are retained until `notify_epoch_committed`
+//! fires, then acked in bulk.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -39,9 +29,7 @@ use crate::health::HealthStatus;
 use crate::metrics::ConnectorMetrics;
 use crate::serde::{self, RecordDeserializer};
 
-/// One inbound NATS message. `ack` is `Some` for `JetStream` (retained
-/// until `notify_epoch_committed` acks it) and `None` for core subscribe
-/// (at-most-once, no server-side ack protocol).
+/// One inbound message. `ack` is `Some` only on the `JetStream` path.
 struct Incoming {
     subject: String,
     payload: Bytes,
@@ -49,20 +37,14 @@ struct Incoming {
     ack: Option<jetstream::Message>,
 }
 
-/// Runtime state created by [`SourceConnector::open`] and torn down in
-/// [`SourceConnector::close`]. Keeping these together avoids a handful of
-/// parallel `Option<>` fields on `NatsSource`.
+/// Runtime state populated by `open()` and torn down by `close()`.
 struct Running {
     deserializer: Box<dyn RecordDeserializer>,
     rx: mpsc::Receiver<Incoming>,
-    /// Wakes the reader task out of a blocking `fetch()`. Using `Notify`
-    /// instead of an `AtomicBool` drops shutdown lag from the fetch
-    /// timeout (default 500ms) to sub-ms.
+    /// Wakes the reader out of a blocking fetch.
     shutdown: Arc<Notify>,
-    /// Consecutive fetch errors, `Some` for `JetStream` pull (which
-    /// surfaces fetch errors we can count) and `None` for core
-    /// subscribe (async-nats reconnects transparently, nothing to
-    /// count). Surfaced through `health_check`.
+    /// `Some` on `JetStream`, `None` on core (async-nats reconnects
+    /// transparently — nothing to count).
     consecutive_errors: Option<Arc<AtomicU32>>,
     handle: JoinHandle<()>,
 }
@@ -84,10 +66,8 @@ pub struct NatsSource {
 }
 
 impl NatsSource {
-    /// Creates a new NATS source with the given output schema.
-    ///
-    /// If `registry` is `Some`, metrics register on it and show up in
-    /// Prometheus scrapes.
+    /// Creates a new NATS source. Metrics register on `registry` if
+    /// provided.
     #[must_use]
     pub fn new(schema: SchemaRef, registry: Option<&prometheus::Registry>) -> Self {
         Self {
@@ -204,9 +184,6 @@ impl NatsSource {
             deserializer,
             rx,
             shutdown,
-            // Core deliveries land on poll_batch's `record_poll`; the
-            // subscriber doesn't surface fetch errors (async-nats
-            // reconnects transparently), so there's nothing to count.
             consecutive_errors: None,
             handle,
         });
@@ -299,10 +276,7 @@ impl SourceConnector for NatsSource {
     }
 
     async fn restore(&mut self, _checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
-        // The durable consumer remembers its ack floor on the server; on
-        // reconnect it resumes from there. If the manifest is ahead of
-        // the floor (out-of-band surgery), we'd just log and proceed —
-        // rewriting the consumer is destructive and not worth it.
+        // Durable consumer's ack floor on the server is authoritative.
         Ok(())
     }
 
@@ -325,10 +299,8 @@ impl SourceConnector for NatsSource {
     }
 
     async fn notify_epoch_committed(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
-        // Seal whatever is in pending so the current in-flight checkpoint
-        // sees it too, then ack every retained message. Any per-message
-        // ack error is logged but doesn't roll the epoch back — the
-        // broker will redeliver on ack_wait and sink dedup will drop it.
+        // Ack everything sealed so far. Per-msg ack errors don't roll
+        // the epoch back — the broker redelivers on ack_wait.
         self.seal_pending();
         while let Some(batch) = self.sealed.pop_front() {
             for msg in batch {
@@ -350,10 +322,7 @@ impl SourceConnector for NatsSource {
             return HealthStatus::Unknown;
         };
 
-        // Unhealthy first: fetch-loop errors indicate a problem even if
-        // `max_ack_pending` happens to be low. Threshold of zero is
-        // treated as "don't flip from error counts" (an escape hatch
-        // for tests); real deployments use the >= 1 default.
+        // Unhealthy beats Degraded. Threshold of zero disables the flip.
         if cfg.fetch_error_threshold > 0 {
             if let Some(errors) = self
                 .running
@@ -451,16 +420,14 @@ fn map_ack_policy(p: AckPolicy) -> async_nats::jetstream::consumer::AckPolicy {
     }
 }
 
-/// Base exponential backoff for fetch errors: 500ms, 1s, 2s, 4s, 5s cap.
+/// 500ms, 1s, 2s, 4s, 5s-cap.
 fn fetch_backoff_base(consecutive_errors: u32) -> Duration {
     let exp = consecutive_errors.saturating_sub(1).min(4);
     let ms = 500u64.saturating_mul(1u64 << exp);
     Duration::from_millis(ms.min(5000))
 }
 
-/// `base ± 20%`. `entropy` is any `u64` — we modulo it into the jitter
-/// window, so callers can pass `Instant::now()` nanos at runtime or a
-/// fixed seed in tests.
+/// `base ± 20%`; `entropy` is any `u64` (tests pass a fixed seed).
 fn with_jitter(base: Duration, entropy: u64) -> Duration {
     let base_ms = u64::try_from(base.as_millis()).unwrap_or(u64::MAX);
     let range = (base_ms / 5).max(1); // 20%
@@ -474,11 +441,8 @@ fn fetch_backoff(consecutive_errors: u32, entropy: u64) -> Duration {
     with_jitter(fetch_backoff_base(consecutive_errors), entropy)
 }
 
-/// Translate a `create_consumer` error into something operator-readable.
-/// A server-side `JetStream` error with code `CONSUMER_ALREADY_EXISTS`
-/// (10148) or `CONSUMER_NAME_EXIST` (10013) means the durable consumer
-/// exists with a different config. We surface a fix-it message instead
-/// of the raw server text.
+/// Server error 10148 / 10013 means the consumer exists with a
+/// conflicting config — raise LDB-5070 with an operator fix-up.
 fn classify_create_consumer_error(
     e: &async_nats::jetstream::stream::ConsumerError,
     consumer_name: &str,
@@ -504,14 +468,12 @@ fn classify_create_consumer_error(
     }
 }
 
-/// Nanos from the system clock, for jitter-seed entropy. Not
-/// cryptographic — just enough to desync siblings.
+/// Jitter seed; not cryptographic.
 #[allow(clippy::cast_possible_truncation)]
 fn entropy_now() -> u64 {
     Instant::now().elapsed().as_nanos() as u64
 }
 
-/// `JetStream` pull-consumer reader task.
 struct JsReader {
     consumer: jetstream::consumer::Consumer<pull::Config>,
     tx: mpsc::Sender<Incoming>,
@@ -596,10 +558,8 @@ impl JsReader {
                 forwarded += 1;
             }
 
-            // Counter accounting for this iteration:
-            //   - any forwarded message → reset (we're delivering data)
-            //   - no messages but errors → count as one failed iteration
-            //   - idle (no messages, no errors) → leave counter alone
+            // Reset on any forwarded message; count an all-error
+            // iteration as one failure; leave idle iterations alone.
             if forwarded > 0 {
                 consecutive_errors.store(0, Ordering::Release);
                 data_ready.notify_one();
@@ -616,8 +576,6 @@ impl JsReader {
     }
 }
 
-/// Core subscribe reader task. No fetch-error surface (async-nats
-/// reconnects transparently); shutdown works the same way.
 struct CoreReader {
     subscriber: async_nats::Subscriber,
     tx: mpsc::Sender<Incoming>,

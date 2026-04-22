@@ -1,15 +1,5 @@
-//! NATS connector metrics.
-//!
-//! Mirrors the shape of `KafkaSourceMetrics` / `KafkaSinkMetrics`: a
-//! handful of Prometheus counters + gauges registered on the shared
-//! registry (if any), with a `record_*` method per interesting event
-//! and `to_connector_metrics()` folding down to the SDK's
-//! [`ConnectorMetrics`].
-//!
-//! We intentionally omit per-subject labels. NATS subjects are
-//! wildcard-addressable and often unbounded-cardinality; attaching
-//! them to a counter is a Prometheus footgun. If a user needs
-//! per-subject visibility, they should aggregate at the server side.
+//! NATS connector metrics. No per-subject labels — NATS subjects are
+//! wildcard-addressable and often unbounded-cardinality.
 
 use prometheus::{IntCounter, IntGauge, Registry};
 
@@ -17,24 +7,18 @@ use crate::metrics::ConnectorMetrics;
 
 /// Prometheus counters for the NATS source.
 #[derive(Debug, Clone)]
+#[allow(missing_docs)]
 pub struct NatsSourceMetrics {
-    /// Total records delivered to `poll_batch` callers.
     pub records_total: IntCounter,
-    /// Total bytes of payload delivered.
     pub bytes_total: IntCounter,
-    /// Errors from `consumer.fetch()` (the pull loop).
     pub fetch_errors_total: IntCounter,
-    /// Successful `JetStream` acks.
     pub acks_total: IntCounter,
-    /// Ack failures (broker rejected, connection dropped mid-ack, etc).
     pub ack_errors_total: IntCounter,
-    /// Retained message handles not yet acked (pending + sealed).
     pub pending_acks: IntGauge,
 }
 
 impl NatsSourceMetrics {
-    /// All counters start at zero. If `registry` is `Some`, the metrics
-    /// register on it; otherwise a local throwaway registry is used.
+    /// Registers the metrics on `registry` if provided.
     #[must_use]
     #[allow(clippy::missing_panics_doc)]
     pub fn new(registry: Option<&Registry>) -> Self {
@@ -73,39 +57,35 @@ impl NatsSourceMetrics {
         }
     }
 
-    /// Records a poll batch of `records` with `bytes` total payload.
+    /// Record a poll batch.
     pub fn record_poll(&self, records: u64, bytes: u64) {
         self.records_total.inc_by(records);
         self.bytes_total.inc_by(bytes);
     }
 
-    /// Records a fetch-loop error.
+    /// Record a fetch-loop error.
     pub fn record_fetch_error(&self) {
         self.fetch_errors_total.inc();
     }
 
-    /// Records one successful ack.
+    /// Record one successful ack.
     pub fn record_ack(&self) {
         self.acks_total.inc();
     }
 
-    /// Records one failed ack.
+    /// Record one failed ack.
     pub fn record_ack_error(&self) {
         self.ack_errors_total.inc();
     }
 
-    /// Sets the pending-ack gauge to `n`.
+    /// Set the pending-ack gauge.
     #[allow(clippy::cast_possible_wrap)]
     pub fn set_pending_acks(&self, n: usize) {
         self.pending_acks.set(n as i64);
     }
 
-    /// Folds to the SDK's [`ConnectorMetrics`].
-    ///
-    /// `lag` is reported as 0 until we poll `consumer.info()` for the
-    /// real broker-side (`last_seq` − `ack_floor`). Our `pending_acks`
-    /// is internal-buffer depth, not consumer lag — surfacing it as
-    /// `lag` would be apples-to-oranges next to the Kafka source.
+    /// Folds to the SDK's [`ConnectorMetrics`]. `lag` stays 0 until
+    /// we poll `consumer.info()` for the real broker-side lag.
     #[must_use]
     #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
     pub fn to_connector_metrics(&self) -> ConnectorMetrics {
@@ -125,28 +105,20 @@ impl NatsSourceMetrics {
 
 /// Prometheus counters for the NATS sink.
 #[derive(Debug, Clone)]
+#[allow(missing_docs)]
 pub struct NatsSinkMetrics {
-    /// Total records published (one per row in `write_batch`).
     pub records_total: IntCounter,
-    /// Total bytes of payload published.
     pub bytes_total: IntCounter,
-    /// Publish errors (serialize → publish).
     pub publish_errors_total: IntCounter,
-    /// Publish-ack errors (`JetStream` did not acknowledge within the
-    /// configured timeout, or returned an error status).
     pub ack_errors_total: IntCounter,
-    /// Publishes the server identified as duplicates (arrived inside
-    /// `duplicate_window` with a repeated `Nats-Msg-Id`).
+    /// Publishes the server dropped as `Nats-Msg-Id` duplicates.
     pub dedup_total: IntCounter,
-    /// Epochs rolled back via `rollback_epoch`.
     pub epochs_rolled_back: IntCounter,
-    /// Outstanding `PublishAckFuture`s.
     pub pending_futures: IntGauge,
 }
 
 impl NatsSinkMetrics {
-    /// All counters start at zero. If `registry` is `Some`, the metrics
-    /// register on it.
+    /// Registers the metrics on `registry` if provided.
     #[must_use]
     #[allow(clippy::missing_panics_doc)]
     pub fn new(registry: Option<&Registry>) -> Self {
@@ -183,35 +155,33 @@ impl NatsSinkMetrics {
         }
     }
 
-    /// Records one successfully published row of `bytes` payload.
-    /// Called per row, not per batch — a partial-failure batch still
-    /// gets accurate success counts.
+    /// Record one successful publish of `bytes`.
     pub fn record_published_row(&self, bytes: u64) {
         self.records_total.inc();
         self.bytes_total.inc_by(bytes);
     }
 
-    /// Records one publish error.
+    /// Record one publish error.
     pub fn record_publish_error(&self) {
         self.publish_errors_total.inc();
     }
 
-    /// Records one ack error.
+    /// Record one ack error.
     pub fn record_ack_error(&self) {
         self.ack_errors_total.inc();
     }
 
-    /// Records one server-identified duplicate publish.
+    /// Record one server-identified duplicate.
     pub fn record_dedup(&self) {
         self.dedup_total.inc();
     }
 
-    /// Records one epoch rollback.
+    /// Record one epoch rollback.
     pub fn record_rollback(&self) {
         self.epochs_rolled_back.inc();
     }
 
-    /// Sets the pending-futures gauge.
+    /// Set the pending-futures gauge.
     #[allow(clippy::cast_possible_wrap)]
     pub fn set_pending_futures(&self, n: usize) {
         self.pending_futures.set(n as i64);
