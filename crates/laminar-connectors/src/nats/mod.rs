@@ -58,10 +58,15 @@ pub fn register_nats_sink(registry: &ConnectorRegistry) {
 fn auth_and_tls_keys() -> Vec<ConfigKeySpec> {
     use ConfigKeySpec as K;
     vec![
-        K::optional("auth.mode", "none | user_pass | token", "none"),
+        K::optional("auth.mode", "none | user_pass | token | creds_file", "none"),
         K::optional("user", "Username (auth.mode=user_pass)", ""),
         K::optional("password", "Password (auth.mode=user_pass)", ""),
         K::optional("token", "Bearer token (auth.mode=token)", ""),
+        K::optional(
+            "creds.file",
+            "Path to a NATS credentials file (auth.mode=creds_file)",
+            "",
+        ),
         K::optional("tls.enabled", "Require TLS on the connection", "false"),
         K::optional(
             "tls.ca.location",
@@ -133,6 +138,11 @@ fn source_config_keys() -> Vec<ConfigKeySpec> {
             "fetch.error.threshold",
             "Consecutive fetch errors before the source reports Unhealthy",
             "10",
+        ),
+        K::optional(
+            "lag.poll.interval.ms",
+            "Interval between consumer.info() polls for the lag gauge (0 disables)",
+            "10000",
         ),
         // Core
         K::optional(

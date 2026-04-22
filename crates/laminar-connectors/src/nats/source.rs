@@ -134,6 +134,7 @@ impl NatsSource {
             metrics: self.metrics.clone(),
             batch_size: cfg.fetch_batch,
             max_wait: cfg.fetch_max_wait,
+            lag_poll_interval: cfg.lag_poll_interval,
         };
         let handle = tokio::spawn(reader.run());
 
@@ -366,7 +367,7 @@ fn err(msg: &str) -> ConnectorError {
 }
 
 async fn connect(cfg: &NatsSourceConfig) -> Result<async_nats::Client, ConnectorError> {
-    build_connect_options(&cfg.auth, &cfg.tls)
+    build_connect_options(&cfg.auth, &cfg.tls)?
         .connect(&cfg.servers)
         .await
         .map_err(|e| err(&format!("nats connect({:?}): {e}", cfg.servers)))
@@ -405,9 +406,14 @@ fn map_deliver_policy(
             start_sequence: cfg.start_sequence.unwrap_or(1),
         },
         DeliverPolicy::ByStartTime => {
-            return Err(err(
-                "deliver.policy=by_start_time is not yet supported; use by_start_sequence",
-            ));
+            let raw = cfg
+                .start_time
+                .as_deref()
+                .ok_or_else(|| err("deliver.policy=by_start_time requires 'start.time'"))?;
+            let start_time =
+                time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+                    .map_err(|e| err(&format!("start.time '{raw}' is not valid RFC3339: {e}")))?;
+            Nats::ByStartTime { start_time }
         }
     })
 }
@@ -483,12 +489,14 @@ struct JsReader {
     metrics: NatsSourceMetrics,
     batch_size: usize,
     max_wait: Duration,
+    /// `Duration::ZERO` disables the poll.
+    lag_poll_interval: Duration,
 }
 
 impl JsReader {
     async fn run(self) {
         let Self {
-            consumer,
+            mut consumer,
             tx,
             shutdown,
             consecutive_errors,
@@ -496,7 +504,11 @@ impl JsReader {
             metrics,
             batch_size,
             max_wait,
+            lag_poll_interval,
         } = self;
+
+        let mut last_lag_poll = Instant::now();
+        let lag_poll_enabled = !lag_poll_interval.is_zero();
 
         loop {
             let fetch_result = tokio::select! {
@@ -570,6 +582,14 @@ impl JsReader {
                     biased;
                     () = shutdown.notified() => break,
                     () = tokio::time::sleep(backoff) => {}
+                }
+            }
+
+            if lag_poll_enabled && last_lag_poll.elapsed() >= lag_poll_interval {
+                last_lag_poll = Instant::now();
+                match consumer.info().await {
+                    Ok(info) => metrics.set_consumer_lag(info.num_pending),
+                    Err(e) => warn!(error = %e, "consumer.info() failed; skipping lag update"),
                 }
             }
         }

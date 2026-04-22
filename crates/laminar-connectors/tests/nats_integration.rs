@@ -393,6 +393,152 @@ async fn source_flips_unhealthy_after_stream_deleted() {
     );
 }
 
+// ── observability ──
+
+/// `nats_source_consumer_lag` is populated by the periodic
+/// `consumer.info()` poll and reaches zero after a full drain + ack.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs docker compose -f docker-compose.nats.yml up"]
+async fn consumer_lag_settles_to_zero_after_drain() {
+    let ctx = connect().await;
+    reset_stream(
+        &ctx,
+        StreamConfig {
+            name: "LAG".into(),
+            subjects: vec!["lag.events".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    for i in 0..5i64 {
+        let payload = format!(r#"{{"id": {i}, "name": "row-{i}"}}"#);
+        ctx.publish("lag.events".to_string(), payload.into())
+            .await
+            .expect("publish")
+            .await
+            .expect("ack");
+    }
+
+    let mut source = NatsSource::new(payload_schema(), None);
+    source
+        .open(&ConnectorConfig::with_properties(
+            "nats",
+            source_props(&[
+                ("servers", NATS_URL),
+                ("stream", "LAG"),
+                ("consumer", "lag-consumer"),
+                ("subject", "lag.events"),
+                ("format", "json"),
+                ("fetch.max.wait.ms", "100"),
+                ("lag.poll.interval.ms", "200"),
+            ]),
+        ))
+        .await
+        .expect("source open");
+
+    drain_rows(&mut source, 5, Duration::from_secs(5)).await;
+    source.notify_epoch_committed(1).await.expect("commit acks");
+
+    let lag_after = poll_gauge_until(&source, "consumer_lag", |v| v == 0, Duration::from_secs(3))
+        .await
+        .expect("expected lag gauge to settle at 0 after drain + ack");
+    assert_eq!(lag_after, 0);
+
+    source.close().await.expect("source close");
+}
+
+/// `deliver.policy=by_start_time` replays from a wall-clock cutoff.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs docker compose -f docker-compose.nats.yml up"]
+async fn by_start_time_replays_from_cutoff() {
+    let ctx = connect().await;
+    reset_stream(
+        &ctx,
+        StreamConfig {
+            name: "BYTIME".into(),
+            subjects: vec!["bytime.events".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Publish 3 before the cutoff, wait, remember the cutoff, publish 3 after.
+    for i in 0..3i64 {
+        let payload = format!(r#"{{"id": {i}, "name": "row-{i}"}}"#);
+        ctx.publish("bytime.events".to_string(), payload.into())
+            .await
+            .expect("publish")
+            .await
+            .expect("ack");
+    }
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let cutoff = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("format");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for i in 3..6i64 {
+        let payload = format!(r#"{{"id": {i}, "name": "row-{i}"}}"#);
+        ctx.publish("bytime.events".to_string(), payload.into())
+            .await
+            .expect("publish")
+            .await
+            .expect("ack");
+    }
+
+    let mut source = NatsSource::new(payload_schema(), None);
+    source
+        .open(&ConnectorConfig::with_properties(
+            "nats",
+            source_props(&[
+                ("servers", NATS_URL),
+                ("stream", "BYTIME"),
+                ("consumer", "bytime-consumer"),
+                ("subject", "bytime.events"),
+                ("format", "json"),
+                ("fetch.max.wait.ms", "100"),
+                ("deliver.policy", "by_start_time"),
+                ("start.time", &cutoff),
+            ]),
+        ))
+        .await
+        .expect("source open");
+
+    let received = drain_rows(&mut source, 3, Duration::from_secs(5)).await;
+    source.close().await.expect("source close");
+    let ids: Vec<i64> = received.into_iter().map(|(id, _)| id).collect();
+    assert_eq!(ids, vec![3, 4, 5], "expected only post-cutoff rows");
+}
+
+async fn poll_gauge_until(
+    source: &NatsSource,
+    custom_key: &str,
+    until: impl Fn(u64) -> bool,
+    timeout: Duration,
+) -> Option<u64> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        let cm = source.metrics();
+        let v = cm
+            .custom
+            .iter()
+            .find_map(|(k, v)| (k == &format!("nats.{custom_key}")).then_some(*v as u64))
+            .unwrap_or_else(|| {
+                // `lag` is exposed directly, not via custom — read it there.
+                if custom_key == "consumer_lag" {
+                    cm.lag
+                } else {
+                    0
+                }
+            });
+        if until(v) {
+            return Some(v);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    None
+}
+
 // ── chaos ──
 
 fn restart_nats() {

@@ -15,6 +15,8 @@ pub struct NatsSourceMetrics {
     pub acks_total: IntCounter,
     pub ack_errors_total: IntCounter,
     pub pending_acks: IntGauge,
+    /// Broker-side lag: stream messages not yet delivered to this consumer.
+    pub consumer_lag: IntGauge,
 }
 
 impl NatsSourceMetrics {
@@ -40,6 +42,12 @@ impl NatsSourceMetrics {
         let pending_acks =
             IntGauge::new("nats_source_pending_acks", "Unacked JetStream messages").unwrap();
         let _ = reg.register(Box::new(pending_acks.clone()));
+        let consumer_lag = IntGauge::new(
+            "nats_source_consumer_lag",
+            "Stream messages not yet delivered to the consumer",
+        )
+        .unwrap();
+        let _ = reg.register(Box::new(consumer_lag.clone()));
 
         Self {
             records_total: reg_c!(
@@ -54,6 +62,7 @@ impl NatsSourceMetrics {
             acks_total: reg_c!("nats_source_acks_total", "Successful JetStream acks"),
             ack_errors_total: reg_c!("nats_source_ack_errors_total", "Failed acks"),
             pending_acks,
+            consumer_lag,
         }
     }
 
@@ -84,8 +93,14 @@ impl NatsSourceMetrics {
         self.pending_acks.set(n as i64);
     }
 
-    /// Folds to the SDK's [`ConnectorMetrics`]. `lag` stays 0 until
-    /// we poll `consumer.info()` for the real broker-side lag.
+    /// Set the broker-side lag gauge.
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn set_consumer_lag(&self, n: u64) {
+        self.consumer_lag.set(n as i64);
+    }
+
+    /// Folds to the SDK's [`ConnectorMetrics`]. `lag` is the broker-
+    /// side pending count from the latest `consumer.info()` poll.
     #[must_use]
     #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
     pub fn to_connector_metrics(&self) -> ConnectorMetrics {
@@ -93,7 +108,7 @@ impl NatsSourceMetrics {
             records_total: self.records_total.get(),
             bytes_total: self.bytes_total.get(),
             errors_total: self.fetch_errors_total.get() + self.ack_errors_total.get(),
-            lag: 0,
+            lag: self.consumer_lag.get().max(0) as u64,
             custom: Vec::new(),
         };
         m.add_custom("nats.acks", self.acks_total.get() as f64);
@@ -231,11 +246,13 @@ mod tests {
         m.record_fetch_error();
         m.set_pending_acks(7);
 
+        m.set_consumer_lag(42);
+
         let cm = m.to_connector_metrics();
         assert_eq!(cm.records_total, 150);
         assert_eq!(cm.bytes_total, 5120);
         assert_eq!(cm.errors_total, 1); // fetch error
-        assert_eq!(cm.lag, 0, "lag stays zero until we poll consumer.info()");
+        assert_eq!(cm.lag, 42, "lag reflects the latest consumer.info() poll");
         assert!(cm.custom.iter().any(|(k, v)| k == "nats.acks" && *v == 2.0));
         assert!(cm
             .custom

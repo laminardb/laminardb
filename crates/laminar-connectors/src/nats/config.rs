@@ -82,6 +82,9 @@ pub enum AuthMode {
     },
     /// Plain-text bearer token.
     Token(String),
+    /// Path to a NATS credentials file (typically `.creds` from
+    /// NATS Cloud / NSC).
+    CredsFile(String),
 }
 
 /// TLS transport configuration. Independent of [`AuthMode`].
@@ -121,6 +124,9 @@ pub struct NatsSourceConfig {
     /// Consecutive fetch errors before `health_check` reports
     /// `Unhealthy`. Zero disables the flip.
     pub fetch_error_threshold: u32,
+    /// Interval between `consumer.info()` polls that feed the
+    /// `nats_source_consumer_lag` gauge. Zero disables the poll.
+    pub lag_poll_interval: Duration,
 
     // Core
     pub queue_group: Option<String>,
@@ -168,6 +174,8 @@ impl NatsSourceConfig {
             parse_duration_ms(config, "fetch.max.wait.ms", Duration::from_millis(500))?;
         let fetch_max_bytes = parse_usize(config, "fetch.max.bytes", 1 << 20)?;
         let fetch_error_threshold = parse_u32(config, "fetch.error.threshold", 10)?;
+        let lag_poll_interval =
+            parse_duration_ms(config, "lag.poll.interval.ms", Duration::from_secs(10))?;
         let queue_group = config.get("queue.group").map(str::to_string);
         let format = parse_format(config)?;
         let include_metadata = parse_bool(config, "include.metadata", false)?;
@@ -195,6 +203,7 @@ impl NatsSourceConfig {
             fetch_max_wait,
             fetch_max_bytes,
             fetch_error_threshold,
+            lag_poll_interval,
             queue_group,
             format,
             include_metadata,
@@ -465,6 +474,7 @@ fn parse_auth(config: &ConnectorConfig) -> Result<AuthMode, ConnectorError> {
             if config.get("user").is_some()
                 || config.get("password").is_some()
                 || config.get("token").is_some()
+                || config.get("creds.file").is_some()
             {
                 return Err(cfg_err(
                     "[LDB-5063] credentials set but auth.mode=none; \
@@ -491,8 +501,15 @@ fn parse_auth(config: &ConnectorConfig) -> Result<AuthMode, ConnectorError> {
                 .to_string();
             Ok(AuthMode::Token(token))
         }
+        "creds_file" => {
+            let path = config
+                .get("creds.file")
+                .ok_or_else(|| cfg_err("[LDB-5064] auth.mode=creds_file requires 'creds.file'"))?
+                .to_string();
+            Ok(AuthMode::CredsFile(path))
+        }
         other => Err(cfg_err(&format!(
-            "invalid auth.mode '{other}'; expected none | user_pass | token"
+            "invalid auth.mode '{other}'; expected none | user_pass | token | creds_file"
         ))),
     }
 }
@@ -516,10 +533,15 @@ fn parse_tls(config: &ConnectorConfig) -> Result<TlsConfig, ConnectorError> {
 
 /// Build `ConnectOptions` from parsed auth + TLS config. Shared by the
 /// source and the sink so they don't drift in how they apply these.
+///
+/// # Errors
+///
+/// Returns `ConnectorError` if `auth.mode=creds_file` points at a file
+/// we can't read or that doesn't parse as a NATS credentials bundle.
 pub(super) fn build_connect_options(
     auth: &AuthMode,
     tls: &TlsConfig,
-) -> async_nats::ConnectOptions {
+) -> Result<async_nats::ConnectOptions, ConnectorError> {
     let mut opts = async_nats::ConnectOptions::new();
     match auth {
         AuthMode::None => {}
@@ -528,6 +550,12 @@ pub(super) fn build_connect_options(
         }
         AuthMode::Token(token) => {
             opts = opts.token(token.clone());
+        }
+        AuthMode::CredsFile(path) => {
+            let contents = std::fs::read_to_string(path)
+                .map_err(|e| cfg_err(&format!("creds.file '{path}': {e}")))?;
+            opts = async_nats::ConnectOptions::with_credentials(&contents)
+                .map_err(|e| cfg_err(&format!("creds.file '{path}' invalid: {e}")))?;
         }
     }
     // Any TLS-related key turns on the requirement. Operators who want
@@ -542,7 +570,7 @@ pub(super) fn build_connect_options(
     if let (Some(cert), Some(key)) = (&tls.cert_location, &tls.key_location) {
         opts = opts.add_client_certificate(cert.into(), key.into());
     }
-    opts
+    Ok(opts)
 }
 
 #[cfg(test)]
@@ -826,6 +854,27 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("LDB-5063"), "got: {err}");
+    }
+
+    #[test]
+    fn auth_creds_file_requires_path() {
+        let err = NatsSourceConfig::from_config(&jetstream_happy(&[("auth.mode", "creds_file")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("LDB-5064"), "got: {err}");
+    }
+
+    #[test]
+    fn auth_creds_file_happy_path() {
+        let parsed = NatsSourceConfig::from_config(&jetstream_happy(&[
+            ("auth.mode", "creds_file"),
+            ("creds.file", "/secrets/user.creds"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.auth,
+            AuthMode::CredsFile("/secrets/user.creds".into())
+        );
     }
 
     #[test]

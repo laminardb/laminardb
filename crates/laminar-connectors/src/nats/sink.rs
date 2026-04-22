@@ -69,7 +69,7 @@ impl SinkConnector for NatsSink {
             serde::create_serializer(cfg.format)
                 .map_err(|e| err(&format!("serializer for format {:?}: {e}", cfg.format)))?,
         );
-        let client = build_connect_options(&cfg.auth, &cfg.tls)
+        let client = build_connect_options(&cfg.auth, &cfg.tls)?
             .connect(&cfg.servers)
             .await
             .map_err(|e| err(&format!("nats connect({:?}): {e}", cfg.servers)))?;
