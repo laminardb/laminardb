@@ -101,6 +101,11 @@ impl NatsSourceMetrics {
     }
 
     /// Folds to the SDK's [`ConnectorMetrics`].
+    ///
+    /// `lag` is reported as 0 until we poll `consumer.info()` for the
+    /// real broker-side (`last_seq` − `ack_floor`). Our `pending_acks`
+    /// is internal-buffer depth, not consumer lag — surfacing it as
+    /// `lag` would be apples-to-oranges next to the Kafka source.
     #[must_use]
     #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
     pub fn to_connector_metrics(&self) -> ConnectorMetrics {
@@ -108,18 +113,13 @@ impl NatsSourceMetrics {
             records_total: self.records_total.get(),
             bytes_total: self.bytes_total.get(),
             errors_total: self.fetch_errors_total.get() + self.ack_errors_total.get(),
-            lag: self.pending_acks.get() as u64,
+            lag: 0,
             custom: Vec::new(),
         };
         m.add_custom("nats.acks", self.acks_total.get() as f64);
         m.add_custom("nats.ack_errors", self.ack_errors_total.get() as f64);
+        m.add_custom("nats.pending_acks", self.pending_acks.get() as f64);
         m
-    }
-}
-
-impl Default for NatsSourceMetrics {
-    fn default() -> Self {
-        Self::new(None)
     }
 }
 
@@ -138,6 +138,8 @@ pub struct NatsSinkMetrics {
     /// Publishes the server identified as duplicates (arrived inside
     /// `duplicate_window` with a repeated `Nats-Msg-Id`).
     pub dedup_total: IntCounter,
+    /// Epochs rolled back via `rollback_epoch`.
+    pub epochs_rolled_back: IntCounter,
     /// Outstanding `PublishAckFuture`s.
     pub pending_futures: IntGauge,
 }
@@ -176,13 +178,16 @@ impl NatsSinkMetrics {
                 "nats_sink_dedup_total",
                 "Publishes identified by the server as duplicates"
             ),
+            epochs_rolled_back: reg_c!("nats_sink_epochs_rolled_back_total", "Epochs rolled back"),
             pending_futures,
         }
     }
 
-    /// Records a successful publish of `records` rows and `bytes` total.
-    pub fn record_publish(&self, records: u64, bytes: u64) {
-        self.records_total.inc_by(records);
+    /// Records one successfully published row of `bytes` payload.
+    /// Called per row, not per batch — a partial-failure batch still
+    /// gets accurate success counts.
+    pub fn record_published_row(&self, bytes: u64) {
+        self.records_total.inc();
         self.bytes_total.inc_by(bytes);
     }
 
@@ -199,6 +204,11 @@ impl NatsSinkMetrics {
     /// Records one server-identified duplicate publish.
     pub fn record_dedup(&self) {
         self.dedup_total.inc();
+    }
+
+    /// Records one epoch rollback.
+    pub fn record_rollback(&self) {
+        self.epochs_rolled_back.inc();
     }
 
     /// Sets the pending-futures gauge.
@@ -219,13 +229,11 @@ impl NatsSinkMetrics {
             custom: Vec::new(),
         };
         m.add_custom("nats.dedup", self.dedup_total.get() as f64);
+        m.add_custom(
+            "nats.epochs_rolled_back",
+            self.epochs_rolled_back.get() as f64,
+        );
         m
-    }
-}
-
-impl Default for NatsSinkMetrics {
-    fn default() -> Self {
-        Self::new(None)
     }
 }
 
@@ -257,25 +265,37 @@ mod tests {
         assert_eq!(cm.records_total, 150);
         assert_eq!(cm.bytes_total, 5120);
         assert_eq!(cm.errors_total, 1); // fetch error
-        assert_eq!(cm.lag, 7);
+        assert_eq!(cm.lag, 0, "lag stays zero until we poll consumer.info()");
         assert!(cm.custom.iter().any(|(k, v)| k == "nats.acks" && *v == 2.0));
+        assert!(cm
+            .custom
+            .iter()
+            .any(|(k, v)| k == "nats.pending_acks" && *v == 7.0));
     }
 
     #[test]
     fn sink_records_and_dedup() {
         let m = NatsSinkMetrics::new(None);
-        m.record_publish(10, 2048);
+        for _ in 0..10 {
+            m.record_published_row(200);
+        }
         m.record_dedup();
         m.record_dedup();
+        m.record_rollback();
         m.set_pending_futures(3);
 
         let cm = m.to_connector_metrics();
         assert_eq!(cm.records_total, 10);
+        assert_eq!(cm.bytes_total, 2000);
         assert_eq!(cm.lag, 3);
         assert!(cm
             .custom
             .iter()
             .any(|(k, v)| k == "nats.dedup" && *v == 2.0));
+        assert!(cm
+            .custom
+            .iter()
+            .any(|(k, v)| k == "nats.epochs_rolled_back" && *v == 1.0));
     }
 
     #[test]

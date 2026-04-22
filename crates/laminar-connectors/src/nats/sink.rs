@@ -157,7 +157,7 @@ impl SinkConnector for NatsSink {
             .map_err(|e| err(&format!("serialize batch: {e}")))?;
 
         let mut bytes_total: u64 = 0;
-        let rows = batch.num_rows();
+        let mut rows_written: usize = 0;
         for (row, payload) in records.into_iter().enumerate() {
             let subject: &str = match (&cfg.subject, subject_col) {
                 (SubjectSpec::Literal(s), _) => s.as_str(),
@@ -172,7 +172,6 @@ impl SinkConnector for NatsSink {
             let headers = build_headers(expected_stream, msg_id, &header_cols, row);
             let payload_len = payload.len() as u64;
             let payload = bytes::Bytes::from(payload);
-            bytes_total += payload_len;
 
             match rt {
                 Runtime::Core { client } => {
@@ -183,32 +182,38 @@ impl SinkConnector for NatsSink {
                     } else {
                         client.publish(subject.to_string(), payload).await
                     };
-                    result.map_err(|e| {
+                    if let Err(e) = result {
                         metrics.record_publish_error();
-                        err(&format!("core publish: {e}"))
-                    })?;
+                        return Err(err(&format!("core publish: {e}")));
+                    }
                 }
                 Runtime::JetStream { context } => {
-                    let fut = if let Some(h) = headers {
+                    let publish_result = if let Some(h) = headers {
                         context
                             .publish_with_headers(subject.to_string(), h, payload)
                             .await
                     } else {
                         context.publish(subject.to_string(), payload).await
                     };
-                    let fut = fut.map_err(|e| {
-                        metrics.record_publish_error();
-                        err(&format!("jetstream publish: {e}"))
-                    })?;
-                    pending_acks.push_back(fut);
+                    match publish_result {
+                        Ok(fut) => pending_acks.push_back(fut),
+                        Err(e) => {
+                            metrics.record_publish_error();
+                            return Err(err(&format!("jetstream publish: {e}")));
+                        }
+                    }
                 }
             }
+
+            // Record per-row so partial-failure batches don't vanish
+            // from the success counter.
+            metrics.record_published_row(payload_len);
+            rows_written += 1;
+            bytes_total += payload_len;
         }
 
-        metrics.record_publish(rows as u64, bytes_total);
-        #[allow(clippy::cast_possible_wrap)]
         metrics.set_pending_futures(pending_acks.len());
-        Ok(WriteResult::new(rows, bytes_total))
+        Ok(WriteResult::new(rows_written, bytes_total))
     }
 
     fn schema(&self) -> SchemaRef {
@@ -258,6 +263,7 @@ impl SinkConnector for NatsSink {
         // Dedup handles any landed publishes on retry (see LDB-5056).
         self.pending_acks.clear();
         self.metrics.set_pending_futures(0);
+        self.metrics.record_rollback();
         Ok(())
     }
 

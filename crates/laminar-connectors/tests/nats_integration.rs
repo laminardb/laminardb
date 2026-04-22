@@ -224,7 +224,8 @@ async fn exactly_once_dedup_drops_duplicate() {
     )
     .unwrap();
 
-    let mut sink = NatsSink::new(schema, None);
+    let prom = prometheus::Registry::new();
+    let mut sink = NatsSink::new(schema, Some(&prom));
     sink.open(&ConnectorConfig::with_properties(
         "nats",
         source_props(&[
@@ -252,6 +253,17 @@ async fn exactly_once_dedup_drops_duplicate() {
         info.state.messages, 1,
         "expected dedup to drop the second publish"
     );
+
+    // Client side: dedup counter should reflect the server's decision.
+    // Read through `SinkConnector::metrics()` — exercises the public
+    // surface operators see.
+    let cm = sink.metrics();
+    let dedup = cm
+        .custom
+        .iter()
+        .find_map(|(k, v)| (k == "nats.dedup").then_some(*v as u64))
+        .expect("nats.dedup custom metric");
+    assert_eq!(dedup, 1, "expected nats.dedup = 1, got {dedup}");
 }
 
 /// A stream with duplicate_window below the sink's minimum makes
