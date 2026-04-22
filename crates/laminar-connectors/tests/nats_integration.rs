@@ -95,7 +95,7 @@ async fn roundtrip_jetstream() {
     .await;
 
     // Sink: publish 3 rows.
-    let mut sink = NatsSink::new(payload_schema());
+    let mut sink = NatsSink::new(payload_schema(), None);
     sink.open(&ConnectorConfig::with_properties(
         "nats",
         source_props(&[
@@ -114,7 +114,7 @@ async fn roundtrip_jetstream() {
     sink.close().await.expect("sink close");
 
     // Source: read them back.
-    let mut source = NatsSource::new(payload_schema());
+    let mut source = NatsSource::new(payload_schema(), None);
     source
         .open(&ConnectorConfig::with_properties(
             "nats",
@@ -147,7 +147,7 @@ async fn roundtrip_jetstream() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs docker compose -f docker-compose.nats.yml up"]
 async fn roundtrip_core() {
-    let mut source = NatsSource::new(payload_schema());
+    let mut source = NatsSource::new(payload_schema(), None);
     source
         .open(&ConnectorConfig::with_properties(
             "nats",
@@ -164,7 +164,7 @@ async fn roundtrip_core() {
     // Subscriber needs to be ready before publish — give it a brief moment.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let mut sink = NatsSink::new(payload_schema());
+    let mut sink = NatsSink::new(payload_schema(), None);
     sink.open(&ConnectorConfig::with_properties(
         "nats",
         source_props(&[
@@ -224,7 +224,7 @@ async fn exactly_once_dedup_drops_duplicate() {
     )
     .unwrap();
 
-    let mut sink = NatsSink::new(schema);
+    let mut sink = NatsSink::new(schema, None);
     sink.open(&ConnectorConfig::with_properties(
         "nats",
         source_props(&[
@@ -272,7 +272,7 @@ async fn exactly_once_rejects_short_duplicate_window() {
     )
     .await;
 
-    let mut sink = NatsSink::new(payload_schema());
+    let mut sink = NatsSink::new(payload_schema(), None);
     let err = sink
         .open(&ConnectorConfig::with_properties(
             "nats",

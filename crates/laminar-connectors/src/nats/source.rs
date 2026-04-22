@@ -31,10 +31,13 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use super::config::{AckPolicy, DeliverPolicy, Mode, NatsSourceConfig};
+use super::metrics::NatsSourceMetrics;
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
 use crate::connector::{PartitionInfo, SourceBatch, SourceConnector};
 use crate::error::ConnectorError;
+use crate::health::HealthStatus;
+use crate::metrics::ConnectorMetrics;
 use crate::serde::{self, RecordDeserializer};
 
 /// One inbound NATS message. `ack` is `Some` for `JetStream` (retained
@@ -62,6 +65,7 @@ pub struct NatsSource {
     schema: SchemaRef,
     config: Option<NatsSourceConfig>,
     data_ready: Arc<Notify>,
+    metrics: NatsSourceMetrics,
     running: Option<Running>,
 
     // Ack-on-commit bookkeeping.
@@ -74,17 +78,27 @@ pub struct NatsSource {
 
 impl NatsSource {
     /// Creates a new NATS source with the given output schema.
+    ///
+    /// If `registry` is `Some`, metrics register on it and show up in
+    /// Prometheus scrapes.
     #[must_use]
-    pub fn new(schema: SchemaRef) -> Self {
+    pub fn new(schema: SchemaRef, registry: Option<&prometheus::Registry>) -> Self {
         Self {
             schema,
             config: None,
             data_ready: Arc::new(Notify::new()),
+            metrics: NatsSourceMetrics::new(registry),
             running: None,
             pending: Vec::new(),
             sealed: VecDeque::new(),
             offsets: FxHashMap::default(),
         }
+    }
+
+    fn update_pending_gauge(&self) {
+        let sealed_total: usize = self.sealed.iter().map(Vec::len).sum();
+        self.metrics
+            .set_pending_acks(self.pending.len() + sealed_total);
     }
 
     /// Parsed config — available after [`SourceConnector::open`].
@@ -124,6 +138,7 @@ impl NatsSource {
         let shutdown = Arc::new(AtomicBool::new(false));
         let reader_shutdown = Arc::clone(&shutdown);
         let data_ready = Arc::clone(&self.data_ready);
+        let metrics = self.metrics.clone();
         let batch_size = cfg.fetch_batch;
         let max_wait = cfg.fetch_max_wait;
 
@@ -143,6 +158,7 @@ impl NatsSource {
                 let mut stream = match fetch {
                     Ok(s) => s,
                     Err(e) => {
+                        metrics.record_fetch_error();
                         warn!(error = %e, "nats fetch() errored; backing off");
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         continue;
@@ -154,6 +170,7 @@ impl NatsSource {
                     let msg = match msg_result {
                         Ok(m) => m,
                         Err(e) => {
+                            metrics.record_fetch_error();
                             warn!(error = %e, "nats message error");
                             continue;
                         }
@@ -210,6 +227,9 @@ impl NatsSource {
                 .map_err(|e| err(&format!("subscribe: {e}")))?
         };
 
+        // Core deliveries land on the poll_batch side's `record_poll`;
+        // the subscriber itself doesn't surface fetch errors the way a
+        // JS pull loop does, so the reader task has no metrics to bump.
         let (tx, rx) = mpsc::bounded_async::<Incoming>(cfg.fetch_batch * 2);
         let shutdown = Arc::new(AtomicBool::new(false));
         let reader_shutdown = Arc::clone(&shutdown);
@@ -299,10 +319,15 @@ impl SourceConnector for NatsSource {
         }
 
         let records: Vec<&[u8]> = payloads.iter().map(Bytes::as_ref).collect();
+        let bytes_total: u64 = records.iter().map(|r| r.len() as u64).sum();
         let batch = running
             .deserializer
             .deserialize_batch(&records, &self.schema)
             .map_err(|e| err(&format!("deserialize batch: {e}")))?;
+
+        self.metrics
+            .record_poll(batch.num_rows() as u64, bytes_total);
+        self.update_pending_gauge();
 
         Ok(Some(SourceBatch {
             records: batch,
@@ -356,12 +381,43 @@ impl SourceConnector for NatsSource {
         self.seal_pending();
         while let Some(batch) = self.sealed.pop_front() {
             for msg in batch {
-                if let Err(e) = msg.ack().await {
-                    warn!(error = %e, "JetStream ack failed; broker will redeliver");
+                match msg.ack().await {
+                    Ok(()) => self.metrics.record_ack(),
+                    Err(e) => {
+                        self.metrics.record_ack_error();
+                        warn!(error = %e, "JetStream ack failed; broker will redeliver");
+                    }
                 }
             }
         }
+        self.update_pending_gauge();
         Ok(())
+    }
+
+    fn health_check(&self) -> HealthStatus {
+        match self.config.as_ref() {
+            None => HealthStatus::Unknown,
+            Some(cfg) => {
+                // Warn when pending acks saturate half of `max_ack_pending`;
+                // the broker pauses delivery at 100% and we want a
+                // yellow-light before that.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let cap = cfg.max_ack_pending.max(1) as u64;
+                #[allow(clippy::cast_sign_loss)]
+                let pending = self.metrics.pending_acks.get().max(0) as u64;
+                if pending * 2 >= cap {
+                    HealthStatus::Degraded(format!(
+                        "pending acks {pending}/{cap} — broker may throttle delivery"
+                    ))
+                } else {
+                    HealthStatus::Healthy
+                }
+            }
+        }
+    }
+
+    fn metrics(&self) -> ConnectorMetrics {
+        self.metrics.to_connector_metrics()
     }
 }
 
@@ -433,7 +489,7 @@ mod tests {
 
     #[test]
     fn seal_pending_moves_to_sealed() {
-        let mut src = NatsSource::new(Arc::new(Schema::empty()));
+        let mut src = NatsSource::new(Arc::new(Schema::empty()), None);
         // We can't easily construct jetstream::Message without a real
         // server, so we just test the empty-pending no-op path.
         src.seal_pending();

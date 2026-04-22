@@ -6,9 +6,11 @@
 //!   at-least-once by default and exactly-once with `Nats-Msg-Id` dedup.
 
 pub mod config;
+pub mod metrics;
 pub mod sink;
 pub mod source;
 
+pub use metrics::{NatsSinkMetrics, NatsSourceMetrics};
 pub use sink::NatsSink;
 pub use source::NatsSource;
 
@@ -32,7 +34,7 @@ pub fn register_nats_source(registry: &ConnectorRegistry) {
     registry.register_source(
         "nats",
         info,
-        Arc::new(|_| Box::new(NatsSource::new(Arc::new(Schema::empty())))),
+        Arc::new(|reg| Box::new(NatsSource::new(Arc::new(Schema::empty()), reg))),
     );
 }
 
@@ -49,7 +51,7 @@ pub fn register_nats_sink(registry: &ConnectorRegistry) {
     registry.register_sink(
         "nats",
         info,
-        Arc::new(|_| Box::new(NatsSink::new(Arc::new(Schema::empty())))),
+        Arc::new(|reg| Box::new(NatsSink::new(Arc::new(Schema::empty()), reg))),
     );
 }
 

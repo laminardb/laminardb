@@ -19,9 +19,12 @@ use async_trait::async_trait;
 use futures_util::future::try_join_all;
 
 use super::config::{Mode, NatsSinkConfig, SubjectSpec};
+use super::metrics::NatsSinkMetrics;
 use crate::config::ConnectorConfig;
 use crate::connector::{DeliveryGuarantee, SinkConnector, SinkConnectorCapabilities, WriteResult};
 use crate::error::ConnectorError;
+use crate::health::HealthStatus;
+use crate::metrics::ConnectorMetrics;
 use crate::serde::{self, RecordSerializer};
 
 /// NATS sink — core and `JetStream` modes behind a single type.
@@ -30,6 +33,7 @@ pub struct NatsSink {
     config: Option<NatsSinkConfig>,
     serializer: Option<Box<dyn RecordSerializer>>,
     runtime: Option<Runtime>,
+    metrics: NatsSinkMetrics,
     /// Publish acks from the in-flight epoch, drained in `flush`/`pre_commit`.
     pending_acks: VecDeque<PublishAckFuture>,
 }
@@ -41,13 +45,16 @@ enum Runtime {
 
 impl NatsSink {
     /// Creates a new NATS sink with the given input schema.
+    ///
+    /// If `registry` is `Some`, metrics register on it.
     #[must_use]
-    pub fn new(schema: SchemaRef) -> Self {
+    pub fn new(schema: SchemaRef, registry: Option<&prometheus::Registry>) -> Self {
         Self {
             schema,
             config: None,
             serializer: None,
             runtime: None,
+            metrics: NatsSinkMetrics::new(registry),
             pending_acks: VecDeque::new(),
         }
     }
@@ -111,6 +118,7 @@ impl SinkConnector for NatsSink {
             serializer,
             runtime,
             pending_acks,
+            metrics,
             schema: _,
         } = self;
         let cfg = config.as_ref().ok_or_else(|| err("sink: open() first"))?;
@@ -175,25 +183,31 @@ impl SinkConnector for NatsSink {
                     } else {
                         client.publish(subject.to_string(), payload).await
                     };
-                    result.map_err(|e| err(&format!("core publish: {e}")))?;
+                    result.map_err(|e| {
+                        metrics.record_publish_error();
+                        err(&format!("core publish: {e}"))
+                    })?;
                 }
                 Runtime::JetStream { context } => {
                     let fut = if let Some(h) = headers {
                         context
                             .publish_with_headers(subject.to_string(), h, payload)
                             .await
-                            .map_err(|e| err(&format!("jetstream publish: {e}")))?
                     } else {
-                        context
-                            .publish(subject.to_string(), payload)
-                            .await
-                            .map_err(|e| err(&format!("jetstream publish: {e}")))?
+                        context.publish(subject.to_string(), payload).await
                     };
+                    let fut = fut.map_err(|e| {
+                        metrics.record_publish_error();
+                        err(&format!("jetstream publish: {e}"))
+                    })?;
                     pending_acks.push_back(fut);
                 }
             }
         }
 
+        metrics.record_publish(rows as u64, bytes_total);
+        #[allow(clippy::cast_possible_wrap)]
+        metrics.set_pending_futures(pending_acks.len());
         Ok(WriteResult::new(rows, bytes_total))
     }
 
@@ -224,7 +238,12 @@ impl SinkConnector for NatsSink {
                 .map_err(|e| err(&format!("core flush: {e}")))?,
             Some(Runtime::JetStream { .. }) | None => {}
         }
-        drain_acks(&mut self.pending_acks, Duration::from_secs(1)).await
+        drain_acks(
+            &mut self.pending_acks,
+            &self.metrics,
+            Duration::from_secs(1),
+        )
+        .await
     }
 
     async fn pre_commit(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
@@ -232,12 +251,13 @@ impl SinkConnector for NatsSink {
             .config
             .as_ref()
             .map_or(Duration::from_secs(30), |c| c.ack_timeout);
-        drain_acks(&mut self.pending_acks, timeout).await
+        drain_acks(&mut self.pending_acks, &self.metrics, timeout).await
     }
 
     async fn rollback_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
         // Dedup handles any landed publishes on retry (see LDB-5056).
         self.pending_acks.clear();
+        self.metrics.set_pending_futures(0);
         Ok(())
     }
 
@@ -252,31 +272,70 @@ impl SinkConnector for NatsSink {
         if let Some(Runtime::Core { client }) = self.runtime.as_ref() {
             let _ = client.flush().await;
         }
-        let _ = drain_acks(&mut self.pending_acks, timeout).await;
+        let _ = drain_acks(&mut self.pending_acks, &self.metrics, timeout).await;
         self.runtime = None;
         Ok(())
+    }
+
+    fn health_check(&self) -> HealthStatus {
+        match self.config.as_ref() {
+            None => HealthStatus::Unknown,
+            Some(cfg) => {
+                let cap = cfg.max_pending.max(1) as u64;
+                #[allow(clippy::cast_sign_loss)]
+                let pending = self.metrics.pending_futures.get().max(0) as u64;
+                if pending * 2 >= cap {
+                    HealthStatus::Degraded(format!(
+                        "pending publish acks {pending}/{cap} — ack drain may stall pre_commit"
+                    ))
+                } else {
+                    HealthStatus::Healthy
+                }
+            }
+        }
+    }
+
+    fn metrics(&self) -> ConnectorMetrics {
+        self.metrics.to_connector_metrics()
     }
 }
 
 /// Concurrently drain every `PublishAckFuture` in `pending`, bounded by
 /// `timeout`. Matches the Kafka sink's rollback shape — serial drains
 /// killed throughput. `PublishAckFuture` only implements `IntoFuture`,
-/// hence the explicit conversion.
+/// hence the explicit conversion. Counts server-identified duplicates
+/// via `PubAck.duplicate`.
 async fn drain_acks(
     pending: &mut VecDeque<PublishAckFuture>,
+    metrics: &NatsSinkMetrics,
     timeout: Duration,
 ) -> Result<(), ConnectorError> {
     if pending.is_empty() {
         return Ok(());
     }
     let futures: Vec<_> = pending.drain(..).map(IntoFuture::into_future).collect();
-    match tokio::time::timeout(timeout, try_join_all(futures)).await {
-        Ok(Ok(_acks)) => Ok(()),
-        Ok(Err(e)) => Err(err(&format!("jetstream publish ack: {e}"))),
-        Err(_) => Err(err(&format!(
-            "jetstream publish ack: timed out after {timeout:?}"
-        ))),
-    }
+    let result = match tokio::time::timeout(timeout, try_join_all(futures)).await {
+        Ok(Ok(acks)) => {
+            for ack in acks {
+                if ack.duplicate {
+                    metrics.record_dedup();
+                }
+            }
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            metrics.record_ack_error();
+            Err(err(&format!("jetstream publish ack: {e}")))
+        }
+        Err(_) => {
+            metrics.record_ack_error();
+            Err(err(&format!(
+                "jetstream publish ack: timed out after {timeout:?}"
+            )))
+        }
+    };
+    metrics.set_pending_futures(pending.len());
+    result
 }
 
 fn resolve_utf8<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray, ConnectorError> {
