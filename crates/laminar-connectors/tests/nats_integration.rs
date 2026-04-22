@@ -415,6 +415,209 @@ async fn source_flips_unhealthy_after_stream_deleted() {
     );
 }
 
+// ── chaos ──
+
+/// Shell out to `docker compose restart nats`. Synchronous; the command
+/// returns when the new container is up.
+fn restart_nats() {
+    let compose_file = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/docker-compose.nats.yml");
+    let status = std::process::Command::new("docker")
+        .args(["compose", "-f", compose_file, "restart", "nats"])
+        .status()
+        .expect("docker compose restart nats");
+    assert!(status.success(), "docker compose restart exited non-zero");
+}
+
+fn dedup_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("event_id", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]))
+}
+
+fn dedup_batch(ids: std::ops::Range<i64>) -> RecordBatch {
+    let evt_ids: Vec<String> = ids.clone().map(|i| format!("evt-{i}")).collect();
+    let values: Vec<i64> = ids.collect();
+    RecordBatch::try_new(
+        dedup_schema(),
+        vec![
+            Arc::new(StringArray::from(
+                evt_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )
+    .unwrap()
+}
+
+/// Exactly-once sink survives a broker restart. Publishes 50 rows,
+/// restarts the broker, re-publishes those same 50 plus 50 new ones
+/// (simulating a rollback + retry). The stream must end up with
+/// exactly 100 unique rows — no duplicates, no loss. This is the
+/// guarantee `duplicate_window` + `Nats-Msg-Id` buy us, and the one
+/// place we get to exercise it end-to-end.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs docker compose available on host; chaos test restarts the broker"]
+async fn exactly_once_survives_broker_restart() {
+    let ctx = connect().await;
+    reset_stream(
+        &ctx,
+        StreamConfig {
+            name: "RESTART".into(),
+            subjects: vec!["restart.events".into()],
+            duplicate_window: Duration::from_secs(300),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let schema = dedup_schema();
+    let props = source_props(&[
+        ("servers", NATS_URL),
+        ("subject", "restart.events"),
+        ("stream", "RESTART"),
+        ("delivery.guarantee", "exactly_once"),
+        ("dedup.id.column", "event_id"),
+        ("format", "json"),
+        ("ack.timeout.ms", "10000"),
+    ]);
+
+    let mut sink = NatsSink::new(schema.clone(), None);
+    sink.open(&ConnectorConfig::with_properties("nats", props.clone()))
+        .await
+        .expect("sink open");
+
+    // First epoch: publish rows 0..50.
+    sink.write_batch(&dedup_batch(0..50))
+        .await
+        .expect("first batch publish");
+    sink.pre_commit(1).await.expect("first epoch drain");
+
+    // Restart the broker while the sink's client is idle between
+    // epochs. JetStream persists stream + dedup state to disk, so the
+    // window survives the restart.
+    restart_nats();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // The sink's TCP connection went with the broker. Close and reopen
+    // rather than wait for transparent reconnect — operators in the
+    // real pipeline loop do the same on hard failures.
+    let _ = sink.close().await;
+    let mut sink = NatsSink::new(schema, None);
+    sink.open(&ConnectorConfig::with_properties("nats", props))
+        .await
+        .expect("sink reopen after restart");
+
+    // Second epoch: replay rows 0..50 (server dedups) + publish 50..100.
+    sink.write_batch(&dedup_batch(0..100))
+        .await
+        .expect("second batch publish");
+    sink.pre_commit(2).await.expect("second epoch drain");
+    sink.close().await.expect("sink close");
+
+    // The stream must hold exactly 100 rows — dedup caught the replay.
+    let mut stream = ctx.get_stream("RESTART").await.expect("get_stream");
+    let info = stream.info().await.expect("info");
+    assert_eq!(
+        info.state.messages, 100,
+        "expected 100 unique messages after dedup; got {}",
+        info.state.messages
+    );
+}
+
+/// Source that never calls `notify_epoch_committed` must not ack.
+/// Re-opening the same durable consumer after `ack_wait` expires
+/// replays the messages; once the second instance commits, a third
+/// instance sees nothing.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs docker compose -f docker-compose.nats.yml up"]
+async fn source_redelivers_when_epoch_not_committed() {
+    let ctx = connect().await;
+    reset_stream(
+        &ctx,
+        StreamConfig {
+            name: "ACKTEST".into(),
+            subjects: vec!["acktest.events".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Seed: publish 3 rows directly via the server-side context so the
+    // source has something to consume.
+    for i in 0..3i64 {
+        let payload = format!(r#"{{"id": {i}, "name": "row-{i}"}}"#);
+        ctx.publish("acktest.events".to_string(), payload.into())
+            .await
+            .expect("publish")
+            .await
+            .expect("ack");
+    }
+
+    let props = source_props(&[
+        ("servers", NATS_URL),
+        ("stream", "ACKTEST"),
+        ("consumer", "acktest-consumer"),
+        ("subject", "acktest.events"),
+        ("format", "json"),
+        ("ack.wait.ms", "2000"),
+        ("fetch.max.wait.ms", "250"),
+    ]);
+
+    // First source: poll, do NOT commit.
+    let mut source = NatsSource::new(payload_schema(), None);
+    source
+        .open(&ConnectorConfig::with_properties("nats", props.clone()))
+        .await
+        .expect("source 1 open");
+    let first = drain_rows(&mut source, 3, Duration::from_secs(5)).await;
+    source.close().await.expect("source 1 close");
+
+    // Wait longer than ack_wait so the server unparks the unacked set
+    // and lets a fresh consumer receive them.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Second source: poll, commit this time.
+    let mut source = NatsSource::new(payload_schema(), None);
+    source
+        .open(&ConnectorConfig::with_properties("nats", props.clone()))
+        .await
+        .expect("source 2 open");
+    let second = drain_rows(&mut source, 3, Duration::from_secs(5)).await;
+    assert_eq!(
+        first, second,
+        "expected the same messages redelivered after no-commit close"
+    );
+    source
+        .notify_epoch_committed(1)
+        .await
+        .expect("epoch commit acks");
+    source.close().await.expect("source 2 close");
+
+    // Third source: now the acks have landed, nothing should remain.
+    let mut source = NatsSource::new(payload_schema(), None);
+    source
+        .open(&ConnectorConfig::with_properties("nats", props))
+        .await
+        .expect("source 3 open");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut saw_redelivery = false;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Some(batch)) = source.poll_batch(10).await {
+            if batch.records.num_rows() > 0 {
+                saw_redelivery = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    source.close().await.expect("source 3 close");
+    assert!(
+        !saw_redelivery,
+        "expected no messages after source 2 committed — got a redelivery"
+    );
+}
+
 // ── auth ──
 
 const SECURE_NATS_URL: &str = "nats://127.0.0.1:4223";
