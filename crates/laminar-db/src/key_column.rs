@@ -3,8 +3,9 @@
 //! Shared key-column utilities for streaming joins (ASOF, interval,
 //! temporal probe).
 
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+
+use rustc_hash::FxHasher;
 
 use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
@@ -30,12 +31,12 @@ impl KeyColumn<'_> {
         if self.is_null(i) {
             return None;
         }
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = FxHasher::default();
         self.hash_into(i, &mut hasher);
         Some(hasher.finish())
     }
 
-    pub fn hash_into(&self, i: usize, hasher: &mut DefaultHasher) {
+    pub fn hash_into(&self, i: usize, hasher: &mut FxHasher) {
         match self {
             KeyColumn::Utf8(a) => a.value(i).hash(hasher),
             KeyColumn::Int64(a) => a.value(i).hash(hasher),
@@ -172,7 +173,7 @@ impl<'a> CompositeKey<'a> {
         if self.columns.iter().any(|c| c.is_null(i)) {
             return None;
         }
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = FxHasher::default();
         for col in &self.columns {
             col.hash_into(i, &mut hasher);
         }

@@ -1,7 +1,7 @@
 //! Avro deserialization using `arrow-avro` with Confluent Schema Registry.
 //!
 //! [`AvroDeserializer`] implements [`RecordDeserializer`] by wrapping the
-//! `arrow-avro` push-based [`Decoder`](arrow_avro::reader::Decoder), which
+//! `arrow-avro` push-based [`Decoder`], which
 //! natively supports the Confluent wire format (`0x00` + 4-byte BE schema ID
 //! + Avro payload).
 
@@ -9,13 +9,16 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_avro::reader::ReaderBuilder;
+use arrow_avro::reader::{Decoder, ReaderBuilder};
 use arrow_avro::schema::{AvroSchema, Fingerprint, FingerprintAlgorithm, SchemaStore};
 use arrow_schema::SchemaRef;
+use parking_lot::Mutex;
 
 use crate::error::SerdeError;
 use crate::kafka::schema_registry::SchemaRegistryClient;
 use crate::serde::{Format, RecordDeserializer};
+
+const DECODER_BATCH_CAPACITY: usize = 8192;
 
 /// Confluent wire format magic byte.
 const CONFLUENT_MAGIC: u8 = 0x00;
@@ -35,6 +38,8 @@ pub struct AvroDeserializer {
     schema_registry: Option<Arc<SchemaRegistryClient>>,
     /// Set of schema IDs already registered in the store.
     known_ids: HashSet<i32>,
+    /// Reused across batches; rebuilt when `register_schema` runs.
+    decoder: Mutex<Option<Decoder>>,
 }
 
 impl AvroDeserializer {
@@ -47,6 +52,7 @@ impl AvroDeserializer {
             schema_store: SchemaStore::new_with_type(FingerprintAlgorithm::Id),
             schema_registry: None,
             known_ids: HashSet::new(),
+            decoder: Mutex::new(None),
         }
     }
 
@@ -60,6 +66,7 @@ impl AvroDeserializer {
             schema_store: SchemaStore::new_with_type(FingerprintAlgorithm::Id),
             schema_registry: Some(registry),
             known_ids: HashSet::new(),
+            decoder: Mutex::new(None),
         }
     }
 
@@ -82,6 +89,9 @@ impl AvroDeserializer {
             .set(fp, avro_schema)
             .map_err(|e| SerdeError::MalformedInput(format!("failed to register schema: {e}")))?;
         self.known_ids.insert(schema_id);
+        // Schema store changed — drop the cached decoder so it rebuilds
+        // against the new store on the next deserialize_batch call.
+        *self.decoder.lock() = None;
         Ok(())
     }
 
@@ -147,12 +157,19 @@ impl RecordDeserializer for AvroDeserializer {
             return Ok(RecordBatch::new_empty(schema.clone()));
         }
 
-        let mut decoder = ReaderBuilder::new()
-            .with_batch_size(records.len())
-            .with_writer_schema_store(self.schema_store.clone())
-            .build_decoder()
-            .map_err(|e| SerdeError::MalformedInput(format!("failed to build decoder: {e}")))?;
+        let mut guard = self.decoder.lock();
+        let decoder = if let Some(d) = guard.as_mut() {
+            d
+        } else {
+            let d = ReaderBuilder::new()
+                .with_batch_size(DECODER_BATCH_CAPACITY)
+                .with_writer_schema_store(self.schema_store.clone())
+                .build_decoder()
+                .map_err(|e| SerdeError::MalformedInput(format!("failed to build decoder: {e}")))?;
+            guard.insert(d)
+        };
 
+        let mut partials: Vec<RecordBatch> = Vec::new();
         for record in records {
             let mut offset = 0;
             while offset < record.len() {
@@ -163,13 +180,29 @@ impl RecordDeserializer for AvroDeserializer {
                     break;
                 }
                 offset += consumed;
+                if decoder.batch_is_full() {
+                    if let Some(b) = decoder
+                        .flush()
+                        .map_err(|e| SerdeError::MalformedInput(format!("Avro flush: {e}")))?
+                    {
+                        partials.push(b);
+                    }
+                }
             }
         }
-
-        decoder
+        if let Some(b) = decoder
             .flush()
-            .map_err(|e| SerdeError::MalformedInput(format!("Avro flush error: {e}")))?
-            .ok_or_else(|| SerdeError::MalformedInput("no records decoded".into()))
+            .map_err(|e| SerdeError::MalformedInput(format!("Avro flush: {e}")))?
+        {
+            partials.push(b);
+        }
+
+        match partials.len() {
+            0 => Err(SerdeError::MalformedInput("no records decoded".into())),
+            1 => Ok(partials.pop().unwrap()),
+            _ => arrow_select::concat::concat_batches(schema, &partials)
+                .map_err(|e| SerdeError::MalformedInput(format!("concat: {e}"))),
+        }
     }
 
     fn format(&self) -> Format {

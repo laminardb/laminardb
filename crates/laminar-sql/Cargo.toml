@@ -17,7 +17,7 @@ cluster-unstable = ["laminar-core/cluster-unstable"]
 
 [dependencies]
 # Core dependency
-laminar-core = { path = "../laminar-core", version = "0.21.0" }
+laminar-core = { path = "../laminar-core", version = "0.21.5" }
 
 # Runtime glue for ClusterRepartitionExec's per-partition channels.
 tokio-stream = { workspace = true }

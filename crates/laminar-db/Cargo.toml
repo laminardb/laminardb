@@ -44,10 +44,10 @@ gcs = ["laminar-storage/gcs"]
 azure = ["laminar-storage/azure"]
 
 [dependencies]
-laminar-core = { path = "../laminar-core", version = "0.21.0" }
-laminar-sql = { path = "../laminar-sql", version = "0.21.0" }
-laminar-storage = { path = "../laminar-storage", version = "0.21.0" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.21.0" }
+laminar-core = { path = "../laminar-core", version = "0.21.5" }
+laminar-sql = { path = "../laminar-sql", version = "0.21.5" }
+laminar-storage = { path = "../laminar-storage", version = "0.21.5" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.21.5" }
 
 # Arrow
 arrow = { workspace = true }
@@ -107,8 +107,8 @@ bytes = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }
-laminar-derive = { path = "../laminar-derive", version = "0.21.0" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.21.0", features = ["testing"] }
+laminar-derive = { path = "../laminar-derive", version = "0.21.5" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.21.5", features = ["testing"] }
 criterion = { workspace = true }
 bytes = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -135,4 +135,8 @@ harness = false
 
 [[bench]]
 name = "stream_executor_bench"
+harness = false
+
+[[bench]]
+name = "hot_path_micro"
 harness = false
