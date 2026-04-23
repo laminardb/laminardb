@@ -1,7 +1,7 @@
 //! Avro deserialization using `arrow-avro` with Confluent Schema Registry.
 //!
 //! [`AvroDeserializer`] implements [`RecordDeserializer`] by wrapping the
-//! `arrow-avro` push-based [`Decoder`](arrow_avro::reader::Decoder), which
+//! `arrow-avro` push-based [`Decoder`], which
 //! natively supports the Confluent wire format (`0x00` + 4-byte BE schema ID
 //! + Avro payload).
 
