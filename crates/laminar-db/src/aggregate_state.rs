@@ -81,10 +81,12 @@ pub(crate) fn emit_window_batch(
         }
     }
 
-    let win_start_array: ArrayRef =
-        Arc::new(arrow::array::Int64Array::from(vec![window_start; num_rows]));
-    let win_end_array: ArrayRef =
-        Arc::new(arrow::array::Int64Array::from(vec![window_end; num_rows]));
+    let win_start_array: ArrayRef = Arc::new(arrow::array::Int64Array::from_iter_values(
+        std::iter::repeat_n(window_start, num_rows),
+    ));
+    let win_end_array: ArrayRef = Arc::new(arrow::array::Int64Array::from_iter_values(
+        std::iter::repeat_n(window_end, num_rows),
+    ));
 
     let group_arrays = if num_group_cols == 0 {
         Vec::new()
@@ -776,20 +778,22 @@ impl IncrementalAggState {
             .convert_columns(&group_cols)
             .map_err(|e| DbError::Pipeline(format!("row conversion: {e}")))?;
 
-        // Group row indices by key for batch accumulator updates.
+        // Local map keyed by borrowed Row: one OwnedRow alloc per unique
+        // group, not per row.
         let estimated_groups = (batch.num_rows() / 4).max(16);
-        let mut group_indices: FxHashMap<arrow::row::OwnedRow, Vec<u32>> =
+        let mut group_indices: FxHashMap<arrow::row::Row<'_>, Vec<u32>> =
             FxHashMap::with_capacity_and_hasher(estimated_groups, rustc_hash::FxBuildHasher);
         for row_idx in 0..batch.num_rows() {
             #[allow(clippy::cast_possible_truncation)]
             group_indices
-                .entry(rows.row(row_idx).owned())
+                .entry(rows.row(row_idx))
                 .or_default()
                 .push(row_idx as u32);
         }
 
-        for (row_key, indices) in &group_indices {
-            if !self.groups.contains_key(row_key) {
+        for (row_ref, indices) in &group_indices {
+            let owned_key = row_ref.owned();
+            if !self.groups.contains_key(&owned_key) {
                 if self.groups.len() >= self.max_groups {
                     tracing::warn!(
                         max_groups = self.max_groups,
@@ -808,14 +812,14 @@ impl IncrementalAggState {
                     accs.push(acc);
                 }
                 self.groups.insert(
-                    row_key.clone(),
+                    owned_key.clone(),
                     GroupEntry {
                         accs,
                         last_updated_ms: watermark_ms,
                     },
                 );
             }
-            let Some(entry) = self.groups.get_mut(row_key) else {
+            let Some(entry) = self.groups.get_mut(&owned_key) else {
                 continue;
             };
             Self::update_group_accumulators(
