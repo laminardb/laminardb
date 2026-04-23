@@ -63,6 +63,7 @@ pub struct MockSourceConnector {
     batch_size: usize,
     records_produced: AtomicU64,
     is_open: std::sync::atomic::AtomicBool,
+    committed_epochs: Arc<Mutex<Vec<u64>>>,
 }
 
 impl MockSourceConnector {
@@ -75,6 +76,7 @@ impl MockSourceConnector {
             batch_size: 5,
             records_produced: AtomicU64::new(0),
             is_open: std::sync::atomic::AtomicBool::new(false),
+            committed_epochs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -87,6 +89,7 @@ impl MockSourceConnector {
             batch_size,
             records_produced: AtomicU64::new(0),
             is_open: std::sync::atomic::AtomicBool::new(false),
+            committed_epochs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -94,6 +97,15 @@ impl MockSourceConnector {
     #[must_use]
     pub fn records_produced(&self) -> u64 {
         self.records_produced.load(Ordering::Relaxed)
+    }
+
+    /// Returns a handle for inspecting epochs reported to
+    /// `notify_epoch_committed` from outside the connector (the
+    /// connector itself is moved into a background task when run via
+    /// the pipeline).
+    #[must_use]
+    pub fn committed_epochs_handle(&self) -> Arc<Mutex<Vec<u64>>> {
+        Arc::clone(&self.committed_epochs)
     }
 }
 
@@ -162,6 +174,11 @@ impl SourceConnector for MockSourceConnector {
     async fn close(&mut self) -> Result<(), ConnectorError> {
         self.is_open
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn notify_epoch_committed(&mut self, epoch: u64) -> Result<(), ConnectorError> {
+        self.committed_epochs.lock().push(epoch);
         Ok(())
     }
 }

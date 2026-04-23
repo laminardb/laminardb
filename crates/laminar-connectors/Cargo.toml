@@ -87,6 +87,13 @@ tokio-tungstenite = { version = "0.28", features = ["native-tls"], optional = tr
 tungstenite = { version = "0.28", optional = true }
 futures-util = { version = "0.3", features = ["sink"], optional = true }
 
+# NATS (core + JetStream)
+async-nats = { version = "0.47", optional = true }
+# Used by the NATS connector for RFC3339 → OffsetDateTime parsing when
+# deliver.policy=by_start_time. Already pulled in transitively by
+# async-nats — making the dep direct so we can name the type.
+time = { version = "0.3", optional = true, features = ["parsing"] }
+
 # OpenTelemetry OTLP/gRPC receiver
 opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "trace", "metrics", "logs"], optional = true }
 tonic = { version = "0.14", optional = true }
@@ -128,6 +135,8 @@ websocket = ["dep:tokio-tungstenite", "dep:tungstenite", "dep:futures-util", "de
 files = ["dep:notify", "dep:globset", "dep:object_store", "dep:parquet", "dep:libc", "dep:tokio-stream", "dep:xorf"]
 # OpenTelemetry OTLP/gRPC source
 otel = ["dep:opentelemetry-proto", "dep:tonic", "dep:prost", "dep:base64"]
+# NATS core + JetStream source and sink
+nats = ["dep:async-nats", "dep:tokio-stream", "dep:futures-util", "dep:time"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

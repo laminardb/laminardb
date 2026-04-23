@@ -441,6 +441,19 @@ pub trait SourceConnector: Send {
     fn checkpoint_requested(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
         None
     }
+
+    /// Acknowledge that `epoch` has been durably committed.
+    ///
+    /// Called after the manifest is persisted and every exactly-once sink
+    /// committed the epoch. Idempotent — a retry after cancellation is
+    /// legal.
+    ///
+    /// # Errors
+    ///
+    /// Errors are logged; they do not roll back the committed epoch.
+    async fn notify_epoch_committed(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
+        Ok(())
+    }
 }
 
 /// Trait for sink connectors that write data to external systems.

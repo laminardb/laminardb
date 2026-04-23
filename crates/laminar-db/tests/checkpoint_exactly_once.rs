@@ -88,20 +88,25 @@ impl PipelineCallback for BarrierTrackingCallback {
             String,
             laminar_connectors::checkpoint::SourceCheckpoint,
         >,
-    ) -> bool {
+    ) -> Option<u64> {
         if force {
             self.force_checkpoints += 1;
-            return true;
+            return Some(self.force_checkpoints);
         }
-        self.should_trigger.load(Ordering::Relaxed)
+        if self.should_trigger.load(Ordering::Relaxed) {
+            Some(1)
+        } else {
+            None
+        }
     }
 
     async fn checkpoint_with_barrier(
         &mut self,
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
-    ) -> bool {
+    ) -> Option<u64> {
+        let epoch = self.barrier_checkpoints.len() as u64 + 1;
         self.barrier_checkpoints.push(source_checkpoints);
-        true
+        Some(epoch)
     }
 
     fn record_cycle(&self, _events_ingested: u64, _batches: u64, _elapsed_ns: u64) {}
@@ -176,6 +181,75 @@ async fn test_barrier_aligned_checkpoint_fires() {
         total > 0,
         "pipeline should have processed records, got {total}"
     );
+}
+
+/// After a barrier checkpoint commits, each source's
+/// `notify_epoch_committed` should fire with a monotonic epoch.
+#[tokio::test]
+async fn test_notify_epoch_committed_propagates_to_sources() {
+    let src_a = laminar_connectors::testing::MockSourceConnector::with_batches(50, 10);
+    let src_b = laminar_connectors::testing::MockSourceConnector::with_batches(50, 10);
+    let epochs_a = src_a.committed_epochs_handle();
+    let epochs_b = src_b.committed_epochs_handle();
+
+    let sources = vec![
+        SourceRegistration {
+            name: "src_a".to_string(),
+            connector: Box::new(src_a),
+            config: laminar_connectors::config::ConnectorConfig::new("mock"),
+            supports_replay: true,
+            restore_checkpoint: None,
+        },
+        SourceRegistration {
+            name: "src_b".to_string(),
+            connector: Box::new(src_b),
+            config: laminar_connectors::config::ConnectorConfig::new("mock"),
+            supports_replay: true,
+            restore_checkpoint: None,
+        },
+    ];
+
+    let shutdown = Arc::new(Notify::new());
+    let shutdown_clone = Arc::clone(&shutdown);
+
+    let config = PipelineConfig {
+        fallback_poll_interval: Duration::from_millis(1),
+        batch_window: Duration::ZERO,
+        checkpoint_interval: Some(Duration::from_millis(10)),
+        barrier_alignment_timeout: Duration::from_secs(5),
+        ..PipelineConfig::default()
+    };
+
+    let (_control_tx, control_rx) =
+        crossfire::mpsc::bounded_async::<laminar_db::pipeline::ControlMsg>(64);
+    let coordinator = StreamingCoordinator::new(sources, config, shutdown, control_rx)
+        .await
+        .unwrap();
+
+    let should_trigger = Arc::new(AtomicBool::new(true));
+    let record_counter = Arc::new(AtomicU64::new(0));
+    let callback =
+        BarrierTrackingCallback::new(Arc::clone(&should_trigger), Arc::clone(&record_counter));
+
+    let handle = tokio::spawn(async move {
+        coordinator.run(callback).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    shutdown_clone.notify_one();
+    handle.await.unwrap();
+
+    for (label, epochs) in [("src_a", &epochs_a), ("src_b", &epochs_b)] {
+        let observed = epochs.lock().clone();
+        assert!(
+            !observed.is_empty(),
+            "{label}: expected at least one notify_epoch_committed call, got {observed:?}"
+        );
+        assert!(
+            observed.windows(2).all(|w| w[0] <= w[1]),
+            "{label}: epochs must be non-decreasing, got {observed:?}"
+        );
+    }
 }
 
 /// Test that checkpoint persisted via barrier path can be recovered.

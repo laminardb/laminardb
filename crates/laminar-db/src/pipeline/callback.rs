@@ -64,7 +64,8 @@ pub trait PipelineCallback: Send + 'static {
     /// Get the current pipeline watermark.
     fn current_watermark(&self) -> i64;
 
-    /// Perform a periodic (timer-based) checkpoint. Returns true if checkpoint was triggered.
+    /// Perform a periodic (timer-based) checkpoint. Returns `Some(epoch)`
+    /// on successful commit, `None` otherwise.
     ///
     /// **Semantics: at-least-once.** Timer-based checkpoints capture source
     /// offsets *before* operator state. On recovery the consumer replays
@@ -80,17 +81,15 @@ pub trait PipelineCallback: Send + 'static {
         &mut self,
         force: bool,
         source_offsets: FxHashMap<String, SourceCheckpoint>,
-    ) -> bool;
+    ) -> Option<u64>;
 
-    /// Called when all sources have aligned on a barrier.
-    ///
-    /// Receives source checkpoints captured at the barrier point (consistent).
-    /// The callback should snapshot operator state and persist the checkpoint.
-    /// Returns true if the checkpoint succeeded.
+    /// Called when all sources have aligned on a barrier. Returns
+    /// `Some(epoch)` on successful commit, `None` on failure — the
+    /// caller retries on the next interval.
     async fn checkpoint_with_barrier(
         &mut self,
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
-    ) -> bool;
+    ) -> Option<u64>;
 
     /// Record cycle metrics.
     fn record_cycle(&self, events_ingested: u64, batches: u64, elapsed_ns: u64);

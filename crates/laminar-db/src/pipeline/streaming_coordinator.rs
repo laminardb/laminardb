@@ -26,7 +26,8 @@ use std::time::{Duration, Instant};
 use arrow_array::RecordBatch;
 use crossfire::{mpsc, AsyncRx};
 use laminar_connectors::checkpoint::SourceCheckpoint;
-use laminar_connectors::connector::DeliveryGuarantee;
+use laminar_connectors::connector::{DeliveryGuarantee, SourceBatch};
+use laminar_connectors::error::ConnectorError;
 use laminar_core::alloc::{PriorityClass, PriorityGuard};
 use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -72,6 +73,9 @@ struct SourceHandle {
     join: tokio::task::JoinHandle<()>,
     /// Injector for Chandy-Lamport checkpoint barriers.
     barrier_injector: CheckpointBarrierInjector,
+    /// Latest committed epoch; source acks on pickup. Monotonic, so
+    /// watch's skip-latest semantics are safe.
+    epoch_committed_tx: tokio::sync::watch::Sender<Option<u64>>,
 }
 
 /// Simplified pipeline coordinator — single tokio task, no core threads.
@@ -153,7 +157,21 @@ impl PendingBarrier {
 /// Fallback timeout for idle wake.
 const IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// What woke a source task's select loop.
+enum SourceWake {
+    Shutdown,
+    EpochCommitted(u64),
+    Polled(Result<Option<SourceBatch>, ConnectorError>),
+}
+
 impl StreamingCoordinator {
+    /// Fan out a committed epoch to every source so they can ack.
+    fn broadcast_epoch_committed(&self, epoch: u64) {
+        for handle in &self.source_handles {
+            let _ = handle.epoch_committed_tx.send(Some(epoch));
+        }
+    }
+
     /// Create a new streaming coordinator.
     ///
     /// Spawns a tokio task for each source that polls the connector and
@@ -240,16 +258,42 @@ impl StreamingCoordinator {
             let barrier_injector = CheckpointBarrierInjector::new();
             let barrier_handle = barrier_injector.handle();
 
+            let (epoch_committed_tx, mut epoch_committed_rx) =
+                tokio::sync::watch::channel::<Option<u64>>(None);
+
             let join = tokio::spawn(async move {
                 let mut epoch: u64 = 0;
 
-                // Poll loop — tokio::select! ensures shutdown cancels a
-                // long-running poll_batch without waiting for it to return.
+                // Ack a fresh commit before polling more — keeps
+                // max_ack_pending headroom for the broker.
                 loop {
-                    let poll_result = tokio::select! {
+                    let wake = tokio::select! {
                         biased;
-                        () = task_shutdown_clone.notified() => break,
-                        result = connector.poll_batch(max_poll) => result,
+                        () = task_shutdown_clone.notified() => SourceWake::Shutdown,
+                        r = epoch_committed_rx.changed() => match r {
+                            Ok(()) => match *epoch_committed_rx.borrow_and_update() {
+                                Some(e) => SourceWake::EpochCommitted(e),
+                                None => continue,
+                            },
+                            Err(_) => SourceWake::Shutdown,
+                        },
+                        r = connector.poll_batch(max_poll) => SourceWake::Polled(r),
+                    };
+
+                    let poll_result = match wake {
+                        SourceWake::Shutdown => break,
+                        SourceWake::EpochCommitted(e) => {
+                            if let Err(err) = connector.notify_epoch_committed(e).await {
+                                tracing::warn!(
+                                    source = %src_name,
+                                    error = %err,
+                                    epoch = e,
+                                    "notify_epoch_committed failed",
+                                );
+                            }
+                            continue;
+                        }
+                        SourceWake::Polled(r) => r,
                     };
 
                     match poll_result {
@@ -330,6 +374,7 @@ impl StreamingCoordinator {
                 shutdown: task_shutdown,
                 join,
                 barrier_injector,
+                epoch_committed_tx,
             });
             source_names.push(arc_name);
         }
@@ -640,8 +685,9 @@ impl StreamingCoordinator {
                     })
                 })
                 .collect();
-            if callback.maybe_checkpoint(true, source_offsets).await {
-                tracing::info!("final checkpoint completed before shutdown");
+            if let Some(epoch) = callback.maybe_checkpoint(true, source_offsets).await {
+                tracing::info!(epoch, "final checkpoint completed before shutdown");
+                self.broadcast_epoch_committed(epoch);
             }
         }
     }
@@ -754,8 +800,9 @@ impl StreamingCoordinator {
         // Check if all sources aligned.
         if self.pending_barrier.sources_aligned.len() >= self.pending_barrier.sources_total {
             let checkpoints = std::mem::take(&mut self.pending_barrier.source_checkpoints);
-            let ok = callback.checkpoint_with_barrier(checkpoints).await;
-            if !ok {
+            if let Some(epoch) = callback.checkpoint_with_barrier(checkpoints).await {
+                self.broadcast_epoch_committed(epoch);
+            } else {
                 tracing::warn!(
                     checkpoint_id = self.pending_barrier.checkpoint_id,
                     "barrier checkpoint failed, will retry on next interval"
@@ -784,7 +831,9 @@ impl StreamingCoordinator {
         // Leader-side nodes short-circuit here (no checkpoint_interval
         // configured in the tests that drive `db.checkpoint()` manually).
         let offsets = FxHashMap::default();
-        callback.maybe_checkpoint(false, offsets).await;
+        if let Some(epoch) = callback.maybe_checkpoint(false, offsets).await {
+            self.broadcast_epoch_committed(epoch);
+        }
 
         let should_checkpoint = self
             .config
@@ -802,8 +851,9 @@ impl StreamingCoordinator {
         if self.source_handles.is_empty() {
             // No sources — timer-based checkpoint only.
             let offsets = FxHashMap::default();
-            if callback.maybe_checkpoint(false, offsets).await {
+            if let Some(epoch) = callback.maybe_checkpoint(false, offsets).await {
                 self.last_checkpoint = Instant::now();
+                self.broadcast_epoch_committed(epoch);
             }
             return;
         }
@@ -887,20 +937,22 @@ mod tests {
             &mut self,
             force: bool,
             _source_offsets: FxHashMap<String, SourceCheckpoint>,
-        ) -> bool {
+        ) -> Option<u64> {
             if force {
                 if let Some(ref flag) = self.force_checkpoint_flag {
                     flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
+                Some(1)
+            } else {
+                None
             }
-            force
         }
 
         async fn checkpoint_with_barrier(
             &mut self,
             _source_checkpoints: FxHashMap<String, SourceCheckpoint>,
-        ) -> bool {
-            true
+        ) -> Option<u64> {
+            Some(1)
         }
 
         fn record_cycle(&self, _events: u64, _batches: u64, _elapsed_ns: u64) {}
@@ -1288,13 +1340,13 @@ mod tests {
             &mut self,
             force: bool,
             offsets: FxHashMap<String, SourceCheckpoint>,
-        ) -> bool {
+        ) -> Option<u64> {
             self.inner.maybe_checkpoint(force, offsets).await
         }
         async fn checkpoint_with_barrier(
             &mut self,
             cp: FxHashMap<String, SourceCheckpoint>,
-        ) -> bool {
+        ) -> Option<u64> {
             self.inner.checkpoint_with_barrier(cp).await
         }
         fn record_cycle(&self, e: u64, b: u64, ns: u64) {
