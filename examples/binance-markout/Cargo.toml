@@ -2,7 +2,7 @@
 
 [package]
 name = "binance-markout"
-version = "0.20.2"
+version = "0.21.5"
 edition = "2021"
 publish = false
 description = "Real-time mark-out analysis over Binance BTC-USDT-PERP using LaminarDB's TEMPORAL PROBE JOIN"
@@ -12,8 +12,8 @@ name = "binance-markout"
 path = "src/main.rs"
 
 [dependencies]
-laminar-db = { path = "../../crates/laminar-db", version = "0.20.2", features = ["websocket"] }
-laminar-derive = { path = "../../crates/laminar-derive", version = "0.20.2" }
+laminar-db = { path = "../../crates/laminar-db", version = "0.21.5", features = ["websocket"] }
+laminar-derive = { path = "../../crates/laminar-derive", version = "0.21.5" }
 arrow = "57.2"
 tokio = { version = "1.50", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

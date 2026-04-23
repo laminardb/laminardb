@@ -158,18 +158,15 @@ impl RecordDeserializer for AvroDeserializer {
         }
 
         let mut guard = self.decoder.lock();
-        let decoder = match guard.as_mut() {
-            Some(d) => d,
-            None => {
-                let d = ReaderBuilder::new()
-                    .with_batch_size(DECODER_BATCH_CAPACITY)
-                    .with_writer_schema_store(self.schema_store.clone())
-                    .build_decoder()
-                    .map_err(|e| {
-                        SerdeError::MalformedInput(format!("failed to build decoder: {e}"))
-                    })?;
-                guard.insert(d)
-            }
+        let decoder = if let Some(d) = guard.as_mut() {
+            d
+        } else {
+            let d = ReaderBuilder::new()
+                .with_batch_size(DECODER_BATCH_CAPACITY)
+                .with_writer_schema_store(self.schema_store.clone())
+                .build_decoder()
+                .map_err(|e| SerdeError::MalformedInput(format!("failed to build decoder: {e}")))?;
+            guard.insert(d)
         };
 
         let mut partials: Vec<RecordBatch> = Vec::new();
