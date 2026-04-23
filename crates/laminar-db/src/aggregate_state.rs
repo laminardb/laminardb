@@ -791,36 +791,35 @@ impl IncrementalAggState {
                 .push(row_idx as u32);
         }
 
+        let max_groups = self.max_groups;
+        let mut groups_len = self.groups.len();
         for (row_ref, indices) in &group_indices {
-            let owned_key = row_ref.owned();
-            if !self.groups.contains_key(&owned_key) {
-                if self.groups.len() >= self.max_groups {
-                    tracing::warn!(
-                        max_groups = self.max_groups,
-                        current_groups = self.groups.len(),
-                        "group cardinality limit reached, dropping new group"
-                    );
-                    continue;
-                }
-                let mut accs = Vec::with_capacity(self.agg_specs.len());
-                for spec in &self.agg_specs {
-                    let acc = if self.weight_col_idx.is_some() {
-                        spec.create_retractable_accumulator()?
-                    } else {
-                        spec.create_accumulator()?
-                    };
-                    accs.push(acc);
-                }
-                self.groups.insert(
-                    owned_key.clone(),
-                    GroupEntry {
+            let entry = match self.groups.entry(row_ref.owned()) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    if groups_len >= max_groups {
+                        tracing::warn!(
+                            max_groups,
+                            current_groups = groups_len,
+                            "group cardinality limit reached, dropping new group"
+                        );
+                        continue;
+                    }
+                    let mut accs = Vec::with_capacity(self.agg_specs.len());
+                    for spec in &self.agg_specs {
+                        let acc = if self.weight_col_idx.is_some() {
+                            spec.create_retractable_accumulator()?
+                        } else {
+                            spec.create_accumulator()?
+                        };
+                        accs.push(acc);
+                    }
+                    groups_len += 1;
+                    e.insert(GroupEntry {
                         accs,
                         last_updated_ms: watermark_ms,
-                    },
-                );
-            }
-            let Some(entry) = self.groups.get_mut(&owned_key) else {
-                continue;
+                    })
+                }
             };
             Self::update_group_accumulators(
                 &mut entry.accs,
