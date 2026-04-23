@@ -230,12 +230,11 @@ impl SinkConnector for NatsSink {
                 .map_err(|e| err(&format!("core flush: {e}")))?,
             Some(Runtime::JetStream { .. }) | None => {}
         }
-        drain_acks(
-            &mut self.pending_acks,
-            &self.metrics,
-            Duration::from_secs(1),
-        )
-        .await
+        let timeout = self
+            .config
+            .as_ref()
+            .map_or(Duration::from_secs(30), |c| c.ack_timeout);
+        drain_acks(&mut self.pending_acks, &self.metrics, timeout).await
     }
 
     async fn pre_commit(&mut self, _epoch: u64) -> Result<(), ConnectorError> {

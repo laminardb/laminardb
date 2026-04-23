@@ -229,6 +229,19 @@ impl SourceConnector for NatsSource {
             }
         }
 
+        if payloads.is_empty() {
+            return Ok(None);
+        }
+
+        let records: Vec<&[u8]> = payloads.iter().map(Bytes::as_ref).collect();
+        let bytes_total: u64 = records.iter().map(|r| r.len() as u64).sum();
+        // Deserialize before parking acks: on failure the handles drop
+        // un-acked and the broker redelivers after ack_wait.
+        let batch = running
+            .deserializer
+            .deserialize_batch(&records, &self.schema)
+            .map_err(|e| err(&format!("deserialize batch: {e}")))?;
+
         if !offset_updates.is_empty() {
             let mut offsets = self.offsets.lock();
             for (subject, seq) in offset_updates {
@@ -241,17 +254,6 @@ impl SourceConnector for NatsSource {
         if !new_acks.is_empty() {
             self.pending.lock().extend(new_acks);
         }
-
-        if payloads.is_empty() {
-            return Ok(None);
-        }
-
-        let records: Vec<&[u8]> = payloads.iter().map(Bytes::as_ref).collect();
-        let bytes_total: u64 = records.iter().map(|r| r.len() as u64).sum();
-        let batch = running
-            .deserializer
-            .deserialize_batch(&records, &self.schema)
-            .map_err(|e| err(&format!("deserialize batch: {e}")))?;
 
         self.metrics
             .record_poll(batch.num_rows() as u64, bytes_total);
@@ -351,18 +353,19 @@ impl SourceConnector for NatsSource {
             }
         }
 
-        // Broker pauses delivery at 100% `max_ack_pending`; flag at 50%.
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let cap = cfg.max_ack_pending.max(1) as u64;
-        #[allow(clippy::cast_sign_loss)]
-        let pending = self.metrics.pending_acks.get().max(0) as u64;
-        if pending * 2 >= cap {
-            HealthStatus::Degraded(format!(
-                "pending acks {pending}/{cap} — broker may throttle delivery"
-            ))
-        } else {
-            HealthStatus::Healthy
+        // Flag at 50% of `max_ack_pending`; -1 means unlimited.
+        if cfg.max_ack_pending > 0 {
+            #[allow(clippy::cast_sign_loss)]
+            let cap = cfg.max_ack_pending as u64;
+            #[allow(clippy::cast_sign_loss)]
+            let pending = self.metrics.pending_acks.get().max(0) as u64;
+            if pending * 2 >= cap {
+                return HealthStatus::Degraded(format!(
+                    "pending acks {pending}/{cap} — broker may throttle delivery"
+                ));
+            }
         }
+        HealthStatus::Healthy
     }
 
     fn metrics(&self) -> ConnectorMetrics {
@@ -484,9 +487,14 @@ fn classify_create_consumer_error(
     }
 }
 
+/// Wall-clock nanos for `with_jitter`. `Instant::now().elapsed()` is ~0
+/// and produces correlated jitter across tasks.
 #[allow(clippy::cast_possible_truncation)]
 fn entropy_now() -> u64 {
-    Instant::now().elapsed().as_nanos() as u64
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
 }
 
 struct JsReader {

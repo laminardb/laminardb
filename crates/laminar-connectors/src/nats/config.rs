@@ -314,7 +314,7 @@ impl NatsSinkConfig {
             expected_stream: config.get("expected.stream").map(str::to_string),
             delivery_guarantee,
             dedup_id_column,
-            min_duplicate_window: parse_duration_ms(
+            min_duplicate_window: require_positive_duration(
                 config,
                 "min.duplicate.window.ms",
                 Duration::from_secs(120),
