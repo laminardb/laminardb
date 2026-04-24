@@ -1,29 +1,20 @@
-//! Connector SDK error types.
-//!
-//! Provides a unified error hierarchy for all connector operations:
-//! - `ConnectorError`: Top-level error for source/sink connector operations
-//! - `SerdeError`: Serialization/deserialization errors
-
 use thiserror::Error;
 
 /// Errors that can occur during connector operations.
+///
+/// Callers that need to distinguish "retry may work" from "propagate"
+/// should use [`ConnectorError::is_transient`] rather than matching
+/// variants directly — the variant set has changed in the past.
 #[derive(Debug, Error)]
 pub enum ConnectorError {
-    /// Failed to connect to the external system.
+    /// Failed to connect to the external system (network error, DNS
+    /// failure, TLS negotiation failure, auth rejection).
     #[error("connection failed: {0}")]
     ConnectionFailed(String),
 
-    /// Authentication or authorization error.
-    #[error("authentication failed: {0}")]
-    AuthenticationFailed(String),
-
-    /// Invalid connector configuration.
+    /// Invalid, missing, or contradictory connector configuration.
     #[error("configuration error: {0}")]
     ConfigurationError(String),
-
-    /// Required configuration key is missing.
-    #[error("missing required config: {0}")]
-    MissingConfig(String),
 
     /// Error reading data from a source.
     #[error("read error: {0}")]
@@ -37,11 +28,12 @@ pub enum ConnectorError {
     #[error("serde error: {0}")]
     Serde(#[from] SerdeError),
 
-    /// Checkpoint or offset commit error.
-    #[error("checkpoint error: {0}")]
-    CheckpointError(String),
-
     /// Transaction error (begin/commit/rollback).
+    ///
+    /// Kept separate from [`Self::WriteError`] because transactional
+    /// failures are classified as **non-transient** by default; a write
+    /// error is transient. Per-connector retry policy can override, but
+    /// the default must not loop forever on bad transactional state.
     #[error("transaction error: {0}")]
     TransactionError(String),
 
@@ -66,10 +58,6 @@ pub enum ConnectorError {
     #[error("connector closed")]
     Closed,
 
-    /// The requested operation is not yet implemented.
-    #[error("unsupported operation: {0}")]
-    UnsupportedOperation(String),
-
     /// An internal error that doesn't fit other categories.
     #[error("internal error: {0}")]
     Internal(String),
@@ -80,11 +68,18 @@ pub enum ConnectorError {
 }
 
 impl ConnectorError {
+    /// Construct a "missing required config" error. Thin helper around
+    /// [`Self::ConfigurationError`] so every "missing required config:
+    /// {key}" message is shaped the same way.
+    #[must_use]
+    pub fn missing_config(key: impl Into<String>) -> Self {
+        Self::ConfigurationError(format!("missing required config: {}", key.into()))
+    }
+
     /// Returns `true` if this error is likely transient and the operation
     /// may succeed on retry (e.g., network timeout, throttled request).
-    ///
-    /// Returns `false` for configuration, authentication, schema, and
-    /// state errors that will not resolve without user intervention.
+    /// Returns `false` for configuration, schema, and state errors that
+    /// will not resolve without user intervention.
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
@@ -94,16 +89,12 @@ impl ConnectorError {
             | Self::Io(_)
             | Self::ConnectionFailed(_) => true,
 
-            Self::AuthenticationFailed(_)
-            | Self::ConfigurationError(_)
-            | Self::MissingConfig(_)
+            Self::ConfigurationError(_)
             | Self::SchemaMismatch(_)
             | Self::InvalidState { .. }
-            | Self::CheckpointError(_)
             | Self::TransactionError(_)
             | Self::Serde(_)
             | Self::Closed
-            | Self::UnsupportedOperation(_)
             | Self::Internal(_) => false,
         }
     }

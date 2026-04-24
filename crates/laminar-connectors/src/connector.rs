@@ -1,11 +1,4 @@
-//! Core connector traits.
-//!
-//! Defines the async traits that all source and sink connectors implement:
-//! - `SourceConnector`: Reads data from external systems
-//! - `SinkConnector`: Writes data to external systems
-//!
-//! These traits operate in Ring 1 (background) and communicate with Ring 0
-//! through the streaming API (`Source<T>::push_arrow()` and subscriptions).
+//! Connector traits — async `SourceConnector` / `SinkConnector`.
 
 use std::fmt;
 use std::str::FromStr;
@@ -111,15 +104,14 @@ impl FromStr for PostgresSslMode {
 /// A batch of records read from a source connector.
 #[derive(Debug, Clone)]
 pub struct SourceBatch {
-    /// The records as an Arrow `RecordBatch`.
+    /// Arrow batch carrying the records.
     pub records: RecordBatch,
-
-    /// The partition this batch came from, if applicable.
+    /// The partition this batch came from, if the source is partitioned.
     pub partition: Option<PartitionInfo>,
 }
 
 impl SourceBatch {
-    /// Creates a new source batch.
+    /// Construct without partition metadata.
     #[must_use]
     pub fn new(records: RecordBatch) -> Self {
         Self {
@@ -128,7 +120,7 @@ impl SourceBatch {
         }
     }
 
-    /// Creates a new source batch from a specific partition.
+    /// Construct with partition metadata attached.
     #[must_use]
     pub fn with_partition(records: RecordBatch, partition: PartitionInfo) -> Self {
         Self {
@@ -137,25 +129,27 @@ impl SourceBatch {
         }
     }
 
-    /// Returns the number of records in the batch.
+    /// Record count in the batch.
     #[must_use]
     pub fn num_rows(&self) -> usize {
         self.records.num_rows()
     }
 }
 
-/// Information about a source partition.
+/// Source partition identity + current offset (Kafka partition number,
+/// CDC slot name, etc.).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PartitionInfo {
-    /// Partition identifier (e.g., Kafka partition number, CDC slot name).
+    /// Partition id — free-form string (Kafka partition number as string,
+    /// CDC slot name, file path, …).
     pub id: String,
-
-    /// Current offset within this partition.
+    /// Current offset — interpretation is connector-specific (Kafka offset
+    /// as string, CDC LSN, etc.).
     pub offset: String,
 }
 
 impl PartitionInfo {
-    /// Creates a new partition info.
+    /// Construct from id/offset strings or anything that converts.
     #[must_use]
     pub fn new(id: impl Into<String>, offset: impl Into<String>) -> Self {
         Self {
@@ -171,18 +165,17 @@ impl fmt::Display for PartitionInfo {
     }
 }
 
-/// Result of writing a batch to a sink connector.
+/// Summary of a successful `write_batch` call.
 #[derive(Debug, Clone)]
 pub struct WriteResult {
-    /// Number of records successfully written.
+    /// Records accepted by the sink.
     pub records_written: usize,
-
-    /// Number of bytes written.
+    /// Bytes written to the underlying transport (may be estimated).
     pub bytes_written: u64,
 }
 
 impl WriteResult {
-    /// Creates a new write result.
+    /// Construct with raw counts.
     #[must_use]
     pub fn new(records_written: usize, bytes_written: u64) -> Self {
         Self {
@@ -223,8 +216,8 @@ pub struct SinkConnectorCapabilities {
 }
 
 impl SinkConnectorCapabilities {
-    /// Constructs capabilities with the required `suggested_write_timeout`.
-    /// All booleans default to `false`; enable via `with_*` builders.
+    /// All booleans default to `false`; flip via `with_*` below or by
+    /// assigning the fields directly (they're `pub`).
     #[must_use]
     pub fn new(suggested_write_timeout: std::time::Duration) -> Self {
         Self {
@@ -239,49 +232,43 @@ impl SinkConnectorCapabilities {
         }
     }
 
-    /// Creates capabilities with exactly-once support.
+    /// Enable exactly-once semantics (requires epoch + 2PC impl).
     #[must_use]
     pub fn with_exactly_once(mut self) -> Self {
         self.exactly_once = true;
         self
     }
-
-    /// Creates capabilities with idempotent write support.
+    /// Enable idempotent writes (safe re-delivery on retry).
     #[must_use]
     pub fn with_idempotent(mut self) -> Self {
         self.idempotent = true;
         self
     }
-
-    /// Creates capabilities with upsert support.
+    /// Enable upsert (key-based insert-or-update).
     #[must_use]
     pub fn with_upsert(mut self) -> Self {
         self.upsert = true;
         self
     }
-
-    /// Creates capabilities with changelog support.
+    /// Enable changelog/retraction records.
     #[must_use]
     pub fn with_changelog(mut self) -> Self {
         self.changelog = true;
         self
     }
-
-    /// Creates capabilities with two-phase commit support (pre-commit + commit).
+    /// Enable two-phase commit (`pre_commit` + `commit_epoch`).
     #[must_use]
     pub fn with_two_phase_commit(mut self) -> Self {
         self.two_phase_commit = true;
         self
     }
-
-    /// Creates capabilities with schema evolution support.
+    /// Enable additive schema evolution.
     #[must_use]
     pub fn with_schema_evolution(mut self) -> Self {
         self.schema_evolution = true;
         self
     }
-
-    /// Creates capabilities with partitioned write support.
+    /// Enable partitioned writes.
     #[must_use]
     pub fn with_partitioned(mut self) -> Self {
         self.partitioned = true;
@@ -296,53 +283,17 @@ impl SinkConnectorCapabilities {
 ///
 /// # Lifecycle
 ///
-/// 1. `open()` - Initialize connection, discover schema
-/// 2. `poll_batch()` - Read batches in a loop
-/// 3. `checkpoint()` / `restore()` - Manage offsets
-/// 4. `close()` - Clean shutdown
-///
-/// # Example
-///
-/// ```rust,ignore
-/// struct MySource { /* ... */ }
-///
-/// #[async_trait]
-/// impl SourceConnector for MySource {
-///     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
-///         // Connect to external system
-///         Ok(())
-///     }
-///
-///     async fn poll_batch(&mut self, max_records: usize) -> Result<Option<SourceBatch>, ConnectorError> {
-///         // Read up to max_records from external system
-///         Ok(None) // None = no data available yet
-///     }
-///
-///     // ... other methods
-/// }
-/// ```
+/// 1. `open()` — initialize connection, discover schema
+/// 2. `poll_batch()` — read batches in a loop
+/// 3. `checkpoint()` / `restore()` — manage offsets
+/// 4. `close()` — clean shutdown
 #[async_trait]
 pub trait SourceConnector: Send {
-    /// Opens the connector and initializes the connection.
-    ///
-    /// Called once before any polling begins. The connector should establish
-    /// connections, discover the schema, and prepare for reading.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConnectorError` if connection or initialization fails.
+    /// Called once before polling begins.
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError>;
 
-    /// Polls for the next batch of records.
-    ///
-    /// Returns `Ok(Some(batch))` when records are available, or `Ok(None)` when
-    /// no data is currently available (the runtime will poll again after a delay).
-    ///
-    /// The `max_records` parameter is a hint; implementations may return fewer.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConnectorError` on read failure.
+    /// `Ok(None)` = no data currently available; runtime retries after a delay.
+    /// `max_records` is a hint — implementations may return fewer.
     async fn poll_batch(
         &mut self,
         max_records: usize,
@@ -355,42 +306,27 @@ pub trait SourceConnector: Send {
     /// failure rather than hang.
     async fn discover_schema(&mut self, _properties: &std::collections::HashMap<String, String>) {}
 
-    /// Returns the schema of records produced by this source.
+    /// Arrow schema of records this source produces.
     fn schema(&self) -> SchemaRef;
 
-    /// Creates a checkpoint of the current source position.
-    ///
-    /// The returned checkpoint contains enough information to resume
-    /// reading from this position after a restart.
+    /// Returned checkpoint must contain enough info to resume from the
+    /// current position after a restart.
     fn checkpoint(&self) -> SourceCheckpoint;
 
-    /// Restores the source to a previously checkpointed position.
-    ///
     /// Called during recovery before polling resumes.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConnectorError` if the checkpoint is invalid or the
-    /// seek operation fails.
     async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError>;
 
-    /// Returns the current health status of the connector.
-    ///
-    /// Defaults to `Unknown`; connectors should override with actual status.
+    /// Defaults to `Unknown`; connectors should override.
     fn health_check(&self) -> HealthStatus {
         HealthStatus::Unknown
     }
 
-    /// Returns current metrics from the connector.
+    /// Current connector metrics snapshot.
     fn metrics(&self) -> ConnectorMetrics {
         ConnectorMetrics::default()
     }
 
-    /// Closes the connector and releases all resources.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConnectorError` if cleanup fails.
+    /// Close the connection and release resources.
     async fn close(&mut self) -> Result<(), ConnectorError>;
 
     /// Returns a [`Notify`] handle that is signalled when new data is available.
@@ -458,144 +394,80 @@ pub trait SourceConnector: Send {
 
 /// Trait for sink connectors that write data to external systems.
 ///
-/// Sink connectors operate in Ring 1, receiving data from Ring 0 via
-/// subscriptions and writing to external systems.
+/// Sink connectors operate in Ring 1, receiving data from Ring 0 and
+/// writing to external systems. Implementations that advertise
+/// `exactly_once` also implement `begin_epoch`/`pre_commit`/`commit_epoch`/
+/// `rollback_epoch`; the runtime drives them via the checkpoint coordinator.
 ///
-/// # Exactly-Once Support
-///
-/// Sinks that support exactly-once semantics implement the epoch-based
-/// methods (`begin_epoch`, `commit_epoch`, `rollback_epoch`). The runtime
-/// calls these in coordination with the checkpoint manager.
-///
-/// # Lifecycle
-///
-/// 1. `open()` - Initialize connection
-/// 2. For each epoch:
-///    a. `begin_epoch()` - Start transaction
-///    b. `write_batch()` - Write records (may be called multiple times)
-///    c. `commit_epoch()` - Commit transaction
-/// 3. `close()` - Clean shutdown
+/// Lifecycle: `open()` → loop over epochs of `begin_epoch()`,
+/// `write_batch()*`, `pre_commit()`, `commit_epoch()` (or `rollback_epoch()`
+/// on failure) → `close()`.
 #[async_trait]
 pub trait SinkConnector: Send {
-    /// Opens the connector and initializes the connection.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConnectorError` if connection or initialization fails.
+    /// Open the connection and prepare to accept writes.
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError>;
 
-    /// Writes a batch of records to the external system.
-    ///
-    /// Implementations must be cancellation-safe: the runtime wraps this
-    /// call in `tokio::time::timeout`. Don't split a `&mut self` mutation
+    /// Must be cancellation-safe: the runtime wraps this in
+    /// `tokio::time::timeout`. Don't split a `&mut self` mutation
     /// across an `.await`. In-flight transactional state may remain open
-    /// after cancellation; the caller will [`Self::rollback_epoch`] it.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConnectorError` on write failure.
+    /// after cancellation; the caller will `rollback_epoch` it.
     async fn write_batch(&mut self, batch: &RecordBatch) -> Result<WriteResult, ConnectorError>;
 
-    /// Returns the expected input schema for this sink.
+    /// Expected Arrow schema of input batches.
     fn schema(&self) -> SchemaRef;
 
-    /// Begins a new epoch for exactly-once processing.
-    ///
-    /// Called by the runtime when a new checkpoint epoch starts.
-    /// Default implementation does nothing (at-least-once semantics).
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConnectorError` if the epoch cannot be started.
+    /// Default: no-op (at-least-once semantics).
     async fn begin_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
         Ok(())
     }
 
-    /// Pre-commits the current epoch (phase 1 of two-phase commit).
-    ///
-    /// Called after all writes for this epoch are complete but before the
-    /// checkpoint manifest is persisted. The sink should flush any buffered
-    /// data and prepare for commit, but must NOT finalize the transaction.
-    ///
-    /// The protocol is:
-    /// 1. `pre_commit(epoch)` — flush/prepare (this method)
-    /// 2. Manifest persisted to disk
-    /// 3. `commit_epoch(epoch)` — finalize transaction
-    /// 4. On failure: `rollback_epoch(epoch)`
-    ///
-    /// Default implementation delegates to `flush()`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConnectorError` if the pre-commit fails.
+    /// Phase 1 of 2PC: flush + prepare, do NOT finalize the txn. The
+    /// runtime persists the manifest between `pre_commit` and
+    /// `commit_epoch`; on failure it calls `rollback_epoch`. Default
+    /// delegates to `flush()`.
     async fn pre_commit(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
         self.flush().await
     }
 
-    /// Commits the current epoch (phase 2 of two-phase commit).
-    ///
-    /// Called by the runtime after the checkpoint manifest is successfully
-    /// persisted. The sink should finalize any pending transactions.
-    /// Default implementation does nothing (at-least-once semantics).
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConnectorError` if the commit fails.
+    /// Phase 2 of 2PC: finalize the txn. Called after the manifest is
+    /// durable. Default: no-op (at-least-once semantics).
     async fn commit_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
         Ok(())
     }
 
-    /// Rolls back the current epoch.
-    ///
     /// Must be idempotent: the runtime calls this on every exactly-once
     /// sink after a `pre_commit` failure, including sinks that never
-    /// successfully `pre_commit`ed.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConnectorError` if the rollback fails.
+    /// `pre_commit`ed.
     async fn rollback_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
         Ok(())
     }
 
-    /// Returns the current health status of the connector.
-    ///
-    /// Defaults to `Unknown`; connectors should override with actual status.
+    /// Defaults to `Unknown`; connectors should override.
     fn health_check(&self) -> HealthStatus {
         HealthStatus::Unknown
     }
 
-    /// Returns current metrics from the connector.
+    /// Current sink metrics snapshot.
     fn metrics(&self) -> ConnectorMetrics {
         ConnectorMetrics::default()
     }
 
-    /// Returns the capabilities of this sink connector. Required (no
-    /// default) so every implementation declares `suggested_write_timeout`.
+    /// Required (no default) so every implementation declares
+    /// `suggested_write_timeout`.
     fn capabilities(&self) -> SinkConnectorCapabilities;
 
-    /// Flushes any buffered data to the external system.
-    ///
-    /// Implementations must be internally bounded — the sink task's
-    /// periodic timer calls this on every tick and wraps it only in a
-    /// generous backstop. Thorough drains belong in `pre_commit` /
-    /// `commit_epoch` / `close`, not here.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConnectorError` if the flush fails.
+    /// Must be internally bounded — the sink task's periodic timer
+    /// calls this on every tick. Thorough drains belong in `pre_commit`
+    /// / `commit_epoch` / `close`, not here.
     async fn flush(&mut self) -> Result<(), ConnectorError> {
         Ok(())
     }
 
-    /// Closes the connector and releases all resources.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ConnectorError` if cleanup fails.
+    /// Close the sink and release resources.
     async fn close(&mut self) -> Result<(), ConnectorError>;
 
-    /// Returns this connector as a [`SchemaRegistryAware`](crate::schema::SchemaRegistryAware), if supported.
+    /// Return a [`SchemaRegistryAware`](crate::schema::SchemaRegistryAware)
+    /// view, if the sink speaks a schema registry protocol.
     fn as_schema_registry_aware(&self) -> Option<&dyn crate::schema::SchemaRegistryAware> {
         None
     }

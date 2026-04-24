@@ -214,7 +214,7 @@ impl PostgresSinkConfig {
     /// Returns `ConnectorError::ConfigurationError` on invalid combinations.
     pub fn validate(&self) -> Result<(), ConnectorError> {
         if self.table_name.is_empty() {
-            return Err(ConnectorError::MissingConfig("table.name".into()));
+            return Err(ConnectorError::missing_config("table.name"));
         }
         if self.write_mode == WriteMode::Upsert && self.primary_key_columns.is_empty() {
             return Err(ConnectorError::ConfigurationError(

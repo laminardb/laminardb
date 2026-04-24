@@ -1,8 +1,5 @@
-//! Delta Lake source connector configuration.
-//!
-//! [`DeltaSourceConfig`] encapsulates all settings for reading Arrow
-//! `RecordBatch` data from Delta Lake tables, parsed from SQL `WITH (...)`
-//! clauses via [`from_config`](DeltaSourceConfig::from_config).
+//! Delta Lake source config. Parsed from SQL `WITH (...)` via
+//! [`DeltaSourceConfig::from_config`].
 #![allow(clippy::disallowed_types)] // cold path: lakehouse configuration
 
 use std::collections::HashMap;
@@ -272,7 +269,7 @@ impl DeltaSourceConfig {
     /// Returns `ConnectorError::ConfigurationError` on invalid combinations.
     pub fn validate(&self) -> Result<(), ConnectorError> {
         if self.table_path.is_empty() {
-            return Err(ConnectorError::MissingConfig("table.path".into()));
+            return Err(ConnectorError::missing_config("table.path"));
         }
 
         // Validate catalog-specific requirements.

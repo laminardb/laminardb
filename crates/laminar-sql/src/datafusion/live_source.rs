@@ -7,7 +7,7 @@
 //! so the cached plan always sees fresh data.
 
 use std::any::Any;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
@@ -23,6 +23,19 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion_common::Statistics;
 use datafusion_expr::TableType;
+use parking_lot::Mutex;
+
+/// Shared batch slot used by the provider and every `LiveSourceExec` scan.
+///
+/// Wrapping the batch list in `Arc` means the hot-path `execute()` clone is
+/// an O(1) Arc bump, not a full `Vec<RecordBatch>` clone (which would
+/// Arc-bump every column of every batch). `swap()` replaces the Arc
+/// wholesale while any in-flight reader keeps its prior snapshot alive.
+type BatchSlot = Arc<Mutex<Arc<Vec<RecordBatch>>>>;
+
+fn new_slot() -> BatchSlot {
+    Arc::new(Mutex::new(Arc::new(Vec::new())))
+}
 
 // ── TableProvider ────────────────────────────────────────────────────
 
@@ -31,7 +44,7 @@ use datafusion_expr::TableType;
 /// `scan()` returns an internal execution plan that reads from the shared
 /// batch slot at `execute()` time — enabling physical plan caching.
 pub struct LiveSourceProvider {
-    current: Arc<Mutex<Vec<RecordBatch>>>,
+    current: BatchSlot,
     schema: SchemaRef,
 }
 
@@ -40,7 +53,7 @@ impl LiveSourceProvider {
     #[must_use]
     pub fn new(schema: SchemaRef) -> Self {
         Self {
-            current: Arc::new(Mutex::new(Vec::new())),
+            current: new_slot(),
             schema,
         }
     }
@@ -97,18 +110,14 @@ impl TableProvider for LiveSourceProvider {
 /// time, not at construction time. This enables physical plan caching:
 /// the plan tree is built once, and each `execute()` call sees fresh data.
 pub(crate) struct LiveSourceExec {
-    slot: Arc<Mutex<Vec<RecordBatch>>>,
+    slot: BatchSlot,
     schema: SchemaRef,
     projection: Option<Vec<usize>>,
     properties: PlanProperties,
 }
 
 impl LiveSourceExec {
-    fn new(
-        slot: Arc<Mutex<Vec<RecordBatch>>>,
-        source_schema: SchemaRef,
-        projection: Option<Vec<usize>>,
-    ) -> Self {
+    fn new(slot: BatchSlot, source_schema: SchemaRef, projection: Option<Vec<usize>>) -> Self {
         let schema = match &projection {
             Some(indices) => {
                 let fields: Vec<_> = indices
@@ -198,20 +207,22 @@ impl ExecutionPlan for LiveSourceExec {
             )));
         }
 
-        let batches = self.slot.lock().expect("LiveSourceExec poisoned").clone();
+        // O(1) snapshot: bump the Arc under the lock and release.
+        // Any concurrent `swap()` installs a new Arc; this reader keeps
+        // its prior snapshot alive until the returned stream is dropped.
+        let batches_arc: Arc<Vec<RecordBatch>> = Arc::clone(&self.slot.lock());
         let schema = self.schema.clone();
         let projection = self.projection.clone();
 
-        // Stream batches individually — no concat. Apply projection per-batch.
-        let output = futures::stream::iter(if batches.is_empty() {
+        let output = futures::stream::iter(if batches_arc.is_empty() {
             vec![Ok(RecordBatch::new_empty(schema))]
         } else if let Some(indices) = projection {
-            batches
-                .into_iter()
-                .map(move |batch| batch.project(&indices).map_err(DataFusionError::from))
+            batches_arc
+                .iter()
+                .map(|batch| batch.project(&indices).map_err(DataFusionError::from))
                 .collect()
         } else {
-            batches.into_iter().map(Ok).collect()
+            batches_arc.iter().cloned().map(Ok).collect()
         });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -252,29 +263,20 @@ impl datafusion::physical_plan::ExecutionPlanProperties for LiveSourceExec {
 /// Handle for swapping batches into a [`LiveSourceProvider`].
 #[derive(Clone)]
 pub struct LiveSourceHandle {
-    slot: Arc<Mutex<Vec<RecordBatch>>>,
+    slot: BatchSlot,
 }
 
 impl LiveSourceHandle {
-    /// Replace current batches.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned (a thread panicked while
-    /// holding it). A poisoned mutex indicates corrupt pipeline state.
+    /// Replace current batches. In-flight readers that captured the
+    /// prior snapshot continue to see the prior data; the next scan
+    /// picks up the new one.
     pub fn swap(&self, batches: Vec<RecordBatch>) {
-        let mut guard = self.slot.lock().expect("LiveSourceHandle poisoned");
-        guard.clear();
-        guard.extend(batches);
+        *self.slot.lock() = Arc::new(batches);
     }
 
     /// Clear all pending batches.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal mutex is poisoned.
     pub fn clear(&self) {
-        self.slot.lock().expect("LiveSourceHandle poisoned").clear();
+        *self.slot.lock() = Arc::new(Vec::new());
     }
 }
 
@@ -336,10 +338,10 @@ mod tests {
         let h2 = h1.clone();
 
         h1.swap(vec![make_batch(&[1, 2], &["A", "B"], &[1.0, 2.0])]);
-        assert_eq!(h2.slot.lock().unwrap().len(), 1);
+        assert_eq!(h2.slot.lock().len(), 1);
 
         h2.clear();
-        assert_eq!(h1.slot.lock().unwrap().len(), 0);
+        assert_eq!(h1.slot.lock().len(), 0);
     }
 
     #[tokio::test]

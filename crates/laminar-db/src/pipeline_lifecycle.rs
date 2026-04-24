@@ -223,10 +223,10 @@ impl LaminarDB {
                         laminar_core::state::NodeId(0)
                     }
                 };
-                // Phase 1.4 fence: both sides of the split-brain guard
-                // must see the same generation. The coordinator stamps
-                // outgoing writes with it (caller side), and the backend
-                // rejects incoming writes below it (authority side).
+                // Both sides of the split-brain guard must see the same
+                // generation. The coordinator stamps outgoing writes with
+                // it (caller side), and the backend rejects incoming
+                // writes below it (authority side).
                 // Without the backend call the authoritative version
                 // stays at 0 and the fence is a silent no-op — the
                 // registry's version carries the snapshot generation
@@ -1259,8 +1259,11 @@ impl LaminarDB {
         // Force-checkpoint channel: `db.checkpoint()` on the caller side
         // hands a oneshot sender across to the callback, which captures
         // operator state and replies. Installed here so both ends exist
-        // before the compute thread spawns.
-        let (force_ckpt_tx, force_ckpt_rx) = tokio::sync::mpsc::unbounded_channel();
+        // before the compute thread spawns. Crossfire for consistency
+        // with the rest of the pipeline plumbing (sink_task, coordinator).
+        let (force_ckpt_tx, force_ckpt_rx) = crossfire::mpsc::bounded_async::<
+            crate::db::ForceCheckpointReply,
+        >(crate::db::FORCE_CHECKPOINT_CHANNEL_CAPACITY);
         *self.force_ckpt_tx.lock() = Some(force_ckpt_tx);
 
         let callback = crate::pipeline_callback::ConnectorPipelineCallback {

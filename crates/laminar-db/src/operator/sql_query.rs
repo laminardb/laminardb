@@ -56,9 +56,9 @@ enum QueryState {
 /// rows arriving on [`ShuffleReceiver`] are drained at the start of
 /// every cycle and fed into the same accumulator.
 ///
-/// Row-shuffle (γ in Phase 0a) ships raw rows, not partial-aggregate
-/// state. Cheaper to implement than two-stage partial aggregation,
-/// linearly more bandwidth-hungry. Phase 5 upgrades this path.
+/// Row-shuffle ships raw rows, not partial-aggregate state. Cheaper
+/// to implement than two-stage partial aggregation, linearly more
+/// bandwidth-hungry.
 #[cfg(feature = "cluster-unstable")]
 #[derive(Clone)]
 pub struct ClusterShuffleConfig {
@@ -120,7 +120,7 @@ impl SqlQueryOperator {
     /// Install the row-shuffle config. When present and the query
     /// resolves to the aggregate fast-path, each cycle's pre-aggregate
     /// rows are hash-routed across the cluster before reaching
-    /// `IncrementalAggState`. See Phase 0a.
+    /// `IncrementalAggState`.
     #[cfg(feature = "cluster-unstable")]
     pub fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
         self.cluster_shuffle = Some(config);
@@ -242,7 +242,6 @@ impl SqlQueryOperator {
 
         let output_schema = Arc::new(arrow::datatypes::Schema::new(proj_fields));
         Some(CompiledProjection {
-            source_table: info.source_table,
             exprs: compiled_exprs,
             filter: compiled_filter,
             output_schema,

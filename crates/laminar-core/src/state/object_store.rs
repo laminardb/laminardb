@@ -26,10 +26,9 @@ pub struct ObjectStoreBackend {
     committer_bytes: Bytes,
     vnode_capacity: u32,
     /// Authoritative vnode-assignment version known to this backend.
-    /// Phase 1.4 split-brain fence: [`write_partial`](Self::write_partial)
-    /// rejects any caller whose `assignment_version` is strictly less
-    /// than this value. Updated via
-    /// [`set_authoritative_version`](Self::set_authoritative_version)
+    /// Split-brain fence: [`write_partial`](Self::write_partial) rejects
+    /// any caller whose `assignment_version` is strictly less than this
+    /// value. Updated via [`set_authoritative_version`](Self::set_authoritative_version)
     /// whenever the host sees a newer `AssignmentSnapshot` rotate in.
     ///
     /// Default is `0`, which disables the fence — unconfigured
@@ -110,11 +109,11 @@ impl StateBackend for ObjectStoreBackend {
         bytes: Bytes,
     ) -> Result<(), StateBackendError> {
         self.check_vnode(vnode)?;
-        // Phase 1.4 split-brain fence. `authoritative_version == 0`
-        // means "unconfigured" — accept every write (matches the
-        // legacy single-instance behavior). Non-zero authoritative
-        // means we know of a specific assignment generation; writes
-        // stamped with an older generation are rejected.
+        // Split-brain fence. `authoritative_version == 0` means
+        // "unconfigured" — accept every write (matches the legacy
+        // single-instance behavior). Non-zero authoritative means we
+        // know of a specific assignment generation; writes stamped with
+        // an older generation are rejected.
         let authoritative = self.authoritative_version.load(Ordering::Acquire);
         if authoritative > 0 && assignment_version < authoritative {
             return Err(StateBackendError::StaleVersion {
@@ -272,8 +271,7 @@ impl ObjectStoreBackend {
     /// against this backend's `instance_id`. Match → `Ok(true)` (we
     /// committed, a retry or observation is fine). Mismatch →
     /// [`StateBackendError::SplitBrainCommit`] so the caller aborts
-    /// rather than double-committing downstream. Phase 2 split-brain
-    /// hardening.
+    /// rather than double-committing downstream.
     async fn verify_commit_marker(&self, commit: &OsPath) -> Result<bool, StateBackendError> {
         let res = self
             .store
@@ -414,9 +412,9 @@ mod tests {
 
     #[tokio::test]
     async fn stale_version_rejected() {
-        // Phase 1.4 AC: force two "nodes" (backend instances wrapping
-        // the same store) to claim the same vnode at different
-        // generations. The stale writer must be rejected.
+        // Force two "nodes" (backend instances wrapping the same store)
+        // to claim the same vnode at different generations. The stale
+        // writer must be rejected.
         let dir = tempdir().unwrap();
         let store = make_store(dir.path());
         let stale = ObjectStoreBackend::new(Arc::clone(&store), "node-stale", 4);
@@ -435,7 +433,7 @@ mod tests {
         // Stale tries to write at version 1 — but only IF it's also
         // learned of the rotation. Model that by promoting stale's
         // view too; the check is intra-backend here because the
-        // durable version-broadcast channel is Phase 2.3 territory.
+        // durable version-broadcast channel is out of scope for this test.
         stale.set_authoritative_version(2);
         let err = stale
             .write_partial(0, 1, 1, Bytes::from_static(b"stale"))

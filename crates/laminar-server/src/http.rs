@@ -26,7 +26,10 @@ use crate::server::ServerError;
 pub struct AppState {
     pub db: Arc<LaminarDB>,
     pub config_path: PathBuf,
-    pub current_config: tokio::sync::RwLock<ServerConfig>,
+    /// `parking_lot::RwLock` is correct here — every reader drops the
+    /// guard before awaiting any I/O (see `reload_config`/`cluster_status`/
+    /// watcher.rs). No writer holds the lock across `.await` either.
+    pub current_config: parking_lot::RwLock<ServerConfig>,
     pub reload_guard: ReloadGuard,
     pub registry: Arc<Registry>,
     pub server_metrics: ServerMetrics,
@@ -336,9 +339,12 @@ async fn handle_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     };
 
     // Diff against current config
-    let current = state.current_config.read().await;
-    let diff = reload::diff_configs(&current, &new_config);
-    drop(current);
+    // Tight guard scope so the `!Send` parking_lot guard doesn't cross
+    // the next `.await`.
+    let diff = {
+        let current = state.current_config.read();
+        reload::diff_configs(&current, &new_config)
+    };
 
     if diff.is_empty() && diff.warnings.is_empty() {
         return Json(reload::ReloadResult {
@@ -358,7 +364,7 @@ async fn handle_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 
     // Update current config on success
     if result.success {
-        let mut current = state.current_config.write().await;
+        let mut current = state.current_config.write();
         *current = new_config;
         info!(
             "Configuration reloaded successfully ({} ops)",
@@ -382,7 +388,7 @@ async fn handle_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 }
 
 async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let config = state.current_config.read().await;
+    let config = state.current_config.read();
     if config.server.mode != "delta" {
         return error_response(
             StatusCode::NOT_FOUND,
@@ -543,7 +549,7 @@ mod tests {
         Arc::new(AppState {
             db,
             config_path: PathBuf::from("test.toml"),
-            current_config: tokio::sync::RwLock::new(crate::config::ServerConfig {
+            current_config: parking_lot::RwLock::new(crate::config::ServerConfig {
                 server: crate::config::ServerSection::default(),
                 state: laminar_core::state::StateBackendConfig::default(),
                 checkpoint: crate::config::CheckpointSection::default(),
@@ -793,7 +799,7 @@ mod tests {
         let state = Arc::new(AppState {
             db,
             config_path: path,
-            current_config: tokio::sync::RwLock::new(crate::config::ServerConfig {
+            current_config: parking_lot::RwLock::new(crate::config::ServerConfig {
                 server: crate::config::ServerSection::default(),
                 state: laminar_core::state::StateBackendConfig::default(),
                 checkpoint: crate::config::CheckpointSection::default(),

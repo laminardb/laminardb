@@ -509,7 +509,6 @@ impl CoreWindowState {
 
         // Build compiled projection for single-source queries.
         let compiled_projection = if compile_ok {
-            let source_table = compile_source.unwrap();
             // Compile WHERE predicate
             let filter = if let Some(where_pred) = &agg_info.where_predicate {
                 if let Ok(phys) = create_physical_expr(where_pred, input_df_schema, compile_props) {
@@ -523,7 +522,6 @@ impl CoreWindowState {
             };
             if compile_ok {
                 Some(CompiledProjection {
-                    source_table,
                     exprs: compiled_exprs,
                     filter,
                     output_schema: Arc::new(Schema::new(proj_fields)),

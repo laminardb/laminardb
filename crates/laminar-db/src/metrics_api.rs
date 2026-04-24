@@ -4,9 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::db::{
-    LaminarDB, STATE_CREATED, STATE_RUNNING, STATE_SHUTTING_DOWN, STATE_STARTING, STATE_STOPPED,
-};
+use crate::db::{DbState, LaminarDB};
 use crate::error::DbError;
 
 impl LaminarDB {
@@ -38,13 +36,14 @@ impl LaminarDB {
 
     /// Get the current pipeline state as a string.
     pub fn pipeline_state(&self) -> &'static str {
-        match self.state.load(std::sync::atomic::Ordering::Acquire) {
-            STATE_CREATED => "Created",
-            STATE_STARTING => "Starting",
-            STATE_RUNNING => "Running",
-            STATE_SHUTTING_DOWN => "ShuttingDown",
-            STATE_STOPPED => "Stopped",
-            _ => "Unknown",
+        let raw = self.state.load(std::sync::atomic::Ordering::Acquire);
+        match DbState::from_u8(raw) {
+            Some(DbState::Created) => "Created",
+            Some(DbState::Starting) => "Starting",
+            Some(DbState::Running) => "Running",
+            Some(DbState::ShuttingDown) => "ShuttingDown",
+            Some(DbState::Stopped) => "Stopped",
+            None => "Unknown",
         }
     }
 
@@ -170,12 +169,13 @@ impl LaminarDB {
 
     /// Convert the internal `AtomicU8` state to a `PipelineState` enum.
     pub(crate) fn pipeline_state_enum(&self) -> crate::metrics::PipelineState {
-        match self.state.load(std::sync::atomic::Ordering::Acquire) {
-            STATE_CREATED => crate::metrics::PipelineState::Created,
-            STATE_STARTING => crate::metrics::PipelineState::Starting,
-            STATE_RUNNING => crate::metrics::PipelineState::Running,
-            STATE_SHUTTING_DOWN => crate::metrics::PipelineState::ShuttingDown,
-            _ => crate::metrics::PipelineState::Stopped,
+        let raw = self.state.load(std::sync::atomic::Ordering::Acquire);
+        match DbState::from_u8(raw) {
+            Some(DbState::Created) => crate::metrics::PipelineState::Created,
+            Some(DbState::Starting) => crate::metrics::PipelineState::Starting,
+            Some(DbState::Running) => crate::metrics::PipelineState::Running,
+            Some(DbState::ShuttingDown) => crate::metrics::PipelineState::ShuttingDown,
+            Some(DbState::Stopped) | None => crate::metrics::PipelineState::Stopped,
         }
     }
 

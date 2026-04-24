@@ -1,10 +1,12 @@
 //! Event time, watermarks, and timer management.
 mod cast;
+mod duration_str;
 mod event_time;
 mod filter;
 mod watermark;
 
 pub use cast::{cast_to_millis_array, CastError};
+pub use duration_str::parse_duration_str;
 pub use event_time::{EventTimeError, EventTimeExtractor, ExtractionMode, TimestampField};
 
 pub use filter::{filter_batch_by_timestamp, ThresholdOp};

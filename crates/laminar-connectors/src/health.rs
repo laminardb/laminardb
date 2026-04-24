@@ -1,8 +1,3 @@
-//! Connector health status types.
-//!
-//! Provides health reporting for connectors used by the runtime
-//! and admin dashboard.
-
 use std::fmt;
 
 /// Health status of a connector.

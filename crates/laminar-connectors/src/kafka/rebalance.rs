@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use prometheus::IntCounter;
 use rdkafka::consumer::{Consumer, ConsumerContext};
 use rdkafka::ClientContext;
 use tracing::{info, warn};
@@ -107,11 +108,19 @@ pub struct LaminarConsumerContext {
     /// Read on Assign to seek newly assigned partitions to last-consumed
     /// offset + 1, preventing duplicates after broker failures.
     offset_snapshot: Arc<Mutex<super::offsets::OffsetTracker>>,
+    /// Counter bumped on every broker-confirmed async commit. The immediate
+    /// return from `CommitMode::Async` only means "queued"; the real
+    /// outcome arrives here via `commit_callback`, so this is the
+    /// authoritative success counter for async commits.
+    commits_counter: IntCounter,
+    /// Counter bumped when the broker rejects an async commit.
+    commit_failures_counter: IntCounter,
 }
 
 impl LaminarConsumerContext {
     /// Wires checkpoint signaling, partition tracking, and rebalance metrics.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         checkpoint_requested: Arc<AtomicBool>,
         rebalance_state: Arc<Mutex<RebalanceState>>,
@@ -120,6 +129,8 @@ impl LaminarConsumerContext {
         reader_paused: Arc<AtomicBool>,
         commit_retry_needed: Arc<AtomicBool>,
         offset_snapshot: Arc<Mutex<super::offsets::OffsetTracker>>,
+        commits_counter: IntCounter,
+        commit_failures_counter: IntCounter,
     ) -> Self {
         Self {
             checkpoint_requested,
@@ -130,6 +141,8 @@ impl LaminarConsumerContext {
             reader_paused,
             commit_retry_needed,
             offset_snapshot,
+            commits_counter,
+            commit_failures_counter,
         }
     }
 
@@ -225,12 +238,14 @@ impl ConsumerContext for LaminarConsumerContext {
     ) {
         match result {
             Ok(()) => {
+                self.commits_counter.inc();
                 tracing::debug!(
                     partition_count = offsets.count(),
                     "broker offset commit confirmed"
                 );
             }
             Err(e) => {
+                self.commit_failures_counter.inc();
                 self.commit_retry_needed.store(true, Ordering::Release);
                 warn!(
                     error = %e,
@@ -381,6 +396,8 @@ mod tests {
         let reader_paused = Arc::new(AtomicBool::new(false));
         let commit_retry = Arc::new(AtomicBool::new(false));
         let offset_snapshot = Arc::new(Mutex::new(super::super::offsets::OffsetTracker::new()));
+        let commits = IntCounter::new("test_commits", "test").unwrap();
+        let commit_failures = IntCounter::new("test_commit_failures", "test").unwrap();
         let ctx = LaminarConsumerContext::new(
             Arc::clone(&flag),
             state,
@@ -389,6 +406,8 @@ mod tests {
             reader_paused,
             commit_retry,
             offset_snapshot,
+            commits,
+            commit_failures,
         );
         (flag, ctx)
     }

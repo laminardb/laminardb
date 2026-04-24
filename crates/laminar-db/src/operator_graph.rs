@@ -228,8 +228,7 @@ pub(crate) struct OperatorGraph {
     live_handles: FxHashMap<String, LiveSourceHandle>,
     /// Cluster-mode row-shuffle config for streaming aggregates.
     /// `None` outside cluster mode; threaded to `SqlQueryOperator` so
-    /// pre-aggregate rows can be hash-routed to vnode owners. See
-    /// Phase 0a in `docs/plans/cluster-production-readiness.md`.
+    /// pre-aggregate rows can be hash-routed to vnode owners.
     #[cfg(feature = "cluster-unstable")]
     cluster_shuffle: Option<crate::operator::sql_query::ClusterShuffleConfig>,
 }
@@ -341,8 +340,7 @@ impl OperatorGraph {
     }
 
     /// Install the row-shuffle config used by streaming aggregates in
-    /// cluster mode. See Phase 0a in
-    /// `docs/plans/cluster-production-readiness.md`.
+    /// cluster mode.
     #[cfg(feature = "cluster-unstable")]
     pub fn set_cluster_shuffle(
         &mut self,

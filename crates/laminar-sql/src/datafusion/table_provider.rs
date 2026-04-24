@@ -109,18 +109,14 @@ impl TableProvider for StreamingTableProvider {
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        // Determine which filters the source supports
-        let supported = self.source.supports_filters(filters);
-        let pushed_filters: Vec<Expr> = filters
-            .iter()
-            .zip(supported.iter())
-            .filter_map(|(f, &s)| if s { Some(f.clone()) } else { None })
-            .collect();
-
+        // DataFusion only passes filters here that `supports_filters_pushdown`
+        // already claimed as `Exact`/`Inexact` — no need to re-ask the source
+        // which ones it can handle. Forwarding all of them was the old path's
+        // cost (two Vec<Expr> clones per scan for nothing).
         Ok(Arc::new(StreamingScanExec::new(
             Arc::clone(&self.source),
             projection.cloned(),
-            pushed_filters,
+            filters.to_vec(),
         )))
     }
 }

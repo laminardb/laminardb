@@ -821,9 +821,9 @@ impl SourceConnector for PostgresCdcSource {
 
     async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
         if let Some(lsn_str) = checkpoint.get_offset("lsn") {
-            let lsn: Lsn = lsn_str.parse().map_err(|e| {
-                ConnectorError::CheckpointError(format!("invalid LSN in checkpoint: {e}"))
-            })?;
+            let lsn: Lsn = lsn_str
+                .parse()
+                .map_err(|e| ConnectorError::Internal(format!("invalid LSN in checkpoint: {e}")))?;
             self.confirmed_flush_lsn = lsn;
             self.polled_lsn = lsn;
             self.metrics.set_confirmed_flush_lsn(lsn.as_u64());

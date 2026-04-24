@@ -124,10 +124,14 @@ pub async fn watch_config(config_path: PathBuf, state: Arc<AppState>, debounce: 
             }
         };
 
-        // Diff against current config
-        let current = state.current_config.read().await;
-        let diff = reload::diff_configs(&current, &new_config);
-        drop(current);
+        // Diff against current config. Scope the read guard tightly so
+        // the compiler knows it's out of scope before the next `.await`
+        // — `parking_lot`'s guard is `!Send` and would fail the
+        // `tokio::spawn` Send bound otherwise.
+        let diff = {
+            let current = state.current_config.read();
+            reload::diff_configs(&current, &new_config)
+        };
 
         if diff.is_empty() {
             for w in &diff.warnings {
@@ -146,7 +150,7 @@ pub async fn watch_config(config_path: PathBuf, state: Arc<AppState>, debounce: 
         state.server_metrics.reload_total.inc();
 
         if result.success {
-            let mut current = state.current_config.write().await;
+            let mut current = state.current_config.write();
             *current = new_config;
             info!(
                 "File-triggered reload complete: {} ops applied",

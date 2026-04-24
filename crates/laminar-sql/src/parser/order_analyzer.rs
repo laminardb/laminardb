@@ -223,8 +223,8 @@ fn check_is_windowed(query: &Query) -> bool {
 /// Detects ROW_NUMBER()/RANK()/DENSE_RANK() OVER (PARTITION BY ... ORDER BY ...) WHERE rn <= N.
 ///
 /// This is a simplified heuristic: it looks for a subquery in FROM with
-/// a ranking function and a filter on the outer query. For Phase 1, we detect
-/// common SQL patterns rather than doing full semantic analysis.
+/// a ranking function and a filter on the outer query. We detect common
+/// SQL patterns rather than doing full semantic analysis.
 fn detect_row_number_pattern(query: &Query) -> Option<(usize, Vec<String>, RankType)> {
     // Look for ranking function in the SELECT items of the query body
     if let SetExpr::Select(select) = query.body.as_ref() {

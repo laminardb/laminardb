@@ -1,13 +1,10 @@
-//! Connector registry with factory pattern.
-//!
-//! The `ConnectorRegistry` maintains a catalog of available connector
-//! implementations and provides factory methods to instantiate them.
+//! Registry of connector factories, keyed by connector type string.
+
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
+use async_trait::async_trait;
 use parking_lot::RwLock;
 
 use crate::config::{ConnectorConfig, ConnectorInfo};
@@ -35,45 +32,30 @@ pub type TableSourceFactory = Arc<
     dyn Fn(&ConnectorConfig) -> Result<Box<dyn ReferenceTableSource>, ConnectorError> + Send + Sync,
 >;
 
-/// Factory function type for creating lookup sources (async, for on-demand mode).
-pub type LookupSourceFactory = Arc<
-    dyn Fn(
-            ConnectorConfig,
-        ) -> Pin<
-            Box<
-                dyn Future<
-                        Output = Result<
-                            Arc<dyn laminar_core::lookup::source::LookupSourceDyn>,
-                            ConnectorError,
-                        >,
-                    > + Send,
-            >,
-        > + Send
-        + Sync,
->;
+/// Factory for constructing a lookup source (async, for on-demand mode).
+///
+/// Previously this was a hand-rolled `Arc<dyn Fn(...) -> Pin<Box<Future>>>`
+/// type alias that nobody could read. A trait with an `async` method
+/// says the same thing without forcing the caller to spell out the
+/// `Pin<Box<...>>`.
+#[async_trait]
+pub trait LookupSourceFactory: Send + Sync {
+    /// Build a lookup source instance from the given config.
+    async fn build(
+        &self,
+        config: ConnectorConfig,
+    ) -> Result<Arc<dyn laminar_core::lookup::source::LookupSourceDyn>, ConnectorError>;
+}
 
-/// Registry of available connector implementations.
-///
-/// Connectors register themselves with a factory function that creates
-/// new instances. The runtime uses the registry to instantiate connectors
-/// based on the `connector` property in the configuration.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use laminar_connectors::registry::ConnectorRegistry;
-///
-/// let mut registry = ConnectorRegistry::new();
-/// registry.register_source("kafka", info, Arc::new(|| Box::new(KafkaSource::new())));
-///
-/// let connector = registry.create_source("kafka", &config)?;
-/// ```
+/// Registry of available connector implementations. Connectors register
+/// a factory per type string; the runtime looks up by the `connector`
+/// property in `CREATE SOURCE/SINK` DDL.
 #[derive(Clone)]
 pub struct ConnectorRegistry {
     sources: Arc<RwLock<HashMap<String, (ConnectorInfo, SourceFactory)>>>,
     sinks: Arc<RwLock<HashMap<String, (ConnectorInfo, SinkFactory)>>>,
     table_sources: Arc<RwLock<HashMap<String, (ConnectorInfo, TableSourceFactory)>>>,
-    lookup_sources: Arc<RwLock<HashMap<String, LookupSourceFactory>>>,
+    lookup_sources: Arc<RwLock<HashMap<String, Arc<dyn LookupSourceFactory>>>>,
 }
 
 impl ConnectorRegistry {
@@ -227,7 +209,11 @@ impl ConnectorRegistry {
     }
 
     /// Registers a lookup source factory for on-demand/partial cache mode.
-    pub fn register_lookup_source(&self, name: impl Into<String>, factory: LookupSourceFactory) {
+    pub fn register_lookup_source(
+        &self,
+        name: impl Into<String>,
+        factory: Arc<dyn LookupSourceFactory>,
+    ) {
         self.lookup_sources.write().insert(name.into(), factory);
     }
 
@@ -242,9 +228,9 @@ impl ConnectorRegistry {
     {
         let factory = {
             let lookup_sources = self.lookup_sources.read();
-            lookup_sources.get(config.connector_type())?.clone()
+            Arc::clone(lookup_sources.get(config.connector_type())?)
         };
-        Some(factory(config).await)
+        Some(factory.build(config).await)
     }
 
     /// Returns information about a registered source connector.

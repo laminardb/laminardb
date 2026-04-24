@@ -110,9 +110,12 @@ pub(crate) struct SinkTaskHandle {
     tx: SinkCommandTx,
     exactly_once: bool,
     /// Held so `close()` can join the task; implicit shutdown happens
-    /// when the command channel drops.
+    /// when the command channel drops. `parking_lot::Mutex` is correct
+    /// here because `close()` extracts the handle under the lock and
+    /// awaits on it *after* dropping the guard — the lock never spans
+    /// an `.await`.
     #[allow(dead_code)]
-    task: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
+    task: Arc<parking_lot::Mutex<Option<JoinHandle<()>>>>,
     /// Used by `write_batch` to emit `ChannelClosed` if the task is gone.
     event_tx: Producer<SinkEvent>,
 }
@@ -157,7 +160,7 @@ impl SinkTaskHandle {
             sink_id,
             tx,
             exactly_once,
-            task: Arc::new(tokio::sync::Mutex::new(Some(handle))),
+            task: Arc::new(parking_lot::Mutex::new(Some(handle))),
             event_tx,
         }
     }
@@ -272,8 +275,10 @@ impl SinkTaskHandle {
     #[cfg(test)]
     pub async fn close(&self) {
         let _ = self.tx.send(SinkCommand::Close).await;
-        let mut guard = self.task.lock().await;
-        if let Some(handle) = guard.take() {
+        // Extract under the lock, release before awaiting. Keeps the
+        // lock scope a handful of ns instead of seconds.
+        let handle = self.task.lock().take();
+        if let Some(handle) = handle {
             let _ = tokio::time::timeout(Duration::from_secs(30), handle).await;
         }
     }

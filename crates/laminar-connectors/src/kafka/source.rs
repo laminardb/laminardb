@@ -335,6 +335,7 @@ impl KafkaSource {
         // -- Commit task: periodic advisory broker offset commits --
         let commit_consumer = Arc::clone(&consumer);
         let commit_retry = Arc::clone(&commit_retry_needed);
+        let commit_metrics = self.metrics.clone();
         let mut commit_shutdown = shutdown_rx.clone();
         let commit_handle = tokio::spawn(async move {
             if broker_commit_interval.is_zero() {
@@ -361,6 +362,13 @@ impl KafkaSource {
                             let n = tpl.count();
                             // Await the blocking commit so it completes before
                             // close() drops the consumer Arc.
+                            //
+                            // Metrics: librdkafka fires `commit_callback` for
+                            // BOTH sync and async commits, and the callback is
+                            // our authoritative counter source. We only bump
+                            // `commit_failures` here for outcomes the callback
+                            // can't observe — a panicked blocking task, or a
+                            // tokio timeout while the commit is still pending.
                             match tokio::time::timeout(
                                 std::time::Duration::from_secs(10),
                                 tokio::task::spawn_blocking(move || {
@@ -369,21 +377,42 @@ impl KafkaSource {
                             )
                             .await
                             {
-                                Ok(Ok(Ok(()))) => info!(partition_count = n, "sync offset commit retry succeeded"),
+                                Ok(Ok(Ok(()))) => {
+                                    // callback already bumped `commits`
+                                    info!(partition_count = n, "sync offset commit retry succeeded");
+                                }
                                 Ok(Ok(Err(e))) => {
+                                    // callback already bumped `commit_failures`
                                     flag.store(true, Ordering::Release);
                                     warn!(error = %e, "sync offset commit retry failed");
                                 }
-                                Ok(Err(e)) => warn!(error = %e, "sync commit blocking task panicked"),
+                                Ok(Err(e)) => {
+                                    commit_metrics.record_commit_failure();
+                                    warn!(error = %e, "sync commit blocking task panicked");
+                                }
                                 Err(_) => {
+                                    commit_metrics.record_commit_failure();
                                     flag.store(true, Ordering::Release);
                                     warn!("sync offset commit retry timed out");
                                 }
                             }
                         } else {
+                            // Async enqueue only — the broker-confirmed outcome
+                            // (Ok or Err) arrives asynchronously via
+                            // `LaminarConsumerContext::commit_callback`, which
+                            // bumps `commits` / `commit_failures`. Counting at
+                            // enqueue would overcount (every rejected commit
+                            // would show as a success here). An immediate `Err`
+                            // below means librdkafka couldn't even queue the
+                            // commit — rare, but worth observing.
                             match commit_consumer.commit(&tpl, CommitMode::Async) {
-                                Ok(()) => info!(partition_count = tpl.count(), "periodic broker offset commit (advisory)"),
-                                Err(e) => warn!(error = %e, "periodic broker offset commit failed"),
+                                Ok(()) => {
+                                    info!(partition_count = tpl.count(), "periodic broker offset commit (advisory)");
+                                }
+                                Err(e) => {
+                                    commit_metrics.record_commit_failure();
+                                    warn!(error = %e, "periodic broker offset commit failed");
+                                }
                             }
                         }
                     }
@@ -660,6 +689,11 @@ impl SourceConnector for KafkaSource {
             Arc::clone(&self.reader_paused),
             Arc::clone(&self.commit_retry_needed),
             Arc::clone(&self.offset_snapshot),
+            // IntCounter::clone is an Arc bump; these are shared with the
+            // metrics struct and bumped from librdkafka's background thread
+            // inside `commit_callback`.
+            self.metrics.commits.clone(),
+            self.metrics.commit_failures.clone(),
         );
         let consumer: StreamConsumer<LaminarConsumerContext> =
             rdkafka_config.create_with_context(context).map_err(|e| {
@@ -1025,10 +1059,21 @@ impl SourceConnector for KafkaSource {
 
         // Publish current offsets to the reader task for periodic broker commits
         // and to the rebalance callback for seek-on-assign.
-        // After retain_assigned, self.offsets only contains assigned partitions.
+        //
+        // Filter by the current assignment: `retain_assigned` only runs when
+        // `had_revoke` is newly detected, so between the revoke callback and
+        // the next `poll_batch` the tracker may transiently hold entries for
+        // partitions we no longer own. An unfiltered commit of those offsets
+        // is rejected by the broker (`IllegalGeneration` / "Consumer not
+        // assigned"), which flips `commit_retry_needed` on and stalls the
+        // commit loop against the same stale TPL — visible as a sawtooth in
+        // consumer lag.
         if had_revoke || !self.poll_payload_offsets.is_empty() {
             if let Some(ref tx) = self.offset_commit_tx {
-                let tpl = self.offsets.to_topic_partition_list();
+                let assigned = lock_or_recover(&self.rebalance_state)
+                    .assigned_partitions()
+                    .clone();
+                let tpl = self.offsets.to_topic_partition_list_filtered(&assigned);
                 if tx.send(tpl).is_err() {
                     debug!("offset_commit_tx closed, reader task shutting down");
                 }

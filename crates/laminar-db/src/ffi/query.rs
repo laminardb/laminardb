@@ -61,7 +61,6 @@ impl LaminarRecordBatch {
     }
 
     /// Get reference to inner `RecordBatch`.
-    #[allow(dead_code)]
     pub(crate) fn inner(&self) -> &RecordBatch {
         &self.inner
     }

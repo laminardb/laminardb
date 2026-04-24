@@ -125,8 +125,10 @@ pub async fn open_or_create_table(
 
     let url = path_to_url(table_path)?;
 
-    // Try to open or initialize the table.
-    let table = DeltaTable::try_from_url_with_storage_options(url.clone(), storage_options.clone())
+    // Try to open or initialize the table. `url` and `storage_options` are
+    // not referenced after this call, so move rather than clone — a cloned
+    // HashMap per compaction tick / table reopen was pure overhead.
+    let table = DeltaTable::try_from_url_with_storage_options(url, storage_options)
         .await
         .map_err(|e| ConnectorError::ConnectionFailed(format!("failed to open table: {e}")))?;
 
@@ -945,6 +947,7 @@ pub struct MergeResult {
 /// Returns `ConnectorError::WriteError` if the merge fails.
 #[cfg(feature = "delta-lake")]
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub async fn merge_changelog(
     table: DeltaTable,
     source_batch: RecordBatch,
@@ -953,6 +956,7 @@ pub async fn merge_changelog(
     epoch: u64,
     schema_evolution: bool,
     writer_properties: Option<deltalake::parquet::file::properties::WriterProperties>,
+    ctx: &datafusion::prelude::SessionContext,
 ) -> Result<(DeltaTable, MergeResult), ConnectorError> {
     use datafusion::prelude::*;
     use deltalake::kernel::transaction::CommitProperties;
@@ -977,7 +981,6 @@ pub async fn merge_changelog(
         "performing atomic changelog MERGE"
     );
 
-    let ctx = SessionContext::new();
     let source_df = ctx.read_batch(source_batch).map_err(|e| {
         ConnectorError::WriteError(format!("failed to create source DataFrame: {e}"))
     })?;

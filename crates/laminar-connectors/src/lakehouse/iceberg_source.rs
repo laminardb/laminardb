@@ -235,9 +235,7 @@ impl SourceConnector for IcebergSource {
         self.epoch = checkpoint.epoch();
         if let Some(sid) = checkpoint.get_offset("snapshot_id") {
             self.last_snapshot_id = Some(sid.parse().map_err(|_| {
-                ConnectorError::CheckpointError(format!(
-                    "invalid snapshot_id in checkpoint: '{sid}'"
-                ))
+                ConnectorError::Internal(format!("invalid snapshot_id in checkpoint: '{sid}'"))
             })?);
             debug!(snapshot_id = ?self.last_snapshot_id, "iceberg source restored");
         }

@@ -87,8 +87,8 @@ pub trait StateBackend: Send + Sync + 'static {
     ///
     /// `assignment_version` is the [`VnodeRegistry::assignment_version`]
     /// the writer observed when it started this write. Backends that
-    /// implement the split-brain fence (Phase 1.4) compare it against
-    /// their own authoritative version and return
+    /// implement the split-brain fence compare it against their own
+    /// authoritative version and return
     /// [`StateBackendError::StaleVersion`] if the writer is behind.
     /// Backends that opt out of fencing accept any version.
     ///

@@ -42,8 +42,7 @@ pub struct LaminarDbBuilder {
     cluster_controller: Option<std::sync::Arc<laminar_core::cluster::control::ClusterController>>,
     /// Outbound shuffle handle for cluster-mode streaming aggregates.
     /// Pair with `shuffle_receiver`; without it, streaming aggregates
-    /// run single-node even when the cluster controller is installed
-    /// (see Phase 0a in `docs/plans/cluster-production-readiness.md`).
+    /// run single-node even when the cluster controller is installed.
     #[cfg(feature = "cluster-unstable")]
     shuffle_sender: Option<std::sync::Arc<laminar_core::shuffle::ShuffleSender>>,
     /// Inbound shuffle handle for cluster-mode streaming aggregates.

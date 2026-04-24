@@ -156,12 +156,12 @@ impl KafkaSinkConfig {
 
         cfg.bootstrap_servers = config
             .get("bootstrap.servers")
-            .ok_or_else(|| ConnectorError::MissingConfig("bootstrap.servers".into()))?
+            .ok_or_else(|| ConnectorError::missing_config("bootstrap.servers"))?
             .to_string();
 
         cfg.topic = config
             .get("topic")
-            .ok_or_else(|| ConnectorError::MissingConfig("topic".into()))?
+            .ok_or_else(|| ConnectorError::missing_config("topic"))?
             .to_string();
 
         if let Some(s) = config.get("security.protocol") {
@@ -299,10 +299,10 @@ impl KafkaSinkConfig {
     /// Returns `ConnectorError::ConfigurationError` on invalid combinations.
     pub fn validate(&self) -> Result<(), ConnectorError> {
         if self.bootstrap_servers.is_empty() {
-            return Err(ConnectorError::MissingConfig("bootstrap.servers".into()));
+            return Err(ConnectorError::missing_config("bootstrap.servers"));
         }
         if self.topic.is_empty() {
-            return Err(ConnectorError::MissingConfig("topic".into()));
+            return Err(ConnectorError::missing_config("topic"));
         }
 
         if self.security_protocol.uses_sasl() && self.sasl_mechanism.is_none() {

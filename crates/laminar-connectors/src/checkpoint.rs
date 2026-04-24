@@ -1,7 +1,5 @@
-//! Connector checkpoint types.
-//!
-//! Checkpoints capture the position of a source connector so it can
-//! resume from where it left off after a restart.
+//! Source checkpoints: the minimal state needed to resume a connector
+//! where it left off after a restart (Kafka offsets, CDC LSN/GTID, etc.).
 #![allow(clippy::disallowed_types)] // cold path: connector checkpoint
 
 use std::collections::HashMap;
