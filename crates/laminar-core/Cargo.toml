@@ -75,7 +75,7 @@ crossfire = { workspace = true }
 criterion = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
-toml = "0.9"
+toml = "1.1"
 tempfile = { workspace = true }
 
 [[bench]]
