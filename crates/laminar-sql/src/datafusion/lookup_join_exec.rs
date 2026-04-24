@@ -426,8 +426,10 @@ pub struct LookupJoinExec {
     join_type: LookupJoinType,
     schema: SchemaRef,
     properties: PlanProperties,
-    /// `RowConverter` config for encoding probe keys identically to the index.
-    key_sort_fields: Vec<SortField>,
+    /// Prebuilt `RowConverter` for encoding probe keys. Shared across
+    /// every `execute()` call so we don't rebuild per-type encoders on
+    /// every cycle of a cached physical plan.
+    converter: Arc<RowConverter>,
     stream_field_count: usize,
 }
 
@@ -455,6 +457,7 @@ impl LookupJoinExec {
             .iter()
             .map(|&i| SortField::new(lookup_batch.schema().field(i).data_type().clone()))
             .collect();
+        let converter = Arc::new(RowConverter::new(key_sort_fields)?);
 
         // Left outer joins produce NULLs for non-matching lookup rows,
         // so force all lookup columns nullable in the output schema.
@@ -493,7 +496,7 @@ impl LookupJoinExec {
             join_type,
             schema: output_schema,
             properties,
-            key_sort_fields,
+            converter,
             stream_field_count,
         })
     }
@@ -564,7 +567,7 @@ impl ExecutionPlan for LookupJoinExec {
             join_type: self.join_type,
             schema: Arc::clone(&self.schema),
             properties: self.properties.clone(),
-            key_sort_fields: self.key_sort_fields.clone(),
+            converter: Arc::clone(&self.converter),
             stream_field_count: self.stream_field_count,
         }))
     }
@@ -575,7 +578,7 @@ impl ExecutionPlan for LookupJoinExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
-        let converter = RowConverter::new(self.key_sort_fields.clone())?;
+        let converter = Arc::clone(&self.converter);
         let index = Arc::clone(&self.index);
         let lookup_batch = Arc::clone(&self.lookup_batch);
         let stream_key_indices = self.stream_key_indices.clone();
@@ -724,7 +727,9 @@ pub struct VersionedLookupJoinExec {
     join_type: LookupJoinType,
     schema: SchemaRef,
     properties: PlanProperties,
-    key_sort_fields: Vec<SortField>,
+    /// Prebuilt `RowConverter` — built once at planning time and reused
+    /// across every `execute()` call. Previously rebuilt per cycle.
+    converter: Arc<RowConverter>,
     stream_field_count: usize,
 }
 
@@ -775,6 +780,7 @@ impl VersionedLookupJoinExec {
         );
 
         let stream_field_count = input.schema().fields().len();
+        let converter = Arc::new(RowConverter::new(key_sort_fields)?);
 
         Ok(Self {
             input,
@@ -785,7 +791,7 @@ impl VersionedLookupJoinExec {
             join_type,
             schema: output_schema,
             properties,
-            key_sort_fields,
+            converter,
             stream_field_count,
         })
     }
@@ -857,7 +863,7 @@ impl ExecutionPlan for VersionedLookupJoinExec {
             join_type: self.join_type,
             schema: Arc::clone(&self.schema),
             properties: self.properties.clone(),
-            key_sort_fields: self.key_sort_fields.clone(),
+            converter: Arc::clone(&self.converter),
             stream_field_count: self.stream_field_count,
         }))
     }
@@ -868,7 +874,7 @@ impl ExecutionPlan for VersionedLookupJoinExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
-        let converter = RowConverter::new(self.key_sort_fields.clone())?;
+        let converter = Arc::clone(&self.converter);
         let index = Arc::clone(&self.index);
         let table_batch = Arc::clone(&self.table_batch);
         let stream_key_indices = self.stream_key_indices.clone();
@@ -1015,7 +1021,9 @@ pub struct PartialLookupJoinExec {
     join_type: LookupJoinType,
     schema: SchemaRef,
     properties: PlanProperties,
-    key_sort_fields: Vec<SortField>,
+    /// Prebuilt `RowConverter` — built once at planning time, reused on
+    /// every `execute()`. Previously rebuilt per-cycle.
+    converter: Arc<RowConverter>,
     stream_field_count: usize,
     lookup_schema: SchemaRef,
     source: Option<Arc<dyn LookupSourceDyn>>,
@@ -1093,6 +1101,7 @@ impl PartialLookupJoinExec {
         );
 
         let stream_field_count = input.schema().fields().len();
+        let converter = Arc::new(RowConverter::new(key_sort_fields)?);
 
         Ok(Self {
             input,
@@ -1101,7 +1110,7 @@ impl PartialLookupJoinExec {
             join_type,
             schema: output_schema,
             properties,
-            key_sort_fields,
+            converter,
             stream_field_count,
             lookup_schema,
             source,
@@ -1174,7 +1183,7 @@ impl ExecutionPlan for PartialLookupJoinExec {
             join_type: self.join_type,
             schema: Arc::clone(&self.schema),
             properties: self.properties.clone(),
-            key_sort_fields: self.key_sort_fields.clone(),
+            converter: Arc::clone(&self.converter),
             stream_field_count: self.stream_field_count,
             lookup_schema: Arc::clone(&self.lookup_schema),
             source: self.source.clone(),
@@ -1188,7 +1197,7 @@ impl ExecutionPlan for PartialLookupJoinExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
-        let converter = Arc::new(RowConverter::new(self.key_sort_fields.clone())?);
+        let converter = Arc::clone(&self.converter);
         let foyer_cache = Arc::clone(&self.foyer_cache);
         let stream_key_indices = self.stream_key_indices.clone();
         let join_type = self.join_type;

@@ -257,7 +257,6 @@ pub(crate) struct ProjectionFilterInfo {
     pub(crate) proj_exprs: Vec<datafusion_expr::Expr>,
     pub(crate) filter_predicate: Option<datafusion_expr::Expr>,
     pub(crate) input_df_schema: Arc<datafusion_common::DFSchema>,
-    pub(crate) source_table: String,
 }
 
 /// Returns `Some` only for plans of the shape
@@ -266,18 +265,17 @@ pub(crate) fn extract_projection_filter(plan: &LogicalPlan) -> Option<Projection
     match plan {
         LogicalPlan::Projection(proj) => {
             let proj_exprs = proj.expr.clone();
-            extract_filter_or_scan(&proj.input).map(|(filter_pred, input_schema, table_name)| {
+            extract_filter_or_scan(&proj.input).map(|(filter_pred, input_schema, _)| {
                 ProjectionFilterInfo {
                     proj_exprs,
                     filter_predicate: filter_pred,
                     input_df_schema: input_schema,
-                    source_table: table_name,
                 }
             })
         }
         // No Projection wrapper — check for Filter -> TableScan directly
         _ => match extract_filter_or_scan(plan) {
-            Some((filter_pred, input_schema, table_name)) => {
+            Some((filter_pred, input_schema, _)) => {
                 // Build identity projection from the scan schema
                 let proj_exprs: Vec<datafusion_expr::Expr> = input_schema
                     .fields()
@@ -292,7 +290,6 @@ pub(crate) fn extract_projection_filter(plan: &LogicalPlan) -> Option<Projection
                     proj_exprs,
                     filter_predicate: filter_pred,
                     input_df_schema: input_schema,
-                    source_table: table_name,
                 })
             }
             None => None,

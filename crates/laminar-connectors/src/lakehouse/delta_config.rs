@@ -1,8 +1,5 @@
-//! Delta Lake sink connector configuration.
-//!
-//! [`DeltaLakeSinkConfig`] encapsulates all settings for writing Arrow
-//! `RecordBatch` data to Delta Lake tables, parsed from SQL `WITH (...)`
-//! clauses via [`from_config`](DeltaLakeSinkConfig::from_config).
+//! Delta Lake sink config. Parsed from SQL `WITH (...)` via
+//! [`DeltaLakeSinkConfig::from_config`].
 #![allow(clippy::disallowed_types)] // cold path: lakehouse configuration
 
 use std::collections::HashMap;
@@ -386,7 +383,7 @@ impl DeltaLakeSinkConfig {
     /// Returns `ConnectorError::ConfigurationError` on invalid combinations.
     pub fn validate(&self) -> Result<(), ConnectorError> {
         if self.table_path.is_empty() {
-            return Err(ConnectorError::MissingConfig("table.path".into()));
+            return Err(ConnectorError::missing_config("table.path"));
         }
         if self.write_mode == DeltaWriteMode::Upsert && self.merge_key_columns.is_empty() {
             return Err(ConnectorError::ConfigurationError(

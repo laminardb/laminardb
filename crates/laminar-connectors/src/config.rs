@@ -1,10 +1,3 @@
-//! Connector configuration types.
-//!
-//! Provides a generic configuration model for connectors:
-//! - `ConnectorConfig`: Key-value configuration with validation
-//! - `ConfigKeySpec`: Specification for a configuration key
-//! - `ConnectorInfo`: Metadata about a connector implementation
-//! - `ConnectorState`: Lifecycle state of a running connector
 #![allow(clippy::disallowed_types)] // cold path: connector configuration
 
 use std::collections::HashMap;
@@ -106,7 +99,7 @@ impl ConnectorConfig {
     /// Returns `ConnectorError::MissingConfig` if the key is not set.
     pub fn require(&self, key: &str) -> Result<&str, ConnectorError> {
         self.get(key)
-            .ok_or_else(|| ConnectorError::MissingConfig(key.to_string()))
+            .ok_or_else(|| ConnectorError::missing_config(key.to_string()))
     }
 
     /// Gets a property parsed as the given type.
@@ -191,7 +184,7 @@ impl ConnectorConfig {
                     // Has a default, skip
                     let _ = default;
                 } else {
-                    return Err(ConnectorError::MissingConfig(spec.key.clone()));
+                    return Err(ConnectorError::missing_config(spec.key.clone()));
                 }
             }
         }

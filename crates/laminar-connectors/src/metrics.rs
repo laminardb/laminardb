@@ -1,12 +1,4 @@
-//! Connector metrics types.
-//!
-//! Provides metrics reporting for connectors:
-//! - `ConnectorMetrics`: Metrics reported by a connector implementation
-
-/// Metrics reported by a connector implementation.
-///
-/// Connectors return this from their `metrics()` method to expose
-/// internal state to the runtime and monitoring systems.
+/// Metrics snapshot returned from a connector's `metrics()` method.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectorMetrics {
     /// Total number of records processed.

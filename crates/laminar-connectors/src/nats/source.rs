@@ -12,9 +12,10 @@ use arrow_schema::SchemaRef;
 use async_nats::jetstream::{self, consumer::pull};
 use async_trait::async_trait;
 use bytes::Bytes;
+use crossfire::{mpsc, AsyncRx, MAsyncTx, TryRecvError};
 use futures_util::StreamExt;
 use rustc_hash::FxHashMap;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -38,7 +39,7 @@ struct Incoming {
 
 struct Running {
     deserializer: Box<dyn RecordDeserializer>,
-    rx: mpsc::Receiver<Incoming>,
+    rx: AsyncRx<mpsc::Array<Incoming>>,
     shutdown: Arc<Notify>,
     /// `Some` on `JetStream`; `None` on core.
     consecutive_errors: Option<Arc<AtomicU32>>,
@@ -115,7 +116,7 @@ impl NatsSource {
             .await
             .map_err(|e| classify_create_consumer_error(&e, consumer_name))?;
 
-        let (tx, rx) = mpsc::channel::<Incoming>(cfg.fetch_batch * 2);
+        let (tx, rx) = mpsc::bounded_async::<Incoming>(cfg.fetch_batch * 2);
         let shutdown = Arc::new(Notify::new());
         let consecutive_errors = Arc::new(AtomicU32::new(0));
 
@@ -164,7 +165,7 @@ impl NatsSource {
                 .map_err(|e| err(&format!("subscribe: {e}")))?
         };
 
-        let (tx, rx) = mpsc::channel::<Incoming>(cfg.fetch_batch * 2);
+        let (tx, rx) = mpsc::bounded_async::<Incoming>(cfg.fetch_batch * 2);
         let shutdown = Arc::new(Notify::new());
 
         let reader = CoreReader {
@@ -214,8 +215,9 @@ impl SourceConnector for NatsSource {
         let mut offset_updates: Vec<(String, u64)> = Vec::new();
 
         while payloads.len() < max_records {
-            let Ok(incoming) = running.rx.try_recv() else {
-                break;
+            let incoming = match running.rx.try_recv() {
+                Ok(m) => m,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             };
             if let Some(seq) = incoming.stream_seq {
                 offset_updates.push((incoming.subject.clone(), seq));
@@ -499,7 +501,7 @@ fn entropy_now() -> u64 {
 
 struct JsReader {
     consumer: jetstream::consumer::Consumer<pull::Config>,
-    tx: mpsc::Sender<Incoming>,
+    tx: MAsyncTx<mpsc::Array<Incoming>>,
     shutdown: Arc<Notify>,
     consecutive_errors: Arc<AtomicU32>,
     data_ready: Arc<Notify>,
@@ -615,7 +617,7 @@ impl JsReader {
 
 struct CoreReader {
     subscriber: async_nats::Subscriber,
-    tx: mpsc::Sender<Incoming>,
+    tx: MAsyncTx<mpsc::Array<Incoming>>,
     shutdown: Arc<Notify>,
     data_ready: Arc<Notify>,
 }

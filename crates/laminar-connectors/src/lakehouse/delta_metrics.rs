@@ -1,10 +1,6 @@
-//! Delta Lake sink connector metrics.
-//!
-//! [`DeltaLakeSinkMetrics`] provides prometheus-backed counters and gauges
-//! for tracking write statistics, convertible to the SDK's
-//! [`ConnectorMetrics`] type.
+//! Prometheus-backed Delta Lake sink metrics.
 
-use prometheus::{IntCounter, IntGauge, Registry};
+use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, Registry};
 
 use super::metrics::LakehouseSinkMetrics;
 use crate::metrics::ConnectorMetrics;
@@ -32,6 +28,16 @@ pub struct DeltaLakeSinkMetrics {
 
     /// Total files deleted by vacuum.
     pub vacuum_files_deleted: IntCounter,
+
+    /// Total optimistic-concurrency conflicts encountered (per retry).
+    pub conflicts: IntCounter,
+
+    /// Total retry attempts kicked off (both conflict and timeout).
+    pub retries: IntCounter,
+
+    /// End-to-end flush duration histogram (concat → write → checkpoint).
+    /// Buckets cover 5ms up to ~160s (0.005 * 2^15).
+    pub flush_duration: Histogram,
 }
 
 impl DeltaLakeSinkMetrics {
@@ -74,6 +80,24 @@ impl DeltaLakeSinkMetrics {
             "Total files deleted by vacuum",
         )
         .unwrap();
+        let conflicts = IntCounter::new(
+            "delta_sink_conflicts_total",
+            "Delta Lake optimistic-concurrency conflicts observed",
+        )
+        .unwrap();
+        let retries = IntCounter::new(
+            "delta_sink_retries_total",
+            "Retry attempts kicked off (conflict + timeout)",
+        )
+        .unwrap();
+        let flush_duration = Histogram::with_opts(
+            HistogramOpts::new(
+                "delta_sink_flush_duration_seconds",
+                "End-to-end Delta Lake flush duration (pre-concat → write → checkpoint)",
+            )
+            .buckets(prometheus::exponential_buckets(0.005, 2.0, 16).unwrap()),
+        )
+        .unwrap();
 
         let _ = reg.register(Box::new(merge_operations.clone()));
         let _ = reg.register(Box::new(last_delta_version.clone()));
@@ -81,6 +105,9 @@ impl DeltaLakeSinkMetrics {
         let _ = reg.register(Box::new(compaction_files_added.clone()));
         let _ = reg.register(Box::new(compaction_files_removed.clone()));
         let _ = reg.register(Box::new(vacuum_files_deleted.clone()));
+        let _ = reg.register(Box::new(conflicts.clone()));
+        let _ = reg.register(Box::new(retries.clone()));
+        let _ = reg.register(Box::new(flush_duration.clone()));
 
         Self {
             common: LakehouseSinkMetrics::new(registry),
@@ -90,6 +117,9 @@ impl DeltaLakeSinkMetrics {
             compaction_files_added,
             compaction_files_removed,
             vacuum_files_deleted,
+            conflicts,
+            retries,
+            flush_duration,
         }
     }
 
@@ -137,6 +167,21 @@ impl DeltaLakeSinkMetrics {
         self.vacuum_files_deleted.inc_by(files_deleted);
     }
 
+    /// Records an optimistic-concurrency conflict (one per retry-triggering conflict).
+    pub fn record_conflict(&self) {
+        self.conflicts.inc();
+    }
+
+    /// Records a retry attempt.
+    pub fn record_retry(&self) {
+        self.retries.inc();
+    }
+
+    /// Records a completed flush duration (seconds).
+    pub fn observe_flush_duration(&self, seconds: f64) {
+        self.flush_duration.observe(seconds);
+    }
+
     /// Converts to the SDK's [`ConnectorMetrics`].
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
@@ -159,6 +204,8 @@ impl DeltaLakeSinkMetrics {
             "delta.vacuum_files_deleted",
             self.vacuum_files_deleted.get() as f64,
         );
+        m.add_custom("delta.conflicts", self.conflicts.get() as f64);
+        m.add_custom("delta.retries", self.retries.get() as f64);
         m
     }
 }

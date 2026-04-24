@@ -1,8 +1,5 @@
-//! Kafka source connector configuration.
-//!
-//! Provides [`KafkaSourceConfig`] for configuring the Kafka consumer,
-//! including broker connection, format, Schema Registry, backpressure,
-//! and pass-through `rdkafka` properties.
+//! Kafka source config — broker connection, format, Schema Registry,
+//! backpressure, and pass-through `rdkafka` properties.
 
 use std::collections::HashMap;
 use std::time::Duration;

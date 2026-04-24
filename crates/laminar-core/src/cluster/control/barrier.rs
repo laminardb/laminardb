@@ -44,14 +44,13 @@ pub struct BarrierAnnouncement {
     /// leader from follower acks (see `BarrierAck.local_watermark_ms`)
     /// plus the leader's own watermark. Populated on
     /// [`Phase::Commit`] announcements. `None` on `Prepare`/`Abort`
-    /// (computed only after acks are in) and on pre-Phase-1.3 payloads
+    /// (computed only after acks are in) and on legacy payloads
     /// deserialised via the `#[serde(default)]` fallback.
     ///
     /// Consumers consult this value instead of their local watermark
     /// when deciding whether an event-time window has closed
     /// cluster-wide — local progress on one node is stale if another
-    /// node is still processing earlier events. See Phase 1.3 in
-    /// `docs/plans/cluster-production-readiness.md`.
+    /// node is still processing earlier events.
     #[serde(default)]
     pub min_watermark_ms: Option<i64>,
 }
@@ -88,7 +87,7 @@ pub enum QuorumOutcome {
         /// `local_watermark_ms` (ignoring `None` values). `None`
         /// means no follower reported a watermark — the leader
         /// falls back to its own local value for the Commit
-        /// announcement. See Phase 1.3.
+        /// announcement.
         min_follower_watermark_ms: Option<i64>,
     },
     /// Deadline expired with at least one peer silent.

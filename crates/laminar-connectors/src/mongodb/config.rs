@@ -176,7 +176,7 @@ impl MongoDbSourceConfig {
         // split_large_events requires raw change stream access not available
         // in the mongodb v3 driver (ChangeStreamEvent drops unknown fields).
         if self.split_large_events {
-            return Err(ConnectorError::UnsupportedOperation(
+            return Err(ConnectorError::ConfigurationError(
                 "split_large_events requires raw change stream access not supported \
                  by the mongodb v3 driver; set split_large_events = false"
                     .to_string(),

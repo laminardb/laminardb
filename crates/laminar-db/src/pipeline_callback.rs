@@ -180,8 +180,8 @@ impl ConnectorPipelineCallback {
                 "coordinator not initialized when force_capture_and_checkpoint ran".into(),
             )
         })?;
-        // Phase 1.3: seed leader-side local watermark so
-        // `await_prepare_quorum` can fold it into the cluster-wide min.
+        // Seed leader-side local watermark so `await_prepare_quorum`
+        // can fold it into the cluster-wide min.
         let wm = self
             .pipeline_watermark
             .load(std::sync::atomic::Ordering::Acquire);
@@ -248,10 +248,9 @@ impl ConnectorPipelineCallback {
 
         let mut guard = self.coordinator.lock().await;
         let coord = (*guard).as_mut()?;
-        // Phase 1.3: stamp this instance's current pipeline watermark
-        // into the coordinator so the next `BarrierAck` carries it.
-        // i64::MIN means unset; don't propagate — leader treats us as
-        // non-blocking.
+        // Stamp this instance's current pipeline watermark into the
+        // coordinator so the next `BarrierAck` carries it. i64::MIN
+        // means unset; don't propagate — leader treats us as non-blocking.
         let wm = self
             .pipeline_watermark
             .load(std::sync::atomic::Ordering::Acquire);
@@ -642,21 +641,21 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         // the oneshot. Without this, `db.checkpoint()` reaches the
         // coordinator with an empty `CheckpointRequest` and the
         // manifest has no operator state — restart loses every
-        // `IncrementalAggState` accumulator on the invoking node. See
-        // Phase 1.1 in docs/plans/cluster-production-readiness.md.
+        // `IncrementalAggState` accumulator on the invoking node.
         let mut force_reqs: Vec<
-            tokio::sync::oneshot::Sender<
+            crossfire::oneshot::TxOneshot<
                 Result<crate::checkpoint_coordinator::CheckpointResult, DbError>,
             >,
         > = Vec::new();
-        if let Some(rx) = self.force_ckpt_rx.as_mut() {
+        if let Some(rx) = self.force_ckpt_rx.as_ref() {
             while let Ok(reply) = rx.try_recv() {
                 force_reqs.push(reply);
             }
         }
         for reply_tx in force_reqs {
             let result = self.force_capture_and_checkpoint().await;
-            let _ = reply_tx.send(result);
+            // Ignore receiver-dropped: caller gave up on `db.checkpoint()`.
+            reply_tx.send(result);
         }
 
         // Cluster mode: only the leader fires periodic checkpoints.

@@ -171,7 +171,8 @@ pub(crate) async fn create_uc_table(
     }
 
     if status.as_u16() == 401 || status.as_u16() == 403 {
-        return Err(ConnectorError::AuthenticationFailed(format!(
+        // Non-transient — credentials are wrong, retry won't help.
+        return Err(ConnectorError::ConfigurationError(format!(
             "Unity Catalog auth failed (HTTP {status}): {error_body}"
         )));
     }
@@ -210,8 +211,9 @@ pub(crate) async fn get_table_storage_location(
 
     let status = resp.status();
     if status.as_u16() == 401 || status.as_u16() == 403 {
+        // Non-transient — credentials are wrong, retry won't help.
         let body = resp.text().await.unwrap_or_default();
-        return Err(ConnectorError::AuthenticationFailed(format!(
+        return Err(ConnectorError::ConfigurationError(format!(
             "Unity Catalog auth failed (HTTP {status}): {body}"
         )));
     }

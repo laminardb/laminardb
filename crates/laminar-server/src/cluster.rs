@@ -446,7 +446,7 @@ pub async fn start_cluster(
     // Shuffle fabric. ShuffleReceiver publishes its bound address into
     // the gossip KV so peer ShuffleSenders discover it on first send.
     // Without this wiring, streaming aggregates never cross node
-    // boundaries — Phase 0a in the plan.
+    // boundaries.
     let shuffle_receiver = build_shuffle_receiver(&discovery, node_id).await?;
     let shuffle_advertise = shuffle_advertise_addr(shuffle_receiver.local_addr(), bind_host);
     let shuffle_sender =

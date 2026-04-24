@@ -1012,13 +1012,13 @@ impl SinkConnector for PostgresSink {
 #[async_trait]
 impl SinkConnector for PostgresSink {
     async fn open(&mut self, _config: &ConnectorConfig) -> Result<(), ConnectorError> {
-        Err(ConnectorError::UnsupportedOperation(
+        Err(ConnectorError::ConfigurationError(
             "PostgreSQL sink requires the 'postgres-sink' feature".into(),
         ))
     }
 
     async fn write_batch(&mut self, _batch: &RecordBatch) -> Result<WriteResult, ConnectorError> {
-        Err(ConnectorError::UnsupportedOperation(
+        Err(ConnectorError::ConfigurationError(
             "PostgreSQL sink requires the 'postgres-sink' feature".into(),
         ))
     }

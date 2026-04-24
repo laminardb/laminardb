@@ -306,7 +306,7 @@ pub(crate) async fn start_http_api(
     let app_state = Arc::new(http::AppState {
         db,
         config_path,
-        current_config: tokio::sync::RwLock::new(config),
+        current_config: parking_lot::RwLock::new(config),
         reload_guard: ReloadGuard::new(),
         registry,
         server_metrics,

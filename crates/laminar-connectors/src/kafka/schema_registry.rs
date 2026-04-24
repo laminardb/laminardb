@@ -129,8 +129,6 @@ struct SchemaVersionResponse {
     #[serde(default = "default_schema_type")]
     #[serde(rename = "schemaType")]
     schema_type: String,
-    #[allow(dead_code)]
-    subject: Option<String>,
 }
 
 #[derive(Deserialize)]

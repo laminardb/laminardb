@@ -24,7 +24,7 @@ pub struct ClusterController {
     /// in a `Commit` announcement. `i64::MIN` means uninitialised
     /// (no Commit observed yet). Operators consult this instead of
     /// their local watermark so event-time decisions stay consistent
-    /// across the cluster. Phase 1.3.
+    /// across the cluster.
     cluster_min_watermark: Arc<AtomicI64>,
 }
 
@@ -56,7 +56,7 @@ impl ClusterController {
 
     /// Latest cluster-wide minimum watermark seen by this instance.
     /// `None` until the leader has published a `Commit` with a
-    /// populated `min_watermark_ms`. Phase 1.3.
+    /// populated `min_watermark_ms`.
     #[must_use]
     pub fn cluster_min_watermark(&self) -> Option<i64> {
         let v = self.cluster_min_watermark.load(Ordering::Acquire);
@@ -73,7 +73,7 @@ impl ClusterController {
     /// and must mirror it into the controller atomic so its own
     /// operators see the same value that followers pick up via
     /// `observe_barrier` on the matching `Commit`. Never lowers the
-    /// published value — event-time progress is monotonic. Phase 1.3.
+    /// published value — event-time progress is monotonic.
     pub fn publish_cluster_min_watermark(&self, wm: i64) {
         let mut cur = self.cluster_min_watermark.load(Ordering::Acquire);
         while wm > cur {
@@ -150,7 +150,7 @@ impl ClusterController {
     /// As a side effect, a `Commit` announcement with a populated
     /// `min_watermark_ms` updates the shared cluster-min-watermark
     /// atomic so operators on this instance see the cluster-wide
-    /// minimum without a separate polling path. Phase 1.3.
+    /// minimum without a separate polling path.
     ///
     /// # Errors
     /// Propagates [`BarrierCoordinator::observe`] errors.
@@ -273,7 +273,7 @@ mod tests {
     #[test]
     fn publish_cluster_min_watermark_is_monotonic() {
         // Leader-side publish mirrors the monotonic contract the
-        // follower path already enforces via observe_barrier. Phase 1.3.
+        // follower path already enforces via observe_barrier.
         let c = ctl(1, vec![]);
         assert_eq!(c.cluster_min_watermark(), None);
 
@@ -295,9 +295,9 @@ mod tests {
 
     #[tokio::test]
     async fn observe_commit_publishes_cluster_min_watermark() {
-        // Phase 1.3: Commit announcements with `min_watermark_ms`
-        // populated propagate into the shared atomic so operators
-        // can read cluster-wide progress without a separate channel.
+        // Commit announcements with `min_watermark_ms` populated
+        // propagate into the shared atomic so operators can read
+        // cluster-wide progress without a separate channel.
         let c = ctl(1, vec![]);
         assert_eq!(c.cluster_min_watermark(), None, "uninitialised");
 

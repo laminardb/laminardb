@@ -130,6 +130,18 @@ pub struct DeltaLakeSink {
     /// the next flush doesn't pay the table-load cost on the commit path.
     #[cfg(feature = "delta-lake")]
     pending_reopen: Option<tokio::task::JoinHandle<Result<DeltaTable, ConnectorError>>>,
+    /// Pre-built Parquet writer properties for hot-path writes. Built once
+    /// in `init_delta_table()` from `config.parquet`; cloning this is far
+    /// cheaper than rebuilding (string parsing, bloom-filter column setup)
+    /// from scratch on every commit.
+    #[cfg(feature = "delta-lake")]
+    cached_writer_properties: Option<deltalake::parquet::file::properties::WriterProperties>,
+    /// Shared `DataFusion` session for upsert/merge operations. Creating a
+    /// fresh `SessionContext` per merge allocated a runtime env, memory
+    /// pool, and object-store registry each commit; reusing one flattens
+    /// allocator churn under steady-state upsert load.
+    #[cfg(feature = "delta-lake")]
+    merge_session: Option<datafusion::prelude::SessionContext>,
 }
 
 impl DeltaLakeSink {
@@ -166,6 +178,10 @@ impl DeltaLakeSink {
             needs_deferred_delta_init: false,
             #[cfg(feature = "delta-lake")]
             pending_reopen: None,
+            #[cfg(feature = "delta-lake")]
+            cached_writer_properties: None,
+            #[cfg(feature = "delta-lake")]
+            merge_session: None,
         }
     }
 
@@ -192,7 +208,7 @@ impl DeltaLakeSink {
 
         // Resolve catalog path: for Unity this calls GET to get the
         // storage_location, bypassing delta-rs credential vending.
-        let (resolved_path, merged_options) = delta_io::resolve_catalog_options(
+        let (resolved_path, mut merged_options) = delta_io::resolve_catalog_options(
             &self.config.catalog_type,
             self.config.catalog_database.as_deref(),
             self.config.catalog_name.as_deref(),
@@ -205,7 +221,6 @@ impl DeltaLakeSink {
         // Inject default connection timeouts if not explicitly set.
         // Azure load balancers close idle connections after ~4 minutes.
         // Without these, a stale connection causes writes to hang forever.
-        let mut merged_options = merged_options;
         merged_options
             .entry("timeout".to_string())
             .or_insert_with(|| "120s".to_string());
@@ -267,15 +282,30 @@ impl DeltaLakeSink {
         }
         self.table = Some(table);
 
-        // Spawn background compaction task if enabled.
+        // Pre-build caches used on every commit. Rebuilding WriterProperties
+        // from config strings per commit was pure churn (HashMap<ColumnPath>
+        // cloned for bloom filters, string lowercase allocs); a cached value
+        // clones cheaply. Similarly, a shared SessionContext avoids
+        // allocating a new RuntimeEnv + MemoryPool + ObjectStoreRegistry
+        // per merge — a significant source of allocator fragmentation on
+        // long-running upsert streams.
+        self.cached_writer_properties = self.config.parquet.to_writer_properties().ok();
+        if self.config.write_mode == DeltaWriteMode::Upsert {
+            self.merge_session = Some(datafusion::prelude::SessionContext::new());
+        }
+
+        // Spawn background compaction task if enabled. Pre-build the
+        // compaction writer properties once; the loop clones per tick
+        // instead of re-parsing config strings.
         if self.config.compaction.enabled {
             let cancel = tokio_util::sync::CancellationToken::new();
+            let compaction_props = self.config.parquet.compaction_writer_properties().ok();
             let handle = tokio::spawn(compaction_loop(
                 resolved_path.clone(),
                 Arc::new(merged_options),
                 self.config.compaction.clone(),
                 self.config.vacuum_retention,
-                self.config.parquet.clone(),
+                compaction_props,
                 cancel.clone(),
             ));
             self.compaction_cancel = Some(cancel);
@@ -476,7 +506,12 @@ impl DeltaLakeSink {
 
         if self.config.write_mode == DeltaWriteMode::Upsert {
             // ── Upsert/Merge path ──
-            let combined =
+            // flush_staged_to_delta pre-concats for upsert so retries don't
+            // pay a full O(rows × cols) copy each attempt. Handle len > 1
+            // defensively in case a future caller skips the pre-concat.
+            let combined = if batches.len() == 1 {
+                batches.into_iter().next().expect("len == 1 checked")
+            } else {
                 match arrow_select::concat::concat_batches(&batches[0].schema(), &batches) {
                     Ok(c) => c,
                     Err(e) => {
@@ -486,7 +521,17 @@ impl DeltaLakeSink {
                             "failed to concat batches: {e}"
                         )));
                     }
-                };
+                }
+            };
+
+            // Cached in init_delta_table — cloning is a small HashMap copy
+            // plus a handful of Arc bumps, far cheaper than rebuilding from
+            // config strings each attempt.
+            let writer_props = self.cached_writer_properties.clone();
+            let merge_session = self
+                .merge_session
+                .as_ref()
+                .expect("merge_session built in init_delta_table for Upsert mode");
 
             super::delta_io::merge_changelog(
                 table,
@@ -495,7 +540,8 @@ impl DeltaLakeSink {
                 &self.config.writer_id,
                 self.current_epoch,
                 self.config.schema_evolution,
-                self.config.parquet.to_writer_properties().ok(),
+                writer_props,
+                merge_session,
             )
             .await
             .map(|(t, result)| {
@@ -534,7 +580,7 @@ impl DeltaLakeSink {
                 self.config.schema_evolution,
                 Some(self.config.target_file_size),
                 should_checkpoint,
-                self.config.parquet.to_writer_properties().ok(),
+                self.cached_writer_properties.clone(),
             )
             .await
             .map(|(t, _version)| t)
@@ -546,16 +592,31 @@ impl DeltaLakeSink {
     /// Retries on optimistic concurrency conflicts with exponential backoff.
     /// On non-conflict errors or exhausted retries, propagates the error.
     #[cfg(feature = "delta-lake")]
+    #[allow(clippy::too_many_lines)]
     async fn flush_staged_to_delta(&mut self) -> Result<WriteResult, ConnectorError> {
         if self.staged_batches.is_empty() {
             return Ok(WriteResult::new(0, 0));
         }
 
+        // Pre-concat upsert batches so conflict retries don't redo the
+        // O(rows × cols) copy each attempt. Append/overwrite passes the Vec
+        // straight to delta-rs, which handles multi-batch internally.
+        if self.config.write_mode == DeltaWriteMode::Upsert && self.staged_batches.len() > 1 {
+            let schema = self.staged_batches[0].schema();
+            let combined = arrow_select::concat::concat_batches(&schema, &self.staged_batches)
+                .map_err(|e| {
+                    ConnectorError::Internal(format!("failed to concat staged batches: {e}"))
+                })?;
+            self.staged_batches.clear();
+            self.staged_batches.push(combined);
+        }
+
         let total_rows = self.staged_rows;
         let estimated_bytes = self.staged_bytes;
+        let flush_start = Instant::now();
 
         // Retry loop with exponential backoff for optimistic concurrency conflicts.
-        let backoff_ms = [100, 500, 2000];
+        let backoff_ms = [100u64, 500, 2000];
         let max_attempts = (self.config.max_commit_retries as usize).saturating_add(1);
         let mut last_error: Option<ConnectorError> = None;
 
@@ -632,6 +693,8 @@ impl DeltaLakeSink {
                     self.metrics
                         .record_flush(total_rows as u64, estimated_bytes);
                     self.metrics.record_commit(self.delta_version);
+                    self.metrics
+                        .observe_flush_duration(flush_start.elapsed().as_secs_f64());
 
                     debug!(
                         rows = total_rows,
@@ -646,7 +709,12 @@ impl DeltaLakeSink {
                 }
                 Err(e) => {
                     if Self::is_conflict_error(&e) && attempt + 1 < max_attempts {
-                        let delay_ms = backoff_ms.get(attempt).copied().unwrap_or(2000);
+                        self.metrics.record_conflict();
+                        self.metrics.record_retry();
+                        // ±25% jitter breaks up lockstep retries from
+                        // concurrent writers colliding on the same version.
+                        let base = backoff_ms.get(attempt).copied().unwrap_or(2000);
+                        let delay_ms = jittered_backoff_ms(base);
                         warn!(
                             attempt = attempt + 1,
                             max_attempts,
@@ -660,6 +728,8 @@ impl DeltaLakeSink {
                         continue;
                     }
                     // Non-conflict error or exhausted retries — propagate.
+                    self.metrics
+                        .observe_flush_duration(flush_start.elapsed().as_secs_f64());
                     return Err(e);
                 }
             }
@@ -737,8 +807,8 @@ impl DeltaLakeSink {
             .map(|(i, _)| i)
             .collect();
 
-        let insert_batch = filter_and_project(batch, &insert_mask, &user_col_indices)?;
-        let delete_batch = filter_and_project(batch, &delete_mask, &user_col_indices)?;
+        let insert_batch = filter_and_project(batch, insert_mask, &user_col_indices)?;
+        let delete_batch = filter_and_project(batch, delete_mask, &user_col_indices)?;
 
         Ok((insert_batch, delete_batch))
     }
@@ -754,7 +824,7 @@ async fn compaction_loop(
     storage_options: Arc<std::collections::HashMap<String, String>>,
     config: super::delta_config::CompactionConfig,
     vacuum_retention: std::time::Duration,
-    parquet_config: super::delta_config::ParquetWriteConfig,
+    compaction_props: Option<deltalake::parquet::file::properties::WriterProperties>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     use super::delta_io;
@@ -828,12 +898,13 @@ async fn compaction_loop(
             current_interval = (current_interval / 2).max(MIN_COMPACTION_INTERVAL);
 
             let target_size = config.target_file_size as u64;
-            let compaction_props = parquet_config.compaction_writer_properties().ok();
+            // Clone the pre-built properties (cheap) instead of re-parsing
+            // from config strings each tick.
             match delta_io::run_compaction(
                 table,
                 target_size,
                 &config.z_order_columns,
-                compaction_props,
+                compaction_props.clone(),
             )
             .await
             {
@@ -1039,34 +1110,36 @@ impl SinkConnector for DeltaLakeSink {
         let num_rows = batch.num_rows();
         let estimated_bytes = Self::estimate_batch_size(batch);
 
-        // Exactly-once cannot flush opportunistically from `write_batch`
-        // — a mid-epoch flush would leak rows on rollback. Apply the
-        // configured target as a hard cap (×4 for checkpoint jitter) and
-        // signal backpressure so the upstream reactor slows down.
+        // Hard cap on combined buffered + staged data. Applies to both
+        // delivery guarantees:
+        // - Exactly-once cannot flush opportunistically from write_batch
+        //   (a mid-epoch flush would leak rows on rollback), so pending
+        //   accumulates until the next checkpoint.
+        // - At-least-once normally auto-flushes via `should_flush()`, but
+        //   if flushes fail repeatedly, `staged_batches` holds data while
+        //   `buffer` keeps growing — without this cap the sink can OOM.
         //
         // A single incoming batch may itself exceed the cap; we cannot
         // split or reject it (the rows would be lost), so we widen the
         // cap to `num_rows`/`estimated_bytes` when a batch alone is
         // larger. This still rejects the *next* batch if that one-shot
         // admission left us bloated.
-        if self.config.delivery_guarantee == DeliveryGuarantee::ExactlyOnce {
-            let pending_rows = self.buffered_rows + self.staged_rows + num_rows;
-            let pending_bytes = self.buffered_bytes + self.staged_bytes + estimated_bytes;
-            let row_cap = self
-                .config
-                .max_buffer_records
-                .saturating_mul(4)
-                .max(num_rows);
-            let byte_cap = (self.config.target_file_size as u64)
-                .saturating_mul(4)
-                .max(estimated_bytes);
-            if pending_rows > row_cap || pending_bytes > byte_cap {
-                return Err(ConnectorError::WriteError(format!(
-                    "delta sink exactly-once buffer full ({pending_rows} rows, \
-                     {pending_bytes} bytes pending; cap {row_cap} rows, \
-                     {byte_cap} bytes) — waiting for next checkpoint"
-                )));
-            }
+        let pending_rows = self.buffered_rows + self.staged_rows + num_rows;
+        let pending_bytes = self.buffered_bytes + self.staged_bytes + estimated_bytes;
+        let row_cap = self
+            .config
+            .max_buffer_records
+            .saturating_mul(4)
+            .max(num_rows);
+        let byte_cap = (self.config.target_file_size as u64)
+            .saturating_mul(4)
+            .max(estimated_bytes);
+        if pending_rows > row_cap || pending_bytes > byte_cap {
+            return Err(ConnectorError::WriteError(format!(
+                "delta sink buffer full ({pending_rows} rows, \
+                 {pending_bytes} bytes pending; cap {row_cap} rows, \
+                 {byte_cap} bytes) — backpressure until next flush/commit"
+            )));
         }
 
         // Buffer the batch.
@@ -1383,26 +1456,45 @@ impl std::fmt::Debug for DeltaLakeSink {
 
 // ── Helper functions ────────────────────────────────────────────────
 
+/// Applies ±25% jitter to a backoff delay in milliseconds.
+///
+/// Without jitter, multiple writers colliding on the same Delta version
+/// retry in lockstep and keep colliding — a thundering herd. The 0.75–1.25
+/// range spreads retries across a 500ms window for the default 2s max.
+#[cfg(feature = "delta-lake")]
+fn jittered_backoff_ms(base_ms: u64) -> u64 {
+    use rand::RngExt as _;
+    let factor: f64 = rand::rng().random_range(0.75_f64..=1.25_f64);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let jittered = (base_ms as f64 * factor) as u64;
+    jittered.max(1)
+}
+
 /// Filters a `RecordBatch` using a boolean mask and projects to the given column indices.
 ///
-/// Uses Arrow's SIMD-optimized `filter` kernel instead of index-gather (`take`).
+/// Takes `mask` by value to hand it straight to `BooleanArray::from` without
+/// an intermediate `Vec<bool>` copy. Projects before filtering so the SIMD
+/// kernel only walks user columns, not the dropped metadata columns.
 fn filter_and_project(
     batch: &RecordBatch,
-    mask: &[bool],
+    mask: Vec<bool>,
     col_indices: &[usize],
 ) -> Result<RecordBatch, ConnectorError> {
     use arrow_array::BooleanArray;
     use arrow_select::filter::filter_record_batch;
 
-    let bool_array = BooleanArray::from(mask.to_vec());
+    let bool_array = BooleanArray::from(mask);
 
-    // Filter the full batch first (SIMD-optimized), then project columns.
-    let filtered = filter_record_batch(batch, &bool_array)
-        .map_err(|e| ConnectorError::Internal(format!("arrow filter failed: {e}")))?;
-
-    filtered
+    let projected = batch
         .project(col_indices)
-        .map_err(|e| ConnectorError::Internal(format!("batch projection failed: {e}")))
+        .map_err(|e| ConnectorError::Internal(format!("batch projection failed: {e}")))?;
+
+    filter_record_batch(&projected, &bool_array)
+        .map_err(|e| ConnectorError::Internal(format!("arrow filter failed: {e}")))
 }
 
 #[cfg(test)]

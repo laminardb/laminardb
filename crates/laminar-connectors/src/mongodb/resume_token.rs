@@ -288,7 +288,10 @@ pub enum ResumeTokenStoreConfig {
 /// In-memory resume token store (no persistence, for testing).
 #[derive(Debug, Default)]
 pub struct InMemoryResumeTokenStore {
-    token: tokio::sync::Mutex<Option<ResumeToken>>,
+    /// `parking_lot::Mutex` is safe here — none of the impl methods hold
+    /// the guard across an `.await`. The trait is async for parity with
+    /// the MongoDB-backed store which does actually await network I/O.
+    token: parking_lot::Mutex<Option<ResumeToken>>,
 }
 
 impl InMemoryResumeTokenStore {
@@ -302,23 +305,23 @@ impl InMemoryResumeTokenStore {
 #[async_trait::async_trait]
 impl ResumeTokenStore for InMemoryResumeTokenStore {
     async fn load(&self) -> Result<Option<ResumeToken>, ResumeTokenStoreError> {
-        Ok(self.token.lock().await.clone())
+        Ok(self.token.lock().clone())
     }
 
     async fn save(&self, token: &ResumeToken) -> Result<(), ResumeTokenStoreError> {
-        *self.token.lock().await = Some(token.clone());
+        *self.token.lock() = Some(token.clone());
         Ok(())
     }
 
     async fn clear(&self) -> Result<(), ResumeTokenStoreError> {
-        *self.token.lock().await = None;
+        *self.token.lock() = None;
         Ok(())
     }
 }
 
 impl From<ResumeTokenStoreError> for ConnectorError {
     fn from(e: ResumeTokenStoreError) -> Self {
-        ConnectorError::CheckpointError(e.to_string())
+        ConnectorError::Internal(format!("resume token store: {e}"))
     }
 }
 

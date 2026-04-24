@@ -394,9 +394,7 @@ impl ReferenceTableSource for DeltaReferenceTableSource {
     async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError> {
         if let Some(v) = checkpoint.get_offset("delta_version") {
             self.current_version = v.parse().map_err(|_| {
-                ConnectorError::CheckpointError(format!(
-                    "invalid delta_version in checkpoint: '{v}'"
-                ))
+                ConnectorError::Internal(format!("invalid delta_version in checkpoint: '{v}'"))
             })?;
             info!(
                 version = self.current_version,

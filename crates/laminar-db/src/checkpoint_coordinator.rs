@@ -187,7 +187,7 @@ pub struct CheckpointCoordinator {
     /// Consulted between manifest persist and sink commit to verify
     /// per-vnode durability.
     state_backend: Option<Arc<dyn StateBackend>>,
-    /// Stamped into every `write_partial` for the Phase 1.4 fence.
+    /// Stamped into every `write_partial` for the split-brain fence.
     /// Zero = fence disabled.
     assignment_version: u64,
     /// Shared commit-marker store. Written before `Commit` is
@@ -278,14 +278,6 @@ impl CheckpointCoordinator {
         self.cluster_controller = Some(controller);
     }
 
-    #[cfg(feature = "cluster-unstable")]
-    #[allow(dead_code)] // kept for future role-aware call sites
-    pub(crate) fn cluster_controller(
-        &self,
-    ) -> Option<&Arc<laminar_core::cluster::control::ClusterController>> {
-        self.cluster_controller.as_ref()
-    }
-
     /// Wired with a non-empty `vnode_set` to enable per-vnode markers
     /// and the `epoch_complete` durability gate.
     pub fn set_state_backend(&mut self, backend: Arc<dyn StateBackend>) {
@@ -302,18 +294,18 @@ impl CheckpointCoordinator {
     }
 
     /// Record the assignment generation this coordinator is writing
-    /// with. Forwarded to `backend.write_partial` so the Phase 1.4
-    /// split-brain fence can reject stale writers. Host sets this
-    /// whenever a fresh `AssignmentSnapshot` rotates in.
+    /// with. Forwarded to `backend.write_partial` so the split-brain
+    /// fence can reject stale writers. Host sets this whenever a fresh
+    /// `AssignmentSnapshot` rotates in.
     pub fn set_assignment_version(&mut self, version: u64) {
         self.assignment_version = version;
     }
 
     /// Record this instance's current local watermark, reported in
     /// every subsequent `BarrierAck` so the leader can compute the
-    /// cluster-wide minimum (Phase 1.3). `None` disables the
-    /// per-follower contribution — leader falls back to its own
-    /// watermark (and the other followers').
+    /// cluster-wide minimum. `None` disables the per-follower
+    /// contribution — leader falls back to its own watermark (and
+    /// the other followers').
     pub fn set_local_watermark_ms(&mut self, watermark: Option<i64>) {
         self.local_watermark_ms = watermark;
     }
@@ -605,9 +597,9 @@ impl CheckpointCoordinator {
             return Ok(());
         }
         let payload = bytes::Bytes::from(format!("ckpt:{checkpoint_id}").into_bytes());
-        // Phase 1.4: stamp every marker with the current assignment
-        // generation. Zero means the host hasn't wired a version (e.g.
-        // pre-Phase-1.2 single-instance path) and the fence is a no-op.
+        // Stamp every marker with the current assignment generation.
+        // Zero means the host hasn't wired a version (single-instance
+        // path) and the fence is a no-op.
         let caller_version = self.assignment_version;
         let writes = self.vnode_set.iter().map(|&v| {
             let backend = Arc::clone(backend);
@@ -728,7 +720,7 @@ impl CheckpointCoordinator {
     /// `Some(cluster_min)` on `Commit` (computed from follower acks +
     /// local watermark). Downstream operators read the published
     /// value from [`ClusterController`] so event-time decisions stay
-    /// consistent across the cluster. See Phase 1.3.
+    /// consistent across the cluster.
     #[cfg(feature = "cluster-unstable")]
     async fn announce_if_leader(
         &self,
@@ -766,7 +758,7 @@ impl CheckpointCoordinator {
     /// When quorum is reached, the `Ok` path writes the cluster-wide
     /// minimum watermark (leader's local + min of follower acks) into
     /// `self.cluster_min_watermark` so the subsequent `Commit`
-    /// announcement can fan it out (Phase 1.3).
+    /// announcement can fan it out.
     #[cfg(feature = "cluster-unstable")]
     async fn await_prepare_quorum(&mut self, epoch: u64, checkpoint_id: u64) -> Option<String> {
         use laminar_core::cluster::control::{Phase, QuorumOutcome};
@@ -1556,8 +1548,8 @@ impl CheckpointCoordinator {
         }
 
         #[cfg(feature = "cluster-unstable")]
-        // Phase 1.3: fan out the cluster-wide min watermark computed
-        // during `await_prepare_quorum`. Followers consume this from
+        // Fan out the cluster-wide min watermark computed during
+        // `await_prepare_quorum`. Followers consume this from
         // `observe_barrier` and update their consumer-side view.
         self.announce_if_leader(
             epoch,
@@ -2280,8 +2272,8 @@ mod tests {
     #[tokio::test]
     async fn durability_gate_skipped_when_vnode_set_empty() {
         // With no state backend installed AND empty vnode set, the commit
-        // path behaves as before. Regression guard: Phase B must not change
-        // single-instance semantics.
+        // path behaves as before. Regression guard: the durability gate
+        // must not change single-instance semantics.
         let dir = tempfile::tempdir().unwrap();
         let mut coord = make_coordinator(dir.path()).await;
         let result = coord
@@ -2622,8 +2614,8 @@ mod tests {
     #[cfg(feature = "cluster-unstable")]
     #[tokio::test]
     async fn leader_publishes_cluster_min_watermark_to_controller() {
-        // Phase 1.3b: on a solo cluster, `await_prepare_quorum` computes
-        // the cluster-wide min as "leader's local watermark" (no followers
+        // On a solo cluster, `await_prepare_quorum` computes the
+        // cluster-wide min as "leader's local watermark" (no followers
         // to fold). This must be mirrored into the controller atomic so
         // the leader's own operators consume the same value that
         // followers pick up via `observe_barrier(Commit)` — otherwise

@@ -42,7 +42,7 @@ struct ShuffleConnection {
     /// when the reader exits (peer closed the socket cleanly OR an
     /// IO error hit). [`ShuffleSender::connection_for`] consults it
     /// before handing out the cached `Arc`; dead entries are purged
-    /// and the next send reconnects. Phase 2.2.
+    /// and the next send reconnects.
     alive: Arc<AtomicBool>,
 }
 
@@ -171,7 +171,7 @@ impl ShuffleSender {
         // address is stale, `TcpStream::connect` will surface that
         // as a connect error and the caller retries after re-register;
         // if callers use KV discovery, a missing `peers` entry triggers
-        // `discover_peer` in the next block. Phase 2.2.
+        // `discover_peer` in the next block.
         {
             let mut pool = self.pool.write().await;
             if let Some(c) = pool.get(&peer) {
@@ -253,7 +253,7 @@ pub struct ShuffleReceiver {
     /// Per-peer reader tasks spawned by the accept loop. Tracked so
     /// [`Drop`] can abort them — otherwise detached tasks keep the
     /// socket open, peers never see EOF, and senders can't detect
-    /// that we went away. Phase 2.2.
+    /// that we went away.
     peer_tasks: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
     rx: Mutex<mpsc::UnboundedReceiver<(ShufflePeerId, ShuffleMessage)>>,
 }
@@ -488,9 +488,9 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
-    /// Phase 2.2 AC: when a peer restarts at a different address, the
-    /// sender's cached connection flips dead (reader exits on EOF), the
-    /// next `send_to` purges the stale entry and reconnects against the
+    /// When a peer restarts at a different address, the sender's cached
+    /// connection flips dead (reader exits on EOF), the next `send_to`
+    /// purges the stale entry and reconnects against the
     /// freshly-registered address.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn send_reconnects_after_peer_restart_at_new_address() {

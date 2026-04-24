@@ -1,8 +1,4 @@
-//! Kafka source connector metrics.
-//!
-//! [`KafkaSourceMetrics`] provides prometheus-backed counters and gauges
-//! for tracking consumption statistics, convertible to the SDK's
-//! [`ConnectorMetrics`] type.
+//! Prometheus-backed Kafka source metrics.
 
 use prometheus::{IntCounter, IntGauge, Registry};
 
@@ -21,6 +17,8 @@ pub struct KafkaSourceMetrics {
     pub batches_polled: IntCounter,
     /// Total offset commits to Kafka.
     pub commits: IntCounter,
+    /// Total offset commit failures (broker rejected, timeout, task panic).
+    pub commit_failures: IntCounter,
     /// Total consumer group rebalances.
     pub rebalances: IntCounter,
     /// Consumer lag (sum across all partitions of `high_watermark - current_offset`).
@@ -34,11 +32,8 @@ pub struct KafkaSourceMetrics {
 }
 
 impl KafkaSourceMetrics {
-    /// All counters start at zero.
-    ///
-    /// If `registry` is `Some`, the metrics are registered on it and
-    /// will appear in the Prometheus scrape output. Otherwise a local
-    /// throwaway registry is used.
+    /// If `registry` is `Some`, counters are registered there (visible
+    /// in the Prometheus scrape); otherwise a throwaway registry is used.
     #[must_use]
     #[allow(clippy::missing_panics_doc)]
     pub fn new(registry: Option<&Registry>) -> Self {
@@ -70,6 +65,11 @@ impl KafkaSourceMetrics {
         let commits = IntCounter::new(
             "kafka_source_commits_total",
             "Total offset commits to Kafka",
+        )
+        .unwrap();
+        let commit_failures = IntCounter::new(
+            "kafka_source_commit_failures_total",
+            "Total offset commit failures (broker rejection, timeout, panic)",
         )
         .unwrap();
         let rebalances = IntCounter::new(
@@ -105,6 +105,7 @@ impl KafkaSourceMetrics {
         let _ = reg.register(Box::new(errors.clone()));
         let _ = reg.register(Box::new(batches_polled.clone()));
         let _ = reg.register(Box::new(commits.clone()));
+        let _ = reg.register(Box::new(commit_failures.clone()));
         let _ = reg.register(Box::new(rebalances.clone()));
         let _ = reg.register(Box::new(lag.clone()));
         let _ = reg.register(Box::new(sr_discovery_successes.clone()));
@@ -117,6 +118,7 @@ impl KafkaSourceMetrics {
             errors,
             batches_polled,
             commits,
+            commit_failures,
             rebalances,
             lag,
             sr_discovery_successes,
@@ -140,6 +142,11 @@ impl KafkaSourceMetrics {
     /// Records a successful offset commit.
     pub fn record_commit(&self) {
         self.commits.inc();
+    }
+
+    /// Records an offset commit failure (broker rejection, timeout, panic).
+    pub fn record_commit_failure(&self) {
+        self.commit_failures.inc();
     }
 
     /// Records a consumer group rebalance event.
@@ -181,6 +188,7 @@ impl KafkaSourceMetrics {
         };
         m.add_custom("kafka.batches_polled", self.batches_polled.get() as f64);
         m.add_custom("kafka.commits", self.commits.get() as f64);
+        m.add_custom("kafka.commit_failures", self.commit_failures.get() as f64);
         m.add_custom("kafka.rebalances", self.rebalances.get() as f64);
         m.add_custom(
             "kafka.sr_discovery_successes",
@@ -237,10 +245,22 @@ mod tests {
 
         let cm = m.to_connector_metrics();
         assert_eq!(cm.errors_total, 2);
-        // 3 base (batches_polled, commits, rebalances) + 3 SR-discovery counters.
-        assert_eq!(cm.custom.len(), 6);
+        // 4 base (batches_polled, commits, commit_failures, rebalances) +
+        // 3 SR-discovery counters.
+        assert_eq!(cm.custom.len(), 7);
         let commits = cm.custom.iter().find(|(k, _)| k == "kafka.commits");
         assert_eq!(commits.unwrap().1, 1.0);
+    }
+
+    #[test]
+    fn test_record_commit_failure() {
+        let m = KafkaSourceMetrics::new(None);
+        m.record_commit_failure();
+        m.record_commit_failure();
+
+        let cm = m.to_connector_metrics();
+        let failures = cm.custom.iter().find(|(k, _)| k == "kafka.commit_failures");
+        assert_eq!(failures.unwrap().1, 2.0);
     }
 
     #[test]

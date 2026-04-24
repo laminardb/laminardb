@@ -373,7 +373,7 @@ impl SourceConnector for MongoDbCdcSource {
             self.resume_token_store
                 .save(&token)
                 .await
-                .map_err(|e| ConnectorError::CheckpointError(format!("save token: {e}")))?;
+                .map_err(|e| ConnectorError::Internal(format!("save resume token: {e}")))?;
         }
         Ok(())
     }

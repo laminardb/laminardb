@@ -176,11 +176,6 @@ impl<T: FromBatch> TypedSubscription<T> {
         }
         count
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn into_raw(self) -> Subscription<ArrowRecord> {
-        self.inner
-    }
 }
 
 impl<T: FromBatch> std::fmt::Debug for TypedSubscription<T> {

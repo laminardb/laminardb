@@ -612,7 +612,6 @@ impl IncrementalAggState {
         // doesn't include the weight column, so process_batch would read
         // the wrong index. The cached plan path handles it via pre_agg_sql.
         let compiled_projection = if compile_ok && weight_col_idx.is_none() {
-            let source_table = compile_source.unwrap();
             // Compile WHERE predicate
             let filter = if let Some(where_pred) = &agg_info.where_predicate {
                 if let Ok(phys) = create_physical_expr(where_pred, input_df_schema, props) {
@@ -626,7 +625,6 @@ impl IncrementalAggState {
             };
             if compile_ok {
                 Some(CompiledProjection {
-                    source_table,
                     exprs: compiled_exprs,
                     filter,
                     output_schema: Arc::new(Schema::new(proj_fields)),

@@ -210,7 +210,7 @@ fn generate_from_config(fields: &[FieldInfo]) -> Result<TokenStream, Error> {
                     quote! {
                         let #ident = {
                             let v = #with_default.ok_or_else(|| {
-                                laminar_connectors::error::ConnectorError::MissingConfig(#key.to_string())
+                                laminar_connectors::error::ConnectorError::missing_config(#key)
                             })?;
                             let ms: u64 = v.parse().map_err(|e| {
                                 laminar_connectors::error::ConnectorError::ConfigurationError(
@@ -250,14 +250,14 @@ fn generate_from_config(fields: &[FieldInfo]) -> Result<TokenStream, Error> {
                 if is_string_type(&f.ty) {
                     quote! {
                         let #ident = #with_default.ok_or_else(|| {
-                            laminar_connectors::error::ConnectorError::MissingConfig(#key.to_string())
+                            laminar_connectors::error::ConnectorError::missing_config(#key)
                         })?;
                     }
                 } else {
                     quote! {
                         let #ident = {
                             let v = #with_default.ok_or_else(|| {
-                                laminar_connectors::error::ConnectorError::MissingConfig(#key.to_string())
+                                laminar_connectors::error::ConnectorError::missing_config(#key)
                             })?;
                             v.parse().map_err(|e| {
                                 laminar_connectors::error::ConnectorError::ConfigurationError(

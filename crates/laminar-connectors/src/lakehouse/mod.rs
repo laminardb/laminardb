@@ -105,55 +105,61 @@ pub fn register_delta_lake_source(registry: &ConnectorRegistry) {
 
     // Register lookup source factory for on-demand/partial cache mode.
     #[cfg(feature = "delta-lake")]
-    registry.register_lookup_source(
-        "delta-lake",
-        Arc::new(|config| {
-            Box::pin(async move {
-                use crate::lakehouse::delta_source_config::DeltaSourceConfig;
-                use crate::lookup::delta_lookup::{DeltaLookupSource, DeltaLookupSourceConfig};
+    registry.register_lookup_source("delta-lake", Arc::new(DeltaLookupFactory));
+}
 
-                let pk_columns: Vec<String> = config
-                    .get("_primary_key_columns")
-                    .unwrap_or("")
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+#[cfg(feature = "delta-lake")]
+struct DeltaLookupFactory;
 
-                if pk_columns.is_empty() {
-                    return Err(crate::error::ConnectorError::ConfigurationError(
-                        "delta-lake lookup source requires primary key columns".into(),
-                    ));
-                }
+#[cfg(feature = "delta-lake")]
+#[async_trait::async_trait]
+impl crate::registry::LookupSourceFactory for DeltaLookupFactory {
+    async fn build(
+        &self,
+        config: crate::config::ConnectorConfig,
+    ) -> Result<Arc<dyn laminar_core::lookup::source::LookupSourceDyn>, crate::error::ConnectorError>
+    {
+        use crate::lakehouse::delta_source_config::DeltaSourceConfig;
+        use crate::lookup::delta_lookup::{DeltaLookupSource, DeltaLookupSourceConfig};
 
-                let src_config = DeltaSourceConfig::from_config(&config)?;
+        let pk_columns: Vec<String> = config
+            .get("_primary_key_columns")
+            .unwrap_or("")
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
 
-                let (resolved_path, resolved_opts) =
-                    crate::lakehouse::delta_io::resolve_catalog_options(
-                        &src_config.catalog_type,
-                        src_config.catalog_database.as_deref(),
-                        src_config.catalog_name.as_deref(),
-                        src_config.catalog_schema.as_deref(),
-                        &src_config.table_path,
-                        &src_config.storage_options,
-                    )
-                    .await?;
+        if pk_columns.is_empty() {
+            return Err(crate::error::ConnectorError::ConfigurationError(
+                "delta-lake lookup source requires primary key columns".into(),
+            ));
+        }
 
-                let lookup_config = DeltaLookupSourceConfig {
-                    table_path: resolved_path,
-                    storage_options: resolved_opts,
-                    primary_key_columns: pk_columns,
-                    table_name: "delta_lookup".to_string(),
-                };
+        let src_config = DeltaSourceConfig::from_config(&config)?;
 
-                let source = DeltaLookupSource::open(lookup_config).await.map_err(|e| {
-                    crate::error::ConnectorError::Internal(format!("delta lookup source open: {e}"))
-                })?;
+        let (resolved_path, resolved_opts) = crate::lakehouse::delta_io::resolve_catalog_options(
+            &src_config.catalog_type,
+            src_config.catalog_database.as_deref(),
+            src_config.catalog_name.as_deref(),
+            src_config.catalog_schema.as_deref(),
+            &src_config.table_path,
+            &src_config.storage_options,
+        )
+        .await?;
 
-                Ok(Arc::new(source) as Arc<dyn laminar_core::lookup::source::LookupSourceDyn>)
-            })
-        }),
-    );
+        let lookup_config = DeltaLookupSourceConfig {
+            table_path: resolved_path,
+            storage_options: resolved_opts,
+            primary_key_columns: pk_columns,
+            table_name: "delta_lookup".to_string(),
+        };
+
+        // `From<LookupError>` preserves transient/non-transient class.
+        let source = DeltaLookupSource::open(lookup_config).await?;
+
+        Ok(Arc::new(source) as Arc<dyn laminar_core::lookup::source::LookupSourceDyn>)
+    }
 }
 
 /// Registers the Iceberg sink connector with the given registry.

@@ -57,6 +57,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
 prometheus = { workspace = true }
+rand = { workspace = true }
 rustc-hash = { workspace = true }
 
 # Arrow for RecordBatch

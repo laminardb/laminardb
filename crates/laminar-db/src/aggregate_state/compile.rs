@@ -268,8 +268,6 @@ pub(crate) fn expr_to_sql(expr: &datafusion_expr::Expr) -> String {
 /// with direct `PhysicalExpr::evaluate()` on the source batch, eliminating
 /// SQL parsing, logical planning, physical planning, and `MemTable` overhead.
 pub(crate) struct CompiledProjection {
-    #[allow(dead_code)]
-    pub(crate) source_table: String,
     pub(crate) exprs: Vec<Arc<dyn PhysicalExpr>>,
     pub(crate) filter: Option<Arc<dyn PhysicalExpr>>,
     pub(crate) output_schema: SchemaRef,

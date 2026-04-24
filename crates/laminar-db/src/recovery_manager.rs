@@ -365,8 +365,8 @@ impl<'a> RecoveryManager<'a> {
         }
 
         // Validate manifest consistency before restoring state.
-        // `DEFAULT_VNODE_COUNT` holds until Phase B plumbs the runtime
-        // `VnodeRegistry` value through recovery.
+        // `DEFAULT_VNODE_COUNT` is a placeholder; the runtime
+        // `VnodeRegistry` value is not threaded through recovery yet.
         let validation_errors =
             manifest.validate(laminar_storage::checkpoint_manifest::DEFAULT_VNODE_COUNT);
         if !validation_errors.is_empty() {

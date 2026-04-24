@@ -213,9 +213,7 @@ impl ReferenceTableSource for IcebergReferenceTableSource {
         self.epoch = checkpoint.epoch();
         if let Some(sid) = checkpoint.get_offset("snapshot_id") {
             let snap: i64 = sid.parse().map_err(|_| {
-                ConnectorError::CheckpointError(format!(
-                    "invalid snapshot_id in checkpoint: '{sid}'"
-                ))
+                ConnectorError::Internal(format!("invalid snapshot_id in checkpoint: '{sid}'"))
             })?;
             // Both cursors restored to the last fully-delivered snapshot.
             self.delivered_snapshot_id = Some(snap);

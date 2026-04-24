@@ -228,7 +228,6 @@ mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema};
 
-    #[allow(dead_code)]
     const TEST_AVRO_SCHEMA: &str = r#"{
         "type": "record",
         "name": "test",

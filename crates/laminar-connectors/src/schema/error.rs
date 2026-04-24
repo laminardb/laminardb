@@ -77,7 +77,8 @@ pub enum SchemaError {
 impl From<ConnectorError> for SchemaError {
     fn from(err: ConnectorError) -> Self {
         match err {
-            ConnectorError::MissingConfig(msg) => SchemaError::MissingConfig(msg),
+            // `ConnectorError::MissingConfig` folded into
+            // `ConfigurationError` — both land in `InvalidConfig` now.
             ConnectorError::ConfigurationError(msg) => SchemaError::InvalidConfig {
                 key: String::new(),
                 message: msg,
@@ -91,7 +92,7 @@ impl From<ConnectorError> for SchemaError {
 impl From<SchemaError> for ConnectorError {
     fn from(err: SchemaError) -> Self {
         match err {
-            SchemaError::MissingConfig(msg) => ConnectorError::MissingConfig(msg),
+            SchemaError::MissingConfig(msg) => ConnectorError::missing_config(msg),
             SchemaError::Incompatible(msg) => ConnectorError::SchemaMismatch(msg),
             SchemaError::DecodeError(msg) => ConnectorError::ReadError(msg),
             other => ConnectorError::Internal(other.to_string()),
@@ -121,9 +122,13 @@ mod tests {
 
     #[test]
     fn test_connector_to_schema_error() {
-        let ce = ConnectorError::MissingConfig("topic".into());
+        let ce = ConnectorError::missing_config("topic");
         let se: SchemaError = ce.into();
-        assert!(matches!(se, SchemaError::MissingConfig(ref m) if m == "topic"));
+        // `missing_config` lands in `ConfigurationError`, which maps to
+        // `SchemaError::InvalidConfig` with the full message preserved.
+        assert!(
+            matches!(&se, SchemaError::InvalidConfig { message, .. } if message.contains("topic"))
+        );
     }
 
     #[test]
