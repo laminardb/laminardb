@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
+use laminar_core::time::parse_duration_str;
 
 /// Parsed configuration for [`super::source::FileSource`].
 #[derive(Debug, Clone)]
@@ -294,7 +295,7 @@ fn parse_duration(
     default: Duration,
 ) -> Result<Duration, ConnectorError> {
     match props.get(key) {
-        Some(s) => laminar_core::time::parse_duration_str(s).ok_or_else(|| {
+        Some(s) => parse_duration_str(s).ok_or_else(|| {
             ConnectorError::ConfigurationError(format!("invalid duration for {key}: '{s}'"))
         }),
         None => Ok(default),

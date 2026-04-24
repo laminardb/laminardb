@@ -155,9 +155,8 @@ impl crate::registry::LookupSourceFactory for DeltaLookupFactory {
             table_name: "delta_lookup".to_string(),
         };
 
-        let source = DeltaLookupSource::open(lookup_config).await.map_err(|e| {
-            crate::error::ConnectorError::Internal(format!("delta lookup source open: {e}"))
-        })?;
+        // `From<LookupError>` preserves transient/non-transient class.
+        let source = DeltaLookupSource::open(lookup_config).await?;
 
         Ok(Arc::new(source) as Arc<dyn laminar_core::lookup::source::LookupSourceDyn>)
     }

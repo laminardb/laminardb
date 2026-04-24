@@ -1,8 +1,4 @@
-//! Kafka source connector metrics.
-//!
-//! [`KafkaSourceMetrics`] provides prometheus-backed counters and gauges
-//! for tracking consumption statistics, convertible to the SDK's
-//! [`ConnectorMetrics`] type.
+//! Prometheus-backed Kafka source metrics.
 
 use prometheus::{IntCounter, IntGauge, Registry};
 
@@ -36,11 +32,8 @@ pub struct KafkaSourceMetrics {
 }
 
 impl KafkaSourceMetrics {
-    /// All counters start at zero.
-    ///
-    /// If `registry` is `Some`, the metrics are registered on it and
-    /// will appear in the Prometheus scrape output. Otherwise a local
-    /// throwaway registry is used.
+    /// If `registry` is `Some`, counters are registered there (visible
+    /// in the Prometheus scrape); otherwise a throwaway registry is used.
     #[must_use]
     #[allow(clippy::missing_panics_doc)]
     pub fn new(registry: Option<&Registry>) -> Self {

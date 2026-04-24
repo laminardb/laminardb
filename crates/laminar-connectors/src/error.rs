@@ -67,6 +67,26 @@ pub enum ConnectorError {
     Io(#[from] std::io::Error),
 }
 
+impl From<laminar_core::lookup::source::LookupError> for ConnectorError {
+    fn from(err: laminar_core::lookup::source::LookupError) -> Self {
+        use laminar_core::lookup::source::LookupError;
+        match err {
+            LookupError::Connection(m) => Self::ConnectionFailed(m),
+            LookupError::Query(m) => Self::ReadError(m),
+            LookupError::Timeout(d) =>
+            {
+                #[allow(clippy::cast_possible_truncation)]
+                Self::Timeout(d.as_millis() as u64)
+            }
+            LookupError::NotAvailable(m) => Self::InvalidState {
+                expected: "lookup source available".into(),
+                actual: m,
+            },
+            LookupError::Internal(m) => Self::Internal(m),
+        }
+    }
+}
+
 impl ConnectorError {
     /// Construct a "missing required config" error. Thin helper around
     /// [`Self::ConfigurationError`] so every "missing required config:

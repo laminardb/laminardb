@@ -1,22 +1,9 @@
-//! `WebSocket` source and sink connectors for `LaminarDB`.
+//! WebSocket source/sink connectors. Four modes: source-client (connect
+//! to a WS server), source-server (listen for clients), sink-server (fan
+//! out results to subscribers), sink-client (push to an external server).
 //!
-//! Provides four connector modes:
-//! - **Source client**: Connects to an external WebSocket server (e.g., exchange feeds)
-//! - **Source server**: Listens for incoming WebSocket connections (e.g., `IoT` sensors)
-//! - **Sink server**: Fans out streaming query results to connected subscribers
-//! - **Sink client**: Pushes streaming query output to an external WebSocket server
-//!
-//! # Delivery Guarantees
-//!
-//! `WebSocket` is a **non-replayable** transport. Source connectors provide
-//! **at-most-once** or **best-effort** delivery — there are no offsets to
-//! seek to on recovery. Sink connectors optionally support a replay buffer
-//! for client-side resume, but this is bounded and best-effort.
-//!
-//! # Architecture
-//!
-//! All WebSocket I/O runs in Ring 2 (Tokio tasks). Parsed Arrow
-//! `RecordBatch` data crosses to Ring 0 via bounded channels.
+//! WebSocket is non-replayable — source connectors are at-most-once / best-effort;
+//! sinks have a bounded, best-effort replay buffer.
 
 pub mod backpressure;
 pub mod checkpoint;

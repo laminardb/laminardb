@@ -1,8 +1,4 @@
-//! Delta Lake sink connector metrics.
-//!
-//! [`DeltaLakeSinkMetrics`] provides prometheus-backed counters and gauges
-//! for tracking write statistics, convertible to the SDK's
-//! [`ConnectorMetrics`] type.
+//! Prometheus-backed Delta Lake sink metrics.
 
 use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, Registry};
 
