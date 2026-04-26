@@ -32,13 +32,12 @@ services:
       test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
       interval: 5s
       timeout: 3s
-      retries: 20
+      retries: 6
       start_period: 10s
 
-  # Creates the `warehouse` bucket once RustFS is healthy. Uses the AWS
-  # CLI rather than `mc` (the MinIO client doesn't talk to RustFS).
+  # Creates the `warehouse` bucket once RustFS is healthy.
   rustfs-init:
-    image: amazon/aws-cli:latest
+    image: amazon/aws-cli:2.13.39
     container_name: rustfs-init
     depends_on:
       rustfs:
@@ -94,6 +93,7 @@ services:
       LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://postgres:postgres@postgres:5432/postgres
       LAKEKEEPER__PG_ENCRYPTION_KEY: demo-encryption-key-32-chars-ok!
       LAKEKEEPER__BASE_URI: http://localhost:8181
+      LAKEKEEPER__ALLOW_ORIGIN: "*"
     ports:
       - "8181:8181"   # catalog API
       - "8182:8182"   # UI

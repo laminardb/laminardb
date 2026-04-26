@@ -4,10 +4,21 @@ Payment events stream off a NATS subject. LaminarDB tumbles them into
 1-minute windows by region+method and writes the rollup to Iceberg via a
 REST catalog (Lakekeeper). Results queryable from DuckDB.
 
-No Kafka. No Redpanda. No JVM. No Go. Two Rust binaries do the work
-(`nats-server` + `laminardb`); three containers (RustFS, Postgres,
-Lakekeeper) provide the lakehouse — RustFS is the S3-compatible Rust
-object store standing in for MinIO.
+Two Rust binaries do the streaming work (`nats-server` + `laminardb`);
+three containers (RustFS, Postgres, Lakekeeper) provide the lakehouse.
+RustFS is the S3-compatible Rust object store standing in for MinIO.
+
+## Prerequisite
+
+Lakekeeper bakes its in-cluster RustFS endpoint (`http://rustfs:9000`)
+into Iceberg manifest paths. Add a hosts entry on your machine so
+DuckDB can resolve it from the host:
+
+    # /etc/hosts (Linux/macOS) or C:\Windows\System32\drivers\etc\hosts
+    127.0.0.1   rustfs
+
+The published `9000:9000` port forwards the host-side `rustfs:9000` to
+the container.
 
 ## Run it
 
@@ -31,7 +42,7 @@ cargo build --release -p laminar-server \
 pip install nats-py
 python examples/nats-payments/gen.py
 
-# 5. Wait ~60 seconds (one tumbling minute closes), then query.
+# 5. Wait ~90 seconds (one tumbling minute closes + first commit), then query.
 pip install duckdb
 python examples/nats-payments/query.py
 ```
