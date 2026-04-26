@@ -750,8 +750,15 @@ impl LaminarDB {
                 continue;
             }
             let mut config = build_sink_config(reg)?;
-            if let Some(schema) = stream_output_schemas.get(&reg.input) {
-                let schema_str = crate::pipeline_callback::encode_arrow_schema(schema);
+            // Resolve the upstream schema from a stream first, then fall back
+            // to a source — `CREATE SINK ... FROM <name>` accepts either.
+            let upstream_schema = stream_output_schemas.get(&reg.input).cloned().or_else(|| {
+                self.catalog
+                    .get_source(&reg.input)
+                    .map(|e| e.schema.clone())
+            });
+            if let Some(schema) = upstream_schema {
+                let schema_str = crate::pipeline_callback::encode_arrow_schema(&schema);
                 config.set("_arrow_schema".to_string(), schema_str);
             }
             let mut sink = self
