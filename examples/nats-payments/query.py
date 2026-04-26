@@ -33,20 +33,13 @@ con.execute("""
     )
 """)
 
-# Catalog auth: Lakekeeper runs unauthenticated in this demo, but
-# DuckDB defaults to oauth2 — flip it to `none`.
-con.execute("""
-    CREATE SECRET catalog_auth (
-        TYPE               ICEBERG,
-        AUTHORIZATION_TYPE 'none'
-    )
-""")
-
-# Lakekeeper REST catalog.
+# Lakekeeper REST catalog. Lakekeeper runs unauthenticated in this demo;
+# DuckDB defaults to oauth2 on the ATTACH so flip it to 'none'.
 con.execute("""
     ATTACH 'demo' AS catalog (
-        TYPE     ICEBERG,
-        ENDPOINT 'http://localhost:8181/catalog'
+        TYPE               ICEBERG,
+        ENDPOINT           'http://localhost:8181/catalog',
+        AUTHORIZATION_TYPE 'none'
     )
 """)
 
