@@ -1,63 +1,56 @@
 #!/usr/bin/env python3
 """
-Reads payment_summary from Lakekeeper via DuckDB's iceberg extension.
+Reads payment_summary from Lakekeeper via PyIceberg.
 
-    pip install duckdb
+    pip install "pyiceberg[s3fs,pyarrow]"
     python query.py
 
 Run after ~90 seconds of `gen.py` so at least one tumbling minute has
 closed and the sink has committed.
 
 Prerequisite: `rustfs` must resolve to `127.0.0.1` from the host so
-that DuckDB can fetch the Iceberg manifest paths Lakekeeper bakes into
-table metadata. See README.
+PyIceberg can fetch the manifest paths Lakekeeper bakes into table
+metadata. See README.
 """
 
-import duckdb
+from datetime import datetime, timezone
+
+from pyiceberg.catalog.rest import RestCatalog
 
 
-con = duckdb.connect()
+catalog = RestCatalog(
+    name="demo",
+    **{
+        "uri":       "http://localhost:8181/catalog",
+        "warehouse": "demo",
+        # Lakekeeper runs unauthenticated in this demo profile.
+        "auth":      {"type": "noop"},
+        # Storage credentials for the data files. Lakekeeper points at
+        # http://rustfs:9000 (in-cluster); on the host `rustfs` resolves
+        # to 127.0.0.1 via the README hosts entry.
+        "s3.endpoint":          "http://rustfs:9000",
+        "s3.access-key-id":     "rustfsadmin",
+        "s3.secret-access-key": "rustfsadmin",
+        "s3.region":            "us-east-1",
+    },
+)
 
-con.execute("INSTALL httpfs;  LOAD httpfs;")
-con.execute("INSTALL iceberg; LOAD iceberg;")
+table = catalog.load_table("finance.payment_summary")
 
-# Storage credentials for the Parquet/manifest fetches.
-con.execute("""
-    CREATE SECRET rustfs (
-        TYPE      S3,
-        KEY_ID    'rustfsadmin',
-        SECRET    'rustfsadmin',
-        ENDPOINT  'rustfs:9000',
-        URL_STYLE 'path',
-        USE_SSL   false
+# scan().to_pandas() applies snapshot resolution and schema evolution.
+df = table.scan().to_pandas()
+
+# window_start / window_end are Int64 epoch ms; render as timestamps.
+for col in ("window_start", "window_end"):
+    df[col] = df[col].apply(
+        lambda ms: datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+        .strftime("%Y-%m-%d %H:%M:%S")
     )
-""")
+df["total_usd"] = df["total_usd"].round(2)
+df["avg_usd"]   = df["avg_usd"].round(2)
 
-# Lakekeeper REST catalog. Lakekeeper runs unauthenticated in this demo;
-# DuckDB defaults to oauth2 on the ATTACH so flip it to 'none'.
-con.execute("""
-    ATTACH 'demo' AS catalog (
-        TYPE               ICEBERG,
-        ENDPOINT           'http://localhost:8181/catalog',
-        AUTHORIZATION_TYPE 'none'
-    )
-""")
+df = df.sort_values(["window_start", "total_usd"], ascending=[False, False]).head(40)
 
 print("\n--- payment summary by region and method ---------------------")
-df = con.execute("""
-    SELECT
-        epoch_ms(window_start)::TIMESTAMP AS window_start,
-        epoch_ms(window_end)::TIMESTAMP   AS window_end,
-        region,
-        method,
-        payment_count,
-        ROUND(total_usd, 2) AS total_usd,
-        ROUND(avg_usd, 2)   AS avg_usd,
-        failed_count
-    FROM catalog.finance.payment_summary
-    ORDER BY window_start DESC, total_usd DESC
-    LIMIT 40
-""").fetchdf()
-
 print(df.to_string(index=False))
 print(f"\n{len(df)} rows")
