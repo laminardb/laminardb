@@ -8,18 +8,6 @@ Two Rust binaries do the streaming work (`nats-server` + `laminardb`);
 three containers (RustFS, Postgres, Lakekeeper) provide the lakehouse.
 RustFS is the S3-compatible Rust object store standing in for MinIO.
 
-## Prerequisite
-
-Lakekeeper bakes its in-cluster RustFS endpoint (`http://rustfs:9000`)
-into Iceberg manifest paths. Add a hosts entry on your machine so
-DuckDB can resolve it from the host:
-
-    # /etc/hosts (Linux/macOS) or C:\Windows\System32\drivers\etc\hosts
-    127.0.0.1   rustfs
-
-The published `9000:9000` port forwards the host-side `rustfs:9000` to
-the container.
-
 ## Run it
 
 ```bash

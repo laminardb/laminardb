@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Reads payment_summary from Lakekeeper via DuckDB's iceberg extension.
+Reads payment_summary committed by laminardb to RustFS and prints a
+window-by-window rollup.
 
     pip install duckdb
     python query.py
@@ -8,47 +9,36 @@ Reads payment_summary from Lakekeeper via DuckDB's iceberg extension.
 Run after ~90 seconds of `gen.py` so at least one tumbling minute has
 closed and the sink has committed.
 
-Prerequisite: `rustfs` must resolve to `127.0.0.1` from the host so
-DuckDB can fetch the manifest paths Lakekeeper bakes into table
-metadata. See README.
+We `parquet_scan` the data files directly. The Iceberg metadata in
+Lakekeeper bakes its in-cluster `http://rustfs:9000` endpoint into
+manifest paths, which the host can't resolve. The Parquet files
+themselves live in RustFS and read fine over the host-published
+`localhost:9000` endpoint.
+
+Path layout: <warehouse-uuid>/<table-uuid>/data/<file>.parquet.
 """
 
+import os
 import duckdb
 
 
+WAREHOUSE_GLOB = os.environ.get(
+    "PAYMENT_SUMMARY_GLOB",
+    "s3://warehouse/finance/*/*/data/*.parquet",
+)
+
 con = duckdb.connect()
-
-# Pull the iceberg extension from core_nightly: AUTHORIZATION_TYPE 'none'
-# is required for unauthenticated REST catalogs and was added after the
-# stable extension cut.
-con.execute("FORCE INSTALL iceberg FROM core_nightly;")
-con.execute("LOAD iceberg;")
 con.execute("INSTALL httpfs; LOAD httpfs;")
-
-# Storage credentials for the Parquet/manifest fetches.
 con.execute("""
-    CREATE SECRET rustfs (
-        TYPE      S3,
-        KEY_ID    'rustfsadmin',
-        SECRET    'rustfsadmin',
-        ENDPOINT  'rustfs:9000',
-        URL_STYLE 'path',
-        USE_SSL   false
-    )
-""")
-
-# Lakekeeper REST catalog. Lakekeeper runs unauthenticated in this demo;
-# DuckDB defaults to oauth2 on the ATTACH so flip it to 'none'.
-con.execute("""
-    ATTACH 'demo' AS catalog (
-        TYPE               ICEBERG,
-        ENDPOINT           'http://localhost:8181/catalog',
-        AUTHORIZATION_TYPE 'none'
-    )
+    SET s3_endpoint          = 'localhost:9000';
+    SET s3_access_key_id     = 'rustfsadmin';
+    SET s3_secret_access_key = 'rustfsadmin';
+    SET s3_use_ssl           = false;
+    SET s3_url_style         = 'path';
 """)
 
 print("\n--- payment summary by region and method ---------------------")
-df = con.execute("""
+df = con.execute(f"""
     SELECT
         epoch_ms(window_start)::TIMESTAMP AS window_start,
         epoch_ms(window_end)::TIMESTAMP   AS window_end,
@@ -58,7 +48,7 @@ df = con.execute("""
         ROUND(total_usd, 2) AS total_usd,
         ROUND(avg_usd, 2)   AS avg_usd,
         failed_count
-    FROM catalog.finance.payment_summary
+    FROM parquet_scan('{WAREHOUSE_GLOB}')
     ORDER BY window_start DESC, total_usd DESC
     LIMIT 40
 """).fetchdf()
