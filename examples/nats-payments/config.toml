@@ -15,7 +15,7 @@ bind = "127.0.0.1:8080"
 backend = "in_process"
 
 [checkpoint]
-interval = "30s"
+interval = "5s"
 
 # ── Source ────────────────────────────────────────────────────────────
 # NATS core-mode subscriber. Mode is "core" (no JetStream) so the demo
@@ -84,7 +84,9 @@ SELECT
     COUNT(*)                                            AS payment_count,
     SUM(amount_usd)                                     AS total_usd,
     AVG(amount_usd)                                     AS avg_usd,
-    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)  AS failed_count
+    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)  AS failed_count,
+    MAX(event_time)                                     AS max_event_time,
+    now()                                               AS emitted_at
 FROM payments
 GROUP BY
     TUMBLE(event_time, INTERVAL '1' MINUTE),
