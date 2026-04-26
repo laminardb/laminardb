@@ -4,16 +4,17 @@ Payment events stream off a NATS subject. LaminarDB tumbles them into
 1-minute windows by region+method and writes the rollup to Iceberg via a
 REST catalog (Lakekeeper). Results queryable from DuckDB.
 
-No Kafka. No Redpanda. No JVM. Two binaries do the work
-(`nats-server` + `laminardb`); three containers (MinIO, Postgres,
-Lakekeeper) provide the lakehouse.
+No Kafka. No Redpanda. No JVM. No Go. Two Rust binaries do the work
+(`nats-server` + `laminardb`); three containers (RustFS, Postgres,
+Lakekeeper) provide the lakehouse — RustFS is the S3-compatible Rust
+object store standing in for MinIO.
 
 ## Run it
 
 ```bash
-# 1. NATS + MinIO + Postgres + Lakekeeper. The lakekeeper-init container
+# 1. NATS + RustFS + Postgres + Lakekeeper. The lakekeeper-init container
 #    bootstraps the catalog and creates the `demo` warehouse pointing at
-#    the `warehouse` MinIO bucket.
+#    the `warehouse` RustFS bucket.
 docker compose -f examples/nats-payments/docker-compose.yml up -d
 
 # 2. Build laminardb (skip postgres-cdc/mysql-cdc — they pull native
@@ -58,7 +59,7 @@ table ends up with eight columns.
 ## Explore
 
 - Lakekeeper UI  → http://localhost:8182
-- MinIO console  → http://localhost:9001  (minioadmin / minioadmin)
+- RustFS console → http://localhost:9001  (rustfsadmin / rustfsadmin)
 - NATS monitor   → http://localhost:8222
 - LaminarDB HTTP → http://127.0.0.1:8080
 
@@ -74,6 +75,6 @@ docker compose -f examples/nats-payments/docker-compose.yml down -v
 |----------------------|--------------------------------------------------------|
 | `config.toml`        | Source, pipeline, sink — what `laminardb` actually reads |
 | `pipeline.sql`       | Reference copy of the SELECT (config has the live one) |
-| `docker-compose.yml` | NATS + MinIO + Postgres + Lakekeeper                   |
+| `docker-compose.yml` | NATS + RustFS + Postgres + Lakekeeper                  |
 | `gen.py`             | NATS publisher — `pip install nats-py`                 |
 | `query.py`           | DuckDB reader — `pip install duckdb`                   |

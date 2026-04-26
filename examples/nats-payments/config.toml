@@ -116,10 +116,10 @@ namespace       = "finance"
 "auto.create"   = "true"
 compression     = "zstd"
 
-# MinIO credentials for OpenDAL FileIO (Lakekeeper does not vend creds
+# RustFS credentials for OpenDAL FileIO (Lakekeeper does not vend creds
 # in this profile — sts-enabled=false in docker-compose.yml).
 "catalog.property.s3.endpoint"          = "http://localhost:9000"
-"catalog.property.s3.access-key-id"     = "minioadmin"
-"catalog.property.s3.secret-access-key" = "minioadmin"
+"catalog.property.s3.access-key-id"     = "rustfsadmin"
+"catalog.property.s3.secret-access-key" = "rustfsadmin"
 "catalog.property.s3.region"            = "us-east-1"
 "catalog.property.s3.path-style-access" = "true"

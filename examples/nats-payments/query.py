@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Reads payment_summary committed by laminardb to MinIO and prints a
+Reads payment_summary committed by laminardb to RustFS and prints a
 window-by-window rollup.
 
     pip install duckdb
@@ -11,9 +11,9 @@ closed and the sink has committed.
 
 We `parquet_scan` the data files directly instead of going through
 DuckDB's iceberg_scan(REST). Lakekeeper bakes its configured endpoint
-(`http://minio:9000`) into table metadata, and DuckDB's iceberg
-extension follows that endpoint as-is from the host where `minio`
-doesn't resolve. The Parquet files themselves live in MinIO and read
+(`http://rustfs:9000`) into table metadata, and DuckDB's iceberg
+extension follows that endpoint as-is from the host where `rustfs`
+doesn't resolve. The Parquet files themselves live in RustFS and read
 fine over the host-published `localhost:9000` endpoint.
 """
 
@@ -30,8 +30,8 @@ con = duckdb.connect()
 con.execute("INSTALL httpfs; LOAD httpfs;")
 con.execute("""
     SET s3_endpoint          = 'localhost:9000';
-    SET s3_access_key_id     = 'minioadmin';
-    SET s3_secret_access_key = 'minioadmin';
+    SET s3_access_key_id     = 'rustfsadmin';
+    SET s3_secret_access_key = 'rustfsadmin';
     SET s3_use_ssl           = false;
     SET s3_url_style         = 'path';
 """)
