@@ -1,0 +1,125 @@
+# LaminarDB demo — NATS payments → Iceberg.
+#
+# Build:
+#   cargo build --release -p laminar-server \
+#       --no-default-features --features mimalloc,nats,iceberg,websocket
+#
+# Run:
+#   ./target/release/laminardb --config examples/nats-payments/config.toml
+
+[server]
+mode = "embedded"
+bind = "127.0.0.1:8080"
+
+[state]
+backend = "in_process"
+
+[checkpoint]
+interval = "30s"
+
+# ── Source ────────────────────────────────────────────────────────────
+# NATS core-mode subscriber. Mode is "core" (no JetStream) so the demo
+# needs nothing more than `nats-server` running on :4222.
+#
+# JSON payloads are decoded against the schema declared below. event_time
+# is RFC3339 → arrow_cast::parse::string_to_timestamp_nanos handles it.
+
+[[source]]
+name = "payments"
+connector = "nats"
+format = "json"
+
+[source.properties]
+servers = "nats://localhost:4222"
+mode    = "core"
+subject = "payments.events"
+
+[[source.schema]]
+name = "payment_id"
+type = "VARCHAR"
+nullable = false
+
+[[source.schema]]
+name = "region"
+type = "VARCHAR"
+nullable = false
+
+[[source.schema]]
+name = "method"
+type = "VARCHAR"
+nullable = false
+
+[[source.schema]]
+name = "amount_usd"
+type = "DOUBLE"
+nullable = false
+
+[[source.schema]]
+name = "status"
+type = "VARCHAR"
+nullable = false
+
+[[source.schema]]
+name = "event_time"
+type = "TIMESTAMP"
+nullable = false
+
+[source.watermark]
+column = "event_time"
+max_out_of_orderness = "10s"
+
+# ── Pipeline ──────────────────────────────────────────────────────────
+# Tumbling 1-minute windows by region+method. window_start/window_end are
+# auto-projected at the head of the SELECT by the windowed-GROUP-BY
+# rewriter, so the sink writes 8 columns:
+#   window_start, window_end, region, method,
+#   payment_count, total_usd, avg_usd, failed_count
+
+[[pipeline]]
+name = "payment_summary"
+sql = """
+SELECT
+    region,
+    method,
+    COUNT(*)                                            AS payment_count,
+    SUM(amount_usd)                                     AS total_usd,
+    AVG(amount_usd)                                     AS avg_usd,
+    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)  AS failed_count
+FROM payments
+GROUP BY
+    TUMBLE(event_time, INTERVAL '1' MINUTE),
+    region,
+    method
+EMIT ON WINDOW CLOSE
+"""
+
+# ── Sink ──────────────────────────────────────────────────────────────
+# Iceberg REST catalog (Lakekeeper). With auto.create=true the sink defers
+# load_table to the first non-empty batch and creates the table from the
+# batch schema, so no pre-existing table or namespace is required.
+
+[[sink]]
+name = "payment_summary_iceberg"
+pipeline = "payment_summary"
+connector = "iceberg"
+
+[sink.properties]
+# Lakekeeper resolves `warehouse` (NAME, not S3 path) to a prefix UUID via
+# GET /v1/config?warehouse=<name>. `storage.type = "s3"` tells the sink
+# what backend the catalog will return URLs for — REST-catalog warehouses
+# use a logical name so the scheme can't be inferred from `warehouse`.
+"catalog.uri"   = "http://localhost:8181/catalog"
+warehouse       = "demo"
+"storage.type"  = "s3"
+namespace       = "finance"
+"table.name"    = "payment_summary"
+"auto.create"   = "true"
+compression     = "zstd"
+
+# MinIO credentials for OpenDAL FileIO (Lakekeeper does not vend creds
+# in this profile — sts-enabled=false in docker-compose.yml).
+"catalog.property.s3.endpoint"          = "http://localhost:9000"
+"catalog.property.s3.access-key-id"     = "minioadmin"
+"catalog.property.s3.secret-access-key" = "minioadmin"
+"catalog.property.s3.region"            = "us-east-1"
+"catalog.property.s3.path-style-access" = "true"
