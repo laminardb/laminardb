@@ -8,21 +8,29 @@ Reads the demo's two Iceberg tables via Lakekeeper:
     pip install duckdb
     python query.py
 
-Run after ~90 seconds of `gen.py` so at least one tumbling minute has
-closed and join rows have flowed.
+Run AFTER stopping gen.py — the tables accumulate parquet files fast
+at 10K/s, and DuckDB's concurrent httpfs reads contend with
+laminardb's ongoing writes against RustFS. Stopping the publisher
+gives DuckDB an idle store to scan.
 
 Prerequisite: `rustfs` must resolve to `127.0.0.1` from the host so
 DuckDB can fetch manifest paths Lakekeeper bakes into table metadata.
 See README.
 """
 
+import time
+
 import duckdb
 
 
 con = duckdb.connect()
-con.execute("FORCE INSTALL iceberg FROM core_nightly;")
+con.execute("INSTALL iceberg FROM core_nightly;")
 con.execute("LOAD iceberg;")
 con.execute("INSTALL httpfs; LOAD httpfs;")
+# Throttle parallel httpfs GETs — at 10K/s ingest the table accumulates
+# many small parquet files and RustFS occasionally drops connections
+# under DuckDB's default concurrency.
+con.execute("SET threads=2;")
 
 con.execute("""
     CREATE SECRET rustfs (
@@ -44,6 +52,26 @@ con.execute("""
 """)
 
 
+def materialise(local_name: str, source: str, attempts: int = 3) -> None:
+    """Materialise an Iceberg table into a local DuckDB table; retry on
+    transient httpfs connect errors."""
+    for i in range(attempts):
+        try:
+            con.execute(f"CREATE OR REPLACE TABLE {local_name} AS SELECT * FROM {source}")
+            return
+        except duckdb.IOException as e:
+            if i == attempts - 1:
+                raise
+            print(f"  retry {local_name} ({i+1}/{attempts}) after: {e}", flush=True)
+            time.sleep(1.0)
+
+
+print("loading payments_summary ...", flush=True)
+materialise("summary", "catalog.finance.payments_summary")
+print("loading payments_with_fraud_score ...", flush=True)
+materialise("joined", "catalog.finance.payments_with_fraud_score")
+
+
 def section(title: str) -> None:
     print(f"\n--- {title} " + "-" * max(0, 60 - len(title) - 5))
 
@@ -57,7 +85,7 @@ df = con.execute("""
         payment_count,
         ROUND(total_usd, 2) AS total_usd,
         ROUND(avg_usd, 2)   AS avg_usd
-    FROM catalog.finance.payments_summary
+    FROM summary
     ORDER BY window_start DESC, total_usd DESC
     LIMIT 16
 """).fetchdf()
@@ -69,7 +97,7 @@ df = con.execute("""
            ROUND(amount_usd, 2) AS amount_usd,
            fraud_score, outcome,
            score_latency_ms
-    FROM catalog.finance.payments_with_fraud_score
+    FROM joined
     ORDER BY scored_at DESC
     LIMIT 20
 """).fetchdf()
@@ -85,7 +113,7 @@ df = con.execute("""
         CAST(quantile_cont(score_latency_ms, 0.99) AS BIGINT)          AS p99_ms,
         CAST(SUM(CASE WHEN outcome = 'blocked' THEN 1 ELSE 0 END) AS BIGINT) AS blocked,
         CAST(SUM(CASE WHEN outcome = 'review'  THEN 1 ELSE 0 END) AS BIGINT) AS review
-    FROM catalog.finance.payments_with_fraud_score
+    FROM joined
     GROUP BY region
     ORDER BY region
 """).fetchdf()

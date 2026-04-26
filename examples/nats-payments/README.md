@@ -57,7 +57,10 @@ python examples/nats-payments/gen.py
 # python examples/nats-payments/gen.py --rate 50000   # 50K/s
 # python examples/nats-payments/gen.py --rate 0       # flat-out
 
-# 5. Wait ~90 seconds, then query.
+# 5. Wait ~90 seconds, then stop the publisher (Ctrl-C the gen.py
+#    terminal) and query. Stopping the publisher first avoids
+#    contention between DuckDB's reads and laminardb's ongoing
+#    writes against RustFS.
 pip install duckdb
 python examples/nats-payments/query.py
 ```
