@@ -129,10 +129,7 @@ impl std::fmt::Display for WindowOperatorConfig {
 
 impl WindowOperatorConfig {
     /// Fields the window operator prepends to every output batch.
-    ///
-    /// This is the canonical contract that downstream consumers (sink schema
-    /// resolvers, schema validators) and runtime emitters (`CoreWindowState`,
-    /// `IncrementalEowcState`) must agree on.
+    /// Single source of truth for the windowed-stream output contract.
     #[must_use]
     pub fn output_prefix_fields() -> Vec<Field> {
         vec![

@@ -546,7 +546,8 @@ impl CoreWindowState {
         }
         let intermediate_schema = Arc::new(Schema::new(intermediate_fields));
 
-        let mut output_fields = laminar_sql::translator::WindowOperatorConfig::output_prefix_fields();
+        let mut output_fields =
+            laminar_sql::translator::WindowOperatorConfig::output_prefix_fields();
         for f in intermediate_schema.fields() {
             output_fields.push(f.as_ref().clone());
         }
@@ -561,7 +562,8 @@ impl CoreWindowState {
                     })?;
                 compiled.push(phys);
             }
-            let mut final_fields = laminar_sql::translator::WindowOperatorConfig::output_prefix_fields();
+            let mut final_fields =
+                laminar_sql::translator::WindowOperatorConfig::output_prefix_fields();
             for f in top_schema.fields() {
                 final_fields.push(f.as_ref().clone());
             }

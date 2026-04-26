@@ -20,12 +20,8 @@ use super::iceberg_config::{IcebergCatalogConfig, IcebergCatalogType};
 use crate::error::ConnectorError;
 
 /// Selects the `OpenDalStorageFactory` for the table-data URLs the catalog
-/// will return. Supported backends: `s3`, `s3a`, `fs`.
-///
-/// Explicit `storage.type` wins. Otherwise the scheme is inferred from
-/// the warehouse URL — `s3://`, `s3a://`, `file://`. Anything else
-/// requires an explicit `storage.type` (REST catalogs use a logical
-/// warehouse name; the scheme can't be inferred).
+/// will return. Explicit `storage.type` wins; otherwise inferred from the
+/// `s3://` / `s3a://` / `file://` warehouse URL.
 fn storage_factory(
     warehouse: &str,
     storage_type: Option<&str>,
@@ -221,7 +217,7 @@ pub fn get_last_committed_epoch(table: &Table, writer_id: &str) -> Option<u64> {
     table.metadata().properties().get(&key)?.parse().ok()
 }
 
-/// Creates an Iceberg table if it does not already exist.
+/// Creates an Iceberg table (and namespace) if it does not already exist.
 ///
 /// # Errors
 ///
@@ -302,7 +298,9 @@ mod tests {
     fn test_storage_factory_bare_path_requires_explicit_storage_type() {
         // Trimmed `/` and `./` inference: REST catalogs use logical names
         // and we don't want a silent default to local fs.
-        let err = storage_factory("/tmp/warehouse", None).unwrap_err().to_string();
+        let err = storage_factory("/tmp/warehouse", None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("LDB-5100"), "got: {err}");
     }
 
@@ -321,7 +319,9 @@ mod tests {
 
     #[test]
     fn test_storage_factory_rejects_unknown_storage_type() {
-        let err = storage_factory("demo", Some("hdfs")).unwrap_err().to_string();
+        let err = storage_factory("demo", Some("hdfs"))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("LDB-5101"), "got: {err}");
     }
 

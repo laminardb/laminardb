@@ -458,7 +458,8 @@ impl IncrementalEowcState {
             None
         };
 
-        let mut output_fields = laminar_sql::translator::WindowOperatorConfig::output_prefix_fields();
+        let mut output_fields =
+            laminar_sql::translator::WindowOperatorConfig::output_prefix_fields();
         for (name, dt) in group_col_names.iter().zip(group_types.iter()) {
             output_fields.push(Field::new(name, dt.clone(), true));
         }
