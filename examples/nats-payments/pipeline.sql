@@ -32,7 +32,7 @@ SELECT
     f.outcome     AS outcome,
     p.event_time                                              AS initiated_at,
     f.event_time                                              AS scored_at,
-    CAST(f.event_time - p.event_time AS BIGINT) / 1000000     AS score_latency_ms
+    (CAST(f.event_time AS BIGINT) - CAST(p.event_time AS BIGINT)) / 1000000 AS score_latency_ms
 FROM payments p
 JOIN fraud_checks f
     ON p.payment_id = f.payment_id

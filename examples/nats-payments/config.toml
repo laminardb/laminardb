@@ -126,7 +126,10 @@ SELECT
     f.outcome     AS outcome,
     p.event_time                                              AS initiated_at,
     f.event_time                                              AS scored_at,
-    CAST(f.event_time - p.event_time AS BIGINT) / 1000000     AS score_latency_ms
+    -- Subtract nanos-since-epoch directly. Timestamp - Timestamp returns
+    -- an Interval(MonthDayNano) whose BIGINT cast doesn't give the
+    -- elapsed nanos we want.
+    (CAST(f.event_time AS BIGINT) - CAST(p.event_time AS BIGINT)) / 1000000 AS score_latency_ms
 FROM payments p
 JOIN fraud_checks f
     ON p.payment_id = f.payment_id
