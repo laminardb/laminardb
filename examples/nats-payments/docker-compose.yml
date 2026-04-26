@@ -35,7 +35,9 @@ services:
       retries: 6
       start_period: 10s
 
-  # Creates the `warehouse` bucket once RustFS is healthy.
+  # Creates the `warehouse` bucket once RustFS is healthy. Public-read
+  # so DuckDB's httpfs can fetch Iceberg manifest URLs (which Lakekeeper
+  # bakes as plain http:// links, not signed s3:// references).
   rustfs-init:
     image: amazon/aws-cli:2.13.39
     container_name: rustfs-init
@@ -50,7 +52,22 @@ services:
       - /bin/sh
       - -c
       - |
+        set -eu
         aws --endpoint-url http://rustfs:9000 s3 mb s3://warehouse || true
+        cat >/tmp/policy.json <<'JSON'
+        {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Sid": "PublicRead",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": ["s3:GetObject"],
+            "Resource": "arn:aws:s3:::warehouse/*"
+          }]
+        }
+        JSON
+        aws --endpoint-url http://rustfs:9000 s3api put-bucket-policy \
+            --bucket warehouse --policy file:///tmp/policy.json || true
 
   postgres:
     image: postgres:16
