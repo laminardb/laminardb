@@ -14,6 +14,85 @@ use crate::db::{
 };
 use crate::error::DbError;
 
+/// Resolves each `CREATE STREAM`'s output Arrow schema by planning its SQL.
+/// Windowed streams get the `window_start, window_end` prefix. Temporary
+/// `EmptyTable` placeholders let downstream streams plan against upstream
+/// streams; they are removed before returning.
+async fn resolve_stream_output_schemas(
+    ctx: &datafusion::prelude::SessionContext,
+    stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
+) -> Result<HashMap<String, arrow_schema::SchemaRef>, DbError> {
+    use arrow_schema::Schema;
+    use datafusion::datasource::empty::EmptyTable;
+
+    let mut out: HashMap<String, arrow_schema::SchemaRef> =
+        HashMap::with_capacity(stream_regs.len());
+    let mut pending: Vec<&crate::connector_manager::StreamRegistration> =
+        stream_regs.values().collect();
+    // Placeholders we own and must clean up; pre-existing tables are left alone.
+    let mut placeholders: Vec<String> = Vec::new();
+
+    let result: Result<(), DbError> = async {
+        while !pending.is_empty() {
+            let mut next: Vec<&crate::connector_manager::StreamRegistration> = Vec::new();
+            let mut progressed = false;
+            for reg in pending {
+                let Ok(plan) = ctx.state().create_logical_plan(&reg.query_sql).await else {
+                    next.push(reg);
+                    continue;
+                };
+
+                let mut fields = if reg.window_config.is_some() {
+                    laminar_sql::translator::WindowOperatorConfig::output_prefix_fields()
+                } else {
+                    Vec::new()
+                };
+                for f in plan.schema().fields() {
+                    fields.push((**f).clone());
+                }
+                let schema = Arc::new(Schema::new(fields));
+
+                if !ctx.table_exist(&reg.name).unwrap_or(false) {
+                    ctx.register_table(&reg.name, Arc::new(EmptyTable::new(schema.clone())))
+                        .map_err(|e| {
+                            DbError::Pipeline(format!(
+                                "could not register placeholder for stream '{}': {e}",
+                                reg.name
+                            ))
+                        })?;
+                    placeholders.push(reg.name.clone());
+                }
+                out.insert(reg.name.clone(), schema);
+                progressed = true;
+            }
+
+            if !progressed {
+                let mut unresolved: Vec<&str> = next.iter().map(|r| r.name.as_str()).collect();
+                unresolved.sort_unstable();
+                let err = ctx
+                    .state()
+                    .create_logical_plan(&next[0].query_sql)
+                    .await
+                    .err()
+                    .map_or_else(|| "unknown error".to_string(), |e| e.to_string());
+                return Err(DbError::Pipeline(format!(
+                    "unresolvable stream dependency among [{}]: {err}",
+                    unresolved.join(", ")
+                )));
+            }
+            pending = next;
+        }
+        Ok(())
+    }
+    .await;
+
+    for name in &placeholders {
+        let _ = ctx.deregister_table(name);
+    }
+
+    result.map(|()| out)
+}
+
 pub(crate) fn url_to_checkpoint_prefix(url: &str) -> String {
     // Strip scheme
     let after_scheme = url.find("://").map_or(url, |i| &url[i + 3..]);
@@ -646,6 +725,11 @@ impl LaminarDB {
             }
         }
 
+        // Resolve each stream's output schema with DataFusion so sinks
+        // downstream see it via `_arrow_schema` (mirrors the source path
+        // above).
+        let stream_output_schemas = resolve_stream_output_schemas(&self.ctx, &stream_regs).await?;
+
         // Build sinks. Each runs in its own tokio task with a bounded
         // command channel and shares one event channel back to the
         // pipeline callback.
@@ -665,7 +749,18 @@ impl LaminarDB {
             if reg.connector_type.is_none() {
                 continue;
             }
-            let config = build_sink_config(reg)?;
+            let mut config = build_sink_config(reg)?;
+            // Resolve the upstream schema from a stream first, then fall back
+            // to a source — `CREATE SINK ... FROM <name>` accepts either.
+            let upstream_schema = stream_output_schemas.get(&reg.input).cloned().or_else(|| {
+                self.catalog
+                    .get_source(&reg.input)
+                    .map(|e| e.schema.clone())
+            });
+            if let Some(schema) = upstream_schema {
+                let schema_str = crate::pipeline_callback::encode_arrow_schema(&schema);
+                config.set("_arrow_schema".to_string(), schema_str);
+            }
             let mut sink = self
                 .connector_registry
                 .create_sink(&config, prom_registry.as_deref())
@@ -1437,5 +1532,150 @@ impl LaminarDB {
             .store(STATE_STOPPED, std::sync::atomic::Ordering::Release);
         self.close();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod resolver_tests {
+    use super::resolve_stream_output_schemas;
+    use crate::connector_manager::StreamRegistration;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::datasource::empty::EmptyTable;
+    use datafusion::prelude::SessionContext;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn ctx_with_payments() -> SessionContext {
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("method", DataType::Utf8, false),
+            Field::new("amount_usd", DataType::Float64, false),
+            Field::new("status", DataType::Utf8, false),
+            Field::new(
+                "event_time",
+                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+                false,
+            ),
+        ]));
+        ctx.register_table("payments", Arc::new(EmptyTable::new(schema)))
+            .unwrap();
+        ctx.register_udf(datafusion_expr::ScalarUDF::from(
+            laminar_sql::datafusion::TumbleWindowStart::new(),
+        ));
+        ctx
+    }
+
+    fn reg(name: &str, sql: &str, windowed: bool) -> StreamRegistration {
+        StreamRegistration {
+            name: name.to_string(),
+            query_sql: sql.to_string(),
+            emit_clause: None,
+            // Resolver only checks `is_some()`; the size doesn't matter.
+            window_config: windowed.then(|| {
+                laminar_sql::translator::WindowOperatorConfig::tumbling(
+                    "event_time".into(),
+                    Duration::ZERO,
+                )
+            }),
+            order_config: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn windowed_stream_gets_window_start_end_prefix() {
+        let ctx = ctx_with_payments();
+        let mut regs = std::collections::HashMap::new();
+        regs.insert(
+            "agg".to_string(),
+            reg(
+                "agg",
+                "SELECT region, COUNT(*) AS n FROM payments \
+                 GROUP BY tumble(event_time, INTERVAL '1' MINUTE), region",
+                true,
+            ),
+        );
+
+        let out = resolve_stream_output_schemas(&ctx, &regs).await.unwrap();
+        let names: Vec<&str> = out["agg"]
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(&names[..2], &["window_start", "window_end"]);
+        assert_eq!(out["agg"].field(0).data_type(), &DataType::Int64);
+        assert!(names.contains(&"region") && names.contains(&"n"));
+    }
+
+    #[tokio::test]
+    async fn non_windowed_stream_has_no_prefix() {
+        let ctx = ctx_with_payments();
+        let mut regs = std::collections::HashMap::new();
+        regs.insert(
+            "passthrough".to_string(),
+            reg(
+                "passthrough",
+                "SELECT region, amount_usd FROM payments",
+                false,
+            ),
+        );
+
+        let out = resolve_stream_output_schemas(&ctx, &regs).await.unwrap();
+        let names: Vec<&str> = out["passthrough"]
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, vec!["region", "amount_usd"]);
+    }
+
+    #[tokio::test]
+    async fn chained_streams_resolve_via_iterative_planning() {
+        // `b` reads from `a`; iteration order doesn't matter — the loop
+        // re-tries `b` after `a` is registered.
+        let ctx = ctx_with_payments();
+        let mut regs = std::collections::HashMap::new();
+        regs.insert(
+            "b".to_string(),
+            reg("b", "SELECT region, n + 1 AS n_plus_one FROM a", false),
+        );
+        regs.insert(
+            "a".to_string(),
+            reg(
+                "a",
+                "SELECT region, COUNT(*) AS n FROM payments GROUP BY region",
+                false,
+            ),
+        );
+
+        let out = resolve_stream_output_schemas(&ctx, &regs).await.unwrap();
+        let b_names: Vec<&str> = out["b"]
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(b_names, vec!["region", "n_plus_one"]);
+
+        // Placeholders must not leak into the public ctx — `subscribe()`
+        // is the data path for streams; `SELECT * FROM <stream>` should
+        // not silently return zero rows from a left-over EmptyTable.
+        assert!(!ctx.table_exist("a").unwrap_or(false));
+        assert!(!ctx.table_exist("b").unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn unresolvable_streams_surface_planner_error() {
+        let ctx = ctx_with_payments();
+        let mut regs = std::collections::HashMap::new();
+        // Cycle: a→b, b→a. Planning stalls; we report the unresolved set.
+        regs.insert("a".to_string(), reg("a", "SELECT * FROM b", false));
+        regs.insert("b".to_string(), reg("b", "SELECT * FROM a", false));
+
+        let err = resolve_stream_output_schemas(&ctx, &regs)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unresolvable stream dependency"), "got: {err}");
+        assert!(err.contains('a') && err.contains('b'), "got: {err}");
     }
 }

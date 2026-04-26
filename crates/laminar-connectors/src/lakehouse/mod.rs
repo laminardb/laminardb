@@ -540,11 +540,16 @@ fn iceberg_sink_config_keys() -> Vec<ConfigKeySpec> {
         ),
         ConfigKeySpec::required(
             "warehouse",
-            "Warehouse location (e.g., s3://bucket/warehouse)",
+            "Warehouse name (REST catalog) or URL (Hadoop catalog, e.g. s3://bucket/wh)",
         ),
         ConfigKeySpec::required("namespace", "Iceberg namespace (e.g., prod)"),
         ConfigKeySpec::required("table.name", "Table name within the namespace"),
         ConfigKeySpec::optional("catalog.type", "Catalog type: rest", "rest"),
+        ConfigKeySpec::optional(
+            "storage.type",
+            "Storage backend (s3 | s3a | fs). Required when warehouse is a name, not a URL",
+            "",
+        ),
         ConfigKeySpec::optional(
             "compression",
             "Parquet compression: zstd, snappy, none",

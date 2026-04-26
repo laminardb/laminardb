@@ -19,25 +19,48 @@ use tokio_stream::StreamExt;
 use super::iceberg_config::{IcebergCatalogConfig, IcebergCatalogType};
 use crate::error::ConnectorError;
 
-/// Selects the correct `OpenDalStorageFactory` based on the warehouse URL scheme.
-fn storage_factory_for_warehouse(warehouse: &str) -> Arc<dyn iceberg::io::StorageFactory> {
-    if warehouse.starts_with("s3://") || warehouse.starts_with("s3a://") {
-        // Note: configured_scheme must be the bare scheme name (e.g. "s3"),
-        // NOT "s3://". The iceberg-storage-opendal crate's create_operator()
-        // builds the prefix via `format!("{}://{}/", configured_scheme, bucket)`,
-        // so including "://" here would produce "s3://://bucket/" — an invalid URL.
-        let scheme = if warehouse.starts_with("s3a://") {
-            "s3a".to_string()
-        } else {
-            "s3".to_string()
-        };
-        Arc::new(OpenDalStorageFactory::S3 {
+/// Selects the `OpenDalStorageFactory` for the table-data URLs the catalog
+/// will return. Explicit `storage.type` wins; otherwise inferred from the
+/// `s3://` / `s3a://` / `file://` warehouse URL.
+fn storage_factory(
+    warehouse: &str,
+    storage_type: Option<&str>,
+) -> Result<Arc<dyn iceberg::io::StorageFactory>, ConnectorError> {
+    let scheme = storage_type
+        .map(str::to_lowercase)
+        .or_else(|| {
+            if warehouse.starts_with("s3a://") {
+                Some("s3a".to_string())
+            } else if warehouse.starts_with("s3://") {
+                Some("s3".to_string())
+            } else if warehouse.starts_with("file://") {
+                Some("fs".to_string())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            ConnectorError::ConfigurationError(format!(
+                "[LDB-5100] cannot infer storage backend from warehouse '{warehouse}'; \
+                 set storage.type = 's3' | 's3a' | 'fs'"
+            ))
+        })?;
+
+    // configured_scheme is the bare scheme ("s3"), NOT "s3://" —
+    // iceberg-storage-opendal formats the prefix as `{scheme}://{bucket}/`.
+    let factory: Arc<dyn iceberg::io::StorageFactory> = match scheme.as_str() {
+        "s3" | "s3a" => Arc::new(OpenDalStorageFactory::S3 {
             configured_scheme: scheme,
             customized_credential_load: None,
-        })
-    } else {
-        Arc::new(OpenDalStorageFactory::Fs)
-    }
+        }),
+        "fs" => Arc::new(OpenDalStorageFactory::Fs),
+        other => {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "[LDB-5101] unsupported storage.type '{other}'; expected s3 | s3a | fs"
+            )));
+        }
+    };
+    Ok(factory)
 }
 
 /// Builds a REST catalog from configuration.
@@ -56,7 +79,7 @@ pub async fn build_catalog(
 async fn build_rest_catalog(
     config: &IcebergCatalogConfig,
 ) -> Result<Arc<dyn Catalog>, ConnectorError> {
-    let storage_factory = storage_factory_for_warehouse(&config.warehouse);
+    let storage_factory = storage_factory(&config.warehouse, config.storage_type.as_deref())?;
 
     let mut props = HashMap::new();
     props.insert("uri".to_string(), config.catalog_uri.clone());
@@ -194,7 +217,7 @@ pub fn get_last_committed_epoch(table: &Table, writer_id: &str) -> Option<u64> {
     table.metadata().properties().get(&key)?.parse().ok()
 }
 
-/// Creates an Iceberg table if it does not already exist.
+/// Creates an Iceberg table (and namespace) if it does not already exist.
 ///
 /// # Errors
 ///
@@ -218,9 +241,12 @@ pub async fn ensure_table_exists(
         return Ok(());
     }
 
-    let iceberg_schema = iceberg::arrow::arrow_schema_to_schema(arrow_schema).map_err(|e| {
-        ConnectorError::SchemaMismatch(format!("arrow→iceberg schema conversion: {e}"))
-    })?;
+    // Pipeline-derived Arrow schemas don't carry `PARQUET:field_id`
+    // metadata; let iceberg-rust assign sequential IDs.
+    let iceberg_schema = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(arrow_schema)
+        .map_err(|e| {
+            ConnectorError::SchemaMismatch(format!("arrow→iceberg schema conversion: {e}"))
+        })?;
 
     if !catalog
         .namespace_exists(&ns)
@@ -251,24 +277,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_storage_factory_dispatch_s3() {
-        let factory = storage_factory_for_warehouse("s3://bucket/warehouse");
-        let debug = format!("{factory:?}");
-        assert!(debug.contains("S3"), "expected S3 factory, got: {debug}");
+    fn test_storage_factory_infers_s3_from_warehouse_url() {
+        let f = storage_factory("s3://bucket/warehouse", None).unwrap();
+        assert!(format!("{f:?}").contains("S3"));
     }
 
     #[test]
-    fn test_storage_factory_dispatch_s3a() {
-        let factory = storage_factory_for_warehouse("s3a://bucket/warehouse");
-        let debug = format!("{factory:?}");
-        assert!(debug.contains("S3"), "expected S3 factory, got: {debug}");
+    fn test_storage_factory_infers_s3a_from_warehouse_url() {
+        let f = storage_factory("s3a://bucket/warehouse", None).unwrap();
+        assert!(format!("{f:?}").contains("S3"));
     }
 
     #[test]
-    fn test_storage_factory_dispatch_local() {
-        let factory = storage_factory_for_warehouse("/tmp/warehouse");
-        let debug = format!("{factory:?}");
-        assert!(debug.contains("Fs"), "expected Fs factory, got: {debug}");
+    fn test_storage_factory_infers_fs_from_file_url() {
+        let f = storage_factory("file:///tmp/warehouse", None).unwrap();
+        assert!(format!("{f:?}").contains("Fs"));
+    }
+
+    #[test]
+    fn test_storage_factory_bare_path_requires_explicit_storage_type() {
+        // Trimmed `/` and `./` inference: REST catalogs use logical names
+        // and we don't want a silent default to local fs.
+        let err = storage_factory("/tmp/warehouse", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("LDB-5100"), "got: {err}");
+    }
+
+    #[test]
+    fn test_storage_factory_explicit_overrides_inference() {
+        // Lakekeeper-style: warehouse is a name, storage backend is S3.
+        let f = storage_factory("demo", Some("s3")).unwrap();
+        assert!(format!("{f:?}").contains("S3"));
+    }
+
+    #[test]
+    fn test_storage_factory_unknown_warehouse_without_storage_type_errors() {
+        let err = storage_factory("demo", None).unwrap_err().to_string();
+        assert!(err.contains("LDB-5100"), "got: {err}");
+    }
+
+    #[test]
+    fn test_storage_factory_rejects_unknown_storage_type() {
+        let err = storage_factory("demo", Some("hdfs"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("LDB-5101"), "got: {err}");
     }
 
     #[test]

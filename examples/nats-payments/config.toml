@@ -1,0 +1,181 @@
+# LaminarDB demo — payments + fraud-check stream-to-stream join.
+#
+# Build:
+#   cargo build --release -p laminar-server \
+#       --no-default-features --features mimalloc,nats,iceberg,websocket
+#
+# Run:
+#   ./target/release/laminardb --config examples/nats-payments/config.toml
+
+[server]
+mode = "embedded"
+bind = "127.0.0.1:8080"
+
+[state]
+backend = "in_process"
+
+[checkpoint]
+interval = "5s"
+
+# ── Sources ───────────────────────────────────────────────────────────
+# Two NATS subjects, one per stream. They correlate on payment_id.
+
+[[source]]
+name = "payments"
+connector = "nats"
+format = "json"
+
+[source.properties]
+servers = "nats://localhost:4222"
+mode    = "core"
+subject = "payments.initiated"
+
+[[source.schema]]
+name = "payment_id"
+type = "BIGINT"
+nullable = false
+[[source.schema]]
+name = "region"
+type = "VARCHAR"
+nullable = false
+[[source.schema]]
+name = "method"
+type = "VARCHAR"
+nullable = false
+[[source.schema]]
+name = "amount_usd"
+type = "DOUBLE"
+nullable = false
+[[source.schema]]
+name = "event_time"
+type = "TIMESTAMP"
+nullable = false
+
+[source.watermark]
+column = "event_time"
+max_out_of_orderness = "2s"
+
+
+[[source]]
+name = "fraud_checks"
+connector = "nats"
+format = "json"
+
+[source.properties]
+servers = "nats://localhost:4222"
+mode    = "core"
+subject = "payments.scored"
+
+[[source.schema]]
+name = "payment_id"
+type = "BIGINT"
+nullable = false
+[[source.schema]]
+name = "region"
+type = "VARCHAR"
+nullable = false
+[[source.schema]]
+name = "fraud_score"
+type = "DOUBLE"
+nullable = false
+[[source.schema]]
+name = "outcome"
+type = "VARCHAR"
+nullable = false
+[[source.schema]]
+name = "event_time"
+type = "TIMESTAMP"
+nullable = false
+
+[source.watermark]
+column = "event_time"
+max_out_of_orderness = "2s"
+
+# ── Pipelines ─────────────────────────────────────────────────────────
+
+# 1) Tumbling 1-minute rollup over the payments stream.
+[[pipeline]]
+name = "payments_summary"
+sql = """
+SELECT
+    region,
+    method,
+    COUNT(*)          AS payment_count,
+    SUM(amount_usd)   AS total_usd,
+    AVG(amount_usd)   AS avg_usd
+FROM payments
+GROUP BY
+    TUMBLE(event_time, INTERVAL '1' MINUTE),
+    region,
+    method
+EMIT ON WINDOW CLOSE
+"""
+
+# 2) Stream-to-stream interval join: a payment matched with its fraud
+#    score within 2 seconds. score_latency_ms is the headline number —
+#    "how long did the fraud system take?", per row.
+[[pipeline]]
+name = "payments_with_fraud_score"
+sql = """
+SELECT
+    p.payment_id  AS payment_id,
+    p.region      AS region,
+    p.method      AS method,
+    p.amount_usd  AS amount_usd,
+    f.fraud_score AS fraud_score,
+    f.outcome     AS outcome,
+    p.event_time                                              AS initiated_at,
+    f.event_time                                              AS scored_at,
+    -- date_part('epoch', ts) returns Float64 seconds since epoch with
+    -- subseconds preserved. Casting Timestamp - Timestamp to BIGINT
+    -- doesn't yield elapsed nanos in DataFusion 52.
+    CAST(
+        (date_part('epoch', f.event_time) - date_part('epoch', p.event_time)) * 1000
+        AS BIGINT
+    ) AS score_latency_ms
+FROM payments p
+JOIN fraud_checks f
+    ON p.payment_id = f.payment_id
+    AND f.event_time BETWEEN p.event_time AND p.event_time + INTERVAL '2' SECOND
+"""
+
+# ── Sinks ─────────────────────────────────────────────────────────────
+
+[[sink]]
+name = "payments_summary_iceberg"
+pipeline = "payments_summary"
+connector = "iceberg"
+
+[sink.properties]
+"catalog.uri"   = "http://localhost:8181/catalog"
+warehouse       = "demo"
+"storage.type"  = "s3"
+namespace       = "finance"
+"table.name"    = "payments_summary"
+"auto.create"   = "true"
+compression     = "zstd"
+"catalog.property.s3.endpoint"          = "http://localhost:9000"
+"catalog.property.s3.access-key-id"     = "rustfsadmin"
+"catalog.property.s3.secret-access-key" = "rustfsadmin"
+"catalog.property.s3.region"            = "us-east-1"
+"catalog.property.s3.path-style-access" = "true"
+
+
+[[sink]]
+name = "payments_with_fraud_score_iceberg"
+pipeline = "payments_with_fraud_score"
+connector = "iceberg"
+
+[sink.properties]
+"catalog.uri"   = "http://localhost:8181/catalog"
+warehouse       = "demo"
+"storage.type"  = "s3"
+namespace       = "finance"
+"table.name"    = "payments_with_fraud_score"
+"auto.create"   = "true"
+compression     = "zstd"
+"catalog.property.s3.endpoint"          = "http://localhost:9000"
+"catalog.property.s3.access-key-id"     = "rustfsadmin"
+"catalog.property.s3.secret-access-key" = "rustfsadmin"
+"catalog.property.s3.region"            = "us-east-1"
+"catalog.property.s3.path-style-access" = "true"

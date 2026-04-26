@@ -458,10 +458,8 @@ impl IncrementalEowcState {
             None
         };
 
-        let mut output_fields: Vec<Field> = vec![
-            Field::new("window_start", DataType::Int64, false),
-            Field::new("window_end", DataType::Int64, false),
-        ];
+        let mut output_fields =
+            laminar_sql::translator::WindowOperatorConfig::output_prefix_fields();
         for (name, dt) in group_col_names.iter().zip(group_types.iter()) {
             output_fields.push(Field::new(name, dt.clone(), true));
         }

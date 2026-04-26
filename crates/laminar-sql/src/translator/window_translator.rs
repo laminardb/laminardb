@@ -5,6 +5,8 @@
 
 use std::time::Duration;
 
+use arrow_schema::{DataType, Field};
+
 use crate::parser::{
     EmitClause, EmitStrategy, LateDataClause, ParseError, WindowFunction, WindowRewriter,
 };
@@ -126,6 +128,16 @@ impl std::fmt::Display for WindowOperatorConfig {
 }
 
 impl WindowOperatorConfig {
+    /// Fields the window operator prepends to every output batch.
+    /// Single source of truth for the windowed-stream output contract.
+    #[must_use]
+    pub fn output_prefix_fields() -> Vec<Field> {
+        vec![
+            Field::new("window_start", DataType::Int64, false),
+            Field::new("window_end", DataType::Int64, false),
+        ]
+    }
+
     /// Create a new tumbling window configuration.
     #[must_use]
     pub fn tumbling(time_column: String, size: Duration) -> Self {

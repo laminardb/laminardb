@@ -1,0 +1,180 @@
+# NATS → Iceberg payments demo.
+#
+# Zero JVM, zero Go. Two Rust binaries (nats-server + laminardb) do the
+# work; three containers for the lakehouse: RustFS (Rust S3 store),
+# Postgres, Lakekeeper.
+
+services:
+
+  nats:
+    image: nats:2.10
+    container_name: nats
+    command: ["--jetstream", "--http_port", "8222"]
+    ports:
+      - "4222:4222"   # client
+      - "8222:8222"   # monitoring
+
+  # RustFS — S3-compatible object store written in Rust.
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: rustfs
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # console
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+  # Creates the `warehouse` bucket once RustFS is healthy. Public-read
+  # so DuckDB's httpfs can fetch Iceberg manifest URLs (which Lakekeeper
+  # bakes as plain http:// links, not signed s3:// references).
+  rustfs-init:
+    image: amazon/aws-cli:2.13.39
+    container_name: rustfs-init
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        aws --endpoint-url http://rustfs:9000 s3 mb s3://warehouse || true
+        cat >/tmp/policy.json <<'JSON'
+        {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Sid": "PublicRead",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": ["s3:GetObject"],
+            "Resource": "arn:aws:s3:::warehouse/*"
+          }]
+        }
+        JSON
+        aws --endpoint-url http://rustfs:9000 s3api put-bucket-policy \
+            --bucket warehouse --policy file:///tmp/policy.json || true
+
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:latest-main
+    container_name: lakekeeper-migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://postgres:postgres@postgres:5432/postgres
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://postgres:postgres@postgres:5432/postgres
+      LAKEKEEPER__PG_ENCRYPTION_KEY: demo-encryption-key-32-chars-ok!
+    command: ["migrate"]
+    restart: "no"
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:latest-main
+    container_name: lakekeeper
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+      rustfs:
+        condition: service_healthy
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://postgres:postgres@postgres:5432/postgres
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://postgres:postgres@postgres:5432/postgres
+      LAKEKEEPER__PG_ENCRYPTION_KEY: demo-encryption-key-32-chars-ok!
+      LAKEKEEPER__BASE_URI: http://localhost:8181
+      LAKEKEEPER__ALLOW_ORIGIN: "*"
+    ports:
+      - "8181:8181"   # catalog API
+      - "8182:8182"   # UI
+    command: ["serve"]
+    # No healthcheck: lakekeeper ships as a distroless image with no
+    # shell or curl/wget. The init container polls /health itself.
+
+  # Bootstraps Lakekeeper and creates the `demo` warehouse pointing at
+  # the `warehouse` bucket in RustFS. Idempotent.
+  lakekeeper-init:
+    image: curlimages/curl:8.10.1
+    container_name: lakekeeper-init
+    depends_on:
+      lakekeeper:
+        condition: service_started
+      rustfs-init:
+        condition: service_completed_successfully
+    restart: "no"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        echo "Waiting for Lakekeeper /health..."
+        for i in $$(seq 1 60); do
+          if curl -fsS http://lakekeeper:8181/health >/dev/null 2>&1; then
+            echo "Lakekeeper is up."
+            break
+          fi
+          sleep 1
+        done
+
+        echo "Bootstrapping Lakekeeper..."
+        curl -fsS -X POST http://lakekeeper:8181/management/v1/bootstrap \
+          -H 'content-type: application/json' \
+          -d '{"accept-terms-of-use":true}' || true
+
+        echo "Creating warehouse 'demo'..."
+        curl -fsS -X POST http://lakekeeper:8181/management/v1/warehouse \
+          -H 'content-type: application/json' \
+          -d @- <<'JSON' || true
+        {
+          "warehouse-name": "demo",
+          "project-id": "00000000-0000-0000-0000-000000000000",
+          "storage-profile": {
+            "type": "s3",
+            "bucket": "warehouse",
+            "key-prefix": "finance",
+            "endpoint": "http://rustfs:9000",
+            "region": "us-east-1",
+            "path-style-access": true,
+            "flavor": "s3-compat",
+            "sts-enabled": false
+          },
+          "storage-credential": {
+            "type": "s3",
+            "credential-type": "access-key",
+            "aws-access-key-id": "rustfsadmin",
+            "aws-secret-access-key": "rustfsadmin"
+          }
+        }
+        JSON
+
+        # The iceberg sink will create the `finance` namespace itself when
+        # `auto.create = "true"`, so no namespace bootstrap here.
+
+        echo "Lakekeeper init done."
