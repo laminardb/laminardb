@@ -1,27 +1,35 @@
--- Reference copy of the pipeline SQL.
---
--- LaminarDB's [[pipeline]] section takes the SQL inline as a string, so
--- the authoritative copy lives in config.toml. This file is here for
--- readability and editor highlighting only — the server does not load it.
---
--- Source `payments` is declared in config.toml ([[source]]) with a flat
--- JSON schema. event_time arrives as RFC3339 and is parsed into a
--- TIMESTAMP column by the JSON decoder. Watermark is configured on
--- event_time with a 10s out-of-order tolerance.
---
--- The window rewriter auto-prepends window_start, window_end to the
--- SELECT list whenever it sees a windowed GROUP BY.
+-- Reference copies of the two pipelines.
+-- Live SQL lives in config.toml's [[pipeline]] sql fields.
 
+-- 1. Tumbling 1-minute rollup over the payments stream.
 SELECT
     region,
     method,
-    COUNT(*)                                            AS payment_count,
-    SUM(amount_usd)                                     AS total_usd,
-    AVG(amount_usd)                                     AS avg_usd,
-    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)  AS failed_count
+    COUNT(*)          AS payment_count,
+    SUM(amount_usd)   AS total_usd,
+    AVG(amount_usd)   AS avg_usd
 FROM payments
 GROUP BY
     TUMBLE(event_time, INTERVAL '1' MINUTE),
     region,
     method
-EMIT ON WINDOW CLOSE
+EMIT ON WINDOW CLOSE;
+
+
+-- 2. Stream-to-stream interval join on payment_id with a 2-second window.
+--    Each row is one payment matched with its fraud score; score_latency_ms
+--    is the wall-clock between the two events.
+SELECT
+    p.payment_id,
+    p.region,
+    p.method,
+    p.amount_usd,
+    f.fraud_score,
+    f.outcome,
+    p.event_time                                              AS initiated_at,
+    f.event_time                                              AS scored_at,
+    CAST(f.event_time - p.event_time AS BIGINT) / 1000000     AS score_latency_ms
+FROM payments p
+JOIN fraud_checks f
+    ON p.payment_id = f.payment_id
+    AND f.event_time BETWEEN p.event_time AND p.event_time + INTERVAL '2' SECOND;

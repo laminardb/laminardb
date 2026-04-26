@@ -1,4 +1,4 @@
-# LaminarDB demo — NATS payments → Iceberg.
+# LaminarDB demo — payments + fraud-check stream-to-stream join.
 #
 # Build:
 #   cargo build --release -p laminar-server \
@@ -17,12 +17,8 @@ backend = "in_process"
 [checkpoint]
 interval = "5s"
 
-# ── Source ────────────────────────────────────────────────────────────
-# NATS core-mode subscriber. Mode is "core" (no JetStream) so the demo
-# needs nothing more than `nats-server` running on :4222.
-#
-# JSON payloads are decoded against the schema declared below. event_time
-# is RFC3339 → arrow_cast::parse::string_to_timestamp_nanos handles it.
+# ── Sources ───────────────────────────────────────────────────────────
+# Two NATS subjects, one per stream. They correlate on payment_id.
 
 [[source]]
 name = "payments"
@@ -32,33 +28,24 @@ format = "json"
 [source.properties]
 servers = "nats://localhost:4222"
 mode    = "core"
-subject = "payments.events"
+subject = "payments.initiated"
 
 [[source.schema]]
 name = "payment_id"
-type = "VARCHAR"
+type = "BIGINT"
 nullable = false
-
 [[source.schema]]
 name = "region"
 type = "VARCHAR"
 nullable = false
-
 [[source.schema]]
 name = "method"
 type = "VARCHAR"
 nullable = false
-
 [[source.schema]]
 name = "amount_usd"
 type = "DOUBLE"
 nullable = false
-
-[[source.schema]]
-name = "status"
-type = "VARCHAR"
-nullable = false
-
 [[source.schema]]
 name = "event_time"
 type = "TIMESTAMP"
@@ -66,25 +53,56 @@ nullable = false
 
 [source.watermark]
 column = "event_time"
-max_out_of_orderness = "10s"
+max_out_of_orderness = "2s"
 
-# ── Pipeline ──────────────────────────────────────────────────────────
-# Tumbling 1-minute windows by region+method. window_start/window_end are
-# auto-projected at the head of the SELECT by the windowed-GROUP-BY
-# rewriter, so the sink writes 8 columns:
-#   window_start, window_end, region, method,
-#   payment_count, total_usd, avg_usd, failed_count
 
+[[source]]
+name = "fraud_checks"
+connector = "nats"
+format = "json"
+
+[source.properties]
+servers = "nats://localhost:4222"
+mode    = "core"
+subject = "payments.scored"
+
+[[source.schema]]
+name = "payment_id"
+type = "BIGINT"
+nullable = false
+[[source.schema]]
+name = "region"
+type = "VARCHAR"
+nullable = false
+[[source.schema]]
+name = "fraud_score"
+type = "DOUBLE"
+nullable = false
+[[source.schema]]
+name = "outcome"
+type = "VARCHAR"
+nullable = false
+[[source.schema]]
+name = "event_time"
+type = "TIMESTAMP"
+nullable = false
+
+[source.watermark]
+column = "event_time"
+max_out_of_orderness = "2s"
+
+# ── Pipelines ─────────────────────────────────────────────────────────
+
+# 1) Tumbling 1-minute rollup over the payments stream.
 [[pipeline]]
-name = "payment_summary"
+name = "payments_summary"
 sql = """
 SELECT
     region,
     method,
-    COUNT(*)                                            AS payment_count,
-    SUM(amount_usd)                                     AS total_usd,
-    AVG(amount_usd)                                     AS avg_usd,
-    SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)  AS failed_count
+    COUNT(*)          AS payment_count,
+    SUM(amount_usd)   AS total_usd,
+    AVG(amount_usd)   AS avg_usd
 FROM payments
 GROUP BY
     TUMBLE(event_time, INTERVAL '1' MINUTE),
@@ -93,31 +111,63 @@ GROUP BY
 EMIT ON WINDOW CLOSE
 """
 
-# ── Sink ──────────────────────────────────────────────────────────────
-# Iceberg REST catalog (Lakekeeper). With auto.create=true the sink defers
-# load_table to the first non-empty batch and creates the table from the
-# batch schema, so no pre-existing table or namespace is required.
+# 2) Stream-to-stream interval join: a payment matched with its fraud
+#    score within 2 seconds. score_latency_ms is the headline number —
+#    "how long did the fraud system take?", per row.
+[[pipeline]]
+name = "payments_with_fraud_score"
+sql = """
+SELECT
+    p.payment_id,
+    p.region,
+    p.method,
+    p.amount_usd,
+    f.fraud_score,
+    f.outcome,
+    p.event_time                                              AS initiated_at,
+    f.event_time                                              AS scored_at,
+    CAST(f.event_time - p.event_time AS BIGINT) / 1000000     AS score_latency_ms
+FROM payments p
+JOIN fraud_checks f
+    ON p.payment_id = f.payment_id
+    AND f.event_time BETWEEN p.event_time AND p.event_time + INTERVAL '2' SECOND
+"""
+
+# ── Sinks ─────────────────────────────────────────────────────────────
 
 [[sink]]
-name = "payment_summary_iceberg"
-pipeline = "payment_summary"
+name = "payments_summary_iceberg"
+pipeline = "payments_summary"
 connector = "iceberg"
 
 [sink.properties]
-# Lakekeeper resolves `warehouse` (NAME, not S3 path) to a prefix UUID via
-# GET /v1/config?warehouse=<name>. `storage.type = "s3"` tells the sink
-# what backend the catalog will return URLs for — REST-catalog warehouses
-# use a logical name so the scheme can't be inferred from `warehouse`.
 "catalog.uri"   = "http://localhost:8181/catalog"
 warehouse       = "demo"
 "storage.type"  = "s3"
 namespace       = "finance"
-"table.name"    = "payment_summary"
+"table.name"    = "payments_summary"
 "auto.create"   = "true"
 compression     = "zstd"
+"catalog.property.s3.endpoint"          = "http://localhost:9000"
+"catalog.property.s3.access-key-id"     = "rustfsadmin"
+"catalog.property.s3.secret-access-key" = "rustfsadmin"
+"catalog.property.s3.region"            = "us-east-1"
+"catalog.property.s3.path-style-access" = "true"
 
-# RustFS credentials for OpenDAL FileIO (Lakekeeper does not vend creds
-# in this profile — sts-enabled=false in docker-compose.yml).
+
+[[sink]]
+name = "payments_with_fraud_score_iceberg"
+pipeline = "payments_with_fraud_score"
+connector = "iceberg"
+
+[sink.properties]
+"catalog.uri"   = "http://localhost:8181/catalog"
+warehouse       = "demo"
+"storage.type"  = "s3"
+namespace       = "finance"
+"table.name"    = "payments_with_fraud_score"
+"auto.create"   = "true"
+compression     = "zstd"
 "catalog.property.s3.endpoint"          = "http://localhost:9000"
 "catalog.property.s3.access-key-id"     = "rustfsadmin"
 "catalog.property.s3.secret-access-key" = "rustfsadmin"
