@@ -43,7 +43,7 @@ pip install nats-py
 python examples/nats-payments/gen.py
 
 # 5. Wait ~90 seconds (one tumbling minute closes + first commit), then query.
-pip install "pyiceberg[s3fs,pyarrow]"
+pip install duckdb
 python examples/nats-payments/query.py
 ```
 
@@ -88,4 +88,4 @@ docker compose -f examples/nats-payments/docker-compose.yml down -v
 | `pipeline.sql`       | Reference copy of the SELECT (config has the live one) |
 | `docker-compose.yml` | NATS + RustFS + Postgres + Lakekeeper                  |
 | `gen.py`             | NATS publisher — `pip install nats-py`                 |
-| `query.py`           | PyIceberg reader — `pip install "pyiceberg[s3fs,pyarrow]"` |
+| `query.py`           | DuckDB reader — `pip install duckdb`                   |
