@@ -143,6 +143,8 @@ impl ConnectorPipelineCallback {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
         let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
 
+        self.sync_sinks_and_drain_events().await;
+
         let operator_states = self
             .capture_and_serialize_operator_state()
             .await
@@ -308,6 +310,43 @@ impl ConnectorPipelineCallback {
         operator_states.extend(mv_states);
 
         Ok(operator_states)
+    }
+
+    /// Wait for every sink to finish processing previously-enqueued
+    /// `WriteBatch` commands, then drain any `SinkEvent`s they produced.
+    /// Callers rely on `sink_timed_out` being current after this returns.
+    async fn sync_sinks_and_drain_events(&mut self) {
+        let sync_futures = self.sinks.iter().map(|(name, handle, _, _, _)| {
+            let name = name.clone();
+            let handle = handle.clone();
+            async move {
+                if let Err(e) = handle.sync().await {
+                    tracing::warn!(sink = %name, error = %e, "sink sync barrier failed");
+                }
+            }
+        });
+        futures::future::join_all(sync_futures).await;
+        self.drain_sink_events();
+    }
+
+    /// Non-blocking drain of `sink_event_rx` into Prometheus counters and
+    /// `sink_timed_out`.
+    fn drain_sink_events(&mut self) {
+        while let Ok(event) = self.sink_event_rx.try_recv() {
+            tracing::debug!(?event, "sink event");
+            match &event {
+                crate::sink_task::SinkEvent::WriteError { .. } => {
+                    self.prom.sink_write_failures.inc();
+                }
+                crate::sink_task::SinkEvent::WriteTimeout { .. } => {
+                    self.sink_timed_out = true;
+                    self.prom.sink_write_timeouts.inc();
+                }
+                crate::sink_task::SinkEvent::ChannelClosed { .. } => {
+                    self.prom.sink_task_channel_closed.inc();
+                }
+            }
+        }
     }
 
     async fn compile_pending_sink_filters(
@@ -518,36 +557,9 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .collect();
         futures::future::join_all(sink_futures).await;
 
-        // Barrier: wait for every sink task to finish processing the
-        // commands we just enqueued, so the drain below catches any
-        // failures before maybe_checkpoint can advance source offsets.
-        let sync_futures = self.sinks.iter().map(|(name, handle, _, _, _)| {
-            let name = name.clone();
-            let handle = handle.clone();
-            async move {
-                if let Err(e) = handle.sync().await {
-                    tracing::warn!(sink = %name, error = %e, "sink sync barrier failed");
-                }
-            }
-        });
-        futures::future::join_all(sync_futures).await;
-
-        // Drain SinkEvents emitted by sink tasks during this cycle.
-        while let Ok(event) = self.sink_event_rx.try_recv() {
-            tracing::debug!(?event, "sink event");
-            match &event {
-                crate::sink_task::SinkEvent::WriteError { .. } => {
-                    self.prom.sink_write_failures.inc();
-                }
-                crate::sink_task::SinkEvent::WriteTimeout { .. } => {
-                    self.sink_timed_out = true;
-                    self.prom.sink_write_timeouts.inc();
-                }
-                crate::sink_task::SinkEvent::ChannelClosed { .. } => {
-                    self.prom.sink_task_channel_closed.inc();
-                }
-            }
-        }
+        // Opportunistic; the strict "all prior writes settled" barrier
+        // runs in the checkpoint paths, not on every cycle.
+        self.drain_sink_events();
     }
 
     fn extract_watermark(&mut self, source_name: &str, batch: &RecordBatch) {
@@ -685,6 +697,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             return None;
         }
 
+        self.sync_sinks_and_drain_events().await;
+
         // After a sink timeout, skip one checkpoint cycle so that source
         // offsets don't advance past the dropped batch. The NEXT cycle will
         // clear this flag and checkpoint normally. This preserves at-least-once:
@@ -814,6 +828,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         if self.prom.cycles.get() == 0 {
             return None;
         }
+
+        self.sync_sinks_and_drain_events().await;
 
         // Clear after one suppression — the timer-based path that also
         // clears this flag is unreachable when barrier checkpointing is active.
