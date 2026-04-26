@@ -80,18 +80,19 @@ python examples/nats-payments/bench.py
 Sample output (10K/s sustained):
 
 ```
-    time   ingest/s   flushed/s  commits   total_in   total_out
-14:32:01    10,012        0        0      10,012          0
-14:32:02    10,005        0        0      20,017          0
+    time   ingest/s   emitted/s  commits   total_in  total_emit
+15:14:01    10,012        0        12      610,012          0
+15:14:02    10,005        0        13      620,017          0
 ...
-14:33:00    10,001    1,920       1     601,210      1,920
+15:14:12    10,001       16        14      720,118         16
 ```
 
-`ingest/s` is the NATS source's record counter delta; `flushed/s` is
-rows staged to Iceberg in that second; `commits` is the cumulative
-Iceberg snapshot count — incremented when a window closes and the
-sink commits. The `commits` column is the visible "engine commit
-cadence" indicator; cadence is bounded by `[checkpoint] interval`.
+`ingest/s` is the NATS source delta; `emitted/s` is the rows the
+windowed pipeline produced this second (~16 per closed minute since
+we have 4 regions × 4 methods); `commits` is the cumulative sink
+commit count. Each minute boundary triggers an emission spike and a
+commit. `commits` cadence between window-close events tracks
+`[checkpoint] interval`.
 
 ## Explore
 
