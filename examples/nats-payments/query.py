@@ -79,12 +79,12 @@ section("fraud-check latency by region")
 df = con.execute("""
     SELECT
         region,
-        COUNT(*)                                        AS scored,
-        CAST(quantile_cont(score_latency_ms, 0.50) AS BIGINT) AS p50_ms,
-        CAST(quantile_cont(score_latency_ms, 0.95) AS BIGINT) AS p95_ms,
-        CAST(quantile_cont(score_latency_ms, 0.99) AS BIGINT) AS p99_ms,
-        SUM(CASE WHEN outcome = 'blocked' THEN 1 ELSE 0 END)  AS blocked,
-        SUM(CASE WHEN outcome = 'review'  THEN 1 ELSE 0 END)  AS review
+        COUNT(*)                                                       AS scored,
+        CAST(quantile_cont(score_latency_ms, 0.50) AS BIGINT)          AS p50_ms,
+        CAST(quantile_cont(score_latency_ms, 0.95) AS BIGINT)          AS p95_ms,
+        CAST(quantile_cont(score_latency_ms, 0.99) AS BIGINT)          AS p99_ms,
+        CAST(SUM(CASE WHEN outcome = 'blocked' THEN 1 ELSE 0 END) AS BIGINT) AS blocked,
+        CAST(SUM(CASE WHEN outcome = 'review'  THEN 1 ELSE 0 END) AS BIGINT) AS review
     FROM catalog.finance.payments_with_fraud_score
     GROUP BY region
     ORDER BY region
