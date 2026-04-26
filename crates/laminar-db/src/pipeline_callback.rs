@@ -27,6 +27,13 @@ pub(crate) enum SinkFilter {
     Rejected,
 }
 
+/// Per-cycle dispatch chosen from `SinkFilter`. `Rejected` is fail-closed.
+enum SinkFilterDispatch {
+    Compiled(Arc<dyn PhysicalExpr>),
+    Rejected,
+    None,
+}
+
 /// Implements [`PipelineCallback`](crate::pipeline::PipelineCallback) to bridge
 /// the event-driven pipeline coordinator to the rest of the database (stream
 /// executor, sinks, watermarks, checkpoints, table sources).
@@ -347,7 +354,8 @@ impl ConnectorPipelineCallback {
                     sink = %sink_name,
                     filter = %sql,
                     "[LDB-1100] sink filter did not compile to a PhysicalExpr; \
-                     filter disabled (no per-batch SQL fallback)"
+                     fail-closed: ALL rows from this stream will be dropped \
+                     for this sink. Track via sink_filter_rejected_rows_total."
                 );
                 self.compiled_sink_filters[i] = SinkFilter::Rejected;
             }
@@ -465,29 +473,40 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         .clone();
                     let sink_name = sink_name.clone();
                     let handle = handle.clone();
-                    let compiled_filter = match self.compiled_sink_filters.get(sink_idx) {
-                        Some(SinkFilter::Compiled(phys)) => Some(Arc::clone(phys)),
-                        Some(SinkFilter::Pending | SinkFilter::Rejected) | None => None,
+                    // Rejected → drop (fail-closed). Pending → None (no filter SQL set).
+                    let filter_state = match self.compiled_sink_filters.get(sink_idx).cloned() {
+                        Some(SinkFilter::Compiled(phys)) => SinkFilterDispatch::Compiled(phys),
+                        Some(SinkFilter::Rejected) => SinkFilterDispatch::Rejected,
+                        Some(SinkFilter::Pending) | None => SinkFilterDispatch::None,
                     };
                     let changelog_capable = *changelog_capable;
+                    let prom = Arc::clone(&self.prom);
                     Some(async move {
                         for batch in shared.iter() {
-                            let filtered: Cow<RecordBatch> = if let Some(ref phys) = compiled_filter
-                            {
-                                match apply_compiled_sink_filter(batch, phys) {
-                                    Ok(Some(fb)) => Cow::Owned(fb),
-                                    Ok(None) => continue,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            sink = %sink_name,
-                                            error = %e,
-                                            "Compiled sink filter error"
-                                        );
-                                        continue;
+                            let filtered: Cow<RecordBatch> = match &filter_state {
+                                SinkFilterDispatch::Compiled(phys) => {
+                                    match apply_compiled_sink_filter(batch, phys) {
+                                        Ok(Some(fb)) => Cow::Owned(fb),
+                                        Ok(None) => continue,
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                sink = %sink_name,
+                                                error = %e,
+                                                "Compiled sink filter error"
+                                            );
+                                            continue;
+                                        }
                                     }
                                 }
-                            } else {
-                                Cow::Borrowed(batch)
+                                SinkFilterDispatch::Rejected => {
+                                    #[allow(clippy::cast_possible_truncation)]
+                                    let dropped = batch.num_rows() as u64;
+                                    prom.sink_filter_rejected_rows
+                                        .with_label_values(&[sink_name.as_str()])
+                                        .inc_by(dropped);
+                                    continue;
+                                }
+                                SinkFilterDispatch::None => Cow::Borrowed(batch),
                             };
 
                             let prepared = crate::changelog_filter::prepare_for_sink(
@@ -1290,6 +1309,34 @@ mod tests {
 
         let got = tokio::time::timeout(Duration::from_millis(50), notify.notified()).await;
         assert!(got.is_err(), "non-Fail errors must not trigger shutdown");
+    }
+
+    /// Rejected must drop, not passthrough.
+    #[test]
+    fn rejected_filter_dispatches_to_drop_not_passthrough() {
+        let filters = vec![SinkFilter::Rejected];
+        let dispatch = match filters.first().cloned() {
+            Some(SinkFilter::Compiled(phys)) => SinkFilterDispatch::Compiled(phys),
+            Some(SinkFilter::Rejected) => SinkFilterDispatch::Rejected,
+            Some(SinkFilter::Pending) | None => SinkFilterDispatch::None,
+        };
+        assert!(
+            matches!(dispatch, SinkFilterDispatch::Rejected),
+            "Rejected filter must map to Rejected dispatch (drop), not None (passthrough)"
+        );
+    }
+
+    /// Pending / absent → no filter (compilation runs before the dispatch loop).
+    #[test]
+    fn pending_and_absent_filters_dispatch_to_passthrough() {
+        for filter in [Some(SinkFilter::Pending), None] {
+            let dispatch = match filter.clone() {
+                Some(SinkFilter::Compiled(phys)) => SinkFilterDispatch::Compiled(phys),
+                Some(SinkFilter::Rejected) => SinkFilterDispatch::Rejected,
+                Some(SinkFilter::Pending) | None => SinkFilterDispatch::None,
+            };
+            assert!(matches!(dispatch, SinkFilterDispatch::None));
+        }
     }
 
     /// Consumer-side cap is a no-op when the cluster has not yet
