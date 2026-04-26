@@ -126,10 +126,13 @@ SELECT
     f.outcome     AS outcome,
     p.event_time                                              AS initiated_at,
     f.event_time                                              AS scored_at,
-    -- Subtract nanos-since-epoch directly. Timestamp - Timestamp returns
-    -- an Interval(MonthDayNano) whose BIGINT cast doesn't give the
-    -- elapsed nanos we want.
-    (CAST(f.event_time AS BIGINT) - CAST(p.event_time AS BIGINT)) / 1000000 AS score_latency_ms
+    -- date_part('epoch', ts) returns Float64 seconds since epoch with
+    -- subseconds preserved. Casting Timestamp - Timestamp to BIGINT
+    -- doesn't yield elapsed nanos in DataFusion 52.
+    CAST(
+        (date_part('epoch', f.event_time) - date_part('epoch', p.event_time)) * 1000
+        AS BIGINT
+    ) AS score_latency_ms
 FROM payments p
 JOIN fraud_checks f
     ON p.payment_id = f.payment_id
