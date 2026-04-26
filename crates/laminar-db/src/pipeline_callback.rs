@@ -340,9 +340,7 @@ impl ConnectorPipelineCallback {
             };
             let schema = batch.schema();
             let sql = filter_sql.as_deref().unwrap();
-            if let Some(compiled) =
-                compile_sink_filter_sql(&self.filter_ctx, sql, &schema).await
-            {
+            if let Some(compiled) = compile_sink_filter_sql(&self.filter_ctx, sql, &schema).await {
                 self.compiled_sink_filters[i] = SinkFilter::Compiled(compiled);
             } else {
                 tracing::error!(
@@ -353,8 +351,7 @@ impl ConnectorPipelineCallback {
                 );
                 self.compiled_sink_filters[i] = SinkFilter::Rejected;
             }
-            self.pending_sink_filter_compiles =
-                self.pending_sink_filter_compiles.saturating_sub(1);
+            self.pending_sink_filter_compiles = self.pending_sink_filter_compiles.saturating_sub(1);
         }
     }
 }
@@ -475,8 +472,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                     let changelog_capable = *changelog_capable;
                     Some(async move {
                         for batch in shared.iter() {
-                            let filtered: Cow<RecordBatch> = if let Some(ref phys) =
-                                compiled_filter
+                            let filtered: Cow<RecordBatch> = if let Some(ref phys) = compiled_filter
                             {
                                 match apply_compiled_sink_filter(batch, phys) {
                                     Ok(Some(fb)) => Cow::Owned(fb),
