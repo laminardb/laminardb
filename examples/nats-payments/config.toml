@@ -118,12 +118,12 @@ EMIT ON WINDOW CLOSE
 name = "payments_with_fraud_score"
 sql = """
 SELECT
-    p.payment_id,
-    p.region,
-    p.method,
-    p.amount_usd,
-    f.fraud_score,
-    f.outcome,
+    p.payment_id  AS payment_id,
+    p.region      AS region,
+    p.method      AS method,
+    p.amount_usd  AS amount_usd,
+    f.fraud_score AS fraud_score,
+    f.outcome     AS outcome,
     p.event_time                                              AS initiated_at,
     f.event_time                                              AS scored_at,
     CAST(f.event_time - p.event_time AS BIGINT) / 1000000     AS score_latency_ms
