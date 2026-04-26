@@ -85,8 +85,10 @@ SELECT
     SUM(amount_usd)                                     AS total_usd,
     AVG(amount_usd)                                     AS avg_usd,
     SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END)  AS failed_count,
-    MAX(event_time)                                     AS max_event_time,
-    now()                                               AS emitted_at
+    -- Iceberg v2 stores microsecond timestamps; DataFusion's now() and
+    -- MAX(event_time) are nanosecond — cast to keep the table on v2.
+    arrow_cast(MAX(event_time), 'Timestamp(Microsecond, None)') AS max_event_time,
+    arrow_cast(now(),           'Timestamp(Microsecond, None)') AS emitted_at
 FROM payments
 GROUP BY
     TUMBLE(event_time, INTERVAL '1' MINUTE),
