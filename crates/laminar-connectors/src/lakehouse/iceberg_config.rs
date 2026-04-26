@@ -47,8 +47,14 @@ pub struct IcebergCatalogConfig {
     pub catalog_type: IcebergCatalogType,
     /// REST catalog URI (e.g., `http://polaris:8181`).
     pub catalog_uri: String,
-    /// Warehouse location (e.g., `s3://bucket/warehouse`).
+    /// For Hadoop-style catalogs this is the warehouse URL (`s3://bucket/wh`).
+    /// For REST catalogs (Lakekeeper, Polaris) it's the warehouse name and the
+    /// REST server resolves storage internally.
     pub warehouse: String,
+    /// Storage backend the catalog will return URLs for. `None` falls back to
+    /// inferring from the warehouse URL scheme (works for Hadoop-style); set
+    /// explicitly for REST catalogs where `warehouse` is a name, not a URL.
+    pub storage_type: Option<String>,
     /// Iceberg namespace (e.g., `prod` or `prod.analytics`).
     pub namespace: String,
     /// Table name within the namespace.
@@ -73,6 +79,7 @@ impl IcebergCatalogConfig {
 
         let catalog_uri = config.require("catalog.uri")?.to_string();
         let warehouse = config.require("warehouse")?.to_string();
+        let storage_type = config.get("storage.type").map(str::to_string);
         let namespace = config.require("namespace")?.to_string();
         let table_name = config.require("table.name")?.to_string();
 
@@ -82,6 +89,7 @@ impl IcebergCatalogConfig {
             catalog_type,
             catalog_uri,
             warehouse,
+            storage_type,
             namespace,
             table_name,
             properties,

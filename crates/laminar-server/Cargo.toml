@@ -96,6 +96,7 @@ default = [
     "postgres-sink",
     "mysql-cdc",
     "mongodb-cdc",
+    "nats",
     "files",
     "parquet-lookup",
     "otel",
@@ -109,6 +110,7 @@ postgres-cdc = ["laminar-db/postgres-cdc"]
 postgres-sink = ["laminar-db/postgres-sink"]
 mysql-cdc = ["laminar-db/mysql-cdc"]
 mongodb-cdc = ["laminar-db/mongodb-cdc"]
+nats = ["laminar-db/nats"]
 delta-lake = ["laminar-db/delta-lake"]
 delta-lake-s3 = ["delta-lake", "laminar-db/delta-lake-s3"]
 delta-lake-azure = ["delta-lake", "laminar-db/delta-lake-azure"]

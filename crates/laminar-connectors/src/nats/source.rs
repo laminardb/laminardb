@@ -191,6 +191,10 @@ impl NatsSource {
 impl SourceConnector for NatsSource {
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         let cfg = NatsSourceConfig::from_config(config)?;
+        // SQL DDL schema overrides the registry placeholder.
+        if let Some(schema) = config.arrow_schema() {
+            self.schema = schema;
+        }
         let deserializer = serde::create_deserializer(cfg.format)
             .map_err(|e| err(&format!("deserializer for format {:?}: {e}", cfg.format)))?;
         match cfg.mode {
