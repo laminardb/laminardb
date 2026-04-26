@@ -151,14 +151,37 @@ impl SideState {
         // Sort by (batch_idx, row_idx) for sequential access
         live_rows.sort_unstable();
 
-        // Slice each live row and collect
-        let mut slices: Vec<RecordBatch> = Vec::with_capacity(live_rows.len());
-        for &(batch_idx, row_idx) in &live_rows {
-            slices.push(self.batches[batch_idx].slice(row_idx, 1));
+        // One `take` per source batch over the contiguous run of live rows.
+        let mut taken: Vec<RecordBatch> = Vec::new();
+        let mut i = 0;
+        while i < live_rows.len() {
+            let batch_idx = live_rows[i].0;
+            let mut j = i + 1;
+            while j < live_rows.len() && live_rows[j].0 == batch_idx {
+                j += 1;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let indices = arrow::array::UInt32Array::from_iter_values(
+                live_rows[i..j].iter().map(|&(_, row)| row as u32),
+            );
+            let src = &self.batches[batch_idx];
+            let cols: Result<Vec<ArrayRef>, _> = src
+                .columns()
+                .iter()
+                .map(|c| arrow::compute::take(c.as_ref(), &indices, None))
+                .collect();
+            let cols = cols
+                .map_err(|e| DbError::query_pipeline_arrow("interval join (compact take)", &e))?;
+            taken.push(
+                RecordBatch::try_new(src.schema(), cols).map_err(|e| {
+                    DbError::query_pipeline_arrow("interval join (compact build)", &e)
+                })?,
+            );
+            i = j;
         }
 
         let schema = self.batches[0].schema();
-        let compacted = concat_batches(&schema, &slices)
+        let compacted = concat_batches(&schema, &taken)
             .map_err(|e| DbError::query_pipeline_arrow("interval join (compact)", &e))?;
 
         // Replace batches and rebuild index

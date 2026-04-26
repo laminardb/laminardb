@@ -595,23 +595,30 @@ impl IncrementalEowcState {
             return Ok(());
         }
 
-        // Grouped path: OwnedRow as key
+        // Grouped path. Dedup group keys per batch and bucket by
+        // (window, group_id) so per-window assignment doesn't clone the
+        // OwnedRow for each overlapping window.
         let rows_ref = rows.as_ref().expect("rows set when has_groups");
-        let mut grouped: AHashMap<(i64, arrow::row::OwnedRow), Vec<u32>> = AHashMap::new();
+        let mut group_keys: indexmap::IndexSet<arrow::row::OwnedRow, ahash::RandomState> =
+            indexmap::IndexSet::default();
+        let mut grouped: AHashMap<(i64, u32), Vec<u32>> = AHashMap::new();
+
         for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
             if ts_ms == NULL_TIMESTAMP {
-                continue; // skip rows with null timestamps
+                continue;
             }
-            let row_key = rows_ref.row(row_idx).owned();
+            let (gid, _) = group_keys.insert_full(rows_ref.row(row_idx).owned());
             #[allow(clippy::cast_possible_truncation)]
-            let idx = row_idx as u32;
+            let (gid, idx) = (gid as u32, row_idx as u32);
             for ws in assign_windows(ts_ms, &self.window_type) {
-                grouped.entry((ws, row_key.clone())).or_default().push(idx);
+                grouped.entry((ws, gid)).or_default().push(idx);
             }
         }
 
-        for ((window_start, row_key), indices) in &grouped {
-            // Ensure group exists (borrow-split pattern)
+        for ((window_start, gid), indices) in &grouped {
+            let row_key = group_keys
+                .get_index(*gid as usize)
+                .expect("gid was just produced by insert_full");
             let needs_insert = {
                 let window_groups = self.windows.entry(*window_start).or_default();
                 if window_groups.contains_key(row_key) {

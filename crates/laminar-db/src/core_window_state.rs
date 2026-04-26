@@ -123,9 +123,12 @@ pub(crate) struct CoreWindowState {
     post_projection: Option<PostProjection>,
     /// Reusable scratch map for no-group window assignment (avoids per-batch allocation).
     scratch_nogroup: AHashMap<i64, Vec<u32>>,
-    /// Reusable scratch map for grouped window assignment (avoids per-batch allocation).
-    #[allow(clippy::type_complexity)]
-    scratch_grouped: AHashMap<(i64, arrow::row::OwnedRow), Vec<u32>>,
+    /// Bucket map keyed by `(window_start, group_id)`. Group ids come
+    /// from `scratch_group_keys` and are dense within a batch.
+    scratch_grouped: AHashMap<(i64, u32), Vec<u32>>,
+    /// Per-batch group-key set; the index is the group id used by
+    /// `scratch_grouped`.
+    scratch_group_keys: indexmap::IndexSet<arrow::row::OwnedRow, ahash::RandomState>,
 }
 
 impl CoreWindowState {
@@ -631,6 +634,7 @@ impl CoreWindowState {
             post_projection,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
+            scratch_group_keys: indexmap::IndexSet::default(),
         }))
     }
 
@@ -728,39 +732,40 @@ impl CoreWindowState {
             return Ok(());
         }
 
-        // Grouped path: OwnedRow as key (one owned() per row, ~8-32 bytes each)
+        // Grouped path: dedup group keys per batch, bucket by integer id.
         let rows_ref = rows.as_ref().expect("rows set when has_groups");
         let mut grouped = std::mem::take(&mut self.scratch_grouped);
+        let mut group_keys = std::mem::take(&mut self.scratch_group_keys);
         grouped.clear();
+        group_keys.clear();
 
         for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
             if ts_ms == NULL_TIMESTAMP {
-                continue; // skip rows with null timestamps
+                continue;
             }
-            let row_key = rows_ref.row(row_idx).owned();
+            let (gid, _) = group_keys.insert_full(rows_ref.row(row_idx).owned());
             #[allow(clippy::cast_possible_truncation)]
-            let idx = row_idx as u32;
+            let (gid, idx) = (gid as u32, row_idx as u32);
             match &self.assigner {
                 CoreWindowAssigner::Tumbling(a) => {
                     grouped
-                        .entry((a.assign(ts_ms).start, row_key))
+                        .entry((a.assign(ts_ms).start, gid))
                         .or_default()
                         .push(idx);
                 }
                 CoreWindowAssigner::Hopping(a) => {
                     for wid in a.assign_windows(ts_ms) {
-                        grouped
-                            .entry((wid.start, row_key.clone()))
-                            .or_default()
-                            .push(idx);
+                        grouped.entry((wid.start, gid)).or_default().push(idx);
                     }
                 }
                 CoreWindowAssigner::Session { .. } => unreachable!("handled above"),
             }
         }
 
-        for ((window_start, row_key), indices) in &grouped {
-            // Ensure group exists in window state (borrow-split pattern)
+        for ((window_start, gid), indices) in &grouped {
+            let row_key = group_keys
+                .get_index(*gid as usize)
+                .expect("gid was just produced by insert_full");
             let needs_insert = {
                 let window_groups = self.windows.entry(*window_start).or_default();
                 if window_groups.contains_key(row_key) {
@@ -802,6 +807,7 @@ impl CoreWindowState {
         }
 
         self.scratch_grouped = grouped;
+        self.scratch_group_keys = group_keys;
         Ok(())
     }
 
@@ -1621,6 +1627,7 @@ mod tests {
             post_projection: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
+            scratch_group_keys: indexmap::IndexSet::default(),
         }
     }
 
@@ -1684,6 +1691,7 @@ mod tests {
             post_projection: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
+            scratch_group_keys: indexmap::IndexSet::default(),
         }
     }
 
@@ -1735,6 +1743,7 @@ mod tests {
             post_projection: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
+            scratch_group_keys: indexmap::IndexSet::default(),
         }
     }
 
@@ -1784,6 +1793,7 @@ mod tests {
             post_projection: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
+            scratch_group_keys: indexmap::IndexSet::default(),
         }
     }
 
