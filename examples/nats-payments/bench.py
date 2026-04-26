@@ -21,9 +21,9 @@ import urllib.request
 METRICS_URL = "http://127.0.0.1:8080/metrics"
 
 PATTERNS = {
-    "ingest":  re.compile(r"^nats_source_records_total(?:\{[^}]*\})?\s+(\d+(?:\.\d+)?)", re.M),
-    "flushed": re.compile(r"^lakehouse_sink_rows_flushed_total(?:\{[^}]*\})?\s+(\d+(?:\.\d+)?)", re.M),
-    "commits": re.compile(r"^lakehouse_sink_commits_total(?:\{[^}]*\})?\s+(\d+(?:\.\d+)?)", re.M),
+    "ingest":  re.compile(r"^laminardb_nats_source_records_total(?:\{[^}]*\})?\s+(\d+(?:\.\d+)?)", re.M),
+    "flushed": re.compile(r"^laminardb_lakehouse_sink_rows_flushed_total(?:\{[^}]*\})?\s+(\d+(?:\.\d+)?)", re.M),
+    "commits": re.compile(r"^laminardb_lakehouse_sink_commits_total(?:\{[^}]*\})?\s+(\d+(?:\.\d+)?)", re.M),
 }
 
 
