@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Reads payment_summary from Lakekeeper via DuckDB's iceberg extension
-and prints both the windowed rollup and engine latency percentiles.
+Reads payment_summary from Lakekeeper via DuckDB's iceberg extension.
 
     pip install duckdb
     python query.py
@@ -13,12 +12,8 @@ Prerequisite: `rustfs` must resolve to `127.0.0.1` from the host so
 DuckDB can fetch the manifest paths Lakekeeper bakes into table
 metadata. See README.
 
-Latency definitions:
-* close_latency_ms — between window_end and emitted_at; measures how
-  long after a window logically closed the engine produced its row.
-  Real "engine commit cadence" indicator.
-* end_to_end_ms — between max event_time in the window and emitted_at;
-  measures publish→materialized lag for the freshest event in each row.
+Throughput and commit cadence (real engine signals) come from
+bench.py scraping /metrics — this script is the readback.
 """
 
 import duckdb
@@ -48,9 +43,8 @@ con.execute("""
     )
 """)
 
-# Pull every row into a temp view we can query twice (rollup + percentiles).
-con.execute("""
-    CREATE OR REPLACE TEMP VIEW summary AS
+print("\n--- payment summary by region and method (latest 40) ---------")
+df = con.execute("""
     SELECT
         epoch_ms(window_start)::TIMESTAMP AS window_start,
         epoch_ms(window_end)::TIMESTAMP   AS window_end,
@@ -59,37 +53,10 @@ con.execute("""
         payment_count,
         ROUND(total_usd, 2) AS total_usd,
         ROUND(avg_usd, 2)   AS avg_usd,
-        failed_count,
-        emitted_at,
-        max_event_time,
-        date_diff('millisecond', epoch_ms(window_end)::TIMESTAMP, emitted_at)
-            AS close_latency_ms,
-        date_diff('millisecond', max_event_time, emitted_at)
-            AS end_to_end_ms
+        failed_count
     FROM catalog.finance.payment_summary
-""")
-
-print("\n--- payment summary by region and method (latest 40) ---------")
-df = con.execute("""
-    SELECT window_start, window_end, region, method,
-           payment_count, total_usd, avg_usd, failed_count
-    FROM summary
     ORDER BY window_start DESC, total_usd DESC
     LIMIT 40
 """).fetchdf()
 print(df.to_string(index=False))
 print(f"\n{len(df)} rows")
-
-print("\n--- engine latency (over all committed window-rows) ----------")
-lat = con.execute("""
-    SELECT
-        COUNT(*)                                            AS n,
-        CAST(quantile_cont(close_latency_ms,  0.50) AS BIGINT) AS p50_close_ms,
-        CAST(quantile_cont(close_latency_ms,  0.95) AS BIGINT) AS p95_close_ms,
-        CAST(quantile_cont(close_latency_ms,  0.99) AS BIGINT) AS p99_close_ms,
-        CAST(quantile_cont(end_to_end_ms,     0.50) AS BIGINT) AS p50_e2e_ms,
-        CAST(quantile_cont(end_to_end_ms,     0.95) AS BIGINT) AS p95_e2e_ms,
-        CAST(quantile_cont(end_to_end_ms,     0.99) AS BIGINT) AS p99_e2e_ms
-    FROM summary
-""").fetchdf()
-print(lat.to_string(index=False))

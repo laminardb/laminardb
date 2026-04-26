@@ -69,12 +69,11 @@ EMIT ON WINDOW CLOSE
 SELECT by the streaming-windowed-GROUP-BY rewriter, so the Iceberg
 table ends up with eight columns.
 
-## Throughput + latency
+## Throughput
 
-Two ways to see the engine work:
+Live throughput off the `/metrics` endpoint:
 
 ```bash
-# Live throughput off the /metrics endpoint (Ctrl-C for summary).
 python examples/nats-payments/bench.py
 ```
 
@@ -88,22 +87,11 @@ Sample output (10K/s sustained):
 14:33:00    10,001    1,920       1     601,210      1,920
 ```
 
-Latency percentiles, computed off committed Iceberg rows:
-
-```
-python examples/nats-payments/query.py | tail -20
-```
-
-```
-  n  p50_close_ms  p95_close_ms  p99_close_ms  p50_e2e_ms  p95_e2e_ms  p99_e2e_ms
- 32         3000         5500          6000        4200        7200        8100
-```
-
-* `close_latency_ms` — between `window_end` and the emit timestamp the
-  pipeline stamped on the row. How long after the window logically
-  closed did the engine commit. Bounded by `[checkpoint] interval`.
-* `end_to_end_ms` — between the freshest `event_time` in the window and
-  the emit timestamp. Publish → readable in Iceberg.
+`ingest/s` is the NATS source's record counter delta; `flushed/s` is
+rows staged to Iceberg in that second; `commits` is the cumulative
+Iceberg snapshot count — incremented when a window closes and the
+sink commits. The `commits` column is the visible "engine commit
+cadence" indicator; cadence is bounded by `[checkpoint] interval`.
 
 ## Explore
 
