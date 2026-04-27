@@ -49,7 +49,6 @@ impl BarrierTrackingCallback {
     }
 }
 
-#[async_trait::async_trait]
 impl PipelineCallback for BarrierTrackingCallback {
     async fn execute_cycle(
         &mut self,

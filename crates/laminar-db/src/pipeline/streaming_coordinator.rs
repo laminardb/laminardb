@@ -897,7 +897,6 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
     impl PipelineCallback for MockCallback {
         async fn execute_cycle(
             &mut self,
@@ -1303,7 +1302,6 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
     impl PipelineCallback for BackpressuredCallback {
         async fn execute_cycle(
             &mut self,

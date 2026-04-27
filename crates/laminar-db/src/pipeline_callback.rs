@@ -1,11 +1,10 @@
 //! Production `PipelineCallback` bridging coordinator to sinks, checkpoints, and watermarks.
 #![allow(clippy::disallowed_types)] // cold path
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
@@ -20,11 +19,20 @@ use rustc_hash::FxHashMap;
 use crate::db::{filter_late_rows, SourceWatermarkState};
 use crate::error::DbError;
 
-/// Base prefix for the temporary table used by sink WHERE filters.
-const FILTER_INPUT_TABLE: &str = "__laminar_filter_input";
+/// Resolution state of a sink WHERE filter.
+#[derive(Clone)]
+pub(crate) enum SinkFilter {
+    Pending,
+    Compiled(Arc<dyn PhysicalExpr>),
+    Rejected,
+}
 
-/// Monotonic counter for unique filter table names (concurrent-safe).
-static FILTER_TABLE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+/// Per-cycle dispatch chosen from `SinkFilter`. `Rejected` is fail-closed.
+enum SinkFilterDispatch {
+    Compiled(Arc<dyn PhysicalExpr>),
+    Rejected,
+    None,
+}
 
 /// Implements [`PipelineCallback`](crate::pipeline::PipelineCallback) to bridge
 /// the event-driven pipeline coordinator to the rest of the database (stream
@@ -49,6 +57,9 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) watermark_states: FxHashMap<String, SourceWatermarkState>,
     pub(crate) source_entries_for_wm: FxHashMap<String, Arc<crate::catalog::SourceEntry>>,
     pub(crate) source_ids: FxHashMap<String, usize>,
+    /// Pre-interned source names keyed by source id; avoids `Arc::from` per cycle.
+    pub(crate) source_name_arcs: FxHashMap<usize, Arc<str>>,
+    pub(crate) source_wms_buf: FxHashMap<Arc<str>, i64>,
     pub(crate) tracker: Option<laminar_core::time::WatermarkTracker>,
     pub(crate) prom: Arc<crate::engine_metrics::EngineMetrics>,
     pub(crate) pipeline_watermark: Arc<std::sync::atomic::AtomicI64>,
@@ -62,11 +73,12 @@ pub(crate) struct ConnectorPipelineCallback {
     )>,
     pub(crate) table_store: Arc<parking_lot::RwLock<crate::table_store::TableStore>>,
     pub(crate) mv_store: Arc<parking_lot::RwLock<crate::mv_store::MvStore>>,
+    /// Mirrors `MvStore::has_any`; read per cycle to skip the write lock.
+    pub(crate) mv_store_has_any: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
-    /// Cached `SessionContext` for sink WHERE filters (avoids per-batch allocation).
     pub(crate) filter_ctx: SessionContext,
-    /// Lazily-compiled sink filter expressions, indexed by sink position.
-    pub(crate) compiled_sink_filters: Vec<Option<Arc<dyn PhysicalExpr>>>,
+    pub(crate) compiled_sink_filters: Vec<SinkFilter>,
+    pub(crate) pending_sink_filter_compiles: usize,
     pub(crate) last_checkpoint: std::time::Instant,
     /// `None` = no automatic checkpointing (manual only via coordinator).
     pub(crate) checkpoint_interval: Option<std::time::Duration>,
@@ -353,17 +365,19 @@ impl ConnectorPipelineCallback {
         &mut self,
         results: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) {
-        // Ensure the compiled_sink_filters vec has the right length.
-        while self.compiled_sink_filters.len() < self.sinks.len() {
-            self.compiled_sink_filters.push(None);
+        if self.pending_sink_filter_compiles == 0 {
+            return;
         }
 
-        for (i, (_, _, filter_sql, sink_input, _)) in self.sinks.iter().enumerate() {
-            // Skip if no filter or already compiled.
-            if filter_sql.is_none() || self.compiled_sink_filters[i].is_some() {
+        while self.compiled_sink_filters.len() < self.sinks.len() {
+            self.compiled_sink_filters.push(SinkFilter::Pending);
+        }
+
+        for (i, (sink_name, _, filter_sql, sink_input, _)) in self.sinks.iter().enumerate() {
+            if filter_sql.is_none() || !matches!(self.compiled_sink_filters[i], SinkFilter::Pending)
+            {
                 continue;
             }
-            // Need a batch to determine the schema.
             let Some(batches) = results.get(sink_input.as_str()) else {
                 continue;
             };
@@ -371,17 +385,24 @@ impl ConnectorPipelineCallback {
                 continue;
             };
             let schema = batch.schema();
-            if let Some(compiled) =
-                compile_sink_filter_sql(&self.filter_ctx, filter_sql.as_deref().unwrap(), &schema)
-                    .await
-            {
-                self.compiled_sink_filters[i] = Some(compiled);
+            let sql = filter_sql.as_deref().unwrap();
+            if let Some(compiled) = compile_sink_filter_sql(&self.filter_ctx, sql, &schema).await {
+                self.compiled_sink_filters[i] = SinkFilter::Compiled(compiled);
+            } else {
+                tracing::error!(
+                    sink = %sink_name,
+                    filter = %sql,
+                    "[LDB-1100] sink filter did not compile to a PhysicalExpr; \
+                     fail-closed: ALL rows from this stream will be dropped \
+                     for this sink. Track via sink_filter_rejected_rows_total."
+                );
+                self.compiled_sink_filters[i] = SinkFilter::Rejected;
             }
+            self.pending_sink_filter_compiles = self.pending_sink_filter_compiles.saturating_sub(1);
         }
     }
 }
 
-#[async_trait::async_trait]
 #[allow(clippy::too_many_lines)]
 impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     async fn execute_cycle(
@@ -389,19 +410,14 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         source_batches: &FxHashMap<Arc<str>, Vec<RecordBatch>>,
         watermark: i64,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, String> {
-        #[cfg_attr(not(feature = "cluster-unstable"), allow(unused_mut))]
-        let mut source_wms: FxHashMap<Arc<str>, i64> = if let Some(ref tracker) = self.tracker {
-            self.source_ids
-                .iter()
-                .filter_map(|(name, &sid)| {
-                    tracker
-                        .source_watermark(sid)
-                        .map(|wm| (Arc::from(name.as_str()), wm))
-                })
-                .collect()
-        } else {
-            FxHashMap::default()
-        };
+        self.source_wms_buf.clear();
+        if let Some(ref tracker) = self.tracker {
+            for (&sid, name_arc) in &self.source_name_arcs {
+                if let Some(wm) = tracker.source_watermark(sid) {
+                    self.source_wms_buf.insert(Arc::clone(name_arc), wm);
+                }
+            }
+        }
 
         #[cfg(feature = "cluster-unstable")]
         {
@@ -409,13 +425,13 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 .cluster_controller
                 .as_ref()
                 .and_then(|cc| cc.cluster_min_watermark());
-            Self::cap_source_watermarks_by_cluster_min(&mut source_wms, cluster_wm);
+            Self::cap_source_watermarks_by_cluster_min(&mut self.source_wms_buf, cluster_wm);
         }
 
-        let swm_ref = if source_wms.is_empty() {
+        let swm_ref = if self.source_wms_buf.is_empty() {
             None
         } else {
-            Some(&source_wms)
+            Some(&self.source_wms_buf)
         };
         self.graph
             .execute_cycle(source_batches, watermark, swm_ref)
@@ -446,6 +462,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         if results.is_empty() {
             return;
         }
+        if !self
+            .mv_store_has_any
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
         let mut store = self.mv_store.write();
         let mut updates = 0u64;
         for (stream_name, batches) in results {
@@ -468,87 +490,78 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     async fn write_to_sinks(&mut self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
-        // Lazy-compile any pending sink filters.
         self.compile_pending_sink_filters(results).await;
 
-        // Route results to sinks concurrently, filtered by FROM clause.
-        // The per-call I/O timeout is enforced inside the sink task; the
-        // bounded command channel backpressures us naturally. Failures
-        // and timeouts are reported out of band via SinkEvents drained
-        // below after join_all.
-        let filter_ctx = self.filter_ctx.clone(); // Arc bump — cheap
+        // Share per-stream batches across sinks so fan-out doesn't reclone the Vec.
+        let mut shared_inputs: FxHashMap<&str, Arc<[RecordBatch]>> = FxHashMap::default();
+
         let sink_futures: Vec<_> = self
             .sinks
             .iter()
             .enumerate()
             .filter_map(
-                |(sink_idx, (sink_name, handle, filter_expr, sink_input, changelog_capable))| {
+                |(sink_idx, (sink_name, handle, _filter_sql, sink_input, changelog_capable))| {
                     // Route by FROM clause: only send matching results.
                     let batches = results.get(sink_input.as_str())?;
                     if batches.is_empty() {
                         return None;
                     }
+                    let shared = shared_inputs
+                        .entry(sink_input.as_str())
+                        .or_insert_with(|| Arc::<[RecordBatch]>::from(batches.as_slice()))
+                        .clone();
                     let sink_name = sink_name.clone();
                     let handle = handle.clone();
-                    let compiled_filter = self
-                        .compiled_sink_filters
-                        .get(sink_idx)
-                        .and_then(Clone::clone);
-                    let filter_expr = filter_expr.clone();
-                    let batches = batches.clone();
-                    let ctx = filter_ctx.clone();
+                    // Rejected → drop (fail-closed). Pending → None (no filter SQL set).
+                    let filter_state = match self.compiled_sink_filters.get(sink_idx).cloned() {
+                        Some(SinkFilter::Compiled(phys)) => SinkFilterDispatch::Compiled(phys),
+                        Some(SinkFilter::Rejected) => SinkFilterDispatch::Rejected,
+                        Some(SinkFilter::Pending) | None => SinkFilterDispatch::None,
+                    };
+                    let changelog_capable = *changelog_capable;
+                    let prom = Arc::clone(&self.prom);
                     Some(async move {
-                        for batch in &batches {
-                            let filtered = if let Some(ref phys) = compiled_filter {
-                                // Use compiled PhysicalExpr — no SQL overhead
-                                match apply_compiled_sink_filter(batch, phys) {
-                                    Ok(Some(fb)) => fb,
-                                    Ok(None) => continue,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            sink = %sink_name,
-                                            error = %e,
-                                            "Compiled sink filter error"
-                                        );
-                                        continue;
+                        for batch in shared.iter() {
+                            let filtered: Cow<RecordBatch> = match &filter_state {
+                                SinkFilterDispatch::Compiled(phys) => {
+                                    match apply_compiled_sink_filter(batch, phys) {
+                                        Ok(Some(fb)) => Cow::Owned(fb),
+                                        Ok(None) => continue,
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                sink = %sink_name,
+                                                error = %e,
+                                                "Compiled sink filter error"
+                                            );
+                                            continue;
+                                        }
                                     }
                                 }
-                            } else if let Some(ref filter_sql) = filter_expr {
-                                // Fallback to SQL-based filter
-                                match apply_filter(&ctx, batch, filter_sql).await {
-                                    Ok(Some(fb)) => fb,
-                                    Ok(None) => continue,
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            sink = %sink_name,
-                                            filter = %filter_sql,
-                                            error = %e,
-                                            "Sink filter error"
-                                        );
-                                        continue;
-                                    }
+                                SinkFilterDispatch::Rejected => {
+                                    #[allow(clippy::cast_possible_truncation)]
+                                    let dropped = batch.num_rows() as u64;
+                                    prom.sink_filter_rejected_rows
+                                        .with_label_values(&[sink_name.as_str()])
+                                        .inc_by(dropped);
+                                    continue;
                                 }
-                            } else {
-                                batch.clone()
+                                SinkFilterDispatch::None => Cow::Borrowed(batch),
                             };
 
-                            let filtered = crate::changelog_filter::prepare_for_sink(
+                            let prepared = crate::changelog_filter::prepare_for_sink(
                                 &filtered,
-                                *changelog_capable,
+                                changelog_capable,
                             );
-
-                            if filtered.num_rows() > 0 {
-                                if let Err(e) = handle.write_batch(filtered).await {
-                                    // ChannelClosed metric is incremented when
-                                    // we drain the event channel below; here
-                                    // we just log and stop sending to this sink.
-                                    tracing::warn!(
-                                        sink = %sink_name,
-                                        error = %e,
-                                        "Sink command channel closed"
-                                    );
-                                    break;
-                                }
+                            if prepared.num_rows() == 0 {
+                                continue;
+                            }
+                            if let Err(e) = handle.write_batch(prepared.into_owned()).await {
+                                tracing::warn!(
+                                    sink = %sink_name,
+                                    error = %e,
+                                    "Sink command channel closed"
+                                );
+                                break;
                             }
                         }
                     })
@@ -1208,70 +1221,6 @@ pub(crate) fn encode_arrow_schema(schema: &arrow_schema::Schema) -> String {
     laminar_connectors::config::encode_arrow_schema_ipc(schema)
 }
 
-/// Apply a SQL WHERE filter to a `RecordBatch` using a cached `SessionContext`.
-///
-/// Each call uses a unique temporary table name so concurrent calls on the
-/// same context (via `join_all`) do not interfere with each other.
-///
-/// Returns `Ok(Some(filtered_batch))` if rows match, `Ok(None)` if no rows match,
-/// or an error if the filter expression is invalid.
-async fn apply_filter(
-    ctx: &SessionContext,
-    batch: &RecordBatch,
-    filter_sql: &str,
-) -> Result<Option<RecordBatch>, DbError> {
-    // Unique table name per call to avoid concurrent conflicts.
-    let id = FILTER_TABLE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let table_name = format!("{FILTER_INPUT_TABLE}_{id}");
-
-    let schema = batch.schema();
-
-    // Register the batch as a temporary table
-    let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch.clone()]])
-        .map_err(|e| DbError::query_pipeline("sink filter", &e))?;
-
-    ctx.register_table(&*table_name, Arc::new(mem_table))
-        .map_err(|e| DbError::query_pipeline("sink filter", &e))?;
-
-    // Execute the filter query, always deregistering the temp table afterward.
-    let sql = format!("SELECT * FROM {table_name} WHERE {filter_sql}");
-    let result = async {
-        let df = ctx
-            .sql(&sql)
-            .await
-            .map_err(|e| DbError::query_pipeline("sink filter", &e))?;
-
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| DbError::query_pipeline("sink filter", &e))?;
-
-        if batches.is_empty() {
-            return Ok(None);
-        }
-
-        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        if total_rows == 0 {
-            return Ok(None);
-        }
-
-        // Merge all result batches into one (DataFusion may split output across
-        // multiple partitions, so dropping all but the first would lose rows).
-        if batches.len() == 1 {
-            return Ok(batches.into_iter().next());
-        }
-        let merged = arrow::compute::concat_batches(&batches[0].schema(), &batches)
-            .map_err(|e| DbError::query_pipeline_arrow("sink filter concat", &e))?;
-        Ok(Some(merged))
-    }
-    .await;
-
-    // Clean up: deregister the temporary table to avoid catalog bloat.
-    let _ = ctx.deregister_table(&*table_name);
-
-    result
-}
-
 /// Apply a compiled `PhysicalExpr` filter to a batch.
 fn apply_compiled_sink_filter(
     batch: &RecordBatch,
@@ -1376,6 +1325,34 @@ mod tests {
 
         let got = tokio::time::timeout(Duration::from_millis(50), notify.notified()).await;
         assert!(got.is_err(), "non-Fail errors must not trigger shutdown");
+    }
+
+    /// Rejected must drop, not passthrough.
+    #[test]
+    fn rejected_filter_dispatches_to_drop_not_passthrough() {
+        let filters = [SinkFilter::Rejected];
+        let dispatch = match filters.first().cloned() {
+            Some(SinkFilter::Compiled(phys)) => SinkFilterDispatch::Compiled(phys),
+            Some(SinkFilter::Rejected) => SinkFilterDispatch::Rejected,
+            Some(SinkFilter::Pending) | None => SinkFilterDispatch::None,
+        };
+        assert!(
+            matches!(dispatch, SinkFilterDispatch::Rejected),
+            "Rejected filter must map to Rejected dispatch (drop), not None (passthrough)"
+        );
+    }
+
+    /// Pending / absent → no filter (compilation runs before the dispatch loop).
+    #[test]
+    fn pending_and_absent_filters_dispatch_to_passthrough() {
+        for filter in [Some(SinkFilter::Pending), None] {
+            let dispatch = match filter.clone() {
+                Some(SinkFilter::Compiled(phys)) => SinkFilterDispatch::Compiled(phys),
+                Some(SinkFilter::Rejected) => SinkFilterDispatch::Rejected,
+                Some(SinkFilter::Pending) | None => SinkFilterDispatch::None,
+            };
+            assert!(matches!(dispatch, SinkFilterDispatch::None));
+        }
     }
 
     /// Consumer-side cap is a no-op when the cluster has not yet

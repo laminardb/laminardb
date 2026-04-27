@@ -80,6 +80,8 @@ sqlparser = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 async-trait = { workspace = true }
+trait-variant = { workspace = true }
+indexmap = { workspace = true }
 futures = { workspace = true }
 crossfire = { workspace = true }
 

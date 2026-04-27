@@ -31,11 +31,8 @@ pub struct SourceRegistration {
 }
 
 /// Callback trait for the coordinator to interact with the rest of the DB.
-///
 /// Trait exists for test seam; production impl is `ConnectorPipelineCallback`.
-///
-/// This decouples the pipeline module from db.rs internals.
-#[async_trait::async_trait]
+#[trait_variant::make(Send)]
 pub trait PipelineCallback: Send + 'static {
     /// Called with accumulated source batches to execute a SQL cycle.
     async fn execute_cycle(
@@ -64,17 +61,8 @@ pub trait PipelineCallback: Send + 'static {
     /// Get the current pipeline watermark.
     fn current_watermark(&self) -> i64;
 
-    /// Perform a periodic (timer-based) checkpoint. Returns `Some(epoch)`
-    /// on successful commit, `None` otherwise.
-    ///
-    /// **Semantics: at-least-once.** Timer-based checkpoints capture source
-    /// offsets *before* operator state. On recovery the consumer replays
-    /// from the offset, and operators may re-process records that were
-    /// already processed before the crash (at-least-once, not exactly-once).
-    ///
-    /// For exactly-once semantics, use [`checkpoint_with_barrier`] instead,
-    /// which captures offsets and operator state at a consistent cut across
-    /// all sources.
+    /// Perform a periodic (timer-based) checkpoint. At-least-once semantics.
+    /// For exactly-once, use [`checkpoint_with_barrier`].
     ///
     /// [`checkpoint_with_barrier`]: PipelineCallback::checkpoint_with_barrier
     async fn maybe_checkpoint(
@@ -83,9 +71,7 @@ pub trait PipelineCallback: Send + 'static {
         source_offsets: FxHashMap<String, SourceCheckpoint>,
     ) -> Option<u64>;
 
-    /// Called when all sources have aligned on a barrier. Returns
-    /// `Some(epoch)` on successful commit, `None` on failure — the
-    /// caller retries on the next interval.
+    /// Called when all sources have aligned on a barrier.
     async fn checkpoint_with_barrier(
         &mut self,
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
@@ -100,8 +86,7 @@ pub trait PipelineCallback: Send + 'static {
     /// Apply a DDL control message (add/drop stream) to the running pipeline.
     fn apply_control(&mut self, msg: super::ControlMsg);
 
-    /// Returns `true` when internal buffers are near capacity and the
-    /// caller should stop feeding new data. Default returns `false`.
+    /// Returns `true` when internal buffers are near capacity.
     fn is_backpressured(&self) -> bool {
         false
     }
