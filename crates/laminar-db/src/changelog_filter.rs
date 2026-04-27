@@ -3,6 +3,8 @@
 //! Filters CDC `RecordBatch`es to separate positive (I, U+, U) and negative (D, U-)
 //! events. Non-CDC batches (no `_op` column) pass through unchanged.
 
+use std::borrow::Cow;
+
 use arrow::array::{BooleanArray, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
 
@@ -57,37 +59,36 @@ pub(crate) fn filter_positive_events(batch: &RecordBatch) -> Result<RecordBatch,
         .map_err(|e| DbError::Pipeline(format!("changelog filter: {e}")))
 }
 
-/// Prepare a batch for a sink. If the batch has a `__weight` column and
-/// the sink is NOT changelog-aware, filter to positive weights and strip
-/// the column. Changelog-aware sinks receive the batch unchanged.
-pub(crate) fn prepare_for_sink(batch: &RecordBatch, changelog_sink: bool) -> RecordBatch {
+/// For non-changelog sinks, drop rows with non-positive `__weight` and strip
+/// the column. Otherwise the input is borrowed unchanged.
+pub(crate) fn prepare_for_sink(batch: &RecordBatch, changelog_sink: bool) -> Cow<'_, RecordBatch> {
     if changelog_sink {
-        return batch.clone();
+        return Cow::Borrowed(batch);
     }
     let Ok(idx) = batch
         .schema()
         .index_of(crate::aggregate_state::WEIGHT_COLUMN)
     else {
-        return batch.clone();
+        return Cow::Borrowed(batch);
     };
     let Some(weights) = batch
         .column(idx)
         .as_any()
         .downcast_ref::<arrow::array::Int64Array>()
     else {
-        return batch.clone();
+        return Cow::Borrowed(batch);
     };
     // Keep only rows with positive weight.
     let mask: BooleanArray = weights.iter().map(|w| Some(w.unwrap_or(0) > 0)).collect();
     let Ok(filtered) = arrow::compute::filter_record_batch(batch, &mask) else {
-        return batch.clone();
+        return Cow::Borrowed(batch);
     };
     // Strip the __weight column.
     if filtered.num_columns() == 0 {
-        return filtered;
+        return Cow::Owned(filtered);
     }
     let indices: Vec<usize> = (0..filtered.num_columns()).filter(|&i| i != idx).collect();
-    filtered.project(&indices).unwrap_or(filtered)
+    Cow::Owned(filtered.project(&indices).unwrap_or(filtered))
 }
 
 #[cfg(test)]

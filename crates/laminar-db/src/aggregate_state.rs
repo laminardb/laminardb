@@ -250,7 +250,9 @@ fn build_weighted_batch(
         }
     }
 
-    let weight_array: ArrayRef = Arc::new(arrow::array::Int64Array::from(weights.to_vec()));
+    let weight_array: ArrayRef = Arc::new(arrow::array::Int64Array::from_iter_values(
+        weights.iter().copied(),
+    ));
 
     let mut all_arrays = group_arrays;
     all_arrays.extend(agg_arrays);

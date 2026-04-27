@@ -5,6 +5,8 @@
 #![allow(clippy::disallowed_types)] // cold path
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
@@ -95,22 +97,34 @@ impl MvEntry {
 /// via `Arc<parking_lot::RwLock<MvStore>>`.
 pub(crate) struct MvStore {
     entries: HashMap<String, MvEntry>,
+    /// Mirrors `!entries.is_empty()`; lets the hot path skip the write lock.
+    has_any: Arc<AtomicBool>,
 }
 
 impl MvStore {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            has_any: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn has_any_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.has_any)
     }
 
     pub fn create_mv(&mut self, name: &str, schema: SchemaRef, mode: MvStorageMode) {
         self.entries
             .insert(name.to_string(), MvEntry::new(schema, mode));
+        self.has_any.store(true, Ordering::Release);
     }
 
     pub fn drop_mv(&mut self, name: &str) -> bool {
-        self.entries.remove(name).is_some()
+        let removed = self.entries.remove(name).is_some();
+        if self.entries.is_empty() {
+            self.has_any.store(false, Ordering::Release);
+        }
+        removed
     }
 
     pub fn has_mv(&self, name: &str) -> bool {

@@ -54,6 +54,9 @@ pub struct EngineMetrics {
     pub sink_write_timeouts: IntCounter,
     /// Sink task channel closed.
     pub sink_task_channel_closed: IntCounter,
+    /// Rows dropped because the sink's WHERE filter failed to compile to
+    /// a `PhysicalExpr` (fail-closed). Label: `sink`.
+    pub sink_filter_rejected_rows: IntCounterVec,
     /// Per-cycle processing duration.
     pub cycle_duration: Histogram,
     /// Checkpoint cycle duration.
@@ -182,6 +185,14 @@ impl EngineMetrics {
             sink_task_channel_closed: reg!(IntCounter::new(
                 "sink_task_channel_closed_total",
                 "Sink task channel closed"
+            )
+            .unwrap()),
+            sink_filter_rejected_rows: reg!(IntCounterVec::new(
+                Opts::new(
+                    "sink_filter_rejected_rows_total",
+                    "Rows dropped because the sink filter failed to compile",
+                ),
+                &["sink"],
             )
             .unwrap()),
             cycle_duration: reg!(Histogram::with_opts(

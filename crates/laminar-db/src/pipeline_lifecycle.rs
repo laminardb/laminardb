@@ -1345,6 +1345,20 @@ impl LaminarDB {
         graph.set_max_input_buf_bytes(pipeline_config.max_input_buf_bytes);
         graph.set_backpressure_policy(pipeline_config.backpressure_policy);
 
+        let sinks_pending_filter_count = sinks
+            .iter()
+            .filter(|(_, _, filter_sql, _, _)| filter_sql.is_some())
+            .count();
+
+        let source_name_arcs: rustc_hash::FxHashMap<usize, Arc<str>> = source_ids
+            .iter()
+            .map(|(name, &sid)| (sid, Arc::<str>::from(name.as_str())))
+            .collect();
+        let source_wms_buf = rustc_hash::FxHashMap::with_capacity_and_hasher(
+            source_name_arcs.len(),
+            rustc_hash::FxBuildHasher,
+        );
+
         let prom = self
             .engine_metrics
             .lock()
@@ -1368,16 +1382,20 @@ impl LaminarDB {
             watermark_states,
             source_entries_for_wm,
             source_ids,
+            source_name_arcs,
+            source_wms_buf,
             tracker,
             prom,
             pipeline_watermark,
             coordinator,
             table_sources,
             table_store: table_store_for_loop,
+            mv_store_has_any: self.mv_store.read().has_any_handle(),
             mv_store: self.mv_store.clone(),
             lookup_registry: Arc::clone(&self.lookup_registry),
             filter_ctx: laminar_sql::create_session_context(),
             compiled_sink_filters: Vec::new(),
+            pending_sink_filter_compiles: sinks_pending_filter_count,
             last_checkpoint: std::time::Instant::now(),
             checkpoint_interval: self
                 .config
