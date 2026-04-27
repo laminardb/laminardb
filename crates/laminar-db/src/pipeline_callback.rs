@@ -1314,7 +1314,7 @@ mod tests {
     /// Rejected must drop, not passthrough.
     #[test]
     fn rejected_filter_dispatches_to_drop_not_passthrough() {
-        let filters = vec![SinkFilter::Rejected];
+        let filters = [SinkFilter::Rejected];
         let dispatch = match filters.first().cloned() {
             Some(SinkFilter::Compiled(phys)) => SinkFilterDispatch::Compiled(phys),
             Some(SinkFilter::Rejected) => SinkFilterDispatch::Rejected,
