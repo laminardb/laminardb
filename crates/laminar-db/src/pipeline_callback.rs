@@ -948,6 +948,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 emit_clause,
                 window_config,
                 order_config,
+                join_config,
             } => {
                 self.graph.add_query(
                     name.clone(),
@@ -956,6 +957,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                     window_config,
                     order_config,
                     None,
+                    join_config,
                 );
                 tracing::info!(stream = %name, "Stream added via control channel");
             }

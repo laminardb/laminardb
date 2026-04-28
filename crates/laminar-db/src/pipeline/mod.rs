@@ -14,7 +14,7 @@ pub use streaming_coordinator::StreamingCoordinator;
 
 use arrow::datatypes::SchemaRef;
 use laminar_sql::parser::EmitClause;
-use laminar_sql::translator::{OrderOperatorConfig, WindowOperatorConfig};
+use laminar_sql::translator::{JoinOperatorConfig, OrderOperatorConfig, WindowOperatorConfig};
 
 /// Control message sent from `LaminarDB` DDL handlers to the running
 /// `StreamingCoordinator` for live schema changes (add/drop streams).
@@ -33,6 +33,8 @@ pub enum ControlMsg {
         window_config: Option<WindowOperatorConfig>,
         /// ORDER BY configuration.
         order_config: Option<OrderOperatorConfig>,
+        /// Per-step join configs from the planner (left-deep).
+        join_config: Option<Vec<JoinOperatorConfig>>,
     },
     /// Remove a streaming query from the running pipeline.
     DropStream {

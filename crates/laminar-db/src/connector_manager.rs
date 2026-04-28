@@ -40,6 +40,10 @@ pub(crate) struct StreamRegistration {
     pub emit_clause: Option<laminar_sql::parser::EmitClause>,
     pub window_config: Option<laminar_sql::translator::WindowOperatorConfig>,
     pub order_config: Option<laminar_sql::translator::OrderOperatorConfig>,
+    /// Per-step join configs from the planner (one entry per binary step,
+    /// left-deep). Lets the executor skip SQL re-parses when the query
+    /// has no streaming-specific join step.
+    pub join_config: Option<Vec<laminar_sql::translator::JoinOperatorConfig>>,
 }
 
 #[derive(Debug, Clone)]
@@ -354,6 +358,7 @@ mod tests {
             emit_clause: None,
             window_config: None,
             order_config: None,
+            join_config: None,
         });
         assert_eq!(mgr.stream_names(), vec!["agg_stream"]);
     }
@@ -511,6 +516,7 @@ mod tests {
             emit_clause: None,
             window_config: None,
             order_config: None,
+            join_config: None,
         });
         assert!(mgr.unregister_sink("s1"));
         assert!(!mgr.unregister_sink("s1"));

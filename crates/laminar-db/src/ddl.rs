@@ -645,8 +645,12 @@ impl LaminarDB {
 
         let query_sql = query_sql.to_string();
 
-        // Plan the statement to extract emit_clause, window_config, and order_config
-        let (plan_emit, plan_window, plan_order) = {
+        // Plan the statement to extract emit_clause, window_config, order_config,
+        // and the multi-step join_config (one entry per binary join step).
+        // Planning errors (e.g. unbounded multi-way stream-stream rejection)
+        // surface to the caller — DDL must not silently fall back when the
+        // planner has rejected the query.
+        let (plan_emit, plan_window, plan_order, plan_joins) = {
             let mut planner = self.planner.lock();
             let stmt = StreamingStatement::CreateStream {
                 name: name.clone(),
@@ -661,8 +665,10 @@ impl LaminarDB {
                     qp.emit_clause.clone(),
                     qp.window_config.clone(),
                     qp.order_config.clone(),
+                    qp.join_config.clone(),
                 ),
-                _ => (emit_clause.cloned(), None, None),
+                Ok(_) => (emit_clause.cloned(), None, None, None),
+                Err(e) => return Err(laminar_sql::Error::from(e).into()),
             }
         };
 
@@ -675,6 +681,7 @@ impl LaminarDB {
                 emit_clause: plan_emit.clone(),
                 window_config: plan_window.clone(),
                 order_config: plan_order.clone(),
+                join_config: plan_joins.clone(),
             });
         }
 
@@ -687,6 +694,7 @@ impl LaminarDB {
                 emit_clause: plan_emit,
                 window_config: plan_window,
                 order_config: plan_order,
+                join_config: plan_joins,
             });
         }
 
@@ -932,8 +940,9 @@ impl LaminarDB {
                 .map_err(|e| DbError::MaterializedView(e.to_string()))?;
         }
 
-        // Plan the MV's backing query to extract emit_clause, window_config, and order_config
-        let (plan_emit, plan_window, plan_order) = {
+        // Plan the MV's backing query to extract emit_clause, window_config,
+        // order_config, and the multi-step join_config.
+        let (plan_emit, plan_window, plan_order, plan_joins) = {
             let mut planner = self.planner.lock();
             // Wrap the inner query as a CreateStream to reuse the planner
             let stmt = StreamingStatement::CreateStream {
@@ -949,8 +958,9 @@ impl LaminarDB {
                     qp.emit_clause.clone(),
                     qp.window_config.clone(),
                     qp.order_config.clone(),
+                    qp.join_config.clone(),
                 ),
-                _ => (None, None, None),
+                _ => (None, None, None, None),
             }
         };
 
@@ -963,6 +973,7 @@ impl LaminarDB {
                 emit_clause: plan_emit.clone(),
                 window_config: plan_window.clone(),
                 order_config: plan_order.clone(),
+                join_config: plan_joins.clone(),
             });
         }
 
@@ -1008,6 +1019,7 @@ impl LaminarDB {
                 emit_clause: plan_emit,
                 window_config: plan_window,
                 order_config: plan_order,
+                join_config: plan_joins,
             });
         }
 
