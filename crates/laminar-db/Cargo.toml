@@ -114,6 +114,7 @@ laminar-connectors = { path = "../laminar-connectors", version = "0.21.5", featu
 criterion = { workspace = true }
 bytes = { workspace = true }
 tracing-subscriber = { workspace = true }
+proptest = { workspace = true }
 # Kafka producer/admin client used by `kafka_docker_scenarios.rs` integration tests.
 # Tests skip gracefully when the Redpanda broker started by
 # `tests/docker/compose.yml` is not reachable on `localhost:19092`.
