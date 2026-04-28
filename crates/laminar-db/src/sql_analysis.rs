@@ -1516,10 +1516,9 @@ fn build_stream_join_projection_sql(
                 // `{qual}_{col}` so output names stay unique.
                 if has_residual {
                     let (qual, natural) = match expr {
-                        Expr::CompoundIdentifier(parts) if parts.len() == 2 => (
-                            Some(parts[0].value.clone()),
-                            Some(parts[1].value.clone()),
-                        ),
+                        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+                            (Some(parts[0].value.clone()), Some(parts[1].value.clone()))
+                        }
                         Expr::Identifier(ident) => (None, Some(ident.value.clone())),
                         _ => (None, None),
                     };
@@ -1559,7 +1558,13 @@ fn build_stream_join_projection_sql(
         .collect();
 
     let residual = if has_residual {
-        render_residual_joins(&select.from[0].joins[1..], config, left_alias, right_alias, tmp_qual)
+        render_residual_joins(
+            &select.from[0].joins[1..],
+            config,
+            left_alias,
+            right_alias,
+            tmp_qual,
+        )
     } else {
         String::new()
     };
@@ -1568,21 +1573,20 @@ fn build_stream_join_projection_sql(
     // BETWEEN is directional (`right_ts >= left_ts AND right_ts <= left_ts +
     // N`). The upper bound is already covered by the symmetric tolerance; we
     // add `right_ts >= left_ts` here to enforce the lower bound.
-    let directional_filter = if !config.left_time_column.is_empty()
-        && !config.right_time_column.is_empty()
-    {
-        let left_ref = match tmp_qual {
-            Some(q) => format!("{q}.{}", config.left_time_column),
-            None => config.left_time_column.clone(),
+    let directional_filter =
+        if !config.left_time_column.is_empty() && !config.right_time_column.is_empty() {
+            let left_ref = match tmp_qual {
+                Some(q) => format!("{q}.{}", config.left_time_column),
+                None => config.left_time_column.clone(),
+            };
+            let right_ref = match tmp_qual {
+                Some(q) => format!("{q}.{}_{}", config.right_time_column, config.right_table),
+                None => format!("{}_{}", config.right_time_column, config.right_table),
+            };
+            format!("{right_ref} >= {left_ref}")
+        } else {
+            String::new()
         };
-        let right_ref = match tmp_qual {
-            Some(q) => format!("{q}.{}_{}", config.right_time_column, config.right_table),
-            None => format!("{}_{}", config.right_time_column, config.right_table),
-        };
-        format!("{right_ref} >= {left_ref}")
-    } else {
-        String::new()
-    };
 
     let combined_where = match (where_clause.is_empty(), directional_filter.is_empty()) {
         (true, true) => String::new(),
@@ -1670,23 +1674,16 @@ fn rewrite_stream_join_expr(
             }
         }
         Expr::BinaryOp { left, op, right } => {
-            let l =
-                rewrite_stream_join_expr(left, left_alias, right_alias, config, tmp_qual);
-            let r = rewrite_stream_join_expr(
-                right, left_alias, right_alias, config, tmp_qual,
-            );
+            let l = rewrite_stream_join_expr(left, left_alias, right_alias, config, tmp_qual);
+            let r = rewrite_stream_join_expr(right, left_alias, right_alias, config, tmp_qual);
             format!("{l} {op} {r}")
         }
         Expr::UnaryOp { op, expr: inner } => {
-            let r = rewrite_stream_join_expr(
-                inner, left_alias, right_alias, config, tmp_qual,
-            );
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
             format!("{op} {r}")
         }
         Expr::Nested(inner) => {
-            let r = rewrite_stream_join_expr(
-                inner, left_alias, right_alias, config, tmp_qual,
-            );
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
             format!("({r})")
         }
         Expr::Cast {
@@ -1694,21 +1691,15 @@ fn rewrite_stream_join_expr(
             data_type,
             ..
         } => {
-            let r = rewrite_stream_join_expr(
-                inner, left_alias, right_alias, config, tmp_qual,
-            );
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
             format!("CAST({r} AS {data_type})")
         }
         Expr::IsNull(inner) => {
-            let r = rewrite_stream_join_expr(
-                inner, left_alias, right_alias, config, tmp_qual,
-            );
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
             format!("{r} IS NULL")
         }
         Expr::IsNotNull(inner) => {
-            let r = rewrite_stream_join_expr(
-                inner, left_alias, right_alias, config, tmp_qual,
-            );
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
             format!("{r} IS NOT NULL")
         }
         Expr::Between {
@@ -1717,15 +1708,9 @@ fn rewrite_stream_join_expr(
             low,
             high,
         } => {
-            let e = rewrite_stream_join_expr(
-                inner, left_alias, right_alias, config, tmp_qual,
-            );
-            let l = rewrite_stream_join_expr(
-                low, left_alias, right_alias, config, tmp_qual,
-            );
-            let h = rewrite_stream_join_expr(
-                high, left_alias, right_alias, config, tmp_qual,
-            );
+            let e = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
+            let l = rewrite_stream_join_expr(low, left_alias, right_alias, config, tmp_qual);
+            let h = rewrite_stream_join_expr(high, left_alias, right_alias, config, tmp_qual);
             if *negated {
                 format!("{e} NOT BETWEEN {l} AND {h}")
             } else {
@@ -1743,7 +1728,11 @@ fn rewrite_stream_join_expr(
                             sqlparser::ast::FunctionArg::Unnamed(
                                 sqlparser::ast::FunctionArgExpr::Expr(e),
                             ) => rewrite_stream_join_expr(
-                                e, left_alias, right_alias, config, tmp_qual,
+                                e,
+                                left_alias,
+                                right_alias,
+                                config,
+                                tmp_qual,
                             ),
                             other => other.to_string(),
                         })

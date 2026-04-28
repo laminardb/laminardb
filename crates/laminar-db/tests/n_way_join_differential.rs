@@ -27,10 +27,7 @@ use proptest::test_runner::{Config as PropConfig, TestRng, TestRunner};
 /// couple of cycles past that point — enough for an IntervalJoinOperator
 /// (cycle N) to feed its post-projection sink (N+1) and reach the
 /// subscription's output queue (N+2).
-async fn await_quiescence(
-    db: &LaminarDB,
-    sources: &[&laminar_db::UntypedSourceHandle],
-) {
+async fn await_quiescence(db: &LaminarDB, sources: &[&laminar_db::UntypedSourceHandle]) {
     const POLL: Duration = Duration::from_millis(20);
     const STAGE_BUDGET: Duration = Duration::from_secs(2);
 
@@ -44,9 +41,7 @@ async fn await_quiescence(
 
     let baseline = db.metrics().total_cycles;
     let deadline = std::time::Instant::now() + STAGE_BUDGET;
-    while std::time::Instant::now() < deadline
-        && db.metrics().total_cycles < baseline + 2
-    {
+    while std::time::Instant::now() < deadline && db.metrics().total_cycles < baseline + 2 {
         tokio::time::sleep(POLL).await;
     }
 }
@@ -168,10 +163,7 @@ fn histogram(rows: &[Vec<u8>]) -> BTreeMap<Vec<u8>, usize> {
     h
 }
 
-fn diff_counts(
-    oracle: &[Vec<u8>],
-    sut: &[Vec<u8>],
-) -> (Vec<(Vec<u8>, isize)>, usize, usize) {
+fn diff_counts(oracle: &[Vec<u8>], sut: &[Vec<u8>]) -> (Vec<(Vec<u8>, isize)>, usize, usize) {
     let h_o = histogram(oracle);
     let h_s = histogram(sut);
     let mut diffs: Vec<(Vec<u8>, isize)> = Vec::new();
@@ -220,9 +212,10 @@ async fn expect_planning_rejection(create_stream_sql: &str) -> String {
         .await
         .expect("ddl c");
 
-    let err = db.execute(create_stream_sql).await.expect_err(
-        "expected planning rejection for unbounded multi-way streaming join",
-    );
+    let err = db
+        .execute(create_stream_sql)
+        .await
+        .expect_err("expected planning rejection for unbounded multi-way streaming join");
     format!("{err}")
 }
 
@@ -400,12 +393,10 @@ async fn run_sut_ts(
     let h_b = db.source_untyped("b").map_err(|e| format!("h_b: {e}"))?;
 
     for batch in a_batches {
-        h_a.push_arrow(batch)
-            .map_err(|e| format!("push a: {e}"))?;
+        h_a.push_arrow(batch).map_err(|e| format!("push a: {e}"))?;
     }
     for batch in b_batches {
-        h_b.push_arrow(batch)
-            .map_err(|e| format!("push b: {e}"))?;
+        h_b.push_arrow(batch).map_err(|e| format!("push b: {e}"))?;
     }
 
     await_quiescence(&db, &[&h_a, &h_b]).await;
@@ -494,8 +485,11 @@ fn between_case_strategy() -> impl Strategy<Value = BetweenCase> {
         }
         by_key.into_values().collect()
     });
-    (between_rows_strategy(), between_rows_strategy(), c_rows)
-        .prop_map(|(a, b, c)| BetweenCase { a, b, c })
+    (between_rows_strategy(), between_rows_strategy(), c_rows).prop_map(|(a, b, c)| BetweenCase {
+        a,
+        b,
+        c,
+    })
 }
 
 fn block_on_check_between(case: &BetweenCase) -> Result<(), String> {
@@ -541,8 +535,7 @@ fn block_on_check_between(case: &BetweenCase) -> Result<(), String> {
         let schema = output_schema_chain_star();
         let oracle_rows =
             batches_to_sorted_rows(&oracle, &schema).map_err(|e| format!("o rows: {e}"))?;
-        let sut_rows =
-            batches_to_sorted_rows(&sut, &schema).map_err(|e| format!("s rows: {e}"))?;
+        let sut_rows = batches_to_sorted_rows(&sut, &schema).map_err(|e| format!("s rows: {e}"))?;
 
         if oracle_rows == sut_rows {
             return Ok(());
@@ -577,4 +570,3 @@ fn property_n3_between_chain() {
         panic!("[BETWEEN CHAIN N=3] property failed: {e}");
     }
 }
-
