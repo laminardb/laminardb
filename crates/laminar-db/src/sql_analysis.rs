@@ -1469,6 +1469,7 @@ fn rewrite_temporal_expr(
 // Private: Stream-stream join projection rewriting
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 fn build_stream_join_projection_sql(
     select: &sqlparser::ast::Select,
     analysis: &laminar_sql::parser::join_parser::JoinAnalysis,

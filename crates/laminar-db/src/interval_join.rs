@@ -26,6 +26,10 @@ use crate::key_column::{extract_column_as_timestamps, extract_key_column, KeyCol
 /// Compact when accumulated batch count exceeds this threshold.
 const COMPACTION_THRESHOLD: usize = 32;
 
+/// Flush partial output once the match buffer reaches this many pairs.
+/// Bounds memory on cross-product shapes.
+const EMIT_THRESHOLD: usize = 65_536;
+
 /// Index type: `key_hash` → sorted `timestamp` → list of `(batch_idx, row_idx)`.
 type SideIndex = FxHashMap<u64, BTreeMap<i64, Vec<(usize, usize)>>>;
 
@@ -88,20 +92,24 @@ impl SideState {
         delete_key: &KeyColumn<'_>,
         delete_row: usize,
         key_col_name: &str,
-    ) {
+    ) -> Result<(), DbError> {
         let Some(btree) = self.index.get_mut(&key_hash) else {
-            return;
+            return Ok(());
         };
         let Some(entries) = btree.get_mut(&ts) else {
-            return;
+            return Ok(());
         };
-        let before = entries.len();
-        entries.retain(|&(batch_idx, row_idx)| {
-            extract_key_column(&self.batches[batch_idx], key_col_name).map_or(true, |stored_key| {
-                !delete_key.keys_equal(delete_row, &stored_key, row_idx)
-            })
-        });
-        let removed = before - entries.len();
+
+        // `Vec::retain` can't surface errors, so do it by hand.
+        let mut kept: Vec<(usize, usize)> = Vec::with_capacity(entries.len());
+        for &(batch_idx, row_idx) in entries.iter() {
+            let stored_key = extract_key_column(&self.batches[batch_idx], key_col_name)?;
+            if !delete_key.keys_equal(delete_row, &stored_key, row_idx) {
+                kept.push((batch_idx, row_idx));
+            }
+        }
+        let removed = entries.len() - kept.len();
+        *entries = kept;
         self.row_count = self.row_count.saturating_sub(removed);
         if entries.is_empty() {
             btree.remove(&ts);
@@ -109,6 +117,7 @@ impl SideState {
         if btree.is_empty() {
             self.index.remove(&key_hash);
         }
+        Ok(())
     }
 
     /// Evict all rows with `ts < cutoff`, then compact if batch count exceeds threshold.
@@ -396,6 +405,67 @@ fn probe_index(
     results
 }
 
+/// Drain `match_pairs` into one output batch via `arrow::compute::interleave` —
+/// one call per column, no per-row slice + concat.
+fn flush_match_pairs(
+    match_pairs: &mut Vec<(usize, usize, usize, usize)>,
+    output_schema: &SchemaRef,
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    left_only: bool,
+    out: &mut Vec<RecordBatch>,
+) -> Result<(), DbError> {
+    if match_pairs.is_empty() {
+        return Ok(());
+    }
+
+    let left_indices: Vec<(usize, usize)> =
+        match_pairs.iter().map(|&(b, r, _, _)| (b, r)).collect();
+    let right_indices: Vec<(usize, usize)> = if left_only {
+        Vec::new()
+    } else {
+        match_pairs.iter().map(|&(_, _, b, r)| (b, r)).collect()
+    };
+
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
+
+    if let Some(first) = left_batches.first() {
+        for col_idx in 0..first.num_columns() {
+            let arrays: Vec<&dyn Array> = left_batches
+                .iter()
+                .map(|b| b.column(col_idx).as_ref())
+                .collect();
+            let arr = arrow::compute::interleave(&arrays, &left_indices).map_err(|e| {
+                DbError::query_pipeline_arrow("interval join (interleave left)", &e)
+            })?;
+            columns.push(arr);
+        }
+    }
+
+    if !left_only {
+        if let Some(first) = right_batches.first() {
+            for col_idx in 0..first.num_columns() {
+                let arrays: Vec<&dyn Array> = right_batches
+                    .iter()
+                    .map(|b| b.column(col_idx).as_ref())
+                    .collect();
+                let arr = arrow::compute::interleave(&arrays, &right_indices).map_err(|e| {
+                    DbError::query_pipeline_arrow("interval join (interleave right)", &e)
+                })?;
+                columns.push(arr);
+            }
+        }
+    }
+
+    let batch = RecordBatch::try_new(output_schema.clone(), columns)
+        .map_err(|e| DbError::query_pipeline_arrow("interval join (result)", &e))?;
+    if batch.num_rows() > 0 {
+        out.push(batch);
+    }
+    match_pairs.clear();
+    Ok(())
+}
+
 /// Execute one cycle of an interval join.
 ///
 /// Bounds are inclusive: `|left_ts - right_ts| <= bound_ms`. NULL keys are
@@ -430,7 +500,7 @@ pub(crate) fn execute_interval_join_cycle(
                 if let Some(kh) = keys.hash_at(i) {
                     state
                         .left
-                        .remove_by_key_ts(kh, ts, &keys, i, &config.left_key);
+                        .remove_by_key_ts(kh, ts, &keys, i, &config.left_key)?;
                 }
             }
         }
@@ -443,135 +513,59 @@ pub(crate) fn execute_interval_join_cycle(
                 if let Some(kh) = keys.hash_at(i) {
                     state
                         .right
-                        .remove_by_key_ts(kh, ts, &keys, i, &config.right_key);
+                        .remove_by_key_ts(kh, ts, &keys, i, &config.right_key)?;
                 }
             }
         }
     }
 
-    let left_batches = &left_pos[..];
-    let right_batches = &right_pos[..];
+    // A pure-delete CDC batch yields zero positive rows; treat it as None
+    // so new_*_batch_idx never points past the end of state.
+    let concat_nonempty =
+        |slices: &[RecordBatch], side: &str| -> Result<Option<RecordBatch>, DbError> {
+            if slices.is_empty() {
+                return Ok(None);
+            }
+            let schema = slices[0].schema();
+            let b = concat_batches(&schema, slices)
+                .map_err(|e| DbError::query_pipeline_arrow(side, &e))?;
+            Ok((b.num_rows() > 0).then_some(b))
+        };
+    let new_left = concat_nonempty(&left_pos, "interval join (left concat)")?;
+    let new_right = concat_nonempty(&right_pos, "interval join (right concat)")?;
 
-    // Concat incoming batches for each side
-    let new_left = if left_batches.is_empty() {
-        None
-    } else {
-        let schema = left_batches[0].schema();
-        Some(
-            concat_batches(&schema, left_batches)
-                .map_err(|e| DbError::query_pipeline_arrow("interval join (left concat)", &e))?,
-        )
-    };
-
-    let new_right = if right_batches.is_empty() {
-        None
-    } else {
-        let schema = right_batches[0].schema();
-        Some(
-            concat_batches(&schema, right_batches)
-                .map_err(|e| DbError::query_pipeline_arrow("interval join (right concat)", &e))?,
-        )
-    };
-
-    // Record the boundary between old and new batches on each side
+    // Buffer before probing so every (batch_idx, row_idx) we produce already
+    // points into state.batches — lets flush_match_pairs run mid-probe
+    // without juggling in-flight batch references.
     let left_old_count = state.left.batches.len();
     let right_old_count = state.right.batches.len();
-
-    // Step 1: Buffer new right into state first (so new left can probe it)
     if let Some(ref rb) = new_right {
         state
             .right
             .add_batch(rb, &config.right_key, &config.right_time_column)?;
     }
-
-    // Collect match pairs: (left_batch_idx, left_row_idx, right_batch_idx, right_row_idx)
-    let mut match_pairs: Vec<(usize, usize, usize, usize)> = Vec::new();
-    let is_semi = config.join_type == StreamJoinType::LeftSemi;
-    // For Semi: track which new left rows already matched (at most one per left row)
-    let mut semi_matched: FxHashSet<usize> = FxHashSet::default();
-
-    // Step 2: Probe new left rows against all right (old + new)
-    if let Some(ref lb) = new_left {
-        let left_keys = extract_key_column(lb, &config.left_key)?;
-        let left_timestamps = extract_column_as_timestamps(lb, &config.left_time_column)?;
-
-        // The new left batch will be added at batch_idx = left_old_count
-        let new_left_batch_idx = left_old_count;
-
-        for (row_idx, &left_ts) in left_timestamps.iter().enumerate() {
-            if is_semi && semi_matched.contains(&row_idx) {
-                continue;
-            }
-            let Some(key_hash) = left_keys.hash_at(row_idx) else {
-                continue; // Skip null keys
-            };
-            let candidates = probe_index(&state.right.index, key_hash, left_ts, bound_ms);
-
-            for (r_batch, r_row) in candidates {
-                if is_semi && semi_matched.contains(&row_idx) {
-                    break;
-                }
-                let r_key_col =
-                    extract_key_column(&state.right.batches[r_batch], &config.right_key)?;
-                if left_keys.keys_equal(row_idx, &r_key_col, r_row) {
-                    match_pairs.push((new_left_batch_idx, row_idx, r_batch, r_row));
-                    if is_semi {
-                        semi_matched.insert(row_idx);
-                    }
-                }
-            }
-        }
-    }
-
-    // Step 3: Probe new right rows against OLD left rows only (avoid double-emit)
-    if let Some(ref rb) = new_right {
-        let right_keys = extract_key_column(rb, &config.right_key)?;
-        let right_timestamps = extract_column_as_timestamps(rb, &config.right_time_column)?;
-
-        let new_right_batch_idx = right_old_count;
-
-        for (row_idx, &right_ts) in right_timestamps.iter().enumerate() {
-            let Some(key_hash) = right_keys.hash_at(row_idx) else {
-                continue; // Skip null keys
-            };
-            let candidates = probe_index(&state.left.index, key_hash, right_ts, bound_ms);
-
-            for (l_batch, l_row) in candidates {
-                if l_batch < left_old_count {
-                    let l_key_col =
-                        extract_key_column(&state.left.batches[l_batch], &config.left_key)?;
-                    if right_keys.keys_equal(row_idx, &l_key_col, l_row) {
-                        match_pairs.push((l_batch, l_row, new_right_batch_idx, row_idx));
-                    }
-                }
-            }
-        }
-    }
-
-    // Step 4: Buffer new left rows into state (after probing to get correct indices)
     if let Some(ref lb) = new_left {
         state
             .left
             .add_batch(lb, &config.left_key, &config.left_time_column)?;
     }
+    let new_left_batch_idx = left_old_count;
+    let new_right_batch_idx = right_old_count;
 
-    // Determine or update output schema. Rebuild when both sides become available
-    // to ensure right-column suffixing is correct.
+    let left_only = matches!(
+        config.join_type,
+        StreamJoinType::LeftSemi | StreamJoinType::LeftAnti
+    );
+
+    // Refresh the output schema once both sides have been seen.
     {
         let left_schema = state.left.batches.first().map(RecordBatch::schema);
         let right_schema = state.right.batches.first().map(RecordBatch::schema);
         match (left_schema, right_schema) {
             (Some(ls), Some(rs)) => {
-                // Always set when both sides available (may upgrade a partial schema)
                 state.output_schema = Some(build_output_schema(&ls, &rs, config));
             }
-            (Some(ls), None)
-                if state.output_schema.is_none()
-                    && matches!(
-                        config.join_type,
-                        StreamJoinType::LeftSemi | StreamJoinType::LeftAnti
-                    ) =>
-            {
+            (Some(ls), None) if state.output_schema.is_none() && left_only => {
                 state.output_schema =
                     Some(build_output_schema(&ls, &Arc::new(Schema::empty()), config));
             }
@@ -585,101 +579,157 @@ pub(crate) fn execute_interval_join_cycle(
         }
     }
 
-    let left_only = matches!(
-        config.join_type,
-        StreamJoinType::LeftSemi | StreamJoinType::LeftAnti
-    );
+    let is_semi = config.join_type == StreamJoinType::LeftSemi;
+    let is_anti = config.join_type == StreamJoinType::LeftAnti;
+    let mut result: Vec<RecordBatch> = Vec::new();
 
-    // Step 5: Build output from match_pairs (Anti emits nothing here — only at eviction)
-    let mut result = if match_pairs.is_empty() || config.join_type == StreamJoinType::LeftAnti {
-        Vec::new()
-    } else {
-        let output_schema = state.output_schema.as_ref().ok_or_else(|| {
-            DbError::Pipeline("interval join: output schema not available".to_string())
-        })?;
-        let left_schema = state
+    // Borrow batches immutably for the probe; eviction below needs &mut so
+    // the cached key columns must drop first.
+    {
+        // One KeyColumn per buffered batch — saves a schema lookup +
+        // downcast per candidate inside the inner probe loops.
+        let left_key_cols: Vec<KeyColumn<'_>> = state
             .left
             .batches
-            .first()
-            .map_or_else(|| Arc::new(Schema::empty()), RecordBatch::schema);
+            .iter()
+            .map(|b| extract_key_column(b, &config.left_key))
+            .collect::<Result<_, _>>()?;
+        let right_key_cols: Vec<KeyColumn<'_>> = state
+            .right
+            .batches
+            .iter()
+            .map(|b| extract_key_column(b, &config.right_key))
+            .collect::<Result<_, _>>()?;
 
-        let num_rows = match_pairs.len();
-        let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
+        // Anti emits only at eviction; don't bother accumulating pairs we'll discard.
+        let collect_pairs = !is_anti;
+        let mut match_pairs: Vec<(usize, usize, usize, usize)> = Vec::new();
+        let mut semi_matched: FxHashSet<usize> = FxHashSet::default();
 
-        for col_idx in 0..left_schema.fields().len() {
-            let mut builder = Vec::with_capacity(num_rows);
-            for &(l_batch, l_row, _, _) in &match_pairs {
-                let array = state.left.batches[l_batch].column(col_idx);
-                let sliced = array.slice(l_row, 1);
-                builder.push(sliced);
+        let flush = |pairs: &mut Vec<_>, result: &mut Vec<RecordBatch>| {
+            if pairs.is_empty() {
+                return Ok(());
             }
-            let refs: Vec<&dyn Array> = builder.iter().map(AsRef::as_ref).collect();
-            let concatenated = arrow::compute::concat(&refs)
-                .map_err(|e| DbError::query_pipeline_arrow("interval join (left concat)", &e))?;
-            columns.push(concatenated);
-        }
+            let schema = state.output_schema.as_ref().ok_or_else(|| {
+                DbError::Pipeline("interval join: output schema not available".to_string())
+            })?;
+            flush_match_pairs(
+                pairs,
+                schema,
+                &state.left.batches,
+                &state.right.batches,
+                left_only,
+                result,
+            )
+        };
 
-        if !left_only {
-            let right_schema = state
-                .right
-                .batches
-                .first()
-                .map_or_else(|| Arc::new(Schema::empty()), RecordBatch::schema);
-            for col_idx in 0..right_schema.fields().len() {
-                let mut builder = Vec::with_capacity(num_rows);
-                for &(_, _, r_batch, r_row) in &match_pairs {
-                    let array = state.right.batches[r_batch].column(col_idx);
-                    let sliced = array.slice(r_row, 1);
-                    builder.push(sliced);
+        // Step 1: probe new left rows against all right (old + new).
+        if new_left.is_some() {
+            let lb_kc = &left_key_cols[new_left_batch_idx];
+            let lb_ts = extract_column_as_timestamps(
+                &state.left.batches[new_left_batch_idx],
+                &config.left_time_column,
+            )?;
+            for (row_idx, &left_ts) in lb_ts.iter().enumerate() {
+                if is_semi && semi_matched.contains(&row_idx) {
+                    continue;
                 }
-                let refs: Vec<&dyn Array> = builder.iter().map(AsRef::as_ref).collect();
-                let concatenated = arrow::compute::concat(&refs).map_err(|e| {
-                    DbError::query_pipeline_arrow("interval join (right concat)", &e)
-                })?;
-                columns.push(concatenated);
+                let Some(key_hash) = lb_kc.hash_at(row_idx) else {
+                    continue;
+                };
+                for (r_batch, r_row) in probe_index(&state.right.index, key_hash, left_ts, bound_ms)
+                {
+                    if is_semi && semi_matched.contains(&row_idx) {
+                        break;
+                    }
+                    if !lb_kc.keys_equal(row_idx, &right_key_cols[r_batch], r_row) {
+                        continue;
+                    }
+                    if collect_pairs {
+                        match_pairs.push((new_left_batch_idx, row_idx, r_batch, r_row));
+                        if match_pairs.len() >= EMIT_THRESHOLD {
+                            flush(&mut match_pairs, &mut result)?;
+                        }
+                    }
+                    if is_semi {
+                        semi_matched.insert(row_idx);
+                    }
+                }
             }
         }
 
-        let batch = RecordBatch::try_new(output_schema.clone(), columns)
-            .map_err(|e| DbError::query_pipeline_arrow("interval join (result)", &e))?;
-        if batch.num_rows() > 0 {
-            vec![batch]
-        } else {
-            Vec::new()
+        // Step 2: probe new right rows against OLD left rows only — new_left ×
+        // new_right pairs were already produced in step 1.
+        if new_right.is_some() {
+            let rb_kc = &right_key_cols[new_right_batch_idx];
+            let rb_ts = extract_column_as_timestamps(
+                &state.right.batches[new_right_batch_idx],
+                &config.right_time_column,
+            )?;
+            for (row_idx, &right_ts) in rb_ts.iter().enumerate() {
+                let Some(key_hash) = rb_kc.hash_at(row_idx) else {
+                    continue;
+                };
+                for (l_batch, l_row) in probe_index(&state.left.index, key_hash, right_ts, bound_ms)
+                {
+                    if l_batch >= left_old_count {
+                        continue;
+                    }
+                    if !rb_kc.keys_equal(row_idx, &left_key_cols[l_batch], l_row) {
+                        continue;
+                    }
+                    if collect_pairs {
+                        match_pairs.push((l_batch, l_row, new_right_batch_idx, row_idx));
+                        if match_pairs.len() >= EMIT_THRESHOLD {
+                            flush(&mut match_pairs, &mut result)?;
+                        }
+                    }
+                }
+            }
         }
-    };
 
-    // Step 5.5: For LEFT/RIGHT/FULL/ANTI, emit unmatched rows about to be evicted.
-    // Probe the opposite side's state — runs BEFORE eviction so all matches are available.
-    if matches!(
-        config.join_type,
-        StreamJoinType::Left | StreamJoinType::Full | StreamJoinType::LeftAnti
-    ) {
-        let left_cutoff = right_watermark.saturating_sub(bound_ms);
-        if left_cutoff > state.left_evicted_cutoff && !state.left.batches.is_empty() {
-            let unmatched = emit_unmatched_left_rows(state, config, left_cutoff, bound_ms)?;
-            if let Some(batch) = unmatched {
-                result.push(batch);
+        flush(&mut match_pairs, &mut result)?;
+
+        // Step 3: emit unmatched rows about to be evicted (LEFT/RIGHT/FULL/ANTI).
+        // Runs before eviction so the opposite side's state is still complete.
+        if matches!(
+            config.join_type,
+            StreamJoinType::Left | StreamJoinType::Full | StreamJoinType::LeftAnti
+        ) {
+            let left_cutoff = right_watermark.saturating_sub(bound_ms);
+            if left_cutoff > state.left_evicted_cutoff && !state.left.batches.is_empty() {
+                emit_unmatched_left_rows(
+                    state,
+                    &left_key_cols,
+                    &right_key_cols,
+                    config,
+                    left_cutoff,
+                    bound_ms,
+                    &mut result,
+                )?;
+            }
+        }
+        if matches!(
+            config.join_type,
+            StreamJoinType::Right | StreamJoinType::Full
+        ) {
+            let right_cutoff = left_watermark.saturating_sub(bound_ms);
+            if right_cutoff > state.right_evicted_cutoff && !state.right.batches.is_empty() {
+                emit_unmatched_right_rows(
+                    state,
+                    &left_key_cols,
+                    &right_key_cols,
+                    right_cutoff,
+                    bound_ms,
+                    &mut result,
+                )?;
             }
         }
     }
-    if matches!(
-        config.join_type,
-        StreamJoinType::Right | StreamJoinType::Full
-    ) {
-        let right_cutoff = left_watermark.saturating_sub(bound_ms);
-        if right_cutoff > state.right_evicted_cutoff && !state.right.batches.is_empty() {
-            let unmatched = emit_unmatched_right_rows(state, config, right_cutoff, bound_ms)?;
-            if let Some(batch) = unmatched {
-                result.push(batch);
-            }
-        }
-    }
 
-    // Step 6: Evict expired rows independently per side.
-    // A left row at ts can match right rows with ts in [left_ts - bound, left_ts + bound].
-    // Once the right watermark passes left_ts + bound, no future right row can match.
-    // So: evict left rows where ts < right_watermark - bound (and vice versa).
+    // Step 4: evict. A left row at ts can only still match right rows with
+    // ts in [left_ts - bound, left_ts + bound], so once the right watermark
+    // passes left_ts + bound it's safe to drop. Symmetric for right.
     let left_cutoff = right_watermark.saturating_sub(bound_ms);
     if left_cutoff > state.left_evicted_cutoff {
         state
@@ -698,16 +748,19 @@ pub(crate) fn execute_interval_join_cycle(
     Ok(result)
 }
 
-/// For LEFT/ANTI joins: emit left rows about to be evicted that have no match
-/// in the current right state. Called BEFORE right-side eviction.
+/// LEFT/ANTI: emit pre-eviction left rows with no match in current right state.
+/// Output is chunked at `EMIT_THRESHOLD` rows.
 fn emit_unmatched_left_rows(
     state: &IntervalJoinState,
+    left_key_cols: &[KeyColumn<'_>],
+    right_key_cols: &[KeyColumn<'_>],
     config: &StreamJoinConfig,
     left_cutoff: i64,
     bound_ms: i64,
-) -> Result<Option<RecordBatch>, DbError> {
+    out: &mut Vec<RecordBatch>,
+) -> Result<(), DbError> {
     let Some(output_schema) = state.output_schema.as_ref() else {
-        return Ok(None);
+        return Ok(());
     };
 
     let left_only = matches!(
@@ -721,11 +774,10 @@ fn emit_unmatched_left_rows(
         for (&ts, entries) in btree.range(..left_cutoff) {
             for &(batch_idx, row_idx) in entries {
                 let candidates = probe_index(&state.right.index, key_hash, ts, bound_ms);
-                let left_key =
-                    extract_key_column(&state.left.batches[batch_idx], &config.left_key)?;
+                let left_key = &left_key_cols[batch_idx];
                 let has_match = candidates.iter().any(|&(rb, rr)| {
-                    extract_key_column(&state.right.batches[rb], &config.right_key)
-                        .is_ok_and(|rk| left_key.keys_equal(row_idx, &rk, rr))
+                    let rk = &right_key_cols[rb];
+                    left_key.keys_equal(row_idx, rk, rr)
                 });
                 if !has_match {
                     unmatched_left.push((batch_idx, row_idx));
@@ -735,59 +787,67 @@ fn emit_unmatched_left_rows(
     }
 
     if unmatched_left.is_empty() {
-        return Ok(None);
+        return Ok(());
     }
 
-    let left_schema = state
+    let left_field_count = state
         .left
         .batches
         .first()
-        .map_or_else(|| Arc::new(Schema::empty()), RecordBatch::schema);
-
-    let num_rows = unmatched_left.len();
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
-
-    for col_idx in 0..left_schema.fields().len() {
-        let mut builder = Vec::with_capacity(num_rows);
-        for &(batch_idx, row_idx) in &unmatched_left {
-            let array = state.left.batches[batch_idx].column(col_idx);
-            builder.push(array.slice(row_idx, 1));
-        }
-        let refs: Vec<&dyn Array> = builder.iter().map(AsRef::as_ref).collect();
-        let concatenated = arrow::compute::concat(&refs)
-            .map_err(|e| DbError::query_pipeline_arrow("interval join (unmatched left)", &e))?;
-        columns.push(concatenated);
-    }
-
-    if !left_only {
-        let right_schema = state
+        .map_or(0, RecordBatch::num_columns);
+    let right_field_count = if left_only {
+        0
+    } else {
+        state
             .right
             .batches
             .first()
-            .map_or_else(|| Arc::new(Schema::empty()), RecordBatch::schema);
-        for col_idx in 0..right_schema.fields().len() {
-            let dt = output_schema
-                .field(left_schema.fields().len() + col_idx)
-                .data_type();
+            .map_or(0, RecordBatch::num_columns)
+    };
+
+    for chunk in unmatched_left.chunks(EMIT_THRESHOLD) {
+        let num_rows = chunk.len();
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
+
+        for col_idx in 0..left_field_count {
+            let arrays: Vec<&dyn Array> = state
+                .left
+                .batches
+                .iter()
+                .map(|b| b.column(col_idx).as_ref())
+                .collect();
+            let arr = arrow::compute::interleave(&arrays, chunk).map_err(|e| {
+                DbError::query_pipeline_arrow("interval join (unmatched left interleave)", &e)
+            })?;
+            columns.push(arr);
+        }
+
+        for col_idx in 0..right_field_count {
+            let dt = output_schema.field(left_field_count + col_idx).data_type();
             columns.push(arrow::array::new_null_array(dt, num_rows));
         }
-    }
 
-    RecordBatch::try_new(output_schema.clone(), columns)
-        .map(|b| if b.num_rows() > 0 { Some(b) } else { None })
-        .map_err(|e| DbError::query_pipeline_arrow("interval join (unmatched result)", &e))
+        let batch = RecordBatch::try_new(output_schema.clone(), columns).map_err(|e| {
+            DbError::query_pipeline_arrow("interval join (unmatched left result)", &e)
+        })?;
+        if batch.num_rows() > 0 {
+            out.push(batch);
+        }
+    }
+    Ok(())
 }
 
-/// For RIGHT/FULL joins: emit right rows about to be evicted that have no match
-/// in the current left state. Symmetric to `emit_unmatched_left_rows`.
+/// RIGHT/FULL: symmetric to `emit_unmatched_left_rows`.
 fn emit_unmatched_right_rows(
     state: &IntervalJoinState,
-    config: &StreamJoinConfig,
+    left_key_cols: &[KeyColumn<'_>],
+    right_key_cols: &[KeyColumn<'_>],
     right_cutoff: i64,
     bound_ms: i64,
-) -> Result<Option<RecordBatch>, DbError> {
+    out: &mut Vec<RecordBatch>,
+) -> Result<(), DbError> {
     let Some(output_schema) = state.output_schema.as_ref() else {
-        return Ok(None);
+        return Ok(());
     };
 
     let mut unmatched_right: Vec<(usize, usize)> = Vec::new();
@@ -796,11 +856,10 @@ fn emit_unmatched_right_rows(
         for (&ts, entries) in btree.range(..right_cutoff) {
             for &(batch_idx, row_idx) in entries {
                 let candidates = probe_index(&state.left.index, key_hash, ts, bound_ms);
-                let right_key =
-                    extract_key_column(&state.right.batches[batch_idx], &config.right_key)?;
+                let right_key = &right_key_cols[batch_idx];
                 let has_match = candidates.iter().any(|&(lb, lr)| {
-                    extract_key_column(&state.left.batches[lb], &config.left_key)
-                        .is_ok_and(|lk| right_key.keys_equal(row_idx, &lk, lr))
+                    let lk = &left_key_cols[lb];
+                    right_key.keys_equal(row_idx, lk, lr)
                 });
                 if !has_match {
                     unmatched_right.push((batch_idx, row_idx));
@@ -810,43 +869,50 @@ fn emit_unmatched_right_rows(
     }
 
     if unmatched_right.is_empty() {
-        return Ok(None);
+        return Ok(());
     }
 
-    let left_schema = state
+    let left_field_count = state
         .left
         .batches
         .first()
-        .map_or_else(|| Arc::new(Schema::empty()), RecordBatch::schema);
-    let right_schema = state
+        .map_or(0, RecordBatch::num_columns);
+    let right_field_count = state
         .right
         .batches
         .first()
-        .map_or_else(|| Arc::new(Schema::empty()), RecordBatch::schema);
+        .map_or(0, RecordBatch::num_columns);
 
-    let num_rows = unmatched_right.len();
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
+    for chunk in unmatched_right.chunks(EMIT_THRESHOLD) {
+        let num_rows = chunk.len();
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(output_schema.fields().len());
 
-    for col_idx in 0..left_schema.fields().len() {
-        let dt = output_schema.field(col_idx).data_type();
-        columns.push(arrow::array::new_null_array(dt, num_rows));
-    }
-
-    for col_idx in 0..right_schema.fields().len() {
-        let mut builder = Vec::with_capacity(num_rows);
-        for &(batch_idx, row_idx) in &unmatched_right {
-            let array = state.right.batches[batch_idx].column(col_idx);
-            builder.push(array.slice(row_idx, 1));
+        for col_idx in 0..left_field_count {
+            let dt = output_schema.field(col_idx).data_type();
+            columns.push(arrow::array::new_null_array(dt, num_rows));
         }
-        let refs: Vec<&dyn Array> = builder.iter().map(AsRef::as_ref).collect();
-        let concatenated = arrow::compute::concat(&refs)
-            .map_err(|e| DbError::query_pipeline_arrow("interval join (unmatched right)", &e))?;
-        columns.push(concatenated);
-    }
 
-    RecordBatch::try_new(output_schema.clone(), columns)
-        .map(|b| if b.num_rows() > 0 { Some(b) } else { None })
-        .map_err(|e| DbError::query_pipeline_arrow("interval join (unmatched right result)", &e))
+        for col_idx in 0..right_field_count {
+            let arrays: Vec<&dyn Array> = state
+                .right
+                .batches
+                .iter()
+                .map(|b| b.column(col_idx).as_ref())
+                .collect();
+            let arr = arrow::compute::interleave(&arrays, chunk).map_err(|e| {
+                DbError::query_pipeline_arrow("interval join (unmatched right interleave)", &e)
+            })?;
+            columns.push(arr);
+        }
+
+        let batch = RecordBatch::try_new(output_schema.clone(), columns).map_err(|e| {
+            DbError::query_pipeline_arrow("interval join (unmatched right result)", &e)
+        })?;
+        if batch.num_rows() > 0 {
+            out.push(batch);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1269,6 +1335,75 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 1);
         assert_eq!(result[0].num_columns(), 3); // Left columns only
+    }
+
+    #[test]
+    fn test_remove_by_key_ts_propagates_extraction_error() {
+        // Buffer one row, then call remove_by_key_ts with a key column name
+        // that does not exist on the buffered batch. Pre-fix this returned
+        // Ok(()) silently because `map_or(true, ...)` retained the row on
+        // extraction failure, leaving phantom state.
+        let mut side = SideState::new();
+        let batch = left_batch(&["A"], &[100], &[1.0]);
+        side.add_batch(&batch, "id", "ts").unwrap();
+
+        // Probe key extracted from a "delete" batch that happens to have an `id` column.
+        let del = left_batch(&["A"], &[100], &[1.0]);
+        let del_keys = extract_key_column(&del, "id").unwrap();
+        let kh = del_keys.hash_at(0).unwrap();
+
+        // Buffered batch has no column called "missing" — extraction must fail.
+        let err = side.remove_by_key_ts(kh, 100, &del_keys, 0, "missing");
+        assert!(err.is_err(), "extraction failure must propagate");
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+    fn test_match_pairs_bounded_partial_emit_on_cross_product() {
+        // Adversarial shape: every left × every right matches (single key,
+        // wide bound, all timestamps within tolerance). Must emit multiple
+        // batches each ≤ EMIT_THRESHOLD rows, never accumulate all M·N pairs.
+        let config = StreamJoinConfig {
+            left_key: "id".to_string(),
+            right_key: "id".to_string(),
+            left_time_column: "ts".to_string(),
+            right_time_column: "ts".to_string(),
+            left_table: "left_stream".to_string(),
+            right_table: "right_stream".to_string(),
+            time_bound: Duration::from_millis(1_000_000),
+            join_type: StreamJoinType::Inner,
+        };
+        let mut state = IntervalJoinState::new();
+
+        // 300 × 300 = 90,000 pairs > 65,536 threshold → at least 2 output batches.
+        let m = 300usize;
+        let ids_l: Vec<&str> = (0..m).map(|_| "K").collect();
+        let ts_l: Vec<i64> = (0..m).map(|i| i as i64).collect();
+        let v_l: Vec<f64> = (0..m).map(|i| i as f64).collect();
+        let left = left_batch(&ids_l, &ts_l, &v_l);
+
+        let ids_r: Vec<&str> = (0..m).map(|_| "K").collect();
+        let ts_r: Vec<i64> = (0..m).map(|i| i as i64).collect();
+        let v_r: Vec<f64> = (0..m).map(|i| i as f64).collect();
+        let right = right_batch(&ids_r, &ts_r, &v_r);
+
+        let result =
+            execute_interval_join_cycle(&mut state, &[left], &[right], &config, 0, 0).unwrap();
+
+        let total: usize = result.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, m * m, "every pair must appear exactly once");
+        assert!(
+            result.len() >= 2,
+            "expected partial emits across multiple batches, got {}",
+            result.len()
+        );
+        for b in &result {
+            assert!(
+                b.num_rows() <= EMIT_THRESHOLD,
+                "partial batch exceeded EMIT_THRESHOLD: {}",
+                b.num_rows()
+            );
+        }
     }
 
     #[test]
