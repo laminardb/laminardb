@@ -25,7 +25,7 @@ use crate::parser::aggregation_parser::analyze_aggregates;
 use crate::parser::analytic_parser::{
     analyze_analytic_functions, analyze_window_frames, FrameBound,
 };
-use crate::parser::join_parser::analyze_joins;
+use crate::parser::join_parser::{analyze_joins, MultiJoinAnalysis};
 use crate::parser::lookup_table::{validate_properties, LookupTableProperties};
 use crate::parser::order_analyzer::analyze_order_by;
 use crate::parser::{
@@ -258,7 +258,6 @@ impl StreamingPlanner {
     }
 
     /// Plans a CREATE CONTINUOUS QUERY statement.
-    #[allow(clippy::unused_self)] // Will use planner state for query registration
     fn plan_continuous_query(
         &mut self,
         name: &ObjectName,
@@ -276,7 +275,7 @@ impl StreamingPlanner {
         };
 
         // Analyze the query for streaming features
-        let query_plan = Self::analyze_query(&stmt, emit_clause)?;
+        let query_plan = self.analyze_query(&stmt, emit_clause)?;
 
         Ok(StreamingPlan::Query(QueryPlan {
             name: Some(object_name_to_string(name)),
@@ -304,6 +303,10 @@ impl StreamingPlanner {
                 let join_analysis = analyze_joins(select).map_err(|e| {
                     PlanningError::InvalidQuery(format!("Join analysis failed: {e}"))
                 })?;
+
+                if let Some(ref multi) = join_analysis {
+                    reject_unbounded_streaming_join(multi, &self.lookup_tables)?;
+                }
 
                 // Check for ORDER BY
                 let order_analysis = analyze_order_by(stmt);
@@ -377,6 +380,7 @@ impl StreamingPlanner {
 
     /// Analyzes a query for streaming features.
     fn analyze_query(
+        &self,
         stmt: &Statement,
         emit_clause: Option<&EmitClause>,
     ) -> Result<QueryAnalysis, PlanningError> {
@@ -403,6 +407,7 @@ impl StreamingPlanner {
                 if let Some(multi) = analyze_joins(select).map_err(|e| {
                     PlanningError::InvalidQuery(format!("Join analysis failed: {e}"))
                 })? {
+                    reject_unbounded_streaming_join(&multi, &self.lookup_tables)?;
                     analysis.join_config = Some(JoinOperatorConfig::from_multi_analysis(&multi));
                 }
             }
@@ -622,6 +627,28 @@ fn object_name_to_string(name: &ObjectName) -> String {
     name.to_string()
 }
 
+/// Reject unbounded joins between two streaming sources.
+fn reject_unbounded_streaming_join(
+    multi: &MultiJoinAnalysis,
+    lookup_tables: &HashMap<String, LookupTableInfo>,
+) -> Result<(), PlanningError> {
+    for step in &multi.joins {
+        if step.is_bounded() {
+            continue;
+        }
+        let left_lookup = lookup_tables.contains_key(&step.left_table);
+        let right_lookup = lookup_tables.contains_key(&step.right_table);
+        if !left_lookup && !right_lookup {
+            return Err(PlanningError::InvalidQuery(format!(
+                "unbounded join between streaming sources '{}' and '{}'; \
+                 add a temporal predicate or use a lookup table",
+                step.left_table, step.right_table,
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Planning errors
 #[derive(Debug, thiserror::Error)]
 pub enum PlanningError {
@@ -817,7 +844,8 @@ mod tests {
     fn test_plan_query_with_join() {
         let mut planner = StreamingPlanner::new();
         let statements = StreamingParser::parse_sql(
-            "SELECT * FROM orders o JOIN payments p ON o.order_id = p.order_id",
+            "SELECT * FROM orders o JOIN payments p ON o.order_id = p.order_id \
+             AND p.ts BETWEEN o.ts AND o.ts + INTERVAL '1' HOUR",
         )
         .unwrap();
 
@@ -832,6 +860,19 @@ mod tests {
             }
             _ => panic!("Expected Query plan"),
         }
+    }
+
+    #[test]
+    fn test_plan_rejects_unbounded_streaming_join() {
+        let mut planner = StreamingPlanner::new();
+        let statements = StreamingParser::parse_sql(
+            "SELECT * FROM orders o JOIN payments p ON o.order_id = p.order_id",
+        )
+        .unwrap();
+        let err = planner.plan(&statements[0]).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("unbounded join"), "got: {msg}");
+        assert!(msg.contains("lookup table"), "got: {msg}");
     }
 
     #[test]
@@ -962,8 +1003,11 @@ mod tests {
     #[test]
     fn test_plan_single_join_produces_vec_of_one() {
         let mut planner = StreamingPlanner::new();
-        let statements =
-            StreamingParser::parse_sql("SELECT * FROM a JOIN b ON a.id = b.a_id").unwrap();
+        let statements = StreamingParser::parse_sql(
+            "SELECT * FROM a JOIN b ON a.id = b.a_id \
+             AND b.ts BETWEEN a.ts AND a.ts + INTERVAL '1' HOUR",
+        )
+        .unwrap();
 
         let plan = planner.plan(&statements[0]).unwrap();
         match plan {
@@ -979,7 +1023,10 @@ mod tests {
     fn test_plan_two_way_join() {
         let mut planner = StreamingPlanner::new();
         let statements = StreamingParser::parse_sql(
-            "SELECT * FROM a JOIN b ON a.id = b.a_id JOIN c ON b.id = c.b_id",
+            "SELECT * FROM a JOIN b ON a.id = b.a_id \
+                 AND b.ts BETWEEN a.ts AND a.ts + INTERVAL '1' HOUR \
+             JOIN c ON b.id = c.b_id \
+                 AND c.ts BETWEEN b.ts AND b.ts + INTERVAL '1' HOUR",
         )
         .unwrap();
 
@@ -1000,6 +1047,16 @@ mod tests {
     #[test]
     fn test_plan_mixed_join_types() {
         let mut planner = StreamingPlanner::new();
+        // The second JOIN here would be unbounded if `customers` were a
+        // streaming source. Register it as a lookup table so the rejection
+        // rule passes.
+        let _ = planner.plan(
+            &StreamingParser::parse_sql(
+                "CREATE LOOKUP TABLE customers (id BIGINT NOT NULL, name VARCHAR, \
+                 PRIMARY KEY (id)) WITH (connector = 'parquet', path = '/tmp/x.parquet')",
+            )
+            .unwrap()[0],
+        );
         let statements = StreamingParser::parse_sql(
             "SELECT * FROM orders o \
              JOIN payments p ON o.id = p.order_id \
