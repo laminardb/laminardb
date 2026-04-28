@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
@@ -1486,6 +1486,24 @@ fn build_stream_join_projection_sql(
     let has_residual = select.from.len() == 1 && select.from[0].joins.len() > 1;
     let tmp_qual: Option<&str> = has_residual.then_some("__interval_tmp");
 
+    // Count natural-name occurrences so colliding projections (`p.type`,
+    // `a.type`) can be aliased as `{qual}_{col}` instead of duplicate `type`.
+    let mut natural_counts: FxHashMap<String, usize> = FxHashMap::default();
+    if has_residual {
+        for item in &select.projection {
+            if let SelectItem::UnnamedExpr(expr) = item {
+                let n = match expr {
+                    Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
+                    Expr::Identifier(ident) => Some(ident.value.clone()),
+                    _ => None,
+                };
+                if let Some(n) = n {
+                    *natural_counts.entry(n).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
     let items: Vec<String> = select
         .projection
         .iter()
@@ -1493,20 +1511,25 @@ fn build_stream_join_projection_sql(
             SelectItem::UnnamedExpr(expr) => {
                 let rewritten =
                     rewrite_stream_join_expr(expr, left_alias, right_alias, config, tmp_qual);
-                // With residual joins we prefix step-0 cols with
-                // `__interval_tmp.`; alias back to the natural column name
-                // so DataFusion's projection labels stay user-visible.
-                // TODO: self-joins on a residual chain (`SELECT p.type, a.type
-                // FROM p JOIN a ... JOIN c ...`) still collide on the natural
-                // name. The fix is collision-aware aliasing — only emit `AS n`
-                // when no other rewritten projection produces the same `n`.
+                // Alias back to the natural column name so projection labels
+                // stay user-visible. On self-join collisions, fall back to
+                // `{qual}_{col}` so output names stay unique.
                 if has_residual {
-                    let natural = match expr {
-                        Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
-                        Expr::Identifier(ident) => Some(ident.value.clone()),
-                        _ => None,
+                    let (qual, natural) = match expr {
+                        Expr::CompoundIdentifier(parts) if parts.len() == 2 => (
+                            Some(parts[0].value.clone()),
+                            Some(parts[1].value.clone()),
+                        ),
+                        Expr::Identifier(ident) => (None, Some(ident.value.clone())),
+                        _ => (None, None),
                     };
                     if let Some(n) = natural {
+                        let collides = natural_counts.get(&n).copied().unwrap_or(0) > 1;
+                        if collides {
+                            if let Some(q) = qual {
+                                return format!("{rewritten} AS {q}_{n}");
+                            }
+                        }
                         if rewritten != n {
                             return format!("{rewritten} AS {n}");
                         }
@@ -1541,11 +1564,10 @@ fn build_stream_join_projection_sql(
         String::new()
     };
 
-    // IntervalJoin matches symmetrically; BETWEEN is directional. The
-    // upper bound is already enforced by the time bound; only `right_ts >=
-    // left_ts` needs to be added here.
-    // TODO(interval-rewriter): remove once `INTERVAL +` against BIGINT is
-    // normalised in the analyzer rule (memory/interval-rewriter-timestamp-plan.md).
+    // IntervalJoin matches symmetrically (`|left_ts - right_ts| <= N`) but
+    // BETWEEN is directional (`right_ts >= left_ts AND right_ts <= left_ts +
+    // N`). The upper bound is already covered by the symmetric tolerance; we
+    // add `right_ts >= left_ts` here to enforce the lower bound.
     let directional_filter = if !config.left_time_column.is_empty()
         && !config.right_time_column.is_empty()
     {
@@ -2152,6 +2174,37 @@ mod self_join_filter_tests {
         assert!(
             d.projection_sql.contains("WHERE"),
             "LEFT JOIN must keep right predicate in WHERE: {}",
+            d.projection_sql
+        );
+    }
+
+    #[test]
+    fn test_residual_self_join_aliases_collisions() {
+        // `p.type` and `a.type` both rewrite to step-0 columns and would
+        // otherwise alias to `AS type` twice. Collision-aware aliasing
+        // must emit `AS p_type` / `AS a_type` so output names stay unique.
+        let d = detect_stream_join_query(
+            "SELECT p.type, a.type, p.key FROM events p \
+             JOIN events a ON p.key = a.key \
+             AND a.ts BETWEEN p.ts AND p.ts + INTERVAL '10' SECOND \
+             JOIN dim d ON d.key = p.key",
+        )
+        .expect("should detect self-join");
+
+        assert!(
+            d.projection_sql.contains("AS p_type"),
+            "expected `AS p_type`, got: {}",
+            d.projection_sql
+        );
+        assert!(
+            d.projection_sql.contains("AS a_type"),
+            "expected `AS a_type`, got: {}",
+            d.projection_sql
+        );
+        // Non-colliding `p.key` keeps the natural-name alias.
+        assert!(
+            d.projection_sql.contains("AS key"),
+            "non-colliding `p.key` should still alias to `key`: {}",
             d.projection_sql
         );
     }
