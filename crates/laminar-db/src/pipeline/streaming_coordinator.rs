@@ -73,9 +73,13 @@ struct SourceHandle {
     join: tokio::task::JoinHandle<()>,
     /// Injector for Chandy-Lamport checkpoint barriers.
     barrier_injector: CheckpointBarrierInjector,
-    /// Latest committed epoch; source acks on pickup. Monotonic, so
-    /// watch's skip-latest semantics are safe.
-    epoch_committed_tx: tokio::sync::watch::Sender<Option<u64>>,
+    /// Latest committed `(epoch, persisted-checkpoint)`. The checkpoint is
+    /// the per-source `SourceCheckpoint` that was actually written to the
+    /// manifest for `epoch` — sources rebuild downstream offset state
+    /// (Kafka group offsets, NATS acks, etc.) from this exact value
+    /// rather than from `self.offsets`, which may have advanced past
+    /// the durability cut. Empty for timer-driven commits.
+    epoch_committed_tx: tokio::sync::watch::Sender<Option<(u64, SourceCheckpoint)>>,
 }
 
 /// Simplified pipeline coordinator — single tokio task, no core threads.
@@ -160,15 +164,26 @@ const IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 /// What woke a source task's select loop.
 enum SourceWake {
     Shutdown,
-    EpochCommitted(u64),
+    EpochCommitted(u64, SourceCheckpoint),
     Polled(Result<Option<SourceBatch>, ConnectorError>),
 }
 
 impl StreamingCoordinator {
-    /// Fan out a committed epoch to every source so they can ack.
-    fn broadcast_epoch_committed(&self, epoch: u64) {
+    /// Fan out a committed epoch to every source so they can ack. Each
+    /// source receives the per-source checkpoint that was persisted into
+    /// the manifest for `epoch`, or an empty checkpoint when no per-source
+    /// state was captured (timer-driven commits).
+    fn broadcast_epoch_committed(
+        &self,
+        epoch: u64,
+        per_source: &FxHashMap<String, SourceCheckpoint>,
+    ) {
         for handle in &self.source_handles {
-            let _ = handle.epoch_committed_tx.send(Some(epoch));
+            let cp = per_source
+                .get(handle.name.as_ref())
+                .cloned()
+                .unwrap_or_else(|| SourceCheckpoint::new(epoch));
+            let _ = handle.epoch_committed_tx.send(Some((epoch, cp)));
         }
     }
 
@@ -259,7 +274,7 @@ impl StreamingCoordinator {
             let barrier_handle = barrier_injector.handle();
 
             let (epoch_committed_tx, mut epoch_committed_rx) =
-                tokio::sync::watch::channel::<Option<u64>>(None);
+                tokio::sync::watch::channel::<Option<(u64, SourceCheckpoint)>>(None);
 
             let join = tokio::spawn(async move {
                 let mut epoch: u64 = 0;
@@ -271,9 +286,12 @@ impl StreamingCoordinator {
                         biased;
                         () = task_shutdown_clone.notified() => SourceWake::Shutdown,
                         r = epoch_committed_rx.changed() => match r {
-                            Ok(()) => match *epoch_committed_rx.borrow_and_update() {
-                                Some(e) => SourceWake::EpochCommitted(e),
-                                None => continue,
+                            Ok(()) => {
+                                let snapshot = epoch_committed_rx.borrow_and_update().clone();
+                                match snapshot {
+                                    Some((e, cp)) => SourceWake::EpochCommitted(e, cp),
+                                    None => continue,
+                                }
                             },
                             Err(_) => SourceWake::Shutdown,
                         },
@@ -282,8 +300,8 @@ impl StreamingCoordinator {
 
                     let poll_result = match wake {
                         SourceWake::Shutdown => break,
-                        SourceWake::EpochCommitted(e) => {
-                            if let Err(err) = connector.notify_epoch_committed(e).await {
+                        SourceWake::EpochCommitted(e, cp) => {
+                            if let Err(err) = connector.notify_epoch_committed(e, &cp).await {
                                 tracing::warn!(
                                     source = %src_name,
                                     error = %err,
@@ -685,9 +703,12 @@ impl StreamingCoordinator {
                     })
                 })
                 .collect();
-            if let Some(epoch) = callback.maybe_checkpoint(true, source_offsets).await {
+            if let Some(epoch) = callback
+                .maybe_checkpoint(true, source_offsets.clone())
+                .await
+            {
                 tracing::info!(epoch, "final checkpoint completed before shutdown");
-                self.broadcast_epoch_committed(epoch);
+                self.broadcast_epoch_committed(epoch, &source_offsets);
             }
         }
     }
@@ -800,8 +821,13 @@ impl StreamingCoordinator {
         // Check if all sources aligned.
         if self.pending_barrier.sources_aligned.len() >= self.pending_barrier.sources_total {
             let checkpoints = std::mem::take(&mut self.pending_barrier.source_checkpoints);
+            // Clone for fan-out — `checkpoint_with_barrier` consumes the
+            // map. The fan-out passes each source the exact `SourceCheckpoint`
+            // that was persisted, so external offset state (Kafka group
+            // offsets, ack tokens) advances only with the durable manifest.
+            let fan_out = checkpoints.clone();
             if let Some(epoch) = callback.checkpoint_with_barrier(checkpoints).await {
-                self.broadcast_epoch_committed(epoch);
+                self.broadcast_epoch_committed(epoch, &fan_out);
             } else {
                 tracing::warn!(
                     checkpoint_id = self.pending_barrier.checkpoint_id,
@@ -832,7 +858,8 @@ impl StreamingCoordinator {
         // configured in the tests that drive `db.checkpoint()` manually).
         let offsets = FxHashMap::default();
         if let Some(epoch) = callback.maybe_checkpoint(false, offsets).await {
-            self.broadcast_epoch_committed(epoch);
+            // Timer-driven follower path — no per-source state captured.
+            self.broadcast_epoch_committed(epoch, &FxHashMap::default());
         }
 
         let should_checkpoint = self
@@ -853,7 +880,7 @@ impl StreamingCoordinator {
             let offsets = FxHashMap::default();
             if let Some(epoch) = callback.maybe_checkpoint(false, offsets).await {
                 self.last_checkpoint = Instant::now();
-                self.broadcast_epoch_committed(epoch);
+                self.broadcast_epoch_committed(epoch, &FxHashMap::default());
             }
             return;
         }

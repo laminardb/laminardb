@@ -101,19 +101,15 @@ pub struct LaminarConsumerContext {
     /// partitions for backpressure. On `Assign`, newly assigned partitions
     /// must be re-paused if this flag is true.
     reader_paused: Arc<AtomicBool>,
-    /// Set by `commit_callback` on broker rejection; reader task escalates
-    /// to `CommitMode::Sync` on the next timer tick.
-    commit_retry_needed: Arc<AtomicBool>,
     /// Snapshot of consumed offsets, updated once per `poll_batch()` cycle.
     /// Read on Assign to seek newly assigned partitions to last-consumed
     /// offset + 1, preventing duplicates after broker failures.
     offset_snapshot: Arc<Mutex<super::offsets::OffsetTracker>>,
-    /// Counter bumped on every broker-confirmed async commit. The immediate
-    /// return from `CommitMode::Async` only means "queued"; the real
-    /// outcome arrives here via `commit_callback`, so this is the
-    /// authoritative success counter for async commits.
+    /// Counter bumped on every broker-confirmed commit. The on-checkpoint
+    /// commit path issues `CommitMode::Sync`, so this is the authoritative
+    /// success counter — `commit_callback` still fires for sync commits.
     commits_counter: IntCounter,
-    /// Counter bumped when the broker rejects an async commit.
+    /// Counter bumped when the broker rejects a commit.
     commit_failures_counter: IntCounter,
 }
 
@@ -127,7 +123,6 @@ impl LaminarConsumerContext {
         rebalance_metric: Arc<AtomicU64>,
         revoke_generation: Arc<AtomicU64>,
         reader_paused: Arc<AtomicBool>,
-        commit_retry_needed: Arc<AtomicBool>,
         offset_snapshot: Arc<Mutex<super::offsets::OffsetTracker>>,
         commits_counter: IntCounter,
         commit_failures_counter: IntCounter,
@@ -139,7 +134,6 @@ impl LaminarConsumerContext {
             rebalance_metric,
             revoke_generation,
             reader_paused,
-            commit_retry_needed,
             offset_snapshot,
             commits_counter,
             commit_failures_counter,
@@ -246,11 +240,10 @@ impl ConsumerContext for LaminarConsumerContext {
             }
             Err(e) => {
                 self.commit_failures_counter.inc();
-                self.commit_retry_needed.store(true, Ordering::Release);
                 warn!(
                     error = %e,
                     partition_count = offsets.count(),
-                    "broker offset commit failed — scheduling sync retry"
+                    "broker offset commit failed (callback)"
                 );
             }
         }
@@ -394,7 +387,6 @@ mod tests {
         let metric = Arc::new(AtomicU64::new(0));
         let revoke_gen = Arc::new(AtomicU64::new(0));
         let reader_paused = Arc::new(AtomicBool::new(false));
-        let commit_retry = Arc::new(AtomicBool::new(false));
         let offset_snapshot = Arc::new(Mutex::new(super::super::offsets::OffsetTracker::new()));
         let commits = IntCounter::new("test_commits", "test").unwrap();
         let commit_failures = IntCounter::new("test_commit_failures", "test").unwrap();
@@ -404,7 +396,6 @@ mod tests {
             metric,
             revoke_gen,
             reader_paused,
-            commit_retry,
             offset_snapshot,
             commits,
             commit_failures,

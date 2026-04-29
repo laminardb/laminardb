@@ -177,7 +177,11 @@ impl SourceConnector for MockSourceConnector {
         Ok(())
     }
 
-    async fn notify_epoch_committed(&mut self, epoch: u64) -> Result<(), ConnectorError> {
+    async fn notify_epoch_committed(
+        &mut self,
+        epoch: u64,
+        _checkpoint: &SourceCheckpoint,
+    ) -> Result<(), ConnectorError> {
         self.committed_epochs.lock().push(epoch);
         Ok(())
     }

@@ -437,7 +437,11 @@ async fn consumer_lag_settles_to_zero_after_drain() {
         .expect("source open");
 
     drain_rows(&mut source, 5, Duration::from_secs(5)).await;
-    source.notify_epoch_committed(1).await.expect("commit acks");
+    let cp = laminar_connectors::checkpoint::SourceCheckpoint::new(1);
+    source
+        .notify_epoch_committed(1, &cp)
+        .await
+        .expect("commit acks");
 
     let lag_after = poll_gauge_until(&source, "consumer_lag", |v| v == 0, Duration::from_secs(3))
         .await
@@ -691,8 +695,9 @@ async fn source_redelivers_when_epoch_not_committed() {
         first, second,
         "expected the same messages redelivered after no-commit close"
     );
+    let cp = laminar_connectors::checkpoint::SourceCheckpoint::new(1);
     source
-        .notify_epoch_committed(1)
+        .notify_epoch_committed(1, &cp)
         .await
         .expect("epoch commit acks");
     source.close().await.expect("source 2 close");
