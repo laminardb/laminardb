@@ -591,11 +591,6 @@ pub struct KafkaSourceConfig {
     /// durable epoch (no skip-ahead window).
     pub broker_commit_on_checkpoint: bool,
 
-    /// Per-commit FFI deadline (default: 5s). The hook is fire-and-forget;
-    /// this bounds how long the dedicated commit task waits before logging
-    /// a failure and dropping the request.
-    pub broker_commit_timeout: Duration,
-
     // -- Backpressure --
     /// Capacity of the bounded channel between the background Kafka reader
     /// task and `poll_batch()` (default: 1024). Must be >= `max_poll_records`.
@@ -684,7 +679,6 @@ impl Default for KafkaSourceConfig {
             max_poll_interval: Duration::from_secs(600),
             queued_max_messages_kbytes: 16384,
             broker_commit_on_checkpoint: true,
-            broker_commit_timeout: Duration::from_secs(5),
             reader_channel_capacity: 1024,
             backpressure_high_watermark: 0.8,
             backpressure_low_watermark: 0.5,
@@ -897,18 +891,14 @@ impl KafkaSourceConfig {
         {
             return Err(ConnectorError::ConfigurationError(
                 "broker.commit.interval.ms is no longer supported — broker offset \
-                 commits now happen on checkpoint completion. Use \
-                 broker.commit.timeout.ms to bound a single commit's duration, \
-                 or broker.commit.on.checkpoint=false to disable."
+                 commits now happen on checkpoint completion. Set \
+                 broker.commit.on.checkpoint=false to disable."
                     .into(),
             ));
         }
         let broker_commit_on_checkpoint = config
             .get_parsed::<bool>("broker.commit.on.checkpoint")?
             .unwrap_or(true);
-        let broker_commit_timeout_ms = config
-            .get_parsed::<u64>("broker.commit.timeout.ms")?
-            .unwrap_or(5_000);
 
         let reader_channel_capacity = config
             .get_parsed::<usize>("reader.channel.capacity")?
@@ -971,7 +961,6 @@ impl KafkaSourceConfig {
             max_poll_interval: Duration::from_millis(max_poll_interval_ms),
             queued_max_messages_kbytes,
             broker_commit_on_checkpoint,
-            broker_commit_timeout: Duration::from_millis(broker_commit_timeout_ms),
             reader_channel_capacity,
             backpressure_high_watermark,
             backpressure_low_watermark,
@@ -1337,16 +1326,7 @@ mod tests {
         assert_eq!(cfg.security_protocol, SecurityProtocol::Plaintext);
         assert!(cfg.sasl_mechanism.is_none());
         assert!(cfg.broker_commit_on_checkpoint);
-        assert_eq!(cfg.broker_commit_timeout, Duration::from_secs(5));
         assert_eq!(cfg.reader_channel_capacity, 1024);
-    }
-
-    #[test]
-    fn test_parse_broker_commit_timeout() {
-        let cfg =
-            KafkaSourceConfig::from_config(&make_config(&[("broker.commit.timeout.ms", "2500")]))
-                .unwrap();
-        assert_eq!(cfg.broker_commit_timeout, Duration::from_millis(2500));
     }
 
     #[test]

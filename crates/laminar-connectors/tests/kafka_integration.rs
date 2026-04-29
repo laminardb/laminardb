@@ -177,6 +177,11 @@ async fn checkpoint_restore(brokers: &str) {
 
     poll_all(&mut source, n, Duration::from_secs(30)).await;
     let checkpoint = source.checkpoint();
+    // The streaming coordinator drives broker commits by calling
+    // `notify_epoch_committed` after a barrier. Without it source 2
+    // joining the same group has no stored offsets and falls back to
+    // `auto.offset.reset`.
+    source.notify_epoch_committed(1, &checkpoint).await.unwrap();
     source.close().await.unwrap();
 
     let extra = 10;

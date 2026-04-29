@@ -327,54 +327,34 @@ impl KafkaSource {
         let resume_threshold = self.config.backpressure_low_watermark;
 
         // Broker commit task: flushes the latest durable TPL to the broker
-        // after each checkpoint. Last-writer-wins via the watch channel —
-        // if multiple checkpoints land while a commit is in flight, only
-        // the newest gets sent.
+        // after each checkpoint. Lifecycle is driven by the watch sender —
+        // when close() drops commit_tx, any pending TPL is processed and
+        // then changed() returns Err, ending the loop.
         let commit_consumer = Arc::clone(&consumer);
         let commit_metrics = self.metrics.clone();
-        let commit_timeout = self.config.broker_commit_timeout;
-        let mut commit_shutdown = shutdown_rx.clone();
         let commit_handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = commit_shutdown.changed() => break,
-                    changed = commit_rx.changed() => {
-                        if changed.is_err() { break }
-                    }
-                }
+            while commit_rx.changed().await.is_ok() {
                 let Some(tpl) = commit_rx.borrow_and_update().clone() else {
                     continue;
                 };
                 if tpl.count() == 0 {
                     continue;
                 }
-
                 let start = std::time::Instant::now();
                 let c = Arc::clone(&commit_consumer);
-                let result = tokio::time::timeout(
-                    commit_timeout,
-                    tokio::task::spawn_blocking(move || c.commit(&tpl, CommitMode::Sync)),
-                )
-                .await;
+                let result =
+                    tokio::task::spawn_blocking(move || c.commit(&tpl, CommitMode::Sync)).await;
                 commit_metrics.observe_broker_commit_duration(start.elapsed().as_secs_f64());
 
                 match result {
-                    Ok(Ok(Ok(()))) => {}
-                    Ok(Ok(Err(e))) => {
-                        commit_metrics.record_commit_failure("rejected");
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        commit_metrics.commit_failures_rejected.inc();
                         warn!(error = %e, "broker offset commit rejected");
                     }
-                    Ok(Err(e)) => {
-                        commit_metrics.record_commit_failure("panic");
+                    Err(e) => {
+                        commit_metrics.commit_failures_panic.inc();
                         warn!(error = %e, "broker offset commit task panicked");
-                    }
-                    Err(_) => {
-                        commit_metrics.record_commit_failure("timeout");
-                        warn!(
-                            timeout_secs = commit_timeout.as_secs_f64(),
-                            "broker offset commit timed out"
-                        );
                     }
                 }
             }
@@ -1352,7 +1332,7 @@ impl SourceConnector for KafkaSource {
             return Ok(());
         }
         if tx.send(Some(tpl)).is_err() {
-            self.metrics.record_commit_failure("enqueue_dropped");
+            self.metrics.commit_failures_enqueue_dropped.inc();
         }
         Ok(())
     }

@@ -19,8 +19,6 @@ pub struct KafkaSourceMetrics {
     pub commits: IntCounter,
     /// Broker rejected the commit.
     pub commit_failures_rejected: IntCounter,
-    /// Commit FFI exceeded `broker_commit_timeout`.
-    pub commit_failures_timeout: IntCounter,
     /// Commit `spawn_blocking` task panicked.
     pub commit_failures_panic: IntCounter,
     /// `notify_epoch_committed` could not enqueue (commit task gone).
@@ -86,7 +84,6 @@ impl KafkaSourceMetrics {
             .unwrap()
         };
         let commit_failures_rejected = make_failure("rejected");
-        let commit_failures_timeout = make_failure("timeout");
         let commit_failures_panic = make_failure("panic");
         let commit_failures_enqueue_dropped = make_failure("enqueue_dropped");
         let rebalances = IntCounter::new(
@@ -131,7 +128,6 @@ impl KafkaSourceMetrics {
         let _ = reg.register(Box::new(batches_polled.clone()));
         let _ = reg.register(Box::new(commits.clone()));
         let _ = reg.register(Box::new(commit_failures_rejected.clone()));
-        let _ = reg.register(Box::new(commit_failures_timeout.clone()));
         let _ = reg.register(Box::new(commit_failures_panic.clone()));
         let _ = reg.register(Box::new(commit_failures_enqueue_dropped.clone()));
         let _ = reg.register(Box::new(rebalances.clone()));
@@ -148,7 +144,6 @@ impl KafkaSourceMetrics {
             batches_polled,
             commits,
             commit_failures_rejected,
-            commit_failures_timeout,
             commit_failures_panic,
             commit_failures_enqueue_dropped,
             rebalances,
@@ -175,18 +170,6 @@ impl KafkaSourceMetrics {
     /// Records a successful offset commit.
     pub fn record_commit(&self) {
         self.commits.inc();
-    }
-
-    /// Records an offset commit failure. `reason` is one of `rejected`,
-    /// `timeout`, `panic`, `enqueue_dropped`. Unknown reasons are dropped.
-    pub fn record_commit_failure(&self, reason: &str) {
-        match reason {
-            "rejected" => self.commit_failures_rejected.inc(),
-            "timeout" => self.commit_failures_timeout.inc(),
-            "panic" => self.commit_failures_panic.inc(),
-            "enqueue_dropped" => self.commit_failures_enqueue_dropped.inc(),
-            _ => debug_assert!(false, "unknown commit failure reason: {reason}"),
-        }
     }
 
     /// Records a consumer group rebalance event.
@@ -234,7 +217,6 @@ impl KafkaSourceMetrics {
         m.add_custom("kafka.batches_polled", self.batches_polled.get() as f64);
         m.add_custom("kafka.commits", self.commits.get() as f64);
         let total_failures = self.commit_failures_rejected.get()
-            + self.commit_failures_timeout.get()
             + self.commit_failures_panic.get()
             + self.commit_failures_enqueue_dropped.get();
         m.add_custom("kafka.commit_failures", total_failures as f64);
@@ -301,8 +283,8 @@ mod tests {
     #[test]
     fn test_record_commit_failure() {
         let m = KafkaSourceMetrics::new(None);
-        m.record_commit_failure("rejected");
-        m.record_commit_failure("timeout");
+        m.commit_failures_rejected.inc();
+        m.commit_failures_panic.inc();
 
         let cm = m.to_connector_metrics();
         let failures = cm.custom.iter().find(|(k, _)| k == "kafka.commit_failures");
