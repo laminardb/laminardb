@@ -396,7 +396,7 @@ impl StreamingCoordinator {
                                 source = %src_name,
                                 error = %err,
                                 epoch = e,
-                                "notify_epoch_committed failed (drain)",
+                                "notify_epoch_committed failed",
                             );
                         }
                     }
@@ -673,11 +673,8 @@ impl StreamingCoordinator {
             }
         }
 
-        // Final drain: pick up any messages source tasks sent between
-        // the first drain and finishing their data-drain phase. Sources
-        // remain alive (blocked on epoch_committed_rx) so they can ack
-        // the final checkpoint below — we drop their senders explicitly
-        // when joining further down.
+        // Second drain: pick up any messages source tasks sent between
+        // the first drain and finishing their data-drain phase.
         self.source_batches_buf.clear();
         self.barrier_seen.clear();
         self.discard_pending_offsets();
