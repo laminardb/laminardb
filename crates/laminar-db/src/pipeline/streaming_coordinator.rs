@@ -381,6 +381,27 @@ impl StreamingCoordinator {
                     }
                 }
 
+                // Drain any post-shutdown EpochCommitted broadcasts before
+                // close — the coordinator's final checkpoint fires after
+                // signalling shutdown, and sources need to ack it so
+                // external state (Kafka group offsets, NATS msg acks) for
+                // the last durable epoch is advanced.  Loop until the
+                // sender is dropped (which happens when the coordinator
+                // joins this task).
+                while let Ok(()) = epoch_committed_rx.changed().await {
+                    let snapshot = epoch_committed_rx.borrow_and_update().clone();
+                    if let Some((e, cp)) = snapshot {
+                        if let Err(err) = connector.notify_epoch_committed(e, &cp).await {
+                            tracing::warn!(
+                                source = %src_name,
+                                error = %err,
+                                epoch = e,
+                                "notify_epoch_committed failed (drain)",
+                            );
+                        }
+                    }
+                }
+
                 if let Err(e) = connector.close().await {
                     tracing::warn!(source = %src_name, error = %e, "source close error");
                 }
@@ -652,15 +673,11 @@ impl StreamingCoordinator {
             }
         }
 
-        // Join source tasks (unblocked by the drain above).
-        for handle in std::mem::take(&mut self.source_handles) {
-            if let Err(e) = handle.join.await {
-                tracing::warn!(source = %handle.name, error = ?e, "source task panicked");
-            }
-        }
-
         // Final drain: pick up any messages source tasks sent between
-        // the first drain and their exit.
+        // the first drain and finishing their data-drain phase. Sources
+        // remain alive (blocked on epoch_committed_rx) so they can ack
+        // the final checkpoint below — we drop their senders explicitly
+        // when joining further down.
         self.source_batches_buf.clear();
         self.barrier_seen.clear();
         self.discard_pending_offsets();
@@ -688,7 +705,9 @@ impl StreamingCoordinator {
         }
 
         // Final checkpoint uses committed_offsets — only reflects data
-        // that successfully passed through execute_cycle.
+        // that successfully passed through execute_cycle. Run BEFORE
+        // dropping source senders so sources receive the EpochCommitted
+        // and ack to their external systems (Kafka group offsets, etc.).
         let checkpoint_enabled = self.config.checkpoint_interval.is_some();
         if checkpoint_enabled {
             let source_offsets: FxHashMap<String, SourceCheckpoint> = self
@@ -709,6 +728,23 @@ impl StreamingCoordinator {
             {
                 tracing::info!(epoch, "final checkpoint completed before shutdown");
                 self.broadcast_epoch_committed(epoch, &source_offsets);
+            }
+        }
+
+        // Drop epoch_committed_tx senders before awaiting join: source
+        // tasks block on epoch_committed_rx.changed() in their drain
+        // phase and only exit once the sender is dropped.
+        for handle in std::mem::take(&mut self.source_handles) {
+            let SourceHandle {
+                name,
+                shutdown: _,
+                join,
+                barrier_injector: _,
+                epoch_committed_tx,
+            } = handle;
+            drop(epoch_committed_tx);
+            if let Err(e) = join.await {
+                tracing::warn!(source = %name, error = ?e, "source task panicked");
             }
         }
     }

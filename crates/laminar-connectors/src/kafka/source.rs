@@ -349,10 +349,16 @@ impl KafkaSource {
                 match result {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
-                        commit_metrics.commit_failures_rejected.inc();
+                        // Failure counting is centralized in
+                        // LaminarConsumerContext::commit_callback (which
+                        // librdkafka fires for both sync and async
+                        // commits) — bumping here would double-count.
                         warn!(error = %e, "broker offset commit rejected");
                     }
                     Err(e) => {
+                        // The callback does not fire for spawn_blocking
+                        // panics, so this is the only path that records
+                        // them.
                         commit_metrics.commit_failures_panic.inc();
                         warn!(error = %e, "broker offset commit task panicked");
                     }
