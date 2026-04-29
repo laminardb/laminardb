@@ -665,7 +665,11 @@ impl OperatorGraph {
         }
     }
 
-    #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::too_many_arguments,
+        clippy::needless_pass_by_value
+    )]
     pub fn add_query(
         &mut self,
         name: String,
@@ -674,25 +678,45 @@ impl OperatorGraph {
         window_config: Option<WindowOperatorConfig>,
         order_config: Option<OrderOperatorConfig>,
         idle_ttl_ms: Option<u64>,
+        join_config: Option<Vec<laminar_sql::translator::JoinOperatorConfig>>,
     ) {
-        // Detection (same as StreamExecutor::add_query)
+        // The planner's vec lets us short-circuit re-parsing for queries
+        // that have no specialized join step (or no joins at all).
+        // TemporalProbe is parsed off the token stream rather than the
+        // sqlparser AST, so it is never present in `join_config` and
+        // always needs its own detector pass.
+        use laminar_sql::translator::JoinOperatorConfig;
+        let needs_specialized_detection = join_config.as_ref().is_none_or(|jcs| {
+            jcs.iter().any(|c| {
+                matches!(
+                    c,
+                    JoinOperatorConfig::StreamStream(_)
+                        | JoinOperatorConfig::Asof(_)
+                        | JoinOperatorConfig::Temporal(_)
+                )
+            })
+        });
+
         let (temporal_probe_config, temporal_probe_projection_sql) =
             detect_temporal_probe_query(&sql);
-        let (asof_config, projection_sql) = if temporal_probe_config.is_none() {
-            detect_asof_query(&sql)
-        } else {
-            (None, None)
-        };
-        let (temporal_config, temporal_projection_sql) = if temporal_probe_config.is_none() {
-            detect_temporal_query(&sql)
-        } else {
-            (None, None)
-        };
-        let stream_join_detection = if temporal_probe_config.is_none() {
-            detect_stream_join_query(&sql)
-        } else {
-            None
-        };
+        let (asof_config, projection_sql) =
+            if temporal_probe_config.is_none() && needs_specialized_detection {
+                detect_asof_query(&sql)
+            } else {
+                (None, None)
+            };
+        let (temporal_config, temporal_projection_sql) =
+            if temporal_probe_config.is_none() && needs_specialized_detection {
+                detect_temporal_query(&sql)
+            } else {
+                (None, None)
+            };
+        let stream_join_detection =
+            if temporal_probe_config.is_none() && needs_specialized_detection {
+                detect_stream_join_query(&sql)
+            } else {
+                None
+            };
         let stream_join_config = stream_join_detection.as_ref().map(|d| d.config.clone());
         let stream_join_projection_sql = stream_join_detection
             .as_ref()
@@ -1477,6 +1501,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert_eq!(graph.nodes.len(), 2); // source "trades" + query "q1"
@@ -1497,10 +1522,12 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         graph.add_query(
             "q2".to_string(),
             "SELECT symbol FROM q1 WHERE price > 100".to_string(),
+            None,
             None,
             None,
             None,
@@ -1527,10 +1554,12 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         graph.add_query(
             "q1".to_string(),
             "SELECT * FROM trades".to_string(),
+            None,
             None,
             None,
             None,
@@ -1568,6 +1597,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(graph.output_map.contains_key("q1"));
 
@@ -1585,6 +1615,7 @@ mod tests {
         graph.add_query(
             "filtered".to_string(),
             "SELECT symbol, price FROM trades WHERE price > 200".to_string(),
+            None,
             None,
             None,
             None,
@@ -1622,6 +1653,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let source_batches = FxHashMap::default();
@@ -1649,10 +1681,12 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         graph.add_query(
             "q2".to_string(),
             "SELECT symbol FROM trades".to_string(),
+            None,
             None,
             None,
             None,
@@ -1678,6 +1712,7 @@ mod tests {
         graph.add_query(
             "q1".to_string(),
             "SELECT * FROM trades".to_string(),
+            None,
             None,
             None,
             None,
@@ -1716,6 +1751,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let mut source = FxHashMap::default();
@@ -1743,6 +1779,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let mut source = FxHashMap::default();
@@ -1759,6 +1796,7 @@ mod tests {
         graph.add_query(
             "agg".to_string(),
             "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol".to_string(),
+            None,
             None,
             None,
             None,
@@ -1810,10 +1848,12 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         graph.add_query(
             "step2".to_string(),
             "SELECT symbol, doubled FROM step1 WHERE doubled > 400".to_string(),
+            None,
             None,
             None,
             None,
@@ -1841,10 +1881,12 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         graph.add_query(
             "low".to_string(),
             "SELECT symbol, price FROM trades WHERE price <= 200".to_string(),
+            None,
             None,
             None,
             None,
@@ -1855,6 +1897,7 @@ mod tests {
             "combined".to_string(),
             "SELECT h.symbol, h.price FROM high h INNER JOIN low l ON h.symbol = l.symbol"
                 .to_string(),
+            None,
             None,
             None,
             None,
@@ -1884,10 +1927,12 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         graph.add_query(
             "q2".to_string(),
             "SELECT * FROM trades".to_string(),
+            None,
             None,
             None,
             None,
@@ -1920,6 +1965,7 @@ mod tests {
             graph.add_query(
                 format!("q{i}"),
                 "SELECT * FROM trades".to_string(),
+                None,
                 None,
                 None,
                 None,
@@ -1960,6 +2006,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let mut source = FxHashMap::default();
@@ -1981,6 +2028,7 @@ mod tests {
         graph.add_query(
             "agg".to_string(),
             "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol".to_string(),
+            None,
             None,
             None,
             None,
@@ -2009,6 +2057,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         // Need one cycle to lazy-init state before restore will take effect
@@ -2030,6 +2079,7 @@ mod tests {
         graph.add_query(
             "agg".to_string(),
             "SELECT symbol, SUM(price) AS total FROM trades GROUP BY symbol".to_string(),
+            None,
             None,
             None,
             None,
@@ -2066,10 +2116,12 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         graph.add_query(
             "q1".to_string(),
             "SELECT symbol, price FROM trades".to_string(),
+            None,
             None,
             None,
             None,
@@ -2119,6 +2171,7 @@ mod tests {
              TEMPORAL PROBE JOIN market_data m ON (symbol) \
              TIMESTAMPS (ts, mts) LIST (0s, 5s) AS p"
                 .to_string(),
+            None,
             None,
             None,
             None,
@@ -2175,6 +2228,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         // Push some data into the source buffer
         if let Some(&node_id) = graph.source_map.get("trades") {
@@ -2194,6 +2248,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         // Fill source buffer to 50% of cap
         if let Some(&node_id) = graph.source_map.get("trades") {
@@ -2209,6 +2264,7 @@ mod tests {
         graph.add_query(
             "q1".to_string(),
             "SELECT * FROM trades".to_string(),
+            None,
             None,
             None,
             None,
@@ -2242,10 +2298,12 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         graph.add_query(
             "downstream".to_string(),
             "SELECT symbol FROM proj".to_string(),
+            None,
             None,
             None,
             None,
@@ -2294,12 +2352,14 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         // Now register `derived` — this replaces the placeholder.
         graph.add_query(
             "derived".to_string(),
             "SELECT symbol, price FROM trades".to_string(),
+            None,
             None,
             None,
             None,
@@ -2321,6 +2381,7 @@ mod tests {
         graph.add_query(
             "sink".to_string(),
             "SELECT symbol FROM trades".to_string(),
+            None,
             None,
             None,
             None,
@@ -2410,6 +2471,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let batch = test_batch(); // AAPL + GOOG
@@ -2460,6 +2522,7 @@ mod tests {
              AND a.ts BETWEEN p.ts AND p.ts + INTERVAL '10' SECOND \
              WHERE p.type = 'A' AND a.type = 'B'"
                 .to_string(),
+            None,
             None,
             None,
             None,
@@ -2528,10 +2591,12 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         graph.add_query(
             "consumer".to_string(),
             "SELECT symbol FROM producer".to_string(),
+            None,
             None,
             None,
             None,
@@ -2608,10 +2673,12 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         graph.add_query(
             "consumer".to_string(),
             "SELECT symbol FROM producer".to_string(),
+            None,
             None,
             None,
             None,

@@ -261,6 +261,13 @@ impl JoinAnalysis {
             additional_key_columns: vec![],
         }
     }
+
+    /// True if this step has any kind of temporal bound — a `BETWEEN`-derived
+    /// time bound, ASOF match condition, or `FOR SYSTEM_TIME AS OF`.
+    #[must_use]
+    pub fn is_bounded(&self) -> bool {
+        self.time_bound.is_some() || self.is_asof_join || self.is_temporal_join
+    }
 }
 
 /// Analyze a SELECT statement for join information.

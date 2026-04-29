@@ -488,6 +488,7 @@ impl LaminarDB {
                 reg.window_config.clone(),
                 reg.order_config.clone(),
                 None,
+                reg.join_config.clone(),
             );
         }
 
@@ -1597,6 +1598,7 @@ mod resolver_tests {
                 )
             }),
             order_config: None,
+            join_config: None,
         }
     }
 

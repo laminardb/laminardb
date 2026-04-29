@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
@@ -779,6 +779,7 @@ fn extract_self_join_pre_filters(
             analysis.left_alias.as_deref(),
             analysis.right_alias.as_deref(),
             config,
+            None,
         )
     });
 
@@ -864,6 +865,7 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection>
                     stream_analysis.left_alias.as_deref(),
                     stream_analysis.right_alias.as_deref(),
                     &config,
+                    None,
                 );
                 format!(" WHERE {rewritten}")
             })
@@ -1467,6 +1469,7 @@ fn rewrite_temporal_expr(
 // Private: Stream-stream join projection rewriting
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 fn build_stream_join_projection_sql(
     select: &sqlparser::ast::Select,
     analysis: &laminar_sql::parser::join_parser::JoinAnalysis,
@@ -1476,15 +1479,67 @@ fn build_stream_join_projection_sql(
     let left_alias = analysis.left_alias.as_deref();
     let right_alias = analysis.right_alias.as_deref();
 
+    // When the original SELECT chains more joins past the stream-stream step
+    // (`A JOIN B ... JOIN C ...`), they run as residual joins in the post-
+    // projection over `__interval_tmp` plus the live source catalog. Step-0
+    // column refs are then prefixed with `__interval_tmp.` so shared names
+    // (e.g. `ka` present in both `__interval_tmp` and `c`) don't collide.
+    let has_residual = select.from.len() == 1 && select.from[0].joins.len() > 1;
+    let tmp_qual: Option<&str> = has_residual.then_some("__interval_tmp");
+
+    // Count natural-name occurrences so colliding projections (`p.type`,
+    // `a.type`) can be aliased as `{qual}_{col}` instead of duplicate `type`.
+    let mut natural_counts: FxHashMap<String, usize> = FxHashMap::default();
+    if has_residual {
+        for item in &select.projection {
+            if let SelectItem::UnnamedExpr(expr) = item {
+                let n = match expr {
+                    Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
+                    Expr::Identifier(ident) => Some(ident.value.clone()),
+                    _ => None,
+                };
+                if let Some(n) = n {
+                    *natural_counts.entry(n).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
     let items: Vec<String> = select
         .projection
         .iter()
         .map(|item| match item {
             SelectItem::UnnamedExpr(expr) => {
-                rewrite_stream_join_expr(expr, left_alias, right_alias, config)
+                let rewritten =
+                    rewrite_stream_join_expr(expr, left_alias, right_alias, config, tmp_qual);
+                // Alias back to the natural column name so projection labels
+                // stay user-visible. On self-join collisions, fall back to
+                // `{qual}_{col}` so output names stay unique.
+                if has_residual {
+                    let (qual, natural) = match expr {
+                        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+                            (Some(parts[0].value.clone()), Some(parts[1].value.clone()))
+                        }
+                        Expr::Identifier(ident) => (None, Some(ident.value.clone())),
+                        _ => (None, None),
+                    };
+                    if let Some(n) = natural {
+                        let collides = natural_counts.get(&n).copied().unwrap_or(0) > 1;
+                        if collides {
+                            if let Some(q) = qual {
+                                return format!("{rewritten} AS {q}_{n}");
+                            }
+                        }
+                        if rewritten != n {
+                            return format!("{rewritten} AS {n}");
+                        }
+                    }
+                }
+                rewritten
             }
             SelectItem::ExprWithAlias { expr, alias } => {
-                let rewritten = rewrite_stream_join_expr(expr, left_alias, right_alias, config);
+                let rewritten =
+                    rewrite_stream_join_expr(expr, left_alias, right_alias, config, tmp_qual);
                 format!("{rewritten} AS {alias}")
             }
             SelectItem::Wildcard(_) => "*".to_string(),
@@ -1503,18 +1558,100 @@ fn build_stream_join_projection_sql(
         })
         .collect();
 
+    let residual = if has_residual {
+        render_residual_joins(
+            &select.from[0].joins[1..],
+            config,
+            left_alias,
+            right_alias,
+            tmp_qual,
+        )
+    } else {
+        String::new()
+    };
+
+    // IntervalJoin matches symmetrically (`|left_ts - right_ts| <= N`) but
+    // BETWEEN is directional (`right_ts >= left_ts AND right_ts <= left_ts +
+    // N`). The upper bound is already covered by the symmetric tolerance; we
+    // add `right_ts >= left_ts` here to enforce the lower bound.
+    let directional_filter =
+        if !config.left_time_column.is_empty() && !config.right_time_column.is_empty() {
+            let left_ref = match tmp_qual {
+                Some(q) => format!("{q}.{}", config.left_time_column),
+                None => config.left_time_column.clone(),
+            };
+            let right_ref = match tmp_qual {
+                Some(q) => format!("{q}.{}_{}", config.right_time_column, config.right_table),
+                None => format!("{}_{}", config.right_time_column, config.right_table),
+            };
+            format!("{right_ref} >= {left_ref}")
+        } else {
+            String::new()
+        };
+
+    let combined_where = match (where_clause.is_empty(), directional_filter.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => where_clause.to_string(),
+        (true, false) => format!(" WHERE {directional_filter}"),
+        (false, false) => format!("{where_clause} AND ({directional_filter})"),
+    };
+
     format!(
-        "SELECT {} FROM __interval_tmp{where_clause}",
+        "SELECT {} FROM __interval_tmp{residual}{combined_where}",
         items.join(", ")
     )
 }
 
-/// Rewrite table-qualified column refs for the `__interval_tmp` schema.
+/// Append residual joins (steps 1..N) onto a projection that selects
+/// from `__interval_tmp`. Unsupported join shapes (CROSS, USING, etc.)
+/// pass through via sqlparser's Display — we only rewrite ON exprs.
+fn render_residual_joins(
+    joins: &[sqlparser::ast::Join],
+    config: &StreamJoinConfig,
+    left_alias: Option<&str>,
+    right_alias: Option<&str>,
+    tmp_qual: Option<&str>,
+) -> String {
+    use sqlparser::ast::{JoinConstraint, JoinOperator};
+    let mut out = String::new();
+    for join in joins {
+        let (kw, on) = match &join.join_operator {
+            JoinOperator::Inner(JoinConstraint::On(e))
+            | JoinOperator::Join(JoinConstraint::On(e))
+            | JoinOperator::StraightJoin(JoinConstraint::On(e)) => ("JOIN", e),
+            JoinOperator::Left(JoinConstraint::On(e))
+            | JoinOperator::LeftOuter(JoinConstraint::On(e)) => ("LEFT JOIN", e),
+            JoinOperator::Right(JoinConstraint::On(e))
+            | JoinOperator::RightOuter(JoinConstraint::On(e)) => ("RIGHT JOIN", e),
+            JoinOperator::FullOuter(JoinConstraint::On(e)) => ("FULL JOIN", e),
+            // No ON expr to rewrite — let sqlparser format the whole join.
+            _ => {
+                out.push(' ');
+                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{join}"));
+                continue;
+            }
+        };
+        let on_sql = rewrite_stream_join_expr(on, left_alias, right_alias, config, tmp_qual);
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(" {kw} {} ON {on_sql}", join.relation),
+        );
+    }
+    out
+}
+
+/// Rewrite `t.col` references against the `__interval_tmp` schema:
+/// step-0 left columns become bare names, right columns get the
+/// `_<right_table>` suffix that `IntervalJoinState` adds. With
+/// `tmp_qual = Some("__interval_tmp")` the rewritten names are also
+/// prefixed to disambiguate from downstream tables in residual joins.
+#[allow(clippy::too_many_lines)]
 fn rewrite_stream_join_expr(
     expr: &sqlparser::ast::Expr,
     left_alias: Option<&str>,
     right_alias: Option<&str>,
     config: &StreamJoinConfig,
+    tmp_qual: Option<&str>,
 ) -> String {
     match expr {
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
@@ -1523,26 +1660,31 @@ fn rewrite_stream_join_expr(
             let is_left = table == &config.left_table || left_alias.is_some_and(|a| a == table);
             let is_right = table == &config.right_table || right_alias.is_some_and(|a| a == table);
             if is_left || is_right {
-                if is_right {
+                let bare = if is_right {
                     format!("{col}_{}", config.right_table)
                 } else {
                     col.clone()
+                };
+                if let Some(q) = tmp_qual {
+                    format!("{q}.{bare}")
+                } else {
+                    bare
                 }
             } else {
                 expr.to_string()
             }
         }
         Expr::BinaryOp { left, op, right } => {
-            let l = rewrite_stream_join_expr(left, left_alias, right_alias, config);
-            let r = rewrite_stream_join_expr(right, left_alias, right_alias, config);
+            let l = rewrite_stream_join_expr(left, left_alias, right_alias, config, tmp_qual);
+            let r = rewrite_stream_join_expr(right, left_alias, right_alias, config, tmp_qual);
             format!("{l} {op} {r}")
         }
         Expr::UnaryOp { op, expr: inner } => {
-            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config);
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
             format!("{op} {r}")
         }
         Expr::Nested(inner) => {
-            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config);
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
             format!("({r})")
         }
         Expr::Cast {
@@ -1550,15 +1692,15 @@ fn rewrite_stream_join_expr(
             data_type,
             ..
         } => {
-            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config);
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
             format!("CAST({r} AS {data_type})")
         }
         Expr::IsNull(inner) => {
-            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config);
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
             format!("{r} IS NULL")
         }
         Expr::IsNotNull(inner) => {
-            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config);
+            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
             format!("{r} IS NOT NULL")
         }
         Expr::Between {
@@ -1567,9 +1709,9 @@ fn rewrite_stream_join_expr(
             low,
             high,
         } => {
-            let e = rewrite_stream_join_expr(inner, left_alias, right_alias, config);
-            let l = rewrite_stream_join_expr(low, left_alias, right_alias, config);
-            let h = rewrite_stream_join_expr(high, left_alias, right_alias, config);
+            let e = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
+            let l = rewrite_stream_join_expr(low, left_alias, right_alias, config, tmp_qual);
+            let h = rewrite_stream_join_expr(high, left_alias, right_alias, config, tmp_qual);
             if *negated {
                 format!("{e} NOT BETWEEN {l} AND {h}")
             } else {
@@ -1586,7 +1728,13 @@ fn rewrite_stream_join_expr(
                         .map(|arg| match arg {
                             sqlparser::ast::FunctionArg::Unnamed(
                                 sqlparser::ast::FunctionArgExpr::Expr(e),
-                            ) => rewrite_stream_join_expr(e, left_alias, right_alias, config),
+                            ) => rewrite_stream_join_expr(
+                                e,
+                                left_alias,
+                                right_alias,
+                                config,
+                                tmp_qual,
+                            ),
                             other => other.to_string(),
                         })
                         .collect();
@@ -1939,9 +2087,11 @@ mod self_join_filter_tests {
 
         assert_eq!(d.left_pre_filter.as_deref(), Some("type = 'A'"));
         assert_eq!(d.right_pre_filter.as_deref(), Some("type = 'B'"));
+        // Only the directional filter remains (user's WHERE pushed to
+        // pre-filters); no user-derived predicate stays post-join.
         assert!(
-            !d.projection_sql.contains("WHERE"),
-            "inner join should have no post-join WHERE, got: {}",
+            !d.projection_sql.contains("type"),
+            "user predicates should be pushed to pre-filters, got: {}",
             d.projection_sql
         );
     }
@@ -2014,6 +2164,37 @@ mod self_join_filter_tests {
         assert!(
             d.projection_sql.contains("WHERE"),
             "LEFT JOIN must keep right predicate in WHERE: {}",
+            d.projection_sql
+        );
+    }
+
+    #[test]
+    fn test_residual_self_join_aliases_collisions() {
+        // `p.type` and `a.type` both rewrite to step-0 columns and would
+        // otherwise alias to `AS type` twice. Collision-aware aliasing
+        // must emit `AS p_type` / `AS a_type` so output names stay unique.
+        let d = detect_stream_join_query(
+            "SELECT p.type, a.type, p.key FROM events p \
+             JOIN events a ON p.key = a.key \
+             AND a.ts BETWEEN p.ts AND p.ts + INTERVAL '10' SECOND \
+             JOIN dim d ON d.key = p.key",
+        )
+        .expect("should detect self-join");
+
+        assert!(
+            d.projection_sql.contains("AS p_type"),
+            "expected `AS p_type`, got: {}",
+            d.projection_sql
+        );
+        assert!(
+            d.projection_sql.contains("AS a_type"),
+            "expected `AS a_type`, got: {}",
+            d.projection_sql
+        );
+        // Non-colliding `p.key` keeps the natural-name alias.
+        assert!(
+            d.projection_sql.contains("AS key"),
+            "non-colliding `p.key` should still alias to `key`: {}",
             d.projection_sql
         );
     }
