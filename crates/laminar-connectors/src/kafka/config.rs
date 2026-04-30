@@ -581,13 +581,15 @@ pub struct KafkaSourceConfig {
     pub queued_max_messages_kbytes: u32,
 
     // -- Broker commit --
-    /// Interval at which to asynchronously commit offsets to the Kafka broker.
+    /// Whether to commit consumed offsets to the Kafka broker after each
+    /// `LaminarDB` checkpoint completes. Default: `true`.
     ///
-    /// This is advisory — it keeps `kafka-consumer-groups` lag monitoring
-    /// accurate. The authoritative offset state lives in `LaminarDB`'s
-    /// checkpoint system. Set to `Duration::ZERO` to disable periodic
-    /// broker commits (default: 5s).
-    pub broker_commit_interval: Duration,
+    /// Advisory — `LaminarDB` recovery uses its own manifest, not broker-stored
+    /// offsets. This exists so external tooling (`kafka-consumer-groups`,
+    /// kafka-exporter, Burrow) sees progress, and so `StartupMode::GroupOffsets`
+    /// can act as a "lost-checkpoint" fallback that resumes from the last
+    /// durable epoch (no skip-ahead window).
+    pub broker_commit_on_checkpoint: bool,
 
     // -- Backpressure --
     /// Capacity of the bounded channel between the background Kafka reader
@@ -676,7 +678,7 @@ impl Default for KafkaSourceConfig {
             heartbeat_interval: Duration::from_secs(10),
             max_poll_interval: Duration::from_secs(600),
             queued_max_messages_kbytes: 16384,
-            broker_commit_interval: Duration::from_secs(5),
+            broker_commit_on_checkpoint: true,
             reader_channel_capacity: 1024,
             backpressure_high_watermark: 0.8,
             backpressure_low_watermark: 0.5,
@@ -879,9 +881,24 @@ impl KafkaSourceConfig {
             .get_parsed::<u64>("max.poll.interval.ms")?
             .unwrap_or(600_000);
 
-        let broker_commit_interval_ms = config
-            .get_parsed::<u64>("broker.commit.interval.ms")?
-            .unwrap_or(5_000);
+        // `broker.commit.interval.ms` is no longer supported. Broker offset
+        // commits now run on checkpoint completion (`notify_epoch_committed`),
+        // not on a wall-clock timer. Reject explicitly so silent semantic
+        // drift can't happen.
+        if config
+            .properties()
+            .contains_key("broker.commit.interval.ms")
+        {
+            return Err(ConnectorError::ConfigurationError(
+                "broker.commit.interval.ms is no longer supported — broker offset \
+                 commits now happen on checkpoint completion. Set \
+                 broker.commit.on.checkpoint=false to disable."
+                    .into(),
+            ));
+        }
+        let broker_commit_on_checkpoint = config
+            .get_parsed::<bool>("broker.commit.on.checkpoint")?
+            .unwrap_or(true);
 
         let reader_channel_capacity = config
             .get_parsed::<usize>("reader.channel.capacity")?
@@ -943,7 +960,7 @@ impl KafkaSourceConfig {
             heartbeat_interval: Duration::from_millis(heartbeat_interval_ms),
             max_poll_interval: Duration::from_millis(max_poll_interval_ms),
             queued_max_messages_kbytes,
-            broker_commit_interval: Duration::from_millis(broker_commit_interval_ms),
+            broker_commit_on_checkpoint,
             reader_channel_capacity,
             backpressure_high_watermark,
             backpressure_low_watermark,
@@ -1185,6 +1202,9 @@ fn is_blocked_passthrough_key(key: &str) -> bool {
                 | "heartbeat.interval.ms"
                 | "max.poll.interval.ms"
                 | "queued.max.messages.kbytes"
+                // librdkafka's own auto-commit interval — only meaningful
+                // when `enable.auto.commit=true`, which we hard-disable.
+                | "auto.commit.interval.ms"
         )
 }
 
@@ -1305,24 +1325,30 @@ mod tests {
         assert!(cfg.schema_registry_url.is_none());
         assert_eq!(cfg.security_protocol, SecurityProtocol::Plaintext);
         assert!(cfg.sasl_mechanism.is_none());
-        assert_eq!(cfg.broker_commit_interval, Duration::from_secs(5));
+        assert!(cfg.broker_commit_on_checkpoint);
         assert_eq!(cfg.reader_channel_capacity, 1024);
     }
 
     #[test]
-    fn test_parse_broker_commit_interval() {
-        let cfg =
-            KafkaSourceConfig::from_config(&make_config(&[("broker.commit.interval.ms", "5000")]))
-                .unwrap();
-        assert_eq!(cfg.broker_commit_interval, Duration::from_secs(5));
+    fn test_parse_broker_commit_on_checkpoint_disabled() {
+        let cfg = KafkaSourceConfig::from_config(&make_config(&[(
+            "broker.commit.on.checkpoint",
+            "false",
+        )]))
+        .unwrap();
+        assert!(!cfg.broker_commit_on_checkpoint);
     }
 
     #[test]
-    fn test_parse_broker_commit_interval_zero_disables() {
-        let cfg =
-            KafkaSourceConfig::from_config(&make_config(&[("broker.commit.interval.ms", "0")]))
-                .unwrap();
-        assert!(cfg.broker_commit_interval.is_zero());
+    fn test_parse_broker_commit_interval_rejected() {
+        let err =
+            KafkaSourceConfig::from_config(&make_config(&[("broker.commit.interval.ms", "5000")]))
+                .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("broker.commit.interval.ms"),
+            "expected hard-error mentioning the deprecated key, got: {msg}"
+        );
     }
 
     #[test]

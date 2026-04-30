@@ -381,13 +381,26 @@ pub trait SourceConnector: Send {
     /// Acknowledge that `epoch` has been durably committed.
     ///
     /// Called after the manifest is persisted and every exactly-once sink
-    /// committed the epoch. Idempotent — a retry after cancellation is
-    /// legal.
+    /// committed the epoch. The `checkpoint` argument is the exact
+    /// per-source `SourceCheckpoint` that was persisted into the manifest
+    /// for this epoch — sources can rely on it to advance external offset
+    /// state (broker group offsets, lookup-DB cursors, ack tokens) using
+    /// values that match what's durable.
+    ///
+    /// May be called with an empty `checkpoint` for timer-driven commits
+    /// where no per-source state was captured; implementations should
+    /// treat that as a no-op for any externally-visible advancement.
+    ///
+    /// Idempotent — a retry after cancellation is legal.
     ///
     /// # Errors
     ///
     /// Errors are logged; they do not roll back the committed epoch.
-    async fn notify_epoch_committed(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
+    async fn notify_epoch_committed(
+        &mut self,
+        _epoch: u64,
+        _checkpoint: &SourceCheckpoint,
+    ) -> Result<(), ConnectorError> {
         Ok(())
     }
 }

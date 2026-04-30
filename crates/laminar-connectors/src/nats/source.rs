@@ -316,7 +316,11 @@ impl SourceConnector for NatsSource {
         !matches!(self.config.as_ref().map(|c| c.mode), Some(Mode::Core))
     }
 
-    async fn notify_epoch_committed(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
+    async fn notify_epoch_committed(
+        &mut self,
+        _epoch: u64,
+        _checkpoint: &crate::checkpoint::SourceCheckpoint,
+    ) -> Result<(), ConnectorError> {
         // Per-msg ack errors don't roll the epoch back; the broker
         // redelivers on ack_wait.
         loop {

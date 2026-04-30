@@ -14,7 +14,7 @@ use rdkafka::TopicPartitionList;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 use tracing::{debug, info, warn};
 
 use super::rebalance::LaminarConsumerContext;
@@ -109,7 +109,8 @@ pub struct KafkaSource {
     commit_handle: Option<tokio::task::JoinHandle<()>>,
     hwm_handle: Option<tokio::task::JoinHandle<()>>,
     reader_shutdown: Option<tokio::sync::watch::Sender<bool>>,
-    offset_commit_tx: Option<tokio::sync::watch::Sender<TopicPartitionList>>,
+    /// Latest TPL the commit task should flush (last-writer-wins).
+    commit_tx: Option<watch::Sender<Option<TopicPartitionList>>>,
     watermark_tracker: Option<KafkaWatermarkTracker>,
     /// Receiver for high watermark data from the background reader task.
     /// Each entry is `(topic, partition, high_watermark)` for lag computation.
@@ -119,9 +120,6 @@ pub struct KafkaSource {
     /// due to downstream backpressure. Used to re-pause newly assigned
     /// partitions during rebalance.
     reader_paused: Arc<AtomicBool>,
-    /// Set by `commit_callback` on async commit failure; reader task
-    /// escalates to `CommitMode::Sync` on the next commit timer tick.
-    commit_retry_needed: Arc<AtomicBool>,
     /// Offset snapshot shared with the rebalance callback for seek-on-assign.
     /// Updated once per `poll_batch()` cycle (not per message).
     offset_snapshot: Arc<Mutex<OffsetTracker>>,
@@ -231,11 +229,10 @@ impl KafkaSource {
             commit_handle: None,
             hwm_handle: None,
             reader_shutdown: None,
-            offset_commit_tx: None,
+            commit_tx: None,
             watermark_tracker,
             high_watermarks_rx: None,
             reader_paused: Arc::new(AtomicBool::new(false)),
-            commit_retry_needed: Arc::new(AtomicBool::new(false)),
             offset_snapshot: Arc::new(Mutex::new(OffsetTracker::new())),
             last_avro_schema: None,
             poll_payload_buf: Vec::new(),
@@ -301,7 +298,7 @@ impl KafkaSource {
     ///
     /// Three tasks handle separate concerns:
     /// - **Reader**: consumes messages, manages backpressure, detects revokes
-    /// - **Commit**: periodic advisory broker offset commits
+    /// - **Commit**: services on-checkpoint broker offset commits
     /// - **HWM**: periodic high watermark queries for lag monitoring
     ///
     /// Deferred to allow `restore()` to access the consumer directly after `open()`.
@@ -315,106 +312,55 @@ impl KafkaSource {
         let (msg_tx, msg_rx) =
             crossfire::mpsc::bounded_async::<KafkaPayload>(self.config.reader_channel_capacity);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let (offset_tx, offset_rx) = tokio::sync::watch::channel(TopicPartitionList::new());
-        let reader_offset_rx = offset_rx.clone(); // reader reads final offsets on shutdown
+        let (commit_tx, mut commit_rx) = watch::channel::<Option<TopicPartitionList>>(None);
         let (hwm_tx, hwm_rx) = tokio::sync::watch::channel(Vec::new());
         // Channel for the reader to publish seen partitions to the HWM task.
         let (seen_tx, seen_rx) = tokio::sync::watch::channel(Vec::<(Arc<str>, i32)>::new());
         let data_ready = Arc::clone(&self.data_ready);
         let channel_len = Arc::clone(&self.channel_len);
         let capture_headers = self.config.include_headers;
-        let broker_commit_interval = self.config.broker_commit_interval;
         let reader_channel_capacity = self.config.reader_channel_capacity;
         let reader_paused = Arc::clone(&self.reader_paused);
         let revoke_generation = Arc::clone(&self.revoke_generation);
         let rebalance_state = Arc::clone(&self.rebalance_state);
-        let commit_retry_needed = Arc::clone(&self.commit_retry_needed);
         let pause_threshold = self.config.backpressure_high_watermark;
         let resume_threshold = self.config.backpressure_low_watermark;
 
-        // -- Commit task: periodic advisory broker offset commits --
+        // Broker commit task: flushes the latest durable TPL to the broker
+        // after each checkpoint. Lifecycle is driven by the watch sender —
+        // when close() drops commit_tx, any pending TPL is processed and
+        // then changed() returns Err, ending the loop.
         let commit_consumer = Arc::clone(&consumer);
-        let commit_retry = Arc::clone(&commit_retry_needed);
         let commit_metrics = self.metrics.clone();
-        let mut commit_shutdown = shutdown_rx.clone();
         let commit_handle = tokio::spawn(async move {
-            if broker_commit_interval.is_zero() {
-                // Disabled — wait for shutdown.
-                let _ = commit_shutdown.changed().await;
-                return;
-            }
-            let mut timer = tokio::time::interval(broker_commit_interval);
-            timer.tick().await; // skip first
+            while commit_rx.changed().await.is_ok() {
+                let Some(tpl) = commit_rx.borrow_and_update().clone() else {
+                    continue;
+                };
+                if tpl.count() == 0 {
+                    continue;
+                }
+                let start = std::time::Instant::now();
+                let c = Arc::clone(&commit_consumer);
+                let result =
+                    tokio::task::spawn_blocking(move || c.commit(&tpl, CommitMode::Sync)).await;
+                commit_metrics.observe_broker_commit_duration(start.elapsed().as_secs_f64());
 
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = commit_shutdown.changed() => break,
-                    _ = timer.tick() => {
-                        let tpl = offset_rx.borrow().clone();
-                        if tpl.count() == 0 { continue; }
-                        if commit_retry
-                            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
-                            .is_ok()
-                        {
-                            let c = Arc::clone(&commit_consumer);
-                            let flag = Arc::clone(&commit_retry);
-                            let n = tpl.count();
-                            // Await the blocking commit so it completes before
-                            // close() drops the consumer Arc.
-                            //
-                            // Metrics: librdkafka fires `commit_callback` for
-                            // BOTH sync and async commits, and the callback is
-                            // our authoritative counter source. We only bump
-                            // `commit_failures` here for outcomes the callback
-                            // can't observe — a panicked blocking task, or a
-                            // tokio timeout while the commit is still pending.
-                            match tokio::time::timeout(
-                                std::time::Duration::from_secs(10),
-                                tokio::task::spawn_blocking(move || {
-                                    c.commit(&tpl, CommitMode::Sync)
-                                }),
-                            )
-                            .await
-                            {
-                                Ok(Ok(Ok(()))) => {
-                                    // callback already bumped `commits`
-                                    info!(partition_count = n, "sync offset commit retry succeeded");
-                                }
-                                Ok(Ok(Err(e))) => {
-                                    // callback already bumped `commit_failures`
-                                    flag.store(true, Ordering::Release);
-                                    warn!(error = %e, "sync offset commit retry failed");
-                                }
-                                Ok(Err(e)) => {
-                                    commit_metrics.record_commit_failure();
-                                    warn!(error = %e, "sync commit blocking task panicked");
-                                }
-                                Err(_) => {
-                                    commit_metrics.record_commit_failure();
-                                    flag.store(true, Ordering::Release);
-                                    warn!("sync offset commit retry timed out");
-                                }
-                            }
-                        } else {
-                            // Async enqueue only — the broker-confirmed outcome
-                            // (Ok or Err) arrives asynchronously via
-                            // `LaminarConsumerContext::commit_callback`, which
-                            // bumps `commits` / `commit_failures`. Counting at
-                            // enqueue would overcount (every rejected commit
-                            // would show as a success here). An immediate `Err`
-                            // below means librdkafka couldn't even queue the
-                            // commit — rare, but worth observing.
-                            match commit_consumer.commit(&tpl, CommitMode::Async) {
-                                Ok(()) => {
-                                    info!(partition_count = tpl.count(), "periodic broker offset commit (advisory)");
-                                }
-                                Err(e) => {
-                                    commit_metrics.record_commit_failure();
-                                    warn!(error = %e, "periodic broker offset commit failed");
-                                }
-                            }
-                        }
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        // Failure counting is centralized in
+                        // LaminarConsumerContext::commit_callback (which
+                        // librdkafka fires for both sync and async
+                        // commits) — bumping here would double-count.
+                        warn!(error = %e, "broker offset commit rejected");
+                    }
+                    Err(e) => {
+                        // The callback does not fire for spawn_blocking
+                        // panics, so this is the only path that records
+                        // them.
+                        commit_metrics.commit_failures_panic.inc();
+                        warn!(error = %e, "broker offset commit task panicked");
                     }
                 }
             }
@@ -596,20 +542,10 @@ impl KafkaSource {
                 }
             }
 
-            // Final commit + unsubscribe (reader owns the consumer Arc).
-            // The close() method sends latest offsets via offset_tx before
-            // signaling shutdown, so the commit task may have already
-            // committed them — this is a best-effort final flush.
-            let tpl = reader_offset_rx.borrow().clone();
-            if tpl.count() > 0 {
-                match consumer.commit(&tpl, CommitMode::Sync) {
-                    Ok(()) => info!(
-                        partition_count = tpl.count(),
-                        "committed final offsets on shutdown"
-                    ),
-                    Err(e) => warn!(error = %e, "failed to commit final offsets on shutdown"),
-                }
-            }
+            // Reader does NOT commit on shutdown. With on-checkpoint
+            // semantics the only durable broker offsets are those that
+            // belong to a committed epoch; close() drains the commit-request
+            // channel before unsubscribing, ensuring nothing is lost.
             consumer.unsubscribe();
         });
 
@@ -618,7 +554,7 @@ impl KafkaSource {
         self.commit_handle = Some(commit_handle);
         self.hwm_handle = Some(hwm_handle);
         self.reader_shutdown = Some(shutdown_tx);
-        self.offset_commit_tx = Some(offset_tx);
+        self.commit_tx = Some(commit_tx);
         self.high_watermarks_rx = Some(hwm_rx);
     }
 }
@@ -687,13 +623,12 @@ impl SourceConnector for KafkaSource {
             Arc::clone(&self.rebalance_counter),
             Arc::clone(&self.revoke_generation),
             Arc::clone(&self.reader_paused),
-            Arc::clone(&self.commit_retry_needed),
             Arc::clone(&self.offset_snapshot),
             // IntCounter::clone is an Arc bump; these are shared with the
             // metrics struct and bumped from librdkafka's background thread
             // inside `commit_callback`.
             self.metrics.commits.clone(),
-            self.metrics.commit_failures.clone(),
+            self.metrics.commit_failures_rejected.clone(),
         );
         let consumer: StreamConsumer<LaminarConsumerContext> =
             rdkafka_config.create_with_context(context).map_err(|e| {
@@ -1057,27 +992,10 @@ impl SourceConnector for KafkaSource {
             }
         }
 
-        // Publish current offsets to the reader task for periodic broker commits
-        // and to the rebalance callback for seek-on-assign.
-        //
-        // Filter by the current assignment: `retain_assigned` only runs when
-        // `had_revoke` is newly detected, so between the revoke callback and
-        // the next `poll_batch` the tracker may transiently hold entries for
-        // partitions we no longer own. An unfiltered commit of those offsets
-        // is rejected by the broker (`IllegalGeneration` / "Consumer not
-        // assigned"), which flips `commit_retry_needed` on and stalls the
-        // commit loop against the same stale TPL — visible as a sawtooth in
-        // consumer lag.
+        // Update the offset snapshot used by `post_rebalance` for seek-on-assign.
+        // No broker commit happens here — that's driven exclusively by
+        // `notify_epoch_committed` against the TPL captured at checkpoint time.
         if had_revoke || !self.poll_payload_offsets.is_empty() {
-            if let Some(ref tx) = self.offset_commit_tx {
-                let assigned = lock_or_recover(&self.rebalance_state)
-                    .assigned_partitions()
-                    .clone();
-                let tpl = self.offsets.to_topic_partition_list_filtered(&assigned);
-                if tx.send(tpl).is_err() {
-                    debug!("offset_commit_tx closed, reader task shutting down");
-                }
-            }
             lock_or_recover(&self.offset_snapshot).clone_from(&self.offsets);
         }
 
@@ -1350,14 +1268,6 @@ impl SourceConnector for KafkaSource {
         let assigned = lock_or_recover(&self.rebalance_state)
             .assigned_partitions()
             .clone();
-
-        // Push filtered offsets to the reader task so it can commit them
-        // on shutdown even if close() is called without a subsequent checkpoint.
-        if let Some(ref tx) = self.offset_commit_tx {
-            let tpl = self.offsets.to_topic_partition_list_filtered(&assigned);
-            let _ = tx.send(tpl);
-        }
-
         self.offsets.to_checkpoint_filtered(&assigned)
     }
 
@@ -1412,20 +1322,36 @@ impl SourceConnector for KafkaSource {
         Some(Arc::clone(&self.checkpoint_request))
     }
 
+    async fn notify_epoch_committed(
+        &mut self,
+        _epoch: u64,
+        checkpoint: &SourceCheckpoint,
+    ) -> Result<(), ConnectorError> {
+        if !self.config.broker_commit_on_checkpoint || checkpoint.is_empty() {
+            return Ok(());
+        }
+        let Some(ref tx) = self.commit_tx else {
+            return Ok(());
+        };
+        let tpl = OffsetTracker::from_checkpoint(checkpoint).to_topic_partition_list();
+        if tpl.count() == 0 {
+            return Ok(());
+        }
+        if tx.send(Some(tpl)).is_err() {
+            self.metrics.commit_failures_enqueue_dropped.inc();
+        }
+        Ok(())
+    }
+
     async fn close(&mut self) -> Result<(), ConnectorError> {
         info!("closing Kafka source connector");
 
-        let assigned = lock_or_recover(&self.rebalance_state)
-            .assigned_partitions()
-            .clone();
-
-        // Send final filtered offsets to the reader task before signaling shutdown.
-        if let Some(ref tx) = self.offset_commit_tx {
-            let tpl = self.offsets.to_topic_partition_list_filtered(&assigned);
-            if tpl.count() > 0 {
-                let _ = tx.send(tpl);
-            }
-        }
+        // Close the commit-request channel so the commit task drains
+        // anything already queued, then exits. We do NOT issue a fresh
+        // commit here — under on-checkpoint semantics the only durable
+        // broker offsets are those tied to a committed epoch, and those
+        // were already enqueued from `notify_epoch_committed`.
+        self.commit_tx = None;
 
         // Signal shutdown and wait for all background tasks to exit.
         if let Some(tx) = self.reader_shutdown.take() {
@@ -1442,17 +1368,11 @@ impl SourceConnector for KafkaSource {
             let _ = tokio::time::timeout(timeout, handle).await;
         }
         self.msg_rx = None;
-        self.offset_commit_tx = None;
 
         // If consumer was never moved to the reader (e.g., close() called
-        // before any poll_batch()), commit directly.
+        // before any poll_batch()), unsubscribe directly. No commit:
+        // nothing has been processed, so there's no durable offset to ack.
         if let Some(ref consumer) = self.consumer {
-            let tpl = self.offsets.to_topic_partition_list_filtered(&assigned);
-            if tpl.count() > 0 {
-                if let Err(e) = consumer.commit(&tpl, CommitMode::Sync) {
-                    warn!(error = %e, "failed to commit final offsets");
-                }
-            }
             consumer.unsubscribe();
         }
 
@@ -1944,5 +1864,37 @@ mod tests {
             Some(3),
             "last_avro_schema should reflect the evolved SR shape"
         );
+    }
+
+    // The hook builds a TPL from a durable SourceCheckpoint and uses
+    // offset+1 (next-to-fetch) per Kafka convention. We exercise the
+    // translation directly via OffsetTracker, since the hook delegates
+    // to it.
+    #[test]
+    fn test_checkpoint_to_tpl_uses_next_offset() {
+        let mut offsets = std::collections::HashMap::new();
+        offsets.insert("events-0".to_string(), "100".to_string());
+        offsets.insert("events-1".to_string(), "200".to_string());
+        let cp = SourceCheckpoint::with_offsets(1, offsets);
+        let tpl = OffsetTracker::from_checkpoint(&cp).to_topic_partition_list();
+        assert_eq!(tpl.count(), 2);
+        for elem in tpl.elements() {
+            let expected = match elem.partition() {
+                0 => rdkafka::Offset::Offset(101),
+                1 => rdkafka::Offset::Offset(201),
+                p => panic!("unexpected partition {p}"),
+            };
+            assert_eq!(elem.offset(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_notify_epoch_committed_empty_cp_is_noop() {
+        let mut source = KafkaSource::new(test_schema(), test_config(), None);
+        // No reader, no commit channel — opt-out path. Empty cp must not panic.
+        source
+            .notify_epoch_committed(1, &SourceCheckpoint::new(1))
+            .await
+            .unwrap();
     }
 }

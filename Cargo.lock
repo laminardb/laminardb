@@ -4621,7 +4621,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-connectors"
-version = "0.21.5"
+version = "0.21.10"
 dependencies = [
  "arrow-array",
  "arrow-avro",
@@ -4692,7 +4692,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-core"
-version = "0.21.5"
+version = "0.21.10"
 dependencies = [
  "anyhow",
  "arrayvec",
@@ -4733,7 +4733,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-db"
-version = "0.21.5"
+version = "0.21.10"
 dependencies = [
  "ahash",
  "arrow",
@@ -4776,7 +4776,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-derive"
-version = "0.21.5"
+version = "0.21.10"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4790,7 +4790,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-server"
-version = "0.21.5"
+version = "0.21.10"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -4829,7 +4829,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-sql"
-version = "0.21.5"
+version = "0.21.10"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4858,7 +4858,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-storage"
-version = "0.21.5"
+version = "0.21.10"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
