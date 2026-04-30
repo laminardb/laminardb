@@ -90,30 +90,37 @@ impl ConnectorRegistry {
         self.sinks.write().insert(name.into(), (info, factory));
     }
 
-    /// Run a connector's `discover_schema` against the given
-    /// properties and return the resulting Arrow schema. `None` means
-    /// the connector type is unknown or discovery produced no fields.
+    /// Run a connector's `discover_schema` against the given properties.
+    ///
+    /// Three outcomes:
+    /// - `Ok(Some(schema))` — discovery succeeded and produced fields.
+    /// - `Ok(None)` — connector type is unknown OR the connector chose
+    ///   not to discover (e.g. non-Avro Kafka format, missing SR url).
+    /// - `Err(_)` — discovery was attempted and failed with a specific
+    ///   cause; callers should surface the message verbatim.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`ConnectorError`] from
+    /// [`SourceConnector::discover_schema`] when discovery fails (bad
+    /// config, unreachable network endpoint, timeout, etc.).
     pub async fn default_source_schema(
         &self,
         connector_type: &str,
         properties: &std::collections::HashMap<String, String>,
-    ) -> Option<SchemaRef> {
-        // Release the read lock before awaiting — `discover_schema` may
-        // do network I/O.
+    ) -> Result<Option<SchemaRef>, ConnectorError> {
         let factory = {
             let sources = self.sources.read();
-            let (_, factory) = sources.get(connector_type)?;
+            let Some((_, factory)) = sources.get(connector_type) else {
+                return Ok(None);
+            };
             factory.clone()
         };
 
         let mut instance = factory(None);
-        instance.discover_schema(properties).await;
+        instance.discover_schema(properties).await?;
         let schema = instance.schema();
-        if schema.fields().is_empty() {
-            None
-        } else {
-            Some(schema)
-        }
+        Ok((!schema.fields().is_empty()).then_some(schema))
     }
 
     /// Creates a new source connector instance.
@@ -411,7 +418,8 @@ mod tests {
         );
         let schema = registry
             .default_source_schema("mock", &std::collections::HashMap::new())
-            .await;
+            .await
+            .expect("discovery must not fail");
         assert!(schema.is_some_and(|s| !s.fields().is_empty()));
     }
 
@@ -421,6 +429,7 @@ mod tests {
         assert!(registry
             .default_source_schema("nope", &std::collections::HashMap::new())
             .await
+            .expect("unknown connector is Ok(None), not Err")
             .is_none());
     }
 

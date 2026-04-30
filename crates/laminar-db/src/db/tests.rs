@@ -600,6 +600,34 @@ async fn test_create_source_with_connector_rejected_when_running() {
     );
 }
 
+#[cfg(feature = "kafka")]
+#[tokio::test]
+async fn create_source_surfaces_kafka_config_error_in_ddl_message() {
+    let db = LaminarDB::open().unwrap();
+    let result = db
+        .execute(
+            "CREATE SOURCE ion_tw FROM KAFKA ( \
+                 'bootstrap.servers' = 'localhost:9092', \
+                 'group.id' = 'g', \
+                 'topic' = 't', \
+                 'format' = 'avro', \
+                 'schema.registry.url' = 'http://localhost:8081', \
+                 'broker.commit.interval.ms' = '5000' \
+             )",
+        )
+        .await;
+    let err = result.expect_err("expected DDL to surface the deprecated-key error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("broker.commit.interval.ms"),
+        "DDL error must name the offending key, got: {msg}"
+    );
+    assert!(
+        msg.contains("schema auto-discovery failed"),
+        "DDL error must use the new framing, got: {msg}"
+    );
+}
+
 #[tokio::test]
 async fn test_create_source_without_connector_allowed_when_running() {
     let db = LaminarDB::open().unwrap();
@@ -874,11 +902,15 @@ async fn fake_source_db(
         async fn poll_batch(&mut self, _: usize) -> Result<Option<SourceBatch>, ConnectorError> {
             Ok(None)
         }
-        async fn discover_schema(&mut self, _: &std::collections::HashMap<String, String>) {
+        async fn discover_schema(
+            &mut self,
+            _: &std::collections::HashMap<String, String>,
+        ) -> Result<(), ConnectorError> {
             self.counter.fetch_add(1, Ordering::SeqCst);
             if let Some(s) = &self.on_discover {
                 self.schema = Arc::clone(s);
             }
+            Ok(())
         }
         fn schema(&self) -> Arc<ArrowSchema> {
             Arc::clone(&self.schema)

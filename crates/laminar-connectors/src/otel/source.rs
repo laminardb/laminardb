@@ -188,24 +188,25 @@ impl SourceConnector for OtelSource {
         Ok(Some(SourceBatch::new(combined)))
     }
 
-    async fn discover_schema(&mut self, properties: &std::collections::HashMap<String, String>) {
-        let sig = properties
+    async fn discover_schema(
+        &mut self,
+        properties: &std::collections::HashMap<String, String>,
+    ) -> Result<(), ConnectorError> {
+        let Some(sig) = properties
             .get("signals")
-            .or_else(|| properties.get("signal"));
-        if let Some(sig) = sig {
-            match OtelSignal::parse(sig) {
-                Ok(signal) => {
-                    self.schema = match signal {
-                        OtelSignal::Traces => traces_schema(),
-                        OtelSignal::Metrics => metrics_schema(),
-                        OtelSignal::Logs => logs_schema(),
-                    };
-                }
-                Err(e) => {
-                    tracing::warn!(%e, "invalid OTel signal type, using default traces schema");
-                }
-            }
-        }
+            .or_else(|| properties.get("signal"))
+        else {
+            return Ok(());
+        };
+        let signal = OtelSignal::parse(sig).map_err(|e| {
+            ConnectorError::ConfigurationError(format!("invalid OTel signal '{sig}': {e}"))
+        })?;
+        self.schema = match signal {
+            OtelSignal::Traces => traces_schema(),
+            OtelSignal::Metrics => metrics_schema(),
+            OtelSignal::Logs => logs_schema(),
+        };
+        Ok(())
     }
 
     fn schema(&self) -> SchemaRef {

@@ -302,9 +302,15 @@ pub trait SourceConnector: Send {
     /// Resolve the source schema from the `WITH (...)` properties before
     /// DDL reaches the planner. Implementations that hit the network
     /// (e.g. Kafka fetching an Avro schema from a Schema Registry) must
-    /// bound their I/O with a timeout and leave the schema empty on
-    /// failure rather than hang.
-    async fn discover_schema(&mut self, _properties: &std::collections::HashMap<String, String>) {}
+    /// bound their I/O with a timeout. Return `Err(ConnectorError::…)` on
+    /// failure so the runtime can surface the cause to DDL — do not log
+    /// and swallow.
+    async fn discover_schema(
+        &mut self,
+        _properties: &std::collections::HashMap<String, String>,
+    ) -> Result<(), ConnectorError> {
+        Ok(())
+    }
 
     /// Arrow schema of records this source produces.
     fn schema(&self) -> SchemaRef;
