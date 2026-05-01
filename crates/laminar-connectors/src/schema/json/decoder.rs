@@ -305,13 +305,11 @@ impl FormatDecoder for JsonDecoder {
             // status frames) are skipped silently. Erroring the batch would
             // poison the source buffer since failures don't clear consumed
             // messages.
-            let default_target: &serde_json::Value = match navigate_path_opt(
-                &value,
-                self.config.json_path.as_deref(),
-            ) {
-                Some(v) => v,
-                None => continue,
-            };
+            let default_target: &serde_json::Value =
+                match navigate_path_opt(&value, self.config.json_path.as_deref()) {
+                    Some(v) => v,
+                    None => continue,
+                };
 
             if let Some(ref col_indices) = self.explode_col_indices {
                 // === EXPLODE MODE ===

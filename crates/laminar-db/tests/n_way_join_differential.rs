@@ -556,7 +556,11 @@ fn block_on_check_between(case: &BetweenCase) -> Result<(), String> {
 fn schema_aa_ts() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("ka", DataType::Int64, false),
-        Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
         Field::new("xa", DataType::Utf8, false),
     ]))
 }
@@ -564,7 +568,11 @@ fn schema_aa_ts() -> SchemaRef {
 fn schema_bb_ts() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("kb", DataType::Int64, false),
-        Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
         Field::new("xb", DataType::Utf8, false),
     ]))
 }
@@ -647,7 +655,13 @@ async fn smoke_n2_timestamp_key_between() {
         Arc::new(MemTable::try_new(schema_bb_ts(), vec![vec![make_bb_ts(&b)]]).unwrap()),
     )
     .unwrap();
-    let oracle = ctx.sql(TS_BETWEEN_SQL).await.unwrap().collect().await.unwrap();
+    let oracle = ctx
+        .sql(TS_BETWEEN_SQL)
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
 
     let db = LaminarDB::open().unwrap();
     db.execute(

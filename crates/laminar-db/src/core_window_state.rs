@@ -571,8 +571,8 @@ impl CoreWindowState {
                     .map_err(|e| {
                         DbError::Pipeline(format!("type-coerce post-aggregate projection: {e}"))
                     })?;
-                let phys = create_physical_expr(&coerced, &agg_df_schema, compile_props)
-                    .map_err(|e| {
+                let phys =
+                    create_physical_expr(&coerced, &agg_df_schema, compile_props).map_err(|e| {
                         DbError::Pipeline(format!("compile post-aggregate projection: {e}"))
                     })?;
                 compiled.push(phys);

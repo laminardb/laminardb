@@ -198,8 +198,8 @@ impl EngineMetrics {
             cycle_duration: reg!(Histogram::with_opts(
                 HistogramOpts::new("cycle_duration_seconds", "Per-cycle processing duration")
                     .buckets(vec![
-                        1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3,
-                        5e-3, 1e-2, 5e-2, 1e-1, 5e-1, 1.0,
+                        1e-7, 5e-7, 1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3, 1e-2, 5e-2,
+                        1e-1, 5e-1, 1.0,
                     ]),
             )
             .unwrap()),

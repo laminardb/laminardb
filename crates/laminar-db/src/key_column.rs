@@ -259,7 +259,11 @@ mod tests {
             DataType::Timestamp(TimeUnit::Millisecond, None),
             true,
         )]));
-        RecordBatch::try_new(schema, vec![Arc::new(TimestampMillisecondArray::from(values.to_vec()))]).unwrap()
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(TimestampMillisecondArray::from(values.to_vec()))],
+        )
+        .unwrap()
     }
 
     fn int64(values: &[i64]) -> RecordBatch {
@@ -279,7 +283,10 @@ mod tests {
         )]));
         let ts = RecordBatch::try_new(
             schema,
-            vec![Arc::new(TimestampNanosecondArray::from(vec![1_000_000_000, 2_000_000_000]))],
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                1_000_000_000,
+                2_000_000_000,
+            ]))],
         )
         .unwrap();
         let ints = int64(&[1_000, 2_000]);
@@ -292,10 +299,12 @@ mod tests {
 
     #[test]
     fn timestamp_key_null_propagates() {
-        let batch = ts_ms(&[Some(100_i64), None, Some(200_i64)]
-            .into_iter()
-            .map(|v| v.unwrap_or(0))
-            .collect::<Vec<_>>());
+        let batch = ts_ms(
+            &[Some(100_i64), None, Some(200_i64)]
+                .into_iter()
+                .map(|v| v.unwrap_or(0))
+                .collect::<Vec<_>>(),
+        );
         // Build with explicit nulls.
         let arr = TimestampMillisecondArray::from(vec![Some(100_i64), None, Some(200_i64)]);
         let schema = batch.schema();

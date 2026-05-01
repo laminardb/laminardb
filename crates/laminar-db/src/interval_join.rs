@@ -918,9 +918,7 @@ fn emit_unmatched_right_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{
-        Float64Array, Int64Array, StringArray, TimestampMillisecondArray,
-    };
+    use arrow::array::{Float64Array, Int64Array, StringArray, TimestampMillisecondArray};
     use arrow::datatypes::{DataType, TimeUnit};
     use laminar_sql::translator::StreamJoinType;
     use std::time::Duration;
@@ -979,7 +977,11 @@ mod tests {
     #[test]
     fn timestamp_key_does_not_abort_cycle() {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("window_start", DataType::Timestamp(TimeUnit::Millisecond, None), false),
+            Field::new(
+                "window_start",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
             Field::new("ts", DataType::Int64, false),
             Field::new("v", DataType::Float64, false),
         ]));
