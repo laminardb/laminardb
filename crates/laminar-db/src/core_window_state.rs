@@ -12,7 +12,9 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
+use datafusion_common::tree_node::TreeNode;
 use datafusion_common::ScalarValue;
+use datafusion_optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 
 use laminar_core::operator::sliding_window::SlidingWindowAssigner;
 use laminar_core::operator::window::{TumblingWindowAssigner, WindowAssigner};
@@ -557,10 +559,20 @@ impl CoreWindowState {
         let output_schema = Arc::new(Schema::new(output_fields));
 
         let post_projection = if let Some((proj_exprs, agg_df_schema)) = projection_info {
+            // Coerce literal types — NULLIF/CASE accept `(any, any)` and
+            // skip DataFusion's normal cast insertion.
+            let mut rewriter = TypeCoercionRewriter::new(&agg_df_schema);
             let mut compiled = Vec::with_capacity(proj_exprs.len());
             for expr in proj_exprs {
-                let phys =
-                    create_physical_expr(expr, &agg_df_schema, compile_props).map_err(|e| {
+                let coerced = expr
+                    .clone()
+                    .rewrite(&mut rewriter)
+                    .map(|t| t.data)
+                    .map_err(|e| {
+                        DbError::Pipeline(format!("type-coerce post-aggregate projection: {e}"))
+                    })?;
+                let phys = create_physical_expr(&coerced, &agg_df_schema, compile_props)
+                    .map_err(|e| {
                         DbError::Pipeline(format!("compile post-aggregate projection: {e}"))
                     })?;
                 compiled.push(phys);

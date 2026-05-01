@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{Int64Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::row::{RowConverter, SortField};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
@@ -549,6 +549,133 @@ fn block_on_check_between(case: &BetweenCase) -> Result<(), String> {
             case.c
         ))
     })
+}
+
+// 2-way streaming join with a `Timestamp(Microsecond)` equi-key.
+
+fn schema_aa_ts() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("ka", DataType::Int64, false),
+        Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+        Field::new("xa", DataType::Utf8, false),
+    ]))
+}
+
+fn schema_bb_ts() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("kb", DataType::Int64, false),
+        Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+        Field::new("xb", DataType::Utf8, false),
+    ]))
+}
+
+fn make_aa_ts(rows: &[(i64, i64, &str)]) -> RecordBatch {
+    let ka: Vec<i64> = rows.iter().map(|r| r.0).collect();
+    let ts_us: Vec<i64> = rows.iter().map(|r| r.1 * 1_000).collect();
+    let xa: Vec<&str> = rows.iter().map(|r| r.2).collect();
+    RecordBatch::try_new(
+        schema_aa_ts(),
+        vec![
+            Arc::new(Int64Array::from(ka)),
+            Arc::new(TimestampMicrosecondArray::from(ts_us)),
+            Arc::new(StringArray::from(xa)),
+        ],
+    )
+    .unwrap()
+}
+
+fn make_bb_ts(rows: &[(i64, i64, &str)]) -> RecordBatch {
+    let kb: Vec<i64> = rows.iter().map(|r| r.0).collect();
+    let ts_us: Vec<i64> = rows.iter().map(|r| r.1 * 1_000).collect();
+    let xb: Vec<&str> = rows.iter().map(|r| r.2).collect();
+    RecordBatch::try_new(
+        schema_bb_ts(),
+        vec![
+            Arc::new(Int64Array::from(kb)),
+            Arc::new(TimestampMicrosecondArray::from(ts_us)),
+            Arc::new(StringArray::from(xb)),
+        ],
+    )
+    .unwrap()
+}
+
+const TS_BETWEEN_SQL: &str = "SELECT a.ka, a.xa, b.xb FROM aa a \
+    JOIN bb b ON a.ts = b.ts \
+              AND b.ts BETWEEN a.ts AND a.ts + INTERVAL '5' SECOND";
+
+/// Sort batches into a multiset keyed by column position. The
+/// `IntervalJoin` rewriter renames right-side columns; the oracle
+/// keeps the original names. Comparing by position ignores both.
+fn rows_by_position(batches: &[RecordBatch]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let Some(first) = batches.iter().find(|b| b.num_rows() > 0) else {
+        return out;
+    };
+    let fields: Vec<SortField> = first
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| SortField::new(f.data_type().clone()))
+        .collect();
+    let converter = RowConverter::new(fields).unwrap();
+    for b in batches {
+        if b.num_rows() == 0 {
+            continue;
+        }
+        let rows = converter.convert_columns(b.columns()).unwrap();
+        for i in 0..rows.num_rows() {
+            out.push(rows.row(i).as_ref().to_vec());
+        }
+    }
+    out.sort();
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn smoke_n2_timestamp_key_between() {
+    let a = [(1_i64, 1_000, "a1"), (2, 2_000, "a2"), (3, 4_000, "a3")];
+    let b = [(10_i64, 1_000, "b1"), (20, 2_000, "b2"), (30, 10_000, "b3")];
+
+    let ctx = SessionContext::new();
+    ctx.register_table(
+        "aa",
+        Arc::new(MemTable::try_new(schema_aa_ts(), vec![vec![make_aa_ts(&a)]]).unwrap()),
+    )
+    .unwrap();
+    ctx.register_table(
+        "bb",
+        Arc::new(MemTable::try_new(schema_bb_ts(), vec![vec![make_bb_ts(&b)]]).unwrap()),
+    )
+    .unwrap();
+    let oracle = ctx.sql(TS_BETWEEN_SQL).await.unwrap().collect().await.unwrap();
+
+    let db = LaminarDB::open().unwrap();
+    db.execute(
+        "CREATE SOURCE aa (ka BIGINT, ts TIMESTAMP, xa VARCHAR, \
+         WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE SOURCE bb (kb BIGINT, ts TIMESTAMP, xb VARCHAR, \
+         WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(&format!("CREATE STREAM out AS {TS_BETWEEN_SQL}"))
+        .await
+        .unwrap();
+    db.start().await.unwrap();
+    let mut sub = db.subscribe::<CapturedBatch>("out").unwrap();
+    let h_a = db.source_untyped("aa").unwrap();
+    let h_b = db.source_untyped("bb").unwrap();
+    h_a.push_arrow(make_aa_ts(&a)).unwrap();
+    h_b.push_arrow(make_bb_ts(&b)).unwrap();
+    await_quiescence(&db, &[&h_a, &h_b]).await;
+    let sut = drain_subscription(&mut sub);
+    db.shutdown().await.unwrap();
+
+    assert_eq!(rows_by_position(&oracle), rows_by_position(&sut));
 }
 
 /// Deterministic seed shared by every property test in this file.

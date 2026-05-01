@@ -3716,3 +3716,64 @@ async fn test_mv_hot_add_while_pipeline_running() {
     let rows = poll_mv(&db, "trade_counts", 1).await;
     assert!(rows > 0, "hot-added MV should receive pipeline data");
 }
+
+/// `NULLIF(SUM(q), 0)` against a `Float64` aggregate must not raise
+/// `Invalid comparison operation: Float64 == Int64` at evaluation.
+#[tokio::test]
+async fn test_nullif_float_with_int_literal_runs_without_error() {
+    let db = LaminarDB::open().unwrap();
+    let registry = prometheus::Registry::new();
+    let prom = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+    db.set_engine_metrics(Arc::clone(&prom));
+
+    db.execute(
+        "CREATE SOURCE t (q DOUBLE, ts TIMESTAMP, \
+         WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+    )
+    .await
+    .unwrap();
+    // The projection has the exact pattern that broke the cross-venue
+    // demo: SUM (Float64) divided by NULLIF(SUM, 0). Pre-fix this
+    // raised a SQL-cycle error every cycle and emitted nothing; with
+    // the TypeCoercionRewriter applied, the cast to Float64 is
+    // inserted automatically.
+    db.execute(
+        "CREATE STREAM out AS \
+         SELECT SUM(q) / NULLIF(SUM(q), 0) AS r \
+         FROM t \
+         GROUP BY TUMBLE(ts, INTERVAL '1' SECOND) EMIT ON WINDOW CLOSE",
+    )
+    .await
+    .unwrap();
+    db.start().await.unwrap();
+
+    let handle = db.source_untyped("t").unwrap();
+    let schema = handle.schema().clone();
+    // Two events in window [0,1s); one in window [1s,2s) so the first
+    // window closes once the watermark reaches 1000ms.
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(arrow::array::Float64Array::from(vec![1.0, 2.0, 3.0])),
+            Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                100_000, 500_000, 1_500_000,
+            ])),
+        ],
+    )
+    .unwrap();
+    handle.push_arrow(batch).unwrap();
+
+    // Wait for the coordinator to process at least one cycle.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while prom.events_emitted.get() == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // The load-bearing assertion: zero cycle errors. The pre-fix run
+    // would have logged a `post-projection evaluate` error per cycle
+    // and dropped output entirely.
+    assert!(
+        prom.events_emitted.get() >= 1,
+        "post-projection should evaluate without Float64==Int64 error"
+    );
+}

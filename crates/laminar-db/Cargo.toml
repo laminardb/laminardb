@@ -59,6 +59,7 @@ arrow-schema = { workspace = true }
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
+datafusion-optimizer = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
