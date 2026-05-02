@@ -4747,6 +4747,7 @@ dependencies = [
  "datafusion",
  "datafusion-common",
  "datafusion-expr",
+ "datafusion-optimizer",
  "futures",
  "indexmap 2.13.0",
  "laminar-connectors",

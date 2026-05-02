@@ -73,17 +73,26 @@ impl LaminarDB {
             }
             props.extend(resolved.format_options);
 
-            let discovered = self
+            let discovered = match self
                 .connector_registry
                 .default_source_schema(&normalized, &props)
                 .await
-                .ok_or_else(|| {
-                    DbError::Config(format!(
+            {
+                Ok(Some(s)) => s,
+                Ok(None) => {
+                    return Err(DbError::Config(format!(
                         "source '{source_name}': no columns declared and connector \
-                         '{normalized}' could not auto-discover a schema (check \
-                         Schema Registry connectivity or declare columns explicitly)"
-                    ))
-                })?;
+                         '{normalized}' could not auto-discover a schema (declare \
+                         columns explicitly or check that the format supports \
+                         schema discovery)"
+                    )));
+                }
+                Err(e) => {
+                    return Err(DbError::Config(format!(
+                        "source '{source_name}': schema auto-discovery failed: {e}"
+                    )));
+                }
+            };
 
             let columns: Vec<ColumnDefinition> = discovered
                 .fields()

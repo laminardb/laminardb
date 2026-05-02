@@ -814,13 +814,14 @@ impl SourceConnector for KafkaSource {
         Ok(())
     }
 
-    async fn discover_schema(&mut self, properties: &std::collections::HashMap<String, String>) {
+    async fn discover_schema(
+        &mut self,
+        properties: &std::collections::HashMap<String, String>,
+    ) -> Result<(), ConnectorError> {
         let cfg = crate::config::ConnectorConfig::with_properties("kafka", properties.clone());
-        let Ok(kafka_config) = KafkaSourceConfig::from_config(&cfg) else {
-            return;
-        };
+        let kafka_config = KafkaSourceConfig::from_config(&cfg)?;
         if kafka_config.format != Format::Avro {
-            return;
+            return Ok(());
         }
 
         let topic = match &kafka_config.subscription {
@@ -832,22 +833,18 @@ impl SourceConnector for KafkaSource {
                     }
                     t.clone()
                 }
-                None => return,
+                None => return Ok(()),
             },
             TopicSubscription::Pattern(pattern) => {
-                warn!(%pattern,
-                    "topic.pattern cannot auto-discover a schema — declare columns explicitly");
-                return;
+                return Err(ConnectorError::ConfigurationError(format!(
+                    "topic.pattern '{pattern}' cannot auto-discover a schema; \
+                     declare columns explicitly"
+                )));
             }
         };
 
-        let sr_client = match Self::build_sr_client(&kafka_config) {
-            Ok(Some(c)) => c,
-            Ok(None) => return,
-            Err(e) => {
-                warn!(error = %e, "Schema Registry client build failed");
-                return;
-            }
+        let Some(sr_client) = Self::build_sr_client(&kafka_config)? else {
+            return Ok(());
         };
 
         let subject = resolve_value_subject(
@@ -864,15 +861,19 @@ impl SourceConnector for KafkaSource {
                     fields = cached.arrow_schema.fields().len(),
                     "discovered Avro schema from Schema Registry");
                 self.schema = cached.arrow_schema;
+                Ok(())
             }
             Ok(Err(e)) => {
                 self.metrics.record_sr_discovery_failure();
-                warn!(%subject, error = %e, "Schema Registry lookup failed");
+                Err(ConnectorError::ConnectionFailed(format!(
+                    "Schema Registry lookup failed for subject '{subject}': {e}"
+                )))
             }
             Err(_) => {
                 self.metrics.record_sr_discovery_timeout();
-                warn!(%subject, timeout_secs = timeout.as_secs(),
-                    "Schema Registry lookup timed out");
+                Err(ConnectorError::Timeout(
+                    u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                ))
             }
         }
     }
@@ -1621,31 +1622,35 @@ mod tests {
                 ("format", "json"),
                 ("schema.registry.url", "http://localhost:8081"),
             ]))
-            .await;
-        // Schema must remain untouched (still empty).
+            .await
+            .expect("non-avro format is a legitimate skip");
         assert_eq!(source.schema().fields().len(), 0);
     }
 
     #[tokio::test]
-    async fn discover_schema_skips_without_sr_url() {
+    async fn discover_schema_errors_on_avro_without_sr_url() {
         let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default(), None);
-        source
+        let err = source
             .discover_schema(&props(&[
                 ("bootstrap.servers", "localhost:9092"),
                 ("group.id", "g"),
                 ("topic", "t"),
                 ("format", "avro"),
             ]))
-            .await;
+            .await
+            .expect_err("avro without schema.registry.url must surface a configuration error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("schema.registry.url"),
+            "error must name the missing key, got: {msg}"
+        );
         assert_eq!(source.schema().fields().len(), 0);
     }
 
     #[tokio::test]
-    async fn discover_schema_skips_topic_pattern() {
-        // topic.pattern cannot map to a single SR subject. Must skip
-        // cleanly, not panic or select an arbitrary topic.
+    async fn discover_schema_errors_on_topic_pattern() {
         let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default(), None);
-        source
+        let err = source
             .discover_schema(&props(&[
                 ("bootstrap.servers", "localhost:9092"),
                 ("group.id", "g"),
@@ -1653,25 +1658,27 @@ mod tests {
                 ("format", "avro"),
                 ("schema.registry.url", "http://localhost:8081"),
             ]))
-            .await;
+            .await
+            .expect_err("topic.pattern + avro must surface a configuration error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("topic.pattern"),
+            "error must name the offending key, got: {msg}"
+        );
         assert_eq!(source.schema().fields().len(), 0);
     }
 
     #[tokio::test]
-    async fn discover_schema_unreachable_sr_leaves_schema_empty() {
-        // Use a reserved-documentation IP on a closed port and bound the
-        // whole test by a generous wall-clock budget so a bug where we
-        // forgot the timeout would fail loudly.
+    async fn discover_schema_errors_on_sr_unreachable() {
         let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default(), None);
         let start = std::time::Instant::now();
-        tokio::time::timeout(
+        let result = tokio::time::timeout(
             std::time::Duration::from_secs(20),
             source.discover_schema(&props(&[
                 ("bootstrap.servers", "localhost:9092"),
                 ("group.id", "g"),
                 ("topic", "t"),
                 ("format", "avro"),
-                // TEST-NET-1 per RFC 5737 — guaranteed not to route.
                 ("schema.registry.url", "http://192.0.2.1:65535"),
             ])),
         )
@@ -1681,7 +1688,36 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(15),
             "discover_schema should have returned well before the outer 20s budget"
         );
+        let err = result.expect_err("unreachable SR must surface as Err");
+        assert!(
+            matches!(
+                err,
+                ConnectorError::ConnectionFailed(_) | ConnectorError::Timeout(_)
+            ),
+            "expected ConnectionFailed or Timeout, got: {err:?}"
+        );
         assert_eq!(source.schema().fields().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn discover_schema_propagates_broker_commit_interval_rejection() {
+        let mut source = KafkaSource::new(empty_schema(), KafkaSourceConfig::default(), None);
+        let err = source
+            .discover_schema(&props(&[
+                ("bootstrap.servers", "localhost:9092"),
+                ("group.id", "g"),
+                ("topic", "t"),
+                ("format", "avro"),
+                ("schema.registry.url", "http://localhost:8081"),
+                ("broker.commit.interval.ms", "5000"),
+            ]))
+            .await
+            .expect_err("deprecated config key must produce a propagated error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("broker.commit.interval.ms"),
+            "error must name the offending key, got: {msg}"
+        );
     }
 
     /// Happy path: wiremock SR returns a record-with-map Avro schema
@@ -1724,7 +1760,8 @@ mod tests {
                 ("format", "avro"),
                 ("schema.registry.url", &sr.uri()),
             ]))
-            .await;
+            .await
+            .expect("happy-path discovery must succeed");
 
         let schema = source.schema();
         assert_eq!(schema.fields().len(), 2, "expected [id, data]");
@@ -1781,7 +1818,8 @@ mod tests {
                 ("schema.registry.subject.name.strategy", "record-name"),
                 ("schema.registry.record.name", "com.acme.Order"),
             ]))
-            .await;
+            .await
+            .expect("happy-path discovery must succeed");
 
         let schema = source.schema();
         assert_eq!(schema.fields().len(), 2);

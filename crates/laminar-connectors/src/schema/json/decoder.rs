@@ -301,17 +301,15 @@ impl FormatDecoder for JsonDecoder {
                 .map_err(|e| SchemaError::DecodeError(format!("JSON parse error: {e}")))?;
 
             // Navigate json.path → default target (borrowed, ZERO alloc).
-            let default_target: &serde_json::Value = if let Some(ref path) = self.config.json_path {
-                let mut current = &value;
-                for segment in path {
-                    current = current.get(segment.as_str()).ok_or_else(|| {
-                        SchemaError::DecodeError(format!("json.path segment '{segment}' not found"))
-                    })?;
-                }
-                current
-            } else {
-                &value
-            };
+            // Records lacking the configured path (subscribe acks, server
+            // status frames) are skipped silently. Erroring the batch would
+            // poison the source buffer since failures don't clear consumed
+            // messages.
+            let default_target: &serde_json::Value =
+                match navigate_path_opt(&value, self.config.json_path.as_deref()) {
+                    Some(v) => v,
+                    None => continue,
+                };
 
             if let Some(ref col_indices) = self.explode_col_indices {
                 // === EXPLODE MODE ===
@@ -527,6 +525,18 @@ fn navigate_path<'a>(
         current = current.get(segment.as_str())?;
     }
     Some(current)
+}
+
+/// Like `navigate_path`, but `None` segments mean "no path configured —
+/// return the root unchanged."
+fn navigate_path_opt<'a>(
+    root: &'a serde_json::Value,
+    segments: Option<&[String]>,
+) -> Option<&'a serde_json::Value> {
+    match segments {
+        Some(s) => navigate_path(root, s),
+        None => Some(root),
+    }
 }
 
 // ── Builder helpers ────────────────────────────────────────────────
@@ -1704,18 +1714,31 @@ mod tests {
         );
     }
 
+    /// Records that don't carry the configured json.path are skipped, not
+    /// erroring the batch. Real-world: WebSocket sources receive subscribe
+    /// acks and control frames mixed with data frames; failing the batch
+    /// would poison the source's input buffer.
     #[test]
-    fn test_json_path_missing_errors() {
+    fn test_json_path_missing_skips_record() {
         let schema = make_schema(vec![("id", DataType::Int64, false)]);
         let config = JsonDecoderConfig {
-            json_path: Some(vec!["nonexistent".into()]),
+            json_path: Some(vec!["data".into()]),
             ..Default::default()
         };
         let decoder = JsonDecoder::with_config(schema, config);
-        let records = vec![json_record(r#"{"data":{"id":1}}"#)];
-        let result = decoder.decode_batch(&records);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not found"));
+        let records = vec![
+            json_record(r#"{"success":true,"op":"subscribe"}"#), // ack — no `data`
+            json_record(r#"{"data":{"id":42}}"#),
+        ];
+        let batch = decoder.decode_batch(&records).unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(
+            batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            42
+        );
     }
 
     // ── json.column.* tests ─────────────────────────────────────

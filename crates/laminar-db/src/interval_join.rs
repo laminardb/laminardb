@@ -918,8 +918,8 @@ fn emit_unmatched_right_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Float64Array, Int64Array, StringArray};
-    use arrow::datatypes::DataType;
+    use arrow::array::{Float64Array, Int64Array, StringArray, TimestampMillisecondArray};
+    use arrow::datatypes::{DataType, TimeUnit};
     use laminar_sql::translator::StreamJoinType;
     use std::time::Duration;
 
@@ -968,6 +968,51 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    /// Regression: equi-join on a `Timestamp(_)` key column must not
+    /// abort the cycle. Pre-fix the operator rejected the key with
+    /// "Unsupported key column type ... Timestamp(ms)" and every cycle
+    /// dropped its output.
+    #[test]
+    fn timestamp_key_does_not_abort_cycle() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "window_start",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("v", DataType::Float64, false),
+        ]));
+        let mk = |w: &[i64], v: &[f64]| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(TimestampMillisecondArray::from(w.to_vec())),
+                    Arc::new(Int64Array::from(w.to_vec())),
+                    Arc::new(Float64Array::from(v.to_vec())),
+                ],
+            )
+            .unwrap()
+        };
+        let config = StreamJoinConfig {
+            left_key: "window_start".into(),
+            right_key: "window_start".into(),
+            left_time_column: "ts".into(),
+            right_time_column: "ts".into(),
+            left_table: "l".into(),
+            right_table: "r".into(),
+            time_bound: Duration::from_millis(1000),
+            join_type: StreamJoinType::Inner,
+        };
+        let mut state = IntervalJoinState::new();
+        let left = mk(&[1_714_478_400_000, 1_714_478_401_000], &[10.0, 20.0]);
+        let right = mk(&[1_714_478_400_000, 1_714_478_401_000], &[1.0, 2.0]);
+        let result =
+            execute_interval_join_cycle(&mut state, &[left], &[right], &config, 0, 0).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 2);
     }
 
     #[test]

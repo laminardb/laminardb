@@ -623,10 +623,11 @@ mod tests {
     }
 
     /// Columnless Kafka source + WATERMARK FOR: the Kafka connector can't
-    /// discover a schema without a reachable Schema Registry, so the DDL
-    /// layer surfaces a "no columns declared and connector … could not
-    /// auto-discover a schema" error. The server no longer pre-empts this
-    /// — we just check the error bubbles up clearly.
+    /// discover a schema without `bootstrap.servers` configured, so the DDL
+    /// layer surfaces a "schema auto-discovery failed: …" error (or, when
+    /// the connector returns no schema, "could not auto-discover a schema").
+    /// The server no longer pre-empts this — we just check the error bubbles
+    /// up clearly.
     #[tokio::test]
     async fn execute_config_ddl_columnless_kafka_surfaces_discovery_error() {
         let mut source = make_source("events", "kafka");
@@ -653,7 +654,9 @@ mod tests {
         let err = execute_config_ddl(&db, &config).await.unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("could not auto-discover a schema") || msg.contains("no columns declared"),
+            msg.contains("schema auto-discovery failed")
+                || msg.contains("could not auto-discover a schema")
+                || msg.contains("no columns declared"),
             "expected schema-discovery error from the DDL layer, got: {msg}"
         );
     }
