@@ -24,7 +24,7 @@ use std::collections::BTreeMap;
 
 use arrow::compute::take;
 use arrow::row::{RowConverter, SortField};
-use arrow_array::{RecordBatch, UInt32Array};
+use arrow_array::{Array, Int64Array, RecordBatch, UInt32Array};
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
@@ -288,16 +288,14 @@ impl VersionedIndex {
         let num_rows = batch.num_rows();
         let mut map: HashMap<Box<[u8]>, BTreeMap<i64, Vec<u32>>> = HashMap::with_capacity(num_rows);
         #[allow(clippy::cast_possible_truncation)]
-        for (i, ts_opt) in timestamps.iter().enumerate() {
-            // Skip rows with null keys or null version timestamps.
-            let Some(version_ts) = ts_opt else { continue };
-            if key_cols.iter().any(|c| c.is_null(i)) {
+        for i in 0..timestamps.len() {
+            if timestamps.is_null(i) || key_cols.iter().any(|c| c.is_null(i)) {
                 continue;
             }
             let key = Box::from(rows.row(i).as_ref());
             map.entry(key)
                 .or_default()
-                .entry(*version_ts)
+                .entry(timestamps.value(i))
                 .or_default()
                 .push(i as u32);
         }
@@ -323,72 +321,23 @@ impl VersionedIndex {
     }
 }
 
-/// Extracts `Option<i64>` timestamp values from an Arrow array column.
+/// Normalises a timestamp-like column to milliseconds as `Int64Array`.
 ///
-/// Returns `None` for null entries (callers must handle nulls explicitly).
-/// Supports `Int64`, all `Timestamp` variants (scaled to milliseconds),
-/// and `Float64` (truncated to `i64`).
-fn extract_i64_timestamps(col: &dyn arrow_array::Array) -> Result<Vec<Option<i64>>> {
-    use arrow_array::{
-        Float64Array, Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampNanosecondArray, TimestampSecondArray,
-    };
+/// Supports `Int64` (interpreted as milliseconds), all `Timestamp` variants,
+/// and `Float64` (saturating truncation, interpreted as milliseconds). The
+/// returned array's null buffer mirrors the source.
+fn extract_i64_timestamps(col: &dyn arrow_array::Array) -> Result<Int64Array> {
+    use arrow::compute::cast;
+    use arrow_array::types::Int64Type;
+    use arrow_array::{ArrayRef, Float64Array};
     use arrow_schema::{DataType, TimeUnit};
 
-    let n = col.len();
-    let mut out = Vec::with_capacity(n);
-    macro_rules! extract_typed {
-        ($arr_type:ty, $scale:expr) => {{
-            let arr = col.as_any().downcast_ref::<$arr_type>().ok_or_else(|| {
-                DataFusionError::Internal(concat!("expected ", stringify!($arr_type)).into())
-            })?;
-            for i in 0..n {
-                out.push(if col.is_null(i) {
-                    None
-                } else {
-                    Some(arr.value(i) * $scale)
-                });
-            }
-        }};
-    }
-
-    match col.data_type() {
-        DataType::Int64 => extract_typed!(Int64Array, 1),
-        DataType::Timestamp(TimeUnit::Millisecond, _) => {
-            extract_typed!(TimestampMillisecondArray, 1);
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("expected TimestampMicrosecondArray".into())
-                })?;
-            for i in 0..n {
-                out.push(if col.is_null(i) {
-                    None
-                } else {
-                    Some(arr.value(i) / 1000)
-                });
-            }
-        }
-        DataType::Timestamp(TimeUnit::Second, _) => {
-            extract_typed!(TimestampSecondArray, 1000);
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<TimestampNanosecondArray>()
-                .ok_or_else(|| {
-                    DataFusionError::Internal("expected TimestampNanosecondArray".into())
-                })?;
-            for i in 0..n {
-                out.push(if col.is_null(i) {
-                    None
-                } else {
-                    Some(arr.value(i) / 1_000_000)
-                });
-            }
+    let int64_arr: ArrayRef = match col.data_type() {
+        DataType::Int64 => col.slice(0, col.len()),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => cast(col, &DataType::Int64)?,
+        DataType::Timestamp(TimeUnit::Microsecond | TimeUnit::Second | TimeUnit::Nanosecond, _) => {
+            let ms = cast(col, &DataType::Timestamp(TimeUnit::Millisecond, None))?;
+            cast(ms.as_ref(), &DataType::Int64)?
         }
         DataType::Float64 => {
             let arr = col
@@ -396,22 +345,20 @@ fn extract_i64_timestamps(col: &dyn arrow_array::Array) -> Result<Vec<Option<i64
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| DataFusionError::Internal("expected Float64Array".into()))?;
             #[allow(clippy::cast_possible_truncation)]
-            for i in 0..n {
-                out.push(if col.is_null(i) {
-                    None
-                } else {
-                    Some(arr.value(i) as i64)
-                });
-            }
+            return Ok(arr.unary::<_, Int64Type>(|v| v as i64));
         }
         other => {
             return Err(DataFusionError::Plan(format!(
                 "unsupported timestamp type for temporal join: {other:?}"
             )));
         }
-    }
+    };
 
-    Ok(out)
+    int64_arr
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .cloned()
+        .ok_or_else(|| DataFusionError::Internal("cast produced non-Int64 array".into()))
 }
 
 // ── Physical Execution Plan ──────────────────────────────────────
@@ -959,9 +906,8 @@ fn probe_versioned_batch(
     let mut lookup_indices: Vec<Option<u32>> = Vec::with_capacity(num_rows);
 
     #[allow(clippy::cast_possible_truncation)]
-    for (row, event_ts_opt) in event_timestamps.iter().enumerate() {
-        // Null keys or null event timestamps cannot match.
-        if key_cols.iter().any(|c| c.is_null(row)) || event_ts_opt.is_none() {
+    for row in 0..event_timestamps.len() {
+        if event_timestamps.is_null(row) || key_cols.iter().any(|c| c.is_null(row)) {
             if join_type == LookupJoinType::LeftOuter {
                 stream_indices.push(row as u32);
                 lookup_indices.push(None);
@@ -970,7 +916,7 @@ fn probe_versioned_batch(
         }
 
         let key = rows.row(row);
-        let event_ts = event_ts_opt.unwrap();
+        let event_ts = event_timestamps.value(row);
         match index.probe_at_time(key.as_ref(), event_ts) {
             Some(table_row_idx) => {
                 stream_indices.push(row as u32);
