@@ -22,14 +22,10 @@ laminar-core = { path = "../laminar-core", version = "0.21.5" }
 # Runtime glue for ClusterRepartitionExec's per-partition channels.
 tokio-stream = { workspace = true }
 
-# Zero-copy byte buffer used for `state_backend.write_partial` payloads.
-bytes = { workspace = true }
-
 # DataFusion for SQL processing
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
-datafusion-sql = { workspace = true }
 datafusion-optimizer = { workspace = true }
 
 # Arrow for columnar data
@@ -62,6 +58,4 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
-criterion = { workspace = true }
-proptest = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }

@@ -27,15 +27,12 @@ foyer = { workspace = true }
 object_store = { workspace = true }
 xxhash-rust = { workspace = true, features = ["xxh3"] }
 equivalent = "1"
-uuid = { workspace = true }
 smallvec = { workspace = true }
-arrayvec = { workspace = true }
 
 # Arrow for columnar data
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
-arrow-cast = { workspace = true }
 arrow-ipc = { workspace = true }
 chrono = { workspace = true }
 
@@ -51,9 +48,6 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 async-trait = { workspace = true }
-
-# SQL parsing (for filter compilation)
-sqlparser = { workspace = true }
 
 
 # Delta (optional, multi-node distributed mode — server-only)

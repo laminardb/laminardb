@@ -28,7 +28,6 @@ pgwire-replication = { version = "0.2", optional = true }
 mysql_async = { version = "0.36", optional = true, default-features = false, features = ["rustls-tls", "binlog", "minimal-rust"] }
 # MongoDB driver (optional, for mongodb-cdc feature)
 mongodb = { version = "3", optional = true }
-bson = { version = "2", optional = true }
 tokio-stream = { workspace = true, optional = true }
 
 # Delta Lake
@@ -98,7 +97,6 @@ time = { version = "0.3", optional = true, features = ["parsing"] }
 # OpenTelemetry OTLP/gRPC receiver
 opentelemetry-proto = { version = "0.31", default-features = false, features = ["gen-tonic", "trace", "metrics", "logs"], optional = true }
 tonic = { version = "0.14", optional = true }
-prost = { version = "0.14", optional = true }
 base64 = { workspace = true, optional = true }
 
 # File source/sink
@@ -116,7 +114,7 @@ postgres-sink = ["dep:tokio-postgres", "dep:postgres-types", "dep:deadpool-postg
 # mysql-cdc: Business logic + mysql_async driver with rustls (no OpenSSL required)
 mysql-cdc = ["dep:mysql_async", "dep:tokio-stream"]
 # MongoDB CDC source and sink
-mongodb-cdc = ["dep:mongodb", "dep:bson", "dep:tokio-stream", "dep:futures-util"]
+mongodb-cdc = ["dep:mongodb", "dep:tokio-stream", "dep:futures-util"]
 # Delta Lake
 delta-lake = ["dep:deltalake", "dep:url", "dep:datafusion", "deltalake/datafusion", "dep:tokio-util", "dep:tokio-stream", "dep:arrow-row"]
 delta-lake-s3 = ["delta-lake", "deltalake/s3"]
@@ -135,7 +133,7 @@ websocket = ["dep:tokio-tungstenite", "dep:tungstenite", "dep:futures-util", "de
 # File source and sink (AutoLoader-style)
 files = ["dep:notify", "dep:globset", "dep:object_store", "dep:parquet", "dep:libc", "dep:tokio-stream", "dep:xorf"]
 # OpenTelemetry OTLP/gRPC source
-otel = ["dep:opentelemetry-proto", "dep:tonic", "dep:prost", "dep:base64"]
+otel = ["dep:opentelemetry-proto", "dep:tonic", "dep:base64"]
 # NATS core + JetStream source and sink
 nats = ["dep:async-nats", "dep:tokio-stream", "dep:futures-util", "dep:time"]
 
