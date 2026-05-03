@@ -56,7 +56,16 @@ impl DeltaLakeSinkMetrics {
             .buckets(prometheus::exponential_buckets(0.005, 2.0, 16).unwrap()),
         )
         .unwrap();
-        let _ = handle.registry().register(Box::new(flush_duration.clone()));
+        // Best-effort registration (matches `kafka/metrics.rs` pattern):
+        // `AlreadyReg` is benign on re-init; surface anything else so a
+        // dropped histogram doesn't disappear silently.
+        if let Err(e) = handle.registry().register(Box::new(flush_duration.clone())) {
+            tracing::warn!(
+                metric = "delta_sink_flush_duration_seconds",
+                error = %e,
+                "failed to register delta lake flush_duration histogram"
+            );
+        }
 
         Self {
             common: LakehouseSinkMetrics::new(registry),

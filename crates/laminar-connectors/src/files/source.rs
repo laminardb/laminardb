@@ -379,11 +379,11 @@ fn build_decoder_and_schema(
 }
 
 fn is_cloud_url(path: &str) -> bool {
-    path.starts_with("s3://")
-        || path.starts_with("gs://")
-        || path.starts_with("az://")
-        || path.starts_with("abfs://")
-        || path.starts_with("abfss://")
+    const CLOUD_SCHEMES: &[&str] = &["s3", "s3a", "s3n", "gs", "gcs", "az", "abfs", "abfss"];
+    let Some((scheme, _)) = path.split_once("://") else {
+        return false;
+    };
+    CLOUD_SCHEMES.iter().any(|s| scheme.eq_ignore_ascii_case(s))
 }
 
 async fn read_file_bytes(path: &str) -> Result<Vec<u8>, ConnectorError> {

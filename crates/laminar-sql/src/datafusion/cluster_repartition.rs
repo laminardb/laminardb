@@ -169,6 +169,10 @@ impl ClusterRepartitionExec {
 
     /// Spawn the router + dispatcher tasks on the first `execute()`.
     fn init_runtime(&self, context: &Arc<TaskContext>) -> Result<Arc<RuntimeState>> {
+        // 256 is generous for what is at most "barriers in flight per
+        // checkpoint cadence × peers"; chosen to avoid coupling test
+        // tunables to per-deployment cluster sizes.
+        const BARRIER_QUEUE: usize = 256;
         if let Some(existing) = self.runtime.get() {
             return Ok(Arc::clone(existing));
         }
@@ -195,10 +199,6 @@ impl ClusterRepartitionExec {
         //   - inject_barrier_(tx|rx): external trigger → router
         //   - peer_barrier_(tx|rx):   dispatcher → router (after peer gossip)
         //   - aligned_(tx|rx):        router → subscribers (watch channel)
-        // 256 is generous for what is at most "barriers in flight per
-        // checkpoint cadence × peers"; choose to avoid coupling test
-        // tunables to per-deployment cluster sizes.
-        const BARRIER_QUEUE: usize = 256;
         let (inject_tx, inject_rx) = mpsc::channel::<CheckpointBarrier>(BARRIER_QUEUE);
         let (peer_tx, peer_rx) = mpsc::channel::<(ShufflePeerId, CheckpointBarrier)>(BARRIER_QUEUE);
         let (aligned_tx, aligned_rx) = watch::channel::<u64>(0);

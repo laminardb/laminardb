@@ -1099,20 +1099,11 @@ impl LaminarDB {
             }
         }
 
-        // Remove stream registrations and MV result stores for dropped MVs
-        {
-            let mut mgr = self.connector_manager.lock();
-            let mut mv_store = self.mv_store.write();
-            for dropped in &dropped_names {
-                mgr.unregister_stream(dropped);
-                mv_store.drop_mv(dropped);
-                let _ = self.ctx.deregister_table(dropped);
-            }
-        }
-
-        // Notify running coordinator to remove the queries. If the
-        // channel saturates partway through, surface that — the catalog
-        // is already updated, so subsequent retries are idempotent.
+        // Notify the coordinator BEFORE the destructive local teardown
+        // so a saturated channel surfaces as a retryable error with
+        // local state still intact. mv_registry was already mutated
+        // above; the coordinator path treats a missing entry as
+        // "already dropped" on retry.
         if let Some(ref tx) = *self.control_tx.lock() {
             for dropped in &dropped_names {
                 tx.try_send(crate::pipeline::ControlMsg::DropStream {
@@ -1123,6 +1114,17 @@ impl LaminarDB {
                         "control channel busy, retry DROP MATERIALIZED VIEW '{dropped}': {e}"
                     ))
                 })?;
+            }
+        }
+
+        // Coordinator notified; now reap local state.
+        {
+            let mut mgr = self.connector_manager.lock();
+            let mut mv_store = self.mv_store.write();
+            for dropped in &dropped_names {
+                mgr.unregister_stream(dropped);
+                mv_store.drop_mv(dropped);
+                let _ = self.ctx.deregister_table(dropped);
             }
         }
 

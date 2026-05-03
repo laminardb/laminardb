@@ -455,7 +455,10 @@ async fn poll_gauge_until(
             "pending_acks" => metrics.pending_acks.get().max(0) as u64,
             "acks" => metrics.acks_total.get(),
             "ack_errors" => metrics.ack_errors_total.get(),
-            _ => 0,
+            other => panic!(
+                "poll_gauge_until: unknown custom_key '{other}'; \
+                 supported keys are: consumer_lag, pending_acks, acks, ack_errors"
+            ),
         };
         if until(v) {
             return Some(v);

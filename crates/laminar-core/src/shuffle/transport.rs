@@ -350,28 +350,29 @@ impl ShuffleReceiver {
     }
 
     /// Await the next `(peer_id, msg)` from any connected peer.
-    ///
-    /// The receiver is single-owner: the production caller is the
-    /// cluster-repartition `dispatch_inbound` loop. Tests run a single
-    /// `recv()` at a time. If a second caller arrives while another holds
-    /// the receiver, it parks on `rx_returned` until the receiver returns
-    /// to the slot — at which point it retries. This avoids holding any
-    /// mutex across an `.await` and never serializes the inner channel.
+    /// Single-owner; concurrent callers serialise via `rx_returned`.
+    /// Cancellation-safe — a dropped `recv()` future returns the
+    /// receiver to its slot via the internal RAII guard.
+    #[allow(clippy::missing_panics_doc)]
     pub async fn recv(&self) -> Option<(ShufflePeerId, ShuffleMessage)> {
         loop {
             // Scope the guard so it is dropped before any `.await` —
             // parking_lot guards are !Send and would make the resulting
             // future !Send.
             let taken = { self.rx.lock().take() };
-            let Some(mut rx) = taken else {
+            let Some(rx) = taken else {
                 self.rx_returned.notified().await;
                 continue;
             };
-            let item = rx.recv().await;
-            {
-                *self.rx.lock() = Some(rx);
-            }
-            self.rx_returned.notify_waiters();
+            // RAII guard: returns `rx` to the slot on Drop so a
+            // cancelled `.await` (e.g. task abort) doesn't leave
+            // the receiver permanently stranded.
+            let mut guard = ReceiverReturnGuard {
+                slot: &self.rx,
+                notify: &self.rx_returned,
+                rx: Some(rx),
+            };
+            let item = guard.rx.as_mut().expect("just initialized").recv().await;
             return item;
         }
     }
@@ -431,6 +432,23 @@ impl ShuffleReceiver {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Returns the receiver to the slot on Drop so a cancelled `recv()`
+/// future doesn't strand it.
+struct ReceiverReturnGuard<'a> {
+    slot: &'a parking_lot::Mutex<Option<mpsc::Receiver<(ShufflePeerId, ShuffleMessage)>>>,
+    notify: &'a Notify,
+    rx: Option<mpsc::Receiver<(ShufflePeerId, ShuffleMessage)>>,
+}
+
+impl Drop for ReceiverReturnGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(rx) = self.rx.take() {
+            *self.slot.lock() = Some(rx);
+            self.notify.notify_waiters();
         }
     }
 }
