@@ -15,11 +15,11 @@ name = "laminardb"
 path = "src/main.rs"
 
 [dependencies]
-# All LaminarDB crates
+# LaminarDB crates. laminar-db re-exports the rest of the workspace; the
+# server only needs the unified facade plus laminar-core for things like
+# metrics types referenced directly.
 laminar-core = { path = "../laminar-core", version = "0.21.5" }
-laminar-sql = { path = "../laminar-sql", version = "0.21.5" }
 laminar-storage = { path = "../laminar-storage", version = "0.21.5" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.21.5" }
 laminar-db = { path = "../laminar-db", version = "0.21.5", features = ["api"] }
 
 # Arrow (for WS JSON serialization)
@@ -135,7 +135,6 @@ azure = ["laminar-db/azure"]
 cluster-unstable = [
     "laminar-core/cluster-unstable",
     "laminar-db/cluster-unstable",
-    "laminar-sql/cluster-unstable",
     "dep:uuid",
     "dep:xxhash-rust",
 ]

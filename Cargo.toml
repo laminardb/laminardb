@@ -130,7 +130,10 @@ lto = "fat"
 codegen-units = 1
 opt-level = 3
 debug = false
+strip = "symbols"
+panic = "abort"
 
 [profile.bench]
 inherits = "release"
 debug = true
+strip = "none"
