@@ -32,13 +32,6 @@ files = ["laminar-connectors/files"]
 otel = ["laminar-connectors/otel"]
 nats = ["laminar-connectors/nats"]
 cluster-unstable = ["laminar-core/cluster-unstable", "laminar-sql/cluster-unstable"]
-# Phase 0 failure-scenario gates. Each flips on when the corresponding
-# phase of `docs/plans/cluster-production-readiness.md` lands; the
-# cluster_e2e_failures.rs test switches its assertions from "demonstrates
-# the bug" to "demonstrates the fix" when its gate is enabled. Preferred
-# over `#[ignore]` so flipping the feature is what un-gates the test.
-phase-1-recovery = ["cluster-unstable"]
-phase-2-rebalance = ["cluster-unstable"]
 aws = ["laminar-storage/aws"]
 gcs = ["laminar-storage/gcs"]
 azure = ["laminar-storage/azure"]

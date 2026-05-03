@@ -20,7 +20,6 @@ use tracing::{debug, info};
 use crate::config::ConnectorConfig;
 use crate::connector::{SinkConnector, SinkConnectorCapabilities, WriteResult};
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
 use crate::schema::traits::FormatEncoder;
 
 use super::config::{FileFormat, FileSinkConfig, SinkMode};
@@ -403,14 +402,6 @@ impl SinkConnector for FileSink {
         self.active_tmp_files.clear();
         self.epoch_batches.clear();
         Ok(())
-    }
-
-    fn health_check(&self) -> HealthStatus {
-        if self.is_open {
-            HealthStatus::Healthy
-        } else {
-            HealthStatus::Unknown
-        }
     }
 
     fn capabilities(&self) -> SinkConnectorCapabilities {

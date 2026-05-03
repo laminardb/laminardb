@@ -35,8 +35,6 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{PartitionInfo, SourceBatch, SourceConnector};
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
-use crate::metrics::ConnectorMetrics;
 use crate::serde::{self, Format, RecordDeserializer};
 
 use super::avro::AvroDeserializer;
@@ -1294,27 +1292,6 @@ impl SourceConnector for KafkaSource {
         Ok(())
     }
 
-    fn health_check(&self) -> HealthStatus {
-        match self.state {
-            ConnectorState::Running => {
-                if self.reader_paused.load(Ordering::Acquire) {
-                    HealthStatus::Degraded("backpressure: consumption paused".into())
-                } else {
-                    HealthStatus::Healthy
-                }
-            }
-            ConnectorState::Created | ConnectorState::Initializing => HealthStatus::Unknown,
-            ConnectorState::Paused => HealthStatus::Degraded("connector paused".into()),
-            ConnectorState::Recovering => HealthStatus::Degraded("recovering".into()),
-            ConnectorState::Closed => HealthStatus::Unhealthy("closed".into()),
-            ConnectorState::Failed => HealthStatus::Unhealthy("failed".into()),
-        }
-    }
-
-    fn metrics(&self) -> ConnectorMetrics {
-        self.metrics.to_connector_metrics()
-    }
-
     fn data_ready_notify(&self) -> Option<Arc<Notify>> {
         Some(Arc::clone(&self.data_ready))
     }
@@ -1483,35 +1460,6 @@ mod tests {
         let cp = source.checkpoint();
         assert_eq!(cp.get_offset("events-0"), Some("100"));
         assert_eq!(cp.get_offset("events-1"), Some("200"));
-    }
-
-    #[test]
-    fn test_health_check_created() {
-        let source = KafkaSource::new(test_schema(), test_config(), None);
-        assert_eq!(source.health_check(), HealthStatus::Unknown);
-    }
-
-    #[test]
-    fn test_health_check_running() {
-        let mut source = KafkaSource::new(test_schema(), test_config(), None);
-        source.state = ConnectorState::Running;
-        assert_eq!(source.health_check(), HealthStatus::Healthy);
-    }
-
-    #[test]
-    fn test_health_check_closed() {
-        let mut source = KafkaSource::new(test_schema(), test_config(), None);
-        source.state = ConnectorState::Closed;
-        assert!(matches!(source.health_check(), HealthStatus::Unhealthy(_)));
-    }
-
-    #[test]
-    fn test_metrics_initial() {
-        let source = KafkaSource::new(test_schema(), test_config(), None);
-        let m = source.metrics();
-        assert_eq!(m.records_total, 0);
-        assert_eq!(m.bytes_total, 0);
-        assert_eq!(m.errors_total, 0);
     }
 
     #[test]

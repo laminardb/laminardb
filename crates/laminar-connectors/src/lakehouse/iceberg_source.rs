@@ -23,8 +23,6 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{SourceBatch, SourceConnector};
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
-use crate::metrics::ConnectorMetrics;
 
 use super::iceberg_config::IcebergSourceConfig;
 
@@ -244,18 +242,6 @@ impl SourceConnector for IcebergSource {
 
     fn supports_replay(&self) -> bool {
         false
-    }
-
-    fn health_check(&self) -> HealthStatus {
-        match self.state {
-            ConnectorState::Running => HealthStatus::Healthy,
-            ConnectorState::Failed => HealthStatus::Unhealthy("source failed".into()),
-            _ => HealthStatus::Unknown,
-        }
-    }
-
-    fn metrics(&self) -> ConnectorMetrics {
-        ConnectorMetrics::default()
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {

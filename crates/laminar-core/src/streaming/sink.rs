@@ -13,6 +13,12 @@ const DEFAULT_BROADCAST_CAPACITY: usize = 2048;
 
 /// A streaming data sink. Each `subscribe()` call returns an independent
 /// receiver that gets a copy of every message via broadcast.
+///
+/// The Sink intentionally outlives itself for a brief window after Drop:
+/// the internal drain task holds the broadcast sender and continues
+/// pumping until the upstream `AsyncConsumer` returns end-of-stream.
+/// This is what lets a query handle keep receiving rows after the
+/// `(source, sink)` pair has been dropped from the bridge function.
 pub struct Sink<T: Record> {
     broadcast_tx: broadcast::Sender<SourceMessage<T>>,
     schema: SchemaRef,
@@ -23,6 +29,9 @@ impl<T: Record> Sink<T> {
         let (broadcast_tx, _) = broadcast::channel(DEFAULT_BROADCAST_CAPACITY);
         let tx = broadcast_tx.clone();
 
+        // Detached on purpose. Task ends naturally when `consumer.recv()`
+        // returns Err (source closed). Aborting on Sink::drop would cut
+        // the tail of in-flight messages off mid-stream.
         tokio::spawn(async move {
             drain_loop(consumer, tx).await;
         });

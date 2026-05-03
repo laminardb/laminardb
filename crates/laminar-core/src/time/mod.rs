@@ -33,27 +33,9 @@ pub type TimerKey = SmallVec<[u8; 16]>;
 /// Size 8 covers most practical cases where timers fire in small batches.
 pub type FiredTimersVec = SmallVec<[TimerRegistration; 8]>;
 
-/// A watermark indicating event time progress.
-///
-/// Watermarks are monotonically increasing assertions that no events with
-/// timestamps earlier than the watermark will arrive. They are used to:
-///
-/// - Trigger window emissions
-/// - Detect late events
-/// - Coordinate time progress across operators
-///
-/// # Example
-///
-/// ```rust
-/// use laminar_core::time::Watermark;
-///
-/// let watermark = Watermark::new(1000);
-///
-/// // Check if an event is late
-/// assert!(watermark.is_late(999));  // Before watermark
-/// assert!(!watermark.is_late(1000)); // At watermark
-/// assert!(!watermark.is_late(1001)); // After watermark
-/// ```
+/// A monotonically-increasing assertion that no events with timestamps
+/// earlier than this will arrive. Drives window emission, late-event
+/// detection, and cross-operator time alignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Watermark(pub i64);
 
@@ -146,28 +128,6 @@ impl PartialOrd for TimerRegistration {
     }
 }
 
-/// Timer service for scheduling and managing timers.
-///
-/// The timer service maintains a priority queue of timer registrations,
-/// ordered by timestamp. Operators can register timers to be fired at
-/// specific event times.
-///
-/// # Example
-///
-/// ```rust
-/// use laminar_core::time::{TimerService, TimerKey};
-///
-/// let mut service = TimerService::new();
-///
-/// // Register timers at different times
-/// let id1 = service.register_timer(100, None, None);
-/// let id2 = service.register_timer(50, Some(TimerKey::from_slice(&[1, 2, 3])), None);
-///
-/// // Poll for timers that should fire at time 75
-/// let fired = service.poll_timers(75);
-/// assert_eq!(fired.len(), 1);
-/// assert_eq!(fired[0].id, id2); // Timer at t=50 fires first
-/// ```
 // Threshold at which the timer service logs a warning about accumulated timers.
 // This typically indicates a stalled watermark preventing timer firing.
 const TIMER_WARN_THRESHOLD: usize = 100_000;

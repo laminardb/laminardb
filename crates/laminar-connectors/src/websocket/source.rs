@@ -22,8 +22,6 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{SourceBatch, SourceConnector};
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
-use crate::metrics::ConnectorMetrics;
 
 use crate::schema::json::decoder::JsonDecoderConfig;
 
@@ -507,21 +505,6 @@ impl SourceConnector for WebSocketSource {
         Ok(())
     }
 
-    fn health_check(&self) -> HealthStatus {
-        match self.state {
-            ConnectorState::Running => HealthStatus::Healthy,
-            ConnectorState::Created | ConnectorState::Initializing => HealthStatus::Unknown,
-            ConnectorState::Paused => HealthStatus::Degraded("connector paused".into()),
-            ConnectorState::Recovering => HealthStatus::Degraded("recovering".into()),
-            ConnectorState::Closed => HealthStatus::Unhealthy("closed".into()),
-            ConnectorState::Failed => HealthStatus::Unhealthy("failed".into()),
-        }
-    }
-
-    fn metrics(&self) -> ConnectorMetrics {
-        self.metrics.to_connector_metrics()
-    }
-
     fn data_ready_notify(&self) -> Option<Arc<Notify>> {
         Some(Arc::clone(&self.data_ready))
     }
@@ -610,19 +593,5 @@ mod tests {
         let source = WebSocketSource::new(test_schema(), test_config(), None);
         let cp = source.checkpoint();
         assert!(!cp.is_empty()); // has websocket_state key
-    }
-
-    #[test]
-    fn test_health_check_created() {
-        let source = WebSocketSource::new(test_schema(), test_config(), None);
-        assert_eq!(source.health_check(), HealthStatus::Unknown);
-    }
-
-    #[test]
-    fn test_metrics_initial() {
-        let source = WebSocketSource::new(test_schema(), test_config(), None);
-        let m = source.metrics();
-        assert_eq!(m.records_total, 0);
-        assert_eq!(m.bytes_total, 0);
     }
 }

@@ -1,12 +1,8 @@
 # laminar-storage
 
-Checkpoint persistence and object store integration for LaminarDB.
+Durability layer for LaminarDB: checkpoint manifests, filesystem/object-store persistence, and recovery validation. Never blocks the hot path.
 
-## Overview
-
-Durability layer: checkpoint manifests, filesystem/object-store persistence, and recovery validation. Never blocks the hot path.
-
-Note: Lakehouse connectors (Delta Lake, Iceberg) live in `laminar-connectors`, not here. This crate handles LaminarDB's internal durability.
+Lakehouse connectors (Delta Lake, Iceberg) live in `laminar-connectors`, not here.
 
 ## Key Modules
 

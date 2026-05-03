@@ -26,8 +26,6 @@ use tracing::{debug, info, warn};
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{SinkConnector, SinkConnectorCapabilities, WriteResult};
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
-use crate::metrics::ConnectorMetrics;
 
 use super::sink_config::{PostgresSinkConfig, WriteMode};
 use super::sink_metrics::PostgresSinkMetrics;
@@ -917,35 +915,6 @@ impl SinkConnector for PostgresSink {
         Ok(())
     }
 
-    fn health_check(&self) -> HealthStatus {
-        match self.state {
-            ConnectorState::Running => {
-                if let Some(pool) = &self.pool {
-                    let status = pool.status();
-                    if status.available > 0 {
-                        HealthStatus::Healthy
-                    } else {
-                        HealthStatus::Degraded(format!(
-                            "no available connections ({} in use)",
-                            status.size
-                        ))
-                    }
-                } else {
-                    HealthStatus::Unhealthy("pool not initialized".into())
-                }
-            }
-            ConnectorState::Created | ConnectorState::Initializing => HealthStatus::Unknown,
-            ConnectorState::Paused => HealthStatus::Degraded("connector paused".into()),
-            ConnectorState::Recovering => HealthStatus::Degraded("recovering".into()),
-            ConnectorState::Closed => HealthStatus::Unhealthy("closed".into()),
-            ConnectorState::Failed => HealthStatus::Unhealthy("failed".into()),
-        }
-    }
-
-    fn metrics(&self) -> ConnectorMetrics {
-        self.metrics.to_connector_metrics()
-    }
-
     fn capabilities(&self) -> SinkConnectorCapabilities {
         // statement_timeout + small margin for pool checkout / setup.
         let write_timeout = self.config.statement_timeout + Duration::from_secs(5);
@@ -1025,21 +994,6 @@ impl SinkConnector for PostgresSink {
 
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
-    }
-
-    fn health_check(&self) -> HealthStatus {
-        match self.state {
-            ConnectorState::Running => HealthStatus::Healthy,
-            ConnectorState::Created | ConnectorState::Initializing => HealthStatus::Unknown,
-            ConnectorState::Paused => HealthStatus::Degraded("connector paused".into()),
-            ConnectorState::Recovering => HealthStatus::Degraded("recovering".into()),
-            ConnectorState::Closed => HealthStatus::Unhealthy("closed".into()),
-            ConnectorState::Failed => HealthStatus::Unhealthy("failed".into()),
-        }
-    }
-
-    fn metrics(&self) -> ConnectorMetrics {
-        self.metrics.to_connector_metrics()
     }
 
     fn capabilities(&self) -> SinkConnectorCapabilities {
@@ -1606,14 +1560,6 @@ mod tests {
         assert_eq!(sink.buffered_rows(), 10);
     }
 
-    // ── Health check tests ──
-
-    #[test]
-    fn test_health_check_created() {
-        let sink = PostgresSink::new(test_schema(), test_config(), None);
-        assert_eq!(sink.health_check(), HealthStatus::Unknown);
-    }
-
     // ── Capabilities tests ──
 
     #[test]
@@ -1652,17 +1598,6 @@ mod tests {
         assert!(caps.exactly_once);
     }
 
-    // ── Metrics tests ──
-
-    #[test]
-    fn test_metrics_initial() {
-        let sink = PostgresSink::new(test_schema(), test_config(), None);
-        let m = sink.metrics();
-        assert_eq!(m.records_total, 0);
-        assert_eq!(m.bytes_total, 0);
-        assert_eq!(m.errors_total, 0);
-    }
-
     // ── Epoch lifecycle tests ──
 
     #[tokio::test]
@@ -1677,9 +1612,7 @@ mod tests {
         sink.commit_epoch(1).await.expect("commit");
         assert_eq!(sink.last_committed_epoch(), 1);
 
-        let m = sink.metrics();
-        let committed = m.custom.iter().find(|(k, _)| k == "pg.epochs_committed");
-        assert_eq!(committed.expect("metric").1, 1.0);
+        assert_eq!(sink.metrics.epochs_committed.get(), 1);
     }
 
     #[tokio::test]

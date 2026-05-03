@@ -1,12 +1,11 @@
 //! `PostgreSQL` sink connector metrics.
 //!
 //! [`PostgresSinkMetrics`] provides prometheus-backed counters for
-//! tracking write statistics, convertible to the SDK's
-//! [`ConnectorMetrics`] type.
+//! tracking write statistics.
 
 use prometheus::{IntCounter, Registry};
 
-use crate::metrics::ConnectorMetrics;
+use crate::prom::reg_or_local;
 
 /// Prometheus-backed counters for `PostgreSQL` sink connector statistics.
 #[derive(Debug, Clone)]
@@ -44,77 +43,43 @@ impl PostgresSinkMetrics {
     #[must_use]
     #[allow(clippy::missing_panics_doc)]
     pub fn new(registry: Option<&Registry>) -> Self {
-        let local;
-        let reg = if let Some(r) = registry {
-            r
-        } else {
-            local = Registry::new();
-            &local
-        };
-
-        let records_written = IntCounter::new(
-            "postgres_sink_records_written_total",
-            "Total records written to PostgreSQL",
-        )
-        .unwrap();
-        let bytes_written = IntCounter::new(
-            "postgres_sink_bytes_written_total",
-            "Total bytes written to PostgreSQL",
-        )
-        .unwrap();
-        let errors_total =
-            IntCounter::new("postgres_sink_errors_total", "Total PostgreSQL sink errors").unwrap();
-        let batches_flushed = IntCounter::new(
-            "postgres_sink_batches_flushed_total",
-            "Total batches flushed",
-        )
-        .unwrap();
-        let copy_operations = IntCounter::new(
-            "postgres_sink_copy_operations_total",
-            "Total COPY BINARY operations",
-        )
-        .unwrap();
-        let upsert_operations = IntCounter::new(
-            "postgres_sink_upsert_operations_total",
-            "Total upsert operations",
-        )
-        .unwrap();
-        let epochs_committed = IntCounter::new(
-            "postgres_sink_epochs_committed_total",
-            "Total epochs committed",
-        )
-        .unwrap();
-        let epochs_rolled_back = IntCounter::new(
-            "postgres_sink_epochs_rolled_back_total",
-            "Total epochs rolled back",
-        )
-        .unwrap();
-        let changelog_deletes = IntCounter::new(
-            "postgres_sink_changelog_deletes_total",
-            "Total changelog deletes applied",
-        )
-        .unwrap();
-
-        let _ = reg.register(Box::new(records_written.clone()));
-        let _ = reg.register(Box::new(bytes_written.clone()));
-        let _ = reg.register(Box::new(errors_total.clone()));
-        let _ = reg.register(Box::new(batches_flushed.clone()));
-        let _ = reg.register(Box::new(copy_operations.clone()));
-        let _ = reg.register(Box::new(upsert_operations.clone()));
-        let _ = reg.register(Box::new(epochs_committed.clone()));
-        let _ = reg.register(Box::new(epochs_rolled_back.clone()));
-        let _ = reg.register(Box::new(changelog_deletes.clone()));
+        let mut local = None;
+        let reg = reg_or_local(registry, &mut local);
 
         Self {
-            records_written,
-            bytes_written,
-            errors_total,
-            batches_flushed,
-            copy_operations,
-            upsert_operations,
-            epochs_committed,
-            epochs_rolled_back,
-            changelog_deletes,
+            records_written: reg.counter(
+                "postgres_sink_records_written_total",
+                "Total records written to PostgreSQL",
+            ),
+            bytes_written: reg.counter(
+                "postgres_sink_bytes_written_total",
+                "Total bytes written to PostgreSQL",
+            ),
+            errors_total: reg.counter("postgres_sink_errors_total", "Total PostgreSQL sink errors"),
+            batches_flushed: reg.counter(
+                "postgres_sink_batches_flushed_total",
+                "Total batches flushed",
+            ),
+            copy_operations: reg.counter(
+                "postgres_sink_copy_operations_total",
+                "Total COPY BINARY operations",
+            ),
+            upsert_operations: reg.counter(
+                "postgres_sink_upsert_operations_total",
+                "Total upsert operations",
+            ),
+            epochs_committed: reg.counter(
+                "postgres_sink_epochs_committed_total",
+                "Total epochs committed",
+            ),
+            epochs_rolled_back: reg.counter(
+                "postgres_sink_epochs_rolled_back_total",
+                "Total epochs rolled back",
+            ),
+            changelog_deletes: reg.counter(
+                "postgres_sink_changelog_deletes_total",
+                "Total changelog deletes applied",
+            ),
         }
     }
 
@@ -158,29 +123,6 @@ impl PostgresSinkMetrics {
     pub fn record_deletes(&self, count: u64) {
         self.changelog_deletes.inc_by(count);
     }
-
-    /// Converts to the SDK's [`ConnectorMetrics`].
-    #[must_use]
-    #[allow(clippy::cast_precision_loss)]
-    pub fn to_connector_metrics(&self) -> ConnectorMetrics {
-        let mut m = ConnectorMetrics {
-            records_total: self.records_written.get(),
-            bytes_total: self.bytes_written.get(),
-            errors_total: self.errors_total.get(),
-            lag: 0,
-            custom: Vec::new(),
-        };
-        m.add_custom("pg.batches_flushed", self.batches_flushed.get() as f64);
-        m.add_custom("pg.copy_operations", self.copy_operations.get() as f64);
-        m.add_custom("pg.upsert_operations", self.upsert_operations.get() as f64);
-        m.add_custom("pg.epochs_committed", self.epochs_committed.get() as f64);
-        m.add_custom(
-            "pg.epochs_rolled_back",
-            self.epochs_rolled_back.get() as f64,
-        );
-        m.add_custom("pg.changelog_deletes", self.changelog_deletes.get() as f64);
-        m
-    }
 }
 
 impl Default for PostgresSinkMetrics {
@@ -196,10 +138,9 @@ mod tests {
     #[test]
     fn test_initial_zeros() {
         let m = PostgresSinkMetrics::new(None);
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.records_total, 0);
-        assert_eq!(cm.bytes_total, 0);
-        assert_eq!(cm.errors_total, 0);
+        assert_eq!(m.records_written.get(), 0);
+        assert_eq!(m.bytes_written.get(), 0);
+        assert_eq!(m.errors_total.get(), 0);
     }
 
     #[test]
@@ -208,9 +149,8 @@ mod tests {
         m.record_write(100, 5000);
         m.record_write(200, 10_000);
 
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.records_total, 300);
-        assert_eq!(cm.bytes_total, 15_000);
+        assert_eq!(m.records_written.get(), 300);
+        assert_eq!(m.bytes_written.get(), 15_000);
     }
 
     #[test]
@@ -220,11 +160,8 @@ mod tests {
         m.record_flush();
         m.record_copy();
 
-        let cm = m.to_connector_metrics();
-        let flushed = cm.custom.iter().find(|(k, _)| k == "pg.batches_flushed");
-        assert_eq!(flushed.unwrap().1, 2.0);
-        let copies = cm.custom.iter().find(|(k, _)| k == "pg.copy_operations");
-        assert_eq!(copies.unwrap().1, 1.0);
+        assert_eq!(m.batches_flushed.get(), 2);
+        assert_eq!(m.copy_operations.get(), 1);
     }
 
     #[test]
@@ -234,11 +171,8 @@ mod tests {
         m.record_commit();
         m.record_rollback();
 
-        let cm = m.to_connector_metrics();
-        let committed = cm.custom.iter().find(|(k, _)| k == "pg.epochs_committed");
-        assert_eq!(committed.unwrap().1, 2.0);
-        let rolled_back = cm.custom.iter().find(|(k, _)| k == "pg.epochs_rolled_back");
-        assert_eq!(rolled_back.unwrap().1, 1.0);
+        assert_eq!(m.epochs_committed.get(), 2);
+        assert_eq!(m.epochs_rolled_back.get(), 1);
     }
 
     #[test]
@@ -247,9 +181,7 @@ mod tests {
         m.record_deletes(50);
         m.record_deletes(30);
 
-        let cm = m.to_connector_metrics();
-        let deletes = cm.custom.iter().find(|(k, _)| k == "pg.changelog_deletes");
-        assert_eq!(deletes.unwrap().1, 80.0);
+        assert_eq!(m.changelog_deletes.get(), 80);
     }
 
     #[test]
@@ -259,8 +191,7 @@ mod tests {
         m.record_error();
         m.record_error();
 
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.errors_total, 3);
+        assert_eq!(m.errors_total.get(), 3);
     }
 
     #[test]
@@ -268,8 +199,6 @@ mod tests {
         let m = PostgresSinkMetrics::new(None);
         m.record_upsert();
 
-        let cm = m.to_connector_metrics();
-        let upserts = cm.custom.iter().find(|(k, _)| k == "pg.upsert_operations");
-        assert_eq!(upserts.unwrap().1, 1.0);
+        assert_eq!(m.upsert_operations.get(), 1);
     }
 }

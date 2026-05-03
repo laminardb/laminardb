@@ -53,10 +53,10 @@ See the [Configuration Reference](https://laminardb.io/docs/) for every field, o
 
 ```toml
 [server]
-mode = "embedded"           # "embedded" (single-node) or "delta" (multi-node scaffolding, not production-hardened)
+mode = "embedded"           # "embedded" (single-node) or "cluster" (multi-node scaffolding, not production-hardened)
 bind = "0.0.0.0:8080"       # HTTP API bind address
-workers = 0                 # 0 = auto-detect CPU count
 log_level = "info"
+# Worker thread count is taken from $TOKIO_WORKER_THREADS — defaults to logical CPUs.
 
 [state]
 backend = "memory"          # "memory" or "mmap"

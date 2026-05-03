@@ -17,7 +17,7 @@ Stream processing today means running a JVM cluster (Flink), paying for a manage
 
 ```toml
 [dependencies]
-laminar-db = "0.20"
+laminar-db = "0.21"
 tokio = { version = "1", features = ["full"] }
 ```
 

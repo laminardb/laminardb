@@ -389,10 +389,10 @@ async fn handle_reload(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 
 async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let config = state.current_config.read();
-    if config.server.mode != "delta" {
+    if config.server.mode != "cluster" {
         return error_response(
             StatusCode::NOT_FOUND,
-            "cluster endpoint is only available in delta mode",
+            "cluster endpoint is only available when server.mode = \"cluster\"",
         )
         .into_response();
     }
@@ -409,7 +409,7 @@ async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
 
     let pipeline_state = state.db.pipeline_state();
     Json(ClusterStatusResponse {
-        mode: "delta",
+        mode: "cluster",
         node_id,
         pipeline_state,
     })

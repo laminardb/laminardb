@@ -449,8 +449,6 @@ mod tests {
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use laminar_connectors::connector::WriteResult;
-    use laminar_connectors::health::HealthStatus;
-    use laminar_connectors::metrics::ConnectorMetrics;
     use laminar_core::streaming::AsyncConsumer;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -509,14 +507,6 @@ mod tests {
 
         fn schema(&self) -> arrow::datatypes::SchemaRef {
             Arc::clone(&self.schema)
-        }
-
-        fn health_check(&self) -> HealthStatus {
-            HealthStatus::Healthy
-        }
-
-        fn metrics(&self) -> ConnectorMetrics {
-            ConnectorMetrics::default()
         }
 
         fn capabilities(&self) -> laminar_connectors::connector::SinkConnectorCapabilities {

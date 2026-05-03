@@ -25,8 +25,6 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{SourceBatch, SourceConnector};
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
-use crate::metrics::ConnectorMetrics;
 
 use super::config::{OtelSignal, OtelSourceConfig};
 use super::schema::{logs_schema, metrics_schema, traces_schema};
@@ -233,46 +231,6 @@ impl SourceConnector for OtelSource {
             "OTel source restore: push-only transport, data gap expected since last checkpoint"
         );
         Ok(())
-    }
-
-    fn health_check(&self) -> HealthStatus {
-        match self.state {
-            ConnectorState::Running => {
-                if self
-                    .server_handle
-                    .as_ref()
-                    .is_some_and(|h| !h.is_finished())
-                {
-                    HealthStatus::Healthy
-                } else {
-                    HealthStatus::Unhealthy("gRPC server task exited".into())
-                }
-            }
-            ConnectorState::Created | ConnectorState::Initializing => HealthStatus::Unknown,
-            ConnectorState::Paused | ConnectorState::Recovering => {
-                HealthStatus::Degraded(format!("{}", self.state))
-            }
-            ConnectorState::Closed | ConnectorState::Failed => {
-                HealthStatus::Unhealthy(format!("{}", self.state))
-            }
-        }
-    }
-
-    #[allow(clippy::cast_precision_loss)]
-    fn metrics(&self) -> ConnectorMetrics {
-        ConnectorMetrics {
-            records_total: self.records_received.load(Ordering::Relaxed),
-            bytes_total: 0,
-            errors_total: 0,
-            lag: 0,
-            custom: vec![
-                (
-                    "requests_received".into(),
-                    self.requests_received.load(Ordering::Relaxed) as f64,
-                ),
-                ("checkpoint_seq".into(), self.checkpoint_seq as f64),
-            ],
-        }
     }
 
     async fn close(&mut self) -> Result<(), ConnectorError> {

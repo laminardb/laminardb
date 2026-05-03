@@ -1,12 +1,11 @@
 //! WebSocket sink connector metrics.
 //!
 //! [`WebSocketSinkMetrics`] provides prometheus-backed counters and gauges
-//! for tracking WebSocket sink statistics, convertible to the SDK's
-//! [`ConnectorMetrics`] type.
+//! for tracking WebSocket sink statistics.
 
 use prometheus::{IntCounter, IntGauge, Registry};
 
-use crate::metrics::ConnectorMetrics;
+use crate::prom::reg_or_local;
 
 /// Prometheus-backed counters/gauges for WebSocket sink connector statistics.
 #[derive(Debug, Clone)]
@@ -32,51 +31,25 @@ impl WebSocketSinkMetrics {
     #[must_use]
     #[allow(clippy::missing_panics_doc)]
     pub fn new(registry: Option<&Registry>) -> Self {
-        let local;
-        let reg = if let Some(r) = registry {
-            r
-        } else {
-            local = Registry::new();
-            &local
-        };
-
-        let messages_sent =
-            IntCounter::new("ws_sink_messages_sent_total", "Total WS messages sent").unwrap();
-        let messages_dropped_slow_client = IntCounter::new(
-            "ws_sink_messages_dropped_slow_client_total",
-            "Total WS messages dropped (slow client)",
-        )
-        .unwrap();
-        let bytes_sent =
-            IntCounter::new("ws_sink_bytes_sent_total", "Total WS bytes sent").unwrap();
-        let connected_clients =
-            IntGauge::new("ws_sink_connected_clients", "Current connected WS clients").unwrap();
-        let client_disconnects = IntCounter::new(
-            "ws_sink_client_disconnects_total",
-            "Total WS client disconnections",
-        )
-        .unwrap();
-        let replay_requests =
-            IntCounter::new("ws_sink_replay_requests_total", "Total WS replay requests").unwrap();
-        let ping_timeouts =
-            IntCounter::new("ws_sink_ping_timeouts_total", "Total WS ping timeouts").unwrap();
-
-        let _ = reg.register(Box::new(messages_sent.clone()));
-        let _ = reg.register(Box::new(messages_dropped_slow_client.clone()));
-        let _ = reg.register(Box::new(bytes_sent.clone()));
-        let _ = reg.register(Box::new(connected_clients.clone()));
-        let _ = reg.register(Box::new(client_disconnects.clone()));
-        let _ = reg.register(Box::new(replay_requests.clone()));
-        let _ = reg.register(Box::new(ping_timeouts.clone()));
+        let mut local = None;
+        let reg = reg_or_local(registry, &mut local);
 
         Self {
-            messages_sent,
-            messages_dropped_slow_client,
-            bytes_sent,
-            connected_clients,
-            client_disconnects,
-            replay_requests,
-            ping_timeouts,
+            messages_sent: reg.counter("ws_sink_messages_sent_total", "Total WS messages sent"),
+            messages_dropped_slow_client: reg.counter(
+                "ws_sink_messages_dropped_slow_client_total",
+                "Total WS messages dropped (slow client)",
+            ),
+            bytes_sent: reg.counter("ws_sink_bytes_sent_total", "Total WS bytes sent"),
+            connected_clients: reg
+                .gauge("ws_sink_connected_clients", "Current connected WS clients"),
+            client_disconnects: reg.counter(
+                "ws_sink_client_disconnects_total",
+                "Total WS client disconnections",
+            ),
+            replay_requests: reg
+                .counter("ws_sink_replay_requests_total", "Total WS replay requests"),
+            ping_timeouts: reg.counter("ws_sink_ping_timeouts_total", "Total WS ping timeouts"),
         }
     }
 
@@ -116,31 +89,6 @@ impl WebSocketSinkMetrics {
     pub fn record_ping_timeout(&self) {
         self.ping_timeouts.inc();
     }
-
-    /// Converts to the SDK's [`ConnectorMetrics`].
-    #[must_use]
-    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
-    pub fn to_connector_metrics(&self) -> ConnectorMetrics {
-        let mut m = ConnectorMetrics {
-            records_total: self.messages_sent.get(),
-            bytes_total: self.bytes_sent.get(),
-            errors_total: self.messages_dropped_slow_client.get(),
-            lag: 0,
-            custom: Vec::new(),
-        };
-        m.add_custom("ws.connected_clients", self.connected_clients.get() as f64);
-        m.add_custom(
-            "ws.client_disconnects",
-            self.client_disconnects.get() as f64,
-        );
-        m.add_custom("ws.replay_requests", self.replay_requests.get() as f64);
-        m.add_custom(
-            "ws.messages_dropped_slow_client",
-            self.messages_dropped_slow_client.get() as f64,
-        );
-        m.add_custom("ws.ping_timeouts", self.ping_timeouts.get() as f64);
-        m
-    }
 }
 
 impl Default for WebSocketSinkMetrics {
@@ -156,10 +104,9 @@ mod tests {
     #[test]
     fn test_initial_zeros() {
         let m = WebSocketSinkMetrics::new(None);
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.records_total, 0);
-        assert_eq!(cm.bytes_total, 0);
-        assert_eq!(cm.errors_total, 0);
+        assert_eq!(m.messages_sent.get(), 0);
+        assert_eq!(m.bytes_sent.get(), 0);
+        assert_eq!(m.messages_dropped_slow_client.get(), 0);
     }
 
     #[test]
@@ -168,9 +115,8 @@ mod tests {
         m.record_send(512);
         m.record_send(1024);
 
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.records_total, 2);
-        assert_eq!(cm.bytes_total, 1536);
+        assert_eq!(m.messages_sent.get(), 2);
+        assert_eq!(m.bytes_sent.get(), 1536);
     }
 
     #[test]
@@ -179,14 +125,7 @@ mod tests {
         m.record_drop();
         m.record_drop();
 
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.errors_total, 2);
-
-        let dropped = cm
-            .custom
-            .iter()
-            .find(|(k, _)| k == "ws.messages_dropped_slow_client");
-        assert_eq!(dropped.unwrap().1, 2.0);
+        assert_eq!(m.messages_dropped_slow_client.get(), 2);
     }
 
     #[test]
@@ -197,12 +136,8 @@ mod tests {
         m.record_connect();
         m.record_disconnect();
 
-        let cm = m.to_connector_metrics();
-        let clients = cm.custom.iter().find(|(k, _)| k == "ws.connected_clients");
-        assert_eq!(clients.unwrap().1, 2.0);
-
-        let disconnects = cm.custom.iter().find(|(k, _)| k == "ws.client_disconnects");
-        assert_eq!(disconnects.unwrap().1, 1.0);
+        assert_eq!(m.connected_clients.get(), 2);
+        assert_eq!(m.client_disconnects.get(), 1);
     }
 
     #[test]
@@ -211,12 +146,8 @@ mod tests {
         // Disconnect without any connect should not underflow
         m.record_disconnect();
 
-        let cm = m.to_connector_metrics();
-        let clients = cm.custom.iter().find(|(k, _)| k == "ws.connected_clients");
-        assert_eq!(clients.unwrap().1, 0.0);
-
-        let disconnects = cm.custom.iter().find(|(k, _)| k == "ws.client_disconnects");
-        assert_eq!(disconnects.unwrap().1, 1.0);
+        assert_eq!(m.connected_clients.get(), 0);
+        assert_eq!(m.client_disconnects.get(), 1);
     }
 
     #[test]
@@ -226,27 +157,15 @@ mod tests {
         m.record_replay();
         m.record_replay();
 
-        let cm = m.to_connector_metrics();
-        let replays = cm.custom.iter().find(|(k, _)| k == "ws.replay_requests");
-        assert_eq!(replays.unwrap().1, 3.0);
+        assert_eq!(m.replay_requests.get(), 3);
     }
 
     #[test]
     fn test_default() {
         let m = WebSocketSinkMetrics::default();
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.records_total, 0);
-        assert_eq!(cm.bytes_total, 0);
-        assert_eq!(cm.errors_total, 0);
-        assert_eq!(cm.custom.len(), 5);
-    }
-
-    #[test]
-    fn test_custom_metrics_count() {
-        let m = WebSocketSinkMetrics::new(None);
-        let cm = m.to_connector_metrics();
-        // Should have exactly 5 custom metrics
-        assert_eq!(cm.custom.len(), 5);
+        assert_eq!(m.messages_sent.get(), 0);
+        assert_eq!(m.bytes_sent.get(), 0);
+        assert_eq!(m.messages_dropped_slow_client.get(), 0);
     }
 
     #[test]
@@ -261,12 +180,9 @@ mod tests {
         m.record_disconnect();
         m.record_replay();
 
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.records_total, 3);
-        assert_eq!(cm.bytes_total, 600);
-        assert_eq!(cm.errors_total, 1);
-
-        let clients = cm.custom.iter().find(|(k, _)| k == "ws.connected_clients");
-        assert_eq!(clients.unwrap().1, 1.0);
+        assert_eq!(m.messages_sent.get(), 3);
+        assert_eq!(m.bytes_sent.get(), 600);
+        assert_eq!(m.messages_dropped_slow_client.get(), 1);
+        assert_eq!(m.connected_clients.get(), 1);
     }
 }

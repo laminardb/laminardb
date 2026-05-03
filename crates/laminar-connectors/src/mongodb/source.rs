@@ -28,8 +28,6 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{SourceBatch, SourceConnector};
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
-use crate::metrics::ConnectorMetrics;
 
 use super::change_event::{MongoDbChangeEvent, OperationType};
 use super::config::MongoDbSourceConfig;
@@ -378,27 +376,6 @@ impl SourceConnector for MongoDbCdcSource {
         Ok(())
     }
 
-    fn health_check(&self) -> HealthStatus {
-        match self.state {
-            ConnectorState::Running => {
-                if self.invalidated {
-                    HealthStatus::Degraded("change stream invalidated".to_string())
-                } else {
-                    HealthStatus::Healthy
-                }
-            }
-            ConnectorState::Created => HealthStatus::Unknown,
-            ConnectorState::Closed | ConnectorState::Failed => {
-                HealthStatus::Unhealthy("closed".to_string())
-            }
-            _ => HealthStatus::Degraded(format!("state: {}", self.state)),
-        }
-    }
-
-    fn metrics(&self) -> ConnectorMetrics {
-        self.metrics.to_connector_metrics()
-    }
-
     async fn close(&mut self) -> Result<(), ConnectorError> {
         // Persist the last resume token before shutting down.
         if let Some(ref token) = self.last_resume_token {
@@ -658,10 +635,10 @@ async fn run_change_stream_reader(
                     let _ = tx.send(ChangeStreamPayload::Error(msg)).await;
                     break 'reconnect;
                 }
-                let backoff_secs = (1u64 << consecutive_failures).min(30);
+                let backoff = crate::retry::Backoff::broker_reconnect().delay(consecutive_failures);
                 tracing::warn!(
                     attempt = consecutive_failures,
-                    backoff_secs,
+                    ?backoff,
                     error = %e,
                     "failed to open change stream, retrying"
                 );
@@ -672,7 +649,7 @@ async fn run_change_stream_reader(
                             break 'reconnect;
                         }
                     }
-                    () = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                    () = tokio::time::sleep(backoff) => {}
                 }
                 continue 'reconnect;
             }
@@ -737,11 +714,11 @@ async fn run_change_stream_reader(
             break 'reconnect;
         }
 
-        let backoff_secs = (1u64 << consecutive_failures).min(30);
+        let backoff = crate::retry::Backoff::broker_reconnect().delay(consecutive_failures);
         tracing::warn!(
             resume_token = ?last_token,
             attempt = consecutive_failures,
-            backoff_secs,
+            ?backoff,
             "reconnecting change stream"
         );
         metrics.record_reconnect();
@@ -753,7 +730,7 @@ async fn run_change_stream_reader(
                     break 'reconnect;
                 }
             }
-            () = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+            () = tokio::time::sleep(backoff) => {}
         }
 
         // Re-create client and database for reconnection.
@@ -1005,23 +982,6 @@ mod tests {
             source.last_resume_token().unwrap().as_str(),
             "restored_token"
         );
-    }
-
-    #[test]
-    fn test_health_check() {
-        let config = MongoDbSourceConfig::new("mongodb://localhost:27017", "db", "coll");
-        let mut source = MongoDbCdcSource::new(config, None);
-
-        assert_eq!(source.health_check(), HealthStatus::Unknown);
-
-        source.state = ConnectorState::Running;
-        assert_eq!(source.health_check(), HealthStatus::Healthy);
-
-        source.invalidated = true;
-        assert!(matches!(source.health_check(), HealthStatus::Degraded(_)));
-
-        source.state = ConnectorState::Closed;
-        assert!(matches!(source.health_check(), HealthStatus::Unhealthy(_)));
     }
 
     #[test]

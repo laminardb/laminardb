@@ -47,29 +47,16 @@ pub enum MvError {
 }
 
 /// Materialized view execution state.
+///
+/// Production currently only distinguishes `Running` from `Dropping`;
+/// the `Paused` and `Error` variants existed for a planned lifecycle
+/// transition that was never wired to operator failure events. Re-add
+/// them when the registry actually transitions on those signals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MvState {
     /// View is actively processing events.
     #[default]
     Running,
-    /// View is paused (e.g., waiting for dependency).
-    Paused,
-    /// View encountered an error.
-    Error,
     /// View is being dropped.
     Dropping,
-}
-
-impl MvState {
-    /// Returns true if the view is in a state that can process events.
-    #[must_use]
-    pub fn can_process(&self) -> bool {
-        matches!(self, Self::Running)
-    }
-
-    /// Returns true if the view is in an error state.
-    #[must_use]
-    pub fn is_error(&self) -> bool {
-        matches!(self, Self::Error)
-    }
 }

@@ -694,17 +694,27 @@ impl LaminarDB {
             });
         }
 
-        // If the pipeline is already running, send via control channel
-        // so the coordinator picks up the new query on the next cycle.
+        // If the pipeline is already running, send via control channel so
+        // the coordinator picks up the new query on the next cycle. The
+        // catalog is already updated; if the channel is saturated we have
+        // to surface that to the caller — silently dropping the message
+        // would leave the new stream registered but never running.
         if let Some(ref tx) = *self.control_tx.lock() {
-            let _ = tx.try_send(crate::pipeline::ControlMsg::AddStream {
+            tx.try_send(crate::pipeline::ControlMsg::AddStream {
                 name: name_str.clone(),
                 sql: query_sql,
                 emit_clause: plan_emit,
                 window_config: plan_window,
                 order_config: plan_order,
                 join_config: plan_joins,
-            });
+            })
+            .map_err(|e| {
+                self.catalog.drop_stream(&name_str);
+                self.connector_manager.lock().unregister_stream(&name_str);
+                DbError::Pipeline(format!(
+                    "control channel busy, retry CREATE STREAM '{name_str}': {e}"
+                ))
+            })?;
         }
 
         Ok(ExecuteResult::Ddl(DdlInfo {
@@ -741,11 +751,19 @@ impl LaminarDB {
         }
         self.connector_manager.lock().unregister_stream(&name_str);
 
-        // Notify the running coordinator to remove the query.
+        // Notify the running coordinator to remove the query. If the
+        // channel is saturated, surface a transient error so the caller
+        // can retry rather than seeing a successful DROP that leaves the
+        // coordinator still running the query.
         if let Some(ref tx) = *self.control_tx.lock() {
-            let _ = tx.try_send(crate::pipeline::ControlMsg::DropStream {
+            tx.try_send(crate::pipeline::ControlMsg::DropStream {
                 name: name_str.clone(),
-            });
+            })
+            .map_err(|e| {
+                DbError::Pipeline(format!(
+                    "control channel busy, retry DROP STREAM '{name_str}': {e}"
+                ))
+            })?;
         }
 
         Ok(ExecuteResult::Ddl(DdlInfo {
@@ -1020,16 +1038,25 @@ impl LaminarDB {
                 })?;
         }
 
-        // If the pipeline is already running, hot-add the query.
+        // If the pipeline is already running, hot-add the query. On a
+        // saturated control channel surface a transient error rather than
+        // leaving the MV catalog-registered but not actually running.
         if let Some(ref tx) = *self.control_tx.lock() {
-            let _ = tx.try_send(crate::pipeline::ControlMsg::AddStream {
+            tx.try_send(crate::pipeline::ControlMsg::AddStream {
                 name: name_str.clone(),
                 sql: query_sql,
                 emit_clause: plan_emit,
                 window_config: plan_window,
                 order_config: plan_order,
                 join_config: plan_joins,
-            });
+            })
+            .map_err(|e| {
+                let _ = self.ctx.deregister_table(&name_str);
+                let _ = self.mv_registry.lock().unregister(&name_str);
+                DbError::Pipeline(format!(
+                    "control channel busy, retry CREATE MATERIALIZED VIEW '{name_str}': {e}"
+                ))
+            })?;
         }
 
         Ok(ExecuteResult::Ddl(DdlInfo {
@@ -1083,12 +1110,19 @@ impl LaminarDB {
             }
         }
 
-        // Notify running coordinator to remove the queries.
+        // Notify running coordinator to remove the queries. If the
+        // channel saturates partway through, surface that — the catalog
+        // is already updated, so subsequent retries are idempotent.
         if let Some(ref tx) = *self.control_tx.lock() {
             for dropped in &dropped_names {
-                let _ = tx.try_send(crate::pipeline::ControlMsg::DropStream {
+                tx.try_send(crate::pipeline::ControlMsg::DropStream {
                     name: dropped.clone(),
-                });
+                })
+                .map_err(|e| {
+                    DbError::Pipeline(format!(
+                        "control channel busy, retry DROP MATERIALIZED VIEW '{dropped}': {e}"
+                    ))
+                })?;
             }
         }
 

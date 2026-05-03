@@ -10,8 +10,16 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
+
+/// Bounded capacity for the inbound shuffle channel. With a single
+/// consumer per `ShuffleReceiver` (the cluster repartition dispatcher
+/// is the only production caller of `recv()`), this caps the in-memory
+/// fan-in queue. A slow consumer + fast peer can still wedge on the
+/// `mpsc::Sender::send` await on the per-peer reader task; that is
+/// the point — TCP backpressure flows back to the sender.
+const SHUFFLE_RECV_QUEUE: usize = 1024;
 
 use super::message::{read_message, write_message, ShuffleMessage};
 use crate::checkpoint::barrier::CheckpointBarrier;
@@ -255,7 +263,14 @@ pub struct ShuffleReceiver {
     /// socket open, peers never see EOF, and senders can't detect
     /// that we went away.
     peer_tasks: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
-    rx: Mutex<mpsc::UnboundedReceiver<(ShufflePeerId, ShuffleMessage)>>,
+    /// Bounded inbound queue. The receiver is parked behind a `parking_lot`
+    /// mutex (lock-free in the uncontended case; never held across `.await`)
+    /// rather than a tokio mutex so concurrent `recv()`/`drain_available()`
+    /// callers can't deadlock or hold a lock across an await point.
+    rx: parking_lot::Mutex<Option<mpsc::Receiver<(ShufflePeerId, ShuffleMessage)>>>,
+    /// Notifies a parked `recv()` when the receiver is returned by a
+    /// previous waiter — so the next caller can pick it up.
+    rx_returned: Arc<Notify>,
 }
 
 impl Drop for ShuffleReceiver {
@@ -312,7 +327,7 @@ impl ShuffleReceiver {
     async fn bind_impl(local_id: ShufflePeerId, addr: SocketAddr) -> io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(SHUFFLE_RECV_QUEUE);
 
         let peer_tasks: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>> =
             Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -323,7 +338,8 @@ impl ShuffleReceiver {
             local_addr,
             accept,
             peer_tasks,
-            rx: Mutex::new(rx),
+            rx: parking_lot::Mutex::new(Some(rx)),
+            rx_returned: Arc::new(Notify::new()),
         })
     }
 
@@ -334,24 +350,42 @@ impl ShuffleReceiver {
     }
 
     /// Await the next `(peer_id, msg)` from any connected peer.
+    ///
+    /// The receiver is single-owner: the production caller is the
+    /// cluster-repartition `dispatch_inbound` loop. Tests run a single
+    /// `recv()` at a time. If a second caller arrives while another holds
+    /// the receiver, it parks on `rx_returned` until the receiver returns
+    /// to the slot — at which point it retries. This avoids holding any
+    /// mutex across an `.await` and never serializes the inner channel.
     pub async fn recv(&self) -> Option<(ShufflePeerId, ShuffleMessage)> {
-        self.rx.lock().await.recv().await
+        loop {
+            // Scope the guard so it is dropped before any `.await` —
+            // parking_lot guards are !Send and would make the resulting
+            // future !Send.
+            let taken = { self.rx.lock().take() };
+            let Some(mut rx) = taken else {
+                self.rx_returned.notified().await;
+                continue;
+            };
+            let item = rx.recv().await;
+            {
+                *self.rx.lock() = Some(rx);
+            }
+            self.rx_returned.notify_waiters();
+            return item;
+        }
     }
 
     /// Drain every currently-available `(peer_id, msg)` without blocking.
-    /// Returns immediately when the internal queue is empty.
-    ///
-    /// Used by the row-shuffle aggregator path to pull remote rows into
-    /// the current streaming cycle without waiting for more. Uses
-    /// `tokio::sync::Mutex::try_lock` so a concurrent `recv()` doesn't
-    /// block us — we just skip this tick when contended (next tick picks
-    /// up the messages).
+    /// Returns an empty vec when the queue is empty *or* when another
+    /// caller currently holds the receiver (next tick picks them up).
     pub fn drain_available(&self) -> Vec<(ShufflePeerId, ShuffleMessage)> {
-        let Ok(mut guard) = self.rx.try_lock() else {
+        let mut slot = self.rx.lock();
+        let Some(rx) = slot.as_mut() else {
             return Vec::new();
         };
         let mut out = Vec::new();
-        while let Ok(msg) = guard.try_recv() {
+        while let Ok(msg) = rx.try_recv() {
             out.push(msg);
         }
         out
@@ -359,7 +393,7 @@ impl ShuffleReceiver {
 
     async fn accept_loop(
         listener: TcpListener,
-        tx: mpsc::UnboundedSender<(ShufflePeerId, ShuffleMessage)>,
+        tx: mpsc::Sender<(ShufflePeerId, ShuffleMessage)>,
         peer_tasks: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>>,
     ) {
         loop {
@@ -380,10 +414,7 @@ impl ShuffleReceiver {
         }
     }
 
-    async fn per_peer_loop(
-        stream: TcpStream,
-        tx: mpsc::UnboundedSender<(ShufflePeerId, ShuffleMessage)>,
-    ) {
+    async fn per_peer_loop(stream: TcpStream, tx: mpsc::Sender<(ShufflePeerId, ShuffleMessage)>) {
         let (mut reader_half, _writer_half) = tokio::io::split(stream);
         // Expect Hello first. Anything else means the peer is broken.
         let Ok(ShuffleMessage::Hello(peer)) = read_message(&mut reader_half).await else {
@@ -393,7 +424,9 @@ impl ShuffleReceiver {
             match read_message(&mut reader_half).await {
                 Ok(ShuffleMessage::Close(_)) | Err(_) => break,
                 Ok(msg) => {
-                    if tx.send((peer, msg)).is_err() {
+                    // Bounded send: blocks the per-peer reader if the
+                    // dispatcher is slow, propagating backpressure to TCP.
+                    if tx.send((peer, msg)).await.is_err() {
                         break;
                     }
                 }

@@ -15,8 +15,6 @@ use tracing::{debug, info, warn};
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{SinkConnector, SinkConnectorCapabilities, WriteResult};
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
-use crate::metrics::ConnectorMetrics;
 use crate::serde::{self, Format, RecordSerializer};
 
 use super::avro_serializer::AvroSerializer;
@@ -863,21 +861,6 @@ impl SinkConnector for KafkaSink {
         Ok(())
     }
 
-    fn health_check(&self) -> HealthStatus {
-        match self.state {
-            ConnectorState::Running => HealthStatus::Healthy,
-            ConnectorState::Created | ConnectorState::Initializing => HealthStatus::Unknown,
-            ConnectorState::Paused => HealthStatus::Degraded("connector paused".into()),
-            ConnectorState::Recovering => HealthStatus::Degraded("recovering".into()),
-            ConnectorState::Closed => HealthStatus::Unhealthy("closed".into()),
-            ConnectorState::Failed => HealthStatus::Unhealthy("failed".into()),
-        }
-    }
-
-    fn metrics(&self) -> ConnectorMetrics {
-        self.metrics.to_connector_metrics()
-    }
-
     fn capabilities(&self) -> SinkConnectorCapabilities {
         // Catch stuck-broker scenarios faster than librdkafka's
         // delivery.timeout.ms (default 5min).
@@ -1026,35 +1009,6 @@ mod tests {
         let schema = test_schema();
         let sink = KafkaSink::new(schema.clone(), test_config(), None);
         assert_eq!(sink.schema(), schema);
-    }
-
-    #[test]
-    fn test_health_check_created() {
-        let sink = KafkaSink::new(test_schema(), test_config(), None);
-        assert_eq!(sink.health_check(), HealthStatus::Unknown);
-    }
-
-    #[test]
-    fn test_health_check_running() {
-        let mut sink = KafkaSink::new(test_schema(), test_config(), None);
-        sink.state = ConnectorState::Running;
-        assert_eq!(sink.health_check(), HealthStatus::Healthy);
-    }
-
-    #[test]
-    fn test_health_check_closed() {
-        let mut sink = KafkaSink::new(test_schema(), test_config(), None);
-        sink.state = ConnectorState::Closed;
-        assert!(matches!(sink.health_check(), HealthStatus::Unhealthy(_)));
-    }
-
-    #[test]
-    fn test_metrics_initial() {
-        let sink = KafkaSink::new(test_schema(), test_config(), None);
-        let m = sink.metrics();
-        assert_eq!(m.records_total, 0);
-        assert_eq!(m.bytes_total, 0);
-        assert_eq!(m.errors_total, 0);
     }
 
     #[test]

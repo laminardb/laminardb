@@ -890,7 +890,11 @@ impl CoreWindowState {
         let new_start = ts_ms;
         let new_end = ts_ms.saturating_add(gap_ms);
 
-        // Check overlap count before mutating
+        // BTreeMap range iteration yields unique keys, so `overlapping`
+        // is dedup-by-construction. The unwraps below rely on this and
+        // on the matching `session_groups.get_mut(key)` succeeding when
+        // we just observed `get(key).map(...)`. A debug_assert encodes
+        // the invariant for refactor safety.
         let overlapping: Vec<i64> = self
             .session_groups
             .get(key)
@@ -902,6 +906,14 @@ impl CoreWindowState {
                     .collect()
             })
             .unwrap_or_default();
+
+        debug_assert!(
+            overlapping
+                .iter()
+                .zip(overlapping.iter().skip(1))
+                .all(|(a, b)| a < b),
+            "session window: overlapping keys must be unique and sorted"
+        );
 
         match overlapping.len() {
             0 => {
@@ -923,27 +935,42 @@ impl CoreWindowState {
                 );
             }
             1 => {
-                let group = self.session_groups.get_mut(key).unwrap();
+                let group = self
+                    .session_groups
+                    .get_mut(key)
+                    .expect("invariant: key present (overlapping derived from same group)");
                 let sess_key = overlapping[0];
-                let sess = group.sessions.get_mut(&sess_key).unwrap();
+                let sess = group
+                    .sessions
+                    .get_mut(&sess_key)
+                    .expect("invariant: session key sourced from this map");
                 let merged_start = sess.start.min(new_start);
                 let merged_end = sess.end.max(new_end);
                 sess.start = merged_start;
                 sess.end = merged_end;
                 Self::update_accumulators(&mut sess.accs, &self.agg_specs, batch, index_array)?;
                 if merged_start != sess_key {
-                    let sess = group.sessions.remove(&sess_key).unwrap();
+                    let sess = group
+                        .sessions
+                        .remove(&sess_key)
+                        .expect("invariant: session key just observed above");
                     group.sessions.insert(merged_start, sess);
                 }
             }
             _ => {
-                let group = self.session_groups.get_mut(key).unwrap();
+                let group = self
+                    .session_groups
+                    .get_mut(key)
+                    .expect("invariant: key present (overlapping derived from same group)");
                 let mut merged_start = new_start;
                 let mut merged_end = new_end;
                 let mut survivor_accs: Option<Vec<Box<dyn datafusion_expr::Accumulator>>> = None;
 
                 for &sess_key in &overlapping {
-                    let sess = group.sessions.remove(&sess_key).unwrap();
+                    let sess = group
+                        .sessions
+                        .remove(&sess_key)
+                        .expect("invariant: overlapping keys are unique BTreeMap entries");
                     merged_start = merged_start.min(sess.start);
                     merged_end = merged_end.max(sess.end);
 
@@ -969,7 +996,8 @@ impl CoreWindowState {
                     }
                 }
 
-                let mut accs = survivor_accs.unwrap();
+                let mut accs = survivor_accs
+                    .expect("invariant: overlapping non-empty, survivor set on first iter");
                 Self::update_accumulators(&mut accs, &self.agg_specs, batch, index_array)?;
                 group.sessions.insert(
                     merged_start,
@@ -1125,7 +1153,10 @@ impl CoreWindowState {
                 .collect();
 
             for sess_key in to_close {
-                let sess = group.sessions.remove(&sess_key).unwrap();
+                let sess = group
+                    .sessions
+                    .remove(&sess_key)
+                    .expect("invariant: to_close keys collected from this map this iteration");
                 rows.push((sess.start, sess.end, key.clone(), sess.accs));
             }
 

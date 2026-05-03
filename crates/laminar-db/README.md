@@ -1,10 +1,6 @@
 # laminar-db
 
-Unified database facade for LaminarDB.
-
-## Overview
-
-`LaminarDB` lives here -- the main entry point that wires together the SQL parser, query planner, DataFusion context, streaming infrastructure, and connector registry.
+Unified database facade for LaminarDB. The main entry point that wires the SQL parser, query planner, DataFusion context, streaming infrastructure, and connector registry.
 
 ## Key Types
 

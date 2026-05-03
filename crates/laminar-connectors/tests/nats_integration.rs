@@ -21,7 +21,6 @@ use async_nats::jetstream::{self, stream::Config as StreamConfig};
 
 use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::{SinkConnector, SourceConnector};
-use laminar_connectors::health::HealthStatus;
 use laminar_connectors::nats::{NatsSink, NatsSource};
 
 const NATS_URL: &str = "nats://127.0.0.1:4222";
@@ -239,13 +238,8 @@ async fn exactly_once_dedup_drops_duplicate() {
         "expected dedup to drop the second publish"
     );
 
-    // Client-side counter via the public `SinkConnector::metrics`.
-    let cm = sink.metrics();
-    let dedup = cm
-        .custom
-        .iter()
-        .find_map(|(k, v)| (k == "nats.dedup").then_some(*v as u64))
-        .expect("nats.dedup custom metric");
+    // Client-side counter via the prometheus-backed metrics handle.
+    let dedup = sink.metrics_handle().dedup_total.get();
     assert_eq!(dedup, 1, "expected nats.dedup = 1, got {dedup}");
 }
 
@@ -325,72 +319,6 @@ fn extract_rows(batch: &RecordBatch) -> Vec<(i64, String)> {
     (0..batch.num_rows())
         .map(|i| (ids.value(i), names.value(i).to_string()))
         .collect()
-}
-
-// ── health escalation ──
-
-/// Delete the stream behind a running source; health flips to Unhealthy.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs docker compose -f docker-compose.nats.yml up"]
-async fn source_flips_unhealthy_after_stream_deleted() {
-    let ctx = connect().await;
-    reset_stream(
-        &ctx,
-        StreamConfig {
-            name: "DROP".into(),
-            subjects: vec!["drop.events".into()],
-            ..Default::default()
-        },
-    )
-    .await;
-
-    let mut source = NatsSource::new(payload_schema(), None);
-    source
-        .open(&ConnectorConfig::with_properties(
-            "nats",
-            source_props(&[
-                ("servers", NATS_URL),
-                ("stream", "DROP"),
-                ("consumer", "drop-consumer"),
-                ("subject", "drop.events"),
-                ("format", "json"),
-                ("fetch.max.wait.ms", "100"),
-                ("fetch.error.threshold", "2"),
-            ]),
-        ))
-        .await
-        .expect("source open");
-
-    // Let the reader establish a few successful fetches first.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        matches!(
-            source.health_check(),
-            HealthStatus::Healthy | HealthStatus::Degraded(_)
-        ),
-        "expected healthy before stream delete, got {:?}",
-        source.health_check()
-    );
-
-    // Pull the stream out from under the running source.
-    ctx.delete_stream("DROP").await.expect("delete_stream");
-
-    // Wait for consecutive errors to accumulate past the threshold.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let mut final_status = source.health_check();
-    while tokio::time::Instant::now() < deadline {
-        final_status = source.health_check();
-        if matches!(final_status, HealthStatus::Unhealthy(_)) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    source.close().await.expect("source close");
-    assert!(
-        matches!(final_status, HealthStatus::Unhealthy(_)),
-        "expected Unhealthy after stream delete, got {final_status:?}"
-    );
 }
 
 // ── observability ──
@@ -520,18 +448,15 @@ async fn poll_gauge_until(
 ) -> Option<u64> {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
-        let cm = source.metrics();
-        let v = cm
-            .custom
-            .iter()
-            .find_map(|(k, v)| (k == &format!("nats.{custom_key}")).then_some(*v as u64))
-            .unwrap_or_else(|| {
-                if custom_key == "consumer_lag" {
-                    cm.lag
-                } else {
-                    0
-                }
-            });
+        let metrics = source.metrics_handle();
+        #[allow(clippy::cast_sign_loss)]
+        let v: u64 = match custom_key {
+            "consumer_lag" => metrics.consumer_lag.get().max(0) as u64,
+            "pending_acks" => metrics.pending_acks.get().max(0) as u64,
+            "acks" => metrics.acks_total.get(),
+            "ack_errors" => metrics.ack_errors_total.get(),
+            _ => 0,
+        };
         if until(v) {
             return Some(v);
         }

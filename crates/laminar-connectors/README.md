@@ -1,10 +1,6 @@
 # laminar-connectors
 
-External system connectors for LaminarDB -- Kafka, CDC, MongoDB, WebSocket, OpenTelemetry, Delta Lake, Iceberg, and files.
-
-## Overview
-
-Source and sink connectors for external systems. Each connector implements the `SourceConnector` or `SinkConnector` trait and supports exactly-once semantics via two-phase commit.
+External system connectors for LaminarDB. Each connector implements the `SourceConnector` or `SinkConnector` trait and supports exactly-once semantics via two-phase commit.
 
 ## Connectors
 
@@ -92,10 +88,9 @@ Source and sink connectors for external systems. Each connector implements the `
 | `delta-lake-glue` | AWS Glue catalog for Delta Lake |
 | `iceberg` | Apache Iceberg source and sink (REST/Glue/Hive catalogs) |
 | `otel` | OpenTelemetry OTLP/gRPC source (traces, metrics, logs) |
-| `parquet-lookup` | Parquet file lookup source |
+| `parquet-lookup` | Parquet schema reader (used by `files` and reference tables) |
 | `websocket` | WebSocket source and sink (tokio-tungstenite) |
 | `files` | File source (auto-loader) and sink (rolling files) |
-| `kafka-discovery` | Kafka-based discovery for delta mode |
 
 ## Custom Connectors
 

@@ -209,18 +209,23 @@ pub async fn connect(
 
     let conn_str = config.connection_string();
 
+    // Control-plane connection has no TLS support yet (replication
+    // stream does — see `build_replication_config`). Refuse anything
+    // other than `Disable` rather than silently downgrading. `Prefer`
+    // in particular MUST NOT silently fall back to NoTls on a
+    // connector that documents TLS support for replication; that
+    // produces a confusing posture where one channel is encrypted
+    // and the other isn't. Operators who need TLS for control-plane
+    // need to wait until it lands; until then they have to opt out
+    // explicitly with `ssl.mode=disable`.
     match config.ssl_mode {
         SslMode::Disable => {}
-        SslMode::Prefer => {
-            tracing::info!(
-                ssl_mode = %config.ssl_mode,
-                "TLS not yet implemented for control-plane connections; using NoTls (Prefer mode)"
-            );
-        }
         mode => {
             return Err(ConnectorError::ConfigurationError(format!(
-                "ssl.mode={mode} requires TLS support which is not yet implemented \
-                 for control-plane connections"
+                "ssl.mode={mode}: TLS for the postgres-cdc control-plane \
+                 connection is not implemented; only ssl.mode=disable is \
+                 currently supported. The replication stream still \
+                 honours ssl.mode."
             )));
         }
     }

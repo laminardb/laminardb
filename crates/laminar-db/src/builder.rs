@@ -274,13 +274,6 @@ impl LaminarDbBuilder {
         self
     }
 
-    /// Set the S3 storage class tiering configuration.
-    #[must_use]
-    pub fn tiering(mut self, tiering: crate::config::TieringConfig) -> Self {
-        self.config.tiering = Some(tiering);
-        self
-    }
-
     /// Set the end-to-end delivery guarantee for the pipeline.
     #[must_use]
     pub fn delivery_guarantee(

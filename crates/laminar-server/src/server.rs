@@ -210,16 +210,6 @@ pub(crate) fn apply_checkpoint_config(
         }
     }
 
-    if let Some(tiering) = &checkpoint.tiering {
-        builder = builder.tiering(laminar_db::TieringConfig {
-            hot_class: tiering.hot_class.clone(),
-            warm_class: tiering.warm_class.clone(),
-            cold_class: tiering.cold_class.clone(),
-            hot_retention_secs: tiering.hot_retention.as_secs(),
-            warm_retention_secs: tiering.warm_retention.as_secs(),
-        });
-    }
-
     builder
 }
 

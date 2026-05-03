@@ -8,12 +8,10 @@
 //!
 //! - `SnapshotOnly` — load once at startup, never update.
 //! - `SnapshotPlusCdc` — load at startup, then apply CDC changes.
-//! - `Periodic` — re-snapshot on a timer.
 //! - `Manual` — no automatic loading; the user triggers refreshes.
 
 #[cfg(any(test, feature = "testing"))]
 use std::collections::VecDeque;
-use std::time::Duration;
 
 use arrow_array::RecordBatch;
 
@@ -27,11 +25,6 @@ pub enum RefreshMode {
     SnapshotOnly,
     /// Load at startup, then apply incremental CDC changes.
     SnapshotPlusCdc,
-    /// Re-snapshot the entire table on a fixed interval.
-    Periodic {
-        /// Interval between full re-snapshots.
-        interval: Duration,
-    },
     /// No automatic loading; the user triggers refreshes explicitly.
     Manual,
 }

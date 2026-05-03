@@ -102,7 +102,7 @@ pub use checkpoint_coordinator::{
     CheckpointConfig, CheckpointCoordinator, CheckpointPhase, CheckpointRequest, CheckpointResult,
     CheckpointStats,
 };
-pub use config::{BackpressurePolicy, IdentifierCaseSensitivity, LaminarConfig, TieringConfig};
+pub use config::{BackpressurePolicy, LaminarConfig};
 pub use db::LaminarDB;
 pub use engine_metrics::EngineMetrics;
 pub use error::DbError;
