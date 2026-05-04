@@ -98,6 +98,8 @@ pub enum StreamingDdlKind {
     Checkpoint,
     /// RESTORE FROM CHECKPOINT <id>
     RestoreCheckpoint,
+    /// SUBSCRIBE <name> [WITH (...)]
+    Subscribe,
     /// Not a streaming DDL statement
     None,
 }
@@ -123,6 +125,14 @@ pub fn detect_streaming_ddl(tokens: &[TokenWithSpan]) -> StreamingDdlKind {
     if let Token::Word(w) = &significant[0].token {
         if is_word_ci(w, "CHECKPOINT") {
             return StreamingDdlKind::Checkpoint;
+        }
+    }
+
+    // SUBSCRIBE <ident> — needs at least 2 tokens but we route here before
+    // the generic match below so the token-prefix detector recognises it.
+    if let Token::Word(w) = &significant[0].token {
+        if is_word_ci(w, "SUBSCRIBE") {
+            return StreamingDdlKind::Subscribe;
         }
     }
 
@@ -864,6 +874,18 @@ mod tests {
         assert_eq!(
             detect_streaming_ddl(&tokenize("RESTORE FROM CHECKPOINT 42")),
             StreamingDdlKind::RestoreCheckpoint
+        );
+    }
+
+    #[test]
+    fn test_detect_subscribe() {
+        assert_eq!(
+            detect_streaming_ddl(&tokenize("SUBSCRIBE foo")),
+            StreamingDdlKind::Subscribe
+        );
+        assert_eq!(
+            detect_streaming_ddl(&tokenize("subscribe foo with ('snapshot' = 'true')")),
+            StreamingDdlKind::Subscribe
         );
     }
 }

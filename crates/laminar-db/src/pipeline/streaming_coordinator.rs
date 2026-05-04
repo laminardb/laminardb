@@ -859,8 +859,11 @@ impl StreamingCoordinator {
             // that was persisted, so external offset state (Kafka group
             // offsets, ack tokens) advances only with the durable manifest.
             let fan_out = checkpoints.clone();
+            let checkpoint_id = self.pending_barrier.checkpoint_id;
             if let Some(epoch) = callback.checkpoint_with_barrier(checkpoints).await {
                 self.broadcast_epoch_committed(epoch, &fan_out);
+                // Wire barrier = durable epoch.
+                callback.publish_barrier(epoch, checkpoint_id);
             } else {
                 tracing::warn!(
                     checkpoint_id = self.pending_barrier.checkpoint_id,

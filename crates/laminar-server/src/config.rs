@@ -173,6 +173,9 @@ pub struct ServerSection {
     pub mode: String,
     #[serde(default = "default_bind")]
     pub bind: String,
+    /// Postgres wire bind address; `None` disables it.
+    #[serde(default)]
+    pub pgwire_bind: Option<String>,
 }
 
 impl Default for ServerSection {
@@ -180,6 +183,7 @@ impl Default for ServerSection {
         Self {
             mode: default_mode(),
             bind: default_bind(),
+            pgwire_bind: None,
         }
     }
 }

@@ -21,10 +21,16 @@ path = "src/main.rs"
 laminar-core = { path = "../laminar-core", version = "0.21.5" }
 laminar-storage = { path = "../laminar-storage", version = "0.21.5" }
 laminar-db = { path = "../laminar-db", version = "0.21.5", features = ["api"] }
+laminar-sql = { path = "../laminar-sql", version = "0.21.5" }
 
-# Arrow (for WS JSON serialization)
+# For pgwire dispatch on parsed AST
+sqlparser = { workspace = true }
+
+# Arrow (for WS JSON serialization + pgwire row encoder)
 arrow-array = { workspace = true }
+arrow-cast = { workspace = true }
 arrow-json = { workspace = true }
+arrow-schema = { workspace = true }
 parking_lot = { workspace = true }
 
 # CLI and configuration
@@ -51,6 +57,11 @@ toml = "1.1"
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
+
+# Postgres wire — bare server, no TLS.
+pgwire = { version = "0.39", default-features = false, features = ["server-api"] }
+async-trait = { workspace = true }
+futures = { workspace = true }
 
 # Config helpers
 regex = { workspace = true }

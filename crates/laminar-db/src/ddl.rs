@@ -751,6 +751,8 @@ impl LaminarDB {
         }
         self.connector_manager.lock().unregister_stream(&name_str);
 
+        self.subscription_registry.drop_name(&name_str);
+
         // Notify the running coordinator to remove the query. If the
         // channel is saturated, surface a transient error so the caller
         // can retry rather than seeing a successful DROP that leaves the
@@ -869,6 +871,7 @@ impl LaminarDB {
             // Try dropping as stream first
             if self.catalog.drop_stream(dep) {
                 self.connector_manager.lock().unregister_stream(dep);
+                self.subscription_registry.drop_name(dep);
             }
             // Try dropping as MV (cascade further)
             {
@@ -878,6 +881,7 @@ impl LaminarDB {
                     let mut mgr = self.connector_manager.lock();
                     for v in &views {
                         mgr.unregister_stream(&v.name);
+                        self.subscription_registry.drop_name(&v.name);
                     }
                 }
             }
@@ -1130,6 +1134,10 @@ impl LaminarDB {
                 mv_store.drop_mv(dropped);
                 let _ = self.ctx.deregister_table(dropped);
             }
+        }
+        // Drop subscription channels outside the locks (registry never nests in mv_store).
+        for dropped in &dropped_names {
+            self.subscription_registry.drop_name(dropped);
         }
 
         Ok(ExecuteResult::Ddl(DdlInfo {

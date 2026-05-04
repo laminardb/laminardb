@@ -1415,6 +1415,7 @@ impl LaminarDB {
             #[cfg(feature = "cluster-unstable")]
             last_follower_epoch: None,
             force_ckpt_rx: Some(force_ckpt_rx),
+            subscription_registry: Arc::clone(&self.subscription_registry),
         };
 
         // Start the streaming coordinator on a dedicated compute thread.

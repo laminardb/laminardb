@@ -25,6 +25,7 @@ pub enum ServerHandle {
     Embedded {
         db: Arc<LaminarDB>,
         api_handle: tokio::task::JoinHandle<()>,
+        pgwire_handle: Option<tokio::task::JoinHandle<()>>,
         watcher_handle: Option<tokio::task::JoinHandle<()>>,
     },
     #[cfg(feature = "cluster-unstable")]
@@ -38,6 +39,7 @@ impl ServerHandle {
             Self::Embedded {
                 db,
                 api_handle,
+                pgwire_handle,
                 watcher_handle,
             } => {
                 wait_for_termination_signal().await?;
@@ -46,6 +48,9 @@ impl ServerHandle {
 
                 if let Some(wh) = &watcher_handle {
                     wh.abort();
+                }
+                if let Some(pg) = &pgwire_handle {
+                    pg.abort();
                 }
                 db.shutdown()
                     .await
@@ -175,13 +180,21 @@ pub async fn run_server(
         .map_err(|e| ServerError::Start(e.to_string()))?;
     info!("Pipeline started");
 
+    let pgwire_bind = config.server.pgwire_bind.clone();
     let (app_state, api_handle) =
         start_http_api(Arc::clone(&db), registry, config_path.clone(), config).await?;
     let watcher_handle = spawn_config_watcher(&app_state, config_path);
 
+    let pgwire_handle = if let Some(bind) = pgwire_bind {
+        Some(crate::pgwire::serve(Arc::clone(&db), &bind).await?)
+    } else {
+        None
+    };
+
     Ok(ServerHandle::Embedded {
         db,
         api_handle,
+        pgwire_handle,
         watcher_handle,
     })
 }

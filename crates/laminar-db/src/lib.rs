@@ -54,6 +54,7 @@ mod eowc_state;
 pub mod api;
 mod ddl;
 mod error;
+mod filter_compile;
 mod handle;
 mod interval_join;
 mod key_column;
@@ -78,6 +79,9 @@ mod show_commands;
 mod sink_task;
 mod sql_analysis;
 mod sql_utils;
+/// External `SUBSCRIBE` substrate: per-name broadcast channel and the
+/// per-portal pump task.
+pub mod subscription;
 mod table_backend;
 mod table_cache_mode;
 mod table_provider;
