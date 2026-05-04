@@ -385,7 +385,9 @@ impl ConnectorPipelineCallback {
             };
             let schema = batch.schema();
             let sql = filter_sql.as_deref().unwrap();
-            if let Some(compiled) = crate::filter_compile::compile(&self.filter_ctx, sql, &schema).await {
+            if let Some(compiled) =
+                crate::filter_compile::compile(&self.filter_ctx, sql, &schema).await
+            {
                 self.compiled_sink_filters[i] = SinkFilter::Compiled(compiled);
             } else {
                 tracing::error!(
@@ -983,7 +985,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn publish_barrier(&self, epoch: u64, checkpoint_id: u64) {
-        self.subscription_registry.broadcast_barrier(epoch, checkpoint_id);
+        self.subscription_registry
+            .broadcast_barrier(epoch, checkpoint_id);
     }
 
     fn has_deferred_input(&self) -> bool {

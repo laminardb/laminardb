@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use arrow_array::{BooleanArray, RecordBatch};
 use arrow::datatypes::SchemaRef;
+use arrow_array::{BooleanArray, RecordBatch};
 use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
 use datafusion_common::DFSchema;
@@ -61,5 +61,9 @@ pub(crate) fn apply(
         .ok_or_else(|| DbError::Pipeline("filter must return BooleanArray".into()))?;
     let filtered = arrow::compute::filter_record_batch(batch, mask)
         .map_err(|e| DbError::Pipeline(format!("filter: {e}")))?;
-    if filtered.num_rows() == 0 { Ok(None) } else { Ok(Some(filtered)) }
+    if filtered.num_rows() == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(filtered))
+    }
 }

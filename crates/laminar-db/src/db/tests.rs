@@ -3800,7 +3800,10 @@ async fn open_subscription_resolves_named_stream() {
         .unwrap();
     db.start().await.unwrap();
 
-    let mut portal = db.open_subscription("all_trades", None).await.expect("portal opens");
+    let mut portal = db
+        .open_subscription("all_trades", None)
+        .await
+        .expect("portal opens");
 
     let handle = db.source_untyped("trades").unwrap();
     let schema = handle.schema().clone();
@@ -3816,13 +3819,10 @@ async fn open_subscription_resolves_named_stream() {
 
     // Wait up to 2s for the cycle to emit. The portal pump runs on the
     // main runtime; the engine's `push_to_streams` fires the broadcast.
-    let frame = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        portal.next_frame(),
-    )
-    .await
-    .expect("portal must produce a frame within 2s")
-    .expect("frame");
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(2), portal.next_frame())
+        .await
+        .expect("portal must produce a frame within 2s")
+        .expect("frame");
     let crate::subscription::PortalFrame::Batch(b) = frame else {
         panic!("expected Batch, got {frame:?}");
     };

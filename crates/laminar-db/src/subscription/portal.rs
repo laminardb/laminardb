@@ -63,7 +63,11 @@ impl SubscriptionPortal {
         let (tx, outbound) = mpsc::bounded_async::<PortalFrame>(OUTBOUND_CAPACITY);
         let closed = Arc::new(AtomicBool::new(false));
         tokio::spawn(pump_loop(name.into(), rx, tx, Arc::clone(&closed), filter));
-        Self { schema, outbound, closed }
+        Self {
+            schema,
+            outbound,
+            closed,
+        }
     }
 
     /// Schema of the subscribed object.
@@ -115,9 +119,13 @@ async fn pump_loop(
                 },
                 None => PortalFrame::Batch(batch),
             },
-            Ok(MvUpdate::Barrier { epoch, checkpoint_id }) => {
-                PortalFrame::Barrier { epoch, checkpoint_id }
-            }
+            Ok(MvUpdate::Barrier {
+                epoch,
+                checkpoint_id,
+            }) => PortalFrame::Barrier {
+                epoch,
+                checkpoint_id,
+            },
             Err(broadcast::error::RecvError::Closed) => return,
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!(subscription = %name, skipped = n, "lagged; closing");
@@ -187,8 +195,9 @@ mod tests {
 
         reg.drop_name("mv");
 
-        let frame =
-            tokio::time::timeout(Duration::from_millis(500), portal.next_frame()).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_millis(500), portal.next_frame())
+            .await
+            .unwrap();
         assert!(frame.is_none());
     }
 

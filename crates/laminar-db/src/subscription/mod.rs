@@ -3,6 +3,6 @@
 mod portal;
 mod registry;
 
-pub use portal::{PortalFrame, SubscriptionPortal};
 pub(crate) use portal::MAX_SUBSCRIBERS_PER_MV;
+pub use portal::{PortalFrame, SubscriptionPortal};
 pub(crate) use registry::SubscriptionRegistry;

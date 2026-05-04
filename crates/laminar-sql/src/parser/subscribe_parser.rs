@@ -11,7 +11,9 @@ use super::ParseError;
 pub fn parse_subscribe(parser: &mut Parser) -> Result<SubscribeStatement, ParseError> {
     expect_custom_keyword(parser, "SUBSCRIBE")?;
 
-    let name = parser.parse_object_name(false).map_err(ParseError::SqlParseError)?;
+    let name = parser
+        .parse_object_name(false)
+        .map_err(ParseError::SqlParseError)?;
 
     // Validate via sqlparser then round-trip; filter_compile re-parses anyway.
     let filter_sql = if parser.parse_keyword(Keyword::WHERE) {
@@ -63,7 +65,10 @@ mod tests {
     fn with_options() {
         let stmt = parse("SUBSCRIBE foo WITH ('snapshot' = 'true')").expect("parse");
         assert_eq!(stmt.name.to_string(), "foo");
-        assert_eq!(stmt.options.get("snapshot").map(String::as_str), Some("true"));
+        assert_eq!(
+            stmt.options.get("snapshot").map(String::as_str),
+            Some("true")
+        );
     }
 
     #[test]
@@ -101,8 +106,7 @@ mod tests {
 
     #[test]
     fn where_then_with() {
-        let stmt = parse("SUBSCRIBE foo WHERE a = 1 WITH ('snapshot' = 'true')")
-            .expect("parse");
+        let stmt = parse("SUBSCRIBE foo WHERE a = 1 WITH ('snapshot' = 'true')").expect("parse");
         assert!(stmt.filter_sql.is_some());
         assert_eq!(
             stmt.options.get("snapshot").map(String::as_str),

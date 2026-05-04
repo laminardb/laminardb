@@ -104,7 +104,10 @@ fn standard_response(db: &LaminarDB, stmt: Statement) -> PgWireResult<Response> 
             "0A000",
             "DDL/DML is not supported on pgwire; use HTTP /api/v1/sql",
         )),
-        other => Err(user_error("0A000", format!("not supported on pgwire: {other}"))),
+        other => Err(user_error(
+            "0A000",
+            format!("not supported on pgwire: {other}"),
+        )),
     }
 }
 
@@ -115,10 +118,7 @@ fn driver_select_response(query: sqlparser::ast::Query) -> PgWireResult<Response
     let SetExpr::Select(select) = *query.body else {
         return Err(unsupported_select());
     };
-    if select.projection.len() != 1
-        || !select.from.is_empty()
-        || select.selection.is_some()
-    {
+    if select.projection.len() != 1 || !select.from.is_empty() || select.selection.is_some() {
         return Err(unsupported_select());
     }
     let SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
@@ -180,7 +180,9 @@ fn unsupported_select() -> PgWireError {
 /// since we don't honor isolation levels.
 fn apply_set(db: &LaminarDB, set: Set) -> PgWireResult<Response> {
     match set {
-        Set::SingleAssignment { variable, values, .. } => {
+        Set::SingleAssignment {
+            variable, values, ..
+        } => {
             let key = variable.to_string();
             let value = values
                 .first()
@@ -226,7 +228,13 @@ async fn engine_metadata_response(db: &LaminarDB, sql: &str) -> PgWireResult<Res
 
 /// Single-row `text` response with one column.
 fn text_response(col: &str, ty: Type, value: String) -> Response {
-    let schema = Arc::new(vec![FieldInfo::new(col.into(), None, None, ty, FieldFormat::Text)]);
+    let schema = Arc::new(vec![FieldInfo::new(
+        col.into(),
+        None,
+        None,
+        ty,
+        FieldFormat::Text,
+    )]);
     let schema_for_row = Arc::clone(&schema);
     let row_stream = stream::iter(std::iter::once(Ok::<_, PgWireError>(()))).map(move |_| {
         let mut enc = DataRowEncoder::new(Arc::clone(&schema_for_row));
@@ -267,7 +275,12 @@ fn portal_to_response(portal: SubscriptionPortal) -> Response {
     // so formatters are built once per batch rather than per cell. Then we
     // drain the row vec before reading the next frame.
     let row_stream = stream::unfold(
-        (portal, Vec::<PgWireResult<pgwire::messages::data::DataRow>>::new(), 0usize, Arc::clone(&fields)),
+        (
+            portal,
+            Vec::<PgWireResult<pgwire::messages::data::DataRow>>::new(),
+            0usize,
+            Arc::clone(&fields),
+        ),
         move |(mut portal, mut rows, mut idx, fields)| async move {
             loop {
                 if idx < rows.len() {
@@ -370,7 +383,9 @@ pub struct LaminarHandlerFactory {
 
 impl LaminarHandlerFactory {
     fn new(db: Arc<LaminarDB>) -> Self {
-        Self { handler: Arc::new(LaminarPgwireHandler { db }) }
+        Self {
+            handler: Arc::new(LaminarPgwireHandler { db }),
+        }
     }
 }
 
@@ -454,7 +469,11 @@ mod tests {
     }
 
     fn parse_one(sql: &str) -> StreamingStatement {
-        parse_streaming_sql(sql).unwrap().into_iter().next().unwrap()
+        parse_streaming_sql(sql)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
     }
 
     fn standard(sql: &str) -> Statement {
@@ -497,18 +516,20 @@ mod tests {
     #[tokio::test]
     async fn ddl_routed_to_http() {
         let db = LaminarDB::open().unwrap();
-        let err = standard_response(
-            &db,
-            standard("CREATE TABLE foo (id INT)"),
-        )
-        .unwrap_err();
+        let err = standard_response(&db, standard("CREATE TABLE foo (id INT)")).unwrap_err();
         assert!(err.to_string().contains("HTTP /api/v1/sql"));
     }
 
     #[tokio::test]
     async fn transaction_control_dispatches() {
         let db = LaminarDB::open().unwrap();
-        for sql in ["BEGIN", "BEGIN TRANSACTION", "START TRANSACTION", "COMMIT", "ROLLBACK"] {
+        for sql in [
+            "BEGIN",
+            "BEGIN TRANSACTION",
+            "START TRANSACTION",
+            "COMMIT",
+            "ROLLBACK",
+        ] {
             standard_response(&db, standard(sql)).unwrap();
         }
     }

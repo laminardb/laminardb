@@ -22,7 +22,9 @@ pub(crate) struct SubscriptionRegistry {
 
 impl SubscriptionRegistry {
     pub(crate) fn new() -> Self {
-        Self { senders: RwLock::new(HashMap::new()) }
+        Self {
+            senders: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Attach a receiver, allocating the channel on first call.
@@ -46,7 +48,10 @@ impl SubscriptionRegistry {
 
     /// Broadcast a barrier marker to every registered name.
     pub(crate) fn broadcast_barrier(&self, epoch: u64, checkpoint_id: u64) {
-        let msg = MvUpdate::Barrier { epoch, checkpoint_id };
+        let msg = MvUpdate::Barrier {
+            epoch,
+            checkpoint_id,
+        };
         for tx in self.senders.read().values() {
             let _ = tx.send(msg.clone());
         }
@@ -58,7 +63,10 @@ impl SubscriptionRegistry {
     }
 
     pub(crate) fn subscriber_count(&self, name: &str) -> usize {
-        self.senders.read().get(name).map_or(0, broadcast::Sender::receiver_count)
+        self.senders
+            .read()
+            .get(name)
+            .map_or(0, broadcast::Sender::receiver_count)
     }
 }
 
@@ -94,7 +102,11 @@ mod tests {
         assert_eq!(b.num_rows(), 3);
 
         reg.broadcast_barrier(7, 42);
-        let MvUpdate::Barrier { epoch, checkpoint_id } = rx.recv().await.unwrap() else {
+        let MvUpdate::Barrier {
+            epoch,
+            checkpoint_id,
+        } = rx.recv().await.unwrap()
+        else {
             panic!("expected barrier");
         };
         assert_eq!((epoch, checkpoint_id), (7, 42));
@@ -113,7 +125,10 @@ mod tests {
         let reg = SubscriptionRegistry::new();
         let mut rx = reg.subscribe("mv");
         assert!(reg.drop_name("mv"));
-        assert!(matches!(rx.recv().await, Err(broadcast::error::RecvError::Closed)));
+        assert!(matches!(
+            rx.recv().await,
+            Err(broadcast::error::RecvError::Closed)
+        ));
     }
 
     #[test]

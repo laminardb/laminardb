@@ -1135,16 +1135,15 @@ impl LaminarDB {
             )));
         }
 
-        let (schema, filterable) =
-            if let Some(mv) = self.mv_registry.lock().get(name).cloned() {
-                (mv.schema, true)
-            } else if let Some(src) = self.catalog.get_source(name) {
-                (Arc::clone(&src.schema), true)
-            } else if let Some(entry) = self.catalog.get_stream_entry(name) {
-                (entry.sink.schema(), false)
-            } else {
-                return Err(DbError::StreamNotFound(name.to_string()));
-            };
+        let (schema, filterable) = if let Some(mv) = self.mv_registry.lock().get(name).cloned() {
+            (mv.schema, true)
+        } else if let Some(src) = self.catalog.get_source(name) {
+            (Arc::clone(&src.schema), true)
+        } else if let Some(entry) = self.catalog.get_stream_entry(name) {
+            (entry.sink.schema(), false)
+        } else {
+            return Err(DbError::StreamNotFound(name.to_string()));
+        };
 
         let filter = match filter_sql {
             None => None,
