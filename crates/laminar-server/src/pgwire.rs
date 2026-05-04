@@ -442,7 +442,7 @@ fn validate_bind(addr: &SocketAddr) -> Result<(), ServerError> {
 pub async fn serve(
     db: Arc<LaminarDB>,
     bind: &str,
-) -> Result<tokio::task::JoinHandle<()>, ServerError> {
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), ServerError> {
     let addr: SocketAddr = bind
         .parse()
         .map_err(|e| ServerError::Http(format!("invalid pgwire_bind '{bind}': {e}")))?;
@@ -451,9 +451,12 @@ pub async fn serve(
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| ServerError::Http(format!("pgwire bind {addr}: {e}")))?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| ServerError::Http(format!("pgwire local_addr: {e}")))?;
 
     let factory = Arc::new(LaminarHandlerFactory::new(db));
-    info!(%addr, "pgwire listening");
+    info!(addr = %local_addr, "pgwire listening");
 
     // Track per-connection tasks so abort on the outer JoinHandle stops
     // active sessions in addition to the accept loop.
@@ -483,7 +486,7 @@ pub async fn serve(
             }
         }
     });
-    Ok(handle)
+    Ok((local_addr, handle))
 }
 
 #[cfg(test)]
@@ -598,5 +601,133 @@ mod tests {
     fn multi_statement_parses() {
         let stmts = parse_streaming_sql("BEGIN; SELECT 1; COMMIT").unwrap();
         assert_eq!(stmts.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    //! End-to-end pgwire driven by `tokio_postgres` against an in-process
+    //! `LaminarDB`. Verifies the wire-protocol surface — handshake, SimpleQuery
+    //! dispatch, error reporting — that unit tests can't reach. Engine-level
+    //! row flow is covered in `laminar-db`'s `db::tests`.
+
+    use std::sync::Arc;
+
+    use laminar_db::LaminarDB;
+    use tokio_postgres::{NoTls, SimpleQueryMessage};
+
+    async fn spawn_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
+            .await
+            .expect("create source");
+        db.execute(
+            "CREATE MATERIALIZED VIEW prices AS \
+             SELECT symbol, price FROM trades",
+        )
+        .await
+        .expect("create mv");
+        db.start().await.expect("db starts");
+
+        let (addr, handle) = super::serve(Arc::clone(&db), "127.0.0.1:0")
+            .await
+            .expect("pgwire serve");
+        (addr, handle)
+    }
+
+    async fn connect(addr: std::net::SocketAddr) -> tokio_postgres::Client {
+        let conn_str = format!(
+            "host={} port={} user=any dbname=laminardb",
+            addr.ip(),
+            addr.port()
+        );
+        let (client, conn) = tokio_postgres::connect(&conn_str, NoTls)
+            .await
+            .expect("pgwire connect");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client
+    }
+
+    fn first_row_value(messages: &[SimpleQueryMessage], col: usize) -> Option<&str> {
+        messages.iter().find_map(|m| match m {
+            SimpleQueryMessage::Row(r) => r.get(col),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn handshake_and_builtins() {
+        let (addr, handle) = spawn_server().await;
+        let client = connect(addr).await;
+
+        let messages = client
+            .simple_query("SELECT version()")
+            .await
+            .expect("version");
+        let v = first_row_value(&messages, 0).expect("row");
+        assert!(v.contains("LaminarDB"), "version: {v}");
+
+        let messages = client
+            .simple_query("SELECT current_database()")
+            .await
+            .expect("current_database");
+        assert_eq!(first_row_value(&messages, 0), Some("laminar"));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn show_streams_runs() {
+        let (addr, handle) = spawn_server().await;
+        let client = connect(addr).await;
+
+        // No assertion on contents — just that the dispatch path returns rows
+        // without error. Engine-level SHOW behavior is covered in laminar-db.
+        client
+            .simple_query("SHOW STREAMS")
+            .await
+            .expect("SHOW STREAMS");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn subscribe_unknown_name_returns_pg_error() {
+        let (addr, handle) = spawn_server().await;
+        let client = connect(addr).await;
+
+        let err = client
+            .simple_query("SUBSCRIBE no_such_view")
+            .await
+            .expect_err("must fail");
+        let db_err = err.as_db_error().expect("typed PG error");
+        assert!(
+            db_err.message().contains("no_such_view"),
+            "message: {}",
+            db_err.message()
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn ddl_returns_pg_error_pointing_at_http() {
+        let (addr, handle) = spawn_server().await;
+        let client = connect(addr).await;
+
+        let err = client
+            .simple_query("CREATE SOURCE more_trades (sym VARCHAR)")
+            .await
+            .expect_err("DDL must be rejected");
+        let db_err = err.as_db_error().expect("typed PG error");
+        assert!(
+            db_err.message().contains("/api/v1/sql"),
+            "message: {}",
+            db_err.message()
+        );
+
+        handle.abort();
     }
 }

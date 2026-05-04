@@ -187,7 +187,7 @@ pub async fn run_server(
 
     let pgwire_handle = if let Some(bind) = pgwire_bind {
         match crate::pgwire::serve(Arc::clone(&db), &bind).await {
-            Ok(h) => Some(h),
+            Ok((_, h)) => Some(h),
             Err(e) => {
                 // Roll back: stop the HTTP server, the file watcher, and the
                 // pipeline before propagating the bind failure.
