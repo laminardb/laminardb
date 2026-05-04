@@ -6,6 +6,7 @@ Standalone server binary for LaminarDB. Reads a TOML configuration file, constru
 
 - **TOML configuration** with `${VAR}` and `${VAR:-default}` environment variable substitution
 - **REST API** (Axum) for health checks, pipeline introspection, ad-hoc SQL, and manual checkpoints
+- **Postgres wire protocol** (optional) for `SUBSCRIBE` streaming via `psql` and any libpq client
 - **Prometheus metrics** at `/metrics`
 - **Hot reload** — edit the TOML file and changes are applied automatically (file watcher with debounce), or `POST /api/v1/reload`
 - **Checkpoint validation** — `--validate-checkpoints` flag validates all stored checkpoints and exits
@@ -55,6 +56,7 @@ See the [Configuration Reference](https://laminardb.io/docs/) for every field, o
 [server]
 mode = "embedded"           # "embedded" (single-node) or "cluster" (multi-node scaffolding, not production-hardened)
 bind = "0.0.0.0:8080"       # HTTP API bind address
+pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for SUBSCRIBE
 log_level = "info"
 # Worker thread count is taken from $TOKIO_WORKER_THREADS — defaults to logical CPUs.
 
@@ -124,6 +126,20 @@ format = "json"
 | POST | `/api/v1/reload` | Hot-reload configuration |
 | GET | `/api/v1/cluster` | Cluster status (only available when `server.mode = "cluster"`) |
 | GET | `/ws/{name}` | WebSocket upgrade for push-based subscriptions to a stream |
+
+## Postgres Wire Protocol
+
+When `[server].pgwire_bind` is set, the server also listens for Postgres clients and serves a small subset of the SimpleQuery protocol:
+
+- `SUBSCRIBE <name> [WHERE <predicate>]` — streams materialized-view rows as they're produced. The query stays open until the client disconnects.
+- `SHOW`, `SET <key> = <value>`, and a handful of driver builtins (`SELECT version()`, `current_database()`, etc.) are accepted so standard psql / libpq clients can connect.
+- `INSERT`, `UPDATE`, `DELETE`, and DDL are rejected with a clear error pointing to `POST /api/v1/sql`.
+
+Filters are compiled with DataFusion against the materialized view's schema, so any DataFusion-supported predicate works (`WHERE price > 100`, `WHERE symbol IN ('AAPL', 'MSFT')`, etc.). Subscribing to a raw stream rejects `WHERE` because stream schemas are opaque to the planner.
+
+```bash
+psql "host=127.0.0.1 port=5433 dbname=laminardb user=any" -c "SUBSCRIBE avg_price WHERE symbol = 'AAPL'"
+```
 
 ## Hot Reload
 
