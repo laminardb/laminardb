@@ -111,6 +111,11 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
             config.server.bind
         ));
     }
+    if let Some(addr) = &config.server.pgwire_bind {
+        if addr.parse::<std::net::SocketAddr>().is_err() {
+            errors.push(format!("invalid server pgwire_bind address: '{}'", addr));
+        }
+    }
 
     // Validate: cluster mode requires discovery and coordination
     if config.server.mode == "cluster" {
