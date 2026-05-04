@@ -3817,16 +3817,20 @@ async fn open_subscription_resolves_named_stream() {
     .unwrap();
     handle.push_arrow(batch).unwrap();
 
-    // Wait up to 2s for the cycle to emit. The portal pump runs on the
-    // main runtime; the engine's `push_to_streams` fires the broadcast.
-    let frame = tokio::time::timeout(std::time::Duration::from_secs(2), portal.next_frame())
-        .await
-        .expect("portal must produce a frame within 2s")
-        .expect("frame");
-    let crate::subscription::PortalFrame::Batch(b) = frame else {
-        panic!("expected Batch, got {frame:?}");
-    };
-    assert!(b.num_rows() >= 1);
+    // Wait up to 2s for a Batch frame, ignoring barrier markers.
+    let batch = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match portal.next_frame().await {
+                Some(crate::subscription::PortalFrame::Batch(b)) => break Some(b),
+                Some(crate::subscription::PortalFrame::Barrier { .. }) => {}
+                None => break None,
+            }
+        }
+    })
+    .await
+    .expect("portal must produce a Batch within 2s")
+    .expect("batch frame");
+    assert!(batch.num_rows() >= 1);
 }
 
 #[tokio::test]

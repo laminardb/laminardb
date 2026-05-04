@@ -1,5 +1,6 @@
 //! Shared SQL filter compile + apply for sinks and SUBSCRIBE.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
@@ -11,20 +12,44 @@ use datafusion_expr::{Expr, LogicalPlan};
 
 use crate::error::DbError;
 
+static COMPILE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Registers a temporary table on construction and deregisters on drop, so a
+/// concurrent compile or an early return can never leak the registration onto
+/// the shared `SessionContext`.
+struct ScopedTable<'a> {
+    ctx: &'a SessionContext,
+    name: String,
+}
+
+impl<'a> ScopedTable<'a> {
+    fn new(ctx: &'a SessionContext, schema: &SchemaRef) -> Option<Self> {
+        let name = format!(
+            "__filter_compile_{}",
+            COMPILE_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let empty = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]]).ok()?;
+        ctx.register_table(&name, Arc::new(empty)).ok()?;
+        Some(Self { ctx, name })
+    }
+}
+
+impl Drop for ScopedTable<'_> {
+    fn drop(&mut self) {
+        let _ = self.ctx.deregister_table(&self.name);
+    }
+}
+
 /// Compile `filter_sql` against `schema`. Returns `None` on any failure.
 pub(crate) async fn compile(
     ctx: &SessionContext,
     filter_sql: &str,
     schema: &SchemaRef,
 ) -> Option<Arc<dyn PhysicalExpr>> {
-    let table = "__filter_compile";
-    let empty = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]]).ok()?;
-    let _ = ctx.deregister_table(table);
-    ctx.register_table(table, Arc::new(empty)).ok()?;
-
-    let sql = format!("SELECT * FROM {table} WHERE {filter_sql}");
+    let scoped = ScopedTable::new(ctx, schema)?;
+    let sql = format!("SELECT * FROM {} WHERE {filter_sql}", scoped.name);
     let plan = ctx.sql(&sql).await.ok()?.logical_plan().clone();
-    let _ = ctx.deregister_table(table);
+    drop(scoped);
 
     let expr = find_predicate(&plan)?;
     let df_schema = DFSchema::try_from(schema.as_ref().clone()).ok()?;

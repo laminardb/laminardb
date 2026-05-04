@@ -186,7 +186,19 @@ pub async fn run_server(
     let watcher_handle = spawn_config_watcher(&app_state, config_path);
 
     let pgwire_handle = if let Some(bind) = pgwire_bind {
-        Some(crate::pgwire::serve(Arc::clone(&db), &bind).await?)
+        match crate::pgwire::serve(Arc::clone(&db), &bind).await {
+            Ok(h) => Some(h),
+            Err(e) => {
+                // Roll back: stop the HTTP server, the file watcher, and the
+                // pipeline before propagating the bind failure.
+                if let Some(wh) = &watcher_handle {
+                    wh.abort();
+                }
+                api_handle.abort();
+                let _ = db.shutdown().await;
+                return Err(e);
+            }
+        }
     } else {
         None
     };

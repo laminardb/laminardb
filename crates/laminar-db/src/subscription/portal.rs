@@ -7,7 +7,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use crossfire::{mpsc, AsyncRx, MAsyncTx};
 use datafusion::physical_expr::PhysicalExpr;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 
 use super::registry::MvUpdate;
 
@@ -34,6 +34,7 @@ pub struct SubscriptionPortal {
     schema: SchemaRef,
     outbound: AsyncRx<mpsc::Array<PortalFrame>>,
     closed: Arc<AtomicBool>,
+    wake: Arc<Notify>,
 }
 
 impl SubscriptionPortal {
@@ -62,11 +63,20 @@ impl SubscriptionPortal {
     ) -> Self {
         let (tx, outbound) = mpsc::bounded_async::<PortalFrame>(OUTBOUND_CAPACITY);
         let closed = Arc::new(AtomicBool::new(false));
-        tokio::spawn(pump_loop(name.into(), rx, tx, Arc::clone(&closed), filter));
+        let wake = Arc::new(Notify::new());
+        tokio::spawn(pump_loop(
+            name.into(),
+            rx,
+            tx,
+            Arc::clone(&closed),
+            Arc::clone(&wake),
+            filter,
+        ));
         Self {
             schema,
             outbound,
             closed,
+            wake,
         }
     }
 
@@ -81,9 +91,11 @@ impl SubscriptionPortal {
         self.outbound.recv().await.ok()
     }
 
-    /// Signal the pump to stop. Idempotent.
+    /// Signal the pump to stop. Idempotent. Wakes the pump if it's parked
+    /// on `broadcast_rx.recv()` so it can re-check the flag and exit.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
+        self.wake.notify_waiters();
     }
 
     /// True after `close()` has been called.
@@ -104,10 +116,16 @@ async fn pump_loop(
     mut broadcast_rx: broadcast::Receiver<MvUpdate>,
     tx: MAsyncTx<mpsc::Array<PortalFrame>>,
     closed: Arc<AtomicBool>,
+    wake: Arc<Notify>,
     filter: Option<Arc<dyn PhysicalExpr>>,
 ) {
     while !closed.load(Ordering::Acquire) {
-        let frame = match broadcast_rx.recv().await {
+        let recv = tokio::select! {
+            biased;
+            () = wake.notified() => continue,
+            r = broadcast_rx.recv() => r,
+        };
+        let frame = match recv {
             Ok(MvUpdate::Batch(batch)) => match filter.as_ref() {
                 Some(f) => match crate::filter_compile::apply(&batch, f.as_ref()) {
                     Ok(Some(b)) => PortalFrame::Batch(b),

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::{stream, Sink, StreamExt};
-use laminar_sql::parser::{parse_streaming_sql, StreamingStatement};
+use laminar_sql::parser::{parse_streaming_sql, ShowCommand, StreamingStatement};
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::query::SimpleQueryHandler;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
@@ -71,7 +71,9 @@ impl SimpleQueryHandler for LaminarPgwireHandler {
                         .map_err(|e| user_error("42P01", format!("SUBSCRIBE '{name}': {e}")))?;
                     portal_to_response(portal)
                 }
-                StreamingStatement::Show(_) => engine_metadata_response(&self.db, query).await?,
+                StreamingStatement::Show(cmd) => {
+                    engine_metadata_response(&self.db, &show_sql(&cmd)).await?
+                }
                 StreamingStatement::Standard(s) => standard_response(&self.db, *s)?,
                 other => {
                     return Err(user_error(
@@ -213,6 +215,23 @@ fn user_error(code: &str, msg: impl Into<String>) -> PgWireError {
     )))
 }
 
+/// Reconstruct a single SHOW statement from the parsed variant. Used by the
+/// pgwire dispatcher so a multi-statement query (`SHOW SOURCES; SHOW SINKS`)
+/// re-executes only the matching statement, not the whole input string.
+fn show_sql(cmd: &ShowCommand) -> String {
+    match cmd {
+        ShowCommand::Sources => "SHOW SOURCES".into(),
+        ShowCommand::Sinks => "SHOW SINKS".into(),
+        ShowCommand::Queries => "SHOW QUERIES".into(),
+        ShowCommand::MaterializedViews => "SHOW MATERIALIZED VIEWS".into(),
+        ShowCommand::Streams => "SHOW STREAMS".into(),
+        ShowCommand::Tables => "SHOW TABLES".into(),
+        ShowCommand::CheckpointStatus => "SHOW CHECKPOINT STATUS".into(),
+        ShowCommand::CreateSource { name } => format!("SHOW CREATE SOURCE {name}"),
+        ShowCommand::CreateSink { name } => format!("SHOW CREATE SINK {name}"),
+    }
+}
+
 /// Run a SHOW through the engine and stream its `RecordBatch` to the wire.
 async fn engine_metadata_response(db: &LaminarDB, sql: &str) -> PgWireResult<Response> {
     use laminar_db::ExecuteResult;
@@ -294,7 +313,17 @@ fn portal_to_response(portal: SubscriptionPortal) -> Response {
                     PortalFrame::Batch(b) if b.num_rows() > 0 => {
                         rows = encode_batch(&b, &fields);
                     }
-                    PortalFrame::Batch(_) | PortalFrame::Barrier { .. } => {}
+                    PortalFrame::Batch(_) => {}
+                    // Barriers are dropped on the SimpleQuery path. PG's
+                    // simple-query protocol has no out-of-band channel for
+                    // checkpoint markers; cursor support (follow-up) will
+                    // surface them via NoticeResponse.
+                    PortalFrame::Barrier {
+                        epoch,
+                        checkpoint_id,
+                    } => {
+                        tracing::trace!(epoch, checkpoint_id, "pgwire SUBSCRIBE: dropping barrier")
+                    }
                 }
             }
         },
@@ -426,20 +455,30 @@ pub async fn serve(
     let factory = Arc::new(LaminarHandlerFactory::new(db));
     info!(%addr, "pgwire listening");
 
+    // Track per-connection tasks so abort on the outer JoinHandle stops
+    // active sessions in addition to the accept loop.
     let handle = tokio::spawn(async move {
+        let mut sessions: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         loop {
-            match listener.accept().await {
-                Ok((sock, peer)) => {
-                    let factory_ref = Arc::clone(&factory);
-                    tokio::spawn(async move {
-                        if let Err(e) = process_socket(sock, None, factory_ref).await {
-                            warn!(%peer, error = %e, "pgwire connection error");
-                        }
-                    });
+            tokio::select! {
+                Some(_) = sessions.join_next(), if !sessions.is_empty() => {
+                    // Reap completed sessions; nothing to do with the result.
                 }
-                Err(e) => {
-                    warn!(error = %e, "pgwire accept failed");
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                accepted = listener.accept() => {
+                    match accepted {
+                        Ok((sock, peer)) => {
+                            let factory_ref = Arc::clone(&factory);
+                            sessions.spawn(async move {
+                                if let Err(e) = process_socket(sock, None, factory_ref).await {
+                                    warn!(%peer, error = %e, "pgwire connection error");
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "pgwire accept failed");
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
                 }
             }
         }
