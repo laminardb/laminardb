@@ -12,8 +12,6 @@ use tokio::sync::Notify;
 use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
-use crate::metrics::ConnectorMetrics;
 
 /// Delivery guarantee level for the pipeline.
 ///
@@ -322,16 +320,6 @@ pub trait SourceConnector: Send {
     /// Called during recovery before polling resumes.
     async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError>;
 
-    /// Defaults to `Unknown`; connectors should override.
-    fn health_check(&self) -> HealthStatus {
-        HealthStatus::Unknown
-    }
-
-    /// Current connector metrics snapshot.
-    fn metrics(&self) -> ConnectorMetrics {
-        ConnectorMetrics::default()
-    }
-
     /// Close the connection and release resources.
     async fn close(&mut self) -> Result<(), ConnectorError>;
 
@@ -459,16 +447,6 @@ pub trait SinkConnector: Send {
     /// `pre_commit`ed.
     async fn rollback_epoch(&mut self, _epoch: u64) -> Result<(), ConnectorError> {
         Ok(())
-    }
-
-    /// Defaults to `Unknown`; connectors should override.
-    fn health_check(&self) -> HealthStatus {
-        HealthStatus::Unknown
-    }
-
-    /// Current sink metrics snapshot.
-    fn metrics(&self) -> ConnectorMetrics {
-        ConnectorMetrics::default()
     }
 
     /// Required (no default) so every implementation declares

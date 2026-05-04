@@ -15,8 +15,6 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
 use crate::connector::{SourceBatch, SourceConnector};
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
-use crate::metrics::ConnectorMetrics;
 
 use super::changelog::ChangeEvent;
 use super::config::MySqlCdcConfig;
@@ -531,35 +529,6 @@ impl SourceConnector for MySqlCdcSource {
         Ok(())
     }
 
-    fn health_check(&self) -> HealthStatus {
-        if !self.connected {
-            return HealthStatus::Unhealthy("Not connected".to_string());
-        }
-
-        // Check for recent activity
-        if let Some(last) = self.last_activity {
-            let idle_duration = self.config.heartbeat_interval * 3;
-            if last.elapsed() > idle_duration {
-                return HealthStatus::Degraded(format!(
-                    "No activity for {}s",
-                    last.elapsed().as_secs()
-                ));
-            }
-        }
-
-        // Check error count
-        let errors = self.metrics.errors.get();
-        if errors > 100 {
-            return HealthStatus::Degraded(format!("{errors} errors encountered"));
-        }
-
-        HealthStatus::Healthy
-    }
-
-    fn metrics(&self) -> ConnectorMetrics {
-        self.metrics.to_connector_metrics()
-    }
-
     fn data_ready_notify(&self) -> Option<Arc<Notify>> {
         Some(Arc::clone(&self.data_ready))
     }
@@ -587,7 +556,6 @@ impl SourceConnector for MySqlCdcSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     fn test_config() -> MySqlCdcConfig {
         MySqlCdcConfig {
@@ -696,76 +664,6 @@ mod tests {
         assert!(field_names.contains(&&"_table".to_string()));
         assert!(field_names.contains(&&"_op".to_string()));
         assert!(field_names.contains(&&"_ts_ms".to_string()));
-    }
-
-    #[test]
-    fn test_health_check_not_connected() {
-        let source = MySqlCdcSource::new(test_config(), None);
-
-        match source.health_check() {
-            HealthStatus::Unhealthy(message) => {
-                assert!(message.contains("Not connected"));
-            }
-            _ => panic!("Expected unhealthy status"),
-        }
-    }
-
-    #[test]
-    fn test_health_check_healthy() {
-        let mut source = MySqlCdcSource::new(test_config(), None);
-        source.connected = true;
-        source.last_activity = Some(Instant::now());
-
-        assert!(matches!(source.health_check(), HealthStatus::Healthy));
-    }
-
-    #[test]
-    fn test_health_check_degraded_no_activity() {
-        let mut source = MySqlCdcSource::new(test_config(), None);
-        source.connected = true;
-        source.config.heartbeat_interval = Duration::from_millis(1);
-        source.last_activity = Instant::now().checked_sub(Duration::from_secs(10));
-
-        match source.health_check() {
-            HealthStatus::Degraded(message) => {
-                assert!(message.contains("No activity"));
-            }
-            _ => panic!("Expected degraded status"),
-        }
-    }
-
-    #[test]
-    fn test_health_check_degraded_errors() {
-        let mut source = MySqlCdcSource::new(test_config(), None);
-        source.connected = true;
-        source.last_activity = Some(Instant::now());
-
-        // Simulate many errors
-        for _ in 0..150 {
-            source.metrics.inc_errors();
-        }
-
-        match source.health_check() {
-            HealthStatus::Degraded(message) => {
-                assert!(message.contains("errors"));
-            }
-            _ => panic!("Expected degraded status"),
-        }
-    }
-
-    #[test]
-    fn test_metrics() {
-        let mut source = MySqlCdcSource::new(test_config(), None);
-        source.metrics.inc_inserts(100);
-        source.metrics.inc_updates(50);
-        source.metrics.inc_deletes(25);
-        source.metrics.add_bytes_received(10000);
-        source.metrics.inc_errors();
-
-        let metrics = source.metrics();
-        assert_eq!(metrics.records_total, 175);
-        assert_eq!(metrics.bytes_total, 10000);
-        assert_eq!(metrics.errors_total, 1);
     }
 
     #[test]

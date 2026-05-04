@@ -25,8 +25,6 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
 use crate::connector::{PartitionInfo, SourceBatch, SourceConnector};
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
-use crate::metrics::ConnectorMetrics;
 use crate::serde::{self, RecordDeserializer};
 
 /// `ack` is `Some` only on the `JetStream` path.
@@ -41,8 +39,6 @@ struct Running {
     deserializer: Box<dyn RecordDeserializer>,
     rx: AsyncRx<mpsc::Array<Incoming>>,
     shutdown: Arc<Notify>,
-    /// `Some` on `JetStream`; `None` on core.
-    consecutive_errors: Option<Arc<AtomicU32>>,
     handle: JoinHandle<()>,
 }
 
@@ -89,6 +85,12 @@ impl NatsSource {
         self.config.as_ref()
     }
 
+    /// Snapshot accessor for the prometheus-backed metrics struct.
+    #[must_use]
+    pub fn metrics_handle(&self) -> &NatsSourceMetrics {
+        &self.metrics
+    }
+
     async fn open_jetstream(
         &mut self,
         cfg: &NatsSourceConfig,
@@ -118,13 +120,12 @@ impl NatsSource {
 
         let (tx, rx) = mpsc::bounded_async::<Incoming>(cfg.fetch_batch * 2);
         let shutdown = Arc::new(Notify::new());
-        let consecutive_errors = Arc::new(AtomicU32::new(0));
 
         let reader = JsReader {
             consumer,
             tx,
             shutdown: Arc::clone(&shutdown),
-            consecutive_errors: Arc::clone(&consecutive_errors),
+            consecutive_errors: Arc::new(AtomicU32::new(0)),
             data_ready: Arc::clone(&self.data_ready),
             metrics: self.metrics.clone(),
             batch_size: cfg.fetch_batch,
@@ -137,7 +138,6 @@ impl NatsSource {
             deserializer,
             rx,
             shutdown,
-            consecutive_errors: Some(consecutive_errors),
             handle,
         });
         Ok(())
@@ -180,7 +180,6 @@ impl NatsSource {
             deserializer,
             rx,
             shutdown,
-            consecutive_errors: None,
             handle,
         });
         Ok(())
@@ -339,47 +338,6 @@ impl SourceConnector for NatsSource {
         }
         self.update_pending_gauge();
         Ok(())
-    }
-
-    fn health_check(&self) -> HealthStatus {
-        let Some(cfg) = self.config.as_ref() else {
-            return HealthStatus::Unknown;
-        };
-
-        // Threshold of zero disables the flip.
-        if cfg.fetch_error_threshold > 0 {
-            if let Some(errors) = self
-                .running
-                .as_ref()
-                .and_then(|r| r.consecutive_errors.as_ref())
-            {
-                let errs = errors.load(Ordering::Acquire);
-                if errs >= cfg.fetch_error_threshold {
-                    return HealthStatus::Unhealthy(format!(
-                        "{errs} consecutive fetch errors (threshold {})",
-                        cfg.fetch_error_threshold
-                    ));
-                }
-            }
-        }
-
-        // Flag at 50% of `max_ack_pending`; -1 means unlimited.
-        if cfg.max_ack_pending > 0 {
-            #[allow(clippy::cast_sign_loss)]
-            let cap = cfg.max_ack_pending as u64;
-            #[allow(clippy::cast_sign_loss)]
-            let pending = self.metrics.pending_acks.get().max(0) as u64;
-            if pending * 2 >= cap {
-                return HealthStatus::Degraded(format!(
-                    "pending acks {pending}/{cap} — broker may throttle delivery"
-                ));
-            }
-        }
-        HealthStatus::Healthy
-    }
-
-    fn metrics(&self) -> ConnectorMetrics {
-        self.metrics.to_connector_metrics()
     }
 }
 

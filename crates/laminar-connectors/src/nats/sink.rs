@@ -18,8 +18,6 @@ use super::metrics::NatsSinkMetrics;
 use crate::config::ConnectorConfig;
 use crate::connector::{DeliveryGuarantee, SinkConnector, SinkConnectorCapabilities, WriteResult};
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
-use crate::metrics::ConnectorMetrics;
 use crate::serde::{self, RecordSerializer};
 
 /// NATS sink — core and `JetStream` modes.
@@ -56,6 +54,12 @@ impl NatsSink {
     #[must_use]
     pub fn config(&self) -> Option<&NatsSinkConfig> {
         self.config.as_ref()
+    }
+
+    /// Snapshot accessor for the prometheus-backed metrics struct.
+    #[must_use]
+    pub fn metrics_handle(&self) -> &NatsSinkMetrics {
+        &self.metrics
     }
 }
 
@@ -265,28 +269,6 @@ impl SinkConnector for NatsSink {
         let _ = drain_acks(&mut self.pending_acks, &self.metrics, timeout).await;
         self.runtime = None;
         Ok(())
-    }
-
-    fn health_check(&self) -> HealthStatus {
-        match self.config.as_ref() {
-            None => HealthStatus::Unknown,
-            Some(cfg) => {
-                let cap = cfg.max_pending.max(1) as u64;
-                #[allow(clippy::cast_sign_loss)]
-                let pending = self.metrics.pending_futures.get().max(0) as u64;
-                if pending * 2 >= cap {
-                    HealthStatus::Degraded(format!(
-                        "pending publish acks {pending}/{cap} — ack drain may stall pre_commit"
-                    ))
-                } else {
-                    HealthStatus::Healthy
-                }
-            }
-        }
-    }
-
-    fn metrics(&self) -> ConnectorMetrics {
-        self.metrics.to_connector_metrics()
     }
 }
 

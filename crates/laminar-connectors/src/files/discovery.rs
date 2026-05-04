@@ -45,8 +45,15 @@ pub struct DiscoveryConfig {
 pub struct FileDiscoveryEngine {
     /// Channel receiver for discovered files.
     rx: AsyncRx<mpsc::Array<DiscoveredFile>>,
-    /// Abort handle for the background task.
-    _abort: tokio::task::JoinHandle<()>,
+    /// Background task. Aborted on Drop so the docstring promise holds —
+    /// plain `JoinHandle::drop` would detach the task, leaking it.
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for FileDiscoveryEngine {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 impl FileDiscoveryEngine {
@@ -56,7 +63,7 @@ impl FileDiscoveryEngine {
     pub fn start(config: DiscoveryConfig, known_files: Arc<FileIngestionManifest>) -> Self {
         let (tx, rx) = mpsc::bounded_async::<DiscoveredFile>(256);
 
-        let abort = if is_cloud_path(&config.path) {
+        let handle = if is_cloud_path(&config.path) {
             tokio::spawn(cloud_poll_loop(config, tx, known_files))
         } else {
             tokio::spawn(async move {
@@ -66,7 +73,7 @@ impl FileDiscoveryEngine {
             })
         };
 
-        Self { rx, _abort: abort }
+        Self { rx, handle }
     }
 
     /// Drains available discovered files (non-blocking).

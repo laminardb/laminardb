@@ -15,7 +15,6 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::ConnectorConfig;
 use crate::connector::{SourceBatch, SourceConnector};
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
 use crate::schema::traits::FormatDecoder;
 use crate::schema::types::RawRecord;
 
@@ -85,6 +84,17 @@ impl std::fmt::Debug for FileSource {
 impl SourceConnector for FileSource {
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         let src_config = FileSourceConfig::from_connector_config(config)?;
+
+        // Cloud read isn't implemented in `read_file_bytes`; rejecting at
+        // open() is the only honest answer. Silently accepting and then
+        // erroring on first poll leaves the connector "registered but
+        // dead" — far worse than a clear configuration error up front.
+        if is_cloud_url(&src_config.path) {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "cloud paths are not supported by the 'files' source yet: {}",
+                src_config.path
+            )));
+        }
 
         // Resolve format (explicit or auto-detect from path).
         let format = match src_config.format {
@@ -300,14 +310,6 @@ impl SourceConnector for FileSource {
         Ok(())
     }
 
-    fn health_check(&self) -> HealthStatus {
-        if self.is_open {
-            HealthStatus::Healthy
-        } else {
-            HealthStatus::Unknown
-        }
-    }
-
     async fn close(&mut self) -> Result<(), ConnectorError> {
         self.discovery = None;
         self.decoder = None;
@@ -376,22 +378,23 @@ fn build_decoder_and_schema(
     }
 }
 
+fn is_cloud_url(path: &str) -> bool {
+    const CLOUD_SCHEMES: &[&str] = &["s3", "s3a", "s3n", "gs", "gcs", "az", "abfs", "abfss"];
+    let Some((scheme, _)) = path.split_once("://") else {
+        return false;
+    };
+    CLOUD_SCHEMES.iter().any(|s| scheme.eq_ignore_ascii_case(s))
+}
+
 async fn read_file_bytes(path: &str) -> Result<Vec<u8>, ConnectorError> {
-    // Cloud paths would use object_store; local paths use tokio::fs.
-    if path.starts_with("s3://")
-        || path.starts_with("gs://")
-        || path.starts_with("az://")
-        || path.starts_with("abfs://")
-        || path.starts_with("abfss://")
-    {
-        Err(ConnectorError::ConfigurationError(
-            "cloud file reading not yet implemented in poll_batch; use local paths".into(),
-        ))
-    } else {
-        tokio::fs::read(path)
-            .await
-            .map_err(|e| ConnectorError::ReadError(format!("cannot read file '{path}': {e}")))
-    }
+    // Cloud paths are rejected at `open()`; this path is local-only.
+    debug_assert!(
+        !is_cloud_url(path),
+        "cloud paths must be rejected at open()"
+    );
+    tokio::fs::read(path)
+        .await
+        .map_err(|e| ConnectorError::ReadError(format!("cannot read file '{path}': {e}")))
 }
 
 fn append_metadata_column(
@@ -542,12 +545,6 @@ mod tests {
         source.restore(&cp).await.unwrap();
         assert_eq!(source.manifest.active_count(), 1);
         assert!(source.manifest.contains("a.csv"));
-    }
-
-    #[test]
-    fn test_health_check() {
-        let source = FileSource::new();
-        assert!(matches!(source.health_check(), HealthStatus::Unknown));
     }
 
     #[test]

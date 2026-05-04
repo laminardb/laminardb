@@ -17,7 +17,7 @@ Stream processing today means running a JVM cluster (Flink), paying for a manage
 
 ```toml
 [dependencies]
-laminar-db = "0.20"
+laminar-db = "0.21"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-This example compiles and runs against the `laminar-db` v0.20 public API. See [`examples/binance-ws`](examples/binance-ws) for a complete working demo that streams live Binance trades through 18 SQL pipeline stages with a TUI dashboard.
+This example compiles and runs against the `laminar-db` v0.21 public API. See [`examples/binance-ws`](examples/binance-ws) for a complete working demo that streams live Binance trades through 18 SQL pipeline stages with a TUI dashboard.
 
 ### Python
 
@@ -398,7 +398,7 @@ Historical mean latencies measured on an AMD Ryzen AI 7 350 development laptop (
 
 ## Project Status
 
-**Version 0.20.2** — active development, pre-1.0. APIs may change between minor versions.
+**Version 0.21** — active development, pre-1.0. APIs may change between minor versions.
 
 | Phase | Description | Progress |
 |-------|-------------|----------|

@@ -53,10 +53,10 @@ See the [Configuration Reference](https://laminardb.io/docs/) for every field, o
 
 ```toml
 [server]
-mode = "embedded"           # "embedded" (single-node) or "delta" (multi-node scaffolding, not production-hardened)
+mode = "embedded"           # "embedded" (single-node) or "cluster" (multi-node scaffolding, not production-hardened)
 bind = "0.0.0.0:8080"       # HTTP API bind address
-workers = 0                 # 0 = auto-detect CPU count
 log_level = "info"
+# Worker thread count is taken from $TOKIO_WORKER_THREADS — defaults to logical CPUs.
 
 [state]
 backend = "memory"          # "memory" or "mmap"
@@ -122,7 +122,7 @@ format = "json"
 | POST | `/api/v1/checkpoint` | Trigger immediate checkpoint |
 | POST | `/api/v1/sql` | Execute ad-hoc SQL (`{"sql": "..."}`) |
 | POST | `/api/v1/reload` | Hot-reload configuration |
-| GET | `/api/v1/cluster` | Cluster status (delta mode only) |
+| GET | `/api/v1/cluster` | Cluster status (only available when `server.mode = "cluster"`) |
 | GET | `/ws/{name}` | WebSocket upgrade for push-based subscriptions to a stream |
 
 ## Hot Reload

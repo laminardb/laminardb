@@ -31,8 +31,6 @@ use tracing::{debug, info};
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{SinkConnector, SinkConnectorCapabilities, WriteResult};
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
-use crate::metrics::ConnectorMetrics;
 
 use super::config::MongoDbSinkConfig;
 use super::metrics::MongoDbSinkMetrics;
@@ -318,21 +316,6 @@ impl SinkConnector for MongoDbSink {
 
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
-    }
-
-    fn health_check(&self) -> HealthStatus {
-        match self.state {
-            ConnectorState::Running => HealthStatus::Healthy,
-            ConnectorState::Created => HealthStatus::Unknown,
-            ConnectorState::Closed | ConnectorState::Failed => {
-                HealthStatus::Unhealthy("closed".to_string())
-            }
-            _ => HealthStatus::Degraded(format!("state: {}", self.state)),
-        }
-    }
-
-    fn metrics(&self) -> ConnectorMetrics {
-        self.metrics.to_connector_metrics()
     }
 
     fn capabilities(&self) -> SinkConnectorCapabilities {
@@ -820,20 +803,6 @@ mod tests {
         sink.clear_buffer();
         assert_eq!(sink.buffered_rows, 0);
         assert!(sink.buffer.is_empty());
-    }
-
-    #[test]
-    fn test_health_check() {
-        let config = MongoDbSinkConfig::default();
-        let mut sink = MongoDbSink::new(test_schema(), config, None);
-
-        assert_eq!(sink.health_check(), HealthStatus::Unknown);
-
-        sink.state = ConnectorState::Running;
-        assert_eq!(sink.health_check(), HealthStatus::Healthy);
-
-        sink.state = ConnectorState::Closed;
-        assert!(matches!(sink.health_check(), HealthStatus::Unhealthy(_)));
     }
 
     #[test]

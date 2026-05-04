@@ -2,7 +2,7 @@
 
 use prometheus::{IntCounter, IntGauge, Registry};
 
-use crate::metrics::ConnectorMetrics;
+use crate::prom::reg_or_local;
 
 /// Prometheus-backed counters for Kafka sink connector statistics.
 #[derive(Debug, Clone)]
@@ -34,52 +34,36 @@ impl KafkaSinkMetrics {
     #[must_use]
     #[allow(clippy::missing_panics_doc)]
     pub fn new(registry: Option<&Registry>) -> Self {
-        let local;
-        let reg = if let Some(r) = registry {
-            r
-        } else {
-            local = Registry::new();
-            &local
-        };
-
-        macro_rules! reg_c {
-            ($name:expr, $help:expr) => {{
-                let c = IntCounter::new($name, $help).unwrap();
-                let _ = reg.register(Box::new(c.clone()));
-                c
-            }};
-        }
-
-        let produce_latency_max_us = IntGauge::new(
-            "kafka_sink_produce_latency_max_us",
-            "Max produce delivery latency (us)",
-        )
-        .unwrap();
-        let _ = reg.register(Box::new(produce_latency_max_us.clone()));
+        let mut local = None;
+        let reg = reg_or_local(registry, &mut local);
 
         Self {
-            records_written: reg_c!(
+            records_written: reg.counter(
                 "kafka_sink_records_written_total",
-                "Records written to Kafka"
+                "Records written to Kafka",
             ),
-            bytes_written: reg_c!("kafka_sink_bytes_written_total", "Bytes written to Kafka"),
-            errors_total: reg_c!("kafka_sink_errors_total", "Kafka sink errors"),
-            epochs_committed: reg_c!("kafka_sink_epochs_committed_total", "Epochs committed"),
-            epochs_rolled_back: reg_c!("kafka_sink_epochs_rolled_back_total", "Epochs rolled back"),
-            dlq_records: reg_c!("kafka_sink_dlq_records_total", "Records routed to DLQ"),
-            serialization_errors: reg_c!(
+            bytes_written: reg.counter("kafka_sink_bytes_written_total", "Bytes written to Kafka"),
+            errors_total: reg.counter("kafka_sink_errors_total", "Kafka sink errors"),
+            epochs_committed: reg.counter("kafka_sink_epochs_committed_total", "Epochs committed"),
+            epochs_rolled_back: reg
+                .counter("kafka_sink_epochs_rolled_back_total", "Epochs rolled back"),
+            dlq_records: reg.counter("kafka_sink_dlq_records_total", "Records routed to DLQ"),
+            serialization_errors: reg.counter(
                 "kafka_sink_serialization_errors_total",
-                "Serialization errors"
+                "Serialization errors",
             ),
-            produce_latency_sum_us: reg_c!(
+            produce_latency_sum_us: reg.counter(
                 "kafka_sink_produce_latency_sum_us",
-                "Sum of produce latencies (us)"
+                "Sum of produce latencies (us)",
             ),
-            produce_latency_count: reg_c!(
+            produce_latency_count: reg.counter(
                 "kafka_sink_produce_latency_count",
-                "Produce latency samples"
+                "Produce latency samples",
             ),
-            produce_latency_max_us,
+            produce_latency_max_us: reg.gauge(
+                "kafka_sink_produce_latency_max_us",
+                "Max produce delivery latency (us)",
+            ),
         }
     }
 
@@ -123,40 +107,6 @@ impl KafkaSinkMetrics {
             self.produce_latency_max_us.set(latency_us as i64);
         }
     }
-
-    /// Converts to the SDK's [`ConnectorMetrics`].
-    #[must_use]
-    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
-    pub fn to_connector_metrics(&self) -> ConnectorMetrics {
-        let mut m = ConnectorMetrics {
-            records_total: self.records_written.get(),
-            bytes_total: self.bytes_written.get(),
-            errors_total: self.errors_total.get(),
-            lag: 0,
-            custom: Vec::new(),
-        };
-        m.add_custom("kafka.epochs_committed", self.epochs_committed.get() as f64);
-        m.add_custom(
-            "kafka.epochs_rolled_back",
-            self.epochs_rolled_back.get() as f64,
-        );
-        m.add_custom("kafka.dlq_records", self.dlq_records.get() as f64);
-        m.add_custom(
-            "kafka.serialization_errors",
-            self.serialization_errors.get() as f64,
-        );
-        let count = self.produce_latency_count.get();
-        let sum = self.produce_latency_sum_us.get();
-        let max = self.produce_latency_max_us.get() as u64;
-        let avg = if count > 0 {
-            sum as f64 / count as f64
-        } else {
-            0.0
-        };
-        m.add_custom("kafka.produce_latency_avg_us", avg);
-        m.add_custom("kafka.produce_latency_max_us", max as f64);
-        m
-    }
 }
 
 impl Default for KafkaSinkMetrics {
@@ -172,10 +122,9 @@ mod tests {
     #[test]
     fn test_initial_zeros() {
         let m = KafkaSinkMetrics::new(None);
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.records_total, 0);
-        assert_eq!(cm.bytes_total, 0);
-        assert_eq!(cm.errors_total, 0);
+        assert_eq!(m.records_written.get(), 0);
+        assert_eq!(m.bytes_written.get(), 0);
+        assert_eq!(m.errors_total.get(), 0);
     }
 
     #[test]
@@ -183,9 +132,8 @@ mod tests {
         let m = KafkaSinkMetrics::new(None);
         m.record_write(100, 5000);
         m.record_write(200, 10000);
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.records_total, 300);
-        assert_eq!(cm.bytes_total, 15000);
+        assert_eq!(m.records_written.get(), 300);
+        assert_eq!(m.bytes_written.get(), 15000);
     }
 
     #[test]

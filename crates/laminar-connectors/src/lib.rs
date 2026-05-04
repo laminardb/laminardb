@@ -43,11 +43,12 @@ pub mod connector;
 /// Connector checkpoint types.
 pub mod checkpoint;
 
-/// Connector health status types.
-pub mod health;
+/// Reconnect/backoff helper shared across source connectors.
+pub mod retry;
 
-/// Connector metrics types.
-pub mod metrics;
+/// Shared Prometheus registry/counter helpers used by per-connector
+/// metric structs.
+pub mod prom;
 
 /// Record serialization and deserialization framework.
 pub mod serde;

@@ -15,8 +15,6 @@ use tracing::{debug, info, warn};
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{SinkConnector, SinkConnectorCapabilities, WriteResult};
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
-use crate::metrics::ConnectorMetrics;
 
 use super::connection::ConnectionManager;
 use super::serializer::BatchSerializer;
@@ -277,27 +275,6 @@ impl SinkConnector for WebSocketSinkClient {
         self.schema.clone()
     }
 
-    fn health_check(&self) -> HealthStatus {
-        match self.state {
-            ConnectorState::Running => {
-                if self.ws_sink.is_some() {
-                    HealthStatus::Healthy
-                } else {
-                    HealthStatus::Degraded("disconnected, buffering".into())
-                }
-            }
-            ConnectorState::Created | ConnectorState::Initializing => HealthStatus::Unknown,
-            ConnectorState::Paused => HealthStatus::Degraded("paused".into()),
-            ConnectorState::Recovering => HealthStatus::Degraded("recovering".into()),
-            ConnectorState::Closed => HealthStatus::Unhealthy("closed".into()),
-            ConnectorState::Failed => HealthStatus::Unhealthy("failed".into()),
-        }
-    }
-
-    fn metrics(&self) -> ConnectorMetrics {
-        self.metrics.to_connector_metrics()
-    }
-
     fn capabilities(&self) -> SinkConnectorCapabilities {
         SinkConnectorCapabilities::new(Duration::from_secs(10))
     }
@@ -440,11 +417,5 @@ mod tests {
         let sink = WebSocketSinkClient::new(test_schema(), test_config(), None);
         let caps = sink.capabilities();
         assert!(!caps.exactly_once);
-    }
-
-    #[test]
-    fn test_health_created() {
-        let sink = WebSocketSinkClient::new(test_schema(), test_config(), None);
-        assert_eq!(sink.health_check(), HealthStatus::Unknown);
     }
 }

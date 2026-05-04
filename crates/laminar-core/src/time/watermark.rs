@@ -32,27 +32,8 @@ pub trait WatermarkGenerator: Send {
     fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark>;
 }
 
-/// Watermark generator with bounded out-of-orderness.
-///
-/// Allows events to arrive out of order by up to `max_out_of_orderness` milliseconds.
-/// The watermark is always `max_timestamp_seen - max_out_of_orderness`.
-///
-/// # Example
-///
-/// ```rust
-/// use laminar_core::time::{BoundedOutOfOrdernessGenerator, WatermarkGenerator, Watermark};
-///
-/// let mut gen = BoundedOutOfOrdernessGenerator::new(100); // 100ms lateness allowed
-///
-/// // First event at t=1000
-/// assert_eq!(gen.on_event(1000), Some(Watermark::new(900)));
-///
-/// // Out-of-order event at t=800 - no watermark advance
-/// assert_eq!(gen.on_event(800), None);
-///
-/// // New max at t=1200
-/// assert_eq!(gen.on_event(1200), Some(Watermark::new(1100)));
-/// ```
+/// Watermark generator with bounded out-of-orderness. The watermark
+/// is always `max_timestamp_seen - max_out_of_orderness`.
 pub struct BoundedOutOfOrdernessGenerator {
     max_out_of_orderness: i64,
     current_max_timestamp: i64,
@@ -129,20 +110,8 @@ impl WatermarkGenerator for BoundedOutOfOrdernessGenerator {
     }
 }
 
-/// Watermark generator for strictly ascending timestamps.
-///
-/// Assumes events arrive in timestamp order with no lateness. The watermark
-/// equals the current timestamp. Use this for sources that guarantee ordering.
-///
-/// # Example
-///
-/// ```rust
-/// use laminar_core::time::{AscendingTimestampsGenerator, WatermarkGenerator, Watermark};
-///
-/// let mut gen = AscendingTimestampsGenerator::new();
-/// assert_eq!(gen.on_event(1000), Some(Watermark::new(1000)));
-/// assert_eq!(gen.on_event(2000), Some(Watermark::new(2000)));
-/// ```
+/// Watermark generator for strictly ascending timestamps; the watermark
+/// equals the current timestamp.
 #[derive(Debug, Default)]
 pub struct AscendingTimestampsGenerator {
     current_watermark: i64,
@@ -190,30 +159,8 @@ impl WatermarkGenerator for AscendingTimestampsGenerator {
     }
 }
 
-/// Periodic watermark generator that emits at fixed wall-clock intervals.
-///
-/// Wraps another generator and emits watermarks periodically even when no
-/// events are arriving. Useful for handling idle sources and ensuring
-/// time-based windows eventually trigger.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use laminar_core::time::{
-///     PeriodicGenerator, BoundedOutOfOrdernessGenerator, WatermarkGenerator,
-/// };
-/// use std::time::Duration;
-///
-/// let inner = BoundedOutOfOrdernessGenerator::new(100);
-/// let mut gen = PeriodicGenerator::new(inner, Duration::from_millis(500));
-///
-/// // First event
-/// gen.on_event(1000);
-///
-/// // Later, periodic check may emit watermark
-/// // (depends on wall-clock time elapsed)
-/// let wm = gen.on_periodic();
-/// ```
+/// Wraps another generator and emits watermarks at fixed wall-clock
+/// intervals so idle sources don't stall time-based windows.
 pub struct PeriodicGenerator<G: WatermarkGenerator> {
     inner: G,
     period: Duration,

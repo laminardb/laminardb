@@ -21,8 +21,6 @@ use tracing::{debug, warn};
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{SinkConnector, SinkConnectorCapabilities, WriteResult};
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
-use crate::metrics::ConnectorMetrics;
 
 use super::iceberg_config::IcebergSinkConfig;
 
@@ -490,18 +488,6 @@ impl SinkConnector for IcebergSink {
         self.clear_staged();
         self.epoch_skipped = false;
         Ok(())
-    }
-
-    fn health_check(&self) -> HealthStatus {
-        match self.state {
-            ConnectorState::Running => HealthStatus::Healthy,
-            ConnectorState::Failed => HealthStatus::Unhealthy("sink failed".into()),
-            _ => HealthStatus::Unknown,
-        }
-    }
-
-    fn metrics(&self) -> ConnectorMetrics {
-        ConnectorMetrics::default()
     }
 
     fn capabilities(&self) -> SinkConnectorCapabilities {

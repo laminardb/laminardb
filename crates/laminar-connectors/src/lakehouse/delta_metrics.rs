@@ -3,7 +3,7 @@
 use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, Registry};
 
 use super::metrics::LakehouseSinkMetrics;
-use crate::metrics::ConnectorMetrics;
+use crate::prom::reg_or_local;
 
 /// Prometheus-backed counters/gauges for Delta Lake sink connector statistics.
 #[derive(Debug, Clone)]
@@ -45,51 +45,9 @@ impl DeltaLakeSinkMetrics {
     #[must_use]
     #[allow(clippy::missing_panics_doc)]
     pub fn new(registry: Option<&Registry>) -> Self {
-        let local;
-        let reg = if let Some(r) = registry {
-            r
-        } else {
-            local = Registry::new();
-            &local
-        };
+        let mut local = None;
+        let handle = reg_or_local(registry, &mut local);
 
-        let merge_operations = IntCounter::new(
-            "delta_sink_merge_operations_total",
-            "Total MERGE operations (upsert)",
-        )
-        .unwrap();
-        let last_delta_version = IntGauge::new(
-            "delta_sink_last_version",
-            "Last committed Delta table version",
-        )
-        .unwrap();
-        let compaction_runs =
-            IntCounter::new("delta_sink_compaction_runs_total", "Total compaction runs").unwrap();
-        let compaction_files_added = IntCounter::new(
-            "delta_sink_compaction_files_added_total",
-            "Total files added by compaction",
-        )
-        .unwrap();
-        let compaction_files_removed = IntCounter::new(
-            "delta_sink_compaction_files_removed_total",
-            "Total files removed by compaction",
-        )
-        .unwrap();
-        let vacuum_files_deleted = IntCounter::new(
-            "delta_sink_vacuum_files_deleted_total",
-            "Total files deleted by vacuum",
-        )
-        .unwrap();
-        let conflicts = IntCounter::new(
-            "delta_sink_conflicts_total",
-            "Delta Lake optimistic-concurrency conflicts observed",
-        )
-        .unwrap();
-        let retries = IntCounter::new(
-            "delta_sink_retries_total",
-            "Retry attempts kicked off (conflict + timeout)",
-        )
-        .unwrap();
         let flush_duration = Histogram::with_opts(
             HistogramOpts::new(
                 "delta_sink_flush_duration_seconds",
@@ -98,27 +56,49 @@ impl DeltaLakeSinkMetrics {
             .buckets(prometheus::exponential_buckets(0.005, 2.0, 16).unwrap()),
         )
         .unwrap();
-
-        let _ = reg.register(Box::new(merge_operations.clone()));
-        let _ = reg.register(Box::new(last_delta_version.clone()));
-        let _ = reg.register(Box::new(compaction_runs.clone()));
-        let _ = reg.register(Box::new(compaction_files_added.clone()));
-        let _ = reg.register(Box::new(compaction_files_removed.clone()));
-        let _ = reg.register(Box::new(vacuum_files_deleted.clone()));
-        let _ = reg.register(Box::new(conflicts.clone()));
-        let _ = reg.register(Box::new(retries.clone()));
-        let _ = reg.register(Box::new(flush_duration.clone()));
+        // Best-effort registration (matches `kafka/metrics.rs` pattern):
+        // `AlreadyReg` is benign on re-init; surface anything else so a
+        // dropped histogram doesn't disappear silently.
+        if let Err(e) = handle.registry().register(Box::new(flush_duration.clone())) {
+            tracing::warn!(
+                metric = "delta_sink_flush_duration_seconds",
+                error = %e,
+                "failed to register delta lake flush_duration histogram"
+            );
+        }
 
         Self {
             common: LakehouseSinkMetrics::new(registry),
-            merge_operations,
-            last_delta_version,
-            compaction_runs,
-            compaction_files_added,
-            compaction_files_removed,
-            vacuum_files_deleted,
-            conflicts,
-            retries,
+            merge_operations: handle.counter(
+                "delta_sink_merge_operations_total",
+                "Total MERGE operations (upsert)",
+            ),
+            last_delta_version: handle.gauge(
+                "delta_sink_last_version",
+                "Last committed Delta table version",
+            ),
+            compaction_runs: handle
+                .counter("delta_sink_compaction_runs_total", "Total compaction runs"),
+            compaction_files_added: handle.counter(
+                "delta_sink_compaction_files_added_total",
+                "Total files added by compaction",
+            ),
+            compaction_files_removed: handle.counter(
+                "delta_sink_compaction_files_removed_total",
+                "Total files removed by compaction",
+            ),
+            vacuum_files_deleted: handle.counter(
+                "delta_sink_vacuum_files_deleted_total",
+                "Total files deleted by vacuum",
+            ),
+            conflicts: handle.counter(
+                "delta_sink_conflicts_total",
+                "Delta Lake optimistic-concurrency conflicts observed",
+            ),
+            retries: handle.counter(
+                "delta_sink_retries_total",
+                "Retry attempts kicked off (conflict + timeout)",
+            ),
             flush_duration,
         }
     }
@@ -181,33 +161,6 @@ impl DeltaLakeSinkMetrics {
     pub fn observe_flush_duration(&self, seconds: f64) {
         self.flush_duration.observe(seconds);
     }
-
-    /// Converts to the SDK's [`ConnectorMetrics`].
-    #[must_use]
-    #[allow(clippy::cast_precision_loss)]
-    pub fn to_connector_metrics(&self) -> ConnectorMetrics {
-        let mut m = ConnectorMetrics::new();
-        self.common.populate_metrics(&mut m, "delta");
-
-        m.add_custom("delta.merge_operations", self.merge_operations.get() as f64);
-        m.add_custom("delta.last_version", self.last_delta_version.get() as f64);
-        m.add_custom("delta.compaction_runs", self.compaction_runs.get() as f64);
-        m.add_custom(
-            "delta.compaction_files_added",
-            self.compaction_files_added.get() as f64,
-        );
-        m.add_custom(
-            "delta.compaction_files_removed",
-            self.compaction_files_removed.get() as f64,
-        );
-        m.add_custom(
-            "delta.vacuum_files_deleted",
-            self.vacuum_files_deleted.get() as f64,
-        );
-        m.add_custom("delta.conflicts", self.conflicts.get() as f64);
-        m.add_custom("delta.retries", self.retries.get() as f64);
-        m
-    }
 }
 
 impl Default for DeltaLakeSinkMetrics {
@@ -224,10 +177,9 @@ mod tests {
     #[test]
     fn test_initial_zeros() {
         let m = DeltaLakeSinkMetrics::new(None);
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.records_total, 0);
-        assert_eq!(cm.bytes_total, 0);
-        assert_eq!(cm.errors_total, 0);
+        assert_eq!(m.common.rows_flushed.get(), 0);
+        assert_eq!(m.common.bytes_written.get(), 0);
+        assert_eq!(m.common.errors_total.get(), 0);
     }
 
     #[test]
@@ -236,12 +188,9 @@ mod tests {
         m.record_flush(100, 5000);
         m.record_flush(200, 10_000);
 
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.records_total, 300);
-        assert_eq!(cm.bytes_total, 15_000);
-
-        let flushes = cm.custom.iter().find(|(k, _)| k == "delta.flush_count");
-        assert_eq!(flushes.unwrap().1, 2.0);
+        assert_eq!(m.common.rows_flushed.get(), 300);
+        assert_eq!(m.common.bytes_written.get(), 15_000);
+        assert_eq!(m.common.flush_count.get(), 2);
     }
 
     #[test]
@@ -250,12 +199,8 @@ mod tests {
         m.record_commit(1);
         m.record_commit(5);
 
-        let cm = m.to_connector_metrics();
-        let commits = cm.custom.iter().find(|(k, _)| k == "delta.commits");
-        assert_eq!(commits.unwrap().1, 2.0);
-
-        let version = cm.custom.iter().find(|(k, _)| k == "delta.last_version");
-        assert_eq!(version.unwrap().1, 5.0);
+        assert_eq!(m.common.commits.get(), 2);
+        assert_eq!(m.last_delta_version.get(), 5);
     }
 
     #[test]
@@ -265,8 +210,7 @@ mod tests {
         m.record_error();
         m.record_error();
 
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.errors_total, 3);
+        assert_eq!(m.common.errors_total.get(), 3);
     }
 
     #[test]
@@ -275,12 +219,7 @@ mod tests {
         m.record_rollback();
         m.record_rollback();
 
-        let cm = m.to_connector_metrics();
-        let rolled_back = cm
-            .custom
-            .iter()
-            .find(|(k, _)| k == "delta.epochs_rolled_back");
-        assert_eq!(rolled_back.unwrap().1, 2.0);
+        assert_eq!(m.common.epochs_rolled_back.get(), 2);
     }
 
     #[test]
@@ -288,12 +227,7 @@ mod tests {
         let m = DeltaLakeSinkMetrics::new(None);
         m.record_merge();
 
-        let cm = m.to_connector_metrics();
-        let merges = cm
-            .custom
-            .iter()
-            .find(|(k, _)| k == "delta.merge_operations");
-        assert_eq!(merges.unwrap().1, 1.0);
+        assert_eq!(m.merge_operations.get(), 1);
     }
 
     #[test]
@@ -302,11 +236,6 @@ mod tests {
         m.record_deletes(50);
         m.record_deletes(30);
 
-        let cm = m.to_connector_metrics();
-        let deletes = cm
-            .custom
-            .iter()
-            .find(|(k, _)| k == "delta.changelog_deletes");
-        assert_eq!(deletes.unwrap().1, 80.0);
+        assert_eq!(m.common.changelog_deletes.get(), 80);
     }
 }

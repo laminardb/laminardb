@@ -18,8 +18,6 @@ use crate::connector::{
     SinkConnector, SinkConnectorCapabilities, SourceBatch, SourceConnector, WriteResult,
 };
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
-use crate::metrics::ConnectorMetrics;
 use crate::registry::ConnectorRegistry;
 
 /// Creates a test schema with `id` (Int64) and `value` (Utf8) columns.
@@ -156,21 +154,6 @@ impl SourceConnector for MockSourceConnector {
         Ok(())
     }
 
-    fn health_check(&self) -> HealthStatus {
-        if self.is_open.load(std::sync::atomic::Ordering::Relaxed) {
-            HealthStatus::Healthy
-        } else {
-            HealthStatus::Unknown
-        }
-    }
-
-    fn metrics(&self) -> ConnectorMetrics {
-        ConnectorMetrics {
-            records_total: self.records_produced.load(Ordering::Relaxed),
-            ..Default::default()
-        }
-    }
-
     async fn close(&mut self) -> Result<(), ConnectorError> {
         self.is_open
             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -272,21 +255,6 @@ impl SinkConnector for MockSinkConnector {
         Ok(())
     }
 
-    fn health_check(&self) -> HealthStatus {
-        if self.is_open.load(std::sync::atomic::Ordering::Relaxed) {
-            HealthStatus::Healthy
-        } else {
-            HealthStatus::Unknown
-        }
-    }
-
-    fn metrics(&self) -> ConnectorMetrics {
-        ConnectorMetrics {
-            records_total: self.records_written.load(Ordering::Relaxed),
-            ..Default::default()
-        }
-    }
-
     fn capabilities(&self) -> SinkConnectorCapabilities {
         SinkConnectorCapabilities::new(Duration::from_secs(60))
             .with_exactly_once()
@@ -349,8 +317,6 @@ mod tests {
         let mut source = MockSourceConnector::with_batches(3, 5);
         source.open(&ConnectorConfig::new("mock")).await.unwrap();
 
-        assert!(source.health_check().is_healthy());
-
         let b1 = source.poll_batch(100).await.unwrap();
         assert!(b1.is_some());
         assert_eq!(b1.unwrap().num_rows(), 5);
@@ -376,8 +342,6 @@ mod tests {
     async fn test_mock_sink_connector() {
         let mut sink = MockSinkConnector::new();
         sink.open(&ConnectorConfig::new("mock")).await.unwrap();
-
-        assert!(sink.health_check().is_healthy());
 
         let batch = mock_batch(10);
         let result = sink.write_batch(&batch).await.unwrap();

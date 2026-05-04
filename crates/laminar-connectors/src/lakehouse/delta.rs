@@ -37,8 +37,6 @@ use deltalake::protocol::SaveMode;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{SinkConnector, SinkConnectorCapabilities, WriteResult};
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
-use crate::metrics::ConnectorMetrics;
 
 use super::delta_config::{DeltaLakeSinkConfig, DeltaWriteMode};
 use super::delta_metrics::DeltaLakeSinkMetrics;
@@ -1293,21 +1291,6 @@ impl SinkConnector for DeltaLakeSink {
         Ok(())
     }
 
-    fn health_check(&self) -> HealthStatus {
-        match self.state {
-            ConnectorState::Running => HealthStatus::Healthy,
-            ConnectorState::Created | ConnectorState::Initializing => HealthStatus::Unknown,
-            ConnectorState::Paused => HealthStatus::Degraded("connector paused".into()),
-            ConnectorState::Recovering => HealthStatus::Degraded("recovering".into()),
-            ConnectorState::Closed => HealthStatus::Unhealthy("closed".into()),
-            ConnectorState::Failed => HealthStatus::Unhealthy("failed".into()),
-        }
-    }
-
-    fn metrics(&self) -> ConnectorMetrics {
-        self.metrics.to_connector_metrics()
-    }
-
     fn capabilities(&self) -> SinkConnectorCapabilities {
         // Delta commits can run long under compaction or contention.
         let mut caps = SinkConnectorCapabilities::new(Duration::from_secs(180)).with_idempotent();
@@ -1679,14 +1662,6 @@ mod tests {
         assert!(!should_defer);
     }
 
-    #[test]
-    fn test_health_check_initializing_during_deferred() {
-        let mut sink = DeltaLakeSink::new(test_config(), None);
-        sink.state = ConnectorState::Initializing;
-        // During deferred init, health should NOT report Healthy.
-        assert!(matches!(sink.health_check(), HealthStatus::Unknown));
-    }
-
     // ── Batch size estimation ──
 
     #[test]
@@ -1967,42 +1942,6 @@ mod tests {
         assert_eq!(sink.state(), ConnectorState::Closed);
     }
 
-    // ── Health check tests ──
-
-    #[test]
-    fn test_health_check_created() {
-        let sink = DeltaLakeSink::new(test_config(), None);
-        assert_eq!(sink.health_check(), HealthStatus::Unknown);
-    }
-
-    #[test]
-    fn test_health_check_running() {
-        let mut sink = DeltaLakeSink::new(test_config(), None);
-        sink.state = ConnectorState::Running;
-        assert_eq!(sink.health_check(), HealthStatus::Healthy);
-    }
-
-    #[test]
-    fn test_health_check_closed() {
-        let mut sink = DeltaLakeSink::new(test_config(), None);
-        sink.state = ConnectorState::Closed;
-        assert!(matches!(sink.health_check(), HealthStatus::Unhealthy(_)));
-    }
-
-    #[test]
-    fn test_health_check_failed() {
-        let mut sink = DeltaLakeSink::new(test_config(), None);
-        sink.state = ConnectorState::Failed;
-        assert!(matches!(sink.health_check(), HealthStatus::Unhealthy(_)));
-    }
-
-    #[test]
-    fn test_health_check_paused() {
-        let mut sink = DeltaLakeSink::new(test_config(), None);
-        sink.state = ConnectorState::Paused;
-        assert!(matches!(sink.health_check(), HealthStatus::Degraded(_)));
-    }
-
     // ── Capabilities tests ──
 
     #[test]
@@ -2054,17 +1993,6 @@ mod tests {
         let caps = sink.capabilities();
         assert!(!caps.exactly_once);
         assert!(caps.idempotent);
-    }
-
-    // ── Metrics tests ──
-
-    #[test]
-    fn test_metrics_initial() {
-        let sink = DeltaLakeSink::new(test_config(), None);
-        let m = sink.metrics();
-        assert_eq!(m.records_total, 0);
-        assert_eq!(m.bytes_total, 0);
-        assert_eq!(m.errors_total, 0);
     }
 
     // ── Changelog splitting tests ──

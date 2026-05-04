@@ -1,10 +1,6 @@
 # laminar-sql
 
-SQL layer for LaminarDB with streaming extensions.
-
-## Overview
-
-Streaming SQL extensions on top of sqlparser-rs: tumbling windows, session windows, watermarks, EMIT clauses, ASOF joins, temporal probe joins. DataFusion handles query planning and execution.
+Streaming SQL extensions on top of sqlparser-rs: tumbling/session windows, watermarks, EMIT clauses, ASOF joins, temporal probe joins. DataFusion handles query planning and execution.
 
 ## Key Modules
 

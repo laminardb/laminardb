@@ -4,7 +4,7 @@
 
 use prometheus::{IntCounter, IntGauge, Registry};
 
-use crate::metrics::ConnectorMetrics;
+use crate::prom::reg_or_local;
 
 /// Metrics for MySQL CDC source connector.
 #[derive(Debug, Clone)]
@@ -48,62 +48,25 @@ impl MySqlCdcMetrics {
     #[must_use]
     #[allow(clippy::missing_panics_doc)]
     pub fn new(registry: Option<&Registry>) -> Self {
-        let local;
-        let reg = if let Some(r) = registry {
-            r
-        } else {
-            local = Registry::new();
-            &local
-        };
-
-        let events_received = IntCounter::new(
-            "mysql_cdc_events_received_total",
-            "Total binlog events received",
-        )
-        .unwrap();
-        let inserts =
-            IntCounter::new("mysql_cdc_inserts_total", "Total INSERT row events").unwrap();
-        let updates =
-            IntCounter::new("mysql_cdc_updates_total", "Total UPDATE row events").unwrap();
-        let deletes =
-            IntCounter::new("mysql_cdc_deletes_total", "Total DELETE row events").unwrap();
-        let transactions =
-            IntCounter::new("mysql_cdc_transactions_total", "Total transactions").unwrap();
-        let table_maps =
-            IntCounter::new("mysql_cdc_table_maps_total", "Total TABLE_MAP events").unwrap();
-        let bytes_received =
-            IntCounter::new("mysql_cdc_bytes_received_total", "Total bytes from binlog").unwrap();
-        let errors = IntCounter::new("mysql_cdc_errors_total", "Total CDC errors").unwrap();
-        let heartbeats =
-            IntCounter::new("mysql_cdc_heartbeats_total", "Total heartbeats received").unwrap();
-        let ddl_events = IntCounter::new("mysql_cdc_ddl_events_total", "Total DDL events").unwrap();
-        let binlog_position =
-            IntGauge::new("mysql_cdc_binlog_position", "Current binlog position").unwrap();
-
-        let _ = reg.register(Box::new(events_received.clone()));
-        let _ = reg.register(Box::new(inserts.clone()));
-        let _ = reg.register(Box::new(updates.clone()));
-        let _ = reg.register(Box::new(deletes.clone()));
-        let _ = reg.register(Box::new(transactions.clone()));
-        let _ = reg.register(Box::new(table_maps.clone()));
-        let _ = reg.register(Box::new(bytes_received.clone()));
-        let _ = reg.register(Box::new(errors.clone()));
-        let _ = reg.register(Box::new(heartbeats.clone()));
-        let _ = reg.register(Box::new(ddl_events.clone()));
-        let _ = reg.register(Box::new(binlog_position.clone()));
+        let mut local = None;
+        let reg = reg_or_local(registry, &mut local);
 
         Self {
-            events_received,
-            inserts,
-            updates,
-            deletes,
-            transactions,
-            table_maps,
-            bytes_received,
-            errors,
-            heartbeats,
-            ddl_events,
-            binlog_position,
+            events_received: reg.counter(
+                "mysql_cdc_events_received_total",
+                "Total binlog events received",
+            ),
+            inserts: reg.counter("mysql_cdc_inserts_total", "Total INSERT row events"),
+            updates: reg.counter("mysql_cdc_updates_total", "Total UPDATE row events"),
+            deletes: reg.counter("mysql_cdc_deletes_total", "Total DELETE row events"),
+            transactions: reg.counter("mysql_cdc_transactions_total", "Total transactions"),
+            table_maps: reg.counter("mysql_cdc_table_maps_total", "Total TABLE_MAP events"),
+            bytes_received: reg
+                .counter("mysql_cdc_bytes_received_total", "Total bytes from binlog"),
+            errors: reg.counter("mysql_cdc_errors_total", "Total CDC errors"),
+            heartbeats: reg.counter("mysql_cdc_heartbeats_total", "Total heartbeats received"),
+            ddl_events: reg.counter("mysql_cdc_ddl_events_total", "Total DDL events"),
+            binlog_position: reg.gauge("mysql_cdc_binlog_position", "Current binlog position"),
         }
     }
 
@@ -192,17 +155,6 @@ impl MySqlCdcMetrics {
             heartbeats: self.heartbeats.get(),
             ddl_events: self.ddl_events.get(),
             binlog_position: self.binlog_position.get() as u64,
-        }
-    }
-
-    /// Converts to generic connector metrics.
-    #[must_use]
-    pub fn to_connector_metrics(&self) -> ConnectorMetrics {
-        ConnectorMetrics {
-            records_total: self.total_row_events(),
-            bytes_total: self.bytes_received.get(),
-            errors_total: self.errors.get(),
-            ..ConnectorMetrics::default()
         }
     }
 }
@@ -304,19 +256,6 @@ mod tests {
         assert_eq!(snap.updates, 5);
         assert_eq!(snap.transactions, 1);
         assert_eq!(snap.total_row_events(), 15);
-    }
-
-    #[test]
-    fn test_to_connector_metrics() {
-        let m = MySqlCdcMetrics::new(None);
-        m.inc_inserts(10);
-        m.add_bytes_received(1000);
-        m.inc_errors();
-
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.records_total, 10);
-        assert_eq!(cm.bytes_total, 1000);
-        assert_eq!(cm.errors_total, 1);
     }
 
     #[test]

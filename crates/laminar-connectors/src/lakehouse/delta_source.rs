@@ -21,8 +21,6 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{SourceBatch, SourceConnector};
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
-use crate::metrics::ConnectorMetrics;
 
 use super::delta_source_config::DeltaSourceConfig;
 #[cfg(feature = "delta-lake")]
@@ -525,24 +523,6 @@ impl SourceConnector for DeltaSource {
         Ok(())
     }
 
-    fn health_check(&self) -> HealthStatus {
-        match self.state {
-            ConnectorState::Running => HealthStatus::Healthy,
-            ConnectorState::Created | ConnectorState::Initializing => HealthStatus::Unknown,
-            ConnectorState::Paused => HealthStatus::Degraded("connector paused".into()),
-            ConnectorState::Recovering => HealthStatus::Degraded("recovering".into()),
-            ConnectorState::Closed => HealthStatus::Unhealthy("closed".into()),
-            ConnectorState::Failed => HealthStatus::Unhealthy("failed".into()),
-        }
-    }
-
-    fn metrics(&self) -> ConnectorMetrics {
-        ConnectorMetrics {
-            records_total: self.records_read,
-            ..ConnectorMetrics::default()
-        }
-    }
-
     async fn close(&mut self) -> Result<(), ConnectorError> {
         info!("closing Delta Lake source connector");
 
@@ -640,18 +620,6 @@ mod tests {
         source.restore(&cp).await.unwrap();
 
         assert_eq!(source.current_version(), 10);
-    }
-
-    #[test]
-    fn test_health_check() {
-        let mut source = DeltaSource::new(test_config(), None);
-        assert_eq!(source.health_check(), HealthStatus::Unknown);
-
-        source.state = ConnectorState::Running;
-        assert_eq!(source.health_check(), HealthStatus::Healthy);
-
-        source.state = ConnectorState::Closed;
-        assert!(matches!(source.health_check(), HealthStatus::Unhealthy(_)));
     }
 
     #[test]

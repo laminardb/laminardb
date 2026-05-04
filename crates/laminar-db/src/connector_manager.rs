@@ -142,19 +142,13 @@ pub(crate) fn parse_refresh_mode(s: &str) -> Result<RefreshMode, DbError> {
         "snapshot_only" | "snapshot" => Ok(RefreshMode::SnapshotOnly),
         "cdc" | "snapshot_plus_cdc" => Ok(RefreshMode::SnapshotPlusCdc),
         "manual" => Ok(RefreshMode::Manual),
-        _ if lower.starts_with("periodic:") => {
-            let secs_str = lower.strip_prefix("periodic:").unwrap();
-            let secs: u64 = secs_str.parse().map_err(|_| {
-                DbError::Connector(format!(
-                    "Invalid periodic interval '{secs_str}': expected integer seconds"
-                ))
-            })?;
-            Ok(RefreshMode::Periodic {
-                interval: std::time::Duration::from_secs(secs),
-            })
-        }
+        _ if lower.starts_with("periodic:") => Err(DbError::Connector(format!(
+            "Refresh mode '{s}' is not implemented: the pipeline does not yet \
+             schedule periodic re-snapshots. Use 'cdc' for incremental updates \
+             or 'manual' for caller-driven refresh."
+        ))),
         _ => Err(DbError::Connector(format!(
-            "Unknown refresh mode '{s}': expected snapshot_only, cdc, periodic:<secs>, or manual"
+            "Unknown refresh mode '{s}': expected snapshot_only, cdc, or manual"
         ))),
     }
 }
@@ -741,8 +735,6 @@ mod tests {
 
     #[test]
     fn test_parse_refresh_mode_variants() {
-        use std::time::Duration;
-
         assert_eq!(
             parse_refresh_mode("snapshot_only").unwrap(),
             RefreshMode::SnapshotOnly
@@ -760,24 +752,16 @@ mod tests {
             RefreshMode::SnapshotPlusCdc
         );
         assert_eq!(parse_refresh_mode("manual").unwrap(), RefreshMode::Manual);
-        assert_eq!(
-            parse_refresh_mode("periodic:60").unwrap(),
-            RefreshMode::Periodic {
-                interval: Duration::from_secs(60)
-            }
-        );
-        assert_eq!(
-            parse_refresh_mode("PERIODIC:30").unwrap(),
-            RefreshMode::Periodic {
-                interval: Duration::from_secs(30)
-            }
-        );
     }
 
     #[test]
     fn test_parse_refresh_mode_invalid() {
         assert!(parse_refresh_mode("bogus").is_err());
-        assert!(parse_refresh_mode("periodic:abc").is_err());
+        // Periodic was advertised but never wired to a scheduler. Until
+        // it is, the parser rejects it loudly rather than letting the
+        // request land in pipeline_callback as a no-op.
+        assert!(parse_refresh_mode("periodic:60").is_err());
+        assert!(parse_refresh_mode("PERIODIC:30").is_err());
     }
 
     #[test]

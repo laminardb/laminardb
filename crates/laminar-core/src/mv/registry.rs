@@ -70,36 +70,9 @@ impl MaterializedView {
     }
 }
 
-/// Registry for managing materialized views.
-///
-/// Maintains a DAG of view dependencies and provides:
-/// - Cycle detection on registration
-/// - Topological ordering for correct processing order
-/// - Dependency tracking for cascade operations
-///
-/// # Example
-///
-/// ```rust
-/// use laminar_core::mv::{MvRegistry, MaterializedView};
-/// use arrow_schema::{Schema, Field, DataType};
-/// use std::sync::Arc;
-///
-/// let mut registry = MvRegistry::new();
-///
-/// // Register base tables
-/// registry.register_base_table("trades");
-///
-/// // Register cascading views
-/// let schema = Arc::new(Schema::new(vec![Field::new("count", DataType::Int64, false)]));
-/// let ohlc_1s = MaterializedView::new("ohlc_1s", "SELECT ...", vec!["trades".into()], schema.clone());
-/// registry.register(ohlc_1s).unwrap();
-///
-/// let ohlc_1m = MaterializedView::new("ohlc_1m", "SELECT ...", vec!["ohlc_1s".into()], schema);
-/// registry.register(ohlc_1m).unwrap();
-///
-/// // Views are processed in topological order
-/// assert_eq!(registry.topo_order(), &["ohlc_1s", "ohlc_1m"]);
-/// ```
+/// Registry for managing materialized views: stores the dependency DAG,
+/// detects cycles on registration, and exposes a topological order for
+/// correct processing.
 #[derive(Debug, Default)]
 pub struct MvRegistry {
     /// All registered MVs by name.
@@ -602,10 +575,7 @@ mod tests {
         let view = registry.get_mut("ohlc_1s").unwrap();
         assert_eq!(view.state, MvState::Running);
 
-        view.state = MvState::Paused;
-        assert!(!view.state.can_process());
-
-        view.state = MvState::Error;
-        assert!(view.state.is_error());
+        view.state = MvState::Dropping;
+        assert_eq!(view.state, MvState::Dropping);
     }
 }

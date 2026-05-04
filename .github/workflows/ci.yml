@@ -217,7 +217,6 @@ jobs:
           cargo check -p laminar-connectors --features postgres-cdc
           cargo check -p laminar-connectors --features postgres-sink
           cargo check -p laminar-connectors --features mysql-cdc
-          cargo check -p laminar-connectors --features kafka-discovery
           cargo check -p laminar-connectors --features files
           cargo check -p laminar-connectors --features parquet-lookup
 

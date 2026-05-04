@@ -2,7 +2,7 @@
 
 use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, Opts, Registry};
 
-use crate::metrics::ConnectorMetrics;
+use crate::prom::reg_or_local;
 
 /// Prometheus-backed counters/gauges for Kafka source connector statistics.
 #[derive(Debug, Clone)]
@@ -43,59 +43,30 @@ impl KafkaSourceMetrics {
     #[must_use]
     #[allow(clippy::missing_panics_doc, clippy::too_many_lines)]
     pub fn new(registry: Option<&Registry>) -> Self {
-        let local;
-        let reg = if let Some(r) = registry {
-            r
-        } else {
-            local = Registry::new();
-            &local
-        };
+        let mut local = None;
+        let handle = reg_or_local(registry, &mut local);
+        let reg = handle.registry();
 
-        let records_polled = IntCounter::new(
-            "kafka_source_records_polled_total",
-            "Total records polled from Kafka",
-        )
-        .unwrap();
-        let bytes_polled = IntCounter::new(
-            "kafka_source_bytes_polled_total",
-            "Total bytes polled from Kafka",
-        )
-        .unwrap();
-        let errors =
-            IntCounter::new("kafka_source_errors_total", "Total Kafka consumer errors").unwrap();
-        let batches_polled = IntCounter::new(
-            "kafka_source_batches_polled_total",
-            "Total batches polled from Kafka",
-        )
-        .unwrap();
-        let commits = IntCounter::new(
-            "kafka_source_commits_total",
-            "Total offset commits to Kafka",
-        )
-        .unwrap();
+        // Const-label counters (`reason=...`) share a metric name and
+        // can't go through the shared helper.
         let make_failure = |reason: &str| {
-            IntCounter::with_opts(
+            let c = IntCounter::with_opts(
                 Opts::new(
                     "kafka_source_commit_failures_total",
                     "Offset commit failures by reason",
                 )
                 .const_label("reason", reason),
             )
-            .unwrap()
+            .unwrap();
+            // Best-effort registration — ignore `AlreadyReg` if another
+            // Kafka source is already on the same registry.
+            let _ = reg.register(Box::new(c.clone()));
+            c
         };
         let commit_failures_rejected = make_failure("rejected");
         let commit_failures_panic = make_failure("panic");
         let commit_failures_enqueue_dropped = make_failure("enqueue_dropped");
-        let rebalances = IntCounter::new(
-            "kafka_source_rebalances_total",
-            "Total consumer group rebalances",
-        )
-        .unwrap();
-        let lag = IntGauge::new(
-            "kafka_source_consumer_lag",
-            "Consumer lag (sum across partitions)",
-        )
-        .unwrap();
+
         let broker_commit_duration = Histogram::with_opts(
             HistogramOpts::new(
                 "kafka_source_broker_commit_duration_seconds",
@@ -104,54 +75,50 @@ impl KafkaSourceMetrics {
             .buckets(prometheus::exponential_buckets(0.01, 4.0, 5).unwrap()),
         )
         .unwrap();
-        let sr_discovery_successes = IntCounter::new(
-            "kafka_source_sr_discovery_successes_total",
-            "Schema Registry discovery successes",
-        )
-        .unwrap();
-        let sr_discovery_failures = IntCounter::new(
-            "kafka_source_sr_discovery_failures_total",
-            "Schema Registry discovery failures",
-        )
-        .unwrap();
-        let sr_discovery_timeouts = IntCounter::new(
-            "kafka_source_sr_discovery_timeouts_total",
-            "Schema Registry discovery timeouts",
-        )
-        .unwrap();
-
-        // Best-effort registration — ignore `AlreadyReg` if another
-        // Kafka source is already on the same registry.
-        let _ = reg.register(Box::new(records_polled.clone()));
-        let _ = reg.register(Box::new(bytes_polled.clone()));
-        let _ = reg.register(Box::new(errors.clone()));
-        let _ = reg.register(Box::new(batches_polled.clone()));
-        let _ = reg.register(Box::new(commits.clone()));
-        let _ = reg.register(Box::new(commit_failures_rejected.clone()));
-        let _ = reg.register(Box::new(commit_failures_panic.clone()));
-        let _ = reg.register(Box::new(commit_failures_enqueue_dropped.clone()));
-        let _ = reg.register(Box::new(rebalances.clone()));
-        let _ = reg.register(Box::new(lag.clone()));
         let _ = reg.register(Box::new(broker_commit_duration.clone()));
-        let _ = reg.register(Box::new(sr_discovery_successes.clone()));
-        let _ = reg.register(Box::new(sr_discovery_failures.clone()));
-        let _ = reg.register(Box::new(sr_discovery_timeouts.clone()));
 
         Self {
-            records_polled,
-            bytes_polled,
-            errors,
-            batches_polled,
-            commits,
+            records_polled: handle.counter(
+                "kafka_source_records_polled_total",
+                "Total records polled from Kafka",
+            ),
+            bytes_polled: handle.counter(
+                "kafka_source_bytes_polled_total",
+                "Total bytes polled from Kafka",
+            ),
+            errors: handle.counter("kafka_source_errors_total", "Total Kafka consumer errors"),
+            batches_polled: handle.counter(
+                "kafka_source_batches_polled_total",
+                "Total batches polled from Kafka",
+            ),
+            commits: handle.counter(
+                "kafka_source_commits_total",
+                "Total offset commits to Kafka",
+            ),
             commit_failures_rejected,
             commit_failures_panic,
             commit_failures_enqueue_dropped,
-            rebalances,
-            lag,
+            rebalances: handle.counter(
+                "kafka_source_rebalances_total",
+                "Total consumer group rebalances",
+            ),
+            lag: handle.gauge(
+                "kafka_source_consumer_lag",
+                "Consumer lag (sum across partitions)",
+            ),
             broker_commit_duration,
-            sr_discovery_successes,
-            sr_discovery_failures,
-            sr_discovery_timeouts,
+            sr_discovery_successes: handle.counter(
+                "kafka_source_sr_discovery_successes_total",
+                "Schema Registry discovery successes",
+            ),
+            sr_discovery_failures: handle.counter(
+                "kafka_source_sr_discovery_failures_total",
+                "Schema Registry discovery failures",
+            ),
+            sr_discovery_timeouts: handle.counter(
+                "kafka_source_sr_discovery_timeouts_total",
+                "Schema Registry discovery timeouts",
+            ),
         }
     }
 
@@ -202,39 +169,6 @@ impl KafkaSourceMetrics {
     pub fn record_sr_discovery_timeout(&self) {
         self.sr_discovery_timeouts.inc();
     }
-
-    /// Converts to the SDK's [`ConnectorMetrics`].
-    #[must_use]
-    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
-    pub fn to_connector_metrics(&self) -> ConnectorMetrics {
-        let mut m = ConnectorMetrics {
-            records_total: self.records_polled.get(),
-            bytes_total: self.bytes_polled.get(),
-            errors_total: self.errors.get(),
-            lag: self.lag.get() as u64,
-            custom: Vec::new(),
-        };
-        m.add_custom("kafka.batches_polled", self.batches_polled.get() as f64);
-        m.add_custom("kafka.commits", self.commits.get() as f64);
-        let total_failures = self.commit_failures_rejected.get()
-            + self.commit_failures_panic.get()
-            + self.commit_failures_enqueue_dropped.get();
-        m.add_custom("kafka.commit_failures", total_failures as f64);
-        m.add_custom("kafka.rebalances", self.rebalances.get() as f64);
-        m.add_custom(
-            "kafka.sr_discovery_successes",
-            self.sr_discovery_successes.get() as f64,
-        );
-        m.add_custom(
-            "kafka.sr_discovery_failures",
-            self.sr_discovery_failures.get() as f64,
-        );
-        m.add_custom(
-            "kafka.sr_discovery_timeouts",
-            self.sr_discovery_timeouts.get() as f64,
-        );
-        m
-    }
 }
 
 impl Default for KafkaSourceMetrics {
@@ -250,10 +184,9 @@ mod tests {
     #[test]
     fn test_initial_zeros() {
         let m = KafkaSourceMetrics::new(None);
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.records_total, 0);
-        assert_eq!(cm.bytes_total, 0);
-        assert_eq!(cm.errors_total, 0);
+        assert_eq!(m.records_polled.get(), 0);
+        assert_eq!(m.bytes_polled.get(), 0);
+        assert_eq!(m.errors.get(), 0);
     }
 
     #[test]
@@ -262,9 +195,8 @@ mod tests {
         m.record_poll(100, 5000);
         m.record_poll(200, 10000);
 
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.records_total, 300);
-        assert_eq!(cm.bytes_total, 15000);
+        assert_eq!(m.records_polled.get(), 300);
+        assert_eq!(m.bytes_polled.get(), 15000);
     }
 
     #[test]
@@ -274,10 +206,8 @@ mod tests {
         m.record_error();
         m.record_commit();
 
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.errors_total, 2);
-        let commits = cm.custom.iter().find(|(k, _)| k == "kafka.commits");
-        assert_eq!(commits.unwrap().1, 1.0);
+        assert_eq!(m.errors.get(), 2);
+        assert_eq!(m.commits.get(), 1);
     }
 
     #[test]
@@ -286,9 +216,8 @@ mod tests {
         m.commit_failures_rejected.inc();
         m.commit_failures_panic.inc();
 
-        let cm = m.to_connector_metrics();
-        let failures = cm.custom.iter().find(|(k, _)| k == "kafka.commit_failures");
-        assert_eq!(failures.unwrap().1, 2.0);
+        let total = m.commit_failures_rejected.get() + m.commit_failures_panic.get();
+        assert_eq!(total, 2);
     }
 
     #[test]
@@ -297,21 +226,19 @@ mod tests {
         m.record_rebalance();
         m.record_rebalance();
 
-        let cm = m.to_connector_metrics();
-        let rebalances = cm.custom.iter().find(|(k, _)| k == "kafka.rebalances");
-        assert_eq!(rebalances.unwrap().1, 2.0);
+        assert_eq!(m.rebalances.get(), 2);
     }
 
     #[test]
     fn test_set_lag() {
         let m = KafkaSourceMetrics::new(None);
-        assert_eq!(m.to_connector_metrics().lag, 0);
+        assert_eq!(m.lag.get(), 0);
 
         m.set_lag(42);
-        assert_eq!(m.to_connector_metrics().lag, 42);
+        assert_eq!(m.lag.get(), 42);
 
         m.set_lag(100);
-        assert_eq!(m.to_connector_metrics().lag, 100);
+        assert_eq!(m.lag.get(), 100);
     }
 
     #[test]
@@ -322,25 +249,9 @@ mod tests {
         m.record_sr_discovery_failure();
         m.record_sr_discovery_timeout();
 
-        let cm = m.to_connector_metrics();
-        let successes = cm
-            .custom
-            .iter()
-            .find(|(k, _)| k == "kafka.sr_discovery_successes")
-            .unwrap();
-        let failures = cm
-            .custom
-            .iter()
-            .find(|(k, _)| k == "kafka.sr_discovery_failures")
-            .unwrap();
-        let timeouts = cm
-            .custom
-            .iter()
-            .find(|(k, _)| k == "kafka.sr_discovery_timeouts")
-            .unwrap();
-        assert_eq!(successes.1, 2.0);
-        assert_eq!(failures.1, 1.0);
-        assert_eq!(timeouts.1, 1.0);
+        assert_eq!(m.sr_discovery_successes.get(), 2);
+        assert_eq!(m.sr_discovery_failures.get(), 1);
+        assert_eq!(m.sr_discovery_timeouts.get(), 1);
     }
 
     #[test]
@@ -366,7 +277,7 @@ mod tests {
 
         let m = KafkaSourceMetrics::new(None);
         m.set_lag(total_lag);
-        assert_eq!(m.to_connector_metrics().lag, 598);
+        assert_eq!(m.lag.get(), 598);
     }
 
     #[test]

@@ -50,7 +50,7 @@ pub struct ClusterRepartitionExec {
 struct RuntimeState {
     /// One receiver per output partition; claimed once by `execute(p)`.
     receivers: AsyncMutex<Vec<Option<mpsc::Receiver<RecordBatch>>>>,
-    inject_barrier_tx: mpsc::UnboundedSender<CheckpointBarrier>,
+    inject_barrier_tx: mpsc::Sender<CheckpointBarrier>,
     /// Carries the aligned checkpoint id for downstream wrappers.
     aligned_epoch_watch: watch::Receiver<u64>,
     _router: JoinHandle<()>,
@@ -143,10 +143,21 @@ impl ClusterRepartitionExec {
                 "ClusterRepartitionExec::inject_barrier before execute()".into(),
             ));
         };
+        // Bounded control channel; barriers arrive at checkpoint cadence
+        // so the queue stays shallow. `try_send` keeps the sync signature
+        // and surfaces backpressure as a hard error rather than silently
+        // queueing arbitrary depth.
         runtime
             .inject_barrier_tx
-            .send(barrier)
-            .map_err(|_| DataFusionError::Execution("router task exited".into()))
+            .try_send(barrier)
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => DataFusionError::Execution(
+                    "barrier inject channel full — router lagging".into(),
+                ),
+                mpsc::error::TrySendError::Closed(_) => {
+                    DataFusionError::Execution("router task exited".into())
+                }
+            })
     }
 
     /// `None` before `execute()`; otherwise a watch that fires each
@@ -158,6 +169,10 @@ impl ClusterRepartitionExec {
 
     /// Spawn the router + dispatcher tasks on the first `execute()`.
     fn init_runtime(&self, context: &Arc<TaskContext>) -> Result<Arc<RuntimeState>> {
+        // 256 is generous for what is at most "barriers in flight per
+        // checkpoint cadence × peers"; chosen to avoid coupling test
+        // tunables to per-deployment cluster sizes.
+        const BARRIER_QUEUE: usize = 256;
         if let Some(existing) = self.runtime.get() {
             return Ok(Arc::clone(existing));
         }
@@ -184,8 +199,8 @@ impl ClusterRepartitionExec {
         //   - inject_barrier_(tx|rx): external trigger → router
         //   - peer_barrier_(tx|rx):   dispatcher → router (after peer gossip)
         //   - aligned_(tx|rx):        router → subscribers (watch channel)
-        let (inject_tx, inject_rx) = mpsc::unbounded_channel::<CheckpointBarrier>();
-        let (peer_tx, peer_rx) = mpsc::unbounded_channel::<(ShufflePeerId, CheckpointBarrier)>();
+        let (inject_tx, inject_rx) = mpsc::channel::<CheckpointBarrier>(BARRIER_QUEUE);
+        let (peer_tx, peer_rx) = mpsc::channel::<(ShufflePeerId, CheckpointBarrier)>(BARRIER_QUEUE);
         let (aligned_tx, aligned_rx) = watch::channel::<u64>(0);
 
         let router_txs = partition_txs.clone();
@@ -398,8 +413,8 @@ async fn route_input_stream(
     sender: Arc<ShuffleSender>,
     partition_txs: Vec<mpsc::Sender<RecordBatch>>,
     peers: Vec<ShufflePeerId>,
-    mut inject_rx: mpsc::UnboundedReceiver<CheckpointBarrier>,
-    mut peer_rx: mpsc::UnboundedReceiver<(ShufflePeerId, CheckpointBarrier)>,
+    mut inject_rx: mpsc::Receiver<CheckpointBarrier>,
+    mut peer_rx: mpsc::Receiver<(ShufflePeerId, CheckpointBarrier)>,
     aligned_tx: watch::Sender<u64>,
 ) {
     let vnode_count = registry.vnode_count();
@@ -493,7 +508,7 @@ async fn dispatch_inbound(
     receiver: Arc<ShuffleReceiver>,
     vnode_to_partition: HashMap<u32, usize>,
     partition_txs: Vec<mpsc::Sender<RecordBatch>>,
-    peer_barrier_tx: mpsc::UnboundedSender<(ShufflePeerId, CheckpointBarrier)>,
+    peer_barrier_tx: mpsc::Sender<(ShufflePeerId, CheckpointBarrier)>,
 ) {
     use laminar_core::shuffle::ShuffleMessage;
     while let Some((from, msg)) = receiver.recv().await {
@@ -511,7 +526,7 @@ async fn dispatch_inbound(
                     return; // downstream dropped
                 }
             }
-            ShuffleMessage::Barrier(b) if peer_barrier_tx.send((from, b)).is_err() => return,
+            ShuffleMessage::Barrier(b) if peer_barrier_tx.send((from, b)).await.is_err() => return,
             // Hello is consumed by per_peer_loop; Close closes the
             // reader. Barriers that succeed fall through here.
             _ => {}

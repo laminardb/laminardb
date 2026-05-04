@@ -5,7 +5,7 @@ use prometheus::core::Collector;
 use prometheus::{Error as PromError, IntCounter, IntGauge, Registry};
 use tracing::warn;
 
-use crate::metrics::ConnectorMetrics;
+use crate::prom::reg_or_local;
 
 fn register_collector<C: Collector + Clone + 'static>(reg: &Registry, name: &str, c: &C) {
     match reg.register(Box::new(c.clone())) {
@@ -41,13 +41,9 @@ impl NatsSourceMetrics {
     #[must_use]
     #[allow(clippy::missing_panics_doc)]
     pub fn new(registry: Option<&Registry>) -> Self {
-        let local;
-        let reg = if let Some(r) = registry {
-            r
-        } else {
-            local = Registry::new();
-            &local
-        };
+        let mut local = None;
+        let handle = reg_or_local(registry, &mut local);
+        let reg = handle.registry();
 
         macro_rules! reg_c {
             ($name:expr, $help:expr) => {{
@@ -107,23 +103,6 @@ impl NatsSourceMetrics {
     pub fn set_consumer_lag(&self, n: u64) {
         self.consumer_lag.set(n as i64);
     }
-
-    /// `lag` comes from the most recent `consumer.info()` poll.
-    #[must_use]
-    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
-    pub fn to_connector_metrics(&self) -> ConnectorMetrics {
-        let mut m = ConnectorMetrics {
-            records_total: self.records_total.get(),
-            bytes_total: self.bytes_total.get(),
-            errors_total: self.fetch_errors_total.get() + self.ack_errors_total.get(),
-            lag: self.consumer_lag.get().max(0) as u64,
-            custom: Vec::new(),
-        };
-        m.add_custom("nats.acks", self.acks_total.get() as f64);
-        m.add_custom("nats.ack_errors", self.ack_errors_total.get() as f64);
-        m.add_custom("nats.pending_acks", self.pending_acks.get() as f64);
-        m
-    }
 }
 
 /// Prometheus counters for the NATS sink.
@@ -145,13 +124,9 @@ impl NatsSinkMetrics {
     #[must_use]
     #[allow(clippy::missing_panics_doc)]
     pub fn new(registry: Option<&Registry>) -> Self {
-        let local;
-        let reg = if let Some(r) = registry {
-            r
-        } else {
-            local = Registry::new();
-            &local
-        };
+        let mut local = None;
+        let handle = reg_or_local(registry, &mut local);
+        let reg = handle.registry();
 
         macro_rules! reg_c {
             ($name:expr, $help:expr) => {{
@@ -205,24 +180,6 @@ impl NatsSinkMetrics {
     pub fn set_pending_futures(&self, n: usize) {
         self.pending_futures.set(n as i64);
     }
-
-    #[must_use]
-    #[allow(missing_docs, clippy::cast_precision_loss, clippy::cast_sign_loss)]
-    pub fn to_connector_metrics(&self) -> ConnectorMetrics {
-        let mut m = ConnectorMetrics {
-            records_total: self.records_total.get(),
-            bytes_total: self.bytes_total.get(),
-            errors_total: self.publish_errors_total.get() + self.ack_errors_total.get(),
-            lag: self.pending_futures.get() as u64,
-            custom: Vec::new(),
-        };
-        m.add_custom("nats.dedup", self.dedup_total.get() as f64);
-        m.add_custom(
-            "nats.epochs_rolled_back",
-            self.epochs_rolled_back.get() as f64,
-        );
-        m
-    }
 }
 
 #[cfg(test)]
@@ -232,11 +189,10 @@ mod tests {
     #[test]
     fn source_initial_zero() {
         let m = NatsSourceMetrics::new(None);
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.records_total, 0);
-        assert_eq!(cm.bytes_total, 0);
-        assert_eq!(cm.errors_total, 0);
-        assert_eq!(cm.lag, 0);
+        assert_eq!(m.records_total.get(), 0);
+        assert_eq!(m.bytes_total.get(), 0);
+        assert_eq!(m.fetch_errors_total.get(), 0);
+        assert_eq!(m.consumer_lag.get(), 0);
     }
 
     #[test]
@@ -251,16 +207,12 @@ mod tests {
 
         m.set_consumer_lag(42);
 
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.records_total, 150);
-        assert_eq!(cm.bytes_total, 5120);
-        assert_eq!(cm.errors_total, 1); // fetch error
-        assert_eq!(cm.lag, 42, "lag reflects the latest consumer.info() poll");
-        assert!(cm.custom.iter().any(|(k, v)| k == "nats.acks" && *v == 2.0));
-        assert!(cm
-            .custom
-            .iter()
-            .any(|(k, v)| k == "nats.pending_acks" && *v == 7.0));
+        assert_eq!(m.records_total.get(), 150);
+        assert_eq!(m.bytes_total.get(), 5120);
+        assert_eq!(m.fetch_errors_total.get(), 1);
+        assert_eq!(m.consumer_lag.get(), 42);
+        assert_eq!(m.acks_total.get(), 2);
+        assert_eq!(m.pending_acks.get(), 7);
     }
 
     #[test]
@@ -274,18 +226,11 @@ mod tests {
         m.record_rollback();
         m.set_pending_futures(3);
 
-        let cm = m.to_connector_metrics();
-        assert_eq!(cm.records_total, 10);
-        assert_eq!(cm.bytes_total, 2000);
-        assert_eq!(cm.lag, 3);
-        assert!(cm
-            .custom
-            .iter()
-            .any(|(k, v)| k == "nats.dedup" && *v == 2.0));
-        assert!(cm
-            .custom
-            .iter()
-            .any(|(k, v)| k == "nats.epochs_rolled_back" && *v == 1.0));
+        assert_eq!(m.records_total.get(), 10);
+        assert_eq!(m.bytes_total.get(), 2000);
+        assert_eq!(m.pending_futures.get(), 3);
+        assert_eq!(m.dedup_total.get(), 2);
+        assert_eq!(m.epochs_rolled_back.get(), 1);
     }
 
     #[test]

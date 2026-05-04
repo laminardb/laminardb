@@ -1,10 +1,6 @@
 # laminar-derive
 
-Derive macros for LaminarDB -- `Record`, `FromRecordBatch`, `FromRow`, and `ConnectorConfig`.
-
-## Overview
-
-Procedural macros for Arrow RecordBatch conversion and connector config parsing. Eliminates the boilerplate of writing `to_record_batch()` / `from_batch()` by hand.
+Derive macros for LaminarDB — `Record`, `FromRecordBatch`, `FromRow`, and `ConnectorConfig`. Eliminates the boilerplate of writing `to_record_batch()` / `from_batch()` by hand.
 
 ## Macros
 

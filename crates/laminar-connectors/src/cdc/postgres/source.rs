@@ -20,8 +20,6 @@ use crate::checkpoint::SourceCheckpoint;
 use crate::config::{ConnectorConfig, ConnectorState};
 use crate::connector::{PartitionInfo, SourceBatch, SourceConnector};
 use crate::error::ConnectorError;
-use crate::health::HealthStatus;
-use crate::metrics::ConnectorMetrics;
 
 use super::changelog::{events_to_record_batch, tuple_to_json, CdcOperation, ChangeEvent};
 use super::config::PostgresCdcConfig;
@@ -664,17 +662,20 @@ impl SourceConnector for PostgresCdcSource {
                         break 'reconnect;
                     }
 
-                    // Exponential backoff: 2^n seconds, capped at 30s.
-                    let backoff_secs = (1u64 << consecutive_failures).min(30);
+                    // Jittered exponential backoff: capped at 30 s and
+                    // shift-overflow-safe even if MAX_FAILURES is raised
+                    // past 63 in a future refactor.
+                    let backoff =
+                        crate::retry::Backoff::broker_reconnect().delay(consecutive_failures);
                     tracing::warn!(
                         attempt = consecutive_failures,
-                        backoff_secs,
+                        ?backoff,
                         "WAL reader reconnecting"
                     );
                     tokio::select! {
                         biased;
                         _ = shutdown_rx.changed() => break 'reconnect,
-                        () = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                        () = tokio::time::sleep(backoff) => {}
                     }
 
                     // Rebuild replication config with resume LSN from checkpoint.
@@ -834,26 +835,6 @@ impl SourceConnector for PostgresCdcSource {
             }
         }
         Ok(())
-    }
-
-    fn health_check(&self) -> HealthStatus {
-        match self.state {
-            ConnectorState::Running => {
-                let lag = self.replication_lag_bytes();
-                if lag > 100_000_000 {
-                    // > 100MB lag
-                    HealthStatus::Degraded(format!("replication lag: {lag} bytes"))
-                } else {
-                    HealthStatus::Healthy
-                }
-            }
-            ConnectorState::Failed => HealthStatus::Unhealthy("connector failed".to_string()),
-            _ => HealthStatus::Unknown,
-        }
-    }
-
-    fn metrics(&self) -> ConnectorMetrics {
-        self.metrics.to_connector_metrics()
     }
 
     fn data_ready_notify(&self) -> Option<Arc<Notify>> {
@@ -1416,53 +1397,6 @@ mod tests {
         let partition = batch.partition.unwrap();
         assert_eq!(partition.id, "laminar_slot");
         assert_eq!(partition.offset, "1/ABCD");
-    }
-
-    // ── Health check ──
-
-    #[test]
-    fn test_health_check_healthy() {
-        let src = running_source();
-        assert!(src.health_check().is_healthy());
-    }
-
-    #[test]
-    fn test_health_check_degraded() {
-        let mut src = running_source();
-        src.write_lsn = Lsn::new(200_000_000);
-        src.confirmed_flush_lsn = Lsn::ZERO;
-        assert!(matches!(src.health_check(), HealthStatus::Degraded(_)));
-    }
-
-    #[test]
-    fn test_health_check_unknown_when_created() {
-        let src = default_source();
-        assert!(matches!(src.health_check(), HealthStatus::Unknown));
-    }
-
-    // ── Metrics ──
-
-    #[tokio::test]
-    async fn test_metrics_after_processing() {
-        let mut src = running_source();
-
-        let rel_msg = PostgresCdcSource::build_relation_message(
-            16384,
-            "public",
-            "users",
-            &[(1, "id", INT8_OID, -1)],
-        );
-        src.enqueue_wal_data(rel_msg);
-
-        src.enqueue_wal_data(PostgresCdcSource::build_begin_message(0x100, 0, 1));
-        src.enqueue_wal_data(PostgresCdcSource::build_insert_message(16384, &[Some("1")]));
-        src.enqueue_wal_data(PostgresCdcSource::build_insert_message(16384, &[Some("2")]));
-        src.enqueue_wal_data(PostgresCdcSource::build_commit_message(0x100, 0x200, 0));
-
-        let _ = src.poll_batch(100).await.unwrap();
-
-        let metrics = src.metrics();
-        assert_eq!(metrics.records_total, 2); // 2 inserts
     }
 
     // ── Replication lag ──

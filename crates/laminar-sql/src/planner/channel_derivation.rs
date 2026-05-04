@@ -104,50 +104,7 @@ impl MvDefinition {
     }
 }
 
-/// Analyzes query plan to determine channel types per source.
-///
-/// Examines how many MVs consume each source and determines whether
-/// SPSC or Broadcast channels are needed.
-///
-/// # Arguments
-///
-/// * `sources` - Registered source definitions
-/// * `mvs` - Materialized view definitions
-///
-/// # Returns
-///
-/// A map from source name to derived channel type.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use laminar_sql::planner::channel_derivation::*;
-///
-/// let sources = vec![
-///     SourceDefinition::new("trades"),
-///     SourceDefinition::new("orders"),
-/// ];
-///
-/// let mvs = vec![
-///     MvDefinition::from_source("vwap", "trades"),
-///     MvDefinition::from_source("max_price", "trades"),
-///     MvDefinition::from_source("order_count", "orders"),
-/// ];
-///
-/// let channel_types = derive_channel_types(&sources, &mvs);
-///
-/// // trades has 2 consumers → Broadcast
-/// assert_eq!(
-///     channel_types.get("trades"),
-///     Some(&DerivedChannelType::Broadcast { consumer_count: 2 })
-/// );
-///
-/// // orders has 1 consumer → SPSC
-/// assert_eq!(
-///     channel_types.get("orders"),
-///     Some(&DerivedChannelType::Spsc)
-/// );
-/// ```
+/// Maps each source to SPSC (single consumer) or Broadcast (multi-consumer).
 #[must_use]
 pub fn derive_channel_types(
     sources: &[SourceDefinition],

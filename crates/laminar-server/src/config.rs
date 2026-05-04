@@ -173,9 +173,6 @@ pub struct ServerSection {
     pub mode: String,
     #[serde(default = "default_bind")]
     pub bind: String,
-    /// Number of worker threads (0 = auto-detect). Used in delta mode.
-    #[serde(default)]
-    pub workers: usize,
 }
 
 impl Default for ServerSection {
@@ -183,7 +180,6 @@ impl Default for ServerSection {
         Self {
             mode: default_mode(),
             bind: default_bind(),
-            workers: 0,
         }
     }
 }
@@ -202,8 +198,6 @@ pub struct CheckpointSection {
     /// Cloud storage credentials/config (e.g., `aws_access_key_id`).
     #[serde(default)]
     pub storage: std::collections::HashMap<String, String>,
-    #[serde(default)]
-    pub tiering: Option<TieringSection>,
 }
 
 impl Default for CheckpointSection {
@@ -213,25 +207,8 @@ impl Default for CheckpointSection {
             interval: default_checkpoint_interval(),
             max_retained: default_max_retained(),
             storage: std::collections::HashMap::new(),
-            tiering: None,
         }
     }
-}
-
-/// `[checkpoint.tiering]` section: S3 storage class tiering for cost optimization.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct TieringSection {
-    #[serde(default = "default_hot_class")]
-    pub hot_class: String,
-    #[serde(default = "default_warm_class")]
-    pub warm_class: String,
-    /// Empty = no cold tier.
-    #[serde(default)]
-    pub cold_class: String,
-    #[serde(default = "default_hot_retention", with = "humantime_serde")]
-    pub hot_retention: Duration,
-    #[serde(default = "default_warm_retention", with = "humantime_serde")]
-    pub warm_retention: Duration,
 }
 
 /// `[[source]]` section.
@@ -407,18 +384,6 @@ fn default_cache_ttl() -> Duration {
 fn default_delivery() -> String {
     "at_least_once".to_string()
 }
-fn default_hot_class() -> String {
-    "STANDARD".to_string()
-}
-fn default_warm_class() -> String {
-    "STANDARD".to_string()
-}
-fn default_hot_retention() -> Duration {
-    Duration::from_secs(86400) // 24h
-}
-fn default_warm_retention() -> Duration {
-    Duration::from_secs(604_800) // 7d
-}
 fn default_gossip_port() -> u16 {
     7946
 }
@@ -460,7 +425,6 @@ mod tests {
 [server]
 mode = "embedded"
 bind = "127.0.0.1:8080"
-workers = 4
 
 [state]
 backend = "in_process"
@@ -522,7 +486,6 @@ node_id = "star-1"
 [server]
 mode = "cluster"
 bind = "0.0.0.0:8080"
-workers = 8
 
 [state]
 backend = "local"
@@ -748,7 +711,6 @@ bind = "not-a-socket-addr"
 
         assert_eq!(config.server.mode, "embedded");
         assert_eq!(config.server.bind, "127.0.0.1:8080");
-        assert_eq!(config.server.workers, 0);
         assert!(matches!(config.state, StateBackendConfig::InProcess { .. }));
         assert_eq!(config.checkpoint.interval, Duration::from_secs(10));
     }
@@ -841,56 +803,6 @@ type = "VARCHAR"
         assert!(!config.sources[0].schema[0].nullable);
         assert_eq!(config.sources[0].schema[1].data_type, "VARCHAR");
         assert!(config.sources[0].schema[1].nullable); // default
-    }
-
-    #[test]
-    fn test_checkpoint_tiering_parsing() {
-        let toml = r#"
-[checkpoint]
-url = "s3://bucket/checkpoints"
-interval = "30s"
-
-[checkpoint.tiering]
-hot_class = "EXPRESS_ONE_ZONE"
-warm_class = "STANDARD"
-cold_class = "GLACIER_IR"
-hot_retention = "12h"
-warm_retention = "3d"
-"#;
-        let config: ServerConfig = toml::from_str(toml).unwrap();
-        let tiering = config.checkpoint.tiering.as_ref().unwrap();
-        assert_eq!(tiering.hot_class, "EXPRESS_ONE_ZONE");
-        assert_eq!(tiering.warm_class, "STANDARD");
-        assert_eq!(tiering.cold_class, "GLACIER_IR");
-        assert_eq!(tiering.hot_retention, Duration::from_secs(43200));
-        assert_eq!(tiering.warm_retention, Duration::from_secs(259_200));
-    }
-
-    #[test]
-    fn test_checkpoint_tiering_defaults() {
-        let toml = r#"
-[checkpoint]
-url = "s3://bucket/checkpoints"
-
-[checkpoint.tiering]
-"#;
-        let config: ServerConfig = toml::from_str(toml).unwrap();
-        let tiering = config.checkpoint.tiering.as_ref().unwrap();
-        assert_eq!(tiering.hot_class, "STANDARD");
-        assert_eq!(tiering.warm_class, "STANDARD");
-        assert!(tiering.cold_class.is_empty());
-        assert_eq!(tiering.hot_retention, Duration::from_secs(86400));
-        assert_eq!(tiering.warm_retention, Duration::from_secs(604_800));
-    }
-
-    #[test]
-    fn test_checkpoint_no_tiering() {
-        let toml = r#"
-[checkpoint]
-url = "s3://bucket/checkpoints"
-"#;
-        let config: ServerConfig = toml::from_str(toml).unwrap();
-        assert!(config.checkpoint.tiering.is_none());
     }
 
     #[test]
