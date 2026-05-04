@@ -448,7 +448,8 @@ impl Drop for ReceiverReturnGuard<'_> {
     fn drop(&mut self) {
         if let Some(rx) = self.rx.take() {
             *self.slot.lock() = Some(rx);
-            self.notify.notify_waiters();
+            // notify_one stores a permit; notify_waiters can lose wakeups.
+            self.notify.notify_one();
         }
     }
 }

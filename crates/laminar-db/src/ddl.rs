@@ -1051,8 +1051,12 @@ impl LaminarDB {
                 join_config: plan_joins,
             })
             .map_err(|e| {
+                // Roll back every piece of state this DDL wrote so a
+                // retry starts from a clean slate.
                 let _ = self.ctx.deregister_table(&name_str);
                 let _ = self.mv_registry.lock().unregister(&name_str);
+                self.connector_manager.lock().unregister_stream(&name_str);
+                self.mv_store.write().drop_mv(&name_str);
                 DbError::Pipeline(format!(
                     "control channel busy, retry CREATE MATERIALIZED VIEW '{name_str}': {e}"
                 ))

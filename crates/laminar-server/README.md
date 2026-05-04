@@ -122,7 +122,7 @@ format = "json"
 | POST | `/api/v1/checkpoint` | Trigger immediate checkpoint |
 | POST | `/api/v1/sql` | Execute ad-hoc SQL (`{"sql": "..."}`) |
 | POST | `/api/v1/reload` | Hot-reload configuration |
-| GET | `/api/v1/cluster` | Cluster status (delta mode only) |
+| GET | `/api/v1/cluster` | Cluster status (only available when `server.mode = "cluster"`) |
 | GET | `/ws/{name}` | WebSocket upgrade for push-based subscriptions to a stream |
 
 ## Hot Reload
