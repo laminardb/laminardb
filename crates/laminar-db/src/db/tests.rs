@@ -3823,7 +3823,7 @@ async fn open_subscription_resolves_named_stream() {
             match portal.next_frame().await {
                 Some(crate::subscription::PortalFrame::Batch(b)) => break Some(b),
                 Some(crate::subscription::PortalFrame::Barrier { .. }) => {}
-                None => break None,
+                Some(crate::subscription::PortalFrame::Lagged(_)) | None => break None,
             }
         }
     })

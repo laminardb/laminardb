@@ -23,6 +23,11 @@ pub enum PortalFrame {
         /// Engine checkpoint id.
         checkpoint_id: u64,
     },
+    /// Consumer fell behind by `skipped` messages and the broadcast dropped
+    /// them. The portal closes immediately after this frame; the wire layer
+    /// translates it into a client-visible error so the disconnect isn't
+    /// silent.
+    Lagged(u64),
 }
 
 const OUTBOUND_CAPACITY: usize = 256;
@@ -147,6 +152,7 @@ async fn pump_loop(
             Err(broadcast::error::RecvError::Closed) => return,
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!(subscription = %name, skipped = n, "lagged; closing");
+                let _ = tx.send(PortalFrame::Lagged(n)).await;
                 return;
             }
         };
@@ -220,7 +226,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portal_closes_on_lag() {
+    async fn portal_emits_lagged_then_closes() {
         let reg = SubscriptionRegistry::new();
         let rx = reg.subscribe("mv");
         let mut portal = SubscriptionPortal::open("mv", schema(), rx);
@@ -229,11 +235,17 @@ mod tests {
             reg.send_batch("mv", batch(&[i]));
         }
 
+        let mut saw_lagged = false;
         tokio::time::timeout(Duration::from_secs(1), async {
-            while portal.next_frame().await.is_some() {}
+            while let Some(frame) = portal.next_frame().await {
+                if let PortalFrame::Lagged(_) = frame {
+                    saw_lagged = true;
+                }
+            }
         })
         .await
         .expect("portal must close after lag");
+        assert!(saw_lagged, "expected a Lagged frame before close");
     }
 
     #[tokio::test]
