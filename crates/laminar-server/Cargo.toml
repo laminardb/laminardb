@@ -94,8 +94,6 @@ mimalloc = { workspace = true, optional = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio-postgres = "0.7"
-arrow = { workspace = true }
-prometheus = { workspace = true }
 
 [features]
 # Cross-platform defaults.

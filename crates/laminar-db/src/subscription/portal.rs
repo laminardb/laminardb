@@ -226,7 +226,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn portal_emits_lagged_then_closes() {
+    async fn portal_emits_lagged_as_final_frame() {
         let reg = SubscriptionRegistry::new();
         let rx = reg.subscribe("mv");
         let mut portal = SubscriptionPortal::open("mv", schema(), rx);
@@ -235,17 +235,21 @@ mod tests {
             reg.send_batch("mv", batch(&[i]));
         }
 
-        let mut saw_lagged = false;
-        tokio::time::timeout(Duration::from_secs(1), async {
+        let frames = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut frames = Vec::new();
             while let Some(frame) = portal.next_frame().await {
-                if let PortalFrame::Lagged(_) = frame {
-                    saw_lagged = true;
-                }
+                frames.push(frame);
             }
+            frames
         })
         .await
         .expect("portal must close after lag");
-        assert!(saw_lagged, "expected a Lagged frame before close");
+
+        assert!(
+            matches!(frames.last(), Some(PortalFrame::Lagged(_))),
+            "last frame must be Lagged, got: {:?}",
+            frames.last()
+        );
     }
 
     #[tokio::test]

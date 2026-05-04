@@ -131,11 +131,11 @@ format = "json"
 
 When `[server].pgwire_bind` is set, the server also listens for Postgres clients and serves a small subset of the SimpleQuery protocol:
 
-- `SUBSCRIBE <name> [WHERE <predicate>]` — streams materialized-view rows as they're produced. The query stays open until the client disconnects.
+- `SUBSCRIBE <name> [WHERE <predicate>]` — streams rows as they're produced. `<name>` may be a materialized view, a source, or a named stream. The query stays open until the client disconnects.
 - `SHOW`, `SET <key> = <value>`, and a handful of driver builtins (`SELECT version()`, `current_database()`, etc.) are accepted so standard psql / libpq clients can connect.
 - `INSERT`, `UPDATE`, `DELETE`, and DDL are rejected with a clear error pointing to `POST /api/v1/sql`.
 
-Filters are compiled with DataFusion against the materialized view's schema, so any DataFusion-supported predicate works (`WHERE price > 100`, `WHERE symbol IN ('AAPL', 'MSFT')`, etc.). Subscribing to a raw stream rejects `WHERE` because stream schemas are opaque to the planner.
+`WHERE` is compiled with DataFusion against the target's schema and works on materialized views and sources. It is rejected on named streams because their output schema isn't introspectable.
 
 ```bash
 psql "host=127.0.0.1 port=5433 dbname=laminardb user=any" -c "SUBSCRIBE avg_price WHERE symbol = 'AAPL'"

@@ -4807,7 +4807,6 @@ name = "laminar-server"
 version = "0.21.10"
 dependencies = [
  "anyhow",
- "arrow",
  "arrow-array",
  "arrow-cast",
  "arrow-json",

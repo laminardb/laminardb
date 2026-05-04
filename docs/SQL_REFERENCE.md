@@ -288,10 +288,9 @@ When the server is started with `pgwire_bind` set, materialized views can be str
 SUBSCRIBE <mv_name> [WHERE <predicate>]
 ```
 
-- `<mv_name>` is the name of a materialized view created with `CREATE MATERIALIZED VIEW ...`.
-- The optional `WHERE` clause is compiled by DataFusion against the view's schema and applied per batch before the row reaches the wire.
+- `<mv_name>` may be a materialized view, a source, or a named stream.
+- The optional `WHERE` clause is compiled by DataFusion against the target's schema and applied per batch before the row reaches the wire. It works on materialized views and sources; named streams reject `WHERE` because their output schema isn't introspectable.
 - The query stays open until the client disconnects; rows arrive as they're produced upstream.
-- `SUBSCRIBE` against a raw stream is rejected — stream schemas aren't introspectable.
 
 ---
 

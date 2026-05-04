@@ -324,12 +324,10 @@ fn portal_to_response(portal: SubscriptionPortal) -> Response {
                     } => {
                         tracing::trace!(epoch, checkpoint_id, "pgwire SUBSCRIBE: dropping barrier")
                     }
-                    // Surface lag as a typed PG error before the stream ends.
-                    // SQLSTATE 57014 = query_canceled — closest standard match
-                    // for "the server stopped serving you on purpose".
+                    // Lag → typed error so the disconnect isn't silent.
                     PortalFrame::Lagged(n) => {
                         let err = user_error(
-                            "57014",
+                            "54000",
                             format!("subscription lagged: skipped {n} messages, terminating"),
                         );
                         return Some((Err(err), (portal, rows, idx, fields)));
