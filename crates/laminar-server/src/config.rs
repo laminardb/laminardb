@@ -181,6 +181,10 @@ pub struct ServerSection {
     /// Postgres wire bind address; `None` disables it.
     #[serde(default)]
     pub pgwire_bind: Option<String>,
+    /// Username -> plaintext password for MD5 auth on the pgwire listener.
+    /// Empty/absent → trust auth (only safe behind a localhost bind).
+    #[serde(default)]
+    pub pgwire_users: std::collections::HashMap<String, String>,
 }
 
 impl Default for ServerSection {
@@ -189,6 +193,7 @@ impl Default for ServerSection {
             mode: default_mode(),
             bind: default_bind(),
             pgwire_bind: None,
+            pgwire_users: std::collections::HashMap::new(),
         }
     }
 }

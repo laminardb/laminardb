@@ -1,6 +1,8 @@
-//! Postgres wire endpoint. Anonymous TRUST auth, no TLS — wildcard binds
-//! are rejected at startup.
+//! Postgres wire endpoint. Wildcard binds are rejected at startup.
+//! Auth: trust by default; MD5 password auth when `[server].pgwire_users`
+//! is non-empty. No TLS yet.
 
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -8,7 +10,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::{stream, Sink, StreamExt};
 use laminar_sql::parser::{parse_streaming_sql, ShowCommand, StreamingStatement};
+use pgwire::api::auth::md5pass::{hash_md5_password, Md5PasswordAuthStartupHandler};
 use pgwire::api::auth::noop::NoopStartupHandler;
+use pgwire::api::auth::{
+    AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler,
+};
 use pgwire::api::query::SimpleQueryHandler;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::store::PortalStore;
@@ -414,15 +420,87 @@ fn arrow_to_pg_type(dt: &arrow_schema::DataType) -> Type {
     }
 }
 
+/// `AuthSource` for `Md5PasswordAuthStartupHandler`. Generates a fresh 4-byte
+/// salt per connection, looks up the user's plaintext password from the
+/// configured map, and returns the salted-hash the client is expected to send.
+#[derive(Debug)]
+struct LaminarAuthSource {
+    users: Arc<HashMap<String, String>>,
+}
+
+#[async_trait]
+impl AuthSource for LaminarAuthSource {
+    async fn get_password(&self, login: &LoginInfo) -> PgWireResult<Password> {
+        let user = login.user().ok_or_else(|| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".into(),
+                "28P01".into(),
+                "user is required".into(),
+            )))
+        })?;
+        let password = self.users.get(user).ok_or_else(|| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".into(),
+                "28P01".into(),
+                format!("password authentication failed for user '{user}'"),
+            )))
+        })?;
+        let salt: [u8; 4] = rand::random();
+        let expected = hash_md5_password(user, password, &salt);
+        Ok(Password::new(Some(salt.to_vec()), expected.into_bytes()))
+    }
+}
+
+type Md5Handler = Md5PasswordAuthStartupHandler<LaminarAuthSource, DefaultServerParameterProvider>;
+
+/// Startup-phase dispatch. `Md5` requires password auth; `Trust` accepts any
+/// connection. Selected once at listener startup based on whether
+/// `pgwire_users` is non-empty.
+enum StartupAuth {
+    Trust(Arc<LaminarPgwireHandler>),
+    Md5(Arc<Md5Handler>),
+}
+
+#[async_trait]
+impl StartupHandler for StartupAuth {
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        match self {
+            Self::Trust(h) => h.on_startup(client, message).await,
+            Self::Md5(h) => h.on_startup(client, message).await,
+        }
+    }
+}
+
 pub struct LaminarHandlerFactory {
     handler: Arc<LaminarPgwireHandler>,
+    startup: Arc<StartupAuth>,
 }
 
 impl LaminarHandlerFactory {
-    fn new(db: Arc<LaminarDB>) -> Self {
-        Self {
-            handler: Arc::new(LaminarPgwireHandler { db }),
-        }
+    fn new(db: Arc<LaminarDB>, users: HashMap<String, String>) -> Self {
+        let handler = Arc::new(LaminarPgwireHandler { db });
+        let startup = if users.is_empty() {
+            Arc::new(StartupAuth::Trust(Arc::clone(&handler)))
+        } else {
+            let auth = LaminarAuthSource {
+                users: Arc::new(users),
+            };
+            let md5 = Md5PasswordAuthStartupHandler::new(
+                Arc::new(auth),
+                Arc::new(DefaultServerParameterProvider::default()),
+            );
+            Arc::new(StartupAuth::Md5(Arc::new(md5)))
+        };
+        Self { handler, startup }
     }
 }
 
@@ -431,8 +509,8 @@ impl PgWireServerHandlers for LaminarHandlerFactory {
         Arc::clone(&self.handler)
     }
 
-    fn startup_handler(&self) -> Arc<impl pgwire::api::auth::StartupHandler> {
-        Arc::clone(&self.handler)
+    fn startup_handler(&self) -> Arc<impl StartupHandler> {
+        Arc::clone(&self.startup)
     }
 }
 
@@ -450,11 +528,14 @@ fn validate_bind(addr: &SocketAddr) -> Result<(), ServerError> {
 pub async fn serve(
     db: Arc<LaminarDB>,
     bind: &str,
+    users: HashMap<String, String>,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), ServerError> {
     let addr: SocketAddr = bind
         .parse()
         .map_err(|e| ServerError::Http(format!("invalid pgwire_bind '{bind}': {e}")))?;
-    validate_bind(&addr)?;
+    if users.is_empty() {
+        validate_bind(&addr)?;
+    }
 
     let listener = TcpListener::bind(addr)
         .await
@@ -463,8 +544,9 @@ pub async fn serve(
         .local_addr()
         .map_err(|e| ServerError::Http(format!("pgwire local_addr: {e}")))?;
 
-    let factory = Arc::new(LaminarHandlerFactory::new(db));
-    info!(addr = %local_addr, "pgwire listening");
+    let auth_mode = if users.is_empty() { "trust" } else { "md5" };
+    let factory = Arc::new(LaminarHandlerFactory::new(db, users));
+    info!(addr = %local_addr, auth = auth_mode, "pgwire listening");
 
     // Track per-connection tasks so abort on the outer JoinHandle stops
     // active sessions in addition to the accept loop.
@@ -619,12 +701,15 @@ mod integration_tests {
     //! dispatch, error reporting — that unit tests can't reach. Engine-level
     //! row flow is covered in `laminar-db`'s `db::tests`.
 
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use laminar_db::LaminarDB;
     use tokio_postgres::{NoTls, SimpleQueryMessage};
 
-    async fn spawn_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    async fn spawn_server_with(
+        users: HashMap<String, String>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         let db = Arc::new(LaminarDB::open().expect("db opens"));
         db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
             .await
@@ -637,10 +722,14 @@ mod integration_tests {
         .expect("create mv");
         db.start().await.expect("db starts");
 
-        let (addr, handle) = super::serve(Arc::clone(&db), "127.0.0.1:0")
+        let (addr, handle) = super::serve(Arc::clone(&db), "127.0.0.1:0", users)
             .await
             .expect("pgwire serve");
         (addr, handle)
+    }
+
+    async fn spawn_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        spawn_server_with(HashMap::new()).await
     }
 
     async fn connect(addr: std::net::SocketAddr) -> tokio_postgres::Client {
@@ -783,6 +872,75 @@ mod integration_tests {
             "message: {}",
             db_err.message()
         );
+
+        handle.abort();
+    }
+
+    async fn md5_users() -> HashMap<String, String> {
+        let mut u = HashMap::new();
+        u.insert("alice".into(), "wonderland".into());
+        u
+    }
+
+    async fn connect_with_password(
+        addr: std::net::SocketAddr,
+        user: &str,
+        password: &str,
+    ) -> Result<tokio_postgres::Client, tokio_postgres::Error> {
+        let conn_str = format!(
+            "host={} port={} user={user} password={password} dbname=laminardb",
+            addr.ip(),
+            addr.port()
+        );
+        let (client, conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        Ok(client)
+    }
+
+    #[tokio::test]
+    async fn md5_auth_accepts_correct_password() {
+        let (addr, handle) = spawn_server_with(md5_users().await).await;
+
+        let client = connect_with_password(addr, "alice", "wonderland")
+            .await
+            .expect("auth must succeed");
+
+        let messages = client
+            .simple_query("SELECT version()")
+            .await
+            .expect("query after auth");
+        let v = first_row_value(&messages, 0).expect("row");
+        assert!(v.contains("LaminarDB"), "version: {v}");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn md5_auth_rejects_wrong_password() {
+        let (addr, handle) = spawn_server_with(md5_users().await).await;
+
+        let err = connect_with_password(addr, "alice", "not-the-password")
+            .await
+            .expect_err("auth must fail");
+
+        let db_err = err.as_db_error().expect("typed PG error");
+        assert_eq!(db_err.code().code(), "28P01", "got: {db_err:?}");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn md5_auth_rejects_unknown_user() {
+        let (addr, handle) = spawn_server_with(md5_users().await).await;
+
+        let err = connect_with_password(addr, "mallory", "anything")
+            .await
+            .expect_err("auth must fail");
+
+        let db_err = err.as_db_error().expect("typed PG error");
+        assert_eq!(db_err.code().code(), "28P01", "got: {db_err:?}");
 
         handle.abort();
     }

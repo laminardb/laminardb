@@ -4829,6 +4829,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "pgwire",
  "prometheus",
+ "rand 0.10.0",
  "regex",
  "serde",
  "serde_json",

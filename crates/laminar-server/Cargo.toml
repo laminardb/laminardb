@@ -62,6 +62,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 pgwire = { version = "0.39", default-features = false, features = ["server-api"] }
 async-trait = { workspace = true }
 futures = { workspace = true }
+rand = { workspace = true }
 
 # Config helpers
 regex = { workspace = true }

@@ -58,6 +58,12 @@ mode = "embedded"           # "embedded" (single-node) or "cluster" (multi-node 
 bind = "0.0.0.0:8080"       # HTTP API bind address
 pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for SUBSCRIBE
 log_level = "info"
+# Optional MD5 password auth for the pgwire listener. When this map is set,
+# the listener requires MD5 auth and is allowed to bind to non-localhost
+# interfaces. When empty, auth is "trust" and the bind must be localhost.
+# [server.pgwire_users]
+# alice = "${ALICE_PASSWORD}"
+# bob   = "${BOB_PASSWORD}"
 # Worker thread count is taken from $TOKIO_WORKER_THREADS — defaults to logical CPUs.
 
 [state]
@@ -136,6 +142,23 @@ When `[server].pgwire_bind` is set, the server also listens for Postgres clients
 - `INSERT`, `UPDATE`, `DELETE`, and DDL are rejected with a clear error pointing to `POST /api/v1/sql`.
 
 `WHERE` is compiled with DataFusion against the target's schema and works on materialized views and sources. It is rejected on named streams because their output schema isn't introspectable.
+
+### Authentication
+
+By default the listener uses **trust** auth and rejects non-localhost binds — the assumption is that any caller who can reach the loopback interface is already trusted. To bind to a routable address, configure password auth:
+
+```toml
+[server.pgwire_users]
+alice = "${ALICE_PASSWORD}"
+```
+
+Clients then connect with the password using the standard Postgres MD5 challenge flow:
+
+```bash
+PGPASSWORD=$ALICE_PASSWORD psql "host=db.internal port=5433 dbname=laminardb user=alice" -c "SUBSCRIBE avg_price"
+```
+
+Plaintext passwords sit in the TOML file. Use `${VAR}` substitution to pull them from environment variables (or a secret manager) rather than committing them. There is no SCRAM, no role hierarchy, and no TLS yet — see the FIR follow-ups.
 
 ```bash
 psql "host=127.0.0.1 port=5433 dbname=laminardb user=any" -c "SUBSCRIBE avg_price WHERE symbol = 'AAPL'"
