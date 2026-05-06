@@ -385,19 +385,21 @@ impl ConnectorPipelineCallback {
             };
             let schema = batch.schema();
             let sql = filter_sql.as_deref().unwrap();
-            if let Some(compiled) =
-                crate::filter_compile::compile(&self.filter_ctx, sql, &schema).await
-            {
-                self.compiled_sink_filters[i] = SinkFilter::Compiled(compiled);
-            } else {
-                tracing::error!(
-                    sink = %sink_name,
-                    filter = %sql,
-                    "[LDB-1100] sink filter did not compile to a PhysicalExpr; \
-                     fail-closed: ALL rows from this stream will be dropped \
-                     for this sink. Track via sink_filter_rejected_rows_total."
-                );
-                self.compiled_sink_filters[i] = SinkFilter::Rejected;
+            match crate::filter_compile::compile(&self.filter_ctx, sql, &schema).await {
+                Ok(compiled) => {
+                    self.compiled_sink_filters[i] = SinkFilter::Compiled(compiled);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        sink = %sink_name,
+                        filter = %sql,
+                        error = %e,
+                        "[LDB-1100] sink filter did not compile; fail-closed: \
+                         ALL rows from this stream will be dropped for this sink. \
+                         Track via sink_filter_rejected_rows_total."
+                    );
+                    self.compiled_sink_filters[i] = SinkFilter::Rejected;
+                }
             }
             self.pending_sink_filter_compiles = self.pending_sink_filter_compiles.saturating_sub(1);
         }

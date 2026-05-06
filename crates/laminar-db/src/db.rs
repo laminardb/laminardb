@@ -1153,13 +1153,7 @@ impl LaminarDB {
                      subscribe to a materialized view"
                 )));
             }
-            Some(sql) => Some(
-                crate::filter_compile::compile(&self.ctx, sql, &schema)
-                    .await
-                    .ok_or_else(|| {
-                        DbError::Pipeline(format!("subscribe filter '{sql}' did not compile"))
-                    })?,
-            ),
+            Some(sql) => Some(crate::filter_compile::compile(&self.ctx, sql, &schema).await?),
         };
 
         let rx = self.subscription_registry.subscribe(name);

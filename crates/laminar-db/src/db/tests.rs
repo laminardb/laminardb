@@ -3846,8 +3846,8 @@ async fn open_subscription_with_invalid_filter_errors_at_open() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("subscribe filter") || msg.contains("nonexistent_col"),
-        "expected filter compile error, got: {msg}"
+        msg.contains("nonexistent_col"),
+        "error must mention the bad column, got: {msg}"
     );
 }
 

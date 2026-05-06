@@ -23,14 +23,16 @@ struct ScopedTable<'a> {
 }
 
 impl<'a> ScopedTable<'a> {
-    fn new(ctx: &'a SessionContext, schema: &SchemaRef) -> Option<Self> {
+    fn new(ctx: &'a SessionContext, schema: &SchemaRef) -> Result<Self, DbError> {
         let name = format!(
             "__filter_compile_{}",
             COMPILE_SEQ.fetch_add(1, Ordering::Relaxed)
         );
-        let empty = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]]).ok()?;
-        ctx.register_table(&name, Arc::new(empty)).ok()?;
-        Some(Self { ctx, name })
+        let empty = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]])
+            .map_err(|e| DbError::Pipeline(format!("filter compile (build temp table): {e}")))?;
+        ctx.register_table(&name, Arc::new(empty))
+            .map_err(|e| DbError::Pipeline(format!("filter compile (register temp table): {e}")))?;
+        Ok(Self { ctx, name })
     }
 }
 
@@ -40,20 +42,33 @@ impl Drop for ScopedTable<'_> {
     }
 }
 
-/// Compile `filter_sql` against `schema`. Returns `None` on any failure.
+/// Compile `filter_sql` into a `PhysicalExpr` against `schema`. Each failure
+/// (planner, predicate extraction, physical lowering) is reported with enough
+/// context that the caller can surface a meaningful message to the user.
 pub(crate) async fn compile(
     ctx: &SessionContext,
     filter_sql: &str,
     schema: &SchemaRef,
-) -> Option<Arc<dyn PhysicalExpr>> {
+) -> Result<Arc<dyn PhysicalExpr>, DbError> {
     let scoped = ScopedTable::new(ctx, schema)?;
     let sql = format!("SELECT * FROM {} WHERE {filter_sql}", scoped.name);
-    let plan = ctx.sql(&sql).await.ok()?.logical_plan().clone();
+    let plan = ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| DbError::Pipeline(format!("filter '{filter_sql}': {e}")))?
+        .logical_plan()
+        .clone();
     drop(scoped);
 
-    let expr = find_predicate(&plan)?;
-    let df_schema = DFSchema::try_from(schema.as_ref().clone()).ok()?;
-    create_physical_expr(&expr, &df_schema, ctx.state().execution_props()).ok()
+    let expr = find_predicate(&plan).ok_or_else(|| {
+        DbError::Pipeline(format!(
+            "filter '{filter_sql}' did not lower to a predicate (DataFusion may have folded it away)"
+        ))
+    })?;
+    let df_schema = DFSchema::try_from(schema.as_ref().clone())
+        .map_err(|e| DbError::Pipeline(format!("filter '{filter_sql}' (df_schema): {e}")))?;
+    create_physical_expr(&expr, &df_schema, ctx.state().execution_props())
+        .map_err(|e| DbError::Pipeline(format!("filter '{filter_sql}' (physical): {e}")))
 }
 
 fn find_predicate(plan: &LogicalPlan) -> Option<Expr> {

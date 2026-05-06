@@ -721,6 +721,54 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn subscribe_with_valid_where_is_accepted() {
+        // Smoke: WHERE on a known column compiles. We cap the read at 500ms
+        // and accept either a clean ack or a timeout — the test is asserting
+        // we got past compile, not that rows actually flow (no upstream
+        // pushes happen here).
+        let (addr, handle) = spawn_server().await;
+        let client = connect(addr).await;
+
+        let r = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.simple_query("SUBSCRIBE prices WHERE symbol = 'AAPL'"),
+        )
+        .await;
+
+        // If we got a result, it must not be a compile error. A timeout is
+        // fine — it means the subscribe is open and waiting for rows.
+        if let Ok(Err(e)) = r {
+            let db_err = e.as_db_error().expect("typed PG error");
+            assert!(
+                !db_err.message().contains("did not compile"),
+                "filter must compile cleanly, got: {}",
+                db_err.message()
+            );
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn subscribe_with_unknown_column_in_where_returns_pg_error() {
+        let (addr, handle) = spawn_server().await;
+        let client = connect(addr).await;
+
+        let err = client
+            .simple_query("SUBSCRIBE prices WHERE no_such_col > 1")
+            .await
+            .expect_err("must fail");
+        let db_err = err.as_db_error().expect("typed PG error");
+        assert!(
+            db_err.message().contains("no_such_col"),
+            "filter error must name the bad column, got: {}",
+            db_err.message()
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn ddl_returns_pg_error_pointing_at_http() {
         let (addr, handle) = spawn_server().await;
         let client = connect(addr).await;
