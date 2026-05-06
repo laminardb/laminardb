@@ -230,6 +230,14 @@ pub struct ServerSection {
     /// TLS private key (PEM, PKCS#8 or RSA).
     #[serde(default)]
     pub pgwire_tls_key: Option<std::path::PathBuf>,
+    /// Cap on concurrent pgwire sessions. New TCP accepts above the cap are
+    /// closed immediately with a server log; in-flight sessions continue.
+    #[serde(default = "default_pgwire_max_connections")]
+    pub pgwire_max_connections: usize,
+}
+
+fn default_pgwire_max_connections() -> usize {
+    256
 }
 
 impl Default for ServerSection {
@@ -242,6 +250,7 @@ impl Default for ServerSection {
             pgwire_allow_remote: false,
             pgwire_tls_cert: None,
             pgwire_tls_key: None,
+            pgwire_max_connections: default_pgwire_max_connections(),
         }
     }
 }

@@ -611,6 +611,7 @@ pub async fn serve(
     users: HashMap<String, Secret>,
     allow_remote: bool,
     tls: Option<TlsPaths<'_>>,
+    max_connections: usize,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), ServerError> {
     let addr: SocketAddr = bind
         .parse()
@@ -669,6 +670,17 @@ pub async fn serve(
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((sock, peer)) => {
+                            if sessions.len() >= max_connections {
+                                tracing::info!(
+                                    target: "audit",
+                                    event = "pgwire.connection_rejected",
+                                    peer = %peer,
+                                    reason = "max_connections",
+                                    in_flight = sessions.len(),
+                                );
+                                drop(sock);
+                                continue;
+                            }
                             let factory_ref = Arc::clone(&factory);
                             let tls_ref = tls_acceptor.clone();
                             let peer_str = peer.to_string();
@@ -823,7 +835,7 @@ mod tests {
     #[tokio::test]
     async fn serve_rejects_remote_bind_in_trust_mode() {
         let db = Arc::new(LaminarDB::open().expect("db opens"));
-        let err = serve(db, "0.0.0.0:0", HashMap::new(), false, None)
+        let err = serve(db, "0.0.0.0:0", HashMap::new(), false, None, 256)
             .await
             .expect_err("trust + 0.0.0.0 must fail");
         assert!(err.to_string().contains("trust auth"), "got: {err}");
@@ -834,7 +846,7 @@ mod tests {
         let db = Arc::new(LaminarDB::open().expect("db opens"));
         let mut users = HashMap::new();
         users.insert("alice".into(), Secret::new("wonderland-key"));
-        let err = serve(db, "0.0.0.0:0", users, false, None)
+        let err = serve(db, "0.0.0.0:0", users, false, None, 256)
             .await
             .expect_err("md5 + 0.0.0.0 without allow_remote must fail");
         assert!(
@@ -874,7 +886,7 @@ mod integration_tests {
         .expect("create mv");
         db.start().await.expect("db starts");
 
-        let (addr, handle) = super::serve(Arc::clone(&db), "127.0.0.1:0", users, false, None)
+        let (addr, handle) = super::serve(Arc::clone(&db), "127.0.0.1:0", users, false, None, 256)
             .await
             .expect("pgwire serve");
         (addr, handle)
@@ -1092,6 +1104,50 @@ mod integration_tests {
         handle.abort();
     }
 
+    #[tokio::test]
+    async fn connection_cap_drops_excess_clients() {
+        // Cap of 1; first client occupies the slot, second is dropped.
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
+            .await
+            .expect("create source");
+        db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades")
+            .await
+            .expect("create mv");
+        db.start().await.expect("db starts");
+        let (addr, handle) = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            None,
+            1,
+        )
+        .await
+        .expect("pgwire serve");
+
+        // First client occupies the slot via SUBSCRIBE (stays open until drop).
+        let first = connect(addr).await;
+        let _bg = tokio::spawn(async move {
+            let _ = first.simple_query("SUBSCRIBE prices").await;
+        });
+        // Give the server a moment to register the session in the JoinSet.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Second connect: server accepts the TCP, then closes it because the
+        // cap is hit. tokio_postgres surfaces this as an IO error during
+        // startup. Exact string varies; just assert it failed.
+        let conn_str = format!(
+            "host={} port={} user=any dbname=laminardb",
+            addr.ip(),
+            addr.port()
+        );
+        let result = tokio_postgres::connect(&conn_str, NoTls).await;
+        assert!(result.is_err(), "second connect must be refused");
+
+        handle.abort();
+    }
+
     /// Self-signed cert+key written to a tempdir for the duration of the
     /// test. `rcgen` is the well-maintained option for ad-hoc certs.
     fn self_signed_pem() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -1119,6 +1175,7 @@ mod integration_tests {
                 cert: &cert_path,
                 key: &key_path,
             }),
+            256,
         )
         .await
         .expect("pgwire serve");
