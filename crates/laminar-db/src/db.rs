@@ -165,12 +165,9 @@ pub struct LaminarDB {
     pub(crate) force_ckpt_tx: parking_lot::Mutex<Option<ForceCheckpointTx>>,
     /// SUBSCRIBE fan-out registry, shared with the pipeline callback.
     pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
-    /// Per-stream output schemas, populated at `start()` from the SQL
-    /// planner. Read by SUBSCRIBE so `WHERE` predicates can compile
-    /// against a real schema instead of the empty placeholder on
-    /// `StreamEntry::sink`.
+    /// Stream output schemas resolved at `start()`; SUBSCRIBE WHERE reads this.
     pub(crate) stream_schemas:
-        Arc<parking_lot::RwLock<std::collections::HashMap<String, arrow_schema::SchemaRef>>>,
+        parking_lot::RwLock<std::collections::HashMap<String, arrow_schema::SchemaRef>>,
 }
 
 /// Oneshot reply carrying the full `CheckpointResult` back to the
@@ -351,7 +348,7 @@ impl LaminarDB {
             assignment_snapshot_store: parking_lot::Mutex::new(None),
             force_ckpt_tx: parking_lot::Mutex::new(None),
             subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
-            stream_schemas: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            stream_schemas: parking_lot::RwLock::new(std::collections::HashMap::new()),
         })
     }
 

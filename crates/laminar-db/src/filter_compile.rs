@@ -58,21 +58,19 @@ pub(crate) async fn compile(
         .map_err(|e| DbError::Pipeline(format!("filter '{filter_sql}': {e}")))?
         .logical_plan()
         .clone();
+    // The predicate columns are qualified by the temp table name; capture
+    // that qualifier into the DFSchema before dropping `scoped`.
+    let df_schema = DFSchema::try_from_qualified_schema(scoped.name.as_str(), schema.as_ref())
+        .map_err(|e| DbError::Pipeline(format!("filter '{filter_sql}' (df_schema): {e}")))?;
+    drop(scoped);
 
     let expr = find_predicate(&plan).ok_or_else(|| {
         DbError::Pipeline(format!(
             "filter '{filter_sql}' did not lower to a predicate (DataFusion may have folded it away)"
         ))
     })?;
-    // The `SELECT * FROM <scoped.name> WHERE ...` planner produces a predicate
-    // whose columns are qualified by the temp table. Build the DFSchema with
-    // the same qualifier so `create_physical_expr` resolves them.
-    let df_schema = DFSchema::try_from_qualified_schema(scoped.name.as_str(), schema.as_ref())
-        .map_err(|e| DbError::Pipeline(format!("filter '{filter_sql}' (df_schema): {e}")))?;
-    let phys = create_physical_expr(&expr, &df_schema, ctx.state().execution_props())
-        .map_err(|e| DbError::Pipeline(format!("filter '{filter_sql}' (physical): {e}")))?;
-    drop(scoped);
-    Ok(phys)
+    create_physical_expr(&expr, &df_schema, ctx.state().execution_props())
+        .map_err(|e| DbError::Pipeline(format!("filter '{filter_sql}' (physical): {e}")))
 }
 
 fn find_predicate(plan: &LogicalPlan) -> Option<Expr> {

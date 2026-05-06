@@ -952,10 +952,9 @@ mod integration_tests {
 
     #[tokio::test]
     async fn subscribe_with_valid_where_is_accepted() {
-        // Smoke: WHERE on a known column compiles. We cap the read at 500ms
-        // and accept either a clean ack or a timeout — the test is asserting
-        // we got past compile, not that rows actually flow (no upstream
-        // pushes happen here).
+        // SUBSCRIBE never returns CommandComplete, so a successful compile
+        // shows up as a timeout. Anything else — Ok(Ok) or Ok(Err) — is a
+        // regression.
         let (addr, handle) = spawn_server().await;
         let client = connect(addr).await;
 
@@ -965,16 +964,10 @@ mod integration_tests {
         )
         .await;
 
-        // If we got a result, it must not be a compile error. A timeout is
-        // fine — it means the subscribe is open and waiting for rows.
-        if let Ok(Err(e)) = r {
-            let db_err = e.as_db_error().expect("typed PG error");
-            assert!(
-                !db_err.message().contains("did not compile"),
-                "filter must compile cleanly, got: {}",
-                db_err.message()
-            );
-        }
+        assert!(
+            r.is_err(),
+            "subscribe must stay open until timeout, got: {r:?}"
+        );
 
         handle.abort();
     }
