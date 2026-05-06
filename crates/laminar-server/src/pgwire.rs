@@ -599,6 +599,38 @@ fn classify_outcome(result: &Result<(), std::io::Error>) -> &'static str {
     }
 }
 
+/// Reject certs already past `notAfter`; warn when expiry is within 30 days.
+/// Saves operators a debugging session: an expired cert otherwise loads fine
+/// and only fails at first client handshake with an opaque error.
+#[allow(clippy::result_large_err)]
+fn check_cert_expiry(
+    der: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+    path: &std::path::Path,
+) -> Result<(), ServerError> {
+    use x509_parser::prelude::FromDer;
+    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der.as_ref())
+        .map_err(|e| ServerError::Http(format!("parse pgwire_tls_cert {}: {e}", path.display())))?;
+    let now = x509_parser::time::ASN1Time::now();
+    let not_after = cert.validity().not_after;
+    if not_after < now {
+        return Err(ServerError::Http(format!(
+            "pgwire_tls_cert {} expired at {not_after}",
+            path.display()
+        )));
+    }
+    // x509-parser's ASN1Time uses the `time` crate. Convert to a `Duration`
+    // for the 30-day window comparison.
+    let remaining = not_after.to_datetime() - now.to_datetime();
+    if remaining <= time::Duration::days(30) {
+        warn!(
+            path = %path.display(),
+            expires_at = %not_after,
+            "pgwire_tls_cert expires within 30 days; rotate before it lapses",
+        );
+    }
+    Ok(())
+}
+
 /// Install aws-lc-rs as the process-wide rustls CryptoProvider. Idempotent —
 /// rustls returns `Err` if a provider is already installed, which we ignore.
 /// Required because other crates in the dep tree (delta-lake, iceberg) pull
@@ -626,6 +658,7 @@ fn load_tls_acceptor(paths: TlsPaths<'_>) -> Result<tokio_rustls::TlsAcceptor, S
             paths.cert.display()
         )));
     }
+    check_cert_expiry(&certs[0], paths.cert)?;
 
     let key_file = File::open(paths.key)
         .map_err(|e| ServerError::Http(format!("open pgwire_tls_key: {e}")))?;
@@ -1264,6 +1297,44 @@ mod integration_tests {
         std::fs::write(&cert_path, cert.cert.pem()).unwrap();
         std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
         (dir, cert_path, key_path)
+    }
+
+    /// Self-signed cert with notAfter in the past, for the expiry test.
+    fn expired_self_signed_pem() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let one_year_ago = time::OffsetDateTime::now_utc() - time::Duration::days(365);
+        params.not_before = one_year_ago - time::Duration::days(2);
+        params.not_after = one_year_ago;
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        (dir, cert_path, key_path)
+    }
+
+    #[tokio::test]
+    async fn tls_load_rejects_expired_cert() {
+        let (_dir, cert_path, key_path) = expired_self_signed_pem();
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        db.start().await.expect("db starts");
+        let err = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            Some(super::TlsPaths {
+                cert: &cert_path,
+                key: &key_path,
+            }),
+            256,
+            10,
+        )
+        .await
+        .expect_err("expired cert must be rejected");
+        assert!(err.to_string().contains("expired"), "got: {err}");
     }
 
     #[tokio::test]

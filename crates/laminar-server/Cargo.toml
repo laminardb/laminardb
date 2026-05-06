@@ -68,6 +68,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "tls12",
 ] }
 rustls-pemfile = "2"
+x509-parser = "0.16"
+time = "0.3"
 async-trait = { workspace = true }
 futures = { workspace = true }
 rand = { workspace = true }
