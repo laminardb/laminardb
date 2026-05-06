@@ -182,12 +182,14 @@ pub async fn run_server(
 
     let pgwire_bind = config.server.pgwire_bind.clone();
     let pgwire_users = config.server.pgwire_users.clone();
+    let pgwire_allow_remote = config.server.pgwire_allow_remote;
     let (app_state, api_handle) =
         start_http_api(Arc::clone(&db), registry, config_path.clone(), config).await?;
     let watcher_handle = spawn_config_watcher(&app_state, config_path);
 
     let pgwire_handle = if let Some(bind) = pgwire_bind {
-        match crate::pgwire::serve(Arc::clone(&db), &bind, pgwire_users).await {
+        match crate::pgwire::serve(Arc::clone(&db), &bind, pgwire_users, pgwire_allow_remote).await
+        {
             Ok((_, h)) => Some(h),
             Err(e) => {
                 // Roll back: stop the HTTP server, the file watcher, and the

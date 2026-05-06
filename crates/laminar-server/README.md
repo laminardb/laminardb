@@ -145,11 +145,14 @@ When `[server].pgwire_bind` is set, the server also listens for Postgres clients
 
 ### Authentication
 
-By default the listener uses **trust** auth and rejects non-localhost binds — the assumption is that any caller who can reach the loopback interface is already trusted. To bind to a routable address, configure password auth:
+By default the listener uses **trust** auth and rejects non-localhost binds — the assumption is that any caller who can reach the loopback interface is already trusted. To bind to a routable address, configure MD5 password auth and explicitly opt in to remote binds:
 
 ```toml
+pgwire_bind = "0.0.0.0:5433"
+pgwire_allow_remote = true        # required even with auth on, two-key rule
+
 [server.pgwire_users]
-alice = "${ALICE_PASSWORD}"
+alice = "${ALICE_PASSWORD}"       # min 12 chars, validated at config load
 ```
 
 Clients then connect with the password using the standard Postgres MD5 challenge flow:
@@ -158,7 +161,9 @@ Clients then connect with the password using the standard Postgres MD5 challenge
 PGPASSWORD=$ALICE_PASSWORD psql "host=db.internal port=5433 dbname=laminardb user=alice" -c "SUBSCRIBE avg_price"
 ```
 
-Plaintext passwords sit in the TOML file. Use `${VAR}` substitution to pull them from environment variables (or a secret manager) rather than committing them. There is no SCRAM, no role hierarchy, and no TLS yet — see the FIR follow-ups.
+> **MD5 is provided for libpq compatibility, not as a recommended production stance.** Postgres itself deprecated it in PG 14 in favor of SCRAM-SHA-256. Use it for development and short-lived deployments; for production, wait for the SCRAM and TLS work in the FIR follow-ups before exposing this listener beyond a trusted network segment.
+
+Plaintext passwords sit in the TOML file. Use `${VAR}` substitution to pull them from environment variables or a secret manager rather than committing them. The listener emits `target: "audit"` events on every connection accepted/closed, including auth-failed outcomes — wire these into your SIEM.
 
 ```bash
 psql "host=127.0.0.1 port=5433 dbname=laminardb user=any" -c "SUBSCRIBE avg_price WHERE symbol = 'AAPL'"

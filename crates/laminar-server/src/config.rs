@@ -16,6 +16,11 @@ static ENV_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}").expect("valid regex")
 });
 
+/// Minimum acceptable pgwire password length, enforced at config load.
+/// MD5 auth offers no work factor, so length is the only knob; 12 is the
+/// usual NIST baseline.
+const MIN_PGWIRE_PASSWORD_LEN: usize = 12;
+
 /// Load, parse, and validate a LaminarDB configuration file.
 pub fn load_config(path: &Path) -> Result<ServerConfig, ConfigError> {
     let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::FileRead {
@@ -116,6 +121,16 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
             errors.push(format!("invalid server pgwire_bind address: '{}'", addr));
         }
     }
+    for (user, password) in &config.server.pgwire_users {
+        if user.is_empty() {
+            errors.push("pgwire_users contains an empty username".to_string());
+        }
+        if password.len() < MIN_PGWIRE_PASSWORD_LEN {
+            errors.push(format!(
+                "pgwire_users['{user}']: password must be at least {MIN_PGWIRE_PASSWORD_LEN} characters"
+            ));
+        }
+    }
 
     // Validate: cluster mode requires discovery and coordination
     if config.server.mode == "cluster" {
@@ -184,7 +199,13 @@ pub struct ServerSection {
     /// Username -> plaintext password for MD5 auth on the pgwire listener.
     /// Empty/absent → trust auth (only safe behind a localhost bind).
     #[serde(default)]
-    pub pgwire_users: std::collections::HashMap<String, String>,
+    pub pgwire_users: std::collections::HashMap<String, Secret>,
+    /// Two-key rule: must be explicitly true to allow `pgwire_bind` on a
+    /// non-localhost address even when MD5 auth is configured. Defaults
+    /// false so a misconfigured `pgwire_users` map can't accidentally expose
+    /// the listener to the wider network.
+    #[serde(default)]
+    pub pgwire_allow_remote: bool,
 }
 
 impl Default for ServerSection {
@@ -194,7 +215,40 @@ impl Default for ServerSection {
             bind: default_bind(),
             pgwire_bind: None,
             pgwire_users: std::collections::HashMap::new(),
+            pgwire_allow_remote: false,
         }
+    }
+}
+
+/// String wrapped to keep its plaintext out of `Debug` output and incidental
+/// log lines. Use `Secret::expose` only at the point of use.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    /// Constructor; intended for tests and bridge code.
+    #[cfg(test)]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Plaintext access. Only call at the point the value is actually used
+    /// (e.g., handing it to a hash function); never store the returned `&str`
+    /// elsewhere.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Char count of the wrapped value, for length validation.
+    pub fn len(&self) -> usize {
+        self.0.chars().count()
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
     }
 }
 
@@ -705,6 +759,43 @@ bind = "not-a-socket-addr"
             }
             _ => panic!("expected ValidationErrors"),
         }
+    }
+
+    #[test]
+    fn test_validate_short_pgwire_password() {
+        let toml = r#"
+[server]
+[server.pgwire_users]
+alice = "short"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        let err = validate_config(&config).unwrap_err();
+        match err {
+            ConfigError::ValidationErrors { errors } => {
+                assert!(
+                    errors.iter().any(|e| e.contains("at least 12 characters")),
+                    "errors: {errors:?}"
+                );
+            }
+            _ => panic!("expected ValidationErrors"),
+        }
+    }
+
+    #[test]
+    fn test_validate_pgwire_password_redacted_in_debug() {
+        let toml = r#"
+[server]
+[server.pgwire_users]
+alice = "wonderland-key"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        validate_config(&config).unwrap();
+        let dump = format!("{:?}", config.server);
+        assert!(!dump.contains("wonderland"), "secret leaked: {dump}");
+        assert!(
+            dump.contains("REDACTED"),
+            "expected REDACTED marker: {dump}"
+        );
     }
 
     #[test]

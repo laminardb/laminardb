@@ -1,6 +1,6 @@
-//! Postgres wire endpoint. Wildcard binds are rejected at startup.
-//! Auth: trust by default; MD5 password auth when `[server].pgwire_users`
-//! is non-empty. No TLS yet.
+//! Postgres wire endpoint. Trust auth by default; MD5 password auth when
+//! `[server].pgwire_users` is non-empty. Non-loopback binds require both
+//! MD5 auth AND `pgwire_allow_remote = true` (two-key rule). No TLS yet.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -29,6 +29,7 @@ use tracing::{info, warn};
 use laminar_db::subscription::{PortalFrame, SubscriptionPortal};
 use laminar_db::LaminarDB;
 
+use crate::config::Secret;
 use crate::server::ServerError;
 
 pub struct LaminarPgwireHandler {
@@ -420,33 +421,25 @@ fn arrow_to_pg_type(dt: &arrow_schema::DataType) -> Type {
     }
 }
 
-/// `AuthSource` for `Md5PasswordAuthStartupHandler`. Generates a fresh 4-byte
-/// salt per connection, looks up the user's plaintext password from the
-/// configured map, and returns the salted-hash the client is expected to send.
+/// Per-call salt + stored plaintext for the MD5 challenge flow.
 #[derive(Debug)]
 struct LaminarAuthSource {
-    users: Arc<HashMap<String, String>>,
+    users: Arc<HashMap<String, Secret>>,
 }
 
 #[async_trait]
 impl AuthSource for LaminarAuthSource {
     async fn get_password(&self, login: &LoginInfo) -> PgWireResult<Password> {
-        let user = login.user().ok_or_else(|| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "FATAL".into(),
-                "28P01".into(),
-                "user is required".into(),
-            )))
-        })?;
-        let password = self.users.get(user).ok_or_else(|| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "FATAL".into(),
-                "28P01".into(),
-                format!("password authentication failed for user '{user}'"),
-            )))
-        })?;
+        let user = login.user().unwrap_or("");
+        // Indistinguishable from a wrong-password failure: both branches must
+        // surface the same wire error so a client can't probe which usernames
+        // are configured. pgwire emits exactly this variant on bad password.
+        let password = self
+            .users
+            .get(user)
+            .ok_or_else(|| PgWireError::InvalidPassword(user.to_string()))?;
         let salt: [u8; 4] = rand::random();
-        let expected = hash_md5_password(user, password, &salt);
+        let expected = hash_md5_password(user, password.expose(), &salt);
         Ok(Password::new(Some(salt.to_vec()), expected.into_bytes()))
     }
 }
@@ -486,7 +479,7 @@ pub struct LaminarHandlerFactory {
 }
 
 impl LaminarHandlerFactory {
-    fn new(db: Arc<LaminarDB>, users: HashMap<String, String>) -> Self {
+    fn new(db: Arc<LaminarDB>, users: HashMap<String, Secret>) -> Self {
         let handler = Arc::new(LaminarPgwireHandler { db });
         let startup = if users.is_empty() {
             Arc::new(StartupAuth::Trust(Arc::clone(&handler)))
@@ -514,27 +507,31 @@ impl PgWireServerHandlers for LaminarHandlerFactory {
     }
 }
 
-#[allow(clippy::result_large_err)]
-fn validate_bind(addr: &SocketAddr) -> Result<(), ServerError> {
-    if addr.ip().is_unspecified() {
-        return Err(ServerError::Http(format!(
-            "pgwire_bind '{addr}' binds to all interfaces and v1 has no auth; \
-             use a specific interface (e.g. 127.0.0.1)"
-        )));
-    }
-    Ok(())
-}
-
 pub async fn serve(
     db: Arc<LaminarDB>,
     bind: &str,
-    users: HashMap<String, String>,
+    users: HashMap<String, Secret>,
+    allow_remote: bool,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), ServerError> {
     let addr: SocketAddr = bind
         .parse()
         .map_err(|e| ServerError::Http(format!("invalid pgwire_bind '{bind}': {e}")))?;
-    if users.is_empty() {
-        validate_bind(&addr)?;
+
+    let auth_mode = if users.is_empty() { "trust" } else { "md5" };
+    let is_remote_bind = !addr.ip().is_loopback();
+    match (auth_mode, is_remote_bind, allow_remote) {
+        ("trust", true, _) => {
+            return Err(ServerError::Http(format!(
+                "pgwire_bind '{addr}' is not loopback and pgwire_users is empty (trust auth); \
+             configure pgwire_users + pgwire_allow_remote=true, or bind to 127.0.0.1"
+            )))
+        }
+        ("md5", true, false) => {
+            return Err(ServerError::Http(format!(
+                "pgwire_bind '{addr}' is not loopback; set pgwire_allow_remote=true to opt in"
+            )))
+        }
+        _ => {}
     }
 
     let listener = TcpListener::bind(addr)
@@ -544,9 +541,15 @@ pub async fn serve(
         .local_addr()
         .map_err(|e| ServerError::Http(format!("pgwire local_addr: {e}")))?;
 
-    let auth_mode = if users.is_empty() { "trust" } else { "md5" };
     let factory = Arc::new(LaminarHandlerFactory::new(db, users));
-    info!(addr = %local_addr, auth = auth_mode, "pgwire listening");
+    if auth_mode == "trust" {
+        warn!(
+            addr = %local_addr,
+            "pgwire listening with TRUST auth — any client reaching this address is admin",
+        );
+    } else {
+        info!(addr = %local_addr, auth = auth_mode, "pgwire listening");
+    }
 
     // Track per-connection tasks so abort on the outer JoinHandle stops
     // active sessions in addition to the accept loop.
@@ -561,9 +564,28 @@ pub async fn serve(
                     match accepted {
                         Ok((sock, peer)) => {
                             let factory_ref = Arc::clone(&factory);
+                            let peer_str = peer.to_string();
+                            tracing::info!(
+                                target: "audit",
+                                event = "pgwire.connection_accepted",
+                                peer = %peer,
+                                auth = auth_mode,
+                            );
                             sessions.spawn(async move {
-                                if let Err(e) = process_socket(sock, None, factory_ref).await {
-                                    warn!(%peer, error = %e, "pgwire connection error");
+                                let result = process_socket(sock, None, factory_ref).await;
+                                let outcome = match &result {
+                                    Ok(()) => "ok",
+                                    Err(e) if e.to_string().contains("28P01") => "auth_failed",
+                                    Err(_) => "error",
+                                };
+                                tracing::info!(
+                                    target: "audit",
+                                    event = "pgwire.connection_closed",
+                                    peer = %peer_str,
+                                    outcome,
+                                );
+                                if let Err(e) = result {
+                                    warn!(peer = %peer_str, error = %e, "pgwire connection error");
                                 }
                             });
                         }
@@ -582,23 +604,6 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rejects_wildcard_bind() {
-        assert!(validate_bind(&"0.0.0.0:5433".parse().unwrap()).is_err());
-        assert!(validate_bind(&"[::]:5433".parse().unwrap()).is_err());
-    }
-
-    #[test]
-    fn accepts_localhost_bind() {
-        validate_bind(&"127.0.0.1:5433".parse().unwrap()).unwrap();
-        validate_bind(&"[::1]:5433".parse().unwrap()).unwrap();
-    }
-
-    #[test]
-    fn accepts_specific_interface_bind() {
-        validate_bind(&"192.168.1.10:5433".parse().unwrap()).unwrap();
-    }
 
     fn parse_one(sql: &str) -> StreamingStatement {
         parse_streaming_sql(sql)
@@ -692,6 +697,29 @@ mod tests {
         let stmts = parse_streaming_sql("BEGIN; SELECT 1; COMMIT").unwrap();
         assert_eq!(stmts.len(), 3);
     }
+
+    #[tokio::test]
+    async fn serve_rejects_remote_bind_in_trust_mode() {
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        let err = serve(db, "0.0.0.0:0", HashMap::new(), false)
+            .await
+            .expect_err("trust + 0.0.0.0 must fail");
+        assert!(err.to_string().contains("trust auth"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn serve_rejects_remote_bind_without_explicit_optin() {
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        let mut users = HashMap::new();
+        users.insert("alice".into(), Secret::new("wonderland-key"));
+        let err = serve(db, "0.0.0.0:0", users, false)
+            .await
+            .expect_err("md5 + 0.0.0.0 without allow_remote must fail");
+        assert!(
+            err.to_string().contains("pgwire_allow_remote"),
+            "got: {err}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -707,8 +735,10 @@ mod integration_tests {
     use laminar_db::LaminarDB;
     use tokio_postgres::{NoTls, SimpleQueryMessage};
 
+    use super::Secret;
+
     async fn spawn_server_with(
-        users: HashMap<String, String>,
+        users: HashMap<String, Secret>,
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
         let db = Arc::new(LaminarDB::open().expect("db opens"));
         db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
@@ -722,7 +752,7 @@ mod integration_tests {
         .expect("create mv");
         db.start().await.expect("db starts");
 
-        let (addr, handle) = super::serve(Arc::clone(&db), "127.0.0.1:0", users)
+        let (addr, handle) = super::serve(Arc::clone(&db), "127.0.0.1:0", users, false)
             .await
             .expect("pgwire serve");
         (addr, handle)
@@ -876,11 +906,13 @@ mod integration_tests {
         handle.abort();
     }
 
-    async fn md5_users() -> HashMap<String, String> {
+    async fn md5_users() -> HashMap<String, Secret> {
         let mut u = HashMap::new();
-        u.insert("alice".into(), "wonderland".into());
+        u.insert("alice".to_string(), Secret::new(TEST_PASSWORD));
         u
     }
+
+    const TEST_PASSWORD: &str = "wonderland-key";
 
     async fn connect_with_password(
         addr: std::net::SocketAddr,
@@ -903,7 +935,7 @@ mod integration_tests {
     async fn md5_auth_accepts_correct_password() {
         let (addr, handle) = spawn_server_with(md5_users().await).await;
 
-        let client = connect_with_password(addr, "alice", "wonderland")
+        let client = connect_with_password(addr, "alice", TEST_PASSWORD)
             .await
             .expect("auth must succeed");
 
