@@ -234,10 +234,20 @@ pub struct ServerSection {
     /// closed immediately with a server log; in-flight sessions continue.
     #[serde(default = "default_pgwire_max_connections")]
     pub pgwire_max_connections: usize,
+    /// Maximum auth failures from a single peer IP within a 60s rolling
+    /// window. Subsequent connect attempts from that IP are dropped at
+    /// accept time until failures expire from the window. 0 disables
+    /// the throttle.
+    #[serde(default = "default_pgwire_max_auth_failures_per_min")]
+    pub pgwire_max_auth_failures_per_min: u32,
 }
 
 fn default_pgwire_max_connections() -> usize {
     256
+}
+
+fn default_pgwire_max_auth_failures_per_min() -> u32 {
+    10
 }
 
 impl Default for ServerSection {
@@ -251,6 +261,7 @@ impl Default for ServerSection {
             pgwire_tls_cert: None,
             pgwire_tls_key: None,
             pgwire_max_connections: default_pgwire_max_connections(),
+            pgwire_max_auth_failures_per_min: default_pgwire_max_auth_failures_per_min(),
         }
     }
 }

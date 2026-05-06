@@ -186,6 +186,7 @@ pub async fn run_server(
     let pgwire_tls_cert = config.server.pgwire_tls_cert.clone();
     let pgwire_tls_key = config.server.pgwire_tls_key.clone();
     let pgwire_max_connections = config.server.pgwire_max_connections;
+    let pgwire_max_auth_failures = config.server.pgwire_max_auth_failures_per_min;
     let (app_state, api_handle) =
         start_http_api(Arc::clone(&db), registry, config_path.clone(), config).await?;
     let watcher_handle = spawn_config_watcher(&app_state, config_path);
@@ -202,6 +203,7 @@ pub async fn run_server(
             pgwire_allow_remote,
             tls,
             pgwire_max_connections,
+            pgwire_max_auth_failures,
         )
         .await
         {

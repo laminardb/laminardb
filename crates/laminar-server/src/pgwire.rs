@@ -536,6 +536,47 @@ fn warn_if_key_world_readable(file: &std::fs::File, path: &std::path::Path) {
 #[cfg(not(unix))]
 fn warn_if_key_world_readable(_file: &std::fs::File, _path: &std::path::Path) {}
 
+/// Per-IP rolling-window auth-failure tracker. Cheap parking_lot mutex over
+/// a HashMap; expected key set is small (active client IPs) and lookups
+/// happen at TCP accept time, not on the hot data path.
+#[derive(Debug, Default)]
+struct FailureTracker {
+    inner: parking_lot::Mutex<
+        HashMap<std::net::IpAddr, std::collections::VecDeque<std::time::Instant>>,
+    >,
+}
+
+impl FailureTracker {
+    /// Drop expired entries and return whether `ip` has hit `limit` failures
+    /// inside `window`. `limit == 0` disables the throttle.
+    fn is_blocked(&self, ip: std::net::IpAddr, limit: u32, window: std::time::Duration) -> bool {
+        if limit == 0 {
+            return false;
+        }
+        let cutoff = std::time::Instant::now() - window;
+        let mut inner = self.inner.lock();
+        let Some(failures) = inner.get_mut(&ip) else {
+            return false;
+        };
+        while failures.front().is_some_and(|t| *t < cutoff) {
+            failures.pop_front();
+        }
+        let blocked = failures.len() >= limit as usize;
+        if failures.is_empty() {
+            inner.remove(&ip);
+        }
+        blocked
+    }
+
+    fn record_failure(&self, ip: std::net::IpAddr) {
+        self.inner
+            .lock()
+            .entry(ip)
+            .or_default()
+            .push_back(std::time::Instant::now());
+    }
+}
+
 /// Map the result of `process_socket` to a stable audit-log code so SOC
 /// dashboards can split TLS handshake errors from auth failures and from
 /// generic runtime errors.
@@ -612,6 +653,7 @@ pub async fn serve(
     allow_remote: bool,
     tls: Option<TlsPaths<'_>>,
     max_connections: usize,
+    max_auth_failures_per_min: u32,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), ServerError> {
     let addr: SocketAddr = bind
         .parse()
@@ -660,6 +702,7 @@ pub async fn serve(
 
     // Track per-connection tasks so abort on the outer JoinHandle stops
     // active sessions in addition to the accept loop.
+    let failures = Arc::new(FailureTracker::default());
     let handle = tokio::spawn(async move {
         let mut sessions: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         loop {
@@ -681,8 +724,23 @@ pub async fn serve(
                                 drop(sock);
                                 continue;
                             }
+                            if failures.is_blocked(
+                                peer.ip(),
+                                max_auth_failures_per_min,
+                                std::time::Duration::from_secs(60),
+                            ) {
+                                tracing::warn!(
+                                    target: "audit",
+                                    event = "pgwire.connection_rejected",
+                                    peer = %peer,
+                                    reason = "auth_failure_throttle",
+                                );
+                                drop(sock);
+                                continue;
+                            }
                             let factory_ref = Arc::clone(&factory);
                             let tls_ref = tls_acceptor.clone();
+                            let failures_ref = Arc::clone(&failures);
                             let peer_str = peer.to_string();
                             tracing::info!(
                                 target: "audit",
@@ -691,9 +749,13 @@ pub async fn serve(
                                 auth = auth_mode,
                                 tls = tls_mode,
                             );
+                            let peer_ip = peer.ip();
                             sessions.spawn(async move {
                                 let result = process_socket(sock, tls_ref, factory_ref).await;
                                 let outcome = classify_outcome(&result);
+                                if outcome == "auth_failed" {
+                                    failures_ref.record_failure(peer_ip);
+                                }
                                 tracing::info!(
                                     target: "audit",
                                     event = "pgwire.connection_closed",
@@ -832,10 +894,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failure_tracker_blocks_after_threshold() {
+        use std::net::{IpAddr, Ipv4Addr};
+        use std::time::Duration;
+        let ip: IpAddr = Ipv4Addr::LOCALHOST.into();
+        let tracker = super::FailureTracker::default();
+        let limit = 3;
+        let window = Duration::from_secs(60);
+
+        for _ in 0..limit {
+            assert!(!tracker.is_blocked(ip, limit, window));
+            tracker.record_failure(ip);
+        }
+        assert!(tracker.is_blocked(ip, limit, window));
+    }
+
+    #[test]
+    fn failure_tracker_disabled_when_limit_zero() {
+        use std::net::{IpAddr, Ipv4Addr};
+        use std::time::Duration;
+        let ip: IpAddr = Ipv4Addr::LOCALHOST.into();
+        let tracker = super::FailureTracker::default();
+        for _ in 0..100 {
+            tracker.record_failure(ip);
+        }
+        assert!(!tracker.is_blocked(ip, 0, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn failure_tracker_expires_old_entries() {
+        use std::net::{IpAddr, Ipv4Addr};
+        use std::time::Duration;
+        let ip: IpAddr = Ipv4Addr::LOCALHOST.into();
+        let tracker = super::FailureTracker::default();
+        for _ in 0..5 {
+            tracker.record_failure(ip);
+        }
+        // Window of 0 means every recorded failure is already expired.
+        assert!(!tracker.is_blocked(ip, 5, Duration::from_secs(0)));
+    }
+
     #[tokio::test]
     async fn serve_rejects_remote_bind_in_trust_mode() {
         let db = Arc::new(LaminarDB::open().expect("db opens"));
-        let err = serve(db, "0.0.0.0:0", HashMap::new(), false, None, 256)
+        let err = serve(db, "0.0.0.0:0", HashMap::new(), false, None, 256, 10)
             .await
             .expect_err("trust + 0.0.0.0 must fail");
         assert!(err.to_string().contains("trust auth"), "got: {err}");
@@ -846,7 +949,7 @@ mod tests {
         let db = Arc::new(LaminarDB::open().expect("db opens"));
         let mut users = HashMap::new();
         users.insert("alice".into(), Secret::new("wonderland-key"));
-        let err = serve(db, "0.0.0.0:0", users, false, None, 256)
+        let err = serve(db, "0.0.0.0:0", users, false, None, 256, 10)
             .await
             .expect_err("md5 + 0.0.0.0 without allow_remote must fail");
         assert!(
@@ -886,9 +989,10 @@ mod integration_tests {
         .expect("create mv");
         db.start().await.expect("db starts");
 
-        let (addr, handle) = super::serve(Arc::clone(&db), "127.0.0.1:0", users, false, None, 256)
-            .await
-            .expect("pgwire serve");
+        let (addr, handle) =
+            super::serve(Arc::clone(&db), "127.0.0.1:0", users, false, None, 256, 10)
+                .await
+                .expect("pgwire serve");
         (addr, handle)
     }
 
@@ -1122,6 +1226,7 @@ mod integration_tests {
             false,
             None,
             1,
+            10,
         )
         .await
         .expect("pgwire serve");
@@ -1176,6 +1281,7 @@ mod integration_tests {
                 key: &key_path,
             }),
             256,
+            10,
         )
         .await
         .expect("pgwire serve");
