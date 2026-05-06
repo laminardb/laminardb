@@ -514,6 +514,50 @@ pub struct TlsPaths<'a> {
     pub key: &'a std::path::Path,
 }
 
+/// Warn if the key file is readable by anyone other than the owner.
+/// PostgreSQL refuses to start in this case; we warn rather than fail
+/// because dev environments often run with looser perms.
+#[cfg(unix)]
+fn warn_if_key_world_readable(file: &std::fs::File, path: &std::path::Path) {
+    use std::os::unix::fs::MetadataExt;
+    if let Ok(meta) = file.metadata() {
+        let mode = meta.mode();
+        if mode & 0o077 != 0 {
+            warn!(
+                path = %path.display(),
+                mode = format!("{:o}", mode & 0o777),
+                "pgwire_tls_key permissions are too broad — postgres rejects \
+                 anything looser than 0600. Tighten before exposing the listener.",
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_if_key_world_readable(_file: &std::fs::File, _path: &std::path::Path) {}
+
+/// Map the result of `process_socket` to a stable audit-log code so SOC
+/// dashboards can split TLS handshake errors from auth failures and from
+/// generic runtime errors.
+fn classify_outcome(result: &Result<(), std::io::Error>) -> &'static str {
+    match result {
+        Ok(()) => "ok",
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("28P01") {
+                "auth_failed"
+            } else if msg.contains("HandshakeFailure")
+                || msg.contains("rustls")
+                || msg.contains("tls")
+            {
+                "tls_failed"
+            } else {
+                "error"
+            }
+        }
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn load_tls_acceptor(paths: TlsPaths<'_>) -> Result<tokio_rustls::TlsAcceptor, ServerError> {
     use std::fs::File;
@@ -533,6 +577,7 @@ fn load_tls_acceptor(paths: TlsPaths<'_>) -> Result<tokio_rustls::TlsAcceptor, S
 
     let key_file = File::open(paths.key)
         .map_err(|e| ServerError::Http(format!("open pgwire_tls_key: {e}")))?;
+    warn_if_key_world_readable(&key_file, paths.key);
     let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
         .map_err(|e| ServerError::Http(format!("parse pgwire_tls_key: {e}")))?
         .ok_or_else(|| {
@@ -625,11 +670,7 @@ pub async fn serve(
                             );
                             sessions.spawn(async move {
                                 let result = process_socket(sock, tls_ref, factory_ref).await;
-                                let outcome = match &result {
-                                    Ok(()) => "ok",
-                                    Err(e) if e.to_string().contains("28P01") => "auth_failed",
-                                    Err(_) => "error",
-                                };
+                                let outcome = classify_outcome(&result);
                                 tracing::info!(
                                     target: "audit",
                                     event = "pgwire.connection_closed",
@@ -748,6 +789,24 @@ mod tests {
     fn multi_statement_parses() {
         let stmts = parse_streaming_sql("BEGIN; SELECT 1; COMMIT").unwrap();
         assert_eq!(stmts.len(), 3);
+    }
+
+    #[test]
+    fn classify_outcome_buckets_errors() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(super::classify_outcome(&Ok(())), "ok");
+        assert_eq!(
+            super::classify_outcome(&Err(Error::other("FATAL: 28P01 bad pass"))),
+            "auth_failed"
+        );
+        assert_eq!(
+            super::classify_outcome(&Err(Error::other("rustls HandshakeFailure"))),
+            "tls_failed"
+        );
+        assert_eq!(
+            super::classify_outcome(&Err(Error::new(ErrorKind::BrokenPipe, "broken"))),
+            "error"
+        );
     }
 
     #[tokio::test]
