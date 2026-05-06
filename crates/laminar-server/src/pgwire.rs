@@ -558,10 +558,21 @@ fn classify_outcome(result: &Result<(), std::io::Error>) -> &'static str {
     }
 }
 
+/// Install aws-lc-rs as the process-wide rustls CryptoProvider. Idempotent —
+/// rustls returns `Err` if a provider is already installed, which we ignore.
+/// Required because other crates in the dep tree (delta-lake, iceberg) pull
+/// in rustls with their own provider features, leaving the auto-pick
+/// ambiguous.
+fn ensure_tls_provider() {
+    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 #[allow(clippy::result_large_err)]
 fn load_tls_acceptor(paths: TlsPaths<'_>) -> Result<tokio_rustls::TlsAcceptor, ServerError> {
     use std::fs::File;
     use std::io::BufReader;
+
+    ensure_tls_provider();
 
     let cert_file = File::open(paths.cert)
         .map_err(|e| ServerError::Http(format!("open pgwire_tls_cert: {e}")))?;
@@ -1121,6 +1132,7 @@ mod integration_tests {
         {
             roots.add(c).unwrap();
         }
+        super::ensure_tls_provider();
         let client_cfg = tokio_rustls::rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
