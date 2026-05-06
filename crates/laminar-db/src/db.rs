@@ -165,6 +165,12 @@ pub struct LaminarDB {
     pub(crate) force_ckpt_tx: parking_lot::Mutex<Option<ForceCheckpointTx>>,
     /// SUBSCRIBE fan-out registry, shared with the pipeline callback.
     pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
+    /// Per-stream output schemas, populated at `start()` from the SQL
+    /// planner. Read by SUBSCRIBE so `WHERE` predicates can compile
+    /// against a real schema instead of the empty placeholder on
+    /// `StreamEntry::sink`.
+    pub(crate) stream_schemas:
+        Arc<parking_lot::RwLock<std::collections::HashMap<String, arrow_schema::SchemaRef>>>,
 }
 
 /// Oneshot reply carrying the full `CheckpointResult` back to the
@@ -345,6 +351,7 @@ impl LaminarDB {
             assignment_snapshot_store: parking_lot::Mutex::new(None),
             force_ckpt_tx: parking_lot::Mutex::new(None),
             subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
+            stream_schemas: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
         })
     }
 
@@ -1135,10 +1142,17 @@ impl LaminarDB {
             )));
         }
 
+        // Schema lookup order: MV registry, catalog source, stream-output
+        // schemas resolved at start(), then the StreamEntry sink as a last
+        // resort. The sink schema is a known placeholder (Schema::empty),
+        // so it disqualifies WHERE clauses but still permits unfiltered
+        // subscribe.
         let (schema, filterable) = if let Some(mv) = self.mv_registry.lock().get(name).cloned() {
             (mv.schema, true)
         } else if let Some(src) = self.catalog.get_source(name) {
             (Arc::clone(&src.schema), true)
+        } else if let Some(schema) = self.stream_schemas.read().get(name).cloned() {
+            (schema, true)
         } else if let Some(entry) = self.catalog.get_stream_entry(name) {
             (entry.sink.schema(), false)
         } else {
@@ -1149,8 +1163,8 @@ impl LaminarDB {
             None => None,
             Some(_) if !filterable => {
                 return Err(DbError::Pipeline(format!(
-                    "WHERE on stream '{name}' is not supported (opaque schema); \
-                     subscribe to a materialized view"
+                    "WHERE on '{name}' is not supported: stream output schema \
+                     was not resolved (likely a planner failure at start())"
                 )));
             }
             Some(sql) => Some(crate::filter_compile::compile(&self.ctx, sql, &schema).await?),

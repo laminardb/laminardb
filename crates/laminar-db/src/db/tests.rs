@@ -3852,7 +3852,9 @@ async fn open_subscription_with_invalid_filter_errors_at_open() {
 }
 
 #[tokio::test]
-async fn open_subscription_with_filter_on_stream_is_rejected() {
+async fn open_subscription_with_filter_on_stream_before_start_is_rejected() {
+    // Before start(), stream_schemas is empty so we fall through to the
+    // placeholder path on StreamEntry::sink and refuse WHERE.
     let db = LaminarDB::open().unwrap();
     db.execute("CREATE SOURCE trades (symbol VARCHAR)")
         .await
@@ -3865,7 +3867,29 @@ async fn open_subscription_with_filter_on_stream_is_rejected() {
         .open_subscription("all_trades", Some("symbol = 'AAPL'"))
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("opaque"), "got: {err}");
+    assert!(err.to_string().contains("not resolved"), "got: {err}");
+}
+
+#[tokio::test]
+async fn open_subscription_with_filter_on_stream_after_start_compiles() {
+    let db = LaminarDB::open().unwrap();
+    let registry = prometheus::Registry::new();
+    let prom = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+    db.set_engine_metrics(Arc::clone(&prom));
+
+    db.execute("CREATE SOURCE trades (symbol VARCHAR)")
+        .await
+        .unwrap();
+    db.execute("CREATE STREAM all_trades AS SELECT * FROM trades")
+        .await
+        .unwrap();
+    db.start().await.unwrap();
+
+    let portal = db
+        .open_subscription("all_trades", Some("symbol = 'AAPL'"))
+        .await
+        .expect("WHERE on a started stream must compile");
+    portal.close();
 }
 
 #[tokio::test]
