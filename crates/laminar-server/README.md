@@ -161,9 +161,20 @@ Clients then connect with the password using the standard Postgres MD5 challenge
 PGPASSWORD=$ALICE_PASSWORD psql "host=db.internal port=5433 dbname=laminardb user=alice" -c "SUBSCRIBE avg_price"
 ```
 
-> **MD5 is provided for libpq compatibility, not as a recommended production stance.** Postgres itself deprecated it in PG 14 in favor of SCRAM-SHA-256. Use it for development and short-lived deployments; for production, wait for the SCRAM and TLS work in the FIR follow-ups before exposing this listener beyond a trusted network segment.
+> **MD5 is provided for libpq compatibility, not as a recommended production stance.** Postgres itself deprecated it in PG 14 in favor of SCRAM-SHA-256. Use it for development and short-lived deployments; for production, wait for the SCRAM work in the FIR follow-ups before exposing this listener beyond a trusted network segment.
 
 Plaintext passwords sit in the TOML file. Use `${VAR}` substitution to pull them from environment variables or a secret manager rather than committing them. The listener emits `target: "audit"` events on every connection accepted/closed, including auth-failed outcomes — wire these into your SIEM.
+
+### TLS
+
+Optional. Setting both `pgwire_tls_cert` and `pgwire_tls_key` enables TLS via [`tokio-rustls`](https://crates.io/crates/tokio-rustls) (aws-lc-rs backend). Both must be PEM-encoded; the key may be PKCS#8 or RSA.
+
+```toml
+pgwire_tls_cert = "/etc/laminar/pgwire.crt"
+pgwire_tls_key  = "/etc/laminar/pgwire.key"
+```
+
+Postgres clients negotiate TLS via `sslmode=require` (or `verify-ca` / `verify-full` if your cert chain is trusted by the client). The handshake follows the standard `SSLRequest` flow — `psql`, JDBC, asyncpg, etc. all just work. Cert rotation requires a server restart; hot reload is a follow-up.
 
 ```bash
 psql "host=127.0.0.1 port=5433 dbname=laminardb user=any" -c "SUBSCRIBE avg_price WHERE symbol = 'AAPL'"

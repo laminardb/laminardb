@@ -183,12 +183,25 @@ pub async fn run_server(
     let pgwire_bind = config.server.pgwire_bind.clone();
     let pgwire_users = config.server.pgwire_users.clone();
     let pgwire_allow_remote = config.server.pgwire_allow_remote;
+    let pgwire_tls_cert = config.server.pgwire_tls_cert.clone();
+    let pgwire_tls_key = config.server.pgwire_tls_key.clone();
     let (app_state, api_handle) =
         start_http_api(Arc::clone(&db), registry, config_path.clone(), config).await?;
     let watcher_handle = spawn_config_watcher(&app_state, config_path);
 
     let pgwire_handle = if let Some(bind) = pgwire_bind {
-        match crate::pgwire::serve(Arc::clone(&db), &bind, pgwire_users, pgwire_allow_remote).await
+        let tls = match (&pgwire_tls_cert, &pgwire_tls_key) {
+            (Some(c), Some(k)) => Some(crate::pgwire::TlsPaths { cert: c, key: k }),
+            _ => None,
+        };
+        match crate::pgwire::serve(
+            Arc::clone(&db),
+            &bind,
+            pgwire_users,
+            pgwire_allow_remote,
+            tls,
+        )
+        .await
         {
             Ok((_, h)) => Some(h),
             Err(e) => {

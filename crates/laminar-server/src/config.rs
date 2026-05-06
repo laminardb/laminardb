@@ -131,6 +131,23 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
             ));
         }
     }
+    match (
+        &config.server.pgwire_tls_cert,
+        &config.server.pgwire_tls_key,
+    ) {
+        (Some(_), None) | (None, Some(_)) => {
+            errors.push("pgwire_tls_cert and pgwire_tls_key must be set together".to_string());
+        }
+        (Some(cert), Some(key)) => {
+            if !cert.exists() {
+                errors.push(format!("pgwire_tls_cert not found: {}", cert.display()));
+            }
+            if !key.exists() {
+                errors.push(format!("pgwire_tls_key not found: {}", key.display()));
+            }
+        }
+        (None, None) => {}
+    }
 
     // Validate: cluster mode requires discovery and coordination
     if config.server.mode == "cluster" {
@@ -206,6 +223,13 @@ pub struct ServerSection {
     /// the listener to the wider network.
     #[serde(default)]
     pub pgwire_allow_remote: bool,
+    /// TLS certificate (PEM). Setting this and `pgwire_tls_key` enables
+    /// TLS on the pgwire listener; both must be provided together.
+    #[serde(default)]
+    pub pgwire_tls_cert: Option<std::path::PathBuf>,
+    /// TLS private key (PEM, PKCS#8 or RSA).
+    #[serde(default)]
+    pub pgwire_tls_key: Option<std::path::PathBuf>,
 }
 
 impl Default for ServerSection {
@@ -216,6 +240,8 @@ impl Default for ServerSection {
             pgwire_bind: None,
             pgwire_users: std::collections::HashMap::new(),
             pgwire_allow_remote: false,
+            pgwire_tls_cert: None,
+            pgwire_tls_key: None,
         }
     }
 }

@@ -1,6 +1,7 @@
 //! Postgres wire endpoint. Trust auth by default; MD5 password auth when
 //! `[server].pgwire_users` is non-empty. Non-loopback binds require both
-//! MD5 auth AND `pgwire_allow_remote = true` (two-key rule). No TLS yet.
+//! MD5 auth AND `pgwire_allow_remote = true` (two-key rule). TLS via
+//! tokio-rustls when `pgwire_tls_cert` and `pgwire_tls_key` are set.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -507,11 +508,53 @@ impl PgWireServerHandlers for LaminarHandlerFactory {
     }
 }
 
+/// Cert + private-key paths for the pgwire TLS listener.
+pub struct TlsPaths<'a> {
+    pub cert: &'a std::path::Path,
+    pub key: &'a std::path::Path,
+}
+
+#[allow(clippy::result_large_err)]
+fn load_tls_acceptor(paths: TlsPaths<'_>) -> Result<tokio_rustls::TlsAcceptor, ServerError> {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let cert_file = File::open(paths.cert)
+        .map_err(|e| ServerError::Http(format!("open pgwire_tls_cert: {e}")))?;
+    let certs = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| ServerError::Http(format!("parse pgwire_tls_cert: {e}")))?;
+    if certs.is_empty() {
+        return Err(ServerError::Http(format!(
+            "pgwire_tls_cert {} contains no certificates",
+            paths.cert.display()
+        )));
+    }
+
+    let key_file = File::open(paths.key)
+        .map_err(|e| ServerError::Http(format!("open pgwire_tls_key: {e}")))?;
+    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+        .map_err(|e| ServerError::Http(format!("parse pgwire_tls_key: {e}")))?
+        .ok_or_else(|| {
+            ServerError::Http(format!(
+                "pgwire_tls_key {} contains no private key",
+                paths.key.display()
+            ))
+        })?;
+
+    let server_config = tokio_rustls::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| ServerError::Http(format!("rustls server config: {e}")))?;
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(server_config)))
+}
+
 pub async fn serve(
     db: Arc<LaminarDB>,
     bind: &str,
     users: HashMap<String, Secret>,
     allow_remote: bool,
+    tls: Option<TlsPaths<'_>>,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), ServerError> {
     let addr: SocketAddr = bind
         .parse()
@@ -534,6 +577,11 @@ pub async fn serve(
         _ => {}
     }
 
+    let tls_acceptor = match tls {
+        Some(paths) => Some(load_tls_acceptor(paths)?),
+        None => None,
+    };
+
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| ServerError::Http(format!("pgwire bind {addr}: {e}")))?;
@@ -542,13 +590,15 @@ pub async fn serve(
         .map_err(|e| ServerError::Http(format!("pgwire local_addr: {e}")))?;
 
     let factory = Arc::new(LaminarHandlerFactory::new(db, users));
+    let tls_mode = if tls_acceptor.is_some() { "on" } else { "off" };
     if auth_mode == "trust" {
         warn!(
             addr = %local_addr,
+            tls = tls_mode,
             "pgwire listening with TRUST auth — any client reaching this address is admin",
         );
     } else {
-        info!(addr = %local_addr, auth = auth_mode, "pgwire listening");
+        info!(addr = %local_addr, auth = auth_mode, tls = tls_mode, "pgwire listening");
     }
 
     // Track per-connection tasks so abort on the outer JoinHandle stops
@@ -564,15 +614,17 @@ pub async fn serve(
                     match accepted {
                         Ok((sock, peer)) => {
                             let factory_ref = Arc::clone(&factory);
+                            let tls_ref = tls_acceptor.clone();
                             let peer_str = peer.to_string();
                             tracing::info!(
                                 target: "audit",
                                 event = "pgwire.connection_accepted",
                                 peer = %peer,
                                 auth = auth_mode,
+                                tls = tls_mode,
                             );
                             sessions.spawn(async move {
-                                let result = process_socket(sock, None, factory_ref).await;
+                                let result = process_socket(sock, tls_ref, factory_ref).await;
                                 let outcome = match &result {
                                     Ok(()) => "ok",
                                     Err(e) if e.to_string().contains("28P01") => "auth_failed",
@@ -701,7 +753,7 @@ mod tests {
     #[tokio::test]
     async fn serve_rejects_remote_bind_in_trust_mode() {
         let db = Arc::new(LaminarDB::open().expect("db opens"));
-        let err = serve(db, "0.0.0.0:0", HashMap::new(), false)
+        let err = serve(db, "0.0.0.0:0", HashMap::new(), false, None)
             .await
             .expect_err("trust + 0.0.0.0 must fail");
         assert!(err.to_string().contains("trust auth"), "got: {err}");
@@ -712,7 +764,7 @@ mod tests {
         let db = Arc::new(LaminarDB::open().expect("db opens"));
         let mut users = HashMap::new();
         users.insert("alice".into(), Secret::new("wonderland-key"));
-        let err = serve(db, "0.0.0.0:0", users, false)
+        let err = serve(db, "0.0.0.0:0", users, false, None)
             .await
             .expect_err("md5 + 0.0.0.0 without allow_remote must fail");
         assert!(
@@ -752,7 +804,7 @@ mod integration_tests {
         .expect("create mv");
         db.start().await.expect("db starts");
 
-        let (addr, handle) = super::serve(Arc::clone(&db), "127.0.0.1:0", users, false)
+        let (addr, handle) = super::serve(Arc::clone(&db), "127.0.0.1:0", users, false, None)
             .await
             .expect("pgwire serve");
         (addr, handle)
@@ -973,6 +1025,73 @@ mod integration_tests {
 
         let db_err = err.as_db_error().expect("typed PG error");
         assert_eq!(db_err.code().code(), "28P01", "got: {db_err:?}");
+
+        handle.abort();
+    }
+
+    /// Self-signed cert+key written to a tempdir for the duration of the
+    /// test. `rcgen` is the well-maintained option for ad-hoc certs.
+    fn self_signed_pem() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("rcgen issue cert");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+        (dir, cert_path, key_path)
+    }
+
+    #[tokio::test]
+    async fn tls_handshake_succeeds() {
+        let (_dir, cert_path, key_path) = self_signed_pem();
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        db.start().await.expect("db starts");
+        let (addr, handle) = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            Some(super::TlsPaths {
+                cert: &cert_path,
+                key: &key_path,
+            }),
+        )
+        .await
+        .expect("pgwire serve");
+
+        // Build a client TLS config that trusts the same self-signed cert.
+        let cert_bytes = std::fs::read(&cert_path).unwrap();
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut std::io::Cursor::new(cert_bytes))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        {
+            roots.add(c).unwrap();
+        }
+        let client_cfg = tokio_rustls::rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        let conn_str = format!(
+            "host=localhost hostaddr={} port={} user=any dbname=laminardb sslmode=require",
+            addr.ip(),
+            addr.port(),
+        );
+        let tls = tokio_postgres_rustls::MakeRustlsConnect::new(client_cfg);
+        let (client, conn) = tokio_postgres::connect(&conn_str, tls)
+            .await
+            .expect("TLS handshake + connect");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let messages = client
+            .simple_query("SELECT version()")
+            .await
+            .expect("query over TLS");
+        let v = first_row_value(&messages, 0).expect("row");
+        assert!(v.contains("LaminarDB"), "version: {v}");
 
         handle.abort();
     }
