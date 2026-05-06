@@ -6,6 +6,7 @@ Standalone server binary for LaminarDB. Reads a TOML configuration file, constru
 
 - **TOML configuration** with `${VAR}` and `${VAR:-default}` environment variable substitution
 - **REST API** (Axum) for health checks, pipeline introspection, ad-hoc SQL, and manual checkpoints
+- **Postgres wire protocol** (optional) for `SUBSCRIBE` streaming via `psql` and any libpq client
 - **Prometheus metrics** at `/metrics`
 - **Hot reload** — edit the TOML file and changes are applied automatically (file watcher with debounce), or `POST /api/v1/reload`
 - **Checkpoint validation** — `--validate-checkpoints` flag validates all stored checkpoints and exits
@@ -55,7 +56,14 @@ See the [Configuration Reference](https://laminardb.io/docs/) for every field, o
 [server]
 mode = "embedded"           # "embedded" (single-node) or "cluster" (multi-node scaffolding, not production-hardened)
 bind = "0.0.0.0:8080"       # HTTP API bind address
+pgwire_bind = "127.0.0.1:5433"  # optional; enables Postgres wire protocol for SUBSCRIBE
 log_level = "info"
+# Optional MD5 password auth for the pgwire listener. When this map is set,
+# the listener requires MD5 auth and is allowed to bind to non-localhost
+# interfaces. When empty, auth is "trust" and the bind must be localhost.
+# [server.pgwire_users]
+# alice = "${ALICE_PASSWORD}"
+# bob   = "${BOB_PASSWORD}"
 # Worker thread count is taken from $TOKIO_WORKER_THREADS — defaults to logical CPUs.
 
 [state]
@@ -124,6 +132,53 @@ format = "json"
 | POST | `/api/v1/reload` | Hot-reload configuration |
 | GET | `/api/v1/cluster` | Cluster status (only available when `server.mode = "cluster"`) |
 | GET | `/ws/{name}` | WebSocket upgrade for push-based subscriptions to a stream |
+
+## Postgres Wire Protocol
+
+When `[server].pgwire_bind` is set, the server also listens for Postgres clients and serves a small subset of the SimpleQuery protocol:
+
+- `SUBSCRIBE <name> [WHERE <predicate>]` — streams rows as they're produced. `<name>` may be a materialized view, a source, or a named stream. The query stays open until the client disconnects.
+- `SHOW`, `SET <key> = <value>`, and a handful of driver builtins (`SELECT version()`, `current_database()`, etc.) are accepted so standard psql / libpq clients can connect.
+- `INSERT`, `UPDATE`, `DELETE`, and DDL are rejected with a clear error pointing to `POST /api/v1/sql`.
+
+`WHERE` is compiled with DataFusion against the target's schema and works on materialized views and sources. It is rejected on named streams because their output schema isn't introspectable.
+
+### Authentication
+
+By default the listener uses **trust** auth and rejects non-localhost binds — the assumption is that any caller who can reach the loopback interface is already trusted. To bind to a routable address, configure MD5 password auth and explicitly opt in to remote binds:
+
+```toml
+pgwire_bind = "0.0.0.0:5433"
+pgwire_allow_remote = true        # required even with auth on, two-key rule
+
+[server.pgwire_users]
+alice = "${ALICE_PASSWORD}"       # min 12 chars, validated at config load
+```
+
+Clients then connect with the password using the standard Postgres MD5 challenge flow:
+
+```bash
+PGPASSWORD=$ALICE_PASSWORD psql "host=db.internal port=5433 dbname=laminardb user=alice" -c "SUBSCRIBE avg_price"
+```
+
+> **MD5 is provided for libpq compatibility, not as a recommended production stance.** Postgres itself deprecated it in PG 14 in favor of SCRAM-SHA-256. Use it for development and short-lived deployments; for production, wait for the SCRAM work in the FIR follow-ups before exposing this listener beyond a trusted network segment.
+
+Plaintext passwords sit in the TOML file. Use `${VAR}` substitution to pull them from environment variables or a secret manager rather than committing them. The listener emits `target: "audit"` events on every connection accepted/closed, including auth-failed outcomes — wire these into your SIEM.
+
+### TLS
+
+Optional. Setting both `pgwire_tls_cert` and `pgwire_tls_key` enables TLS via [`tokio-rustls`](https://crates.io/crates/tokio-rustls) (aws-lc-rs backend). Both must be PEM-encoded; the key may be PKCS#8 or RSA.
+
+```toml
+pgwire_tls_cert = "/etc/laminar/pgwire.crt"
+pgwire_tls_key  = "/etc/laminar/pgwire.key"
+```
+
+Postgres clients negotiate TLS via `sslmode=require` (or `verify-ca` / `verify-full` if your cert chain is trusted by the client). The handshake follows the standard `SSLRequest` flow — `psql`, JDBC, asyncpg, etc. all just work. Cert rotation requires a server restart; hot reload is a follow-up.
+
+```bash
+psql "host=127.0.0.1 port=5433 dbname=laminardb user=any" -c "SUBSCRIBE avg_price WHERE symbol = 'AAPL'"
+```
 
 ## Hot Reload
 

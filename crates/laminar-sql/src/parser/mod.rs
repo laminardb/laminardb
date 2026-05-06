@@ -17,14 +17,15 @@ pub mod order_analyzer;
 mod sink_parser;
 mod source_parser;
 mod statements;
+mod subscribe_parser;
 mod tokenizer;
 mod window_rewriter;
 
 pub use lookup_table::CreateLookupTableStatement;
 pub use statements::{
     AlterSourceOperation, CreateSinkStatement, CreateSourceStatement, EmitClause, EmitStrategy,
-    FormatSpec, LateDataClause, ShowCommand, SinkFrom, StreamingStatement, WatermarkDef,
-    WindowFunction,
+    FormatSpec, LateDataClause, ShowCommand, SinkFrom, StreamingStatement, SubscribeStatement,
+    WatermarkDef, WindowFunction,
 };
 pub use window_rewriter::WindowRewriter;
 
@@ -211,6 +212,13 @@ impl StreamingParser {
                 Ok(vec![stmt])
             }
             StreamingDdlKind::Checkpoint => Ok(vec![StreamingStatement::Checkpoint]),
+            StreamingDdlKind::Subscribe => {
+                let mut parser =
+                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
+                let stmt = subscribe_parser::parse_subscribe(&mut parser)
+                    .map_err(parse_error_to_parser_error)?;
+                Ok(vec![StreamingStatement::Subscribe(Box::new(stmt))])
+            }
             StreamingDdlKind::RestoreCheckpoint => {
                 let mut parser =
                     sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);

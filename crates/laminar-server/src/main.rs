@@ -9,6 +9,7 @@ mod cluster_config;
 mod config;
 mod http;
 mod metrics;
+mod pgwire;
 mod reload;
 mod server;
 mod watcher;
@@ -40,6 +41,9 @@ struct Args {
     log_level: String,
     #[arg(long)]
     admin_bind: Option<String>,
+    /// Postgres wire bind address (e.g. `127.0.0.1:5433`). Wildcard binds rejected.
+    #[arg(long)]
+    pgwire_bind: Option<String>,
     /// Validate checkpoints and exit without starting the server.
     #[arg(long)]
     validate_checkpoints: bool,
@@ -72,6 +76,10 @@ async fn main() -> Result<()> {
 
     if let Some(bind) = args.admin_bind {
         config.server.bind = bind;
+    }
+    if let Some(pg) = args.pgwire_bind {
+        // Empty string disables; a value overrides config.
+        config.server.pgwire_bind = if pg.is_empty() { None } else { Some(pg) };
     }
 
     if args.validate_checkpoints {

@@ -280,6 +280,18 @@ while let Some(rows) = sub.poll() {
 
 **Critical:** `FromRow` struct field order must match the SQL `SELECT` column order. Field names don't matter — only position.
 
+### SUBSCRIBE over the Postgres wire protocol
+
+When the server is started with `pgwire_bind` set, materialized views can be streamed directly to any libpq client (psql, JDBC, asyncpg, etc.):
+
+```sql
+SUBSCRIBE <mv_name> [WHERE <predicate>]
+```
+
+- `<mv_name>` may be a materialized view, a source, or a named stream.
+- The optional `WHERE` clause is compiled by DataFusion against the target's schema and applied per batch before the row reaches the wire. It works on materialized views and sources; named streams reject `WHERE` because their output schema isn't introspectable.
+- The query stays open until the client disconnects; rows arrive as they're produced upstream.
+
 ---
 
 ## Watermarks

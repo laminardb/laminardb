@@ -7,10 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arrow::array::RecordBatch;
-use arrow::datatypes::SchemaRef;
-use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::SessionContext;
-use datafusion_common::DFSchema;
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_core::alloc::{PriorityClass, PriorityGuard};
 use laminar_core::streaming;
@@ -109,6 +107,7 @@ pub(crate) struct ConnectorPipelineCallback {
     /// the coordinator with an empty `CheckpointRequest` and the
     /// leader's manifest is useless for restart recovery.
     pub(crate) force_ckpt_rx: Option<crate::db::ForceCheckpointRx>,
+    pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
 }
 
 impl ConnectorPipelineCallback {
@@ -386,17 +385,21 @@ impl ConnectorPipelineCallback {
             };
             let schema = batch.schema();
             let sql = filter_sql.as_deref().unwrap();
-            if let Some(compiled) = compile_sink_filter_sql(&self.filter_ctx, sql, &schema).await {
-                self.compiled_sink_filters[i] = SinkFilter::Compiled(compiled);
-            } else {
-                tracing::error!(
-                    sink = %sink_name,
-                    filter = %sql,
-                    "[LDB-1100] sink filter did not compile to a PhysicalExpr; \
-                     fail-closed: ALL rows from this stream will be dropped \
-                     for this sink. Track via sink_filter_rejected_rows_total."
-                );
-                self.compiled_sink_filters[i] = SinkFilter::Rejected;
+            match crate::filter_compile::compile(&self.filter_ctx, sql, &schema).await {
+                Ok(compiled) => {
+                    self.compiled_sink_filters[i] = SinkFilter::Compiled(compiled);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        sink = %sink_name,
+                        filter = %sql,
+                        error = %e,
+                        "[LDB-1100] sink filter did not compile; fail-closed: \
+                         ALL rows from this stream will be dropped for this sink. \
+                         Track via sink_filter_rejected_rows_total."
+                    );
+                    self.compiled_sink_filters[i] = SinkFilter::Rejected;
+                }
             }
             self.pending_sink_filter_compiles = self.pending_sink_filter_compiles.saturating_sub(1);
         }
@@ -452,6 +455,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                             let dropped = batch.num_rows() as u64;
                             self.prom.events_dropped.inc_by(dropped);
                         }
+                        self.subscription_registry
+                            .send_batch(stream_name, batch.clone());
                     }
                 }
             }
@@ -476,6 +481,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                     if batch.num_rows() > 0 {
                         store.update(stream_name, batch);
                         updates += 1;
+                        self.subscription_registry
+                            .send_batch(stream_name, batch.clone());
                     }
                 }
             }
@@ -524,7 +531,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         for batch in shared.iter() {
                             let filtered: Cow<RecordBatch> = match &filter_state {
                                 SinkFilterDispatch::Compiled(phys) => {
-                                    match apply_compiled_sink_filter(batch, phys) {
+                                    match crate::filter_compile::apply(batch, phys.as_ref()) {
                                         Ok(Some(fb)) => Cow::Owned(fb),
                                         Ok(None) => continue,
                                         Err(e) => {
@@ -979,6 +986,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         bp
     }
 
+    fn publish_barrier(&self, epoch: u64, checkpoint_id: u64) {
+        self.subscription_registry
+            .broadcast_barrier(epoch, checkpoint_id);
+    }
+
     fn has_deferred_input(&self) -> bool {
         // In cluster mode, always claim pending input so the coordinator
         // runs `execute_cycle` each idle tick — otherwise a follower with
@@ -1221,85 +1233,6 @@ fn update_partial_cache_from_batch(
 /// Encode an Arrow schema as a hex-encoded IPC flatbuffer for `ConnectorConfig`.
 pub(crate) fn encode_arrow_schema(schema: &arrow_schema::Schema) -> String {
     laminar_connectors::config::encode_arrow_schema_ipc(schema)
-}
-
-/// Apply a compiled `PhysicalExpr` filter to a batch.
-fn apply_compiled_sink_filter(
-    batch: &RecordBatch,
-    filter: &Arc<dyn PhysicalExpr>,
-) -> Result<Option<RecordBatch>, DbError> {
-    if batch.num_rows() == 0 {
-        return Ok(None);
-    }
-    let result = filter
-        .evaluate(batch)
-        .map_err(|e| DbError::Pipeline(format!("sink filter evaluate: {e}")))?;
-    let mask = result
-        .into_array(batch.num_rows())
-        .map_err(|e| DbError::Pipeline(format!("sink filter to array: {e}")))?;
-    let bool_arr = mask
-        .as_any()
-        .downcast_ref::<arrow::array::BooleanArray>()
-        .ok_or_else(|| DbError::Pipeline("sink filter not boolean".into()))?;
-    let filtered = arrow::compute::filter_record_batch(batch, bool_arr)
-        .map_err(|e| DbError::Pipeline(format!("sink filter: {e}")))?;
-    if filtered.num_rows() == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(filtered))
-    }
-}
-
-/// Try to compile a sink filter SQL expression to a `PhysicalExpr`.
-///
-/// Plans the filter as a full SQL query against an empty table with the batch
-/// schema, then extracts the Filter predicate from the logical plan and
-/// compiles it. Returns `None` if compilation fails (caller falls back to
-/// SQL-based filter).
-async fn compile_sink_filter_sql(
-    ctx: &SessionContext,
-    filter_sql: &str,
-    batch_schema: &SchemaRef,
-) -> Option<Arc<dyn PhysicalExpr>> {
-    let table_name = "__compile_filter";
-    let empty =
-        datafusion::datasource::MemTable::try_new(batch_schema.clone(), vec![vec![]]).ok()?;
-    let _ = ctx.deregister_table(table_name);
-    ctx.register_table(table_name, Arc::new(empty)).ok()?;
-
-    let sql = format!("SELECT * FROM {table_name} WHERE {filter_sql}");
-    let plan = {
-        let df = ctx.sql(&sql).await.ok()?;
-        df.logical_plan().clone()
-    };
-    let _ = ctx.deregister_table(table_name);
-
-    // Walk plan to find Filter node
-    let filter_expr = find_filter_predicate(&plan)?;
-
-    // Compile against the batch schema
-    let df_schema = DFSchema::try_from(batch_schema.as_ref().clone()).ok()?;
-    let state = ctx.state();
-    let props = state.execution_props();
-    create_physical_expr(&filter_expr, &df_schema, props).ok()
-}
-
-/// Walk a logical plan to find the first Filter predicate.
-fn find_filter_predicate(plan: &datafusion_expr::LogicalPlan) -> Option<datafusion_expr::Expr> {
-    match plan {
-        datafusion_expr::LogicalPlan::Filter(f) => Some(f.predicate.clone()),
-        datafusion_expr::LogicalPlan::Projection(p) => find_filter_predicate(&p.input),
-        datafusion_expr::LogicalPlan::Sort(s) => find_filter_predicate(&s.input),
-        datafusion_expr::LogicalPlan::Limit(l) => find_filter_predicate(&l.input),
-        _ => {
-            for input in plan.inputs() {
-                if let Some(expr) = find_filter_predicate(input) {
-                    return Some(expr);
-                }
-            }
-            None
-        }
-    }
 }
 
 #[cfg(test)]

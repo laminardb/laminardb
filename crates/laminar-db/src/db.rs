@@ -163,6 +163,11 @@ pub struct LaminarDB {
     /// `None`, `db.checkpoint()` falls back to the direct coordinator
     /// path (only valid when the engine has no stateful operators).
     pub(crate) force_ckpt_tx: parking_lot::Mutex<Option<ForceCheckpointTx>>,
+    /// SUBSCRIBE fan-out registry, shared with the pipeline callback.
+    pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
+    /// Stream output schemas resolved at `start()`; SUBSCRIBE WHERE reads this.
+    pub(crate) stream_schemas:
+        parking_lot::RwLock<std::collections::HashMap<String, arrow_schema::SchemaRef>>,
 }
 
 /// Oneshot reply carrying the full `CheckpointResult` back to the
@@ -342,6 +347,8 @@ impl LaminarDB {
             #[cfg(feature = "cluster-unstable")]
             assignment_snapshot_store: parking_lot::Mutex::new(None),
             force_ckpt_tx: parking_lot::Mutex::new(None),
+            subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
+            stream_schemas: parking_lot::RwLock::new(std::collections::HashMap::new()),
         })
     }
 
@@ -975,6 +982,9 @@ impl LaminarDB {
             StreamingStatement::AlterSource { name, operation } => {
                 self.handle_alter_source(name, operation)
             }
+            StreamingStatement::Subscribe(_) => Err(DbError::InvalidOperation(
+                "SUBSCRIBE requires the pgwire endpoint, not HTTP /api/v1/sql".into(),
+            )),
         }
     }
 
@@ -1072,6 +1082,13 @@ impl LaminarDB {
         self.session_properties.lock().clone()
     }
 
+    /// Set a session property. Keys are lowercased.
+    pub fn set_session_property(&self, key: &str, value: &str) {
+        self.session_properties
+            .lock()
+            .insert(key.to_lowercase(), value.to_string());
+    }
+
     /// Subscribe to a named stream or materialized view.
     ///
     /// # Errors
@@ -1101,6 +1118,62 @@ impl LaminarDB {
         self.catalog
             .get_stream_subscription(name)
             .ok_or_else(|| DbError::StreamNotFound(name.to_string()))
+    }
+
+    /// Open a SUBSCRIBE portal against a named MV, source, or stream.
+    /// `filter_sql` is rejected on streams (their schema is opaque).
+    ///
+    /// # Errors
+    /// Returns `StreamNotFound` if `name` is unknown, or `Pipeline` if the
+    /// subscriber cap is reached or the filter fails to compile.
+    pub async fn open_subscription(
+        &self,
+        name: &str,
+        filter_sql: Option<&str>,
+    ) -> Result<crate::subscription::SubscriptionPortal, DbError> {
+        let attached = self.subscription_registry.subscriber_count(name);
+        if attached >= crate::subscription::MAX_SUBSCRIBERS_PER_MV {
+            return Err(DbError::Pipeline(format!(
+                "subscriber cap reached for '{name}' ({attached}/{})",
+                crate::subscription::MAX_SUBSCRIBERS_PER_MV
+            )));
+        }
+
+        // Schema lookup order: MV registry, catalog source, stream-output
+        // schemas resolved at start(), then the StreamEntry sink as a last
+        // resort. The sink schema is a known placeholder (Schema::empty),
+        // so it disqualifies WHERE clauses but still permits unfiltered
+        // subscribe.
+        let (schema, filterable) = if let Some(mv) = self.mv_registry.lock().get(name).cloned() {
+            (mv.schema, true)
+        } else if let Some(src) = self.catalog.get_source(name) {
+            (Arc::clone(&src.schema), true)
+        } else if let Some(schema) = self.stream_schemas.read().get(name).cloned() {
+            (schema, true)
+        } else if let Some(entry) = self.catalog.get_stream_entry(name) {
+            (entry.sink.schema(), false)
+        } else {
+            return Err(DbError::StreamNotFound(name.to_string()));
+        };
+
+        let filter = match filter_sql {
+            None => None,
+            Some(_) if !filterable => {
+                return Err(DbError::Pipeline(format!(
+                    "WHERE on '{name}' is not supported: stream output schema \
+                     was not resolved (likely a planner failure at start())"
+                )));
+            }
+            Some(sql) => Some(crate::filter_compile::compile(&self.ctx, sql, &schema).await?),
+        };
+
+        let rx = self.subscription_registry.subscribe(name);
+        Ok(match filter {
+            Some(phys) => {
+                crate::subscription::SubscriptionPortal::open_with_filter(name, schema, rx, phys)
+            }
+            None => crate::subscription::SubscriptionPortal::open(name, schema, rx),
+        })
     }
 
     /// Handle EXPLAIN statement — show the streaming query plan.

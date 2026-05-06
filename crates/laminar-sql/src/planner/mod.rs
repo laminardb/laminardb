@@ -183,7 +183,8 @@ impl StreamingPlanner {
             | StreamingStatement::InsertInto { .. }
             | StreamingStatement::AlterSource { .. }
             | StreamingStatement::Checkpoint
-            | StreamingStatement::RestoreCheckpoint { .. } => {
+            | StreamingStatement::RestoreCheckpoint { .. }
+            | StreamingStatement::Subscribe(_) => {
                 // These statements are handled directly by the database facade
                 // and don't need query planning. Return as Standard pass-through.
                 Err(PlanningError::UnsupportedSql(format!(

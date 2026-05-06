@@ -3777,3 +3777,144 @@ async fn test_nullif_float_with_int_literal_runs_without_error() {
         "post-projection should evaluate without Float64==Int64 error"
     );
 }
+
+#[tokio::test]
+async fn open_subscription_resolves_unknown_name_to_error() {
+    let db = LaminarDB::open().unwrap();
+    let err = db.open_subscription("nope", None).await.unwrap_err();
+    assert!(matches!(err, DbError::StreamNotFound(_)));
+}
+
+#[tokio::test]
+async fn open_subscription_resolves_named_stream() {
+    let db = LaminarDB::open().unwrap();
+    let registry = prometheus::Registry::new();
+    let prom = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+    db.set_engine_metrics(Arc::clone(&prom));
+
+    db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
+        .await
+        .unwrap();
+    db.execute("CREATE STREAM all_trades AS SELECT * FROM trades")
+        .await
+        .unwrap();
+    db.start().await.unwrap();
+
+    let mut portal = db
+        .open_subscription("all_trades", None)
+        .await
+        .expect("portal opens");
+
+    let handle = db.source_untyped("trades").unwrap();
+    let schema = handle.schema().clone();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(arrow::array::StringArray::from(vec!["AAPL"])),
+            Arc::new(arrow::array::Float64Array::from(vec![150.0])),
+        ],
+    )
+    .unwrap();
+    handle.push_arrow(batch).unwrap();
+
+    // Wait up to 2s for a Batch frame, ignoring barrier markers.
+    let batch = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match portal.next_frame().await {
+                Some(crate::subscription::PortalFrame::Batch(b)) => break Some(b),
+                Some(crate::subscription::PortalFrame::Barrier { .. }) => {}
+                Some(crate::subscription::PortalFrame::Lagged(_)) | None => break None,
+            }
+        }
+    })
+    .await
+    .expect("portal must produce a Batch within 2s")
+    .expect("batch frame");
+    assert!(batch.num_rows() >= 1);
+}
+
+#[tokio::test]
+async fn open_subscription_with_invalid_filter_errors_at_open() {
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE trades (symbol VARCHAR)")
+        .await
+        .unwrap();
+
+    let err = db
+        .open_subscription("trades", Some("nonexistent_col > 1"))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("nonexistent_col"),
+        "error must mention the bad column, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn open_subscription_with_filter_on_stream_before_start_is_rejected() {
+    // Before start(), stream_schemas is empty so we fall through to the
+    // placeholder path on StreamEntry::sink and refuse WHERE.
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE trades (symbol VARCHAR)")
+        .await
+        .unwrap();
+    db.execute("CREATE STREAM all_trades AS SELECT * FROM trades")
+        .await
+        .unwrap();
+
+    let err = db
+        .open_subscription("all_trades", Some("symbol = 'AAPL'"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not resolved"), "got: {err}");
+}
+
+#[tokio::test]
+async fn open_subscription_with_filter_on_stream_after_start_compiles() {
+    let db = LaminarDB::open().unwrap();
+    let registry = prometheus::Registry::new();
+    let prom = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+    db.set_engine_metrics(Arc::clone(&prom));
+
+    db.execute("CREATE SOURCE trades (symbol VARCHAR)")
+        .await
+        .unwrap();
+    db.execute("CREATE STREAM all_trades AS SELECT * FROM trades")
+        .await
+        .unwrap();
+    db.start().await.unwrap();
+
+    let portal = db
+        .open_subscription("all_trades", Some("symbol = 'AAPL'"))
+        .await
+        .expect("WHERE on a started stream must compile");
+    portal.close();
+}
+
+#[tokio::test]
+async fn drop_stream_closes_subscription() {
+    let db = LaminarDB::open().unwrap();
+    let registry = prometheus::Registry::new();
+    let prom = Arc::new(crate::engine_metrics::EngineMetrics::new(&registry));
+    db.set_engine_metrics(Arc::clone(&prom));
+
+    db.execute("CREATE SOURCE trades (symbol VARCHAR)")
+        .await
+        .unwrap();
+    db.execute("CREATE STREAM s AS SELECT * FROM trades")
+        .await
+        .unwrap();
+    db.start().await.unwrap();
+
+    let mut portal = db.open_subscription("s", None).await.unwrap();
+
+    db.execute("DROP STREAM s").await.unwrap();
+
+    // Pump exits, mpsc closes, next_frame eventually returns None.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while portal.next_frame().await.is_some() {}
+    })
+    .await
+    .expect("portal must close");
+}

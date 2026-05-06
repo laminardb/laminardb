@@ -728,8 +728,18 @@ impl LaminarDB {
 
         // Resolve each stream's output schema with DataFusion so sinks
         // downstream see it via `_arrow_schema` (mirrors the source path
-        // above).
+        // above). Publish the result into `LaminarDB::stream_schemas` so
+        // SUBSCRIBE WHERE can compile predicates against the real schema.
         let stream_output_schemas = resolve_stream_output_schemas(&self.ctx, &stream_regs).await?;
+        {
+            let mut schemas = self.stream_schemas.write();
+            schemas.clear();
+            schemas.extend(
+                stream_output_schemas
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Arc::clone(v))),
+            );
+        }
 
         // Build sinks. Each runs in its own tokio task with a bounded
         // command channel and shares one event channel back to the
@@ -1415,6 +1425,7 @@ impl LaminarDB {
             #[cfg(feature = "cluster-unstable")]
             last_follower_epoch: None,
             force_ckpt_rx: Some(force_ckpt_rx),
+            subscription_registry: Arc::clone(&self.subscription_registry),
         };
 
         // Start the streaming coordinator on a dedicated compute thread.

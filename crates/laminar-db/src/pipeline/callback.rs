@@ -95,4 +95,9 @@ pub trait PipelineCallback: Send + 'static {
     fn has_deferred_input(&self) -> bool {
         false
     }
+
+    /// Forward a durable checkpoint epoch to external SUBSCRIBE consumers.
+    fn publish_barrier(&self, epoch: u64, checkpoint_id: u64) {
+        let _ = (epoch, checkpoint_id);
+    }
 }

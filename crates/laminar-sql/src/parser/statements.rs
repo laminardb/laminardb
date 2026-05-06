@@ -191,6 +191,20 @@ pub enum StreamingStatement {
         /// The checkpoint ID to restore from
         checkpoint_id: u64,
     },
+
+    /// `SUBSCRIBE <name> [WHERE ...] [WITH (...)]`.
+    Subscribe(Box<SubscribeStatement>),
+}
+
+/// `SUBSCRIBE <name> [WHERE <fragment>] [WITH (...)]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubscribeStatement {
+    /// Target stream or materialized view name.
+    pub name: ObjectName,
+    /// Raw WHERE fragment, compiled by the engine against the target schema.
+    pub filter_sql: Option<String>,
+    /// Reserved for future WITH options.
+    pub options: HashMap<String, String>,
 }
 
 /// Operations for ALTER SOURCE statements.
