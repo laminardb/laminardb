@@ -1,7 +1,6 @@
-//! Postgres wire endpoint. Trust auth by default; MD5 password auth when
-//! `[server].pgwire_users` is non-empty. Non-loopback binds require both
-//! MD5 auth AND `pgwire_allow_remote = true` (two-key rule). TLS via
-//! tokio-rustls when `pgwire_tls_cert` and `pgwire_tls_key` are set.
+//! Postgres wire endpoint. Trust by default; MD5 with `pgwire_users`;
+//! TLS with `pgwire_tls_cert` + `pgwire_tls_key`. Non-loopback binds
+//! require `pgwire_allow_remote = true`.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -508,15 +507,12 @@ impl PgWireServerHandlers for LaminarHandlerFactory {
     }
 }
 
-/// Cert + private-key paths for the pgwire TLS listener.
 pub struct TlsPaths<'a> {
     pub cert: &'a std::path::Path,
     pub key: &'a std::path::Path,
 }
 
-/// Warn if the key file is readable by anyone other than the owner.
-/// PostgreSQL refuses to start in this case; we warn rather than fail
-/// because dev environments often run with looser perms.
+/// Warn if the key file is group/other-readable.
 #[cfg(unix)]
 fn warn_if_key_world_readable(file: &std::fs::File, path: &std::path::Path) {
     use std::os::unix::fs::MetadataExt;
@@ -526,8 +522,7 @@ fn warn_if_key_world_readable(file: &std::fs::File, path: &std::path::Path) {
             warn!(
                 path = %path.display(),
                 mode = format!("{:o}", mode & 0o777),
-                "pgwire_tls_key permissions are too broad — postgres rejects \
-                 anything looser than 0600. Tighten before exposing the listener.",
+                "pgwire_tls_key permissions are too broad; tighten to 0600",
             );
         }
     }
@@ -536,9 +531,7 @@ fn warn_if_key_world_readable(file: &std::fs::File, path: &std::path::Path) {
 #[cfg(not(unix))]
 fn warn_if_key_world_readable(_file: &std::fs::File, _path: &std::path::Path) {}
 
-/// Per-IP rolling-window auth-failure tracker. Cheap parking_lot mutex over
-/// a HashMap; expected key set is small (active client IPs) and lookups
-/// happen at TCP accept time, not on the hot data path.
+/// Rolling-window auth-failure count per peer IP.
 #[derive(Debug, Default)]
 struct FailureTracker {
     inner: parking_lot::Mutex<
@@ -547,8 +540,6 @@ struct FailureTracker {
 }
 
 impl FailureTracker {
-    /// Drop expired entries and return whether `ip` has hit `limit` failures
-    /// inside `window`. `limit == 0` disables the throttle.
     fn is_blocked(&self, ip: std::net::IpAddr, limit: u32, window: std::time::Duration) -> bool {
         if limit == 0 {
             return false;
@@ -569,17 +560,27 @@ impl FailureTracker {
     }
 
     fn record_failure(&self, ip: std::net::IpAddr) {
-        self.inner
-            .lock()
+        let mut inner = self.inner.lock();
+        // When full, evict the entry whose newest failure is oldest.
+        if !inner.contains_key(&ip) && inner.len() >= MAX_TRACKED_IPS {
+            if let Some(oldest) = inner
+                .iter()
+                .min_by_key(|(_, q)| q.back().copied())
+                .map(|(k, _)| *k)
+            {
+                inner.remove(&oldest);
+            }
+        }
+        inner
             .entry(ip)
             .or_default()
             .push_back(std::time::Instant::now());
     }
 }
 
-/// Map the result of `process_socket` to a stable audit-log code so SOC
-/// dashboards can split TLS handshake errors from auth failures and from
-/// generic runtime errors.
+const MAX_TRACKED_IPS: usize = 4096;
+
+/// Stable audit code for a session's exit status.
 fn classify_outcome(result: &Result<(), std::io::Error>) -> &'static str {
     match result {
         Ok(()) => "ok",
@@ -599,9 +600,7 @@ fn classify_outcome(result: &Result<(), std::io::Error>) -> &'static str {
     }
 }
 
-/// Reject certs already past `notAfter`; warn when expiry is within 30 days.
-/// Saves operators a debugging session: an expired cert otherwise loads fine
-/// and only fails at first client handshake with an opaque error.
+/// Reject certs past `notAfter`; warn within 30 days.
 #[allow(clippy::result_large_err)]
 fn check_cert_expiry(
     der: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
@@ -618,8 +617,6 @@ fn check_cert_expiry(
             path.display()
         )));
     }
-    // x509-parser's ASN1Time uses the `time` crate. Convert to a `Duration`
-    // for the 30-day window comparison.
     let remaining = not_after.to_datetime() - now.to_datetime();
     if remaining <= time::Duration::days(30) {
         warn!(
@@ -631,11 +628,7 @@ fn check_cert_expiry(
     Ok(())
 }
 
-/// Install aws-lc-rs as the process-wide rustls CryptoProvider. Idempotent —
-/// rustls returns `Err` if a provider is already installed, which we ignore.
-/// Required because other crates in the dep tree (delta-lake, iceberg) pull
-/// in rustls with their own provider features, leaving the auto-pick
-/// ambiguous.
+/// Idempotent install of aws-lc-rs as rustls' default provider.
 fn ensure_tls_provider() {
     let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
@@ -658,7 +651,9 @@ fn load_tls_acceptor(paths: TlsPaths<'_>) -> Result<tokio_rustls::TlsAcceptor, S
             paths.cert.display()
         )));
     }
-    check_cert_expiry(&certs[0], paths.cert)?;
+    for cert in &certs {
+        check_cert_expiry(cert, paths.cert)?;
+    }
 
     let key_file = File::open(paths.key)
         .map_err(|e| ServerError::Http(format!("open pgwire_tls_key: {e}")))?;
@@ -966,6 +961,24 @@ mod tests {
         }
         // Window of 0 means every recorded failure is already expired.
         assert!(!tracker.is_blocked(ip, 5, Duration::from_secs(0)));
+    }
+
+    #[test]
+    fn failure_tracker_caps_distinct_ips() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let tracker = super::FailureTracker::default();
+        // Push past the cap; map size must stay bounded.
+        for i in 0..(super::MAX_TRACKED_IPS + 100) {
+            #[allow(clippy::cast_possible_truncation)]
+            let ip: IpAddr = Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8).into();
+            tracker.record_failure(ip);
+        }
+        let len = tracker.inner.lock().len();
+        assert!(
+            len <= super::MAX_TRACKED_IPS,
+            "tracker exceeded cap: {len} > {}",
+            super::MAX_TRACKED_IPS
+        );
     }
 
     #[tokio::test]

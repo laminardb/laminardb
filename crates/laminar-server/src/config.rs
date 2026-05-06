@@ -16,9 +16,7 @@ static ENV_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}").expect("valid regex")
 });
 
-/// Minimum acceptable pgwire password length, enforced at config load.
-/// MD5 auth offers no work factor, so length is the only knob; 12 is the
-/// usual NIST baseline.
+/// NIST baseline; MD5 has no work factor, so length is the only knob.
 const MIN_PGWIRE_PASSWORD_LEN: usize = 12;
 
 /// Load, parse, and validate a LaminarDB configuration file.
@@ -131,6 +129,12 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
             ));
         }
     }
+    if config.server.pgwire_max_connections == 0 {
+        errors.push(
+            "pgwire_max_connections must be > 0; remove pgwire_bind to disable the listener"
+                .to_string(),
+        );
+    }
     match (
         &config.server.pgwire_tls_cert,
         &config.server.pgwire_tls_key,
@@ -213,31 +217,22 @@ pub struct ServerSection {
     /// Postgres wire bind address; `None` disables it.
     #[serde(default)]
     pub pgwire_bind: Option<String>,
-    /// Username -> plaintext password for MD5 auth on the pgwire listener.
-    /// Empty/absent → trust auth (only safe behind a localhost bind).
+    /// MD5 auth users. Empty → trust auth (loopback only).
     #[serde(default)]
     pub pgwire_users: std::collections::HashMap<String, Secret>,
-    /// Two-key rule: must be explicitly true to allow `pgwire_bind` on a
-    /// non-localhost address even when MD5 auth is configured. Defaults
-    /// false so a misconfigured `pgwire_users` map can't accidentally expose
-    /// the listener to the wider network.
+    /// Required true to bind pgwire on a non-loopback address.
     #[serde(default)]
     pub pgwire_allow_remote: bool,
-    /// TLS certificate (PEM). Setting this and `pgwire_tls_key` enables
-    /// TLS on the pgwire listener; both must be provided together.
+    /// PEM cert; pair with `pgwire_tls_key` to enable TLS.
     #[serde(default)]
     pub pgwire_tls_cert: Option<std::path::PathBuf>,
-    /// TLS private key (PEM, PKCS#8 or RSA).
+    /// PEM private key (PKCS#8 or RSA).
     #[serde(default)]
     pub pgwire_tls_key: Option<std::path::PathBuf>,
-    /// Cap on concurrent pgwire sessions. New TCP accepts above the cap are
-    /// closed immediately with a server log; in-flight sessions continue.
+    /// Concurrent session cap; excess accepts close immediately.
     #[serde(default = "default_pgwire_max_connections")]
     pub pgwire_max_connections: usize,
-    /// Maximum auth failures from a single peer IP within a 60s rolling
-    /// window. Subsequent connect attempts from that IP are dropped at
-    /// accept time until failures expire from the window. 0 disables
-    /// the throttle.
+    /// Per-IP auth-failure cap in a 60s rolling window. 0 disables.
     #[serde(default = "default_pgwire_max_auth_failures_per_min")]
     pub pgwire_max_auth_failures_per_min: u32,
 }
@@ -266,27 +261,21 @@ impl Default for ServerSection {
     }
 }
 
-/// String wrapped to keep its plaintext out of `Debug` output and incidental
-/// log lines. Use `Secret::expose` only at the point of use.
+/// String that redacts itself in `Debug` output.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(transparent)]
 pub struct Secret(String);
 
 impl Secret {
-    /// Constructor; intended for tests and bridge code.
     #[cfg(test)]
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
 
-    /// Plaintext access. Only call at the point the value is actually used
-    /// (e.g., handing it to a hash function); never store the returned `&str`
-    /// elsewhere.
     pub fn expose(&self) -> &str {
         &self.0
     }
 
-    /// Char count of the wrapped value, for length validation.
     pub fn len(&self) -> usize {
         self.0.chars().count()
     }
@@ -802,6 +791,25 @@ bind = "not-a-socket-addr"
         match err {
             ConfigError::ValidationErrors { errors } => {
                 assert!(errors.iter().any(|e| e.contains("invalid server bind")));
+            }
+            _ => panic!("expected ValidationErrors"),
+        }
+    }
+
+    #[test]
+    fn test_validate_zero_max_connections() {
+        let toml = r#"
+[server]
+pgwire_max_connections = 0
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        let err = validate_config(&config).unwrap_err();
+        match err {
+            ConfigError::ValidationErrors { errors } => {
+                assert!(
+                    errors.iter().any(|e| e.contains("must be > 0")),
+                    "errors: {errors:?}"
+                );
             }
             _ => panic!("expected ValidationErrors"),
         }
