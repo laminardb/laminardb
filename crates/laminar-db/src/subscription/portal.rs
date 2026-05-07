@@ -46,23 +46,26 @@ impl SubscriptionPortal {
     pub(crate) fn open(
         name: impl Into<String>,
         schema: SchemaRef,
+        replay: Vec<MvUpdate>,
         rx: broadcast::Receiver<MvUpdate>,
     ) -> Self {
-        Self::spawn(name, schema, rx, None)
+        Self::spawn(name, schema, replay, rx, None)
     }
 
     pub(crate) fn open_with_filter(
         name: impl Into<String>,
         schema: SchemaRef,
+        replay: Vec<MvUpdate>,
         rx: broadcast::Receiver<MvUpdate>,
         filter: Arc<dyn PhysicalExpr>,
     ) -> Self {
-        Self::spawn(name, schema, rx, Some(filter))
+        Self::spawn(name, schema, replay, rx, Some(filter))
     }
 
     fn spawn(
         name: impl Into<String>,
         schema: SchemaRef,
+        replay: Vec<MvUpdate>,
         rx: broadcast::Receiver<MvUpdate>,
         filter: Option<Arc<dyn PhysicalExpr>>,
     ) -> Self {
@@ -71,6 +74,7 @@ impl SubscriptionPortal {
         let wake = Arc::new(Notify::new());
         tokio::spawn(pump_loop(
             name.into(),
+            replay,
             rx,
             tx,
             Arc::clone(&closed),
@@ -116,39 +120,67 @@ impl Drop for SubscriptionPortal {
     }
 }
 
+/// Translate one `MvUpdate` into a `PortalFrame`, applying the filter if any.
+/// Returns `Ok(None)` for batches the filter excluded entirely, and `Err(())`
+/// when the filter itself failed (the pump should close).
+fn translate(
+    msg: MvUpdate,
+    filter: Option<&Arc<dyn PhysicalExpr>>,
+    name: &str,
+) -> Result<Option<PortalFrame>, ()> {
+    match msg {
+        MvUpdate::Batch(batch) => match filter {
+            Some(f) => match crate::filter_compile::apply(&batch, f.as_ref()) {
+                Ok(Some(b)) => Ok(Some(PortalFrame::Batch(b))),
+                Ok(None) => Ok(None),
+                Err(e) => {
+                    tracing::warn!(subscription = %name, error = %e, "filter failed; closing");
+                    Err(())
+                }
+            },
+            None => Ok(Some(PortalFrame::Batch(batch))),
+        },
+        MvUpdate::Barrier {
+            epoch,
+            checkpoint_id,
+        } => Ok(Some(PortalFrame::Barrier {
+            epoch,
+            checkpoint_id,
+        })),
+    }
+}
+
 async fn pump_loop(
     name: String,
+    replay: Vec<MvUpdate>,
     mut broadcast_rx: broadcast::Receiver<MvUpdate>,
     tx: MAsyncTx<mpsc::Array<PortalFrame>>,
     closed: Arc<AtomicBool>,
     wake: Arc<Notify>,
     filter: Option<Arc<dyn PhysicalExpr>>,
 ) {
+    for msg in replay {
+        if closed.load(Ordering::Acquire) {
+            return;
+        }
+        match translate(msg, filter.as_ref(), &name) {
+            Ok(Some(frame)) => {
+                if tx.send(frame).await.is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {}
+            Err(()) => return,
+        }
+    }
     while !closed.load(Ordering::Acquire) {
         let recv = tokio::select! {
             biased;
             () = wake.notified() => continue,
             r = broadcast_rx.recv() => r,
         };
-        let frame = match recv {
-            Ok(MvUpdate::Batch(batch)) => match filter.as_ref() {
-                Some(f) => match crate::filter_compile::apply(&batch, f.as_ref()) {
-                    Ok(Some(b)) => PortalFrame::Batch(b),
-                    Ok(None) => continue,
-                    Err(e) => {
-                        tracing::warn!(subscription = %name, error = %e, "filter failed; closing");
-                        return;
-                    }
-                },
-                None => PortalFrame::Batch(batch),
-            },
-            Ok(MvUpdate::Barrier {
-                epoch,
-                checkpoint_id,
-            }) => PortalFrame::Barrier {
-                epoch,
-                checkpoint_id,
-            },
+        let msg = match recv {
+            Ok(m) => m,
             Err(broadcast::error::RecvError::Closed) => return,
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 tracing::warn!(subscription = %name, skipped = n, "lagged; closing");
@@ -156,8 +188,14 @@ async fn pump_loop(
                 return;
             }
         };
-        if tx.send(frame).await.is_err() {
-            return;
+        match translate(msg, filter.as_ref(), &name) {
+            Ok(Some(frame)) => {
+                if tx.send(frame).await.is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {}
+            Err(()) => return,
         }
     }
 }
@@ -170,7 +208,7 @@ mod tests {
     use arrow_array::Int64Array;
     use arrow_schema::{DataType, Field, Schema};
 
-    use super::super::registry::SubscriptionRegistry;
+    use super::super::registry::{SubscribeStart, SubscriptionRegistry};
     use super::*;
 
     fn schema() -> SchemaRef {
@@ -184,8 +222,8 @@ mod tests {
     #[tokio::test]
     async fn portal_forwards_batch_and_barrier() {
         let reg = SubscriptionRegistry::new();
-        let rx = reg.subscribe("mv");
-        let mut portal = SubscriptionPortal::open("mv", schema(), rx);
+        let (replay, rx) = reg.subscribe("mv", SubscribeStart::Tail).unwrap();
+        let mut portal = SubscriptionPortal::open("mv", schema(), replay, rx);
 
         reg.send_batch("mv", batch(&[1, 2]));
         reg.broadcast_barrier(7, 99);
@@ -211,8 +249,8 @@ mod tests {
     #[tokio::test]
     async fn portal_closes_on_drop_name() {
         let reg = SubscriptionRegistry::new();
-        let rx = reg.subscribe("mv");
-        let mut portal = SubscriptionPortal::open("mv", schema(), rx);
+        let (replay, rx) = reg.subscribe("mv", SubscribeStart::Tail).unwrap();
+        let mut portal = SubscriptionPortal::open("mv", schema(), replay, rx);
 
         reg.send_batch("mv", batch(&[1]));
         let _ = portal.next_frame().await;
@@ -228,8 +266,8 @@ mod tests {
     #[tokio::test]
     async fn portal_emits_lagged_as_final_frame() {
         let reg = SubscriptionRegistry::new();
-        let rx = reg.subscribe("mv");
-        let mut portal = SubscriptionPortal::open("mv", schema(), rx);
+        let (replay, rx) = reg.subscribe("mv", SubscribeStart::Tail).unwrap();
+        let mut portal = SubscriptionPortal::open("mv", schema(), replay, rx);
 
         for i in 0..1024 {
             reg.send_batch("mv", batch(&[i]));
@@ -253,10 +291,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn portal_drains_replay_before_live() {
+        let reg = SubscriptionRegistry::new();
+        reg.configure("mv", 1 << 20);
+
+        // Two epochs of pre-existing history.
+        reg.broadcast_barrier(1, 1);
+        reg.send_batch("mv", batch(&[10]));
+        reg.broadcast_barrier(2, 2);
+        reg.send_batch("mv", batch(&[20]));
+
+        // Subscribe AS OF EPOCH 1: the client has everything up to and
+        // including the epoch-1 barrier; replay must cover everything after
+        // it. That's batch[10], then barrier(2), then batch[20].
+        let (replay, rx) = reg.subscribe("mv", SubscribeStart::AsOfEpoch(1)).unwrap();
+        let mut portal = SubscriptionPortal::open("mv", schema(), replay, rx);
+
+        reg.send_batch("mv", batch(&[30]));
+
+        let mut row_seq = Vec::new();
+        let mut barriers = Vec::new();
+        for _ in 0..4 {
+            match portal.next_frame().await.unwrap() {
+                PortalFrame::Batch(b) => {
+                    let v = b
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0);
+                    row_seq.push(v);
+                }
+                PortalFrame::Barrier { epoch, .. } => barriers.push(epoch),
+                PortalFrame::Lagged(n) => panic!("unexpected lag: {n}"),
+            }
+        }
+        assert_eq!(row_seq, vec![10, 20, 30]);
+        assert_eq!(barriers, vec![2]);
+    }
+
+    #[tokio::test]
     async fn close_is_idempotent() {
         let reg = SubscriptionRegistry::new();
-        let rx = reg.subscribe("mv");
-        let portal = SubscriptionPortal::open("mv", schema(), rx);
+        let (replay, rx) = reg.subscribe("mv", SubscribeStart::Tail).unwrap();
+        let portal = SubscriptionPortal::open("mv", schema(), replay, rx);
 
         portal.close();
         portal.close();

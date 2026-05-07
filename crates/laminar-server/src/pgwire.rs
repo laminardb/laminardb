@@ -71,9 +71,13 @@ impl SimpleQueryHandler for LaminarPgwireHandler {
             out.push(match stmt {
                 StreamingStatement::Subscribe(s) => {
                     let name = s.name.to_string();
+                    let start = match s.as_of_epoch {
+                        Some(n) => laminar_db::subscription::SubscribeStart::AsOfEpoch(n),
+                        None => laminar_db::subscription::SubscribeStart::Tail,
+                    };
                     let portal = self
                         .db
-                        .open_subscription(&name, s.filter_sql.as_deref())
+                        .open_subscription(&name, s.filter_sql.as_deref(), start)
                         .await
                         .map_err(|e| user_error("42P01", format!("SUBSCRIBE '{name}': {e}")))?;
                     portal_to_response(portal)
@@ -1158,6 +1162,27 @@ mod integration_tests {
         assert!(
             db_err.message().contains("no_such_col"),
             "filter error must name the bad column, got: {}",
+            db_err.message()
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn subscribe_as_of_unretained_returns_pg_error() {
+        // No retention configured on the `prices` MV from the default setup,
+        // so AS OF EPOCH 1 must come back as a typed PG error.
+        let (addr, handle) = spawn_server().await;
+        let client = connect(addr).await;
+
+        let err = client
+            .simple_query("SUBSCRIBE prices AS OF EPOCH 1")
+            .await
+            .expect_err("must fail");
+        let db_err = err.as_db_error().expect("typed PG error");
+        assert!(
+            db_err.message().contains("no longer retained"),
+            "message: {}",
             db_err.message()
         );
 

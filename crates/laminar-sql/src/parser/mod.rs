@@ -476,9 +476,11 @@ fn parse_create_stream(
         .expect_keyword(sqlparser::keywords::Keyword::AS)
         .map_err(ParseError::SqlParseError)?;
 
-    // Collect remaining tokens and split at EMIT boundary
+    // Collect remaining tokens, then peel off the optional trailing
+    // `WITH (...)` before splitting query / EMIT.
     let remaining = collect_remaining_tokens(parser);
-    let (query_tokens, emit_tokens) = split_at_emit(&remaining);
+    let (head_tokens, with_tokens) = split_off_trailing_with(&remaining);
+    let (query_tokens, emit_tokens) = split_at_emit(&head_tokens);
 
     let query_sql = query_body_sql(original_sql, &query_tokens, &emit_tokens);
 
@@ -507,6 +509,16 @@ fn parse_create_stream(
         emit_parser::parse_emit_clause(&mut emit_parser)?
     };
 
+    let retention_bytes = match with_tokens {
+        None => None,
+        Some(tokens) => {
+            let mut with_parser =
+                sqlparser::parser::Parser::new(&stream_dialect).with_tokens_with_locations(tokens);
+            let opts = tokenizer::parse_with_options(&mut with_parser)?;
+            extract_retention_bytes(&opts)?
+        }
+    };
+
     Ok(StreamingStatement::CreateStream {
         name,
         query: Box::new(query_stmt),
@@ -514,7 +526,71 @@ fn parse_create_stream(
         or_replace,
         if_not_exists,
         query_sql,
+        retention_bytes,
     })
+}
+
+/// Find the last top-level `WITH (` and split the token stream there. The
+/// returned tail (when present) ends with EOF and is suitable for feeding to
+/// `parse_with_options`. CTE-style `WITH ident AS (...)` is ignored because
+/// it is followed by an identifier, not `(`.
+fn split_off_trailing_with(
+    tokens: &[sqlparser::tokenizer::TokenWithSpan],
+) -> (
+    Vec<sqlparser::tokenizer::TokenWithSpan>,
+    Option<Vec<sqlparser::tokenizer::TokenWithSpan>>,
+) {
+    use sqlparser::tokenizer::Token;
+    let mut depth: i32 = 0;
+    let mut last_with_idx: Option<usize> = None;
+    for (i, t) in tokens.iter().enumerate() {
+        match &t.token {
+            Token::LParen => depth += 1,
+            Token::RParen => depth -= 1,
+            Token::Word(w) if depth == 0 && w.value.eq_ignore_ascii_case("WITH") => {
+                if matches!(tokens.get(i + 1).map(|t| &t.token), Some(Token::LParen)) {
+                    last_with_idx = Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    match last_with_idx {
+        None => (tokens.to_vec(), None),
+        Some(i) => {
+            let mut head = tokens[..i].to_vec();
+            head.push(sqlparser::tokenizer::TokenWithSpan {
+                token: Token::EOF,
+                span: sqlparser::tokenizer::Span::empty(),
+            });
+            let tail = tokens[i..].to_vec();
+            (head, Some(tail))
+        }
+    }
+}
+
+/// Pull `RETAIN_HISTORY` out of the WITH-options map and parse it as a byte
+/// size. Unknown keys are rejected so typos surface immediately.
+fn extract_retention_bytes(
+    opts: &std::collections::HashMap<String, String>,
+) -> Result<Option<u64>, ParseError> {
+    for key in opts.keys() {
+        if !key.eq_ignore_ascii_case("retain_history") {
+            return Err(ParseError::StreamingError(format!(
+                "unknown CREATE STREAM option '{key}' (expected RETAIN_HISTORY)"
+            )));
+        }
+    }
+    match opts
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("retain_history"))
+    {
+        None => Ok(None),
+        Some((_, v)) => {
+            let bytes = lookup_table::ByteSize::parse(v)?;
+            Ok(Some(bytes.as_bytes()))
+        }
+    }
 }
 
 /// Slice `original_sql` from the first query token to the start of EMIT
@@ -1359,6 +1435,45 @@ mod tests {
             }
             _ => panic!("Expected CreateStream, got {stmt:?}"),
         }
+    }
+
+    #[test]
+    fn create_stream_with_retain_history() {
+        let stmt = parse_one(
+            "CREATE STREAM trades AS SELECT * FROM events WITH ('retain_history' = '64mb')",
+        );
+        let StreamingStatement::CreateStream {
+            retention_bytes, ..
+        } = stmt
+        else {
+            panic!("expected CreateStream");
+        };
+        assert_eq!(retention_bytes, Some(64 * 1024 * 1024));
+    }
+
+    #[test]
+    fn create_stream_with_retain_history_after_emit() {
+        let stmt = parse_one(
+            "CREATE STREAM trades AS SELECT COUNT(*) FROM events EMIT ON WINDOW CLOSE \
+             WITH ('retain_history' = '8mb')",
+        );
+        let StreamingStatement::CreateStream {
+            retention_bytes,
+            emit_clause,
+            ..
+        } = stmt
+        else {
+            panic!("expected CreateStream");
+        };
+        assert_eq!(retention_bytes, Some(8 * 1024 * 1024));
+        assert_eq!(emit_clause, Some(EmitClause::OnWindowClose));
+    }
+
+    #[test]
+    fn create_stream_rejects_unknown_with_option() {
+        let res = parse_streaming_sql("CREATE STREAM s AS SELECT * FROM e WITH ('bogus' = '1')");
+        let err = res.expect_err("unknown WITH key must error");
+        assert!(err.to_string().contains("bogus"), "got: {err}");
     }
 
     #[test]

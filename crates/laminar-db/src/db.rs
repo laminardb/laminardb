@@ -872,8 +872,15 @@ impl LaminarDB {
                 query,
                 emit_clause,
                 query_sql,
+                retention_bytes,
                 ..
-            } => self.handle_create_stream(name, query, emit_clause.as_ref(), query_sql),
+            } => self.handle_create_stream(
+                name,
+                query,
+                emit_clause.as_ref(),
+                query_sql,
+                *retention_bytes,
+            ),
             StreamingStatement::CreateContinuousQuery { .. }
             | StreamingStatement::CreateLookupTable(_)
             | StreamingStatement::DropLookupTable { .. } => self.handle_query(sql).await,
@@ -1121,15 +1128,20 @@ impl LaminarDB {
     }
 
     /// Open a SUBSCRIBE portal against a named MV, source, or stream.
-    /// `filter_sql` is rejected on streams (their schema is opaque).
+    /// `filter_sql` is rejected on streams (their schema is opaque). `start`
+    /// controls whether the subscriber sees only future frames (`Tail`) or
+    /// replays history from a specific checkpoint epoch (`AsOfEpoch`).
     ///
     /// # Errors
-    /// Returns `StreamNotFound` if `name` is unknown, or `Pipeline` if the
-    /// subscriber cap is reached or the filter fails to compile.
+    /// Returns `StreamNotFound` if `name` is unknown; `Pipeline` if the
+    /// subscriber cap is reached or the filter fails to compile;
+    /// `InvalidOperation` if `AsOfEpoch(n)` was requested but `n` is no
+    /// longer retained.
     pub async fn open_subscription(
         &self,
         name: &str,
         filter_sql: Option<&str>,
+        start: crate::subscription::SubscribeStart,
     ) -> Result<crate::subscription::SubscriptionPortal, DbError> {
         let attached = self.subscription_registry.subscriber_count(name);
         if attached >= crate::subscription::MAX_SUBSCRIBERS_PER_MV {
@@ -1167,12 +1179,25 @@ impl LaminarDB {
             Some(sql) => Some(crate::filter_compile::compile(&self.ctx, sql, &schema).await?),
         };
 
-        let rx = self.subscription_registry.subscribe(name);
+        let (replay, rx) = self
+            .subscription_registry
+            .subscribe(name, start)
+            .map_err(|e| {
+                let requested = match start {
+                    crate::subscription::SubscribeStart::AsOfEpoch(n) => n,
+                    crate::subscription::SubscribeStart::Tail => 0,
+                };
+                DbError::InvalidOperation(format!(
+                    "epoch {requested} for stream '{name}' is no longer retained \
+                     (earliest retained is {})",
+                    e.earliest_retained
+                ))
+            })?;
         Ok(match filter {
-            Some(phys) => {
-                crate::subscription::SubscriptionPortal::open_with_filter(name, schema, rx, phys)
-            }
-            None => crate::subscription::SubscriptionPortal::open(name, schema, rx),
+            Some(phys) => crate::subscription::SubscriptionPortal::open_with_filter(
+                name, schema, replay, rx, phys,
+            ),
+            None => crate::subscription::SubscriptionPortal::open(name, schema, replay, rx),
         })
     }
 

@@ -648,9 +648,16 @@ impl LaminarDB {
         query: &StreamingStatement,
         emit_clause: Option<&laminar_sql::parser::EmitClause>,
         query_sql: &str,
+        retention_bytes: Option<u64>,
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
         self.catalog.register_stream(&name_str)?;
+
+        // None leaves retention off; AS OF on this stream will return pruned.
+        if let Some(bytes) = retention_bytes {
+            let cap = usize::try_from(bytes).unwrap_or(usize::MAX);
+            self.subscription_registry.configure(&name_str, cap);
+        }
 
         let query_sql = query_sql.to_string();
 
@@ -668,6 +675,7 @@ impl LaminarDB {
                 or_replace: false,
                 if_not_exists: false,
                 query_sql: query_sql.clone(),
+                retention_bytes: None,
             };
             match planner.plan(&stmt) {
                 Ok(laminar_sql::planner::StreamingPlan::Query(ref qp)) => (
@@ -983,6 +991,7 @@ impl LaminarDB {
                 or_replace: false,
                 if_not_exists: false,
                 query_sql: query_sql.clone(),
+                retention_bytes: None,
             };
             match planner.plan(&stmt) {
                 Ok(laminar_sql::planner::StreamingPlan::Query(ref qp)) => (
