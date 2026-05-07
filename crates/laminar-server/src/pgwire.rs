@@ -1,7 +1,6 @@
-//! Postgres wire endpoint. Trust auth by default; MD5 password auth when
-//! `[server].pgwire_users` is non-empty. Non-loopback binds require both
-//! MD5 auth AND `pgwire_allow_remote = true` (two-key rule). TLS via
-//! tokio-rustls when `pgwire_tls_cert` and `pgwire_tls_key` are set.
+//! Postgres wire endpoint. Trust by default; MD5 with `pgwire_users`;
+//! TLS with `pgwire_tls_cert` + `pgwire_tls_key`. Non-loopback binds
+//! require `pgwire_allow_remote = true`.
 
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -508,15 +507,12 @@ impl PgWireServerHandlers for LaminarHandlerFactory {
     }
 }
 
-/// Cert + private-key paths for the pgwire TLS listener.
 pub struct TlsPaths<'a> {
     pub cert: &'a std::path::Path,
     pub key: &'a std::path::Path,
 }
 
-/// Warn if the key file is readable by anyone other than the owner.
-/// PostgreSQL refuses to start in this case; we warn rather than fail
-/// because dev environments often run with looser perms.
+/// Warn if the key file is group/other-readable.
 #[cfg(unix)]
 fn warn_if_key_world_readable(file: &std::fs::File, path: &std::path::Path) {
     use std::os::unix::fs::MetadataExt;
@@ -526,8 +522,7 @@ fn warn_if_key_world_readable(file: &std::fs::File, path: &std::path::Path) {
             warn!(
                 path = %path.display(),
                 mode = format!("{:o}", mode & 0o777),
-                "pgwire_tls_key permissions are too broad — postgres rejects \
-                 anything looser than 0600. Tighten before exposing the listener.",
+                "pgwire_tls_key permissions are too broad; tighten to 0600",
             );
         }
     }
@@ -536,9 +531,56 @@ fn warn_if_key_world_readable(file: &std::fs::File, path: &std::path::Path) {
 #[cfg(not(unix))]
 fn warn_if_key_world_readable(_file: &std::fs::File, _path: &std::path::Path) {}
 
-/// Map the result of `process_socket` to a stable audit-log code so SOC
-/// dashboards can split TLS handshake errors from auth failures and from
-/// generic runtime errors.
+/// Rolling-window auth-failure count per peer IP.
+#[derive(Debug, Default)]
+struct FailureTracker {
+    inner: parking_lot::Mutex<
+        HashMap<std::net::IpAddr, std::collections::VecDeque<std::time::Instant>>,
+    >,
+}
+
+impl FailureTracker {
+    fn is_blocked(&self, ip: std::net::IpAddr, limit: u32, window: std::time::Duration) -> bool {
+        if limit == 0 {
+            return false;
+        }
+        let cutoff = std::time::Instant::now() - window;
+        let mut inner = self.inner.lock();
+        let Some(failures) = inner.get_mut(&ip) else {
+            return false;
+        };
+        while failures.front().is_some_and(|t| *t < cutoff) {
+            failures.pop_front();
+        }
+        let blocked = failures.len() >= limit as usize;
+        if failures.is_empty() {
+            inner.remove(&ip);
+        }
+        blocked
+    }
+
+    fn record_failure(&self, ip: std::net::IpAddr) {
+        let mut inner = self.inner.lock();
+        // When full, evict the entry whose newest failure is oldest.
+        if !inner.contains_key(&ip) && inner.len() >= MAX_TRACKED_IPS {
+            if let Some(oldest) = inner
+                .iter()
+                .min_by_key(|(_, q)| q.back().copied())
+                .map(|(k, _)| *k)
+            {
+                inner.remove(&oldest);
+            }
+        }
+        inner
+            .entry(ip)
+            .or_default()
+            .push_back(std::time::Instant::now());
+    }
+}
+
+const MAX_TRACKED_IPS: usize = 4096;
+
+/// Stable audit code for a session's exit status.
 fn classify_outcome(result: &Result<(), std::io::Error>) -> &'static str {
     match result {
         Ok(()) => "ok",
@@ -558,11 +600,35 @@ fn classify_outcome(result: &Result<(), std::io::Error>) -> &'static str {
     }
 }
 
-/// Install aws-lc-rs as the process-wide rustls CryptoProvider. Idempotent —
-/// rustls returns `Err` if a provider is already installed, which we ignore.
-/// Required because other crates in the dep tree (delta-lake, iceberg) pull
-/// in rustls with their own provider features, leaving the auto-pick
-/// ambiguous.
+/// Reject certs past `notAfter`; warn within 30 days.
+#[allow(clippy::result_large_err)]
+fn check_cert_expiry(
+    der: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+    path: &std::path::Path,
+) -> Result<(), ServerError> {
+    use x509_parser::prelude::FromDer;
+    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der.as_ref())
+        .map_err(|e| ServerError::Http(format!("parse pgwire_tls_cert {}: {e}", path.display())))?;
+    let now = x509_parser::time::ASN1Time::now();
+    let not_after = cert.validity().not_after;
+    if not_after < now {
+        return Err(ServerError::Http(format!(
+            "pgwire_tls_cert {} expired at {not_after}",
+            path.display()
+        )));
+    }
+    let remaining = not_after.to_datetime() - now.to_datetime();
+    if remaining <= time::Duration::days(30) {
+        warn!(
+            path = %path.display(),
+            expires_at = %not_after,
+            "pgwire_tls_cert expires within 30 days; rotate before it lapses",
+        );
+    }
+    Ok(())
+}
+
+/// Idempotent install of aws-lc-rs as rustls' default provider.
 fn ensure_tls_provider() {
     let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
@@ -584,6 +650,9 @@ fn load_tls_acceptor(paths: TlsPaths<'_>) -> Result<tokio_rustls::TlsAcceptor, S
             "pgwire_tls_cert {} contains no certificates",
             paths.cert.display()
         )));
+    }
+    for cert in &certs {
+        check_cert_expiry(cert, paths.cert)?;
     }
 
     let key_file = File::open(paths.key)
@@ -611,6 +680,8 @@ pub async fn serve(
     users: HashMap<String, Secret>,
     allow_remote: bool,
     tls: Option<TlsPaths<'_>>,
+    max_connections: usize,
+    max_auth_failures_per_min: u32,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), ServerError> {
     let addr: SocketAddr = bind
         .parse()
@@ -659,6 +730,7 @@ pub async fn serve(
 
     // Track per-connection tasks so abort on the outer JoinHandle stops
     // active sessions in addition to the accept loop.
+    let failures = Arc::new(FailureTracker::default());
     let handle = tokio::spawn(async move {
         let mut sessions: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         loop {
@@ -669,8 +741,34 @@ pub async fn serve(
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((sock, peer)) => {
+                            if sessions.len() >= max_connections {
+                                tracing::info!(
+                                    target: "audit",
+                                    event = "pgwire.connection_rejected",
+                                    peer = %peer,
+                                    reason = "max_connections",
+                                    in_flight = sessions.len(),
+                                );
+                                drop(sock);
+                                continue;
+                            }
+                            if failures.is_blocked(
+                                peer.ip(),
+                                max_auth_failures_per_min,
+                                std::time::Duration::from_secs(60),
+                            ) {
+                                tracing::warn!(
+                                    target: "audit",
+                                    event = "pgwire.connection_rejected",
+                                    peer = %peer,
+                                    reason = "auth_failure_throttle",
+                                );
+                                drop(sock);
+                                continue;
+                            }
                             let factory_ref = Arc::clone(&factory);
                             let tls_ref = tls_acceptor.clone();
+                            let failures_ref = Arc::clone(&failures);
                             let peer_str = peer.to_string();
                             tracing::info!(
                                 target: "audit",
@@ -679,9 +777,13 @@ pub async fn serve(
                                 auth = auth_mode,
                                 tls = tls_mode,
                             );
+                            let peer_ip = peer.ip();
                             sessions.spawn(async move {
                                 let result = process_socket(sock, tls_ref, factory_ref).await;
                                 let outcome = classify_outcome(&result);
+                                if outcome == "auth_failed" {
+                                    failures_ref.record_failure(peer_ip);
+                                }
                                 tracing::info!(
                                     target: "audit",
                                     event = "pgwire.connection_closed",
@@ -820,10 +922,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failure_tracker_blocks_after_threshold() {
+        use std::net::{IpAddr, Ipv4Addr};
+        use std::time::Duration;
+        let ip: IpAddr = Ipv4Addr::LOCALHOST.into();
+        let tracker = super::FailureTracker::default();
+        let limit = 3;
+        let window = Duration::from_secs(60);
+
+        for _ in 0..limit {
+            assert!(!tracker.is_blocked(ip, limit, window));
+            tracker.record_failure(ip);
+        }
+        assert!(tracker.is_blocked(ip, limit, window));
+    }
+
+    #[test]
+    fn failure_tracker_disabled_when_limit_zero() {
+        use std::net::{IpAddr, Ipv4Addr};
+        use std::time::Duration;
+        let ip: IpAddr = Ipv4Addr::LOCALHOST.into();
+        let tracker = super::FailureTracker::default();
+        for _ in 0..100 {
+            tracker.record_failure(ip);
+        }
+        assert!(!tracker.is_blocked(ip, 0, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn failure_tracker_expires_old_entries() {
+        use std::net::{IpAddr, Ipv4Addr};
+        use std::time::Duration;
+        let ip: IpAddr = Ipv4Addr::LOCALHOST.into();
+        let tracker = super::FailureTracker::default();
+        for _ in 0..5 {
+            tracker.record_failure(ip);
+        }
+        // Window of 0 means every recorded failure is already expired.
+        assert!(!tracker.is_blocked(ip, 5, Duration::from_secs(0)));
+    }
+
+    #[test]
+    fn failure_tracker_caps_distinct_ips() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let tracker = super::FailureTracker::default();
+        // Push past the cap; map size must stay bounded.
+        for i in 0..(super::MAX_TRACKED_IPS + 100) {
+            #[allow(clippy::cast_possible_truncation)]
+            let ip: IpAddr = Ipv4Addr::new(10, 0, (i / 256) as u8, (i % 256) as u8).into();
+            tracker.record_failure(ip);
+        }
+        let len = tracker.inner.lock().len();
+        assert!(
+            len <= super::MAX_TRACKED_IPS,
+            "tracker exceeded cap: {len} > {}",
+            super::MAX_TRACKED_IPS
+        );
+    }
+
     #[tokio::test]
     async fn serve_rejects_remote_bind_in_trust_mode() {
         let db = Arc::new(LaminarDB::open().expect("db opens"));
-        let err = serve(db, "0.0.0.0:0", HashMap::new(), false, None)
+        let err = serve(db, "0.0.0.0:0", HashMap::new(), false, None, 256, 10)
             .await
             .expect_err("trust + 0.0.0.0 must fail");
         assert!(err.to_string().contains("trust auth"), "got: {err}");
@@ -834,7 +995,7 @@ mod tests {
         let db = Arc::new(LaminarDB::open().expect("db opens"));
         let mut users = HashMap::new();
         users.insert("alice".into(), Secret::new("wonderland-key"));
-        let err = serve(db, "0.0.0.0:0", users, false, None)
+        let err = serve(db, "0.0.0.0:0", users, false, None, 256, 10)
             .await
             .expect_err("md5 + 0.0.0.0 without allow_remote must fail");
         assert!(
@@ -874,9 +1035,10 @@ mod integration_tests {
         .expect("create mv");
         db.start().await.expect("db starts");
 
-        let (addr, handle) = super::serve(Arc::clone(&db), "127.0.0.1:0", users, false, None)
-            .await
-            .expect("pgwire serve");
+        let (addr, handle) =
+            super::serve(Arc::clone(&db), "127.0.0.1:0", users, false, None, 256, 10)
+                .await
+                .expect("pgwire serve");
         (addr, handle)
     }
 
@@ -1092,6 +1254,51 @@ mod integration_tests {
         handle.abort();
     }
 
+    #[tokio::test]
+    async fn connection_cap_drops_excess_clients() {
+        // Cap of 1; first client occupies the slot, second is dropped.
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
+            .await
+            .expect("create source");
+        db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades")
+            .await
+            .expect("create mv");
+        db.start().await.expect("db starts");
+        let (addr, handle) = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            None,
+            1,
+            10,
+        )
+        .await
+        .expect("pgwire serve");
+
+        // First client occupies the slot via SUBSCRIBE (stays open until drop).
+        let first = connect(addr).await;
+        let _bg = tokio::spawn(async move {
+            let _ = first.simple_query("SUBSCRIBE prices").await;
+        });
+        // Give the server a moment to register the session in the JoinSet.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Second connect: server accepts the TCP, then closes it because the
+        // cap is hit. tokio_postgres surfaces this as an IO error during
+        // startup. Exact string varies; just assert it failed.
+        let conn_str = format!(
+            "host={} port={} user=any dbname=laminardb",
+            addr.ip(),
+            addr.port()
+        );
+        let result = tokio_postgres::connect(&conn_str, NoTls).await;
+        assert!(result.is_err(), "second connect must be refused");
+
+        handle.abort();
+    }
+
     /// Self-signed cert+key written to a tempdir for the duration of the
     /// test. `rcgen` is the well-maintained option for ad-hoc certs.
     fn self_signed_pem() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -1103,6 +1310,44 @@ mod integration_tests {
         std::fs::write(&cert_path, cert.cert.pem()).unwrap();
         std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
         (dir, cert_path, key_path)
+    }
+
+    /// Self-signed cert with notAfter in the past, for the expiry test.
+    fn expired_self_signed_pem() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let one_year_ago = time::OffsetDateTime::now_utc() - time::Duration::days(365);
+        params.not_before = one_year_ago - time::Duration::days(2);
+        params.not_after = one_year_ago;
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key.serialize_pem()).unwrap();
+        (dir, cert_path, key_path)
+    }
+
+    #[tokio::test]
+    async fn tls_load_rejects_expired_cert() {
+        let (_dir, cert_path, key_path) = expired_self_signed_pem();
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        db.start().await.expect("db starts");
+        let err = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            Some(super::TlsPaths {
+                cert: &cert_path,
+                key: &key_path,
+            }),
+            256,
+            10,
+        )
+        .await
+        .expect_err("expired cert must be rejected");
+        assert!(err.to_string().contains("expired"), "got: {err}");
     }
 
     #[tokio::test]
@@ -1119,6 +1364,8 @@ mod integration_tests {
                 cert: &cert_path,
                 key: &key_path,
             }),
+            256,
+            10,
         )
         .await
         .expect("pgwire serve");
