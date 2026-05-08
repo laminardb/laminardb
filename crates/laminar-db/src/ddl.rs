@@ -719,6 +719,7 @@ impl LaminarDB {
             .map_err(|e| {
                 self.catalog.drop_stream(&name_str);
                 self.connector_manager.lock().unregister_stream(&name_str);
+                self.subscription_registry.drop_name(&name_str);
                 DbError::Pipeline(format!(
                     "control channel busy, retry CREATE STREAM '{name_str}': {e}"
                 ))

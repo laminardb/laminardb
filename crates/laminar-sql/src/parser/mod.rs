@@ -482,7 +482,12 @@ fn parse_create_stream(
     let (head_tokens, with_tokens) = split_off_trailing_with(&remaining);
     let (query_tokens, emit_tokens) = split_at_emit(&head_tokens);
 
-    let query_sql = query_body_sql(original_sql, &query_tokens, &emit_tokens);
+    let query_sql = query_body_sql(
+        original_sql,
+        &query_tokens,
+        &emit_tokens,
+        with_tokens.as_deref(),
+    );
 
     let stream_dialect = LaminarDialect::default();
 
@@ -593,13 +598,15 @@ fn extract_retention_bytes(
     }
 }
 
-/// Slice `original_sql` from the first query token to the start of EMIT
-/// (or end of input). Preserves custom streaming syntax that sqlparser's
-/// AST would drop. Falls back to joining token text if spans are empty.
+/// Slice `original_sql` from the first query token to whichever trailing
+/// clause comes next (`EMIT` or `WITH`), or end of input if neither is
+/// present. Preserves custom streaming syntax that sqlparser's AST would
+/// drop. Falls back to joining token text if spans are empty.
 pub(super) fn query_body_sql(
     original_sql: &str,
     query_tokens: &[sqlparser::tokenizer::TokenWithSpan],
     emit_tokens: &[sqlparser::tokenizer::TokenWithSpan],
+    with_tokens: Option<&[sqlparser::tokenizer::TokenWithSpan]>,
 ) -> String {
     use sqlparser::tokenizer::Token;
 
@@ -608,10 +615,11 @@ pub(super) fn query_body_sql(
             .iter()
             .find(|t| !matches!(t.token, Token::EOF))?;
         let start = location_to_byte_offset(original_sql, first.span.start)?;
-        let end = match emit_tokens.first() {
-            Some(t) => location_to_byte_offset(original_sql, t.span.start)?,
-            None => original_sql.len(),
-        };
+        let trailer_starts = [emit_tokens.first(), with_tokens.and_then(|t| t.first())]
+            .into_iter()
+            .flatten()
+            .filter_map(|t| location_to_byte_offset(original_sql, t.span.start));
+        let end = trailer_starts.min().unwrap_or(original_sql.len());
         let slice = original_sql.get(start..end)?;
         Some(
             slice
@@ -896,7 +904,7 @@ fn parse_create_materialized_view(
     let remaining = collect_remaining_tokens(parser);
     let (query_tokens, emit_tokens) = split_at_emit(&remaining);
 
-    let query_sql = query_body_sql(original_sql, &query_tokens, &emit_tokens);
+    let query_sql = query_body_sql(original_sql, &query_tokens, &emit_tokens, None);
 
     let mv_dialect = LaminarDialect::default();
 
@@ -1474,6 +1482,27 @@ mod tests {
         let res = parse_streaming_sql("CREATE STREAM s AS SELECT * FROM e WITH ('bogus' = '1')");
         let err = res.expect_err("unknown WITH key must error");
         assert!(err.to_string().contains("bogus"), "got: {err}");
+    }
+
+    #[test]
+    fn create_stream_with_retain_history_excludes_with_from_query_sql() {
+        // Regression: query_body_sql used to extend to original_sql.len() when
+        // EMIT was absent, which sucked the trailing WITH clause into query_sql
+        // and broke planner re-parsing.
+        let stmt = parse_one(
+            "CREATE STREAM trades AS SELECT * FROM events WITH ('retain_history' = '64mb')",
+        );
+        let StreamingStatement::CreateStream { query_sql, .. } = stmt else {
+            panic!("expected CreateStream");
+        };
+        assert!(
+            !query_sql.to_uppercase().contains("RETAIN_HISTORY"),
+            "query_sql leaked WITH clause: {query_sql}"
+        );
+        assert!(
+            query_sql.contains("FROM events"),
+            "query_sql should still hold the SELECT body, got: {query_sql}"
+        );
     }
 
     #[test]
