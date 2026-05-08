@@ -3781,7 +3781,10 @@ async fn test_nullif_float_with_int_literal_runs_without_error() {
 #[tokio::test]
 async fn open_subscription_resolves_unknown_name_to_error() {
     let db = LaminarDB::open().unwrap();
-    let err = db.open_subscription("nope", None).await.unwrap_err();
+    let err = db
+        .open_subscription("nope", None, crate::subscription::SubscribeStart::Tail)
+        .await
+        .unwrap_err();
     assert!(matches!(err, DbError::StreamNotFound(_)));
 }
 
@@ -3801,7 +3804,11 @@ async fn open_subscription_resolves_named_stream() {
     db.start().await.unwrap();
 
     let mut portal = db
-        .open_subscription("all_trades", None)
+        .open_subscription(
+            "all_trades",
+            None,
+            crate::subscription::SubscribeStart::Tail,
+        )
         .await
         .expect("portal opens");
 
@@ -3841,7 +3848,11 @@ async fn open_subscription_with_invalid_filter_errors_at_open() {
         .unwrap();
 
     let err = db
-        .open_subscription("trades", Some("nonexistent_col > 1"))
+        .open_subscription(
+            "trades",
+            Some("nonexistent_col > 1"),
+            crate::subscription::SubscribeStart::Tail,
+        )
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -3864,7 +3875,11 @@ async fn open_subscription_with_filter_on_stream_before_start_is_rejected() {
         .unwrap();
 
     let err = db
-        .open_subscription("all_trades", Some("symbol = 'AAPL'"))
+        .open_subscription(
+            "all_trades",
+            Some("symbol = 'AAPL'"),
+            crate::subscription::SubscribeStart::Tail,
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("not resolved"), "got: {err}");
@@ -3886,7 +3901,11 @@ async fn open_subscription_with_filter_on_stream_after_start_compiles() {
     db.start().await.unwrap();
 
     let portal = db
-        .open_subscription("all_trades", Some("symbol = 'AAPL'"))
+        .open_subscription(
+            "all_trades",
+            Some("symbol = 'AAPL'"),
+            crate::subscription::SubscribeStart::Tail,
+        )
         .await
         .expect("WHERE on a started stream must compile");
     portal.close();
@@ -3907,7 +3926,10 @@ async fn drop_stream_closes_subscription() {
         .unwrap();
     db.start().await.unwrap();
 
-    let mut portal = db.open_subscription("s", None).await.unwrap();
+    let mut portal = db
+        .open_subscription("s", None, crate::subscription::SubscribeStart::Tail)
+        .await
+        .unwrap();
 
     db.execute("DROP STREAM s").await.unwrap();
 
@@ -3917,4 +3939,86 @@ async fn drop_stream_closes_subscription() {
     })
     .await
     .expect("portal must close");
+}
+
+#[tokio::test]
+async fn create_stream_with_retain_history_enables_as_of_replay() {
+    use crate::subscription::SubscribeStart;
+
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
+        .await
+        .unwrap();
+    db.execute("CREATE STREAM all_trades AS SELECT * FROM trades WITH ('retain_history' = '4mb')")
+        .await
+        .unwrap();
+
+    // Drive the registry directly: barrier(1) -> batch -> barrier(2). We're
+    // not testing the pipeline; we're testing that DDL plumbed the cap so
+    // the buffer actually retains.
+    let reg = &db.subscription_registry;
+    reg.broadcast_barrier(1, 100);
+
+    let schema = db.source_untyped("trades").unwrap().schema().clone();
+    let batch = arrow_array::RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(arrow::array::StringArray::from(vec!["AAPL"])),
+            Arc::new(arrow::array::Float64Array::from(vec![150.0])),
+        ],
+    )
+    .unwrap();
+    reg.send_batch("all_trades", batch);
+    reg.broadcast_barrier(2, 200);
+
+    // Subscribe AS OF EPOCH 1 — should replay batch + barrier(2).
+    let mut portal = db
+        .open_subscription("all_trades", None, SubscribeStart::AsOfEpoch(1))
+        .await
+        .expect("AS OF EPOCH 1 must be retained");
+
+    let frames = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let mut frames = Vec::new();
+        for _ in 0..2 {
+            if let Some(f) = portal.next_frame().await {
+                frames.push(f);
+            }
+        }
+        frames
+    })
+    .await
+    .expect("frames within 1s");
+    assert_eq!(frames.len(), 2);
+    assert!(matches!(
+        frames[0],
+        crate::subscription::PortalFrame::Batch(_)
+    ));
+    assert!(matches!(
+        frames[1],
+        crate::subscription::PortalFrame::Barrier { epoch: 2, .. }
+    ));
+}
+
+#[tokio::test]
+async fn open_subscription_as_of_unretained_returns_invalid_operation() {
+    use crate::subscription::SubscribeStart;
+
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE trades (symbol VARCHAR)")
+        .await
+        .unwrap();
+    db.execute("CREATE STREAM all_trades AS SELECT * FROM trades")
+        .await
+        .unwrap();
+
+    // No retention configured: AS OF anything must be pruned.
+    let err = db
+        .open_subscription("all_trades", None, SubscribeStart::AsOfEpoch(1))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DbError::InvalidOperation(_)),
+        "expected InvalidOperation, got: {err:?}"
+    );
+    assert!(err.to_string().contains("no longer retained"), "msg: {err}");
 }

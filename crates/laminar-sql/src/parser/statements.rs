@@ -142,6 +142,8 @@ pub enum StreamingStatement {
         if_not_exists: bool,
         /// Raw query text between `AS` and `EMIT`.
         query_sql: String,
+        /// `RETAIN_HISTORY` cap in bytes from the trailing `WITH (...)`.
+        retention_bytes: Option<u64>,
     },
 
     /// DROP STREAM statement
@@ -196,13 +198,15 @@ pub enum StreamingStatement {
     Subscribe(Box<SubscribeStatement>),
 }
 
-/// `SUBSCRIBE <name> [WHERE <fragment>] [WITH (...)]`.
+/// `SUBSCRIBE <name> [AS OF EPOCH n] [WHERE <fragment>] [WITH (...)]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubscribeStatement {
     /// Target stream or materialized view name.
     pub name: ObjectName,
     /// Raw WHERE fragment, compiled by the engine against the target schema.
     pub filter_sql: Option<String>,
+    /// `AS OF EPOCH n`: replay everything emitted strictly after barrier `n`.
+    pub as_of_epoch: Option<u64>,
     /// Reserved for future WITH options.
     pub options: HashMap<String, String>,
 }

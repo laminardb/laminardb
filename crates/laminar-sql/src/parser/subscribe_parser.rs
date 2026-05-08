@@ -15,6 +15,8 @@ pub fn parse_subscribe(parser: &mut Parser) -> Result<SubscribeStatement, ParseE
         .parse_object_name(false)
         .map_err(ParseError::SqlParseError)?;
 
+    let as_of_epoch = parse_as_of_epoch(parser)?;
+
     // Validate via sqlparser then round-trip; filter_compile re-parses anyway.
     let filter_sql = if parser.parse_keyword(Keyword::WHERE) {
         let expr = parser.parse_expr().map_err(ParseError::SqlParseError)?;
@@ -37,8 +39,31 @@ pub fn parse_subscribe(parser: &mut Parser) -> Result<SubscribeStatement, ParseE
     Ok(SubscribeStatement {
         name,
         filter_sql,
+        as_of_epoch,
         options,
     })
+}
+
+fn parse_as_of_epoch(parser: &mut Parser) -> Result<Option<u64>, ParseError> {
+    if !parser.parse_keyword(Keyword::AS) {
+        return Ok(None);
+    }
+    if !parser.parse_keyword(Keyword::OF) {
+        return Err(ParseError::StreamingError(
+            "expected `OF` after `AS`".to_string(),
+        ));
+    }
+    expect_custom_keyword(parser, "EPOCH")?;
+    match parser.next_token().token {
+        Token::Number(n, _) => n.parse::<u64>().map(Some).map_err(|_| {
+            ParseError::StreamingError(format!(
+                "invalid epoch: {n} (expected non-negative integer)"
+            ))
+        }),
+        other => Err(ParseError::StreamingError(format!(
+            "expected integer after `AS OF EPOCH`, found {other}"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -117,5 +142,39 @@ mod tests {
     #[test]
     fn rejects_with_before_where() {
         assert!(parse("SUBSCRIBE foo WITH ('snapshot' = 'true') WHERE c > 1").is_err());
+    }
+
+    #[test]
+    fn parses_as_of_epoch() {
+        let stmt = parse("SUBSCRIBE foo AS OF EPOCH 42").expect("parse");
+        assert_eq!(stmt.as_of_epoch, Some(42));
+    }
+
+    #[test]
+    fn as_of_then_where_then_with() {
+        let stmt = parse("SUBSCRIBE foo AS OF EPOCH 7 WHERE c > 1 WITH ('snapshot' = 'true')")
+            .expect("parse");
+        assert_eq!(stmt.as_of_epoch, Some(7));
+        assert!(stmt.filter_sql.is_some());
+        assert_eq!(
+            stmt.options.get("snapshot").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn rejects_as_of_without_epoch_keyword() {
+        // `AS OF SYSTEM TIME ...` is not yet supported.
+        assert!(parse("SUBSCRIBE foo AS OF SYSTEM TIME '...'").is_err());
+    }
+
+    #[test]
+    fn rejects_as_of_with_non_integer() {
+        assert!(parse("SUBSCRIBE foo AS OF EPOCH 'abc'").is_err());
+    }
+
+    #[test]
+    fn rejects_negative_epoch() {
+        assert!(parse("SUBSCRIBE foo AS OF EPOCH -1").is_err());
     }
 }
