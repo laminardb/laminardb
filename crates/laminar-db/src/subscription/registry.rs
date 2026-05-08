@@ -63,11 +63,7 @@ impl StreamLog {
         if g.cap > 0 {
             g.bytes += approx_size(&msg);
             g.buf.push_back(msg.clone());
-            while g.bytes > g.cap && g.buf.len() > 1 {
-                if let Some(evicted) = g.buf.pop_front() {
-                    g.bytes = g.bytes.saturating_sub(approx_size(&evicted));
-                }
-            }
+            evict_to_cap(&mut g);
         }
         let _ = g.sender.send(msg);
     }
@@ -88,19 +84,19 @@ impl StreamLog {
     fn set_cap(&self, cap: usize) {
         let mut g = self.inner.lock();
         g.cap = cap;
-        while g.cap > 0 && g.bytes > g.cap && g.buf.len() > 1 {
-            if let Some(evicted) = g.buf.pop_front() {
-                g.bytes = g.bytes.saturating_sub(approx_size(&evicted));
-            }
-        }
-        if g.cap == 0 {
-            g.buf.clear();
-            g.bytes = 0;
-        }
+        evict_to_cap(&mut g);
     }
 
     fn subscriber_count(&self) -> usize {
         self.inner.lock().sender.receiver_count()
+    }
+}
+
+fn evict_to_cap(g: &mut StreamLogInner) {
+    while g.bytes > g.cap && !g.buf.is_empty() {
+        if let Some(evicted) = g.buf.pop_front() {
+            g.bytes = g.bytes.saturating_sub(approx_size(&evicted));
+        }
     }
 }
 
@@ -352,6 +348,21 @@ mod tests {
             .subscribe("mv", SubscribeStart::AsOfEpoch(1))
             .unwrap_err();
         assert!(err.earliest_retained >= 9 || err.earliest_retained == 0);
+    }
+
+    #[test]
+    fn single_oversize_message_is_evicted_not_retained() {
+        // A batch larger than the entire cap must not stick around — better
+        // to surface pruned at AS OF time than silently blow the budget.
+        let reg = SubscriptionRegistry::new();
+        reg.configure("mv", 8); // tiny cap, smaller than any real batch
+        reg.broadcast_barrier(1, 1);
+        reg.send_batch("mv", batch(&[1, 2, 3, 4, 5, 6, 7, 8]));
+
+        let err = reg
+            .subscribe("mv", SubscribeStart::AsOfEpoch(1))
+            .unwrap_err();
+        assert_eq!(err.earliest_retained, 0, "buffer should be empty");
     }
 
     #[test]
