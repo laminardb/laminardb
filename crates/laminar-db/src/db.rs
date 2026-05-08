@@ -1128,15 +1128,12 @@ impl LaminarDB {
     }
 
     /// Open a SUBSCRIBE portal against a named MV, source, or stream.
-    /// `filter_sql` is rejected on streams (their schema is opaque). `start`
-    /// controls whether the subscriber sees only future frames (`Tail`) or
-    /// replays history from a specific checkpoint epoch (`AsOfEpoch`).
+    /// `filter_sql` is rejected on streams (their schema is opaque).
     ///
     /// # Errors
-    /// Returns `StreamNotFound` if `name` is unknown; `Pipeline` if the
-    /// subscriber cap is reached or the filter fails to compile;
-    /// `InvalidOperation` if `AsOfEpoch(n)` was requested but `n` is no
-    /// longer retained.
+    /// `StreamNotFound` for unknown `name`; `Pipeline` for subscriber-cap
+    /// or filter-compile failures; `InvalidOperation` when `AsOfEpoch(n)`
+    /// is requested but `n` is no longer retained.
     pub async fn open_subscription(
         &self,
         name: &str,

@@ -44,9 +44,6 @@ pub fn parse_subscribe(parser: &mut Parser) -> Result<SubscribeStatement, ParseE
     })
 }
 
-/// Parses an optional `AS OF EPOCH <integer>` clause. Returns `Ok(None)` if
-/// the next token isn't `AS`. EPOCH is the only spelling for now; TIMESTAMP
-/// resolution is a follow-up.
 fn parse_as_of_epoch(parser: &mut Parser) -> Result<Option<u64>, ParseError> {
     if !parser.parse_keyword(Keyword::AS) {
         return Ok(None);

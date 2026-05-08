@@ -535,10 +535,8 @@ fn parse_create_stream(
     })
 }
 
-/// Find the last top-level `WITH (` and split the token stream there. The
-/// returned tail (when present) ends with EOF and is suitable for feeding to
-/// `parse_with_options`. CTE-style `WITH ident AS (...)` is ignored because
-/// it is followed by an identifier, not `(`.
+/// Split off a trailing `WITH (` at depth 0. CTE-style `WITH ident AS (...)`
+/// is ignored because it's followed by an identifier, not `(`.
 fn split_off_trailing_with(
     tokens: &[sqlparser::tokenizer::TokenWithSpan],
 ) -> (
@@ -574,8 +572,7 @@ fn split_off_trailing_with(
     }
 }
 
-/// Pull `RETAIN_HISTORY` out of the WITH-options map and parse it as a byte
-/// size. Unknown keys are rejected so typos surface immediately.
+/// Unknown keys are rejected so typos surface immediately.
 fn extract_retention_bytes(
     opts: &std::collections::HashMap<String, String>,
 ) -> Result<Option<u64>, ParseError> {

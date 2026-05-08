@@ -653,7 +653,6 @@ impl LaminarDB {
         let name_str = name.to_string();
         self.catalog.register_stream(&name_str)?;
 
-        // None leaves retention off; AS OF on this stream will return pruned.
         if let Some(bytes) = retention_bytes {
             let cap = usize::try_from(bytes).unwrap_or(usize::MAX);
             self.subscription_registry.configure(&name_str, cap);

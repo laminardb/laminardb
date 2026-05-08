@@ -1,11 +1,6 @@
-//! Per-name replayable broadcast log for SUBSCRIBE.
-//!
-//! Each registered name owns a `StreamLog`: a small ring buffer of recent
-//! `MvUpdate`s plus a live broadcast channel. Sending appends to the ring
-//! (with byte-bounded eviction) and broadcasts. Subscribing under the same
-//! lock atomically snapshots the ring and attaches a fresh receiver, so a
-//! consumer that asks for `AS OF EPOCH N` can replay the tail of the log
-//! and then stream live without a gap between the two.
+//! Per-name replayable broadcast log for SUBSCRIBE. Send and subscribe
+//! are serialized by one mutex per stream so the (replay snapshot, live
+//! receiver) pair an `AS OF EPOCH n` consumer gets has no gap.
 
 #![allow(clippy::disallowed_types)] // cold path
 
@@ -33,11 +28,9 @@ pub enum SubscribeStart {
     AsOfEpoch(u64),
 }
 
-/// Returned when `AsOfEpoch(n)` is requested but `n` is no longer in the log.
 #[derive(Debug)]
 pub(crate) struct ReplayPruned {
-    /// The earliest barrier epoch the log can still serve, or `0` if the log
-    /// is empty / has no barriers retained.
+    /// Earliest barrier epoch still in the log, or `0` if none retained.
     pub(crate) earliest_retained: u64,
 }
 
@@ -148,17 +141,12 @@ impl SubscriptionRegistry {
         }
     }
 
-    /// Set the retention byte cap for `name`, creating the log if needed.
-    /// `cap == 0` disables retention (the live broadcast still works, but
-    /// no replay buffer is kept).
+    /// `cap == 0` disables retention; the live broadcast still works.
     pub(crate) fn configure(&self, name: &str, cap: usize) {
         let log = self.get_or_create(name);
         log.set_cap(cap);
     }
 
-    /// Attach a receiver. If `start` is `AsOfEpoch(n)` and `n` is no longer
-    /// retained, returns the `ReplayPruned` error so the caller can surface
-    /// it as a typed wire-level error.
     pub(crate) fn subscribe(
         &self,
         name: &str,
@@ -168,14 +156,12 @@ impl SubscriptionRegistry {
         log.subscribe(start)
     }
 
-    /// Send a batch to subscribers of `name`. No-op if no log exists yet.
     pub(crate) fn send_batch(&self, name: &str, batch: RecordBatch) {
         if let Some(log) = self.streams.read().get(name).cloned() {
             log.send(MvUpdate::Batch(batch));
         }
     }
 
-    /// Broadcast a barrier marker to every registered name.
     pub(crate) fn broadcast_barrier(&self, epoch: u64, checkpoint_id: u64) {
         let msg = MvUpdate::Barrier {
             epoch,
@@ -186,7 +172,6 @@ impl SubscriptionRegistry {
         }
     }
 
-    /// Drop the log for `name`. Existing receivers see `Closed`.
     pub(crate) fn drop_name(&self, name: &str) -> bool {
         self.streams.write().remove(name).is_some()
     }

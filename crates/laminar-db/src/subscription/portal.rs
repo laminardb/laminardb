@@ -120,9 +120,8 @@ impl Drop for SubscriptionPortal {
     }
 }
 
-/// Translate one `MvUpdate` into a `PortalFrame`, applying the filter if any.
-/// Returns `Ok(None)` for batches the filter excluded entirely, and `Err(())`
-/// when the filter itself failed (the pump should close).
+/// `Ok(None)` when the filter excluded the batch; `Err(())` when the
+/// filter itself failed (caller should close the pump).
 fn translate(
     msg: MvUpdate,
     filter: Option<&Arc<dyn PhysicalExpr>>,

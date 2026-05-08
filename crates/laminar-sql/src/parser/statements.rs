@@ -142,10 +142,7 @@ pub enum StreamingStatement {
         if_not_exists: bool,
         /// Raw query text between `AS` and `EMIT`.
         query_sql: String,
-        /// `RETAIN_HISTORY` cap in bytes from the trailing `WITH (...)` clause.
-        /// `None` means retention is off (matches today's behavior); `Some(n)`
-        /// keeps `n` bytes of recent broadcast updates so SUBSCRIBE clients
-        /// can resume `AS OF EPOCH N` after a brief disconnect.
+        /// `RETAIN_HISTORY` cap in bytes from the trailing `WITH (...)`.
         retention_bytes: Option<u64>,
     },
 
@@ -208,9 +205,7 @@ pub struct SubscribeStatement {
     pub name: ObjectName,
     /// Raw WHERE fragment, compiled by the engine against the target schema.
     pub filter_sql: Option<String>,
-    /// `AS OF EPOCH n`: replay everything emitted strictly after the
-    /// barrier with `epoch == n` before delivering live updates. Errors at
-    /// open if the requested epoch is no longer retained.
+    /// `AS OF EPOCH n`: replay everything emitted strictly after barrier `n`.
     pub as_of_epoch: Option<u64>,
     /// Reserved for future WITH options.
     pub options: HashMap<String, String>,
