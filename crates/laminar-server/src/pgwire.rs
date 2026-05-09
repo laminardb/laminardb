@@ -413,9 +413,7 @@ fn encode_row(
         let info = &fields[i];
         match info.format() {
             FieldFormat::Text => encode_field_text(&mut enc, col.as_ref(), row, &formatters[i])?,
-            FieldFormat::Binary => {
-                encode_field_binary(&mut enc, col.as_ref(), row, info.name())?
-            }
+            FieldFormat::Binary => encode_field_binary(&mut enc, col.as_ref(), row, info.name())?,
         }
     }
     Ok(enc.take_row())
@@ -476,35 +474,60 @@ fn encode_field_binary(
         DataType::UInt64 => prim!(UInt64Type, |x: u64| i64::try_from(x).unwrap_or(i64::MAX)),
         DataType::Float32 => prim!(Float32Type, |x: f32| f64::from(x)),
         DataType::Float64 => prim!(Float64Type, |x: f64| x),
-        DataType::Boolean => {
-            enc.encode_field(&Some(col.as_any().downcast_ref::<BooleanArray>().unwrap().value(row)))
-        }
+        DataType::Boolean => enc.encode_field(&Some(
+            col.as_any()
+                .downcast_ref::<BooleanArray>()
+                .unwrap()
+                .value(row),
+        )),
         DataType::Utf8 => enc.encode_field(&Some(col.as_string::<i32>().value(row))),
         DataType::LargeUtf8 => enc.encode_field(&Some(col.as_string::<i64>().value(row))),
         DataType::Timestamp(unit, _tz) => {
+            // Each unit has its own Arrow type — `PrimitiveArray<TimestampMicrosecondType>`
+            // is *not* `PrimitiveArray<Int64Type>`, so the downcast must match the unit.
             use arrow_array::temporal_conversions::{
                 timestamp_ms_to_datetime, timestamp_ns_to_datetime, timestamp_s_to_datetime,
                 timestamp_us_to_datetime,
             };
             use arrow_schema::TimeUnit;
-            let raw = col.as_primitive::<Int64Type>().value(row);
-            let dt = match unit {
-                TimeUnit::Second => timestamp_s_to_datetime(raw),
-                TimeUnit::Millisecond => timestamp_ms_to_datetime(raw),
-                TimeUnit::Microsecond => timestamp_us_to_datetime(raw),
-                TimeUnit::Nanosecond => timestamp_ns_to_datetime(raw),
-            }
-            .ok_or_else(|| user_error("22008", format!("timestamp out of range: {raw}")))?;
+            let (raw, dt) = match unit {
+                TimeUnit::Second => {
+                    let v = col.as_primitive::<TimestampSecondType>().value(row);
+                    (v, timestamp_s_to_datetime(v))
+                }
+                TimeUnit::Millisecond => {
+                    let v = col.as_primitive::<TimestampMillisecondType>().value(row);
+                    (v, timestamp_ms_to_datetime(v))
+                }
+                TimeUnit::Microsecond => {
+                    let v = col.as_primitive::<TimestampMicrosecondType>().value(row);
+                    (v, timestamp_us_to_datetime(v))
+                }
+                TimeUnit::Nanosecond => {
+                    let v = col.as_primitive::<TimestampNanosecondType>().value(row);
+                    (v, timestamp_ns_to_datetime(v))
+                }
+            };
+            let dt =
+                dt.ok_or_else(|| user_error("22008", format!("timestamp out of range: {raw}")))?;
             enc.encode_field(&Some(dt))
         }
         DataType::Date32 => {
-            let v = col.as_any().downcast_ref::<Date32Array>().unwrap().value(row);
+            let v = col
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap()
+                .value(row);
             let dt = arrow_array::temporal_conversions::date32_to_datetime(v)
                 .ok_or_else(|| user_error("22008", format!("DATE out of range: {v}")))?;
             enc.encode_field(&Some(dt.date()))
         }
         DataType::Date64 => {
-            let v = col.as_any().downcast_ref::<Date64Array>().unwrap().value(row);
+            let v = col
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .unwrap()
+                .value(row);
             let dt = arrow_array::temporal_conversions::date64_to_datetime(v)
                 .ok_or_else(|| user_error("22008", format!("DATE out of range: {v}")))?;
             enc.encode_field(&Some(dt.date()))
@@ -673,10 +696,9 @@ impl QueryParser for LaminarQueryParser {
         match stmt {
             StreamingStatement::Subscribe(s) => {
                 let name = s.name.to_string();
-                let (schema, _) =
-                    self.db.lookup_subscription_schema(&name).ok_or_else(|| {
-                        user_error("42P01", format!("SUBSCRIBE '{name}': stream not found"))
-                    })?;
+                let (schema, _) = self.db.lookup_subscription_schema(&name).ok_or_else(|| {
+                    user_error("42P01", format!("SUBSCRIBE '{name}': stream not found"))
+                })?;
                 Ok(LaminarStmt::Subscribe {
                     name,
                     filter_sql: s.filter_sql,
@@ -1864,6 +1886,84 @@ mod integration_tests {
 
         // Don't roll back — the SUBSCRIBE never completes, so let the
         // server-side abort tear it down.
+        handle.abort();
+    }
+
+    /// Regression: binary encoding of `TIMESTAMP` columns must downcast
+    /// the Arrow array as its unit-specific primitive type
+    /// (`PrimitiveArray<TimestampMicrosecondType>`, not
+    /// `PrimitiveArray<Int64Type>`). A bug in this branch would panic on
+    /// the first row.
+    #[tokio::test]
+    async fn extended_query_binary_timestamp() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        // `WATERMARK FOR ts AS ts - INTERVAL '0' SECOND` declares event time
+        // so the streaming pipeline drives progress on the timestamp
+        // column — without it, the MV stays empty.
+        db.execute(
+            "CREATE SOURCE events (ts TIMESTAMP, sym VARCHAR, \
+             WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+        )
+        .await
+        .expect("create source");
+        db.execute("CREATE MATERIALIZED VIEW ev AS SELECT ts, sym FROM events")
+            .await
+            .expect("create mv");
+        db.start().await.expect("db starts");
+
+        let (addr, handle) = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            None,
+            256,
+            10,
+        )
+        .await
+        .expect("pgwire serve");
+
+        // Push one row: ts = 2026-05-09T00:00:00Z, sym = AAPL.
+        let ts_us = 1_778_544_000_000_000_i64; // 2026-05-09T00:00:00Z in microseconds
+        let handle_src = db.source_untyped("events").expect("source");
+        let schema = handle_src.schema().clone();
+        let batch = arrow_array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![ts_us])),
+                Arc::new(arrow_array::StringArray::from(vec!["AAPL"])),
+            ],
+        )
+        .expect("batch");
+        handle_src.push_arrow(batch).expect("push");
+
+        let mut client = connect(addr).await;
+        let tx = client.transaction().await.expect("BEGIN");
+        let stmt = tx.prepare("SUBSCRIBE ev").await.expect("prepare");
+        let portal = tx.bind(&stmt, &[]).await.expect("bind");
+
+        let rows = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tx.query_portal(&portal, 1),
+        )
+        .await
+        .expect("row arrives within 2s")
+        .expect("query_portal");
+        assert_eq!(rows.len(), 1);
+
+        // Decoded round-trip via tokio_postgres' chrono mapping
+        // (TIMESTAMP → NaiveDateTime).
+        let ts: chrono::NaiveDateTime = rows[0].get(0);
+        let sym: &str = rows[0].get(1);
+
+        let expected_ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_micros(ts_us as u64);
+        let expected_naive = chrono::DateTime::<chrono::Utc>::from(expected_ts).naive_utc();
+        assert_eq!(ts, expected_naive);
+        assert_eq!(sym, "AAPL");
+
+        let _ = UNIX_EPOCH;
         handle.abort();
     }
 
