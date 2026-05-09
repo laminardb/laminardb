@@ -26,7 +26,9 @@ pub fn parse_declare_cursor(parser: &mut Parser) -> Result<StreamingStatement, P
             "BINARY cursors are not supported on pgwire SimpleQuery (text format only)".into(),
         ));
     }
-    if try_parse_custom_keyword(parser, "INSENSITIVE") || try_parse_custom_keyword(parser, "ASENSITIVE") {
+    if try_parse_custom_keyword(parser, "INSENSITIVE")
+        || try_parse_custom_keyword(parser, "ASENSITIVE")
+    {
         return Err(ParseError::StreamingError(
             "INSENSITIVE/ASENSITIVE cursors are not supported".into(),
         ));
@@ -122,10 +124,9 @@ mod tests {
 
     #[test]
     fn cursor_with_subscribe_filter_and_epoch() {
-        let stmt = parse(
-            "DECLARE c CURSOR FOR SUBSCRIBE prices AS OF EPOCH 7 WHERE symbol = 'AAPL'",
-        )
-        .expect("parse");
+        let stmt =
+            parse("DECLARE c CURSOR FOR SUBSCRIBE prices AS OF EPOCH 7 WHERE symbol = 'AAPL'")
+                .expect("parse");
         let StreamingStatement::DeclareCursorForSubscribe { subscribe, .. } = stmt else {
             panic!("wrong variant");
         };

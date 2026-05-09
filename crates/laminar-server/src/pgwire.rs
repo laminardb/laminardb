@@ -288,9 +288,9 @@ fn handle_fetch(
     cursor_name: &str,
     target: FetchTarget,
 ) -> PgWireResult<Response> {
-    let h = state.get(cursor_name).ok_or_else(|| {
-        user_error("34000", format!("cursor \"{cursor_name}\" does not exist"))
-    })?;
+    let h = state
+        .get(cursor_name)
+        .ok_or_else(|| user_error("34000", format!("cursor \"{cursor_name}\" does not exist")))?;
     Ok(fetch_response(h.schema, h.portal, h.exhausted, target))
 }
 

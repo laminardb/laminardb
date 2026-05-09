@@ -938,9 +938,7 @@ mod tests {
             StreamingDdlKind::DeclareCursor
         );
         assert_eq!(
-            detect_streaming_ddl(&tokenize(
-                "declare c cursor without hold for subscribe foo"
-            )),
+            detect_streaming_ddl(&tokenize("declare c cursor without hold for subscribe foo")),
             StreamingDdlKind::DeclareCursor
         );
     }
