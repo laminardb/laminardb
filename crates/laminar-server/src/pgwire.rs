@@ -1146,6 +1146,9 @@ pub struct TlsPaths<'a> {
     pub cert: &'a std::path::Path,
     pub key: &'a std::path::Path,
     pub min_version: TlsMinVersion,
+    /// PEM bundle of CA roots; presence enables mTLS — every client must
+    /// present a cert that chains to one of these roots.
+    pub client_ca: Option<&'a std::path::Path>,
 }
 
 /// Minimum TLS protocol version accepted on the pgwire listener. rustls
@@ -1339,12 +1342,53 @@ fn load_tls_acceptor(paths: TlsPaths<'_>) -> Result<tokio_rustls::TlsAcceptor, S
             ))
         })?;
 
-    let server_config =
-        tokio_rustls::rustls::ServerConfig::builder_with_protocol_versions(paths.min_version.versions())
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| ServerError::Http(format!("rustls server config: {e}")))?;
+    let builder = tokio_rustls::rustls::ServerConfig::builder_with_protocol_versions(
+        paths.min_version.versions(),
+    );
+    let builder = match paths.client_ca {
+        Some(ca_path) => {
+            let verifier = build_client_cert_verifier(ca_path)?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let server_config = builder
+        .with_single_cert(certs, key)
+        .map_err(|e| ServerError::Http(format!("rustls server config: {e}")))?;
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(server_config)))
+}
+
+#[allow(clippy::result_large_err)]
+fn build_client_cert_verifier(
+    ca_path: &std::path::Path,
+) -> Result<Arc<dyn tokio_rustls::rustls::server::danger::ClientCertVerifier>, ServerError> {
+    use std::fs::File;
+    use std::io::BufReader;
+    use tokio_rustls::rustls::server::WebPkiClientVerifier;
+    use tokio_rustls::rustls::RootCertStore;
+
+    let file = File::open(ca_path)
+        .map_err(|e| ServerError::Http(format!("open pgwire_tls_client_ca: {e}")))?;
+    let mut roots = RootCertStore::empty();
+    let mut added = 0usize;
+    for cert in rustls_pemfile::certs(&mut BufReader::new(file)) {
+        let cert = cert.map_err(|e| {
+            ServerError::Http(format!("parse pgwire_tls_client_ca: {e}"))
+        })?;
+        roots
+            .add(cert)
+            .map_err(|e| ServerError::Http(format!("invalid CA in pgwire_tls_client_ca: {e}")))?;
+        added += 1;
+    }
+    if added == 0 {
+        return Err(ServerError::Http(format!(
+            "pgwire_tls_client_ca {} contains no certificates",
+            ca_path.display()
+        )));
+    }
+    WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|e| ServerError::Http(format!("build client-cert verifier: {e}")))
 }
 
 pub async fn serve(
@@ -1378,6 +1422,7 @@ pub async fn serve(
     }
 
     let tls_min_label = tls.as_ref().map(|p| p.min_version.label());
+    let mtls_on = tls.as_ref().is_some_and(|p| p.client_ca.is_some());
     let tls_acceptor = match tls {
         Some(paths) => Some(load_tls_acceptor(paths)?),
         None => None,
@@ -1393,11 +1438,13 @@ pub async fn serve(
     let factory = Arc::new(LaminarHandlerFactory::new(db, users));
     let tls_mode = if tls_acceptor.is_some() { "on" } else { "off" };
     let tls_min = tls_min_label.unwrap_or("-");
+    let mtls = if mtls_on { "on" } else { "off" };
     if auth_mode == "trust" {
         warn!(
             addr = %local_addr,
             tls = tls_mode,
             tls_min,
+            mtls,
             "pgwire listening with TRUST auth — any client reaching this address is admin",
         );
     } else {
@@ -1406,6 +1453,7 @@ pub async fn serve(
             auth = auth_mode,
             tls = tls_mode,
             tls_min,
+            mtls,
             "pgwire listening",
         );
     }
@@ -2015,6 +2063,81 @@ mod integration_tests {
         (dir, cert_path, key_path)
     }
 
+    /// CA + client-leaf bundle for mTLS tests. The CA PEM is written to a
+    /// tempfile so the server can be pointed at it via `pgwire_tls_client_ca`;
+    /// the leaf cert+key are returned in DER form for direct use by a rustls
+    /// `ClientConfig`.
+    struct MintedClientPki {
+        _dir: tempfile::TempDir,
+        ca_pem_path: std::path::PathBuf,
+        leaf_chain: Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>,
+        leaf_key: tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>,
+    }
+
+    fn mint_ca_and_client_leaf(common_name: &str) -> MintedClientPki {
+        use tokio_rustls::rustls::pki_types::{
+            CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer,
+        };
+
+        let mut ca_params =
+            rcgen::CertificateParams::new(vec!["mtls-test-ca".into()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let mut leaf_params =
+            rcgen::CertificateParams::new(vec![common_name.into()]).unwrap();
+        leaf_params.extended_key_usages =
+            vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca_pem_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_pem_path, ca_cert.pem()).unwrap();
+
+        let leaf_chain = vec![CertificateDer::from(leaf_cert.der().to_vec())];
+        let leaf_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            leaf_key.serialize_der(),
+        ));
+
+        MintedClientPki {
+            _dir: dir,
+            ca_pem_path,
+            leaf_chain,
+            leaf_key,
+        }
+    }
+
+    /// Builds a tokio_postgres TLS connector that trusts `server_cert_path`
+    /// for the server hello and (optionally) presents a client cert for mTLS.
+    fn make_client_tls(
+        server_cert_path: &std::path::Path,
+        client_auth: Option<(
+            Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>,
+            tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>,
+        )>,
+    ) -> tokio_postgres_rustls::MakeRustlsConnect {
+        super::ensure_tls_provider();
+        let cert_bytes = std::fs::read(server_cert_path).unwrap();
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut std::io::Cursor::new(cert_bytes))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        {
+            roots.add(c).unwrap();
+        }
+        let builder = tokio_rustls::rustls::ClientConfig::builder()
+            .with_root_certificates(roots);
+        let client_cfg = match client_auth {
+            Some((chain, key)) => builder.with_client_auth_cert(chain, key).unwrap(),
+            None => builder.with_no_client_auth(),
+        };
+        tokio_postgres_rustls::MakeRustlsConnect::new(client_cfg)
+    }
+
     /// Self-signed cert with notAfter in the past, for the expiry test.
     fn expired_self_signed_pem() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
@@ -2045,6 +2168,7 @@ mod integration_tests {
                 cert: &cert_path,
                 key: &key_path,
                 min_version: super::TlsMinVersion::V1_2,
+                client_ca: None,
             }),
             256,
             10,
@@ -2068,6 +2192,7 @@ mod integration_tests {
                 cert: &cert_path,
                 key: &key_path,
                 min_version: super::TlsMinVersion::V1_3,
+                client_ca: None,
             }),
             256,
             10,
@@ -2132,6 +2257,7 @@ mod integration_tests {
                 cert: &cert_path,
                 key: &key_path,
                 min_version: super::TlsMinVersion::V1_2,
+                client_ca: None,
             }),
             256,
             10,
@@ -2174,6 +2300,165 @@ mod integration_tests {
         assert!(v.contains("LaminarDB"), "version: {v}");
 
         handle.abort();
+    }
+
+    /// mTLS: with a client_ca configured, a client that presents no cert
+    /// must be refused at handshake time.
+    #[tokio::test]
+    async fn mtls_rejects_client_without_cert() {
+        let (_dir, cert_path, key_path) = self_signed_pem();
+        let pki = mint_ca_and_client_leaf("alice");
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        db.start().await.expect("db starts");
+        let (addr, handle) = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            Some(super::TlsPaths {
+                cert: &cert_path,
+                key: &key_path,
+                min_version: super::TlsMinVersion::V1_2,
+                client_ca: Some(&pki.ca_pem_path),
+            }),
+            256,
+            10,
+        )
+        .await
+        .expect("pgwire serve");
+
+        let tls = make_client_tls(&cert_path, None);
+        let conn_str = format!(
+            "host=localhost hostaddr={} port={} user=any dbname=laminardb sslmode=require",
+            addr.ip(),
+            addr.port(),
+        );
+        let err = match tokio_postgres::connect(&conn_str, tls).await {
+            Ok(_) => panic!("client without a cert must be refused under mTLS"),
+            Err(e) => e,
+        };
+        assert!(
+            err_chain(&err).contains("CertificateRequired")
+                || err_chain(&err).contains("HandshakeFailure")
+                || err_chain(&err).contains("certificate required"),
+            "expected a missing-client-cert error, got: {}",
+            err_chain(&err),
+        );
+        handle.abort();
+    }
+
+    /// mTLS: a client cert signed by an unknown CA must be refused.
+    #[tokio::test]
+    async fn mtls_rejects_untrusted_client_cert() {
+        let (_dir, cert_path, key_path) = self_signed_pem();
+        let trusted = mint_ca_and_client_leaf("trusted");
+        let stranger = mint_ca_and_client_leaf("stranger");
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        db.start().await.expect("db starts");
+        let (addr, handle) = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            Some(super::TlsPaths {
+                cert: &cert_path,
+                key: &key_path,
+                min_version: super::TlsMinVersion::V1_2,
+                client_ca: Some(&trusted.ca_pem_path),
+            }),
+            256,
+            10,
+        )
+        .await
+        .expect("pgwire serve");
+
+        // Client presents a leaf signed by a CA the server doesn't know.
+        let tls = make_client_tls(
+            &cert_path,
+            Some((stranger.leaf_chain.clone(), stranger.leaf_key.clone_key())),
+        );
+        let conn_str = format!(
+            "host=localhost hostaddr={} port={} user=any dbname=laminardb sslmode=require",
+            addr.ip(),
+            addr.port(),
+        );
+        let err = match tokio_postgres::connect(&conn_str, tls).await {
+            Ok(_) => panic!("untrusted client cert must be refused"),
+            Err(e) => e,
+        };
+        // rustls maps a verifier-rejected client cert to a fatal alert; the
+        // exact variant depends on the protocol version and verifier path
+        // (UnknownCA / BadCertificate on 1.2, DecryptError or
+        // CertificateUnknown on 1.3). We assert it failed at the TLS layer.
+        let chain = err_chain(&err);
+        assert!(
+            chain.contains("UnknownCA")
+                || chain.contains("BadCertificate")
+                || chain.contains("CertificateUnknown")
+                || chain.contains("DecryptError")
+                || chain.contains("HandshakeFailure"),
+            "expected a cert-rejection alert, got: {chain}",
+        );
+        handle.abort();
+    }
+
+    /// mTLS: a client cert signed by the configured CA is accepted, and a
+    /// SimpleQuery completes over the encrypted+authenticated session.
+    #[tokio::test]
+    async fn mtls_accepts_trusted_client_cert() {
+        let (_dir, cert_path, key_path) = self_signed_pem();
+        let pki = mint_ca_and_client_leaf("alice");
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        db.start().await.expect("db starts");
+        let (addr, handle) = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            Some(super::TlsPaths {
+                cert: &cert_path,
+                key: &key_path,
+                min_version: super::TlsMinVersion::V1_2,
+                client_ca: Some(&pki.ca_pem_path),
+            }),
+            256,
+            10,
+        )
+        .await
+        .expect("pgwire serve");
+
+        let tls = make_client_tls(
+            &cert_path,
+            Some((pki.leaf_chain.clone(), pki.leaf_key.clone_key())),
+        );
+        let conn_str = format!(
+            "host=localhost hostaddr={} port={} user=any dbname=laminardb sslmode=require",
+            addr.ip(),
+            addr.port(),
+        );
+        let (client, conn) = tokio_postgres::connect(&conn_str, tls)
+            .await
+            .expect("mTLS handshake + connect");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let messages = client
+            .simple_query("SELECT version()")
+            .await
+            .expect("query over mTLS");
+        let v = first_row_value(&messages, 0).expect("row");
+        assert!(v.contains("LaminarDB"), "version: {v}");
+        handle.abort();
+    }
+
+    /// Flatten an error and its `source()` chain to a single string for
+    /// substring assertions.
+    fn err_chain(err: &(dyn std::error::Error + 'static)) -> String {
+        std::iter::successors(Some(err), |e| e.source())
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ")
     }
 
     /// Push one row into the `trades` source so subsequent SUBSCRIBE

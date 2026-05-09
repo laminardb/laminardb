@@ -158,6 +158,21 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
             "pgwire_tls_min_version must be \"1.2\" or \"1.3\" (got \"{other}\")"
         )),
     }
+    if let Some(ca) = &config.server.pgwire_tls_client_ca {
+        if config.server.pgwire_tls_cert.is_none() {
+            errors.push(
+                "pgwire_tls_client_ca requires pgwire_tls_cert + pgwire_tls_key (mTLS \
+                 layers on top of server TLS)"
+                    .to_string(),
+            );
+        }
+        if !ca.exists() {
+            errors.push(format!(
+                "pgwire_tls_client_ca not found: {}",
+                ca.display()
+            ));
+        }
+    }
 
     // Validate: cluster mode requires discovery and coordination
     if config.server.mode == "cluster" {
@@ -235,6 +250,10 @@ pub struct ServerSection {
     /// PEM private key (PKCS#8 or RSA).
     #[serde(default)]
     pub pgwire_tls_key: Option<std::path::PathBuf>,
+    /// PEM CA bundle. Setting this requires every connecting client to
+    /// present a certificate chained to one of these roots (mTLS).
+    #[serde(default)]
+    pub pgwire_tls_client_ca: Option<std::path::PathBuf>,
     /// Concurrent session cap; excess accepts close immediately.
     #[serde(default = "default_pgwire_max_connections")]
     pub pgwire_max_connections: usize,
@@ -270,6 +289,7 @@ impl Default for ServerSection {
             pgwire_allow_remote: false,
             pgwire_tls_cert: None,
             pgwire_tls_key: None,
+            pgwire_tls_client_ca: None,
             pgwire_max_connections: default_pgwire_max_connections(),
             pgwire_max_auth_failures_per_min: default_pgwire_max_auth_failures_per_min(),
             pgwire_tls_min_version: default_pgwire_tls_min_version(),
@@ -824,6 +844,25 @@ pgwire_max_connections = 0
             ConfigError::ValidationErrors { errors } => {
                 assert!(
                     errors.iter().any(|e| e.contains("must be > 0")),
+                    "errors: {errors:?}"
+                );
+            }
+            _ => panic!("expected ValidationErrors"),
+        }
+    }
+
+    #[test]
+    fn test_validate_client_ca_requires_server_cert() {
+        let toml = r#"
+[server]
+pgwire_tls_client_ca = "/does/not/matter.pem"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        let err = validate_config(&config).unwrap_err();
+        match err {
+            ConfigError::ValidationErrors { errors } => {
+                assert!(
+                    errors.iter().any(|e| e.contains("requires pgwire_tls_cert")),
                     "errors: {errors:?}"
                 );
             }
