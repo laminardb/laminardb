@@ -1835,27 +1835,34 @@ mod integration_tests {
         let (db, addr, handle) = spawn_with_data().await;
         let mut client = connect(addr).await;
 
-        // Push two rows BEFORE the SUBSCRIBE so the portal sees them via
-        // replay rather than racing the listener.
-        push_one_trade(&db, "AAPL", 150.5).await;
-        push_one_trade(&db, "GOOG", 2700.25).await;
-
         // tokio_postgres' `bind` + `query_portal` uses the extended-query
-        // protocol with binary format for known column types. This is the
-        // path JDBC and asyncpg take with prepared statements.
+        // protocol with binary format for known column types — the path
+        // JDBC and asyncpg take with prepared statements.
         let tx = client.transaction().await.expect("BEGIN");
         let stmt = tx.prepare("SUBSCRIBE prices").await.expect("prepare");
         let portal = tx.bind(&stmt, &[]).await.expect("bind portal");
 
-        // Pull rows in chunks. `query_portal` returns up to `max_rows` rows
-        // for the current Execute, surfacing `PortalSuspended` as a normal
-        // partial result.
+        // The MV broadcast has no receiver until `Execute` reaches the
+        // server and runs `do_query` → `open_subscription`. We can't push
+        // from this task before query_portal because query_portal blocks
+        // waiting for a row, so spawn the pushes from a sibling task with
+        // a short head start for the receiver to attach. With cap=0
+        // retention, a push that lands before the receiver is dropped.
+        let pusher = {
+            let db = Arc::clone(&db);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                push_one_trade(&db, "AAPL", 150.5).await;
+                push_one_trade(&db, "GOOG", 2700.25).await;
+            })
+        };
+
         let first = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(3),
             tx.query_portal(&portal, 1),
         )
         .await
-        .expect("first chunk arrives within 2s")
+        .expect("first chunk arrives within 3s")
         .expect("query_portal #1");
         assert_eq!(first.len(), 1);
         let symbol: &str = first[0].get(0);
@@ -1864,11 +1871,11 @@ mod integration_tests {
         assert!((price - 150.5).abs() < 1e-9);
 
         let second = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(3),
             tx.query_portal(&portal, 1),
         )
         .await
-        .expect("second chunk arrives within 2s")
+        .expect("second chunk arrives within 3s")
         .expect("query_portal #2");
         assert_eq!(second.len(), 1);
         let symbol: &str = second[0].get(0);
@@ -1876,8 +1883,7 @@ mod integration_tests {
         assert_eq!(symbol, "GOOG");
         assert!((price - 2700.25).abs() < 1e-9);
 
-        // Don't roll back — the SUBSCRIBE never completes, so let the
-        // server-side abort tear it down.
+        pusher.await.expect("push task");
         handle.abort();
     }
 
@@ -1915,34 +1921,44 @@ mod integration_tests {
         .await
         .expect("pgwire serve");
 
+        let mut client = connect(addr).await;
+        let tx = client.transaction().await.expect("BEGIN");
+        let stmt = tx.prepare("SUBSCRIBE ev").await.expect("prepare");
+        let portal = tx.bind(&stmt, &[]).await.expect("bind");
+
         let expected = chrono::NaiveDate::from_ymd_opt(2026, 5, 9)
             .unwrap()
             .and_hms_opt(0, 0, 0)
             .unwrap();
         let ts_us = expected.and_utc().timestamp_micros();
 
-        let src = db.source_untyped("events").expect("source");
-        let batch = arrow_array::RecordBatch::try_new(
-            src.schema().clone(),
-            vec![
-                Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![ts_us])),
-                Arc::new(arrow_array::StringArray::from(vec!["AAPL"])),
-            ],
-        )
-        .expect("batch");
-        src.push_arrow(batch).expect("push");
-
-        let mut client = connect(addr).await;
-        let tx = client.transaction().await.expect("BEGIN");
-        let stmt = tx.prepare("SUBSCRIBE ev").await.expect("prepare");
-        let portal = tx.bind(&stmt, &[]).await.expect("bind");
+        // Push from a sibling task after a short delay so the MV
+        // broadcast receiver (created inside `Execute`) is attached
+        // before send_batch fires. See the matching note in
+        // `extended_query_binary_chunked_subscribe`.
+        let pusher = {
+            let db = Arc::clone(&db);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let src = db.source_untyped("events").expect("source");
+                let batch = arrow_array::RecordBatch::try_new(
+                    src.schema().clone(),
+                    vec![
+                        Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![ts_us])),
+                        Arc::new(arrow_array::StringArray::from(vec!["AAPL"])),
+                    ],
+                )
+                .expect("batch");
+                src.push_arrow(batch).expect("push");
+            })
+        };
 
         let rows = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(3),
             tx.query_portal(&portal, 1),
         )
         .await
-        .expect("row arrives within 2s")
+        .expect("row arrives within 3s")
         .expect("query_portal");
         assert_eq!(rows.len(), 1);
 
@@ -1951,6 +1967,7 @@ mod integration_tests {
         assert_eq!(ts, expected);
         assert_eq!(sym, "AAPL");
 
+        pusher.await.expect("push task");
         handle.abort();
     }
 
