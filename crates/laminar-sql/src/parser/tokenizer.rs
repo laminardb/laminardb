@@ -100,6 +100,8 @@ pub enum StreamingDdlKind {
     RestoreCheckpoint,
     /// SUBSCRIBE <name> [WITH (...)]
     Subscribe,
+    /// DECLARE <name> [NO SCROLL] CURSOR [WITHOUT HOLD] FOR SUBSCRIBE …
+    DeclareCursor,
     /// Not a streaming DDL statement
     None,
 }
@@ -133,6 +135,16 @@ pub fn detect_streaming_ddl(tokens: &[TokenWithSpan]) -> StreamingDdlKind {
     if let Token::Word(w) = &significant[0].token {
         if is_word_ci(w, "SUBSCRIBE") {
             return StreamingDdlKind::Subscribe;
+        }
+    }
+
+    // DECLARE <ident> ... CURSOR FOR SUBSCRIBE — pre-empts sqlparser, which
+    // expects the body of a DECLARE…CURSOR FOR clause to be a regular Query.
+    // Plain `DECLARE x INT` and DECLARE-cursor-for-SELECT shapes are still
+    // routed through sqlparser via `None`.
+    if let Token::Word(w) = &significant[0].token {
+        if is_word_ci(w, "DECLARE") && contains_for_subscribe(&significant) {
+            return StreamingDdlKind::DeclareCursor;
         }
     }
 
@@ -490,6 +502,32 @@ fn classify_after_or_replace(token: &Token, significant: &[&TokenWithSpan]) -> S
 /// Check if a Word matches a keyword string (case-insensitive).
 fn is_word_ci(word: &Word, keyword: &str) -> bool {
     word.value.eq_ignore_ascii_case(keyword)
+}
+
+/// True if the token sequence contains adjacent `FOR SUBSCRIBE`. Used to
+/// disambiguate `DECLARE` between sqlparser's cursor-for-Query shape and
+/// our SUBSCRIBE-specific extension. Loose enough to allow `WITHOUT HOLD`
+/// between `CURSOR` and `FOR`.
+fn contains_for_subscribe(significant: &[&TokenWithSpan]) -> bool {
+    let mut i = 0;
+    while i + 1 < significant.len() {
+        let for_kw = matches!(
+            &significant[i].token,
+            Token::Word(Word {
+                keyword: Keyword::FOR,
+                ..
+            })
+        );
+        let subscribe = matches!(
+            &significant[i + 1].token,
+            Token::Word(w) if is_word_ci(w, "SUBSCRIBE")
+        );
+        if for_kw && subscribe {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Try to consume a custom keyword that may not be in sqlparser's keyword enum.
@@ -886,6 +924,33 @@ mod tests {
         assert_eq!(
             detect_streaming_ddl(&tokenize("subscribe foo with ('snapshot' = 'true')")),
             StreamingDdlKind::Subscribe
+        );
+    }
+
+    #[test]
+    fn test_detect_declare_cursor_for_subscribe() {
+        assert_eq!(
+            detect_streaming_ddl(&tokenize("DECLARE c CURSOR FOR SUBSCRIBE foo")),
+            StreamingDdlKind::DeclareCursor
+        );
+        assert_eq!(
+            detect_streaming_ddl(&tokenize("DECLARE c NO SCROLL CURSOR FOR SUBSCRIBE foo")),
+            StreamingDdlKind::DeclareCursor
+        );
+        assert_eq!(
+            detect_streaming_ddl(&tokenize(
+                "declare c cursor without hold for subscribe foo"
+            )),
+            StreamingDdlKind::DeclareCursor
+        );
+    }
+
+    #[test]
+    fn test_detect_declare_cursor_for_select_falls_through() {
+        // DECLARE…CURSOR FOR <regular query> is left to sqlparser.
+        assert_eq!(
+            detect_streaming_ddl(&tokenize("DECLARE c CURSOR FOR SELECT 1")),
+            StreamingDdlKind::None
         );
     }
 }
