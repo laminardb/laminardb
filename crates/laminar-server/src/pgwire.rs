@@ -878,10 +878,40 @@ fn arrow_to_pg_type(dt: &arrow_schema::DataType) -> Type {
     }
 }
 
-/// Per-call salt + stored plaintext for the MD5 challenge flow.
+/// Per-call salt + stored credential for the MD5 challenge flow. The
+/// stored value is either plaintext (legacy) or `md5<32-hex>`, the same
+/// format Postgres' `pg_authid` uses, where the hex is `md5(password ‖
+/// user)`. The pre-hashed form lets operators avoid plaintext at rest.
 #[derive(Debug)]
 struct LaminarAuthSource {
     users: Arc<HashMap<String, Secret>>,
+}
+
+/// If `stored` is a `pg_authid`-style pre-hash, return the inner hex
+/// (the bit after the `md5` tag). Lowercase hex only; uppercase or
+/// other lengths fall back to plaintext handling.
+pub(crate) fn parse_pre_hashed_md5(stored: &str) -> Option<&str> {
+    let inner = stored.strip_prefix("md5")?;
+    if inner.len() == 32
+        && inner
+            .chars()
+            .all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+    {
+        Some(inner)
+    } else {
+        None
+    }
+}
+
+/// MD5 challenge response when only the inner hash is known: the client
+/// sends `md5{hex(md5(inner_hex || salt))}` and the server precomputes
+/// the same string for comparison.
+fn outer_md5_challenge(inner_hex: &str, salt: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    let mut hasher = Md5::new();
+    hasher.update(inner_hex.as_bytes());
+    hasher.update(salt);
+    format!("md5{:x}", hasher.finalize())
 }
 
 #[async_trait]
@@ -891,12 +921,15 @@ impl AuthSource for LaminarAuthSource {
         // Indistinguishable from a wrong-password failure: both branches must
         // surface the same wire error so a client can't probe which usernames
         // are configured. pgwire emits exactly this variant on bad password.
-        let password = self
+        let stored = self
             .users
             .get(user)
             .ok_or_else(|| PgWireError::InvalidPassword(user.to_string()))?;
         let salt: [u8; 4] = rand::random();
-        let expected = hash_md5_password(user, password.expose(), &salt);
+        let expected = match parse_pre_hashed_md5(stored.expose()) {
+            Some(inner_hex) => outer_md5_challenge(inner_hex, &salt),
+            None => hash_md5_password(user, stored.expose(), &salt),
+        };
         Ok(Password::new(Some(salt.to_vec()), expected.into_bytes()))
     }
 }
@@ -2176,6 +2209,68 @@ mod integration_tests {
         assert_eq!(db_err.code().code(), "28P01", "got: {db_err:?}");
 
         handle.abort();
+    }
+
+    /// Pre-hashed pgwire_users entry: stored value is `md5{hex(md5(pw||user))}`,
+    /// matching pg_authid. Plaintext never touches disk yet auth still succeeds.
+    fn md5_users_prehashed(user: &str, password: &str) -> HashMap<String, Secret> {
+        use md5::{Digest, Md5};
+        let mut h = Md5::new();
+        h.update(password.as_bytes());
+        h.update(user.as_bytes());
+        let inner = format!("{:x}", h.finalize());
+        let mut u = HashMap::new();
+        u.insert(user.to_string(), Secret::new(format!("md5{inner}")));
+        u
+    }
+
+    #[tokio::test]
+    async fn md5_auth_accepts_correct_password_against_prehash() {
+        let (addr, handle) =
+            spawn_server_with(md5_users_prehashed("alice", TEST_PASSWORD)).await;
+        let client = connect_with_password(addr, "alice", TEST_PASSWORD)
+            .await
+            .expect("auth must succeed against pre-hashed entry");
+        let messages = client
+            .simple_query("SELECT version()")
+            .await
+            .expect("query after auth");
+        let v = first_row_value(&messages, 0).expect("row");
+        assert!(v.contains("LaminarDB"), "version: {v}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn md5_auth_rejects_wrong_password_against_prehash() {
+        let (addr, handle) =
+            spawn_server_with(md5_users_prehashed("alice", TEST_PASSWORD)).await;
+        let err = connect_with_password(addr, "alice", "not-the-password")
+            .await
+            .expect_err("auth must fail");
+        let db_err = err.as_db_error().expect("typed PG error");
+        assert_eq!(db_err.code().code(), "28P01", "got: {db_err:?}");
+        handle.abort();
+    }
+
+    #[test]
+    fn parse_pre_hashed_md5_strict_format() {
+        // 32 lowercase hex after the tag → accepted.
+        let inner = "5d41402abc4b2a76b9719d911017c592";
+        assert_eq!(
+            super::parse_pre_hashed_md5(&format!("md5{inner}")),
+            Some(inner),
+        );
+        // Wrong length, uppercase hex, missing prefix, or non-hex → rejected.
+        assert_eq!(super::parse_pre_hashed_md5("md5short"), None);
+        assert_eq!(
+            super::parse_pre_hashed_md5("md55D41402ABC4B2A76B9719D911017C592"),
+            None,
+        );
+        assert_eq!(super::parse_pre_hashed_md5(inner), None);
+        assert_eq!(
+            super::parse_pre_hashed_md5("md5zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
+            None,
+        );
     }
 
     #[tokio::test]

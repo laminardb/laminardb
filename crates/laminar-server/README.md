@@ -163,7 +163,14 @@ PGPASSWORD=$ALICE_PASSWORD psql "host=db.internal port=5433 dbname=laminardb use
 
 > **MD5 is provided for libpq compatibility, not as a recommended production stance.** Postgres itself deprecated it in PG 14 in favor of SCRAM-SHA-256. Use it for development and short-lived deployments; for production, wait for the SCRAM work in the FIR follow-ups before exposing this listener beyond a trusted network segment.
 
-Plaintext passwords sit in the TOML file. Use `${VAR}` substitution to pull them from environment variables or a secret manager rather than committing them. The listener emits `target: "audit"` events on every connection accepted/closed, including auth-failed outcomes — wire these into your SIEM.
+Plaintext passwords sit in the TOML file. Use `${VAR}` substitution to pull them from environment variables or a secret manager rather than committing them. To avoid plaintext at rest entirely, supply the `pg_authid`-style pre-hashed form: `md5` followed by `md5(password ‖ username)` as 32 lowercase hex characters. The wire protocol is unchanged — clients still send the same plaintext password.
+
+```bash
+# bash, where pw and user are the plaintext password and username:
+printf '%s' "${pw}${user}" | md5sum | awk '{print "md5"$1}'
+```
+
+The listener emits `target: "audit"` events on every connection accepted/closed, including auth-failed outcomes — wire these into your SIEM.
 
 ### TLS
 

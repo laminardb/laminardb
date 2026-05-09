@@ -123,7 +123,19 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         if user.is_empty() {
             errors.push("pgwire_users contains an empty username".to_string());
         }
-        if password.len() < MIN_PGWIRE_PASSWORD_LEN {
+        let pw = password.expose();
+        if let Some(rest) = pw.strip_prefix("md5") {
+            // pg_authid-style pre-hash: 'md5' + lowercase-hex(md5(password ‖ user)).
+            // Strict shape so a typo isn't silently treated as plaintext.
+            let valid =
+                rest.len() == 32 && rest.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'));
+            if !valid {
+                errors.push(format!(
+                    "pgwire_users['{user}']: pre-hashed value must be 'md5' \
+                     followed by 32 lowercase hex characters"
+                ));
+            }
+        } else if password.len() < MIN_PGWIRE_PASSWORD_LEN {
             errors.push(format!(
                 "pgwire_users['{user}']: password must be at least {MIN_PGWIRE_PASSWORD_LEN} characters"
             ));
@@ -883,6 +895,40 @@ pgwire_tls_min_version = "1.4"
                 assert!(
                     errors.iter().any(|e| e.contains("pgwire_tls_min_version")),
                     "errors: {errors:?}"
+                );
+            }
+            _ => panic!("expected ValidationErrors"),
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_well_formed_pre_hashed_pgwire_password() {
+        let toml = r#"
+[server]
+[server.pgwire_users]
+alice = "md55d41402abc4b2a76b9719d911017c592"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        // 35-char pre-hashed value bypasses the MIN_PGWIRE_PASSWORD_LEN gate.
+        validate_config(&config).expect("well-formed pre-hash must validate");
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_pre_hashed_pgwire_password() {
+        // 'md5' prefix followed by non-hex — clearly meant to be pre-hashed
+        // but malformed; rejected so a typo doesn't slip through as plaintext.
+        let toml = r#"
+[server]
+[server.pgwire_users]
+alice = "md5zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        let err = validate_config(&config).unwrap_err();
+        match err {
+            ConfigError::ValidationErrors { errors } => {
+                assert!(
+                    errors.iter().any(|e| e.contains("pre-hashed")),
+                    "errors: {errors:?}",
                 );
             }
             _ => panic!("expected ValidationErrors"),
