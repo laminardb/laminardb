@@ -67,11 +67,10 @@ impl LaminarPgwireHandler {
         )
     }
 
-    fn gc_peer(&self, peer: SocketAddr) {
+    fn evict_idle_peer(&self, peer: SocketAddr) {
         let mut guard = self.connections.lock();
         if let Some(state) = guard.get(&peer) {
-            state.prune_dead();
-            if state.is_idle() {
+            if state.prune_dead_and_check_idle() {
                 guard.remove(&peer);
             }
         }
@@ -106,7 +105,7 @@ impl SimpleQueryHandler for LaminarPgwireHandler {
             return Ok(vec![Response::EmptyQuery]);
         }
         let peer = client.socket_addr();
-        self.gc_peer(peer);
+        self.evict_idle_peer(peer);
         let stmts = parse_streaming_sql(query)
             .map_err(|e| user_error("42601", format!("parse error: {e}")))?;
 
@@ -139,47 +138,51 @@ impl SimpleQueryHandler for LaminarPgwireHandler {
     }
 }
 
-async fn subscribe_response(db: &LaminarDB, s: SubscribeStatement) -> PgWireResult<Response> {
+async fn open_portal_for_subscribe(
+    db: &LaminarDB,
+    s: &SubscribeStatement,
+) -> PgWireResult<SubscriptionPortal> {
     let name = s.name.to_string();
     let start = match s.as_of_epoch {
         Some(n) => SubscribeStart::AsOfEpoch(n),
         None => SubscribeStart::Tail,
     };
-    let portal = db
-        .open_subscription(&name, s.filter_sql.as_deref(), start)
+    db.open_subscription(&name, s.filter_sql.as_deref(), start)
         .await
-        .map_err(|e| user_error("42P01", format!("SUBSCRIBE '{name}': {e}")))?;
+        .map_err(|e| user_error("42P01", format!("SUBSCRIBE '{name}': {e}")))
+}
+
+async fn subscribe_response(db: &LaminarDB, s: SubscribeStatement) -> PgWireResult<Response> {
+    let portal = open_portal_for_subscribe(db, &s).await?;
     Ok(portal_to_response(portal, None))
 }
 
-/// One open cursor. The portal sits behind a tokio mutex so a streaming
-/// FETCH can hold it across awaits without the row stream needing to own it.
-struct ActiveCursor {
-    portal: Arc<TokioMutex<SubscriptionPortal>>,
-    schema: arrow_schema::SchemaRef,
-    /// Rows encoded from a prior frame but not yet consumed. A multi-row
-    /// batch followed by `FETCH 1` would otherwise drop the leftover rows
-    /// when the response stream ends — keeping them on the cursor lets the
-    /// next FETCH pick up where the previous one stopped.
-    pending: Arc<parking_lot::Mutex<VecDeque<PgWireResult<pgwire::messages::data::DataRow>>>>,
-    /// Flipped when the pump emits `None` or `Lagged`. The next `gc_peer`
+/// State that shares the cursor's lifetime: the portal, the leftover-row
+/// buffer, and the exhausted flag. Held by `Arc` so a row stream can keep
+/// reading after `ConnState::get` returns.
+struct CursorInner {
+    /// Tokio mutex because a FETCH stream holds it across `await` while
+    /// pulling frames.
+    portal: TokioMutex<SubscriptionPortal>,
+    /// Rows encoded from a prior frame that the previous FETCH didn't
+    /// consume. Without this, a multi-row batch + `FETCH 1` would drop the
+    /// leftover rows when the response stream ends.
+    pending: parking_lot::Mutex<VecDeque<PgWireResult<pgwire::messages::data::DataRow>>>,
+    /// Flipped when the pump emits `None` or `Lagged`. The next `evict_idle_peer`
     /// pass reaps the cursor.
-    exhausted: Arc<AtomicBool>,
+    exhausted: AtomicBool,
+}
+
+#[derive(Clone)]
+struct ActiveCursor {
+    inner: Arc<CursorInner>,
+    schema: arrow_schema::SchemaRef,
 }
 
 #[derive(Default)]
 struct ConnState {
     cursors: parking_lot::Mutex<HashMap<String, ActiveCursor>>,
     in_tx: AtomicBool,
-}
-
-/// Snapshot of an `ActiveCursor` that can be used outside the cursor-map
-/// lock — all fields are cheap clones.
-struct CursorHandle {
-    portal: Arc<TokioMutex<SubscriptionPortal>>,
-    schema: arrow_schema::SchemaRef,
-    pending: Arc<parking_lot::Mutex<VecDeque<PgWireResult<pgwire::messages::data::DataRow>>>>,
-    exhausted: Arc<AtomicBool>,
 }
 
 impl ConnState {
@@ -198,15 +201,8 @@ impl ConnState {
         self.cursors.lock().contains_key(&Self::key(name))
     }
 
-    fn get(&self, name: &str) -> Option<CursorHandle> {
-        let g = self.cursors.lock();
-        let c = g.get(&Self::key(name))?;
-        Some(CursorHandle {
-            portal: Arc::clone(&c.portal),
-            schema: Arc::clone(&c.schema),
-            pending: Arc::clone(&c.pending),
-            exhausted: Arc::clone(&c.exhausted),
-        })
+    fn get(&self, name: &str) -> Option<ActiveCursor> {
+        self.cursors.lock().get(&Self::key(name)).cloned()
     }
 
     fn remove(&self, name: &str) -> bool {
@@ -217,14 +213,12 @@ impl ConnState {
         self.cursors.lock().clear();
     }
 
-    fn prune_dead(&self) {
-        self.cursors
-            .lock()
-            .retain(|_, c| !c.exhausted.load(Ordering::Acquire));
-    }
-
-    fn is_idle(&self) -> bool {
-        !self.in_tx.load(Ordering::Acquire) && self.cursors.lock().is_empty()
+    /// Drop dead cursors and report whether the connection is now idle
+    /// (no cursors, no transaction). Single inner-lock acquisition.
+    fn prune_dead_and_check_idle(&self) -> bool {
+        let mut cursors = self.cursors.lock();
+        cursors.retain(|_, c| !c.inner.exhausted.load(Ordering::Acquire));
+        cursors.is_empty() && !self.in_tx.load(Ordering::Acquire)
     }
 }
 
@@ -242,23 +236,19 @@ async fn handle_declare_cursor(
             format!("cursor \"{cursor_name}\" already exists"),
         ));
     }
-    let name = subscribe.name.to_string();
-    let start = match subscribe.as_of_epoch {
-        Some(n) => SubscribeStart::AsOfEpoch(n),
-        None => SubscribeStart::Tail,
-    };
-    let portal = db
-        .open_subscription(&name, subscribe.filter_sql.as_deref(), start)
-        .await
-        .map_err(|e| user_error("42P01", format!("SUBSCRIBE '{name}': {e}")))?;
+    let portal = open_portal_for_subscribe(db, &subscribe).await?;
     let schema = portal.schema();
-    let active = ActiveCursor {
-        portal: Arc::new(TokioMutex::new(portal)),
-        schema,
-        pending: Arc::new(parking_lot::Mutex::new(VecDeque::new())),
-        exhausted: Arc::new(AtomicBool::new(false)),
-    };
-    state.insert(cursor_name, active);
+    state.insert(
+        cursor_name,
+        ActiveCursor {
+            inner: Arc::new(CursorInner {
+                portal: TokioMutex::new(portal),
+                pending: parking_lot::Mutex::new(VecDeque::new()),
+                exhausted: AtomicBool::new(false),
+            }),
+            schema,
+        },
+    );
     Ok(Response::Execution(Tag::new("DECLARE CURSOR")))
 }
 
@@ -306,16 +296,10 @@ fn handle_fetch(
     cursor_name: &str,
     target: FetchTarget,
 ) -> PgWireResult<Response> {
-    let h = state
+    let cursor = state
         .get(cursor_name)
         .ok_or_else(|| user_error("34000", format!("cursor \"{cursor_name}\" does not exist")))?;
-    Ok(fetch_response(
-        h.schema,
-        h.portal,
-        h.pending,
-        h.exhausted,
-        target,
-    ))
+    Ok(fetch_response(cursor, target))
 }
 
 fn handle_close(state: &ConnState, cursor: &CloseCursor) -> PgWireResult<Response> {
@@ -639,36 +623,25 @@ fn empty_row(fields: &Arc<Vec<FieldInfo>>) -> pgwire::messages::data::DataRow {
 }
 
 /// Strict-PG FETCH: blocks until `target` rows are produced, the pump exits,
-/// or the broadcast lags. Lag/exit flips `exhausted` so `gc_peer` reaps the
-/// cursor on the next call. Text format only; SimpleQuery has no binary.
-///
-/// Leftover rows from a multi-row frame stay in the cursor's `pending`
-/// buffer so successive FETCHes consume the frame in order.
-fn fetch_response(
-    schema: arrow_schema::SchemaRef,
-    portal: Arc<TokioMutex<SubscriptionPortal>>,
-    pending: Arc<parking_lot::Mutex<VecDeque<PgWireResult<pgwire::messages::data::DataRow>>>>,
-    exhausted: Arc<AtomicBool>,
-    target: FetchTarget,
-) -> Response {
-    let fields = Arc::new(field_infos(&schema, None));
+/// or the broadcast lags. Lag/exit flips `cursor.inner.exhausted` so the next
+/// `evict_idle_peer` reaps the cursor. Text format only; SimpleQuery has no
+/// binary. Leftover rows from a multi-row frame stay in `cursor.inner.pending`
+/// so successive FETCHes consume the frame in order.
+fn fetch_response(cursor: ActiveCursor, target: FetchTarget) -> Response {
+    let fields = Arc::new(field_infos(&cursor.schema, None));
     let remaining = match target {
         FetchTarget::Count(n) => Some(n),
         FetchTarget::All => None,
     };
 
     struct State {
-        portal: Arc<TokioMutex<SubscriptionPortal>>,
-        pending: Arc<parking_lot::Mutex<VecDeque<PgWireResult<pgwire::messages::data::DataRow>>>>,
-        exhausted: Arc<AtomicBool>,
+        cursor: ActiveCursor,
         fields: Arc<Vec<FieldInfo>>,
         remaining: Option<u64>,
     }
 
     let init = State {
-        portal,
-        pending,
-        exhausted,
+        cursor,
         fields: Arc::clone(&fields),
         remaining,
     };
@@ -680,36 +653,33 @@ fn fetch_response(
             }
             // Pending rows from a prior FETCH come out first. Anything left
             // here when remaining hits 0 stays for the next call.
-            let popped = s.pending.lock().pop_front();
+            let popped = s.cursor.inner.pending.lock().pop_front();
             if let Some(row) = popped {
                 if let Some(n) = s.remaining.as_mut() {
                     *n = n.saturating_sub(1);
                 }
                 return Some((row, s));
             }
-            if s.exhausted.load(Ordering::Acquire) {
+            if s.cursor.inner.exhausted.load(Ordering::Acquire) {
                 return None;
             }
 
-            let next = {
-                let mut guard = s.portal.lock().await;
-                guard.next_frame().await
-            };
+            let next = s.cursor.inner.portal.lock().await.next_frame().await;
             match next {
                 None => {
-                    s.exhausted.store(true, Ordering::Release);
+                    s.cursor.inner.exhausted.store(true, Ordering::Release);
                     return None;
                 }
                 Some(PortalFrame::Batch(b)) if b.num_rows() > 0 => {
                     let encoded = encode_batch(&b, &s.fields);
-                    s.pending.lock().extend(encoded);
+                    s.cursor.inner.pending.lock().extend(encoded);
                 }
                 Some(PortalFrame::Batch(_)) => {}
                 Some(PortalFrame::Barrier { .. }) => {
                     // Same as portal_to_response: PG has no out-of-band marker.
                 }
                 Some(PortalFrame::Lagged(n)) => {
-                    s.exhausted.store(true, Ordering::Release);
+                    s.cursor.inner.exhausted.store(true, Ordering::Release);
                     let err = user_error(
                         "54000",
                         format!("subscription lagged: skipped {n} messages, terminating cursor"),
@@ -2148,6 +2118,40 @@ mod integration_tests {
         (db, addr, handle)
     }
 
+    /// Same as `spawn_with_data`, but `prices` is a STREAM with retained
+    /// history. Lets cursor tests push rows *before* SUBSCRIBE attaches
+    /// without losing them — the receiver replays on attach.
+    async fn spawn_with_retained_data() -> (
+        Arc<LaminarDB>,
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
+            .await
+            .expect("create source");
+        db.execute(
+            "CREATE STREAM prices AS SELECT symbol, price FROM trades \
+             WITH ('retain_history' = '4mb')",
+        )
+        .await
+        .expect("create stream");
+        db.start().await.expect("db starts");
+
+        let (addr, handle) = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            None,
+            256,
+            10,
+        )
+        .await
+        .expect("pgwire serve");
+        (db, addr, handle)
+    }
+
     /// `prepare()` triggers `Parse` + `Describe(Statement)`. Verifies the
     /// extended-query parser resolves stream schemas at parse time and
     /// returns column metadata to the client.
@@ -2354,28 +2358,17 @@ mod integration_tests {
         handle.abort();
     }
 
-    /// Background ingester for cursor tests: pushes one row per sleep tick
-    /// until the test calls `pusher.abort()`. We need this because cursor
-    /// FETCH on a streaming SUBSCRIBE blocks until the row count is met or
-    /// the cursor closes.
-    fn spawn_pusher(db: Arc<LaminarDB>, count: usize) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            for i in 0..count {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                let symbol = format!("S{i}");
-                push_one_trade(&db, &symbol, i as f64).await;
-            }
-        })
-    }
-
     /// `\set FETCH_COUNT N` flow: BEGIN; DECLARE …; FETCH N FROM …; CLOSE; COMMIT.
     /// All over SimpleQuery — the path psql uses when `FETCH_COUNT` is set.
+    /// Uses the retained-history variant so we can push before SUBSCRIBE.
     #[tokio::test]
     async fn cursor_declare_fetch_close_happy_path() {
-        let (db, addr, handle) = spawn_with_data().await;
+        let (db, addr, handle) = spawn_with_retained_data().await;
         let client = connect(addr).await;
 
-        let pusher = spawn_pusher(Arc::clone(&db), 4);
+        for i in 0..4 {
+            push_one_trade(&db, &format!("S{i}"), i as f64).await;
+        }
 
         client.simple_query("BEGIN").await.expect("BEGIN");
         client
@@ -2383,14 +2376,10 @@ mod integration_tests {
             .await
             .expect("DECLARE");
 
-        // FETCH blocks until 2 rows arrive, no matter how slow the pusher is.
-        let messages = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            client.simple_query("FETCH 2 FROM c"),
-        )
-        .await
-        .expect("FETCH 2 within 3s")
-        .expect("FETCH 2");
+        let messages = client
+            .simple_query("FETCH 2 FROM c")
+            .await
+            .expect("FETCH 2");
         let row_count = messages
             .iter()
             .filter(|m| matches!(m, SimpleQueryMessage::Row(_)))
@@ -2400,7 +2389,6 @@ mod integration_tests {
         client.simple_query("CLOSE c").await.expect("CLOSE");
         client.simple_query("COMMIT").await.expect("COMMIT");
 
-        let _ = pusher.await;
         handle.abort();
     }
 
@@ -2568,44 +2556,33 @@ mod integration_tests {
 
     /// A multi-row batch with `FETCH 1` repeated must return each row in
     /// order — leftover rows persist on the cursor instead of being dropped
-    /// when the response stream ends.
+    /// when the response stream ends. With the bug, `FETCH 1` would consume
+    /// the batch internally, return row[0], and discard row[1].
     #[tokio::test]
     async fn cursor_fetch_preserves_leftover_rows_in_one_batch() {
-        let (db, addr, handle) = spawn_with_data().await;
+        let (db, addr, handle) = spawn_with_retained_data().await;
         let client = connect(addr).await;
 
-        // Push a single 2-row batch. With the bug, FETCH 1 would consume the
-        // batch internally, hand back row[0], and discard row[1] — the next
-        // FETCH would then block waiting for fresh frames and time out.
-        let pusher = {
-            let db = Arc::clone(&db);
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let src = db.source_untyped("trades").expect("source");
-                let batch = arrow_array::RecordBatch::try_new(
-                    src.schema().clone(),
-                    vec![
-                        Arc::new(arrow_array::StringArray::from(vec!["AAPL", "GOOG"])),
-                        Arc::new(arrow_array::Float64Array::from(vec![1.0, 2.0])),
-                    ],
-                )
-                .expect("batch");
-                src.push_arrow(batch).expect("push");
-            })
-        };
+        let src = db.source_untyped("trades").expect("source");
+        let batch = arrow_array::RecordBatch::try_new(
+            src.schema().clone(),
+            vec![
+                Arc::new(arrow_array::StringArray::from(vec!["AAPL", "GOOG"])),
+                Arc::new(arrow_array::Float64Array::from(vec![1.0, 2.0])),
+            ],
+        )
+        .expect("batch");
+        src.push_arrow(batch).expect("push");
 
         client
             .simple_query("DECLARE c CURSOR FOR SUBSCRIBE prices")
             .await
             .expect("DECLARE");
 
-        let first = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            client.simple_query("FETCH 1 FROM c"),
-        )
-        .await
-        .expect("first FETCH within 3s")
-        .expect("FETCH 1 #1");
+        let first = client
+            .simple_query("FETCH 1 FROM c")
+            .await
+            .expect("FETCH 1");
         let r1: Vec<&str> = first
             .iter()
             .filter_map(|m| match m {
@@ -2615,13 +2592,10 @@ mod integration_tests {
             .collect();
         assert_eq!(r1, vec!["AAPL"]);
 
-        let second = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            client.simple_query("FETCH 1 FROM c"),
-        )
-        .await
-        .expect("second FETCH within 3s")
-        .expect("FETCH 1 #2");
+        let second = client
+            .simple_query("FETCH 1 FROM c")
+            .await
+            .expect("FETCH 1");
         let r2: Vec<&str> = second
             .iter()
             .filter_map(|m| match m {
@@ -2632,7 +2606,6 @@ mod integration_tests {
         assert_eq!(r2, vec!["GOOG"]);
 
         client.simple_query("CLOSE c").await.expect("CLOSE");
-        let _ = pusher.await;
         handle.abort();
     }
 
@@ -2668,22 +2641,19 @@ mod integration_tests {
     /// Cursor name lookup is case-insensitive (PG identifier folding rules).
     #[tokio::test]
     async fn cursor_name_case_insensitive() {
-        let (db, addr, handle) = spawn_with_data().await;
+        let (db, addr, handle) = spawn_with_retained_data().await;
         let client = connect(addr).await;
-        let pusher = spawn_pusher(Arc::clone(&db), 1);
+        push_one_trade(&db, "AAPL", 1.0).await;
 
         client
             .simple_query("DECLARE MyCursor CURSOR FOR SUBSCRIBE prices")
             .await
             .expect("DECLARE");
 
-        let messages = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            client.simple_query("FETCH 1 FROM mycursor"),
-        )
-        .await
-        .expect("within 3s")
-        .expect("FETCH from lowercased name");
+        let messages = client
+            .simple_query("FETCH 1 FROM mycursor")
+            .await
+            .expect("FETCH from lowercased name");
         let row_count = messages
             .iter()
             .filter(|m| matches!(m, SimpleQueryMessage::Row(_)))
@@ -2691,8 +2661,6 @@ mod integration_tests {
         assert_eq!(row_count, 1);
 
         client.simple_query("CLOSE MYCURSOR").await.expect("CLOSE");
-
-        let _ = pusher.await;
         handle.abort();
     }
 }
