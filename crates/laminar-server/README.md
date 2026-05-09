@@ -179,7 +179,9 @@ pgwire_tls_min_version = "1.2"
 pgwire_tls_client_ca = "/etc/laminar/clients-ca.pem"
 ```
 
-Postgres clients negotiate TLS via `sslmode=require` (or `verify-ca` / `verify-full` if your cert chain is trusted by the client). The handshake follows the standard `SSLRequest` flow — `psql`, JDBC, asyncpg, etc. all just work. Cert rotation requires a server restart; hot reload is a follow-up.
+Postgres clients negotiate TLS via `sslmode=require` (or `verify-ca` / `verify-full` if your cert chain is trusted by the client). The handshake follows the standard `SSLRequest` flow — `psql`, JDBC, asyncpg, etc. all just work.
+
+The server watches `pgwire_tls_cert`, `pgwire_tls_key`, and `pgwire_tls_client_ca` and reloads the TLS acceptor in place after a 500ms debounce, so cert rotation does not require a restart. In-flight handshakes finish with the cert that was current when the socket was accepted; new accepts pick up the rotated cert. A bad rotation (truncated file, expired cert) is logged as `pgwire.tls_reload outcome=failed` and the previous acceptor is kept. Set `LAMINAR_DISABLE_FILE_WATCH=1` to disable.
 
 ```bash
 psql "host=127.0.0.1 port=5433 dbname=laminardb user=any" -c "SUBSCRIBE avg_price WHERE symbol = 'AAPL'"

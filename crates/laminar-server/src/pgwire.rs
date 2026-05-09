@@ -1151,6 +1151,167 @@ pub struct TlsPaths<'a> {
     pub client_ca: Option<&'a std::path::Path>,
 }
 
+/// Owned counterpart to `TlsPaths` that the listener keeps for the
+/// lifetime of `serve()` so the file watcher can rebuild the acceptor
+/// without the original config still being in scope.
+#[derive(Debug, Clone)]
+struct TlsConfigPaths {
+    cert: std::path::PathBuf,
+    key: std::path::PathBuf,
+    min_version: TlsMinVersion,
+    client_ca: Option<std::path::PathBuf>,
+}
+
+impl TlsConfigPaths {
+    fn from_paths(paths: &TlsPaths<'_>) -> Self {
+        Self {
+            cert: paths.cert.to_path_buf(),
+            key: paths.key.to_path_buf(),
+            min_version: paths.min_version,
+            client_ca: paths.client_ca.map(|p| p.to_path_buf()),
+        }
+    }
+
+    fn borrow(&self) -> TlsPaths<'_> {
+        TlsPaths {
+            cert: &self.cert,
+            key: &self.key,
+            min_version: self.min_version,
+            client_ca: self.client_ca.as_deref(),
+        }
+    }
+}
+
+/// Live TLS acceptor + paths needed to rebuild it on cert rotation.
+/// Reads on the accept path are a single mutex acquire and a cheap
+/// `TlsAcceptor` clone; reloads are triggered by the file watcher.
+pub struct TlsReloadState {
+    paths: TlsConfigPaths,
+    acceptor: parking_lot::Mutex<Arc<tokio_rustls::TlsAcceptor>>,
+}
+
+impl TlsReloadState {
+    fn snapshot(&self) -> Arc<tokio_rustls::TlsAcceptor> {
+        Arc::clone(&self.acceptor.lock())
+    }
+}
+
+/// Rebuild the TLS acceptor from `state.paths` and atomically swap it in.
+/// On any error the previous acceptor is left in place, so a bad rotation
+/// (truncated file, expired cert) doesn't take TLS down.
+#[allow(clippy::result_large_err)]
+pub(crate) fn try_reload_tls(state: &TlsReloadState) -> Result<(), ServerError> {
+    let new_acceptor = load_tls_acceptor(state.paths.borrow())?;
+    *state.acceptor.lock() = Arc::new(new_acceptor);
+    Ok(())
+}
+
+/// Watch the cert / key / client-CA files and call `try_reload_tls` after
+/// debounced changes. Mirrors the pattern in `watcher.rs` (parent-dir
+/// watch, debounce, then act). Runs until the channel closes; the caller
+/// drives shutdown by aborting the task that owns this future.
+async fn watch_tls_files(state: Arc<TlsReloadState>, debounce: std::time::Duration) {
+    use crossfire::{mpsc, MTx};
+    use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+
+    // Resolve the set of files we care about, then derive the parent dirs
+    // to watch. Watching parents (not files) is what makes atomic-rename
+    // rotations (write-tmp + rename-into-place) reliably visible.
+    let mut targets: Vec<std::path::PathBuf> = Vec::new();
+    for path in [
+        Some(state.paths.cert.clone()),
+        Some(state.paths.key.clone()),
+        state.paths.client_ca.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        match path.canonicalize() {
+            Ok(p) => targets.push(p),
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "pgwire TLS watcher: cannot canonicalize path; reload disabled",
+                );
+                return;
+            }
+        }
+    }
+    let mut dirs: Vec<std::path::PathBuf> = targets
+        .iter()
+        .filter_map(|p| p.parent().map(|d| d.to_path_buf()))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+
+    let (tx, rx) = mpsc::bounded_async::<()>(16);
+    let blocking_tx: MTx<_> = tx.clone().into_blocking();
+    let watch_targets: Vec<std::path::PathBuf> = targets.clone();
+
+    let mut watcher: RecommendedWatcher =
+        match notify::recommended_watcher(move |result: Result<Event, notify::Error>| match result {
+            Ok(event) => {
+                let touched = event.paths.iter().any(|p| {
+                    p.canonicalize()
+                        .ok()
+                        .as_ref()
+                        .is_some_and(|c| watch_targets.contains(c))
+                });
+                if touched {
+                    let _ = blocking_tx.send(());
+                }
+            }
+            Err(e) => warn!(error = %e, "pgwire TLS watcher: notify error"),
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!(error = %e, "pgwire TLS watcher: failed to create watcher; reload disabled");
+                return;
+            }
+        };
+
+    for dir in &dirs {
+        if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+            warn!(
+                dir = %dir.display(),
+                error = %e,
+                "pgwire TLS watcher: failed to watch directory; reload disabled",
+            );
+            return;
+        }
+    }
+    info!(
+        files = ?targets.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "pgwire TLS watcher started",
+    );
+
+    loop {
+        if rx.recv().await.is_err() {
+            return;
+        }
+        // Debounce: sleep then drain so a burst of inotify events
+        // (cert + key written separately) coalesces into one reload.
+        tokio::time::sleep(debounce).await;
+        while rx.try_recv().is_ok() {}
+
+        match try_reload_tls(&state) {
+            Ok(()) => tracing::info!(
+                target: "audit",
+                event = "pgwire.tls_reload",
+                outcome = "ok",
+            ),
+            Err(e) => tracing::warn!(
+                target: "audit",
+                event = "pgwire.tls_reload",
+                outcome = "failed",
+                error = %e,
+                "pgwire TLS reload failed; previous certificate kept",
+            ),
+        }
+    }
+}
+
 /// Minimum TLS protocol version accepted on the pgwire listener. rustls
 /// already disables TLS 1.0/1.1; this narrows further when an operator
 /// needs TLS 1.3 only.
@@ -1423,8 +1584,19 @@ pub async fn serve(
 
     let tls_min_label = tls.as_ref().map(|p| p.min_version.label());
     let mtls_on = tls.as_ref().is_some_and(|p| p.client_ca.is_some());
-    let tls_acceptor = match tls {
-        Some(paths) => Some(load_tls_acceptor(paths)?),
+    let tls_state: Option<Arc<TlsReloadState>> = match tls {
+        Some(paths) => {
+            let acceptor = load_tls_acceptor(TlsPaths {
+                cert: paths.cert,
+                key: paths.key,
+                min_version: paths.min_version,
+                client_ca: paths.client_ca,
+            })?;
+            Some(Arc::new(TlsReloadState {
+                paths: TlsConfigPaths::from_paths(&paths),
+                acceptor: parking_lot::Mutex::new(Arc::new(acceptor)),
+            }))
+        }
         None => None,
     };
 
@@ -1436,7 +1608,7 @@ pub async fn serve(
         .map_err(|e| ServerError::Http(format!("pgwire local_addr: {e}")))?;
 
     let factory = Arc::new(LaminarHandlerFactory::new(db, users));
-    let tls_mode = if tls_acceptor.is_some() { "on" } else { "off" };
+    let tls_mode = if tls_state.is_some() { "on" } else { "off" };
     let tls_min = tls_min_label.unwrap_or("-");
     let mtls = if mtls_on { "on" } else { "off" };
     if auth_mode == "trust" {
@@ -1461,8 +1633,18 @@ pub async fn serve(
     // Track per-connection tasks so abort on the outer JoinHandle stops
     // active sessions in addition to the accept loop.
     let failures = Arc::new(FailureTracker::default());
+    let watcher_state = tls_state.as_ref().map(Arc::clone);
+    let watcher_disabled =
+        std::env::var("LAMINAR_DISABLE_FILE_WATCH").is_ok_and(|v| v == "1" || v == "true");
     let handle = tokio::spawn(async move {
         let mut sessions: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        // Spawn the TLS hot-reload watcher into the same JoinSet so it's
+        // aborted alongside sessions when the outer handle is dropped.
+        if let (Some(state), false) = (watcher_state, watcher_disabled) {
+            sessions.spawn(async move {
+                watch_tls_files(state, std::time::Duration::from_millis(500)).await;
+            });
+        }
         loop {
             tokio::select! {
                 Some(_) = sessions.join_next(), if !sessions.is_empty() => {
@@ -1497,7 +1679,12 @@ pub async fn serve(
                                 continue;
                             }
                             let factory_ref = Arc::clone(&factory);
-                            let tls_ref = tls_acceptor.clone();
+                            // Snapshot the live acceptor so that an in-flight
+                            // handshake completes against whatever cert was
+                            // current when the socket was accepted, even if a
+                            // hot-reload swaps it under us.
+                            let tls_ref: Option<tokio_rustls::TlsAcceptor> =
+                                tls_state.as_ref().map(|s| (*s.snapshot()).clone());
                             let failures_ref = Arc::clone(&failures);
                             let peer_str = peer.to_string();
                             tracing::info!(
@@ -2450,6 +2637,90 @@ mod integration_tests {
         let v = first_row_value(&messages, 0).expect("row");
         assert!(v.contains("LaminarDB"), "version: {v}");
         handle.abort();
+    }
+
+    /// Build a `TlsReloadState` directly for unit-testing the reload path
+    /// without standing up a listener.
+    fn build_reload_state(
+        cert: &std::path::Path,
+        key: &std::path::Path,
+    ) -> super::TlsReloadState {
+        let paths = super::TlsPaths {
+            cert,
+            key,
+            min_version: super::TlsMinVersion::V1_2,
+            client_ca: None,
+        };
+        let acceptor = super::load_tls_acceptor(super::TlsPaths {
+            cert: paths.cert,
+            key: paths.key,
+            min_version: paths.min_version,
+            client_ca: paths.client_ca,
+        })
+        .expect("initial acceptor loads");
+        super::TlsReloadState {
+            paths: super::TlsConfigPaths::from_paths(&paths),
+            acceptor: parking_lot::Mutex::new(Arc::new(acceptor)),
+        }
+    }
+
+    /// Hot-reload: writing a fresh cert+key over the configured paths and
+    /// calling `try_reload_tls` swaps the acceptor under the mutex.
+    #[test]
+    fn tls_reload_swaps_acceptor_on_valid_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        // Initial cert.
+        let first =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        std::fs::write(&cert_path, first.cert.pem()).unwrap();
+        std::fs::write(&key_path, first.key_pair.serialize_pem()).unwrap();
+
+        let state = build_reload_state(&cert_path, &key_path);
+        let before = state.snapshot();
+
+        // Rotate to a brand-new pair.
+        let second =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        std::fs::write(&cert_path, second.cert.pem()).unwrap();
+        std::fs::write(&key_path, second.key_pair.serialize_pem()).unwrap();
+
+        super::try_reload_tls(&state).expect("reload succeeds");
+        let after = state.snapshot();
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "acceptor pointer must change after a successful reload",
+        );
+    }
+
+    /// Hot-reload: a corrupt cert file leaves the previous acceptor in
+    /// place — TLS doesn't go down on a bad rotation.
+    #[test]
+    fn tls_reload_keeps_old_acceptor_on_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        let first =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        std::fs::write(&cert_path, first.cert.pem()).unwrap();
+        std::fs::write(&key_path, first.key_pair.serialize_pem()).unwrap();
+
+        let state = build_reload_state(&cert_path, &key_path);
+        let before = state.snapshot();
+
+        // Truncate cert.pem to non-PEM garbage.
+        std::fs::write(&cert_path, b"this is not a certificate").unwrap();
+        let err = super::try_reload_tls(&state).expect_err("reload must fail");
+        let after = state.snapshot();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "acceptor must be unchanged on reload failure",
+        );
+        assert!(
+            err.to_string().contains("pgwire_tls_cert"),
+            "error should mention pgwire_tls_cert, got: {err}",
+        );
     }
 
     /// Flatten an error and its `source()` chain to a single string for
