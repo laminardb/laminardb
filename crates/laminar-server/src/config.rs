@@ -179,10 +179,7 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
             );
         }
         if !ca.exists() {
-            errors.push(format!(
-                "pgwire_tls_client_ca not found: {}",
-                ca.display()
-            ));
+            errors.push(format!("pgwire_tls_client_ca not found: {}", ca.display()));
         }
     }
 
@@ -874,7 +871,9 @@ pgwire_tls_client_ca = "/does/not/matter.pem"
         match err {
             ConfigError::ValidationErrors { errors } => {
                 assert!(
-                    errors.iter().any(|e| e.contains("requires pgwire_tls_cert")),
+                    errors
+                        .iter()
+                        .any(|e| e.contains("requires pgwire_tls_cert")),
                     "errors: {errors:?}"
                 );
             }

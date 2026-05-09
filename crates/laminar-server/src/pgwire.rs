@@ -892,11 +892,7 @@ struct LaminarAuthSource {
 /// other lengths fall back to plaintext handling.
 pub(crate) fn parse_pre_hashed_md5(stored: &str) -> Option<&str> {
     let inner = stored.strip_prefix("md5")?;
-    if inner.len() == 32
-        && inner
-            .chars()
-            .all(|c| matches!(c, '0'..='9' | 'a'..='f'))
-    {
+    if inner.len() == 32 && inner.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
         Some(inner)
     } else {
         None
@@ -1282,8 +1278,8 @@ async fn watch_tls_files(state: Arc<TlsReloadState>, debounce: std::time::Durati
     let blocking_tx: MTx<_> = tx.clone().into_blocking();
     let watch_targets: Vec<std::path::PathBuf> = targets.clone();
 
-    let mut watcher: RecommendedWatcher =
-        match notify::recommended_watcher(move |result: Result<Event, notify::Error>| match result {
+    let mut watcher: RecommendedWatcher = match notify::recommended_watcher(
+        move |result: Result<Event, notify::Error>| match result {
             Ok(event) => {
                 let touched = event.paths.iter().any(|p| {
                     p.canonicalize()
@@ -1296,13 +1292,14 @@ async fn watch_tls_files(state: Arc<TlsReloadState>, debounce: std::time::Durati
                 }
             }
             Err(e) => warn!(error = %e, "pgwire TLS watcher: notify error"),
-        }) {
-            Ok(w) => w,
-            Err(e) => {
-                warn!(error = %e, "pgwire TLS watcher: failed to create watcher; reload disabled");
-                return;
-            }
-        };
+        },
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            warn!(error = %e, "pgwire TLS watcher: failed to create watcher; reload disabled");
+            return;
+        }
+    };
 
     for dir in &dirs {
         if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
@@ -1566,9 +1563,8 @@ fn build_client_cert_verifier(
     let mut roots = RootCertStore::empty();
     let mut added = 0usize;
     for cert in rustls_pemfile::certs(&mut BufReader::new(file)) {
-        let cert = cert.map_err(|e| {
-            ServerError::Http(format!("parse pgwire_tls_client_ca: {e}"))
-        })?;
+        let cert =
+            cert.map_err(|e| ServerError::Http(format!("parse pgwire_tls_client_ca: {e}")))?;
         roots
             .add(cert)
             .map_err(|e| ServerError::Http(format!("invalid CA in pgwire_tls_client_ca: {e}")))?;
@@ -2226,8 +2222,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn md5_auth_accepts_correct_password_against_prehash() {
-        let (addr, handle) =
-            spawn_server_with(md5_users_prehashed("alice", TEST_PASSWORD)).await;
+        let (addr, handle) = spawn_server_with(md5_users_prehashed("alice", TEST_PASSWORD)).await;
         let client = connect_with_password(addr, "alice", TEST_PASSWORD)
             .await
             .expect("auth must succeed against pre-hashed entry");
@@ -2242,8 +2237,7 @@ mod integration_tests {
 
     #[tokio::test]
     async fn md5_auth_rejects_wrong_password_against_prehash() {
-        let (addr, handle) =
-            spawn_server_with(md5_users_prehashed("alice", TEST_PASSWORD)).await;
+        let (addr, handle) = spawn_server_with(md5_users_prehashed("alice", TEST_PASSWORD)).await;
         let err = connect_with_password(addr, "alice", "not-the-password")
             .await
             .expect_err("auth must fail");
@@ -2357,33 +2351,24 @@ mod integration_tests {
     }
 
     fn mint_ca_and_client_leaf(common_name: &str) -> MintedClientPki {
-        use tokio_rustls::rustls::pki_types::{
-            CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer,
-        };
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-        let mut ca_params =
-            rcgen::CertificateParams::new(vec!["mtls-test-ca".into()]).unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(vec!["mtls-test-ca".into()]).unwrap();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         let ca_key = rcgen::KeyPair::generate().unwrap();
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
 
-        let mut leaf_params =
-            rcgen::CertificateParams::new(vec![common_name.into()]).unwrap();
-        leaf_params.extended_key_usages =
-            vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let mut leaf_params = rcgen::CertificateParams::new(vec![common_name.into()]).unwrap();
+        leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
         let leaf_key = rcgen::KeyPair::generate().unwrap();
-        let leaf_cert = leaf_params
-            .signed_by(&leaf_key, &ca_cert, &ca_key)
-            .unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
         let ca_pem_path = dir.path().join("ca.pem");
         std::fs::write(&ca_pem_path, ca_cert.pem()).unwrap();
 
         let leaf_chain = vec![CertificateDer::from(leaf_cert.der().to_vec())];
-        let leaf_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            leaf_key.serialize_der(),
-        ));
+        let leaf_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
 
         MintedClientPki {
             _dir: dir,
@@ -2411,8 +2396,7 @@ mod integration_tests {
         {
             roots.add(c).unwrap();
         }
-        let builder = tokio_rustls::rustls::ClientConfig::builder()
-            .with_root_certificates(roots);
+        let builder = tokio_rustls::rustls::ClientConfig::builder().with_root_certificates(roots);
         let client_cfg = match client_auth {
             Some((chain, key)) => builder.with_client_auth_cert(chain, key).unwrap(),
             None => builder.with_no_client_auth(),
@@ -2492,9 +2476,9 @@ mod integration_tests {
         }
         super::ensure_tls_provider();
         // Client pinned to TLS 1.2 only — must be refused by a 1.3-min server.
-        let client_cfg = tokio_rustls::rustls::ClientConfig::builder_with_protocol_versions(
-            &[&tokio_rustls::rustls::version::TLS12],
-        )
+        let client_cfg = tokio_rustls::rustls::ClientConfig::builder_with_protocol_versions(&[
+            &tokio_rustls::rustls::version::TLS12,
+        ])
         .with_root_certificates(roots)
         .with_no_client_auth();
 
@@ -2510,13 +2494,10 @@ mod integration_tests {
         };
         // tokio_postgres wraps the rustls error; flatten the chain so we can
         // assert against the version-mismatch token rustls emits.
-        let chain = std::iter::successors(
-            Some(&err as &dyn std::error::Error),
-            |e| e.source(),
-        )
-        .map(|e| e.to_string())
-        .collect::<Vec<_>>()
-        .join(" | ");
+        let chain = std::iter::successors(Some(&err as &dyn std::error::Error), |e| e.source())
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
         assert!(
             chain.contains("ProtocolVersion") || chain.contains("incompatible"),
             "expected a TLS version-mismatch error, got: {chain}"
@@ -2736,10 +2717,7 @@ mod integration_tests {
 
     /// Build a `TlsReloadState` directly for unit-testing the reload path
     /// without standing up a listener.
-    fn build_reload_state(
-        cert: &std::path::Path,
-        key: &std::path::Path,
-    ) -> super::TlsReloadState {
+    fn build_reload_state(cert: &std::path::Path, key: &std::path::Path) -> super::TlsReloadState {
         let paths = super::TlsPaths {
             cert,
             key,
@@ -2767,8 +2745,7 @@ mod integration_tests {
         let cert_path = dir.path().join("cert.pem");
         let key_path = dir.path().join("key.pem");
         // Initial cert.
-        let first =
-            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let first = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         std::fs::write(&cert_path, first.cert.pem()).unwrap();
         std::fs::write(&key_path, first.key_pair.serialize_pem()).unwrap();
 
@@ -2776,8 +2753,7 @@ mod integration_tests {
         let before = state.snapshot();
 
         // Rotate to a brand-new pair.
-        let second =
-            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let second = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         std::fs::write(&cert_path, second.cert.pem()).unwrap();
         std::fs::write(&key_path, second.key_pair.serialize_pem()).unwrap();
 
@@ -2796,8 +2772,7 @@ mod integration_tests {
         let dir = tempfile::tempdir().unwrap();
         let cert_path = dir.path().join("cert.pem");
         let key_path = dir.path().join("key.pem");
-        let first =
-            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let first = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         std::fs::write(&cert_path, first.cert.pem()).unwrap();
         std::fs::write(&key_path, first.key_pair.serialize_pem()).unwrap();
 
