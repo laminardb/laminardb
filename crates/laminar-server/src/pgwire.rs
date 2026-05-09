@@ -444,42 +444,42 @@ fn encode_field_binary(
     row: usize,
     name: &str,
 ) -> PgWireResult<()> {
-    use arrow_array::{cast::AsArray, types::*, BooleanArray, Date32Array, Date64Array};
+    use arrow_array::{cast::AsArray, types::*};
     use arrow_schema::DataType;
 
     if col.is_null(row) {
         return enc.encode_field(&None::<&str>);
     }
 
-    // Each arm pulls the typed array from `col` and hands the value to
-    // `DataRowEncoder` which calls `postgres-types::ToSql` for the wire
-    // format. The casts widen narrower Arrow ints to the matching
-    // Postgres OID (`arrow_to_pg_type`).
+    // Pull the typed Arrow value and pass it to `DataRowEncoder`, which
+    // calls `postgres-types::ToSql` for the wire format. The `as $cast`
+    // arm widens a narrower Arrow int to the matching Postgres OID (see
+    // `arrow_to_pg_type`); only lossless `From` casts go through here.
     macro_rules! prim {
-        ($ArrowTy:ty, $cast:expr) => {{
-            let arr = col.as_primitive::<$ArrowTy>();
-            #[allow(clippy::redundant_closure_call)]
-            enc.encode_field(&Some(($cast)(arr.value(row))))
-        }};
+        ($ty:ty as $cast:ty) => {
+            enc.encode_field(&Some(<$cast>::from(col.as_primitive::<$ty>().value(row))))
+        };
+        ($ty:ty) => {
+            enc.encode_field(&Some(col.as_primitive::<$ty>().value(row)))
+        };
     }
 
     match col.data_type() {
-        DataType::Int8 => prim!(Int8Type, |x: i8| i32::from(x)),
-        DataType::Int16 => prim!(Int16Type, |x: i16| i32::from(x)),
-        DataType::Int32 => prim!(Int32Type, |x: i32| x),
-        DataType::Int64 => prim!(Int64Type, |x: i64| x),
-        DataType::UInt8 => prim!(UInt8Type, |x: u8| i32::from(x)),
-        DataType::UInt16 => prim!(UInt16Type, |x: u16| i32::from(x)),
-        DataType::UInt32 => prim!(UInt32Type, |x: u32| i64::from(x)),
-        DataType::UInt64 => prim!(UInt64Type, |x: u64| i64::try_from(x).unwrap_or(i64::MAX)),
-        DataType::Float32 => prim!(Float32Type, |x: f32| f64::from(x)),
-        DataType::Float64 => prim!(Float64Type, |x: f64| x),
-        DataType::Boolean => enc.encode_field(&Some(
-            col.as_any()
-                .downcast_ref::<BooleanArray>()
-                .unwrap()
-                .value(row),
-        )),
+        DataType::Int8 => prim!(Int8Type as i32),
+        DataType::Int16 => prim!(Int16Type as i32),
+        DataType::Int32 => prim!(Int32Type),
+        DataType::Int64 => prim!(Int64Type),
+        DataType::UInt8 => prim!(UInt8Type as i32),
+        DataType::UInt16 => prim!(UInt16Type as i32),
+        DataType::UInt32 => prim!(UInt32Type as i64),
+        DataType::UInt64 => {
+            // PG has no unsigned 64; saturate so we never wrap.
+            let v = col.as_primitive::<UInt64Type>().value(row);
+            enc.encode_field(&Some(i64::try_from(v).unwrap_or(i64::MAX)))
+        }
+        DataType::Float32 => prim!(Float32Type as f64),
+        DataType::Float64 => prim!(Float64Type),
+        DataType::Boolean => enc.encode_field(&Some(col.as_boolean().value(row))),
         DataType::Utf8 => enc.encode_field(&Some(col.as_string::<i32>().value(row))),
         DataType::LargeUtf8 => enc.encode_field(&Some(col.as_string::<i64>().value(row))),
         DataType::Timestamp(unit, _tz) => {
@@ -513,21 +513,13 @@ fn encode_field_binary(
             enc.encode_field(&Some(dt))
         }
         DataType::Date32 => {
-            let v = col
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .unwrap()
-                .value(row);
+            let v = col.as_primitive::<Date32Type>().value(row);
             let dt = arrow_array::temporal_conversions::date32_to_datetime(v)
                 .ok_or_else(|| user_error("22008", format!("DATE out of range: {v}")))?;
             enc.encode_field(&Some(dt.date()))
         }
         DataType::Date64 => {
-            let v = col
-                .as_any()
-                .downcast_ref::<Date64Array>()
-                .unwrap()
-                .value(row);
+            let v = col.as_primitive::<Date64Type>().value(row);
             let dt = arrow_array::temporal_conversions::date64_to_datetime(v)
                 .ok_or_else(|| user_error("22008", format!("DATE out of range: {v}")))?;
             enc.encode_field(&Some(dt.date()))
@@ -1896,8 +1888,6 @@ mod integration_tests {
     /// the first row.
     #[tokio::test]
     async fn extended_query_binary_timestamp() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
         let db = Arc::new(LaminarDB::open().expect("db opens"));
         // `WATERMARK FOR ts AS ts - INTERVAL '0' SECOND` declares event time
         // so the streaming pipeline drives progress on the timestamp
@@ -1925,19 +1915,22 @@ mod integration_tests {
         .await
         .expect("pgwire serve");
 
-        // Push one row: ts = 2026-05-09T00:00:00Z, sym = AAPL.
-        let ts_us = 1_778_544_000_000_000_i64; // 2026-05-09T00:00:00Z in microseconds
-        let handle_src = db.source_untyped("events").expect("source");
-        let schema = handle_src.schema().clone();
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 5, 9)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let ts_us = expected.and_utc().timestamp_micros();
+
+        let src = db.source_untyped("events").expect("source");
         let batch = arrow_array::RecordBatch::try_new(
-            Arc::clone(&schema),
+            src.schema().clone(),
             vec![
                 Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![ts_us])),
                 Arc::new(arrow_array::StringArray::from(vec!["AAPL"])),
             ],
         )
         .expect("batch");
-        handle_src.push_arrow(batch).expect("push");
+        src.push_arrow(batch).expect("push");
 
         let mut client = connect(addr).await;
         let tx = client.transaction().await.expect("BEGIN");
@@ -1953,17 +1946,11 @@ mod integration_tests {
         .expect("query_portal");
         assert_eq!(rows.len(), 1);
 
-        // Decoded round-trip via tokio_postgres' chrono mapping
-        // (TIMESTAMP → NaiveDateTime).
         let ts: chrono::NaiveDateTime = rows[0].get(0);
         let sym: &str = rows[0].get(1);
-
-        let expected_ts = SystemTime::UNIX_EPOCH + std::time::Duration::from_micros(ts_us as u64);
-        let expected_naive = chrono::DateTime::<chrono::Utc>::from(expected_ts).naive_utc();
-        assert_eq!(ts, expected_naive);
+        assert_eq!(ts, expected);
         assert_eq!(sym, "AAPL");
 
-        let _ = UNIX_EPOCH;
         handle.abort();
     }
 
