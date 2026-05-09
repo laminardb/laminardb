@@ -172,6 +172,8 @@ Optional. Setting both `pgwire_tls_cert` and `pgwire_tls_key` enables TLS via [`
 ```toml
 pgwire_tls_cert = "/etc/laminar/pgwire.crt"
 pgwire_tls_key  = "/etc/laminar/pgwire.key"
+# Optional. Default "1.2"; set "1.3" to refuse TLS 1.2 handshakes.
+pgwire_tls_min_version = "1.2"
 ```
 
 Postgres clients negotiate TLS via `sslmode=require` (or `verify-ca` / `verify-full` if your cert chain is trusted by the client). The handshake follows the standard `SSLRequest` flow — `psql`, JDBC, asyncpg, etc. all just work. Cert rotation requires a server restart; hot reload is a follow-up.

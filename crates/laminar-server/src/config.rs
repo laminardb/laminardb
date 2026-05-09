@@ -152,6 +152,12 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
         (None, None) => {}
     }
+    match config.server.pgwire_tls_min_version.as_str() {
+        "1.2" | "1.3" => {}
+        other => errors.push(format!(
+            "pgwire_tls_min_version must be \"1.2\" or \"1.3\" (got \"{other}\")"
+        )),
+    }
 
     // Validate: cluster mode requires discovery and coordination
     if config.server.mode == "cluster" {
@@ -235,6 +241,11 @@ pub struct ServerSection {
     /// Per-IP auth-failure cap in a 60s rolling window. 0 disables.
     #[serde(default = "default_pgwire_max_auth_failures_per_min")]
     pub pgwire_max_auth_failures_per_min: u32,
+    /// Minimum TLS protocol version: `"1.2"` (default) or `"1.3"`. Pinning
+    /// to `"1.3"` is the PCI-DSS / FedRAMP-High posture; rustls already
+    /// disables TLS 1.0/1.1 unconditionally.
+    #[serde(default = "default_pgwire_tls_min_version")]
+    pub pgwire_tls_min_version: String,
 }
 
 fn default_pgwire_max_connections() -> usize {
@@ -243,6 +254,10 @@ fn default_pgwire_max_connections() -> usize {
 
 fn default_pgwire_max_auth_failures_per_min() -> u32 {
     10
+}
+
+fn default_pgwire_tls_min_version() -> String {
+    "1.2".to_string()
 }
 
 impl Default for ServerSection {
@@ -257,6 +272,7 @@ impl Default for ServerSection {
             pgwire_tls_key: None,
             pgwire_max_connections: default_pgwire_max_connections(),
             pgwire_max_auth_failures_per_min: default_pgwire_max_auth_failures_per_min(),
+            pgwire_tls_min_version: default_pgwire_tls_min_version(),
         }
     }
 }
@@ -808,6 +824,25 @@ pgwire_max_connections = 0
             ConfigError::ValidationErrors { errors } => {
                 assert!(
                     errors.iter().any(|e| e.contains("must be > 0")),
+                    "errors: {errors:?}"
+                );
+            }
+            _ => panic!("expected ValidationErrors"),
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_unknown_tls_min_version() {
+        let toml = r#"
+[server]
+pgwire_tls_min_version = "1.4"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        let err = validate_config(&config).unwrap_err();
+        match err {
+            ConfigError::ValidationErrors { errors } => {
+                assert!(
+                    errors.iter().any(|e| e.contains("pgwire_tls_min_version")),
                     "errors: {errors:?}"
                 );
             }

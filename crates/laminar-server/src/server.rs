@@ -185,6 +185,9 @@ pub async fn run_server(
     let pgwire_allow_remote = config.server.pgwire_allow_remote;
     let pgwire_tls_cert = config.server.pgwire_tls_cert.clone();
     let pgwire_tls_key = config.server.pgwire_tls_key.clone();
+    let pgwire_tls_min_version =
+        crate::pgwire::TlsMinVersion::from_config_str(&config.server.pgwire_tls_min_version)
+            .expect("pgwire_tls_min_version validated at config load");
     let pgwire_max_connections = config.server.pgwire_max_connections;
     let pgwire_max_auth_failures = config.server.pgwire_max_auth_failures_per_min;
     let (app_state, api_handle) =
@@ -193,7 +196,11 @@ pub async fn run_server(
 
     let pgwire_handle = if let Some(bind) = pgwire_bind {
         let tls = match (&pgwire_tls_cert, &pgwire_tls_key) {
-            (Some(c), Some(k)) => Some(crate::pgwire::TlsPaths { cert: c, key: k }),
+            (Some(c), Some(k)) => Some(crate::pgwire::TlsPaths {
+                cert: c,
+                key: k,
+                min_version: pgwire_tls_min_version,
+            }),
             _ => None,
         };
         match crate::pgwire::serve(

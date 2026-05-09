@@ -1145,6 +1145,43 @@ impl ExtendedQueryHandler for LaminarPgwireHandler {
 pub struct TlsPaths<'a> {
     pub cert: &'a std::path::Path,
     pub key: &'a std::path::Path,
+    pub min_version: TlsMinVersion,
+}
+
+/// Minimum TLS protocol version accepted on the pgwire listener. rustls
+/// already disables TLS 1.0/1.1; this narrows further when an operator
+/// needs TLS 1.3 only.
+#[derive(Clone, Copy, Debug)]
+pub enum TlsMinVersion {
+    V1_2,
+    V1_3,
+}
+
+impl TlsMinVersion {
+    pub(crate) fn from_config_str(s: &str) -> Option<Self> {
+        match s {
+            "1.2" => Some(Self::V1_2),
+            "1.3" => Some(Self::V1_3),
+            _ => None,
+        }
+    }
+
+    fn versions(self) -> &'static [&'static tokio_rustls::rustls::SupportedProtocolVersion] {
+        use tokio_rustls::rustls::version::{TLS12, TLS13};
+        static BOTH: &[&tokio_rustls::rustls::SupportedProtocolVersion] = &[&TLS12, &TLS13];
+        static ONLY_13: &[&tokio_rustls::rustls::SupportedProtocolVersion] = &[&TLS13];
+        match self {
+            Self::V1_2 => BOTH,
+            Self::V1_3 => ONLY_13,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::V1_2 => "1.2",
+            Self::V1_3 => "1.3",
+        }
+    }
 }
 
 /// Warn if the key file is group/other-readable.
@@ -1302,10 +1339,11 @@ fn load_tls_acceptor(paths: TlsPaths<'_>) -> Result<tokio_rustls::TlsAcceptor, S
             ))
         })?;
 
-    let server_config = tokio_rustls::rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| ServerError::Http(format!("rustls server config: {e}")))?;
+    let server_config =
+        tokio_rustls::rustls::ServerConfig::builder_with_protocol_versions(paths.min_version.versions())
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| ServerError::Http(format!("rustls server config: {e}")))?;
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(server_config)))
 }
 
@@ -1339,6 +1377,7 @@ pub async fn serve(
         _ => {}
     }
 
+    let tls_min_label = tls.as_ref().map(|p| p.min_version.label());
     let tls_acceptor = match tls {
         Some(paths) => Some(load_tls_acceptor(paths)?),
         None => None,
@@ -1353,14 +1392,22 @@ pub async fn serve(
 
     let factory = Arc::new(LaminarHandlerFactory::new(db, users));
     let tls_mode = if tls_acceptor.is_some() { "on" } else { "off" };
+    let tls_min = tls_min_label.unwrap_or("-");
     if auth_mode == "trust" {
         warn!(
             addr = %local_addr,
             tls = tls_mode,
+            tls_min,
             "pgwire listening with TRUST auth — any client reaching this address is admin",
         );
     } else {
-        info!(addr = %local_addr, auth = auth_mode, tls = tls_mode, "pgwire listening");
+        info!(
+            addr = %local_addr,
+            auth = auth_mode,
+            tls = tls_mode,
+            tls_min,
+            "pgwire listening",
+        );
     }
 
     // Track per-connection tasks so abort on the outer JoinHandle stops
@@ -1997,6 +2044,7 @@ mod integration_tests {
             Some(super::TlsPaths {
                 cert: &cert_path,
                 key: &key_path,
+                min_version: super::TlsMinVersion::V1_2,
             }),
             256,
             10,
@@ -2004,6 +2052,70 @@ mod integration_tests {
         .await
         .expect_err("expired cert must be rejected");
         assert!(err.to_string().contains("expired"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn tls_min_1_3_rejects_tls_1_2_client() {
+        let (_dir, cert_path, key_path) = self_signed_pem();
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        db.start().await.expect("db starts");
+        let (addr, handle) = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            Some(super::TlsPaths {
+                cert: &cert_path,
+                key: &key_path,
+                min_version: super::TlsMinVersion::V1_3,
+            }),
+            256,
+            10,
+        )
+        .await
+        .expect("pgwire serve");
+
+        let cert_bytes = std::fs::read(&cert_path).unwrap();
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut std::io::Cursor::new(cert_bytes))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        {
+            roots.add(c).unwrap();
+        }
+        super::ensure_tls_provider();
+        // Client pinned to TLS 1.2 only — must be refused by a 1.3-min server.
+        let client_cfg = tokio_rustls::rustls::ClientConfig::builder_with_protocol_versions(
+            &[&tokio_rustls::rustls::version::TLS12],
+        )
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+        let conn_str = format!(
+            "host=localhost hostaddr={} port={} user=any dbname=laminardb sslmode=require",
+            addr.ip(),
+            addr.port(),
+        );
+        let tls = tokio_postgres_rustls::MakeRustlsConnect::new(client_cfg);
+        let err = match tokio_postgres::connect(&conn_str, tls).await {
+            Ok(_) => panic!("TLS 1.2 client must be refused by a 1.3-min server"),
+            Err(e) => e,
+        };
+        // tokio_postgres wraps the rustls error; flatten the chain so we can
+        // assert against the version-mismatch token rustls emits.
+        let chain = std::iter::successors(
+            Some(&err as &dyn std::error::Error),
+            |e| e.source(),
+        )
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(" | ");
+        assert!(
+            chain.contains("ProtocolVersion") || chain.contains("incompatible"),
+            "expected a TLS version-mismatch error, got: {chain}"
+        );
+
+        handle.abort();
     }
 
     #[tokio::test]
@@ -2019,6 +2131,7 @@ mod integration_tests {
             Some(super::TlsPaths {
                 cert: &cert_path,
                 key: &key_path,
+                min_version: super::TlsMinVersion::V1_2,
             }),
             256,
             10,
