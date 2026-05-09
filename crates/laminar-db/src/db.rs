@@ -992,6 +992,10 @@ impl LaminarDB {
             StreamingStatement::Subscribe(_) => Err(DbError::InvalidOperation(
                 "SUBSCRIBE requires the pgwire endpoint, not HTTP /api/v1/sql".into(),
             )),
+            StreamingStatement::DeclareCursorForSubscribe { .. } => Err(DbError::InvalidOperation(
+                "DECLARE CURSOR FOR SUBSCRIBE requires the pgwire endpoint, not HTTP /api/v1/sql"
+                    .into(),
+            )),
         }
     }
 

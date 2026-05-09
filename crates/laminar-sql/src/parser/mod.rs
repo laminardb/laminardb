@@ -7,6 +7,7 @@
 pub mod aggregation_parser;
 pub mod analytic_parser;
 mod continuous_query_parser;
+mod declare_parser;
 pub(crate) mod dialect;
 mod emit_parser;
 pub mod join_parser;
@@ -218,6 +219,13 @@ impl StreamingParser {
                 let stmt = subscribe_parser::parse_subscribe(&mut parser)
                     .map_err(parse_error_to_parser_error)?;
                 Ok(vec![StreamingStatement::Subscribe(Box::new(stmt))])
+            }
+            StreamingDdlKind::DeclareCursor => {
+                let mut parser =
+                    sqlparser::parser::Parser::new(&dialect).with_tokens_with_locations(tokens);
+                let stmt = declare_parser::parse_declare_cursor(&mut parser)
+                    .map_err(parse_error_to_parser_error)?;
+                Ok(vec![stmt])
             }
             StreamingDdlKind::RestoreCheckpoint => {
                 let mut parser =

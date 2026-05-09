@@ -196,6 +196,20 @@ pub enum StreamingStatement {
 
     /// `SUBSCRIBE <name> [WHERE ...] [WITH (...)]`.
     Subscribe(Box<SubscribeStatement>),
+
+    /// `DECLARE <name> [NO SCROLL] CURSOR [WITHOUT HOLD] FOR SUBSCRIBE …`
+    ///
+    /// Forward-only cursor over a SUBSCRIBE, scoped to the current SimpleQuery
+    /// connection. SCROLL, BINARY, WITH HOLD, INSENSITIVE, and ASENSITIVE are
+    /// rejected at parse time.
+    DeclareCursorForSubscribe {
+        /// Cursor identifier as supplied by the client.
+        name: Ident,
+        /// `NO SCROLL` was explicit in the source. We never emit SCROLL.
+        no_scroll: bool,
+        /// The SUBSCRIBE body the cursor wraps.
+        subscribe: Box<SubscribeStatement>,
+    },
 }
 
 /// `SUBSCRIBE <name> [AS OF EPOCH n] [WHERE <fragment>] [WITH (...)]`.
