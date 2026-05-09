@@ -1127,6 +1127,33 @@ impl LaminarDB {
             .ok_or_else(|| DbError::StreamNotFound(name.to_string()))
     }
 
+    /// Schema a `SUBSCRIBE` against `name` would emit, plus a `filterable`
+    /// flag that's `false` only when the schema came from a `StreamEntry`
+    /// sink placeholder (`Schema::empty`) — a `WHERE` clause can't compile
+    /// against that and must be rejected.
+    ///
+    /// Lookup order: MV registry → catalog source → `start()`-resolved
+    /// stream output → `StreamEntry` sink (placeholder).
+    #[must_use]
+    pub fn lookup_subscription_schema(
+        &self,
+        name: &str,
+    ) -> Option<(arrow_schema::SchemaRef, bool)> {
+        if let Some(mv) = self.mv_registry.lock().get(name).cloned() {
+            return Some((mv.schema, true));
+        }
+        if let Some(src) = self.catalog.get_source(name) {
+            return Some((Arc::clone(&src.schema), true));
+        }
+        if let Some(schema) = self.stream_schemas.read().get(name).cloned() {
+            return Some((schema, true));
+        }
+        if let Some(entry) = self.catalog.get_stream_entry(name) {
+            return Some((entry.sink.schema(), false));
+        }
+        None
+    }
+
     /// Open a SUBSCRIBE portal against a named MV, source, or stream.
     /// `filter_sql` is rejected on streams (their schema is opaque).
     ///
@@ -1148,22 +1175,9 @@ impl LaminarDB {
             )));
         }
 
-        // Schema lookup order: MV registry, catalog source, stream-output
-        // schemas resolved at start(), then the StreamEntry sink as a last
-        // resort. The sink schema is a known placeholder (Schema::empty),
-        // so it disqualifies WHERE clauses but still permits unfiltered
-        // subscribe.
-        let (schema, filterable) = if let Some(mv) = self.mv_registry.lock().get(name).cloned() {
-            (mv.schema, true)
-        } else if let Some(src) = self.catalog.get_source(name) {
-            (Arc::clone(&src.schema), true)
-        } else if let Some(schema) = self.stream_schemas.read().get(name).cloned() {
-            (schema, true)
-        } else if let Some(entry) = self.catalog.get_stream_entry(name) {
-            (entry.sink.schema(), false)
-        } else {
-            return Err(DbError::StreamNotFound(name.to_string()));
-        };
+        let (schema, filterable) = self
+            .lookup_subscription_schema(name)
+            .ok_or_else(|| DbError::StreamNotFound(name.to_string()))?;
 
         let filter = match filter_sql {
             None => None,

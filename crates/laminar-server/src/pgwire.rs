@@ -15,8 +15,10 @@ use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::auth::{
     AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler,
 };
-use pgwire::api::query::SimpleQueryHandler;
+use pgwire::api::portal::{Format, Portal};
+use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
+use pgwire::api::stmt::QueryParser;
 use pgwire::api::store::PortalStore;
 use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
@@ -26,7 +28,7 @@ use sqlparser::ast::{Expr, FunctionArguments, SelectItem, Set, SetExpr, Statemen
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
-use laminar_db::subscription::{PortalFrame, SubscriptionPortal};
+use laminar_db::subscription::{PortalFrame, SubscribeStart, SubscriptionPortal};
 use laminar_db::LaminarDB;
 
 use crate::config::Secret;
@@ -72,15 +74,15 @@ impl SimpleQueryHandler for LaminarPgwireHandler {
                 StreamingStatement::Subscribe(s) => {
                     let name = s.name.to_string();
                     let start = match s.as_of_epoch {
-                        Some(n) => laminar_db::subscription::SubscribeStart::AsOfEpoch(n),
-                        None => laminar_db::subscription::SubscribeStart::Tail,
+                        Some(n) => SubscribeStart::AsOfEpoch(n),
+                        None => SubscribeStart::Tail,
                     };
                     let portal = self
                         .db
                         .open_subscription(&name, s.filter_sql.as_deref(), start)
                         .await
                         .map_err(|e| user_error("42P01", format!("SUBSCRIBE '{name}': {e}")))?;
-                    portal_to_response(portal)
+                    portal_to_response(portal, None)
                 }
                 StreamingStatement::Show(cmd) => {
                     engine_metadata_response(&self.db, &show_sql(&cmd)).await?
@@ -275,7 +277,7 @@ fn text_response(col: &str, ty: Type, value: String) -> Response {
 }
 
 fn record_batch_response(batch: arrow_array::RecordBatch) -> Response {
-    let fields = Arc::new(field_infos(&batch.schema()));
+    let fields = Arc::new(field_infos(&batch.schema(), None));
     let nrows = batch.num_rows();
 
     // Encode rows eagerly: SHOW outputs are tiny and this avoids the
@@ -298,8 +300,14 @@ fn record_batch_response(batch: arrow_array::RecordBatch) -> Response {
     Response::Query(QueryResponse::new(fields, row_stream))
 }
 
-fn portal_to_response(portal: SubscriptionPortal) -> Response {
-    let fields = Arc::new(field_infos(&portal.schema()));
+/// Stream a `SubscriptionPortal`'s frames as a pgwire `Response::Query`.
+///
+/// `result_format` is `None` on the SimpleQuery path (text always) and
+/// `Some(format)` on the extended-query path, where the `Bind` message
+/// supplies per-column format codes. Binary-encoded fields use
+/// `postgres-types` `ToSql` impls dispatched per Arrow type.
+fn portal_to_response(portal: SubscriptionPortal, result_format: Option<Format>) -> Response {
+    let fields = Arc::new(field_infos(&portal.schema(), result_format.as_ref()));
 
     // Each batch is converted to a Vec<DataRow> in one shot when received,
     // so formatters are built once per batch rather than per cell. Then we
@@ -325,10 +333,9 @@ fn portal_to_response(portal: SubscriptionPortal) -> Response {
                         rows = encode_batch(&b, &fields);
                     }
                     PortalFrame::Batch(_) => {}
-                    // Barriers are dropped on the SimpleQuery path. PG's
-                    // simple-query protocol has no out-of-band channel for
-                    // checkpoint markers; cursor support (follow-up) will
-                    // surface them via NoticeResponse.
+                    // Barriers are dropped: PG has no out-of-band marker
+                    // for checkpoint epochs on either protocol path. Reads
+                    // are at-most-once-after-epoch via `AS OF EPOCH n`.
                     PortalFrame::Barrier {
                         epoch,
                         checkpoint_id,
@@ -375,17 +382,21 @@ fn encode_batch(
         .collect()
 }
 
-fn field_infos(schema: &arrow_schema::Schema) -> Vec<FieldInfo> {
+/// Build pgwire `FieldInfo`s from an Arrow schema. `result_format` (from a
+/// `Bind`) sets per-column text/binary; `None` defaults all-text.
+fn field_infos(schema: &arrow_schema::Schema, result_format: Option<&Format>) -> Vec<FieldInfo> {
     schema
         .fields()
         .iter()
-        .map(|f| {
+        .enumerate()
+        .map(|(i, f)| {
+            let format = result_format.map_or(FieldFormat::Text, |rf| rf.format_for(i));
             FieldInfo::new(
                 f.name().clone(),
                 None,
                 None,
                 arrow_to_pg_type(f.data_type()),
-                FieldFormat::Text,
+                format,
             )
         })
         .collect()
@@ -397,16 +408,112 @@ fn encode_row(
     fields: &Arc<Vec<FieldInfo>>,
     formatters: &[arrow_cast::display::ArrayFormatter<'_>],
 ) -> PgWireResult<pgwire::messages::data::DataRow> {
-    use arrow_array::Array;
     let mut enc = DataRowEncoder::new(Arc::clone(fields));
     for (i, col) in batch.columns().iter().enumerate() {
-        if col.is_null(row) {
-            enc.encode_field(&None::<&str>)?;
-        } else {
-            enc.encode_field(&Some(formatters[i].value(row).to_string()))?;
+        let info = &fields[i];
+        match info.format() {
+            FieldFormat::Text => encode_field_text(&mut enc, col.as_ref(), row, &formatters[i])?,
+            FieldFormat::Binary => {
+                encode_field_binary(&mut enc, col.as_ref(), row, info.name())?
+            }
         }
     }
     Ok(enc.take_row())
+}
+
+fn encode_field_text(
+    enc: &mut DataRowEncoder,
+    col: &dyn arrow_array::Array,
+    row: usize,
+    formatter: &arrow_cast::display::ArrayFormatter<'_>,
+) -> PgWireResult<()> {
+    if col.is_null(row) {
+        enc.encode_field(&None::<&str>)
+    } else {
+        enc.encode_field(&Some(formatter.value(row).to_string()))
+    }
+}
+
+/// Binary-encode a single Arrow value via `postgres-types` `ToSql`.
+///
+/// Coverage: Int{8,16,32,64}, UInt{8,16,32,64}, Float{32,64}, Bool,
+/// Utf8/LargeUtf8, Timestamp (any unit, naive), Date32, Date64. UInt64
+/// is widened to INT8 with saturation since Postgres has no unsigned 64.
+/// Any other column type yields `0A000` — client should request text.
+fn encode_field_binary(
+    enc: &mut DataRowEncoder,
+    col: &dyn arrow_array::Array,
+    row: usize,
+    name: &str,
+) -> PgWireResult<()> {
+    use arrow_array::{cast::AsArray, types::*, BooleanArray, Date32Array, Date64Array};
+    use arrow_schema::DataType;
+
+    if col.is_null(row) {
+        return enc.encode_field(&None::<&str>);
+    }
+
+    // Each arm pulls the typed array from `col` and hands the value to
+    // `DataRowEncoder` which calls `postgres-types::ToSql` for the wire
+    // format. The casts widen narrower Arrow ints to the matching
+    // Postgres OID (`arrow_to_pg_type`).
+    macro_rules! prim {
+        ($ArrowTy:ty, $cast:expr) => {{
+            let arr = col.as_primitive::<$ArrowTy>();
+            #[allow(clippy::redundant_closure_call)]
+            enc.encode_field(&Some(($cast)(arr.value(row))))
+        }};
+    }
+
+    match col.data_type() {
+        DataType::Int8 => prim!(Int8Type, |x: i8| i32::from(x)),
+        DataType::Int16 => prim!(Int16Type, |x: i16| i32::from(x)),
+        DataType::Int32 => prim!(Int32Type, |x: i32| x),
+        DataType::Int64 => prim!(Int64Type, |x: i64| x),
+        DataType::UInt8 => prim!(UInt8Type, |x: u8| i32::from(x)),
+        DataType::UInt16 => prim!(UInt16Type, |x: u16| i32::from(x)),
+        DataType::UInt32 => prim!(UInt32Type, |x: u32| i64::from(x)),
+        DataType::UInt64 => prim!(UInt64Type, |x: u64| i64::try_from(x).unwrap_or(i64::MAX)),
+        DataType::Float32 => prim!(Float32Type, |x: f32| f64::from(x)),
+        DataType::Float64 => prim!(Float64Type, |x: f64| x),
+        DataType::Boolean => {
+            enc.encode_field(&Some(col.as_any().downcast_ref::<BooleanArray>().unwrap().value(row)))
+        }
+        DataType::Utf8 => enc.encode_field(&Some(col.as_string::<i32>().value(row))),
+        DataType::LargeUtf8 => enc.encode_field(&Some(col.as_string::<i64>().value(row))),
+        DataType::Timestamp(unit, _tz) => {
+            use arrow_array::temporal_conversions::{
+                timestamp_ms_to_datetime, timestamp_ns_to_datetime, timestamp_s_to_datetime,
+                timestamp_us_to_datetime,
+            };
+            use arrow_schema::TimeUnit;
+            let raw = col.as_primitive::<Int64Type>().value(row);
+            let dt = match unit {
+                TimeUnit::Second => timestamp_s_to_datetime(raw),
+                TimeUnit::Millisecond => timestamp_ms_to_datetime(raw),
+                TimeUnit::Microsecond => timestamp_us_to_datetime(raw),
+                TimeUnit::Nanosecond => timestamp_ns_to_datetime(raw),
+            }
+            .ok_or_else(|| user_error("22008", format!("timestamp out of range: {raw}")))?;
+            enc.encode_field(&Some(dt))
+        }
+        DataType::Date32 => {
+            let v = col.as_any().downcast_ref::<Date32Array>().unwrap().value(row);
+            let dt = arrow_array::temporal_conversions::date32_to_datetime(v)
+                .ok_or_else(|| user_error("22008", format!("DATE out of range: {v}")))?;
+            enc.encode_field(&Some(dt.date()))
+        }
+        DataType::Date64 => {
+            let v = col.as_any().downcast_ref::<Date64Array>().unwrap().value(row);
+            let dt = arrow_array::temporal_conversions::date64_to_datetime(v)
+                .ok_or_else(|| user_error("22008", format!("DATE out of range: {v}")))?;
+            enc.encode_field(&Some(dt.date()))
+        }
+        other => Err(user_error(
+            "0A000",
+            format!("binary format not supported for column '{name}' (type {other:?})"),
+        )),
+    }
 }
 
 fn arrow_to_pg_type(dt: &arrow_schema::DataType) -> Type {
@@ -506,8 +613,187 @@ impl PgWireServerHandlers for LaminarHandlerFactory {
         Arc::clone(&self.handler)
     }
 
+    fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
+        Arc::clone(&self.handler)
+    }
+
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
         Arc::clone(&self.startup)
+    }
+}
+
+/// Parsed statement carried through `Parse` → `Bind` → `Execute`.
+#[derive(Clone, Debug)]
+pub enum LaminarStmt {
+    /// `SUBSCRIBE` with its schema resolved at parse time so `Describe` can
+    /// answer before the portal is bound.
+    Subscribe {
+        name: String,
+        filter_sql: Option<String>,
+        as_of_epoch: Option<u64>,
+        schema: arrow_schema::SchemaRef,
+    },
+    Show(ShowCommand),
+    Standard(Box<Statement>),
+}
+
+/// Resolves SQL to `LaminarStmt`, looking up stream schemas against the
+/// live `LaminarDB` so the extended-query `Describe` returns columns
+/// without running the query.
+#[derive(Clone)]
+pub struct LaminarQueryParser {
+    db: Arc<LaminarDB>,
+}
+
+#[async_trait]
+impl QueryParser for LaminarQueryParser {
+    type Statement = LaminarStmt;
+
+    async fn parse_sql<C>(
+        &self,
+        _client: &C,
+        sql: &str,
+        _types: &[Option<Type>],
+    ) -> PgWireResult<Self::Statement>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let mut stmts = parse_streaming_sql(sql)
+            .map_err(|e| user_error("42601", format!("parse error: {e}")))?;
+        let stmt = stmts
+            .pop()
+            .ok_or_else(|| user_error("42601", "empty statement"))?;
+        if !stmts.is_empty() {
+            return Err(user_error(
+                "42601",
+                "extended query: multiple statements per Parse are not supported",
+            ));
+        }
+
+        match stmt {
+            StreamingStatement::Subscribe(s) => {
+                let name = s.name.to_string();
+                let (schema, _) =
+                    self.db.lookup_subscription_schema(&name).ok_or_else(|| {
+                        user_error("42P01", format!("SUBSCRIBE '{name}': stream not found"))
+                    })?;
+                Ok(LaminarStmt::Subscribe {
+                    name,
+                    filter_sql: s.filter_sql,
+                    as_of_epoch: s.as_of_epoch,
+                    schema,
+                })
+            }
+            StreamingStatement::Show(cmd) => Ok(LaminarStmt::Show(cmd)),
+            StreamingStatement::Standard(s) => Ok(LaminarStmt::Standard(s)),
+            other => Err(user_error(
+                "0A000",
+                format!("not supported on pgwire (use HTTP /api/v1/sql): {other:?}"),
+            )),
+        }
+    }
+
+    fn get_parameter_types(&self, _stmt: &Self::Statement) -> PgWireResult<Vec<Type>> {
+        // SUBSCRIBE has no `$N` placeholders.
+        Ok(Vec::new())
+    }
+
+    fn get_result_schema(
+        &self,
+        stmt: &Self::Statement,
+        column_format: Option<&Format>,
+    ) -> PgWireResult<Vec<FieldInfo>> {
+        // SHOW and Standard are tiny single-row outputs whose schema only
+        // materialises after execution; clients see it on Execute's
+        // RowDescription instead.
+        match stmt {
+            LaminarStmt::Subscribe { schema, .. } => Ok(field_infos(schema, column_format)),
+            LaminarStmt::Show(_) | LaminarStmt::Standard(_) => Ok(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl ExtendedQueryHandler for LaminarPgwireHandler {
+    type Statement = LaminarStmt;
+    type QueryParser = LaminarQueryParser;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        Arc::new(LaminarQueryParser {
+            db: Arc::clone(&self.db),
+        })
+    }
+
+    async fn do_query<C>(
+        &self,
+        _client: &mut C,
+        portal: &Portal<Self::Statement>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        match &portal.statement.statement {
+            LaminarStmt::Subscribe {
+                name,
+                filter_sql,
+                as_of_epoch,
+                ..
+            } => {
+                let start = match as_of_epoch {
+                    Some(n) => SubscribeStart::AsOfEpoch(*n),
+                    None => SubscribeStart::Tail,
+                };
+                let sub = self
+                    .db
+                    .open_subscription(name, filter_sql.as_deref(), start)
+                    .await
+                    .map_err(|e| user_error("42P01", format!("SUBSCRIBE '{name}': {e}")))?;
+                Ok(portal_to_response(
+                    sub,
+                    Some(portal.result_column_format.clone()),
+                ))
+            }
+            LaminarStmt::Show(cmd) => engine_metadata_response(&self.db, &show_sql(cmd)).await,
+            LaminarStmt::Standard(s) => standard_response(&self.db, *s.clone()),
+        }
+    }
+
+    /// Per-Sync portal cleanup: only the unnamed portal is destroyed.
+    ///
+    /// The pgwire 0.39 default `on_sync` calls `clear_portals()`, which wipes
+    /// every named portal on the connection. PostgreSQL keeps named portals
+    /// alive until `Close` or end-of-transaction, so the default would break
+    /// any client that does `Bind named_portal; Sync; Execute named_portal;`
+    /// — the standard JDBC / asyncpg / tokio-postgres pattern for chunked
+    /// fetches via `setFetchSize` / `query_portal`.
+    async fn on_sync<C>(
+        &self,
+        client: &mut C,
+        _message: pgwire::messages::extendedquery::Sync,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        use futures::SinkExt;
+        use pgwire::messages::response::ReadyForQuery;
+
+        // Drop only the unnamed portal; named portals survive Sync.
+        client.portal_store().rm_portal("");
+
+        client
+            .send(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                client.transaction_status(),
+            )))
+            .await?;
+        client.flush().await?;
+        Ok(())
     }
 }
 
@@ -1428,6 +1714,177 @@ mod integration_tests {
             .expect("query over TLS");
         let v = first_row_value(&messages, 0).expect("row");
         assert!(v.contains("LaminarDB"), "version: {v}");
+
+        handle.abort();
+    }
+
+    /// Push one row into the `trades` source so subsequent SUBSCRIBE
+    /// reads have something to drain. Returns the schema for tests
+    /// that want to build their own batches.
+    async fn push_one_trade(
+        db: &Arc<LaminarDB>,
+        symbol: &str,
+        price: f64,
+    ) -> arrow_schema::SchemaRef {
+        let handle = db.source_untyped("trades").expect("source handle");
+        let schema = handle.schema().clone();
+        let batch = arrow_array::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow_array::StringArray::from(vec![symbol])),
+                Arc::new(arrow_array::Float64Array::from(vec![price])),
+            ],
+        )
+        .expect("batch");
+        handle.push_arrow(batch).expect("push");
+        schema
+    }
+
+    /// Ingest a row and return both the running server and the underlying db
+    /// so tests can keep pushing rows after the listener is up.
+    async fn spawn_with_data() -> (
+        Arc<LaminarDB>,
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
+            .await
+            .expect("create source");
+        db.execute(
+            "CREATE MATERIALIZED VIEW prices AS \
+             SELECT symbol, price FROM trades",
+        )
+        .await
+        .expect("create mv");
+        db.start().await.expect("db starts");
+
+        let (addr, handle) = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            None,
+            256,
+            10,
+        )
+        .await
+        .expect("pgwire serve");
+        (db, addr, handle)
+    }
+
+    /// `prepare()` triggers `Parse` + `Describe(Statement)`. Verifies the
+    /// extended-query parser resolves stream schemas at parse time and
+    /// returns column metadata to the client.
+    #[tokio::test]
+    async fn extended_query_describe_subscribe_returns_columns() {
+        let (_db, addr, handle) = spawn_with_data().await;
+        let client = connect(addr).await;
+
+        let stmt = client
+            .prepare("SUBSCRIBE prices")
+            .await
+            .expect("prepare SUBSCRIBE prices");
+
+        let cols = stmt.columns();
+        assert_eq!(cols.len(), 2, "expected 2 columns, got {}", cols.len());
+        assert_eq!(cols[0].name(), "symbol");
+        assert_eq!(cols[1].name(), "price");
+        assert_eq!(cols[0].type_(), &tokio_postgres::types::Type::VARCHAR);
+        assert_eq!(cols[1].type_(), &tokio_postgres::types::Type::FLOAT8);
+
+        handle.abort();
+    }
+
+    /// Unknown stream → typed PG error at `Parse` time, before any rows
+    /// are pulled.
+    #[tokio::test]
+    async fn extended_query_prepare_unknown_stream_errors() {
+        let (_db, addr, handle) = spawn_with_data().await;
+        let client = connect(addr).await;
+
+        let err = client
+            .prepare("SUBSCRIBE no_such_view")
+            .await
+            .expect_err("must fail at Parse");
+        let db_err = err.as_db_error().expect("typed PG error");
+        assert!(db_err.message().contains("no_such_view"));
+
+        handle.abort();
+    }
+
+    /// Bind + Execute with `max_rows=1` against a portal returns one row at a
+    /// time and `PortalSuspended`. Drives the binary-format encoders for
+    /// VARCHAR + FLOAT8.
+    #[tokio::test]
+    async fn extended_query_binary_chunked_subscribe() {
+        let (db, addr, handle) = spawn_with_data().await;
+        let mut client = connect(addr).await;
+
+        // Push two rows BEFORE the SUBSCRIBE so the portal sees them via
+        // replay rather than racing the listener.
+        push_one_trade(&db, "AAPL", 150.5).await;
+        push_one_trade(&db, "GOOG", 2700.25).await;
+
+        // tokio_postgres' `bind` + `query_portal` uses the extended-query
+        // protocol with binary format for known column types. This is the
+        // path JDBC and asyncpg take with prepared statements.
+        let tx = client.transaction().await.expect("BEGIN");
+        let stmt = tx.prepare("SUBSCRIBE prices").await.expect("prepare");
+        let portal = tx.bind(&stmt, &[]).await.expect("bind portal");
+
+        // Pull rows in chunks. `query_portal` returns up to `max_rows` rows
+        // for the current Execute, surfacing `PortalSuspended` as a normal
+        // partial result.
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tx.query_portal(&portal, 1),
+        )
+        .await
+        .expect("first chunk arrives within 2s")
+        .expect("query_portal #1");
+        assert_eq!(first.len(), 1);
+        let symbol: &str = first[0].get(0);
+        let price: f64 = first[0].get(1);
+        assert_eq!(symbol, "AAPL");
+        assert!((price - 150.5).abs() < 1e-9);
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tx.query_portal(&portal, 1),
+        )
+        .await
+        .expect("second chunk arrives within 2s")
+        .expect("query_portal #2");
+        assert_eq!(second.len(), 1);
+        let symbol: &str = second[0].get(0);
+        let price: f64 = second[0].get(1);
+        assert_eq!(symbol, "GOOG");
+        assert!((price - 2700.25).abs() < 1e-9);
+
+        // Don't roll back — the SUBSCRIBE never completes, so let the
+        // server-side abort tear it down.
+        handle.abort();
+    }
+
+    /// DDL on the extended-query path is refused at `Parse` with a typed
+    /// 0A000 error pointing at the HTTP endpoint — same surface as the
+    /// SimpleQuery path.
+    #[tokio::test]
+    async fn extended_query_ddl_rejected() {
+        let (_db, addr, handle) = spawn_with_data().await;
+        let client = connect(addr).await;
+
+        let err = client
+            .prepare("CREATE SOURCE more_trades (sym VARCHAR)")
+            .await
+            .expect_err("DDL must be rejected at Parse");
+        let db_err = err.as_db_error().expect("typed PG error");
+        assert!(
+            db_err.message().contains("/api/v1/sql"),
+            "message: {}",
+            db_err.message()
+        );
 
         handle.abort();
     }
