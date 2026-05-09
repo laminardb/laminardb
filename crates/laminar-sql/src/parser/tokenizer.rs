@@ -504,13 +504,17 @@ fn is_word_ci(word: &Word, keyword: &str) -> bool {
     word.value.eq_ignore_ascii_case(keyword)
 }
 
-/// True if the token sequence contains adjacent `FOR SUBSCRIBE`. Used to
-/// disambiguate `DECLARE` between sqlparser's cursor-for-Query shape and
-/// our SUBSCRIBE-specific extension. Loose enough to allow `WITHOUT HOLD`
-/// between `CURSOR` and `FOR`.
+/// True if the *first* statement in the token sequence contains adjacent
+/// `FOR SUBSCRIBE`. Used to disambiguate `DECLARE` between sqlparser's
+/// cursor-for-Query shape and our SUBSCRIBE-specific extension. Loose
+/// enough to allow `WITHOUT HOLD` between `CURSOR` and `FOR`. Stops at the
+/// first `;` so a later statement can't accidentally route us here.
 fn contains_for_subscribe(significant: &[&TokenWithSpan]) -> bool {
     let mut i = 0;
     while i + 1 < significant.len() {
+        if matches!(&significant[i].token, Token::SemiColon | Token::EOF) {
+            return false;
+        }
         let for_kw = matches!(
             &significant[i].token,
             Token::Word(Word {
@@ -948,6 +952,18 @@ mod tests {
         // DECLARE…CURSOR FOR <regular query> is left to sqlparser.
         assert_eq!(
             detect_streaming_ddl(&tokenize("DECLARE c CURSOR FOR SELECT 1")),
+            StreamingDdlKind::None
+        );
+    }
+
+    #[test]
+    fn test_declare_does_not_cross_statement_boundary() {
+        // A trailing `FOR SUBSCRIBE` in a *later* statement must not route
+        // the leading DECLARE into our SUBSCRIBE-specific parser.
+        assert_eq!(
+            detect_streaming_ddl(&tokenize(
+                "DECLARE x INT; SELECT 1 FROM t FOR SUBSCRIBE foo"
+            )),
             StreamingDdlKind::None
         );
     }

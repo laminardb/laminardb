@@ -2,7 +2,7 @@
 //! TLS with `pgwire_tls_cert` + `pgwire_tls_key`. Non-loopback binds
 //! require `pgwire_allow_remote = true`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -157,6 +157,11 @@ async fn subscribe_response(db: &LaminarDB, s: SubscribeStatement) -> PgWireResu
 struct ActiveCursor {
     portal: Arc<TokioMutex<SubscriptionPortal>>,
     schema: arrow_schema::SchemaRef,
+    /// Rows encoded from a prior frame but not yet consumed. A multi-row
+    /// batch followed by `FETCH 1` would otherwise drop the leftover rows
+    /// when the response stream ends — keeping them on the cursor lets the
+    /// next FETCH pick up where the previous one stopped.
+    pending: Arc<parking_lot::Mutex<VecDeque<PgWireResult<pgwire::messages::data::DataRow>>>>,
     /// Flipped when the pump emits `None` or `Lagged`. The next `gc_peer`
     /// pass reaps the cursor.
     exhausted: Arc<AtomicBool>,
@@ -173,6 +178,7 @@ struct ConnState {
 struct CursorHandle {
     portal: Arc<TokioMutex<SubscriptionPortal>>,
     schema: arrow_schema::SchemaRef,
+    pending: Arc<parking_lot::Mutex<VecDeque<PgWireResult<pgwire::messages::data::DataRow>>>>,
     exhausted: Arc<AtomicBool>,
 }
 
@@ -188,12 +194,17 @@ impl ConnState {
         self.cursors.lock().insert(Self::key(name), cursor);
     }
 
+    fn contains(&self, name: &str) -> bool {
+        self.cursors.lock().contains_key(&Self::key(name))
+    }
+
     fn get(&self, name: &str) -> Option<CursorHandle> {
         let g = self.cursors.lock();
         let c = g.get(&Self::key(name))?;
         Some(CursorHandle {
             portal: Arc::clone(&c.portal),
             schema: Arc::clone(&c.schema),
+            pending: Arc::clone(&c.pending),
             exhausted: Arc::clone(&c.exhausted),
         })
     }
@@ -217,14 +228,20 @@ impl ConnState {
     }
 }
 
-/// Open a SUBSCRIBE behind a cursor name. Replacing an existing cursor drops
-/// its portal, which closes the pump.
+/// Open a SUBSCRIBE behind a cursor name. Rejects with 42P03 if the name is
+/// already in use on this connection (matches PG; user must `CLOSE` first).
 async fn handle_declare_cursor(
     db: &LaminarDB,
     state: &ConnState,
     cursor_name: &str,
     subscribe: SubscribeStatement,
 ) -> PgWireResult<Response> {
+    if state.contains(cursor_name) {
+        return Err(user_error(
+            "42P03",
+            format!("cursor \"{cursor_name}\" already exists"),
+        ));
+    }
     let name = subscribe.name.to_string();
     let start = match subscribe.as_of_epoch {
         Some(n) => SubscribeStart::AsOfEpoch(n),
@@ -238,6 +255,7 @@ async fn handle_declare_cursor(
     let active = ActiveCursor {
         portal: Arc::new(TokioMutex::new(portal)),
         schema,
+        pending: Arc::new(parking_lot::Mutex::new(VecDeque::new())),
         exhausted: Arc::new(AtomicBool::new(false)),
     };
     state.insert(cursor_name, active);
@@ -291,7 +309,13 @@ fn handle_fetch(
     let h = state
         .get(cursor_name)
         .ok_or_else(|| user_error("34000", format!("cursor \"{cursor_name}\" does not exist")))?;
-    Ok(fetch_response(h.schema, h.portal, h.exhausted, target))
+    Ok(fetch_response(
+        h.schema,
+        h.portal,
+        h.pending,
+        h.exhausted,
+        target,
+    ))
 }
 
 fn handle_close(state: &ConnState, cursor: &CloseCursor) -> PgWireResult<Response> {
@@ -617,9 +641,13 @@ fn empty_row(fields: &Arc<Vec<FieldInfo>>) -> pgwire::messages::data::DataRow {
 /// Strict-PG FETCH: blocks until `target` rows are produced, the pump exits,
 /// or the broadcast lags. Lag/exit flips `exhausted` so `gc_peer` reaps the
 /// cursor on the next call. Text format only; SimpleQuery has no binary.
+///
+/// Leftover rows from a multi-row frame stay in the cursor's `pending`
+/// buffer so successive FETCHes consume the frame in order.
 fn fetch_response(
     schema: arrow_schema::SchemaRef,
     portal: Arc<TokioMutex<SubscriptionPortal>>,
+    pending: Arc<parking_lot::Mutex<VecDeque<PgWireResult<pgwire::messages::data::DataRow>>>>,
     exhausted: Arc<AtomicBool>,
     target: FetchTarget,
 ) -> Response {
@@ -631,47 +659,38 @@ fn fetch_response(
 
     struct State {
         portal: Arc<TokioMutex<SubscriptionPortal>>,
+        pending: Arc<parking_lot::Mutex<VecDeque<PgWireResult<pgwire::messages::data::DataRow>>>>,
         exhausted: Arc<AtomicBool>,
-        rows: Vec<PgWireResult<pgwire::messages::data::DataRow>>,
-        idx: usize,
         fields: Arc<Vec<FieldInfo>>,
         remaining: Option<u64>,
     }
 
     let init = State {
         portal,
+        pending,
         exhausted,
-        rows: Vec::new(),
-        idx: 0,
         fields: Arc::clone(&fields),
         remaining,
     };
 
     let row_stream = stream::unfold(init, |mut s| async move {
         loop {
-            // Drain any rows already pulled from a prior batch first.
-            if s.idx < s.rows.len() {
-                if matches!(s.remaining, Some(0)) {
-                    return None;
-                }
-                let row = std::mem::replace(&mut s.rows[s.idx], Ok(empty_row(&s.fields)));
-                s.idx += 1;
+            if matches!(s.remaining, Some(0)) {
+                return None;
+            }
+            // Pending rows from a prior FETCH come out first. Anything left
+            // here when remaining hits 0 stays for the next call.
+            let popped = s.pending.lock().pop_front();
+            if let Some(row) = popped {
                 if let Some(n) = s.remaining.as_mut() {
                     *n = n.saturating_sub(1);
                 }
                 return Some((row, s));
             }
-
-            if matches!(s.remaining, Some(0)) {
-                return None;
-            }
-            // Fast-path: a previous frame marked the cursor exhausted.
             if s.exhausted.load(Ordering::Acquire) {
                 return None;
             }
 
-            s.rows.clear();
-            s.idx = 0;
             let next = {
                 let mut guard = s.portal.lock().await;
                 guard.next_frame().await
@@ -682,7 +701,8 @@ fn fetch_response(
                     return None;
                 }
                 Some(PortalFrame::Batch(b)) if b.num_rows() > 0 => {
-                    s.rows = encode_batch(&b, &s.fields);
+                    let encoded = encode_batch(&b, &s.fields);
+                    s.pending.lock().extend(encoded);
                 }
                 Some(PortalFrame::Batch(_)) => {}
                 Some(PortalFrame::Barrier { .. }) => {
@@ -2542,6 +2562,105 @@ mod integration_tests {
             .expect_err("must fail");
         let db_err = err.as_db_error().expect("typed PG error");
         assert_eq!(db_err.code().code(), "34000", "got {db_err:?}");
+
+        handle.abort();
+    }
+
+    /// A multi-row batch with `FETCH 1` repeated must return each row in
+    /// order — leftover rows persist on the cursor instead of being dropped
+    /// when the response stream ends.
+    #[tokio::test]
+    async fn cursor_fetch_preserves_leftover_rows_in_one_batch() {
+        let (db, addr, handle) = spawn_with_data().await;
+        let client = connect(addr).await;
+
+        // Push a single 2-row batch. With the bug, FETCH 1 would consume the
+        // batch internally, hand back row[0], and discard row[1] — the next
+        // FETCH would then block waiting for fresh frames and time out.
+        let pusher = {
+            let db = Arc::clone(&db);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let src = db.source_untyped("trades").expect("source");
+                let batch = arrow_array::RecordBatch::try_new(
+                    src.schema().clone(),
+                    vec![
+                        Arc::new(arrow_array::StringArray::from(vec!["AAPL", "GOOG"])),
+                        Arc::new(arrow_array::Float64Array::from(vec![1.0, 2.0])),
+                    ],
+                )
+                .expect("batch");
+                src.push_arrow(batch).expect("push");
+            })
+        };
+
+        client
+            .simple_query("DECLARE c CURSOR FOR SUBSCRIBE prices")
+            .await
+            .expect("DECLARE");
+
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.simple_query("FETCH 1 FROM c"),
+        )
+        .await
+        .expect("first FETCH within 3s")
+        .expect("FETCH 1 #1");
+        let r1: Vec<&str> = first
+            .iter()
+            .filter_map(|m| match m {
+                SimpleQueryMessage::Row(r) => r.get(0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(r1, vec!["AAPL"]);
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.simple_query("FETCH 1 FROM c"),
+        )
+        .await
+        .expect("second FETCH within 3s")
+        .expect("FETCH 1 #2");
+        let r2: Vec<&str> = second
+            .iter()
+            .filter_map(|m| match m {
+                SimpleQueryMessage::Row(r) => r.get(0),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(r2, vec!["GOOG"]);
+
+        client.simple_query("CLOSE c").await.expect("CLOSE");
+        let _ = pusher.await;
+        handle.abort();
+    }
+
+    /// Re-DECLAREing an open cursor name returns 42P03; user must CLOSE first.
+    #[tokio::test]
+    async fn cursor_duplicate_declare_rejected() {
+        let (_db, addr, handle) = spawn_with_data().await;
+        let client = connect(addr).await;
+
+        client
+            .simple_query("DECLARE c CURSOR FOR SUBSCRIBE prices")
+            .await
+            .expect("first DECLARE");
+
+        let err = client
+            .simple_query("DECLARE c CURSOR FOR SUBSCRIBE prices")
+            .await
+            .expect_err("duplicate DECLARE must fail");
+        let db_err = err.as_db_error().expect("typed PG error");
+        assert_eq!(db_err.code().code(), "42P03", "got {db_err:?}");
+
+        // After CLOSE the name is free again.
+        client.simple_query("CLOSE c").await.expect("CLOSE");
+        client
+            .simple_query("DECLARE c CURSOR FOR SUBSCRIBE prices")
+            .await
+            .expect("re-DECLARE after CLOSE");
+        client.simple_query("CLOSE c").await.expect("CLOSE again");
 
         handle.abort();
     }
