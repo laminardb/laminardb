@@ -354,7 +354,7 @@ db.start().await?;</code></pre>
           <div class="hero-metric">
             <div class="hero-metric-value">&lt;500<span class="unit">ns</span></div>
             <div class="hero-metric-label">state lookup target</div>
-            <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/blob/main/docs/BENCHMARKS.md" target="_blank" rel="noopener">BENCHMARKS.md</a></div>
+            <div class="hero-metric-source"><a href="https://github.com/laminardb/laminardb/tree/main/crates/laminar-core/benches" target="_blank" rel="noopener">laminar-core/benches</a></div>
           </div>
           <div class="hero-metric">
             <div class="hero-metric-value">1M+<span class="unit">/s</span></div>
@@ -754,7 +754,7 @@ CREATE SINK lake INTO DELTA_LAKE (
               The server has scaffolding for cluster mode; inter-node coordination
               and state replication are still being designed.
             </p>
-            <p><a href="https://github.com/laminardb/laminardb/blob/main/docs/ROADMAP.md" target="_blank" rel="noopener">Track progress on the roadmap</a></p>
+            <p><a href="https://github.com/laminardb/laminardb/issues" target="_blank" rel="noopener">Open issues for cluster work</a></p>
           </div>
         </div>
       </div>
@@ -907,8 +907,7 @@ CREATE SINK lake INTO DELTA_LAKE (
         <h2>Benchmarks</h2>
         <p class="section-desc">
           Criterion numbers from an AMD Ryzen AI 7 350 laptop. Not server-grade hardware:
-          dedicated boxes with isolated cores will do better.
-          <a href="https://github.com/laminardb/laminardb/blob/main/docs/BENCHMARKS.md" target="_blank" rel="noopener">Full results</a>.
+          dedicated boxes with isolated cores will do better. Reproduce with <code>cargo bench</code>.
         </p>
 
         <div class="connector-table-wrapper">
@@ -926,7 +925,7 @@ CREATE SINK lake INTO DELTA_LAKE (
                 <td>State lookup (AHash get_ref)</td>
                 <td>&lt;500ns</td>
                 <td>10&ndash;16ns (zero-copy)</td>
-                <td><a href="https://github.com/laminardb/laminardb/blob/main/docs/BENCHMARKS.md" target="_blank" rel="noopener">BENCHMARKS.md</a></td>
+                <td><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/benches/streaming_bench.rs" target="_blank" rel="noopener">streaming_bench.rs</a></td>
               </tr>
               <tr>
                 <td>Throughput / core</td>
@@ -944,7 +943,7 @@ CREATE SINK lake INTO DELTA_LAKE (
                 <td>Checkpoint recovery</td>
                 <td>&lt;10s</td>
                 <td>1.39ms</td>
-                <td><a href="https://github.com/laminardb/laminardb/blob/main/docs/BENCHMARKS.md" target="_blank" rel="noopener">BENCHMARKS.md</a></td>
+                <td><a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-db/benches/recovery_bench.rs" target="_blank" rel="noopener">recovery_bench.rs</a></td>
               </tr>
             </tbody>
           </table>
@@ -965,7 +964,7 @@ CREATE SINK lake INTO DELTA_LAKE (
         <p class="section-desc">
           Current version: <strong data-version="bare">0.20.0</strong> (pre-1.0).
           <a href="https://github.com/laminardb/laminardb/releases" target="_blank" rel="noopener">Releases</a> &middot;
-          <a href="https://github.com/laminardb/laminardb/blob/main/docs/ROADMAP.md" target="_blank" rel="noopener">Roadmap</a>
+          <a href="https://github.com/laminardb/laminardb/issues" target="_blank" rel="noopener">Issues</a>
         </p>
 
         <div class="status-grid">

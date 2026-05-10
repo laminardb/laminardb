@@ -380,7 +380,7 @@ Benchmark suites live under `crates/laminar-core/benches/`, `crates/laminar-db/b
 | Checkpoint recovery | < 10s | `crates/laminar-db/benches/recovery_bench.rs` |
 | MongoDB throughput | -- | `crates/laminar-connectors/benches/mongodb_throughput.rs` |
 
-Historical mean latencies measured on an AMD Ryzen AI 7 350 development laptop (see [BENCHMARKS.md](docs/BENCHMARKS.md)) against minimal operator chains showed per-event latency of 0.55-1.16µs and single-core throughput of 1.1-1.46M events/sec on a reactor+window pipeline. Real pipelines with multiple operators, joins, and state lookups will show higher latency. p99 under sustained load is not continuously measured in CI. Run `cargo bench` to measure on your own hardware.
+Historical mean latencies on an AMD Ryzen AI 7 350 against minimal operator chains: per-event latency 0.55-1.16µs, single-core throughput 1.1-1.46M events/sec on a reactor+window pipeline. Real pipelines with multiple operators, joins, and state lookups show higher latency. p99 under sustained load is not continuously measured in CI. Run `cargo bench` to measure on your own hardware.
 
 ---
 
@@ -441,8 +441,6 @@ Historical mean latencies measured on an AMD Ryzen AI 7 350 development laptop (
 | Phase 6c | Delta Production Hardening | 🔧 8/10 |
 
 Test coverage: ~2,700 tests across the workspace. CI runs on Linux and Windows.
-
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the full phase timeline.
 
 ---
 
@@ -511,10 +509,9 @@ examples/
 
 ## Documentation
 
-- [Architecture Guide](docs/ARCHITECTURE.md) — Three-ring design, data flow, state management
-- [SQL Reference](docs/SQL_REFERENCE.md) — Streaming SQL dialect, tested patterns, gotchas
-- [Roadmap](docs/ROADMAP.md) — Phases, milestones, feature status
-- [API Reference](https://docs.rs/laminar-db) — Rustdoc
+- [Architecture Guide](docs/ARCHITECTURE.md) — design overview, data flow, state management
+- [SQL Reference](docs/SQL_REFERENCE.md) — streaming SQL dialect, tested patterns
+- [API Reference](https://docs.rs/laminar-db) — rustdoc
 
 ## Contributing
 
