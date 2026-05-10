@@ -1,668 +1,262 @@
 //! Scalar UDFs that compute window boundary timestamps for streaming
 //! `GROUP BY TUMBLE(...)` style queries.
 //!
-//! Pairs: `tumble`/`tumble_end`, `hop`/`hop_end`, `cumulate`/`cumulate_end`.
-//! `session` is a pass-through (sessions are data-dependent — no row-local
-//! end exists, so there is no `session_end`).
-//!
-//! Both halves of a pair must appear in `GROUP BY` so DataFusion accepts
-//! them as group keys; they are functionally redundant within a fixed
-//! interval but standard SQL requires every projected non-aggregate to
-//! be in the grouping set. Example:
+//! Pairs `tumble`/`tumble_end`, `hop`/`hop_end`, `cumulate`/`cumulate_end`
+//! must both appear in `GROUP BY`: DataFusion treats them as independent
+//! group keys, even though within a fixed interval they are functionally
+//! redundant. `session(ts, gap)` is a passthrough — real session
+//! boundaries are computed by Ring 0 operators.
 //!
 //! ```sql
-//! SELECT
-//!     TUMBLE(ts, INTERVAL '1' MINUTE)     AS window_start,
-//!     TUMBLE_END(ts, INTERVAL '1' MINUTE) AS window_end,
-//!     symbol,
-//!     MAX(price)
+//! SELECT tumble(ts, INTERVAL '1' MINUTE)     AS window_start,
+//!        tumble_end(ts, INTERVAL '1' MINUTE) AS window_end, ...
 //! FROM ev
-//! GROUP BY
-//!     TUMBLE(ts, INTERVAL '1' MINUTE),
-//!     TUMBLE_END(ts, INTERVAL '1' MINUTE),
-//!     symbol;
+//! GROUP BY tumble(ts, INTERVAL '1' MINUTE),
+//!          tumble_end(ts, INTERVAL '1' MINUTE), ...
 //! ```
+//!
+//! Math runs in milliseconds (matching the Ring 0 watermark). The SQL
+//! boundary returns `Timestamp(Microsecond, None)` so lakehouse sinks
+//! (Iceberg, Delta, Parquet) accept the columns directly — Iceberg
+//! rejects `Timestamp(Millisecond)`.
 
 use std::any::Any;
 use std::hash::{Hash, Hasher};
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, TimeUnit};
-use arrow_array::{ArrayRef, TimestampMillisecondArray};
+use arrow_array::{ArrayRef, TimestampMicrosecondArray, TimestampMillisecondArray};
 use datafusion_common::{DataFusionError, Result, ScalarValue};
 use datafusion_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature, Volatility,
 };
 use laminar_core::time::cast_to_millis_array;
 
-// ─── TumbleWindowStart ───────────────────────────────────────────────────────
+// ─── window_udf! macro ──────────────────────────────────────────────────────
+//
+// Generates the trait boilerplate (Default + PartialEq + Eq + Hash +
+// ScalarUDFImpl) for a zero-state singleton UDF that returns a
+// `Timestamp(Microsecond)`. Each UDF declaration below is just SQL name,
+// arity, and a body closure.
 
-/// Computes the tumbling window start for a given timestamp.
-///
-/// `tumble(timestamp, interval)` returns `floor(ts / interval) * interval`,
-/// which is the start of the non-overlapping window that contains `ts`.
-///
-/// # Arguments
-///
-/// * Arg 0: Timestamp column or scalar (`TimestampMillisecond` or `Int64` ms)
-/// * Arg 1: Window size as an interval scalar
-///
-/// # Returns
-///
-/// `TimestampMillisecond` representing the window start.
-#[derive(Debug)]
-pub struct TumbleWindowStart {
-    signature: Signature,
-}
-
-impl TumbleWindowStart {
-    /// Creates a new tumble window start UDF.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            signature: Signature::new(
-                TypeSignature::OneOf(vec![TypeSignature::Any(2), TypeSignature::Any(3)]),
-                Volatility::Immutable,
-            ),
+macro_rules! window_udf {
+    (
+        $(#[$attr:meta])*
+        $type:ident, $sql_name:literal, $arity:expr, |$args:ident| $body:expr
+    ) => {
+        $(#[$attr])*
+        #[derive(Debug)]
+        pub struct $type {
+            signature: Signature,
         }
-    }
-}
 
-impl Default for TumbleWindowStart {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PartialEq for TumbleWindowStart {
-    fn eq(&self, _other: &Self) -> bool {
-        true // All instances are identical
-    }
-}
-
-impl Eq for TumbleWindowStart {}
-
-impl Hash for TumbleWindowStart {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        "tumble".hash(state);
-    }
-}
-
-impl ScalarUDFImpl for TumbleWindowStart {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &'static str {
-        "tumble"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Timestamp(TimeUnit::Millisecond, None))
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let ScalarFunctionArgs { args, .. } = args;
-        if args.len() < 2 || args.len() > 3 {
-            return Err(DataFusionError::Plan(
-                "tumble() requires 2-3 arguments: (timestamp, interval [, offset])".to_string(),
-            ));
-        }
-        let interval_ms = extract_interval_ms(&args[1])?;
-        if interval_ms <= 0 {
-            return Err(DataFusionError::Plan(
-                "tumble() interval must be positive".to_string(),
-            ));
-        }
-        let offset_ms = if args.len() == 3 {
-            extract_interval_ms(&args[2])?
-        } else {
-            0
-        };
-        compute_tumble_with_offset(&args[0], interval_ms, offset_ms)
-    }
-}
-
-// ─── TumbleWindowEnd ─────────────────────────────────────────────────────────
-
-/// `tumble_end(ts, interval)` — exclusive upper bound of the tumble
-/// window containing `ts`. See [`TumbleWindowStart`].
-#[derive(Debug)]
-pub struct TumbleWindowEnd {
-    signature: Signature,
-}
-
-impl TumbleWindowEnd {
-    /// Creates a new tumble window end UDF.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            signature: Signature::new(
-                TypeSignature::OneOf(vec![TypeSignature::Any(2), TypeSignature::Any(3)]),
-                Volatility::Immutable,
-            ),
-        }
-    }
-}
-
-impl Default for TumbleWindowEnd {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PartialEq for TumbleWindowEnd {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
-impl Eq for TumbleWindowEnd {}
-
-impl Hash for TumbleWindowEnd {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        "tumble_end".hash(state);
-    }
-}
-
-impl ScalarUDFImpl for TumbleWindowEnd {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &'static str {
-        "tumble_end"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Timestamp(TimeUnit::Millisecond, None))
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let ScalarFunctionArgs { args, .. } = args;
-        if args.len() < 2 || args.len() > 3 {
-            return Err(DataFusionError::Plan(
-                "tumble_end() requires 2-3 arguments: (timestamp, interval [, offset])".to_string(),
-            ));
-        }
-        let interval_ms = extract_interval_ms(&args[1])?;
-        if interval_ms <= 0 {
-            return Err(DataFusionError::Plan(
-                "tumble_end() interval must be positive".to_string(),
-            ));
-        }
-        let offset_ms = if args.len() == 3 {
-            extract_interval_ms(&args[2])?
-        } else {
-            0
-        };
-        shift_timestamp_ms(
-            &compute_tumble_with_offset(&args[0], interval_ms, offset_ms)?,
-            interval_ms,
-        )
-    }
-}
-
-// ─── HopWindowStart ──────────────────────────────────────────────────────────
-
-/// Computes the earliest hopping window start for a given timestamp.
-///
-/// `hop(timestamp, slide, size)` returns the start of the earliest window
-/// (of the given `size`, sliding by `slide`) that contains `ts`.
-///
-/// # Limitation
-///
-/// This returns only the *earliest* window start. Full multi-window
-/// assignment (one row per window) is handled by Ring 0 operators.
-///
-/// # Arguments
-///
-/// * Arg 0: Timestamp column or scalar
-/// * Arg 1: Slide interval scalar
-/// * Arg 2: Window size interval scalar
-#[derive(Debug)]
-pub struct HopWindowStart {
-    signature: Signature,
-}
-
-impl HopWindowStart {
-    /// Creates a new hop window start UDF.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            signature: Signature::new(
-                TypeSignature::OneOf(vec![TypeSignature::Any(3), TypeSignature::Any(4)]),
-                Volatility::Immutable,
-            ),
-        }
-    }
-}
-
-impl Default for HopWindowStart {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PartialEq for HopWindowStart {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
-impl Eq for HopWindowStart {}
-
-impl Hash for HopWindowStart {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        "hop".hash(state);
-    }
-}
-
-impl ScalarUDFImpl for HopWindowStart {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &'static str {
-        "hop"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Timestamp(TimeUnit::Millisecond, None))
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let ScalarFunctionArgs { args, .. } = args;
-        if args.len() < 3 || args.len() > 4 {
-            return Err(DataFusionError::Plan(
-                "hop() requires 3-4 arguments: (timestamp, slide, size [, offset])".to_string(),
-            ));
-        }
-        let slide_ms = extract_interval_ms(&args[1])?;
-        let size_ms = extract_interval_ms(&args[2])?;
-        if slide_ms <= 0 || size_ms <= 0 {
-            return Err(DataFusionError::Plan(
-                "hop() slide and size must be positive".to_string(),
-            ));
-        }
-        let offset_ms = if args.len() == 4 {
-            extract_interval_ms(&args[3])?
-        } else {
-            0
-        };
-        compute_hop_with_offset(&args[0], slide_ms, size_ms, offset_ms)
-    }
-}
-
-// ─── HopWindowEnd ────────────────────────────────────────────────────────────
-
-/// `hop_end(ts, slide, size)` — end of the earliest hop window
-/// containing `ts`. See [`HopWindowStart`].
-#[derive(Debug)]
-pub struct HopWindowEnd {
-    signature: Signature,
-}
-
-impl HopWindowEnd {
-    /// Creates a new hop window end UDF.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            signature: Signature::new(
-                TypeSignature::OneOf(vec![TypeSignature::Any(3), TypeSignature::Any(4)]),
-                Volatility::Immutable,
-            ),
-        }
-    }
-}
-
-impl Default for HopWindowEnd {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PartialEq for HopWindowEnd {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
-impl Eq for HopWindowEnd {}
-
-impl Hash for HopWindowEnd {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        "hop_end".hash(state);
-    }
-}
-
-impl ScalarUDFImpl for HopWindowEnd {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &'static str {
-        "hop_end"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Timestamp(TimeUnit::Millisecond, None))
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let ScalarFunctionArgs { args, .. } = args;
-        if args.len() < 3 || args.len() > 4 {
-            return Err(DataFusionError::Plan(
-                "hop_end() requires 3-4 arguments: (timestamp, slide, size [, offset])".to_string(),
-            ));
-        }
-        let slide_ms = extract_interval_ms(&args[1])?;
-        let size_ms = extract_interval_ms(&args[2])?;
-        if slide_ms <= 0 || size_ms <= 0 {
-            return Err(DataFusionError::Plan(
-                "hop_end() slide and size must be positive".to_string(),
-            ));
-        }
-        let offset_ms = if args.len() == 4 {
-            extract_interval_ms(&args[3])?
-        } else {
-            0
-        };
-        shift_timestamp_ms(
-            &compute_hop_with_offset(&args[0], slide_ms, size_ms, offset_ms)?,
-            size_ms,
-        )
-    }
-}
-
-// ─── SessionWindowStart ──────────────────────────────────────────────────────
-
-/// Pass-through UDF for session window compatibility.
-///
-/// `session(timestamp, gap)` returns the input timestamp unchanged.
-/// Session windows are data-dependent (gap-based grouping) and cannot
-/// be computed as a per-row scalar. The actual session assignment is
-/// handled by Ring 0 operators.
-///
-/// This UDF exists so that `GROUP BY SESSION(ts, gap)` is syntactically
-/// valid in `DataFusion` queries, with real session logic deferred to
-/// the streaming engine.
-#[derive(Debug)]
-pub struct SessionWindowStart {
-    signature: Signature,
-}
-
-impl SessionWindowStart {
-    /// Creates a new session window start UDF.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            signature: Signature::new(TypeSignature::Any(2), Volatility::Immutable),
-        }
-    }
-}
-
-impl Default for SessionWindowStart {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PartialEq for SessionWindowStart {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
-impl Eq for SessionWindowStart {}
-
-impl Hash for SessionWindowStart {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        "session".hash(state);
-    }
-}
-
-impl ScalarUDFImpl for SessionWindowStart {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &'static str {
-        "session"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Timestamp(TimeUnit::Millisecond, None))
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let ScalarFunctionArgs { args, .. } = args;
-        if args.len() != 2 {
-            return Err(DataFusionError::Plan(
-                "session() requires exactly 2 arguments: (timestamp, gap)".to_string(),
-            ));
-        }
-        // Pass-through: return the input timestamp as-is
-        match &args[0] {
-            ColumnarValue::Array(array) => {
-                let result = convert_to_timestamp_ms_array(array)?;
-                Ok(ColumnarValue::Array(result))
-            }
-            ColumnarValue::Scalar(scalar) => {
-                let ts_ms = scalar_to_timestamp_ms(scalar)?;
-                Ok(ColumnarValue::Scalar(ScalarValue::TimestampMillisecond(
-                    ts_ms, None,
-                )))
+        impl $type {
+            /// Constructs the UDF instance.
+            #[must_use]
+            pub fn new() -> Self {
+                Self { signature: variadic_signature($arity) }
             }
         }
-    }
-}
 
-// ─── CumulateWindowStart ────────────────────────────────────────────────────
-
-/// Computes the cumulate window epoch start for a given timestamp.
-///
-/// `cumulate(timestamp, step, size)` returns `floor(ts / size) * size`,
-/// which is the epoch start for the cumulating window that contains `ts`.
-/// The actual multi-window assignment (one row per cumulating window) is
-/// handled by Ring 0 operators.
-///
-/// # Arguments
-///
-/// * Arg 0: Timestamp column or scalar (`TimestampMillisecond` or `Int64` ms)
-/// * Arg 1: Step interval scalar (window growth increment)
-/// * Arg 2: Max size interval scalar (epoch size)
-#[derive(Debug)]
-pub struct CumulateWindowStart {
-    signature: Signature,
-}
-
-impl CumulateWindowStart {
-    /// Creates a new cumulate window start UDF.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            signature: Signature::new(TypeSignature::Any(3), Volatility::Immutable),
+        impl Default for $type {
+            fn default() -> Self { Self::new() }
         }
-    }
-}
 
-impl Default for CumulateWindowStart {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PartialEq for CumulateWindowStart {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
-impl Eq for CumulateWindowStart {}
-
-impl Hash for CumulateWindowStart {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        "cumulate".hash(state);
-    }
-}
-
-impl ScalarUDFImpl for CumulateWindowStart {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &'static str {
-        "cumulate"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Timestamp(TimeUnit::Millisecond, None))
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let ScalarFunctionArgs { args, .. } = args;
-        if args.len() != 3 {
-            return Err(DataFusionError::Plan(
-                "cumulate() requires exactly 3 arguments: (timestamp, step, size)".to_string(),
-            ));
+        impl PartialEq for $type {
+            fn eq(&self, _: &Self) -> bool { true }
         }
-        let step_ms = extract_interval_ms(&args[1])?;
-        let size_ms = extract_interval_ms(&args[2])?;
-        if step_ms <= 0 || size_ms <= 0 {
-            return Err(DataFusionError::Plan(
-                "cumulate() step and size must be positive".to_string(),
-            ));
+
+        impl Eq for $type {}
+
+        impl Hash for $type {
+            fn hash<H: Hasher>(&self, state: &mut H) { $sql_name.hash(state); }
         }
-        if step_ms > size_ms {
-            return Err(DataFusionError::Plan(
-                "cumulate() step must not exceed size".to_string(),
-            ));
+
+        impl ScalarUDFImpl for $type {
+            fn as_any(&self) -> &dyn Any { self }
+            fn name(&self) -> &'static str { $sql_name }
+            fn signature(&self) -> &Signature { &self.signature }
+            fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+                Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
+            }
+            fn invoke_with_args(&self, sfa: ScalarFunctionArgs) -> Result<ColumnarValue> {
+                let $args = sfa.args;
+                check_arity(&$args, $arity, $sql_name)?;
+                $body
+            }
         }
-        if size_ms % step_ms != 0 {
-            return Err(DataFusionError::Plan(
-                "cumulate() size must be evenly divisible by step".to_string(),
-            ));
-        }
-        // Return epoch start = floor(ts / size) * size (same as tumble with size)
-        compute_tumble(&args[0], size_ms)
+    };
+}
+
+// ─── UDF declarations ───────────────────────────────────────────────────────
+
+window_udf!(
+    /// `tumble(ts, interval [, offset])` — start of the non-overlapping
+    /// window containing `ts`. Returns `Timestamp(Microsecond, None)`.
+    TumbleWindowStart, "tumble", 2..=3,
+    |args| {
+        let interval_ms = positive_interval(&args[1], "tumble", "interval")?;
+        let offset_ms = optional_offset(&args, 2)?;
+        into_us_columnar(&args[0], |ts| tumble_start_ms(ts, interval_ms, offset_ms))
+    }
+);
+
+window_udf!(
+    /// `tumble_end(ts, interval [, offset])` — exclusive upper bound of
+    /// the tumble window containing `ts` (i.e. `tumble(...) + interval`).
+    TumbleWindowEnd, "tumble_end", 2..=3,
+    |args| {
+        let interval_ms = positive_interval(&args[1], "tumble_end", "interval")?;
+        let offset_ms = optional_offset(&args, 2)?;
+        into_us_columnar(&args[0], |ts| {
+            tumble_start_ms(ts, interval_ms, offset_ms).saturating_add(interval_ms)
+        })
+    }
+);
+
+window_udf!(
+    /// `hop(ts, slide, size [, offset])` — earliest sliding window
+    /// (size `size`, sliding by `slide`) that contains `ts`. Full
+    /// multi-window assignment is handled by Ring 0.
+    HopWindowStart, "hop", 3..=4,
+    |args| {
+        let slide_ms = positive_interval(&args[1], "hop", "slide")?;
+        let size_ms = positive_interval(&args[2], "hop", "size")?;
+        let offset_ms = optional_offset(&args, 3)?;
+        into_us_columnar(&args[0], |ts| hop_start_ms(ts, slide_ms, size_ms, offset_ms))
+    }
+);
+
+window_udf!(
+    /// `hop_end(ts, slide, size [, offset])` — end of the earliest
+    /// sliding window containing `ts` (i.e. `hop(...) + size`).
+    HopWindowEnd, "hop_end", 3..=4,
+    |args| {
+        let slide_ms = positive_interval(&args[1], "hop_end", "slide")?;
+        let size_ms = positive_interval(&args[2], "hop_end", "size")?;
+        let offset_ms = optional_offset(&args, 3)?;
+        into_us_columnar(&args[0], |ts| {
+            hop_start_ms(ts, slide_ms, size_ms, offset_ms).saturating_add(size_ms)
+        })
+    }
+);
+
+window_udf!(
+    /// `session(ts, gap)` — passthrough that converts `ts` to
+    /// microsecond resolution. Real session start/end are data-dependent
+    /// and computed by Ring 0; this UDF exists so `GROUP BY session(ts,
+    /// gap)` parses. There is no `session_end` UDF for the same reason.
+    SessionWindowStart, "session", 2..=2,
+    |args| into_us_columnar(&args[0], |ts| ts)
+);
+
+window_udf!(
+    /// `cumulate(ts, step, size)` — epoch start (size-aligned bucket)
+    /// containing `ts`. Per-step cumulating boundaries (which depend on
+    /// data) are exposed by Ring 0.
+    CumulateWindowStart, "cumulate", 3..=3,
+    |args| {
+        let (_step_ms, size_ms) = cumulate_intervals(&args, "cumulate")?;
+        into_us_columnar(&args[0], |ts| tumble_start_ms(ts, size_ms, 0))
+    }
+);
+
+window_udf!(
+    /// `cumulate_end(ts, step, size)` — exclusive upper bound of the
+    /// epoch (size-aligned bucket) containing `ts`.
+    CumulateWindowEnd, "cumulate_end", 3..=3,
+    |args| {
+        let (_step_ms, size_ms) = cumulate_intervals(&args, "cumulate_end")?;
+        into_us_columnar(&args[0], |ts| {
+            tumble_start_ms(ts, size_ms, 0).saturating_add(size_ms)
+        })
+    }
+);
+
+// ─── Math helpers ──────────────────────────────────────────────────────────
+//
+// All in milliseconds. Pure i64 → i64.
+
+/// Tumble window start: `floor((ts - offset) / interval) * interval + offset`.
+fn tumble_start_ms(ts: i64, interval_ms: i64, offset_ms: i64) -> i64 {
+    let adj = ts - offset_ms;
+    (adj - adj.rem_euclid(interval_ms)) + offset_ms
+}
+
+/// Earliest start of a hopping window of `size` (sliding by `slide`)
+/// that contains `ts`.
+fn hop_start_ms(ts: i64, slide_ms: i64, size_ms: i64, offset_ms: i64) -> i64 {
+    let adj = ts - size_ms + slide_ms - offset_ms;
+    (adj - adj.rem_euclid(slide_ms)) + offset_ms
+}
+
+// ─── Argument parsing helpers ──────────────────────────────────────────────
+
+/// Builds `Signature::any(N)` or `Signature::one_of([Any(N), …])` for a
+/// scalar UDF whose arity covers a contiguous range.
+fn variadic_signature(arity: RangeInclusive<usize>) -> Signature {
+    let mut arities: Vec<TypeSignature> = arity.map(TypeSignature::Any).collect();
+    let inner = if arities.len() == 1 {
+        arities.pop().unwrap()
+    } else {
+        TypeSignature::OneOf(arities)
+    };
+    Signature::new(inner, Volatility::Immutable)
+}
+
+fn check_arity(args: &[ColumnarValue], arity: RangeInclusive<usize>, fn_name: &str) -> Result<()> {
+    if arity.contains(&args.len()) {
+        return Ok(());
+    }
+    let expected = if arity.start() == arity.end() {
+        format!("exactly {}", arity.start())
+    } else {
+        format!("{}-{}", arity.start(), arity.end())
+    };
+    Err(DataFusionError::Plan(format!(
+        "{}() requires {} arguments, got {}",
+        fn_name,
+        expected,
+        args.len()
+    )))
+}
+
+fn positive_interval(value: &ColumnarValue, fn_name: &str, arg_name: &str) -> Result<i64> {
+    let ms = extract_interval_ms(value)?;
+    if ms <= 0 {
+        return Err(DataFusionError::Plan(format!(
+            "{fn_name}() {arg_name} must be positive"
+        )));
+    }
+    Ok(ms)
+}
+
+fn optional_offset(args: &[ColumnarValue], idx: usize) -> Result<i64> {
+    match args.get(idx) {
+        Some(value) => extract_interval_ms(value),
+        None => Ok(0),
     }
 }
 
-// ─── CumulateWindowEnd ──────────────────────────────────────────────────────
-
-/// `cumulate_end(ts, step, size)` — exclusive upper bound of the epoch
-/// (size-aligned bucket) containing `ts`. See [`CumulateWindowStart`].
-#[derive(Debug)]
-pub struct CumulateWindowEnd {
-    signature: Signature,
+fn cumulate_intervals(args: &[ColumnarValue], fn_name: &str) -> Result<(i64, i64)> {
+    let step_ms = positive_interval(&args[1], fn_name, "step")?;
+    let size_ms = positive_interval(&args[2], fn_name, "size")?;
+    if step_ms > size_ms {
+        return Err(DataFusionError::Plan(format!(
+            "{fn_name}() step must not exceed size"
+        )));
+    }
+    if size_ms % step_ms != 0 {
+        return Err(DataFusionError::Plan(format!(
+            "{fn_name}() size must be evenly divisible by step"
+        )));
+    }
+    Ok((step_ms, size_ms))
 }
 
-impl CumulateWindowEnd {
-    /// Creates a new cumulate window end UDF.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            signature: Signature::new(TypeSignature::Any(3), Volatility::Immutable),
-        }
-    }
-}
-
-impl Default for CumulateWindowEnd {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PartialEq for CumulateWindowEnd {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
-impl Eq for CumulateWindowEnd {}
-
-impl Hash for CumulateWindowEnd {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        "cumulate_end".hash(state);
-    }
-}
-
-impl ScalarUDFImpl for CumulateWindowEnd {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn name(&self) -> &'static str {
-        "cumulate_end"
-    }
-
-    fn signature(&self) -> &Signature {
-        &self.signature
-    }
-
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Timestamp(TimeUnit::Millisecond, None))
-    }
-
-    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let ScalarFunctionArgs { args, .. } = args;
-        if args.len() != 3 {
-            return Err(DataFusionError::Plan(
-                "cumulate_end() requires exactly 3 arguments: (timestamp, step, size)".to_string(),
-            ));
-        }
-        let step_ms = extract_interval_ms(&args[1])?;
-        let size_ms = extract_interval_ms(&args[2])?;
-        if step_ms <= 0 || size_ms <= 0 {
-            return Err(DataFusionError::Plan(
-                "cumulate_end() step and size must be positive".to_string(),
-            ));
-        }
-        if step_ms > size_ms {
-            return Err(DataFusionError::Plan(
-                "cumulate_end() step must not exceed size".to_string(),
-            ));
-        }
-        if size_ms % step_ms != 0 {
-            return Err(DataFusionError::Plan(
-                "cumulate_end() size must be evenly divisible by step".to_string(),
-            ));
-        }
-        shift_timestamp_ms(&compute_tumble(&args[0], size_ms)?, size_ms)
-    }
-}
-
-// ─── Helper Functions ────────────────────────────────────────────────────────
-
-/// Extracts an interval value in milliseconds from a `ColumnarValue`.
-///
-/// Only scalar intervals are supported (array intervals would require
-/// per-row window sizes, which is not a valid streaming pattern).
+/// Extracts a scalar interval in milliseconds. Array intervals are
+/// rejected — per-row window sizes are not a valid streaming pattern.
 fn extract_interval_ms(value: &ColumnarValue) -> Result<i64> {
     match value {
         ColumnarValue::Scalar(scalar) => scalar_interval_to_ms(scalar),
@@ -672,7 +266,6 @@ fn extract_interval_ms(value: &ColumnarValue) -> Result<i64> {
     }
 }
 
-/// Converts a scalar interval to milliseconds.
 fn scalar_interval_to_ms(scalar: &ScalarValue) -> Result<i64> {
     match scalar {
         ScalarValue::IntervalDayTime(Some(v)) => {
@@ -698,7 +291,38 @@ fn scalar_interval_to_ms(scalar: &ScalarValue) -> Result<i64> {
     }
 }
 
-/// Converts a scalar value to a timestamp in milliseconds.
+// ─── Dispatch helper ───────────────────────────────────────────────────────
+
+/// Applies `transform` (ms → ms) to every non-null input timestamp and
+/// returns a `Timestamp(Microsecond)` result. One allocation per call;
+/// null inputs propagate.
+fn into_us_columnar(
+    value: &ColumnarValue,
+    transform: impl Fn(i64) -> i64,
+) -> Result<ColumnarValue> {
+    match value {
+        ColumnarValue::Array(array) => {
+            let input = to_millis_array(array)?;
+            let result: TimestampMicrosecondArray = input
+                .iter()
+                .map(|opt| opt.map(|ms| transform(ms).saturating_mul(1000)))
+                .collect();
+            Ok(ColumnarValue::Array(Arc::new(result)))
+        }
+        ColumnarValue::Scalar(scalar) => {
+            let result =
+                scalar_to_timestamp_ms(scalar)?.map(|ms| transform(ms).saturating_mul(1000));
+            Ok(ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(
+                result, None,
+            )))
+        }
+    }
+}
+
+fn to_millis_array(array: &ArrayRef) -> Result<TimestampMillisecondArray> {
+    cast_to_millis_array(array.as_ref()).map_err(|e| DataFusionError::Plan(e.to_string()))
+}
+
 fn scalar_to_timestamp_ms(scalar: &ScalarValue) -> Result<Option<i64>> {
     match scalar {
         ScalarValue::TimestampMillisecond(v, _) | ScalarValue::Int64(v) => Ok(*v),
@@ -711,204 +335,10 @@ fn scalar_to_timestamp_ms(scalar: &ScalarValue) -> Result<Option<i64>> {
     }
 }
 
-/// Computes tumble window start for a `ColumnarValue`.
-fn compute_tumble(value: &ColumnarValue, interval_ms: i64) -> Result<ColumnarValue> {
-    match value {
-        ColumnarValue::Array(array) => {
-            let result = compute_tumble_array(array, interval_ms)?;
-            Ok(ColumnarValue::Array(result))
-        }
-        ColumnarValue::Scalar(scalar) => {
-            let ts_ms = scalar_to_timestamp_ms(scalar)?;
-            let window_start = ts_ms.map(|ts| ts - ts.rem_euclid(interval_ms));
-            Ok(ColumnarValue::Scalar(ScalarValue::TimestampMillisecond(
-                window_start,
-                None,
-            )))
-        }
-    }
-}
-
-/// Normalise a timestamp array to `TimestampMillisecond` for the window
-/// math below. Wraps the shared helper so DataFusion gets a `Plan` error
-/// on non-timestamp columns.
-fn to_millis_array(array: &ArrayRef) -> Result<TimestampMillisecondArray> {
-    cast_to_millis_array(array.as_ref()).map_err(|e| DataFusionError::Plan(e.to_string()))
-}
-
-/// Computes tumble window start for an array of timestamps.
-fn compute_tumble_array(array: &ArrayRef, interval_ms: i64) -> Result<ArrayRef> {
-    let input = to_millis_array(array)?;
-    let result: TimestampMillisecondArray = input
-        .iter()
-        .map(|opt_ts| opt_ts.map(|ts| ts - ts.rem_euclid(interval_ms)))
-        .collect();
-    Ok(Arc::new(result))
-}
-
-/// Computes tumble window start with offset for a `ColumnarValue`.
-fn compute_tumble_with_offset(
-    value: &ColumnarValue,
-    interval_ms: i64,
-    offset_ms: i64,
-) -> Result<ColumnarValue> {
-    if offset_ms == 0 {
-        return compute_tumble(value, interval_ms);
-    }
-    match value {
-        ColumnarValue::Array(array) => {
-            let result = compute_tumble_array_with_offset(array, interval_ms, offset_ms)?;
-            Ok(ColumnarValue::Array(result))
-        }
-        ColumnarValue::Scalar(scalar) => {
-            let ts_ms = scalar_to_timestamp_ms(scalar)?;
-            let window_start = ts_ms.map(|ts| {
-                let adj = ts - offset_ms;
-                (adj - adj.rem_euclid(interval_ms)) + offset_ms
-            });
-            Ok(ColumnarValue::Scalar(ScalarValue::TimestampMillisecond(
-                window_start,
-                None,
-            )))
-        }
-    }
-}
-
-/// Computes tumble window start with offset for an array of timestamps.
-fn compute_tumble_array_with_offset(
-    array: &ArrayRef,
-    interval_ms: i64,
-    offset_ms: i64,
-) -> Result<ArrayRef> {
-    let input = to_millis_array(array)?;
-    let result: TimestampMillisecondArray = input
-        .iter()
-        .map(|opt_ts| {
-            opt_ts.map(|ts| {
-                let adj = ts - offset_ms;
-                (adj - adj.rem_euclid(interval_ms)) + offset_ms
-            })
-        })
-        .collect();
-    Ok(Arc::new(result))
-}
-
-/// Computes hop (earliest) window start for a `ColumnarValue`.
-fn compute_hop(value: &ColumnarValue, slide_ms: i64, size_ms: i64) -> Result<ColumnarValue> {
-    match value {
-        ColumnarValue::Array(array) => {
-            let result = compute_hop_array(array, slide_ms, size_ms)?;
-            Ok(ColumnarValue::Array(result))
-        }
-        ColumnarValue::Scalar(scalar) => {
-            let ts_ms = scalar_to_timestamp_ms(scalar)?;
-            let window_start = ts_ms.map(|ts| hop_earliest_start(ts, slide_ms, size_ms));
-            Ok(ColumnarValue::Scalar(ScalarValue::TimestampMillisecond(
-                window_start,
-                None,
-            )))
-        }
-    }
-}
-
-/// Computes hop window start for an array of timestamps.
-fn compute_hop_array(array: &ArrayRef, slide_ms: i64, size_ms: i64) -> Result<ArrayRef> {
-    let input = to_millis_array(array)?;
-    let result: TimestampMillisecondArray = input
-        .iter()
-        .map(|opt_ts| opt_ts.map(|ts| hop_earliest_start(ts, slide_ms, size_ms)))
-        .collect();
-    Ok(Arc::new(result))
-}
-
-/// Computes the earliest window start for a hopping window containing `ts`.
-///
-/// Windows of `size_ms` slide by `slide_ms`. The earliest window that
-/// contains `ts` starts at `floor((ts - size + slide) / slide) * slide`.
-#[inline]
-fn hop_earliest_start(ts: i64, slide_ms: i64, size_ms: i64) -> i64 {
-    let adjusted = ts - size_ms + slide_ms;
-    adjusted - adjusted.rem_euclid(slide_ms)
-}
-
-/// Computes hop (earliest) window start with offset.
-fn compute_hop_with_offset(
-    value: &ColumnarValue,
-    slide_ms: i64,
-    size_ms: i64,
-    offset_ms: i64,
-) -> Result<ColumnarValue> {
-    if offset_ms == 0 {
-        return compute_hop(value, slide_ms, size_ms);
-    }
-    match value {
-        ColumnarValue::Array(array) => {
-            let result = compute_hop_array_with_offset(array, slide_ms, size_ms, offset_ms)?;
-            Ok(ColumnarValue::Array(result))
-        }
-        ColumnarValue::Scalar(scalar) => {
-            let ts_ms = scalar_to_timestamp_ms(scalar)?;
-            let window_start =
-                ts_ms.map(|ts| hop_earliest_start(ts - offset_ms, slide_ms, size_ms) + offset_ms);
-            Ok(ColumnarValue::Scalar(ScalarValue::TimestampMillisecond(
-                window_start,
-                None,
-            )))
-        }
-    }
-}
-
-/// Computes hop window start with offset for an array.
-fn compute_hop_array_with_offset(
-    array: &ArrayRef,
-    slide_ms: i64,
-    size_ms: i64,
-    offset_ms: i64,
-) -> Result<ArrayRef> {
-    let input = to_millis_array(array)?;
-    let result: TimestampMillisecondArray = input
-        .iter()
-        .map(|opt_ts| {
-            opt_ts.map(|ts| hop_earliest_start(ts - offset_ms, slide_ms, size_ms) + offset_ms)
-        })
-        .collect();
-    Ok(Arc::new(result))
-}
-
-/// Converts a timestamp array to `TimestampMillisecond` for consistent output.
-fn convert_to_timestamp_ms_array(array: &ArrayRef) -> Result<ArrayRef> {
-    let ms = to_millis_array(array)?;
-    Ok(Arc::new(ms))
-}
-
-/// Saturating-shifts every non-null `TimestampMillisecond` forward.
-fn shift_timestamp_ms(value: &ColumnarValue, delta_ms: i64) -> Result<ColumnarValue> {
-    match value {
-        ColumnarValue::Array(array) => {
-            let input = to_millis_array(array)?;
-            let result: TimestampMillisecondArray = input
-                .iter()
-                .map(|opt_ts| opt_ts.map(|ts| ts.saturating_add(delta_ms)))
-                .collect();
-            Ok(ColumnarValue::Array(Arc::new(result)))
-        }
-        ColumnarValue::Scalar(ScalarValue::TimestampMillisecond(opt, tz)) => {
-            let shifted = opt.map(|ts| ts.saturating_add(delta_ms));
-            Ok(ColumnarValue::Scalar(ScalarValue::TimestampMillisecond(
-                shifted,
-                tz.clone(),
-            )))
-        }
-        ColumnarValue::Scalar(other) => Err(DataFusionError::Plan(format!(
-            "expected TimestampMillisecond from window-start helper, got: {other:?}"
-        ))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{IntervalDayTime, IntervalMonthDayNano, TimestampMillisecondType};
+    use arrow::datatypes::{IntervalDayTime, IntervalMonthDayNano, TimestampMicrosecondType};
     use arrow_array::cast::AsArray;
     use arrow_array::Array;
     use arrow_schema::Field;
@@ -925,11 +355,21 @@ mod tests {
         ColumnarValue::Scalar(ScalarValue::TimestampMillisecond(ms, None))
     }
 
-    fn expect_ts_ms(result: ColumnarValue) -> Option<i64> {
+    /// Returns the microsecond value of a UDF scalar result, or panics
+    /// if the result isn't a `TimestampMicrosecond` scalar.
+    fn expect_ts_us(result: ColumnarValue) -> Option<i64> {
         match result {
-            ColumnarValue::Scalar(ScalarValue::TimestampMillisecond(v, _)) => v,
-            other => panic!("Expected TimestampMillisecond scalar, got: {other:?}"),
+            ColumnarValue::Scalar(ScalarValue::TimestampMicrosecond(v, _)) => v,
+            other => panic!("Expected TimestampMicrosecond scalar, got: {other:?}"),
         }
+    }
+
+    /// Returns the per-row microsecond values of a UDF array result.
+    fn array_values_us(arr: &dyn Array) -> Vec<Option<i64>> {
+        let r = arr.as_primitive::<TimestampMicrosecondType>();
+        (0..r.len())
+            .map(|i| if r.is_null(i) { None } else { Some(r.value(i)) })
+            .collect()
     }
 
     fn make_args(args: Vec<ColumnarValue>, rows: usize) -> ScalarFunctionArgs {
@@ -939,184 +379,247 @@ mod tests {
             number_rows: rows,
             return_field: Arc::new(Field::new(
                 "output",
-                DataType::Timestamp(TimeUnit::Millisecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, None),
                 true,
             )),
             config_options: Arc::new(ConfigOptions::default()),
         }
     }
 
-    // ── Tumble tests ─────────────────────────────────────────────────────
+    // ── Tumble ──────────────────────────────────────────────────────────
 
     #[test]
     fn test_tumble_basic() {
-        let udf = TumbleWindowStart::new();
-        // 5-minute interval = 300_000 ms, timestamp at 7 min
-        let result = udf
+        // 5-minute interval, ts=7 minutes (420 000 ms) → bucket start =
+        // 5 minutes = 300 000 ms = 300 000 000 µs.
+        let result = TumbleWindowStart::new()
             .invoke_with_args(make_args(
                 vec![ts_ms(Some(420_000)), interval_dt(0, 300_000)],
                 1,
             ))
             .unwrap();
-        assert_eq!(expect_ts_ms(result), Some(300_000));
+        assert_eq!(expect_ts_us(result), Some(300_000_000));
     }
 
     #[test]
     fn test_tumble_exact_boundary() {
-        let udf = TumbleWindowStart::new();
-        let result = udf
+        let result = TumbleWindowStart::new()
             .invoke_with_args(make_args(
                 vec![ts_ms(Some(300_000)), interval_dt(0, 300_000)],
                 1,
             ))
             .unwrap();
-        assert_eq!(expect_ts_ms(result), Some(300_000));
+        assert_eq!(expect_ts_us(result), Some(300_000_000));
     }
 
     #[test]
     fn test_tumble_zero_timestamp() {
-        let udf = TumbleWindowStart::new();
-        let result = udf
+        let result = TumbleWindowStart::new()
             .invoke_with_args(make_args(vec![ts_ms(Some(0)), interval_dt(0, 300_000)], 1))
             .unwrap();
-        assert_eq!(expect_ts_ms(result), Some(0));
+        assert_eq!(expect_ts_us(result), Some(0));
     }
 
     #[test]
     fn test_tumble_null_handling() {
-        let udf = TumbleWindowStart::new();
-        let result = udf
+        let result = TumbleWindowStart::new()
             .invoke_with_args(make_args(vec![ts_ms(None), interval_dt(0, 300_000)], 1))
             .unwrap();
-        assert_eq!(expect_ts_ms(result), None);
+        assert_eq!(expect_ts_us(result), None);
     }
 
     #[test]
     fn test_tumble_array_input() {
-        let udf = TumbleWindowStart::new();
-        let ts_array = TimestampMillisecondArray::from(vec![
+        let ts = ColumnarValue::Array(Arc::new(TimestampMillisecondArray::from(vec![
             Some(0),
             Some(150_000),
             Some(300_000),
             Some(420_000),
             None,
-        ]);
-        let ts = ColumnarValue::Array(Arc::new(ts_array));
-        let interval = interval_dt(0, 300_000);
-
-        let result = udf
-            .invoke_with_args(make_args(vec![ts, interval], 5))
+        ])));
+        let result = TumbleWindowStart::new()
+            .invoke_with_args(make_args(vec![ts, interval_dt(0, 300_000)], 5))
             .unwrap();
         match result {
-            ColumnarValue::Array(arr) => {
-                let r = arr.as_primitive::<TimestampMillisecondType>();
-                assert_eq!(r.value(0), 0);
-                assert_eq!(r.value(1), 0);
-                assert_eq!(r.value(2), 300_000);
-                assert_eq!(r.value(3), 300_000);
-                assert!(r.is_null(4));
-            }
+            ColumnarValue::Array(arr) => assert_eq!(
+                array_values_us(&arr),
+                vec![Some(0), Some(0), Some(300_000_000), Some(300_000_000), None,]
+            ),
             ColumnarValue::Scalar(_) => panic!("Expected array result"),
         }
     }
 
-    /// Regression: TUMBLE over a `Timestamp(Nanosecond)` column used to
-    /// bail out with "Unsupported timestamp type for tumble()" because
-    /// the array fast path only handled `Timestamp(Millisecond)` and
-    /// `Int64`. `to_millis_array` now casts any Timestamp precision.
+    /// Regression: TUMBLE over a `Timestamp(Nanosecond)` column must
+    /// take the `to_millis_array` path (any precision in, milliseconds
+    /// out) rather than failing on the array fast path.
     #[test]
     fn test_tumble_array_input_nanosecond() {
         use arrow_array::TimestampNanosecondArray;
-
-        let udf = TumbleWindowStart::new();
-        // 0s, 150s, 300s, 420s in ns.
-        let ts_array = TimestampNanosecondArray::from(vec![
+        let ts = ColumnarValue::Array(Arc::new(TimestampNanosecondArray::from(vec![
             Some(0),
             Some(150_000_000_000),
             Some(300_000_000_000),
             Some(420_000_000_000),
             None,
-        ]);
-        let ts = ColumnarValue::Array(Arc::new(ts_array));
-        let interval = interval_dt(0, 300_000); // 5 minutes
-
-        let result = udf
-            .invoke_with_args(make_args(vec![ts, interval], 5))
+        ])));
+        let result = TumbleWindowStart::new()
+            .invoke_with_args(make_args(vec![ts, interval_dt(0, 300_000)], 5))
             .unwrap();
         match result {
-            ColumnarValue::Array(arr) => {
-                let r = arr.as_primitive::<TimestampMillisecondType>();
-                assert_eq!(r.value(0), 0);
-                assert_eq!(r.value(1), 0);
-                assert_eq!(r.value(2), 300_000);
-                assert_eq!(r.value(3), 300_000);
-                assert!(r.is_null(4));
-            }
+            ColumnarValue::Array(arr) => assert_eq!(
+                array_values_us(&arr),
+                vec![Some(0), Some(0), Some(300_000_000), Some(300_000_000), None,]
+            ),
             ColumnarValue::Scalar(_) => panic!("Expected array result"),
         }
     }
 
-    /// Regression: HOP over a `Timestamp(Nanosecond)` column — same
-    /// missing arm as TUMBLE, fixed by the same `to_millis_array` helper.
+    /// Regression: HOP over `Timestamp(Nanosecond)` — same shape as the
+    /// tumble nanosecond regression.
     #[test]
     fn test_hop_array_input_nanosecond() {
         use arrow_array::TimestampNanosecondArray;
-
-        let udf = HopWindowStart::new();
-        // 7 minutes in ns.
-        let ts_array = TimestampNanosecondArray::from(vec![Some(420_000_000_000)]);
-        let ts = ColumnarValue::Array(Arc::new(ts_array));
-        // slide=5min, size=10min
-        let result = udf
+        let ts = ColumnarValue::Array(Arc::new(TimestampNanosecondArray::from(vec![Some(
+            420_000_000_000,
+        )])));
+        let result = HopWindowStart::new()
             .invoke_with_args(make_args(
                 vec![ts, interval_dt(0, 300_000), interval_dt(0, 600_000)],
                 1,
             ))
             .unwrap();
         match result {
-            ColumnarValue::Array(arr) => {
-                let r = arr.as_primitive::<TimestampMillisecondType>();
-                assert_eq!(r.value(0), 0);
-            }
+            ColumnarValue::Array(arr) => assert_eq!(array_values_us(&arr), vec![Some(0)]),
             ColumnarValue::Scalar(_) => panic!("Expected array result"),
         }
     }
 
     #[test]
     fn test_tumble_month_day_nano_interval() {
-        let udf = TumbleWindowStart::new();
-        // 1 hour = 3_600_000_000_000 nanoseconds
+        // 1 hour as IntervalMonthDayNano (3 600 s in nanoseconds);
+        // ts = 90 minutes (5 400 000 ms) → bucket start = 1 hour =
+        // 3 600 000 ms = 3 600 000 000 µs.
         let interval = ColumnarValue::Scalar(ScalarValue::IntervalMonthDayNano(Some(
             IntervalMonthDayNano::new(0, 0, 3_600_000_000_000),
         )));
-        // 90 minutes = 5_400_000 ms
-        let result = udf
+        let result = TumbleWindowStart::new()
             .invoke_with_args(make_args(vec![ts_ms(Some(5_400_000)), interval], 1))
             .unwrap();
-        assert_eq!(expect_ts_ms(result), Some(3_600_000));
+        assert_eq!(expect_ts_us(result), Some(3_600_000_000));
     }
 
     #[test]
     fn test_tumble_rejects_zero_interval() {
-        let udf = TumbleWindowStart::new();
-        let result = udf.invoke_with_args(make_args(vec![ts_ms(Some(1000)), interval_dt(0, 0)], 1));
+        let result = TumbleWindowStart::new()
+            .invoke_with_args(make_args(vec![ts_ms(Some(1000)), interval_dt(0, 0)], 1));
         assert!(result.is_err());
     }
 
     #[test]
     fn test_tumble_rejects_wrong_arg_count() {
-        let udf = TumbleWindowStart::new();
-        let result = udf.invoke_with_args(make_args(vec![ts_ms(Some(1000))], 1));
+        let result =
+            TumbleWindowStart::new().invoke_with_args(make_args(vec![ts_ms(Some(1000))], 1));
         assert!(result.is_err());
     }
 
-    // ── Hop tests ────────────────────────────────────────────────────────
+    // ── Tumble end ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_tumble_end_basic() {
+        // 5-minute interval, ts=7 min → window [5, 10) min → end = 10
+        // min = 600 000 ms = 600 000 000 µs.
+        let result = TumbleWindowEnd::new()
+            .invoke_with_args(make_args(
+                vec![ts_ms(Some(420_000)), interval_dt(0, 300_000)],
+                1,
+            ))
+            .unwrap();
+        assert_eq!(expect_ts_us(result), Some(600_000_000));
+    }
+
+    #[test]
+    fn test_tumble_end_at_boundary() {
+        let result = TumbleWindowEnd::new()
+            .invoke_with_args(make_args(
+                vec![ts_ms(Some(300_000)), interval_dt(0, 300_000)],
+                1,
+            ))
+            .unwrap();
+        assert_eq!(expect_ts_us(result), Some(600_000_000));
+    }
+
+    #[test]
+    fn test_tumble_end_null_propagates() {
+        let result = TumbleWindowEnd::new()
+            .invoke_with_args(make_args(vec![ts_ms(None), interval_dt(0, 300_000)], 1))
+            .unwrap();
+        assert_eq!(expect_ts_us(result), None);
+    }
+
+    #[test]
+    fn test_tumble_end_array_input() {
+        let ts = ColumnarValue::Array(Arc::new(TimestampMillisecondArray::from(vec![
+            Some(0),
+            Some(150_000),
+            Some(300_000),
+            Some(420_000),
+            None,
+        ])));
+        let result = TumbleWindowEnd::new()
+            .invoke_with_args(make_args(vec![ts, interval_dt(0, 300_000)], 5))
+            .unwrap();
+        match result {
+            ColumnarValue::Array(arr) => assert_eq!(
+                array_values_us(&arr),
+                vec![
+                    Some(300_000_000),
+                    Some(300_000_000),
+                    Some(600_000_000),
+                    Some(600_000_000),
+                    None,
+                ]
+            ),
+            ColumnarValue::Scalar(_) => panic!("Expected array result"),
+        }
+    }
+
+    #[test]
+    fn test_tumble_end_array_input_nanosecond() {
+        use arrow_array::TimestampNanosecondArray;
+        let ts = ColumnarValue::Array(Arc::new(TimestampNanosecondArray::from(vec![Some(
+            420_000_000_000,
+        )])));
+        let result = TumbleWindowEnd::new()
+            .invoke_with_args(make_args(vec![ts, interval_dt(0, 300_000)], 1))
+            .unwrap();
+        match result {
+            ColumnarValue::Array(arr) => assert_eq!(array_values_us(&arr), vec![Some(600_000_000)]),
+            ColumnarValue::Scalar(_) => panic!("Expected array result"),
+        }
+    }
+
+    #[test]
+    fn test_tumble_end_rejects_zero_interval() {
+        let result = TumbleWindowEnd::new()
+            .invoke_with_args(make_args(vec![ts_ms(Some(1000)), interval_dt(0, 0)], 1));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tumble_end_rejects_wrong_arg_count() {
+        let result = TumbleWindowEnd::new().invoke_with_args(make_args(vec![ts_ms(Some(1000))], 1));
+        assert!(result.is_err());
+    }
+
+    // ── Hop ─────────────────────────────────────────────────────────────
 
     #[test]
     fn test_hop_basic() {
-        let udf = HopWindowStart::new();
-        // slide=5min, size=10min, ts=7min
-        let result = udf
+        // slide=5 min, size=10 min, ts=7 min → earliest start = 0 (the
+        // `[-2 min, 8 min)` window doesn't exist because earliest start
+        // is non-negative; correct earliest start that contains 7 min
+        // is 0 because `[0, 10)` is the first such window).
+        let result = HopWindowStart::new()
             .invoke_with_args(make_args(
                 vec![
                     ts_ms(Some(420_000)),
@@ -1126,17 +629,12 @@ mod tests {
                 1,
             ))
             .unwrap();
-        // Earliest 10-min window (sliding 5min) containing 420_000:
-        // adjusted = 420_000 - 600_000 + 300_000 = 120_000
-        // 120_000 - (120_000 % 300_000) = 120_000 - 120_000 = 0
-        assert_eq!(expect_ts_ms(result), Some(0));
+        assert_eq!(expect_ts_us(result), Some(0));
     }
 
     #[test]
     fn test_hop_at_boundary() {
-        let udf = HopWindowStart::new();
-        // slide=5min, size=10min, ts=exactly 5min
-        let result = udf
+        let result = HopWindowStart::new()
             .invoke_with_args(make_args(
                 vec![
                     ts_ms(Some(300_000)),
@@ -1146,53 +644,73 @@ mod tests {
                 1,
             ))
             .unwrap();
-        // adjusted = 300_000 - 600_000 + 300_000 = 0
-        // 0 - (0 % 300_000) = 0
-        assert_eq!(expect_ts_ms(result), Some(0));
+        assert_eq!(expect_ts_us(result), Some(0));
     }
 
     #[test]
     fn test_hop_rejects_wrong_arg_count() {
-        let udf = HopWindowStart::new();
-        let result = udf.invoke_with_args(make_args(
+        let result = HopWindowStart::new().invoke_with_args(make_args(
             vec![ts_ms(Some(1000)), interval_dt(0, 300_000)],
             1,
         ));
         assert!(result.is_err());
     }
 
-    // ── Session tests ────────────────────────────────────────────────────
+    // ── Hop end ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_hop_end_basic() {
+        // slide=5 min, size=10 min, ts=7 min → earliest start=0,
+        // end=10 min = 600 000 000 µs.
+        let result = HopWindowEnd::new()
+            .invoke_with_args(make_args(
+                vec![
+                    ts_ms(Some(420_000)),
+                    interval_dt(0, 300_000),
+                    interval_dt(0, 600_000),
+                ],
+                1,
+            ))
+            .unwrap();
+        assert_eq!(expect_ts_us(result), Some(600_000_000));
+    }
+
+    #[test]
+    fn test_hop_end_rejects_wrong_arg_count() {
+        let result = HopWindowEnd::new().invoke_with_args(make_args(
+            vec![ts_ms(Some(1000)), interval_dt(0, 300_000)],
+            1,
+        ));
+        assert!(result.is_err());
+    }
+
+    // ── Session ─────────────────────────────────────────────────────────
 
     #[test]
     fn test_session_passthrough_scalar() {
-        let udf = SessionWindowStart::new();
-        let result = udf
+        let result = SessionWindowStart::new()
             .invoke_with_args(make_args(
                 vec![ts_ms(Some(42_000)), interval_dt(0, 60_000)],
                 1,
             ))
             .unwrap();
-        assert_eq!(expect_ts_ms(result), Some(42_000));
+        assert_eq!(expect_ts_us(result), Some(42_000_000));
     }
 
     #[test]
     fn test_session_passthrough_null() {
-        let udf = SessionWindowStart::new();
-        let result = udf
+        let result = SessionWindowStart::new()
             .invoke_with_args(make_args(vec![ts_ms(None), interval_dt(0, 60_000)], 1))
             .unwrap();
-        assert_eq!(expect_ts_ms(result), None);
+        assert_eq!(expect_ts_us(result), None);
     }
 
-    // ── Registration & signature tests ───────────────────────────────────
-
-    // ── Cumulate tests ──────────────────────────────────────────────────
+    // ── Cumulate ────────────────────────────────────────────────────────
 
     #[test]
     fn test_cumulate_basic() {
-        let udf = CumulateWindowStart::new();
-        // step=1min, size=5min, ts=30s → epoch start = 0
-        let result = udf
+        // step=1 min, size=5 min, ts=30 s → epoch start = 0.
+        let result = CumulateWindowStart::new()
             .invoke_with_args(make_args(
                 vec![
                     ts_ms(Some(30_000)),
@@ -1202,14 +720,13 @@ mod tests {
                 1,
             ))
             .unwrap();
-        assert_eq!(expect_ts_ms(result), Some(0));
+        assert_eq!(expect_ts_us(result), Some(0));
     }
 
     #[test]
     fn test_cumulate_second_epoch() {
-        let udf = CumulateWindowStart::new();
-        // step=1min, size=5min, ts=350s → epoch start = 300_000
-        let result = udf
+        // ts=350 s → epoch start = 5 min = 300 000 000 µs.
+        let result = CumulateWindowStart::new()
             .invoke_with_args(make_args(
                 vec![
                     ts_ms(Some(350_000)),
@@ -1219,13 +736,12 @@ mod tests {
                 1,
             ))
             .unwrap();
-        assert_eq!(expect_ts_ms(result), Some(300_000));
+        assert_eq!(expect_ts_us(result), Some(300_000_000));
     }
 
     #[test]
     fn test_cumulate_rejects_step_exceeds_size() {
-        let udf = CumulateWindowStart::new();
-        let result = udf.invoke_with_args(make_args(
+        let result = CumulateWindowStart::new().invoke_with_args(make_args(
             vec![
                 ts_ms(Some(1000)),
                 interval_dt(0, 600_000),
@@ -1238,8 +754,7 @@ mod tests {
 
     #[test]
     fn test_cumulate_rejects_not_divisible() {
-        let udf = CumulateWindowStart::new();
-        let result = udf.invoke_with_args(make_args(
+        let result = CumulateWindowStart::new().invoke_with_args(make_args(
             vec![
                 ts_ms(Some(1000)),
                 interval_dt(0, 70_000),
@@ -1252,173 +767,19 @@ mod tests {
 
     #[test]
     fn test_cumulate_rejects_wrong_arg_count() {
-        let udf = CumulateWindowStart::new();
-        let result = udf.invoke_with_args(make_args(
+        let result = CumulateWindowStart::new().invoke_with_args(make_args(
             vec![ts_ms(Some(1000)), interval_dt(0, 60_000)],
             1,
         ));
         assert!(result.is_err());
     }
 
-    // ── Registration & signature tests ───────────────────────────────────
-
-    #[test]
-    fn test_udf_registration() {
-        let tumble = ScalarUDF::new_from_impl(TumbleWindowStart::new());
-        assert_eq!(tumble.name(), "tumble");
-
-        let tumble_end = ScalarUDF::new_from_impl(TumbleWindowEnd::new());
-        assert_eq!(tumble_end.name(), "tumble_end");
-
-        let hop = ScalarUDF::new_from_impl(HopWindowStart::new());
-        assert_eq!(hop.name(), "hop");
-
-        let hop_end = ScalarUDF::new_from_impl(HopWindowEnd::new());
-        assert_eq!(hop_end.name(), "hop_end");
-
-        let session = ScalarUDF::new_from_impl(SessionWindowStart::new());
-        assert_eq!(session.name(), "session");
-
-        let cumulate = ScalarUDF::new_from_impl(CumulateWindowStart::new());
-        assert_eq!(cumulate.name(), "cumulate");
-
-        let cumulate_end = ScalarUDF::new_from_impl(CumulateWindowEnd::new());
-        assert_eq!(cumulate_end.name(), "cumulate_end");
-    }
-
-    // ── *_end tests ──────────────────────────────────────────────────────
-
-    #[test]
-    fn test_tumble_end_basic() {
-        let udf = TumbleWindowEnd::new();
-        // 5-min interval, ts=7min ⇒ window = [5min, 10min) ⇒ end=600_000
-        let result = udf
-            .invoke_with_args(make_args(
-                vec![ts_ms(Some(420_000)), interval_dt(0, 300_000)],
-                1,
-            ))
-            .unwrap();
-        assert_eq!(expect_ts_ms(result), Some(600_000));
-    }
-
-    #[test]
-    fn test_tumble_end_at_boundary() {
-        let udf = TumbleWindowEnd::new();
-        // ts exactly on a boundary: ts=300_000 in 5-min windows ⇒ start=300_000, end=600_000
-        let result = udf
-            .invoke_with_args(make_args(
-                vec![ts_ms(Some(300_000)), interval_dt(0, 300_000)],
-                1,
-            ))
-            .unwrap();
-        assert_eq!(expect_ts_ms(result), Some(600_000));
-    }
-
-    #[test]
-    fn test_tumble_end_null_propagates() {
-        let udf = TumbleWindowEnd::new();
-        let result = udf
-            .invoke_with_args(make_args(vec![ts_ms(None), interval_dt(0, 300_000)], 1))
-            .unwrap();
-        assert_eq!(expect_ts_ms(result), None);
-    }
-
-    #[test]
-    fn test_tumble_end_array_input() {
-        let udf = TumbleWindowEnd::new();
-        let ts_array = TimestampMillisecondArray::from(vec![
-            Some(0),
-            Some(150_000),
-            Some(300_000),
-            Some(420_000),
-            None,
-        ]);
-        let ts = ColumnarValue::Array(Arc::new(ts_array));
-        let interval = interval_dt(0, 300_000);
-
-        let result = udf
-            .invoke_with_args(make_args(vec![ts, interval], 5))
-            .unwrap();
-        match result {
-            ColumnarValue::Array(arr) => {
-                let r = arr.as_primitive::<TimestampMillisecondType>();
-                assert_eq!(r.value(0), 300_000); // start=0,   end=300_000
-                assert_eq!(r.value(1), 300_000); // start=0,   end=300_000
-                assert_eq!(r.value(2), 600_000); // start=300, end=600
-                assert_eq!(r.value(3), 600_000); // start=300, end=600
-                assert!(r.is_null(4));
-            }
-            ColumnarValue::Scalar(_) => panic!("Expected array result"),
-        }
-    }
-
-    /// Regression: TUMBLE_END over a `Timestamp(Nanosecond)` input must
-    /// take the same `to_millis_array` path as TUMBLE.
-    #[test]
-    fn test_tumble_end_array_input_nanosecond() {
-        use arrow_array::TimestampNanosecondArray;
-        let udf = TumbleWindowEnd::new();
-        let ts_array = TimestampNanosecondArray::from(vec![Some(420_000_000_000)]);
-        let ts = ColumnarValue::Array(Arc::new(ts_array));
-        let interval = interval_dt(0, 300_000);
-        let result = udf
-            .invoke_with_args(make_args(vec![ts, interval], 1))
-            .unwrap();
-        match result {
-            ColumnarValue::Array(arr) => {
-                let r = arr.as_primitive::<TimestampMillisecondType>();
-                assert_eq!(r.value(0), 600_000);
-            }
-            ColumnarValue::Scalar(_) => panic!("Expected array result"),
-        }
-    }
-
-    #[test]
-    fn test_tumble_end_rejects_zero_interval() {
-        let udf = TumbleWindowEnd::new();
-        let result = udf.invoke_with_args(make_args(vec![ts_ms(Some(1000)), interval_dt(0, 0)], 1));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_tumble_end_rejects_wrong_arg_count() {
-        let udf = TumbleWindowEnd::new();
-        let result = udf.invoke_with_args(make_args(vec![ts_ms(Some(1000))], 1));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_hop_end_basic() {
-        let udf = HopWindowEnd::new();
-        // slide=5min, size=10min, ts=7min ⇒ earliest start=0, end=600_000
-        let result = udf
-            .invoke_with_args(make_args(
-                vec![
-                    ts_ms(Some(420_000)),
-                    interval_dt(0, 300_000),
-                    interval_dt(0, 600_000),
-                ],
-                1,
-            ))
-            .unwrap();
-        assert_eq!(expect_ts_ms(result), Some(600_000));
-    }
-
-    #[test]
-    fn test_hop_end_rejects_wrong_arg_count() {
-        let udf = HopWindowEnd::new();
-        let result = udf.invoke_with_args(make_args(
-            vec![ts_ms(Some(1000)), interval_dt(0, 300_000)],
-            1,
-        ));
-        assert!(result.is_err());
-    }
+    // ── Cumulate end ────────────────────────────────────────────────────
 
     #[test]
     fn test_cumulate_end_basic() {
-        let udf = CumulateWindowEnd::new();
-        // step=1min, size=5min, ts=30s ⇒ epoch=[0, 300_000) ⇒ end=300_000
-        let result = udf
+        // ts=30 s → epoch=[0, 5 min) → end = 5 min = 300 000 000 µs.
+        let result = CumulateWindowEnd::new()
             .invoke_with_args(make_args(
                 vec![
                     ts_ms(Some(30_000)),
@@ -1428,13 +789,12 @@ mod tests {
                 1,
             ))
             .unwrap();
-        assert_eq!(expect_ts_ms(result), Some(300_000));
+        assert_eq!(expect_ts_us(result), Some(300_000_000));
     }
 
     #[test]
     fn test_cumulate_end_rejects_step_exceeds_size() {
-        let udf = CumulateWindowEnd::new();
-        let result = udf.invoke_with_args(make_args(
+        let result = CumulateWindowEnd::new().invoke_with_args(make_args(
             vec![
                 ts_ms(Some(1000)),
                 interval_dt(0, 600_000),
@@ -1445,37 +805,82 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ── Registration / signature ────────────────────────────────────────
+
+    #[test]
+    fn test_udf_registration() {
+        for (impl_name, expected) in [
+            (
+                ScalarUDF::new_from_impl(TumbleWindowStart::new())
+                    .name()
+                    .to_string(),
+                "tumble",
+            ),
+            (
+                ScalarUDF::new_from_impl(TumbleWindowEnd::new())
+                    .name()
+                    .to_string(),
+                "tumble_end",
+            ),
+            (
+                ScalarUDF::new_from_impl(HopWindowStart::new())
+                    .name()
+                    .to_string(),
+                "hop",
+            ),
+            (
+                ScalarUDF::new_from_impl(HopWindowEnd::new())
+                    .name()
+                    .to_string(),
+                "hop_end",
+            ),
+            (
+                ScalarUDF::new_from_impl(SessionWindowStart::new())
+                    .name()
+                    .to_string(),
+                "session",
+            ),
+            (
+                ScalarUDF::new_from_impl(CumulateWindowStart::new())
+                    .name()
+                    .to_string(),
+                "cumulate",
+            ),
+            (
+                ScalarUDF::new_from_impl(CumulateWindowEnd::new())
+                    .name()
+                    .to_string(),
+                "cumulate_end",
+            ),
+        ] {
+            assert_eq!(impl_name, expected);
+        }
+    }
+
     #[test]
     fn test_udf_signatures_immutable() {
-        assert_eq!(
-            TumbleWindowStart::new().signature().volatility,
-            Volatility::Immutable
-        );
-        assert_eq!(
-            HopWindowStart::new().signature().volatility,
-            Volatility::Immutable
-        );
-        assert_eq!(
-            SessionWindowStart::new().signature().volatility,
-            Volatility::Immutable
-        );
-        assert_eq!(
-            CumulateWindowStart::new().signature().volatility,
-            Volatility::Immutable
-        );
+        for sig in [
+            TumbleWindowStart::new().signature().clone(),
+            TumbleWindowEnd::new().signature().clone(),
+            HopWindowStart::new().signature().clone(),
+            HopWindowEnd::new().signature().clone(),
+            SessionWindowStart::new().signature().clone(),
+            CumulateWindowStart::new().signature().clone(),
+            CumulateWindowEnd::new().signature().clone(),
+        ] {
+            assert_eq!(sig.volatility, Volatility::Immutable);
+        }
     }
 
     #[test]
-    fn test_tumble_return_type() {
-        let udf = TumbleWindowStart::new();
-        let rt = udf.return_type(&[]).unwrap();
-        assert_eq!(rt, DataType::Timestamp(TimeUnit::Millisecond, None));
-    }
-
-    #[test]
-    fn test_cumulate_return_type() {
-        let udf = CumulateWindowStart::new();
-        let rt = udf.return_type(&[]).unwrap();
-        assert_eq!(rt, DataType::Timestamp(TimeUnit::Millisecond, None));
+    fn test_return_types_microsecond() {
+        let target = DataType::Timestamp(TimeUnit::Microsecond, None);
+        assert_eq!(TumbleWindowStart::new().return_type(&[]).unwrap(), target);
+        assert_eq!(TumbleWindowEnd::new().return_type(&[]).unwrap(), target);
+        assert_eq!(HopWindowStart::new().return_type(&[]).unwrap(), target);
+        assert_eq!(HopWindowEnd::new().return_type(&[]).unwrap(), target);
+        assert_eq!(SessionWindowStart::new().return_type(&[]).unwrap(), target);
+        assert_eq!(CumulateWindowStart::new().return_type(&[]).unwrap(), target);
+        assert_eq!(CumulateWindowEnd::new().return_type(&[]).unwrap(), target);
     }
 }

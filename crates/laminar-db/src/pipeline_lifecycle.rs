@@ -1637,11 +1637,11 @@ mod resolver_tests {
         assert_eq!(names, vec!["window_start", "window_end", "region", "n"]);
         assert_eq!(
             out["agg"].field(0).data_type(),
-            &DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None)
+            &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
         );
         assert_eq!(
             out["agg"].field(1).data_type(),
-            &DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None)
+            &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
         );
     }
 

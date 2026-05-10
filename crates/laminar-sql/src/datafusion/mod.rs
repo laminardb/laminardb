@@ -185,17 +185,11 @@ pub fn create_streaming_context_with_validator(mode: StreamingValidatorMode) -> 
     ctx
 }
 
-/// Registers `LaminarDB` streaming UDFs with a session context.
-///
-/// Registers the following scalar functions:
-/// - `tumble(timestamp, interval)` — tumbling window start
-/// - `hop(timestamp, slide, size)` — hopping window start
-/// - `session(timestamp, gap)` — session window pass-through
-/// - `watermark()` — current watermark (returns NULL, no live source)
-///
-/// Use [`register_streaming_functions_with_watermark`] to provide a
-/// live watermark source from Ring 0.
-pub fn register_streaming_functions(ctx: &SessionContext) {
+/// Window-time, JSON, complex-type, lambda, and `proctime()` UDFs —
+/// every streaming UDF except `watermark()`. Pulled out of the public
+/// `register_streaming_functions*` entry points so they share a single
+/// list and stay in sync.
+fn register_non_watermark_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::new_from_impl(TumbleWindowStart::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(TumbleWindowEnd::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(HopWindowStart::new()));
@@ -203,7 +197,6 @@ pub fn register_streaming_functions(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::new_from_impl(SessionWindowStart::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(CumulateWindowStart::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(CumulateWindowEnd::new()));
-    ctx.register_udf(ScalarUDF::new_from_impl(WatermarkUdf::unset()));
     ctx.register_udf(ScalarUDF::new_from_impl(ProcTimeUdf::new()));
     register_json_functions(ctx);
     register_json_extensions(ctx);
@@ -211,33 +204,25 @@ pub fn register_streaming_functions(ctx: &SessionContext) {
     register_lambda_functions(ctx);
 }
 
-/// Registers streaming UDFs with a live watermark source.
-///
-/// Same as [`register_streaming_functions`] but connects the `watermark()`
-/// UDF to a shared atomic value that Ring 0 updates in real time.
-///
-/// # Arguments
-///
-/// * `ctx` - `DataFusion` session context
-/// * `watermark_ms` - Shared atomic holding the current watermark in
-///   milliseconds since epoch. Values < 0 mean "no watermark" (returns NULL).
+/// Registers `LaminarDB` streaming UDFs with a session context. The
+/// `watermark()` UDF is registered in unset mode (always returns NULL);
+/// use [`register_streaming_functions_with_watermark`] to provide a
+/// live watermark source from Ring 0.
+pub fn register_streaming_functions(ctx: &SessionContext) {
+    register_non_watermark_udfs(ctx);
+    ctx.register_udf(ScalarUDF::new_from_impl(WatermarkUdf::unset()));
+}
+
+/// Registers streaming UDFs with a live watermark source — same as
+/// [`register_streaming_functions`] but `watermark()` reads
+/// `watermark_ms` (in milliseconds since epoch; values < 0 mean "no
+/// watermark", returning NULL).
 pub fn register_streaming_functions_with_watermark(
     ctx: &SessionContext,
     watermark_ms: Arc<AtomicI64>,
 ) {
-    ctx.register_udf(ScalarUDF::new_from_impl(TumbleWindowStart::new()));
-    ctx.register_udf(ScalarUDF::new_from_impl(TumbleWindowEnd::new()));
-    ctx.register_udf(ScalarUDF::new_from_impl(HopWindowStart::new()));
-    ctx.register_udf(ScalarUDF::new_from_impl(HopWindowEnd::new()));
-    ctx.register_udf(ScalarUDF::new_from_impl(SessionWindowStart::new()));
-    ctx.register_udf(ScalarUDF::new_from_impl(CumulateWindowStart::new()));
-    ctx.register_udf(ScalarUDF::new_from_impl(CumulateWindowEnd::new()));
+    register_non_watermark_udfs(ctx);
     ctx.register_udf(ScalarUDF::new_from_impl(WatermarkUdf::new(watermark_ms)));
-    ctx.register_udf(ScalarUDF::new_from_impl(ProcTimeUdf::new()));
-    register_json_functions(ctx);
-    register_json_extensions(ctx);
-    register_complex_type_functions(ctx);
-    register_lambda_functions(ctx);
 }
 
 /// Registers all PostgreSQL-compatible JSON UDFs and UDAFs
@@ -527,7 +512,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tumble_udf_via_datafusion() {
-        use arrow_array::TimestampMillisecondArray;
+        use arrow_array::{TimestampMicrosecondArray, TimestampMillisecondArray};
         use arrow_schema::TimeUnit;
 
         let ctx = create_streaming_context();
@@ -578,17 +563,18 @@ mod tests {
         let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total_rows, 3);
 
-        // Verify the window_start values (single batch, order preserved)
+        // tumble() returns microsecond timestamps for lakehouse-sink compat;
+        // expected window starts are scaled accordingly (× 1000).
         let ws_col = batches[0]
             .column(0)
             .as_any()
-            .downcast_ref::<TimestampMillisecondArray>()
-            .expect("window_start should be TimestampMillisecond");
-        // 60_000 and 120_000 → window [0, 300_000), start = 0
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("window_start should be TimestampMicrosecond");
+        // 60_000 and 120_000 ms → window [0, 300_000) ms, start = 0 µs.
         assert_eq!(ws_col.value(0), 0);
         assert_eq!(ws_col.value(1), 0);
-        // 360_000 → window [300_000, 600_000), start = 300_000
-        assert_eq!(ws_col.value(2), 300_000);
+        // 360_000 ms → window [300_000, 600_000) ms, start = 300_000_000 µs.
+        assert_eq!(ws_col.value(2), 300_000_000);
     }
 
     #[tokio::test]
