@@ -86,14 +86,10 @@ pub(crate) struct CoreWindowCheckpoint {
     /// Discriminant so restore can pick the right branch.
     #[serde(default = "default_window_type_tag")]
     pub window_type: String,
-    /// Highest watermark observed at checkpoint time, so recovery
-    /// doesn't re-admit late events the previous run already dropped.
-    #[serde(default = "default_high_watermark")]
+    /// Highest watermark observed at checkpoint time. Adding this field
+    /// is a breaking rkyv schema change; pre-feature checkpoints fail to
+    /// deserialize and a fresh start path is taken.
     pub high_watermark_ms: i64,
-}
-
-fn default_high_watermark() -> i64 {
-    i64::MIN
 }
 
 fn default_window_type_tag() -> String {
@@ -698,17 +694,21 @@ impl CoreWindowState {
                 if ts_ms == NULL_TIMESTAMP {
                     continue; // skip rows with null timestamps
                 }
-                if self.is_event_late_beyond_recovery(ts_ms) {
-                    continue;
-                }
                 #[allow(clippy::cast_possible_truncation)]
                 let idx = row_idx as u32;
                 match &self.assigner {
                     CoreWindowAssigner::Tumbling(a) => {
-                        grouped.entry(a.assign(ts_ms).start).or_default().push(idx);
+                        let ws = a.assign(ts_ms).start;
+                        if self.is_window_closed(ws) {
+                            continue;
+                        }
+                        grouped.entry(ws).or_default().push(idx);
                     }
                     CoreWindowAssigner::Hopping(a) => {
                         for wid in a.assign_windows(ts_ms) {
+                            if self.is_window_closed(wid.start) {
+                                continue;
+                            }
                             grouped.entry(wid.start).or_default().push(idx);
                         }
                     }
@@ -757,21 +757,22 @@ impl CoreWindowState {
             if ts_ms == NULL_TIMESTAMP {
                 continue;
             }
-            if self.is_event_late_beyond_recovery(ts_ms) {
-                continue;
-            }
             let (gid, _) = group_keys.insert_full(rows_ref.row(row_idx).owned());
             #[allow(clippy::cast_possible_truncation)]
             let (gid, idx) = (gid as u32, row_idx as u32);
             match &self.assigner {
                 CoreWindowAssigner::Tumbling(a) => {
-                    grouped
-                        .entry((a.assign(ts_ms).start, gid))
-                        .or_default()
-                        .push(idx);
+                    let ws = a.assign(ts_ms).start;
+                    if self.is_window_closed(ws) {
+                        continue;
+                    }
+                    grouped.entry((ws, gid)).or_default().push(idx);
                 }
                 CoreWindowAssigner::Hopping(a) => {
                     for wid in a.assign_windows(ts_ms) {
+                        if self.is_window_closed(wid.start) {
+                            continue;
+                        }
                         grouped.entry((wid.start, gid)).or_default().push(idx);
                     }
                 }
@@ -1069,26 +1070,26 @@ impl CoreWindowState {
         Ok(())
     }
 
-    /// True when the watermark has passed every window `ts_ms` could
-    /// belong to (plus the grace period). Sessions are excluded because
-    /// their end is data-dependent — merging is handled at close time.
+    /// True if the window starting at `window_start` has already closed.
+    /// Checked per assigned window so an event whose hopping windows are
+    /// partly closed still updates the still-open ones without
+    /// re-creating closed buckets. The window-start values are produced
+    /// by the assigner's `assign()` / `assign_windows()`, which already
+    /// account for window offsets.
     #[inline]
-    fn is_event_late_beyond_recovery(&self, ts_ms: i64) -> bool {
+    fn is_window_closed(&self, window_start: i64) -> bool {
         if self.high_watermark_ms == i64::MIN {
             return false;
         }
-        let max_end_ms = match &self.assigner {
-            CoreWindowAssigner::Tumbling(a) => {
-                let size = a.size_ms();
-                ts_ms - ts_ms.rem_euclid(size) + size
-            }
-            CoreWindowAssigner::Hopping(a) => {
-                let slide = a.slide_ms();
-                ts_ms - ts_ms.rem_euclid(slide) + a.size_ms()
-            }
+        let size_ms = match &self.assigner {
+            CoreWindowAssigner::Tumbling(a) => a.size_ms(),
+            CoreWindowAssigner::Hopping(a) => a.size_ms(),
             CoreWindowAssigner::Session { .. } => return false,
         };
-        max_end_ms.saturating_add(self.allowed_lateness_ms) <= self.high_watermark_ms
+        window_start
+            .saturating_add(size_ms)
+            .saturating_add(self.allowed_lateness_ms)
+            <= self.high_watermark_ms
     }
 
     /// Close windows whose end <= watermark, returning emitted batches.

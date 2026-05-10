@@ -523,28 +523,24 @@ impl IncrementalEowcState {
         }))
     }
 
-    /// Mirror of [`CoreWindowState::is_event_late_beyond_recovery`].
+    /// True if the window starting at `window_start` has already closed.
+    /// Checked per assigned window so that for hopping windows, an event
+    /// whose *earlier* (already-emitted) windows are closed still
+    /// updates its still-open *later* windows, without re-creating the
+    /// closed buckets.
     #[inline]
-    fn is_event_late_beyond_recovery(&self, ts_ms: i64) -> bool {
+    fn is_window_closed(&self, window_start: i64) -> bool {
         if self.high_watermark_ms == i64::MIN {
             return false;
         }
-        let max_end_ms = match &self.window_type {
-            EowcWindowType::Tumbling { size_ms } => {
-                if *size_ms <= 0 {
-                    return false;
-                }
-                ts_ms - ts_ms.rem_euclid(*size_ms) + size_ms
-            }
-            EowcWindowType::Hopping { size_ms, slide_ms } => {
-                if *slide_ms <= 0 || *size_ms <= 0 {
-                    return false;
-                }
-                ts_ms - ts_ms.rem_euclid(*slide_ms) + size_ms
-            }
-            EowcWindowType::Session { .. } => return false,
-        };
-        max_end_ms.saturating_add(self.allowed_lateness_ms) <= self.high_watermark_ms
+        let size_ms = self.window_type.size_ms();
+        if size_ms <= 0 {
+            return false;
+        }
+        window_start
+            .saturating_add(size_ms)
+            .saturating_add(self.allowed_lateness_ms)
+            <= self.high_watermark_ms
     }
 
     /// Vectorized batch update: extracts timestamps and group keys at the
@@ -582,12 +578,12 @@ impl IncrementalEowcState {
                 if ts_ms == NULL_TIMESTAMP {
                     continue; // skip rows with null timestamps
                 }
-                if self.is_event_late_beyond_recovery(ts_ms) {
-                    continue;
-                }
                 #[allow(clippy::cast_possible_truncation)]
                 let idx = row_idx as u32;
                 for ws in assign_windows(ts_ms, &self.window_type) {
+                    if self.is_window_closed(ws) {
+                        continue;
+                    }
                     grouped.entry(ws).or_default().push(idx);
                 }
             }
@@ -636,13 +632,13 @@ impl IncrementalEowcState {
             if ts_ms == NULL_TIMESTAMP {
                 continue;
             }
-            if self.is_event_late_beyond_recovery(ts_ms) {
-                continue;
-            }
             let (gid, _) = group_keys.insert_full(rows_ref.row(row_idx).owned());
             #[allow(clippy::cast_possible_truncation)]
             let (gid, idx) = (gid as u32, row_idx as u32);
             for ws in assign_windows(ts_ms, &self.window_type) {
+                if self.is_window_closed(ws) {
+                    continue;
+                }
                 grouped.entry((ws, gid)).or_default().push(idx);
             }
         }
@@ -1255,6 +1251,37 @@ mod tests {
 
         let second = state.close_windows(2000).unwrap();
         assert!(second.is_empty());
+    }
+
+    /// Hopping: ts=999 belongs to [500, 1500) (open) and [0, 1000) (closed
+    /// once watermark hits 1000). The late update must reach [500, 1500)
+    /// without re-creating [0, 1000).
+    #[test]
+    fn test_hopping_late_event_only_updates_still_open_windows() {
+        let mut state = make_eowc_state(EowcWindowType::Hopping {
+            size_ms: 1000,
+            slide_ms: 500,
+        });
+
+        let batch1 = make_pre_agg_batch(vec!["A", "A"], vec![10, 20], vec![600, 600]);
+        state.update_batch(&batch1).unwrap();
+
+        let first = state.close_windows(1000).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(state.open_window_count(), 1);
+
+        let late = make_pre_agg_batch(vec!["A"], vec![30], vec![999]);
+        state.update_batch(&late).unwrap();
+        assert_eq!(state.open_window_count(), 1);
+
+        let second = state.close_windows(1500).unwrap();
+        assert_eq!(second.len(), 1);
+        let total = second[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(total.value(0), 60);
     }
 
     #[test]

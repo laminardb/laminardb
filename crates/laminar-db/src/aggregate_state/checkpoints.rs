@@ -68,14 +68,10 @@ pub(crate) struct EowcStateCheckpoint {
     pub fingerprint: u64,
     pub windows: Vec<WindowCheckpoint>,
     /// Highest watermark at checkpoint time, so recovery doesn't re-admit
-    /// late events the previous run already dropped. `i64::MIN` for
-    /// checkpoints written before this field existed.
-    #[serde(default = "default_high_watermark")]
+    /// late events the previous run already dropped. Adding this field
+    /// is a breaking rkyv schema change; pre-feature checkpoints will
+    /// fail to deserialize and a fresh start path is taken.
     pub high_watermark_ms: i64,
-}
-
-fn default_high_watermark() -> i64 {
-    i64::MIN
 }
 
 #[derive(
