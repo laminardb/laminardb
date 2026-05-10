@@ -523,11 +523,7 @@ impl IncrementalEowcState {
         }))
     }
 
-    /// True if the window starting at `window_start` has already closed.
-    /// Checked per assigned window so that for hopping windows, an event
-    /// whose *earlier* (already-emitted) windows are closed still
-    /// updates its still-open *later* windows, without re-creating the
-    /// closed buckets.
+    /// See [`CoreWindowState::is_window_closed`].
     #[inline]
     fn is_window_closed(&self, window_start: i64) -> bool {
         if self.high_watermark_ms == i64::MIN {
@@ -1094,6 +1090,16 @@ mod tests {
         .unwrap()
     }
 
+    fn sum_total(batch: &RecordBatch) -> i64 {
+        batch
+            .column_by_name("total")
+            .expect("output schema has 'total' column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("'total' is Int64")
+            .value(0)
+    }
+
     fn make_eowc_state(window_type: EowcWindowType) -> IncrementalEowcState {
         use datafusion::execution::FunctionRegistry;
 
@@ -1237,12 +1243,7 @@ mod tests {
 
         let first = state.close_windows(1000).unwrap();
         assert_eq!(first.len(), 1);
-        let total = first[0]
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(total.value(0), 60);
+        assert_eq!(sum_total(&first[0]), 60);
         assert_eq!(state.open_window_count(), 0);
 
         let late = make_pre_agg_batch(vec!["AAPL"], vec![999], vec![300]);
@@ -1276,12 +1277,7 @@ mod tests {
 
         let second = state.close_windows(1500).unwrap();
         assert_eq!(second.len(), 1);
-        let total = second[0]
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(total.value(0), 60);
+        assert_eq!(sum_total(&second[0]), 60);
     }
 
     #[test]

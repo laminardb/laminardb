@@ -843,11 +843,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
     ) -> crate::pipeline::BarrierOutcome {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
-        use crate::pipeline::BarrierOutcome;
+        use crate::pipeline::{BarrierOutcome, SkipReason};
         let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
 
         if self.prom.cycles.get() == 0 {
-            return BarrierOutcome::Skipped("no execution cycles since last checkpoint");
+            return BarrierOutcome::Skipped(SkipReason::NoCyclesSinceLastCheckpoint);
         }
 
         self.sync_sinks_and_drain_events().await;
@@ -856,7 +856,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         // clears this flag is unreachable when barrier checkpointing is active.
         if self.sink_timed_out {
             self.sink_timed_out = false;
-            return BarrierOutcome::Skipped("preserving replay window after sink timeout");
+            return BarrierOutcome::Skipped(SkipReason::PreservingReplayWindowAfterSinkTimeout);
         }
 
         // Capture table source offsets.

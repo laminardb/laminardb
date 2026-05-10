@@ -67,10 +67,9 @@ pub(crate) struct WindowCheckpoint {
 pub(crate) struct EowcStateCheckpoint {
     pub fingerprint: u64,
     pub windows: Vec<WindowCheckpoint>,
-    /// Highest watermark at checkpoint time, so recovery doesn't re-admit
-    /// late events the previous run already dropped. Adding this field
-    /// is a breaking rkyv schema change; pre-feature checkpoints will
-    /// fail to deserialize and a fresh start path is taken.
+    /// Highest watermark at checkpoint time. Bumps the rkyv schema —
+    /// pre-feature checkpoints fail to deserialize and the recovery
+    /// path falls back to a fresh start.
     pub high_watermark_ms: i64,
 }
 

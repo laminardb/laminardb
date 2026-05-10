@@ -867,7 +867,7 @@ impl StreamingCoordinator {
                     callback.publish_barrier(epoch, checkpoint_id);
                 }
                 BarrierOutcome::Skipped(reason) => {
-                    tracing::debug!(checkpoint_id, reason, "barrier checkpoint skipped");
+                    tracing::debug!(checkpoint_id, reason = %reason, "barrier checkpoint skipped");
                 }
                 BarrierOutcome::Failed => {
                     tracing::warn!(

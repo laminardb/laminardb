@@ -12,19 +12,36 @@ use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::SourceConnector;
 use rustc_hash::FxHashMap;
 
-/// Outcome of a barrier-aligned checkpoint attempt.
-///
-/// `Skipped` distinguishes "deliberately did not try" (e.g. no execution
-/// cycles since the last checkpoint) from `Failed` ("tried and could not
-/// commit"). The coordinator demotes `Skipped` to `debug!` so an idle
-/// pipeline doesn't flood the log with warnings.
+/// Why a barrier checkpoint was deliberately skipped, as opposed to
+/// attempted-and-failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// No execution cycles ran since the last checkpoint.
+    NoCyclesSinceLastCheckpoint,
+    /// A sink write timed out; skip to keep the replay window intact.
+    PreservingReplayWindowAfterSinkTimeout,
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SkipReason::NoCyclesSinceLastCheckpoint => "no_cycles_since_last_checkpoint",
+            SkipReason::PreservingReplayWindowAfterSinkTimeout => {
+                "preserving_replay_window_after_sink_timeout"
+            }
+        })
+    }
+}
+
+/// Outcome of a barrier-aligned checkpoint attempt. `Skipped` is logged
+/// at debug; `Failed` keeps the retry warning.
 #[derive(Debug)]
 pub enum BarrierOutcome {
     /// Checkpoint committed at the given epoch.
     Committed(u64),
-    /// Checkpoint was deliberately skipped; `reason` is logged at debug.
-    Skipped(&'static str),
-    /// Checkpoint attempt failed and should be retried on the next interval.
+    /// Deliberately skipped (see `SkipReason`).
+    Skipped(SkipReason),
+    /// Attempted and failed; retry on the next interval.
     Failed,
 }
 

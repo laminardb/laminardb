@@ -86,9 +86,8 @@ pub(crate) struct CoreWindowCheckpoint {
     /// Discriminant so restore can pick the right branch.
     #[serde(default = "default_window_type_tag")]
     pub window_type: String,
-    /// Highest watermark observed at checkpoint time. Adding this field
-    /// is a breaking rkyv schema change; pre-feature checkpoints fail to
-    /// deserialize and a fresh start path is taken.
+    /// Highest watermark at checkpoint time. See
+    /// [`crate::aggregate_state::checkpoints::EowcStateCheckpoint::high_watermark_ms`].
     pub high_watermark_ms: i64,
 }
 
@@ -125,9 +124,8 @@ pub(crate) struct CoreWindowState {
     /// Grace period (ms) after window end before closing. Late events
     /// arriving within this window are included instead of dropped.
     allowed_lateness_ms: i64,
-    /// Highest watermark seen via `close_windows`; `i64::MIN` before the
-    /// first close. Used by `update_batch` to drop events whose window
-    /// has already closed instead of re-creating the bucket.
+    /// Highest watermark seen via `close_windows`; `i64::MIN` until
+    /// the first close. Drives [`Self::is_window_closed`].
     high_watermark_ms: i64,
     post_projection: Option<PostProjection>,
     /// Reusable scratch map for no-group window assignment (avoids per-batch allocation).
@@ -1070,12 +1068,9 @@ impl CoreWindowState {
         Ok(())
     }
 
-    /// True if the window starting at `window_start` has already closed.
-    /// Checked per assigned window so an event whose hopping windows are
-    /// partly closed still updates the still-open ones without
-    /// re-creating closed buckets. The window-start values are produced
-    /// by the assigner's `assign()` / `assign_windows()`, which already
-    /// account for window offsets.
+    /// Per-window late-event predicate. Per-window (not per-event) so
+    /// hopping windows whose earlier slices have closed still admit
+    /// the event into their still-open later slices.
     #[inline]
     fn is_window_closed(&self, window_start: i64) -> bool {
         if self.high_watermark_ms == i64::MIN {
@@ -1635,6 +1630,16 @@ mod tests {
         .unwrap()
     }
 
+    fn sum_total(batch: &RecordBatch) -> i64 {
+        batch
+            .column_by_name("total")
+            .expect("output schema has 'total' column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("'total' is Int64")
+            .value(0)
+    }
+
     /// Build a `CoreWindowState` for SUM(Int64) with 1-second tumbling
     /// windows and a single Utf8 group-by column.
     fn make_core_window_state(size_ms: i64) -> CoreWindowState {
@@ -2052,6 +2057,30 @@ mod tests {
         assert!(batches.is_empty());
     }
 
+    /// Late-event check must use the assigner's window-start, not naive
+    /// `ts.rem_euclid(size)`, when an offset is configured.
+    #[test]
+    fn test_late_events_with_window_offset_are_dropped() {
+        let mut state = make_core_window_state(1000);
+        state.assigner = CoreWindowAssigner::Tumbling(
+            TumblingWindowAssigner::from_millis(1000).with_offset_ms(200),
+        );
+
+        let batch = make_pre_agg_batch(vec!["A"], vec![10], vec![500]);
+        state.update_batch(&batch).unwrap();
+
+        let first = state.close_windows(1200).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(sum_total(&first[0]), 10);
+
+        // ts=1100 maps to [200, 1200), already closed at watermark 1200.
+        let late = make_pre_agg_batch(vec!["A"], vec![1100], vec![999]);
+        state.update_batch(&late).unwrap();
+
+        let second = state.close_windows(2200).unwrap();
+        assert!(second.is_empty());
+    }
+
     /// Late events for an already-closed window must not re-create the
     /// bucket — otherwise the next close re-emits the same row.
     #[test]
@@ -2063,23 +2092,13 @@ mod tests {
 
         let first = state.close_windows(1000).unwrap();
         assert_eq!(first.len(), 1);
-        let total = first[0]
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(total.value(0), 60);
+        assert_eq!(sum_total(&first[0]), 60);
 
-        // Late event for the closed window [0, 1000); watermark already past 1000.
         let late = make_pre_agg_batch(vec!["A"], vec![999], vec![300]);
         state.update_batch(&late).unwrap();
 
         let second = state.close_windows(2000).unwrap();
-        assert!(
-            second.is_empty(),
-            "late events for already-closed windows must not re-emit; got {} batches",
-            second.len()
-        );
+        assert!(second.is_empty());
     }
 
     #[test]

@@ -8,7 +8,7 @@ pub mod callback;
 pub mod config;
 pub mod streaming_coordinator;
 
-pub use callback::{BarrierOutcome, PipelineCallback, SourceRegistration};
+pub use callback::{BarrierOutcome, PipelineCallback, SkipReason, SourceRegistration};
 pub use config::PipelineConfig;
 pub use streaming_coordinator::StreamingCoordinator;
 
