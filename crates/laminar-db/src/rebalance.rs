@@ -1,5 +1,4 @@
-//! Dynamic vnode rebalance control plane. See
-//! `docs/plans/cluster-production-readiness.md`.
+//! Dynamic vnode rebalance control plane.
 
 #![cfg(feature = "cluster-unstable")]
 #![allow(clippy::disallowed_types)] // cold path

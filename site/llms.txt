@@ -13,8 +13,6 @@ LaminarDB is pre-1.0. Single-node embedded and standalone server deployments are
 - [README](https://raw.githubusercontent.com/laminardb/laminardb/main/README.md): Project overview, install, and quick start
 - [Architecture](https://raw.githubusercontent.com/laminardb/laminardb/main/docs/ARCHITECTURE.md): System design and execution model
 - [SQL Reference](https://raw.githubusercontent.com/laminardb/laminardb/main/docs/SQL_REFERENCE.md): Streaming SQL syntax reference
-- [Roadmap](https://raw.githubusercontent.com/laminardb/laminardb/main/docs/ROADMAP.md): Phase timeline and feature status
-- [Benchmarks](https://raw.githubusercontent.com/laminardb/laminardb/main/docs/BENCHMARKS.md): Criterion benchmark results
 - [Contributing](https://raw.githubusercontent.com/laminardb/laminardb/main/CONTRIBUTING.md): Contribution guide and hot-path constraints
 - [Changelog](https://raw.githubusercontent.com/laminardb/laminardb/main/CHANGELOG.md): Release history
 
