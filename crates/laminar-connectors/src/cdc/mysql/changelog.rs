@@ -317,7 +317,10 @@ pub fn column_value_to_json(value: &ColumnValue) -> serde_json::Value {
         ColumnValue::Float(v) => serde_json::json!(v),
         ColumnValue::Double(v) => serde_json::json!(v),
         ColumnValue::String(s) => serde_json::json!(s),
-        ColumnValue::Bytes(b) => serde_json::json!(base64_encode(b)),
+        ColumnValue::Bytes(b) => {
+            use base64::Engine;
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(b))
+        }
         ColumnValue::Date(y, m, d) => serde_json::json!(format!("{y:04}-{m:02}-{d:02}")),
         ColumnValue::Time(h, m, s, us) => {
             if *us > 0 {
@@ -357,35 +360,6 @@ pub fn row_to_json(row: &RowData, columns: &[super::types::MySqlColumn]) -> serd
         }
     }
     serde_json::Value::Object(obj)
-}
-
-/// Simple base64 encoding for binary data.
-fn base64_encode(data: &[u8]) -> String {
-    use std::fmt::Write;
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    let mut result = String::new();
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as usize;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
-
-        let _ = result.write_char(ALPHABET[b0 >> 2] as char);
-        let _ = result.write_char(ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
-
-        if chunk.len() > 1 {
-            let _ = result.write_char(ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)] as char);
-        } else {
-            result.push('=');
-        }
-
-        if chunk.len() > 2 {
-            let _ = result.write_char(ALPHABET[b2 & 0x3f] as char);
-        } else {
-            result.push('=');
-        }
-    }
-    result
 }
 
 #[cfg(test)]
@@ -520,10 +494,12 @@ mod tests {
 
     #[test]
     fn test_base64_encode() {
-        assert_eq!(base64_encode(&[]), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        use base64::Engine;
+        let enc = base64::engine::general_purpose::STANDARD;
+        assert_eq!(enc.encode([] as [u8; 0]), "");
+        assert_eq!(enc.encode(b"f"), "Zg==");
+        assert_eq!(enc.encode(b"fo"), "Zm8=");
+        assert_eq!(enc.encode(b"foo"), "Zm9v");
+        assert_eq!(enc.encode(b"foob"), "Zm9vYg==");
     }
 }

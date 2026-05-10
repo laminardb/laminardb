@@ -10,6 +10,7 @@
 //! is performed during the Arrow builder append phase.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
 use std::sync::Arc;
 
 use arrow_array::builder::{
@@ -352,35 +353,7 @@ impl FormatDecoder for CsvDecoder {
 
 // ── Builder helpers ────────────────────────────────────────────────
 
-/// Trait-object wrapper so we can store heterogeneous builders in a `Vec`.
-trait ColumnBuilder: Send {
-    fn finish(&mut self) -> ArrayRef;
-    fn append_null_value(&mut self);
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
-}
-
-macro_rules! impl_column_builder {
-    ($builder:ty) => {
-        impl ColumnBuilder for $builder {
-            fn finish(&mut self) -> ArrayRef {
-                Arc::new(<$builder>::finish(self))
-            }
-            fn append_null_value(&mut self) {
-                self.append_null();
-            }
-            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-                self
-            }
-        }
-    };
-}
-
-impl_column_builder!(BooleanBuilder);
-impl_column_builder!(Int64Builder);
-impl_column_builder!(Float64Builder);
-impl_column_builder!(StringBuilder);
-impl_column_builder!(TimestampNanosecondBuilder);
-impl_column_builder!(Date32Builder);
+use crate::schema::builder::ColumnBuilder;
 
 fn create_builders(schema: &SchemaRef, capacity: usize) -> Vec<Box<dyn ColumnBuilder>> {
     schema

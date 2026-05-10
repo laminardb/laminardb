@@ -541,56 +541,7 @@ fn navigate_path_opt<'a>(
 
 // ── Builder helpers ────────────────────────────────────────────────
 
-/// Trait-object wrapper so we can store heterogeneous builders in a `Vec`.
-trait ColumnBuilder: Send {
-    fn finish(&mut self) -> ArrayRef;
-    fn append_null_value(&mut self);
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
-}
-
-macro_rules! impl_column_builder {
-    ($builder:ty, $array:ty) => {
-        impl ColumnBuilder for $builder {
-            fn finish(&mut self) -> ArrayRef {
-                Arc::new(<$builder>::finish(self))
-            }
-            fn append_null_value(&mut self) {
-                self.append_null();
-            }
-            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-                self
-            }
-        }
-    };
-}
-
-impl_column_builder!(BooleanBuilder, arrow_array::BooleanArray);
-impl_column_builder!(Int8Builder, arrow_array::Int8Array);
-impl_column_builder!(Int16Builder, arrow_array::Int16Array);
-impl_column_builder!(Int32Builder, arrow_array::Int32Array);
-impl_column_builder!(Int64Builder, arrow_array::Int64Array);
-impl_column_builder!(UInt8Builder, arrow_array::UInt8Array);
-impl_column_builder!(UInt16Builder, arrow_array::UInt16Array);
-impl_column_builder!(UInt32Builder, arrow_array::UInt32Array);
-impl_column_builder!(UInt64Builder, arrow_array::UInt64Array);
-impl_column_builder!(Float32Builder, arrow_array::Float32Array);
-impl_column_builder!(Float64Builder, arrow_array::Float64Array);
-impl_column_builder!(StringBuilder, arrow_array::StringArray);
-impl_column_builder!(LargeStringBuilder, arrow_array::LargeStringArray);
-impl_column_builder!(LargeBinaryBuilder, arrow_array::LargeBinaryArray);
-impl_column_builder!(TimestampSecondBuilder, arrow_array::TimestampSecondArray);
-impl_column_builder!(
-    TimestampMillisecondBuilder,
-    arrow_array::TimestampMillisecondArray
-);
-impl_column_builder!(
-    TimestampMicrosecondBuilder,
-    arrow_array::TimestampMicrosecondArray
-);
-impl_column_builder!(
-    TimestampNanosecondBuilder,
-    arrow_array::TimestampNanosecondArray
-);
+use crate::schema::builder::ColumnBuilder;
 
 fn create_builders(schema: &SchemaRef, capacity: usize) -> Vec<Box<dyn ColumnBuilder>> {
     schema

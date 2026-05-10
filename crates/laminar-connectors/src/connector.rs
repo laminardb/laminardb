@@ -336,16 +336,6 @@ pub trait SourceConnector: Send {
         None
     }
 
-    /// Returns this connector as a [`SchemaProvider`](crate::schema::SchemaProvider), if supported.
-    fn as_schema_provider(&self) -> Option<&dyn crate::schema::SchemaProvider> {
-        None
-    }
-
-    /// Returns this connector as a [`SchemaRegistryAware`](crate::schema::SchemaRegistryAware), if supported.
-    fn as_schema_registry_aware(&self) -> Option<&dyn crate::schema::SchemaRegistryAware> {
-        None
-    }
-
     /// Whether this source supports replay from a checkpointed position.
     ///
     /// Sources that return `false` (e.g., WebSocket, raw TCP) cannot seek
@@ -462,12 +452,6 @@ pub trait SinkConnector: Send {
 
     /// Close the sink and release resources.
     async fn close(&mut self) -> Result<(), ConnectorError>;
-
-    /// Return a [`SchemaRegistryAware`](crate::schema::SchemaRegistryAware)
-    /// view, if the sink speaks a schema registry protocol.
-    fn as_schema_registry_aware(&self) -> Option<&dyn crate::schema::SchemaRegistryAware> {
-        None
-    }
 }
 
 #[cfg(test)]

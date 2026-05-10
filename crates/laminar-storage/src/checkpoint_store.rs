@@ -882,29 +882,38 @@ impl ObjectStoreCheckpointStore {
         payload: PutPayload,
         opts: &PutOptions,
     ) -> Result<(), CheckpointStoreError> {
-        const BACKOFFS_MS: &[u64] = &[100, 500, 2000];
-        let mut attempt = 0usize;
-        loop {
-            let result = self
-                .store
-                .put_opts(path, payload.clone(), opts.clone())
-                .await;
-            match result {
-                Ok(_) => return Ok(()),
-                Err(object_store::Error::Generic { .. }) if attempt < BACKOFFS_MS.len() => {
-                    let delay = std::time::Duration::from_millis(BACKOFFS_MS[attempt]);
-                    tracing::warn!(
-                        path = %path,
-                        attempt = attempt + 1,
-                        delay_ms = delay.as_millis(),
-                        "transient put error, retrying"
-                    );
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
-                }
-                Err(e) => return Err(CheckpointStoreError::ObjectStore(e)),
-            }
-        }
+        let policy = backoff::ExponentialBackoffBuilder::new()
+            .with_initial_interval(std::time::Duration::from_millis(100))
+            .with_max_interval(std::time::Duration::from_secs(2))
+            .with_max_elapsed_time(Some(std::time::Duration::from_secs(5)))
+            .build();
+
+        backoff::future::retry_notify(
+            policy,
+            || async {
+                self.store
+                    .put_opts(path, payload.clone(), opts.clone())
+                    .await
+                    .map_err(|e| match e {
+                        object_store::Error::Generic { .. } => {
+                            backoff::Error::transient(CheckpointStoreError::ObjectStore(e))
+                        }
+                        other => {
+                            backoff::Error::permanent(CheckpointStoreError::ObjectStore(other))
+                        }
+                    })?;
+                Ok(())
+            },
+            |err, delay: std::time::Duration| {
+                tracing::warn!(
+                    path = %path,
+                    delay_ms = delay.as_millis(),
+                    error = %err,
+                    "transient put error, retrying"
+                );
+            },
+        )
+        .await
     }
 
     /// GET an object, returning `Ok(None)` for `NotFound`.

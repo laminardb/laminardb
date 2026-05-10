@@ -1,5 +1,6 @@
 //! Schema evolution, format codecs, and connector schema traits.
 
+pub(crate) mod builder;
 pub mod csv;
 pub mod error;
 pub mod evolution;
