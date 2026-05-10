@@ -207,7 +207,7 @@ impl TableStore {
                 lru.invalidate(&key);
             }
             let row = batch.slice(i, 1);
-            let existed = state.backend.put(&key, row)?;
+            let existed = state.backend.put(&key, row);
             if !existed {
                 state.row_count += 1;
             }
@@ -224,12 +224,11 @@ impl TableStore {
             if let Some(ref mut lru) = state.lru_cache {
                 lru.invalidate(key);
             }
-            match state.backend.remove(key) {
-                Ok(true) => {
-                    state.row_count = state.row_count.saturating_sub(1);
-                    true
-                }
-                _ => false,
+            if state.backend.remove(key) {
+                state.row_count = state.row_count.saturating_sub(1);
+                true
+            } else {
+                false
             }
         } else {
             false
@@ -245,7 +244,7 @@ impl TableStore {
         let state = self.tables.get_mut(name)?;
 
         match state.cache_mode {
-            TableCacheMode::Full | TableCacheMode::None => state.backend.get(key).ok().flatten(),
+            TableCacheMode::Full | TableCacheMode::None => state.backend.get(key),
             TableCacheMode::Partial { .. } => {
                 // Step 1: Xor filter check — if definitely absent, short-circuit
                 if !state.xor_filter.contains(key) {
@@ -260,7 +259,7 @@ impl TableStore {
                 }
 
                 // Step 3: Backing store lookup -> populate LRU on hit
-                let batch = state.backend.get(key).ok().flatten()?;
+                let batch = state.backend.get(key)?;
                 if let Some(lru) = &mut state.lru_cache {
                     lru.insert(key.to_string(), batch.clone());
                 }
@@ -289,7 +288,7 @@ impl TableStore {
     /// Rebuild the xor filter for a table from all current keys.
     pub fn rebuild_xor_filter(&mut self, name: &str) {
         if let Some(state) = self.tables.get_mut(name) {
-            let keys = state.backend.keys().unwrap_or_default();
+            let keys = state.backend.keys();
             state.xor_filter.rebuild(&keys);
         }
     }
@@ -310,7 +309,7 @@ impl TableStore {
     /// (with correct schema) if the table has no rows.
     pub fn to_record_batch(&self, name: &str) -> Option<RecordBatch> {
         let state = self.tables.get(name)?;
-        state.backend.to_record_batch(&state.schema).ok().flatten()
+        state.backend.to_record_batch(&state.schema).ok()
     }
 }
 

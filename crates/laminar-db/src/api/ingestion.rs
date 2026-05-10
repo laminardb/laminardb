@@ -129,9 +129,6 @@ impl Writer {
     }
 }
 
-// SAFETY: Writer wraps UntypedSourceHandle which uses Arc<SourceEntry>.
-// All operations are thread-safe via internal synchronization.
-unsafe impl Send for Writer {}
 
 #[cfg(test)]
 mod tests {

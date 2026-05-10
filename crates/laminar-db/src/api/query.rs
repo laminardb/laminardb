@@ -170,9 +170,6 @@ impl QueryStream {
     }
 }
 
-// SAFETY: QueryStream uses Arc and Mutex internally for thread safety.
-// The subscription is based on lock-free channels.
-unsafe impl Send for QueryStream {}
 
 #[cfg(test)]
 mod tests {

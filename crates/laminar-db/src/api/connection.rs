@@ -463,11 +463,6 @@ impl Connection {
     }
 }
 
-// Thread safety guarantees for FFI.
-// SAFETY: LaminarDB uses Arc, Mutex, and atomic types internally.
-// All public methods take &self and use internal synchronization.
-unsafe impl Send for Connection {}
-unsafe impl Sync for Connection {}
 
 /// Result of executing a SQL statement (API variant).
 #[derive(Debug)]

@@ -120,9 +120,6 @@ impl ArrowSubscription {
     }
 }
 
-// SAFETY: ArrowSubscription wraps Subscription<ArrowRecord> which uses
-// lock-free channels with atomic operations.
-unsafe impl Send for ArrowSubscription {}
 
 #[cfg(test)]
 mod tests {
