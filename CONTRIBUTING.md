@@ -59,7 +59,6 @@ A few common starting points:
 - **Recovery manager**: `crates/laminar-db/src/recovery_manager.rs`
 - **Server HTTP API**: `crates/laminar-server/src/http.rs` -- REST endpoints
 - **FFI layer**: `crates/laminar-db/src/ffi/` -- C bindings for language interop
-- **Roadmap**: `docs/ROADMAP.md` -- phase timeline and feature status
 
 ## Feature flags
 
