@@ -1243,10 +1243,10 @@ async fn watch_tls_files(state: Arc<TlsReloadState>, debounce: std::time::Durati
     use crossfire::{mpsc, MTx};
     use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
-    // Resolve the set of files we care about, then derive the parent dirs
-    // to watch. Watching parents (not files) is what makes atomic-rename
-    // rotations (write-tmp + rename-into-place) reliably visible.
-    let mut targets: Vec<std::path::PathBuf> = Vec::new();
+    // Track raw + canonical paths so symlink-swap rotations and edits to
+    // the symlink target both produce visible events.
+    let mut raw_targets: Vec<std::path::PathBuf> = Vec::new();
+    let mut canon_targets: Vec<std::path::PathBuf> = Vec::new();
     for path in [
         Some(state.paths.cert.clone()),
         Some(state.paths.key.clone()),
@@ -1256,7 +1256,10 @@ async fn watch_tls_files(state: Arc<TlsReloadState>, debounce: std::time::Durati
     .flatten()
     {
         match path.canonicalize() {
-            Ok(p) => targets.push(p),
+            Ok(canonical) => {
+                canon_targets.push(canonical);
+                raw_targets.push(path);
+            }
             Err(e) => {
                 warn!(
                     path = %path.display(),
@@ -1267,8 +1270,9 @@ async fn watch_tls_files(state: Arc<TlsReloadState>, debounce: std::time::Durati
             }
         }
     }
-    let mut dirs: Vec<std::path::PathBuf> = targets
+    let mut dirs: Vec<std::path::PathBuf> = raw_targets
         .iter()
+        .chain(canon_targets.iter())
         .filter_map(|p| p.parent().map(|d| d.to_path_buf()))
         .collect();
     dirs.sort();
@@ -1276,16 +1280,18 @@ async fn watch_tls_files(state: Arc<TlsReloadState>, debounce: std::time::Durati
 
     let (tx, rx) = mpsc::bounded_async::<()>(16);
     let blocking_tx: MTx<_> = tx.clone().into_blocking();
-    let watch_targets: Vec<std::path::PathBuf> = targets.clone();
+    let watch_raw = raw_targets.clone();
+    let watch_canon = canon_targets.clone();
 
     let mut watcher: RecommendedWatcher = match notify::recommended_watcher(
         move |result: Result<Event, notify::Error>| match result {
             Ok(event) => {
                 let touched = event.paths.iter().any(|p| {
-                    p.canonicalize()
-                        .ok()
-                        .as_ref()
-                        .is_some_and(|c| watch_targets.contains(c))
+                    watch_raw.iter().any(|t| t == p)
+                        || p.canonicalize()
+                            .ok()
+                            .as_ref()
+                            .is_some_and(|c| watch_canon.contains(c))
                 });
                 if touched {
                     let _ = blocking_tx.send(());
@@ -1312,7 +1318,7 @@ async fn watch_tls_files(state: Arc<TlsReloadState>, debounce: std::time::Durati
         }
     }
     info!(
-        files = ?targets.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        files = ?raw_targets.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
         "pgwire TLS watcher started",
     );
 
@@ -1667,10 +1673,10 @@ pub async fn serve(
         std::env::var("LAMINAR_DISABLE_FILE_WATCH").is_ok_and(|v| v == "1" || v == "true");
     let handle = tokio::spawn(async move {
         let mut sessions: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-        // Spawn the TLS hot-reload watcher into the same JoinSet so it's
-        // aborted alongside sessions when the outer handle is dropped.
+        // Watcher in its own JoinSet so it doesn't count toward max_connections.
+        let mut watcher_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         if let (Some(state), false) = (watcher_state, watcher_disabled) {
-            sessions.spawn(async move {
+            watcher_set.spawn(async move {
                 watch_tls_files(state, std::time::Duration::from_millis(500)).await;
             });
         }
@@ -1679,6 +1685,7 @@ pub async fn serve(
                 Some(_) = sessions.join_next(), if !sessions.is_empty() => {
                     // Reap completed sessions; nothing to do with the result.
                 }
+                Some(_) = watcher_set.join_next(), if !watcher_set.is_empty() => {}
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((sock, peer)) => {
