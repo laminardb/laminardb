@@ -36,14 +36,12 @@ impl LaminarDB {
 
     /// Get the current pipeline state as a string.
     pub fn pipeline_state(&self) -> &'static str {
-        let raw = self.state.load(std::sync::atomic::Ordering::Acquire);
-        match DbState::from_u8(raw) {
-            Some(DbState::Created) => "Created",
-            Some(DbState::Starting) => "Starting",
-            Some(DbState::Running) => "Running",
-            Some(DbState::ShuttingDown) => "ShuttingDown",
-            Some(DbState::Stopped) => "Stopped",
-            None => "Unknown",
+        match DbState::load(&self.state) {
+            DbState::Created => "Created",
+            DbState::Starting => "Starting",
+            DbState::Running => "Running",
+            DbState::ShuttingDown => "ShuttingDown",
+            DbState::Stopped => "Stopped",
         }
     }
 
@@ -167,15 +165,13 @@ impl LaminarDB {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Convert the internal `AtomicU8` state to a `PipelineState` enum.
     pub(crate) fn pipeline_state_enum(&self) -> crate::metrics::PipelineState {
-        let raw = self.state.load(std::sync::atomic::Ordering::Acquire);
-        match DbState::from_u8(raw) {
-            Some(DbState::Created) => crate::metrics::PipelineState::Created,
-            Some(DbState::Starting) => crate::metrics::PipelineState::Starting,
-            Some(DbState::Running) => crate::metrics::PipelineState::Running,
-            Some(DbState::ShuttingDown) => crate::metrics::PipelineState::ShuttingDown,
-            Some(DbState::Stopped) | None => crate::metrics::PipelineState::Stopped,
+        match DbState::load(&self.state) {
+            DbState::Created => crate::metrics::PipelineState::Created,
+            DbState::Starting => crate::metrics::PipelineState::Starting,
+            DbState::Running => crate::metrics::PipelineState::Running,
+            DbState::ShuttingDown => crate::metrics::PipelineState::ShuttingDown,
+            DbState::Stopped => crate::metrics::PipelineState::Stopped,
         }
     }
 

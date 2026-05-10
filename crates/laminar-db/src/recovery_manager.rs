@@ -460,7 +460,7 @@ impl<'a> RecoveryManager<'a> {
             );
         }
 
-        // Step 3: Restore source offsets
+        // Restore source offsets.
         for source in sources {
             if !source.supports_replay {
                 info!(
@@ -502,7 +502,7 @@ impl<'a> RecoveryManager<'a> {
             }
         }
 
-        // Step 4: Restore table source offsets
+        // Restore table source offsets.
         for table_source in table_sources {
             if let Some(cp) = manifest.table_offsets.get(&table_source.name) {
                 let source_cp = connector_to_source_checkpoint(cp);
@@ -521,10 +521,8 @@ impl<'a> RecoveryManager<'a> {
             }
         }
 
-        // Step 5: Rollback sinks for exactly-once semantics.
-        // Only roll back sinks that did NOT successfully commit (Pending or Failed).
-        // Sinks with SinkCommitStatus::Committed already completed their commit
-        // and should not be rolled back.
+        // Roll back exactly-once sinks that did NOT commit (Pending or Failed).
+        // Already-Committed sinks are left alone.
         for sink in sinks {
             if sink.exactly_once {
                 // Check per-sink commit status — if the sink committed, skip rollback.
