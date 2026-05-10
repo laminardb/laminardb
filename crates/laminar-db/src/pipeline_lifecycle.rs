@@ -8,10 +8,7 @@ use arrow_array::RecordBatch;
 use laminar_core::streaming;
 use rustc_hash::FxHashMap;
 
-use crate::db::{
-    LaminarDB, SourceWatermarkState, STATE_CREATED, STATE_RUNNING, STATE_SHUTTING_DOWN,
-    STATE_STARTING, STATE_STOPPED,
-};
+use crate::db::{DbState, LaminarDB, SourceWatermarkState};
 use crate::error::DbError;
 
 /// Resolves each `CREATE STREAM`'s output Arrow schema by planning its SQL.
@@ -130,40 +127,33 @@ impl LaminarDB {
     }
 
     pub(crate) fn is_pipeline_running(&self) -> bool {
-        let s = self.state.load(std::sync::atomic::Ordering::Acquire);
-        s == STATE_RUNNING || s == STATE_STARTING || s == STATE_SHUTTING_DOWN
+        matches!(
+            DbState::load(&self.state),
+            DbState::Running | DbState::Starting | DbState::ShuttingDown
+        )
     }
 
-    /// Start the streaming pipeline.
+    /// Start the streaming pipeline. Idempotent if already running.
     ///
-    /// Activates all registered connectors and begins processing.
-    /// This is a no-op if the pipeline is already running.
-    ///
-    /// When the `kafka` feature is enabled and Kafka sources/sinks are
-    /// registered, this builds `KafkaSource`/`KafkaSink` instances and
-    /// spawns a background task that polls sources, executes stream queries
-    /// via `DataFusion`, and writes results to sinks.
-    ///
-    /// In embedded (in-memory) mode, this simply transitions to `Running`.
+    /// Activates registered connectors and spawns the background processing
+    /// task. On failure the instance is unwound back to `Created` so the
+    /// caller can retry after fixing the offending config.
     ///
     /// # Errors
     ///
-    /// Returns an error if the pipeline cannot be started. On failure, the
-    /// instance is unwound back to `STATE_CREATED` so the caller can retry
-    /// after fixing the offending config.
+    /// Returns an error if the pipeline cannot be started.
     pub async fn start(&self) -> Result<(), DbError> {
-        let current = self.state.load(std::sync::atomic::Ordering::Acquire);
-        if current == STATE_RUNNING || current == STATE_STARTING {
-            return Ok(());
-        }
-        if current == STATE_STOPPED {
-            return Err(DbError::InvalidOperation(
-                "Cannot start a stopped pipeline. Create a new LaminarDB instance.".into(),
-            ));
+        match DbState::load(&self.state) {
+            DbState::Running | DbState::Starting => return Ok(()),
+            DbState::Stopped => {
+                return Err(DbError::InvalidOperation(
+                    "Cannot start a stopped pipeline. Create a new LaminarDB instance.".into(),
+                ));
+            }
+            DbState::Created | DbState::ShuttingDown => {}
         }
 
-        self.state
-            .store(STATE_STARTING, std::sync::atomic::Ordering::Release);
+        DbState::Starting.store(&self.state);
 
         // Fallback for embedded use without a server.
         {
@@ -177,24 +167,18 @@ impl LaminarDB {
 
         match self.start_inner().await {
             Ok(()) => {
-                self.state
-                    .store(STATE_RUNNING, std::sync::atomic::Ordering::Release);
+                DbState::Running.store(&self.state);
                 Ok(())
             }
             Err(e) => {
-                // Any failure between STATE_STARTING and STATE_RUNNING must
-                // unwind — otherwise the instance is wedged and a retry from
-                // the caller silently succeeds without actually starting.
-                self.state
-                    .store(STATE_CREATED, std::sync::atomic::Ordering::Release);
+                // Unwind so a retry actually re-runs startup instead of
+                // silently succeeding against a wedged Starting state.
+                DbState::Created.store(&self.state);
                 Err(e)
             }
         }
     }
 
-    /// Runs the actual startup sequence. Called exclusively by
-    /// [`LaminarDB::start`], which handles the `STATE_STARTING` ↔
-    /// `STATE_RUNNING` / `STATE_CREATED` transitions around it.
     #[allow(clippy::too_many_lines)]
     async fn start_inner(&self) -> Result<(), DbError> {
         // Snapshot connector registrations under the lock
@@ -1505,7 +1489,7 @@ impl LaminarDB {
             let handle = tokio::spawn(async move {
                 if done_rx.await.is_err() {
                     tracing::error!("laminar-compute thread exited unexpectedly");
-                    watcher_state.store(STATE_STOPPED, std::sync::atomic::Ordering::Release);
+                    DbState::Stopped.store(&watcher_state);
                     watcher_shutdown.notify_one();
                 }
             });
@@ -1515,51 +1499,37 @@ impl LaminarDB {
         Ok(())
     }
 
-    /// Shut down the streaming pipeline gracefully.
-    ///
-    /// Signals the processing loop to stop, waits for it to complete
-    /// (with a timeout), then transitions to `Stopped`.
-    /// This is idempotent -- calling it multiple times is safe.
+    /// Shut down the streaming pipeline gracefully. Idempotent.
     ///
     /// # Errors
     ///
     /// Returns an error if shutdown encounters an error.
     pub async fn shutdown(&self) -> Result<(), DbError> {
-        let current = self.state.load(std::sync::atomic::Ordering::Acquire);
-        if current == STATE_STOPPED || current == STATE_SHUTTING_DOWN {
+        if matches!(
+            DbState::load(&self.state),
+            DbState::Stopped | DbState::ShuttingDown
+        ) {
             return Ok(());
         }
 
-        self.state
-            .store(STATE_SHUTTING_DOWN, std::sync::atomic::Ordering::Release);
+        DbState::ShuttingDown.store(&self.state);
 
-        // Drop the force-checkpoint sender before signalling shutdown.
-        // Any subsequent `db.checkpoint()` call falls through to the
-        // (now-defunct) coordinator path, which errors cleanly instead
-        // of hanging on a oneshot that will never be answered.
+        // Drop the force-checkpoint sender first so any later db.checkpoint()
+        // errors cleanly instead of waiting on a oneshot that will never reply.
         *self.force_ckpt_tx.lock() = None;
 
-        // Signal the runtime loop to stop
         self.shutdown_signal.notify_one();
 
-        // Await the runtime handle (with timeout)
         let handle = self.runtime_handle.lock().take();
         if let Some(handle) = handle {
             match tokio::time::timeout(std::time::Duration::from_secs(10), handle).await {
-                Ok(Ok(())) => {
-                    tracing::info!("Pipeline shut down cleanly");
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "Pipeline task panicked during shutdown");
-                }
-                Err(_) => {
-                    tracing::warn!("Pipeline shutdown timed out after 10s");
-                }
+                Ok(Ok(())) => tracing::info!("Pipeline shut down cleanly"),
+                Ok(Err(e)) => tracing::warn!(error = %e, "Pipeline task panicked during shutdown"),
+                Err(_) => tracing::warn!("Pipeline shutdown timed out after 10s"),
             }
         }
 
-        self.state
-            .store(STATE_STOPPED, std::sync::atomic::Ordering::Release);
+        DbState::Stopped.store(&self.state);
         self.close();
         Ok(())
     }
