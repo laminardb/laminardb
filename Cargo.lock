@@ -4956,6 +4956,7 @@ dependencies = [
  "laminar-db",
  "laminar-sql",
  "laminar-storage",
+ "md-5",
  "mimalloc",
  "notify",
  "openssl",

@@ -17,7 +17,7 @@ use crate::config::{
 use crate::http;
 use crate::metrics::ServerMetrics;
 use crate::reload::ReloadGuard;
-#[cfg(test)]
+#[cfg(all(test, any(feature = "otel", feature = "kafka")))]
 use laminar_core::state::StateBackendConfig;
 
 /// Handle to a running LaminarDB server. Call `wait_for_shutdown` to block until Ctrl-C.
@@ -185,6 +185,10 @@ pub async fn run_server(
     let pgwire_allow_remote = config.server.pgwire_allow_remote;
     let pgwire_tls_cert = config.server.pgwire_tls_cert.clone();
     let pgwire_tls_key = config.server.pgwire_tls_key.clone();
+    let pgwire_tls_client_ca = config.server.pgwire_tls_client_ca.clone();
+    let pgwire_tls_min_version =
+        crate::pgwire::TlsMinVersion::from_config_str(&config.server.pgwire_tls_min_version)
+            .expect("pgwire_tls_min_version validated at config load");
     let pgwire_max_connections = config.server.pgwire_max_connections;
     let pgwire_max_auth_failures = config.server.pgwire_max_auth_failures_per_min;
     let (app_state, api_handle) =
@@ -193,7 +197,12 @@ pub async fn run_server(
 
     let pgwire_handle = if let Some(bind) = pgwire_bind {
         let tls = match (&pgwire_tls_cert, &pgwire_tls_key) {
-            (Some(c), Some(k)) => Some(crate::pgwire::TlsPaths { cert: c, key: k }),
+            (Some(c), Some(k)) => Some(crate::pgwire::TlsPaths {
+                cert: c,
+                key: k,
+                min_version: pgwire_tls_min_version,
+                client_ca: pgwire_tls_client_ca.as_deref(),
+            }),
             _ => None,
         };
         match crate::pgwire::serve(
@@ -662,7 +671,8 @@ mod tests {
     /// layer surfaces a "schema auto-discovery failed: …" error (or, when
     /// the connector returns no schema, "could not auto-discover a schema").
     /// The server no longer pre-empts this — we just check the error bubbles
-    /// up clearly.
+    /// up clearly. Requires the kafka connector to be registered.
+    #[cfg(feature = "kafka")]
     #[tokio::test]
     async fn execute_config_ddl_columnless_kafka_surfaces_discovery_error() {
         let mut source = make_source("events", "kafka");

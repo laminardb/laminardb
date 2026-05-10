@@ -123,7 +123,19 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         if user.is_empty() {
             errors.push("pgwire_users contains an empty username".to_string());
         }
-        if password.len() < MIN_PGWIRE_PASSWORD_LEN {
+        let pw = password.expose();
+        if let Some(rest) = pw.strip_prefix("md5") {
+            // pg_authid-style pre-hash: 'md5' + lowercase-hex(md5(password ‖ user)).
+            // Strict shape so a typo isn't silently treated as plaintext.
+            let valid =
+                rest.len() == 32 && rest.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'));
+            if !valid {
+                errors.push(format!(
+                    "pgwire_users['{user}']: pre-hashed value must be 'md5' \
+                     followed by 32 lowercase hex characters"
+                ));
+            }
+        } else if password.len() < MIN_PGWIRE_PASSWORD_LEN {
             errors.push(format!(
                 "pgwire_users['{user}']: password must be at least {MIN_PGWIRE_PASSWORD_LEN} characters"
             ));
@@ -151,6 +163,24 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
             }
         }
         (None, None) => {}
+    }
+    match config.server.pgwire_tls_min_version.as_str() {
+        "1.2" | "1.3" => {}
+        other => errors.push(format!(
+            "pgwire_tls_min_version must be \"1.2\" or \"1.3\" (got \"{other}\")"
+        )),
+    }
+    if let Some(ca) = &config.server.pgwire_tls_client_ca {
+        if config.server.pgwire_tls_cert.is_none() {
+            errors.push(
+                "pgwire_tls_client_ca requires pgwire_tls_cert + pgwire_tls_key (mTLS \
+                 layers on top of server TLS)"
+                    .to_string(),
+            );
+        }
+        if !ca.exists() {
+            errors.push(format!("pgwire_tls_client_ca not found: {}", ca.display()));
+        }
     }
 
     // Validate: cluster mode requires discovery and coordination
@@ -229,12 +259,21 @@ pub struct ServerSection {
     /// PEM private key (PKCS#8 or RSA).
     #[serde(default)]
     pub pgwire_tls_key: Option<std::path::PathBuf>,
+    /// PEM CA bundle. Setting this requires every connecting client to
+    /// present a certificate chained to one of these roots (mTLS).
+    #[serde(default)]
+    pub pgwire_tls_client_ca: Option<std::path::PathBuf>,
     /// Concurrent session cap; excess accepts close immediately.
     #[serde(default = "default_pgwire_max_connections")]
     pub pgwire_max_connections: usize,
     /// Per-IP auth-failure cap in a 60s rolling window. 0 disables.
     #[serde(default = "default_pgwire_max_auth_failures_per_min")]
     pub pgwire_max_auth_failures_per_min: u32,
+    /// Minimum TLS protocol version: `"1.2"` (default) or `"1.3"`. Pinning
+    /// to `"1.3"` is the PCI-DSS / FedRAMP-High posture; rustls already
+    /// disables TLS 1.0/1.1 unconditionally.
+    #[serde(default = "default_pgwire_tls_min_version")]
+    pub pgwire_tls_min_version: String,
 }
 
 fn default_pgwire_max_connections() -> usize {
@@ -243,6 +282,10 @@ fn default_pgwire_max_connections() -> usize {
 
 fn default_pgwire_max_auth_failures_per_min() -> u32 {
     10
+}
+
+fn default_pgwire_tls_min_version() -> String {
+    "1.2".to_string()
 }
 
 impl Default for ServerSection {
@@ -255,8 +298,10 @@ impl Default for ServerSection {
             pgwire_allow_remote: false,
             pgwire_tls_cert: None,
             pgwire_tls_key: None,
+            pgwire_tls_client_ca: None,
             pgwire_max_connections: default_pgwire_max_connections(),
             pgwire_max_auth_failures_per_min: default_pgwire_max_auth_failures_per_min(),
+            pgwire_tls_min_version: default_pgwire_tls_min_version(),
         }
     }
 }
@@ -809,6 +854,80 @@ pgwire_max_connections = 0
                 assert!(
                     errors.iter().any(|e| e.contains("must be > 0")),
                     "errors: {errors:?}"
+                );
+            }
+            _ => panic!("expected ValidationErrors"),
+        }
+    }
+
+    #[test]
+    fn test_validate_client_ca_requires_server_cert() {
+        let toml = r#"
+[server]
+pgwire_tls_client_ca = "/does/not/matter.pem"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        let err = validate_config(&config).unwrap_err();
+        match err {
+            ConfigError::ValidationErrors { errors } => {
+                assert!(
+                    errors
+                        .iter()
+                        .any(|e| e.contains("requires pgwire_tls_cert")),
+                    "errors: {errors:?}"
+                );
+            }
+            _ => panic!("expected ValidationErrors"),
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_unknown_tls_min_version() {
+        let toml = r#"
+[server]
+pgwire_tls_min_version = "1.4"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        let err = validate_config(&config).unwrap_err();
+        match err {
+            ConfigError::ValidationErrors { errors } => {
+                assert!(
+                    errors.iter().any(|e| e.contains("pgwire_tls_min_version")),
+                    "errors: {errors:?}"
+                );
+            }
+            _ => panic!("expected ValidationErrors"),
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_well_formed_pre_hashed_pgwire_password() {
+        let toml = r#"
+[server]
+[server.pgwire_users]
+alice = "md55d41402abc4b2a76b9719d911017c592"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        // 35-char pre-hashed value bypasses the MIN_PGWIRE_PASSWORD_LEN gate.
+        validate_config(&config).expect("well-formed pre-hash must validate");
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_pre_hashed_pgwire_password() {
+        // 'md5' prefix followed by non-hex — clearly meant to be pre-hashed
+        // but malformed; rejected so a typo doesn't slip through as plaintext.
+        let toml = r#"
+[server]
+[server.pgwire_users]
+alice = "md5zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        let err = validate_config(&config).unwrap_err();
+        match err {
+            ConfigError::ValidationErrors { errors } => {
+                assert!(
+                    errors.iter().any(|e| e.contains("pre-hashed")),
+                    "errors: {errors:?}",
                 );
             }
             _ => panic!("expected ValidationErrors"),

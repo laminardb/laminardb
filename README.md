@@ -187,7 +187,7 @@ Watermark types: per-partition, per-key, and alignment groups (synchronized acro
 
 ```sql
 CREATE SOURCE ... [FROM connector(...)]
-CREATE STREAM ... AS SELECT ...
+CREATE STREAM ... AS SELECT ...                    [WITH ('retain_history' = '64mb')]
 CREATE MATERIALIZED VIEW ... AS SELECT ...
 CREATE SINK ... INTO connector(...) AS SELECT ...
 CREATE LOOKUP TABLE ... FROM POSTGRES(...) | PARQUET(...)
@@ -196,7 +196,11 @@ SHOW SOURCES | STREAMS | SINKS | MATERIALIZED VIEWS
 SHOW CREATE SOURCE name
 DESCRIBE [EXTENDED] table_name
 EXPLAIN ANALYZE SELECT ...
+SUBSCRIBE <stream> [AS OF EPOCH n] [WHERE …]      -- live tail of a stream
+DECLARE c CURSOR FOR SUBSCRIBE … ; FETCH n FROM c -- cursored consumption
 ```
+
+`retain_history` keeps a bounded ring of recent committed epochs in memory; combined with `SUBSCRIBE … AS OF EPOCH n`, a client can resume from the last epoch it saw and reconnect without gaps.
 
 All aggregation functions from DataFusion 52 are available: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `FIRST_VALUE`, `LAST_VALUE`, `STDDEV`, `PERCENTILE_CONT`, `APPROX_COUNT_DISTINCT`, `LAG`, `LEAD`, `ROW_NUMBER`, and 40+ more. JSON extraction, array/struct/map functions, and `UNNEST` are also supported.
 
@@ -262,6 +266,29 @@ CREATE SINK trade_archive INTO DELTA_LAKE (
 Supported formats: `json`, `csv`, `avro` (with Schema Registry), `raw` (bytes), `debezium` (CDC envelope).
 
 Custom connectors can be built by implementing the `SourceConnector` or `SinkConnector` trait and registering with `ConnectorRegistry`.
+
+---
+
+## Postgres Wire Protocol
+
+The standalone server speaks the Postgres v3 wire protocol, so any libpq-derived client — `psql`, JDBC, asyncpg, `tokio-postgres`, Grafana's Postgres datasource — can connect and tail a stream:
+
+```bash
+psql "host=db.internal port=5433 dbname=laminardb user=alice" \
+  -c "SUBSCRIBE avg_price WHERE symbol = 'AAPL'"
+```
+
+Enable the listener by setting `pgwire_bind` in `laminardb.toml`. Auth is trust on loopback or MD5 for remote binds; TLS, mTLS (`pgwire_tls_client_ca`), TLS 1.3 pinning, hot-reload of certificates, and `pg_authid`-style pre-hashed passwords are all supported. See [crates/laminar-server/README.md](crates/laminar-server/README.md) for configuration.
+
+| Statement | Behavior |
+|-----------|----------|
+| `SUBSCRIBE <stream>` | Stream rows as they're committed |
+| `SUBSCRIBE … WHERE <expr>` | Server-side filter, schema-aware |
+| `SUBSCRIBE … AS OF EPOCH n` | Replay from epoch `n` (stream must be `WITH ('retain_history' = '…')`) |
+| `DECLARE c CURSOR FOR SUBSCRIBE …` + `FETCH n FROM c` | Cursored consumption for `\set FETCH_COUNT n` clients |
+| `SELECT version()` / `SELECT 1` / transaction control | The handful of meta-commands clients issue at startup |
+
+DDL (`CREATE SOURCE`, `CREATE STREAM`, etc.) goes through the HTTP API (`POST /api/v1/sql`); the pgwire surface is intentionally narrow — read-side only.
 
 ---
 

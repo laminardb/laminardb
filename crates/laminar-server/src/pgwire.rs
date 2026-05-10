@@ -878,10 +878,36 @@ fn arrow_to_pg_type(dt: &arrow_schema::DataType) -> Type {
     }
 }
 
-/// Per-call salt + stored plaintext for the MD5 challenge flow.
+/// Per-call salt + stored credential for the MD5 challenge flow. The
+/// stored value is either plaintext (legacy) or `md5<32-hex>`, the same
+/// format Postgres' `pg_authid` uses, where the hex is `md5(password ‖
+/// user)`. The pre-hashed form lets operators avoid plaintext at rest.
 #[derive(Debug)]
 struct LaminarAuthSource {
     users: Arc<HashMap<String, Secret>>,
+}
+
+/// If `stored` is a `pg_authid`-style pre-hash, return the inner hex
+/// (the bit after the `md5` tag). Lowercase hex only; uppercase or
+/// other lengths fall back to plaintext handling.
+pub(crate) fn parse_pre_hashed_md5(stored: &str) -> Option<&str> {
+    let inner = stored.strip_prefix("md5")?;
+    if inner.len() == 32 && inner.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
+        Some(inner)
+    } else {
+        None
+    }
+}
+
+/// MD5 challenge response when only the inner hash is known: the client
+/// sends `md5{hex(md5(inner_hex || salt))}` and the server precomputes
+/// the same string for comparison.
+fn outer_md5_challenge(inner_hex: &str, salt: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    let mut hasher = Md5::new();
+    hasher.update(inner_hex.as_bytes());
+    hasher.update(salt);
+    format!("md5{:x}", hasher.finalize())
 }
 
 #[async_trait]
@@ -891,12 +917,15 @@ impl AuthSource for LaminarAuthSource {
         // Indistinguishable from a wrong-password failure: both branches must
         // surface the same wire error so a client can't probe which usernames
         // are configured. pgwire emits exactly this variant on bad password.
-        let password = self
+        let stored = self
             .users
             .get(user)
             .ok_or_else(|| PgWireError::InvalidPassword(user.to_string()))?;
         let salt: [u8; 4] = rand::random();
-        let expected = hash_md5_password(user, password.expose(), &salt);
+        let expected = match parse_pre_hashed_md5(stored.expose()) {
+            Some(inner_hex) => outer_md5_challenge(inner_hex, &salt),
+            None => hash_md5_password(user, stored.expose(), &salt),
+        };
         Ok(Password::new(Some(salt.to_vec()), expected.into_bytes()))
     }
 }
@@ -1145,6 +1174,214 @@ impl ExtendedQueryHandler for LaminarPgwireHandler {
 pub struct TlsPaths<'a> {
     pub cert: &'a std::path::Path,
     pub key: &'a std::path::Path,
+    pub min_version: TlsMinVersion,
+    /// PEM bundle of CA roots; presence enables mTLS — every client must
+    /// present a cert that chains to one of these roots.
+    pub client_ca: Option<&'a std::path::Path>,
+}
+
+/// Owned counterpart to `TlsPaths` that the listener keeps for the
+/// lifetime of `serve()` so the file watcher can rebuild the acceptor
+/// without the original config still being in scope.
+#[derive(Debug, Clone)]
+struct TlsConfigPaths {
+    cert: std::path::PathBuf,
+    key: std::path::PathBuf,
+    min_version: TlsMinVersion,
+    client_ca: Option<std::path::PathBuf>,
+}
+
+impl TlsConfigPaths {
+    fn from_paths(paths: &TlsPaths<'_>) -> Self {
+        Self {
+            cert: paths.cert.to_path_buf(),
+            key: paths.key.to_path_buf(),
+            min_version: paths.min_version,
+            client_ca: paths.client_ca.map(|p| p.to_path_buf()),
+        }
+    }
+
+    fn borrow(&self) -> TlsPaths<'_> {
+        TlsPaths {
+            cert: &self.cert,
+            key: &self.key,
+            min_version: self.min_version,
+            client_ca: self.client_ca.as_deref(),
+        }
+    }
+}
+
+/// Live TLS acceptor + paths needed to rebuild it on cert rotation.
+/// Reads on the accept path are a single mutex acquire and a cheap
+/// `TlsAcceptor` clone; reloads are triggered by the file watcher.
+pub struct TlsReloadState {
+    paths: TlsConfigPaths,
+    acceptor: parking_lot::Mutex<Arc<tokio_rustls::TlsAcceptor>>,
+}
+
+impl TlsReloadState {
+    fn snapshot(&self) -> Arc<tokio_rustls::TlsAcceptor> {
+        Arc::clone(&self.acceptor.lock())
+    }
+}
+
+/// Rebuild the TLS acceptor from `state.paths` and atomically swap it in.
+/// On any error the previous acceptor is left in place, so a bad rotation
+/// (truncated file, expired cert) doesn't take TLS down.
+#[allow(clippy::result_large_err)]
+pub(crate) fn try_reload_tls(state: &TlsReloadState) -> Result<(), ServerError> {
+    let new_acceptor = load_tls_acceptor(state.paths.borrow())?;
+    *state.acceptor.lock() = Arc::new(new_acceptor);
+    Ok(())
+}
+
+/// Watch the cert / key / client-CA files and call `try_reload_tls` after
+/// debounced changes. Mirrors the pattern in `watcher.rs` (parent-dir
+/// watch, debounce, then act). Runs until the channel closes; the caller
+/// drives shutdown by aborting the task that owns this future.
+async fn watch_tls_files(state: Arc<TlsReloadState>, debounce: std::time::Duration) {
+    use crossfire::{mpsc, MTx};
+    use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+
+    // Track raw + canonical paths so symlink-swap rotations and edits to
+    // the symlink target both produce visible events.
+    let mut raw_targets: Vec<std::path::PathBuf> = Vec::new();
+    let mut canon_targets: Vec<std::path::PathBuf> = Vec::new();
+    for path in [
+        Some(state.paths.cert.clone()),
+        Some(state.paths.key.clone()),
+        state.paths.client_ca.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        match path.canonicalize() {
+            Ok(canonical) => {
+                canon_targets.push(canonical);
+                raw_targets.push(path);
+            }
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "pgwire TLS watcher: cannot canonicalize path; reload disabled",
+                );
+                return;
+            }
+        }
+    }
+    let mut dirs: Vec<std::path::PathBuf> = raw_targets
+        .iter()
+        .chain(canon_targets.iter())
+        .filter_map(|p| p.parent().map(|d| d.to_path_buf()))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+
+    let (tx, rx) = mpsc::bounded_async::<()>(16);
+    let blocking_tx: MTx<_> = tx.clone().into_blocking();
+    let watch_raw = raw_targets.clone();
+    let watch_canon = canon_targets.clone();
+
+    let mut watcher: RecommendedWatcher = match notify::recommended_watcher(
+        move |result: Result<Event, notify::Error>| match result {
+            Ok(event) => {
+                let touched = event.paths.iter().any(|p| {
+                    watch_raw.iter().any(|t| t == p)
+                        || p.canonicalize()
+                            .ok()
+                            .as_ref()
+                            .is_some_and(|c| watch_canon.contains(c))
+                });
+                if touched {
+                    let _ = blocking_tx.send(());
+                }
+            }
+            Err(e) => warn!(error = %e, "pgwire TLS watcher: notify error"),
+        },
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            warn!(error = %e, "pgwire TLS watcher: failed to create watcher; reload disabled");
+            return;
+        }
+    };
+
+    for dir in &dirs {
+        if let Err(e) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+            warn!(
+                dir = %dir.display(),
+                error = %e,
+                "pgwire TLS watcher: failed to watch directory; reload disabled",
+            );
+            return;
+        }
+    }
+    info!(
+        files = ?raw_targets.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "pgwire TLS watcher started",
+    );
+
+    loop {
+        if rx.recv().await.is_err() {
+            return;
+        }
+        // Debounce: sleep then drain so a burst of inotify events
+        // (cert + key written separately) coalesces into one reload.
+        tokio::time::sleep(debounce).await;
+        while rx.try_recv().is_ok() {}
+
+        match try_reload_tls(&state) {
+            Ok(()) => tracing::info!(
+                target: "audit",
+                event = "pgwire.tls_reload",
+                outcome = "ok",
+            ),
+            Err(e) => tracing::warn!(
+                target: "audit",
+                event = "pgwire.tls_reload",
+                outcome = "failed",
+                error = %e,
+                "pgwire TLS reload failed; previous certificate kept",
+            ),
+        }
+    }
+}
+
+/// Minimum TLS protocol version accepted on the pgwire listener. rustls
+/// already disables TLS 1.0/1.1; this narrows further when an operator
+/// needs TLS 1.3 only.
+#[derive(Clone, Copy, Debug)]
+pub enum TlsMinVersion {
+    V1_2,
+    V1_3,
+}
+
+impl TlsMinVersion {
+    pub(crate) fn from_config_str(s: &str) -> Option<Self> {
+        match s {
+            "1.2" => Some(Self::V1_2),
+            "1.3" => Some(Self::V1_3),
+            _ => None,
+        }
+    }
+
+    fn versions(self) -> &'static [&'static tokio_rustls::rustls::SupportedProtocolVersion] {
+        use tokio_rustls::rustls::version::{TLS12, TLS13};
+        static BOTH: &[&tokio_rustls::rustls::SupportedProtocolVersion] = &[&TLS12, &TLS13];
+        static ONLY_13: &[&tokio_rustls::rustls::SupportedProtocolVersion] = &[&TLS13];
+        match self {
+            Self::V1_2 => BOTH,
+            Self::V1_3 => ONLY_13,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::V1_2 => "1.2",
+            Self::V1_3 => "1.3",
+        }
+    }
 }
 
 /// Warn if the key file is group/other-readable.
@@ -1302,11 +1539,52 @@ fn load_tls_acceptor(paths: TlsPaths<'_>) -> Result<tokio_rustls::TlsAcceptor, S
             ))
         })?;
 
-    let server_config = tokio_rustls::rustls::ServerConfig::builder()
-        .with_no_client_auth()
+    let builder = tokio_rustls::rustls::ServerConfig::builder_with_protocol_versions(
+        paths.min_version.versions(),
+    );
+    let builder = match paths.client_ca {
+        Some(ca_path) => {
+            let verifier = build_client_cert_verifier(ca_path)?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let server_config = builder
         .with_single_cert(certs, key)
         .map_err(|e| ServerError::Http(format!("rustls server config: {e}")))?;
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(server_config)))
+}
+
+#[allow(clippy::result_large_err)]
+fn build_client_cert_verifier(
+    ca_path: &std::path::Path,
+) -> Result<Arc<dyn tokio_rustls::rustls::server::danger::ClientCertVerifier>, ServerError> {
+    use std::fs::File;
+    use std::io::BufReader;
+    use tokio_rustls::rustls::server::WebPkiClientVerifier;
+    use tokio_rustls::rustls::RootCertStore;
+
+    let file = File::open(ca_path)
+        .map_err(|e| ServerError::Http(format!("open pgwire_tls_client_ca: {e}")))?;
+    let mut roots = RootCertStore::empty();
+    let mut added = 0usize;
+    for cert in rustls_pemfile::certs(&mut BufReader::new(file)) {
+        let cert =
+            cert.map_err(|e| ServerError::Http(format!("parse pgwire_tls_client_ca: {e}")))?;
+        roots
+            .add(cert)
+            .map_err(|e| ServerError::Http(format!("invalid CA in pgwire_tls_client_ca: {e}")))?;
+        added += 1;
+    }
+    if added == 0 {
+        return Err(ServerError::Http(format!(
+            "pgwire_tls_client_ca {} contains no certificates",
+            ca_path.display()
+        )));
+    }
+    WebPkiClientVerifier::builder(Arc::new(roots))
+        .build()
+        .map_err(|e| ServerError::Http(format!("build client-cert verifier: {e}")))
 }
 
 pub async fn serve(
@@ -1339,8 +1617,21 @@ pub async fn serve(
         _ => {}
     }
 
-    let tls_acceptor = match tls {
-        Some(paths) => Some(load_tls_acceptor(paths)?),
+    let tls_min_label = tls.as_ref().map(|p| p.min_version.label());
+    let mtls_on = tls.as_ref().is_some_and(|p| p.client_ca.is_some());
+    let tls_state: Option<Arc<TlsReloadState>> = match tls {
+        Some(paths) => {
+            let acceptor = load_tls_acceptor(TlsPaths {
+                cert: paths.cert,
+                key: paths.key,
+                min_version: paths.min_version,
+                client_ca: paths.client_ca,
+            })?;
+            Some(Arc::new(TlsReloadState {
+                paths: TlsConfigPaths::from_paths(&paths),
+                acceptor: parking_lot::Mutex::new(Arc::new(acceptor)),
+            }))
+        }
         None => None,
     };
 
@@ -1352,27 +1643,49 @@ pub async fn serve(
         .map_err(|e| ServerError::Http(format!("pgwire local_addr: {e}")))?;
 
     let factory = Arc::new(LaminarHandlerFactory::new(db, users));
-    let tls_mode = if tls_acceptor.is_some() { "on" } else { "off" };
+    let tls_mode = if tls_state.is_some() { "on" } else { "off" };
+    let tls_min = tls_min_label.unwrap_or("-");
+    let mtls = if mtls_on { "on" } else { "off" };
     if auth_mode == "trust" {
         warn!(
             addr = %local_addr,
             tls = tls_mode,
+            tls_min,
+            mtls,
             "pgwire listening with TRUST auth — any client reaching this address is admin",
         );
     } else {
-        info!(addr = %local_addr, auth = auth_mode, tls = tls_mode, "pgwire listening");
+        info!(
+            addr = %local_addr,
+            auth = auth_mode,
+            tls = tls_mode,
+            tls_min,
+            mtls,
+            "pgwire listening",
+        );
     }
 
     // Track per-connection tasks so abort on the outer JoinHandle stops
     // active sessions in addition to the accept loop.
     let failures = Arc::new(FailureTracker::default());
+    let watcher_state = tls_state.as_ref().map(Arc::clone);
+    let watcher_disabled =
+        std::env::var("LAMINAR_DISABLE_FILE_WATCH").is_ok_and(|v| v == "1" || v == "true");
     let handle = tokio::spawn(async move {
         let mut sessions: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        // Watcher in its own JoinSet so it doesn't count toward max_connections.
+        let mut watcher_set: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        if let (Some(state), false) = (watcher_state, watcher_disabled) {
+            watcher_set.spawn(async move {
+                watch_tls_files(state, std::time::Duration::from_millis(500)).await;
+            });
+        }
         loop {
             tokio::select! {
                 Some(_) = sessions.join_next(), if !sessions.is_empty() => {
                     // Reap completed sessions; nothing to do with the result.
                 }
+                Some(_) = watcher_set.join_next(), if !watcher_set.is_empty() => {}
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((sock, peer)) => {
@@ -1402,7 +1715,12 @@ pub async fn serve(
                                 continue;
                             }
                             let factory_ref = Arc::clone(&factory);
-                            let tls_ref = tls_acceptor.clone();
+                            // Snapshot the live acceptor so that an in-flight
+                            // handshake completes against whatever cert was
+                            // current when the socket was accepted, even if a
+                            // hot-reload swaps it under us.
+                            let tls_ref: Option<tokio_rustls::TlsAcceptor> =
+                                tls_state.as_ref().map(|s| (*s.snapshot()).clone());
                             let failures_ref = Arc::clone(&failures);
                             let peer_str = peer.to_string();
                             tracing::info!(
@@ -1896,6 +2214,66 @@ mod integration_tests {
         handle.abort();
     }
 
+    /// Pre-hashed pgwire_users entry: stored value is `md5{hex(md5(pw||user))}`,
+    /// matching pg_authid. Plaintext never touches disk yet auth still succeeds.
+    fn md5_users_prehashed(user: &str, password: &str) -> HashMap<String, Secret> {
+        use md5::{Digest, Md5};
+        let mut h = Md5::new();
+        h.update(password.as_bytes());
+        h.update(user.as_bytes());
+        let inner = format!("{:x}", h.finalize());
+        let mut u = HashMap::new();
+        u.insert(user.to_string(), Secret::new(format!("md5{inner}")));
+        u
+    }
+
+    #[tokio::test]
+    async fn md5_auth_accepts_correct_password_against_prehash() {
+        let (addr, handle) = spawn_server_with(md5_users_prehashed("alice", TEST_PASSWORD)).await;
+        let client = connect_with_password(addr, "alice", TEST_PASSWORD)
+            .await
+            .expect("auth must succeed against pre-hashed entry");
+        let messages = client
+            .simple_query("SELECT version()")
+            .await
+            .expect("query after auth");
+        let v = first_row_value(&messages, 0).expect("row");
+        assert!(v.contains("LaminarDB"), "version: {v}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn md5_auth_rejects_wrong_password_against_prehash() {
+        let (addr, handle) = spawn_server_with(md5_users_prehashed("alice", TEST_PASSWORD)).await;
+        let err = connect_with_password(addr, "alice", "not-the-password")
+            .await
+            .expect_err("auth must fail");
+        let db_err = err.as_db_error().expect("typed PG error");
+        assert_eq!(db_err.code().code(), "28P01", "got: {db_err:?}");
+        handle.abort();
+    }
+
+    #[test]
+    fn parse_pre_hashed_md5_strict_format() {
+        // 32 lowercase hex after the tag → accepted.
+        let inner = "5d41402abc4b2a76b9719d911017c592";
+        assert_eq!(
+            super::parse_pre_hashed_md5(&format!("md5{inner}")),
+            Some(inner),
+        );
+        // Wrong length, uppercase hex, missing prefix, or non-hex → rejected.
+        assert_eq!(super::parse_pre_hashed_md5("md5short"), None);
+        assert_eq!(
+            super::parse_pre_hashed_md5("md55D41402ABC4B2A76B9719D911017C592"),
+            None,
+        );
+        assert_eq!(super::parse_pre_hashed_md5(inner), None);
+        assert_eq!(
+            super::parse_pre_hashed_md5("md5zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"),
+            None,
+        );
+    }
+
     #[tokio::test]
     async fn md5_auth_rejects_unknown_user() {
         let (addr, handle) = spawn_server_with(md5_users().await).await;
@@ -1968,6 +2346,71 @@ mod integration_tests {
         (dir, cert_path, key_path)
     }
 
+    /// CA + client-leaf bundle for mTLS tests. The CA PEM is written to a
+    /// tempfile so the server can be pointed at it via `pgwire_tls_client_ca`;
+    /// the leaf cert+key are returned in DER form for direct use by a rustls
+    /// `ClientConfig`.
+    struct MintedClientPki {
+        _dir: tempfile::TempDir,
+        ca_pem_path: std::path::PathBuf,
+        leaf_chain: Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>,
+        leaf_key: tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>,
+    }
+
+    fn mint_ca_and_client_leaf(common_name: &str) -> MintedClientPki {
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let mut ca_params = rcgen::CertificateParams::new(vec!["mtls-test-ca".into()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let mut leaf_params = rcgen::CertificateParams::new(vec![common_name.into()]).unwrap();
+        leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca_pem_path = dir.path().join("ca.pem");
+        std::fs::write(&ca_pem_path, ca_cert.pem()).unwrap();
+
+        let leaf_chain = vec![CertificateDer::from(leaf_cert.der().to_vec())];
+        let leaf_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
+
+        MintedClientPki {
+            _dir: dir,
+            ca_pem_path,
+            leaf_chain,
+            leaf_key,
+        }
+    }
+
+    /// Builds a tokio_postgres TLS connector that trusts `server_cert_path`
+    /// for the server hello and (optionally) presents a client cert for mTLS.
+    fn make_client_tls(
+        server_cert_path: &std::path::Path,
+        client_auth: Option<(
+            Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>,
+            tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>,
+        )>,
+    ) -> tokio_postgres_rustls::MakeRustlsConnect {
+        super::ensure_tls_provider();
+        let cert_bytes = std::fs::read(server_cert_path).unwrap();
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut std::io::Cursor::new(cert_bytes))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        {
+            roots.add(c).unwrap();
+        }
+        let builder = tokio_rustls::rustls::ClientConfig::builder().with_root_certificates(roots);
+        let client_cfg = match client_auth {
+            Some((chain, key)) => builder.with_client_auth_cert(chain, key).unwrap(),
+            None => builder.with_no_client_auth(),
+        };
+        tokio_postgres_rustls::MakeRustlsConnect::new(client_cfg)
+    }
+
     /// Self-signed cert with notAfter in the past, for the expiry test.
     fn expired_self_signed_pem() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let mut params = rcgen::CertificateParams::new(vec!["localhost".into()]).unwrap();
@@ -1997,6 +2440,8 @@ mod integration_tests {
             Some(super::TlsPaths {
                 cert: &cert_path,
                 key: &key_path,
+                min_version: super::TlsMinVersion::V1_2,
+                client_ca: None,
             }),
             256,
             10,
@@ -2004,6 +2449,68 @@ mod integration_tests {
         .await
         .expect_err("expired cert must be rejected");
         assert!(err.to_string().contains("expired"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn tls_min_1_3_rejects_tls_1_2_client() {
+        let (_dir, cert_path, key_path) = self_signed_pem();
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        db.start().await.expect("db starts");
+        let (addr, handle) = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            Some(super::TlsPaths {
+                cert: &cert_path,
+                key: &key_path,
+                min_version: super::TlsMinVersion::V1_3,
+                client_ca: None,
+            }),
+            256,
+            10,
+        )
+        .await
+        .expect("pgwire serve");
+
+        let cert_bytes = std::fs::read(&cert_path).unwrap();
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut std::io::Cursor::new(cert_bytes))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        {
+            roots.add(c).unwrap();
+        }
+        super::ensure_tls_provider();
+        // Client pinned to TLS 1.2 only — must be refused by a 1.3-min server.
+        let client_cfg = tokio_rustls::rustls::ClientConfig::builder_with_protocol_versions(&[
+            &tokio_rustls::rustls::version::TLS12,
+        ])
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+        let conn_str = format!(
+            "host=localhost hostaddr={} port={} user=any dbname=laminardb sslmode=require",
+            addr.ip(),
+            addr.port(),
+        );
+        let tls = tokio_postgres_rustls::MakeRustlsConnect::new(client_cfg);
+        let err = match tokio_postgres::connect(&conn_str, tls).await {
+            Ok(_) => panic!("TLS 1.2 client must be refused by a 1.3-min server"),
+            Err(e) => e,
+        };
+        // tokio_postgres wraps the rustls error; flatten the chain so we can
+        // assert against the version-mismatch token rustls emits.
+        let chain = std::iter::successors(Some(&err as &dyn std::error::Error), |e| e.source())
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            chain.contains("ProtocolVersion") || chain.contains("incompatible"),
+            "expected a TLS version-mismatch error, got: {chain}"
+        );
+
+        handle.abort();
     }
 
     #[tokio::test]
@@ -2019,6 +2526,8 @@ mod integration_tests {
             Some(super::TlsPaths {
                 cert: &cert_path,
                 key: &key_path,
+                min_version: super::TlsMinVersion::V1_2,
+                client_ca: None,
             }),
             256,
             10,
@@ -2061,6 +2570,243 @@ mod integration_tests {
         assert!(v.contains("LaminarDB"), "version: {v}");
 
         handle.abort();
+    }
+
+    /// mTLS: with a client_ca configured, a client that presents no cert
+    /// must be refused at handshake time.
+    #[tokio::test]
+    async fn mtls_rejects_client_without_cert() {
+        let (_dir, cert_path, key_path) = self_signed_pem();
+        let pki = mint_ca_and_client_leaf("alice");
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        db.start().await.expect("db starts");
+        let (addr, handle) = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            Some(super::TlsPaths {
+                cert: &cert_path,
+                key: &key_path,
+                min_version: super::TlsMinVersion::V1_2,
+                client_ca: Some(&pki.ca_pem_path),
+            }),
+            256,
+            10,
+        )
+        .await
+        .expect("pgwire serve");
+
+        let tls = make_client_tls(&cert_path, None);
+        let conn_str = format!(
+            "host=localhost hostaddr={} port={} user=any dbname=laminardb sslmode=require",
+            addr.ip(),
+            addr.port(),
+        );
+        let err = match tokio_postgres::connect(&conn_str, tls).await {
+            Ok(_) => panic!("client without a cert must be refused under mTLS"),
+            Err(e) => e,
+        };
+        assert!(
+            err_chain(&err).contains("CertificateRequired")
+                || err_chain(&err).contains("HandshakeFailure")
+                || err_chain(&err).contains("certificate required"),
+            "expected a missing-client-cert error, got: {}",
+            err_chain(&err),
+        );
+        handle.abort();
+    }
+
+    /// mTLS: a client cert signed by an unknown CA must be refused.
+    #[tokio::test]
+    async fn mtls_rejects_untrusted_client_cert() {
+        let (_dir, cert_path, key_path) = self_signed_pem();
+        let trusted = mint_ca_and_client_leaf("trusted");
+        let stranger = mint_ca_and_client_leaf("stranger");
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        db.start().await.expect("db starts");
+        let (addr, handle) = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            Some(super::TlsPaths {
+                cert: &cert_path,
+                key: &key_path,
+                min_version: super::TlsMinVersion::V1_2,
+                client_ca: Some(&trusted.ca_pem_path),
+            }),
+            256,
+            10,
+        )
+        .await
+        .expect("pgwire serve");
+
+        // Client presents a leaf signed by a CA the server doesn't know.
+        let tls = make_client_tls(
+            &cert_path,
+            Some((stranger.leaf_chain.clone(), stranger.leaf_key.clone_key())),
+        );
+        let conn_str = format!(
+            "host=localhost hostaddr={} port={} user=any dbname=laminardb sslmode=require",
+            addr.ip(),
+            addr.port(),
+        );
+        let err = match tokio_postgres::connect(&conn_str, tls).await {
+            Ok(_) => panic!("untrusted client cert must be refused"),
+            Err(e) => e,
+        };
+        // rustls maps a verifier-rejected client cert to a fatal alert; the
+        // exact variant depends on the protocol version and verifier path
+        // (UnknownCA / BadCertificate on 1.2, DecryptError or
+        // CertificateUnknown on 1.3). We assert it failed at the TLS layer.
+        let chain = err_chain(&err);
+        assert!(
+            chain.contains("UnknownCA")
+                || chain.contains("BadCertificate")
+                || chain.contains("CertificateUnknown")
+                || chain.contains("DecryptError")
+                || chain.contains("HandshakeFailure"),
+            "expected a cert-rejection alert, got: {chain}",
+        );
+        handle.abort();
+    }
+
+    /// mTLS: a client cert signed by the configured CA is accepted, and a
+    /// SimpleQuery completes over the encrypted+authenticated session.
+    #[tokio::test]
+    async fn mtls_accepts_trusted_client_cert() {
+        let (_dir, cert_path, key_path) = self_signed_pem();
+        let pki = mint_ca_and_client_leaf("alice");
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        db.start().await.expect("db starts");
+        let (addr, handle) = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            Some(super::TlsPaths {
+                cert: &cert_path,
+                key: &key_path,
+                min_version: super::TlsMinVersion::V1_2,
+                client_ca: Some(&pki.ca_pem_path),
+            }),
+            256,
+            10,
+        )
+        .await
+        .expect("pgwire serve");
+
+        let tls = make_client_tls(
+            &cert_path,
+            Some((pki.leaf_chain.clone(), pki.leaf_key.clone_key())),
+        );
+        let conn_str = format!(
+            "host=localhost hostaddr={} port={} user=any dbname=laminardb sslmode=require",
+            addr.ip(),
+            addr.port(),
+        );
+        let (client, conn) = tokio_postgres::connect(&conn_str, tls)
+            .await
+            .expect("mTLS handshake + connect");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let messages = client
+            .simple_query("SELECT version()")
+            .await
+            .expect("query over mTLS");
+        let v = first_row_value(&messages, 0).expect("row");
+        assert!(v.contains("LaminarDB"), "version: {v}");
+        handle.abort();
+    }
+
+    /// Build a `TlsReloadState` directly for unit-testing the reload path
+    /// without standing up a listener.
+    fn build_reload_state(cert: &std::path::Path, key: &std::path::Path) -> super::TlsReloadState {
+        let paths = super::TlsPaths {
+            cert,
+            key,
+            min_version: super::TlsMinVersion::V1_2,
+            client_ca: None,
+        };
+        let acceptor = super::load_tls_acceptor(super::TlsPaths {
+            cert: paths.cert,
+            key: paths.key,
+            min_version: paths.min_version,
+            client_ca: paths.client_ca,
+        })
+        .expect("initial acceptor loads");
+        super::TlsReloadState {
+            paths: super::TlsConfigPaths::from_paths(&paths),
+            acceptor: parking_lot::Mutex::new(Arc::new(acceptor)),
+        }
+    }
+
+    /// Hot-reload: writing a fresh cert+key over the configured paths and
+    /// calling `try_reload_tls` swaps the acceptor under the mutex.
+    #[test]
+    fn tls_reload_swaps_acceptor_on_valid_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        // Initial cert.
+        let first = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        std::fs::write(&cert_path, first.cert.pem()).unwrap();
+        std::fs::write(&key_path, first.key_pair.serialize_pem()).unwrap();
+
+        let state = build_reload_state(&cert_path, &key_path);
+        let before = state.snapshot();
+
+        // Rotate to a brand-new pair.
+        let second = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        std::fs::write(&cert_path, second.cert.pem()).unwrap();
+        std::fs::write(&key_path, second.key_pair.serialize_pem()).unwrap();
+
+        super::try_reload_tls(&state).expect("reload succeeds");
+        let after = state.snapshot();
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "acceptor pointer must change after a successful reload",
+        );
+    }
+
+    /// Hot-reload: a corrupt cert file leaves the previous acceptor in
+    /// place — TLS doesn't go down on a bad rotation.
+    #[test]
+    fn tls_reload_keeps_old_acceptor_on_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        let first = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        std::fs::write(&cert_path, first.cert.pem()).unwrap();
+        std::fs::write(&key_path, first.key_pair.serialize_pem()).unwrap();
+
+        let state = build_reload_state(&cert_path, &key_path);
+        let before = state.snapshot();
+
+        // Truncate cert.pem to non-PEM garbage.
+        std::fs::write(&cert_path, b"this is not a certificate").unwrap();
+        let err = super::try_reload_tls(&state).expect_err("reload must fail");
+        let after = state.snapshot();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "acceptor must be unchanged on reload failure",
+        );
+        assert!(
+            err.to_string().contains("pgwire_tls_cert"),
+            "error should mention pgwire_tls_cert, got: {err}",
+        );
+    }
+
+    /// Flatten an error and its `source()` chain to a single string for
+    /// substring assertions.
+    fn err_chain(err: &(dyn std::error::Error + 'static)) -> String {
+        std::iter::successors(Some(err), |e| e.source())
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ")
     }
 
     /// Push one row into the `trades` source so subsequent SUBSCRIBE

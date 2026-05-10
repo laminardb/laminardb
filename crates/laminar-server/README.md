@@ -163,7 +163,14 @@ PGPASSWORD=$ALICE_PASSWORD psql "host=db.internal port=5433 dbname=laminardb use
 
 > **MD5 is provided for libpq compatibility, not as a recommended production stance.** Postgres itself deprecated it in PG 14 in favor of SCRAM-SHA-256. Use it for development and short-lived deployments; for production, wait for the SCRAM work in the FIR follow-ups before exposing this listener beyond a trusted network segment.
 
-Plaintext passwords sit in the TOML file. Use `${VAR}` substitution to pull them from environment variables or a secret manager rather than committing them. The listener emits `target: "audit"` events on every connection accepted/closed, including auth-failed outcomes — wire these into your SIEM.
+Plaintext passwords sit in the TOML file. Use `${VAR}` substitution to pull them from environment variables or a secret manager rather than committing them. To avoid plaintext at rest entirely, supply the `pg_authid`-style pre-hashed form: `md5` followed by `md5(password ‖ username)` as 32 lowercase hex characters. The wire protocol is unchanged — clients still send the same plaintext password.
+
+```bash
+# bash, where pw and user are the plaintext password and username:
+printf '%s' "${pw}${user}" | md5sum | awk '{print "md5"$1}'
+```
+
+The listener emits `target: "audit"` events on every connection accepted/closed, including auth-failed outcomes — wire these into your SIEM.
 
 ### TLS
 
@@ -172,9 +179,16 @@ Optional. Setting both `pgwire_tls_cert` and `pgwire_tls_key` enables TLS via [`
 ```toml
 pgwire_tls_cert = "/etc/laminar/pgwire.crt"
 pgwire_tls_key  = "/etc/laminar/pgwire.key"
+# Optional. Default "1.2"; set "1.3" to refuse TLS 1.2 handshakes.
+pgwire_tls_min_version = "1.2"
+# Optional. Enable mTLS: every client must present a cert chained to
+# one of the roots in this PEM bundle. No revocation (CRL/OCSP) yet.
+pgwire_tls_client_ca = "/etc/laminar/clients-ca.pem"
 ```
 
-Postgres clients negotiate TLS via `sslmode=require` (or `verify-ca` / `verify-full` if your cert chain is trusted by the client). The handshake follows the standard `SSLRequest` flow — `psql`, JDBC, asyncpg, etc. all just work. Cert rotation requires a server restart; hot reload is a follow-up.
+Postgres clients negotiate TLS via `sslmode=require` (or `verify-ca` / `verify-full` if your cert chain is trusted by the client). The handshake follows the standard `SSLRequest` flow — `psql`, JDBC, asyncpg, etc. all just work.
+
+The server watches `pgwire_tls_cert`, `pgwire_tls_key`, and `pgwire_tls_client_ca` and reloads the TLS acceptor in place after a 500ms debounce, so cert rotation does not require a restart. In-flight handshakes finish with the cert that was current when the socket was accepted; new accepts pick up the rotated cert. A bad rotation (truncated file, expired cert) is logged as `pgwire.tls_reload outcome=failed` and the previous acceptor is kept. Set `LAMINAR_DISABLE_FILE_WATCH=1` to disable.
 
 ```bash
 psql "host=127.0.0.1 port=5433 dbname=laminardb user=any" -c "SUBSCRIBE avg_price WHERE symbol = 'AAPL'"
