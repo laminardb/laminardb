@@ -458,10 +458,6 @@ impl IncrementalEowcState {
             None
         };
 
-        // Output = group cols (in GROUP BY order) followed by agg outputs
-        // in the order they appear in SELECT. Window-time columns are
-        // surfaced explicitly by the user via `tumble(...)` / `tumble_end(...)`
-        // and arrive here as ordinary group columns.
         let mut output_fields = Vec::with_capacity(group_col_names.len() + agg_specs.len());
         for (name, dt) in group_col_names.iter().zip(group_types.iter()) {
             output_fields.push(Field::new(name, dt.clone(), true));
@@ -1084,9 +1080,6 @@ mod tests {
             filter_col_index: None,
         }];
 
-        // Output = group cols + agg outputs (no implicit window_start/end —
-        // see commit history; users now project `tumble(ts, …)` /
-        // `tumble_end(ts, …)` explicitly when they want those values).
         let output_schema = Arc::new(Schema::new(vec![
             Field::new("symbol", DataType::Utf8, true),
             Field::new("total", DataType::Int64, true),
@@ -1183,7 +1176,7 @@ mod tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
         let total = batches[0]
-            .column(1) // [symbol, total]
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
@@ -1227,9 +1220,6 @@ mod tests {
 
     #[test]
     fn test_window_close_emits_correct_schema() {
-        // EOWC output is now `[group_cols..., agg_outputs...]`. Window
-        // boundaries are no longer prepended; users surface them via
-        // `tumble(...)` / `tumble_end(...)` UDFs in the upstream SELECT.
         let mut state = make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
 
         let batch = make_pre_agg_batch(vec!["AAPL"], vec![42], vec![100]);
@@ -1268,8 +1258,7 @@ mod tests {
         assert!(restored > 0, "Should have restored groups");
         assert_eq!(state2.open_window_count(), 2);
 
-        // Close first window and verify SUM. Schema is [symbol, total];
-        // the agg col sits at index 1 now that window_start/end are gone.
+        // Close first window and verify SUM.
         let batches = state2.close_windows(1000).unwrap();
         assert_eq!(batches.len(), 1);
         let result = &batches[0];

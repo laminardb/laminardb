@@ -129,13 +129,8 @@ impl ScalarUDFImpl for TumbleWindowStart {
 
 // ─── TumbleWindowEnd ─────────────────────────────────────────────────────────
 
-/// Computes the tumbling window end for a given timestamp.
-///
-/// `tumble_end(timestamp, interval)` returns `tumble(...) + interval`,
-/// i.e. the exclusive upper bound of the non-overlapping window that
-/// contains `ts`.
-///
-/// Same arguments as [`TumbleWindowStart`].
+/// `tumble_end(ts, interval)` — exclusive upper bound of the tumble
+/// window containing `ts`. See [`TumbleWindowStart`].
 #[derive(Debug)]
 pub struct TumbleWindowEnd {
     signature: Signature,
@@ -313,12 +308,8 @@ impl ScalarUDFImpl for HopWindowStart {
 
 // ─── HopWindowEnd ────────────────────────────────────────────────────────────
 
-/// Computes the hopping window end for a given timestamp.
-///
-/// `hop_end(timestamp, slide, size)` returns the *end* of the earliest
-/// hopping window of `size` (sliding by `slide`) that contains `ts`,
-/// i.e. `hop(...) + size`. Same multi-window caveat as
-/// [`HopWindowStart`]: only the earliest window's end is returned.
+/// `hop_end(ts, slide, size)` — end of the earliest hop window
+/// containing `ts`. See [`HopWindowStart`].
 #[derive(Debug)]
 pub struct HopWindowEnd {
     signature: Signature,
@@ -584,12 +575,8 @@ impl ScalarUDFImpl for CumulateWindowStart {
 
 // ─── CumulateWindowEnd ──────────────────────────────────────────────────────
 
-/// Computes the cumulate epoch end for a given timestamp.
-///
-/// `cumulate_end(timestamp, step, size)` returns the exclusive upper
-/// bound of the epoch (size-aligned bucket) that contains `ts`, i.e.
-/// `cumulate(...) + size`. The actual per-step cumulating boundary
-/// (which is data-determined within the epoch) is exposed by Ring 0.
+/// `cumulate_end(ts, step, size)` — exclusive upper bound of the epoch
+/// (size-aligned bucket) containing `ts`. See [`CumulateWindowStart`].
 #[derive(Debug)]
 pub struct CumulateWindowEnd {
     signature: Signature,
@@ -894,10 +881,7 @@ fn convert_to_timestamp_ms_array(array: &ArrayRef) -> Result<ArrayRef> {
     Ok(Arc::new(ms))
 }
 
-/// Shifts every non-null `TimestampMillisecond` in `value` forward by
-/// `delta_ms`. Used by the `*_end` UDFs to derive the window upper bound
-/// from the corresponding window start. Saturating add keeps overflow
-/// well-defined; null inputs propagate.
+/// Saturating-shifts every non-null `TimestampMillisecond` forward.
 fn shift_timestamp_ms(value: &ColumnarValue, delta_ms: i64) -> Result<ColumnarValue> {
     match value {
         ColumnarValue::Array(array) => {

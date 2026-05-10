@@ -51,11 +51,8 @@ pub(crate) use keys::{
 };
 pub(crate) use scalar_ipc::{ipc_to_scalars, scalars_to_ipc};
 
-/// Builds the per-window result batch for one closed window. The
-/// returned batch's schema is `[group_cols..., agg_outputs...]` — no
-/// implicit `window_start` / `window_end` columns. Callers that want
-/// those values in the output should project the matching window UDFs
-/// (`tumble(...)`, `tumble_end(...)`, etc.) in the upstream MV SQL.
+/// Builds the per-window result batch for one closed window.
+/// Output schema: `[group_cols..., agg_outputs...]`.
 pub(crate) fn emit_window_batch(
     groups: ahash::AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>,
     row_converter: &arrow::row::RowConverter,

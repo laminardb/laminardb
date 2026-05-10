@@ -28,11 +28,7 @@ use crate::sql_utils;
 /// Cloneable async sender for the live-DDL control channel.
 pub(crate) type ControlMsgTx = crossfire::MAsyncTx<crossfire::mpsc::Array<ControlMsg>>;
 
-/// Lifecycle state of a [`LaminarDB`] instance.
-///
-/// Stored as `AtomicU8` on [`LaminarDB::state`] so transitions are
-/// lock-free; the repr is fixed so `as u8` / `TryFrom<u8>` give the
-/// same bytes the atomic sees.
+/// Lifecycle state of a [`LaminarDB`] instance, stored as `AtomicU8`.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DbState {
@@ -44,9 +40,6 @@ pub(crate) enum DbState {
 }
 
 impl DbState {
-    /// Decode a byte previously stored into the atomic. Returns `None`
-    /// if the byte isn't a known variant — always a bug, because only
-    /// `Self::store_into` / `DbState::* as u8` write this atomic.
     pub(crate) fn from_u8(raw: u8) -> Option<Self> {
         Some(match raw {
             0 => Self::Created,
@@ -57,17 +50,15 @@ impl DbState {
             _ => return None,
         })
     }
-}
 
-// Compat aliases — remaining call sites still read/write raw bytes via
-// the atomic. The enum variants and these constants share the same
-// byte values (`#[repr(u8)]` above), so both work until the mechanical
-// rewrite lands.
-pub(crate) const STATE_CREATED: u8 = DbState::Created as u8;
-pub(crate) const STATE_STARTING: u8 = DbState::Starting as u8;
-pub(crate) const STATE_RUNNING: u8 = DbState::Running as u8;
-pub(crate) const STATE_SHUTTING_DOWN: u8 = DbState::ShuttingDown as u8;
-pub(crate) const STATE_STOPPED: u8 = DbState::Stopped as u8;
+    pub(crate) fn load(atomic: &std::sync::atomic::AtomicU8) -> Self {
+        Self::from_u8(atomic.load(std::sync::atomic::Ordering::Acquire)).unwrap_or(Self::Stopped)
+    }
+
+    pub(crate) fn store(self, atomic: &std::sync::atomic::AtomicU8) {
+        atomic.store(self as u8, std::sync::atomic::Ordering::Release);
+    }
+}
 
 fn cache_entries_from_memory(mem: laminar_sql::parser::lookup_table::ByteSize) -> usize {
     (mem.as_bytes() / 256).max(1024) as usize
@@ -85,7 +76,7 @@ pub struct LaminarDB {
     pub(crate) config: LaminarConfig,
     pub(crate) config_vars: Arc<HashMap<String, String>>,
     pub(crate) shutdown: std::sync::atomic::AtomicBool,
-    /// Unified checkpoint coordinator (populated by `start()`).
+    /// Populated by `start()`.
     pub(crate) coordinator:
         Arc<tokio::sync::Mutex<Option<crate::checkpoint_coordinator::CheckpointCoordinator>>>,
     pub(crate) connector_manager: parking_lot::Mutex<crate::connector_manager::ConnectorManager>,
@@ -93,105 +84,68 @@ pub struct LaminarDB {
     pub(crate) mv_registry: parking_lot::Mutex<laminar_core::mv::MvRegistry>,
     pub(crate) table_store: Arc<parking_lot::RwLock<crate::table_store::TableStore>>,
     pub(crate) state: Arc<std::sync::atomic::AtomicU8>,
-    /// Handle to the background processing task (if running).
     pub(crate) runtime_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Signal to stop the processing loop.
     pub(crate) shutdown_signal: Arc<tokio::sync::Notify>,
-    /// Prometheus engine metrics. `None` until `set_engine_metrics()` is called.
     pub(crate) engine_metrics:
         parking_lot::Mutex<Option<Arc<crate::engine_metrics::EngineMetrics>>>,
-    /// Shared Prometheus registry. `None` until `set_prometheus_registry()` is called.
     pub(crate) prometheus_registry: parking_lot::Mutex<Option<Arc<prometheus::Registry>>>,
-    /// Instant when the database was created, for uptime calculation.
     pub(crate) start_time: std::time::Instant,
-    /// Session properties set via `SET key = value`.
     pub(crate) session_properties: parking_lot::Mutex<HashMap<String, String>>,
-    /// Global pipeline watermark (min of all source watermarks).
+    /// Min of all source watermarks.
     pub(crate) pipeline_watermark: Arc<std::sync::atomic::AtomicI64>,
-    /// Shared lookup table registry for physical planning of lookup joins.
     pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
-    /// Control channel sender for live DDL to the running coordinator.
-    /// `None` before `start()` or after `shutdown()`.
+    /// Live-DDL channel to the running coordinator. `None` outside `start..shutdown`.
     pub(crate) control_tx: parking_lot::Mutex<Option<ControlMsgTx>>,
-    /// Materialized view result store (shared with compute thread and query threads).
     pub(crate) mv_store: Arc<parking_lot::RwLock<crate::mv_store::MvStore>>,
-    /// Cluster control facade, installed by `LaminarDbBuilder::cluster_controller`.
-    /// `None` in embedded / single-instance mode; `Some` activates the
-    /// leader / follower checkpoint flow when the coordinator starts.
+    /// Activates leader/follower checkpoint flow when set. `None` in embedded mode.
     #[cfg(feature = "cluster-unstable")]
     pub(crate) cluster_controller:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::ClusterController>>>,
-    /// State backend for durability-gate participation. Installed by
-    /// `LaminarDbBuilder::state_backend`. When paired with a
-    /// `vnode_registry` the coordinator writes per-vnode markers each
-    /// checkpoint and the gate runs.
+    /// Pair with `vnode_registry`; the coordinator writes per-vnode durability
+    /// markers each checkpoint and runs the gate when both are installed.
     pub(crate) state_backend:
         parking_lot::Mutex<Option<Arc<dyn laminar_core::state::StateBackend>>>,
-    /// Vnode topology + assignment. Installed by
-    /// `LaminarDbBuilder::vnode_registry`. Needed for the coordinator to
-    /// know which vnodes this instance owns.
     pub(crate) vnode_registry: parking_lot::Mutex<Option<Arc<laminar_core::state::VnodeRegistry>>>,
-    /// Extra physical optimizer rules from the builder, applied to both
-    /// `self.ctx` and the pipeline-side `OperatorGraph` context.
+    /// Applied to both `self.ctx` and the pipeline-side `OperatorGraph` context.
     pub(crate) physical_optimizer_rules:
         Arc<[Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>]>,
-    /// `target_partitions` override from the builder, mirrored into the
-    /// pipeline-side `SessionContext`.
+    /// `target_partitions` override; cluster mode sets this to `vnode_count`.
     pub(crate) pipeline_target_partitions: Option<usize>,
-    /// Outbound shuffle handle. Installed via `LaminarDbBuilder::shuffle_sender`;
-    /// used by `SqlQueryOperator` to row-shuffle pre-aggregate batches to vnode
-    /// owners.
+    /// Used by `SqlQueryOperator` to row-shuffle pre-aggregate batches to owners.
     #[cfg(feature = "cluster-unstable")]
     pub(crate) shuffle_sender:
         parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleSender>>>,
-    /// Inbound shuffle handle. Installed via `LaminarDbBuilder::shuffle_receiver`.
     #[cfg(feature = "cluster-unstable")]
     pub(crate) shuffle_receiver:
         parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleReceiver>>>,
-    /// Shared commit-marker store. Installed via the builder.
     #[cfg(feature = "cluster-unstable")]
     pub(crate) decision_store:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::CheckpointDecisionStore>>>,
-    /// Shared vnode-assignment snapshot store. Installed via the
-    /// builder; the rebalance tasks (spawned by the caller) watch it.
     #[cfg(feature = "cluster-unstable")]
     pub(crate) assignment_snapshot_store:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>>,
-    /// Forwards `db.checkpoint()` requests to the running pipeline so
-    /// the callback captures operator state before the manifest is
-    /// packed. `None` before `start()` or after `shutdown()`; when
-    /// `None`, `db.checkpoint()` falls back to the direct coordinator
-    /// path (only valid when the engine has no stateful operators).
+    /// Hands `db.checkpoint()` requests to the pipeline callback so it can capture
+    /// operator state before the manifest is packed. When `None`, falls back to
+    /// the direct coordinator path — only valid for stateless engines.
     pub(crate) force_ckpt_tx: parking_lot::Mutex<Option<ForceCheckpointTx>>,
-    /// SUBSCRIBE fan-out registry, shared with the pipeline callback.
     pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
-    /// Stream output schemas resolved at `start()`; SUBSCRIBE WHERE reads this.
+    /// Stream output schemas resolved at `start()`; consulted by SUBSCRIBE WHERE.
     pub(crate) stream_schemas:
         parking_lot::RwLock<std::collections::HashMap<String, arrow_schema::SchemaRef>>,
 }
 
-/// Oneshot reply carrying the full `CheckpointResult` back to the
-/// caller of `db.checkpoint()`. Created per-request.
-///
-/// Uses crossfire's oneshot (matches `sink_task`) rather than
-/// `tokio::sync::oneshot` so the whole checkpoint plumbing uses a
-/// consistent primitive family.
+/// Reply channel for a single `db.checkpoint()` request.
 pub(crate) type ForceCheckpointReply =
     crossfire::oneshot::TxOneshot<Result<crate::checkpoint_coordinator::CheckpointResult, DbError>>;
 
-/// Channel used by `db.checkpoint()` to hand a reply sender to the
-/// running pipeline callback. Bounded at 64 — cold path (one item per
-/// manual `db.checkpoint()` call); the cap is generous enough that the
-/// caller is never expected to wait.
+/// `db.checkpoint()` → pipeline callback request channel. Cold path; the cap
+/// is generous enough that callers never wait.
 pub(crate) type ForceCheckpointTx =
     crossfire::MAsyncTx<crossfire::mpsc::Array<ForceCheckpointReply>>;
 
-/// Paired receive-side of [`ForceCheckpointTx`], held by
-/// `ConnectorPipelineCallback`.
 pub(crate) type ForceCheckpointRx =
     crossfire::AsyncRx<crossfire::mpsc::Array<ForceCheckpointReply>>;
 
-/// Capacity of the force-checkpoint request channel.
 pub(crate) const FORCE_CHECKPOINT_CHANNEL_CAPACITY: usize = 64;
 
 pub(crate) struct SourceWatermarkState {
@@ -321,7 +275,7 @@ impl LaminarDB {
             table_store: Arc::new(parking_lot::RwLock::new(
                 crate::table_store::TableStore::new(),
             )),
-            state: Arc::new(std::sync::atomic::AtomicU8::new(STATE_CREATED)),
+            state: Arc::new(std::sync::atomic::AtomicU8::new(DbState::Created as u8)),
             runtime_handle: parking_lot::Mutex::new(None),
             shutdown_signal: Arc::new(tokio::sync::Notify::new()),
             engine_metrics: parking_lot::Mutex::new(None),
@@ -352,17 +306,11 @@ impl LaminarDB {
         })
     }
 
-    /// Install the outbound shuffle handle used by cluster-mode streaming
-    /// aggregates to route pre-aggregate rows to vnode owners. Called by
-    /// [`LaminarDbBuilder::shuffle_sender`]. Must be set before `start()`
-    /// to take effect.
     #[cfg(feature = "cluster-unstable")]
     pub(crate) fn set_shuffle_sender(&self, sender: Arc<laminar_core::shuffle::ShuffleSender>) {
         *self.shuffle_sender.lock() = Some(sender);
     }
 
-    /// Install the inbound shuffle handle. Pair with
-    /// [`Self::set_shuffle_sender`]; neither alone is a no-op.
     #[cfg(feature = "cluster-unstable")]
     pub(crate) fn set_shuffle_receiver(
         &self,
@@ -371,7 +319,6 @@ impl LaminarDB {
         *self.shuffle_receiver.lock() = Some(receiver);
     }
 
-    /// Install the commit-marker store. Must be called before `start()`.
     #[cfg(feature = "cluster-unstable")]
     pub(crate) fn set_decision_store(
         &self,
@@ -380,7 +327,6 @@ impl LaminarDB {
         *self.decision_store.lock() = Some(store);
     }
 
-    /// Install the assignment snapshot store. Must be called before `start()`.
     #[cfg(feature = "cluster-unstable")]
     pub(crate) fn set_assignment_snapshot_store(
         &self,
@@ -389,10 +335,9 @@ impl LaminarDB {
         *self.assignment_snapshot_store.lock() = Some(store);
     }
 
-    /// Adopt a new assignment snapshot: update the registry, backend
-    /// fence, and coordinator under the coordinator mutex so the
-    /// change lands strictly between checkpoints. Idempotent for
-    /// versions at or below the current registry version.
+    /// Adopt a new vnode assignment snapshot atomically across the registry,
+    /// state-backend fence, and coordinator. Idempotent for versions ≤ the
+    /// current registry version.
     #[cfg(feature = "cluster-unstable")]
     pub async fn adopt_assignment_snapshot(
         &self,
@@ -408,8 +353,7 @@ impl LaminarDB {
         let new_assignment: Arc<[laminar_core::state::NodeId]> =
             snapshot.to_vnode_vec(vnode_count).into();
 
-        // Hold the coord mutex so the registry and fence update land
-        // between epochs from the coordinator's perspective.
+        // Hold the coord mutex so registry + fence updates land between epochs.
         let mut guard = self.coordinator.lock().await;
         registry.set_assignment_and_version(new_assignment, snapshot.version);
         if let Some(backend) = self.state_backend.lock().clone() {
@@ -432,10 +376,6 @@ impl LaminarDB {
         tracing::info!(version = snapshot.version, "adopted assignment snapshot",);
     }
 
-    /// Install the cluster control facade. Called by
-    /// [`LaminarDbBuilder::cluster_controller`](crate::LaminarDbBuilder::cluster_controller)
-    /// before the pipeline starts; the `CheckpointCoordinator` picks
-    /// it up when constructed in `pipeline_lifecycle`.
     #[cfg(feature = "cluster-unstable")]
     pub(crate) fn set_cluster_controller(
         &self,
@@ -444,29 +384,21 @@ impl LaminarDB {
         *self.cluster_controller.lock() = Some(controller);
     }
 
-    /// Install a state backend so the checkpoint coordinator publishes
-    /// per-vnode durability markers and the gate runs. Pair with
-    /// [`Self::set_vnode_registry`]; either alone is a no-op.
     pub(crate) fn set_state_backend(&self, backend: Arc<dyn laminar_core::state::StateBackend>) {
         *self.state_backend.lock() = Some(backend);
     }
 
-    /// Install a vnode registry so the checkpoint coordinator knows
-    /// which vnodes this instance owns. Pair with
-    /// [`Self::set_state_backend`]; either alone is a no-op.
     pub(crate) fn set_vnode_registry(&self, registry: Arc<laminar_core::state::VnodeRegistry>) {
         *self.vnode_registry.lock() = Some(registry);
     }
 
-    /// Underlying `DataFusion` `SessionContext`. Primarily for tests
-    /// that need to compile SQL through the same session the engine
-    /// uses.
+    /// The underlying `DataFusion` `SessionContext`.
     #[must_use]
     pub fn session_context(&self) -> &SessionContext {
         &self.ctx
     }
 
-    /// Get a fluent builder for constructing a `LaminarDB`.
+    /// Returns a fluent builder for constructing a [`LaminarDB`].
     #[must_use]
     pub fn builder() -> LaminarDbBuilder {
         LaminarDbBuilder::new()

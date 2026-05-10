@@ -537,9 +537,6 @@ impl CoreWindowState {
             None
         };
 
-        // Output schema = group cols (in GROUP BY order) + agg outputs.
-        // No implicit window_start/window_end prepend; users surface those
-        // via the `tumble(...)` / `tumble_end(...)` UDFs explicitly.
         let mut output_fields: Vec<Field> = Vec::new();
         for (name, dt) in group_col_names.iter().zip(group_types.iter()) {
             output_fields.push(Field::new(name, dt.clone(), true));
@@ -572,8 +569,6 @@ impl CoreWindowState {
                     })?;
                 compiled.push(phys);
             }
-            // Final schema = the post-aggregate projection's output, exactly
-            // as DataFusion planned it. No window_start/window_end prepend.
             let final_schema = Arc::clone(&top_schema);
 
             Some(PostProjection {
@@ -1170,14 +1165,9 @@ impl CoreWindowState {
     }
 
     /// Build a `RecordBatch` from closed session rows.
-    ///
-    /// Output schema = `[group_cols..., agg_outputs...]`. Session start
-    /// and end timestamps are NOT in the row output: each session has a
-    /// data-dependent end (the timestamp of its last event) that no
-    /// row-local function can compute, so there is no `session_end`
-    /// UDF and no implicit prepend. Consumers that need session
-    /// boundaries should add timestamp columns to the upstream SELECT
-    /// (e.g. `MIN(ts) AS session_start`, `MAX(ts) AS session_end`).
+    /// Output schema: `[group_cols..., agg_outputs...]`.
+    /// Sessions have data-dependent ends, so session boundaries are not
+    /// in the row output; project `MIN(ts)` / `MAX(ts)` upstream instead.
     #[allow(clippy::type_complexity)]
     fn emit_session_rows(
         &self,
@@ -1251,7 +1241,6 @@ impl CoreWindowState {
     }
 
     /// Emit a single window's accumulated state as a `RecordBatch`.
-    /// Output schema = `[group_cols..., agg_outputs...]`.
     fn emit_window(
         &self,
         groups: AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>,
@@ -1617,7 +1606,6 @@ mod tests {
             filter_col_index: None,
         }];
 
-        // Output = group cols + agg outputs (no implicit window_start/end).
         let output_schema = Arc::new(Schema::new(vec![
             Field::new("symbol", DataType::Utf8, true),
             Field::new("total", DataType::Int64, true),
@@ -1679,7 +1667,6 @@ mod tests {
             },
         ];
 
-        // Output = group cols + agg outputs (no implicit window_start/end).
         let output_schema = Arc::new(Schema::new(vec![
             Field::new("symbol", DataType::Utf8, true),
             Field::new("total", DataType::Int64, true),
@@ -1729,7 +1716,6 @@ mod tests {
             filter_col_index: None,
         }];
 
-        // Output = group cols + agg outputs (no implicit window_start/end).
         let output_schema = Arc::new(Schema::new(vec![
             Field::new("symbol", DataType::Utf8, true),
             Field::new("total", DataType::Int64, true),
@@ -1780,7 +1766,6 @@ mod tests {
             filter_col_index: None,
         }];
 
-        // Output = group cols + agg outputs (no implicit window_start/end).
         let output_schema = Arc::new(Schema::new(vec![
             Field::new("symbol", DataType::Utf8, true),
             Field::new("total", DataType::Int64, true),
@@ -1936,9 +1921,7 @@ mod tests {
         let batch2 = make_pre_agg_batch(vec!["AAPL"], vec![30], vec![800]);
         state.update_batch(&batch2).unwrap();
 
-        // Close window at watermark 1000. Output schema is [symbol, total];
-        // window timing is no longer prepended (users opt in via tumble/
-        // tumble_end UDFs in their MV SELECT).
+        // Close window at watermark 1000.
         let batches = state.close_windows(1000).unwrap();
         assert_eq!(batches.len(), 1);
 
@@ -1946,7 +1929,7 @@ mod tests {
         assert_eq!(result.num_rows(), 1);
         assert_eq!(result.schema().fields().len(), 2);
 
-        // SUM = 10 + 20 + 30 = 60 (column(1) is the agg output).
+        // SUM = 10 + 20 + 30 = 60.
         let total = result
             .column(1)
             .as_any()
@@ -1998,7 +1981,7 @@ mod tests {
         let batches = state.close_windows(1500).unwrap();
         assert_eq!(batches.len(), 1);
         let total = batches[0]
-            .column(1) // [symbol, total]
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
@@ -2072,8 +2055,7 @@ mod tests {
         let restored = state2.restore_windows(&cp).unwrap();
         assert!(restored > 0, "Should have restored groups");
 
-        // Close first window and verify SUM. Schema is [symbol, total];
-        // the agg col is at index 1.
+        // Close first window and verify SUM.
         let batches = state2.close_windows(1000).unwrap();
         assert_eq!(batches.len(), 1);
         let result = &batches[0];
@@ -2227,16 +2209,11 @@ mod tests {
         let batch = make_pre_agg_batch(vec!["A", "A"], vec![10, 20], vec![1000, 3000]);
         state.update_batch(&batch).unwrap();
 
-        // Without window_start in the emitted columns, attribution to a
-        // specific hop window comes from closing one boundary at a time:
-        // each `close_windows(watermark)` call closes exactly the windows
-        // whose end ≤ watermark.
-        //
         //   watermark=2000 → window [-2000, 2000): only ts=1000 → SUM=10
         //   watermark=4000 → window [0, 4000):     ts=1000+3000 → SUM=30
         //   watermark=6000 → window [2000, 6000):  only ts=3000 → SUM=20
         let read_total = |b: &arrow_array::RecordBatch| -> i64 {
-            b.column(1) // [symbol, total]
+            b.column(1)
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .unwrap()
@@ -2267,9 +2244,6 @@ mod tests {
         );
         state.update_batch(&batch).unwrap();
 
-        // Same iterative-close trick as `test_hopping_basic_sum`.
-        // Within each window, sort the rows by (symbol, total) for a
-        // stable assertion regardless of group iteration order.
         let collect_sym_total = |b: &arrow_array::RecordBatch| -> Vec<(String, i64)> {
             let syms = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
             let totals = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
@@ -2348,10 +2322,8 @@ mod tests {
         );
         state.update_batch(&batch).unwrap();
 
-        // Session: start=1000, end=4000+5000=9000
-        // Watermark at 9000 → session closes; output is [symbol, total],
-        // session boundaries are no longer prepended (sessions are
-        // data-dependent — there is no `session_end` UDF).
+        // Session: start=1000, end=4000+5000=9000.
+        // Watermark at 9000 → session closes.
         let batches = state.close_windows(9000).unwrap();
         assert_eq!(batches.len(), 1);
         let result = &batches[0];
@@ -2380,8 +2352,6 @@ mod tests {
 
         // Session 1: [1000, 3000) → SUM=10
         // Session 2: [5000, 8000) → SUM=20+30=50
-        // Watermark at 8000 → both close. The two sessions emit in time
-        // order; output is [symbol, total].
         let batches = state.close_windows(8000).unwrap();
         assert_eq!(batches.len(), 1);
         let result = &batches[0];
@@ -2410,10 +2380,8 @@ mod tests {
         // Late event at ts=3500 bridges the two sessions
         let batch2 = make_pre_agg_batch(vec!["A"], vec![30], vec![3500]);
         state.update_batch(&batch2).unwrap();
-        // Merged: [1000, 8000) with SUM = 10+20+30 = 60
+        // Merged: [1000, 8000) with SUM = 10+20+30 = 60.
 
-        // Merged session: [1000, 8000) with SUM=10+20+30=60.
-        // Output is [symbol, total]; session boundaries no longer in cols.
         let batches = state.close_windows(8000).unwrap();
         assert_eq!(batches.len(), 1);
         let result = &batches[0];
@@ -2440,8 +2408,6 @@ mod tests {
 
         // A: session [1000, 5000) SUM=30
         // B: session [2000, 6000) SUM=300
-        // Output schema [symbol, total]; per-session start/end are
-        // data-dependent and no longer surfaced as columns.
         let batches = state.close_windows(6000).unwrap();
         assert_eq!(batches.len(), 1);
         let result = &batches[0];
@@ -2485,7 +2451,6 @@ mod tests {
         let batches = state.close_windows(10_000).unwrap();
         assert_eq!(batches.len(), 1);
         let result = &batches[0];
-        // Output is [symbol, total].
         let syms = result
             .column(0)
             .as_any()
@@ -2518,9 +2483,6 @@ mod tests {
         let restored = state2.restore_windows(&cp).unwrap();
         assert!(restored > 0);
 
-        // Restore-then-close iteratively to attribute sums to each
-        // window without relying on a window_start column (no longer
-        // emitted; consumers project tumble/hop UDFs themselves).
         let total = |b: &arrow_array::RecordBatch| -> i64 {
             b.column(1)
                 .as_any()
@@ -2704,17 +2666,11 @@ mod tests {
         assert_eq!(batches.len(), 1, "should emit one batch");
         let out = &batches[0];
 
-        // The post-aggregate projection has 2 items (symbol, ratio), so
-        // the final schema is exactly [symbol, ratio]. Window-time cols
-        // are no longer prepended; if the user wants them they project
-        // `tumble(ts, INTERVAL '10' SECOND)` and `tumble_end(ts, …)`
-        // explicitly (and add them to GROUP BY).
+        // The post-aggregate projection emits [symbol, ratio].
         assert_eq!(out.num_columns(), 2, "schema: {:?}", out.schema());
         assert_eq!(out.num_rows(), 1);
 
-        // MemTable has 1 row: a=1.0, b=2.0.
-        // ratio = SUM(a) / SUM(b) = 1.0 / 2.0 = 0.5.
-        // Output columns: [symbol, ratio].
+        // a=1.0, b=2.0 → ratio = SUM(a)/SUM(b) = 0.5.
         let ratio_col = out
             .column(1)
             .as_any()
