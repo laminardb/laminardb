@@ -390,7 +390,6 @@ Historical mean latencies measured on an AMD Ryzen AI 7 350 development laptop (
 |----------|---------|--------|
 | **Rust** | [`laminar-db`](https://crates.io/crates/laminar-db) | Primary API |
 | **Python** | [`laminardb`](https://pypi.org/project/laminardb/) | Via [`laminardb-python`](https://github.com/laminardb/laminardb-python) (separate repo) |
-| **C/C++** | Via FFI (`--features ffi`) | ✅ Arrow C Data Interface, 50+ exported functions |
 | Java | `laminardb-java` | 📋 Planned |
 | Node.js | `@laminardb/node` | 📋 Planned |
 

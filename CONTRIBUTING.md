@@ -58,7 +58,6 @@ A few common starting points:
 - **Checkpoint coordinator**: `crates/laminar-db/src/checkpoint_coordinator.rs`
 - **Recovery manager**: `crates/laminar-db/src/recovery_manager.rs`
 - **Server HTTP API**: `crates/laminar-server/src/http.rs` -- REST endpoints
-- **FFI layer**: `crates/laminar-db/src/ffi/` -- C bindings for language interop
 - **Roadmap**: `docs/ROADMAP.md` -- phase timeline and feature status
 
 ## Feature flags
@@ -78,7 +77,6 @@ Most connectors are behind feature flags so the default build stays fast. Here a
 | `files` | File source and sink (AutoLoader-style) |
 | `parquet-lookup` | Parquet file lookup table source |
 | `otel` | OpenTelemetry OTLP/gRPC source (traces, metrics, logs) |
-| `ffi` | C FFI layer and Arrow C Data Interface |
 | `delta` | Distributed delta mode (Raft, gossip, gRPC) |
 
 To run tests with a specific connector:

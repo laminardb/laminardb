@@ -88,8 +88,7 @@ laminar-db
 
 | Flag | Purpose |
 |------|---------|
-| `api` | FFI-friendly API module with `Connection`, `Writer`, `QueryStream` |
-| `ffi` | C FFI layer with `extern "C"` functions and Arrow C Data Interface (implies `api`) |
+| `api` | API module with `Connection`, `Writer`, `QueryStream` (used by `laminardb-python` via pyo3) |
 | `kafka` | Kafka source/sink connector |
 | `postgres-cdc` | PostgreSQL CDC source (also enables Postgres lookup) |
 | `postgres-sink` | PostgreSQL sink |

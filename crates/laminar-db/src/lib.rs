@@ -88,18 +88,6 @@ mod table_provider;
 mod table_store;
 mod temporal_probe;
 
-/// C FFI layer for LaminarDB.
-///
-/// Enable with the `ffi` feature flag:
-/// ```toml
-/// laminar-db = { version = "0.1", features = ["ffi"] }
-/// ```
-///
-/// This module provides `extern "C"` functions for calling LaminarDB from C
-/// and any language with C FFI support (Python, Java, Node.js, .NET, etc.).
-#[cfg(feature = "ffi")]
-pub mod ffi;
-
 pub use builder::LaminarDbBuilder;
 pub use catalog::{ArrowRecord, SourceCatalog, SourceEntry};
 pub use checkpoint_coordinator::{
