@@ -17,7 +17,7 @@ use crate::config::{
 use crate::http;
 use crate::metrics::ServerMetrics;
 use crate::reload::ReloadGuard;
-#[cfg(test)]
+#[cfg(all(test, any(feature = "otel", feature = "kafka")))]
 use laminar_core::state::StateBackendConfig;
 
 /// Handle to a running LaminarDB server. Call `wait_for_shutdown` to block until Ctrl-C.
@@ -671,7 +671,8 @@ mod tests {
     /// layer surfaces a "schema auto-discovery failed: …" error (or, when
     /// the connector returns no schema, "could not auto-discover a schema").
     /// The server no longer pre-empts this — we just check the error bubbles
-    /// up clearly.
+    /// up clearly. Requires the kafka connector to be registered.
+    #[cfg(feature = "kafka")]
     #[tokio::test]
     async fn execute_config_ddl_columnless_kafka_surfaces_discovery_error() {
         let mut source = make_source("events", "kafka");
