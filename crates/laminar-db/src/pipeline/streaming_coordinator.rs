@@ -32,7 +32,7 @@ use laminar_core::alloc::{PriorityClass, PriorityGuard};
 use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::callback::{PipelineCallback, SourceRegistration};
+use super::callback::{BarrierOutcome, PipelineCallback, SourceRegistration};
 use super::config::PipelineConfig;
 use crate::error::DbError;
 
@@ -860,15 +860,21 @@ impl StreamingCoordinator {
             // offsets, ack tokens) advances only with the durable manifest.
             let fan_out = checkpoints.clone();
             let checkpoint_id = self.pending_barrier.checkpoint_id;
-            if let Some(epoch) = callback.checkpoint_with_barrier(checkpoints).await {
-                self.broadcast_epoch_committed(epoch, &fan_out);
-                // Wire barrier = durable epoch.
-                callback.publish_barrier(epoch, checkpoint_id);
-            } else {
-                tracing::warn!(
-                    checkpoint_id = self.pending_barrier.checkpoint_id,
-                    "barrier checkpoint failed, will retry on next interval"
-                );
+            match callback.checkpoint_with_barrier(checkpoints).await {
+                BarrierOutcome::Committed(epoch) => {
+                    self.broadcast_epoch_committed(epoch, &fan_out);
+                    // Wire barrier = durable epoch.
+                    callback.publish_barrier(epoch, checkpoint_id);
+                }
+                BarrierOutcome::Skipped(reason) => {
+                    tracing::debug!(checkpoint_id, reason, "barrier checkpoint skipped");
+                }
+                BarrierOutcome::Failed => {
+                    tracing::warn!(
+                        checkpoint_id,
+                        "barrier checkpoint failed, will retry on next interval"
+                    );
+                }
             }
             self.pending_barrier.active = false;
             self.last_checkpoint = Instant::now();
@@ -1013,8 +1019,8 @@ mod tests {
         async fn checkpoint_with_barrier(
             &mut self,
             _source_checkpoints: FxHashMap<String, SourceCheckpoint>,
-        ) -> Option<u64> {
-            Some(1)
+        ) -> BarrierOutcome {
+            BarrierOutcome::Committed(1)
         }
 
         fn record_cycle(&self, _events: u64, _batches: u64, _elapsed_ns: u64) {}
@@ -1407,7 +1413,7 @@ mod tests {
         async fn checkpoint_with_barrier(
             &mut self,
             cp: FxHashMap<String, SourceCheckpoint>,
-        ) -> Option<u64> {
+        ) -> BarrierOutcome {
             self.inner.checkpoint_with_barrier(cp).await
         }
         fn record_cycle(&self, e: u64, b: u64, ns: u64) {

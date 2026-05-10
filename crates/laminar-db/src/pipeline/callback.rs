@@ -12,6 +12,22 @@ use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::SourceConnector;
 use rustc_hash::FxHashMap;
 
+/// Outcome of a barrier-aligned checkpoint attempt.
+///
+/// `Skipped` distinguishes "deliberately did not try" (e.g. no execution
+/// cycles since the last checkpoint) from `Failed` ("tried and could not
+/// commit"). The coordinator demotes `Skipped` to `debug!` so an idle
+/// pipeline doesn't flood the log with warnings.
+#[derive(Debug)]
+pub enum BarrierOutcome {
+    /// Checkpoint committed at the given epoch.
+    Committed(u64),
+    /// Checkpoint was deliberately skipped; `reason` is logged at debug.
+    Skipped(&'static str),
+    /// Checkpoint attempt failed and should be retried on the next interval.
+    Failed,
+}
+
 /// A registered source with its name and config.
 pub struct SourceRegistration {
     /// Source name.
@@ -75,7 +91,7 @@ pub trait PipelineCallback: Send + 'static {
     async fn checkpoint_with_barrier(
         &mut self,
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
-    ) -> Option<u64>;
+    ) -> BarrierOutcome;
 
     /// Record cycle metrics.
     fn record_cycle(&self, events_ingested: u64, batches: u64, elapsed_ns: u64);
