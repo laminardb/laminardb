@@ -42,14 +42,15 @@ async fn resolve_stream_output_schemas(
                     continue;
                 };
 
-                let mut fields = if reg.window_config.is_some() {
-                    laminar_sql::translator::WindowOperatorConfig::output_prefix_fields()
-                } else {
-                    Vec::new()
-                };
-                for f in plan.schema().fields() {
-                    fields.push((**f).clone());
-                }
+                // Schema = `plan.schema()` verbatim. Don't prepend
+                // window_start/window_end here — sinks would see a
+                // schema wider than the runtime batches.
+                let fields: Vec<_> = plan
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| (**f).clone())
+                    .collect();
                 let schema = Arc::new(Schema::new(fields));
 
                 if !ctx.table_exist(&reg.name).unwrap_or(false) {
@@ -1614,7 +1615,11 @@ mod resolver_tests {
     }
 
     #[tokio::test]
-    async fn windowed_stream_gets_window_start_end_prefix() {
+    async fn windowed_stream_schema_matches_user_select() {
+        // The resolver no longer prepends `window_start` / `window_end`
+        // onto windowed-stream schemas. Schema-claim equals exactly what
+        // DataFusion plans for the user's SELECT — matching what EOWC
+        // emits and what downstream sinks see in `write_batch`.
         let ctx = ctx_with_payments();
         let mut regs = std::collections::HashMap::new();
         regs.insert(
@@ -1633,9 +1638,54 @@ mod resolver_tests {
             .iter()
             .map(|f| f.name().as_str())
             .collect();
-        assert_eq!(&names[..2], &["window_start", "window_end"]);
-        assert_eq!(out["agg"].field(0).data_type(), &DataType::Int64);
-        assert!(names.contains(&"region") && names.contains(&"n"));
+        assert_eq!(names, vec!["region", "n"]);
+    }
+
+    /// Users that want `window_start` / `window_end` opt in by projecting
+    /// the `tumble(...)` / `tumble_end(...)` UDFs explicitly. The resolver
+    /// surfaces them as ordinary projection columns with the user-chosen
+    /// aliases.
+    #[tokio::test]
+    async fn windowed_stream_with_explicit_window_columns() {
+        let ctx = ctx_with_payments();
+        ctx.register_udf(datafusion_expr::ScalarUDF::from(
+            laminar_sql::datafusion::TumbleWindowEnd::new(),
+        ));
+        let mut regs = std::collections::HashMap::new();
+        regs.insert(
+            "agg".to_string(),
+            reg(
+                "agg",
+                "SELECT \
+                    tumble(event_time, INTERVAL '1' MINUTE)     AS window_start, \
+                    tumble_end(event_time, INTERVAL '1' MINUTE) AS window_end, \
+                    region, \
+                    COUNT(*) AS n \
+                 FROM payments \
+                 GROUP BY \
+                    tumble(event_time, INTERVAL '1' MINUTE), \
+                    tumble_end(event_time, INTERVAL '1' MINUTE), \
+                    region",
+                true,
+            ),
+        );
+
+        let out = resolve_stream_output_schemas(&ctx, &regs).await.unwrap();
+        let names: Vec<&str> = out["agg"]
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, vec!["window_start", "window_end", "region", "n"]);
+        // tumble / tumble_end UDFs return Timestamp(Millisecond), not Int64.
+        assert_eq!(
+            out["agg"].field(0).data_type(),
+            &DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None)
+        );
+        assert_eq!(
+            out["agg"].field(1).data_type(),
+            &DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None)
+        );
     }
 
     #[tokio::test]

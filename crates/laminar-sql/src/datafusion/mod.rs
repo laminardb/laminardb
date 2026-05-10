@@ -81,7 +81,10 @@ pub use proctime_udf::ProcTimeUdf;
 pub use source::{SortColumn, StreamSource, StreamSourceRef};
 pub use table_provider::StreamingTableProvider;
 pub use watermark_udf::WatermarkUdf;
-pub use window_udf::{CumulateWindowStart, HopWindowStart, SessionWindowStart, TumbleWindowStart};
+pub use window_udf::{
+    CumulateWindowEnd, CumulateWindowStart, HopWindowEnd, HopWindowStart, SessionWindowStart,
+    TumbleWindowEnd, TumbleWindowStart,
+};
 
 use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
@@ -194,9 +197,12 @@ pub fn create_streaming_context_with_validator(mode: StreamingValidatorMode) -> 
 /// live watermark source from Ring 0.
 pub fn register_streaming_functions(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::new_from_impl(TumbleWindowStart::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(TumbleWindowEnd::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(HopWindowStart::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(HopWindowEnd::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(SessionWindowStart::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(CumulateWindowStart::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(CumulateWindowEnd::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(WatermarkUdf::unset()));
     ctx.register_udf(ScalarUDF::new_from_impl(ProcTimeUdf::new()));
     register_json_functions(ctx);
@@ -220,9 +226,12 @@ pub fn register_streaming_functions_with_watermark(
     watermark_ms: Arc<AtomicI64>,
 ) {
     ctx.register_udf(ScalarUDF::new_from_impl(TumbleWindowStart::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(TumbleWindowEnd::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(HopWindowStart::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(HopWindowEnd::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(SessionWindowStart::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(CumulateWindowStart::new()));
+    ctx.register_udf(ScalarUDF::new_from_impl(CumulateWindowEnd::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(WatermarkUdf::new(watermark_ms)));
     ctx.register_udf(ScalarUDF::new_from_impl(ProcTimeUdf::new()));
     register_json_functions(ctx);

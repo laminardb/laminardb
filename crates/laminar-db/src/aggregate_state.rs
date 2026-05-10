@@ -51,9 +51,12 @@ pub(crate) use keys::{
 };
 pub(crate) use scalar_ipc::{ipc_to_scalars, scalars_to_ipc};
 
+/// Builds the per-window result batch for one closed window. The
+/// returned batch's schema is `[group_cols..., agg_outputs...]` — no
+/// implicit `window_start` / `window_end` columns. Callers that want
+/// those values in the output should project the matching window UDFs
+/// (`tumble(...)`, `tumble_end(...)`, etc.) in the upstream MV SQL.
 pub(crate) fn emit_window_batch(
-    window_start: i64,
-    window_end: i64,
     groups: ahash::AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>,
     row_converter: &arrow::row::RowConverter,
     num_group_cols: usize,
@@ -81,13 +84,6 @@ pub(crate) fn emit_window_batch(
         }
     }
 
-    let win_start_array: ArrayRef = Arc::new(arrow::array::Int64Array::from_iter_values(
-        std::iter::repeat_n(window_start, num_rows),
-    ));
-    let win_end_array: ArrayRef = Arc::new(arrow::array::Int64Array::from_iter_values(
-        std::iter::repeat_n(window_end, num_rows),
-    ));
-
     let group_arrays = if num_group_cols == 0 {
         Vec::new()
     } else {
@@ -109,7 +105,7 @@ pub(crate) fn emit_window_batch(
         }
     }
 
-    let mut all_arrays = vec![win_start_array, win_end_array];
+    let mut all_arrays = Vec::with_capacity(group_arrays.len() + agg_arrays.len());
     all_arrays.extend(group_arrays);
     all_arrays.extend(agg_arrays);
 

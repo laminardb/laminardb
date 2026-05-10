@@ -458,8 +458,11 @@ impl IncrementalEowcState {
             None
         };
 
-        let mut output_fields =
-            laminar_sql::translator::WindowOperatorConfig::output_prefix_fields();
+        // Output = group cols (in GROUP BY order) followed by agg outputs
+        // in the order they appear in SELECT. Window-time columns are
+        // surfaced explicitly by the user via `tumble(...)` / `tumble_end(...)`
+        // and arrive here as ordinary group columns.
+        let mut output_fields = Vec::with_capacity(group_col_names.len() + agg_specs.len());
         for (name, dt) in group_col_names.iter().zip(group_types.iter()) {
             output_fields.push(Field::new(name, dt.clone(), true));
         }
@@ -702,9 +705,7 @@ impl IncrementalEowcState {
                 continue;
             }
 
-            let window_end = window_start.saturating_add(size_ms);
-            let batch = self.emit_window(window_start, window_end, groups)?;
-            if let Some(b) = batch {
+            if let Some(b) = self.emit_window(groups)? {
                 result_batches.push(b);
             }
         }
@@ -714,13 +715,9 @@ impl IncrementalEowcState {
 
     fn emit_window(
         &self,
-        window_start: i64,
-        window_end: i64,
         groups: AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>,
     ) -> Result<Option<RecordBatch>, DbError> {
         crate::aggregate_state::emit_window_batch(
-            window_start,
-            window_end,
             groups,
             &self.row_converter,
             self.num_group_cols,
@@ -1087,9 +1084,10 @@ mod tests {
             filter_col_index: None,
         }];
 
+        // Output = group cols + agg outputs (no implicit window_start/end —
+        // see commit history; users now project `tumble(ts, …)` /
+        // `tumble_end(ts, …)` explicitly when they want those values).
         let output_schema = Arc::new(Schema::new(vec![
-            Field::new("window_start", DataType::Int64, false),
-            Field::new("window_end", DataType::Int64, false),
             Field::new("symbol", DataType::Utf8, true),
             Field::new("total", DataType::Int64, true),
         ]));
@@ -1130,32 +1128,19 @@ mod tests {
 
         assert_eq!(state.open_window_count(), 1);
 
-        // Close window at watermark 1000
+        // Close window at watermark 1000 — only window [0, 1000) qualifies.
         let batches = state.close_windows(1000).unwrap();
         assert_eq!(batches.len(), 1);
 
         let result = &batches[0];
         assert_eq!(result.num_rows(), 1);
+        assert_eq!(result.schema().fields().len(), 2);
+        assert_eq!(result.schema().field(0).name(), "symbol");
+        assert_eq!(result.schema().field(1).name(), "total");
 
-        // Check window_start = 0
-        let ws = result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(ws.value(0), 0);
-
-        // Check window_end = 1000
-        let we = result
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(we.value(0), 1000);
-
-        // Check SUM = 10 + 20 + 30 = 60
+        // SUM = 10 + 20 + 30 = 60
         let total = result
-            .column(3)
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
@@ -1191,16 +1176,18 @@ mod tests {
 
         assert_eq!(state.open_window_count(), 2);
 
-        // Close only the first window (watermark at 1000)
+        // Close only the first window (watermark at 1000) — first event
+        // contributes 10 to the sum; the second event lives in [1000, 2000)
+        // and is not yet emitted.
         let batches = state.close_windows(1000).unwrap();
         assert_eq!(batches.len(), 1);
-
-        let ws = batches[0]
-            .column(0)
+        assert_eq!(batches[0].num_rows(), 1);
+        let total = batches[0]
+            .column(1) // [symbol, total]
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(ws.value(0), 0);
+        assert_eq!(total.value(0), 10);
 
         // Second window still open
         assert_eq!(state.open_window_count(), 1);
@@ -1240,6 +1227,9 @@ mod tests {
 
     #[test]
     fn test_window_close_emits_correct_schema() {
+        // EOWC output is now `[group_cols..., agg_outputs...]`. Window
+        // boundaries are no longer prepended; users surface them via
+        // `tumble(...)` / `tumble_end(...)` UDFs in the upstream SELECT.
         let mut state = make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
 
         let batch = make_pre_agg_batch(vec!["AAPL"], vec![42], vec![100]);
@@ -1249,11 +1239,9 @@ mod tests {
         let result = &batches[0];
         let schema = result.schema();
 
-        assert_eq!(schema.field(0).name(), "window_start");
-        assert_eq!(schema.field(1).name(), "window_end");
-        assert_eq!(schema.field(2).name(), "symbol");
-        assert_eq!(schema.field(3).name(), "total");
-        assert_eq!(schema.fields().len(), 4);
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "symbol");
+        assert_eq!(schema.field(1).name(), "total");
     }
 
     #[test]
@@ -1280,14 +1268,15 @@ mod tests {
         assert!(restored > 0, "Should have restored groups");
         assert_eq!(state2.open_window_count(), 2);
 
-        // Close first window and verify SUM
+        // Close first window and verify SUM. Schema is [symbol, total];
+        // the agg col sits at index 1 now that window_start/end are gone.
         let batches = state2.close_windows(1000).unwrap();
         assert_eq!(batches.len(), 1);
         let result = &batches[0];
         assert_eq!(result.num_rows(), 1); // Only AAPL in window [0,1000)
 
         let total = result
-            .column(3)
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
@@ -1297,7 +1286,7 @@ mod tests {
         let batches = state2.close_windows(2000).unwrap();
         assert_eq!(batches.len(), 1);
         let total2 = batches[0]
-            .column(3)
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
