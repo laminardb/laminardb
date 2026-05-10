@@ -10,6 +10,7 @@ Unified database facade for LaminarDB. The main entry point that wires the SQL p
 - **`QueryHandle`** -- Handle to a running streaming query with schema and subscription access.
 - **`SourceHandle<T>`** / **`UntypedSourceHandle`** -- Typed and untyped handles for pushing data into sources.
 - **`TypedSubscription<T>`** -- Subscription to a named stream with automatic RecordBatch-to-struct conversion.
+- **`SubscriptionRegistry`** / **`SubscriptionPortal`** -- Broadcast fan-out and per-consumer pump used by the Postgres-wire `SUBSCRIBE` listener and any in-process consumer that wants a back-pressured tail of a stream. Supports `AS OF EPOCH n` resume when the stream was created `WITH ('retain_history' = '…')`.
 - **`CheckpointCoordinator`** -- Orchestrates two-phase commit checkpoints across all operators and sinks.
 - **`RecoveryManager`** -- Restores operator state, connector offsets, and watermarks from the latest checkpoint.
 - **`Profile`** -- Deployment profile (`BareMetal`, `Embedded`, `Durable`, `Delta`).
@@ -40,6 +41,15 @@ let source = db.source_untyped("trades")?;
 
 // Start the pipeline
 db.start().await?;
+
+// In-process tail of a stream (the same machinery the pgwire SUBSCRIBE
+// listener uses). Frames carry RecordBatches plus an epoch marker so the
+// consumer can resume after a disconnect.
+use laminar_db::subscription::SubscribeStart;
+let mut portal = db
+    .open_subscription("avg_price", None, SubscribeStart::Tail)
+    .await?;
+while let Some(frame) = portal.next_frame().await { /* … */ }
 
 // Shutdown
 db.shutdown().await?;

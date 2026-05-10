@@ -6,7 +6,7 @@ Streaming SQL extensions on top of sqlparser-rs: tumbling/session windows, water
 
 | Module | Purpose |
 |--------|---------|
-| `parser` | Streaming SQL parser: windows, emit, late data, joins, aggregation, analytics, ranking, DDL (CREATE SOURCE/STREAM/SINK/LOOKUP TABLE) |
+| `parser` | Streaming SQL parser: windows, emit, late data, joins, aggregation, analytics, ranking, DDL (CREATE SOURCE/STREAM/SINK/LOOKUP TABLE), `SUBSCRIBE`, `DECLARE … CURSOR FOR SUBSCRIBE`, `FETCH`, `CLOSE` |
 | `planner` | `StreamingPlanner` converts parsed SQL into `StreamingPlan` / `QueryPlan` |
 | `translator` | Operator config builders: window, join, analytic, order, having, DDL, ASOF join, temporal probe join |
 | `datafusion` | DataFusion integration: custom UDFs (tumble, hop, session, slide, first_value, last_value), aggregate bridge, `execute_streaming_sql`, PROCTIME() UDF, JSON functions, complex type functions |
@@ -58,6 +58,23 @@ CREATE SOURCE ... FROM POSTGRES_CDC (hostname = '...', database = '...')
 CREATE SOURCE ... FROM MYSQL_CDC (hostname = '...', database = '...')
 CREATE SINK ... INTO KAFKA (brokers = '...', topic = '...')
 CREATE SINK ... INTO DELTA_LAKE (path = '...')
+
+-- Retain a bounded ring of recent epochs so SUBSCRIBE clients can
+-- reconnect without gaps.
+CREATE STREAM trades AS SELECT * FROM events
+  WITH ('retain_history' = '64mb')
+
+-- Streaming subscriptions (consumed by the pgwire listener or the
+-- in-process SubscriptionPortal API in laminar-db).
+SUBSCRIBE my_stream
+SUBSCRIBE my_stream WHERE symbol = 'AAPL'
+SUBSCRIBE my_stream AS OF EPOCH 42
+
+-- Forward-only cursor over a SUBSCRIBE for libpq clients that prefer
+-- FETCH-driven flow control (e.g. psql with \set FETCH_COUNT 100).
+DECLARE c CURSOR FOR SUBSCRIBE my_stream
+FETCH FORWARD 100 FROM c
+CLOSE c
 ```
 
 ## Custom UDFs Registered with DataFusion
