@@ -67,6 +67,15 @@ pub(crate) struct WindowCheckpoint {
 pub(crate) struct EowcStateCheckpoint {
     pub fingerprint: u64,
     pub windows: Vec<WindowCheckpoint>,
+    /// Highest watermark at checkpoint time, so recovery doesn't re-admit
+    /// late events the previous run already dropped. `i64::MIN` for
+    /// checkpoints written before this field existed.
+    #[serde(default = "default_high_watermark")]
+    pub high_watermark_ms: i64,
+}
+
+fn default_high_watermark() -> i64 {
+    i64::MIN
 }
 
 #[derive(

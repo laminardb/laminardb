@@ -127,6 +127,8 @@ pub(crate) struct IncrementalEowcState {
     /// arriving within this window are included instead of dropped.
     /// Must match `CoreWindowState::allowed_lateness_ms` behavior.
     allowed_lateness_ms: i64,
+    /// See [`CoreWindowState::high_watermark_ms`].
+    high_watermark_ms: i64,
 }
 
 impl IncrementalEowcState {
@@ -517,7 +519,32 @@ impl IncrementalEowcState {
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: i64::try_from(window_config.allowed_lateness.as_millis())
                 .unwrap_or(0),
+            high_watermark_ms: i64::MIN,
         }))
+    }
+
+    /// Mirror of [`CoreWindowState::is_event_late_beyond_recovery`].
+    #[inline]
+    fn is_event_late_beyond_recovery(&self, ts_ms: i64) -> bool {
+        if self.high_watermark_ms == i64::MIN {
+            return false;
+        }
+        let max_end_ms = match &self.window_type {
+            EowcWindowType::Tumbling { size_ms } => {
+                if *size_ms <= 0 {
+                    return false;
+                }
+                ts_ms - ts_ms.rem_euclid(*size_ms) + size_ms
+            }
+            EowcWindowType::Hopping { size_ms, slide_ms } => {
+                if *slide_ms <= 0 || *size_ms <= 0 {
+                    return false;
+                }
+                ts_ms - ts_ms.rem_euclid(*slide_ms) + size_ms
+            }
+            EowcWindowType::Session { .. } => return false,
+        };
+        max_end_ms.saturating_add(self.allowed_lateness_ms) <= self.high_watermark_ms
     }
 
     /// Vectorized batch update: extracts timestamps and group keys at the
@@ -554,6 +581,9 @@ impl IncrementalEowcState {
             for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
                 if ts_ms == NULL_TIMESTAMP {
                     continue; // skip rows with null timestamps
+                }
+                if self.is_event_late_beyond_recovery(ts_ms) {
+                    continue;
                 }
                 #[allow(clippy::cast_possible_truncation)]
                 let idx = row_idx as u32;
@@ -604,6 +634,9 @@ impl IncrementalEowcState {
 
         for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
             if ts_ms == NULL_TIMESTAMP {
+                continue;
+            }
+            if self.is_event_late_beyond_recovery(ts_ms) {
                 continue;
             }
             let (gid, _) = group_keys.insert_full(rows_ref.row(row_idx).owned());
@@ -670,6 +703,7 @@ impl IncrementalEowcState {
     /// where `window_start + window_size <= watermark_ms`. Closed windows
     /// are removed from state.
     pub fn close_windows(&mut self, watermark_ms: i64) -> Result<Vec<RecordBatch>, DbError> {
+        self.high_watermark_ms = self.high_watermark_ms.max(watermark_ms);
         let size_ms = self.window_type.size_ms();
         if size_ms <= 0 {
             return Ok(Vec::new());
@@ -800,6 +834,7 @@ impl IncrementalEowcState {
         Ok(EowcStateCheckpoint {
             fingerprint,
             windows,
+            high_watermark_ms: self.high_watermark_ms,
         })
     }
 
@@ -818,6 +853,7 @@ impl IncrementalEowcState {
             )));
         }
         self.windows.clear();
+        self.high_watermark_ms = checkpoint.high_watermark_ms;
         let mut total_groups = 0usize;
         for wc in &checkpoint.windows {
             let mut groups = AHashMap::new();
@@ -1104,6 +1140,7 @@ mod tests {
             having_sql: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
+            high_watermark_ms: i64::MIN,
         }
     }
 
@@ -1189,6 +1226,35 @@ mod tests {
         let batches = state.close_windows(2000).unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(state.open_window_count(), 0);
+    }
+
+    #[test]
+    fn test_late_events_for_closed_windows_are_dropped() {
+        let mut state = make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+
+        let batch1 = make_pre_agg_batch(
+            vec!["AAPL", "AAPL", "AAPL"],
+            vec![10, 20, 30],
+            vec![100, 200, 500],
+        );
+        state.update_batch(&batch1).unwrap();
+
+        let first = state.close_windows(1000).unwrap();
+        assert_eq!(first.len(), 1);
+        let total = first[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(total.value(0), 60);
+        assert_eq!(state.open_window_count(), 0);
+
+        let late = make_pre_agg_batch(vec!["AAPL"], vec![999], vec![300]);
+        state.update_batch(&late).unwrap();
+        assert_eq!(state.open_window_count(), 0);
+
+        let second = state.close_windows(2000).unwrap();
+        assert!(second.is_empty());
     }
 
     #[test]

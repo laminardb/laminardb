@@ -902,11 +902,13 @@ impl LaminarDB {
     /// then executes the backing query through `DataFusion` to obtain the
     /// output schema.
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn handle_create_materialized_view(
         &self,
         sql: &str,
         name: &sqlparser::ast::ObjectName,
         query: &StreamingStatement,
+        emit_clause: Option<laminar_sql::parser::EmitClause>,
         or_replace: bool,
         if_not_exists: bool,
         query_sql: &str,
@@ -979,15 +981,16 @@ impl LaminarDB {
                 .map_err(|e| DbError::MaterializedView(e.to_string()))?;
         }
 
-        // Plan the MV's backing query to extract emit_clause, window_config,
-        // order_config, and the multi-step join_config.
+        // Reuse the planner by wrapping as a CreateStream. The MV's EMIT
+        // clause must be passed through — OperatorGraph routes
+        // EMIT ON WINDOW CLOSE to EowcQueryOperator (close-only emit),
+        // anything else to SqlQueryOperator (per-cycle emit).
         let (plan_emit, plan_window, plan_order, plan_joins) = {
             let mut planner = self.planner.lock();
-            // Wrap the inner query as a CreateStream to reuse the planner
             let stmt = StreamingStatement::CreateStream {
                 name: name.clone(),
                 query: Box::new(query.clone()),
-                emit_clause: None,
+                emit_clause,
                 or_replace: false,
                 if_not_exists: false,
                 query_sql: query_sql.clone(),

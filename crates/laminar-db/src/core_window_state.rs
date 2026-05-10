@@ -86,6 +86,14 @@ pub(crate) struct CoreWindowCheckpoint {
     /// Discriminant so restore can pick the right branch.
     #[serde(default = "default_window_type_tag")]
     pub window_type: String,
+    /// Highest watermark observed at checkpoint time, so recovery
+    /// doesn't re-admit late events the previous run already dropped.
+    #[serde(default = "default_high_watermark")]
+    pub high_watermark_ms: i64,
+}
+
+fn default_high_watermark() -> i64 {
+    i64::MIN
 }
 
 fn default_window_type_tag() -> String {
@@ -121,6 +129,10 @@ pub(crate) struct CoreWindowState {
     /// Grace period (ms) after window end before closing. Late events
     /// arriving within this window are included instead of dropped.
     allowed_lateness_ms: i64,
+    /// Highest watermark seen via `close_windows`; `i64::MIN` before the
+    /// first close. Used by `update_batch` to drop events whose window
+    /// has already closed instead of re-creating the bucket.
+    high_watermark_ms: i64,
     post_projection: Option<PostProjection>,
     /// Reusable scratch map for no-group window assignment (avoids per-batch allocation).
     scratch_nogroup: AHashMap<i64, Vec<u32>>,
@@ -629,6 +641,7 @@ impl CoreWindowState {
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: i64::try_from(window_config.allowed_lateness.as_millis())
                 .unwrap_or(0),
+            high_watermark_ms: i64::MIN,
             post_projection,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
@@ -685,6 +698,9 @@ impl CoreWindowState {
                 if ts_ms == NULL_TIMESTAMP {
                     continue; // skip rows with null timestamps
                 }
+                if self.is_event_late_beyond_recovery(ts_ms) {
+                    continue;
+                }
                 #[allow(clippy::cast_possible_truncation)]
                 let idx = row_idx as u32;
                 match &self.assigner {
@@ -739,6 +755,9 @@ impl CoreWindowState {
 
         for (row_idx, &ts_ms) in ts_array.iter().enumerate() {
             if ts_ms == NULL_TIMESTAMP {
+                continue;
+            }
+            if self.is_event_late_beyond_recovery(ts_ms) {
                 continue;
             }
             let (gid, _) = group_keys.insert_full(rows_ref.row(row_idx).owned());
@@ -1050,8 +1069,31 @@ impl CoreWindowState {
         Ok(())
     }
 
+    /// True when the watermark has passed every window `ts_ms` could
+    /// belong to (plus the grace period). Sessions are excluded because
+    /// their end is data-dependent — merging is handled at close time.
+    #[inline]
+    fn is_event_late_beyond_recovery(&self, ts_ms: i64) -> bool {
+        if self.high_watermark_ms == i64::MIN {
+            return false;
+        }
+        let max_end_ms = match &self.assigner {
+            CoreWindowAssigner::Tumbling(a) => {
+                let size = a.size_ms();
+                ts_ms - ts_ms.rem_euclid(size) + size
+            }
+            CoreWindowAssigner::Hopping(a) => {
+                let slide = a.slide_ms();
+                ts_ms - ts_ms.rem_euclid(slide) + a.size_ms()
+            }
+            CoreWindowAssigner::Session { .. } => return false,
+        };
+        max_end_ms.saturating_add(self.allowed_lateness_ms) <= self.high_watermark_ms
+    }
+
     /// Close windows whose end <= watermark, returning emitted batches.
     pub fn close_windows(&mut self, watermark_ms: i64) -> Result<Vec<RecordBatch>, DbError> {
+        self.high_watermark_ms = self.high_watermark_ms.max(watermark_ms);
         let batches = match &self.assigner {
             CoreWindowAssigner::Tumbling(a) => self.close_fixed_windows(watermark_ms, a.size_ms()),
             CoreWindowAssigner::Hopping(a) => self.close_fixed_windows(watermark_ms, a.size_ms()),
@@ -1398,6 +1440,7 @@ impl CoreWindowState {
                     windows,
                     session_state: Vec::new(),
                     window_type,
+                    high_watermark_ms: self.high_watermark_ms,
                 })
             }
             CoreWindowAssigner::Session { .. } => {
@@ -1434,6 +1477,7 @@ impl CoreWindowState {
                     windows: Vec::new(),
                     session_state,
                     window_type,
+                    high_watermark_ms: self.high_watermark_ms,
                 })
             }
         }
@@ -1452,6 +1496,7 @@ impl CoreWindowState {
             )));
         }
 
+        self.high_watermark_ms = checkpoint.high_watermark_ms;
         if checkpoint.window_type == "session" {
             self.restore_session_windows(checkpoint)
         } else {
@@ -1631,6 +1676,7 @@ mod tests {
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
+            high_watermark_ms: i64::MIN,
             post_projection: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
@@ -1693,6 +1739,7 @@ mod tests {
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
+            high_watermark_ms: i64::MIN,
             post_projection: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
@@ -1743,6 +1790,7 @@ mod tests {
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
+            high_watermark_ms: i64::MIN,
             post_projection: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
@@ -1791,6 +1839,7 @@ mod tests {
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
+            high_watermark_ms: i64::MIN,
             post_projection: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
@@ -2000,6 +2049,36 @@ mod tests {
         // Watermark at 2500 → nothing to close (window [2000,3000) still open).
         let batches = state.close_windows(2500).unwrap();
         assert!(batches.is_empty());
+    }
+
+    /// Late events for an already-closed window must not re-create the
+    /// bucket — otherwise the next close re-emits the same row.
+    #[test]
+    fn test_late_events_for_closed_windows_are_dropped() {
+        let mut state = make_core_window_state(1000);
+
+        let batch1 = make_pre_agg_batch(vec!["A", "A", "A"], vec![10, 20, 30], vec![100, 200, 500]);
+        state.update_batch(&batch1).unwrap();
+
+        let first = state.close_windows(1000).unwrap();
+        assert_eq!(first.len(), 1);
+        let total = first[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(total.value(0), 60);
+
+        // Late event for the closed window [0, 1000); watermark already past 1000.
+        let late = make_pre_agg_batch(vec!["A"], vec![999], vec![300]);
+        state.update_batch(&late).unwrap();
+
+        let second = state.close_windows(2000).unwrap();
+        assert!(
+            second.is_empty(),
+            "late events for already-closed windows must not re-emit; got {} batches",
+            second.len()
+        );
     }
 
     #[test]
