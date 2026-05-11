@@ -978,6 +978,44 @@ async fn test_create_materialized_view() {
     }
 }
 
+/// An MV's `EMIT ON WINDOW CLOSE` must reach `StreamRegistration` so
+/// `OperatorGraph` routes it through `EowcQueryOperator` rather than the
+/// per-cycle `SqlQueryOperator`.
+#[tokio::test]
+async fn test_mv_emit_on_window_close_threads_through_to_registration() {
+    let db = LaminarDB::open().unwrap();
+    db.execute(
+        "CREATE SOURCE ticks (sym VARCHAR, price DOUBLE, ts TIMESTAMP, \
+         WATERMARK FOR ts AS ts - INTERVAL '1' SECOND)",
+    )
+    .await
+    .unwrap();
+
+    db.execute(
+        "CREATE MATERIALIZED VIEW per_minute \
+         AS SELECT sym, AVG(price) AS avg_px \
+            FROM ticks \
+            GROUP BY sym, tumble(ts, INTERVAL '1' MINUTE) \
+            EMIT ON WINDOW CLOSE",
+    )
+    .await
+    .expect("MV creation should succeed");
+
+    let mgr = db.connector_manager.lock();
+    let reg = mgr
+        .streams()
+        .get("per_minute")
+        .expect("MV should be registered as a stream");
+    assert!(
+        matches!(
+            reg.emit_clause,
+            Some(laminar_sql::parser::EmitClause::OnWindowClose)
+        ),
+        "EMIT ON WINDOW CLOSE was dropped on the way to StreamRegistration: {:?}",
+        reg.emit_clause
+    );
+}
+
 #[tokio::test]
 async fn test_mv_registry_base_tables() {
     let db = LaminarDB::open().unwrap();

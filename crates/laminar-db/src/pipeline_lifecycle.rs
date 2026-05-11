@@ -12,9 +12,8 @@ use crate::db::{DbState, LaminarDB, SourceWatermarkState};
 use crate::error::DbError;
 
 /// Resolves each `CREATE STREAM`'s output Arrow schema by planning its SQL.
-/// Windowed streams get the `window_start, window_end` prefix. Temporary
-/// `EmptyTable` placeholders let downstream streams plan against upstream
-/// streams; they are removed before returning.
+/// Temporary `EmptyTable` placeholders let downstream streams plan against
+/// upstream streams; they are removed before returning.
 async fn resolve_stream_output_schemas(
     ctx: &datafusion::prelude::SessionContext,
     stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
@@ -39,14 +38,12 @@ async fn resolve_stream_output_schemas(
                     continue;
                 };
 
-                let mut fields = if reg.window_config.is_some() {
-                    laminar_sql::translator::WindowOperatorConfig::output_prefix_fields()
-                } else {
-                    Vec::new()
-                };
-                for f in plan.schema().fields() {
-                    fields.push((**f).clone());
-                }
+                let fields: Vec<_> = plan
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| (**f).clone())
+                    .collect();
                 let schema = Arc::new(Schema::new(fields));
 
                 if !ctx.table_exist(&reg.name).unwrap_or(false) {
@@ -1584,7 +1581,7 @@ mod resolver_tests {
     }
 
     #[tokio::test]
-    async fn windowed_stream_gets_window_start_end_prefix() {
+    async fn windowed_stream_schema_matches_user_select() {
         let ctx = ctx_with_payments();
         let mut regs = std::collections::HashMap::new();
         regs.insert(
@@ -1603,9 +1600,49 @@ mod resolver_tests {
             .iter()
             .map(|f| f.name().as_str())
             .collect();
-        assert_eq!(&names[..2], &["window_start", "window_end"]);
-        assert_eq!(out["agg"].field(0).data_type(), &DataType::Int64);
-        assert!(names.contains(&"region") && names.contains(&"n"));
+        assert_eq!(names, vec!["region", "n"]);
+    }
+
+    #[tokio::test]
+    async fn windowed_stream_with_explicit_window_columns() {
+        let ctx = ctx_with_payments();
+        ctx.register_udf(datafusion_expr::ScalarUDF::from(
+            laminar_sql::datafusion::TumbleWindowEnd::new(),
+        ));
+        let mut regs = std::collections::HashMap::new();
+        regs.insert(
+            "agg".to_string(),
+            reg(
+                "agg",
+                "SELECT \
+                    tumble(event_time, INTERVAL '1' MINUTE)     AS window_start, \
+                    tumble_end(event_time, INTERVAL '1' MINUTE) AS window_end, \
+                    region, \
+                    COUNT(*) AS n \
+                 FROM payments \
+                 GROUP BY \
+                    tumble(event_time, INTERVAL '1' MINUTE), \
+                    tumble_end(event_time, INTERVAL '1' MINUTE), \
+                    region",
+                true,
+            ),
+        );
+
+        let out = resolve_stream_output_schemas(&ctx, &regs).await.unwrap();
+        let names: Vec<&str> = out["agg"]
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, vec!["window_start", "window_end", "region", "n"]);
+        assert_eq!(
+            out["agg"].field(0).data_type(),
+            &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
+        );
+        assert_eq!(
+            out["agg"].field(1).data_type(),
+            &DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
+        );
     }
 
     #[tokio::test]

@@ -67,6 +67,10 @@ pub(crate) struct WindowCheckpoint {
 pub(crate) struct EowcStateCheckpoint {
     pub fingerprint: u64,
     pub windows: Vec<WindowCheckpoint>,
+    /// Highest watermark at checkpoint time. Bumps the rkyv schema —
+    /// pre-feature checkpoints fail to deserialize and the recovery
+    /// path falls back to a fresh start.
+    pub high_watermark_ms: i64,
 }
 
 #[derive(

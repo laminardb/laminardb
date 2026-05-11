@@ -12,6 +12,39 @@ use laminar_connectors::config::ConnectorConfig;
 use laminar_connectors::connector::SourceConnector;
 use rustc_hash::FxHashMap;
 
+/// Why a barrier checkpoint was deliberately skipped, as opposed to
+/// attempted-and-failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// No execution cycles ran since the last checkpoint.
+    NoCyclesSinceLastCheckpoint,
+    /// A sink write timed out; skip to keep the replay window intact.
+    PreservingReplayWindowAfterSinkTimeout,
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SkipReason::NoCyclesSinceLastCheckpoint => "no_cycles_since_last_checkpoint",
+            SkipReason::PreservingReplayWindowAfterSinkTimeout => {
+                "preserving_replay_window_after_sink_timeout"
+            }
+        })
+    }
+}
+
+/// Outcome of a barrier-aligned checkpoint attempt. `Skipped` is logged
+/// at debug; `Failed` keeps the retry warning.
+#[derive(Debug)]
+pub enum BarrierOutcome {
+    /// Checkpoint committed at the given epoch.
+    Committed(u64),
+    /// Deliberately skipped (see `SkipReason`).
+    Skipped(SkipReason),
+    /// Attempted and failed; retry on the next interval.
+    Failed,
+}
+
 /// A registered source with its name and config.
 pub struct SourceRegistration {
     /// Source name.
@@ -75,7 +108,7 @@ pub trait PipelineCallback: Send + 'static {
     async fn checkpoint_with_barrier(
         &mut self,
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
-    ) -> Option<u64>;
+    ) -> BarrierOutcome;
 
     /// Record cycle metrics.
     fn record_cycle(&self, events_ingested: u64, batches: u64, elapsed_ns: u64);

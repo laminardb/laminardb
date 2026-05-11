@@ -39,7 +39,6 @@ enum CoreWindowAssigner {
 struct PostProjection {
     exprs: Vec<Arc<dyn PhysicalExpr>>,
     final_schema: SchemaRef,
-    intermediate_schema: SchemaRef,
 }
 
 struct SessionAccState {
@@ -87,6 +86,9 @@ pub(crate) struct CoreWindowCheckpoint {
     /// Discriminant so restore can pick the right branch.
     #[serde(default = "default_window_type_tag")]
     pub window_type: String,
+    /// Highest watermark at checkpoint time. See
+    /// [`crate::aggregate_state::checkpoints::EowcStateCheckpoint::high_watermark_ms`].
+    pub high_watermark_ms: i64,
 }
 
 fn default_window_type_tag() -> String {
@@ -122,6 +124,9 @@ pub(crate) struct CoreWindowState {
     /// Grace period (ms) after window end before closing. Late events
     /// arriving within this window are included instead of dropped.
     allowed_lateness_ms: i64,
+    /// Highest watermark seen via `close_windows`; `i64::MIN` until
+    /// the first close. Drives [`Self::is_window_closed`].
+    high_watermark_ms: i64,
     post_projection: Option<PostProjection>,
     /// Reusable scratch map for no-group window assignment (avoids per-batch allocation).
     scratch_nogroup: AHashMap<i64, Vec<u32>>,
@@ -538,23 +543,16 @@ impl CoreWindowState {
             None
         };
 
-        let mut intermediate_fields: Vec<Field> = Vec::new();
+        let mut output_fields: Vec<Field> = Vec::new();
         for (name, dt) in group_col_names.iter().zip(group_types.iter()) {
-            intermediate_fields.push(Field::new(name, dt.clone(), true));
+            output_fields.push(Field::new(name, dt.clone(), true));
         }
         for spec in &agg_specs {
-            intermediate_fields.push(Field::new(
+            output_fields.push(Field::new(
                 &spec.output_name,
                 spec.return_type.clone(),
                 true,
             ));
-        }
-        let intermediate_schema = Arc::new(Schema::new(intermediate_fields));
-
-        let mut output_fields =
-            laminar_sql::translator::WindowOperatorConfig::output_prefix_fields();
-        for f in intermediate_schema.fields() {
-            output_fields.push(f.as_ref().clone());
         }
         let output_schema = Arc::new(Schema::new(output_fields));
 
@@ -577,17 +575,11 @@ impl CoreWindowState {
                     })?;
                 compiled.push(phys);
             }
-            let mut final_fields =
-                laminar_sql::translator::WindowOperatorConfig::output_prefix_fields();
-            for f in top_schema.fields() {
-                final_fields.push(f.as_ref().clone());
-            }
-            let final_schema = Arc::new(Schema::new(final_fields));
+            let final_schema = Arc::clone(&top_schema);
 
             Some(PostProjection {
                 exprs: compiled,
                 final_schema,
-                intermediate_schema: Arc::clone(&intermediate_schema),
             })
         } else {
             None
@@ -643,6 +635,7 @@ impl CoreWindowState {
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: i64::try_from(window_config.allowed_lateness.as_millis())
                 .unwrap_or(0),
+            high_watermark_ms: i64::MIN,
             post_projection,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
@@ -703,10 +696,17 @@ impl CoreWindowState {
                 let idx = row_idx as u32;
                 match &self.assigner {
                     CoreWindowAssigner::Tumbling(a) => {
-                        grouped.entry(a.assign(ts_ms).start).or_default().push(idx);
+                        let ws = a.assign(ts_ms).start;
+                        if self.is_window_closed(ws) {
+                            continue;
+                        }
+                        grouped.entry(ws).or_default().push(idx);
                     }
                     CoreWindowAssigner::Hopping(a) => {
                         for wid in a.assign_windows(ts_ms) {
+                            if self.is_window_closed(wid.start) {
+                                continue;
+                            }
                             grouped.entry(wid.start).or_default().push(idx);
                         }
                     }
@@ -760,13 +760,17 @@ impl CoreWindowState {
             let (gid, idx) = (gid as u32, row_idx as u32);
             match &self.assigner {
                 CoreWindowAssigner::Tumbling(a) => {
-                    grouped
-                        .entry((a.assign(ts_ms).start, gid))
-                        .or_default()
-                        .push(idx);
+                    let ws = a.assign(ts_ms).start;
+                    if self.is_window_closed(ws) {
+                        continue;
+                    }
+                    grouped.entry((ws, gid)).or_default().push(idx);
                 }
                 CoreWindowAssigner::Hopping(a) => {
                     for wid in a.assign_windows(ts_ms) {
+                        if self.is_window_closed(wid.start) {
+                            continue;
+                        }
                         grouped.entry((wid.start, gid)).or_default().push(idx);
                     }
                 }
@@ -1064,8 +1068,28 @@ impl CoreWindowState {
         Ok(())
     }
 
+    /// Per-window late-event predicate. Per-window (not per-event) so
+    /// hopping windows whose earlier slices have closed still admit
+    /// the event into their still-open later slices.
+    #[inline]
+    fn is_window_closed(&self, window_start: i64) -> bool {
+        if self.high_watermark_ms == i64::MIN {
+            return false;
+        }
+        let size_ms = match &self.assigner {
+            CoreWindowAssigner::Tumbling(a) => a.size_ms(),
+            CoreWindowAssigner::Hopping(a) => a.size_ms(),
+            CoreWindowAssigner::Session { .. } => return false,
+        };
+        window_start
+            .saturating_add(size_ms)
+            .saturating_add(self.allowed_lateness_ms)
+            <= self.high_watermark_ms
+    }
+
     /// Close windows whose end <= watermark, returning emitted batches.
     pub fn close_windows(&mut self, watermark_ms: i64) -> Result<Vec<RecordBatch>, DbError> {
+        self.high_watermark_ms = self.high_watermark_ms.max(watermark_ms);
         let batches = match &self.assigner {
             CoreWindowAssigner::Tumbling(a) => self.close_fixed_windows(watermark_ms, a.size_ms()),
             CoreWindowAssigner::Hopping(a) => self.close_fixed_windows(watermark_ms, a.size_ms()),
@@ -1113,8 +1137,7 @@ impl CoreWindowState {
             if groups.is_empty() {
                 continue;
             }
-            let window_end = window_start.saturating_add(size_ms);
-            if let Some(b) = self.emit_window(window_start, window_end, groups)? {
+            if let Some(b) = self.emit_window(groups)? {
                 result_batches.push(b);
             }
         }
@@ -1179,7 +1202,10 @@ impl CoreWindowState {
         self.emit_session_rows(rows)
     }
 
-    /// Build a `RecordBatch` from closed session rows (variable start/end).
+    /// Build a `RecordBatch` from closed session rows.
+    /// Output schema: `[group_cols..., agg_outputs...]`.
+    /// Sessions have data-dependent ends, so session boundaries are not
+    /// in the row output; project `MIN(ts)` / `MAX(ts)` upstream instead.
     #[allow(clippy::type_complexity)]
     fn emit_session_rows(
         &self,
@@ -1192,16 +1218,12 @@ impl CoreWindowState {
     ) -> Result<Vec<RecordBatch>, DbError> {
         let num_rows = rows.len();
 
-        let mut starts = Vec::with_capacity(num_rows);
-        let mut ends = Vec::with_capacity(num_rows);
         let mut row_keys: Vec<arrow::row::OwnedRow> = Vec::with_capacity(num_rows);
         let mut agg_scalars: Vec<Vec<ScalarValue>> = (0..self.agg_specs.len())
             .map(|_| Vec::with_capacity(num_rows))
             .collect();
 
-        for (ws, we, key, mut accs) in rows {
-            starts.push(ws);
-            ends.push(we);
+        for (_ws, _we, key, mut accs) in rows {
             row_keys.push(key);
             for (i, acc) in accs.iter_mut().enumerate() {
                 let sv = acc
@@ -1210,9 +1232,6 @@ impl CoreWindowState {
                 agg_scalars[i].push(sv);
             }
         }
-
-        let win_start_array: ArrayRef = Arc::new(arrow::array::Int64Array::from(starts));
-        let win_end_array: ArrayRef = Arc::new(arrow::array::Int64Array::from(ends));
 
         // Convert OwnedRow keys back to columnar arrays via RowConverter
         let group_arrays: Vec<ArrayRef> = if self.num_group_cols > 0 {
@@ -1249,7 +1268,7 @@ impl CoreWindowState {
             }
         }
 
-        let mut all_arrays = vec![win_start_array, win_end_array];
+        let mut all_arrays = Vec::with_capacity(group_arrays.len() + agg_arrays.len());
         all_arrays.extend(group_arrays);
         all_arrays.extend(agg_arrays);
 
@@ -1262,13 +1281,9 @@ impl CoreWindowState {
     /// Emit a single window's accumulated state as a `RecordBatch`.
     fn emit_window(
         &self,
-        window_start: i64,
-        window_end: i64,
         groups: AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>,
     ) -> Result<Option<RecordBatch>, DbError> {
         crate::aggregate_state::emit_window_batch(
-            window_start,
-            window_end,
             groups,
             &self.row_converter,
             self.num_group_cols,
@@ -1278,6 +1293,8 @@ impl CoreWindowState {
     }
 
     /// Apply compiled post-aggregate projection to emitted batches.
+    /// Input schema is `[group_cols..., agg_outputs...]`; output schema
+    /// is `final_schema` (the user's SELECT list).
     fn apply_post_projection(
         &self,
         batches: Vec<RecordBatch>,
@@ -1293,23 +1310,10 @@ impl CoreWindowState {
                 continue;
             }
 
-            let win_start = Arc::clone(batch.column(0));
-            let win_end = Arc::clone(batch.column(1));
-
-            let content_cols: Vec<ArrayRef> = (2..batch.num_columns())
-                .map(|i| Arc::clone(batch.column(i)))
-                .collect();
-            let intermediate =
-                RecordBatch::try_new(Arc::clone(&proj.intermediate_schema), content_cols).map_err(
-                    |e| DbError::Pipeline(format!("post-projection intermediate batch: {e}")),
-                )?;
-
-            let mut projected_cols = Vec::with_capacity(2 + proj.exprs.len());
-            projected_cols.push(win_start);
-            projected_cols.push(win_end);
+            let mut projected_cols = Vec::with_capacity(proj.exprs.len());
             for phys_expr in &proj.exprs {
                 let col_val = phys_expr
-                    .evaluate(&intermediate)
+                    .evaluate(batch)
                     .map_err(|e| DbError::Pipeline(format!("post-projection evaluate: {e}")))?;
                 let array = col_val
                     .into_array(num_rows)
@@ -1432,6 +1436,7 @@ impl CoreWindowState {
                     windows,
                     session_state: Vec::new(),
                     window_type,
+                    high_watermark_ms: self.high_watermark_ms,
                 })
             }
             CoreWindowAssigner::Session { .. } => {
@@ -1468,6 +1473,7 @@ impl CoreWindowState {
                     windows: Vec::new(),
                     session_state,
                     window_type,
+                    high_watermark_ms: self.high_watermark_ms,
                 })
             }
         }
@@ -1486,6 +1492,7 @@ impl CoreWindowState {
             )));
         }
 
+        self.high_watermark_ms = checkpoint.high_watermark_ms;
         if checkpoint.window_type == "session" {
             self.restore_session_windows(checkpoint)
         } else {
@@ -1623,6 +1630,16 @@ mod tests {
         .unwrap()
     }
 
+    fn sum_total(batch: &RecordBatch) -> i64 {
+        batch
+            .column_by_name("total")
+            .expect("output schema has 'total' column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("'total' is Int64")
+            .value(0)
+    }
+
     /// Build a `CoreWindowState` for SUM(Int64) with 1-second tumbling
     /// windows and a single Utf8 group-by column.
     fn make_core_window_state(size_ms: i64) -> CoreWindowState {
@@ -1641,8 +1658,6 @@ mod tests {
         }];
 
         let output_schema = Arc::new(Schema::new(vec![
-            Field::new("window_start", DataType::Int64, false),
-            Field::new("window_end", DataType::Int64, false),
             Field::new("symbol", DataType::Utf8, true),
             Field::new("total", DataType::Int64, true),
         ]));
@@ -1667,6 +1682,7 @@ mod tests {
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
+            high_watermark_ms: i64::MIN,
             post_projection: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
@@ -1704,8 +1720,6 @@ mod tests {
         ];
 
         let output_schema = Arc::new(Schema::new(vec![
-            Field::new("window_start", DataType::Int64, false),
-            Field::new("window_end", DataType::Int64, false),
             Field::new("symbol", DataType::Utf8, true),
             Field::new("total", DataType::Int64, true),
             Field::new("cnt", DataType::Int64, true),
@@ -1731,6 +1745,7 @@ mod tests {
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
+            high_watermark_ms: i64::MIN,
             post_projection: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
@@ -1755,8 +1770,6 @@ mod tests {
         }];
 
         let output_schema = Arc::new(Schema::new(vec![
-            Field::new("window_start", DataType::Int64, false),
-            Field::new("window_end", DataType::Int64, false),
             Field::new("symbol", DataType::Utf8, true),
             Field::new("total", DataType::Int64, true),
         ]));
@@ -1783,6 +1796,7 @@ mod tests {
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
+            high_watermark_ms: i64::MIN,
             post_projection: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
@@ -1807,8 +1821,6 @@ mod tests {
         }];
 
         let output_schema = Arc::new(Schema::new(vec![
-            Field::new("window_start", DataType::Int64, false),
-            Field::new("window_end", DataType::Int64, false),
             Field::new("symbol", DataType::Utf8, true),
             Field::new("total", DataType::Int64, true),
         ]));
@@ -1833,6 +1845,7 @@ mod tests {
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
+            high_watermark_ms: i64::MIN,
             post_projection: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
@@ -1963,32 +1976,17 @@ mod tests {
         let batch2 = make_pre_agg_batch(vec!["AAPL"], vec![30], vec![800]);
         state.update_batch(&batch2).unwrap();
 
-        // Close window at watermark 1000
+        // Close window at watermark 1000.
         let batches = state.close_windows(1000).unwrap();
         assert_eq!(batches.len(), 1);
 
         let result = &batches[0];
         assert_eq!(result.num_rows(), 1);
+        assert_eq!(result.schema().fields().len(), 2);
 
-        // Check window_start = 0
-        let ws = result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(ws.value(0), 0);
-
-        // Check window_end = 1000
-        let we = result
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(we.value(0), 1000);
-
-        // Check SUM = 10 + 20 + 30 = 60
+        // SUM = 10 + 20 + 30 = 60.
         let total = result
-            .column(3)
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
@@ -2030,33 +2028,77 @@ mod tests {
     fn test_core_window_close_windows_watermark() {
         let mut state = make_core_window_state(1000);
 
-        // Events in three windows
+        // Events in three windows: SUMs by window are 1, 2, 3.
         let batch = make_pre_agg_batch(vec!["A", "A", "A"], vec![1, 2, 3], vec![100, 1100, 2100]);
         state.update_batch(&batch).unwrap();
 
-        // Watermark at 1500 → only window [0, 1000) closes
+        // Watermark at 1500 → only window [0, 1000) closes; SUM=1.
         let batches = state.close_windows(1500).unwrap();
         assert_eq!(batches.len(), 1);
-        let ws = batches[0]
-            .column(0)
+        let total = batches[0]
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(ws.value(0), 0);
+        assert_eq!(total.value(0), 1);
 
-        // Watermark at 2000 → window [1000, 2000) closes
+        // Watermark at 2000 → window [1000, 2000) closes; SUM=2.
         let batches = state.close_windows(2000).unwrap();
         assert_eq!(batches.len(), 1);
-        let ws = batches[0]
-            .column(0)
+        let total = batches[0]
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(ws.value(0), 1000);
+        assert_eq!(total.value(0), 2);
 
-        // Watermark at 2500 → nothing to close (window [2000,3000) still open)
+        // Watermark at 2500 → nothing to close (window [2000,3000) still open).
         let batches = state.close_windows(2500).unwrap();
         assert!(batches.is_empty());
+    }
+
+    /// Late-event check must use the assigner's window-start, not naive
+    /// `ts.rem_euclid(size)`, when an offset is configured.
+    #[test]
+    fn test_late_events_with_window_offset_are_dropped() {
+        let mut state = make_core_window_state(1000);
+        state.assigner = CoreWindowAssigner::Tumbling(
+            TumblingWindowAssigner::from_millis(1000).with_offset_ms(200),
+        );
+
+        let batch = make_pre_agg_batch(vec!["A"], vec![10], vec![500]);
+        state.update_batch(&batch).unwrap();
+
+        let first = state.close_windows(1200).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(sum_total(&first[0]), 10);
+
+        // ts=1100 maps to [200, 1200), already closed at watermark 1200.
+        let late = make_pre_agg_batch(vec!["A"], vec![1100], vec![999]);
+        state.update_batch(&late).unwrap();
+
+        let second = state.close_windows(2200).unwrap();
+        assert!(second.is_empty());
+    }
+
+    /// Late events for an already-closed window must not re-create the
+    /// bucket — otherwise the next close re-emits the same row.
+    #[test]
+    fn test_late_events_for_closed_windows_are_dropped() {
+        let mut state = make_core_window_state(1000);
+
+        let batch1 = make_pre_agg_batch(vec!["A", "A", "A"], vec![10, 20, 30], vec![100, 200, 500]);
+        state.update_batch(&batch1).unwrap();
+
+        let first = state.close_windows(1000).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(sum_total(&first[0]), 60);
+
+        let late = make_pre_agg_batch(vec!["A"], vec![999], vec![300]);
+        state.update_batch(&late).unwrap();
+
+        let second = state.close_windows(2000).unwrap();
+        assert!(second.is_empty());
     }
 
     #[test]
@@ -2112,14 +2154,14 @@ mod tests {
         let restored = state2.restore_windows(&cp).unwrap();
         assert!(restored > 0, "Should have restored groups");
 
-        // Close first window and verify SUM
+        // Close first window and verify SUM.
         let batches = state2.close_windows(1000).unwrap();
         assert_eq!(batches.len(), 1);
         let result = &batches[0];
         assert_eq!(result.num_rows(), 1); // Only AAPL in window [0,1000)
 
         let total = result
-            .column(3)
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
@@ -2129,7 +2171,7 @@ mod tests {
         let batches = state2.close_windows(2000).unwrap();
         assert_eq!(batches.len(), 1);
         let total2 = batches[0]
-            .column(3)
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
@@ -2266,24 +2308,28 @@ mod tests {
         let batch = make_pre_agg_batch(vec!["A", "A"], vec![10, 20], vec![1000, 3000]);
         state.update_batch(&batch).unwrap();
 
-        // Close everything up to watermark 6000
-        let batches = state.close_windows(6000).unwrap();
+        //   watermark=2000 → window [-2000, 2000): only ts=1000 → SUM=10
+        //   watermark=4000 → window [0, 4000):     ts=1000+3000 → SUM=30
+        //   watermark=6000 → window [2000, 6000):  only ts=3000 → SUM=20
+        let read_total = |b: &arrow_array::RecordBatch| -> i64 {
+            b.column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
 
-        // Collect all (window_start, sum) pairs
-        let mut results: Vec<(i64, i64)> = Vec::new();
-        for b in &batches {
-            let ws = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-            let totals = b.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
-            for i in 0..b.num_rows() {
-                results.push((ws.value(i), totals.value(i)));
-            }
-        }
-        results.sort_unstable();
+        let b = state.close_windows(2000).unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(read_total(&b[0]), 10);
 
-        // window [-2000, 2000): only ts=1000 → SUM=10
-        // window [0, 4000): ts=1000 + ts=3000 → SUM=30
-        // window [2000, 6000): only ts=3000 → SUM=20
-        assert_eq!(results, vec![(-2000, 10), (0, 30), (2000, 20)]);
+        let b = state.close_windows(4000).unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(read_total(&b[0]), 30);
+
+        let b = state.close_windows(6000).unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(read_total(&b[0]), 20);
     }
 
     #[test]
@@ -2297,27 +2343,39 @@ mod tests {
         );
         state.update_batch(&batch).unwrap();
 
-        let batches = state.close_windows(6000).unwrap();
-
-        let mut results: Vec<(i64, String, i64)> = Vec::new();
-        for b in &batches {
-            let ws = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-            let syms = b.column(2).as_any().downcast_ref::<StringArray>().unwrap();
-            let totals = b.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
-            for i in 0..b.num_rows() {
-                results.push((ws.value(i), syms.value(i).to_string(), totals.value(i)));
-            }
-        }
-        results.sort();
+        let collect_sym_total = |b: &arrow_array::RecordBatch| -> Vec<(String, i64)> {
+            let syms = b.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+            let totals = b.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+            (0..b.num_rows())
+                .map(|i| (syms.value(i).to_string(), totals.value(i)))
+                .collect()
+        };
+        let sorted = |b: &arrow_array::RecordBatch| -> Vec<(String, i64)> {
+            let mut v = collect_sym_total(b);
+            v.sort();
+            v
+        };
 
         // window [-2000, 2000): A=10, B=100
+        let b = state.close_windows(2000).unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(
+            sorted(&b[0]),
+            vec![("A".to_string(), 10), ("B".to_string(), 100)]
+        );
+
         // window [0, 4000): A=10+20=30, B=100
-        // window [2000, 6000): A=20
-        assert!(results.contains(&(-2000, "A".to_string(), 10)));
-        assert!(results.contains(&(-2000, "B".to_string(), 100)));
-        assert!(results.contains(&(0, "A".to_string(), 30)));
-        assert!(results.contains(&(0, "B".to_string(), 100)));
-        assert!(results.contains(&(2000, "A".to_string(), 20)));
+        let b = state.close_windows(4000).unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(
+            sorted(&b[0]),
+            vec![("A".to_string(), 30), ("B".to_string(), 100)]
+        );
+
+        // window [2000, 6000): A=20 (B has no event in [2000,6000))
+        let b = state.close_windows(6000).unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(sorted(&b[0]), vec![("A".to_string(), 20)]);
     }
 
     #[test]
@@ -2327,25 +2385,23 @@ mod tests {
         let batch = make_pre_agg_batch(vec!["A", "A"], vec![10, 20], vec![1000, 3000]);
         state.update_batch(&batch).unwrap();
 
-        // Watermark at 2000 → only window [-2000, 2000) closes
+        let total = |b: &arrow_array::RecordBatch| -> i64 {
+            b.column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+
+        // Watermark at 2000 → window [-2000, 2000): only ts=1000, SUM=10.
         let batches = state.close_windows(2000).unwrap();
         assert_eq!(batches.len(), 1);
-        let ws = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(ws.value(0), -2000);
+        assert_eq!(total(&batches[0]), 10);
 
-        // Watermark at 4000 → window [0, 4000) closes
+        // Watermark at 4000 → window [0, 4000): ts=1000+3000, SUM=30.
         let batches = state.close_windows(4000).unwrap();
         assert_eq!(batches.len(), 1);
-        let ws = batches[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(ws.value(0), 0);
+        assert_eq!(total(&batches[0]), 30);
 
         // Watermark at 5000 → nothing (window [2000,6000) still open)
         let batches = state.close_windows(5000).unwrap();
@@ -2365,29 +2421,15 @@ mod tests {
         );
         state.update_batch(&batch).unwrap();
 
-        // Session: start=1000, end=4000+5000=9000
-        // Watermark at 9000 → session closes
+        // Session: start=1000, end=4000+5000=9000.
+        // Watermark at 9000 → session closes.
         let batches = state.close_windows(9000).unwrap();
         assert_eq!(batches.len(), 1);
         let result = &batches[0];
         assert_eq!(result.num_rows(), 1);
 
-        let ws = result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(ws.value(0), 1000);
-
-        let we = result
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(we.value(0), 9000);
-
         let total = result
-            .column(3)
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
@@ -2407,29 +2449,21 @@ mod tests {
         );
         state.update_batch(&batch).unwrap();
 
-        // Session 1: [1000, 3000), Session 2: [5000, 8000)
-        // Watermark at 8000 → both close
+        // Session 1: [1000, 3000) → SUM=10
+        // Session 2: [5000, 8000) → SUM=20+30=50
         let batches = state.close_windows(8000).unwrap();
         assert_eq!(batches.len(), 1);
         let result = &batches[0];
         assert_eq!(result.num_rows(), 2);
 
-        let ws = result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
         let totals = result
-            .column(3)
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-
-        // Sorted by window_start
-        assert_eq!(ws.value(0), 1000);
-        assert_eq!(totals.value(0), 10);
-        assert_eq!(ws.value(1), 5000);
-        assert_eq!(totals.value(1), 50);
+        let mut sums: Vec<i64> = (0..result.num_rows()).map(|i| totals.value(i)).collect();
+        sums.sort_unstable();
+        assert_eq!(sums, vec![10, 50]);
     }
 
     #[test]
@@ -2445,29 +2479,15 @@ mod tests {
         // Late event at ts=3500 bridges the two sessions
         let batch2 = make_pre_agg_batch(vec!["A"], vec![30], vec![3500]);
         state.update_batch(&batch2).unwrap();
-        // Merged: [1000, 8000) with SUM = 10+20+30 = 60
+        // Merged: [1000, 8000) with SUM = 10+20+30 = 60.
 
         let batches = state.close_windows(8000).unwrap();
         assert_eq!(batches.len(), 1);
         let result = &batches[0];
         assert_eq!(result.num_rows(), 1);
 
-        let ws = result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(ws.value(0), 1000);
-
-        let we = result
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(we.value(0), 8000);
-
         let total = result
-            .column(3)
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
@@ -2492,29 +2512,24 @@ mod tests {
         let result = &batches[0];
         assert_eq!(result.num_rows(), 2);
 
-        let ws = result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
         let syms = result
-            .column(2)
+            .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
         let totals = result
-            .column(3)
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
 
-        let mut results: Vec<(String, i64, i64)> = (0..result.num_rows())
-            .map(|i| (syms.value(i).to_string(), ws.value(i), totals.value(i)))
+        let mut results: Vec<(String, i64)> = (0..result.num_rows())
+            .map(|i| (syms.value(i).to_string(), totals.value(i)))
             .collect();
         results.sort();
 
-        assert_eq!(results[0], ("A".to_string(), 1000, 30));
-        assert_eq!(results[1], ("B".to_string(), 2000, 300));
+        assert_eq!(results[0], ("A".to_string(), 30));
+        assert_eq!(results[1], ("B".to_string(), 300));
     }
 
     #[test]
@@ -2536,12 +2551,12 @@ mod tests {
         assert_eq!(batches.len(), 1);
         let result = &batches[0];
         let syms = result
-            .column(2)
+            .column(0)
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
         let totals = result
-            .column(3)
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
@@ -2567,17 +2582,22 @@ mod tests {
         let restored = state2.restore_windows(&cp).unwrap();
         assert!(restored > 0);
 
-        let batches = state2.close_windows(6000).unwrap();
-        let mut results: Vec<(i64, i64)> = Vec::new();
-        for b in &batches {
-            let ws = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-            let totals = b.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
-            for i in 0..b.num_rows() {
-                results.push((ws.value(i), totals.value(i)));
-            }
-        }
-        results.sort_unstable();
-        assert_eq!(results, vec![(-2000, 10), (0, 30), (2000, 20)]);
+        let total = |b: &arrow_array::RecordBatch| -> i64 {
+            b.column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        let b = state2.close_windows(2000).unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(total(&b[0]), 10);
+        let b = state2.close_windows(4000).unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(total(&b[0]), 30);
+        let b = state2.close_windows(6000).unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(total(&b[0]), 20);
     }
 
     #[test]
@@ -2605,7 +2625,7 @@ mod tests {
         assert_eq!(result.num_rows(), 1);
 
         let total = result
-            .column(3)
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
@@ -2745,18 +2765,13 @@ mod tests {
         assert_eq!(batches.len(), 1, "should emit one batch");
         let out = &batches[0];
 
-        // The projection SELECT has 2 items (symbol, ratio), so the
-        // final schema is [window_start, window_end, symbol, ratio].
-        assert_eq!(out.num_columns(), 4, "schema: {:?}", out.schema());
+        // The post-aggregate projection emits [symbol, ratio].
+        assert_eq!(out.num_columns(), 2, "schema: {:?}", out.schema());
         assert_eq!(out.num_rows(), 1);
 
-        // MemTable has 1 row: a=1.0, b=2.0.
-        // ratio = SUM(a) / SUM(b) = 1.0 / 2.0 = 0.5
-        // Output columns: [window_start, window_end, symbol, ratio]
-        // (group_1 = TUMBLE is consumed by window assignment, projection
-        //  selects only symbol + ratio)
+        // a=1.0, b=2.0 → ratio = SUM(a)/SUM(b) = 0.5.
         let ratio_col = out
-            .column(out.num_columns() - 1)
+            .column(1)
             .as_any()
             .downcast_ref::<arrow::array::Float64Array>()
             .expect("ratio should be Float64");

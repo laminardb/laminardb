@@ -102,10 +102,10 @@ impl PipelineCallback for BarrierTrackingCallback {
     async fn checkpoint_with_barrier(
         &mut self,
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
-    ) -> Option<u64> {
+    ) -> laminar_db::pipeline::BarrierOutcome {
         let epoch = self.barrier_checkpoints.len() as u64 + 1;
         self.barrier_checkpoints.push(source_checkpoints);
-        Some(epoch)
+        laminar_db::pipeline::BarrierOutcome::Committed(epoch)
     }
 
     fn record_cycle(&self, _events_ingested: u64, _batches: u64, _elapsed_ns: u64) {}

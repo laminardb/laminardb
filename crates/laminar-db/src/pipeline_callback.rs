@@ -841,12 +841,13 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     async fn checkpoint_with_barrier(
         &mut self,
         source_checkpoints: FxHashMap<String, SourceCheckpoint>,
-    ) -> Option<u64> {
+    ) -> crate::pipeline::BarrierOutcome {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
+        use crate::pipeline::{BarrierOutcome, SkipReason};
         let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
 
         if self.prom.cycles.get() == 0 {
-            return None;
+            return BarrierOutcome::Skipped(SkipReason::NoCyclesSinceLastCheckpoint);
         }
 
         self.sync_sinks_and_drain_events().await;
@@ -855,10 +856,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         // clears this flag is unreachable when barrier checkpointing is active.
         if self.sink_timed_out {
             self.sink_timed_out = false;
-            tracing::warn!(
-                "skipping barrier checkpoint after sink timeout to preserve replay window"
-            );
-            return None;
+            return BarrierOutcome::Skipped(SkipReason::PreservingReplayWindowAfterSinkTimeout);
         }
 
         // Capture table source offsets.
@@ -877,8 +875,8 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         let operator_states = match self.capture_and_serialize_operator_state().await {
             Ok(states) => states,
             Err(e) => {
-                tracing::warn!(error = %e, "Stream executor barrier checkpoint failed — skipping");
-                return None;
+                tracing::warn!(error = %e, "Stream executor barrier checkpoint failed");
+                return BarrierOutcome::Failed;
             }
         };
 
@@ -920,7 +918,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         "Barrier-aligned checkpoint completed"
                     );
                     self.last_checkpoint = std::time::Instant::now();
-                    return Some(result.epoch);
+                    return BarrierOutcome::Committed(result.epoch);
                 }
                 Ok(result) => {
                     tracing::warn!(
@@ -935,7 +933,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
 
-        None
+        BarrierOutcome::Failed
     }
 
     fn record_cycle(&self, events_ingested: u64, _batches: u64, elapsed_ns: u64) {

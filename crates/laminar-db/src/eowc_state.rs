@@ -127,6 +127,8 @@ pub(crate) struct IncrementalEowcState {
     /// arriving within this window are included instead of dropped.
     /// Must match `CoreWindowState::allowed_lateness_ms` behavior.
     allowed_lateness_ms: i64,
+    /// See [`CoreWindowState::high_watermark_ms`].
+    high_watermark_ms: i64,
 }
 
 impl IncrementalEowcState {
@@ -458,8 +460,7 @@ impl IncrementalEowcState {
             None
         };
 
-        let mut output_fields =
-            laminar_sql::translator::WindowOperatorConfig::output_prefix_fields();
+        let mut output_fields = Vec::with_capacity(group_col_names.len() + agg_specs.len());
         for (name, dt) in group_col_names.iter().zip(group_types.iter()) {
             output_fields.push(Field::new(name, dt.clone(), true));
         }
@@ -518,7 +519,24 @@ impl IncrementalEowcState {
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: i64::try_from(window_config.allowed_lateness.as_millis())
                 .unwrap_or(0),
+            high_watermark_ms: i64::MIN,
         }))
+    }
+
+    /// See [`CoreWindowState::is_window_closed`].
+    #[inline]
+    fn is_window_closed(&self, window_start: i64) -> bool {
+        if self.high_watermark_ms == i64::MIN {
+            return false;
+        }
+        let size_ms = self.window_type.size_ms();
+        if size_ms <= 0 {
+            return false;
+        }
+        window_start
+            .saturating_add(size_ms)
+            .saturating_add(self.allowed_lateness_ms)
+            <= self.high_watermark_ms
     }
 
     /// Vectorized batch update: extracts timestamps and group keys at the
@@ -559,6 +577,9 @@ impl IncrementalEowcState {
                 #[allow(clippy::cast_possible_truncation)]
                 let idx = row_idx as u32;
                 for ws in assign_windows(ts_ms, &self.window_type) {
+                    if self.is_window_closed(ws) {
+                        continue;
+                    }
                     grouped.entry(ws).or_default().push(idx);
                 }
             }
@@ -611,6 +632,9 @@ impl IncrementalEowcState {
             #[allow(clippy::cast_possible_truncation)]
             let (gid, idx) = (gid as u32, row_idx as u32);
             for ws in assign_windows(ts_ms, &self.window_type) {
+                if self.is_window_closed(ws) {
+                    continue;
+                }
                 grouped.entry((ws, gid)).or_default().push(idx);
             }
         }
@@ -671,6 +695,7 @@ impl IncrementalEowcState {
     /// where `window_start + window_size <= watermark_ms`. Closed windows
     /// are removed from state.
     pub fn close_windows(&mut self, watermark_ms: i64) -> Result<Vec<RecordBatch>, DbError> {
+        self.high_watermark_ms = self.high_watermark_ms.max(watermark_ms);
         let size_ms = self.window_type.size_ms();
         if size_ms <= 0 {
             return Ok(Vec::new());
@@ -702,9 +727,7 @@ impl IncrementalEowcState {
                 continue;
             }
 
-            let window_end = window_start.saturating_add(size_ms);
-            let batch = self.emit_window(window_start, window_end, groups)?;
-            if let Some(b) = batch {
+            if let Some(b) = self.emit_window(groups)? {
                 result_batches.push(b);
             }
         }
@@ -714,13 +737,9 @@ impl IncrementalEowcState {
 
     fn emit_window(
         &self,
-        window_start: i64,
-        window_end: i64,
         groups: AHashMap<arrow::row::OwnedRow, Vec<Box<dyn datafusion_expr::Accumulator>>>,
     ) -> Result<Option<RecordBatch>, DbError> {
         crate::aggregate_state::emit_window_batch(
-            window_start,
-            window_end,
             groups,
             &self.row_converter,
             self.num_group_cols,
@@ -807,6 +826,7 @@ impl IncrementalEowcState {
         Ok(EowcStateCheckpoint {
             fingerprint,
             windows,
+            high_watermark_ms: self.high_watermark_ms,
         })
     }
 
@@ -825,6 +845,7 @@ impl IncrementalEowcState {
             )));
         }
         self.windows.clear();
+        self.high_watermark_ms = checkpoint.high_watermark_ms;
         let mut total_groups = 0usize;
         for wc in &checkpoint.windows {
             let mut groups = AHashMap::new();
@@ -1069,6 +1090,16 @@ mod tests {
         .unwrap()
     }
 
+    fn sum_total(batch: &RecordBatch) -> i64 {
+        batch
+            .column_by_name("total")
+            .expect("output schema has 'total' column")
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("'total' is Int64")
+            .value(0)
+    }
+
     fn make_eowc_state(window_type: EowcWindowType) -> IncrementalEowcState {
         use datafusion::execution::FunctionRegistry;
 
@@ -1088,8 +1119,6 @@ mod tests {
         }];
 
         let output_schema = Arc::new(Schema::new(vec![
-            Field::new("window_start", DataType::Int64, false),
-            Field::new("window_end", DataType::Int64, false),
             Field::new("symbol", DataType::Utf8, true),
             Field::new("total", DataType::Int64, true),
         ]));
@@ -1113,6 +1142,7 @@ mod tests {
             having_sql: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
+            high_watermark_ms: i64::MIN,
         }
     }
 
@@ -1130,32 +1160,19 @@ mod tests {
 
         assert_eq!(state.open_window_count(), 1);
 
-        // Close window at watermark 1000
+        // Close window at watermark 1000 — only window [0, 1000) qualifies.
         let batches = state.close_windows(1000).unwrap();
         assert_eq!(batches.len(), 1);
 
         let result = &batches[0];
         assert_eq!(result.num_rows(), 1);
+        assert_eq!(result.schema().fields().len(), 2);
+        assert_eq!(result.schema().field(0).name(), "symbol");
+        assert_eq!(result.schema().field(1).name(), "total");
 
-        // Check window_start = 0
-        let ws = result
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(ws.value(0), 0);
-
-        // Check window_end = 1000
-        let we = result
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(we.value(0), 1000);
-
-        // Check SUM = 10 + 20 + 30 = 60
+        // SUM = 10 + 20 + 30 = 60
         let total = result
-            .column(3)
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
@@ -1191,16 +1208,18 @@ mod tests {
 
         assert_eq!(state.open_window_count(), 2);
 
-        // Close only the first window (watermark at 1000)
+        // Close only the first window (watermark at 1000) — first event
+        // contributes 10 to the sum; the second event lives in [1000, 2000)
+        // and is not yet emitted.
         let batches = state.close_windows(1000).unwrap();
         assert_eq!(batches.len(), 1);
-
-        let ws = batches[0]
-            .column(0)
+        assert_eq!(batches[0].num_rows(), 1);
+        let total = batches[0]
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
-        assert_eq!(ws.value(0), 0);
+        assert_eq!(total.value(0), 10);
 
         // Second window still open
         assert_eq!(state.open_window_count(), 1);
@@ -1209,6 +1228,56 @@ mod tests {
         let batches = state.close_windows(2000).unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(state.open_window_count(), 0);
+    }
+
+    #[test]
+    fn test_late_events_for_closed_windows_are_dropped() {
+        let mut state = make_eowc_state(EowcWindowType::Tumbling { size_ms: 1000 });
+
+        let batch1 = make_pre_agg_batch(
+            vec!["AAPL", "AAPL", "AAPL"],
+            vec![10, 20, 30],
+            vec![100, 200, 500],
+        );
+        state.update_batch(&batch1).unwrap();
+
+        let first = state.close_windows(1000).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(sum_total(&first[0]), 60);
+        assert_eq!(state.open_window_count(), 0);
+
+        let late = make_pre_agg_batch(vec!["AAPL"], vec![999], vec![300]);
+        state.update_batch(&late).unwrap();
+        assert_eq!(state.open_window_count(), 0);
+
+        let second = state.close_windows(2000).unwrap();
+        assert!(second.is_empty());
+    }
+
+    /// Hopping: ts=999 belongs to [500, 1500) (open) and [0, 1000) (closed
+    /// once watermark hits 1000). The late update must reach [500, 1500)
+    /// without re-creating [0, 1000).
+    #[test]
+    fn test_hopping_late_event_only_updates_still_open_windows() {
+        let mut state = make_eowc_state(EowcWindowType::Hopping {
+            size_ms: 1000,
+            slide_ms: 500,
+        });
+
+        let batch1 = make_pre_agg_batch(vec!["A", "A"], vec![10, 20], vec![600, 600]);
+        state.update_batch(&batch1).unwrap();
+
+        let first = state.close_windows(1000).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(state.open_window_count(), 1);
+
+        let late = make_pre_agg_batch(vec!["A"], vec![30], vec![999]);
+        state.update_batch(&late).unwrap();
+        assert_eq!(state.open_window_count(), 1);
+
+        let second = state.close_windows(1500).unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(sum_total(&second[0]), 60);
     }
 
     #[test]
@@ -1249,11 +1318,9 @@ mod tests {
         let result = &batches[0];
         let schema = result.schema();
 
-        assert_eq!(schema.field(0).name(), "window_start");
-        assert_eq!(schema.field(1).name(), "window_end");
-        assert_eq!(schema.field(2).name(), "symbol");
-        assert_eq!(schema.field(3).name(), "total");
-        assert_eq!(schema.fields().len(), 4);
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "symbol");
+        assert_eq!(schema.field(1).name(), "total");
     }
 
     #[test]
@@ -1280,14 +1347,14 @@ mod tests {
         assert!(restored > 0, "Should have restored groups");
         assert_eq!(state2.open_window_count(), 2);
 
-        // Close first window and verify SUM
+        // Close first window and verify SUM.
         let batches = state2.close_windows(1000).unwrap();
         assert_eq!(batches.len(), 1);
         let result = &batches[0];
         assert_eq!(result.num_rows(), 1); // Only AAPL in window [0,1000)
 
         let total = result
-            .column(3)
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
@@ -1297,7 +1364,7 @@ mod tests {
         let batches = state2.close_windows(2000).unwrap();
         assert_eq!(batches.len(), 1);
         let total2 = batches[0]
-            .column(3)
+            .column(1)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();

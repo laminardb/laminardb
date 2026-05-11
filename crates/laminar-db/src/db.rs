@@ -903,6 +903,7 @@ impl LaminarDB {
             StreamingStatement::CreateMaterializedView {
                 name,
                 query,
+                emit_clause,
                 or_replace,
                 if_not_exists,
                 query_sql,
@@ -912,6 +913,7 @@ impl LaminarDB {
                     sql,
                     name,
                     query,
+                    emit_clause.clone(),
                     *or_replace,
                     *if_not_exists,
                     query_sql,
