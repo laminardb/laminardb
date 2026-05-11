@@ -1,6 +1,6 @@
 # SQL Dialect Reference
 
-> Practical guide to LaminarDB's SQL dialect — gotchas, working patterns, and tested examples.
+> Practical guide to LaminarDB's SQL dialect: gotchas, working patterns, tested examples.
 
 LaminarDB uses [Apache DataFusion](https://datafusion.apache.org/) as its SQL engine. While most standard SQL works, streaming-specific operations have differences from other streaming databases (Flink SQL, ksqlDB, etc.). This reference documents patterns that are **confirmed working** in LaminarDB embedded mode.
 
@@ -23,7 +23,7 @@ LaminarDB uses [Apache DataFusion](https://datafusion.apache.org/) as its SQL en
 ## Sources
 
 Create data sources using `CREATE SOURCE`. Event-time columns must be
-declared as `TIMESTAMP` — LaminarDB uses Arrow `Timestamp(_)` internally
+declared as `TIMESTAMP`. LaminarDB uses Arrow `Timestamp(_)` internally
 at any precision and rescales to milliseconds via the Arrow cast kernel.
 
 ```sql
@@ -94,8 +94,8 @@ GROUP BY symbol, tumble(ts, INTERVAL '1' HOUR, INTERVAL '8' HOUR)
 ```
 
 **Key points:**
-- Use lowercase `tumble()` (not `TUMBLE()` — both work, but lowercase is canonical)
-- `tumble()` returns `Timestamp(Millisecond)` directly — there is no `TUMBLE_START()` function
+- Use lowercase `tumble()`. `TUMBLE()` also works, but lowercase is canonical.
+- `tumble()` returns `Timestamp(Millisecond)` directly. There is no `TUMBLE_START()` function.
 - Optional third argument for timezone offset alignment
 - Window closes when watermark passes window end
 
@@ -116,7 +116,7 @@ GROUP BY symbol, HOP(ts, INTERVAL '2' SECOND, INTERVAL '10' SECOND)
 **Key points:**
 - First interval = slide, second interval = window size
 - Each event appears in `size / slide` windows (here: 10/2 = 5)
-- More output rows than TUMBLE — plan downstream capacity accordingly
+- More output rows than TUMBLE. Plan downstream capacity accordingly.
 
 ### SESSION (Gap-based windows)
 
@@ -164,7 +164,7 @@ AND o.ts BETWEEN t.ts - INTERVAL '10' SECOND AND t.ts + INTERVAL '10' SECOND
 
 **Key points:**
 - `INTERVAL` arithmetic on `TIMESTAMP` columns is handled natively by
-  DataFusion — no need for the old `ts - 10000` millisecond tricks
+  DataFusion. No need for the old `ts - 10000` millisecond tricks.
 - Both sources need watermarks advanced for the join to emit
 - Column aliases (`AS trade_price`) are required when both sources have columns with the same name
 
@@ -223,7 +223,7 @@ FROM trades
 GROUP BY account_id, symbol, TUMBLE(ts, INTERVAL '5' SECOND)
 ```
 
-**Key point:** The `ELSE` branch must match the column type. Use `CAST(0 AS BIGINT)` when summing BIGINT columns — `ELSE 0` alone produces INT32, causing a type mismatch.
+**Key point:** The `ELSE` branch must match the column type. Use `CAST(0 AS BIGINT)` when summing BIGINT columns. `ELSE 0` alone produces INT32, causing a type mismatch.
 
 ### Computed columns
 
@@ -247,6 +247,20 @@ GROUP BY symbol, tumble(ts, INTERVAL '5' SECOND)
 | `MIN(col)` / `MAX(col)` | Min/max |
 | `first_value(col)` | First value in window (NOT `FIRST()`) |
 | `last_value(col)` | Last value in window (NOT `LAST()`) |
+
+### Streaming UDFs
+
+| Function | Returns | Use |
+|----------|---------|-----|
+| `tumble(ts, size)` | `Timestamp(Millisecond)` (window start) | `GROUP BY tumble(...)` |
+| `tumble(ts, size, offset)` | `Timestamp(Millisecond)` | Timezone-aligned window boundaries |
+| `tumble_end(ts, size)` | `Timestamp(Millisecond)` | Explicit window-end column in `SELECT` |
+| `hop(ts, slide, size)` / `slide(ts, size, slide)` | `Timestamp(Millisecond)` | Sliding / hopping windows |
+| `hop_end(ts, slide, size)` | `Timestamp(Millisecond)` | Window end for hop |
+| `session(ts, gap)` | `Timestamp(Millisecond)` | Session windows |
+| `cumulate(ts, step, max_size)` | `Timestamp(Millisecond)` | Cumulating windows (parsed; pipeline support pending) |
+| `cumulate_end(ts, step, max_size)` | `Timestamp(Millisecond)` | Cumulating window end |
+| `proctime()` | `Timestamp(Millisecond)` | Processing-time stamp at evaluation |
 
 ---
 
@@ -278,19 +292,49 @@ while let Some(rows) = sub.poll() {
 }
 ```
 
-**Critical:** `FromRow` struct field order must match the SQL `SELECT` column order. Field names don't matter — only position.
+**Critical:** `FromRow` struct field order must match the SQL `SELECT` column order. Field names don't matter, only position does.
 
 ### SUBSCRIBE over the Postgres wire protocol
 
 When the server is started with `pgwire_bind` set, materialized views can be streamed directly to any libpq client (psql, JDBC, asyncpg, etc.):
 
 ```sql
-SUBSCRIBE <mv_name> [WHERE <predicate>]
+SUBSCRIBE <name> [WHERE <predicate>] [AS OF EPOCH <n>]
 ```
 
-- `<mv_name>` may be a materialized view, a source, or a named stream.
+- `<name>` may be a materialized view, a source, or a named stream.
 - The optional `WHERE` clause is compiled by DataFusion against the target's schema and applied per batch before the row reaches the wire. It works on materialized views and sources; named streams reject `WHERE` because their output schema isn't introspectable.
 - The query stays open until the client disconnects; rows arrive as they're produced upstream.
+
+#### Reconnect without gaps: `RETAIN HISTORY` + `AS OF EPOCH`
+
+Create the stream with a bounded history ring:
+
+```sql
+CREATE STREAM trades AS SELECT * FROM raw_trades
+  WITH ('retain_history' = '64mb');
+```
+
+The server keeps recent committed epochs in memory up to that budget. A client that crashed at epoch `42` can reconnect and resume from exactly where it left off:
+
+```sql
+SUBSCRIBE trades AS OF EPOCH 42;
+```
+
+If epoch `42` has already fallen out of the ring the server returns an error instead of silently skipping rows. Pick a larger budget if your clients can disconnect for longer.
+
+#### Cursored consumption: `DECLARE` / `FETCH` / `CLOSE`
+
+For libpq clients that drive flow control via `\set FETCH_COUNT n` (psql, JDBC with `setFetchSize`):
+
+```sql
+DECLARE c CURSOR FOR SUBSCRIBE trades WHERE symbol = 'AAPL';
+FETCH FORWARD 100 FROM c;
+FETCH FORWARD 100 FROM c;
+CLOSE c;
+```
+
+The cursor is forward-only, lives for the duration of the connection, and shares the same `WHERE` and `AS OF EPOCH` semantics as bare `SUBSCRIBE`.
 
 ---
 
@@ -307,7 +351,7 @@ source.watermark(current_ts + 10_000);  // 10s ahead covers HOP(10s) windows
 - Advance watermark on **all** sources (both sides of a join)
 - Watermark should be at least `current_ts + largest_window_size`
 - HOP(10s) needs watermark 10s ahead; SESSION(2s) needs 2s past last event
-- LaminarDB processes in 100ms micro-batch ticks — results appear after next tick
+- LaminarDB processes in 100ms micro-batch ticks. Results appear after the next tick.
 
 ---
 
@@ -393,7 +437,7 @@ SELECT tumble(ts, INTERVAL '5' SECOND), first_value(price), last_value(price)
 ```rust
 // SQL: SELECT symbol, SUM(volume) AS total, AVG(price) AS avg_price
 
-// WRONG — field names don't matter, ORDER matters
+// WRONG: field names don't matter, ORDER matters
 #[derive(FromRow)]
 pub struct Bad {
     pub avg_price: f64,  // This gets the 1st column (symbol), not avg_price!
@@ -401,7 +445,7 @@ pub struct Bad {
     pub total: i64,
 }
 
-// CORRECT — matches SELECT column order
+// CORRECT: matches SELECT column order
 #[derive(FromRow)]
 pub struct Good {
     pub symbol: String,    // 1st column
@@ -413,10 +457,10 @@ pub struct Good {
 ### 5. Both sources need watermarks for joins
 
 ```rust
-// WRONG — join will never emit because orders watermark isn't advancing
+// WRONG: join will never emit because orders watermark isn't advancing
 trade_source.watermark(ts + 10_000);
 
-// CORRECT — advance both
+// CORRECT: advance both
 trade_source.watermark(ts + 10_000);
 order_source.watermark(ts + 10_000);
 ```
@@ -469,9 +513,9 @@ Connector-produced schemas may use other `Timestamp(_)` precisions:
 | `file_modification_time` | `Timestamp(Millisecond)` | Files connector |
 
 Despite the `_ms` / `_ns` suffixes in some historical names, these are
-real Arrow `Timestamp` columns — not `Int64`. `INTERVAL` arithmetic and
+real Arrow `Timestamp` columns, not `Int64`. `INTERVAL` arithmetic and
 window functions compose correctly against any precision.
 
 ---
 
-*This reference is based on LaminarDB v0.20.2 with DataFusion 52.x and Arrow 57.x. Contributions and corrections welcome — please open an issue or PR.*
+*Tracks LaminarDB 0.22 on DataFusion 52.x / Arrow 57.x. Corrections welcome: open an issue or PR.*

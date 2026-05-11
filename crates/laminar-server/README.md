@@ -8,9 +8,9 @@ Standalone server binary for LaminarDB. Reads a TOML configuration file, constru
 - **REST API** (Axum) for health checks, pipeline introspection, ad-hoc SQL, and manual checkpoints
 - **Postgres wire protocol** (optional) for `SUBSCRIBE` streaming via `psql` and any libpq client
 - **Prometheus metrics** at `/metrics`
-- **Hot reload** — edit the TOML file and changes are applied automatically (file watcher with debounce), or `POST /api/v1/reload`
-- **Checkpoint validation** — `--validate-checkpoints` flag validates all stored checkpoints and exits
-- **Platform allocators** — jemalloc on Linux, mimalloc on Windows MSVC (see [Tuning the Allocator](#tuning-the-allocator-malloc_conf) for `MALLOC_CONF` recommendations)
+- **Hot reload**: edit the TOML file and changes are applied automatically (file watcher with debounce), or `POST /api/v1/reload`
+- **Checkpoint validation**: `--validate-checkpoints` flag validates all stored checkpoints and exits
+- **Platform allocators**: jemalloc on Linux, mimalloc on Windows MSVC (see [Tuning the Allocator](#tuning-the-allocator-malloc_conf) for `MALLOC_CONF` recommendations)
 - **Docker and Helm** deployment with multi-arch images
 
 ## CLI
@@ -64,7 +64,7 @@ log_level = "info"
 # [server.pgwire_users]
 # alice = "${ALICE_PASSWORD}"
 # bob   = "${BOB_PASSWORD}"
-# Worker thread count is taken from $TOKIO_WORKER_THREADS — defaults to logical CPUs.
+# Worker thread count is taken from $TOKIO_WORKER_THREADS. Defaults to logical CPUs.
 
 [state]
 backend = "memory"          # "memory" or "mmap"
@@ -137,7 +137,7 @@ format = "json"
 
 When `[server].pgwire_bind` is set, the server also listens for Postgres clients and serves a small subset of the SimpleQuery protocol:
 
-- `SUBSCRIBE <name> [WHERE <predicate>]` — streams rows as they're produced. `<name>` may be a materialized view, a source, or a named stream. The query stays open until the client disconnects.
+- `SUBSCRIBE <name> [WHERE <predicate>]`: streams rows as they're produced. `<name>` may be a materialized view, a source, or a named stream. The query stays open until the client disconnects.
 - `SHOW`, `SET <key> = <value>`, and a handful of driver builtins (`SELECT version()`, `current_database()`, etc.) are accepted so standard psql / libpq clients can connect.
 - `INSERT`, `UPDATE`, `DELETE`, and DDL are rejected with a clear error pointing to `POST /api/v1/sql`.
 
@@ -145,7 +145,7 @@ When `[server].pgwire_bind` is set, the server also listens for Postgres clients
 
 ### Authentication
 
-By default the listener uses **trust** auth and rejects non-localhost binds — the assumption is that any caller who can reach the loopback interface is already trusted. To bind to a routable address, configure MD5 password auth and explicitly opt in to remote binds:
+By default the listener uses **trust** auth and rejects non-localhost binds. The assumption is that any caller who can reach the loopback interface is already trusted. To bind to a routable address, configure MD5 password auth and explicitly opt in to remote binds:
 
 ```toml
 pgwire_bind = "0.0.0.0:5433"
@@ -163,14 +163,14 @@ PGPASSWORD=$ALICE_PASSWORD psql "host=db.internal port=5433 dbname=laminardb use
 
 > **MD5 is provided for libpq compatibility, not as a recommended production stance.** Postgres itself deprecated it in PG 14 in favor of SCRAM-SHA-256. Use it for development and short-lived deployments; for production, wait for the SCRAM work in the FIR follow-ups before exposing this listener beyond a trusted network segment.
 
-Plaintext passwords sit in the TOML file. Use `${VAR}` substitution to pull them from environment variables or a secret manager rather than committing them. To avoid plaintext at rest entirely, supply the `pg_authid`-style pre-hashed form: `md5` followed by `md5(password ‖ username)` as 32 lowercase hex characters. The wire protocol is unchanged — clients still send the same plaintext password.
+Plaintext passwords sit in the TOML file. Use `${VAR}` substitution to pull them from environment variables or a secret manager rather than committing them. To avoid plaintext at rest entirely, supply the `pg_authid`-style pre-hashed form: `md5` followed by `md5(password ‖ username)` as 32 lowercase hex characters. The wire protocol is unchanged; clients still send the same plaintext password.
 
 ```bash
 # bash, where pw and user are the plaintext password and username:
 printf '%s' "${pw}${user}" | md5sum | awk '{print "md5"$1}'
 ```
 
-The listener emits `target: "audit"` events on every connection accepted/closed, including auth-failed outcomes — wire these into your SIEM.
+The listener emits `target: "audit"` events on every connection accepted/closed, including auth-failed outcomes. Wire these into your SIEM.
 
 ### TLS
 
@@ -186,7 +186,7 @@ pgwire_tls_min_version = "1.2"
 pgwire_tls_client_ca = "/etc/laminar/clients-ca.pem"
 ```
 
-Postgres clients negotiate TLS via `sslmode=require` (or `verify-ca` / `verify-full` if your cert chain is trusted by the client). The handshake follows the standard `SSLRequest` flow — `psql`, JDBC, asyncpg, etc. all just work.
+Postgres clients negotiate TLS via `sslmode=require` (or `verify-ca` / `verify-full` if your cert chain is trusted by the client). The handshake follows the standard `SSLRequest` flow, so `psql`, JDBC, asyncpg, and friends all just work.
 
 The server watches `pgwire_tls_cert`, `pgwire_tls_key`, and `pgwire_tls_client_ca` and reloads the TLS acceptor in place after a 500ms debounce, so cert rotation does not require a restart. In-flight handshakes finish with the cert that was current when the socket was accepted; new accepts pick up the rotated cert. A bad rotation (truncated file, expired cert) is logged as `pgwire.tls_reload outcome=failed` and the previous acceptor is kept. Set `LAMINAR_DISABLE_FILE_WATCH=1` to disable.
 
@@ -205,7 +205,7 @@ Changes to `[server]`, `[state]`, and `[checkpoint]` sections require a restart.
 
 ## Tuning the Allocator (`MALLOC_CONF`)
 
-The server ships with [`jemalloc`](https://jemalloc.net/) on Linux / non-MSVC (via `tikv-jemallocator`) and `mimalloc` on Windows MSVC. These replace the system allocator and materially reduce fragmentation under bursty sink workloads (Delta Lake, Iceberg, Parquet writers). Both are enabled by default — no action needed to turn them on.
+The server ships with [`jemalloc`](https://jemalloc.net/) on Linux / non-MSVC (via `tikv-jemallocator`) and `mimalloc` on Windows MSVC. These replace the system allocator and materially reduce fragmentation under bursty sink workloads (Delta Lake, Iceberg, Parquet writers). Both are enabled by default; no action needed to turn them on.
 
 For long-running deployments, jemalloc's behavior can be tuned at process start via the `MALLOC_CONF` environment variable. The recommended baseline is:
 
@@ -226,7 +226,7 @@ MALLOC_CONF=background_thread:true,metadata_thp:auto,dirty_decay_ms:3000,muzzy_d
 
 ### Settings to avoid
 
-- **Do not set `narenas:N` to a small value.** The jemalloc default is `ncpus * 4`, which gives each reactor / sink thread its own arena and eliminates cross-thread contention on `malloc`/`free`. LaminarDB is thread-per-core — forcing `narenas:4` on an 8-core box means multiple reactors share an arena, and the lock contention shows up directly in the sink commit path. Leave `narenas` unset.
+- **Do not set `narenas:N` to a small value.** The jemalloc default is `ncpus * 4`, which gives each reactor / sink thread its own arena and eliminates cross-thread contention on `malloc`/`free`. LaminarDB is thread-per-core. Forcing `narenas:4` on an 8-core box means multiple reactors share an arena, and the lock contention shows up directly in the sink commit path. Leave `narenas` unset.
 - **Do not set `tcache:false`.** The per-thread small-allocation cache is load-bearing on any sink that churns Arrow/Parquet buffers.
 
 ### How to set it
@@ -236,7 +236,7 @@ MALLOC_CONF=background_thread:true,metadata_thp:auto,dirty_decay_ms:3000,muzzy_d
 - **Kubernetes / Helm**: add to `env:` on the container, or set via the Helm chart's `env` values.
 - **Shell**: `MALLOC_CONF=... laminardb --config laminardb.toml`.
 
-The setting is read by jemalloc at process start; changing it requires a restart. It has no effect on the Windows MSVC build (mimalloc has its own env vars — see the [mimalloc options](https://microsoft.github.io/mimalloc/environment.html) if tuning is needed).
+The setting is read by jemalloc at process start; changing it requires a restart. It has no effect on the Windows MSVC build (mimalloc has its own env vars; see the [mimalloc options](https://microsoft.github.io/mimalloc/environment.html) if tuning is needed).
 
 ### Verifying it took effect
 

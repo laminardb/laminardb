@@ -1,6 +1,6 @@
 # laminar-core
 
-Core streaming engine for LaminarDB — operators, checkpoint barriers, and streaming infrastructure.
+Core streaming engine for LaminarDB: operators, checkpoint barriers, and streaming infrastructure.
 
 ## Modules
 
