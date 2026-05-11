@@ -1,0 +1,57 @@
+# Demo runtime config — empirical test of explicit window_start/end projection.
+
+sql = """
+CREATE SOURCE crypto_ticks (
+    ts        TIMESTAMP,
+    symbol    VARCHAR,
+    price     DOUBLE,
+    qty       DOUBLE,
+    WATERMARK FOR ts AS ts - INTERVAL '5' SECOND
+) FROM KAFKA (
+    'bootstrap.servers'      = 'localhost:9092',
+    'topic'                  = 'crypto.ticks',
+    'group.id'               = 'laminar-ohlc-demo',
+    'startup.mode'           = 'earliest',
+    'event.time.column'      = 'ts',
+    'max.out.of.orderness.ms' = '5000'
+) FORMAT JSON;
+
+CREATE MATERIALIZED VIEW ohlc_1m AS
+SELECT
+    TUMBLE(ts, INTERVAL '1' MINUTE)     AS window_start,
+    TUMBLE_END(ts, INTERVAL '1' MINUTE) AS window_end,
+    symbol,
+    FIRST_VALUE(price) AS open,
+    MAX(price)         AS high,
+    MIN(price)         AS low,
+    LAST_VALUE(price)  AS close,
+    SUM(qty)           AS volume,
+    SUM(price * qty)   AS notional,
+    COUNT(*)           AS tick_count
+FROM crypto_ticks
+GROUP BY
+    TUMBLE(ts, INTERVAL '1' MINUTE),
+    TUMBLE_END(ts, INTERVAL '1' MINUTE),
+    symbol
+EMIT ON WINDOW CLOSE;
+
+CREATE SINK ohlc_iceberg_sink FROM ohlc_1m
+INTO ICEBERG (
+    'catalog.uri'                            = 'http://localhost:8181',
+    'warehouse'                              = 's3://warehouse/wh',
+    'namespace'                              = 'demo',
+    'table.name'                             = 'ohlc_1m',
+    'storage.type'                           = 's3',
+    'auto.create'                            = 'true',
+    'compression'                            = 'zstd',
+    'catalog.property.s3.endpoint'           = 'http://localhost:9000',
+    'catalog.property.s3.access-key-id'      = 'minioadmin',
+    'catalog.property.s3.secret-access-key'  = 'minioadmin',
+    'catalog.property.s3.path-style-access'  = 'true',
+    'catalog.property.s3.region'             = 'us-east-1'
+);
+"""
+
+[server]
+bind         = "127.0.0.1:7777"
+pgwire_bind  = "127.0.0.1:5432"
