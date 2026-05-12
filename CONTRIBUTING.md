@@ -6,7 +6,7 @@ This guide will get you from zero to a working build in a few minutes.
 
 ## Quick Setup
 
-You need **Rust stable** (1.85+). That's it for the default build.
+You need **Rust stable** (1.95+). That's it for the default build.
 
 ```bash
 git clone https://github.com/laminardb/laminardb.git

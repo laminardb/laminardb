@@ -2,7 +2,7 @@
 [![Crates.io](https://img.shields.io/crates/v/laminar-db.svg)](https://crates.io/crates/laminar-db)
 [![docs.rs](https://docs.rs/laminar-db/badge.svg)](https://docs.rs/laminar-db)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.95%2B-orange)](https://www.rust-lang.org)
 [![Website](https://img.shields.io/badge/website-laminardb.io-blue)](https://laminardb.io)
 
 # LaminarDB
@@ -400,7 +400,7 @@ Criterion suites live under `crates/laminar-core/benches/`, `crates/laminar-db/b
 ## Building from Source
 
 ```bash
-# Prerequisites: Rust 1.85+ (stable)
+# Prerequisites: Rust 1.95+ (stable)
 git clone https://github.com/laminardb/laminardb.git
 cd laminardb
 
