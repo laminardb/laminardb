@@ -231,9 +231,9 @@ jobs:
       - name: Extract MSRV
         id: msrv
         run: |
-          MSRV=$(grep -m1 'rust-version' Cargo.toml | cut -d'"' -f2 || echo "1.75")
+          MSRV=$(grep -m1 'rust-version' Cargo.toml | cut -d'"' -f2 || echo "1.95")
           if [[ -z "$MSRV" ]]; then
-            MSRV="1.85"
+            MSRV="1.95"
           fi
           echo "MSRV: $MSRV"
           echo "version=$MSRV" >> $GITHUB_OUTPUT
