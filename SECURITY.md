@@ -2,10 +2,12 @@
 
 ## Supported Versions
 
+Pre-1.0, only the latest minor receives fixes.
+
 | Version | Supported |
 |---------|-----------|
-| 0.20.x (latest) | Yes |
-| < 0.20 | No |
+| 0.22.x (latest) | Yes |
+| < 0.22 | No |
 
 ## Reporting a Vulnerability
 
@@ -24,7 +26,9 @@ We will:
 LaminarDB is an embedded database. Security considerations depend on your deployment model:
 
 - **Embedded (library)**: Security is inherited from the host application. LaminarDB does not open network ports unless you use the admin API or server binary.
-- **Server binary**: The standalone server exposes a network interface. Authentication and authorization are planned for a future release.
+- **Server binary**: The standalone server exposes two listeners.
+  - The Postgres-wire listener (`pgwire_bind`) supports MD5 password auth (plaintext or `pg_authid`-style pre-hashed), TLS with `pgwire_tls_min_version` pinning, optional mTLS via `pgwire_tls_client_ca`, and hot certificate reload. Trust auth is restricted to loopback binds; remote binds require `pgwire_allow_remote = true` plus configured users.
+  - The HTTP admin API has no built-in authentication yet. Put it behind a reverse proxy or network policy. SCRAM-SHA-256 and HTTP auth are tracked for a later release.
 - **Connectors**: Kafka, PostgreSQL, MySQL, and MongoDB connectors handle credentials. Connector configurations support TLS and are subject to secret masking in logs.
 
 ## Unsafe Code
