@@ -2,14 +2,12 @@
 [![Crates.io](https://img.shields.io/crates/v/laminar-db.svg)](https://crates.io/crates/laminar-db)
 [![docs.rs](https://docs.rs/laminar-db/badge.svg)](https://docs.rs/laminar-db)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.95%2B-orange)](https://www.rust-lang.org)
 [![Website](https://img.shields.io/badge/website-laminardb.io-blue)](https://laminardb.io)
 
 # LaminarDB
 
-A streaming SQL engine for Rust — embed it in your process or run it standalone.
-
-Stream processing today means running a JVM cluster (Flink), paying for a managed service (RisingWave, Confluent), or hand-rolling state machines. LaminarDB brings continuous SQL queries, event-time windowing, and exactly-once checkpointing to a single Rust crate. Rust gives you predictable latency without GC pauses and memory safety without a runtime. No JVM. No cluster. `cargo add laminar-db` and go.
+A streaming SQL engine for Rust. Embed it as a library or run the standalone server. Continuous queries, event-time windows, exactly-once checkpoints. No JVM, no cluster required.
 
 ## Quick Start
 
@@ -17,7 +15,7 @@ Stream processing today means running a JVM cluster (Flink), paying for a manage
 
 ```toml
 [dependencies]
-laminar-db = "0.21"
+laminar-db = "0.22"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -56,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-This example compiles and runs against the `laminar-db` v0.21 public API. See [`examples/binance-ws`](examples/binance-ws) for a complete working demo that streams live Binance trades through 18 SQL pipeline stages with a TUI dashboard.
+This example compiles and runs against the `laminar-db` v0.22 public API. See [`examples/binance-ws`](examples/binance-ws) for a complete working demo that streams live Binance trades through 18 SQL pipeline stages with a TUI dashboard.
 
 ### Python
 
@@ -81,19 +79,15 @@ conn.close()
 
 ---
 
-## What It Is
+## Deployment modes
 
-LaminarDB is a streaming SQL engine built on [Apache Arrow](https://arrow.apache.org/) and [DataFusion](https://datafusion.apache.org/). It runs continuous queries over unbounded data streams, manages windowed state, and handles event-time semantics including watermarks and late data.
+| Mode | How |
+|------|-----|
+| Embedded | `cargo add laminar-db`. Runs in-process. |
+| Standalone | `laminardb` binary. TOML config, REST API, Prometheus metrics, hot reload. |
+| Distributed | `--features delta`. Multi-node scaffolding (gossip, Raft, gRPC). Not production-ready. |
 
-Three deployment modes:
-
-| Mode | How | Status |
-|------|-----|--------|
-| **Embedded** | `cargo add laminar-db` — runs inside your Rust process | ✅ Implemented |
-| **Standalone** | `laminardb` binary — TOML config, REST API, Prometheus metrics, hot-reload | ✅ Implemented |
-| **Distributed** | Multi-node via gossip discovery, Raft consensus, gRPC — `--features delta` | 🚧 Scaffolding only (Phase 6c production hardening in progress) |
-
-The embedded mode is the primary deployment target. You get a `LaminarDB` handle, register sources with SQL DDL, push `RecordBatch` data in, subscribe to output streams, and let the engine handle windowing, joins, checkpointing, and exactly-once delivery.
+Built on [Apache Arrow](https://arrow.apache.org/) and [DataFusion](https://datafusion.apache.org/). Embedded is the primary target.
 
 ---
 
@@ -271,7 +265,7 @@ Custom connectors can be built by implementing the `SourceConnector` or `SinkCon
 
 ## Postgres Wire Protocol
 
-The standalone server speaks the Postgres v3 wire protocol, so any libpq-derived client — `psql`, JDBC, asyncpg, `tokio-postgres`, Grafana's Postgres datasource — can connect and tail a stream:
+The standalone server speaks the Postgres v3 wire protocol. Any libpq-derived client (`psql`, JDBC, asyncpg, `tokio-postgres`, Grafana's Postgres datasource) can connect and tail a stream:
 
 ```bash
 psql "host=db.internal port=5433 dbname=laminardb user=alice" \
@@ -288,7 +282,7 @@ Enable the listener by setting `pgwire_bind` in `laminardb.toml`. Auth is trust 
 | `DECLARE c CURSOR FOR SUBSCRIBE …` + `FETCH n FROM c` | Cursored consumption for `\set FETCH_COUNT n` clients |
 | `SELECT version()` / `SELECT 1` / transaction control | The handful of meta-commands clients issue at startup |
 
-DDL (`CREATE SOURCE`, `CREATE STREAM`, etc.) goes through the HTTP API (`POST /api/v1/sql`); the pgwire surface is intentionally narrow — read-side only.
+DDL (`CREATE SOURCE`, `CREATE STREAM`, etc.) goes through the HTTP API (`POST /api/v1/sql`). The pgwire surface is intentionally narrow: read-side only.
 
 ---
 
@@ -332,18 +326,18 @@ DDL (`CREATE SOURCE`, `CREATE STREAM`, etc.) goes through the HTTP API (`POST /a
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **Streaming coordinator** — Single tokio task on a dedicated single-threaded runtime (the `laminar-compute` thread), isolating CPU-bound event processing from I/O tasks on the main runtime. Source connectors push batches via `tokio::sync::mpsc` channels; the coordinator runs compiled projections / cached logical plans, routes results to sinks, and manages checkpoint barriers. Sub-microsecond for compiled single-source projections; microseconds for incremental aggregations and cached-plan queries; DataFusion fallback for complex queries.
-- **Background I/O** — Source connectors, sink writers, and the checkpoint coordinator all run on the main tokio work-stealing runtime.
-- **Admin** — HTTP REST API (Axum), Prometheus metrics, ad-hoc SQL, hot-reload, checkpoint triggers. Auth is planned (Phase 4).
+- **Streaming coordinator.** Single tokio task on a dedicated single-threaded runtime (the `laminar-compute` thread), isolating CPU-bound event processing from I/O on the main runtime. Source connectors push batches in via `tokio::sync::mpsc`; the coordinator runs compiled projections or cached logical plans, routes results to sinks, and manages checkpoint barriers. Compiled single-source projections are sub-microsecond; incremental aggregations and cached-plan queries are microseconds; complex queries fall back to DataFusion.
+- **Background I/O.** Source connectors, sink writers, and the checkpoint coordinator all run on the main tokio work-stealing runtime.
+- **Admin.** HTTP REST API (Axum), Prometheus metrics, ad-hoc SQL, hot reload, manual checkpoints. No built-in auth on the HTTP API; put it behind a reverse proxy. The Postgres-wire listener has MD5 + TLS + mTLS auth (see above).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 
 ### Checkpointing and Recovery
 
-1. **Coordinated Snapshots** — Barrier-based (Chandy-Lamport) checkpoint protocol: the coordinator injects barriers into all sources; operators with multiple inputs align barriers before snapshotting
-2. **Two-Phase Commit** — Exactly-once sinks participate in pre-commit/commit phases, coordinated by `CheckpointCoordinator`
-3. **Atomic Manifest** — Each checkpoint writes a JSON manifest (with operator state and connector offsets) via temp-file-plus-rename to filesystem or object store (S3/GCS/Azure)
-4. **Recovery** — `RecoveryManager` loads the latest manifest, restores operator state, rolls back exactly-once sinks, and resumes connectors from committed offsets
+1. **Coordinated snapshots.** Chandy-Lamport barriers injected at sources; operators with multiple inputs align before snapshotting.
+2. **Two-phase commit.** Exactly-once sinks participate in pre-commit / commit phases coordinated by `CheckpointCoordinator`.
+3. **Atomic manifest.** Each checkpoint writes a JSON manifest (operator state + connector offsets) via temp-file-plus-rename, to filesystem or object store (S3 / GCS / Azure).
+4. **Recovery.** `RecoveryManager` loads the latest manifest, restores operator state, rolls back exactly-once sinks, and resumes connectors from committed offsets.
 
 ```rust
 // Note: StreamCheckpointConfig is from laminar-core (add as a dependency)
@@ -367,80 +361,17 @@ Non-aggregate single-source queries are compiled to `PhysicalExpr` projections o
 
 ## Benchmarks
 
-Benchmark suites live under `crates/laminar-core/benches/`, `crates/laminar-db/benches/`, and `crates/laminar-connectors/benches/` (all using Criterion):
-
-| Metric | Target | Benchmark File |
-|--------|--------|----------------|
-| Streaming throughput | 500K events/sec | `crates/laminar-core/benches/streaming_bench.rs` |
-| Event latency (mean) | < 10us | `crates/laminar-core/benches/latency_bench.rs` |
-| Window operations | -- | `crates/laminar-core/benches/window_bench.rs` |
-| Lookup join | -- | `crates/laminar-core/benches/lookup_join_bench.rs` |
-| foyer cache | -- | `crates/laminar-core/benches/cache_bench.rs` |
-| Stream executor | -- | `crates/laminar-db/benches/stream_executor_bench.rs` |
-| Checkpoint recovery | < 10s | `crates/laminar-db/benches/recovery_bench.rs` |
-| MongoDB throughput | -- | `crates/laminar-connectors/benches/mongodb_throughput.rs` |
-
-Historical mean latencies on an AMD Ryzen AI 7 350 against minimal operator chains: per-event latency 0.55-1.16µs, single-core throughput 1.1-1.46M events/sec on a reactor+window pipeline. Real pipelines with multiple operators, joins, and state lookups show higher latency. p99 under sustained load is not continuously measured in CI. Run `cargo bench` to measure on your own hardware.
+Criterion suites live under `crates/laminar-core/benches/`, `crates/laminar-db/benches/`, and `crates/laminar-connectors/benches/`. Run `cargo bench` to measure on your own hardware. The numbers in the docs are from a developer laptop on minimal operator chains; they are not continuously validated and do not represent p99 under load.
 
 ---
 
 ## Language Bindings
 
-| Language | Package | Status |
-|----------|---------|--------|
-| **Rust** | [`laminar-db`](https://crates.io/crates/laminar-db) | Primary API |
-| **Python** | [`laminardb`](https://pypi.org/project/laminardb/) | Via [`laminardb-python`](https://github.com/laminardb/laminardb-python) (separate repo) |
-| **C/C++** | Via FFI (`--features ffi`) | ✅ Arrow C Data Interface, 50+ exported functions |
-| Java | `laminardb-java` | 📋 Planned |
-| Node.js | `@laminardb/node` | 📋 Planned |
-
----
-
-## Why LaminarDB vs. X?
-
-| | LaminarDB | Apache Flink | Kafka Streams | RisingWave | kdb+ |
-|---|---|---|---|---|---|
-| Deployment | Library or binary | JVM cluster | JVM library | Distributed cluster | Proprietary binary |
-| Language | Rust (+ Python, C FFI) | Java/Scala/Python | Java | Rust/Python/SQL | Q/Python |
-| Embed in your process | Yes | No | Yes (JVM) | No | No |
-| Latency (per-event, microbench) | Sub-microsecond (compiled queries, microbench) | Milliseconds–seconds | Milliseconds | Milliseconds | Microseconds |
-| Operational overhead | None (embedded) or single binary | K8s operator or YARN | Kafka cluster | etcd/K8s/S3 | Vendor support |
-| SQL | Full (DataFusion) | Flink SQL | None (DSL only) | Full (Postgres-compatible) | Q language |
-| Exactly-once | Yes (checkpoint + 2PC) | Yes | Yes | Yes | No |
-| License | Apache-2.0 | Apache-2.0 | Apache-2.0 | Apache-2.0 | Commercial |
-| Maturity | Pre-1.0, active development | Production (10+ years) | Production | Production | Production (25+ years) |
-
-**Where competitors are stronger:**
-- Flink has a decade of production hardening, hundreds of connectors, TB-scale state management (RocksDB backend), and a massive ecosystem.
-- kdb+ has unmatched time-series query performance, handles billions of rows in-memory, and has decades of finance-specific optimization.
-- RisingWave offers managed cloud deployment with zero operational overhead and Postgres wire compatibility.
-- Kafka Streams has been validated across thousands of production deployments for JVM-based event processing at scale.
-
-**Where LaminarDB fits:**
-- You want stream processing without a cluster or JVM dependency.
-- You need sub-millisecond latency and are willing to work with a pre-1.0 project.
-- You want to embed a streaming SQL engine directly in a Rust, C, or Python application.
-
----
-
-## Project Status
-
-**Version 0.21** — active development, pre-1.0. APIs may change between minor versions.
-
-| Phase | Description | Progress |
-|-------|-------------|----------|
-| Phase 1 | Core Engine | ✅ 12/12 |
-| Phase 1.5 | SQL Parser | ✅ 1/1 |
-| Phase 2 | Production Hardening | ✅ 38/38 |
-| Phase 2.5 | JIT Compiler | ❌ Removed (replaced by compiled `PhysicalExpr` projections) |
-| Phase 3 | Connectors & Integration | 🔧 95/100 |
-| Phase 4 | Enterprise Security (Auth, RBAC) | 📋 Planned |
-| Phase 5 | Admin & Observability | 🔧 4/10 |
-| Phase 6a | Partition-Parallel Embedded | ✅ 27/29 |
-| Phase 6b | Delta Foundation | ✅ 14/14 |
-| Phase 6c | Delta Production Hardening | 🔧 8/10 |
-
-Test coverage: ~2,700 tests across the workspace. CI runs on Linux and Windows.
+| Language | Package |
+|----------|---------|
+| Rust | [`laminar-db`](https://crates.io/crates/laminar-db) |
+| Python | [`laminardb`](https://pypi.org/project/laminardb/) (in [`laminardb-python`](https://github.com/laminardb/laminardb-python)) |
+| C / C++ | FFI (`--features ffi`), Arrow C Data Interface |
 
 ---
 
@@ -462,14 +393,14 @@ Test coverage: ~2,700 tests across the workspace. CI runs on Linux and Windows.
 | `otel` | OpenTelemetry OTLP/gRPC source (traces, metrics, logs) |
 | `parquet-lookup` | Parquet lookup source for reference tables |
 | `api` / `ffi` | C FFI layer with Arrow C Data Interface |
-| `delta` | Distributed mode scaffolding (gossip, Raft, gRPC) — not production-ready |
+| `delta` | Distributed mode scaffolding (gossip, Raft, gRPC). Not production-ready. |
 
 ---
 
 ## Building from Source
 
 ```bash
-# Prerequisites: Rust 1.85+ (stable)
+# Prerequisites: Rust 1.95+ (stable)
 git clone https://github.com/laminardb/laminardb.git
 cd laminardb
 
@@ -509,9 +440,9 @@ examples/
 
 ## Documentation
 
-- [Architecture Guide](docs/ARCHITECTURE.md) — design overview, data flow, state management
-- [SQL Reference](docs/SQL_REFERENCE.md) — streaming SQL dialect, tested patterns
-- [API Reference](https://docs.rs/laminar-db) — rustdoc
+- [Architecture Guide](docs/ARCHITECTURE.md): design overview, data flow, state management.
+- [SQL Reference](docs/SQL_REFERENCE.md): streaming SQL dialect, tested patterns.
+- [API Reference](https://docs.rs/laminar-db): rustdoc.
 
 ## Contributing
 
@@ -519,10 +450,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code style, Ring 0
 
 ## Support
 
-- [GitHub Issues](https://github.com/laminardb/laminardb/issues) — Bug reports and feature requests
-- [GitHub Discussions](https://github.com/laminardb/laminardb/discussions) — Questions and community help
-- Email: support@laminardb.io
+- [GitHub Issues](https://github.com/laminardb/laminardb/issues) for bug reports and feature requests.
+- [GitHub Discussions](https://github.com/laminardb/laminardb/discussions) for questions.
+- Email: support@laminardb.io.
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](LICENSE).

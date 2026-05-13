@@ -314,8 +314,8 @@ Historical mean-latency measurements (laptop hardware, Criterion microbenchmarks
 
 These are Criterion means from a developer laptop, not continuously
 validated in CI. True p99 under sustained load is not currently
-measured. See [BENCHMARKS.md](BENCHMARKS.md) for the historical
-baseline and caveats.
+measured. Run `cargo bench` on your own hardware to get numbers that
+mean something for your workload.
 
 ## Execution Model
 
@@ -333,7 +333,7 @@ The thread-per-core model described in earlier documentation was removed in PR #
 **Coordinator → Executor relationship:** `StreamingCoordinator` is the
 single tokio task that owns the event loop. It calls `PipelineCallback::execute_cycle()`,
 which delegates to `StreamExecutor::execute_cycle()`. The coordinator drives the
-executor through a callback interface — there is a single execution loop, not
+executor through a callback interface. There is a single execution loop, not
 multiple competing ones.
 
 ### Deployment Model

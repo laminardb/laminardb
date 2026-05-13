@@ -69,11 +69,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
             cross: false
             features: --all-features
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            cross: true
-            # vendored-openssl compiles OpenSSL from source for the target triple
-            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket,vendored-openssl"
+            cross: false
+            # Native ARM runner — no QEMU emulation, system libssl-dev is available
+            features: --features "kafka,postgres-cdc,postgres-sink,mysql-cdc,delta-lake,delta,websocket"
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: true

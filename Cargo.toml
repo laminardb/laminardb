@@ -17,7 +17,7 @@ resolver = "2"
 version = "0.22.0"
 authors = ["LaminarDB Contributors"]
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.95"
 license = "Apache-2.0"
 repository = "https://github.com/laminardb/laminardb"
 homepage = "https://laminardb.io"
@@ -126,11 +126,11 @@ proptest = "1.11"
 tempfile = "3.27"
 
 [profile.release]
-lto = "fat"
+lto = "thin"
 codegen-units = 1
 opt-level = 3
 debug = false
-strip = "symbols"
+strip = "debuginfo"
 
 [profile.bench]
 inherits = "release"

@@ -4,7 +4,7 @@
 
 ## Why
 
-<!-- Explain the motivation — link to an issue or describe the problem you're solving. -->
+<!-- Explain the motivation. Link to an issue or describe the problem you're solving. -->
 
 ## How
 
