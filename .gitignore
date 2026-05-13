@@ -63,4 +63,3 @@ docs/adr/
 /examples/binance-markout/target
 /examples/binance-markout/Cargo.lock
 /examples/binance-markout/smoke-report.txt
-/demo/kafka-iceberg-timeseries/validate/target
