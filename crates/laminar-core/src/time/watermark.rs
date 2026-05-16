@@ -32,12 +32,24 @@ pub trait WatermarkGenerator: Send {
     fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark>;
 }
 
-/// Watermark generator with bounded out-of-orderness. The watermark
-/// is always `max_timestamp_seen - max_out_of_orderness`.
+/// Default `max_future_skew_ms`: 5 min.
+pub const DEFAULT_MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1000;
+
+/// Wall clock in epoch millis; `0` if unreadable (callers fail open).
+fn now_unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Watermark = `max_timestamp_seen - max_out_of_orderness`. `on_event`
+/// ignores timestamps far beyond wall clock for advancement.
 pub struct BoundedOutOfOrdernessGenerator {
     max_out_of_orderness: i64,
     current_max_timestamp: i64,
     current_watermark: i64,
+    /// `0` (or negative) disables the guard (unbounded — legacy behaviour).
+    max_future_skew_ms: i64,
 }
 
 impl BoundedOutOfOrdernessGenerator {
@@ -52,7 +64,15 @@ impl BoundedOutOfOrdernessGenerator {
             max_out_of_orderness,
             current_max_timestamp: i64::MIN,
             current_watermark: i64::MIN,
+            max_future_skew_ms: DEFAULT_MAX_FUTURE_SKEW_MS,
         }
+    }
+
+    /// Sets the future-skew ceiling; `<= 0` disables the guard.
+    #[must_use]
+    pub fn with_max_future_skew(mut self, skew_ms: i64) -> Self {
+        self.max_future_skew_ms = skew_ms;
+        self
     }
 
     /// Creates a new generator from a `Duration`.
@@ -72,6 +92,13 @@ impl BoundedOutOfOrdernessGenerator {
 impl WatermarkGenerator for BoundedOutOfOrdernessGenerator {
     #[inline]
     fn on_event(&mut self, timestamp: i64) -> Option<Watermark> {
+        // Don't let a corrupt far-future producer clock advance the watermark.
+        if self.max_future_skew_ms > 0 {
+            let now = now_unix_millis();
+            if now > 0 && timestamp > now.saturating_add(self.max_future_skew_ms) {
+                return None;
+            }
+        }
         if timestamp > self.current_max_timestamp {
             self.current_max_timestamp = timestamp;
             let new_watermark = timestamp.saturating_sub(self.max_out_of_orderness);
@@ -602,15 +629,6 @@ impl ProcessingTimeGenerator {
             current_watermark: i64::MIN,
         }
     }
-
-    /// Returns the current wall-clock time in milliseconds since Unix epoch.
-    #[allow(clippy::cast_possible_truncation)]
-    fn now_millis() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_millis() as i64
-    }
 }
 
 impl Default for ProcessingTimeGenerator {
@@ -628,7 +646,7 @@ impl WatermarkGenerator for ProcessingTimeGenerator {
 
     #[inline]
     fn on_periodic(&mut self) -> Option<Watermark> {
-        let now = Self::now_millis();
+        let now = now_unix_millis();
         if now > self.current_watermark {
             self.current_watermark = now;
             Some(Watermark::new(now))
@@ -1038,5 +1056,18 @@ mod tests {
     fn test_processing_time_generator_default() {
         let gen = ProcessingTimeGenerator::default();
         assert_eq!(gen.current_watermark(), i64::MIN);
+    }
+
+    // --- future-skew guard ---
+
+    #[test]
+    fn future_skew_event_does_not_advance_watermark() {
+        let mut gen = BoundedOutOfOrdernessGenerator::new(0);
+        let now = super::now_unix_millis();
+        // A ~2h-future event must not poison the watermark...
+        assert_eq!(gen.on_event(now + 2 * 60 * 60 * 1000), None);
+        assert_eq!(gen.current_watermark(), i64::MIN);
+        // ...but a normal event still advances it.
+        assert_eq!(gen.on_event(now), Some(Watermark::new(now)));
     }
 }
