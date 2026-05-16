@@ -1068,7 +1068,7 @@ fn extract_timestamp(
 ) -> Result<i64, String> {
     // Numeric values: treat as epoch milliseconds.
     if let Some(n) = value.as_i64() {
-        return Ok(millis_to_unit(n, unit));
+        return checked_millis_to_unit(n, unit);
     }
     if let Some(f) = value.as_f64() {
         // 2^63 == i64::MAX + 1; exclusive upper bound for a lossless f64->i64.
@@ -1084,7 +1084,7 @@ fn extract_timestamp(
         }
         #[allow(clippy::cast_possible_truncation)] // range-checked; already integral
         let ms = rounded as i64;
-        return Ok(millis_to_unit(ms, unit));
+        return checked_millis_to_unit(ms, unit);
     }
 
     // String values: try configured timestamp formats.
@@ -1107,13 +1107,18 @@ fn extract_timestamp(
     Err(format!("expected timestamp, got {}", json_type_name(value)))
 }
 
-/// Converts epoch milliseconds to the target time unit.
-fn millis_to_unit(ms: i64, unit: TimeUnit) -> i64 {
+/// Converts epoch milliseconds to the target `TimeUnit`, erroring rather
+/// than wrapping when scaling overflows i64 (Microsecond/Nanosecond).
+fn checked_millis_to_unit(ms: i64, unit: TimeUnit) -> Result<i64, String> {
     match unit {
-        TimeUnit::Second => ms / 1_000,
-        TimeUnit::Millisecond => ms,
-        TimeUnit::Microsecond => ms * 1_000,
-        TimeUnit::Nanosecond => ms * 1_000_000,
+        TimeUnit::Second => Ok(ms / 1_000),
+        TimeUnit::Millisecond => Ok(ms),
+        TimeUnit::Microsecond => ms
+            .checked_mul(1_000)
+            .ok_or_else(|| format!("timestamp {ms} out of i64 microsecond range")),
+        TimeUnit::Nanosecond => ms
+            .checked_mul(1_000_000)
+            .ok_or_else(|| format!("timestamp {ms} out of i64 nanosecond range")),
     }
 }
 
@@ -1470,6 +1475,26 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("out of i64 millisecond range"));
+    }
+
+    #[test]
+    fn test_decode_timestamp_overflow_on_nanosecond_scaling_is_rejected() {
+        // A ms value that fits i64 but overflows when scaled to nanoseconds
+        // must error, not wrap into a bogus (watermark-poisoning) timestamp.
+        let schema = make_schema(vec![(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]);
+        let decoder = JsonDecoder::new(schema);
+        let records = vec![json_record(r#"{"ts": 9999999999999999}"#)];
+        let result = decoder.decode_batch(&records);
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("out of i64 nanosecond range"));
     }
 
     // ── Nested objects as LargeBinary ─────────────────────────
