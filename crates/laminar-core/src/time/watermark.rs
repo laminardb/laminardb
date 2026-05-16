@@ -36,11 +36,10 @@ pub trait WatermarkGenerator: Send {
 pub const DEFAULT_MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1000;
 
 /// Wall clock in epoch millis; `0` if unreadable (callers fail open).
-#[allow(clippy::cast_possible_truncation)]
 fn now_unix_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 /// Watermark = `max_timestamp_seen - max_out_of_orderness`. `on_event`

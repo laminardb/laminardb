@@ -42,13 +42,12 @@ enum SinkFilterDispatch {
 /// 2. `spawn_blocking` on `current_thread` has no dedicated blocking pool
 /// 3. The compute thread is dedicated — blocking is acceptable
 // Throttled (~once/10s) WARN so silent watermark drops are diagnosable.
-#[allow(clippy::cast_possible_truncation)]
 fn warn_late_drops(source: &str, column: &str, watermark_ms: i64, dropped: usize) {
     use std::sync::atomic::{AtomicI64, Ordering};
     static LAST_WARN_MS: AtomicI64 = AtomicI64::new(0);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64);
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
     if now_ms - LAST_WARN_MS.load(Ordering::Relaxed) < 10_000 {
         return;
     }
@@ -668,9 +667,9 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         let after = out.as_ref().map_or(0, arrow_array::RecordBatch::num_rows);
                         let dropped = before.saturating_sub(after);
                         if dropped > 0 {
-                            #[allow(clippy::cast_possible_truncation)]
-                            let d = dropped as u64;
-                            self.prom.events_dropped.inc_by(d);
+                            self.prom
+                                .events_dropped
+                                .inc_by(u64::try_from(dropped).unwrap_or(u64::MAX));
                             warn_late_drops(source_name, &wm_state.column, current_wm, dropped);
                         }
                         return out;
