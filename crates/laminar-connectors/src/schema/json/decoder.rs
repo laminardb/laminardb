@@ -1071,15 +1071,19 @@ fn extract_timestamp(
         return Ok(millis_to_unit(n, unit));
     }
     if let Some(f) = value.as_f64() {
-        // `f as i64` saturates (NaN -> 0, +-huge -> i64::MIN/MAX), which would
-        // silently turn a garbage timestamp into a valid-looking one and
-        // poison event-time/watermarks. Reject out-of-range values so the
-        // configured type-mismatch strategy applies, like any other bad value.
-        if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&f) {
+        // 2^63 == i64::MAX + 1; exclusive upper bound for a lossless f64->i64.
+        const POW2_63: f64 = 9_223_372_036_854_775_808.0;
+        // `f as i64` saturates (NaN -> 0, +-huge -> i64::MIN/MAX), silently
+        // turning a garbage timestamp into a valid-looking one that poisons
+        // event-time/watermarks. Round to the nearest millisecond and reject
+        // out-of-range/non-finite so the configured type-mismatch strategy
+        // applies, like any other bad value.
+        let rounded = f.round();
+        if !(-POW2_63..POW2_63).contains(&rounded) {
             return Err(format!("timestamp {f} out of i64 millisecond range"));
         }
-        #[allow(clippy::cast_possible_truncation)] // range-checked above; drops sub-ms fraction
-        let ms = f as i64;
+        #[allow(clippy::cast_possible_truncation)] // range-checked; already integral
+        let ms = rounded as i64;
         return Ok(millis_to_unit(ms, unit));
     }
 

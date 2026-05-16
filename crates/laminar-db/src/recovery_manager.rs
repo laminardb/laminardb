@@ -308,17 +308,18 @@ impl<'a> RecoveryManager<'a> {
         let mut all_resolved = true;
         for (name, op) in &mut manifest.operator_states {
             if op.external {
-                // `external_offset`/`external_length` are u64 read from the
-                // on-disk manifest; compute bounds with checked arithmetic so a
-                // corrupt/tampered manifest can't overflow past the length
-                // check below.
-                let bounds = usize::try_from(op.external_offset).ok().and_then(|start| {
-                    usize::try_from(op.external_length)
-                        .ok()
-                        .and_then(|len| start.checked_add(len))
-                        .map(|end| (start, end))
-                });
-                if let Some((start, end)) = bounds.filter(|&(_, end)| end <= state_data.len()) {
+                // `external_offset`/`external_length` are u64 from the on-disk
+                // manifest; use checked arithmetic so a corrupt/tampered
+                // manifest can't overflow past the length check.
+                let range = match (
+                    usize::try_from(op.external_offset),
+                    usize::try_from(op.external_length),
+                ) {
+                    (Ok(start), Ok(len)) => start.checked_add(len).map(|end| (start, end)),
+                    _ => None,
+                }
+                .filter(|&(_, end)| end <= state_data.len());
+                if let Some((start, end)) = range {
                     let external_offset = op.external_offset;
                     let external_length = op.external_length;
                     let data = &state_data[start..end];
