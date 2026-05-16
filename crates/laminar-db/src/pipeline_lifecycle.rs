@@ -1268,7 +1268,10 @@ impl LaminarDB {
                 .checkpoint
                 .as_ref()
                 .and_then(|c| c.alignment_timeout_ms)
-                .map_or(std::time::Duration::from_secs(30), std::time::Duration::from_millis),
+                .map_or(
+                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_millis,
+                ),
             delivery_guarantee: self.config.delivery_guarantee,
             // cycle_budget is a soft cap for logging; ensure it's at least
             // drain + query so sub-budgets can actually be used.

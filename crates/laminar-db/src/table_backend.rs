@@ -129,7 +129,11 @@ mod tests {
         let schema = test_schema();
         backend.put("2", make_batch(2, "C", 3.0)).unwrap();
         assert_eq!(
-            backend.to_record_batch(&schema).unwrap().unwrap().num_rows(),
+            backend
+                .to_record_batch(&schema)
+                .unwrap()
+                .unwrap()
+                .num_rows(),
             2
         );
 

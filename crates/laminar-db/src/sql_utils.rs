@@ -289,14 +289,14 @@ pub fn sql_values_to_record_batch(
                 )?)));
             }
             DataType::Int16 => {
-                columns.push(std::sync::Arc::new(Int16Array::from(narrow_i64_col::<i16>(
-                    values, col_idx, field, "INT16",
-                )?)));
+                columns.push(std::sync::Arc::new(Int16Array::from(
+                    narrow_i64_col::<i16>(values, col_idx, field, "INT16")?,
+                )));
             }
             DataType::Int32 => {
-                columns.push(std::sync::Arc::new(Int32Array::from(narrow_i64_col::<i32>(
-                    values, col_idx, field, "INT32",
-                )?)));
+                columns.push(std::sync::Arc::new(Int32Array::from(
+                    narrow_i64_col::<i32>(values, col_idx, field, "INT32")?,
+                )));
             }
             DataType::Int64 => {
                 let arr: Int64Array = values
