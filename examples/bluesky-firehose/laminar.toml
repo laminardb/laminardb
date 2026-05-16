@@ -1,0 +1,50 @@
+# Bluesky firehose → LaminarDB → SUBSCRIBE over the Postgres wire protocol.
+#
+# The source is the public Bluesky Jetstream firehose (no auth, no Docker).
+# Each WebSocket frame is a deeply-nested JSON commit event; the connector
+# flattens the fields we care about with `json.column.<col>` paths and
+# silently skips frames that don't match (deletes, identity/account events).
+#
+# No event-time watermark: `createdAt` is client-supplied and a single
+# bad clock would poison an event-time watermark. This demo is about the
+# Postgres wire protocol, not windowing — `posts` is a plain projection
+# stream with history retained so `AS OF EPOCH` replay works.
+#
+# Scope: the URL pins `?wantedCollections=app.bsky.feed.post`, so this is
+# posts only (~30-60/sec, every row has readable `text`). For the WHOLE
+# firehose — likes, reposts, follows, profile edits: several thousand
+# events/sec, much higher throughput but mostly NULL text — change the
+# url below to 'wss://jetstream2.us-east.bsky.network/subscribe' (no
+# query string). Non-post records simply lack `commit.record.text`, and
+# the connector nulls missing fields rather than failing.
+#
+# Exposed over pgwire (port 5432):
+#   * posts  — the live post stream; SUBSCRIBE [WHERE ...] [AS OF EPOCH n]
+
+sql = """
+CREATE SOURCE bluesky_posts (
+    did         VARCHAR,
+    operation   VARCHAR,
+    collection  VARCHAR,
+    text        VARCHAR,
+    created_at  VARCHAR
+) FROM WEBSOCKET (
+    url    = 'wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post',
+    format = 'json',
+    'json.column.did'        = 'did',
+    'json.column.operation'  = 'commit.operation',
+    'json.column.collection' = 'commit.collection',
+    'json.column.text'       = 'commit.record.text',
+    'json.column.created_at' = 'commit.record.createdAt'
+) FORMAT JSON;
+
+CREATE STREAM posts AS
+SELECT did, collection, text, created_at
+FROM bluesky_posts
+WHERE operation = 'create' AND text IS NOT NULL
+WITH ('retain_history' = '256mb');
+"""
+
+[server]
+bind        = "127.0.0.1:7777"
+pgwire_bind = "127.0.0.1:5432"
