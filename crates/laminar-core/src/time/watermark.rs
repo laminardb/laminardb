@@ -37,16 +37,19 @@ pub trait WatermarkGenerator: Send {
 /// progress (5 minutes). See [ADR-002].
 pub const DEFAULT_MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1000;
 
-/// Watermark generator with bounded out-of-orderness. The watermark
-/// is always `max_timestamp_seen - max_out_of_orderness`.
-///
-/// `on_event` ignores — for watermark advancement only — timestamps more
-/// than `max_future_skew_ms` beyond wall clock, so a single future-dated
-/// event (e.g. a producer with a wrong clock) cannot drag the watermark
-/// arbitrarily far ahead and silently starve the stream (ADR-002). The
-/// row itself is not dropped here; only its ability to move the watermark
-/// is suppressed. `advance_watermark` (external / source-provided
-/// watermarks) is a trusted assertion and is never guarded.
+/// Wall clock in Unix epoch millis; `0` if the clock is unreadable
+/// (pre-1970 / failure), on which callers fail open.
+#[allow(clippy::cast_possible_truncation)]
+fn now_unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// Watermark generator with bounded out-of-orderness; the watermark is
+/// `max_timestamp_seen - max_out_of_orderness`. `on_event` ignores
+/// timestamps too far beyond wall clock so one bad producer clock can't
+/// poison it; `advance_watermark` is trusted. See ADR-002.
 pub struct BoundedOutOfOrdernessGenerator {
     max_out_of_orderness: i64,
     current_max_timestamp: i64,
@@ -80,16 +83,6 @@ impl BoundedOutOfOrdernessGenerator {
         self
     }
 
-    /// Wall clock in epoch millis, or `0` if the system clock is
-    /// unreadable — in which case the future-skew guard fails open
-    /// (preserving legacy behaviour rather than rejecting everything).
-    #[allow(clippy::cast_possible_truncation)]
-    fn now_ms() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as i64)
-    }
-
     /// Creates a new generator from a `Duration`.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // Duration.as_millis() fits i64 for practical values
@@ -111,7 +104,7 @@ impl WatermarkGenerator for BoundedOutOfOrdernessGenerator {
         // clock is a corrupt producer clock, not time progress. Ignore it
         // for watermark advancement (the row still flows downstream).
         if self.max_future_skew_ms > 0 {
-            let now = Self::now_ms();
+            let now = now_unix_millis();
             if now > 0 && timestamp > now.saturating_add(self.max_future_skew_ms) {
                 return None;
             }
@@ -647,14 +640,6 @@ impl ProcessingTimeGenerator {
         }
     }
 
-    /// Returns the current wall-clock time in milliseconds since Unix epoch.
-    #[allow(clippy::cast_possible_truncation)]
-    fn now_millis() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_millis() as i64
-    }
 }
 
 impl Default for ProcessingTimeGenerator {
@@ -672,7 +657,7 @@ impl WatermarkGenerator for ProcessingTimeGenerator {
 
     #[inline]
     fn on_periodic(&mut self) -> Option<Watermark> {
-        let now = Self::now_millis();
+        let now = now_unix_millis();
         if now > self.current_watermark {
             self.current_watermark = now;
             Some(Watermark::new(now))
@@ -1086,37 +1071,23 @@ mod tests {
 
     // --- ADR-002 future-skew guard ---
 
-    fn now_ms() -> i64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64
-    }
-
     #[test]
     fn future_skew_event_does_not_advance_watermark() {
-        let mut gen = BoundedOutOfOrdernessGenerator::new(0); // 5-min default skew
-        let now = now_ms();
-        // One event ~2h in the future must NOT poison the watermark.
+        let mut gen = BoundedOutOfOrdernessGenerator::new(0);
+        let now = super::now_unix_millis();
+        // A ~2h-future event must not poison the watermark...
         assert_eq!(gen.on_event(now + 2 * 60 * 60 * 1000), None);
         assert_eq!(gen.current_watermark(), i64::MIN);
-        // A normal event still advances it.
-        let wm = gen.on_event(now);
-        assert_eq!(wm, Some(Watermark::new(now)));
+        // ...but a normal event still advances it.
+        assert_eq!(gen.on_event(now), Some(Watermark::new(now)));
     }
 
     #[test]
-    fn future_skew_guard_disabled_restores_legacy() {
-        let mut gen = BoundedOutOfOrdernessGenerator::new(0).with_max_future_skew(0);
-        let future = now_ms() + 2 * 60 * 60 * 1000;
-        assert_eq!(gen.on_event(future), Some(Watermark::new(future)));
-    }
-
-    #[test]
-    fn advance_watermark_is_not_guarded() {
-        // External / source-provided watermarks are trusted assertions.
+    fn advance_watermark_bypasses_the_future_guard() {
+        // External / source-provided watermarks are trusted; this is why
+        // the source-side late-drop tests still pass.
         let mut gen = BoundedOutOfOrdernessGenerator::new(0);
-        let future = now_ms() + 2 * 60 * 60 * 1000;
+        let future = super::now_unix_millis() + 2 * 60 * 60 * 1000;
         assert_eq!(gen.advance_watermark(future), Some(Watermark::new(future)));
     }
 }
