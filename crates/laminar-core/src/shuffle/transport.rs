@@ -353,7 +353,7 @@ impl ShuffleReceiver {
     /// Single-owner; concurrent callers serialise via `rx_returned`.
     /// Cancellation-safe — a dropped `recv()` future returns the
     /// receiver to its slot via the internal RAII guard.
-    #[allow(clippy::missing_panics_doc)]
+    #[allow(clippy::missing_panics_doc)] // `expect` upholds a local invariant set 3 lines above
     pub async fn recv(&self) -> Option<(ShufflePeerId, ShuffleMessage)> {
         loop {
             // Scope the guard so it is dropped before any `.await` —

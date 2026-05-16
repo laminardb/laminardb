@@ -386,10 +386,11 @@ fn mysql_value_to_column_value(val: &mysql_async::Value) -> ColumnValue {
             }
         }
         mysql_async::Value::Time(is_negative, days, hours, minutes, seconds, micros) => {
-            // Convert days+hours to total hours.
-            // days is u32 and hours is u8, product fits in i32.
-            #[allow(clippy::cast_possible_wrap)]
-            let total_hours = (*days as i32) * 24 + i32::from(*hours);
+            // `days`/`hours` come off the wire; compute in i64 and clamp so a
+            // corrupt value can't overflow or sign-flip (a valid MySQL TIME is
+            // at most 838 hours).
+            let total_hours_wide = i64::from(*days) * 24 + i64::from(*hours);
+            let total_hours = i32::try_from(total_hours_wide).unwrap_or(i32::MAX);
             let h = if *is_negative {
                 -total_hours
             } else {

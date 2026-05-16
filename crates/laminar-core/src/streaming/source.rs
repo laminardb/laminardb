@@ -55,9 +55,6 @@ pub(crate) enum SourceMessage<T> {
 
     /// A batch of Arrow records.
     Batch(RecordBatch),
-
-    /// A watermark timestamp.
-    Watermark(#[allow(dead_code)] i64),
 }
 
 /// Shared state for watermark tracking.
@@ -197,7 +194,7 @@ impl<T: Record> Source<T> {
                     value: r,
                     error: StreamingError::ChannelFull,
                 },
-                _ => unreachable!(),
+                SourceMessage::Batch(_) => unreachable!("only Record is pushed here"),
             })?;
 
         self.inner.sequence.fetch_add(1, Ordering::Relaxed);
@@ -275,14 +272,11 @@ impl<T: Record> Source<T> {
     /// Watermarks are monotonically increasing - if a lower timestamp is
     /// passed, it will be ignored.
     pub fn watermark(&self, timestamp: i64) {
+        // The shared atomic is the authoritative watermark: the pipeline's
+        // watermark UDF, late-row filter, and checkpoint registration all
+        // read it via `watermark_atomic()`. Subscribers receive data only,
+        // so there is no in-band watermark message to emit.
         self.inner.watermark.update(timestamp);
-
-        // Best-effort send of watermark message
-        // It's okay if this fails - the atomic watermark state is updated
-        let _ = self
-            .inner
-            .producer
-            .try_push(SourceMessage::Watermark(timestamp));
     }
 
     /// Returns the current watermark value.

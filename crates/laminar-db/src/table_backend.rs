@@ -11,6 +11,9 @@ use arrow::datatypes::SchemaRef;
 use crate::error::DbError;
 
 /// Backend storage for a single reference table.
+// Single-variant backend abstraction: `contains_key`/`len`/`drain`/`is_empty`
+// are exercised by unit tests / reserved for a future persistent backend;
+// the rest are used by `table_store.rs`.
 #[allow(dead_code)]
 pub(crate) enum TableBackend {
     /// In-memory storage (default behavior).
@@ -20,7 +23,7 @@ pub(crate) enum TableBackend {
     },
 }
 
-#[allow(dead_code, clippy::unnecessary_wraps)]
+#[allow(dead_code, clippy::unnecessary_wraps)] // see TableBackend: not all methods are wired into prod yet
 impl TableBackend {
     /// Create a new in-memory backend.
     pub fn in_memory() -> Self {
