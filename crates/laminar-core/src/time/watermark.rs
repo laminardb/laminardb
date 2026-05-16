@@ -639,7 +639,6 @@ impl ProcessingTimeGenerator {
             current_watermark: i64::MIN,
         }
     }
-
 }
 
 impl Default for ProcessingTimeGenerator {

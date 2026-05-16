@@ -664,16 +664,31 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             let current_wm = wm_state.generator.current_watermark();
             if current_wm > i64::MIN {
                 let before = batch.num_rows();
-                let out = filter_late_rows(batch, &wm_state.column, current_wm);
-                let after = out.as_ref().map_or(0, arrow_array::RecordBatch::num_rows);
-                let dropped = before.saturating_sub(after);
-                if dropped > 0 {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let d = dropped as u64;
-                    self.prom.events_dropped.inc_by(d);
-                    warn_late_drops(source_name, &wm_state.column, current_wm, dropped);
+                match filter_late_rows(batch, &wm_state.column, current_wm) {
+                    Ok(out) => {
+                        let after = out.as_ref().map_or(0, arrow_array::RecordBatch::num_rows);
+                        let dropped = before.saturating_sub(after);
+                        if dropped > 0 {
+                            #[allow(clippy::cast_possible_truncation)]
+                            let d = dropped as u64;
+                            self.prom.events_dropped.inc_by(d);
+                            warn_late_drops(source_name, &wm_state.column, current_wm, dropped);
+                        }
+                        return out;
+                    }
+                    Err(e) => {
+                        // Schema drift, not a late-data condition: drop the
+                        // batch (fail-safe) and log it as the error it is —
+                        // no misleading watermark warning.
+                        tracing::error!(
+                            source = source_name,
+                            column = %wm_state.column,
+                            error = %e,
+                            "filter_late_rows: dropping batch (schema drift)"
+                        );
+                        return None;
+                    }
                 }
-                return out;
             }
         }
         // No watermark configured → pass through all rows.

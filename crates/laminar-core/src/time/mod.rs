@@ -9,7 +9,7 @@ pub use cast::{cast_to_millis_array, CastError};
 pub use duration_str::parse_duration_str;
 pub use event_time::{EventTimeError, EventTimeExtractor, ExtractionMode, TimestampField};
 
-pub use filter::{filter_batch_by_timestamp, ThresholdOp};
+pub use filter::{filter_batch_by_timestamp, FilterError, ThresholdOp};
 
 pub use watermark::{
     AscendingTimestampsGenerator, BoundedOutOfOrdernessGenerator, PeriodicGenerator,

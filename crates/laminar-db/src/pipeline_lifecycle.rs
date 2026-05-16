@@ -1123,10 +1123,17 @@ impl LaminarDB {
         // rather than time progress. `LAMINAR_MAX_FUTURE_SKEW_MS=0`
         // disables it (restores legacy unbounded behaviour) for the rare
         // legitimately-far-future pipeline.
-        let future_skew_ms = std::env::var("LAMINAR_MAX_FUTURE_SKEW_MS")
-            .ok()
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS);
+        let future_skew_ms = match std::env::var("LAMINAR_MAX_FUTURE_SKEW_MS") {
+            Ok(v) => v.parse::<i64>().unwrap_or_else(|_| {
+                tracing::warn!(
+                    value = %v,
+                    "invalid LAMINAR_MAX_FUTURE_SKEW_MS (expected an integer); \
+                     using the default"
+                );
+                laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS
+            }),
+            Err(_) => laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
+        };
         let source_names = self.catalog.list_sources();
         let mut watermark_states: FxHashMap<String, SourceWatermarkState> =
             FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);

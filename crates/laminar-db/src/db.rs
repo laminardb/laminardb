@@ -154,24 +154,20 @@ pub(crate) struct SourceWatermarkState {
     pub(crate) column: String,
 }
 
+/// Keep rows at/after the watermark; `Ok(None)` means every row was late.
+/// `Err` is schema drift (missing/!timestamp column) — distinct from
+/// all-late so the caller doesn't misreport it as a watermark drop.
 pub(crate) fn filter_late_rows(
     batch: &RecordBatch,
     column: &str,
     watermark: i64,
-) -> Option<RecordBatch> {
-    match laminar_core::time::filter_batch_by_timestamp(
+) -> Result<Option<RecordBatch>, laminar_core::time::FilterError> {
+    laminar_core::time::filter_batch_by_timestamp(
         batch,
         column,
         watermark,
         laminar_core::time::ThresholdOp::GreaterEq,
-    ) {
-        Ok(out) => out,
-        Err(e) => {
-            // Schema drift — drop the batch rather than silently admit late rows.
-            tracing::error!(%column, error = %e, "filter_late_rows: dropping batch");
-            None
-        }
-    }
+    )
 }
 
 pub(crate) use laminar_core::time::parse_duration_str;
