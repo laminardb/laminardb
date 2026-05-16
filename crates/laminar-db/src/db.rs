@@ -154,9 +154,8 @@ pub(crate) struct SourceWatermarkState {
     pub(crate) column: String,
 }
 
-/// Keep rows at/after the watermark; `Ok(None)` means every row was late.
-/// `Err` is schema drift (missing/!timestamp column) — distinct from
-/// all-late so the caller doesn't misreport it as a watermark drop.
+/// Keep rows at/after the watermark. `Ok(None)` = all rows late;
+/// `Err` = schema drift (missing/non-timestamp column).
 pub(crate) fn filter_late_rows(
     batch: &RecordBatch,
     column: &str,

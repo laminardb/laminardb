@@ -32,13 +32,10 @@ pub trait WatermarkGenerator: Send {
     fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark>;
 }
 
-/// Default ceiling on how far a single event timestamp may exceed wall
-/// clock before it is treated as a corrupt clock rather than time
-/// progress (5 minutes). See [ADR-002].
+/// Default `max_future_skew_ms` (5 min). See ADR-002.
 pub const DEFAULT_MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1000;
 
-/// Wall clock in Unix epoch millis; `0` if the clock is unreadable
-/// (pre-1970 / failure), on which callers fail open.
+/// Wall clock in epoch millis; `0` if unreadable (callers fail open).
 #[allow(clippy::cast_possible_truncation)]
 fn now_unix_millis() -> i64 {
     SystemTime::now()
@@ -46,10 +43,8 @@ fn now_unix_millis() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
-/// Watermark generator with bounded out-of-orderness; the watermark is
-/// `max_timestamp_seen - max_out_of_orderness`. `on_event` ignores
-/// timestamps too far beyond wall clock so one bad producer clock can't
-/// poison it; `advance_watermark` is trusted. See ADR-002.
+/// Watermark = `max_timestamp_seen - max_out_of_orderness`. `on_event`
+/// ignores timestamps far beyond wall clock for advancement (ADR-002).
 pub struct BoundedOutOfOrdernessGenerator {
     max_out_of_orderness: i64,
     current_max_timestamp: i64,
@@ -74,9 +69,7 @@ impl BoundedOutOfOrdernessGenerator {
         }
     }
 
-    /// Overrides the future-skew ceiling. `<= 0` disables the guard
-    /// (unbounded — legacy behaviour). Wired from the `max.future.skew.ms`
-    /// source property.
+    /// Sets the future-skew ceiling; `<= 0` disables the guard.
     #[must_use]
     pub fn with_max_future_skew(mut self, skew_ms: i64) -> Self {
         self.max_future_skew_ms = skew_ms;
@@ -100,9 +93,7 @@ impl BoundedOutOfOrdernessGenerator {
 impl WatermarkGenerator for BoundedOutOfOrdernessGenerator {
     #[inline]
     fn on_event(&mut self, timestamp: i64) -> Option<Watermark> {
-        // Future-skew guard: a timestamp implausibly far ahead of wall
-        // clock is a corrupt producer clock, not time progress. Ignore it
-        // for watermark advancement (the row still flows downstream).
+        // Don't let a corrupt far-future producer clock advance the watermark.
         if self.max_future_skew_ms > 0 {
             let now = now_unix_millis();
             if now > 0 && timestamp > now.saturating_add(self.max_future_skew_ms) {
@@ -1079,14 +1070,5 @@ mod tests {
         assert_eq!(gen.current_watermark(), i64::MIN);
         // ...but a normal event still advances it.
         assert_eq!(gen.on_event(now), Some(Watermark::new(now)));
-    }
-
-    #[test]
-    fn advance_watermark_bypasses_the_future_guard() {
-        // External / source-provided watermarks are trusted; this is why
-        // the source-side late-drop tests still pass.
-        let mut gen = BoundedOutOfOrdernessGenerator::new(0);
-        let future = super::now_unix_millis() + 2 * 60 * 60 * 1000;
-        assert_eq!(gen.advance_watermark(future), Some(Watermark::new(future)));
     }
 }

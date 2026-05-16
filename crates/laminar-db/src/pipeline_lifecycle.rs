@@ -1117,12 +1117,8 @@ impl LaminarDB {
             }
         }
 
-        // Build per-source watermark tracking state (connector pipeline).
-        // ADR-002: cap how far a single event timestamp may run ahead of
-        // wall clock before it's treated as a corrupt producer clock
-        // rather than time progress. `LAMINAR_MAX_FUTURE_SKEW_MS=0`
-        // disables it (restores legacy unbounded behaviour) for the rare
-        // legitimately-far-future pipeline.
+        // Per-source watermark state. ADR-002 future-skew ceiling;
+        // `LAMINAR_MAX_FUTURE_SKEW_MS=0` disables it (legacy unbounded).
         let future_skew_ms = match std::env::var("LAMINAR_MAX_FUTURE_SKEW_MS") {
             Ok(v) => v.parse::<i64>().unwrap_or_else(|_| {
                 tracing::warn!(

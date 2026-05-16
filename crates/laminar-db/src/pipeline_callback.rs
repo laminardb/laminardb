@@ -41,8 +41,7 @@ enum SinkFilterDispatch {
 /// 1. `tokio::spawn` on `current_thread` has no parallelism benefit
 /// 2. `spawn_blocking` on `current_thread` has no dedicated blocking pool
 /// 3. The compute thread is dedicated — blocking is acceptable
-// Throttled (~once/10s) WARN so a watermark silently dropping rows is
-// diagnosable instead of looking like a hang.
+// Throttled (~once/10s) WARN so silent watermark drops are diagnosable.
 #[allow(clippy::cast_possible_truncation)]
 fn warn_late_drops(source: &str, column: &str, watermark_ms: i64, dropped: usize) {
     use std::sync::atomic::{AtomicI64, Ordering};
@@ -677,9 +676,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         return out;
                     }
                     Err(e) => {
-                        // Schema drift, not a late-data condition: drop the
-                        // batch (fail-safe) and log it as the error it is —
-                        // no misleading watermark warning.
+                        // Schema drift, not lateness: fail-safe drop + error.
                         tracing::error!(
                             source = source_name,
                             column = %wm_state.column,
