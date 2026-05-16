@@ -1263,10 +1263,15 @@ impl LaminarDB {
                 } else {
                     std::time::Duration::ZERO
                 }),
-            // Tracks CheckpointConfig::default().alignment_timeout.
-            // TODO: expose alignment_timeout_ms in LaminarDbConfig.checkpoint
-            // so users can configure this.
-            barrier_alignment_timeout: std::time::Duration::from_secs(30),
+            barrier_alignment_timeout: self
+                .config
+                .checkpoint
+                .as_ref()
+                .and_then(|c| c.alignment_timeout_ms)
+                .map_or(
+                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_millis,
+                ),
             delivery_guarantee: self.config.delivery_guarantee,
             // cycle_budget is a soft cap for logging; ensure it's at least
             // drain + query so sub-budgets can actually be used.

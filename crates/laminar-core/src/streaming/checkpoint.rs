@@ -11,6 +11,9 @@ pub struct StreamCheckpointConfig {
     pub data_dir: Option<std::path::PathBuf>,
     /// Maximum number of retained checkpoints. `None` = default (3).
     pub max_retained: Option<usize>,
+    /// Barrier-alignment timeout in milliseconds at fan-in operators.
+    /// `None` = default (`30_000`).
+    pub alignment_timeout_ms: Option<u64>,
 }
 
 /// Errors from checkpoint operations.
@@ -55,5 +58,6 @@ mod tests {
         assert!(config.interval_ms.is_none());
         assert!(config.data_dir.is_none());
         assert!(config.max_retained.is_none());
+        assert!(config.alignment_timeout_ms.is_none());
     }
 }

@@ -380,8 +380,7 @@ pub(crate) fn extract_projection_exprs(
 pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperatorConfig) -> i64 {
     match config.window_type {
         WindowType::Tumbling => {
-            #[allow(clippy::cast_possible_truncation)]
-            let size = config.size.as_millis() as i64;
+            let size = i64::try_from(config.size.as_millis()).unwrap_or(i64::MAX);
             if size <= 0 {
                 tracing::warn!("tumbling window size is zero or negative, EOWC filtering disabled");
                 return watermark_ms;
@@ -394,15 +393,16 @@ pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperator
             floored.saturating_add(offset)
         }
         WindowType::Session => {
-            #[allow(clippy::cast_possible_truncation)]
-            let gap = config.gap.map_or(0, |g| g.as_millis() as i64);
+            let gap = config
+                .gap
+                .map_or(0, |g| i64::try_from(g.as_millis()).unwrap_or(i64::MAX));
             watermark_ms.saturating_sub(gap)
         }
         WindowType::Sliding => {
-            #[allow(clippy::cast_possible_truncation)]
-            let size = config.size.as_millis() as i64;
-            #[allow(clippy::cast_possible_truncation)]
-            let slide = config.slide.map_or(size, |s| s.as_millis() as i64);
+            let size = i64::try_from(config.size.as_millis()).unwrap_or(i64::MAX);
+            let slide = config
+                .slide
+                .map_or(size, |s| i64::try_from(s.as_millis()).unwrap_or(i64::MAX));
             if slide <= 0 || size <= 0 {
                 tracing::warn!(
                     slide_ms = slide,
@@ -426,8 +426,7 @@ pub(crate) fn compute_closed_boundary(watermark_ms: i64, config: &WindowOperator
         WindowType::Cumulate => {
             // Cumulate windows share the same epoch alignment as tumbling.
             // A full epoch is closed when watermark >= epoch_end.
-            #[allow(clippy::cast_possible_truncation)]
-            let size = config.size.as_millis() as i64;
+            let size = i64::try_from(config.size.as_millis()).unwrap_or(i64::MAX);
             if size <= 0 {
                 tracing::warn!("cumulate window size is zero or negative, EOWC filtering disabled");
                 return watermark_ms;

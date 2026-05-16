@@ -161,6 +161,7 @@ impl ClusterEngineHarness {
                 interval_ms: None, // manual only — tests drive checkpoint() explicitly
                 data_dir: Some(checkpoint_dirs[idx].path().to_path_buf()),
                 max_retained: Some(3),
+                ..StreamCheckpointConfig::default()
             };
 
             // Skip `.profile(Cluster)` — `ObjectStoreCheckpointStore`

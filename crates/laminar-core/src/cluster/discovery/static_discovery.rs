@@ -80,7 +80,6 @@ struct PeerState {
 pub struct StaticDiscovery {
     config: StaticDiscoveryConfig,
     peers: Arc<RwLock<HashMap<u64, PeerState>>>,
-    #[allow(dead_code)]
     membership_tx: watch::Sender<Vec<NodeInfo>>,
     membership_rx: watch::Receiver<Vec<NodeInfo>>,
     cancel: CancellationToken,

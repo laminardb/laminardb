@@ -254,6 +254,8 @@ pub(crate) fn apply_checkpoint_config(
         interval_ms: Some(checkpoint.interval.as_millis() as u64),
         data_dir: file_url_to_path(checkpoint_url),
         max_retained: Some(checkpoint.max_retained),
+        // Not yet exposed in the server TOML; keeps the 30s default.
+        alignment_timeout_ms: None,
     };
     builder = builder.checkpoint(cfg);
 

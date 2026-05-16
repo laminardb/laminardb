@@ -308,11 +308,18 @@ impl<'a> RecoveryManager<'a> {
         let mut all_resolved = true;
         for (name, op) in &mut manifest.operator_states {
             if op.external {
-                #[allow(clippy::cast_possible_truncation)] // Sidecar files are always < 4 GB
-                let start = op.external_offset as usize;
-                #[allow(clippy::cast_possible_truncation)]
-                let end = start + op.external_length as usize;
-                if end <= state_data.len() {
+                // `external_offset`/`external_length` are u64 from the on-disk
+                // manifest; use checked arithmetic so a corrupt/tampered
+                // manifest can't overflow past the length check.
+                let range = match (
+                    usize::try_from(op.external_offset),
+                    usize::try_from(op.external_length),
+                ) {
+                    (Ok(start), Ok(len)) => start.checked_add(len).map(|end| (start, end)),
+                    _ => None,
+                }
+                .filter(|&(_, end)| end <= state_data.len());
+                if let Some((start, end)) = range {
                     let external_offset = op.external_offset;
                     let external_length = op.external_length;
                     let data = &state_data[start..end];
@@ -326,11 +333,12 @@ impl<'a> RecoveryManager<'a> {
                 } else {
                     error!(
                         operator = %name,
-                        offset = start,
+                        offset = op.external_offset,
                         length = op.external_length,
                         sidecar_len = state_data.len(),
-                        "[LDB-6010] sidecar too small for external operator state — \
-                         operator will start with empty state"
+                        "[LDB-6010] sidecar too small or offset/length out of \
+                         range for external operator state — operator will \
+                         start with empty state"
                     );
                     *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
                     all_resolved = false;
