@@ -32,7 +32,7 @@ pub trait WatermarkGenerator: Send {
     fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark>;
 }
 
-/// Default `max_future_skew_ms` (5 min). See ADR-002.
+/// Default `max_future_skew_ms`: 5 min.
 pub const DEFAULT_MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1000;
 
 /// Wall clock in epoch millis; `0` if unreadable (callers fail open).
@@ -44,7 +44,7 @@ fn now_unix_millis() -> i64 {
 }
 
 /// Watermark = `max_timestamp_seen - max_out_of_orderness`. `on_event`
-/// ignores timestamps far beyond wall clock for advancement (ADR-002).
+/// ignores timestamps far beyond wall clock for advancement.
 pub struct BoundedOutOfOrdernessGenerator {
     max_out_of_orderness: i64,
     current_max_timestamp: i64,
@@ -1059,7 +1059,7 @@ mod tests {
         assert_eq!(gen.current_watermark(), i64::MIN);
     }
 
-    // --- ADR-002 future-skew guard ---
+    // --- future-skew guard ---
 
     #[test]
     fn future_skew_event_does_not_advance_watermark() {

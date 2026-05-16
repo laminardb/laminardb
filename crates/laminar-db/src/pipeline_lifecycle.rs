@@ -1117,7 +1117,7 @@ impl LaminarDB {
             }
         }
 
-        // Per-source watermark state. ADR-002 future-skew ceiling;
+        // Per-source watermark state. Future-skew ceiling;
         // `LAMINAR_MAX_FUTURE_SKEW_MS=0` disables it (legacy unbounded).
         let future_skew_ms = match std::env::var("LAMINAR_MAX_FUTURE_SKEW_MS") {
             Ok(v) => v.parse::<i64>().unwrap_or_else(|_| {
