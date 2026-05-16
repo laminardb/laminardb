@@ -1117,7 +1117,16 @@ impl LaminarDB {
             }
         }
 
-        // Build per-source watermark tracking state (connector pipeline)
+        // Build per-source watermark tracking state (connector pipeline).
+        // ADR-002: cap how far a single event timestamp may run ahead of
+        // wall clock before it's treated as a corrupt producer clock
+        // rather than time progress. `LAMINAR_MAX_FUTURE_SKEW_MS=0`
+        // disables it (restores legacy unbounded behaviour) for the rare
+        // legitimately-far-future pipeline.
+        let future_skew_ms = std::env::var("LAMINAR_MAX_FUTURE_SKEW_MS")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS);
         let source_names = self.catalog.list_sources();
         let mut watermark_states: FxHashMap<String, SourceWatermarkState> =
             FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
@@ -1139,7 +1148,8 @@ impl LaminarDB {
                         Box::new(laminar_core::time::ProcessingTimeGenerator::new())
                     } else {
                         Box::new(
-                            laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(dur),
+                            laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(dur)
+                                .with_max_future_skew(future_skew_ms),
                         )
                     };
                     let id = source_ids.len();
@@ -1185,7 +1195,8 @@ impl LaminarDB {
                         Box::new(
                             laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
                                 ooo_bound,
-                            ),
+                            )
+                            .with_max_future_skew(future_skew_ms),
                         )
                     };
                     let id = source_ids.len();
