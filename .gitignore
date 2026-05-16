@@ -63,3 +63,6 @@ docs/adr/
 /examples/binance-markout/target
 /examples/binance-markout/Cargo.lock
 /examples/binance-markout/smoke-report.txt
+
+# Private internal docs (formerly a git submodule; kept local-only, untracked)
+/private/
