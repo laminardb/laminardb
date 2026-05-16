@@ -1071,7 +1071,14 @@ fn extract_timestamp(
         return Ok(millis_to_unit(n, unit));
     }
     if let Some(f) = value.as_f64() {
-        #[allow(clippy::cast_possible_truncation)]
+        // `f as i64` saturates (NaN -> 0, +-huge -> i64::MIN/MAX), which would
+        // silently turn a garbage timestamp into a valid-looking one and
+        // poison event-time/watermarks. Reject out-of-range values so the
+        // configured type-mismatch strategy applies, like any other bad value.
+        if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&f) {
+            return Err(format!("timestamp {f} out of i64 millisecond range"));
+        }
+        #[allow(clippy::cast_possible_truncation)] // range-checked above; drops sub-ms fraction
         let ms = f as i64;
         return Ok(millis_to_unit(ms, unit));
     }
@@ -1438,6 +1445,27 @@ mod tests {
             .as_primitive::<arrow_array::types::TimestampNanosecondType>();
         // 1705312200000 ms * 1_000_000 = nanos
         assert_eq!(ts_col.value(0), 1_705_312_200_000_000_000);
+    }
+
+    #[test]
+    fn test_decode_out_of_range_float_timestamp_is_rejected() {
+        // A garbage float epoch-ms must not silently saturate to i64::MAX
+        // and poison event-time/watermarks — it routes through the
+        // configured type-mismatch path instead.
+        let schema = make_schema(vec![(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        )]);
+        let decoder = JsonDecoder::new(schema);
+        let records = vec![json_record(r#"{"ts": 1e30}"#)];
+        let result = decoder.decode_batch(&records);
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("out of i64 millisecond range"));
     }
 
     // ── Nested objects as LargeBinary ─────────────────────────
