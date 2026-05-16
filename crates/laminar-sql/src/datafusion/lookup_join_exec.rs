@@ -344,8 +344,19 @@ fn extract_i64_timestamps(col: &dyn arrow_array::Array) -> Result<Int64Array> {
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or_else(|| DataFusionError::Internal("expected Float64Array".into()))?;
-            #[allow(clippy::cast_possible_truncation)]
-            return Ok(arr.unary::<_, Int64Type>(|v| v as i64));
+            // A non-finite/out-of-range float join key would saturate
+            // (NaN -> 0, huge -> i64::MIN/MAX) and silently mis-join.
+            return arr.try_unary::<_, Int64Type, DataFusionError>(|v| {
+                let r = v.round();
+                if !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&r) {
+                    return Err(DataFusionError::Plan(format!(
+                        "Float64 temporal-join key {v} out of i64 range"
+                    )));
+                }
+                #[allow(clippy::cast_possible_truncation)] // range-checked; integral
+                let ms = r as i64;
+                Ok(ms)
+            });
         }
         other => {
             return Err(DataFusionError::Plan(format!(

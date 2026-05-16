@@ -11,10 +11,6 @@ use arrow::datatypes::SchemaRef;
 use crate::error::DbError;
 
 /// Backend storage for a single reference table.
-// Single-variant backend abstraction: `contains_key`/`len`/`drain`/`is_empty`
-// are exercised by unit tests / reserved for a future persistent backend;
-// the rest are used by `table_store.rs`.
-#[allow(dead_code)]
 pub(crate) enum TableBackend {
     /// In-memory storage (default behavior).
     InMemory {
@@ -23,7 +19,9 @@ pub(crate) enum TableBackend {
     },
 }
 
-#[allow(dead_code, clippy::unnecessary_wraps)] // see TableBackend: not all methods are wired into prod yet
+// `get`/`remove` are used by `table_store` reference-table read paths that
+// aren't reachable in the minimal (no-default-features) lib build.
+#[allow(dead_code, clippy::unnecessary_wraps)]
 impl TableBackend {
     /// Create a new in-memory backend.
     pub fn in_memory() -> Self {
@@ -58,31 +56,10 @@ impl TableBackend {
         }
     }
 
-    /// Check if a key exists.
-    pub fn contains_key(&self, key: &str) -> Result<bool, DbError> {
-        match self {
-            Self::InMemory { rows } => Ok(rows.contains_key(key)),
-        }
-    }
-
     /// Collect all keys.
     pub fn keys(&self) -> Result<Vec<String>, DbError> {
         match self {
             Self::InMemory { rows } => Ok(rows.keys().cloned().collect()),
-        }
-    }
-
-    /// Row count.
-    pub fn len(&self) -> Result<usize, DbError> {
-        match self {
-            Self::InMemory { rows } => Ok(rows.len()),
-        }
-    }
-
-    /// Drain all rows from the backend and return them.
-    pub fn drain(&mut self) -> Result<Vec<(String, RecordBatch)>, DbError> {
-        match self {
-            Self::InMemory { rows } => Ok(rows.drain().collect()),
         }
     }
 
@@ -105,11 +82,6 @@ impl TableBackend {
     #[allow(clippy::unused_self)]
     pub fn is_persistent(&self) -> bool {
         false
-    }
-
-    /// Whether this backend is empty.
-    pub fn is_empty(&self) -> Result<bool, DbError> {
-        self.len().map(|n| n == 0)
     }
 }
 
@@ -142,67 +114,26 @@ mod tests {
     }
 
     #[test]
-    fn test_in_memory_crud() {
+    fn in_memory_backend_round_trips_the_used_api() {
         let mut backend = TableBackend::in_memory();
         assert!(!backend.is_persistent());
-        assert!(backend.is_empty().unwrap());
 
-        // Put
-        let existed = backend.put("1", make_batch(1, "A", 1.0)).unwrap();
-        assert!(!existed);
-        assert_eq!(backend.len().unwrap(), 1);
+        // Insert (new) then update (existing) report the right prior state.
+        assert!(!backend.put("1", make_batch(1, "A", 1.0)).unwrap());
+        assert!(backend.put("1", make_batch(1, "B", 2.0)).unwrap());
 
-        // Get
-        let row = backend.get("1").unwrap().unwrap();
-        assert_eq!(row.num_rows(), 1);
+        assert_eq!(backend.get("1").unwrap().unwrap().num_rows(), 1);
+        assert_eq!(backend.keys().unwrap(), vec!["1".to_string()]);
 
-        // Contains
-        assert!(backend.contains_key("1").unwrap());
-        assert!(!backend.contains_key("2").unwrap());
-
-        // Update
-        let existed = backend.put("1", make_batch(1, "B", 2.0)).unwrap();
-        assert!(existed);
-        assert_eq!(backend.len().unwrap(), 1);
-
-        // Remove
-        let existed = backend.remove("1").unwrap();
-        assert!(existed);
-        assert!(backend.is_empty().unwrap());
-
-        // Remove missing
-        let existed = backend.remove("1").unwrap();
-        assert!(!existed);
-    }
-
-    #[test]
-    fn test_in_memory_keys_and_drain() {
-        let mut backend = TableBackend::in_memory();
-        backend.put("a", make_batch(1, "A", 1.0)).unwrap();
-        backend.put("b", make_batch(2, "B", 2.0)).unwrap();
-
-        let mut keys = backend.keys().unwrap();
-        keys.sort();
-        assert_eq!(keys, vec!["a", "b"]);
-
-        let items = backend.drain().unwrap();
-        assert_eq!(items.len(), 2);
-        assert!(backend.is_empty().unwrap());
-    }
-
-    #[test]
-    fn test_in_memory_to_record_batch() {
-        let mut backend = TableBackend::in_memory();
+        // Empty schema-only batch when present; row when populated.
         let schema = test_schema();
+        backend.put("2", make_batch(2, "C", 3.0)).unwrap();
+        assert_eq!(
+            backend.to_record_batch(&schema).unwrap().unwrap().num_rows(),
+            2
+        );
 
-        // Empty
-        let batch = backend.to_record_batch(&schema).unwrap().unwrap();
-        assert_eq!(batch.num_rows(), 0);
-
-        // With data
-        backend.put("1", make_batch(1, "A", 1.0)).unwrap();
-        backend.put("2", make_batch(2, "B", 2.0)).unwrap();
-        let batch = backend.to_record_batch(&schema).unwrap().unwrap();
-        assert_eq!(batch.num_rows(), 2);
+        assert!(backend.remove("1").unwrap());
+        assert!(!backend.remove("1").unwrap());
     }
 }
