@@ -48,6 +48,9 @@ impl MessageParser {
                 delimiter,
                 has_header,
             } => {
+                // `parse_format` hard-codes the CSV delimiter to ',', so this
+                // is ASCII by construction. If the delimiter ever becomes
+                // user-configurable, validate `is_ascii()` at config parse.
                 #[allow(clippy::cast_possible_truncation)]
                 let csv_config = CsvDecoderConfig {
                     delimiter: *delimiter as u8,

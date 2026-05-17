@@ -1117,7 +1117,19 @@ impl LaminarDB {
             }
         }
 
-        // Build per-source watermark tracking state (connector pipeline)
+        // Per-source watermark state. Future-skew ceiling;
+        // `LAMINAR_MAX_FUTURE_SKEW_MS=0` disables it (legacy unbounded).
+        let future_skew_ms = match std::env::var("LAMINAR_MAX_FUTURE_SKEW_MS") {
+            Ok(v) => v.parse::<i64>().unwrap_or_else(|_| {
+                tracing::warn!(
+                    value = %v,
+                    "invalid LAMINAR_MAX_FUTURE_SKEW_MS (expected an integer); \
+                     using the default"
+                );
+                laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS
+            }),
+            Err(_) => laminar_core::time::DEFAULT_MAX_FUTURE_SKEW_MS,
+        };
         let source_names = self.catalog.list_sources();
         let mut watermark_states: FxHashMap<String, SourceWatermarkState> =
             FxHashMap::with_capacity_and_hasher(source_names.len(), rustc_hash::FxBuildHasher);
@@ -1139,7 +1151,8 @@ impl LaminarDB {
                         Box::new(laminar_core::time::ProcessingTimeGenerator::new())
                     } else {
                         Box::new(
-                            laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(dur),
+                            laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(dur)
+                                .with_max_future_skew(future_skew_ms),
                         )
                     };
                     let id = source_ids.len();
@@ -1185,7 +1198,8 @@ impl LaminarDB {
                         Box::new(
                             laminar_core::time::BoundedOutOfOrdernessGenerator::from_duration(
                                 ooo_bound,
-                            ),
+                            )
+                            .with_max_future_skew(future_skew_ms),
                         )
                     };
                     let id = source_ids.len();
@@ -1249,10 +1263,15 @@ impl LaminarDB {
                 } else {
                     std::time::Duration::ZERO
                 }),
-            // Tracks CheckpointConfig::default().alignment_timeout.
-            // TODO: expose alignment_timeout_ms in LaminarDbConfig.checkpoint
-            // so users can configure this.
-            barrier_alignment_timeout: std::time::Duration::from_secs(30),
+            barrier_alignment_timeout: self
+                .config
+                .checkpoint
+                .as_ref()
+                .and_then(|c| c.alignment_timeout_ms)
+                .map_or(
+                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_millis,
+                ),
             delivery_guarantee: self.config.delivery_guarantee,
             // cycle_budget is a soft cap for logging; ensure it's at least
             // drain + query so sub-budgets can actually be used.

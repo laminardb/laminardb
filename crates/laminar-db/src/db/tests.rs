@@ -2738,7 +2738,9 @@ fn test_filter_late_rows_filters_correctly() {
     .unwrap();
 
     // Watermark at 300: rows with ts >= 300 survive (ts=500, ts=800).
-    let filtered = filter_late_rows(&batch, "ts", 300).expect("should have some on-time rows");
+    let filtered = filter_late_rows(&batch, "ts", 300)
+        .expect("no schema drift")
+        .expect("some on-time rows");
     assert_eq!(filtered.num_rows(), 2);
 
     let ids = filtered
@@ -2772,7 +2774,10 @@ fn test_filter_late_rows_all_late() {
     .unwrap();
 
     let result = filter_late_rows(&batch, "ts", 1000);
-    assert!(result.is_none(), "all-late batch should return None");
+    assert!(
+        matches!(result, Ok(None)),
+        "all-late batch should be Ok(None), got {result:?}"
+    );
 }
 
 #[test]
@@ -2782,8 +2787,9 @@ fn test_filter_late_rows_no_column() {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
 
-    // Missing event-time column is schema drift — drop the batch.
-    assert!(filter_late_rows(&batch, "ts", 1000).is_none());
+    // Missing event-time column is schema drift — an error, distinct
+    // from an all-late batch so it isn't misreported as a watermark drop.
+    assert!(filter_late_rows(&batch, "ts", 1000).is_err());
 }
 
 /// Helper: creates a `RecordBatch` with (id: BIGINT, ts: BIGINT).

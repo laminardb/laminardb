@@ -245,11 +245,12 @@ impl ColumnValue {
                 }
             }
             ColumnValue::Timestamp(us) => {
-                // Convert microseconds to ISO format
-                let secs = us / 1_000_000;
-                // us % 1_000_000 is always in [0, 999_999] so u32 cast is safe
-                #[allow(clippy::cast_sign_loss)]
-                let micros = (us % 1_000_000) as u32;
+                // Floor-divide so the sub-second part is always non-negative,
+                // even for pre-epoch (negative) microsecond timestamps.
+                let secs = us.div_euclid(1_000_000);
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                // rem_euclid yields [0, 999_999]
+                let micros = us.rem_euclid(1_000_000) as u32;
                 format!("{secs}.{micros:06}")
             }
         }

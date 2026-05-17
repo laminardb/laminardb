@@ -18,9 +18,12 @@ impl RegHandle<'_> {
         self.registry
     }
 
-    /// Register an `IntCounter`. Panics on a malformed name/help.
+    /// Register an `IntCounter`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name`/`help` is not a valid Prometheus identifier.
     #[must_use]
-    #[allow(clippy::missing_panics_doc)]
     pub fn counter(&self, name: &str, help: &str) -> IntCounter {
         let c =
             IntCounter::new(name, help).unwrap_or_else(|e| panic!("invalid counter '{name}': {e}"));
@@ -28,18 +31,24 @@ impl RegHandle<'_> {
         c
     }
 
-    /// Register an `IntGauge`. Panics on a malformed name/help.
+    /// Register an `IntGauge`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name`/`help` is not a valid Prometheus identifier.
     #[must_use]
-    #[allow(clippy::missing_panics_doc)]
     pub fn gauge(&self, name: &str, help: &str) -> IntGauge {
         let g = IntGauge::new(name, help).unwrap_or_else(|e| panic!("invalid gauge '{name}': {e}"));
         self.registry.register(Box::new(g.clone())).ok();
         g
     }
 
-    /// Register an `IntCounterVec`. Panics on malformed name/help/labels.
+    /// Register an `IntCounterVec`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name`/`help`/`labels` are not valid Prometheus identifiers.
     #[must_use]
-    #[allow(clippy::missing_panics_doc)]
     pub fn counter_vec(&self, name: &str, help: &str, labels: &[&str]) -> IntCounterVec {
         let v = IntCounterVec::new(Opts::new(name, help), labels)
             .unwrap_or_else(|e| panic!("invalid counter_vec '{name}': {e}"));
@@ -47,9 +56,12 @@ impl RegHandle<'_> {
         v
     }
 
-    /// Register an `IntGaugeVec`. Panics on malformed name/help/labels.
+    /// Register an `IntGaugeVec`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name`/`help`/`labels` are not valid Prometheus identifiers.
     #[must_use]
-    #[allow(clippy::missing_panics_doc)]
     pub fn gauge_vec(&self, name: &str, help: &str, labels: &[&str]) -> IntGaugeVec {
         let v = IntGaugeVec::new(Opts::new(name, help), labels)
             .unwrap_or_else(|e| panic!("invalid gauge_vec '{name}': {e}"));
@@ -62,7 +74,7 @@ impl RegHandle<'_> {
 /// in `local` (which must outlive construction). Pattern:
 /// `let mut local = None; let reg = reg_or_local(registry, &mut local);`
 #[must_use]
-#[allow(clippy::missing_panics_doc)]
+#[allow(clippy::missing_panics_doc)] // `expect` follows an unconditional `*local = Some(..)`
 pub fn reg_or_local<'a>(
     registry: Option<&'a Registry>,
     local: &'a mut Option<Registry>,

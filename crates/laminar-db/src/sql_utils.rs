@@ -227,6 +227,31 @@ pub fn expr_to_bool(expr: Option<&sqlparser::ast::Expr>) -> Option<bool> {
     }
 }
 
+/// Narrow `i64` SQL literals to a smaller signed Arrow integer type,
+/// erroring on out-of-range values rather than silently wrapping.
+fn narrow_i64_col<N: TryFrom<i64>>(
+    values: &[Vec<sqlparser::ast::Expr>],
+    col_idx: usize,
+    field: &arrow::datatypes::Field,
+    sql_ty: &str,
+) -> Result<Vec<Option<N>>, DbError> {
+    values
+        .iter()
+        .map(|row| {
+            expr_to_i64(row.get(col_idx))
+                .map(|v| {
+                    N::try_from(v).map_err(|_| {
+                        DbError::InsertError(format!(
+                            "literal {v} out of range for {sql_ty} column '{}'",
+                            field.name()
+                        ))
+                    })
+                })
+                .transpose()
+        })
+        .collect()
+}
+
 /// Convert SQL `VALUES (...)` rows into an Arrow `RecordBatch`.
 ///
 /// Each inner `Vec<Expr>` is one row. Columns are matched positionally
@@ -236,7 +261,7 @@ pub fn expr_to_bool(expr: Option<&sqlparser::ast::Expr>) -> Option<bool> {
 ///
 /// Returns `DbError::InsertError` if the batch cannot be constructed
 /// (e.g. column count mismatch).
-#[allow(clippy::cast_possible_truncation)] // SQL literal values converted to Arrow numeric types
+#[allow(clippy::cast_possible_truncation)] // SQL float literals widened to Arrow f32
 pub fn sql_values_to_record_batch(
     schema: &arrow::datatypes::SchemaRef,
     values: &[Vec<sqlparser::ast::Expr>],
@@ -259,25 +284,19 @@ pub fn sql_values_to_record_batch(
                 columns.push(std::sync::Arc::new(arr));
             }
             DataType::Int8 => {
-                let arr: Int8Array = values
-                    .iter()
-                    .map(|row| expr_to_i64(row.get(col_idx)).map(|v| v as i8))
-                    .collect();
-                columns.push(std::sync::Arc::new(arr));
+                columns.push(std::sync::Arc::new(Int8Array::from(narrow_i64_col::<i8>(
+                    values, col_idx, field, "INT8",
+                )?)));
             }
             DataType::Int16 => {
-                let arr: Int16Array = values
-                    .iter()
-                    .map(|row| expr_to_i64(row.get(col_idx)).map(|v| v as i16))
-                    .collect();
-                columns.push(std::sync::Arc::new(arr));
+                columns.push(std::sync::Arc::new(Int16Array::from(
+                    narrow_i64_col::<i16>(values, col_idx, field, "INT16")?,
+                )));
             }
             DataType::Int32 => {
-                let arr: Int32Array = values
-                    .iter()
-                    .map(|row| expr_to_i64(row.get(col_idx)).map(|v| v as i32))
-                    .collect();
-                columns.push(std::sync::Arc::new(arr));
+                columns.push(std::sync::Arc::new(Int32Array::from(
+                    narrow_i64_col::<i32>(values, col_idx, field, "INT32")?,
+                )));
             }
             DataType::Int64 => {
                 let arr: Int64Array = values
@@ -391,6 +410,29 @@ mod tests {
     fn test_block_comment_only_segment() {
         let stmts = split_statements("/* just a block comment */");
         assert!(stmts.is_empty());
+    }
+
+    #[test]
+    fn int8_literal_out_of_range_is_an_error_not_a_silent_wrap() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let lit = |s: &str| {
+            Parser::new(&GenericDialect {})
+                .try_with_sql(s)
+                .unwrap()
+                .parse_expr()
+                .unwrap()
+        };
+        let schema = std::sync::Arc::new(Schema::new(vec![Field::new("v", DataType::Int8, true)]));
+
+        // In range → Ok.
+        assert!(sql_values_to_record_batch(&schema, &[vec![lit("42")]]).is_ok());
+
+        // Out of i8 range → hard error (previously silently wrapped to 159i8).
+        let err = sql_values_to_record_batch(&schema, &[vec![lit("99999")]]).unwrap_err();
+        assert!(matches!(err, DbError::InsertError(_)));
     }
 
     #[test]

@@ -125,7 +125,7 @@ pub struct MongoDbCdcSource {
 }
 
 /// Payload from the background change stream reader task.
-#[allow(dead_code)]
+#[allow(dead_code)] // constructed + consumed only with feature = "mongodb-cdc"
 enum ChangeStreamPayload {
     /// A change event.
     Event(Box<MongoDbChangeEvent>),

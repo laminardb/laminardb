@@ -41,6 +41,27 @@ enum SinkFilterDispatch {
 /// 1. `tokio::spawn` on `current_thread` has no parallelism benefit
 /// 2. `spawn_blocking` on `current_thread` has no dedicated blocking pool
 /// 3. The compute thread is dedicated — blocking is acceptable
+// Throttled (~once/10s) WARN so silent watermark drops are diagnosable.
+fn warn_late_drops(source: &str, column: &str, watermark_ms: i64, dropped: usize) {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST_WARN_MS: AtomicI64 = AtomicI64::new(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    if now_ms - LAST_WARN_MS.load(Ordering::Relaxed) < 10_000 {
+        return;
+    }
+    LAST_WARN_MS.store(now_ms, Ordering::Relaxed);
+    tracing::warn!(
+        source,
+        time_column = column,
+        watermark_ms,
+        dropped,
+        "dropping rows older than the event-time watermark; a future-dated \
+         timestamp can advance the watermark and starve the stream"
+    );
+}
+
 pub(crate) struct ConnectorPipelineCallback {
     pub(crate) graph: crate::operator_graph::OperatorGraph,
     pub(crate) stream_sources: Vec<(String, streaming::Source<crate::catalog::ArrowRecord>)>,
@@ -640,7 +661,30 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         if let Some(wm_state) = self.watermark_states.get(source_name) {
             let current_wm = wm_state.generator.current_watermark();
             if current_wm > i64::MIN {
-                return filter_late_rows(batch, &wm_state.column, current_wm);
+                let before = batch.num_rows();
+                match filter_late_rows(batch, &wm_state.column, current_wm) {
+                    Ok(out) => {
+                        let after = out.as_ref().map_or(0, arrow_array::RecordBatch::num_rows);
+                        let dropped = before.saturating_sub(after);
+                        if dropped > 0 {
+                            self.prom
+                                .events_dropped
+                                .inc_by(u64::try_from(dropped).unwrap_or(u64::MAX));
+                            warn_late_drops(source_name, &wm_state.column, current_wm, dropped);
+                        }
+                        return out;
+                    }
+                    Err(e) => {
+                        // Schema drift, not lateness: fail-safe drop + error.
+                        tracing::error!(
+                            source = source_name,
+                            column = %wm_state.column,
+                            error = %e,
+                            "filter_late_rows: dropping batch (schema drift)"
+                        );
+                        return None;
+                    }
+                }
             }
         }
         // No watermark configured → pass through all rows.

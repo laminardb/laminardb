@@ -27,17 +27,13 @@ impl<T: Record> Subscription<T> {
         }
     }
 
-    /// Non-blocking poll. Returns the next batch, skipping watermarks.
+    /// Non-blocking poll. Returns the next batch.
     /// Returns `None` on empty or closed channel. Check `is_disconnected()`
     /// to distinguish.
     pub fn poll(&mut self) -> Option<RecordBatch> {
         loop {
             match self.rx.try_recv() {
-                Ok(msg) => {
-                    if let Some(batch) = message_to_batch(msg) {
-                        return Some(batch);
-                    }
-                }
+                Ok(msg) => return Some(to_batch(msg)),
                 Err(broadcast::error::TryRecvError::Empty) => return None,
                 Err(broadcast::error::TryRecvError::Closed) => {
                     self.closed = true;
@@ -48,7 +44,7 @@ impl<T: Record> Subscription<T> {
         }
     }
 
-    /// Async receive. Awaits the next batch, skipping watermarks.
+    /// Async receive. Awaits the next batch.
     ///
     /// # Errors
     ///
@@ -56,11 +52,7 @@ impl<T: Record> Subscription<T> {
     pub async fn recv_async(&mut self) -> Result<RecordBatch, RecvError> {
         loop {
             match self.rx.recv().await {
-                Ok(msg) => {
-                    if let Some(batch) = message_to_batch(msg) {
-                        return Ok(batch);
-                    }
-                }
+                Ok(msg) => return Ok(to_batch(msg)),
                 Err(broadcast::error::RecvError::Closed) => {
                     self.closed = true;
                     return Err(RecvError::Disconnected);
@@ -78,11 +70,7 @@ impl<T: Record> Subscription<T> {
     pub fn recv(&mut self) -> Result<RecordBatch, RecvError> {
         loop {
             match self.rx.blocking_recv() {
-                Ok(msg) => {
-                    if let Some(batch) = message_to_batch(msg) {
-                        return Ok(batch);
-                    }
-                }
+                Ok(msg) => return Ok(to_batch(msg)),
                 Err(broadcast::error::RecvError::Closed) => {
                     self.closed = true;
                     return Err(RecvError::Disconnected);
@@ -120,11 +108,10 @@ impl<T: Record> Subscription<T> {
     }
 }
 
-fn message_to_batch<T: Record>(msg: SourceMessage<T>) -> Option<RecordBatch> {
+fn to_batch<T: Record>(msg: SourceMessage<T>) -> RecordBatch {
     match msg {
-        SourceMessage::Record(r) => Some(r.to_record_batch()),
-        SourceMessage::Batch(b) => Some(b),
-        SourceMessage::Watermark(_) => None,
+        SourceMessage::Record(r) => r.to_record_batch(),
+        SourceMessage::Batch(b) => b,
     }
 }
 
