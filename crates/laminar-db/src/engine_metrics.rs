@@ -33,6 +33,9 @@ pub struct EngineMetrics {
     pub pipeline_watermark: IntGauge,
     /// Per-source watermark (epoch-ms). Label: `source`.
     pub source_watermark_ms: IntGaugeVec,
+    /// `1` if a source is idle (excluded from the watermark min), else
+    /// `0`. Label: `source`.
+    pub source_idle: IntGaugeVec,
     /// Per-stream watermark (epoch-ms). Label: `stream`.
     pub stream_watermark_ms: IntGaugeVec,
     /// Per-stream input-port buffered bytes. Label: `stream`.
@@ -126,6 +129,14 @@ impl EngineMetrics {
             // Labels are catalog-bound, so cardinality is finite.
             source_watermark_ms: reg!(IntGaugeVec::new(
                 Opts::new("source_watermark_ms", "Per-source watermark (epoch-ms)"),
+                &["source"],
+            )
+            .unwrap()),
+            source_idle: reg!(IntGaugeVec::new(
+                Opts::new(
+                    "source_idle",
+                    "1 if source idle (excluded from watermark min)"
+                ),
                 &["source"],
             )
             .unwrap()),

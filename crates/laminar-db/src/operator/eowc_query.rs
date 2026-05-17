@@ -221,6 +221,12 @@ impl EowcQueryOperator {
         op_name: &str,
         ctx: &SessionContext,
     ) -> Result<Vec<RecordBatch>, DbError> {
+        // Resolve a `now()` WHERE clause against the event-time watermark
+        // (replay-deterministic) and pre-filter the inputs. No-op for
+        // predicates without `now()`.
+        let now_filtered = cw.apply_dynamic_now_filter(ctx, inputs, watermark)?;
+        let inputs: &[RecordBatch] = now_filtered.as_deref().unwrap_or(inputs);
+
         let pre_agg_batches = if let Some(proj) = cw.compiled_projection() {
             match try_evaluate_compiled(proj, inputs) {
                 Ok(result) => result,

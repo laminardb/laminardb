@@ -696,6 +696,28 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn tick_idle_watermark(&mut self) {
+        let Some(ref mut trk) = self.tracker else {
+            return;
+        };
+        // `update_combined` is monotone, so a re-activating source with an
+        // older watermark can't regress the combined value.
+        if let Some(global) = trk.check_idle_sources() {
+            self.pipeline_watermark
+                .store(global.timestamp(), std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                watermark_ms = global.timestamp(),
+                "pipeline watermark advanced via idle-source detection"
+            );
+        }
+        for (name, &id) in &self.source_ids {
+            self.prom
+                .source_idle
+                .with_label_values(&[name.as_str()])
+                .set(i64::from(trk.is_idle(id)));
+        }
+    }
+
     /// Timer-based checkpoint (at-least-once semantics).
     ///
     /// Source offsets are captured BEFORE operator state. On recovery:

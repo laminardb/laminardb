@@ -12,8 +12,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
-use datafusion_common::tree_node::TreeNode;
-use datafusion_common::ScalarValue;
+use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion_common::{DFSchema, ScalarValue};
 use datafusion_optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 
 use laminar_core::operator::sliding_window::SlidingWindowAssigner;
@@ -39,6 +39,57 @@ enum CoreWindowAssigner {
 struct PostProjection {
     exprs: Vec<Arc<dyn PhysicalExpr>>,
     final_schema: SchemaRef,
+}
+
+/// A `WHERE` predicate calling `now()`: kept logical and re-resolved per
+/// cycle (a statically-compiled `now()` errors at `evaluate()` because
+/// `DataFusion` only folds it in the `SimplifyExpressions` pass we skip).
+struct NowWhereFilter {
+    predicate: datafusion_expr::Expr,
+    /// Schema the predicate was planned against (carries table qualifiers).
+    df_schema: Arc<DFSchema>,
+}
+
+fn is_wallclock_fn(name: &str) -> bool {
+    name.eq_ignore_ascii_case("now") || name.eq_ignore_ascii_case("current_timestamp")
+}
+
+/// True if `expr` calls `now()`/`current_timestamp()`.
+fn expr_uses_wallclock(expr: &datafusion_expr::Expr) -> bool {
+    let mut found = false;
+    let _ = expr.apply(|e| {
+        if let datafusion_expr::Expr::ScalarFunction(f) = e {
+            if is_wallclock_fn(f.func.name()) {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
+}
+
+/// Replace `now()`/`current_timestamp()` with a fixed `Timestamp(ns,
+/// "+00:00")` literal — matching `DataFusion`'s own return type so the
+/// analyzer's coercion casts stay valid — so the predicate lowers to a
+/// static `PhysicalExpr` for this cycle.
+fn substitute_wallclock(
+    expr: datafusion_expr::Expr,
+    now_ns: i64,
+) -> Result<datafusion_expr::Expr, DbError> {
+    expr.transform(|e| {
+        if let datafusion_expr::Expr::ScalarFunction(ref f) = e {
+            if is_wallclock_fn(f.func.name()) {
+                return Ok(Transformed::yes(datafusion_expr::Expr::Literal(
+                    ScalarValue::TimestampNanosecond(Some(now_ns), Some(Arc::from("+00:00"))),
+                    None,
+                )));
+            }
+        }
+        Ok(Transformed::no(e))
+    })
+    .map(|t| t.data)
+    .map_err(|e| DbError::Pipeline(format!("[LDB-1002] now() substitution failed: {e}")))
 }
 
 struct SessionAccState {
@@ -119,6 +170,14 @@ pub(crate) struct CoreWindowState {
     compiled_projection: Option<CompiledProjection>,
     /// Cached optimized logical plan for the pre-agg SQL (multi-source queries).
     cached_pre_agg_plan: Option<datafusion_expr::LogicalPlan>,
+    /// Set when the `WHERE` clause references `now()`/`current_timestamp()`:
+    /// the predicate is re-resolved and applied per cycle instead of being
+    /// compiled into `compiled_projection.filter` (see [`NowWhereFilter`]).
+    now_where: Option<NowWhereFilter>,
+    /// Compiled `now()` predicate cached by the whole-second it was built
+    /// for, so the per-cycle path only recompiles when the second rolls
+    /// over (sub-second drain loops would otherwise recompile every cycle).
+    now_filter_cache: Option<(i64, Arc<dyn PhysicalExpr>)>,
     having_filter: Option<Arc<dyn PhysicalExpr>>,
     max_groups_per_window: usize,
     /// Grace period (ms) after window end before closing. Late events
@@ -262,6 +321,26 @@ impl CoreWindowState {
         } else {
             None
         };
+
+        // `now()` is re-resolved per cycle only in WHERE; in
+        // GROUP BY / SELECT / HAVING it would freeze at plan time, so
+        // reject at CREATE rather than emit subtly wrong results.
+        let nonwhere_now = group_exprs.iter().any(expr_uses_wallclock)
+            || having_predicate.as_ref().is_some_and(expr_uses_wallclock)
+            || projection_info
+                .as_ref()
+                .is_some_and(|(exprs, _)| exprs.iter().any(expr_uses_wallclock));
+        if nonwhere_now {
+            return Err(DbError::Pipeline(format!(
+                "[{}] now()/current_timestamp() is only supported in the WHERE \
+                 clause of a windowed query (it would freeze at plan time elsewhere)",
+                laminar_core::error_codes::SQL_UNSUPPORTED
+            )));
+        }
+        let where_uses_now = agg_info
+            .where_predicate
+            .as_ref()
+            .is_some_and(expr_uses_wallclock);
 
         let num_group_cols = group_exprs.len();
 
@@ -519,8 +598,12 @@ impl CoreWindowState {
 
         // Build compiled projection for single-source queries.
         let compiled_projection = if compile_ok {
-            // Compile WHERE predicate
-            let filter = if let Some(where_pred) = &agg_info.where_predicate {
+            // Compile WHERE predicate. A `now()`/`current_timestamp()`
+            // predicate cannot be compiled once (it errors at evaluate),
+            // so leave the static filter empty and apply it per cycle.
+            let filter = if where_uses_now {
+                None
+            } else if let Some(where_pred) = &agg_info.where_predicate {
                 if let Ok(phys) = create_physical_expr(where_pred, input_df_schema, compile_props) {
                     Some(phys)
                 } else {
@@ -539,6 +622,26 @@ impl CoreWindowState {
             } else {
                 None
             }
+        } else {
+            None
+        };
+
+        // `now()` in WHERE re-resolves per cycle only on the compiled
+        // single-source path; the interpreted cached-plan fallback would
+        // freeze it at plan time. Fail loud at CREATE instead.
+        if where_uses_now && compiled_projection.is_none() {
+            return Err(DbError::Pipeline(format!(
+                "[{}] now()/current_timestamp() in WHERE requires the single-source \
+                 compiled path; this query falls back to the interpreted plan where \
+                 now() would freeze at plan time",
+                laminar_core::error_codes::SQL_UNSUPPORTED
+            )));
+        }
+        let now_where = if where_uses_now {
+            agg_info.where_predicate.as_ref().map(|p| NowWhereFilter {
+                predicate: p.clone(),
+                df_schema: Arc::clone(&agg_info.input_df_schema),
+            })
         } else {
             None
         };
@@ -631,6 +734,8 @@ impl CoreWindowState {
             having_sql,
             compiled_projection,
             cached_pre_agg_plan,
+            now_where,
+            now_filter_cache: None,
             having_filter,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: i64::try_from(window_config.allowed_lateness.as_millis())
@@ -1350,6 +1455,59 @@ impl CoreWindowState {
         self.cached_pre_agg_plan.as_ref()
     }
 
+    /// Filter `inputs` by the `now()` `WHERE` clause, with `now()` bound
+    /// to the event-time watermark (not wall clock) so it is
+    /// replay-deterministic. `watermark_ms == i64::MIN` ⇒ `Ok(None)` (no
+    /// frontier yet — don't drop startup rows). Compiled predicate cached
+    /// per watermark-second.
+    pub(crate) fn apply_dynamic_now_filter(
+        &mut self,
+        ctx: &SessionContext,
+        inputs: &[RecordBatch],
+        watermark_ms: i64,
+    ) -> Result<Option<Vec<RecordBatch>>, DbError> {
+        if self.now_where.is_none() || watermark_ms == i64::MIN {
+            return Ok(None);
+        }
+        // Bind now() to the watermark, coarsened to whole seconds so the
+        // compiled predicate is reused until the frontier second rolls.
+        let secs = watermark_ms.div_euclid(1000);
+        if self
+            .now_filter_cache
+            .as_ref()
+            .is_none_or(|(s, _)| *s != secs)
+        {
+            let nw = self.now_where.as_ref().expect("checked above");
+            // Re-run type coercion so the substituted literal gets the
+            // casts DataFusion inserted around the original `now()`.
+            let pred = substitute_wallclock(nw.predicate.clone(), secs * 1_000_000_000)?;
+            let mut coercer = TypeCoercionRewriter::new(&nw.df_schema);
+            let pred = pred.rewrite(&mut coercer).map(|t| t.data).map_err(|e| {
+                DbError::Pipeline(format!(
+                    "[{}] now() WHERE type-coerce: {e}",
+                    laminar_core::error_codes::SQL_PLANNING_FAILED
+                ))
+            })?;
+            let state = ctx.state();
+            let phys = create_physical_expr(&pred, &nw.df_schema, state.execution_props())
+                .map_err(|e| {
+                    DbError::Pipeline(format!(
+                        "[{}] now() WHERE physical compile: {e}",
+                        laminar_core::error_codes::SQL_PLANNING_FAILED
+                    ))
+                })?;
+            self.now_filter_cache = Some((secs, phys));
+        }
+        let phys = &self.now_filter_cache.as_ref().expect("set above").1;
+        let mut out = Vec::with_capacity(inputs.len());
+        for b in inputs {
+            if let Some(f) = crate::filter_compile::apply(b, phys.as_ref())? {
+                out.push(f);
+            }
+        }
+        Ok(Some(out))
+    }
+
     pub(crate) fn query_fingerprint(&self) -> u64 {
         query_fingerprint(&self.pre_agg_sql, &self.output_schema)
     }
@@ -1679,6 +1837,8 @@ mod tests {
             having_sql: None,
             compiled_projection: None,
             cached_pre_agg_plan: None,
+            now_where: None,
+            now_filter_cache: None,
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
@@ -1742,6 +1902,8 @@ mod tests {
             having_sql: None,
             compiled_projection: None,
             cached_pre_agg_plan: None,
+            now_where: None,
+            now_filter_cache: None,
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
@@ -1793,6 +1955,8 @@ mod tests {
             having_sql: None,
             compiled_projection: None,
             cached_pre_agg_plan: None,
+            now_where: None,
+            now_filter_cache: None,
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
@@ -1842,6 +2006,8 @@ mod tests {
             having_sql: None,
             compiled_projection: None,
             cached_pre_agg_plan: None,
+            now_where: None,
+            now_filter_cache: None,
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
@@ -2843,5 +3009,122 @@ mod tests {
         let result = state.apply_post_projection(vec![batch.clone()]).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), batch.num_rows());
+    }
+
+    // ── now()/current_timestamp() in streaming predicates ─────
+
+    use laminar_core::time::now_unix_millis as now_ms;
+
+    #[tokio::test]
+    async fn now_in_where_builds_and_filters_per_cycle() {
+        use laminar_sql::{create_session_context, register_streaming_functions};
+        use std::time::Duration;
+
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new("v", DataType::Float64, false),
+        ]));
+        let mem = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]]).unwrap();
+        ctx.register_table("evt", Arc::new(mem)).unwrap();
+
+        let window_config = WindowOperatorConfig {
+            window_type: WindowType::Tumbling,
+            time_column: "ts".to_string(),
+            size: Duration::from_secs(60),
+            slide: None,
+            gap: None,
+            offset_ms: 0,
+            allowed_lateness: Duration::ZERO,
+            emit_strategy: laminar_sql::parser::EmitStrategy::Periodic(Duration::from_secs(5)),
+            late_data_side_output: None,
+        };
+        let sql = "SELECT TUMBLE(ts, INTERVAL '1' MINUTE) AS w, COUNT(*) AS c \
+                   FROM evt \
+                   WHERE ts > now() - INTERVAL '10' MINUTE \
+                     AND ts < now() + INTERVAL '2' MINUTE \
+                   GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE)";
+        let mut cw = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None)
+            .await
+            .expect("now() in WHERE must build, not error")
+            .expect("tumbling aggregate => Some");
+        assert!(cw.now_where.is_some(), "WHERE now() captured dynamically");
+        assert!(
+            cw.compiled_projection
+                .as_ref()
+                .is_some_and(|p| p.filter.is_none()),
+            "static filter must be empty (now() is applied per cycle)"
+        );
+
+        // Three rows: ~now (kept), 1h old (dropped), 1h future (dropped).
+        let n = now_ms();
+        let ts = arrow::array::TimestampMillisecondArray::from(vec![
+            n,
+            n - 60 * 60 * 1000,
+            n + 60 * 60 * 1000,
+        ]);
+        let v = arrow::array::Float64Array::from(vec![1.0, 2.0, 3.0]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(ts) as ArrayRef, Arc::new(v) as ArrayRef],
+        )
+        .unwrap();
+
+        // now() binds to the watermark; pass the same reference time.
+        let filtered = cw
+            .apply_dynamic_now_filter(&ctx, std::slice::from_ref(&batch), n)
+            .expect("dynamic now() filter compiles + applies")
+            .expect("now_where set => Some");
+        let kept: usize = filtered.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(kept, 1, "only the ~now row is within now()±bounds");
+    }
+
+    #[tokio::test]
+    async fn now_outside_where_is_rejected_at_build() {
+        use laminar_sql::{create_session_context, register_streaming_functions};
+        use std::time::Duration;
+
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new("v", DataType::Float64, false),
+        ]));
+        let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![]]).unwrap();
+        ctx.register_table("evt", Arc::new(mem)).unwrap();
+
+        let window_config = WindowOperatorConfig {
+            window_type: WindowType::Tumbling,
+            time_column: "ts".to_string(),
+            size: Duration::from_secs(60),
+            slide: None,
+            gap: None,
+            offset_ms: 0,
+            allowed_lateness: Duration::ZERO,
+            emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
+            late_data_side_output: None,
+        };
+        // now() in SELECT (not WHERE) must fail loud at CREATE, not freeze.
+        let sql =
+            "SELECT TUMBLE(ts, INTERVAL '1' MINUTE) AS w, COUNT(*) AS c, now() AS planned_at \
+                   FROM evt GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE)";
+        let err = match CoreWindowState::try_from_sql(&ctx, sql, &window_config, None).await {
+            Ok(_) => panic!("now() outside WHERE must be rejected at build"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err}").contains(laminar_core::error_codes::SQL_UNSUPPORTED),
+            "expected {} in error, got: {err}",
+            laminar_core::error_codes::SQL_UNSUPPORTED
+        );
     }
 }

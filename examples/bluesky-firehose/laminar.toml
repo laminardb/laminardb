@@ -1,25 +1,17 @@
-# Bluesky firehose → LaminarDB → SUBSCRIBE over the Postgres wire protocol.
+# Bluesky public Jetstream firehose → LaminarDB → SUBSCRIBE over pgwire.
+# No auth, no Docker. Two independent pipelines on the same firehose,
+# both SUBSCRIBE-able on port 5432:
 #
-# The source is the public Bluesky Jetstream firehose (no auth, no Docker).
-# Each WebSocket frame is a deeply-nested JSON commit event; the connector
-# flattens the fields we care about with `json.column.<col>` paths and
-# silently skips frames that don't match (deletes, identity/account events).
+#   posts          — plain projection stream, no watermark (never
+#                     late-drops): SUBSCRIBE [WHERE ...] [AS OF EPOCH n].
+#   posts_per_min  — 1-min tumbling COUNT(*) on event time, on its own
+#                     2nd connection so its WATERMARK can't late-drop
+#                     `posts` (a source watermark affects every consumer).
 #
-# No event-time watermark: `createdAt` is client-supplied and a single
-# bad clock would poison an event-time watermark. This demo is about the
-# Postgres wire protocol, not windowing — `posts` is a plain projection
-# stream with history retained so `AS OF EPOCH` replay works.
-#
-# Scope: the URL pins `?wantedCollections=app.bsky.feed.post`, so this is
-# posts only (~30-60/sec, every row has readable `text`). For the WHOLE
-# firehose — likes, reposts, follows, profile edits: several thousand
-# events/sec, much higher throughput but mostly NULL text — change the
-# url below to 'wss://jetstream2.us-east.bsky.network/subscribe' (no
-# query string). Non-post records simply lack `commit.record.text`, and
-# the connector nulls missing fields rather than failing.
-#
-# Exposed over pgwire (port 5432):
-#   * posts  — the live post stream; SUBSCRIBE [WHERE ...] [AS OF EPOCH n]
+# Event time is Jetstream's server `time_us`, not client `createdAt`
+# (device clocks run minutes off and poison a tight watermark). See
+# README §4. The URL pins app.bsky.feed.post (~30-60/s); drop the query
+# string for the whole firehose.
 
 sql = """
 CREATE SOURCE bluesky_posts (
@@ -43,6 +35,35 @@ SELECT did, collection, text, created_at
 FROM bluesky_posts
 WHERE operation = 'create' AND text IS NOT NULL
 WITH ('retain_history' = '256mb');
+
+-- 2nd connection: event time = server `time_us` (microseconds;
+-- epoch_unit scales it — decoder defaults numeric to millis). Separate
+-- source so this WATERMARK can't late-drop `posts`.
+CREATE SOURCE bluesky_posts_wm (
+    operation   VARCHAR,
+    evt_us      TIMESTAMP,
+    WATERMARK FOR evt_us AS evt_us - INTERVAL '15' SECOND
+) FROM WEBSOCKET (
+    url    = 'wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post',
+    format = 'json',
+    'json.column.operation'         = 'commit.operation',
+    'json.column.evt_us'            = 'time_us',
+    'json.column.evt_us.epoch_unit' = 'micros'
+) FORMAT JSON;
+
+-- 1-min tumbling COUNT(*) by event time. EMIT ON WINDOW CLOSE: one
+-- final row per minute, ~1–1.5 min after the minute starts.
+CREATE MATERIALIZED VIEW posts_per_min AS
+SELECT
+    TUMBLE(evt_us, INTERVAL '1' MINUTE)     AS window_start,
+    TUMBLE_END(evt_us, INTERVAL '1' MINUTE) AS window_end,
+    COUNT(*)                                AS posts
+FROM bluesky_posts_wm
+WHERE operation = 'create'
+GROUP BY
+    TUMBLE(evt_us, INTERVAL '1' MINUTE),
+    TUMBLE_END(evt_us, INTERVAL '1' MINUTE)
+EMIT ON WINDOW CLOSE;
 """
 
 [server]

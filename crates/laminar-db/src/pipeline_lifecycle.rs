@@ -1216,10 +1216,35 @@ impl LaminarDB {
             }
         }
 
+        // Idle-source detection off by default (opt in via
+        // LAMINAR_SOURCE_IDLE_TIMEOUT_MS > 0, applied to all sources;
+        // unset/0/invalid ⇒ disabled). Tracker is per-source capable.
+        let idle_timeout_ms: Option<u64> = match std::env::var("LAMINAR_SOURCE_IDLE_TIMEOUT_MS") {
+            Ok(v) => match v.parse::<u64>() {
+                Ok(0) => None,
+                Ok(ms) => Some(ms),
+                Err(_) => {
+                    tracing::warn!(
+                        value = %v,
+                        "invalid LAMINAR_SOURCE_IDLE_TIMEOUT_MS (expected a non-negative \
+                         integer); idle-source detection disabled"
+                    );
+                    None
+                }
+            },
+            Err(_) => None,
+        };
         let tracker = if source_ids.is_empty() {
             None
         } else {
-            Some(laminar_core::time::WatermarkTracker::new(source_ids.len()))
+            let mut t = laminar_core::time::WatermarkTracker::new(source_ids.len());
+            if let Some(ms) = idle_timeout_ms {
+                let d = std::time::Duration::from_millis(ms);
+                for id in 0..source_ids.len() {
+                    t.set_idle_timeout(id, Some(d));
+                }
+            }
+            Some(t)
         };
 
         let max_poll = self.config.default_buffer_size.min(1024);

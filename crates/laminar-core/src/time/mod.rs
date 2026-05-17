@@ -20,6 +20,15 @@ pub use watermark::{
 use smallvec::SmallVec;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Wall clock as epoch milliseconds; `0` if unreadable (callers fail open).
+#[must_use]
+pub fn now_unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
 
 /// Timer key type optimized for window IDs (16 bytes).
 ///

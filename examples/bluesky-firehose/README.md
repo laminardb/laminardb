@@ -4,13 +4,16 @@ LaminarDB speaks the Postgres wire protocol. Point any libpq client at it
 and `SUBSCRIBE` to a live stream — no client library, no Kafka, no Docker.
 
 This demo connects LaminarDB straight to the **public Bluesky Jetstream
-firehose** (~30–60 posts/sec, no auth) and exposes it as a streaming
-Postgres relation called `posts`. Three things to try:
+firehose** (~30–60 posts/sec, no auth) and exposes two streaming Postgres
+relations: `posts` (the raw stream) and `posts_per_min` (a 1-minute
+windowed count over event time). Four things to try:
 
 1. **Live throughput** — `SUBSCRIBE posts` and watch the rate.
 2. **Server-side filter** — `SUBSCRIBE posts WHERE text LIKE '%…%'`.
 3. **Reconnect without a gap** — kill the consumer, reconnect with
    `AS OF EPOCH`, and recover everything you missed during the downtime.
+4. **Windowed aggregation over event time** — `SUBSCRIBE posts_per_min`
+   for one row per minute, on Jetstream's trustworthy server clock.
 
 ## Prerequisites
 
@@ -28,9 +31,9 @@ No Docker. No external services. The firehose is public.
 
 ```
 examples/bluesky-firehose/
-├── laminar.toml     # WEBSOCKET source on Jetstream → retained `posts` stream + pgwire
+├── laminar.toml     # 2 WEBSOCKET sources → `posts` stream + `posts_per_min` MV, over pgwire
 ├── run.ps1 / run.sh # start the server
-├── watch.py         # tiny psycopg SUBSCRIBE client with a rolling rate line
+├── watch.py         # psycopg SUBSCRIBE client (--from <relation>) with a rolling rate line
 └── README.md        # you are here
 ```
 
@@ -102,48 +105,72 @@ python watch.py
 
 # Reconnect with replay: history streams back instantly (oldest first),
 # including everything during the downtime, then it continues live.
-python watch.py "AS OF EPOCH 2"
+python watch.py "AS OF EPOCH 0"
 ```
 
-Why `2`? The replay anchor is the subscription-registry barrier epoch,
-not the checkpoint id. With no windowed operators it stays at `2`
-("everything retained"). If you pick an evicted epoch, LaminarDB tells
-you the earliest one it still has:
+The replay anchor is the subscription-registry barrier epoch, not the
+checkpoint id, and it is **not a fixed number** — the windowed
+`posts_per_min` MV advances it as windows close. So don't hardcode it:
+ask for `AS OF EPOCH 0` and LaminarDB tells you the earliest epoch it
+still retains —
 
 ```
-epoch 0 for stream 'posts' is no longer retained (earliest retained is 2)
+epoch 0 for stream 'posts' is no longer retained (earliest retained is 7)
 ```
 
-— subscribe with that number. The pruning error is the contract: a
-consumer that falls outside the retention window is told so explicitly
-rather than silently skipping data.
+— then subscribe with that number (`python watch.py "AS OF EPOCH 7"`).
+The pruning error is the contract: a consumer that falls outside the
+retention window is told so explicitly rather than silently skipping
+data.
+
+## 4 — Windowed aggregation over event time
+
+`posts_per_min` is a 1-minute tumbling `COUNT(*)` over **event time** —
+not wall-clock, and deliberately not the client's `createdAt` either.
+
+```sh
+psql "host=127.0.0.1 port=5432 dbname=laminardb user=demo" -c "SUBSCRIBE posts_per_min"
+
+# or, without psql:
+python watch.py --from posts_per_min
+```
+
+One final row per minute (`window_start, window_end, posts`), emitted
+when the watermark crosses the window end (`EMIT ON WINDOW CLOSE`). First
+row ~1–1.5 min in — that lag is the watermark being honest, not a stall.
+
+**The lesson: window on a clock you trust.** `commit.record.createdAt`
+is a device clock; a steady fraction of the public firehose runs minutes
+off, which drags an event-time watermark ahead until normal posts look
+"late" and get dropped. So `posts_per_min` uses Jetstream's
+server-stamped `time_us` instead (trustworthy, ~wall-clock, monotone),
+which makes a tight 15s bound safe. `time_us` is microseconds; the
+decoder defaults numeric timestamps to millis, so
+`'json.column.evt_us.epoch_unit' = 'micros'` scales it.
 
 ## How it works
 
 `laminar.toml` is the whole pipeline — embedded SQL, run before the
 server opens its ports:
 
-- **`CREATE SOURCE bluesky_posts … FROM WEBSOCKET (…)`** — the connector
-  dials the Jetstream `wss://` URL, auto-reconnects with backoff (Bluesky
-  drops idle sockets every few minutes; the log shows the reconnect),
-  and decodes each JSON frame. Jetstream events are deeply nested, so
-  `json.column.<col> = 'commit.record.text'` pulls scalar fields out by
-  dotted path. Frames that don't match (identity/account events) are
-  skipped silently. The URL pins `?wantedCollections=app.bsky.feed.post`,
-  so this is **posts only**, not the entire firehose — drop that query
-  string for all collections (likes/follows/reposts: ~thousands/sec, much
-  higher throughput, mostly NULL `text`). See the note in `laminar.toml`.
-- **`CREATE STREAM posts AS SELECT … WITH ('retain_history' = '256mb')`**
-  — a plain projection with a retained history buffer. `SUBSCRIBE`
-  targets this; `WHERE` is compiled against its schema.
+- **`CREATE SOURCE bluesky_posts … FROM WEBSOCKET (…)`** — dials the
+  `wss://` URL (auto-reconnect with backoff), decodes each nested JSON
+  frame via `json.column.<col>` dotted paths, skips non-matching frames.
+- **`CREATE STREAM posts AS … WITH ('retain_history' = '256mb')`** — a
+  plain projection, **no watermark**; `SUBSCRIBE posts` targets it.
+- **`CREATE SOURCE bluesky_posts_wm … WATERMARK FOR evt_us …`** — a
+  *separate* connection on server `time_us` (see §4). Separate because a
+  source `WATERMARK` late-drops rows for *every* consumer, and
+  `WATERMARK` is `CREATE SOURCE`-only — so sharing it with `posts` would
+  silently thin scenario 1. The extra connection costs ~30–60 rows/s.
+- **`CREATE MATERIALIZED VIEW posts_per_min AS … EMIT ON WINDOW
+  CLOSE`** — the 1-minute count, SUBSCRIBE-able over the wire.
 
-**No event-time watermark — on purpose.** `commit.record.createdAt` is
-client-supplied; a single device with a wrong clock would jump an
-event-time watermark far into the future and stall every downstream
-operator (real-time events would all look "late"). This demo is about
-the wire protocol, not windowing, so it runs on processing order and
-never stalls. If you add windowed aggregation here, derive event time
-from a trustworthy field and expect to filter clock outliers.
+`posts_per_min` emits ~one tiny row/minute. pgwire `feed()`s `DataRow`s
+into an ~8 KB buffer and only flushes at end-of-response (never, for an
+unbounded SUBSCRIBE) or when that buffer fills — so a sparse stream
+would stall undelivered. LaminarDB drives the SUBSCRIBE sink itself and
+flushes per batch, so each row arrives as its window closes.
 
 ## Notes
 

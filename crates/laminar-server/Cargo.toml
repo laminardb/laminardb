@@ -61,7 +61,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 # Postgres wire with optional TLS (aws-lc-rs backend). pg-type-chrono and
 # pg-type-rust-decimal pull in the postgres-types ToSql impls used by the
 # extended-query binary-format encoders for TIMESTAMP/DATE/NUMERIC columns.
-pgwire = { version = "0.39", default-features = false, features = [
+pgwire = { version = "0.40", default-features = false, features = [
     "server-api",
     "_aws-lc-rs",
     "pg-type-chrono",
