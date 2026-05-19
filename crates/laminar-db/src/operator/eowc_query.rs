@@ -111,6 +111,10 @@ impl EowcQueryOperator {
                     return Ok(());
                 }
                 Ok(None) => {}
+                // A `now()`-misuse rejection is a hard error, not a
+                // "not this path" signal — propagate it instead of
+                // silently degrading to the incremental/raw path.
+                Err(e @ DbError::Unsupported(_)) => return Err(e),
                 Err(e) => {
                     tracing::debug!(
                         query = %self.op_name,

@@ -69,7 +69,7 @@ def main() -> int:
             for row in stream:
                 if names is None:
                     names = [d.name for d in cur.description]
-                cols = dict(zip(names, row))
+                cols = dict(zip(names, row, strict=True))
                 n += 1
                 # Use the rich post formatter when the schema looks like
                 # `posts`; otherwise print columns generically.

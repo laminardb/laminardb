@@ -322,16 +322,18 @@ impl CoreWindowState {
             None
         };
 
-        // `now()` is re-resolved per cycle only in WHERE; in
-        // GROUP BY / SELECT / HAVING it would freeze at plan time, so
-        // reject at CREATE rather than emit subtly wrong results.
+        // `now()` re-resolves per cycle only in WHERE; elsewhere
+        // (GROUP BY/SELECT/HAVING/aggregate args+FILTER) it would freeze
+        // at plan time. `Unsupported` (not `Pipeline`) so the EOWC
+        // operator re-propagates rather than falling back to raw.
         let nonwhere_now = group_exprs.iter().any(expr_uses_wallclock)
+            || aggr_exprs.iter().any(expr_uses_wallclock)
             || having_predicate.as_ref().is_some_and(expr_uses_wallclock)
             || projection_info
                 .as_ref()
                 .is_some_and(|(exprs, _)| exprs.iter().any(expr_uses_wallclock));
         if nonwhere_now {
-            return Err(DbError::Pipeline(format!(
+            return Err(DbError::Unsupported(format!(
                 "[{}] now()/current_timestamp() is only supported in the WHERE \
                  clause of a windowed query (it would freeze at plan time elsewhere)",
                 laminar_core::error_codes::SQL_UNSUPPORTED
@@ -630,7 +632,7 @@ impl CoreWindowState {
         // single-source path; the interpreted cached-plan fallback would
         // freeze it at plan time. Fail loud at CREATE instead.
         if where_uses_now && compiled_projection.is_none() {
-            return Err(DbError::Pipeline(format!(
+            return Err(DbError::Unsupported(format!(
                 "[{}] now()/current_timestamp() in WHERE requires the single-source \
                  compiled path; this query falls back to the interpreted plan where \
                  now() would freeze at plan time",
@@ -3117,9 +3119,8 @@ mod tests {
         let sql =
             "SELECT TUMBLE(ts, INTERVAL '1' MINUTE) AS w, COUNT(*) AS c, now() AS planned_at \
                    FROM evt GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE)";
-        let err = match CoreWindowState::try_from_sql(&ctx, sql, &window_config, None).await {
-            Ok(_) => panic!("now() outside WHERE must be rejected at build"),
-            Err(e) => e,
+        let Err(err) = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None).await else {
+            panic!("now() outside WHERE must be rejected at build");
         };
         assert!(
             format!("{err}").contains(laminar_core::error_codes::SQL_UNSUPPORTED),
