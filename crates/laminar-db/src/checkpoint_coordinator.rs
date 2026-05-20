@@ -213,10 +213,7 @@ pub struct CheckpointCoordinator {
     cached_sorted_sink_names: Option<Vec<String>>,
 }
 
-/// Highest-loadable manifest, ignoring `latest.txt`. A crash between
-/// manifest-write and pointer-update can leave a valid newer manifest
-/// the pointer doesn't reference; scanning `list_ids` descending and
-/// returning the first that loads tolerates that torn write.
+/// Highest-loadable manifest — tolerates a torn `latest.txt` pointer.
 async fn load_highest(
     store: &dyn CheckpointStore,
 ) -> Result<Option<CheckpointManifest>, laminar_storage::checkpoint_store::CheckpointStoreError> {
@@ -230,27 +227,17 @@ async fn load_highest(
 }
 
 impl CheckpointCoordinator {
-    /// Creates a new checkpoint coordinator, seeded from the latest
-    /// stored checkpoint.
+    /// Creates a new checkpoint coordinator, seeded from the highest
+    /// loadable stored checkpoint.
     ///
     /// # Errors
-    /// Returns [`DbError::Checkpoint`] if `store.load_latest()` fails.
-    /// A store read error is surfaced rather than silently starting at
-    /// `(1, 1)` and clobbering existing on-disk state. `Ok(None)` is
-    /// the fresh-start path and is not an error.
+    /// Surfaces a store read failure rather than silently starting at
+    /// `(1, 1)` and clobbering on-disk state.
     pub async fn new(
         config: CheckpointConfig,
         store: Box<dyn CheckpointStore>,
     ) -> Result<Self, DbError> {
         let store: Arc<dyn CheckpointStore> = Arc::from(store);
-        // Derive `(next_id, epoch)` from the highest *loadable* checkpoint
-        // id rather than the `latest` pointer. `latest.txt`/`latest.json`
-        // is written *after* the manifest, so a crash between leaves a
-        // valid new manifest the pointer doesn't reference. Scanning
-        // `list_ids` (sorted ascending, includes corrupt entries) and
-        // walking descending until one loads tolerates that torn write
-        // and prevents id-reuse / `PutMode::Create` collisions on the
-        // next boot.
         let highest = load_highest(store.as_ref()).await.map_err(|e| {
             DbError::Checkpoint(format!(
                 "[LDB-6028] failed to list checkpoints at coordinator \
@@ -625,9 +612,6 @@ impl CheckpointCoordinator {
     /// every node; in cluster mode the leader additionally
     /// re-announces the decision.
     pub async fn reconcile_prepared_on_init(&self) {
-        // Walk highest-loadable rather than trusting `latest.txt`; a crash
-        // between manifest-write and pointer-update can leave a valid
-        // newer manifest the pointer doesn't reference.
         let Ok(Some(last)) = load_highest(self.store.as_ref()).await else {
             return;
         };

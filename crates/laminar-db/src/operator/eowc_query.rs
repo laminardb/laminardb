@@ -242,9 +242,8 @@ impl EowcQueryOperator {
                     return Ok(());
                 }
                 Ok(None) => {}
-                // `now()`-misuse is a hard error — propagate. Other
-                // feature gaps (CUMULATE, hop wpe cap, ...) fall through
-                // to the incremental/raw paths.
+                // Propagate `now()`-misuse; let other feature gaps
+                // (CUMULATE, hop cap, ...) fall through.
                 Err(e @ DbError::Unsupported(_)) if e.to_string().contains("now()") => {
                     return Err(e);
                 }

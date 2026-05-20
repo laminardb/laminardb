@@ -2243,10 +2243,8 @@ pub(crate) fn analyze_temporal_filter(sql: &str) -> TemporalFilterAnalysis {
         return TemporalFilterAnalysis::NotPresent;
     }
 
-    // Only the canonical shape is allowed: SELECT * or simple cols,
-    // no DISTINCT/HAVING/TOP/ORDER/GROUP/JOIN/LIMIT/FETCH, single source.
-    // (Retraction semantics don't compose with row-limiting clauses —
-    // first-N-ever vs first-N-currently-live is ambiguous.)
+    // Canonical shape only — no DISTINCT/HAVING/TOP/ORDER/GROUP/JOIN/
+    // LIMIT/FETCH; row-limiting doesn't compose with retraction.
     let recognised = (|| {
         if query.order_by.is_some() || query.limit_clause.is_some() || query.fetch.is_some() {
             return None;
