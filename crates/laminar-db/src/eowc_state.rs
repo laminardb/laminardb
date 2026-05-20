@@ -12,6 +12,7 @@ use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
 use datafusion_common::ScalarValue;
 
+use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 
 use crate::aggregate_state::{
@@ -60,28 +61,27 @@ impl EowcWindowType {
     }
 }
 
-fn assign_windows(ts_ms: i64, window_type: &EowcWindowType) -> Vec<i64> {
+/// Inline storage avoids the hot-path alloc for tumbling/small-hop cases.
+type WindowStarts = smallvec::SmallVec<[i64; 4]>;
+
+fn assign_windows(ts_ms: i64, window_type: &EowcWindowType) -> WindowStarts {
     match window_type {
         EowcWindowType::Tumbling { size_ms } => {
             if *size_ms <= 0 {
-                return vec![0];
+                return smallvec::smallvec![0];
             }
-            vec![ts_ms.div_euclid(*size_ms) * size_ms]
+            smallvec::smallvec![ts_ms.div_euclid(*size_ms) * size_ms]
         }
         EowcWindowType::Hopping {
             size_ms, slide_ms, ..
         } => {
             if *slide_ms <= 0 || *size_ms <= 0 {
-                return vec![0];
+                return smallvec::smallvec![0];
             }
-            let mut windows = Vec::new();
-            // The last slide-aligned start at or before ts
+            let mut windows = WindowStarts::new();
             let last_start = ts_ms.div_euclid(*slide_ms) * slide_ms;
             let mut start = last_start;
-            // Loop terminates naturally: runs at most ceil(size/slide) iterations
-            // because `start` decreases by `slide_ms` each iteration.
-            // Do NOT break on `start < 0` — windows with negative start times
-            // are valid when the event falls within [start, start + size).
+            // At most ceil(size/slide) iterations (capped at 10000 at DDL).
             while start + size_ms > ts_ms {
                 windows.push(start);
                 start -= slide_ms;
@@ -119,7 +119,8 @@ pub(crate) struct IncrementalEowcState {
     output_schema: SchemaRef,
     time_col_index: usize,
     compiled_projection: Option<CompiledProjection>,
-    cached_pre_agg_plan: Option<datafusion_expr::LogicalPlan>,
+    /// See [`CoreWindowState::cached_pre_agg_physical`].
+    cached_pre_agg_physical: Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
     having_filter: Option<Arc<dyn PhysicalExpr>>,
     having_sql: Option<String>,
     max_groups_per_window: usize,
@@ -129,6 +130,8 @@ pub(crate) struct IncrementalEowcState {
     allowed_lateness_ms: i64,
     /// See [`CoreWindowState::high_watermark_ms`].
     high_watermark_ms: i64,
+    prom: Option<Arc<crate::engine_metrics::EngineMetrics>>,
+    having_sql_cache: Option<crate::operator::HavingSqlCache>,
 }
 
 impl IncrementalEowcState {
@@ -140,6 +143,7 @@ impl IncrementalEowcState {
         ctx: &SessionContext,
         sql: &str,
         window_config: &WindowOperatorConfig,
+        emit_clause: Option<&EmitClause>,
     ) -> Result<Option<Self>, DbError> {
         let df = ctx
             .sql(sql)
@@ -483,13 +487,17 @@ impl IncrementalEowcState {
 
         let window_type = EowcWindowType::from_config(window_config);
 
-        // ONE-TIME setup: cache the optimized logical plan for multi-source
-        // pre-agg queries. This ctx.sql() call runs ONLY at first-cycle
-        // initialization, never per-cycle.
-        let cached_pre_agg_plan = if compiled_projection.is_none() {
-            match ctx.sql(&pre_agg_sql).await {
+        // Plan once at init; `LiveSourceExec` leaves carry fresh data.
+        // Best-effort: a planning failure leaves the compiled path active.
+        let cached_pre_agg_physical = if compiled_projection.is_none() {
+            let logical = match ctx.sql(&pre_agg_sql).await {
                 Ok(df) => Some(df.logical_plan().clone()),
                 Err(_) => None,
+            };
+            if let Some(plan) = logical {
+                ctx.state().create_physical_plan(&plan).await.ok()
+            } else {
+                None
             }
         } else {
             None
@@ -513,13 +521,19 @@ impl IncrementalEowcState {
             output_schema,
             time_col_index,
             compiled_projection,
-            cached_pre_agg_plan,
+            cached_pre_agg_physical,
             having_filter,
             having_sql,
             max_groups_per_window: 1_000_000,
-            allowed_lateness_ms: i64::try_from(window_config.allowed_lateness.as_millis())
-                .unwrap_or(0),
+            // EMIT FINAL drops late data; see CoreWindowState.
+            allowed_lateness_ms: if matches!(emit_clause, Some(EmitClause::Final)) {
+                0
+            } else {
+                i64::try_from(window_config.allowed_lateness.as_millis()).unwrap_or(0)
+            },
             high_watermark_ms: i64::MIN,
+            prom: None,
+            having_sql_cache: None,
         }))
     }
 
@@ -578,6 +592,7 @@ impl IncrementalEowcState {
                 let idx = row_idx as u32;
                 for ws in assign_windows(ts_ms, &self.window_type) {
                     if self.is_window_closed(ws) {
+                        self.record_late_drop(1);
                         continue;
                     }
                     grouped.entry(ws).or_default().push(idx);
@@ -633,6 +648,7 @@ impl IncrementalEowcState {
             let (gid, idx) = (gid as u32, row_idx as u32);
             for ws in assign_windows(ts_ms, &self.window_type) {
                 if self.is_window_closed(ws) {
+                    self.record_late_drop(1);
                     continue;
                 }
                 grouped.entry((ws, gid)).or_default().push(idx);
@@ -760,8 +776,14 @@ impl IncrementalEowcState {
         self.compiled_projection.as_ref()
     }
 
-    pub fn cached_pre_agg_plan(&self) -> Option<&datafusion_expr::LogicalPlan> {
-        self.cached_pre_agg_plan.as_ref()
+    pub fn cached_pre_agg_physical(
+        &self,
+    ) -> Option<&Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.cached_pre_agg_physical.as_ref()
+    }
+
+    pub(crate) fn having_sql_cache_mut(&mut self) -> &mut Option<crate::operator::HavingSqlCache> {
+        &mut self.having_sql_cache
     }
 
     #[cfg(test)]
@@ -769,8 +791,49 @@ impl IncrementalEowcState {
         self.windows.len()
     }
 
+    pub(crate) fn attach_metrics(
+        &mut self,
+        prom: Option<Arc<crate::engine_metrics::EngineMetrics>>,
+    ) {
+        self.prom = prom;
+    }
+
+    #[inline]
+    fn record_late_drop(&self, n: usize) {
+        if let Some(prom) = &self.prom {
+            if n > 0 {
+                prom.window_late_dropped
+                    .inc_by(u64::try_from(n).unwrap_or(u64::MAX));
+            }
+        }
+    }
+
     pub(crate) fn query_fingerprint(&self) -> u64 {
-        crate::aggregate_state::query_fingerprint(&self.pre_agg_sql, &self.output_schema)
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        self.pre_agg_sql.hash(&mut h);
+        for f in self.output_schema.fields() {
+            f.name().hash(&mut h);
+            f.data_type().to_string().hash(&mut h);
+        }
+        // Window shape: see CoreWindowState::query_fingerprint.
+        match &self.window_type {
+            EowcWindowType::Tumbling { size_ms } => {
+                "tumbling".hash(&mut h);
+                size_ms.hash(&mut h);
+            }
+            EowcWindowType::Hopping { size_ms, slide_ms } => {
+                "hopping".hash(&mut h);
+                size_ms.hash(&mut h);
+                slide_ms.hash(&mut h);
+            }
+            EowcWindowType::Session { gap_ms } => {
+                "session".hash(&mut h);
+                gap_ms.hash(&mut h);
+            }
+        }
+        self.allowed_lateness_ms.hash(&mut h);
+        h.finish()
     }
 
     /// Estimated memory usage in bytes across all windows and groups.
@@ -996,12 +1059,12 @@ mod tests {
     #[test]
     fn test_tumbling_window_assignment_aligns_to_boundary() {
         let wt = EowcWindowType::Tumbling { size_ms: 1000 };
-        assert_eq!(assign_windows(0, &wt), vec![0]);
-        assert_eq!(assign_windows(500, &wt), vec![0]);
-        assert_eq!(assign_windows(999, &wt), vec![0]);
-        assert_eq!(assign_windows(1000, &wt), vec![1000]);
-        assert_eq!(assign_windows(1500, &wt), vec![1000]);
-        assert_eq!(assign_windows(2000, &wt), vec![2000]);
+        assert_eq!(assign_windows(0, &wt).as_slice(), vec![0].as_slice());
+        assert_eq!(assign_windows(500, &wt).as_slice(), vec![0].as_slice());
+        assert_eq!(assign_windows(999, &wt).as_slice(), vec![0].as_slice());
+        assert_eq!(assign_windows(1000, &wt).as_slice(), vec![1000].as_slice());
+        assert_eq!(assign_windows(1500, &wt).as_slice(), vec![1000].as_slice());
+        assert_eq!(assign_windows(2000, &wt).as_slice(), vec![2000].as_slice());
     }
 
     #[test]
@@ -1013,12 +1076,12 @@ mod tests {
         // ts=750 belongs to windows starting at [500, 0]
         let mut ws = assign_windows(750, &wt);
         ws.sort_unstable();
-        assert_eq!(ws, vec![0, 500]);
+        assert_eq!(ws.as_slice(), [0_i64, 500].as_slice());
 
         // ts=1250 belongs to windows starting at [1000, 500]
         let mut ws = assign_windows(1250, &wt);
         ws.sort_unstable();
-        assert_eq!(ws, vec![500, 1000]);
+        assert_eq!(ws.as_slice(), [500_i64, 1000].as_slice());
     }
 
     #[test]
@@ -1031,7 +1094,7 @@ mod tests {
     #[test]
     fn test_tumbling_window_zero_size_returns_zero() {
         let wt = EowcWindowType::Tumbling { size_ms: 0 };
-        assert_eq!(assign_windows(500, &wt), vec![0]);
+        assert_eq!(assign_windows(500, &wt).as_slice(), vec![0].as_slice());
     }
 
     #[test]
@@ -1137,12 +1200,14 @@ mod tests {
             output_schema,
             time_col_index: 2,
             compiled_projection: None,
-            cached_pre_agg_plan: None,
+            cached_pre_agg_physical: None,
             having_filter: None,
             having_sql: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
             high_watermark_ms: i64::MIN,
+            prom: None,
+            having_sql_cache: None,
         }
     }
 

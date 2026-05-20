@@ -210,36 +210,46 @@ impl LaminarDB {
                 |r| u16::try_from(r.vnode_count()).unwrap_or(u16::MAX),
             );
 
-            let store: Box<dyn laminar_storage::CheckpointStore> =
-                if let Some(ref url) = self.config.object_store_url {
-                    let obj_store = laminar_storage::object_store_builder::build_object_store(
-                        url,
-                        &self.config.object_store_options,
-                    )
-                    .map_err(|e| DbError::Config(format!("object store: {e}")))?;
-                    let prefix = url_to_checkpoint_prefix(url);
-                    Box::new(
-                        laminar_storage::checkpoint_store::ObjectStoreCheckpointStore::new(
-                            obj_store,
-                            prefix,
-                            max_retained,
-                        )
-                        .with_vnode_count(vnode_count),
-                    )
-                } else {
-                    let data_dir = cp_config
-                        .data_dir
-                        .clone()
-                        .or_else(|| self.config.storage_dir.clone())
-                        .unwrap_or_else(|| std::path::PathBuf::from("./data"));
-                    Box::new(
-                        laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(
-                            &data_dir,
-                            max_retained,
-                        )
-                        .with_vnode_count(vnode_count),
-                    )
-                };
+            // Resolve once; both the checkpoint store and the decision
+            // store want the same root.
+            let data_dir = cp_config
+                .data_dir
+                .clone()
+                .or_else(|| self.config.storage_dir.clone())
+                .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+
+            let (store, decision_backing): (
+                Box<dyn laminar_storage::CheckpointStore>,
+                Arc<dyn object_store::ObjectStore>,
+            ) = if let Some(ref url) = self.config.object_store_url {
+                let obj = laminar_storage::object_store_builder::build_object_store(
+                    url,
+                    &self.config.object_store_options,
+                )
+                .map_err(|e| DbError::Config(format!("object store: {e}")))?;
+                let prefix = url_to_checkpoint_prefix(url);
+                let cs = laminar_storage::checkpoint_store::ObjectStoreCheckpointStore::new(
+                    Arc::clone(&obj),
+                    prefix,
+                    max_retained,
+                )
+                .with_vnode_count(vnode_count);
+                (Box::new(cs), obj)
+            } else {
+                std::fs::create_dir_all(&data_dir).map_err(|e| {
+                    DbError::Config(format!("data dir {}: {e}", data_dir.display()))
+                })?;
+                let obj: Arc<dyn object_store::ObjectStore> = Arc::new(
+                    object_store::local::LocalFileSystem::new_with_prefix(&data_dir)
+                        .map_err(|e| DbError::Config(format!("local fs: {e}")))?,
+                );
+                let cs = laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(
+                    &data_dir,
+                    max_retained,
+                )
+                .with_vnode_count(vnode_count);
+                (Box::new(cs), obj)
+            };
 
             let config = CkpConfig {
                 interval: cp_config.interval_ms.map(std::time::Duration::from_millis),
@@ -302,23 +312,33 @@ impl LaminarDB {
                 coord.set_gate_vnode_set((0..registry.vnode_count()).collect());
             }
 
-            // Plug in the cluster 2PC decision store before the
-            // recovery sweep so `reconcile_prepared_on_init` can
-            // consult it. Writes land here before the leader's Commit
-            // announcement goes out, so a new leader mid-2PC reads
-            // the durable vote instead of guessing.
-            #[cfg(feature = "cluster-unstable")]
-            if let Some(ds) = self.decision_store.lock().clone() {
-                coord.set_decision_store(ds);
-            }
+            // Decision store: caller-supplied (cluster) wins, else
+            // auto-wire one on the same backing so recovery can read
+            // the commit marker.
+            let ds = {
+                #[cfg(feature = "cluster-unstable")]
+                {
+                    self.decision_store.lock().clone().unwrap_or_else(|| {
+                        Arc::new(
+                            laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+                                Arc::clone(&decision_backing),
+                            ),
+                        )
+                    })
+                }
+                #[cfg(not(feature = "cluster-unstable"))]
+                {
+                    Arc::new(
+                        laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
+                            Arc::clone(&decision_backing),
+                        ),
+                    )
+                }
+            };
+            coord.set_decision_store(ds);
 
-            // Cluster recovery: if this instance's last persisted
-            // manifest has any sink in Pending state, consult the
-            // durable 2PC decision store and drive local sinks to the
-            // recorded verdict. Committed → local commit + leader
-            // re-announces Commit for stragglers; Aborted or absent →
-            // rollback + leader announces Abort.
-            #[cfg(feature = "cluster-unstable")]
+            // Reconcile any Pending sinks from the last manifest against
+            // the durable commit marker before accepting new traffic.
             coord.reconcile_prepared_on_init().await;
 
             *self.coordinator.lock().await = Some(coord);
@@ -845,12 +865,28 @@ impl LaminarDB {
 
         // Recovery: restore sink/table state via unified coordinator.
         // Must run BEFORE begin_initial_epoch so the coordinator's epoch
-        // reflects the recovered state.
+        // reflects the recovered state. We also hoist the recovered
+        // per-source watermarks out of the coordinator lock so the later
+        // watermark-state construction can seed each generator + the
+        // combined tracker. Without this, generators restart at
+        // `i64::MIN` while source offsets resume mid-stream — windowed
+        // operators re-fire and late-drop diverges from the pre-crash
+        // run, breaking deterministic recovery for every event-time
+        // pipeline.
+        let mut recovered_source_wms: rustc_hash::FxHashMap<String, i64> =
+            rustc_hash::FxHashMap::default();
         {
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
                 match coord.recover().await {
                     Ok(Some(recovered)) => {
+                        recovered_source_wms = recovered
+                            .manifest
+                            .source_watermarks
+                            .iter()
+                            .filter(|(_, &wm)| wm != i64::MIN)
+                            .map(|(name, &wm)| (name.clone(), wm))
+                            .collect();
                         for (name, source, _) in &mut table_sources {
                             if let Some(cp) = recovered.manifest.table_offsets.get(name) {
                                 let restored =
@@ -918,11 +954,19 @@ impl LaminarDB {
                                         );
                                     }
                                     Err(e) => {
-                                        graph_restore_failed = true;
-                                        tracing::warn!(
-                                            error = %e,
-                                            "Operator graph state restore failed, starting fresh"
-                                        );
+                                        // Source offsets were already staged
+                                        // for the connectors above. Resuming
+                                        // with empty operator state would
+                                        // silently lose every in-flight
+                                        // window / aggregator. Fail loud
+                                        // instead — the operator can drop
+                                        // the checkpoint and restart fresh
+                                        // explicitly if that's the intent.
+                                        return Err(DbError::Checkpoint(format!(
+                                            "[LDB-6029] operator graph restore failed: \
+                                             {e} — refusing to start with checkpointed \
+                                             source offsets and empty operator state"
+                                        )));
                                     }
                                 }
                             } else {
@@ -1234,7 +1278,7 @@ impl LaminarDB {
             },
             Err(_) => None,
         };
-        let tracker = if source_ids.is_empty() {
+        let mut tracker = if source_ids.is_empty() {
             None
         } else {
             let mut t = laminar_core::time::WatermarkTracker::new(source_ids.len());
@@ -1246,6 +1290,57 @@ impl LaminarDB {
             }
             Some(t)
         };
+
+        // A pipeline with some watermarked and some un-watermarked sources
+        // is a semantic hazard: an un-watermarked source's per-stream
+        // watermark falls back to the global, so a join/window over both
+        // closes on the *watermarked* source's clock. Surface this so it
+        // isn't an invisible source of "where did my late rows go?"
+        // bug reports. The real fix needs planner-level rejection.
+        let registered = self.catalog.list_sources();
+        let unwatermarked: Vec<&str> = registered
+            .iter()
+            .filter(|n| !source_ids.contains_key(*n))
+            .map(String::as_str)
+            .collect();
+        if !source_ids.is_empty() && !unwatermarked.is_empty() {
+            tracing::warn!(
+                watermarked = source_ids.len(),
+                unwatermarked = unwatermarked.len(),
+                unwatermarked_names = ?unwatermarked,
+                "Pipeline mixes watermarked and un-watermarked sources. An un-watermarked \
+                 source in a join/window inherits the global watermark — time-based \
+                 operators may behave unexpectedly. Add `WATERMARK FOR` to the missing \
+                 sources or split into separate pipelines."
+            );
+        }
+
+        // Seed every restored generator and the combined tracker with the
+        // watermark captured at checkpoint time. Anything not in the
+        // recovered map (or `i64::MIN`) starts cold, which is correct for
+        // first-run / fresh sources.
+        if !recovered_source_wms.is_empty() {
+            let mut combined = i64::MIN;
+            for (name, wm) in &recovered_source_wms {
+                if let Some(state) = watermark_states.get_mut(name) {
+                    let _ = state.generator.advance_watermark(*wm);
+                }
+                if let (Some(t), Some(&id)) = (tracker.as_mut(), source_ids.get(name)) {
+                    if let Some(global) = t.update_source(id, *wm) {
+                        combined = combined.max(global.timestamp());
+                    }
+                }
+            }
+            if combined != i64::MIN {
+                self.pipeline_watermark
+                    .store(combined, std::sync::atomic::Ordering::SeqCst);
+                tracing::info!(
+                    sources = recovered_source_wms.len(),
+                    pipeline_watermark = combined,
+                    "Restored watermarks from checkpoint"
+                );
+            }
+        }
 
         let max_poll = self.config.default_buffer_size.min(1024);
         let checkpoint_interval = self

@@ -662,15 +662,25 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             let current_wm = wm_state.generator.current_watermark();
             if current_wm > i64::MIN {
                 let before = batch.num_rows();
+                // Null timestamps are data-quality, not lateness — count separately.
+                let null_ts = batch
+                    .column_by_name(&wm_state.column)
+                    .map_or(0, |c| c.null_count());
                 match filter_late_rows(batch, &wm_state.column, current_wm) {
                     Ok(out) => {
                         let after = out.as_ref().map_or(0, arrow_array::RecordBatch::num_rows);
                         let dropped = before.saturating_sub(after);
-                        if dropped > 0 {
+                        let late = dropped.saturating_sub(null_ts);
+                        if null_ts > 0 {
+                            self.prom
+                                .events_null_timestamp
+                                .inc_by(u64::try_from(null_ts).unwrap_or(u64::MAX));
+                        }
+                        if late > 0 {
                             self.prom
                                 .events_dropped
-                                .inc_by(u64::try_from(dropped).unwrap_or(u64::MAX));
-                            warn_late_drops(source_name, &wm_state.column, current_wm, dropped);
+                                .inc_by(u64::try_from(late).unwrap_or(u64::MAX));
+                            warn_late_drops(source_name, &wm_state.column, current_wm, late);
                         }
                         return out;
                     }
@@ -700,6 +710,33 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         let Some(ref mut trk) = self.tracker else {
             return;
         };
+        // Drive periodic generators (ProcessingTime) and pull external
+        // `Source::watermark()` so a quiet source still advances the frontier.
+        for (name, state) in &mut self.watermark_states {
+            if let Some(wm) = state.generator.on_periodic() {
+                if let Some(&id) = self.source_ids.get(name) {
+                    if let Some(global) = trk.update_source(id, wm.timestamp()) {
+                        self.pipeline_watermark
+                            .store(global.timestamp(), std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+            if let Some(entry) = self.source_entries_for_wm.get(name) {
+                let external = entry.source.current_watermark();
+                if external > i64::MIN {
+                    if let Some(wm) = state.generator.advance_watermark(external) {
+                        if let Some(&id) = self.source_ids.get(name) {
+                            if let Some(global) = trk.update_source(id, wm.timestamp()) {
+                                self.pipeline_watermark.store(
+                                    global.timestamp(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // `update_combined` is monotone, so a re-activating source with an
         // older watermark can't regress the combined value.
         if let Some(global) = trk.check_idle_sources() {

@@ -186,6 +186,30 @@ fn sha256_hex_chunks(chunks: &[bytes::Bytes]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// SHA-256 over inline operator-state entries in sorted-name order,
+/// used as the `state_checksum` when no sidecar exists.
+fn sha256_hex_inline_states(
+    states: &std::collections::HashMap<String, crate::checkpoint_manifest::OperatorCheckpoint>,
+) -> String {
+    let mut names: Vec<&String> = states.keys().collect();
+    names.sort_unstable();
+    let mut hasher = Sha256::new();
+    for n in names {
+        if let Some(op) = states.get(n) {
+            if op.external {
+                continue;
+            }
+            hasher.update(n.as_bytes());
+            hasher.update([0u8]);
+            if let Some(b64) = &op.state_b64 {
+                hasher.update(b64.as_bytes());
+            }
+            hasher.update([0u8]);
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 /// Trait for checkpoint persistence backends.
 ///
 /// Implementations must guarantee atomic manifest writes (readers never see
@@ -327,21 +351,34 @@ pub trait CheckpointStore: Send + Sync {
             )));
         }
 
-        // Verify state sidecar checksum.
+        // `state_checksum` covers either the sidecar or the inline state,
+        // dispatch on whether any operator state was externalised.
         if let Some(expected) = &manifest.state_checksum {
-            match self.load_state_data(id).await? {
-                Some(data) => {
-                    let actual = sha256_hex(&data);
-                    if actual != *expected {
-                        issues.push(ValidationIssue::IntegrityFailure(format!(
-                            "state.bin checksum mismatch: expected {expected}, got {actual}"
-                        )));
-                    }
+            let any_inline = manifest.operator_states.values().any(|o| !o.external);
+            let any_external = manifest.operator_states.values().any(|o| o.external);
+            let purely_inline = any_inline && !any_external;
+            if purely_inline {
+                let actual = sha256_hex_inline_states(&manifest.operator_states);
+                if actual != *expected {
+                    issues.push(ValidationIssue::IntegrityFailure(format!(
+                        "inline state checksum mismatch: expected {expected}, got {actual}"
+                    )));
                 }
-                None => {
-                    issues.push(ValidationIssue::IntegrityFailure(
-                        "state.bin referenced by checksum but not found".into(),
-                    ));
+            } else {
+                match self.load_state_data(id).await? {
+                    Some(data) => {
+                        let actual = sha256_hex(&data);
+                        if actual != *expected {
+                            issues.push(ValidationIssue::IntegrityFailure(format!(
+                                "state.bin checksum mismatch: expected {expected}, got {actual}"
+                            )));
+                        }
+                    }
+                    None => {
+                        issues.push(ValidationIssue::IntegrityFailure(
+                            "state.bin referenced by checksum but not found".into(),
+                        ));
+                    }
                 }
             }
         }
@@ -453,6 +490,12 @@ pub trait CheckpointStore: Send + Sync {
             // is never persisted.
             manifest.state_checksum = Some(sha256_hex_chunks(chunks));
             self.save_state_data(manifest.checkpoint_id, chunks).await?;
+        } else if !manifest.operator_states.is_empty()
+            && manifest.operator_states.values().all(|o| !o.external)
+            && manifest.state_checksum.is_none()
+        {
+            // Inline-only: checksum guards against a torn manifest.json write.
+            manifest.state_checksum = Some(sha256_hex_inline_states(&manifest.operator_states));
         }
         self.save(&manifest).await
     }

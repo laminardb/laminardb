@@ -59,6 +59,19 @@ pub struct EngineMetrics {
     /// Rows dropped because the sink's WHERE filter failed to compile to
     /// a `PhysicalExpr` (fail-closed). Label: `sink`.
     pub sink_filter_rejected_rows: IntCounterVec,
+    /// Rows dropped at operator level past `allowed_lateness` (distinct
+    /// from `events_dropped`, which is source-side).
+    pub window_late_dropped: IntCounter,
+    /// Source rows dropped because the event-time column was null.
+    pub events_null_timestamp: IntCounter,
+    /// Rows currently buffered by temporal-filter operators.
+    pub temporal_filter_buffered: IntGauge,
+    /// Z-set inserts (+1) emitted by temporal-filter operators.
+    pub temporal_filter_inserts: IntCounter,
+    /// Z-set retractions (-1) emitted by temporal-filter operators.
+    pub temporal_filter_retracts: IntCounter,
+    /// Late / born-expired / beyond-horizon rows dropped un-emitted.
+    pub temporal_filter_dropped: IntCounter,
     /// Per-cycle processing duration.
     pub cycle_duration: Histogram,
     /// Checkpoint cycle duration.
@@ -194,6 +207,36 @@ impl EngineMetrics {
                     "Rows dropped because the sink filter failed to compile",
                 ),
                 &["sink"],
+            )
+            .unwrap()),
+            window_late_dropped: reg!(IntCounter::new(
+                "window_late_dropped_total",
+                "Rows dropped by window operators past allowed_lateness"
+            )
+            .unwrap()),
+            events_null_timestamp: reg!(IntCounter::new(
+                "events_null_timestamp_total",
+                "Source rows dropped because the event-time column was null"
+            )
+            .unwrap()),
+            temporal_filter_buffered: reg!(IntGauge::new(
+                "temporal_filter_buffered",
+                "Rows buffered by retracting temporal-filter operators"
+            )
+            .unwrap()),
+            temporal_filter_inserts: reg!(IntCounter::new(
+                "temporal_filter_inserts_total",
+                "Z-set inserts emitted by temporal-filter operators"
+            )
+            .unwrap()),
+            temporal_filter_retracts: reg!(IntCounter::new(
+                "temporal_filter_retracts_total",
+                "Z-set retractions emitted by temporal-filter operators"
+            )
+            .unwrap()),
+            temporal_filter_dropped: reg!(IntCounter::new(
+                "temporal_filter_dropped_total",
+                "Rows dropped un-emitted by temporal-filter operators"
             )
             .unwrap()),
             cycle_duration: reg!(Histogram::with_opts(

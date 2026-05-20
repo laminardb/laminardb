@@ -35,6 +35,17 @@ pub trait WatermarkGenerator: Send {
 /// Default `max_future_skew_ms`: 5 min.
 pub const DEFAULT_MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1000;
 
+/// `true` if `timestamp` is more than `skew_ms` beyond wall-clock now.
+/// `skew_ms <= 0` or an unset system clock disables the guard.
+#[inline]
+fn is_grossly_future(timestamp: i64, skew_ms: i64) -> bool {
+    if skew_ms <= 0 {
+        return false;
+    }
+    let now = super::now_unix_millis();
+    now > 0 && timestamp > now.saturating_add(skew_ms)
+}
+
 /// Watermark = `max_timestamp_seen - max_out_of_orderness`. `on_event`
 /// ignores timestamps far beyond wall clock for advancement.
 pub struct BoundedOutOfOrdernessGenerator {
@@ -85,12 +96,8 @@ impl BoundedOutOfOrdernessGenerator {
 impl WatermarkGenerator for BoundedOutOfOrdernessGenerator {
     #[inline]
     fn on_event(&mut self, timestamp: i64) -> Option<Watermark> {
-        // Don't let a corrupt far-future producer clock advance the watermark.
-        if self.max_future_skew_ms > 0 {
-            let now = super::now_unix_millis();
-            if now > 0 && timestamp > now.saturating_add(self.max_future_skew_ms) {
-                return None;
-            }
+        if is_grossly_future(timestamp, self.max_future_skew_ms) {
+            return None;
         }
         if timestamp > self.current_max_timestamp {
             self.current_max_timestamp = timestamp;
@@ -116,6 +123,9 @@ impl WatermarkGenerator for BoundedOutOfOrdernessGenerator {
 
     #[inline]
     fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark> {
+        if is_grossly_future(timestamp, self.max_future_skew_ms) {
+            return None;
+        }
         if timestamp > self.current_watermark {
             self.current_watermark = timestamp;
             // Maintain invariant: current_max_timestamp >= current_watermark + max_out_of_orderness
@@ -132,9 +142,17 @@ impl WatermarkGenerator for BoundedOutOfOrdernessGenerator {
 
 /// Watermark generator for strictly ascending timestamps; the watermark
 /// equals the current timestamp.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AscendingTimestampsGenerator {
     current_watermark: i64,
+    /// `0` ⇒ disabled.
+    max_future_skew_ms: i64,
+}
+
+impl Default for AscendingTimestampsGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AscendingTimestampsGenerator {
@@ -143,13 +161,24 @@ impl AscendingTimestampsGenerator {
     pub fn new() -> Self {
         Self {
             current_watermark: i64::MIN,
+            max_future_skew_ms: DEFAULT_MAX_FUTURE_SKEW_MS,
         }
+    }
+
+    /// Override the future-skew ceiling (`0` disables).
+    #[must_use]
+    pub fn with_max_future_skew(mut self, skew_ms: i64) -> Self {
+        self.max_future_skew_ms = skew_ms;
+        self
     }
 }
 
 impl WatermarkGenerator for AscendingTimestampsGenerator {
     #[inline]
     fn on_event(&mut self, timestamp: i64) -> Option<Watermark> {
+        if is_grossly_future(timestamp, self.max_future_skew_ms) {
+            return None;
+        }
         if timestamp > self.current_watermark {
             self.current_watermark = timestamp;
             Some(Watermark::new(timestamp))

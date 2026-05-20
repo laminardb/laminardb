@@ -190,11 +190,10 @@ pub struct CheckpointCoordinator {
     /// Stamped into every `write_partial` for the split-brain fence.
     /// Zero = fence disabled.
     assignment_version: u64,
-    /// Shared commit-marker store. Written before `Commit` is
-    /// announced; absence means "no quorum, safe to abort". `None`
-    /// in single-instance mode.
-    #[cfg(feature = "cluster-unstable")]
-    decision_store: Option<Arc<laminar_core::cluster::control::CheckpointDecisionStore>>,
+    /// Durable commit marker, written before sinks are told to commit
+    /// so recovery can tell the 2PC verdict apart from a mid-flight
+    /// crash. `None` falls back to "rollback on recovery".
+    decision_store: Option<Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>>,
     /// Reported in each `BarrierAck`; the leader folds these with its
     /// own watermark to compute the cluster-wide min.
     local_watermark_ms: Option<i64>,
@@ -228,16 +227,31 @@ impl CheckpointCoordinator {
         store: Box<dyn CheckpointStore>,
     ) -> Result<Self, DbError> {
         let store: Arc<dyn CheckpointStore> = Arc::from(store);
-        let (next_id, epoch) = match store.load_latest().await {
-            Ok(Some(m)) => (m.checkpoint_id + 1, m.epoch + 1),
-            Ok(None) => (1, 1),
-            Err(e) => {
-                return Err(DbError::Checkpoint(format!(
-                    "[LDB-6028] failed to load latest checkpoint at coordinator \
-                     construction: {e} — refusing to start at epoch 1 and \
-                     clobber existing on-disk state"
-                )));
+        // Derive `(next_id, epoch)` from the highest *loadable* checkpoint
+        // id rather than the `latest` pointer. `latest.txt`/`latest.json`
+        // is written *after* the manifest, so a crash between leaves a
+        // valid new manifest the pointer doesn't reference. Scanning
+        // `list_ids` (sorted ascending, includes corrupt entries) and
+        // walking descending until one loads tolerates that torn write
+        // and prevents id-reuse / `PutMode::Create` collisions on the
+        // next boot.
+        let ids = store.list_ids().await.map_err(|e| {
+            DbError::Checkpoint(format!(
+                "[LDB-6028] failed to list checkpoints at coordinator \
+                 construction: {e} — refusing to start at epoch 1 and \
+                 clobber existing on-disk state"
+            ))
+        })?;
+        let mut found: Option<(u64, u64)> = None;
+        for id in ids.iter().rev() {
+            if let Some(m) = store.load_by_id(*id).await.ok().flatten() {
+                found = Some((m.checkpoint_id, m.epoch));
+                break;
             }
+        }
+        let (next_id, epoch) = match found {
+            Some((id, ep)) => (id + 1, ep + 1),
+            None => (1, 1),
         };
 
         Ok(Self {
@@ -255,7 +269,6 @@ impl CheckpointCoordinator {
             total_bytes_written: 0,
             state_backend: None,
             assignment_version: 0,
-            #[cfg(feature = "cluster-unstable")]
             decision_store: None,
             local_watermark_ms: None,
             #[cfg(feature = "cluster-unstable")]
@@ -284,11 +297,10 @@ impl CheckpointCoordinator {
         self.state_backend = Some(backend);
     }
 
-    /// Install the shared commit-marker store.
-    #[cfg(feature = "cluster-unstable")]
+    /// Install the durable commit-marker store.
     pub fn set_decision_store(
         &mut self,
-        store: Arc<laminar_core::cluster::control::CheckpointDecisionStore>,
+        store: Arc<laminar_core::checkpoint_decision::CheckpointDecisionStore>,
     ) {
         self.decision_store = Some(store);
     }
@@ -476,81 +488,61 @@ impl CheckpointCoordinator {
         futures::future::try_join_all(futures).await.map(|_| ())
     }
 
-    /// Commits all exactly-once sinks with per-sink status tracking.
-    ///
-    /// Returns a map of sink name → commit status. Sinks that committed
-    /// successfully are `Committed`; failures are `Failed(message)`.
-    /// All sinks are attempted even if some fail.
-    ///
-    /// Bounded by [`CheckpointConfig::commit_timeout`] to prevent a stuck
-    /// sink from blocking checkpoint completion indefinitely.
+    /// Commit each exactly-once sink in its own task, bounded by
+    /// `commit_timeout`. Per-sink isolation avoids a slow sink blanket-
+    /// failing the whole batch; cancellation lives inside the spawned
+    /// task so an outer drop doesn't leave the sink-task with a dropped
+    /// oneshot ack.
     async fn commit_sinks_tracked(&self, epoch: u64) -> HashMap<String, SinkCommitStatus> {
         let timeout_dur = self.config.commit_timeout;
         let start = std::time::Instant::now();
 
-        let statuses = match tokio::time::timeout(timeout_dur, self.commit_sinks_inner(epoch)).await
-        {
-            Ok(statuses) => statuses,
-            Err(_elapsed) => {
-                error!(
-                    epoch,
-                    timeout_secs = timeout_dur.as_secs(),
-                    "[LDB-6012] sink commit timed out — marking all pending sinks as failed"
-                );
-                self.sinks
-                    .iter()
-                    .filter(|s| s.exactly_once)
-                    .map(|s| {
-                        (
-                            s.name.clone(),
-                            SinkCommitStatus::Failed(format!(
-                                "sink '{}' commit timed out after {}s",
-                                s.name,
-                                timeout_dur.as_secs()
-                            )),
-                        )
-                    })
-                    .collect()
-            }
-        };
+        let tasks: Vec<_> = self
+            .sinks
+            .iter()
+            .filter(|s| s.exactly_once)
+            .map(|sink| {
+                let handle = sink.handle.clone();
+                let name = sink.name.clone();
+                let task = tokio::spawn(async move {
+                    tokio::time::timeout(timeout_dur, handle.commit_epoch(epoch)).await
+                });
+                (name, task)
+            })
+            .collect();
 
-        // Record commit duration regardless of success/failure.
+        let mut statuses = HashMap::new();
+        for (name, task) in tasks {
+            let status = match task.await {
+                Ok(Ok(Ok(()))) => SinkCommitStatus::Committed,
+                Ok(Ok(Err(e))) => {
+                    error!(sink = %name, epoch, error = %e, "sink commit failed");
+                    SinkCommitStatus::Failed(format!("sink '{name}' commit failed: {e}"))
+                }
+                Ok(Err(_)) => {
+                    error!(
+                        sink = %name, epoch,
+                        timeout_secs = timeout_dur.as_secs(),
+                        "[LDB-6012] sink commit timed out",
+                    );
+                    SinkCommitStatus::Failed(format!(
+                        "sink '{name}' commit timed out after {}s",
+                        timeout_dur.as_secs()
+                    ))
+                }
+                Err(join_err) => {
+                    error!(sink = %name, epoch, error = %join_err, "sink commit task panicked");
+                    SinkCommitStatus::Failed(format!("sink '{name}' commit panicked: {join_err}"))
+                }
+            };
+            statuses.insert(name, status);
+        }
+
         if let Some(ref m) = self.prom {
             m.sink_commit_duration
                 .observe(start.elapsed().as_secs_f64());
         }
-
         statuses
-    }
-
-    /// Inner commit loop (no timeout).
-    ///
-    /// Fires every sink's `commit_epoch` concurrently via `join_all`
-    /// (not `try_join_all` — one sink failing must not short-circuit
-    /// the others, because each sink's status is tracked independently
-    /// and callers inspect the map). Matches the rollback path's
-    /// pattern at `rollback_sinks_inner`.
-    async fn commit_sinks_inner(&self, epoch: u64) -> HashMap<String, SinkCommitStatus> {
-        let futures = self.sinks.iter().filter(|s| s.exactly_once).map(|sink| {
-            let handle = sink.handle.clone();
-            let name = sink.name.clone();
-            async move {
-                let status = match handle.commit_epoch(epoch).await {
-                    Ok(()) => {
-                        debug!(sink = %name, epoch, "sink committed");
-                        SinkCommitStatus::Committed
-                    }
-                    Err(e) => {
-                        let msg = format!("sink '{name}' commit failed: {e}");
-                        error!(sink = %name, epoch, error = %e, "sink commit failed");
-                        SinkCommitStatus::Failed(msg)
-                    }
-                };
-                (name, status)
-            }
-        });
-        let results = futures::future::join_all(futures).await;
-        results.into_iter().collect()
     }
 
     /// Saves a manifest to the checkpoint store.
@@ -621,11 +613,9 @@ impl CheckpointCoordinator {
     /// On startup, reconcile any Pending sinks in the last manifest
     /// against the durable commit marker. Marker present → drive
     /// local commit (idempotent); marker absent → rollback. Runs on
-    /// every node; the leader additionally re-announces the decision.
-    #[cfg(feature = "cluster-unstable")]
+    /// every node; in cluster mode the leader additionally
+    /// re-announces the decision.
     pub async fn reconcile_prepared_on_init(&self) {
-        use laminar_core::cluster::control::Phase;
-
         let Ok(Some(last)) = self.store.load_latest().await else {
             return;
         };
@@ -651,6 +641,7 @@ impl CheckpointCoordinator {
             None => false,
         };
 
+        #[cfg(feature = "cluster-unstable")]
         let is_leader = self
             .cluster_controller
             .as_ref()
@@ -668,9 +659,15 @@ impl CheckpointCoordinator {
             {
                 warn!(epoch, checkpoint_id, error = %e, "post-recovery manifest update failed");
             }
+            #[cfg(feature = "cluster-unstable")]
             if is_leader {
-                self.announce_if_leader(epoch, checkpoint_id, Phase::Commit, None)
-                    .await;
+                self.announce_if_leader(
+                    epoch,
+                    checkpoint_id,
+                    laminar_core::cluster::control::Phase::Commit,
+                    None,
+                )
+                .await;
             }
         } else {
             warn!(
@@ -680,13 +677,20 @@ impl CheckpointCoordinator {
             if let Err(e) = self.rollback_sinks(epoch).await {
                 error!(epoch, checkpoint_id, error = %e, "sink rollback failed during recovery");
             }
+            #[cfg(feature = "cluster-unstable")]
             if is_leader {
-                self.announce_if_leader(epoch, checkpoint_id, Phase::Abort, None)
-                    .await;
+                self.announce_if_leader(
+                    epoch,
+                    checkpoint_id,
+                    laminar_core::cluster::control::Phase::Abort,
+                    None,
+                )
+                .await;
             }
         }
 
         // Brief pause so the announcement gossips before the next checkpoint tick.
+        #[cfg(feature = "cluster-unstable")]
         if is_leader {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -694,7 +698,6 @@ impl CheckpointCoordinator {
 
     /// Overwrite the Pending sink statuses on the last manifest with
     /// the outcomes produced during recovery.
-    #[cfg(feature = "cluster-unstable")]
     async fn persist_recovered_statuses(
         &self,
         checkpoint_id: u64,
@@ -1502,48 +1505,56 @@ impl CheckpointCoordinator {
             }
         }
 
-        // Record the commit marker before announcing Commit so a new
-        // leader elected mid-2PC can recover the decision. A
-        // cluster leader without a decision store is a misconfig.
-        #[cfg(feature = "cluster-unstable")]
-        if self
-            .cluster_controller
-            .as_ref()
-            .is_some_and(|cc| cc.is_leader())
-        {
-            let marker_result = match self.decision_store.as_ref() {
-                Some(ds) => ds.record_committed(epoch).await.map_err(|e| e.to_string()),
-                None => Err("no decision store configured for cluster leader".to_string()),
-            };
-            if let Err(reason) = marker_result {
-                error!(
-                    checkpoint_id, epoch, error = %reason,
-                    "[LDB-6038] cannot record commit marker — aborting epoch",
-                );
-                self.announce_if_leader(
-                    epoch,
-                    checkpoint_id,
-                    laminar_core::cluster::control::Phase::Abort,
-                    None,
-                )
-                .await;
-                self.checkpoints_failed += 1;
-                self.phase = CheckpointPhase::Idle;
-                let duration = start.elapsed();
-                self.emit_checkpoint_metrics(false, epoch, duration);
-                if let Err(rollback_err) = self.rollback_sinks(epoch).await {
+        // Record the commit marker before issuing sink commits — this
+        // is the durable record of the commit decision that recovery
+        // reads to distinguish "committed mid-flight" from "never
+        // committed". Cluster mode gates on leadership.
+        let is_decision_leader = {
+            #[cfg(feature = "cluster-unstable")]
+            {
+                self.cluster_controller
+                    .as_ref()
+                    .is_none_or(|cc| cc.is_leader())
+            }
+            #[cfg(not(feature = "cluster-unstable"))]
+            {
+                true
+            }
+        };
+        if is_decision_leader {
+            if let Some(ds) = self.decision_store.as_ref() {
+                if let Err(e) = ds.record_committed(epoch).await {
+                    let reason = e.to_string();
                     error!(
-                        checkpoint_id, epoch, error = %rollback_err,
-                        "[LDB-6039] sink rollback failed after commit marker failure",
+                        checkpoint_id, epoch, error = %reason,
+                        "[LDB-6038] cannot record commit marker — aborting epoch",
                     );
+                    #[cfg(feature = "cluster-unstable")]
+                    self.announce_if_leader(
+                        epoch,
+                        checkpoint_id,
+                        laminar_core::cluster::control::Phase::Abort,
+                        None,
+                    )
+                    .await;
+                    self.checkpoints_failed += 1;
+                    self.phase = CheckpointPhase::Idle;
+                    let duration = start.elapsed();
+                    self.emit_checkpoint_metrics(false, epoch, duration);
+                    if let Err(rollback_err) = self.rollback_sinks(epoch).await {
+                        error!(
+                            checkpoint_id, epoch, error = %rollback_err,
+                            "[LDB-6039] sink rollback failed after commit marker failure",
+                        );
+                    }
+                    return Ok(CheckpointResult {
+                        success: false,
+                        checkpoint_id,
+                        epoch,
+                        duration,
+                        error: Some(format!("commit marker: {reason}")),
+                    });
                 }
-                return Ok(CheckpointResult {
-                    success: false,
-                    checkpoint_id,
-                    epoch,
-                    duration,
-                    error: Some(format!("commit marker: {reason}")),
-                });
             }
         }
 
@@ -1632,7 +1643,6 @@ impl CheckpointCoordinator {
                         "[LDB-6026] state backend prune failed; old partials will linger"
                     );
                 }
-                #[cfg(feature = "cluster-unstable")]
                 if let Some(ref ds) = self.decision_store {
                     if let Err(e) = ds.prune_before(horizon).await {
                         warn!(epoch, horizon, error = %e, "decision prune failed");

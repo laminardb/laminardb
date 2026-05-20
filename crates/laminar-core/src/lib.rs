@@ -29,6 +29,13 @@ pub mod time;
 #[cfg(feature = "cluster-unstable")]
 pub mod cluster;
 
+/// Per-epoch checkpoint commit marker store. Used by the checkpoint
+/// coordinator's 2PC to record the commit decision durably before
+/// sinks are told to commit, so recovery can re-establish the verdict
+/// after a crash. Lives outside the cluster gate because
+/// single-instance also needs it.
+pub mod checkpoint_decision;
+
 /// Result type for laminar-core operations
 pub type Result<T> = std::result::Result<T, Error>;
 

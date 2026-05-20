@@ -1941,6 +1941,416 @@ fn rewrite_probe_expr(
     }
 }
 
+// --- Retracting temporal-filter recognition ---
+
+/// One side of `time_col CMP now()+off_ms`. `strict` ⇒ `>`/`<`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TemporalBound {
+    pub(crate) off_ms: i64,
+    pub(crate) strict: bool,
+}
+
+/// `SELECT cols FROM <t> WHERE time_col {>|>=|<|<=} now() ± INTERVAL`
+/// (or BETWEEN). Empty `proj_cols` ⇒ `SELECT *`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TemporalFilterConfig {
+    pub(crate) source_table: String,
+    pub(crate) time_col: String,
+    pub(crate) proj_cols: Vec<String>,
+    pub(crate) lower: Option<TemporalBound>,
+    pub(crate) upper: Option<TemporalBound>,
+}
+
+pub(crate) enum TemporalFilterAnalysis {
+    NotPresent,
+    Recognized(Box<TemporalFilterConfig>),
+    /// `now()` used in some shape we don't support.
+    PresentUnrecognized,
+}
+
+fn ident_is_wallclock(name: &str) -> bool {
+    name.eq_ignore_ascii_case("now") || name.eq_ignore_ascii_case("current_timestamp")
+}
+
+fn expr_is_wallclock(expr: &Expr) -> bool {
+    match strip_nested(expr) {
+        Expr::Function(f) => ident_is_wallclock(&f.name.to_string()),
+        Expr::Identifier(id) => ident_is_wallclock(&id.value),
+        Expr::CompoundIdentifier(parts) => {
+            parts.last().is_some_and(|i| ident_is_wallclock(&i.value))
+        }
+        _ => false,
+    }
+}
+
+fn expr_uses_wallclock(expr: &Expr) -> bool {
+    if expr_is_wallclock(expr) {
+        return true;
+    }
+    match expr {
+        Expr::BinaryOp { left, right, .. } => {
+            expr_uses_wallclock(left) || expr_uses_wallclock(right)
+        }
+        Expr::UnaryOp { expr: e, .. }
+        | Expr::Cast { expr: e, .. }
+        | Expr::Nested(e)
+        | Expr::IsNull(e)
+        | Expr::IsNotNull(e) => expr_uses_wallclock(e),
+        Expr::Between {
+            expr: e, low, high, ..
+        } => expr_uses_wallclock(e) || expr_uses_wallclock(low) || expr_uses_wallclock(high),
+        Expr::InList { expr: e, list, .. } => {
+            expr_uses_wallclock(e) || list.iter().any(expr_uses_wallclock)
+        }
+        Expr::Function(f) => {
+            if let sqlparser::ast::FunctionArguments::List(al) = &f.args {
+                al.args.iter().any(|a| match a {
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(e),
+                    )
+                    | sqlparser::ast::FunctionArg::Named {
+                        arg: sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ..
+                    } => expr_uses_wallclock(e),
+                    _ => false,
+                })
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn strip_nested(expr: &Expr) -> &Expr {
+    let mut e = expr;
+    while let Expr::Nested(inner) = e {
+        e = inner.as_ref();
+    }
+    e
+}
+
+/// `INTERVAL '<n>' <unit>` → magnitude in ms (sub-ms truncated).
+fn interval_to_ms(expr: &Expr) -> Option<i64> {
+    let Expr::Interval(iv) = strip_nested(expr) else {
+        return None;
+    };
+    let value_str = match strip_nested(iv.value.as_ref()) {
+        Expr::Value(v) => match &v.value {
+            sqlparser::ast::Value::SingleQuotedString(s) => s.clone(),
+            sqlparser::ast::Value::Number(n, _) => n.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let value: i128 = value_str.trim().parse().ok()?;
+    let us: i128 = match &iv.leading_field {
+        Some(sqlparser::ast::DateTimeField::Microsecond) => 1,
+        Some(sqlparser::ast::DateTimeField::Millisecond) => 1_000,
+        Some(sqlparser::ast::DateTimeField::Second) | None => 1_000_000,
+        Some(sqlparser::ast::DateTimeField::Minute) => 60_000_000,
+        Some(sqlparser::ast::DateTimeField::Hour) => 3_600_000_000,
+        Some(sqlparser::ast::DateTimeField::Day) => 86_400_000_000,
+        Some(sqlparser::ast::DateTimeField::Week(_)) => 604_800_000_000,
+        _ => return None,
+    };
+    i64::try_from(value.checked_mul(us)? / 1_000).ok()
+}
+
+/// `now()` ⇒ 0, `now() ± I` ⇒ ±I (ms).
+fn now_offset_ms(expr: &Expr) -> Option<i64> {
+    let expr = strip_nested(expr);
+    if expr_is_wallclock(expr) {
+        return Some(0);
+    }
+    let Expr::BinaryOp { left, op, right } = expr else {
+        return None;
+    };
+    let (now_side, iv_side) = if expr_is_wallclock(left) {
+        (left.as_ref(), right.as_ref())
+    } else if expr_is_wallclock(right) {
+        (right.as_ref(), left.as_ref())
+    } else {
+        return None;
+    };
+    if !expr_is_wallclock(now_side) {
+        return None;
+    }
+    let mag = interval_to_ms(iv_side)?;
+    match op {
+        sqlparser::ast::BinaryOperator::Plus => Some(mag),
+        // `now() - I` only (subtraction is not commutative).
+        sqlparser::ast::BinaryOperator::Minus if expr_is_wallclock(left) => Some(-mag),
+        _ => None,
+    }
+}
+
+fn column_name(expr: &Expr) -> Option<String> {
+    match strip_nested(expr) {
+        Expr::Identifier(id) => Some(id.value.clone()),
+        Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.clone()),
+        _ => None,
+    }
+}
+
+/// Recognise `col CMP now()±I` or `col BETWEEN now()-X AND now()+Y`.
+/// Anything else (conjuncts, disjunctions, ...) ⇒ `None`.
+fn parse_temporal_predicate(
+    expr: &Expr,
+) -> Option<(String, Option<TemporalBound>, Option<TemporalBound>)> {
+    use sqlparser::ast::BinaryOperator as Bop;
+    match strip_nested(expr) {
+        Expr::Between {
+            expr: col,
+            negated: false,
+            low,
+            high,
+        } => {
+            let name = column_name(col)?;
+            let off_lo = now_offset_ms(low)?;
+            let off_hi = now_offset_ms(high)?;
+            Some((
+                name,
+                Some(TemporalBound {
+                    off_ms: off_lo,
+                    strict: false,
+                }),
+                Some(TemporalBound {
+                    off_ms: off_hi,
+                    strict: false,
+                }),
+            ))
+        }
+        Expr::BinaryOp { left, op, right } => {
+            // Normalise to `col OP now()+off` (flip if column is on the right).
+            let (col_e, now_e, op) = if column_name(left).is_some() {
+                (left.as_ref(), right.as_ref(), op.clone())
+            } else {
+                let flipped = match op {
+                    Bop::Gt => Bop::Lt,
+                    Bop::GtEq => Bop::LtEq,
+                    Bop::Lt => Bop::Gt,
+                    Bop::LtEq => Bop::GtEq,
+                    _ => return None,
+                };
+                (right.as_ref(), left.as_ref(), flipped)
+            };
+            let name = column_name(col_e)?;
+            let off = now_offset_ms(now_e)?;
+            let (lower, upper) = match op {
+                Bop::Gt => (
+                    Some(TemporalBound {
+                        off_ms: off,
+                        strict: true,
+                    }),
+                    None,
+                ),
+                Bop::GtEq => (
+                    Some(TemporalBound {
+                        off_ms: off,
+                        strict: false,
+                    }),
+                    None,
+                ),
+                Bop::Lt => (
+                    None,
+                    Some(TemporalBound {
+                        off_ms: off,
+                        strict: true,
+                    }),
+                ),
+                Bop::LtEq => (
+                    None,
+                    Some(TemporalBound {
+                        off_ms: off,
+                        strict: false,
+                    }),
+                ),
+                _ => return None,
+            };
+            Some((name, lower, upper))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn analyze_temporal_filter(sql: &str) -> TemporalFilterAnalysis {
+    let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
+        return TemporalFilterAnalysis::NotPresent;
+    };
+    let Some(laminar_sql::parser::StreamingStatement::Standard(stmt)) = statements.first() else {
+        return TemporalFilterAnalysis::NotPresent;
+    };
+    let Statement::Query(query) = stmt.as_ref() else {
+        return TemporalFilterAnalysis::NotPresent;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return TemporalFilterAnalysis::NotPresent;
+    };
+
+    let uses_now = select.selection.as_ref().is_some_and(expr_uses_wallclock)
+        || select.having.as_ref().is_some_and(expr_uses_wallclock)
+        || select.projection.iter().any(|item| match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                expr_uses_wallclock(e)
+            }
+            _ => false,
+        });
+    if !uses_now {
+        return TemporalFilterAnalysis::NotPresent;
+    }
+
+    // Only the canonical shape is allowed: SELECT * or simple cols,
+    // no DISTINCT/HAVING/TOP/ORDER/GROUP/JOIN, single source.
+    let recognised = (|| {
+        let proj_cols = if select.projection.len() == 1
+            && matches!(select.projection[0], SelectItem::Wildcard(_))
+        {
+            Vec::new()
+        } else {
+            let mut cols = Vec::with_capacity(select.projection.len());
+            for item in &select.projection {
+                match item {
+                    SelectItem::UnnamedExpr(Expr::Identifier(id)) => cols.push(id.value.clone()),
+                    _ => return None,
+                }
+            }
+            cols
+        };
+        if select.distinct.is_some()
+            || select.having.is_some()
+            || select.top.is_some()
+            || !select.sort_by.is_empty()
+            || !select.named_window.is_empty()
+            || select.qualify.is_some()
+        {
+            return None;
+        }
+        if !matches!(
+            &select.group_by,
+            sqlparser::ast::GroupByExpr::Expressions(e, m) if e.is_empty() && m.is_empty()
+        ) {
+            return None;
+        }
+        if select.from.len() != 1 {
+            return None;
+        }
+        let twj = &select.from[0];
+        if !twj.joins.is_empty() {
+            return None;
+        }
+        let sqlparser::ast::TableFactor::Table { name, .. } = &twj.relation else {
+            return None;
+        };
+        let source_table = name.to_string();
+        let where_expr = select.selection.as_ref()?;
+        let (time_col, lower, upper) = parse_temporal_predicate(where_expr)?;
+        if lower.is_none() && upper.is_none() {
+            return None;
+        }
+        Some(TemporalFilterConfig {
+            source_table,
+            time_col,
+            proj_cols,
+            lower,
+            upper,
+        })
+    })();
+
+    match recognised {
+        Some(cfg) => TemporalFilterAnalysis::Recognized(Box::new(cfg)),
+        None => TemporalFilterAnalysis::PresentUnrecognized,
+    }
+}
+
+#[cfg(test)]
+mod temporal_filter_recognition_tests {
+    use super::*;
+
+    fn cfg(sql: &str) -> TemporalFilterConfig {
+        match analyze_temporal_filter(sql) {
+            TemporalFilterAnalysis::Recognized(c) => *c,
+            TemporalFilterAnalysis::PresentUnrecognized => {
+                panic!("expected Recognized, got PresentUnrecognized: {sql}")
+            }
+            TemporalFilterAnalysis::NotPresent => {
+                panic!("expected Recognized, got NotPresent: {sql}")
+            }
+        }
+    }
+
+    #[test]
+    fn projection_list_recognised() {
+        let c = cfg("SELECT id, amount FROM events WHERE ts > now() - INTERVAL '1' MINUTE");
+        assert_eq!(c.proj_cols, vec!["id".to_string(), "amount".to_string()]);
+        assert_eq!(c.time_col, "ts");
+        // Expression / aliased / qualified projections stay out of scope.
+        assert!(matches!(
+            analyze_temporal_filter(
+                "SELECT id + 1 FROM events WHERE ts > now() - INTERVAL '1' MINUTE"
+            ),
+            TemporalFilterAnalysis::PresentUnrecognized
+        ));
+    }
+
+    #[test]
+    fn lower_bound_ttl_strict() {
+        let c = cfg("SELECT * FROM events WHERE evt > now() - INTERVAL '10' MINUTE");
+        assert_eq!(c.source_table, "events");
+        assert!(c.proj_cols.is_empty(), "`SELECT *` ⇒ no explicit columns");
+        assert_eq!(c.time_col, "evt");
+        assert_eq!(
+            c.lower,
+            Some(TemporalBound {
+                off_ms: -600_000,
+                strict: true
+            })
+        );
+        assert_eq!(c.upper, None);
+    }
+
+    #[test]
+    fn between_inclusive_both_bounds() {
+        let c = cfg(
+            "SELECT * FROM e WHERE ts BETWEEN now() - INTERVAL '2' MINUTE \
+             AND now() + INTERVAL '30' SECOND",
+        );
+        assert_eq!(
+            c.lower,
+            Some(TemporalBound {
+                off_ms: -120_000,
+                strict: false
+            })
+        );
+        assert_eq!(
+            c.upper,
+            Some(TemporalBound {
+                off_ms: 30_000,
+                strict: false
+            })
+        );
+    }
+
+    #[test]
+    fn unrecognised_when_extra_conjunct() {
+        assert!(matches!(
+            analyze_temporal_filter(
+                "SELECT * FROM e WHERE region = 'us' AND ts > now() - INTERVAL '1' MINUTE"
+            ),
+            TemporalFilterAnalysis::PresentUnrecognized
+        ));
+    }
+
+    #[test]
+    fn not_present_for_ordinary_query() {
+        // No false positives — ordinary queries are untouched.
+        assert!(matches!(
+            analyze_temporal_filter("SELECT * FROM e WHERE region = 'us'"),
+            TemporalFilterAnalysis::NotPresent
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

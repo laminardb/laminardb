@@ -188,7 +188,10 @@ impl MvStore {
 /// Prefix for MV entries in the `operator_states` checkpoint map.
 pub(crate) const CHECKPOINT_KEY_PREFIX: &str = "mv:";
 
-fn batches_to_ipc(schema: &SchemaRef, batches: &VecDeque<RecordBatch>) -> Result<Vec<u8>, DbError> {
+pub(crate) fn batches_to_ipc<'a, I>(schema: &SchemaRef, batches: I) -> Result<Vec<u8>, DbError>
+where
+    I: IntoIterator<Item = &'a RecordBatch>,
+{
     let mut buf = Vec::new();
     let mut writer = StreamWriter::try_new(&mut buf, schema)
         .map_err(|e| DbError::Storage(format!("IPC write: {e}")))?;
@@ -203,7 +206,7 @@ fn batches_to_ipc(schema: &SchemaRef, batches: &VecDeque<RecordBatch>) -> Result
     Ok(buf)
 }
 
-fn ipc_to_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>, arrow::error::ArrowError> {
+pub(crate) fn ipc_to_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>, arrow::error::ArrowError> {
     let reader = StreamReader::try_new(std::io::Cursor::new(bytes), None)?;
     reader.into_iter().collect()
 }

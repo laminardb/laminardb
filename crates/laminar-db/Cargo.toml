@@ -100,6 +100,10 @@ prometheus = { workspace = true }
 # Zero-copy byte buffers (used by state backend payloads).
 bytes = { workspace = true }
 
+# Object-store handle for the auto-wired 2PC decision store (single-instance
+# uses `LocalFileSystem`; cluster reuses the configured remote store).
+object_store = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = { workspace = true }

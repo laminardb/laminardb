@@ -22,8 +22,8 @@ use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 
 use crate::aggregate_state::{
-    compile_having_filter, expr_to_sql, extract_clauses, find_aggregate, query_fingerprint,
-    resolve_expr_type, AggFuncSpec, CompiledProjection, GroupCheckpoint, WindowCheckpoint,
+    compile_having_filter, expr_to_sql, extract_clauses, find_aggregate, resolve_expr_type,
+    AggFuncSpec, CompiledProjection, GroupCheckpoint, WindowCheckpoint,
 };
 use crate::eowc_state::{extract_i64_timestamps, NULL_TIMESTAMP};
 use crate::error::DbError;
@@ -128,22 +128,15 @@ pub(crate) struct SessionGroupCheckpoint {
 )]
 pub(crate) struct CoreWindowCheckpoint {
     pub fingerprint: u64,
-    /// Per-window checkpoint data (reuses EOWC format) — used by
-    /// tumbling and hopping assigners.
+    /// Tumbling / hopping per-window state (reuses EOWC format).
     pub windows: Vec<WindowCheckpoint>,
-    /// Per-group session checkpoint data — used by session assigner.
+    /// Session-assigner per-group state.
     #[serde(default)]
     pub session_state: Vec<SessionGroupCheckpoint>,
-    /// Discriminant so restore can pick the right branch.
-    #[serde(default = "default_window_type_tag")]
+    /// Restore discriminant. No serde default — missing tag must fail
+    /// loud rather than silently routing into the wrong branch.
     pub window_type: String,
-    /// Highest watermark at checkpoint time. See
-    /// [`crate::aggregate_state::checkpoints::EowcStateCheckpoint::high_watermark_ms`].
     pub high_watermark_ms: i64,
-}
-
-fn default_window_type_tag() -> String {
-    "tumbling".to_string()
 }
 
 /// Core window state for windowed aggregate queries.
@@ -168,26 +161,24 @@ pub(crate) struct CoreWindowState {
     output_schema: SchemaRef,
     having_sql: Option<String>,
     compiled_projection: Option<CompiledProjection>,
-    /// Cached optimized logical plan for the pre-agg SQL (multi-source queries).
-    cached_pre_agg_plan: Option<datafusion_expr::LogicalPlan>,
-    /// Set when the `WHERE` clause references `now()`/`current_timestamp()`:
-    /// the predicate is re-resolved and applied per cycle instead of being
-    /// compiled into `compiled_projection.filter` (see [`NowWhereFilter`]).
+    /// Built once; `LiveSourceExec` leaves carry fresh data per execute.
+    cached_pre_agg_physical: Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
+    /// Set when WHERE references `now()`; resolved per cycle.
     now_where: Option<NowWhereFilter>,
-    /// Compiled `now()` predicate cached by the whole-second it was built
-    /// for, so the per-cycle path only recompiles when the second rolls
-    /// over (sub-second drain loops would otherwise recompile every cycle).
-    now_filter_cache: Option<(i64, Arc<dyn PhysicalExpr>)>,
+    /// Compiled `now()` predicate keyed by the second it was built for.
+    /// `Err` caches a compile failure so we don't re-run the analyzer
+    /// every cycle while it's broken; retries at the next second roll.
+    #[allow(clippy::type_complexity)]
+    now_filter_cache: Option<(i64, Result<Arc<dyn PhysicalExpr>, String>)>,
     having_filter: Option<Arc<dyn PhysicalExpr>>,
     max_groups_per_window: usize,
-    /// Grace period (ms) after window end before closing. Late events
-    /// arriving within this window are included instead of dropped.
+    /// Grace after window end; late events within this window are kept.
     allowed_lateness_ms: i64,
-    /// Highest watermark seen via `close_windows`; `i64::MIN` until
-    /// the first close. Drives [`Self::is_window_closed`].
+    /// Highest watermark seen via `close_windows`; `i64::MIN` until first close.
     high_watermark_ms: i64,
     post_projection: Option<PostProjection>,
-    /// Reusable scratch map for no-group window assignment (avoids per-batch allocation).
+    prom: Option<Arc<crate::engine_metrics::EngineMetrics>>,
+    having_sql_cache: Option<crate::operator::HavingSqlCache>,
     scratch_nogroup: AHashMap<i64, Vec<u32>>,
     /// Bucket map keyed by `(window_start, group_id)`. Group ids come
     /// from `scratch_group_keys` and are dense within a batch.
@@ -206,7 +197,7 @@ impl CoreWindowState {
         ctx: &SessionContext,
         sql: &str,
         window_config: &WindowOperatorConfig,
-        _emit_clause: Option<&EmitClause>,
+        emit_clause: Option<&EmitClause>,
     ) -> Result<Option<Self>, DbError> {
         let size_ms = i64::try_from(window_config.size.as_millis()).unwrap_or(i64::MAX);
 
@@ -237,6 +228,16 @@ impl CoreWindowState {
                 .unwrap_or(i64::MAX);
                 if size_ms <= 0 || slide_ms <= 0 || slide_ms > size_ms {
                     return Ok(None);
+                }
+                // OOM guard: cap windows-per-event (Flink/RW also warn here).
+                let wpe = (size_ms - 1) / slide_ms + 1;
+                if wpe > 10_000 {
+                    return Err(DbError::Unsupported(format!(
+                        "[{}] hopping window size/slide ratio is {wpe} (size={size_ms}ms, \
+                         slide={slide_ms}ms); each event would be assigned to that many \
+                         open windows. Cap is 10000 — widen `slide` or narrow `size`.",
+                        laminar_core::error_codes::SQL_UNSUPPORTED
+                    )));
                 }
                 CoreWindowAssigner::Hopping(
                     SlidingWindowAssigner::from_millis(size_ms, slide_ms).with_offset_ms(offset_ms),
@@ -698,19 +699,19 @@ impl CoreWindowState {
             None
         };
 
-        // ONE-TIME setup: cache the optimized logical plan for multi-source
-        // pre-agg queries. This ctx.sql() call runs ONLY at first-cycle
-        // initialization, never per-cycle. Fail fast if the pre-agg SQL is
-        // invalid — it would fail every cycle.
-        let cached_pre_agg_plan = if compiled_projection.is_none() {
-            match ctx.sql(&pre_agg_sql).await {
-                Ok(df) => Some(df.logical_plan().clone()),
-                Err(e) => {
-                    return Err(DbError::Pipeline(format!(
-                        "pre-agg SQL planning failed for windowed aggregate: {e}"
-                    )));
-                }
-            }
+        // Plan once at init; `LiveSourceProvider` leaves carry fresh data.
+        let cached_pre_agg_physical = if compiled_projection.is_none() {
+            let df = ctx
+                .sql(&pre_agg_sql)
+                .await
+                .map_err(|e| DbError::Pipeline(format!("pre-agg SQL planning failed: {e}")))?;
+            let logical = df.logical_plan().clone();
+            let physical = ctx
+                .state()
+                .create_physical_plan(&logical)
+                .await
+                .map_err(|e| DbError::Pipeline(format!("pre-agg physical planning failed: {e}")))?;
+            Some(physical)
         } else {
             None
         };
@@ -735,15 +736,21 @@ impl CoreWindowState {
             time_col_index,
             having_sql,
             compiled_projection,
-            cached_pre_agg_plan,
+            cached_pre_agg_physical,
             now_where,
             now_filter_cache: None,
             having_filter,
             max_groups_per_window: 1_000_000,
-            allowed_lateness_ms: i64::try_from(window_config.allowed_lateness.as_millis())
-                .unwrap_or(0),
+            // EMIT FINAL drops late data, so force lateness=0 (Flink "drop late").
+            allowed_lateness_ms: if matches!(emit_clause, Some(EmitClause::Final)) {
+                0
+            } else {
+                i64::try_from(window_config.allowed_lateness.as_millis()).unwrap_or(0)
+            },
             high_watermark_ms: i64::MIN,
             post_projection,
+            prom: None,
+            having_sql_cache: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
             scratch_group_keys: indexmap::IndexSet::default(),
@@ -805,6 +812,7 @@ impl CoreWindowState {
                     CoreWindowAssigner::Tumbling(a) => {
                         let ws = a.assign(ts_ms).start;
                         if self.is_window_closed(ws) {
+                            self.record_late_drop(1);
                             continue;
                         }
                         grouped.entry(ws).or_default().push(idx);
@@ -812,6 +820,7 @@ impl CoreWindowState {
                     CoreWindowAssigner::Hopping(a) => {
                         for wid in a.assign_windows(ts_ms) {
                             if self.is_window_closed(wid.start) {
+                                self.record_late_drop(1);
                                 continue;
                             }
                             grouped.entry(wid.start).or_default().push(idx);
@@ -869,6 +878,7 @@ impl CoreWindowState {
                 CoreWindowAssigner::Tumbling(a) => {
                     let ws = a.assign(ts_ms).start;
                     if self.is_window_closed(ws) {
+                        self.record_late_drop(1);
                         continue;
                     }
                     grouped.entry((ws, gid)).or_default().push(idx);
@@ -876,6 +886,7 @@ impl CoreWindowState {
                 CoreWindowAssigner::Hopping(a) => {
                     for wid in a.assign_windows(ts_ms) {
                         if self.is_window_closed(wid.start) {
+                            self.record_late_drop(1);
                             continue;
                         }
                         grouped.entry((wid.start, gid)).or_default().push(idx);
@@ -1453,8 +1464,14 @@ impl CoreWindowState {
         self.compiled_projection.as_ref()
     }
 
-    pub fn cached_pre_agg_plan(&self) -> Option<&datafusion_expr::LogicalPlan> {
-        self.cached_pre_agg_plan.as_ref()
+    pub fn cached_pre_agg_physical(
+        &self,
+    ) -> Option<&Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.cached_pre_agg_physical.as_ref()
+    }
+
+    pub(crate) fn having_sql_cache_mut(&mut self) -> &mut Option<crate::operator::HavingSqlCache> {
+        &mut self.having_sql_cache
     }
 
     /// Filter `inputs` by the `now()` `WHERE` clause, with `now()` bound
@@ -1480,27 +1497,39 @@ impl CoreWindowState {
             .is_none_or(|(s, _)| *s != secs)
         {
             let nw = self.now_where.as_ref().expect("checked above");
-            // Re-run type coercion so the substituted literal gets the
-            // casts DataFusion inserted around the original `now()`.
-            let pred = substitute_wallclock(nw.predicate.clone(), secs * 1_000_000_000)?;
-            let mut coercer = TypeCoercionRewriter::new(&nw.df_schema);
-            let pred = pred.rewrite(&mut coercer).map(|t| t.data).map_err(|e| {
-                DbError::Pipeline(format!(
-                    "[{}] now() WHERE type-coerce: {e}",
-                    laminar_core::error_codes::SQL_PLANNING_FAILED
-                ))
-            })?;
-            let state = ctx.state();
-            let phys = create_physical_expr(&pred, &nw.df_schema, state.execution_props())
-                .map_err(|e| {
+            // Saturate to avoid panic past year 2262.
+            let now_ns = secs.checked_mul(1_000_000_000).unwrap_or(i64::MAX);
+            let result = (|| -> Result<Arc<dyn PhysicalExpr>, DbError> {
+                let pred = substitute_wallclock(nw.predicate.clone(), now_ns)?;
+                let mut coercer = TypeCoercionRewriter::new(&nw.df_schema);
+                let pred = pred.rewrite(&mut coercer).map(|t| t.data).map_err(|e| {
+                    DbError::Pipeline(format!(
+                        "[{}] now() WHERE type-coerce: {e}",
+                        laminar_core::error_codes::SQL_PLANNING_FAILED
+                    ))
+                })?;
+                let state = ctx.state();
+                create_physical_expr(&pred, &nw.df_schema, state.execution_props()).map_err(|e| {
                     DbError::Pipeline(format!(
                         "[{}] now() WHERE physical compile: {e}",
                         laminar_core::error_codes::SQL_PLANNING_FAILED
                     ))
-                })?;
-            self.now_filter_cache = Some((secs, phys));
+                })
+            })();
+            match result {
+                Ok(phys) => self.now_filter_cache = Some((secs, Ok(phys))),
+                Err(e) => {
+                    let msg = e.to_string();
+                    self.now_filter_cache = Some((secs, Err(msg.clone())));
+                    return Err(DbError::Pipeline(msg));
+                }
+            }
         }
-        let phys = &self.now_filter_cache.as_ref().expect("set above").1;
+        let cached = &self.now_filter_cache.as_ref().expect("set above").1;
+        let phys = match cached {
+            Ok(p) => p,
+            Err(msg) => return Err(DbError::Pipeline(msg.clone())),
+        };
         let mut out = Vec::with_capacity(inputs.len());
         for b in inputs {
             if let Some(f) = crate::filter_compile::apply(b, phys.as_ref())? {
@@ -1510,8 +1539,43 @@ impl CoreWindowState {
         Ok(Some(out))
     }
 
+    pub(crate) fn attach_metrics(
+        &mut self,
+        prom: Option<Arc<crate::engine_metrics::EngineMetrics>>,
+    ) {
+        self.prom = prom;
+    }
+
+    #[inline]
+    fn record_late_drop(&self, n: usize) {
+        if let Some(prom) = &self.prom {
+            if n > 0 {
+                prom.window_late_dropped
+                    .inc_by(u64::try_from(n).unwrap_or(u64::MAX));
+            }
+        }
+    }
+
     pub(crate) fn query_fingerprint(&self) -> u64 {
-        query_fingerprint(&self.pre_agg_sql, &self.output_schema)
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        self.pre_agg_sql.hash(&mut h);
+        for f in self.output_schema.fields() {
+            f.name().hash(&mut h);
+            f.data_type().to_string().hash(&mut h);
+        }
+        // Window shape must invalidate the checkpoint on change.
+        self.window_type_tag().hash(&mut h);
+        match &self.assigner {
+            CoreWindowAssigner::Tumbling(t) => t.size_ms().hash(&mut h),
+            CoreWindowAssigner::Hopping(s) => {
+                s.size_ms().hash(&mut h);
+                s.slide_ms().hash(&mut h);
+            }
+            CoreWindowAssigner::Session { gap_ms } => gap_ms.hash(&mut h),
+        }
+        self.allowed_lateness_ms.hash(&mut h);
+        h.finish()
     }
 
     /// Returns a tag string for the current assigner type.
@@ -1653,10 +1717,13 @@ impl CoreWindowState {
         }
 
         self.high_watermark_ms = checkpoint.high_watermark_ms;
-        if checkpoint.window_type == "session" {
-            self.restore_session_windows(checkpoint)
-        } else {
-            self.restore_fixed_windows(checkpoint)
+        match checkpoint.window_type.as_str() {
+            "session" => self.restore_session_windows(checkpoint),
+            "tumbling" | "hopping" => self.restore_fixed_windows(checkpoint),
+            other => Err(DbError::Pipeline(format!(
+                "core window checkpoint has unknown window_type `{other}` — \
+                 refusing to silently route to the wrong restore path"
+            ))),
         }
     }
 
@@ -1838,7 +1905,7 @@ mod tests {
             time_col_index: 2,
             having_sql: None,
             compiled_projection: None,
-            cached_pre_agg_plan: None,
+            cached_pre_agg_physical: None,
             now_where: None,
             now_filter_cache: None,
             having_filter: None,
@@ -1846,6 +1913,8 @@ mod tests {
             allowed_lateness_ms: 0,
             high_watermark_ms: i64::MIN,
             post_projection: None,
+            prom: None,
+            having_sql_cache: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
             scratch_group_keys: indexmap::IndexSet::default(),
@@ -1903,7 +1972,7 @@ mod tests {
             time_col_index: 2,
             having_sql: None,
             compiled_projection: None,
-            cached_pre_agg_plan: None,
+            cached_pre_agg_physical: None,
             now_where: None,
             now_filter_cache: None,
             having_filter: None,
@@ -1911,6 +1980,8 @@ mod tests {
             allowed_lateness_ms: 0,
             high_watermark_ms: i64::MIN,
             post_projection: None,
+            prom: None,
+            having_sql_cache: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
             scratch_group_keys: indexmap::IndexSet::default(),
@@ -1956,7 +2027,7 @@ mod tests {
             time_col_index: 2,
             having_sql: None,
             compiled_projection: None,
-            cached_pre_agg_plan: None,
+            cached_pre_agg_physical: None,
             now_where: None,
             now_filter_cache: None,
             having_filter: None,
@@ -1964,6 +2035,8 @@ mod tests {
             allowed_lateness_ms: 0,
             high_watermark_ms: i64::MIN,
             post_projection: None,
+            prom: None,
+            having_sql_cache: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
             scratch_group_keys: indexmap::IndexSet::default(),
@@ -2007,7 +2080,7 @@ mod tests {
             time_col_index: 2,
             having_sql: None,
             compiled_projection: None,
-            cached_pre_agg_plan: None,
+            cached_pre_agg_physical: None,
             now_where: None,
             now_filter_cache: None,
             having_filter: None,
@@ -2015,6 +2088,8 @@ mod tests {
             allowed_lateness_ms: 0,
             high_watermark_ms: i64::MIN,
             post_projection: None,
+            prom: None,
+            having_sql_cache: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
             scratch_group_keys: indexmap::IndexSet::default(),
