@@ -242,10 +242,12 @@ impl EowcQueryOperator {
                     return Ok(());
                 }
                 Ok(None) => {}
-                // A `now()`-misuse rejection is a hard error, not a
-                // "not this path" signal — propagate it instead of
-                // silently degrading to the incremental/raw path.
-                Err(e @ DbError::Unsupported(_)) => return Err(e),
+                // `now()`-misuse is a hard error — propagate. Other
+                // feature gaps (CUMULATE, hop wpe cap, ...) fall through
+                // to the incremental/raw paths.
+                Err(e @ DbError::Unsupported(_)) if e.to_string().contains("now()") => {
+                    return Err(e);
+                }
                 Err(e) => {
                     tracing::debug!(
                         query = %self.op_name,

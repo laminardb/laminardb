@@ -2244,8 +2244,13 @@ pub(crate) fn analyze_temporal_filter(sql: &str) -> TemporalFilterAnalysis {
     }
 
     // Only the canonical shape is allowed: SELECT * or simple cols,
-    // no DISTINCT/HAVING/TOP/ORDER/GROUP/JOIN, single source.
+    // no DISTINCT/HAVING/TOP/ORDER/GROUP/JOIN/LIMIT/FETCH, single source.
+    // (Retraction semantics don't compose with row-limiting clauses —
+    // first-N-ever vs first-N-currently-live is ambiguous.)
     let recognised = (|| {
+        if query.order_by.is_some() || query.limit_clause.is_some() || query.fetch.is_some() {
+            return None;
+        }
         let proj_cols = if select.projection.len() == 1
             && matches!(select.projection[0], SelectItem::Wildcard(_))
         {
