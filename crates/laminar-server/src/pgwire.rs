@@ -246,6 +246,52 @@ where
     }
 }
 
+/// Wrap a `SubscriptionPortal` in a pgwire `Response::Query` so the
+/// framework can chunk via `Execute(max_rows)` and emit PortalSuspended
+/// automatically. Used by the chunked extended-query path.
+fn subscription_query_response(
+    portal: SubscriptionPortal,
+    result_format: Option<&Format>,
+) -> Response {
+    use futures::stream;
+    let schema = portal.schema();
+    let fields = Arc::new(field_infos(&schema, result_format));
+    struct State {
+        portal: SubscriptionPortal,
+        fields: Arc<Vec<FieldInfo>>,
+        pending: VecDeque<PgWireResult<pgwire::messages::data::DataRow>>,
+    }
+    let init = State {
+        portal,
+        fields: Arc::clone(&fields),
+        pending: VecDeque::new(),
+    };
+    let row_stream = stream::unfold(init, |mut s| async move {
+        loop {
+            if let Some(row) = s.pending.pop_front() {
+                return Some((row, s));
+            }
+            match s.portal.next_frame().await {
+                None => return None,
+                Some(PortalFrame::Batch(b)) if b.num_rows() > 0 => {
+                    s.pending.extend(encode_batch(&b, &s.fields));
+                }
+                Some(PortalFrame::Batch(_)) | Some(PortalFrame::Barrier { .. }) => {}
+                Some(PortalFrame::Lagged(n)) => {
+                    let err = user_error(
+                        "54000",
+                        format!("subscription lagged: skipped {n} messages, terminating"),
+                    );
+                    return Some((Err(err), s));
+                }
+            }
+        }
+    });
+    let mut resp = QueryResponse::new(fields, row_stream);
+    resp.set_command_tag("SUBSCRIBE");
+    Response::Query(resp)
+}
+
 /// State that shares the cursor's lifetime: the portal, the leftover-row
 /// buffer, and the exhausted flag. Held by `Arc` so a row stream can keep
 /// reading after `ConnState::get` returns.
@@ -1130,7 +1176,7 @@ impl ExtendedQueryHandler for LaminarPgwireHandler {
         &self,
         client: &mut C,
         portal: &Portal<Self::Statement>,
-        _max_rows: usize,
+        max_rows: usize,
     ) -> PgWireResult<Response>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -1154,11 +1200,26 @@ impl ExtendedQueryHandler for LaminarPgwireHandler {
                     .open_subscription(name, filter_sql.as_deref(), start)
                     .await
                     .map_err(|e| user_error("42P01", format!("SUBSCRIBE '{name}': {e}")))?;
-                // Per-batch flush (see `stream_subscribe_flushing`);
-                // `Describe` already sent RowDescription, so `false`.
-                stream_subscribe_flushing(client, sub, false, Some(&portal.result_column_format))
+                if max_rows == 0 {
+                    // Unbounded fetch — pgwire would buffer infinitely.
+                    // Drive the stream ourselves with per-batch flushing.
+                    stream_subscribe_flushing(
+                        client,
+                        sub,
+                        false,
+                        Some(&portal.result_column_format),
+                    )
                     .await?;
-                Ok(Response::Execution(Tag::new("SUBSCRIBE")))
+                    Ok(Response::Execution(Tag::new("SUBSCRIBE")))
+                } else {
+                    // Chunked (JDBC setFetchSize / tokio-postgres query_portal).
+                    // Hand pgwire a row stream so it honours max_rows and
+                    // emits PortalSuspended automatically.
+                    Ok(subscription_query_response(
+                        sub,
+                        Some(&portal.result_column_format),
+                    ))
+                }
             }
             LaminarStmt::Show(cmd) => engine_metadata_response(&self.db, &show_sql(cmd)).await,
             LaminarStmt::Standard(s) => standard_response(&self.db, *s.clone()),

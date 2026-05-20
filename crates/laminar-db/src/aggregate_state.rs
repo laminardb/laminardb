@@ -1025,13 +1025,18 @@ impl IncrementalAggState {
             if let Some(old) = self.last_emitted.get(key) {
                 // `ScalarValue::eq` says NaN != NaN; treat both-NaN as
                 // equal to avoid an infinite retract+insert loop.
-                let changed = old.iter().zip(current.iter()).any(|(a, b)| {
-                    if let (ScalarValue::Float64(Some(x)), ScalarValue::Float64(Some(y))) = (a, b) {
-                        if x.is_nan() && y.is_nan() {
-                            return false;
-                        }
+                let changed = old.iter().zip(current.iter()).any(|(a, b)| match (a, b) {
+                    (ScalarValue::Float64(Some(x)), ScalarValue::Float64(Some(y)))
+                        if x.is_nan() && y.is_nan() =>
+                    {
+                        false
                     }
-                    a != b
+                    (ScalarValue::Float32(Some(x)), ScalarValue::Float32(Some(y)))
+                        if x.is_nan() && y.is_nan() =>
+                    {
+                        false
+                    }
+                    _ => a != b,
                 });
                 if changed {
                     retract_keys.push(key.clone());

@@ -801,6 +801,12 @@ impl CheckpointStore for FileSystemCheckpointStore {
         if let Some(chunks) = state_data {
             manifest.state_checksum = Some(sha256_hex_chunks(chunks));
             self.save_state_data(manifest.checkpoint_id, chunks).await?;
+        } else if !manifest.operator_states.is_empty()
+            && manifest.operator_states.values().all(|o| !o.external)
+            && manifest.state_checksum.is_none()
+        {
+            // Inline-only: checksum guards against a torn manifest.json write.
+            manifest.state_checksum = Some(sha256_hex_inline_states(&manifest.operator_states));
         }
         self.save(&manifest).await
     }

@@ -1973,12 +1973,14 @@ fn ident_is_wallclock(name: &str) -> bool {
 }
 
 fn expr_is_wallclock(expr: &Expr) -> bool {
+    // Only unquoted identifiers are the wallclock keyword; `"now"` is a column.
+    fn ident(i: &sqlparser::ast::Ident) -> bool {
+        i.quote_style.is_none() && ident_is_wallclock(&i.value)
+    }
     match strip_nested(expr) {
         Expr::Function(f) => ident_is_wallclock(&f.name.to_string()),
-        Expr::Identifier(id) => ident_is_wallclock(&id.value),
-        Expr::CompoundIdentifier(parts) => {
-            parts.last().is_some_and(|i| ident_is_wallclock(&i.value))
-        }
+        Expr::Identifier(id) => ident(id),
+        Expr::CompoundIdentifier(parts) => parts.last().is_some_and(ident),
         _ => false,
     }
 }
