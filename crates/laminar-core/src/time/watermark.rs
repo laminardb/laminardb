@@ -199,6 +199,9 @@ impl WatermarkGenerator for AscendingTimestampsGenerator {
 
     #[inline]
     fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark> {
+        if is_grossly_future(timestamp, self.max_future_skew_ms) {
+            return None;
+        }
         if timestamp > self.current_watermark {
             self.current_watermark = timestamp;
             Some(Watermark::new(timestamp))

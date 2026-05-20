@@ -1997,7 +1997,8 @@ fn expr_uses_wallclock(expr: &Expr) -> bool {
         | Expr::Cast { expr: e, .. }
         | Expr::Nested(e)
         | Expr::IsNull(e)
-        | Expr::IsNotNull(e) => expr_uses_wallclock(e),
+        | Expr::IsNotNull(e)
+        | Expr::Collate { expr: e, .. } => expr_uses_wallclock(e),
         Expr::Between {
             expr: e, low, high, ..
         } => expr_uses_wallclock(e) || expr_uses_wallclock(low) || expr_uses_wallclock(high),
@@ -2019,6 +2020,45 @@ fn expr_uses_wallclock(expr: &Expr) -> bool {
             } else {
                 false
             }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            operand.as_deref().is_some_and(expr_uses_wallclock)
+                || conditions
+                    .iter()
+                    .any(|w| expr_uses_wallclock(&w.condition) || expr_uses_wallclock(&w.result))
+                || else_result.as_deref().is_some_and(expr_uses_wallclock)
+        }
+        Expr::Tuple(items) => items.iter().any(expr_uses_wallclock),
+        Expr::Array(arr) => arr.elem.iter().any(expr_uses_wallclock),
+        Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => set_expr_uses_wallclock(&q.body),
+        Expr::InSubquery {
+            expr: e, subquery, ..
+        } => expr_uses_wallclock(e) || set_expr_uses_wallclock(&subquery.body),
+        _ => false,
+    }
+}
+
+fn set_expr_uses_wallclock(set: &SetExpr) -> bool {
+    match set {
+        SetExpr::Select(sel) => {
+            sel.selection.as_ref().is_some_and(expr_uses_wallclock)
+                || sel.having.as_ref().is_some_and(expr_uses_wallclock)
+                || sel.qualify.as_ref().is_some_and(expr_uses_wallclock)
+                || sel.projection.iter().any(|p| match p {
+                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                        expr_uses_wallclock(e)
+                    }
+                    _ => false,
+                })
+        }
+        SetExpr::Query(q) => set_expr_uses_wallclock(&q.body),
+        SetExpr::SetOperation { left, right, .. } => {
+            set_expr_uses_wallclock(left) || set_expr_uses_wallclock(right)
         }
         _ => false,
     }

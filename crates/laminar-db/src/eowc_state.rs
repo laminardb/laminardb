@@ -488,17 +488,21 @@ impl IncrementalEowcState {
         let window_type = EowcWindowType::from_config(window_config);
 
         // Plan once at init; `LiveSourceExec` leaves carry fresh data.
-        // Best-effort: a planning failure leaves the compiled path active.
+        // No compiled fast-path ⇒ the cached plan is the only path, so
+        // propagate any planning error rather than failing at process time.
         let cached_pre_agg_physical = if compiled_projection.is_none() {
-            let logical = match ctx.sql(&pre_agg_sql).await {
-                Ok(df) => Some(df.logical_plan().clone()),
-                Err(_) => None,
-            };
-            if let Some(plan) = logical {
-                ctx.state().create_physical_plan(&plan).await.ok()
-            } else {
-                None
-            }
+            let logical = ctx
+                .sql(&pre_agg_sql)
+                .await
+                .map_err(|e| DbError::Pipeline(format!("EOWC pre-agg SQL plan: {e}")))?
+                .logical_plan()
+                .clone();
+            Some(
+                ctx.state()
+                    .create_physical_plan(&logical)
+                    .await
+                    .map_err(|e| DbError::Pipeline(format!("EOWC pre-agg physical plan: {e}")))?,
+            )
         } else {
             None
         };

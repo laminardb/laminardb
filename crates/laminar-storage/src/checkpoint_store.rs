@@ -186,6 +186,24 @@ fn sha256_hex_chunks(chunks: &[bytes::Bytes]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Combined checksum for a mixed (inline + external) manifest:
+/// `sha256(inline_hash_hex || concat(sidecar_chunks))`.
+fn sha256_hex_mixed<'a, I>(
+    states: &std::collections::HashMap<String, crate::checkpoint_manifest::OperatorCheckpoint>,
+    sidecar_chunks: I,
+) -> String
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let inline = sha256_hex_inline_states(states);
+    let mut hasher = Sha256::new();
+    hasher.update(inline.as_bytes());
+    for chunk in sidecar_chunks {
+        hasher.update(chunk);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 /// SHA-256 over inline operator-state entries in sorted-name order,
 /// used as the `state_checksum` when no sidecar exists.
 fn sha256_hex_inline_states(
@@ -351,35 +369,44 @@ pub trait CheckpointStore: Send + Sync {
             )));
         }
 
-        // `state_checksum` covers either the sidecar or the inline state,
-        // dispatch on whether any operator state was externalised.
+        // `state_checksum` covers, depending on shape: the sidecar bytes
+        // (purely-external), the inline operator_states (purely-inline),
+        // or both (mixed) — see `sha256_hex_mixed`.
         if let Some(expected) = &manifest.state_checksum {
             let any_inline = manifest.operator_states.values().any(|o| !o.external);
             let any_external = manifest.operator_states.values().any(|o| o.external);
-            let purely_inline = any_inline && !any_external;
-            if purely_inline {
-                let actual = sha256_hex_inline_states(&manifest.operator_states);
-                if actual != *expected {
-                    issues.push(ValidationIssue::IntegrityFailure(format!(
-                        "inline state checksum mismatch: expected {expected}, got {actual}"
-                    )));
-                }
+            let needs_sidecar = any_external || !any_inline;
+            let sidecar = if needs_sidecar {
+                self.load_state_data(id).await?
             } else {
-                match self.load_state_data(id).await? {
-                    Some(data) => {
-                        let actual = sha256_hex(&data);
-                        if actual != *expected {
-                            issues.push(ValidationIssue::IntegrityFailure(format!(
-                                "state.bin checksum mismatch: expected {expected}, got {actual}"
-                            )));
-                        }
-                    }
-                    None => {
-                        issues.push(ValidationIssue::IntegrityFailure(
-                            "state.bin referenced by checksum but not found".into(),
-                        ));
-                    }
+                None
+            };
+            let actual = match (any_inline, &sidecar) {
+                (true, Some(data)) => {
+                    sha256_hex_mixed(&manifest.operator_states, std::iter::once(data.as_slice()))
                 }
+                (true, None) if !any_external => {
+                    sha256_hex_inline_states(&manifest.operator_states)
+                }
+                (_, Some(data)) => sha256_hex(data),
+                (_, None) => {
+                    issues.push(ValidationIssue::IntegrityFailure(
+                        "state.bin referenced by checksum but not found".into(),
+                    ));
+                    String::new()
+                }
+            };
+            if !actual.is_empty() && actual != *expected {
+                let label = if any_inline && any_external {
+                    "mixed state checksum mismatch"
+                } else if any_inline {
+                    "inline state checksum mismatch"
+                } else {
+                    "state.bin checksum mismatch"
+                };
+                issues.push(ValidationIssue::IntegrityFailure(format!(
+                    "{label}: expected {expected}, got {actual}"
+                )));
             }
         }
 
@@ -488,7 +515,7 @@ pub trait CheckpointStore: Send + Sync {
             // in-memory chain exactly; (2) if the sidecar write fails,
             // save() is never called, so the manifest with the checksum
             // is never persisted.
-            manifest.state_checksum = Some(sha256_hex_chunks(chunks));
+            manifest.state_checksum = Some(stamp_checksum(&manifest.operator_states, Some(chunks)));
             self.save_state_data(manifest.checkpoint_id, chunks).await?;
         } else if !manifest.operator_states.is_empty()
             && manifest.operator_states.values().all(|o| !o.external)
@@ -498,6 +525,21 @@ pub trait CheckpointStore: Send + Sync {
             manifest.state_checksum = Some(sha256_hex_inline_states(&manifest.operator_states));
         }
         self.save(&manifest).await
+    }
+}
+
+/// Stamp `state_checksum` for a save: mixed manifests hash inline+sidecar
+/// together, purely-external hash the sidecar alone.
+fn stamp_checksum(
+    states: &std::collections::HashMap<String, crate::checkpoint_manifest::OperatorCheckpoint>,
+    chunks: Option<&[bytes::Bytes]>,
+) -> String {
+    let chunks = chunks.unwrap_or_default();
+    let any_inline = states.values().any(|o| !o.external);
+    if any_inline {
+        sha256_hex_mixed(states, chunks.iter().map(AsRef::as_ref))
+    } else {
+        sha256_hex_chunks(chunks)
     }
 }
 
@@ -799,7 +841,7 @@ impl CheckpointStore for FileSystemCheckpointStore {
         // Write sidecar FIRST — if this fails, manifest is never written
         // and latest.txt still points to the previous valid checkpoint.
         if let Some(chunks) = state_data {
-            manifest.state_checksum = Some(sha256_hex_chunks(chunks));
+            manifest.state_checksum = Some(stamp_checksum(&manifest.operator_states, Some(chunks)));
             self.save_state_data(manifest.checkpoint_id, chunks).await?;
         } else if !manifest.operator_states.is_empty()
             && manifest.operator_states.values().all(|o| !o.external)

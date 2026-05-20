@@ -111,21 +111,24 @@ impl SimpleQueryHandler for LaminarPgwireHandler {
         let stmts = parse_streaming_sql(query)
             .map_err(|e| user_error("42601", format!("parse error: {e}")))?;
 
+        // SUBSCRIBE owns the socket for its lifetime; it can't share a
+        // simple-query batch with earlier or later statements. Reject
+        // up front so trailing statements aren't silently dropped.
+        if stmts.len() > 1
+            && stmts
+                .iter()
+                .any(|s| matches!(s, StreamingStatement::Subscribe(_)))
+        {
+            return Err(user_error(
+                "0A000",
+                "SUBSCRIBE must be the only statement in a simple query",
+            ));
+        }
+
         let mut out = Vec::with_capacity(stmts.len());
         for stmt in stmts {
             out.push(match stmt {
-                // Streams inline with a per-batch flush and owns the
-                // socket for the connection's life (see
-                // `stream_subscribe_flushing`). An unbounded SUBSCRIBE
-                // can't share a simple-query batch — reject rather than
-                // silently drop the earlier statements' results.
                 StreamingStatement::Subscribe(s) => {
-                    if !out.is_empty() {
-                        return Err(user_error(
-                            "0A000",
-                            "SUBSCRIBE must be the only statement in a simple query",
-                        ));
-                    }
                     let portal = open_portal_for_subscribe(&self.db, &s).await?;
                     // Simple query is always text (no Bind result format).
                     stream_subscribe_flushing(client, portal, true, None).await?;

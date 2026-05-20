@@ -280,20 +280,32 @@ impl TemporalFilterOperator {
             }
             idx
         };
-        // `restore` may have set the output schemas already.
-        if self.row_schema.is_none() {
-            let row_fields: Vec<Field> = self
-                .proj_indices
-                .iter()
-                .map(|&i| schema.field(i).clone())
-                .collect();
-            let mut out_fields = row_fields.clone();
+        let live_row_fields: Vec<Field> = self
+            .proj_indices
+            .iter()
+            .map(|&i| schema.field(i).clone())
+            .collect();
+        if let Some(saved) = &self.row_schema {
+            // `restore` set this from the persisted columns; the live source
+            // must still produce the same projected shape or the buffered
+            // rows can't be combined with new ingest.
+            if saved.fields() != &live_row_fields.clone().into() {
+                return Err(DbError::Pipeline(format!(
+                    "[LDB-1001] temporal filter '{}' source schema diverged \
+                     from checkpoint: saved={:?} live={:?}",
+                    self.op_name,
+                    saved.fields(),
+                    live_row_fields,
+                )));
+            }
+        } else {
+            let mut out_fields = live_row_fields.clone();
             out_fields.push(Field::new(
                 crate::aggregate_state::WEIGHT_COLUMN,
                 DataType::Int64,
                 false,
             ));
-            self.row_schema = Some(Arc::new(Schema::new(row_fields)));
+            self.row_schema = Some(Arc::new(Schema::new(live_row_fields)));
             self.output_schema = Some(Arc::new(Schema::new(out_fields)));
         }
         self.input_schema = Some(schema);
