@@ -612,8 +612,13 @@ impl CheckpointCoordinator {
     /// every node; in cluster mode the leader additionally
     /// re-announces the decision.
     pub async fn reconcile_prepared_on_init(&self) {
-        let Ok(Some(last)) = load_highest(self.store.as_ref()).await else {
-            return;
+        let last = match load_highest(self.store.as_ref()).await {
+            Ok(Some(m)) => m,
+            Ok(None) => return,
+            Err(e) => {
+                error!(error = %e, "[LDB-6041] reconcile skipped: could not load checkpoints");
+                return;
+            }
         };
         let has_pending = last
             .sink_commit_statuses

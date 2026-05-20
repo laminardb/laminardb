@@ -242,9 +242,14 @@ impl EowcQueryOperator {
                     return Ok(());
                 }
                 Ok(None) => {}
-                // Propagate `now()`-misuse; let other feature gaps
+                // Propagate wallclock misuse; let other feature gaps
                 // (CUMULATE, hop cap, ...) fall through.
-                Err(e @ DbError::Unsupported(_)) if e.to_string().contains("now()") => {
+                Err(e @ DbError::Unsupported(_))
+                    if {
+                        let s = e.to_string();
+                        s.contains("now()") || s.contains("current_timestamp")
+                    } =>
+                {
                     return Err(e);
                 }
                 Err(e) => {
