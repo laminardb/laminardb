@@ -43,12 +43,24 @@ struct BufferedRow {
 
 /// Which map a row lives in *is* its membership state; `len` is
 /// maintained at every push/remove so the per-cycle metric is O(1).
-#[derive(Default)]
 struct TfState {
     by_enter: BTreeMap<i64, Vec<BufferedRow>>,
     by_exit: BTreeMap<i64, Vec<BufferedRow>>,
+    /// `i64::MIN` = no frontier seen yet, so any first watermark
+    /// (including negative epoch ms) drives `advance`.
     last_frontier: i64,
     len: usize,
+}
+
+impl Default for TfState {
+    fn default() -> Self {
+        Self {
+            by_enter: BTreeMap::new(),
+            by_exit: BTreeMap::new(),
+            last_frontier: i64::MIN,
+            len: 0,
+        }
+    }
 }
 
 impl TfState {

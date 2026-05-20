@@ -133,12 +133,16 @@ fn rewrite_source(sql: &str, source: &str, temp: &str) -> Result<String, DbError
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
+    // Compare on the unqualified tail of both sides so `db.events` and
+    // bare `events` match when either form names the registered source.
+    fn unqualify(s: &str) -> &str {
+        s.rsplit('.').next().unwrap_or(s)
+    }
     fn walk_factor(f: &mut TableFactor, source: &str, temp: &str) {
         match f {
             TableFactor::Table { name, .. } => {
                 let s = name.to_string();
-                let unqual = s.rsplit('.').next().unwrap_or(&s);
-                if unqual.eq_ignore_ascii_case(source) {
+                if unqualify(&s).eq_ignore_ascii_case(unqualify(source)) {
                     *name = ObjectName::from(vec![Ident::new(temp)]);
                 }
             }

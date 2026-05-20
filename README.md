@@ -15,7 +15,7 @@ A streaming SQL engine for Rust. Embed it as a library or run the standalone ser
 
 ```toml
 [dependencies]
-laminar-db = "0.22"
+laminar-db = "0.23"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-This example compiles and runs against the `laminar-db` v0.22 public API. See [`examples/binance-ws`](examples/binance-ws) for a complete working demo that streams live Binance trades through 18 SQL pipeline stages with a TUI dashboard.
+This example compiles and runs against the `laminar-db` v0.23 public API. See [`examples/binance-ws`](examples/binance-ws) for a complete working demo that streams live Binance trades through 18 SQL pipeline stages with a TUI dashboard.
 
 ### Python
 

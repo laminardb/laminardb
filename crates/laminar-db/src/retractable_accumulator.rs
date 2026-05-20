@@ -145,11 +145,11 @@ pub(crate) fn create_retractable(
         "min" => Ok(Box::new(RetractableExtremumAccum::new(
             return_type.clone(),
             Extremum::Min,
-        ))),
+        )?)),
         "max" => Ok(Box::new(RetractableExtremumAccum::new(
             return_type.clone(),
             Extremum::Max,
-        ))),
+        )?)),
         other => Err(DbError::Pipeline(format!(
             "Cannot compute {other}() over a changelog stream. \
              Supported: SUM, COUNT, AVG, MIN, MAX.",
@@ -541,16 +541,20 @@ struct RetractableExtremumAccum {
 }
 
 impl RetractableExtremumAccum {
-    fn new(return_type: DataType, direction: Extremum) -> Self {
+    fn new(return_type: DataType, direction: Extremum) -> Result<Self, DbError> {
         let row_converter =
             arrow::row::RowConverter::new(vec![arrow::row::SortField::new(return_type.clone())])
-                .expect("RowConverter supports the MIN/MAX value type");
-        Self {
+                .map_err(|e| {
+                    DbError::Pipeline(format!(
+                        "MIN/MAX row converter init for {return_type:?}: {e}"
+                    ))
+                })?;
+        Ok(Self {
             counts: BTreeMap::new(),
             row_converter,
             return_type,
             direction,
-        }
+        })
     }
 }
 
@@ -807,7 +811,7 @@ mod tests {
 
     #[test]
     fn min_retract_current_min() {
-        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min);
+        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min).unwrap();
         acc.update_batch(&[i64_arr(&[10, 20, 30]), i64_arr(&[1, 1, 1])])
             .unwrap();
         assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int64(Some(10)));
@@ -818,7 +822,7 @@ mod tests {
 
     #[test]
     fn min_retract_all() {
-        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min);
+        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min).unwrap();
         acc.update_batch(&[i64_arr(&[10, 20]), i64_arr(&[1, 1])])
             .unwrap();
         acc.update_batch(&[i64_arr(&[10, 20]), i64_arr(&[-1, -1])])
@@ -828,7 +832,7 @@ mod tests {
 
     #[test]
     fn min_duplicate_values() {
-        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min);
+        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min).unwrap();
         acc.update_batch(&[i64_arr(&[10, 10, 20]), i64_arr(&[1, 1, 1])])
             .unwrap();
         acc.update_batch(&[i64_arr(&[10]), i64_arr(&[-1])]).unwrap();
@@ -840,12 +844,12 @@ mod tests {
 
     #[test]
     fn min_checkpoint_roundtrip() {
-        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min);
+        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min).unwrap();
         acc.update_batch(&[i64_arr(&[30, 10, 20]), i64_arr(&[1, 1, 1])])
             .unwrap();
 
         let state = acc.state().unwrap();
-        let mut restored = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min);
+        let mut restored = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min).unwrap();
         let arrays: Vec<ArrayRef> = state.iter().map(|s| s.to_array().unwrap()).collect();
         restored.merge_batch(&arrays).unwrap();
         assert_eq!(restored.evaluate().unwrap(), ScalarValue::Int64(Some(10)));
@@ -853,7 +857,7 @@ mod tests {
 
     #[test]
     fn max_retract_current_max() {
-        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Max);
+        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Max).unwrap();
         acc.update_batch(&[i64_arr(&[10, 20, 30]), i64_arr(&[1, 1, 1])])
             .unwrap();
         acc.update_batch(&[i64_arr(&[30]), i64_arr(&[-1])]).unwrap();
@@ -870,12 +874,14 @@ mod tests {
         assert!(RetractableAvgAccum::default().evaluate().unwrap().is_null());
         assert!(
             RetractableExtremumAccum::new(DataType::Int64, Extremum::Min)
+                .unwrap()
                 .evaluate()
                 .unwrap()
                 .is_null()
         );
         assert!(
             RetractableExtremumAccum::new(DataType::Int64, Extremum::Max)
+                .unwrap()
                 .evaluate()
                 .unwrap()
                 .is_null()
@@ -884,8 +890,8 @@ mod tests {
 
     #[test]
     fn min_max_float64() {
-        let mut min_acc = RetractableExtremumAccum::new(DataType::Float64, Extremum::Min);
-        let mut max_acc = RetractableExtremumAccum::new(DataType::Float64, Extremum::Max);
+        let mut min_acc = RetractableExtremumAccum::new(DataType::Float64, Extremum::Min).unwrap();
+        let mut max_acc = RetractableExtremumAccum::new(DataType::Float64, Extremum::Max).unwrap();
 
         let vals = f64_arr(&[3.25, 1.41, 2.72]);
         let wts = i64_arr(&[1, 1, 1]);
@@ -909,8 +915,8 @@ mod tests {
     #[test]
     fn min_max_utf8() {
         use arrow::array::StringArray;
-        let mut min_acc = RetractableExtremumAccum::new(DataType::Utf8, Extremum::Min);
-        let mut max_acc = RetractableExtremumAccum::new(DataType::Utf8, Extremum::Max);
+        let mut min_acc = RetractableExtremumAccum::new(DataType::Utf8, Extremum::Min).unwrap();
+        let mut max_acc = RetractableExtremumAccum::new(DataType::Utf8, Extremum::Max).unwrap();
         let vals: ArrayRef = Arc::new(StringArray::from(vec!["banana", "apple", "cherry"]));
         min_acc
             .update_batch(&[Arc::clone(&vals), i64_arr(&[1, 1, 1])])

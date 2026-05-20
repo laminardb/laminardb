@@ -2190,6 +2190,7 @@ pub(crate) fn analyze_temporal_filter(sql: &str) -> TemporalFilterAnalysis {
 
     let uses_now = select.selection.as_ref().is_some_and(expr_uses_wallclock)
         || select.having.as_ref().is_some_and(expr_uses_wallclock)
+        || select.qualify.as_ref().is_some_and(expr_uses_wallclock)
         || select.projection.iter().any(|item| match item {
             SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
                 expr_uses_wallclock(e)
