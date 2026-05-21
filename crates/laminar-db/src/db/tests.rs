@@ -4289,6 +4289,42 @@ async fn keyword_spike_pipeline_detects_injected_spike() {
     assert!(max_ratio >= 10.0, "injected 10x spike should yield ratio >= 10, got {max_ratio}");
 }
 
+/// Processing-time windows: `TUMBLE(proctime(), ..)` must close on wall-clock
+/// advancement and emit, with no event-time column or watermark. This is how
+/// sources without a usable event time (e.g. a firehose serving backfill) do
+/// windowed aggregation.
+#[tokio::test]
+async fn proctime_tumble_window_closes_on_walltime() {
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE s (x VARCHAR)").await.unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW c AS \
+         SELECT TUMBLE(proctime(), INTERVAL '1' SECOND) AS bucket, COUNT(*) AS n \
+         FROM s GROUP BY TUMBLE(proctime(), INTERVAL '1' SECOND) EMIT ON WINDOW CLOSE",
+    )
+    .await
+    .unwrap();
+    db.start().await.unwrap();
+    let handle = db.source_untyped("s").unwrap();
+    let schema = handle.schema().clone();
+    let push = |n: usize| {
+        handle
+            .push_arrow(
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![Arc::new(arrow::array::StringArray::from(vec!["a"; n]))],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+    };
+    push(3);
+    tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+    push(1); // proctime now past the first 1s window
+    let rows = poll_mv(&db, "c", 1).await;
+    assert!(rows >= 1, "proctime() tumble window should close and emit (got {rows})");
+}
+
 #[tokio::test]
 async fn open_subscription_resolves_unknown_name_to_error() {
     let db = LaminarDB::open().unwrap();
