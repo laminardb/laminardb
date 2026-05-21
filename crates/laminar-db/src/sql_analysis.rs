@@ -176,7 +176,10 @@ fn collect_factor_counting(factor: &TableFactor, tables: &mut Vec<String>) {
                 collect_factor_counting(&join.relation, tables);
             }
         }
-        _ => {}
+        // A non-table factor (lateral UNNEST, TVF, ...) can't be evaluated by
+        // the single-source fast path; count it so the query uses the full
+        // per-cycle plan instead of silently dropping the factor.
+        _ => tables.push("\u{0}non_table_factor".to_string()),
     }
 }
 
@@ -2514,6 +2517,14 @@ mod tests {
         let name =
             single_source_table("SELECT COUNT(*) FROM TUMBLE(trades, ts, INTERVAL '5' SECOND)");
         assert_eq!(name.as_deref(), Some("trades"));
+    }
+
+    #[test]
+    fn single_source_none_for_lateral_unnest() {
+        // A lateral UNNEST is an extra input the compiled fast path cannot
+        // run, so the query must not be classified as single-source.
+        let name = single_source_table("SELECT x FROM trades, UNNEST(make_array(1, 2)) AS u(x)");
+        assert_eq!(name, None);
     }
 
     #[test]

@@ -3970,6 +3970,53 @@ async fn test_nullif_float_with_int_literal_runs_without_error() {
     );
 }
 
+/// Regression: a windowed aggregate over a lateral `UNNEST` must emit.
+/// `single_source_table` ignored the UNNEST factor, so the compiled fast path
+/// skipped it and the aggregate saw no rows (planned clean, emitted nothing).
+#[tokio::test]
+async fn windowed_aggregate_over_lateral_unnest_emits() {
+    let db = LaminarDB::open().unwrap();
+    db.execute(
+        "CREATE SOURCE events (msg VARCHAR, ts TIMESTAMP, \
+         WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW tag_counts AS \
+         SELECT TUMBLE(ts, INTERVAL '5' SECOND) AS bucket, tag, COUNT(*) AS n \
+         FROM events, UNNEST(make_array('alpha','beta','gamma')) AS t(tag) \
+         WHERE strpos(msg, tag) > 0 \
+         GROUP BY TUMBLE(ts, INTERVAL '5' SECOND), tag \
+         EMIT ON WINDOW CLOSE",
+    )
+    .await
+    .unwrap();
+    db.start().await.unwrap();
+
+    let handle = db.source_untyped("events").unwrap();
+    let schema = handle.schema().clone();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(arrow::array::StringArray::from(vec![
+                "alpha and beta",
+                "gamma only",
+                "no match here",
+                "tick", // next-window event advances the watermark to close [0,5s)
+            ])),
+            Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                100_000, 200_000, 300_000, 6_000_000,
+            ])),
+        ],
+    )
+    .unwrap();
+    handle.push_arrow(batch).unwrap();
+
+    let rows = poll_mv(&db, "tag_counts", 1).await;
+    assert!(rows >= 1, "windowed aggregate over lateral UNNEST should emit");
+}
+
 #[tokio::test]
 async fn open_subscription_resolves_unknown_name_to_error() {
     let db = LaminarDB::open().unwrap();
