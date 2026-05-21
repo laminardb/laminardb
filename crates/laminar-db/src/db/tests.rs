@@ -4140,6 +4140,67 @@ async fn asof_join_in_materialized_view_emits_backward_match() {
     assert_eq!(prices, vec![10.0, 20.0], "backward ASOF should pick the latest quote at-or-before each trade");
 }
 
+/// Regression: a windowed aggregate over a SELECT-list `UNNEST` (in a
+/// subquery) must emit. The unnest is invisible to FROM-based source
+/// detection, so `single_source_table` must still treat it as multi-source —
+/// otherwise the compiled fast path skips the expansion and emits nothing.
+#[tokio::test]
+async fn windowed_aggregate_over_projection_unnest_emits() {
+    let db = LaminarDB::open().unwrap();
+    db.execute(
+        "CREATE SOURCE docs (text VARCHAR, ts TIMESTAMP, \
+         WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW word_counts AS \
+         SELECT TUMBLE(ts, INTERVAL '5' SECOND) AS bucket, w, COUNT(*) AS n \
+         FROM (SELECT ts, unnest(string_to_array(text, ' ')) AS w FROM docs) \
+         WHERE w <> '' \
+         GROUP BY TUMBLE(ts, INTERVAL '5' SECOND), w \
+         EMIT ON WINDOW CLOSE",
+    )
+    .await
+    .unwrap();
+    db.start().await.unwrap();
+
+    let handle = db.source_untyped("docs").unwrap();
+    let schema = handle.schema().clone();
+    handle
+        .push_arrow(
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    // [0,5s): "a b", "a c" -> a=2, b=1, c=1. "tick" closes it.
+                    Arc::new(arrow::array::StringArray::from(vec!["a b", "a c", "tick"])),
+                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                        100_000, 200_000, 6_000_000,
+                    ])),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    assert!(poll_mv(&db, "word_counts", 1).await >= 1, "projection-unnest MV should emit");
+    let batches = db
+        .ctx
+        .sql("SELECT n FROM word_counts WHERE w = 'a'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let n = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(n, 2, "word 'a' appears in both docs within the window");
+}
+
 #[tokio::test]
 async fn open_subscription_resolves_unknown_name_to_error() {
     let db = LaminarDB::open().unwrap();

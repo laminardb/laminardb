@@ -148,6 +148,11 @@ fn collect_tables_counting(set_expr: &SetExpr, tables: &mut Vec<String>) {
                     collect_factor_counting(&join.relation, tables);
                 }
             }
+            // UNNEST in the projection expands rows just like a FROM-clause
+            // UNNEST; the single-source fast path can't, so force the full plan.
+            if projection_has_unnest(&select.projection) {
+                tables.push("\u{0}non_table_factor".to_string());
+            }
         }
         SetExpr::SetOperation { left, right, .. } => {
             collect_tables_counting(left.as_ref(), tables);
@@ -158,6 +163,15 @@ fn collect_tables_counting(set_expr: &SetExpr, tables: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// True if any projection item is (or wraps) an `UNNEST(..)`. Checked on the
+/// serialized item, so it's robust to the parser's UNNEST representation; a
+/// false positive only forces the safe full-plan path.
+fn projection_has_unnest(items: &[SelectItem]) -> bool {
+    items
+        .iter()
+        .any(|item| item.to_string().to_ascii_lowercase().contains("unnest("))
 }
 
 fn collect_factor_counting(factor: &TableFactor, tables: &mut Vec<String>) {
