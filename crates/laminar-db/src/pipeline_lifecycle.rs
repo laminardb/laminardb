@@ -14,11 +14,27 @@ use crate::error::DbError;
 /// Resolves each `CREATE STREAM`'s output Arrow schema by planning its SQL.
 /// Temporary `EmptyTable` placeholders let downstream streams plan against
 /// upstream streams; they are removed before returning.
+/// Resolve a query's output schema by planning it. `DataFusion` can't lower
+/// `ASOF JOIN`, so on failure retry with the schema-equivalent rewrite. `None`
+/// if it still can't be planned (e.g. a dependency isn't registered yet).
+pub(crate) async fn plan_output_schema(
+    ctx: &datafusion::prelude::SessionContext,
+    sql: &str,
+) -> Option<arrow_schema::SchemaRef> {
+    let plan = if let Ok(plan) = ctx.state().create_logical_plan(sql).await {
+        plan
+    } else {
+        let rewritten = crate::sql_analysis::rewrite_asof_joins_for_planning(sql)?;
+        ctx.state().create_logical_plan(&rewritten).await.ok()?
+    };
+    let fields: Vec<_> = plan.schema().fields().iter().map(|f| (**f).clone()).collect();
+    Some(Arc::new(arrow_schema::Schema::new(fields)))
+}
+
 async fn resolve_stream_output_schemas(
     ctx: &datafusion::prelude::SessionContext,
     stream_regs: &HashMap<String, crate::connector_manager::StreamRegistration>,
 ) -> Result<HashMap<String, arrow_schema::SchemaRef>, DbError> {
-    use arrow_schema::Schema;
     use datafusion::datasource::empty::EmptyTable;
 
     let mut out: HashMap<String, arrow_schema::SchemaRef> =
@@ -33,32 +49,10 @@ async fn resolve_stream_output_schemas(
             let mut next: Vec<&crate::connector_manager::StreamRegistration> = Vec::new();
             let mut progressed = false;
             for reg in pending {
-                // DataFusion can't lower `ASOF JOIN`; resolve such schemas via a
-                // schema-equivalent inner-join rewrite. Execution still uses the
-                // ASOF operator. A genuine missing dependency falls through to
-                // the retry queue as before.
-                let planned = match ctx.state().create_logical_plan(&reg.query_sql).await {
-                    Ok(plan) => Some(plan),
-                    Err(_) => match crate::sql_analysis::rewrite_asof_joins_to_inner(&reg.query_sql)
-                    {
-                        Some(rewritten) => {
-                            ctx.state().create_logical_plan(&rewritten).await.ok()
-                        }
-                        None => None,
-                    },
-                };
-                let Some(plan) = planned else {
+                let Some(schema) = plan_output_schema(ctx, &reg.query_sql).await else {
                     next.push(reg);
                     continue;
                 };
-
-                let fields: Vec<_> = plan
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|f| (**f).clone())
-                    .collect();
-                let schema = Arc::new(Schema::new(fields));
 
                 if !ctx.table_exist(&reg.name).unwrap_or(false) {
                     ctx.register_table(&reg.name, Arc::new(EmptyTable::new(schema.clone())))

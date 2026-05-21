@@ -183,12 +183,11 @@ fn collect_factor_counting(factor: &TableFactor, tables: &mut Vec<String>) {
     }
 }
 
-/// Rewrite `ASOF JOIN … MATCH_CONDITION(..)` to a plain `JOIN … ON ..` so
-/// `DataFusion` can resolve the query's output schema — the match condition
-/// only chooses which right row matches at runtime, so an inner join is
-/// schema-equivalent. Returns `None` when there is no ASOF join. Execution
-/// still routes through the streaming ASOF operator.
-pub(crate) fn rewrite_asof_joins_to_inner(sql: &str) -> Option<String> {
+/// Rewrite `ASOF JOIN … MATCH_CONDITION(..)` to a `LEFT JOIN … ON ..` for
+/// schema resolution: `DataFusion` can't lower `AsOf`, and the match condition
+/// picks the matching right row at runtime, not the columns. Left keeps the
+/// right side nullable. `None` if there is no ASOF join.
+pub(crate) fn rewrite_asof_joins_for_planning(sql: &str) -> Option<String> {
     use sqlparser::ast::{JoinConstraint, JoinOperator};
 
     let dialect = GenericDialect {};
@@ -207,7 +206,7 @@ pub(crate) fn rewrite_asof_joins_to_inner(sql: &str) -> Option<String> {
                             JoinOperator::Inner(JoinConstraint::None),
                         );
                         if let JoinOperator::AsOf { constraint, .. } = op {
-                            join.join_operator = JoinOperator::Inner(constraint);
+                            join.join_operator = JoinOperator::LeftOuter(constraint);
                             changed = true;
                         }
                     }
