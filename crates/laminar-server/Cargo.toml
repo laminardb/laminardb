@@ -18,10 +18,10 @@ path = "src/main.rs"
 # LaminarDB crates. laminar-db re-exports the rest of the workspace; the
 # server only needs the unified facade plus laminar-core for things like
 # metrics types referenced directly.
-laminar-core = { path = "../laminar-core", version = "0.22.0" }
-laminar-storage = { path = "../laminar-storage", version = "0.22.0" }
-laminar-db = { path = "../laminar-db", version = "0.22.0", features = ["api"] }
-laminar-sql = { path = "../laminar-sql", version = "0.22.0" }
+laminar-core = { path = "../laminar-core", version = "0.23.0" }
+laminar-storage = { path = "../laminar-storage", version = "0.23.0" }
+laminar-db = { path = "../laminar-db", version = "0.23.0", features = ["api"] }
+laminar-sql = { path = "../laminar-sql", version = "0.23.0" }
 
 # For pgwire dispatch on parsed AST
 sqlparser = { workspace = true }
@@ -61,7 +61,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 # Postgres wire with optional TLS (aws-lc-rs backend). pg-type-chrono and
 # pg-type-rust-decimal pull in the postgres-types ToSql impls used by the
 # extended-query binary-format encoders for TIMESTAMP/DATE/NUMERIC columns.
-pgwire = { version = "0.39", default-features = false, features = [
+pgwire = { version = "0.40", default-features = false, features = [
     "server-api",
     "_aws-lc-rs",
     "pg-type-chrono",

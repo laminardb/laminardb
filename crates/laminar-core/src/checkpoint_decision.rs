@@ -1,11 +1,11 @@
-//! Durable cluster-wide commit marker for checkpoint 2PC.
+//! Durable commit marker for checkpoint 2PC.
 //!
-//! The leader's `Commit` barrier announcement on gossip KV is
-//! ephemeral. A leader that crashes between "announce Commit" and
-//! "commit own sinks" leaves surviving followers in a different state
-//! than a new leader, which would otherwise pick `Abort` as the safe
-//! default. We record a durable marker on shared storage _before_ the
-//! announcement so recovery can recover the cluster vote.
+//! Recovery needs to distinguish "we decided to commit this epoch and
+//! crashed mid-commit" from "we never reached the commit point". The
+//! coordinator writes this marker before sinks are told to commit;
+//! presence on restart = re-drive commit, absence = roll back. In
+//! cluster mode the marker also carries the leader's decision across
+//! leader re-election.
 
 use std::sync::Arc;
 

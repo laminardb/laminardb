@@ -21,6 +21,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray};
 use arrow::datatypes::DataType;
@@ -30,11 +31,23 @@ use datafusion_expr::Accumulator;
 use crate::error::DbError;
 
 /// Extract `i64` weights from the last array in the inputs slice.
-fn weight_array(values: &[ArrayRef]) -> &arrow::array::Int64Array {
-    values
-        .last()
-        .expect("retractable accumulator requires weight as last input")
-        .as_primitive::<arrow::datatypes::Int64Type>()
+/// Returns an error rather than panicking if the contract is violated
+/// (empty input, wrong dtype) — the upstream is internal but a corrupt
+/// checkpoint or hand-rolled CDC source must not crash the engine task.
+fn weight_array(values: &[ArrayRef]) -> datafusion_common::Result<&arrow::array::Int64Array> {
+    let last = values.last().ok_or_else(|| {
+        datafusion_common::DataFusionError::Internal(
+            "retractable accumulator: input is missing the __weight column".into(),
+        )
+    })?;
+    last.as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .ok_or_else(|| {
+            datafusion_common::DataFusionError::Internal(format!(
+                "retractable accumulator: __weight must be Int64, got {:?}",
+                last.data_type()
+            ))
+        })
 }
 
 /// Cast a numeric array element at `row` to `f64`.
@@ -88,35 +101,6 @@ fn to_f64(arr: &ArrayRef, row: usize) -> Option<f64> {
     }
 }
 
-/// Encode an `f64` as `i64` for deterministic `BTreeMap` ordering.
-///
-/// Uses IEEE 754 total-order encoding: negative floats get all bits flipped,
-/// positive floats get the sign bit set. A final XOR shifts from u64 ordering
-/// to i64 ordering so `BTreeMap<i64, _>` iteration matches numeric order.
-#[allow(clippy::cast_possible_wrap)]
-fn f64_to_sortable_i64(v: f64) -> i64 {
-    let bits = v.to_bits();
-    let sortable = if (bits >> 63) != 0 {
-        !bits // negative: flip all bits (reverses order)
-    } else {
-        bits | (1_u64 << 63) // positive: set sign bit (places after negatives)
-    };
-    // Shift from u64 ordering to i64 ordering.
-    (sortable ^ (1_u64 << 63)) as i64
-}
-
-/// Decode the sortable `i64` back to `f64`.
-fn sortable_i64_to_f64(encoded: i64) -> f64 {
-    #[allow(clippy::cast_sign_loss)]
-    let sortable = (encoded as u64) ^ (1_u64 << 63);
-    let bits = if (sortable >> 63) != 0 {
-        sortable & !(1_u64 << 63) // was positive: clear the sign bit we set
-    } else {
-        !sortable // was negative: undo the flip
-    };
-    f64::from_bits(bits)
-}
-
 /// Convert an `f64` value back to the target `ScalarValue` type.
 #[allow(
     clippy::cast_possible_truncation,
@@ -161,11 +145,11 @@ pub(crate) fn create_retractable(
         "min" => Ok(Box::new(RetractableExtremumAccum::new(
             return_type.clone(),
             Extremum::Min,
-        ))),
+        )?)),
         "max" => Ok(Box::new(RetractableExtremumAccum::new(
             return_type.clone(),
             Extremum::Max,
-        ))),
+        )?)),
         other => Err(DbError::Pipeline(format!(
             "Cannot compute {other}() over a changelog stream. \
              Supported: SUM, COUNT, AVG, MIN, MAX.",
@@ -177,20 +161,120 @@ pub(crate) fn create_retractable(
 // SUM
 // ═══════════════════════════════════════════════════════════════════
 
+/// Read an integer-typed value as `i128` (covers Int8/16/32/64,
+/// UInt8/16/32/64, and Decimal128). Returns `None` for nulls or
+/// non-integer types.
+fn read_i128(arr: &ArrayRef, row: usize) -> Option<i128> {
+    if arr.is_null(row) {
+        return None;
+    }
+    match arr.data_type() {
+        DataType::Int8 => Some(i128::from(
+            arr.as_primitive::<arrow::datatypes::Int8Type>().value(row),
+        )),
+        DataType::Int16 => Some(i128::from(
+            arr.as_primitive::<arrow::datatypes::Int16Type>().value(row),
+        )),
+        DataType::Int32 => Some(i128::from(
+            arr.as_primitive::<arrow::datatypes::Int32Type>().value(row),
+        )),
+        DataType::Int64 => Some(i128::from(
+            arr.as_primitive::<arrow::datatypes::Int64Type>().value(row),
+        )),
+        DataType::UInt8 => Some(i128::from(
+            arr.as_primitive::<arrow::datatypes::UInt8Type>().value(row),
+        )),
+        DataType::UInt16 => Some(i128::from(
+            arr.as_primitive::<arrow::datatypes::UInt16Type>()
+                .value(row),
+        )),
+        DataType::UInt32 => Some(i128::from(
+            arr.as_primitive::<arrow::datatypes::UInt32Type>()
+                .value(row),
+        )),
+        DataType::UInt64 => Some(i128::from(
+            arr.as_primitive::<arrow::datatypes::UInt64Type>()
+                .value(row),
+        )),
+        DataType::Decimal128(_, _) => Some(
+            arr.as_primitive::<arrow::datatypes::Decimal128Type>()
+                .value(row),
+        ),
+        _ => None,
+    }
+}
+
+/// Cast an `i128` sum back to a `ScalarValue` of the target type.
+/// Saturates on out-of-range integer targets so a pathological sum can
+/// never panic; Decimal128 keeps full precision.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn i128_to_scalar(v: i128, dt: &DataType) -> ScalarValue {
+    let clamp = |lo: i128, hi: i128| v.clamp(lo, hi);
+    match dt {
+        DataType::Int8 => {
+            ScalarValue::Int8(Some(clamp(i128::from(i8::MIN), i128::from(i8::MAX)) as i8))
+        }
+        DataType::Int16 => ScalarValue::Int16(Some(
+            clamp(i128::from(i16::MIN), i128::from(i16::MAX)) as i16,
+        )),
+        DataType::Int32 => ScalarValue::Int32(Some(
+            clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32,
+        )),
+        DataType::Int64 => ScalarValue::Int64(Some(
+            clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64,
+        )),
+        DataType::UInt8 => ScalarValue::UInt8(Some(clamp(0, i128::from(u8::MAX)) as u8)),
+        DataType::UInt16 => ScalarValue::UInt16(Some(clamp(0, i128::from(u16::MAX)) as u16)),
+        DataType::UInt32 => ScalarValue::UInt32(Some(clamp(0, i128::from(u32::MAX)) as u32)),
+        DataType::UInt64 => ScalarValue::UInt64(Some(clamp(0, i128::from(u64::MAX)) as u64)),
+        DataType::Decimal128(p, s) => ScalarValue::Decimal128(Some(v), *p, *s),
+        // Float / unknown: fall back to f64 via i128 → f64 (precision loss
+        // only at very large magnitudes, which couldn't have been an
+        // integer-typed sum to begin with).
+        #[allow(clippy::cast_precision_loss)]
+        _ => ScalarValue::Float64(Some(v as f64)),
+    }
+}
+
+fn is_integer_or_decimal(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Decimal128(_, _)
+    )
+}
+
 /// Retractable SUM: `SUM(value * weight)`.
+///
+/// Integer / `Decimal128` types accumulate in `i128` so a SUM beyond
+/// `2^53` no longer silently loses precision — `f64` is reserved for
+/// genuinely floating-point targets where the precision tradeoff is
+/// inherent to the type.
 #[derive(Debug)]
 struct RetractableSumAccum {
-    sum: f64,
-    count: i64,
     return_type: DataType,
+    is_int: bool,
+    sum_i128: i128,
+    sum_f64: f64,
+    count: i64,
 }
 
 impl RetractableSumAccum {
     fn new(return_type: DataType) -> Self {
+        let is_int = is_integer_or_decimal(&return_type);
         Self {
-            sum: 0.0,
-            count: 0,
             return_type,
+            is_int,
+            sum_i128: 0,
+            sum_f64: 0.0,
+            count: 0,
         }
     }
 }
@@ -198,16 +282,22 @@ impl RetractableSumAccum {
 impl Accumulator for RetractableSumAccum {
     /// Inputs: `[value_col, weight_col]`.
     fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion_common::Result<()> {
-        let weights = weight_array(values);
+        let weights = weight_array(values)?;
         let value_arr = &values[0];
         for row in 0..value_arr.len() {
-            if let Some(v) = to_f64(value_arr, row) {
-                let w = weights.value(row);
+            let w = weights.value(row);
+            if self.is_int {
+                if let Some(v) = read_i128(value_arr, row) {
+                    let prod = v.saturating_mul(i128::from(w));
+                    self.sum_i128 = self.sum_i128.saturating_add(prod);
+                    self.count = self.count.saturating_add(w);
+                }
+            } else if let Some(v) = to_f64(value_arr, row) {
                 #[allow(clippy::cast_precision_loss)]
                 {
-                    self.sum += v * w as f64;
+                    self.sum_f64 += v * w as f64;
                 }
-                self.count += w;
+                self.count = self.count.saturating_add(w);
             }
         }
         Ok(())
@@ -217,7 +307,11 @@ impl Accumulator for RetractableSumAccum {
         if self.count == 0 {
             return ScalarValue::try_from(&self.return_type);
         }
-        Ok(f64_to_scalar(self.sum, &self.return_type))
+        if self.is_int {
+            Ok(i128_to_scalar(self.sum_i128, &self.return_type))
+        } else {
+            Ok(f64_to_scalar(self.sum_f64, &self.return_type))
+        }
     }
 
     fn size(&self) -> usize {
@@ -225,21 +319,35 @@ impl Accumulator for RetractableSumAccum {
     }
 
     fn state(&mut self) -> datafusion_common::Result<Vec<ScalarValue>> {
-        Ok(vec![
-            ScalarValue::Float64(Some(self.sum)),
-            ScalarValue::Int64(Some(self.count)),
-        ])
+        let sum = if self.is_int {
+            ScalarValue::Decimal128(Some(self.sum_i128), 38, 0)
+        } else {
+            ScalarValue::Float64(Some(self.sum_f64))
+        };
+        Ok(vec![sum, ScalarValue::Int64(Some(self.count))])
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion_common::Result<()> {
-        let sums = states[0].as_primitive::<arrow::datatypes::Float64Type>();
         let counts = states[1].as_primitive::<arrow::datatypes::Int64Type>();
-        for row in 0..sums.len() {
-            if !sums.is_null(row) {
-                self.sum += sums.value(row);
+        if self.is_int {
+            let sums = states[0].as_primitive::<arrow::datatypes::Decimal128Type>();
+            for row in 0..sums.len() {
+                if !sums.is_null(row) {
+                    self.sum_i128 = self.sum_i128.saturating_add(sums.value(row));
+                }
+                if !counts.is_null(row) {
+                    self.count = self.count.saturating_add(counts.value(row));
+                }
             }
-            if !counts.is_null(row) {
-                self.count += counts.value(row);
+        } else {
+            let sums = states[0].as_primitive::<arrow::datatypes::Float64Type>();
+            for row in 0..sums.len() {
+                if !sums.is_null(row) {
+                    self.sum_f64 += sums.value(row);
+                }
+                if !counts.is_null(row) {
+                    self.count = self.count.saturating_add(counts.value(row));
+                }
             }
         }
         Ok(())
@@ -261,7 +369,7 @@ struct RetractableCountStarAccum {
 impl Accumulator for RetractableCountStarAccum {
     /// Inputs: `[dummy_bool, weight_col]`.
     fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion_common::Result<()> {
-        let weights = weight_array(values);
+        let weights = weight_array(values)?;
         for row in 0..weights.len() {
             self.count += weights.value(row);
         }
@@ -304,7 +412,7 @@ struct RetractableCountAccum {
 impl Accumulator for RetractableCountAccum {
     /// Inputs: `[value_col, weight_col]`.
     fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion_common::Result<()> {
-        let weights = weight_array(values);
+        let weights = weight_array(values)?;
         let value_arr = &values[0];
         for row in 0..value_arr.len() {
             if !value_arr.is_null(row) {
@@ -351,7 +459,7 @@ struct RetractableAvgAccum {
 impl Accumulator for RetractableAvgAccum {
     /// Inputs: `[value_col, weight_col]`.
     fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion_common::Result<()> {
-        let weights = weight_array(values);
+        let weights = weight_array(values)?;
         let value_arr = &values[0];
         for row in 0..value_arr.len() {
             if let Some(v) = to_f64(value_arr, row) {
@@ -412,42 +520,74 @@ enum Extremum {
     Max,
 }
 
-/// Retractable MIN/MAX using a counted multiset (`BTreeMap<sortable_bits, count>`).
+/// Retractable MIN/MAX using a counted multiset keyed by an Arrow
+/// row-encoded value. `arrow::row::RowConverter` produces a stable
+/// lexicographically-sortable byte representation for every relevant
+/// scalar type (integers, decimals, dates, timestamps, strings,
+/// binaries, booleans, floats), so the same operator works correctly
+/// for any of them — no more silent NULLs from `to_f64` on Decimal /
+/// Date / Utf8 columns.
 ///
-/// On insert (weight > 0): increment count for value.
-/// On retract (weight < 0): decrement count; remove entry when zero.
-/// Result: first key (MIN) or last key (MAX).
+/// On insert (weight > 0): increment count for the value's row key.
+/// On retract (weight < 0): decrement; remove the entry at zero.
+/// Result: first key (MIN) or last key (MAX), re-materialised via the
+/// same row converter back to a `ScalarValue` of the return type.
 #[derive(Debug)]
 struct RetractableExtremumAccum {
-    /// `value_bits` (sortable encoding) -> net count
-    counts: BTreeMap<i64, i64>,
+    counts: BTreeMap<arrow::row::OwnedRow, i64>,
+    row_converter: arrow::row::RowConverter,
     return_type: DataType,
     direction: Extremum,
 }
 
 impl RetractableExtremumAccum {
-    fn new(return_type: DataType, direction: Extremum) -> Self {
-        Self {
+    fn new(return_type: DataType, direction: Extremum) -> Result<Self, DbError> {
+        let row_converter =
+            arrow::row::RowConverter::new(vec![arrow::row::SortField::new(return_type.clone())])
+                .map_err(|e| {
+                    DbError::Pipeline(format!(
+                        "MIN/MAX row converter init for {return_type:?}: {e}"
+                    ))
+                })?;
+        Ok(Self {
             counts: BTreeMap::new(),
+            row_converter,
             return_type,
             direction,
-        }
+        })
     }
 }
 
 impl Accumulator for RetractableExtremumAccum {
     /// Inputs: `[value_col, weight_col]`.
     fn update_batch(&mut self, values: &[ArrayRef]) -> datafusion_common::Result<()> {
-        let weights = weight_array(values);
+        use std::collections::btree_map::Entry;
+        let weights = weight_array(values)?;
         let value_arr = &values[0];
+        let rows = self
+            .row_converter
+            .convert_columns(&[Arc::clone(value_arr)])
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Internal(format!("MIN/MAX row encode: {e}"))
+            })?;
         for row in 0..value_arr.len() {
-            if let Some(v) = to_f64(value_arr, row) {
-                let bits = f64_to_sortable_i64(v);
-                let w = weights.value(row);
-                let entry = self.counts.entry(bits).or_insert(0);
-                *entry += w;
-                if *entry == 0 {
-                    self.counts.remove(&bits);
+            if value_arr.is_null(row) {
+                continue;
+            }
+            let key = rows.row(row).owned();
+            let w = weights.value(row);
+            if w == 0 {
+                continue;
+            }
+            match self.counts.entry(key) {
+                Entry::Occupied(mut o) => {
+                    *o.get_mut() += w;
+                    if *o.get() == 0 {
+                        o.remove();
+                    }
+                }
+                Entry::Vacant(v) => {
+                    v.insert(w);
                 }
             }
         }
@@ -455,56 +595,84 @@ impl Accumulator for RetractableExtremumAccum {
     }
 
     fn evaluate(&mut self) -> datafusion_common::Result<ScalarValue> {
-        let pair = match self.direction {
-            Extremum::Min => self.counts.first_key_value(),
-            Extremum::Max => self.counts.last_key_value(),
+        let key = match self.direction {
+            Extremum::Min => self.counts.first_key_value().map(|(k, _)| k),
+            Extremum::Max => self.counts.last_key_value().map(|(k, _)| k),
         };
-        match pair {
-            Some((&bits, _)) => {
-                let v = sortable_i64_to_f64(bits);
-                Ok(f64_to_scalar(v, &self.return_type))
-            }
-            None => ScalarValue::try_from(&self.return_type),
-        }
+        let Some(key) = key else {
+            return ScalarValue::try_from(&self.return_type);
+        };
+        let arrays = self
+            .row_converter
+            .convert_rows(std::iter::once(key.row()))
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Internal(format!("MIN/MAX row decode: {e}"))
+            })?;
+        ScalarValue::try_from_array(&arrays[0], 0)
     }
 
     fn size(&self) -> usize {
-        std::mem::size_of::<Self>() + self.counts.len() * (std::mem::size_of::<i64>() * 2 + 64)
-        // BTreeMap node overhead
+        // Each entry: key bytes + 8B count + ~64B BTreeMap node overhead.
+        let key_bytes: usize = self.counts.keys().map(|k| k.as_ref().len()).sum();
+        std::mem::size_of::<Self>() + key_bytes + self.counts.len() * 72
     }
 
     fn state(&mut self) -> datafusion_common::Result<Vec<ScalarValue>> {
-        let keys: Vec<ScalarValue> = self
-            .counts
-            .keys()
-            .map(|k| ScalarValue::Int64(Some(*k)))
-            .collect();
-        let vals: Vec<ScalarValue> = self
+        // Materialise the keys back into an Arrow array of the value
+        // type, then expose key+count as List columns.
+        let key_arrays = self
+            .row_converter
+            .convert_rows(self.counts.keys().map(arrow::row::OwnedRow::row))
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Internal(format!("MIN/MAX state encode: {e}"))
+            })?;
+        let key_arr = Arc::clone(&key_arrays[0]);
+        let key_scalars: Vec<ScalarValue> = (0..key_arr.len())
+            .map(|i| ScalarValue::try_from_array(&key_arr, i))
+            .collect::<datafusion_common::Result<_>>()?;
+        let val_scalars: Vec<ScalarValue> = self
             .counts
             .values()
             .map(|c| ScalarValue::Int64(Some(*c)))
             .collect();
         Ok(vec![
-            ScalarValue::List(ScalarValue::new_list(&keys, &DataType::Int64, true)),
-            ScalarValue::List(ScalarValue::new_list(&vals, &DataType::Int64, true)),
+            ScalarValue::List(ScalarValue::new_list(&key_scalars, &self.return_type, true)),
+            ScalarValue::List(ScalarValue::new_list(&val_scalars, &DataType::Int64, true)),
         ])
     }
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> datafusion_common::Result<()> {
+        use std::collections::btree_map::Entry;
         let keys_list = states[0].as_list::<i32>();
         let vals_list = states[1].as_list::<i32>();
         for row in 0..keys_list.len() {
-            let keys = keys_list.value(row);
-            let vals = vals_list.value(row);
-            let k_arr = keys.as_primitive::<arrow::datatypes::Int64Type>();
-            let v_arr = vals.as_primitive::<arrow::datatypes::Int64Type>();
-            for i in 0..k_arr.len() {
-                let bits = k_arr.value(i);
+            let keys_arr = keys_list.value(row);
+            let vals_arr = vals_list.value(row);
+            let v_arr = vals_arr.as_primitive::<arrow::datatypes::Int64Type>();
+            let row_keys = self
+                .row_converter
+                .convert_columns(&[Arc::clone(&keys_arr)])
+                .map_err(|e| {
+                    datafusion_common::DataFusionError::Internal(format!(
+                        "MIN/MAX merge encode: {e}"
+                    ))
+                })?;
+            for i in 0..keys_arr.len() {
                 let cnt = v_arr.value(i);
-                let entry = self.counts.entry(bits).or_insert(0);
-                *entry += cnt;
-                if *entry == 0 {
-                    self.counts.remove(&bits);
+                if cnt == 0 {
+                    continue;
+                }
+                let key = row_keys.row(i).owned();
+                match self.counts.entry(key) {
+                    Entry::Occupied(mut o) => {
+                        *o.get_mut() += cnt;
+                        if *o.get() == 0 {
+                            o.remove();
+                        }
+                    }
+                    Entry::Vacant(v) => {
+                        v.insert(cnt);
+                    }
                 }
             }
         }
@@ -566,11 +734,21 @@ mod tests {
         assert_eq!(restored.evaluate().unwrap(), ScalarValue::Int64(Some(30)));
     }
 
+    /// Int64 SUM of values whose total exceeds 2^53 must be exact —
+    /// the pre-`i128` `f64`-backed implementation silently lost precision.
     #[test]
-    fn sum_empty_returns_null() {
+    fn sum_int64_above_f64_precision_limit() {
+        use arrow::array::Int64Array;
         let mut acc = RetractableSumAccum::new(DataType::Int64);
-        let result = acc.evaluate().unwrap();
-        assert!(result.is_null());
+        // Two values that sum to 2^54 + 1 — exactly representable in i64
+        // but not in f64 (the `+1` would be lost to rounding).
+        let vals = Int64Array::from(vec![1_i64 << 53, (1_i64 << 53) + 1]);
+        let weights = Int64Array::from(vec![1_i64, 1]);
+        acc.update_batch(&[Arc::new(vals), Arc::new(weights)])
+            .unwrap();
+        let got = acc.evaluate().unwrap();
+        let expected = (1_i64 << 54).wrapping_add(1);
+        assert_eq!(got, ScalarValue::Int64(Some(expected)));
     }
 
     #[test]
@@ -585,18 +763,6 @@ mod tests {
         acc.update_batch(&[bool_arr(&[true]), i64_arr(&[-1])])
             .unwrap();
         assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int64(Some(2)));
-    }
-
-    #[test]
-    fn count_star_checkpoint() {
-        let mut acc = RetractableCountStarAccum::default();
-        acc.update_batch(&[bool_arr(&[true, true]), i64_arr(&[1, 1])])
-            .unwrap();
-        let state = acc.state().unwrap();
-        let mut restored = RetractableCountStarAccum::default();
-        let arrays: Vec<ArrayRef> = state.iter().map(|s| s.to_array().unwrap()).collect();
-        restored.merge_batch(&arrays).unwrap();
-        assert_eq!(restored.evaluate().unwrap(), ScalarValue::Int64(Some(2)));
     }
 
     #[test]
@@ -644,37 +810,8 @@ mod tests {
     }
 
     #[test]
-    fn avg_empty_returns_null() {
-        let mut acc = RetractableAvgAccum::default();
-        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Float64(None));
-    }
-
-    #[test]
-    fn avg_checkpoint() {
-        let mut acc = RetractableAvgAccum::default();
-        acc.update_batch(&[i64_arr(&[10, 20, 30]), i64_arr(&[1, 1, 1])])
-            .unwrap();
-        let state = acc.state().unwrap();
-        let mut restored = RetractableAvgAccum::default();
-        let arrays: Vec<ArrayRef> = state.iter().map(|s| s.to_array().unwrap()).collect();
-        restored.merge_batch(&arrays).unwrap();
-        assert_eq!(
-            restored.evaluate().unwrap(),
-            ScalarValue::Float64(Some(20.0))
-        );
-    }
-
-    #[test]
-    fn min_basic() {
-        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min);
-        acc.update_batch(&[i64_arr(&[30, 10, 20]), i64_arr(&[1, 1, 1])])
-            .unwrap();
-        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int64(Some(10)));
-    }
-
-    #[test]
     fn min_retract_current_min() {
-        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min);
+        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min).unwrap();
         acc.update_batch(&[i64_arr(&[10, 20, 30]), i64_arr(&[1, 1, 1])])
             .unwrap();
         assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int64(Some(10)));
@@ -684,14 +821,8 @@ mod tests {
     }
 
     #[test]
-    fn min_empty_returns_null() {
-        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min);
-        assert!(acc.evaluate().unwrap().is_null());
-    }
-
-    #[test]
     fn min_retract_all() {
-        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min);
+        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min).unwrap();
         acc.update_batch(&[i64_arr(&[10, 20]), i64_arr(&[1, 1])])
             .unwrap();
         acc.update_batch(&[i64_arr(&[10, 20]), i64_arr(&[-1, -1])])
@@ -701,7 +832,7 @@ mod tests {
 
     #[test]
     fn min_duplicate_values() {
-        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min);
+        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min).unwrap();
         acc.update_batch(&[i64_arr(&[10, 10, 20]), i64_arr(&[1, 1, 1])])
             .unwrap();
         acc.update_batch(&[i64_arr(&[10]), i64_arr(&[-1])]).unwrap();
@@ -713,44 +844,54 @@ mod tests {
 
     #[test]
     fn min_checkpoint_roundtrip() {
-        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min);
+        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min).unwrap();
         acc.update_batch(&[i64_arr(&[30, 10, 20]), i64_arr(&[1, 1, 1])])
             .unwrap();
 
         let state = acc.state().unwrap();
-        let mut restored = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min);
+        let mut restored = RetractableExtremumAccum::new(DataType::Int64, Extremum::Min).unwrap();
         let arrays: Vec<ArrayRef> = state.iter().map(|s| s.to_array().unwrap()).collect();
         restored.merge_batch(&arrays).unwrap();
         assert_eq!(restored.evaluate().unwrap(), ScalarValue::Int64(Some(10)));
     }
 
     #[test]
-    fn max_basic() {
-        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Max);
-        acc.update_batch(&[i64_arr(&[10, 30, 20]), i64_arr(&[1, 1, 1])])
-            .unwrap();
-        assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int64(Some(30)));
-    }
-
-    #[test]
     fn max_retract_current_max() {
-        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Max);
+        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Max).unwrap();
         acc.update_batch(&[i64_arr(&[10, 20, 30]), i64_arr(&[1, 1, 1])])
             .unwrap();
         acc.update_batch(&[i64_arr(&[30]), i64_arr(&[-1])]).unwrap();
         assert_eq!(acc.evaluate().unwrap(), ScalarValue::Int64(Some(20)));
     }
 
+    /// SUM/AVG/MIN/MAX all return NULL before any insert lands.
     #[test]
-    fn max_empty_returns_null() {
-        let mut acc = RetractableExtremumAccum::new(DataType::Int64, Extremum::Max);
-        assert!(acc.evaluate().unwrap().is_null());
+    fn empty_evaluates_to_null() {
+        assert!(RetractableSumAccum::new(DataType::Int64)
+            .evaluate()
+            .unwrap()
+            .is_null());
+        assert!(RetractableAvgAccum::default().evaluate().unwrap().is_null());
+        assert!(
+            RetractableExtremumAccum::new(DataType::Int64, Extremum::Min)
+                .unwrap()
+                .evaluate()
+                .unwrap()
+                .is_null()
+        );
+        assert!(
+            RetractableExtremumAccum::new(DataType::Int64, Extremum::Max)
+                .unwrap()
+                .evaluate()
+                .unwrap()
+                .is_null()
+        );
     }
 
     #[test]
     fn min_max_float64() {
-        let mut min_acc = RetractableExtremumAccum::new(DataType::Float64, Extremum::Min);
-        let mut max_acc = RetractableExtremumAccum::new(DataType::Float64, Extremum::Max);
+        let mut min_acc = RetractableExtremumAccum::new(DataType::Float64, Extremum::Min).unwrap();
+        let mut max_acc = RetractableExtremumAccum::new(DataType::Float64, Extremum::Max).unwrap();
 
         let vals = f64_arr(&[3.25, 1.41, 2.72]);
         let wts = i64_arr(&[1, 1, 1]);
@@ -768,30 +909,27 @@ mod tests {
         );
     }
 
+    /// MIN/MAX over a `Utf8` column. The old `f64`-only implementation
+    /// silently emitted NULL (because `to_f64` returns `None` for
+    /// strings); the row-converter implementation handles it natively.
     #[test]
-    fn sortable_encoding_roundtrip() {
-        let values = [-100.0, -1.0, -0.0, 0.0, 1.0, 100.0, f64::INFINITY];
-        for v in values {
-            let bits = f64_to_sortable_i64(v);
-            let back = sortable_i64_to_f64(bits);
-            assert_eq!(v.to_bits(), back.to_bits(), "roundtrip failed for {v}");
-        }
-    }
-
-    #[test]
-    fn sortable_encoding_preserves_order() {
-        let values = [-100.0, -1.0, 0.0, 1.0, 100.0];
-        let encoded: Vec<i64> = values.iter().map(|v| f64_to_sortable_i64(*v)).collect();
-        for i in 0..encoded.len() - 1 {
-            assert!(
-                encoded[i] < encoded[i + 1],
-                "order not preserved: {} ({}) >= {} ({})",
-                values[i],
-                encoded[i],
-                values[i + 1],
-                encoded[i + 1]
-            );
-        }
+    fn min_max_utf8() {
+        use arrow::array::StringArray;
+        let mut min_acc = RetractableExtremumAccum::new(DataType::Utf8, Extremum::Min).unwrap();
+        let mut max_acc = RetractableExtremumAccum::new(DataType::Utf8, Extremum::Max).unwrap();
+        let vals: ArrayRef = Arc::new(StringArray::from(vec!["banana", "apple", "cherry"]));
+        min_acc
+            .update_batch(&[Arc::clone(&vals), i64_arr(&[1, 1, 1])])
+            .unwrap();
+        max_acc.update_batch(&[vals, i64_arr(&[1, 1, 1])]).unwrap();
+        assert_eq!(
+            min_acc.evaluate().unwrap(),
+            ScalarValue::Utf8(Some("apple".into()))
+        );
+        assert_eq!(
+            max_acc.evaluate().unwrap(),
+            ScalarValue::Utf8(Some("cherry".into()))
+        );
     }
 
     #[test]

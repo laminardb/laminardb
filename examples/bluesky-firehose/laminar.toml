@@ -1,0 +1,71 @@
+# Bluesky public Jetstream firehose → LaminarDB → SUBSCRIBE over pgwire.
+# No auth, no Docker. Two independent pipelines on the same firehose,
+# both SUBSCRIBE-able on port 5432:
+#
+#   posts          — plain projection stream, no watermark (never
+#                     late-drops): SUBSCRIBE [WHERE ...] [AS OF EPOCH n].
+#   posts_per_min  — 1-min tumbling COUNT(*) on event time, on its own
+#                     2nd connection so its WATERMARK can't late-drop
+#                     `posts` (a source watermark affects every consumer).
+#
+# Event time is Jetstream's server `time_us`, not client `createdAt`
+# (device clocks run minutes off and poison a tight watermark). See
+# README §4. The URL pins app.bsky.feed.post (~30-60/s); drop the query
+# string for the whole firehose.
+
+sql = """
+CREATE SOURCE bluesky_posts (
+    did         VARCHAR,
+    operation   VARCHAR,
+    collection  VARCHAR,
+    text        VARCHAR,
+    created_at  VARCHAR
+) FROM WEBSOCKET (
+    url    = 'wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post',
+    format = 'json',
+    'json.column.did'        = 'did',
+    'json.column.operation'  = 'commit.operation',
+    'json.column.collection' = 'commit.collection',
+    'json.column.text'       = 'commit.record.text',
+    'json.column.created_at' = 'commit.record.createdAt'
+) FORMAT JSON;
+
+CREATE STREAM posts AS
+SELECT did, collection, text, created_at
+FROM bluesky_posts
+WHERE operation = 'create' AND text IS NOT NULL
+WITH ('retain_history' = '256mb');
+
+-- 2nd connection: event time = server `time_us` (microseconds;
+-- epoch_unit scales it — decoder defaults numeric to millis). Separate
+-- source so this WATERMARK can't late-drop `posts`.
+CREATE SOURCE bluesky_posts_wm (
+    operation   VARCHAR,
+    evt_us      TIMESTAMP,
+    WATERMARK FOR evt_us AS evt_us - INTERVAL '15' SECOND
+) FROM WEBSOCKET (
+    url    = 'wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post',
+    format = 'json',
+    'json.column.operation'         = 'commit.operation',
+    'json.column.evt_us'            = 'time_us',
+    'json.column.evt_us.epoch_unit' = 'micros'
+) FORMAT JSON;
+
+-- 1-min tumbling COUNT(*) by event time. EMIT ON WINDOW CLOSE: one
+-- final row per minute, ~1–1.5 min after the minute starts.
+CREATE MATERIALIZED VIEW posts_per_min AS
+SELECT
+    TUMBLE(evt_us, INTERVAL '1' MINUTE)     AS window_start,
+    TUMBLE_END(evt_us, INTERVAL '1' MINUTE) AS window_end,
+    COUNT(*)                                AS posts
+FROM bluesky_posts_wm
+WHERE operation = 'create'
+GROUP BY
+    TUMBLE(evt_us, INTERVAL '1' MINUTE),
+    TUMBLE_END(evt_us, INTERVAL '1' MINUTE)
+EMIT ON WINDOW CLOSE;
+"""
+
+[server]
+bind        = "127.0.0.1:7777"
+pgwire_bind = "127.0.0.1:5432"

@@ -30,7 +30,7 @@ use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
 use datafusion_common::ScalarValue;
 use datafusion_expr::function::AccumulatorArgs;
-use datafusion_expr::{AggregateUDF, LogicalPlan};
+use datafusion_expr::AggregateUDF;
 
 use crate::error::DbError;
 
@@ -188,7 +188,8 @@ pub(crate) struct IncrementalAggState {
     row_converter: arrow::row::RowConverter,
     output_schema: SchemaRef,
     compiled_projection: Option<CompiledProjection>,
-    cached_pre_agg_plan: Option<LogicalPlan>,
+    /// Built once; `LiveSourceExec` leaves carry fresh data per execute.
+    cached_pre_agg_physical: Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
     having_filter: Option<Arc<dyn PhysicalExpr>>,
     having_sql: Option<String>,
     max_groups: usize,
@@ -655,23 +656,19 @@ impl IncrementalAggState {
             None
         };
 
-        // ONE-TIME setup: cache the optimized logical plan for multi-source
-        // pre-agg queries (when compiled projection is not available). This
-        // ctx.sql() call runs ONLY at first-cycle initialization, never
-        // per-cycle. Subsequent cycles use the cached plan directly.
-        // Fail fast if the pre-agg SQL is invalid — it would fail every cycle.
-        let cached_pre_agg_plan = if compiled_projection.is_none() {
-            match ctx.sql(&pre_agg_sql).await {
-                Ok(df) => Some(df.logical_plan().clone()),
-                Err(e) => {
-                    return Err(DbError::Pipeline(format!(
-                        "pre-agg SQL planning failed for aggregate: {e}"
-                    )));
-                }
-            }
-        } else {
-            None
-        };
+        // Plan once at init; `LiveSourceProvider` leaves carry fresh data.
+        let cached_pre_agg_physical =
+            if compiled_projection.is_none() {
+                let logical = ctx.sql(&pre_agg_sql).await.map_err(|e| {
+                    DbError::Pipeline(format!("pre-agg SQL planning failed for aggregate: {e}"))
+                })?;
+                let plan = logical.logical_plan().clone();
+                Some(ctx.state().create_physical_plan(&plan).await.map_err(|e| {
+                    DbError::Pipeline(format!("pre-agg physical planning failed: {e}"))
+                })?)
+            } else {
+                None
+            };
 
         let sort_fields: Vec<arrow::row::SortField> = group_types
             .iter()
@@ -689,7 +686,7 @@ impl IncrementalAggState {
             row_converter,
             output_schema,
             compiled_projection,
-            cached_pre_agg_plan,
+            cached_pre_agg_physical,
             having_filter,
             having_sql,
             max_groups: 1_000_000,
@@ -993,6 +990,24 @@ impl IncrementalAggState {
     }
 
     fn emit_changelog_delta(&mut self) -> Result<Vec<RecordBatch>, DbError> {
+        // Without `idle_ttl_ms`, `last_emitted` never shrinks. Warn once
+        // every ~5min so operators see the leak before OOM.
+        if self.idle_ttl_ms.is_none() && self.last_emitted.len() > 10_000 {
+            use std::sync::atomic::{AtomicI64, Ordering};
+            static LAST_WARN_S: AtomicI64 = AtomicI64::new(0);
+            let now_s = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+            if now_s - LAST_WARN_S.load(Ordering::Relaxed) > 300 {
+                LAST_WARN_S.store(now_s, Ordering::Relaxed);
+                tracing::warn!(
+                    last_emitted_size = self.last_emitted.len(),
+                    "EMIT CHANGES aggregate has {} group keys with no idle_ttl_ms; \
+                     set `idle_ttl_ms` to bound memory.",
+                    self.last_emitted.len()
+                );
+            }
+        }
         // Collect retractions and inserts.
         let mut retract_keys: Vec<arrow::row::OwnedRow> = Vec::new();
         let mut retract_vals: Vec<Vec<ScalarValue>> = Vec::new();
@@ -1008,7 +1023,22 @@ impl IncrementalAggState {
                 .map_err(|e| DbError::Pipeline(format!("accumulator evaluate: {e}")))?;
 
             if let Some(old) = self.last_emitted.get(key) {
-                if old != &current {
+                // `ScalarValue::eq` says NaN != NaN; treat both-NaN as
+                // equal to avoid an infinite retract+insert loop.
+                let changed = old.iter().zip(current.iter()).any(|(a, b)| match (a, b) {
+                    (ScalarValue::Float64(Some(x)), ScalarValue::Float64(Some(y)))
+                        if x.is_nan() && y.is_nan() =>
+                    {
+                        false
+                    }
+                    (ScalarValue::Float32(Some(x)), ScalarValue::Float32(Some(y)))
+                        if x.is_nan() && y.is_nan() =>
+                    {
+                        false
+                    }
+                    _ => a != b,
+                });
+                if changed {
                     retract_keys.push(key.clone());
                     retract_vals.push(old.clone());
                     insert_keys.push(key.clone());
@@ -1081,8 +1111,10 @@ impl IncrementalAggState {
         self.compiled_projection.as_ref()
     }
 
-    pub fn cached_pre_agg_plan(&self) -> Option<&LogicalPlan> {
-        self.cached_pre_agg_plan.as_ref()
+    pub fn cached_pre_agg_physical(
+        &self,
+    ) -> Option<&Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.cached_pre_agg_physical.as_ref()
     }
 
     pub(crate) fn query_fingerprint(&self) -> u64 {
@@ -1151,9 +1183,11 @@ impl IncrementalAggState {
                 checkpoint.fingerprint, current_fp
             )));
         }
-        self.groups.clear();
+        // Two-phase: build maps locally then swap, so a mid-list decode
+        // error doesn't leave `last_emitted` partially populated.
+        let mut new_groups: AHashMap<arrow::row::OwnedRow, GroupEntry> =
+            AHashMap::with_capacity(checkpoint.groups.len());
         for gc in &checkpoint.groups {
-            // Decode IPC bytes → ScalarValue → Array → OwnedRow.
             let sv_key = ipc_to_scalars(&gc.key)?;
             let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key, &self.group_types)?;
 
@@ -1178,7 +1212,7 @@ impl IncrementalAggState {
                 }
                 accs.push(acc);
             }
-            self.groups.insert(
+            new_groups.insert(
                 row_key,
                 GroupEntry {
                     accs,
@@ -1187,15 +1221,17 @@ impl IncrementalAggState {
             );
         }
 
-        // Restore last_emitted for changelog recovery.
-        self.last_emitted.clear();
+        let mut new_last_emitted: AHashMap<arrow::row::OwnedRow, Vec<ScalarValue>> =
+            AHashMap::with_capacity(checkpoint.last_emitted.len());
         for ec in &checkpoint.last_emitted {
             let sv_key = ipc_to_scalars(&ec.key)?;
             let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key, &self.group_types)?;
             let vals = ipc_to_scalars(&ec.values)?;
-            self.last_emitted.insert(row_key, vals);
+            new_last_emitted.insert(row_key, vals);
         }
 
+        self.groups = new_groups;
+        self.last_emitted = new_last_emitted;
         Ok(checkpoint.groups.len())
     }
 }

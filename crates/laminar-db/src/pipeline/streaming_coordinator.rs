@@ -540,6 +540,11 @@ impl StreamingCoordinator {
                 callback.extract_watermark(&name, &batch);
             }
 
+            // Demote watermarked sources idle past their timeout so a quiet
+            // input doesn't pin the combined watermark (active sources keep
+            // driving the cycle below, which then closes pending windows).
+            callback.tick_idle_watermark();
+
             // Step: Execute SQL cycle. Also runs on idle wakeups when
             // operators have deferred input from a prior budget-exceeded
             // cycle — otherwise that data is stuck forever once the source
@@ -657,6 +662,7 @@ impl StreamingCoordinator {
         for (name, batch) in self.pending_watermark_batches.drain(..) {
             callback.extract_watermark(&name, &batch);
         }
+        callback.tick_idle_watermark();
         if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
             let wm = callback.current_watermark();
             match callback.execute_cycle(&self.source_batches_buf, wm).await {
@@ -685,6 +691,7 @@ impl StreamingCoordinator {
         for (name, batch) in self.pending_watermark_batches.drain(..) {
             callback.extract_watermark(&name, &batch);
         }
+        callback.tick_idle_watermark();
         if !self.source_batches_buf.is_empty() || callback.has_deferred_input() {
             let wm = callback.current_watermark();
             match callback.execute_cycle(&self.source_batches_buf, wm).await {

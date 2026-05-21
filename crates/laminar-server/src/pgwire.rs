@@ -98,8 +98,10 @@ impl NoopStartupHandler for LaminarPgwireHandler {
 impl SimpleQueryHandler for LaminarPgwireHandler {
     async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
-        C: ClientInfo + ClientPortalStore + Unpin + Send + Sync,
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         if query.trim().is_empty() {
             return Ok(vec![Response::EmptyQuery]);
@@ -109,10 +111,29 @@ impl SimpleQueryHandler for LaminarPgwireHandler {
         let stmts = parse_streaming_sql(query)
             .map_err(|e| user_error("42601", format!("parse error: {e}")))?;
 
+        // SUBSCRIBE owns the socket for its lifetime; it can't share a
+        // simple-query batch with earlier or later statements. Reject
+        // up front so trailing statements aren't silently dropped.
+        if stmts.len() > 1
+            && stmts
+                .iter()
+                .any(|s| matches!(s, StreamingStatement::Subscribe(_)))
+        {
+            return Err(user_error(
+                "0A000",
+                "SUBSCRIBE must be the only statement in a simple query",
+            ));
+        }
+
         let mut out = Vec::with_capacity(stmts.len());
         for stmt in stmts {
             out.push(match stmt {
-                StreamingStatement::Subscribe(s) => subscribe_response(&self.db, *s).await?,
+                StreamingStatement::Subscribe(s) => {
+                    let portal = open_portal_for_subscribe(&self.db, &s).await?;
+                    // Simple query is always text (no Bind result format).
+                    stream_subscribe_flushing(client, portal, true, None).await?;
+                    return Ok(Vec::new());
+                }
                 StreamingStatement::Show(cmd) => {
                     engine_metadata_response(&self.db, &show_sql(&cmd)).await?
                 }
@@ -152,9 +173,126 @@ async fn open_portal_for_subscribe(
         .map_err(|e| user_error("42P01", format!("SUBSCRIBE '{name}': {e}")))
 }
 
-async fn subscribe_response(db: &LaminarDB, s: SubscribeStatement) -> PgWireResult<Response> {
-    let portal = open_portal_for_subscribe(db, &s).await?;
-    Ok(portal_to_response(portal, None))
+/// Stream a SUBSCRIBE, flushing the `Sink` after every batch.
+///
+/// Workaround: pgwire `feed()`s `DataRow`s and only flushes at
+/// end-of-response (never, for an unbounded SUBSCRIBE) or at its ~8 KB
+/// buffer, so a sparse stream stalls. Per-batch flush is unconditional
+/// (fine — batches amortise; not per-row). Retire when pgwire flushes
+/// streaming responses upstream. Both paths need it (psql=simple,
+/// psycopg/JDBC=extended).
+///
+/// `send_row_desc`: simple query carries `RowDescription`; extended
+/// already sent it via `Describe` (caller returns `Response::Execution`
+/// for `CommandComplete`). Returns `Ok(())` only on pump exit.
+async fn stream_subscribe_flushing<C>(
+    client: &mut C,
+    mut portal: SubscriptionPortal,
+    send_row_desc: bool,
+    result_format: Option<&Format>,
+) -> PgWireResult<()>
+where
+    C: Sink<PgWireBackendMessage> + Unpin + Send,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    use futures::SinkExt;
+
+    let schema = portal.schema();
+    // Honour the extended client's per-column binary/text choice; pgwire's
+    // `Describe` advertised it, so the `DataRow` encoding must match.
+    let fields = std::sync::Arc::new(field_infos(&schema, result_format));
+
+    if send_row_desc {
+        // Equivalent to pgwire's crate-private `into_row_description`.
+        let row_desc =
+            pgwire::messages::data::RowDescription::new(fields.iter().map(Into::into).collect());
+        client
+            .feed(PgWireBackendMessage::RowDescription(row_desc))
+            .await?;
+        client.flush().await?;
+    }
+
+    let mut rows: usize = 0;
+    loop {
+        match portal.next_frame().await {
+            Some(PortalFrame::Batch(b)) if b.num_rows() > 0 => {
+                for row in encode_batch(&b, &fields) {
+                    client.feed(PgWireBackendMessage::DataRow(row?)).await?;
+                    rows += 1;
+                }
+                client.flush().await?;
+            }
+            Some(PortalFrame::Batch(_)) => {}
+            // Checkpoint barriers have no Postgres wire representation.
+            Some(PortalFrame::Barrier { .. }) => {}
+            Some(PortalFrame::Lagged(n)) => {
+                return Err(user_error(
+                    "54000",
+                    format!("subscription lagged: skipped {n} messages, terminating"),
+                ));
+            }
+            None => {
+                // Simple query owns the whole response, so emit
+                // CommandComplete here. The extended path lets pgwire
+                // emit it from the returned `Response::Execution`.
+                if send_row_desc {
+                    let tag = Tag::new("SUBSCRIBE").with_rows(rows);
+                    client
+                        .feed(PgWireBackendMessage::CommandComplete(tag.into()))
+                        .await?;
+                    client.flush().await?;
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Wrap a `SubscriptionPortal` in a pgwire `Response::Query` so the
+/// framework can chunk via `Execute(max_rows)` and emit PortalSuspended
+/// automatically. Used by the chunked extended-query path.
+fn subscription_query_response(
+    portal: SubscriptionPortal,
+    result_format: Option<&Format>,
+) -> Response {
+    use futures::stream;
+    let schema = portal.schema();
+    let fields = Arc::new(field_infos(&schema, result_format));
+    struct State {
+        portal: SubscriptionPortal,
+        fields: Arc<Vec<FieldInfo>>,
+        pending: VecDeque<PgWireResult<pgwire::messages::data::DataRow>>,
+    }
+    let init = State {
+        portal,
+        fields: Arc::clone(&fields),
+        pending: VecDeque::new(),
+    };
+    let row_stream = stream::unfold(init, |mut s| async move {
+        loop {
+            if let Some(row) = s.pending.pop_front() {
+                return Some((row, s));
+            }
+            match s.portal.next_frame().await {
+                None => return None,
+                Some(PortalFrame::Batch(b)) if b.num_rows() > 0 => {
+                    s.pending.extend(encode_batch(&b, &s.fields));
+                }
+                Some(PortalFrame::Batch(_)) | Some(PortalFrame::Barrier { .. }) => {}
+                Some(PortalFrame::Lagged(n)) => {
+                    let err = user_error(
+                        "54000",
+                        format!("subscription lagged: skipped {n} messages, terminating"),
+                    );
+                    return Some((Err(err), s));
+                }
+            }
+        }
+    });
+    let mut resp = QueryResponse::new(fields, row_stream);
+    resp.set_command_tag("SUBSCRIBE");
+    Response::Query(resp)
 }
 
 /// State that shares the cursor's lifetime: the portal, the leftover-row
@@ -559,67 +697,6 @@ fn record_batch_response(batch: arrow_array::RecordBatch) -> Response {
 
     let row_stream = stream::iter(rows);
     Response::Query(QueryResponse::new(fields, row_stream))
-}
-
-/// Stream a `SubscriptionPortal`'s frames as a pgwire `Response::Query`.
-///
-/// `result_format` is `None` on the SimpleQuery path (text always) and
-/// `Some(format)` on the extended-query path, where the `Bind` message
-/// supplies per-column format codes. Binary-encoded fields use
-/// `postgres-types` `ToSql` impls dispatched per Arrow type.
-fn portal_to_response(portal: SubscriptionPortal, result_format: Option<Format>) -> Response {
-    let fields = Arc::new(field_infos(&portal.schema(), result_format.as_ref()));
-
-    // Each batch is converted to a Vec<DataRow> in one shot when received,
-    // so formatters are built once per batch rather than per cell. Then we
-    // drain the row vec before reading the next frame.
-    let row_stream = stream::unfold(
-        (
-            portal,
-            Vec::<PgWireResult<pgwire::messages::data::DataRow>>::new(),
-            0usize,
-            Arc::clone(&fields),
-        ),
-        move |(mut portal, mut rows, mut idx, fields)| async move {
-            loop {
-                if idx < rows.len() {
-                    let row = std::mem::replace(&mut rows[idx], Ok(empty_row(&fields)));
-                    idx += 1;
-                    return Some((row, (portal, rows, idx, fields)));
-                }
-                rows.clear();
-                idx = 0;
-                match portal.next_frame().await? {
-                    PortalFrame::Batch(b) if b.num_rows() > 0 => {
-                        rows = encode_batch(&b, &fields);
-                    }
-                    PortalFrame::Batch(_) => {}
-                    // Barriers are dropped: PG has no out-of-band marker
-                    // for checkpoint epochs on either protocol path. Reads
-                    // are at-most-once-after-epoch via `AS OF EPOCH n`.
-                    PortalFrame::Barrier {
-                        epoch,
-                        checkpoint_id,
-                    } => {
-                        tracing::trace!(epoch, checkpoint_id, "pgwire SUBSCRIBE: dropping barrier")
-                    }
-                    // Lag → typed error so the disconnect isn't silent.
-                    PortalFrame::Lagged(n) => {
-                        let err = user_error(
-                            "54000",
-                            format!("subscription lagged: skipped {n} messages, terminating"),
-                        );
-                        return Some((Err(err), (portal, rows, idx, fields)));
-                    }
-                }
-            }
-        },
-    );
-    Response::Query(QueryResponse::new(fields, row_stream))
-}
-
-fn empty_row(fields: &Arc<Vec<FieldInfo>>) -> pgwire::messages::data::DataRow {
-    DataRowEncoder::new(Arc::clone(fields)).take_row()
 }
 
 /// Strict-PG FETCH: blocks until `target` rows are produced, the pump exits,
@@ -1100,9 +1177,9 @@ impl ExtendedQueryHandler for LaminarPgwireHandler {
 
     async fn do_query<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         portal: &Portal<Self::Statement>,
-        _max_rows: usize,
+        max_rows: usize,
     ) -> PgWireResult<Response>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -1126,10 +1203,26 @@ impl ExtendedQueryHandler for LaminarPgwireHandler {
                     .open_subscription(name, filter_sql.as_deref(), start)
                     .await
                     .map_err(|e| user_error("42P01", format!("SUBSCRIBE '{name}': {e}")))?;
-                Ok(portal_to_response(
-                    sub,
-                    Some(portal.result_column_format.clone()),
-                ))
+                if max_rows == 0 {
+                    // Unbounded fetch — pgwire would buffer infinitely.
+                    // Drive the stream ourselves with per-batch flushing.
+                    stream_subscribe_flushing(
+                        client,
+                        sub,
+                        false,
+                        Some(&portal.result_column_format),
+                    )
+                    .await?;
+                    Ok(Response::Execution(Tag::new("SUBSCRIBE")))
+                } else {
+                    // Chunked (JDBC setFetchSize / tokio-postgres query_portal).
+                    // Hand pgwire a row stream so it honours max_rows and
+                    // emits PortalSuspended automatically.
+                    Ok(subscription_query_response(
+                        sub,
+                        Some(&portal.result_column_format),
+                    ))
+                }
             }
             LaminarStmt::Show(cmd) => engine_metadata_response(&self.db, &show_sql(cmd)).await,
             LaminarStmt::Standard(s) => standard_response(&self.db, *s.clone()),

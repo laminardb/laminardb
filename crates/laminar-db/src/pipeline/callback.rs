@@ -94,6 +94,10 @@ pub trait PipelineCallback: Send + 'static {
     /// Get the current pipeline watermark.
     fn current_watermark(&self) -> i64;
 
+    /// Per drain cycle: demote sources idle past their timeout so a quiet
+    /// input doesn't hold back the combined watermark. Default: no-op.
+    fn tick_idle_watermark(&mut self) {}
+
     /// Perform a periodic (timer-based) checkpoint. At-least-once semantics.
     /// For exactly-once, use [`checkpoint_with_barrier`].
     ///

@@ -2849,6 +2849,154 @@ async fn test_programmatic_watermark_filters_late_rows() {
     assert_eq!(late_rows, 0, "late data behind watermark should be dropped");
 }
 
+/// End-to-end: a non-windowed `EMIT CHANGES` view with a `now()`
+/// temporal predicate emits a `+1` when the watermark frontier admits a
+/// row and a `-1` when it ages out.
+#[tokio::test]
+async fn test_retracting_temporal_filter_emits_insert_then_retract() {
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE events (id BIGINT, ts TIMESTAMP)")
+        .await
+        .unwrap();
+    db.execute(
+        "CREATE STREAM recent AS SELECT * FROM events \
+         WHERE ts > now() - INTERVAL '10' SECOND EMIT CHANGES",
+    )
+    .await
+    .unwrap();
+
+    let mut sub = db.catalog.get_stream_subscription("recent").unwrap();
+    let handle = db.source_untyped("events").unwrap();
+    handle.set_event_time_column("ts");
+    db.start().await.unwrap();
+
+    let schema = handle.schema().clone();
+
+    // `(weight, ts_ms)` for one changelog batch.
+    let rows = |b: &RecordBatch| -> Vec<(i64, i64)> {
+        let w = b
+            .column(b.schema().index_of("__weight").unwrap())
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        let ts = b
+            .column(b.schema().index_of("ts").unwrap())
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .unwrap();
+        (0..b.num_rows())
+            .map(|r| (w.value(r), ts.value(r) / 1000))
+            .collect()
+    };
+    macro_rules! drain {
+        () => {{
+            let mut out = Vec::new();
+            for _ in 0..256 {
+                match sub.poll() {
+                    Some(b) => out.extend(rows(&b)),
+                    None => break,
+                }
+            }
+            out
+        }};
+    }
+
+    // Phase 1: row ts=5000ms is a member while frontier < 15000ms
+    // (exit = 5000 - (-10000)). External watermark 8000 < 15000 ⇒ +1.
+    handle.push_arrow(make_ts_batch(&schema, &[5000])).unwrap();
+    handle.watermark(8000);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(drain!(), vec![(1, 5000)], "row admitted ⇒ +1");
+
+    // Phase 2: advance the frontier to 20000ms (≥ 15000) — the ts=5000
+    // row ages out. A fresh ts=18000 row (not late vs the prior 8000
+    // frontier) carries the drain cycle and is itself a new member.
+    handle.watermark(20_000);
+    handle
+        .push_arrow(make_ts_batch(&schema, &[18_000]))
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let mut got = drain!();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        vec![(-1, 5000), (1, 18_000)],
+        "aged-out row retracts (-1) while the fresh row inserts (+1)"
+    );
+}
+
+/// The production path: a `WATERMARK FOR ts` stream where the frontier
+/// advances purely from event-time data (no manual watermark calls). A
+/// later event ages out an earlier one. (A *fully silent* source does
+/// not advance event time and so does not retract — correct event-time
+/// semantics, identical to windowed operators; not exercised here
+/// because it is, by definition, the absence of behaviour.)
+#[tokio::test]
+async fn test_retracting_temporal_filter_event_time_driven() {
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE events (id BIGINT, ts TIMESTAMP, WATERMARK FOR ts)")
+        .await
+        .unwrap();
+    db.execute(
+        "CREATE STREAM recent AS SELECT * FROM events \
+         WHERE ts > now() - INTERVAL '10' SECOND EMIT CHANGES",
+    )
+    .await
+    .unwrap();
+
+    let mut sub = db.catalog.get_stream_subscription("recent").unwrap();
+    db.start().await.unwrap();
+    let handle = db.source_untyped("events").unwrap();
+    let schema = handle.schema().clone();
+
+    let rows = |b: &RecordBatch| -> Vec<(i64, i64)> {
+        let w = b
+            .column(b.schema().index_of("__weight").unwrap())
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        let ts = b
+            .column(b.schema().index_of("ts").unwrap())
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .unwrap();
+        (0..b.num_rows())
+            .map(|r| (w.value(r), ts.value(r) / 1000))
+            .collect()
+    };
+    macro_rules! drain {
+        () => {{
+            let mut out = Vec::new();
+            for _ in 0..256 {
+                match sub.poll() {
+                    Some(b) => out.extend(rows(&b)),
+                    None => break,
+                }
+            }
+            out
+        }};
+    }
+
+    // ts=5000 is a member while frontier < 15000ms; the watermark comes
+    // only from event time (zero-delay WATERMARK FOR ts), no manual calls.
+    handle.push_arrow(make_ts_batch(&schema, &[5000])).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(drain!(), vec![(1, 5000)], "first event admitted ⇒ +1");
+
+    // A much later event advances event time past ts=5000's exit (15000).
+    handle
+        .push_arrow(make_ts_batch(&schema, &[30_000]))
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let mut got = drain!();
+    got.sort_unstable();
+    assert_eq!(
+        got,
+        vec![(-1, 5000), (1, 30_000)],
+        "later event ages out the earlier one purely via event time"
+    );
+}
+
 #[tokio::test]
 async fn test_sql_watermark_for_col_filters_late_rows() {
     // Source with WATERMARK FOR ts (no AS expr), should use zero delay.

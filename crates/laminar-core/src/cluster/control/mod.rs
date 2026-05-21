@@ -3,7 +3,6 @@
 
 pub mod barrier;
 pub mod controller;
-pub mod decision;
 pub mod leader;
 pub mod snapshot;
 
@@ -12,7 +11,11 @@ pub use barrier::{
     QuorumOutcome, ACK_KEY, ANNOUNCEMENT_KEY,
 };
 pub use controller::ClusterController;
-pub use decision::{CheckpointDecisionStore, DecisionError};
+// Re-exported from `crate::checkpoint_decision` (lives outside the
+// cluster gate because single-instance also relies on it for crash-safe
+// 2PC). Callers that already qualify with `cluster::control::…` keep
+// working.
+pub use crate::checkpoint_decision::{CheckpointDecisionStore, DecisionError};
 pub use leader::leader_of;
 pub use snapshot::{AssignmentSnapshot, AssignmentSnapshotStore, RotateOutcome, SnapshotError};
 

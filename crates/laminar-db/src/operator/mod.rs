@@ -9,33 +9,115 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion::prelude::SessionContext;
 
-use datafusion_expr::LogicalPlan;
-
 use crate::error::DbError;
 use crate::sql_analysis::{extract_projection_exprs, CompiledPostProjection};
 
-/// Physical plan is rebuilt per call because sub-query `MemTable` leaves
-/// have different data each time.
-pub(crate) async fn execute_logical_plan(
+/// Execute a pre-built physical plan. The plan's source leaves are
+/// `LiveSourceExec` (registered once at startup), so re-executing reads
+/// fresh per-cycle data without re-running the analyzer/optimizer/physical
+/// planner. All EOWC and multi-source operator paths go through this.
+pub(crate) async fn execute_cached_physical(
     ctx: &SessionContext,
     op_name: &str,
-    plan: &LogicalPlan,
+    physical: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
 ) -> Result<Vec<RecordBatch>, DbError> {
-    let physical = ctx
-        .state()
-        .create_physical_plan(plan)
-        .await
-        .map_err(|e| DbError::query_pipeline(op_name, &e))?;
     let task_ctx = ctx.task_ctx();
-    datafusion::physical_plan::collect(physical, task_ctx)
+    datafusion::physical_plan::collect(Arc::clone(physical), task_ctx)
         .await
         .map_err(|e| DbError::query_pipeline(op_name, &e))
+}
+
+/// Pre-built physical plan whose only source leaf is a
+/// `LiveSourceProvider` — callers swap fresh batches in via the handle
+/// and re-execute without re-planning. Underpins HAVING-SQL fallback
+/// (see [`HavingSqlCache`]) and raw-EOWC close-cycle execution.
+pub(crate) struct LiveSqlCache {
+    handle: laminar_sql::datafusion::LiveSourceHandle,
+    physical: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+}
+
+impl LiveSqlCache {
+    /// Register a `LiveSourceProvider` under `table_name`, plan `sql`
+    /// against it, and cache the physical plan. `what` is used in error
+    /// messages to identify the caller (`"HAVING"`, `"raw EOWC"`, ...).
+    pub(crate) async fn build(
+        ctx: &SessionContext,
+        table_name: &str,
+        schema: SchemaRef,
+        sql: &str,
+        what: &str,
+    ) -> Result<Self, DbError> {
+        use laminar_sql::datafusion::LiveSourceProvider;
+        let provider = Arc::new(LiveSourceProvider::new(schema));
+        let handle = provider.handle();
+        let _ = ctx.deregister_table(table_name);
+        ctx.register_table(table_name, provider)
+            .map_err(|e| DbError::Pipeline(format!("{what} register_table: {e}")))?;
+        let logical = ctx
+            .sql(sql)
+            .await
+            .map_err(|e| DbError::Pipeline(format!("{what} plan: {e}")))?
+            .logical_plan()
+            .clone();
+        let physical = ctx
+            .state()
+            .create_physical_plan(&logical)
+            .await
+            .map_err(|e| DbError::Pipeline(format!("{what} physical: {e}")))?;
+        Ok(Self { handle, physical })
+    }
+
+    pub(crate) async fn apply(
+        &self,
+        ctx: &SessionContext,
+        op_name: &str,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        self.handle.swap(batches);
+        execute_cached_physical(ctx, op_name, &self.physical).await
+    }
+}
+
+/// HAVING-SQL fallback: a [`LiveSqlCache`] over `SELECT cols FROM
+/// table WHERE having_sql`. Used by both `EowcQueryOperator` and
+/// `SqlQueryOperator` when the HAVING predicate can't compile to a
+/// `PhysicalExpr`.
+pub(crate) struct HavingSqlCache(LiveSqlCache);
+
+impl HavingSqlCache {
+    pub(crate) async fn build(
+        ctx: &SessionContext,
+        table_name: &str,
+        schema: SchemaRef,
+        having_sql: &str,
+    ) -> Result<Self, DbError> {
+        let col_list = schema
+            .fields()
+            .iter()
+            .map(|f| format!("\"{}\"", f.name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {col_list} FROM \"{table_name}\" WHERE {having_sql}");
+        LiveSqlCache::build(ctx, table_name, schema, &sql, "HAVING")
+            .await
+            .map(Self)
+    }
+
+    pub(crate) async fn apply(
+        &self,
+        ctx: &SessionContext,
+        op_name: &str,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        self.0.apply(ctx, op_name, batches).await
+    }
 }
 
 pub(crate) mod asof_join;
 pub(crate) mod eowc_query;
 pub(crate) mod interval_join;
 pub(crate) mod sql_query;
+pub(crate) mod temporal_filter;
 pub(crate) mod temporal_join;
 pub(crate) mod temporal_probe_join;
 

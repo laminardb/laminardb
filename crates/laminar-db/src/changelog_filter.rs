@@ -4,6 +4,7 @@
 //! events. Non-CDC batches (no `_op` column) pass through unchanged.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use arrow::array::{BooleanArray, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
@@ -61,6 +62,11 @@ pub(crate) fn filter_positive_events(batch: &RecordBatch) -> Result<RecordBatch,
 
 /// For non-changelog sinks, drop rows with non-positive `__weight` and strip
 /// the column. Otherwise the input is borrowed unchanged.
+///
+/// Fail-closed: any error on the filter/strip path returns an empty batch
+/// with `__weight` removed rather than leaking negative weights or an
+/// unexpected column into an append-only sink (which would either corrupt
+/// the table or break its schema).
 pub(crate) fn prepare_for_sink(batch: &RecordBatch, changelog_sink: bool) -> Cow<'_, RecordBatch> {
     if changelog_sink {
         return Cow::Borrowed(batch);
@@ -71,24 +77,49 @@ pub(crate) fn prepare_for_sink(batch: &RecordBatch, changelog_sink: bool) -> Cow
     else {
         return Cow::Borrowed(batch);
     };
+    // Schema with `__weight` removed — the only safe fallback for an
+    // append-only sink when we can't filter properly.
+    let stripped_schema = {
+        let fields: Vec<_> = batch
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != idx)
+            .map(|(_, f)| f.as_ref().clone())
+            .collect();
+        Arc::new(arrow::datatypes::Schema::new(fields))
+    };
+    let empty = || Cow::Owned(RecordBatch::new_empty(Arc::clone(&stripped_schema)));
+
     let Some(weights) = batch
         .column(idx)
         .as_any()
         .downcast_ref::<arrow::array::Int64Array>()
     else {
-        return Cow::Borrowed(batch);
+        tracing::error!(
+            "prepare_for_sink: __weight column is not Int64; dropping batch \
+             to avoid leaking it to an append-only sink"
+        );
+        return empty();
     };
     // Keep only rows with positive weight.
     let mask: BooleanArray = weights.iter().map(|w| Some(w.unwrap_or(0) > 0)).collect();
     let Ok(filtered) = arrow::compute::filter_record_batch(batch, &mask) else {
-        return Cow::Borrowed(batch);
+        tracing::error!("prepare_for_sink: filter_record_batch failed; dropping batch");
+        return empty();
     };
     // Strip the __weight column.
     if filtered.num_columns() == 0 {
         return Cow::Owned(filtered);
     }
     let indices: Vec<usize> = (0..filtered.num_columns()).filter(|&i| i != idx).collect();
-    Cow::Owned(filtered.project(&indices).unwrap_or(filtered))
+    if let Ok(projected) = filtered.project(&indices) {
+        Cow::Owned(projected)
+    } else {
+        tracing::error!("prepare_for_sink: failed to strip __weight; dropping batch");
+        empty()
+    }
 }
 
 #[cfg(test)]

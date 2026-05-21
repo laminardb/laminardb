@@ -4775,7 +4775,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-connectors"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "arrow-array",
  "arrow-avro",
@@ -4844,7 +4844,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-core"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -4881,7 +4881,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-db"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -4925,7 +4925,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-derive"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "arrow",
  "laminar-connectors",
@@ -4937,7 +4937,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-server"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "anyhow",
  "arrow-array",
@@ -4990,7 +4990,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-sql"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5015,7 +5015,7 @@ dependencies = [
 
 [[package]]
 name = "laminar-storage"
-version = "0.22.0"
+version = "0.23.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6290,10 +6290,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "pg_interval_2"
-version = "0.5.2"
+name = "pg_interval"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a055f44628dcf9c4e68f931535dabd3544a239655fdde25a3b0e95d4b36e9260"
+checksum = "c386dd54fce258fc04e668126ae68589a0d92e03a90ea67881d1300f70fd6170"
 dependencies = [
  "bytes",
  "chrono",
@@ -6316,9 +6316,9 @@ dependencies = [
 
 [[package]]
 name = "pgwire"
-version = "0.39.0"
+version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3cee243b682091188b90f22b07585ad6b43e699b52bc29422bd9ca6ce2c2deb"
+checksum = "c764131468c2049ee0d9324e1f465d45f9b16d54797cb75d401a60a39429dfa9"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -6330,7 +6330,7 @@ dependencies = [
  "hex",
  "lazy-regex",
  "md5",
- "pg_interval_2",
+ "pg_interval",
  "postgres-types",
  "rand 0.10.0",
  "rust_decimal",

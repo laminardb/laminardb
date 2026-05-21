@@ -928,6 +928,43 @@ impl OperatorGraph {
             ));
         }
 
+        // Non-windowed `now()` is only valid as the recognised retracting
+        // temporal-filter shape under EMIT CHANGES; anything else gets a
+        // typed LDB-1001 rejection rather than a silently frozen plan-time
+        // `now()`. Windowed queries keep the existing path.
+        if window_config.is_none() {
+            use crate::sql_analysis::TemporalFilterAnalysis as Tfa;
+            match crate::sql_analysis::analyze_temporal_filter(sql) {
+                Tfa::NotPresent => {}
+                Tfa::Recognized(cfg) => {
+                    let emit_changes =
+                        emit_clause.is_some_and(|ec| matches!(ec, EmitClause::Changes));
+                    if emit_changes {
+                        return Box::new(operator::temporal_filter::TemporalFilterOperator::new(
+                            name,
+                            sql,
+                            *cfg,
+                            self.prom.clone(),
+                        ));
+                    }
+                    return Box::new(operator::temporal_filter::RejectingOperator::new(
+                        "[LDB-1001] a retracting temporal filter (time_col vs \
+                         now() ± INTERVAL) must be declared `EMIT CHANGES`; \
+                         append-only / EMIT ON WINDOW CLOSE / text SUBSCRIBE \
+                         consumers cannot consume retractions",
+                    ));
+                }
+                Tfa::PresentUnrecognized => {
+                    return Box::new(operator::temporal_filter::RejectingOperator::new(
+                        "[LDB-1001] now()/current_timestamp() in a non-windowed \
+                         query is only supported as a retracting temporal filter \
+                         `SELECT * FROM <src> WHERE time_col {>|>=|<|<=} now() ± \
+                         INTERVAL` (or BETWEEN) declared `EMIT CHANGES`",
+                    ));
+                }
+            }
+        }
+
         let is_eowc = emit_clause
             .is_some_and(|ec| matches!(ec, EmitClause::OnWindowClose | EmitClause::Final));
 
@@ -1721,6 +1758,74 @@ mod tests {
         // No state yet → None
         let cp = graph.snapshot_state().unwrap();
         assert!(cp.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_temporal_filter_checkpoint_restore_through_graph() {
+        use laminar_sql::parser::EmitClause;
+        // test_batch(): ts is Int64 epoch-ms — AAPL@1000, GOOG@2000.
+        let sql = "SELECT * FROM trades WHERE ts > now() - INTERVAL '10' SECOND";
+        let mut g1 = test_graph();
+        g1.add_query(
+            "recent".into(),
+            sql.into(),
+            Some(EmitClause::Changes),
+            None,
+            None,
+            None,
+            None,
+        );
+        let mut src = FxHashMap::default();
+        src.insert(Arc::from("trades"), vec![test_batch()]);
+        // Frontier 5000ms: both rows are members (exit 11000/12000) ⇒ +1,+1.
+        let r = g1.execute_cycle(&src, 5_000, None).await.unwrap();
+        assert_eq!(total_rows(&r, "recent"), 2);
+
+        // Snapshot + restore through the real GraphCheckpoint/rkyv path.
+        let cp = g1.snapshot_state().unwrap().expect("buffered state");
+        let bytes = OperatorGraph::serialize_checkpoint(&cp).unwrap();
+        let mut g2 = test_graph();
+        g2.add_query(
+            "recent".into(),
+            sql.into(),
+            Some(EmitClause::Changes),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(g2.restore_from_bytes(&bytes).unwrap(), 1);
+
+        // Advancing to 11000ms ages out AAPL@1000 (exit 11000, strict `>`)
+        // but not GOOG@2000 (exit 12000): exactly one -1, nothing lost.
+        let empty = FxHashMap::default();
+        let r = g2.execute_cycle(&empty, 11_000, None).await.unwrap();
+        let batches = r.get("recent").expect("recent output");
+        let mut wts = Vec::new();
+        for b in batches {
+            let w = b
+                .column(b.schema().index_of("__weight").unwrap())
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let ts = b
+                .column(b.schema().index_of("ts").unwrap())
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                wts.push((w.value(i), ts.value(i)));
+            }
+        }
+        assert_eq!(
+            wts,
+            vec![(-1, 1000)],
+            "only AAPL@1000 ages out post-restore"
+        );
+
+        // Re-advancing to the same frontier must not double-retract.
+        let r = g2.execute_cycle(&empty, 11_000, None).await.unwrap();
+        assert_eq!(total_rows(&r, "recent"), 0);
     }
 
     /// Helper: total row count from result batches.

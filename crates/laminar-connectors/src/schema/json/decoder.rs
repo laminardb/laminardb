@@ -59,6 +59,48 @@ impl TypeMismatchStrategy {
     }
 }
 
+/// Epoch unit for *numeric* JSON timestamps feeding a `Timestamp` column
+/// (strings still go through `timestamp_formats`). Default `Millis`
+/// preserves historical behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EpochUnit {
+    /// Epoch seconds.
+    Seconds,
+    /// Epoch milliseconds (default).
+    #[default]
+    Millis,
+    /// Epoch microseconds.
+    Micros,
+    /// Epoch nanoseconds.
+    Nanos,
+}
+
+impl EpochUnit {
+    /// Parse a `json.column.<col>.epoch_unit` value. Accepts the bare
+    /// unit and the `epoch_*` spelling the WebSocket connector's
+    /// `event.time.format` already uses.
+    #[must_use]
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "seconds" | "epoch_seconds" => Some(Self::Seconds),
+            "millis" | "epoch_millis" => Some(Self::Millis),
+            "micros" | "epoch_micros" => Some(Self::Micros),
+            "nanos" | "epoch_nanos" => Some(Self::Nanos),
+            _ => None,
+        }
+    }
+
+    /// Nanoseconds per one unit (used for lossless scaling).
+    const fn nanos_per(self) -> i64 {
+        match self {
+            Self::Seconds => 1_000_000_000,
+            Self::Millis => 1_000_000,
+            Self::Micros => 1_000,
+            Self::Nanos => 1,
+        }
+    }
+}
+
 /// Per-column extraction strategy, pre-computed at Ring 2.
 #[derive(Debug, Clone)]
 enum ColumnExtraction {
@@ -97,6 +139,10 @@ pub struct JsonDecoderConfig {
     /// These paths are absolute from the root, ignoring `json_path`.
     pub json_column_paths: HashMap<String, Vec<String>>,
 
+    /// Per-column numeric-timestamp epoch unit, from
+    /// `json.column.<name>.epoch_unit`. Absent ⇒ [`EpochUnit::Millis`].
+    pub numeric_timestamp_units: HashMap<String, EpochUnit>,
+
     /// Column names for array-to-rows expansion.
     /// When set, the target (after `json_path`) must be an array.
     /// Each element becomes a row; positional names map array elements to columns.
@@ -118,6 +164,7 @@ impl Default for JsonDecoderConfig {
             nested_as_jsonb: false,
             json_path: None,
             json_column_paths: HashMap::new(),
+            numeric_timestamp_units: HashMap::new(),
             json_explode: None,
         }
     }
@@ -138,11 +185,26 @@ impl JsonDecoderConfig {
         }
 
         let col_props = config.properties_with_prefix("json.column.");
-        for (col_name, path_str) in col_props {
-            cfg.json_column_paths.insert(
-                col_name,
-                path_str.split('.').map(ToString::to_string).collect(),
-            );
+        for (col_name, val) in col_props {
+            // `json.column.<col>.epoch_unit = '<unit>'` configures numeric
+            // timestamp scaling for <col>; everything else is a path.
+            // (Column names are SQL identifiers — no dots — so the suffix
+            // split is unambiguous against dotted path *values*.)
+            if let Some(col) = col_name.strip_suffix(".epoch_unit") {
+                if let Some(unit) = EpochUnit::from_str_opt(&val) {
+                    cfg.numeric_timestamp_units.insert(col.to_string(), unit);
+                } else {
+                    tracing::warn!(
+                        column = col,
+                        value = %val,
+                        "invalid json.column.<col>.epoch_unit (expected \
+                         seconds|millis|micros|nanos); using millis"
+                    );
+                }
+                continue;
+            }
+            cfg.json_column_paths
+                .insert(col_name, val.split('.').map(ToString::to_string).collect());
         }
 
         if let Some(explode) = config.get("json.explode") {
@@ -178,6 +240,9 @@ pub struct JsonDecoder {
     mismatch_count: AtomicU64,
     /// Ring 2 pre-computed: extraction strategy per schema column.
     column_extractions: Vec<ColumnExtraction>,
+    /// Ring 2 pre-computed: numeric epoch unit per schema column
+    /// (aligned to `schema.fields()`; default [`EpochUnit::Millis`]).
+    column_epoch_units: Vec<EpochUnit>,
     /// Ring 2 pre-computed: explode position → schema column index.
     /// `Some` when `json.explode` is configured; each entry maps an
     /// explode position to the schema column index (or `None` if
@@ -231,6 +296,18 @@ impl JsonDecoder {
             })
             .collect();
 
+        let column_epoch_units: Vec<EpochUnit> = schema
+            .fields()
+            .iter()
+            .map(|f| {
+                config
+                    .numeric_timestamp_units
+                    .get(f.name().as_str())
+                    .copied()
+                    .unwrap_or_default()
+            })
+            .collect();
+
         let explode_col_indices = config.json_explode.as_ref().map(|names| {
             names
                 .iter()
@@ -249,6 +326,7 @@ impl JsonDecoder {
             field_indices,
             mismatch_count: AtomicU64::new(0),
             column_extractions,
+            column_epoch_units,
             explode_col_indices,
         }
     }
@@ -331,6 +409,7 @@ impl FormatDecoder for JsonDecoder {
                                         &self.config,
                                         &self.mismatch_count,
                                         jsonb_encoder.as_mut(),
+                                        self.column_epoch_units[*col_idx],
                                     )?;
                                     populated[*col_idx] = true;
                                 }
@@ -347,6 +426,7 @@ impl FormatDecoder for JsonDecoder {
                                         &self.config,
                                         &self.mismatch_count,
                                         jsonb_encoder.as_mut(),
+                                        self.column_epoch_units[col_idx],
                                     )?;
                                     populated[col_idx] = true;
                                 }
@@ -399,6 +479,7 @@ impl FormatDecoder for JsonDecoder {
                                     &self.config,
                                     &self.mismatch_count,
                                     jsonb_encoder.as_mut(),
+                                    self.column_epoch_units[col_idx],
                                 )?;
                             }
                         }
@@ -415,6 +496,7 @@ impl FormatDecoder for JsonDecoder {
                                     &self.config,
                                     &self.mismatch_count,
                                     jsonb_encoder.as_mut(),
+                                    self.column_epoch_units[col_idx],
                                 )?;
                             }
                         }
@@ -655,6 +737,7 @@ fn append_value(
     config: &JsonDecoderConfig,
     mismatch_count: &AtomicU64,
     jsonb_encoder: Option<&mut JsonbEncoder>,
+    numeric_ts_unit: EpochUnit,
 ) -> SchemaResult<()> {
     if value.is_null() {
         builder.append_null_value();
@@ -779,10 +862,12 @@ fn append_value(
                 b.append_value(&bytes);
             }
         }
-        DataType::Timestamp(unit, _) => match extract_timestamp(value, config, *unit) {
-            Ok(ts) => append_timestamp(builder, *unit, ts),
-            Err(e) => handle_mismatch(builder, config, mismatch_count, &e)?,
-        },
+        DataType::Timestamp(unit, _) => {
+            match extract_timestamp(value, config, *unit, numeric_ts_unit) {
+                Ok(ts) => append_timestamp(builder, *unit, ts),
+                Err(e) => handle_mismatch(builder, config, mismatch_count, &e)?,
+            }
+        }
         // Unsupported types: serialize as JSON string.
         _ => {
             let b = builder
@@ -1059,32 +1144,35 @@ fn extract_u64(value: &serde_json::Value, config: &JsonDecoderConfig) -> Result<
 
 /// Extracts a timestamp value as an i64 in the specified [`TimeUnit`].
 ///
-/// For numeric JSON values, treats them as epoch milliseconds and converts.
-/// For string values, tries the configured timestamp format patterns.
+/// For numeric JSON values, scales from `from` (the column's configured
+/// [`EpochUnit`], default millis) to the target Arrow `TimeUnit`. For
+/// string values, tries the configured timestamp format patterns (the
+/// `from` unit does not apply — strings carry their own resolution).
 fn extract_timestamp(
     value: &serde_json::Value,
     config: &JsonDecoderConfig,
     unit: TimeUnit,
+    from: EpochUnit,
 ) -> Result<i64, String> {
-    // Numeric values: treat as epoch milliseconds.
+    // Numeric values: scale from the configured epoch unit.
     if let Some(n) = value.as_i64() {
-        return checked_millis_to_unit(n, unit);
+        return checked_epoch_to_unit(n, from, unit);
     }
     if let Some(f) = value.as_f64() {
         // 2^63 == i64::MAX + 1; exclusive upper bound for a lossless f64->i64.
         const POW2_63: f64 = 9_223_372_036_854_775_808.0;
         // `f as i64` saturates (NaN -> 0, +-huge -> i64::MIN/MAX), silently
         // turning a garbage timestamp into a valid-looking one that poisons
-        // event-time/watermarks. Round to the nearest millisecond and reject
-        // out-of-range/non-finite so the configured type-mismatch strategy
-        // applies, like any other bad value.
+        // event-time/watermarks. Round to the nearest integer in `from`
+        // units and reject out-of-range/non-finite so the configured
+        // type-mismatch strategy applies, like any other bad value.
         let rounded = f.round();
         if !(-POW2_63..POW2_63).contains(&rounded) {
-            return Err(format!("timestamp {f} out of i64 millisecond range"));
+            return Err(format!("timestamp {f} out of i64 range"));
         }
         #[allow(clippy::cast_possible_truncation)] // range-checked; already integral
-        let ms = rounded as i64;
-        return checked_millis_to_unit(ms, unit);
+        let v = rounded as i64;
+        return checked_epoch_to_unit(v, from, unit);
     }
 
     // String values: try configured timestamp formats.
@@ -1107,18 +1195,30 @@ fn extract_timestamp(
     Err(format!("expected timestamp, got {}", json_type_name(value)))
 }
 
-/// Converts epoch milliseconds to the target `TimeUnit`, erroring rather
-/// than wrapping when scaling overflows i64 (Microsecond/Nanosecond).
-fn checked_millis_to_unit(ms: i64, unit: TimeUnit) -> Result<i64, String> {
-    match unit {
-        TimeUnit::Second => Ok(ms / 1_000),
-        TimeUnit::Millisecond => Ok(ms),
-        TimeUnit::Microsecond => ms
-            .checked_mul(1_000)
-            .ok_or_else(|| format!("timestamp {ms} out of i64 microsecond range")),
-        TimeUnit::Nanosecond => ms
-            .checked_mul(1_000_000)
-            .ok_or_else(|| format!("timestamp {ms} out of i64 nanosecond range")),
+/// Scales an integer epoch `value` from `from` units to the target Arrow
+/// `TimeUnit`. Up-scaling (e.g. seconds→nanos) is checked and errors
+/// rather than wrapping on i64 overflow; down-scaling (e.g. nanos→millis)
+/// truncates toward zero, the conventional and expected precision loss.
+///
+/// `from == EpochUnit::Millis` reproduces the historical
+/// `checked_millis_to_unit` behaviour bit-for-bit.
+fn checked_epoch_to_unit(value: i64, from: EpochUnit, to: TimeUnit) -> Result<i64, String> {
+    let from_ns = from.nanos_per();
+    let to_ns = match to {
+        TimeUnit::Second => 1_000_000_000,
+        TimeUnit::Millisecond => 1_000_000,
+        TimeUnit::Microsecond => 1_000,
+        TimeUnit::Nanosecond => 1,
+    };
+    if from_ns >= to_ns {
+        // Exact integer factor (both are powers-of-ten multiples of 1ns).
+        let factor = from_ns / to_ns;
+        value
+            .checked_mul(factor)
+            .ok_or_else(|| format!("timestamp {value} ({from:?}) out of i64 {to:?} range"))
+    } else {
+        let factor = to_ns / from_ns;
+        Ok(value / factor)
     }
 }
 
@@ -1471,10 +1571,7 @@ mod tests {
         let result = decoder.decode_batch(&records);
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("out of i64 millisecond range"));
+        assert!(result.unwrap_err().to_string().contains("out of i64 range"));
     }
 
     #[test]
@@ -1494,7 +1591,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("out of i64 nanosecond range"));
+            .contains("out of i64 Nanosecond range"));
     }
 
     // ── Nested objects as LargeBinary ─────────────────────────
@@ -2013,5 +2110,66 @@ mod tests {
         assert_eq!(batch.num_columns(), 2); // a + _extra
         assert_eq!(batch.schema().field(1).name(), "_extra");
         assert!(!batch.column(1).is_null(0));
+    }
+
+    // ── Per-column numeric epoch unit ─────────────────────────
+
+    #[test]
+    fn from_connector_config_parses_epoch_unit_without_polluting_paths() {
+        use crate::config::ConnectorConfig;
+        let mut props = std::collections::HashMap::new();
+        props.insert("json.column.evt".to_string(), "time_us".to_string());
+        props.insert(
+            "json.column.evt.epoch_unit".to_string(),
+            "micros".to_string(),
+        );
+        let cc = ConnectorConfig::with_properties("websocket", props);
+        let cfg = JsonDecoderConfig::from_connector_config(&cc);
+        assert_eq!(
+            cfg.numeric_timestamp_units.get("evt"),
+            Some(&EpochUnit::Micros)
+        );
+        // The `.epoch_unit` key must NOT become a phantom path column.
+        assert!(cfg.json_column_paths.contains_key("evt"));
+        assert!(!cfg.json_column_paths.contains_key("evt.epoch_unit"));
+    }
+
+    #[test]
+    fn numeric_micros_decodes_into_millis_timestamp_column() {
+        // End-to-end: a numeric microsecond field (Jetstream time_us shape)
+        // mapped to a Timestamp(ms) column lands at a wall-clock-plausible
+        // millisecond value instead of being misread as epoch-millis.
+        let schema = make_schema(vec![(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        )]);
+        let mut units = HashMap::new();
+        units.insert("ts".to_string(), EpochUnit::Micros);
+        let config = JsonDecoderConfig {
+            numeric_timestamp_units: units,
+            ..Default::default()
+        };
+        let decoder = JsonDecoder::with_config(schema, config);
+        // 1_779_019_200_123_456 µs == 1_779_019_200_123 ms (~2026-05-17).
+        let records = vec![json_record(r#"{"ts": 1779019200123456}"#)];
+        let batch = decoder.decode_batch(&records).unwrap();
+        let col = batch
+            .column(0)
+            .as_primitive::<arrow_array::types::TimestampMillisecondType>();
+        assert_eq!(col.value(0), 1_779_019_200_123);
+
+        // Without the override the same number is (legacy) read as millis.
+        let schema2 = make_schema(vec![(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        )]);
+        let d2 = JsonDecoder::new(schema2);
+        let b2 = d2.decode_batch(&records).unwrap();
+        let c2 = b2
+            .column(0)
+            .as_primitive::<arrow_array::types::TimestampMillisecondType>();
+        assert_eq!(c2.value(0), 1_779_019_200_123_456);
     }
 }

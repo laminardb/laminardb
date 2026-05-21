@@ -17,7 +17,6 @@ use arrow::row::{RowConverter, SortField};
 use arrow_array::UInt32Array;
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
-use datafusion_expr::LogicalPlan;
 #[cfg(feature = "cluster-unstable")]
 use laminar_core::shuffle::ShuffleMessage;
 #[cfg(feature = "cluster-unstable")]
@@ -31,8 +30,6 @@ use crate::error::DbError;
 use crate::operator_graph::{try_evaluate_compiled, GraphOperator, OperatorCheckpoint};
 use crate::sql_analysis::{extract_projection_filter, single_source_table};
 
-use super::execute_logical_plan;
-
 /// Internal state for the query operator (lazy initialization).
 enum QueryState {
     /// Not yet initialized -- need to introspect SQL on first call.
@@ -44,10 +41,11 @@ enum QueryState {
     /// Single-source non-compilable -- cached physical plan. `LiveSourceExec`
     /// reads fresh data from swapped handles on each `execute()`.
     CachedPlan(Arc<dyn datafusion::physical_plan::ExecutionPlan>),
-    /// Multi-source (JOIN) -- cached logical plan, physical rebuilt per cycle.
-    /// `HashJoinExec::OnceAsync` freezes the build-side hash table on first
-    /// execution, so reusing the physical plan returns stale lookup data.
-    CachedLogical(Box<LogicalPlan>),
+    /// Multi-source (JOIN) -- cached physical plan with `LiveSourceExec`
+    /// leaves. Each `collect()` re-runs `HashJoinExec::execute()`, which
+    /// creates a fresh `OnceFut<JoinLeftData>` for the build side, so the
+    /// hash table is rebuilt per cycle from the latest live-source data.
+    CachedPhysical(Arc<dyn datafusion::physical_plan::ExecutionPlan>),
 }
 
 /// Row-shuffle config threaded in cluster mode. Pre-aggregate rows are
@@ -85,7 +83,7 @@ pub(crate) struct SqlQueryOperator {
     prom: Option<Arc<EngineMetrics>>,
     pending_restore: Option<AggStateCheckpoint>,
     tier_logged: bool,
-    cached_having_plan: Option<LogicalPlan>,
+    having_cache: Option<super::HavingSqlCache>,
     emit_changelog: bool,
     idle_ttl_ms: Option<u64>,
     #[cfg(feature = "cluster-unstable")]
@@ -109,7 +107,7 @@ impl SqlQueryOperator {
             prom,
             pending_restore: None,
             tier_logged: false,
-            cached_having_plan: None,
+            having_cache: None,
             emit_changelog,
             idle_ttl_ms,
             #[cfg(feature = "cluster-unstable")]
@@ -186,9 +184,17 @@ impl SqlQueryOperator {
             self.log_tier(false);
             self.state = QueryState::CachedPlan(physical);
         } else {
-            // Multi-source (JOIN): cache logical plan, rebuild physical per cycle.
+            // Multi-source (JOIN): bake the physical plan once. Source leaves
+            // are `LiveSourceExec`; each cycle's `collect()` recreates the
+            // HashJoinExec build side from fresh data.
+            let physical = self
+                .ctx
+                .state()
+                .create_physical_plan(&plan)
+                .await
+                .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
             self.log_tier(false);
-            self.state = QueryState::CachedLogical(Box::new(plan));
+            self.state = QueryState::CachedPhysical(physical);
         }
         Ok(())
     }
@@ -301,9 +307,8 @@ impl SqlQueryOperator {
                         error = %e,
                         "Compiled pre-agg projection failed, falling back to cached plan"
                     );
-                    if let Some(plan) = agg_state.cached_pre_agg_plan() {
-                        let plan = plan.clone();
-                        execute_logical_plan(&self.ctx, &self.op_name, &plan).await?
+                    if let Some(physical) = agg_state.cached_pre_agg_physical() {
+                        super::execute_cached_physical(&self.ctx, &self.op_name, physical).await?
                     } else {
                         return Err(DbError::Pipeline(format!(
                             "[LDB-8051] query '{}': compiled pre-agg failed and no cached plan: {e}",
@@ -312,9 +317,8 @@ impl SqlQueryOperator {
                     }
                 }
             }
-        } else if let Some(plan) = agg_state.cached_pre_agg_plan() {
-            let plan = plan.clone();
-            execute_logical_plan(&self.ctx, &self.op_name, &plan).await?
+        } else if let Some(physical) = agg_state.cached_pre_agg_physical() {
+            super::execute_cached_physical(&self.ctx, &self.op_name, physical).await?
         } else {
             return Err(DbError::Pipeline(format!(
                 "[LDB-8050] query '{}': no compiled projection or cached plan",
@@ -388,9 +392,9 @@ impl SqlQueryOperator {
         }
     }
 
-    /// Apply a HAVING predicate via SQL. Caches the `LogicalPlan` on first call
-    /// (saves SQL parsing + logical optimization), but physical plan is rebuilt
-    /// per call because the `MemTable` leaf has different data each time.
+    /// Apply a HAVING predicate via SQL. First call builds a
+    /// `LiveSourceProvider`-backed cache; subsequent calls swap batches into
+    /// the handle and re-run the cached physical plan.
     async fn apply_having_sql(
         &mut self,
         batches: &[RecordBatch],
@@ -399,48 +403,27 @@ impl SqlQueryOperator {
         if batches.is_empty() {
             return Ok(Vec::new());
         }
-
-        let schema = batches[0].schema();
-        let table_name = format!("__having_{}", self.op_name);
-
-        let mem_table =
-            datafusion::datasource::MemTable::try_new(schema.clone(), vec![batches.to_vec()])
-                .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
-        let _ = self.ctx.deregister_table(&table_name);
-        self.ctx
-            .register_table(&table_name, Arc::new(mem_table))
-            .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))?;
-
-        let result = if let Some(ref plan) = self.cached_having_plan {
-            execute_logical_plan(&self.ctx, &self.op_name, plan).await
-        } else {
-            let col_list: Vec<String> = schema
-                .fields()
-                .iter()
-                .map(|f| format!("\"{}\"", f.name()))
-                .collect();
-            let filter_sql = format!(
-                "SELECT {} FROM \"{}\" WHERE {having_sql}",
-                col_list.join(", "),
-                table_name,
-            );
+        if self.having_cache.is_none() {
             tracing::warn!(
                 query = %self.op_name,
                 "HAVING filter compiled to PhysicalExpr failed -- using cached SQL plan"
             );
-            match self.ctx.sql(&filter_sql).await {
-                Ok(df) => {
-                    self.cached_having_plan = Some(df.logical_plan().clone());
-                    df.collect()
-                        .await
-                        .map_err(|e| DbError::query_pipeline(&*self.op_name, &e))
-                }
-                Err(e) => Err(DbError::query_pipeline(&*self.op_name, &e)),
-            }
-        };
-
-        let _ = self.ctx.deregister_table(&table_name);
-        result
+            let table_name = format!("__having_{}", self.op_name);
+            self.having_cache = Some(
+                super::HavingSqlCache::build(
+                    &self.ctx,
+                    &table_name,
+                    batches[0].schema(),
+                    having_sql,
+                )
+                .await?,
+            );
+        }
+        self.having_cache
+            .as_ref()
+            .expect("just initialized")
+            .apply(&self.ctx, &self.op_name, batches.to_vec())
+            .await
     }
 }
 
@@ -660,8 +643,8 @@ impl GraphOperator for SqlQueryOperator {
                     }
                 }
             },
-            QueryState::CachedLogical(ref plan) => {
-                execute_logical_plan(&self.ctx, &self.op_name, plan).await
+            QueryState::CachedPhysical(ref physical) => {
+                super::execute_cached_physical(&self.ctx, &self.op_name, physical).await
             }
         }
     }
@@ -716,7 +699,7 @@ impl GraphOperator for SqlQueryOperator {
             QueryState::Uninit => {
                 self.pending_restore = Some(cp);
             }
-            QueryState::Compiled(_) | QueryState::CachedPlan(_) | QueryState::CachedLogical(_) => {
+            QueryState::Compiled(_) | QueryState::CachedPlan(_) | QueryState::CachedPhysical(_) => {
                 tracing::warn!(
                     query = %self.op_name,
                     "Ignoring aggregate checkpoint for non-aggregate query (schema evolution?)"

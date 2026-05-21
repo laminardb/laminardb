@@ -1,6 +1,6 @@
 //! Watermark generators and multi-source tracking.
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use super::Watermark;
 
@@ -35,11 +35,15 @@ pub trait WatermarkGenerator: Send {
 /// Default `max_future_skew_ms`: 5 min.
 pub const DEFAULT_MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1000;
 
-/// Wall clock in epoch millis; `0` if unreadable (callers fail open).
-fn now_unix_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+/// `true` if `timestamp` is more than `skew_ms` beyond wall-clock now.
+/// `skew_ms <= 0` or an unset system clock disables the guard.
+#[inline]
+fn is_grossly_future(timestamp: i64, skew_ms: i64) -> bool {
+    if skew_ms <= 0 {
+        return false;
+    }
+    let now = super::now_unix_millis();
+    now > 0 && timestamp > now.saturating_add(skew_ms)
 }
 
 /// Watermark = `max_timestamp_seen - max_out_of_orderness`. `on_event`
@@ -92,12 +96,8 @@ impl BoundedOutOfOrdernessGenerator {
 impl WatermarkGenerator for BoundedOutOfOrdernessGenerator {
     #[inline]
     fn on_event(&mut self, timestamp: i64) -> Option<Watermark> {
-        // Don't let a corrupt far-future producer clock advance the watermark.
-        if self.max_future_skew_ms > 0 {
-            let now = now_unix_millis();
-            if now > 0 && timestamp > now.saturating_add(self.max_future_skew_ms) {
-                return None;
-            }
+        if is_grossly_future(timestamp, self.max_future_skew_ms) {
+            return None;
         }
         if timestamp > self.current_max_timestamp {
             self.current_max_timestamp = timestamp;
@@ -123,6 +123,9 @@ impl WatermarkGenerator for BoundedOutOfOrdernessGenerator {
 
     #[inline]
     fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark> {
+        if is_grossly_future(timestamp, self.max_future_skew_ms) {
+            return None;
+        }
         if timestamp > self.current_watermark {
             self.current_watermark = timestamp;
             // Maintain invariant: current_max_timestamp >= current_watermark + max_out_of_orderness
@@ -139,9 +142,17 @@ impl WatermarkGenerator for BoundedOutOfOrdernessGenerator {
 
 /// Watermark generator for strictly ascending timestamps; the watermark
 /// equals the current timestamp.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AscendingTimestampsGenerator {
     current_watermark: i64,
+    /// `0` ⇒ disabled.
+    max_future_skew_ms: i64,
+}
+
+impl Default for AscendingTimestampsGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AscendingTimestampsGenerator {
@@ -150,13 +161,24 @@ impl AscendingTimestampsGenerator {
     pub fn new() -> Self {
         Self {
             current_watermark: i64::MIN,
+            max_future_skew_ms: DEFAULT_MAX_FUTURE_SKEW_MS,
         }
+    }
+
+    /// Override the future-skew ceiling (`0` disables).
+    #[must_use]
+    pub fn with_max_future_skew(mut self, skew_ms: i64) -> Self {
+        self.max_future_skew_ms = skew_ms;
+        self
     }
 }
 
 impl WatermarkGenerator for AscendingTimestampsGenerator {
     #[inline]
     fn on_event(&mut self, timestamp: i64) -> Option<Watermark> {
+        if is_grossly_future(timestamp, self.max_future_skew_ms) {
+            return None;
+        }
         if timestamp > self.current_watermark {
             self.current_watermark = timestamp;
             Some(Watermark::new(timestamp))
@@ -177,6 +199,9 @@ impl WatermarkGenerator for AscendingTimestampsGenerator {
 
     #[inline]
     fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark> {
+        if is_grossly_future(timestamp, self.max_future_skew_ms) {
+            return None;
+        }
         if timestamp > self.current_watermark {
             self.current_watermark = timestamp;
             Some(Watermark::new(timestamp))
@@ -376,12 +401,15 @@ pub struct WatermarkTracker {
     idle_sources: Vec<bool>,
     /// Last activity time for each source
     last_activity: Vec<Instant>,
-    /// Idle timeout duration
-    idle_timeout: Duration,
+    /// Per-source idle timeout; `None` ⇒ that source never auto-idles
+    /// (the default — idleness is opt-in, like Flink `withIdleness`).
+    idle_timeout: Vec<Option<Duration>>,
 }
 
 impl WatermarkTracker {
-    /// Creates a new tracker for the specified number of sources.
+    /// Creates a tracker with idleness **disabled** for all sources
+    /// (strict correctness; configure per source via
+    /// [`Self::set_idle_timeout`]).
     #[must_use]
     pub fn new(num_sources: usize) -> Self {
         Self {
@@ -389,11 +417,11 @@ impl WatermarkTracker {
             combined_watermark: i64::MIN,
             idle_sources: vec![false; num_sources],
             last_activity: vec![Instant::now(); num_sources],
-            idle_timeout: Duration::from_secs(30), // Default 30 second idle timeout
+            idle_timeout: vec![None; num_sources],
         }
     }
 
-    /// Creates a new tracker with a custom idle timeout.
+    /// Creates a tracker with the same idle timeout for every source.
     #[must_use]
     pub fn with_idle_timeout(num_sources: usize, idle_timeout: Duration) -> Self {
         Self {
@@ -401,7 +429,14 @@ impl WatermarkTracker {
             combined_watermark: i64::MIN,
             idle_sources: vec![false; num_sources],
             last_activity: vec![Instant::now(); num_sources],
-            idle_timeout,
+            idle_timeout: vec![Some(idle_timeout); num_sources],
+        }
+    }
+
+    /// Sets (or clears, with `None`) the idle timeout for one source.
+    pub fn set_idle_timeout(&mut self, source_id: usize, timeout: Option<Duration>) {
+        if let Some(slot) = self.idle_timeout.get_mut(source_id) {
+            *slot = timeout;
         }
     }
 
@@ -444,7 +479,10 @@ impl WatermarkTracker {
     pub fn check_idle_sources(&mut self) -> Option<Watermark> {
         let mut any_marked = false;
         for i in 0..self.idle_sources.len() {
-            if !self.idle_sources[i] && self.last_activity[i].elapsed() >= self.idle_timeout {
+            let Some(timeout) = self.idle_timeout[i] else {
+                continue; // idleness disabled for this source
+            };
+            if !self.idle_sources[i] && self.last_activity[i].elapsed() >= timeout {
                 self.idle_sources[i] = true;
                 any_marked = true;
             }
@@ -646,7 +684,7 @@ impl WatermarkGenerator for ProcessingTimeGenerator {
 
     #[inline]
     fn on_periodic(&mut self) -> Option<Watermark> {
-        let now = now_unix_millis();
+        let now = super::now_unix_millis();
         if now > self.current_watermark {
             self.current_watermark = now;
             Some(Watermark::new(now))
@@ -832,6 +870,33 @@ mod tests {
 
         // Now only source 0's watermark counts
         assert_eq!(wm, Some(Watermark::new(5000)));
+    }
+
+    #[test]
+    fn check_idle_sources_advances_then_reactivation_is_monotone() {
+        // A quiet watermarked source must not pin the combined-min, and a
+        // later-reactivating source with an OLD watermark must not regress
+        // it. `idle_timeout = 0` makes any source immediately eligible for
+        // `check_idle_sources` without sleeping.
+        let mut tracker = WatermarkTracker::with_idle_timeout(2, Duration::ZERO);
+        tracker.update_source(0, 5_000); // active, fast
+        tracker.update_source(1, 1_000); // will go quiet
+        assert_eq!(tracker.current_watermark(), Some(Watermark::new(1_000)));
+
+        // Source 1 idle past timeout → excluded → combined jumps to s0.
+        let advanced = tracker.check_idle_sources();
+        assert_eq!(advanced, Some(Watermark::new(5_000)));
+        assert_eq!(tracker.current_watermark(), Some(Watermark::new(5_000)));
+
+        // Source 1 reactivates with a STALE watermark: must not regress.
+        let res = tracker.update_source(1, 1_500);
+        assert_eq!(res, None, "stale reactivation must not emit a regress");
+        assert_eq!(tracker.current_watermark(), Some(Watermark::new(5_000)));
+
+        // Once it catches up past the combined, progress resumes from min.
+        tracker.update_source(0, 9_000);
+        tracker.update_source(1, 8_000);
+        assert_eq!(tracker.current_watermark(), Some(Watermark::new(8_000)));
     }
 
     #[test]
@@ -1063,7 +1128,7 @@ mod tests {
     #[test]
     fn future_skew_event_does_not_advance_watermark() {
         let mut gen = BoundedOutOfOrdernessGenerator::new(0);
-        let now = super::now_unix_millis();
+        let now = crate::time::now_unix_millis();
         // A ~2h-future event must not poison the watermark...
         assert_eq!(gen.on_event(now + 2 * 60 * 60 * 1000), None);
         assert_eq!(gen.current_watermark(), i64::MIN);

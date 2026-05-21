@@ -12,8 +12,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::prelude::SessionContext;
-use datafusion_common::tree_node::TreeNode;
-use datafusion_common::ScalarValue;
+use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion_common::{DFSchema, ScalarValue};
 use datafusion_optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 
 use laminar_core::operator::sliding_window::SlidingWindowAssigner;
@@ -22,8 +22,8 @@ use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{WindowOperatorConfig, WindowType};
 
 use crate::aggregate_state::{
-    compile_having_filter, expr_to_sql, extract_clauses, find_aggregate, query_fingerprint,
-    resolve_expr_type, AggFuncSpec, CompiledProjection, GroupCheckpoint, WindowCheckpoint,
+    compile_having_filter, expr_to_sql, extract_clauses, find_aggregate, resolve_expr_type,
+    AggFuncSpec, CompiledProjection, GroupCheckpoint, WindowCheckpoint,
 };
 use crate::eowc_state::{extract_i64_timestamps, NULL_TIMESTAMP};
 use crate::error::DbError;
@@ -39,6 +39,57 @@ enum CoreWindowAssigner {
 struct PostProjection {
     exprs: Vec<Arc<dyn PhysicalExpr>>,
     final_schema: SchemaRef,
+}
+
+/// A `WHERE` predicate calling `now()`: kept logical and re-resolved per
+/// cycle (a statically-compiled `now()` errors at `evaluate()` because
+/// `DataFusion` only folds it in the `SimplifyExpressions` pass we skip).
+struct NowWhereFilter {
+    predicate: datafusion_expr::Expr,
+    /// Schema the predicate was planned against (carries table qualifiers).
+    df_schema: Arc<DFSchema>,
+}
+
+fn is_wallclock_fn(name: &str) -> bool {
+    name.eq_ignore_ascii_case("now") || name.eq_ignore_ascii_case("current_timestamp")
+}
+
+/// True if `expr` calls `now()`/`current_timestamp()`.
+fn expr_uses_wallclock(expr: &datafusion_expr::Expr) -> bool {
+    let mut found = false;
+    let _ = expr.apply(|e| {
+        if let datafusion_expr::Expr::ScalarFunction(f) = e {
+            if is_wallclock_fn(f.func.name()) {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
+}
+
+/// Replace `now()`/`current_timestamp()` with a fixed `Timestamp(ns,
+/// "+00:00")` literal — matching `DataFusion`'s own return type so the
+/// analyzer's coercion casts stay valid — so the predicate lowers to a
+/// static `PhysicalExpr` for this cycle.
+fn substitute_wallclock(
+    expr: datafusion_expr::Expr,
+    now_ns: i64,
+) -> Result<datafusion_expr::Expr, DbError> {
+    expr.transform(|e| {
+        if let datafusion_expr::Expr::ScalarFunction(ref f) = e {
+            if is_wallclock_fn(f.func.name()) {
+                return Ok(Transformed::yes(datafusion_expr::Expr::Literal(
+                    ScalarValue::TimestampNanosecond(Some(now_ns), Some(Arc::from("+00:00"))),
+                    None,
+                )));
+            }
+        }
+        Ok(Transformed::no(e))
+    })
+    .map(|t| t.data)
+    .map_err(|e| DbError::Pipeline(format!("[LDB-1002] now() substitution failed: {e}")))
 }
 
 struct SessionAccState {
@@ -77,22 +128,15 @@ pub(crate) struct SessionGroupCheckpoint {
 )]
 pub(crate) struct CoreWindowCheckpoint {
     pub fingerprint: u64,
-    /// Per-window checkpoint data (reuses EOWC format) — used by
-    /// tumbling and hopping assigners.
+    /// Tumbling / hopping per-window state (reuses EOWC format).
     pub windows: Vec<WindowCheckpoint>,
-    /// Per-group session checkpoint data — used by session assigner.
+    /// Session-assigner per-group state.
     #[serde(default)]
     pub session_state: Vec<SessionGroupCheckpoint>,
-    /// Discriminant so restore can pick the right branch.
-    #[serde(default = "default_window_type_tag")]
+    /// Restore discriminant. No serde default — missing tag must fail
+    /// loud rather than silently routing into the wrong branch.
     pub window_type: String,
-    /// Highest watermark at checkpoint time. See
-    /// [`crate::aggregate_state::checkpoints::EowcStateCheckpoint::high_watermark_ms`].
     pub high_watermark_ms: i64,
-}
-
-fn default_window_type_tag() -> String {
-    "tumbling".to_string()
 }
 
 /// Core window state for windowed aggregate queries.
@@ -117,18 +161,24 @@ pub(crate) struct CoreWindowState {
     output_schema: SchemaRef,
     having_sql: Option<String>,
     compiled_projection: Option<CompiledProjection>,
-    /// Cached optimized logical plan for the pre-agg SQL (multi-source queries).
-    cached_pre_agg_plan: Option<datafusion_expr::LogicalPlan>,
+    /// Built once; `LiveSourceExec` leaves carry fresh data per execute.
+    cached_pre_agg_physical: Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
+    /// Set when WHERE references `now()`; resolved per cycle.
+    now_where: Option<NowWhereFilter>,
+    /// Compiled `now()` predicate keyed by the second it was built for.
+    /// `Err` caches a compile failure so we don't re-run the analyzer
+    /// every cycle while it's broken; retries at the next second roll.
+    #[allow(clippy::type_complexity)]
+    now_filter_cache: Option<(i64, Result<Arc<dyn PhysicalExpr>, String>)>,
     having_filter: Option<Arc<dyn PhysicalExpr>>,
     max_groups_per_window: usize,
-    /// Grace period (ms) after window end before closing. Late events
-    /// arriving within this window are included instead of dropped.
+    /// Grace after window end; late events within this window are kept.
     allowed_lateness_ms: i64,
-    /// Highest watermark seen via `close_windows`; `i64::MIN` until
-    /// the first close. Drives [`Self::is_window_closed`].
+    /// Highest watermark seen via `close_windows`; `i64::MIN` until first close.
     high_watermark_ms: i64,
     post_projection: Option<PostProjection>,
-    /// Reusable scratch map for no-group window assignment (avoids per-batch allocation).
+    prom: Option<Arc<crate::engine_metrics::EngineMetrics>>,
+    having_sql_cache: Option<crate::operator::HavingSqlCache>,
     scratch_nogroup: AHashMap<i64, Vec<u32>>,
     /// Bucket map keyed by `(window_start, group_id)`. Group ids come
     /// from `scratch_group_keys` and are dense within a batch.
@@ -147,7 +197,7 @@ impl CoreWindowState {
         ctx: &SessionContext,
         sql: &str,
         window_config: &WindowOperatorConfig,
-        _emit_clause: Option<&EmitClause>,
+        emit_clause: Option<&EmitClause>,
     ) -> Result<Option<Self>, DbError> {
         let size_ms = i64::try_from(window_config.size.as_millis()).unwrap_or(i64::MAX);
 
@@ -178,6 +228,16 @@ impl CoreWindowState {
                 .unwrap_or(i64::MAX);
                 if size_ms <= 0 || slide_ms <= 0 || slide_ms > size_ms {
                     return Ok(None);
+                }
+                // OOM guard: cap windows-per-event (Flink/RW also warn here).
+                let wpe = (size_ms - 1) / slide_ms + 1;
+                if wpe > 10_000 {
+                    return Err(DbError::Unsupported(format!(
+                        "[{}] hopping window size/slide ratio is {wpe} (size={size_ms}ms, \
+                         slide={slide_ms}ms); each event would be assigned to that many \
+                         open windows. Cap is 10000 — widen `slide` or narrow `size`.",
+                        laminar_core::error_codes::SQL_UNSUPPORTED
+                    )));
                 }
                 CoreWindowAssigner::Hopping(
                     SlidingWindowAssigner::from_millis(size_ms, slide_ms).with_offset_ms(offset_ms),
@@ -262,6 +322,28 @@ impl CoreWindowState {
         } else {
             None
         };
+
+        // `now()` re-resolves per cycle only in WHERE; elsewhere
+        // (GROUP BY/SELECT/HAVING/aggregate args+FILTER) it would freeze
+        // at plan time. `Unsupported` (not `Pipeline`) so the EOWC
+        // operator re-propagates rather than falling back to raw.
+        let nonwhere_now = group_exprs.iter().any(expr_uses_wallclock)
+            || aggr_exprs.iter().any(expr_uses_wallclock)
+            || having_predicate.as_ref().is_some_and(expr_uses_wallclock)
+            || projection_info
+                .as_ref()
+                .is_some_and(|(exprs, _)| exprs.iter().any(expr_uses_wallclock));
+        if nonwhere_now {
+            return Err(DbError::Unsupported(format!(
+                "[{}] now()/current_timestamp() is only supported in the WHERE \
+                 clause of a windowed query (it would freeze at plan time elsewhere)",
+                laminar_core::error_codes::SQL_UNSUPPORTED
+            )));
+        }
+        let where_uses_now = agg_info
+            .where_predicate
+            .as_ref()
+            .is_some_and(expr_uses_wallclock);
 
         let num_group_cols = group_exprs.len();
 
@@ -519,8 +601,12 @@ impl CoreWindowState {
 
         // Build compiled projection for single-source queries.
         let compiled_projection = if compile_ok {
-            // Compile WHERE predicate
-            let filter = if let Some(where_pred) = &agg_info.where_predicate {
+            // Compile WHERE predicate. A `now()`/`current_timestamp()`
+            // predicate cannot be compiled once (it errors at evaluate),
+            // so leave the static filter empty and apply it per cycle.
+            let filter = if where_uses_now {
+                None
+            } else if let Some(where_pred) = &agg_info.where_predicate {
                 if let Ok(phys) = create_physical_expr(where_pred, input_df_schema, compile_props) {
                     Some(phys)
                 } else {
@@ -539,6 +625,26 @@ impl CoreWindowState {
             } else {
                 None
             }
+        } else {
+            None
+        };
+
+        // `now()` in WHERE re-resolves per cycle only on the compiled
+        // single-source path; the interpreted cached-plan fallback would
+        // freeze it at plan time. Fail loud at CREATE instead.
+        if where_uses_now && compiled_projection.is_none() {
+            return Err(DbError::Unsupported(format!(
+                "[{}] now()/current_timestamp() in WHERE requires the single-source \
+                 compiled path; this query falls back to the interpreted plan where \
+                 now() would freeze at plan time",
+                laminar_core::error_codes::SQL_UNSUPPORTED
+            )));
+        }
+        let now_where = if where_uses_now {
+            agg_info.where_predicate.as_ref().map(|p| NowWhereFilter {
+                predicate: p.clone(),
+                df_schema: Arc::clone(&agg_info.input_df_schema),
+            })
         } else {
             None
         };
@@ -593,19 +699,19 @@ impl CoreWindowState {
             None
         };
 
-        // ONE-TIME setup: cache the optimized logical plan for multi-source
-        // pre-agg queries. This ctx.sql() call runs ONLY at first-cycle
-        // initialization, never per-cycle. Fail fast if the pre-agg SQL is
-        // invalid — it would fail every cycle.
-        let cached_pre_agg_plan = if compiled_projection.is_none() {
-            match ctx.sql(&pre_agg_sql).await {
-                Ok(df) => Some(df.logical_plan().clone()),
-                Err(e) => {
-                    return Err(DbError::Pipeline(format!(
-                        "pre-agg SQL planning failed for windowed aggregate: {e}"
-                    )));
-                }
-            }
+        // Plan once at init; `LiveSourceProvider` leaves carry fresh data.
+        let cached_pre_agg_physical = if compiled_projection.is_none() {
+            let df = ctx
+                .sql(&pre_agg_sql)
+                .await
+                .map_err(|e| DbError::Pipeline(format!("pre-agg SQL planning failed: {e}")))?;
+            let logical = df.logical_plan().clone();
+            let physical = ctx
+                .state()
+                .create_physical_plan(&logical)
+                .await
+                .map_err(|e| DbError::Pipeline(format!("pre-agg physical planning failed: {e}")))?;
+            Some(physical)
         } else {
             None
         };
@@ -630,13 +736,21 @@ impl CoreWindowState {
             time_col_index,
             having_sql,
             compiled_projection,
-            cached_pre_agg_plan,
+            cached_pre_agg_physical,
+            now_where,
+            now_filter_cache: None,
             having_filter,
             max_groups_per_window: 1_000_000,
-            allowed_lateness_ms: i64::try_from(window_config.allowed_lateness.as_millis())
-                .unwrap_or(0),
+            // EMIT FINAL drops late data, so force lateness=0 (Flink "drop late").
+            allowed_lateness_ms: if matches!(emit_clause, Some(EmitClause::Final)) {
+                0
+            } else {
+                i64::try_from(window_config.allowed_lateness.as_millis()).unwrap_or(0)
+            },
             high_watermark_ms: i64::MIN,
             post_projection,
+            prom: None,
+            having_sql_cache: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
             scratch_group_keys: indexmap::IndexSet::default(),
@@ -698,6 +812,7 @@ impl CoreWindowState {
                     CoreWindowAssigner::Tumbling(a) => {
                         let ws = a.assign(ts_ms).start;
                         if self.is_window_closed(ws) {
+                            self.record_late_drop(1);
                             continue;
                         }
                         grouped.entry(ws).or_default().push(idx);
@@ -705,6 +820,7 @@ impl CoreWindowState {
                     CoreWindowAssigner::Hopping(a) => {
                         for wid in a.assign_windows(ts_ms) {
                             if self.is_window_closed(wid.start) {
+                                self.record_late_drop(1);
                                 continue;
                             }
                             grouped.entry(wid.start).or_default().push(idx);
@@ -762,6 +878,7 @@ impl CoreWindowState {
                 CoreWindowAssigner::Tumbling(a) => {
                     let ws = a.assign(ts_ms).start;
                     if self.is_window_closed(ws) {
+                        self.record_late_drop(1);
                         continue;
                     }
                     grouped.entry((ws, gid)).or_default().push(idx);
@@ -769,6 +886,7 @@ impl CoreWindowState {
                 CoreWindowAssigner::Hopping(a) => {
                     for wid in a.assign_windows(ts_ms) {
                         if self.is_window_closed(wid.start) {
+                            self.record_late_drop(1);
                             continue;
                         }
                         grouped.entry((wid.start, gid)).or_default().push(idx);
@@ -1346,12 +1464,118 @@ impl CoreWindowState {
         self.compiled_projection.as_ref()
     }
 
-    pub fn cached_pre_agg_plan(&self) -> Option<&datafusion_expr::LogicalPlan> {
-        self.cached_pre_agg_plan.as_ref()
+    pub fn cached_pre_agg_physical(
+        &self,
+    ) -> Option<&Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.cached_pre_agg_physical.as_ref()
+    }
+
+    pub(crate) fn having_sql_cache_mut(&mut self) -> &mut Option<crate::operator::HavingSqlCache> {
+        &mut self.having_sql_cache
+    }
+
+    /// Filter `inputs` by the `now()` `WHERE` clause, with `now()` bound
+    /// to the event-time watermark (not wall clock) so it is
+    /// replay-deterministic. `watermark_ms == i64::MIN` ⇒ `Ok(None)` (no
+    /// frontier yet — don't drop startup rows). Compiled predicate cached
+    /// per watermark-second.
+    pub(crate) fn apply_dynamic_now_filter(
+        &mut self,
+        ctx: &SessionContext,
+        inputs: &[RecordBatch],
+        watermark_ms: i64,
+    ) -> Result<Option<Vec<RecordBatch>>, DbError> {
+        if self.now_where.is_none() || watermark_ms == i64::MIN {
+            return Ok(None);
+        }
+        // Bind now() to the watermark, coarsened to whole seconds so the
+        // compiled predicate is reused until the frontier second rolls.
+        let secs = watermark_ms.div_euclid(1000);
+        if self
+            .now_filter_cache
+            .as_ref()
+            .is_none_or(|(s, _)| *s != secs)
+        {
+            let nw = self.now_where.as_ref().expect("checked above");
+            // Saturate to avoid panic past year 2262.
+            let now_ns = secs.checked_mul(1_000_000_000).unwrap_or(i64::MAX);
+            let result = (|| -> Result<Arc<dyn PhysicalExpr>, DbError> {
+                let pred = substitute_wallclock(nw.predicate.clone(), now_ns)?;
+                let mut coercer = TypeCoercionRewriter::new(&nw.df_schema);
+                let pred = pred.rewrite(&mut coercer).map(|t| t.data).map_err(|e| {
+                    DbError::Pipeline(format!(
+                        "[{}] now() WHERE type-coerce: {e}",
+                        laminar_core::error_codes::SQL_PLANNING_FAILED
+                    ))
+                })?;
+                let state = ctx.state();
+                create_physical_expr(&pred, &nw.df_schema, state.execution_props()).map_err(|e| {
+                    DbError::Pipeline(format!(
+                        "[{}] now() WHERE physical compile: {e}",
+                        laminar_core::error_codes::SQL_PLANNING_FAILED
+                    ))
+                })
+            })();
+            match result {
+                Ok(phys) => self.now_filter_cache = Some((secs, Ok(phys))),
+                Err(e) => {
+                    let msg = e.to_string();
+                    self.now_filter_cache = Some((secs, Err(msg.clone())));
+                    return Err(DbError::Pipeline(msg));
+                }
+            }
+        }
+        let cached = &self.now_filter_cache.as_ref().expect("set above").1;
+        let phys = match cached {
+            Ok(p) => p,
+            Err(msg) => return Err(DbError::Pipeline(msg.clone())),
+        };
+        let mut out = Vec::with_capacity(inputs.len());
+        for b in inputs {
+            if let Some(f) = crate::filter_compile::apply(b, phys.as_ref())? {
+                out.push(f);
+            }
+        }
+        Ok(Some(out))
+    }
+
+    pub(crate) fn attach_metrics(
+        &mut self,
+        prom: Option<Arc<crate::engine_metrics::EngineMetrics>>,
+    ) {
+        self.prom = prom;
+    }
+
+    #[inline]
+    fn record_late_drop(&self, n: usize) {
+        if let Some(prom) = &self.prom {
+            if n > 0 {
+                prom.window_late_dropped
+                    .inc_by(u64::try_from(n).unwrap_or(u64::MAX));
+            }
+        }
     }
 
     pub(crate) fn query_fingerprint(&self) -> u64 {
-        query_fingerprint(&self.pre_agg_sql, &self.output_schema)
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        self.pre_agg_sql.hash(&mut h);
+        for f in self.output_schema.fields() {
+            f.name().hash(&mut h);
+            f.data_type().to_string().hash(&mut h);
+        }
+        // Window shape must invalidate the checkpoint on change.
+        self.window_type_tag().hash(&mut h);
+        match &self.assigner {
+            CoreWindowAssigner::Tumbling(t) => t.size_ms().hash(&mut h),
+            CoreWindowAssigner::Hopping(s) => {
+                s.size_ms().hash(&mut h);
+                s.slide_ms().hash(&mut h);
+            }
+            CoreWindowAssigner::Session { gap_ms } => gap_ms.hash(&mut h),
+        }
+        self.allowed_lateness_ms.hash(&mut h);
+        h.finish()
     }
 
     /// Returns a tag string for the current assigner type.
@@ -1493,10 +1717,13 @@ impl CoreWindowState {
         }
 
         self.high_watermark_ms = checkpoint.high_watermark_ms;
-        if checkpoint.window_type == "session" {
-            self.restore_session_windows(checkpoint)
-        } else {
-            self.restore_fixed_windows(checkpoint)
+        match checkpoint.window_type.as_str() {
+            "session" => self.restore_session_windows(checkpoint),
+            "tumbling" | "hopping" => self.restore_fixed_windows(checkpoint),
+            other => Err(DbError::Pipeline(format!(
+                "core window checkpoint has unknown window_type `{other}` — \
+                 refusing to silently route to the wrong restore path"
+            ))),
         }
     }
 
@@ -1678,12 +1905,16 @@ mod tests {
             time_col_index: 2,
             having_sql: None,
             compiled_projection: None,
-            cached_pre_agg_plan: None,
+            cached_pre_agg_physical: None,
+            now_where: None,
+            now_filter_cache: None,
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
             high_watermark_ms: i64::MIN,
             post_projection: None,
+            prom: None,
+            having_sql_cache: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
             scratch_group_keys: indexmap::IndexSet::default(),
@@ -1741,12 +1972,16 @@ mod tests {
             time_col_index: 2,
             having_sql: None,
             compiled_projection: None,
-            cached_pre_agg_plan: None,
+            cached_pre_agg_physical: None,
+            now_where: None,
+            now_filter_cache: None,
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
             high_watermark_ms: i64::MIN,
             post_projection: None,
+            prom: None,
+            having_sql_cache: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
             scratch_group_keys: indexmap::IndexSet::default(),
@@ -1792,12 +2027,16 @@ mod tests {
             time_col_index: 2,
             having_sql: None,
             compiled_projection: None,
-            cached_pre_agg_plan: None,
+            cached_pre_agg_physical: None,
+            now_where: None,
+            now_filter_cache: None,
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
             high_watermark_ms: i64::MIN,
             post_projection: None,
+            prom: None,
+            having_sql_cache: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
             scratch_group_keys: indexmap::IndexSet::default(),
@@ -1841,12 +2080,16 @@ mod tests {
             time_col_index: 2,
             having_sql: None,
             compiled_projection: None,
-            cached_pre_agg_plan: None,
+            cached_pre_agg_physical: None,
+            now_where: None,
+            now_filter_cache: None,
             having_filter: None,
             max_groups_per_window: 1_000_000,
             allowed_lateness_ms: 0,
             high_watermark_ms: i64::MIN,
             post_projection: None,
+            prom: None,
+            having_sql_cache: None,
             scratch_nogroup: AHashMap::new(),
             scratch_grouped: AHashMap::new(),
             scratch_group_keys: indexmap::IndexSet::default(),
@@ -2843,5 +3086,121 @@ mod tests {
         let result = state.apply_post_projection(vec![batch.clone()]).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), batch.num_rows());
+    }
+
+    // ── now()/current_timestamp() in streaming predicates ─────
+
+    use laminar_core::time::now_unix_millis as now_ms;
+
+    #[tokio::test]
+    async fn now_in_where_builds_and_filters_per_cycle() {
+        use laminar_sql::{create_session_context, register_streaming_functions};
+        use std::time::Duration;
+
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new("v", DataType::Float64, false),
+        ]));
+        let mem = datafusion::datasource::MemTable::try_new(schema.clone(), vec![vec![]]).unwrap();
+        ctx.register_table("evt", Arc::new(mem)).unwrap();
+
+        let window_config = WindowOperatorConfig {
+            window_type: WindowType::Tumbling,
+            time_column: "ts".to_string(),
+            size: Duration::from_secs(60),
+            slide: None,
+            gap: None,
+            offset_ms: 0,
+            allowed_lateness: Duration::ZERO,
+            emit_strategy: laminar_sql::parser::EmitStrategy::Periodic(Duration::from_secs(5)),
+            late_data_side_output: None,
+        };
+        let sql = "SELECT TUMBLE(ts, INTERVAL '1' MINUTE) AS w, COUNT(*) AS c \
+                   FROM evt \
+                   WHERE ts > now() - INTERVAL '10' MINUTE \
+                     AND ts < now() + INTERVAL '2' MINUTE \
+                   GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE)";
+        let mut cw = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None)
+            .await
+            .expect("now() in WHERE must build, not error")
+            .expect("tumbling aggregate => Some");
+        assert!(cw.now_where.is_some(), "WHERE now() captured dynamically");
+        assert!(
+            cw.compiled_projection
+                .as_ref()
+                .is_some_and(|p| p.filter.is_none()),
+            "static filter must be empty (now() is applied per cycle)"
+        );
+
+        // Three rows: ~now (kept), 1h old (dropped), 1h future (dropped).
+        let n = now_ms();
+        let ts = arrow::array::TimestampMillisecondArray::from(vec![
+            n,
+            n - 60 * 60 * 1000,
+            n + 60 * 60 * 1000,
+        ]);
+        let v = arrow::array::Float64Array::from(vec![1.0, 2.0, 3.0]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(ts) as ArrayRef, Arc::new(v) as ArrayRef],
+        )
+        .unwrap();
+
+        // now() binds to the watermark; pass the same reference time.
+        let filtered = cw
+            .apply_dynamic_now_filter(&ctx, std::slice::from_ref(&batch), n)
+            .expect("dynamic now() filter compiles + applies")
+            .expect("now_where set => Some");
+        let kept: usize = filtered.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(kept, 1, "only the ~now row is within now()±bounds");
+    }
+
+    #[tokio::test]
+    async fn now_outside_where_is_rejected_at_build() {
+        use laminar_sql::{create_session_context, register_streaming_functions};
+        use std::time::Duration;
+
+        let ctx = create_session_context();
+        register_streaming_functions(&ctx);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new("v", DataType::Float64, false),
+        ]));
+        let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![]]).unwrap();
+        ctx.register_table("evt", Arc::new(mem)).unwrap();
+
+        let window_config = WindowOperatorConfig {
+            window_type: WindowType::Tumbling,
+            time_column: "ts".to_string(),
+            size: Duration::from_secs(60),
+            slide: None,
+            gap: None,
+            offset_ms: 0,
+            allowed_lateness: Duration::ZERO,
+            emit_strategy: laminar_sql::parser::EmitStrategy::OnWindowClose,
+            late_data_side_output: None,
+        };
+        // now() in SELECT (not WHERE) must fail loud at CREATE, not freeze.
+        let sql =
+            "SELECT TUMBLE(ts, INTERVAL '1' MINUTE) AS w, COUNT(*) AS c, now() AS planned_at \
+                   FROM evt GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE)";
+        let Err(err) = CoreWindowState::try_from_sql(&ctx, sql, &window_config, None).await else {
+            panic!("now() outside WHERE must be rejected at build");
+        };
+        assert!(
+            format!("{err}").contains(laminar_core::error_codes::SQL_UNSUPPORTED),
+            "expected {} in error, got: {err}",
+            laminar_core::error_codes::SQL_UNSUPPORTED
+        );
     }
 }
