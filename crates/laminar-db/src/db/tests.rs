@@ -4201,6 +4201,94 @@ async fn windowed_aggregate_over_projection_unnest_emits() {
     assert_eq!(n, 2, "word 'a' appears in both docs within the window");
 }
 
+/// Use-case acceptance: the keyword-spike pipeline (5s term counts + a coarse
+/// per-term baseline + an ASOF join for the ratio) must surface an injected
+/// spike. Exercises ASOF JOIN over two materialized views. Event-time +
+/// watermark for determinism; the live demo tumbles on processing time.
+#[tokio::test]
+async fn keyword_spike_pipeline_detects_injected_spike() {
+    let db = LaminarDB::open().unwrap();
+    db.execute(
+        "CREATE SOURCE posts (text VARCHAR, ts TIMESTAMP, \
+         WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW term_5s AS \
+         SELECT TUMBLE(ts, INTERVAL '5' SECOND) AS bucket, term, COUNT(*) AS n \
+         FROM posts, UNNEST(make_array('cpi','fed')) AS t(term) \
+         WHERE strpos(lower(text), term) > 0 \
+         GROUP BY TUMBLE(ts, INTERVAL '5' SECOND), term EMIT ON WINDOW CLOSE",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW term_baseline AS \
+         SELECT TUMBLE(ts, INTERVAL '10' SECOND) AS win, term, \
+                CAST(COUNT(*) AS DOUBLE) / 2.0 AS expected_per_5s \
+         FROM posts, UNNEST(make_array('cpi','fed')) AS t(term) \
+         WHERE strpos(lower(text), term) > 0 \
+         GROUP BY TUMBLE(ts, INTERVAL '10' SECOND), term EMIT ON WINDOW CLOSE",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW keyword_spikes AS \
+         SELECT c.bucket, c.term, c.n, \
+                CAST(c.n AS DOUBLE) / NULLIF(b.expected_per_5s, 0) AS spike_ratio \
+         FROM term_5s c ASOF JOIN term_baseline b \
+         MATCH_CONDITION(c.bucket >= b.win) ON c.term = b.term",
+    )
+    .await
+    .unwrap();
+    db.start().await.unwrap();
+
+    // Baseline: 2 'cpi' in [0,10s) -> expected_per_5s = 1.0. Spike: 10 'cpi'
+    // in [10,15s) -> n=10 -> ratio 10. 'tick' at 16s advances the watermark.
+    let mut texts: Vec<&str> = vec!["cpi", "cpi"];
+    let mut times: Vec<i64> = vec![1_000_000, 2_000_000];
+    for i in 0..10 {
+        texts.push("cpi");
+        times.push(10_000_000 + i * 100_000);
+    }
+    texts.push("noise");
+    times.push(16_000_000);
+
+    let handle = db.source_untyped("posts").unwrap();
+    let schema = handle.schema().clone();
+    handle
+        .push_arrow(
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(arrow::array::StringArray::from(texts)),
+                    Arc::new(arrow::array::TimestampMicrosecondArray::from(times)),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    assert!(poll_mv(&db, "keyword_spikes", 1).await >= 1, "spike MV should emit");
+    let batches = db
+        .ctx
+        .sql("SELECT spike_ratio FROM keyword_spikes WHERE term = 'cpi' AND n = 10")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let max_ratio = batches
+        .iter()
+        .flat_map(|b| {
+            let r = b.column(0).as_any().downcast_ref::<arrow::array::Float64Array>().unwrap();
+            (0..b.num_rows()).map(|i| r.value(i)).collect::<Vec<_>>()
+        })
+        .fold(0.0_f64, f64::max);
+    assert!(max_ratio >= 10.0, "injected 10x spike should yield ratio >= 10, got {max_ratio}");
+}
+
 #[tokio::test]
 async fn open_subscription_resolves_unknown_name_to_error() {
     let db = LaminarDB::open().unwrap();
