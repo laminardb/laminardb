@@ -33,7 +33,21 @@ async fn resolve_stream_output_schemas(
             let mut next: Vec<&crate::connector_manager::StreamRegistration> = Vec::new();
             let mut progressed = false;
             for reg in pending {
-                let Ok(plan) = ctx.state().create_logical_plan(&reg.query_sql).await else {
+                // DataFusion can't lower `ASOF JOIN`; resolve such schemas via a
+                // schema-equivalent inner-join rewrite. Execution still uses the
+                // ASOF operator. A genuine missing dependency falls through to
+                // the retry queue as before.
+                let planned = match ctx.state().create_logical_plan(&reg.query_sql).await {
+                    Ok(plan) => Some(plan),
+                    Err(_) => match crate::sql_analysis::rewrite_asof_joins_to_inner(&reg.query_sql)
+                    {
+                        Some(rewritten) => {
+                            ctx.state().create_logical_plan(&rewritten).await.ok()
+                        }
+                        None => None,
+                    },
+                };
+                let Some(plan) = planned else {
                     next.push(reg);
                     continue;
                 };

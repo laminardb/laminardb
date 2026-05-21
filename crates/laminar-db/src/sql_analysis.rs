@@ -183,6 +183,41 @@ fn collect_factor_counting(factor: &TableFactor, tables: &mut Vec<String>) {
     }
 }
 
+/// Rewrite `ASOF JOIN … MATCH_CONDITION(..)` to a plain `JOIN … ON ..` so
+/// `DataFusion` can resolve the query's output schema — the match condition
+/// only chooses which right row matches at runtime, so an inner join is
+/// schema-equivalent. Returns `None` when there is no ASOF join. Execution
+/// still routes through the streaming ASOF operator.
+pub(crate) fn rewrite_asof_joins_to_inner(sql: &str) -> Option<String> {
+    use sqlparser::ast::{JoinConstraint, JoinOperator};
+
+    let dialect = GenericDialect {};
+    let mut stmts = Parser::parse_sql(&dialect, sql).ok()?;
+    let mut changed = false;
+    for stmt in &mut stmts {
+        if let Statement::Query(query) = stmt {
+            if let SetExpr::Select(select) = query.body.as_mut() {
+                for twj in &mut select.from {
+                    for join in &mut twj.joins {
+                        if !matches!(join.join_operator, JoinOperator::AsOf { .. }) {
+                            continue;
+                        }
+                        let op = std::mem::replace(
+                            &mut join.join_operator,
+                            JoinOperator::Inner(JoinConstraint::None),
+                        );
+                        if let JoinOperator::AsOf { constraint, .. } = op {
+                            join.join_operator = JoinOperator::Inner(constraint);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    changed.then(|| stmts.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))
+}
+
 /// Resolve the source table name from a `TableFactor::Table`.
 ///
 /// sqlparser parses `FROM TUMBLE(events, ts, ...)` as `TableFactor::Table`

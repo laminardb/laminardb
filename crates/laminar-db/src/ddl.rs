@@ -935,15 +935,32 @@ impl LaminarDB {
 
         let query_sql = query_sql.to_string();
 
-        // Execute the backing query to get the output schema
-        let result = self.handle_query(&query_sql).await?;
-        let schema = match &result {
-            ExecuteResult::Query(qh) => qh.schema().clone(),
-            _ => Arc::new(Schema::new(vec![Field::new(
-                "result",
-                DataType::Utf8,
-                true,
-            )])),
+        // ASOF joins don't lower in DataFusion, so executing the backing query
+        // yields an empty schema. Resolve it from a schema-equivalent inner-join
+        // rewrite instead; execution still routes through the ASOF operator.
+        let schema = if let Some(rewritten) =
+            crate::sql_analysis::rewrite_asof_joins_to_inner(&query_sql)
+        {
+            let plan = self
+                .ctx
+                .state()
+                .create_logical_plan(&rewritten)
+                .await
+                .map_err(|e| {
+                    DbError::MaterializedView(format!(
+                        "could not resolve schema for '{name_str}': {e}"
+                    ))
+                })?;
+            let fields: Vec<Field> =
+                plan.schema().fields().iter().map(|f| (**f).clone()).collect();
+            Arc::new(Schema::new(fields))
+        } else {
+            // Execute the backing query to get the output schema.
+            let result = self.handle_query(&query_sql).await?;
+            match &result {
+                ExecuteResult::Query(qh) => qh.schema().clone(),
+                _ => Arc::new(Schema::new(vec![Field::new("result", DataType::Utf8, true)])),
+            }
         };
 
         // Discover source references via AST-based extraction (not substring matching)

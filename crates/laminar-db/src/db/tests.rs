@@ -4017,6 +4017,129 @@ async fn windowed_aggregate_over_lateral_unnest_emits() {
     assert!(rows >= 1, "windowed aggregate over lateral UNNEST should emit");
 }
 
+/// A tumbling-window `COUNT(DISTINCT)` must emit the correct per-window
+/// cardinality (not a plain count, not zero).
+#[tokio::test]
+async fn windowed_count_distinct_emits_correct_cardinality() {
+    let db = LaminarDB::open().unwrap();
+    db.execute(
+        "CREATE SOURCE visits (user_id VARCHAR, ts TIMESTAMP, \
+         WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW uniques AS \
+         SELECT TUMBLE(ts, INTERVAL '5' SECOND) AS bucket, COUNT(DISTINCT user_id) AS n \
+         FROM visits \
+         GROUP BY TUMBLE(ts, INTERVAL '5' SECOND) \
+         EMIT ON WINDOW CLOSE",
+    )
+    .await
+    .unwrap();
+    db.start().await.unwrap();
+
+    let handle = db.source_untyped("visits").unwrap();
+    let schema = handle.schema().clone();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            // [0,5s): users a, b, a -> 2 distinct. "tick" lands in the next
+            // window and advances the watermark to close [0,5s).
+            Arc::new(arrow::array::StringArray::from(vec!["a", "b", "a", "tick"])),
+            Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                100_000, 200_000, 300_000, 6_000_000,
+            ])),
+        ],
+    )
+    .unwrap();
+    handle.push_arrow(batch).unwrap();
+
+    assert!(poll_mv(&db, "uniques", 1).await >= 1, "windowed COUNT(DISTINCT) should emit");
+    let batches = db.ctx.sql("SELECT n FROM uniques").await.unwrap().collect().await.unwrap();
+    let n = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(n, 2, "distinct user count in the closed window");
+}
+
+/// An `ASOF JOIN` feeding a materialized view must plan and emit, matching
+/// each left row to the latest right row at-or-before its timestamp (per key).
+/// `DataFusion` can't lower `AsOf`, so schema resolution rewrites it to a plain
+/// join; execution uses the ASOF operator.
+#[tokio::test]
+async fn asof_join_in_materialized_view_emits_backward_match() {
+    let db = LaminarDB::open().unwrap();
+    db.execute(
+        "CREATE SOURCE quotes (sym VARCHAR, price DOUBLE, qts TIMESTAMP, \
+         WATERMARK FOR qts AS qts - INTERVAL '0' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE SOURCE trades (sym VARCHAR, tts TIMESTAMP, \
+         WATERMARK FOR tts AS tts - INTERVAL '0' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW enriched AS \
+         SELECT t.sym, q.price \
+         FROM trades t ASOF JOIN quotes q \
+         MATCH_CONDITION(t.tts >= q.qts) \
+         ON t.sym = q.sym",
+    )
+    .await
+    .unwrap();
+    db.start().await.unwrap();
+
+    let q = db.source_untyped("quotes").unwrap();
+    q.push_arrow(
+        RecordBatch::try_new(
+            q.schema().clone(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x", "x", "x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![10.0, 20.0, 30.0])),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                    1_000_000, 5_000_000, 8_000_000,
+                ])),
+            ],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let t = db.source_untyped("trades").unwrap();
+    t.push_arrow(
+        RecordBatch::try_new(
+            t.schema().clone(),
+            vec![
+                // trade@3s -> latest quote qts<=3s = 10.0; trade@7s -> 20.0.
+                Arc::new(arrow::array::StringArray::from(vec!["x", "x"])),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                    3_000_000, 7_000_000,
+                ])),
+            ],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert!(poll_mv(&db, "enriched", 2).await >= 2, "ASOF join in an MV should emit matches");
+    let batches = db.ctx.sql("SELECT price FROM enriched ORDER BY price").await.unwrap().collect().await.unwrap();
+    let prices: Vec<f64> = batches
+        .iter()
+        .flat_map(|b| {
+            let col = b.column(0).as_any().downcast_ref::<arrow::array::Float64Array>().unwrap();
+            (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(prices, vec![10.0, 20.0], "backward ASOF should pick the latest quote at-or-before each trade");
+}
+
 #[tokio::test]
 async fn open_subscription_resolves_unknown_name_to_error() {
     let db = LaminarDB::open().unwrap();
