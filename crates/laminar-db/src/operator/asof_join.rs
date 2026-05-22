@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
 
@@ -26,6 +27,11 @@ pub(crate) struct AsofJoinOperator {
     projection: ProjectingJoinState,
     right_buffer: AsofRightBuffer,
     last_evicted_watermark: i64,
+    /// Right input schema, captured from the first non-empty right batch. Lets
+    /// a later cycle whose right buffer is empty still emit left rows with null
+    /// right columns, so a downstream projection over a right column keeps
+    /// resolving. `None` until the right side has emitted anything.
+    right_schema: Option<SchemaRef>,
 }
 
 impl AsofJoinOperator {
@@ -40,6 +46,7 @@ impl AsofJoinOperator {
             projection: ProjectingJoinState::new(name, ctx, projection_sql, "__asof_tmp"),
             right_buffer: AsofRightBuffer::default(),
             last_evicted_watermark: i64::MIN,
+            right_schema: None,
         }
     }
 }
@@ -78,7 +85,21 @@ impl GraphOperator for AsofJoinOperator {
             return Ok(Vec::new());
         }
 
-        let joined = execute_asof_join_with_state(left_batches, &self.right_buffer, &self.config)?;
+        // Capture the right schema from the first batch we see, so a later
+        // cycle with an empty right buffer can still emit left rows with null
+        // right columns instead of dropping them.
+        if self.right_schema.is_none() {
+            if let Some(b) = right_batches.first() {
+                self.right_schema = Some(b.schema());
+            }
+        }
+
+        let joined = execute_asof_join_with_state(
+            left_batches,
+            &self.right_buffer,
+            &self.config,
+            self.right_schema.as_ref(),
+        )?;
 
         if joined.num_rows() == 0 {
             return Ok(Vec::new());
