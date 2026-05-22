@@ -833,19 +833,66 @@ fn encode_field_text(
     row: usize,
     formatter: &arrow_cast::display::ArrayFormatter<'_>,
 ) -> PgWireResult<()> {
+    use arrow_schema::DataType;
     if col.is_null(row) {
-        enc.encode_field(&None::<&str>)
-    } else {
-        enc.encode_field(&Some(formatter.value(row).to_string()))
+        return enc.encode_field(&None::<&str>);
     }
+    // A TEXT[] column must serialize as a Postgres array literal `{..}`, not
+    // Arrow's `[..]` display, so text-mode clients parse it as an array.
+    if matches!(col.data_type(), DataType::List(f) if matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8))
+    {
+        return enc.encode_field(&Some(pg_text_array_literal(&list_text_elements(col, row))));
+    }
+    enc.encode_field(&Some(formatter.value(row).to_string()))
+}
+
+/// Owned elements of a `List<Utf8|LargeUtf8>` row, NULLs preserved.
+fn list_text_elements(col: &dyn arrow_array::Array, row: usize) -> Vec<Option<String>> {
+    use arrow_array::cast::AsArray;
+    use arrow_array::Array;
+    use arrow_schema::DataType;
+    let values = col.as_list::<i32>().value(row);
+    if matches!(values.data_type(), DataType::LargeUtf8) {
+        let s = values.as_string::<i64>();
+        (0..s.len()).map(|i| (!s.is_null(i)).then(|| s.value(i).to_owned())).collect()
+    } else {
+        let s = values.as_string::<i32>();
+        (0..s.len()).map(|i| (!s.is_null(i)).then(|| s.value(i).to_owned())).collect()
+    }
+}
+
+/// Postgres `text[]` literal, e.g. `{"en","ja",NULL}`. Every element is quoted
+/// (NULL excepted) so commas/braces/quotes in values are unambiguous.
+fn pg_text_array_literal(elements: &[Option<String>]) -> String {
+    let mut out = String::from("{");
+    for (i, elem) in elements.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match elem {
+            None => out.push_str("NULL"),
+            Some(v) => {
+                out.push('"');
+                for ch in v.chars() {
+                    if ch == '"' || ch == '\\' {
+                        out.push('\\');
+                    }
+                    out.push(ch);
+                }
+                out.push('"');
+            }
+        }
+    }
+    out.push('}');
+    out
 }
 
 /// Binary-encode a single Arrow value via `postgres-types` `ToSql`.
 ///
 /// Coverage: Int{8,16,32,64}, UInt{8,16,32,64}, Float{32,64}, Bool,
-/// Utf8/LargeUtf8, Timestamp (any unit, naive), Date32, Date64. UInt64
-/// is widened to INT8 with saturation since Postgres has no unsigned 64.
-/// Any other column type yields `0A000` — client should request text.
+/// Utf8/LargeUtf8, Timestamp (any unit, naive), Date32, Date64, and
+/// `List<Utf8>` (as `text[]`). UInt64 is widened to INT8 with saturation
+/// since Postgres has no unsigned 64. Any other column type yields `0A000`.
 fn encode_field_binary(
     enc: &mut DataRowEncoder,
     col: &dyn arrow_array::Array,
@@ -932,6 +979,13 @@ fn encode_field_binary(
                 .ok_or_else(|| user_error("22008", format!("DATE out of range: {v}")))?;
             enc.encode_field(&Some(dt.date()))
         }
+        DataType::List(field)
+            if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            // `postgres-types` encodes Vec<Option<String>> as the binary
+            // text[] wire format (the column's OID is TEXT_ARRAY).
+            enc.encode_field(&Some(list_text_elements(col, row)))
+        }
         other => Err(user_error(
             "0A000",
             format!("binary format not supported for column '{name}' (type {other:?})"),
@@ -951,6 +1005,11 @@ fn arrow_to_pg_type(dt: &arrow_schema::DataType) -> Type {
         DataType::Timestamp(_, _) => Type::TIMESTAMP,
         DataType::Date32 | DataType::Date64 => Type::DATE,
         DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => Type::NUMERIC,
+        DataType::List(field)
+            if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
+        {
+            Type::TEXT_ARRAY
+        }
         _ => Type::TEXT,
     }
 }
@@ -2287,6 +2346,55 @@ mod integration_tests {
             rows.iter().map(|r| r.get::<_, &str>(0).to_string()).collect();
         symbols.sort();
         assert_eq!(symbols, ["AAPL", "MSFT"], "both emitted rows arrive over pgwire");
+
+        handle.abort();
+    }
+
+    /// A TEXT[] column must round-trip over the binary wire (asyncpg/JDBC
+    /// request binary): the column advertises the _text OID and encodes as a
+    /// Postgres array, so tokio_postgres decodes it into a Vec<String>.
+    #[tokio::test]
+    async fn subscribe_decodes_text_array_in_binary_format() {
+        use std::time::Duration;
+
+        use arrow_array::{Int64Array, RecordBatch};
+
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        db.execute("CREATE SOURCE feed (id BIGINT)").await.expect("create source");
+        db.execute("CREATE MATERIALIZED VIEW tagged AS SELECT id, make_array('en','ja') AS tags FROM feed")
+            .await
+            .expect("create mv");
+        db.start().await.expect("db starts");
+        let (addr, handle) =
+            super::serve(Arc::clone(&db), "127.0.0.1:0", HashMap::new(), false, None, 256, 10)
+                .await
+                .expect("serve");
+        let mut client = connect(addr).await;
+        let txn = client.transaction().await.expect("begin");
+        let stmt = txn.prepare("SUBSCRIBE tagged").await.expect("prepare");
+        let portal = txn.bind(&stmt, &[]).await.expect("bind");
+
+        let pusher = tokio::spawn({
+            let db = Arc::clone(&db);
+            async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let src = db.source_untyped("feed").expect("source handle");
+                let batch =
+                    RecordBatch::try_new(src.schema().clone(), vec![Arc::new(Int64Array::from(vec![1_i64]))])
+                        .expect("batch");
+                src.push_arrow(batch).expect("push");
+            }
+        });
+
+        let rows = tokio::time::timeout(Duration::from_secs(10), txn.query_portal(&portal, 1))
+            .await
+            .expect("read did not time out")
+            .expect("query_portal");
+        pusher.await.expect("pusher");
+
+        assert_eq!(rows.len(), 1);
+        let tags: Vec<String> = rows[0].get(1);
+        assert_eq!(tags, vec!["en".to_string(), "ja".to_string()], "TEXT[] decoded over the binary wire");
 
         handle.abort();
     }
