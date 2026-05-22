@@ -1,13 +1,13 @@
-# Bluesky news-event detection & cashtag tracking.
-# Jetstream firehose -> keyword spikes + cashtag frequency, all in SQL,
+# Bluesky trending-hashtag detection.
+# Jetstream firehose -> live trending hashtags + spike detection, all in SQL,
 # SUBSCRIBE-able over pgwire on 5432. No auth, no Docker.
 #
-# Windows are event-time, keyed on Jetstream's `time_us` (microseconds since
-# epoch) decoded into a TIMESTAMP via `epoch_unit`. A bounded watermark (5s
+# Windows are event-time, keyed on Jetstream's `time_us` (epoch microseconds,
+# decoded into a TIMESTAMP via `epoch_unit`). A bounded watermark (5s
 # out-of-orderness) advances from the live max event time, so windows close
-# continuously; backfill replayed on reconnect is older than the watermark
-# and is dropped as late (standard late-data handling). The URL pins
-# app.bsky.feed.post (~30-60/s).
+# continuously; backfill replayed on reconnect is older than the watermark and
+# is dropped as late (standard late-data handling). The URL pins
+# app.bsky.feed.post (~30-60/s); hashtags are common, so output is immediate.
 
 sql = """
 -- Source: nested JSON fields pulled out with json.column.<col> = '<dot.path>'.
@@ -43,47 +43,40 @@ WHERE collection = 'app.bsky.feed.post'
   AND operation  = 'create'
   AND (langs IS NULL OR array_has(langs, 'en'));
 
--- Keyword spikes: 5s term counts over a fixed macro lexicon.
-CREATE MATERIALIZED VIEW bsky_term_5s AS
-SELECT TUMBLE(event_time, INTERVAL '5' SECOND) AS bucket, term, COUNT(*) AS n
-FROM bsky_jetstream_raw,
-     UNNEST(make_array('powell','fed','rate cut','cpi','nfp','recession','tariff','ecb','boj')) AS t(term)
-WHERE collection = 'app.bsky.feed.post' AND operation = 'create'
-  AND strpos(lower(text), term) > 0
-GROUP BY TUMBLE(event_time, INTERVAL '5' SECOND), term
-EMIT ON WINDOW CLOSE;
-
--- 5-minute per-term baseline, normalized to an expected count per 5s bucket.
-CREATE MATERIALIZED VIEW bsky_term_baseline AS
-SELECT TUMBLE(event_time, INTERVAL '5' MINUTE) AS win, term,
-       CAST(COUNT(*) AS DOUBLE) / 60.0 AS expected_per_5s
-FROM bsky_jetstream_raw,
-     UNNEST(make_array('powell','fed','rate cut','cpi','nfp','recession','tariff','ecb','boj')) AS t(term)
-WHERE collection = 'app.bsky.feed.post' AND operation = 'create'
-  AND strpos(lower(text), term) > 0
-GROUP BY TUMBLE(event_time, INTERVAL '5' MINUTE), term
-EMIT ON WINDOW CLOSE;
-
--- Spike ratio: each 5s bucket vs the latest baseline for its term.
--- (Baseline warms up over the first 5 minutes; spikes get a ratio after that.)
-CREATE MATERIALIZED VIEW bsky_keyword_spikes AS
-SELECT c.bucket, c.term, c.n,
-       CAST(c.n AS DOUBLE) / NULLIF(b.expected_per_5s, 0) AS spike_ratio
-FROM bsky_term_5s c ASOF JOIN bsky_term_baseline b
-  MATCH_CONDITION(c.bucket >= b.win) ON c.term = b.term;
-
--- Cashtag frequency: tokenize on spaces, keep $TICKER tokens, count per 1m.
-CREATE MATERIALIZED VIEW bsky_cashtags_1m AS
-SELECT TUMBLE(event_time, INTERVAL '1' MINUTE) AS bucket, cashtag,
-       COUNT(*) AS mentions, COUNT(DISTINCT author_did) AS unique_authors
+-- Hashtags per 5s: tokenize lowercased text, keep #tags. uses = mentions,
+-- authors = distinct posters (so one user spamming a tag can't dominate).
+CREATE MATERIALIZED VIEW bsky_hashtags_5s AS
+SELECT TUMBLE(event_time, INTERVAL '5' SECOND) AS bucket, tag,
+       COUNT(*) AS uses, COUNT(DISTINCT author_did) AS authors
 FROM (
-    SELECT event_time, author_did, unnest(string_to_array(text, ' ')) AS cashtag
+    SELECT event_time, author_did, unnest(string_to_array(lower(text), ' ')) AS tag
     FROM bsky_jetstream_raw
     WHERE collection = 'app.bsky.feed.post' AND operation = 'create'
 )
-WHERE regexp_like(cashtag, '^\\$[A-Z]{1,5}$')
-GROUP BY TUMBLE(event_time, INTERVAL '1' MINUTE), cashtag
+WHERE regexp_like(tag, '^#[a-z][a-z0-9_]{1,29}$')
+GROUP BY TUMBLE(event_time, INTERVAL '5' SECOND), tag
 EMIT ON WINDOW CLOSE;
+
+-- 5-minute per-hashtag baseline, normalized to an expected count per 5s bucket.
+CREATE MATERIALIZED VIEW bsky_hashtag_baseline AS
+SELECT TUMBLE(event_time, INTERVAL '5' MINUTE) AS win, tag,
+       CAST(COUNT(*) AS DOUBLE) / 60.0 AS expected_per_5s
+FROM (
+    SELECT event_time, unnest(string_to_array(lower(text), ' ')) AS tag
+    FROM bsky_jetstream_raw
+    WHERE collection = 'app.bsky.feed.post' AND operation = 'create'
+)
+WHERE regexp_like(tag, '^#[a-z][a-z0-9_]{1,29}$')
+GROUP BY TUMBLE(event_time, INTERVAL '5' MINUTE), tag
+EMIT ON WINDOW CLOSE;
+
+-- Spiking hashtags: each 5s bucket vs the latest baseline for its tag.
+-- (Baseline warms up over the first 5 minutes; spikes get a ratio after that.)
+CREATE MATERIALIZED VIEW bsky_hashtag_spikes AS
+SELECT c.bucket, c.tag, c.uses, c.authors,
+       CAST(c.uses AS DOUBLE) / NULLIF(b.expected_per_5s, 0) AS spike_ratio
+FROM bsky_hashtags_5s c ASOF JOIN bsky_hashtag_baseline b
+  MATCH_CONDITION(c.bucket >= b.win) ON c.tag = b.tag;
 """
 
 [server]
