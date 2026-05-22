@@ -2231,6 +2231,66 @@ mod integration_tests {
         handle.abort();
     }
 
+    /// SUBSCRIBE must actually stream emitted MV rows over the socket: bind a
+    /// portal, push rows into the source, and read them back via the
+    /// extended-query portal (the chunked path JDBC/asyncpg use).
+    #[tokio::test]
+    async fn subscribe_streams_emitted_rows_over_the_wire() {
+        use std::time::Duration;
+
+        use arrow_array::{Float64Array, RecordBatch, StringArray};
+
+        let db = Arc::new(LaminarDB::open().expect("db opens"));
+        db.execute("CREATE SOURCE trades (symbol VARCHAR, price DOUBLE)")
+            .await
+            .expect("create source");
+        db.execute("CREATE MATERIALIZED VIEW prices AS SELECT symbol, price FROM trades")
+            .await
+            .expect("create mv");
+        db.start().await.expect("db starts");
+        let (addr, handle) =
+            super::serve(Arc::clone(&db), "127.0.0.1:0", HashMap::new(), false, None, 256, 10)
+                .await
+                .expect("serve");
+        let mut client = connect(addr).await;
+        let txn = client.transaction().await.expect("begin");
+
+        // The subscription opens when the first Execute runs, so push once the
+        // read is in flight (Tail would otherwise miss earlier rows).
+        let stmt = txn.prepare("SUBSCRIBE prices").await.expect("prepare");
+        let portal = txn.bind(&stmt, &[]).await.expect("bind");
+
+        let pusher = tokio::spawn({
+            let db = Arc::clone(&db);
+            async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let src = db.source_untyped("trades").expect("source handle");
+                let batch = RecordBatch::try_new(
+                    src.schema().clone(),
+                    vec![
+                        Arc::new(StringArray::from(vec!["AAPL", "MSFT"])),
+                        Arc::new(Float64Array::from(vec![100.0, 200.0])),
+                    ],
+                )
+                .expect("batch");
+                src.push_arrow(batch).expect("push");
+            }
+        });
+
+        let rows = tokio::time::timeout(Duration::from_secs(10), txn.query_portal(&portal, 2))
+            .await
+            .expect("read did not time out")
+            .expect("query_portal");
+        pusher.await.expect("pusher");
+
+        let mut symbols: Vec<String> =
+            rows.iter().map(|r| r.get::<_, &str>(0).to_string()).collect();
+        symbols.sort();
+        assert_eq!(symbols, ["AAPL", "MSFT"], "both emitted rows arrive over pgwire");
+
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn ddl_returns_pg_error_pointing_at_http() {
         let (addr, handle) = spawn_server().await;
