@@ -113,6 +113,10 @@ criterion = { workspace = true }
 bytes = { workspace = true }
 tracing-subscriber = { workspace = true }
 proptest = { workspace = true }
+# WebSocket stub server for the Bluesky e2e test (used only by the
+# websocket-gated test; no TLS so non-websocket dev builds stay openssl-free).
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3" }
 # Kafka producer/admin client used by `kafka_docker_scenarios.rs` integration tests.
 # Tests skip gracefully when the Redpanda broker started by
 # `tests/docker/compose.yml` is not reachable on `localhost:19092`.

@@ -12,7 +12,7 @@ CREATE SOURCE bsky_jetstream_raw (
     event_time_us BIGINT,
     author_did    TEXT,
     text          TEXT,
-    langs         TEXT[],
+    langs         ARRAY<TEXT>,
     kind          TEXT,
     operation     TEXT,
     collection    TEXT
