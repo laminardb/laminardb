@@ -9,7 +9,6 @@ cashtag top-list is kept client-side. Ctrl-C to stop.
 """
 
 import asyncio
-from collections import defaultdict
 
 import asyncpg
 
@@ -28,12 +27,17 @@ async def tail_spikes(conn: asyncpg.Connection) -> None:
 
 
 async def tail_cashtags(conn: asyncpg.Connection) -> None:
-    per_bucket: dict[object, dict[str, tuple[int, int]]] = defaultdict(dict)
+    # The 1-min window emits on close, so a bucket's rows arrive together and
+    # buckets advance in order. Keep only the current bucket's counts so memory
+    # stays bounded over an unbounded subscription.
+    current = None
+    counts: dict[str, tuple[int, int]] = {}
     async with conn.transaction():
         async for row in conn.cursor(CASHTAGS):
-            bucket = per_bucket[row["bucket"]]
-            bucket[row["cashtag"]] = (row["mentions"], row["unique_authors"])
-            top = sorted(bucket.items(), key=lambda kv: kv[1][0], reverse=True)[:10]
+            if row["bucket"] != current:
+                current, counts = row["bucket"], {}
+            counts[row["cashtag"]] = (row["mentions"], row["unique_authors"])
+            top = sorted(counts.items(), key=lambda kv: kv[1][0], reverse=True)[:10]
             line = ", ".join(f"{tag}={m}({u})" for tag, (m, u) in top)
             print(f"[cashtag] {row['bucket']}  {line}")
 

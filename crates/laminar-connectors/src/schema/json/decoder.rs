@@ -873,11 +873,11 @@ fn append_value(
             }
         }
         DataType::List(field) if matches!(field.data_type(), DataType::Utf8) => {
-            let b = builder
-                .as_any_mut()
-                .downcast_mut::<ListBuilder<StringBuilder>>()
-                .unwrap();
             if let Some(items) = value.as_array() {
+                let b = builder
+                    .as_any_mut()
+                    .downcast_mut::<ListBuilder<StringBuilder>>()
+                    .unwrap();
                 for item in items {
                     if let Some(s) = item.as_str() {
                         b.values().append_value(s);
@@ -889,7 +889,14 @@ fn append_value(
                 }
                 b.append(true);
             } else {
-                b.append_null();
+                // A non-array value for a list column is a type mismatch; honor
+                // the Null/Coerce/Reject policy like the scalar arms above.
+                handle_mismatch(
+                    builder,
+                    config,
+                    mismatch_count,
+                    &format!("expected array, got {}", json_type_name(value)),
+                )?;
             }
         }
         // Unsupported types: serialize as JSON string.
@@ -2030,6 +2037,28 @@ mod tests {
         assert_eq!(strs.len(), 2);
         assert_eq!(strs.value(0), "en");
         assert_eq!(strs.value(1), "es");
+    }
+
+    #[test]
+    fn test_list_column_non_array_honors_reject_strategy() {
+        use arrow_schema::Field;
+        let schema = make_schema(vec![(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        )]);
+        let config = JsonDecoderConfig {
+            type_mismatch: TypeMismatchStrategy::Reject,
+            ..Default::default()
+        };
+        let decoder = JsonDecoder::with_config(schema, config);
+        // A scalar where the list column expects an array must be rejected, not
+        // silently coerced to NULL.
+        let records = vec![json_record(r#"{"tags": "en"}"#)];
+        let result = decoder.decode_batch(&records);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("type mismatch"));
     }
 
     // ── json.explode tests ──────────────────────────────────────
