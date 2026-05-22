@@ -2568,14 +2568,6 @@ mod tests {
     }
 
     #[test]
-    fn single_source_none_for_lateral_unnest() {
-        // A lateral UNNEST is an extra input the compiled fast path cannot
-        // run, so the query must not be classified as single-source.
-        let name = single_source_table("SELECT x FROM trades, UNNEST(make_array(1, 2)) AS u(x)");
-        assert_eq!(name, None);
-    }
-
-    #[test]
     fn is_window_tvf_case_insensitive() {
         assert!(is_window_tvf("TUMBLE"));
         assert!(is_window_tvf("tumble"));

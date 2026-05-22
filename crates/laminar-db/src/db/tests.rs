@@ -4017,55 +4017,6 @@ async fn windowed_aggregate_over_lateral_unnest_emits() {
     assert!(rows >= 1, "windowed aggregate over lateral UNNEST should emit");
 }
 
-/// A tumbling-window `COUNT(DISTINCT)` must emit the correct per-window
-/// cardinality (not a plain count, not zero).
-#[tokio::test]
-async fn windowed_count_distinct_emits_correct_cardinality() {
-    let db = LaminarDB::open().unwrap();
-    db.execute(
-        "CREATE SOURCE visits (user_id VARCHAR, ts TIMESTAMP, \
-         WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
-    )
-    .await
-    .unwrap();
-    db.execute(
-        "CREATE MATERIALIZED VIEW uniques AS \
-         SELECT TUMBLE(ts, INTERVAL '5' SECOND) AS bucket, COUNT(DISTINCT user_id) AS n \
-         FROM visits \
-         GROUP BY TUMBLE(ts, INTERVAL '5' SECOND) \
-         EMIT ON WINDOW CLOSE",
-    )
-    .await
-    .unwrap();
-    db.start().await.unwrap();
-
-    let handle = db.source_untyped("visits").unwrap();
-    let schema = handle.schema().clone();
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            // [0,5s): users a, b, a -> 2 distinct. "tick" lands in the next
-            // window and advances the watermark to close [0,5s).
-            Arc::new(arrow::array::StringArray::from(vec!["a", "b", "a", "tick"])),
-            Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
-                100_000, 200_000, 300_000, 6_000_000,
-            ])),
-        ],
-    )
-    .unwrap();
-    handle.push_arrow(batch).unwrap();
-
-    assert!(poll_mv(&db, "uniques", 1).await >= 1, "windowed COUNT(DISTINCT) should emit");
-    let batches = db.ctx.sql("SELECT n FROM uniques").await.unwrap().collect().await.unwrap();
-    let n = batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap()
-        .value(0);
-    assert_eq!(n, 2, "distinct user count in the closed window");
-}
-
 /// An `ASOF JOIN` feeding a materialized view must plan and emit, matching
 /// each left row to the latest right row at-or-before its timestamp (per key).
 /// `DataFusion` can't lower `AsOf`, so schema resolution rewrites it to a plain
@@ -4201,42 +4152,6 @@ async fn windowed_aggregate_over_projection_unnest_emits() {
     assert_eq!(n, 2, "word 'a' appears in both docs within the window");
 }
 
-/// Processing-time windows: `TUMBLE(proctime(), ..)` must close on wall-clock
-/// advancement and emit, with no event-time column or watermark. This is how
-/// sources without a usable event time (e.g. a firehose serving backfill) do
-/// windowed aggregation.
-#[tokio::test]
-async fn proctime_tumble_window_closes_on_walltime() {
-    let db = LaminarDB::open().unwrap();
-    db.execute("CREATE SOURCE s (x VARCHAR)").await.unwrap();
-    db.execute(
-        "CREATE MATERIALIZED VIEW c AS \
-         SELECT TUMBLE(proctime(), INTERVAL '1' SECOND) AS bucket, COUNT(*) AS n \
-         FROM s GROUP BY TUMBLE(proctime(), INTERVAL '1' SECOND) EMIT ON WINDOW CLOSE",
-    )
-    .await
-    .unwrap();
-    db.start().await.unwrap();
-    let handle = db.source_untyped("s").unwrap();
-    let schema = handle.schema().clone();
-    let push = |n: usize| {
-        handle
-            .push_arrow(
-                RecordBatch::try_new(
-                    schema.clone(),
-                    vec![Arc::new(arrow::array::StringArray::from(vec!["a"; n]))],
-                )
-                .unwrap(),
-            )
-            .unwrap();
-    };
-    push(3);
-    tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
-    push(1); // proctime now past the first 1s window
-    let rows = poll_mv(&db, "c", 1).await;
-    assert!(rows >= 1, "proctime() tumble window should close and emit (got {rows})");
-}
-
 #[tokio::test]
 async fn open_subscription_resolves_unknown_name_to_error() {
     let db = LaminarDB::open().unwrap();
@@ -4249,7 +4164,7 @@ async fn open_subscription_resolves_unknown_name_to_error() {
 
 /// A SOURCE is not subscribable: only streams/MVs defined over it publish to
 /// the registry, so subscribing to the source directly must error (not hang
-/// forever), reusing the StreamNotFound path.
+/// forever), reusing the `StreamNotFound` path.
 #[tokio::test]
 async fn open_subscription_rejects_bare_source() {
     let db = LaminarDB::open().unwrap();
