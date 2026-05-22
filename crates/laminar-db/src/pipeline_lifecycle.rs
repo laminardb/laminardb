@@ -76,12 +76,15 @@ async fn resolve_stream_output_schemas(
             if !progressed {
                 let mut unresolved: Vec<&str> = next.iter().map(|r| r.name.as_str()).collect();
                 unresolved.sort_unstable();
-                let err = ctx
-                    .state()
-                    .create_logical_plan(&next[0].query_sql)
-                    .await
-                    .err()
-                    .map_or_else(|| "unknown error".to_string(), |e| e.to_string());
+                // Report the rewritten-plan error when the query is an ASOF join:
+                // the raw plan only ever says "AsOf unsupported", which masks the
+                // real blocker (the rewrite is what we actually plan against).
+                let sql = &next[0].query_sql;
+                let err = match crate::sql_analysis::rewrite_asof_joins_for_planning(sql) {
+                    Some(rewritten) => ctx.state().create_logical_plan(&rewritten).await.err(),
+                    None => ctx.state().create_logical_plan(sql).await.err(),
+                }
+                .map_or_else(|| "unknown error".to_string(), |e| e.to_string());
                 return Err(DbError::Pipeline(format!(
                     "unresolvable stream dependency among [{}]: {err}",
                     unresolved.join(", ")

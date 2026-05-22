@@ -2,35 +2,42 @@
 # Jetstream firehose -> keyword spikes + cashtag frequency, all in SQL,
 # SUBSCRIBE-able over pgwire on 5432. No auth, no Docker.
 #
-# Windows tumble on proctime() (processing time): no event-time watermark,
-# by design — Jetstream serves backfill on reconnect, which would stall an
-# event-time watermark. The URL pins app.bsky.feed.post (~30-60/s).
+# Windows are event-time, keyed on Jetstream's `time_us` (microseconds since
+# epoch) decoded into a TIMESTAMP via `epoch_unit`. A bounded watermark (5s
+# out-of-orderness) advances from the live max event time, so windows close
+# continuously; backfill replayed on reconnect is older than the watermark
+# and is dropped as late (standard late-data handling). The URL pins
+# app.bsky.feed.post (~30-60/s).
 
 sql = """
 -- Source: nested JSON fields pulled out with json.column.<col> = '<dot.path>'.
+-- time_us is epoch microseconds -> TIMESTAMP via .epoch_unit; the watermark
+-- makes it the event-time axis for the windows below.
 CREATE SOURCE bsky_jetstream_raw (
-    event_time_us BIGINT,
+    event_time    TIMESTAMP,
     author_did    TEXT,
     text          TEXT,
     langs         ARRAY<TEXT>,
     kind          TEXT,
     operation     TEXT,
-    collection    TEXT
+    collection    TEXT,
+    WATERMARK FOR event_time AS event_time - INTERVAL '5' SECOND
 ) FROM WEBSOCKET (
     url    = 'wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post',
     format = 'json',
-    'json.column.event_time_us' = 'time_us',
-    'json.column.author_did'    = 'did',
-    'json.column.text'          = 'commit.record.text',
-    'json.column.langs'         = 'commit.record.langs',
-    'json.column.kind'          = 'kind',
-    'json.column.operation'     = 'commit.operation',
-    'json.column.collection'    = 'commit.collection'
+    'json.column.event_time'            = 'time_us',
+    'json.column.event_time.epoch_unit' = 'micros',
+    'json.column.author_did'            = 'did',
+    'json.column.text'                  = 'commit.record.text',
+    'json.column.langs'                 = 'commit.record.langs',
+    'json.column.kind'                  = 'kind',
+    'json.column.operation'             = 'commit.operation',
+    'json.column.collection'            = 'commit.collection'
 );
 
 -- Subscribable raw feed: English post creates.
 CREATE STREAM bsky_posts AS
-SELECT event_time_us, author_did, text, langs
+SELECT event_time, author_did, text, langs
 FROM bsky_jetstream_raw
 WHERE collection = 'app.bsky.feed.post'
   AND operation  = 'create'
@@ -38,23 +45,23 @@ WHERE collection = 'app.bsky.feed.post'
 
 -- Keyword spikes: 5s term counts over a fixed macro lexicon.
 CREATE MATERIALIZED VIEW bsky_term_5s AS
-SELECT TUMBLE(proctime(), INTERVAL '5' SECOND) AS bucket, term, COUNT(*) AS n
+SELECT TUMBLE(event_time, INTERVAL '5' SECOND) AS bucket, term, COUNT(*) AS n
 FROM bsky_jetstream_raw,
      UNNEST(make_array('powell','fed','rate cut','cpi','nfp','recession','tariff','ecb','boj')) AS t(term)
 WHERE collection = 'app.bsky.feed.post' AND operation = 'create'
   AND strpos(lower(text), term) > 0
-GROUP BY TUMBLE(proctime(), INTERVAL '5' SECOND), term
+GROUP BY TUMBLE(event_time, INTERVAL '5' SECOND), term
 EMIT ON WINDOW CLOSE;
 
 -- 5-minute per-term baseline, normalized to an expected count per 5s bucket.
 CREATE MATERIALIZED VIEW bsky_term_baseline AS
-SELECT TUMBLE(proctime(), INTERVAL '5' MINUTE) AS win, term,
+SELECT TUMBLE(event_time, INTERVAL '5' MINUTE) AS win, term,
        CAST(COUNT(*) AS DOUBLE) / 60.0 AS expected_per_5s
 FROM bsky_jetstream_raw,
      UNNEST(make_array('powell','fed','rate cut','cpi','nfp','recession','tariff','ecb','boj')) AS t(term)
 WHERE collection = 'app.bsky.feed.post' AND operation = 'create'
   AND strpos(lower(text), term) > 0
-GROUP BY TUMBLE(proctime(), INTERVAL '5' MINUTE), term
+GROUP BY TUMBLE(event_time, INTERVAL '5' MINUTE), term
 EMIT ON WINDOW CLOSE;
 
 -- Spike ratio: each 5s bucket vs the latest baseline for its term.
@@ -67,15 +74,15 @@ FROM bsky_term_5s c ASOF JOIN bsky_term_baseline b
 
 -- Cashtag frequency: tokenize on spaces, keep $TICKER tokens, count per 1m.
 CREATE MATERIALIZED VIEW bsky_cashtags_1m AS
-SELECT TUMBLE(proctime(), INTERVAL '1' MINUTE) AS bucket, cashtag,
+SELECT TUMBLE(event_time, INTERVAL '1' MINUTE) AS bucket, cashtag,
        COUNT(*) AS mentions, COUNT(DISTINCT author_did) AS unique_authors
 FROM (
-    SELECT author_did, unnest(string_to_array(text, ' ')) AS cashtag
+    SELECT event_time, author_did, unnest(string_to_array(text, ' ')) AS cashtag
     FROM bsky_jetstream_raw
     WHERE collection = 'app.bsky.feed.post' AND operation = 'create'
 )
 WHERE regexp_like(cashtag, '^\\$[A-Z]{1,5}$')
-GROUP BY TUMBLE(proctime(), INTERVAL '1' MINUTE), cashtag
+GROUP BY TUMBLE(event_time, INTERVAL '1' MINUTE), cashtag
 EMIT ON WINDOW CLOSE;
 """
 

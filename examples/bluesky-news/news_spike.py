@@ -17,9 +17,12 @@ SPIKES = "SUBSCRIBE bsky_keyword_spikes WHERE spike_ratio > 5"
 CASHTAGS = "SUBSCRIBE bsky_cashtags_1m"
 
 
+# asyncpg cursors default to prefetch=50: they won't yield until 50 rows have
+# batched, so a live tail appears to hang. prefetch=1 streams each row as it
+# arrives.
 async def tail_spikes(conn: asyncpg.Connection) -> None:
     async with conn.transaction():
-        async for row in conn.cursor(SPIKES):
+        async for row in conn.cursor(SPIKES, prefetch=1):
             print(
                 f"[spike]   {row['bucket']}  {row['term']:<10}  "
                 f"n={row['n']:<4} ratio={row['spike_ratio']:.1f}"
@@ -33,7 +36,7 @@ async def tail_cashtags(conn: asyncpg.Connection) -> None:
     current = None
     counts: dict[str, tuple[int, int]] = {}
     async with conn.transaction():
-        async for row in conn.cursor(CASHTAGS):
+        async for row in conn.cursor(CASHTAGS, prefetch=1):
             if row["bucket"] != current:
                 current, counts = row["bucket"], {}
             counts[row["cashtag"]] = (row["mentions"], row["unique_authors"])

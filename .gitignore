@@ -66,3 +66,7 @@ docs/adr/
 
 # Private internal docs (formerly a git submodule; kept local-only, untracked)
 /private/
+
+# Python artifacts (example clients)
+__pycache__/
+*.pyc

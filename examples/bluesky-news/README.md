@@ -18,8 +18,11 @@ via `json.column.<col>` paths, and the analytics are plain materialized views.
 - **`bsky_cashtags_1m`** — `$TICKER` tokens extracted from text (tokenize +
   regexp), counted per 1-minute window with `COUNT(DISTINCT author_did)`.
 
-Windows tumble on `proctime()` (processing time) — deliberately no event-time
-watermark, since Jetstream replays backfill on reconnect and would stall one.
+Windows are event-time, keyed on Jetstream's `time_us` (epoch microseconds,
+decoded into a `TIMESTAMP` via `epoch_unit`). A bounded watermark (5s
+out-of-orderness) advances from the live max event time, so windows close
+continuously; backfill replayed on reconnect is older than the watermark and
+is dropped as late (standard late-data handling).
 
 ## Run
 
@@ -44,7 +47,8 @@ after that. Cashtag and spike-term volume depends on what's trending.
 
 The engine constructs this demo relies on are covered by tests in
 `crates/laminar-db` and `crates/laminar-connectors`: windowed aggregation over
-`UNNEST`, `ASOF JOIN` across materialized views, windowed `COUNT(DISTINCT)`,
-`proctime()` windows, and `json.column` decoding of nested objects and string
-arrays. `keyword_spike_pipeline_detects_injected_spike` exercises the full
-spike pipeline against an injected synthetic spike.
+`UNNEST` (`windowed_aggregate_over_lateral_unnest_emits`), `ASOF JOIN` in a
+materialized view (`asof_join_in_materialized_view_emits_backward_match`),
+event-time windows with a `WATERMARK`, and `json.column` decoding of nested
+objects and string arrays (`test_json_column_path_to_nested_string_array`,
+plus `epoch_unit` numeric-timestamp decoding).
