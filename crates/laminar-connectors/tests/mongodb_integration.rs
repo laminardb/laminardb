@@ -55,20 +55,23 @@ async fn start_mongo() -> (testcontainers::ContainerAsync<GenericImage>, String)
         .await
         .expect("init replica set");
 
-    // Wait for the replica set to stabilize.
-    for _ in 0..30 {
-        sleep(Duration::from_millis(500)).await;
-        if let Ok(status) = admin.run_command(doc! { "replSetGetStatus": 1 }).await {
-            if let Ok(members) = status.get_array("members") {
-                let primary = members.iter().any(|m| {
-                    m.as_document().and_then(|d| d.get_str("stateStr").ok()) == Some("PRIMARY")
-                });
-                if primary {
-                    break;
-                }
+    // Wait until the node actually accepts writes. With directConnection=true
+    // the driver sends writes straight to this node rather than doing its own
+    // primary selection, so `stateStr: PRIMARY` from replSetGetStatus is not
+    // enough — a freshly elected primary briefly rejects writes with
+    // NotWritablePrimary until catch-up completes. `hello.isWritablePrimary`
+    // is the authoritative "ready for writes" signal.
+    let mut writable = false;
+    for _ in 0..40 {
+        if let Ok(hello) = admin.run_command(doc! { "hello": 1 }).await {
+            if hello.get_bool("isWritablePrimary").unwrap_or(false) {
+                writable = true;
+                break;
             }
         }
+        sleep(Duration::from_millis(500)).await;
     }
+    assert!(writable, "replica set did not become writable in time");
 
     (container, uri)
 }
