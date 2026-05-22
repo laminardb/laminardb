@@ -939,15 +939,18 @@ impl LaminarDB {
         // read its schema is wasteful and yields an empty schema for joins
         // DataFusion can't lower (ASOF); fall back to execution only if
         // planning fails.
-        let schema = match crate::pipeline_lifecycle::plan_output_schema(&self.ctx, &query_sql)
-            .await
-        {
-            Some(s) => s,
-            None => match self.handle_query(&query_sql).await? {
-                ExecuteResult::Query(qh) => qh.schema().clone(),
-                _ => Arc::new(Schema::new(vec![Field::new("result", DataType::Utf8, true)])),
-            },
-        };
+        let schema =
+            match crate::pipeline_lifecycle::plan_output_schema(&self.ctx, &query_sql).await {
+                Some(s) => s,
+                None => match self.handle_query(&query_sql).await? {
+                    ExecuteResult::Query(qh) => qh.schema().clone(),
+                    _ => Arc::new(Schema::new(vec![Field::new(
+                        "result",
+                        DataType::Utf8,
+                        true,
+                    )])),
+                },
+            };
 
         // Discover source references via AST-based extraction (not substring matching)
         let table_refs = crate::sql_analysis::extract_table_references(&query_sql);

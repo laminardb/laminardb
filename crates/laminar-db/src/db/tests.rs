@@ -4014,7 +4014,10 @@ async fn windowed_aggregate_over_lateral_unnest_emits() {
     handle.push_arrow(batch).unwrap();
 
     let rows = poll_mv(&db, "tag_counts", 1).await;
-    assert!(rows >= 1, "windowed aggregate over lateral UNNEST should emit");
+    assert!(
+        rows >= 1,
+        "windowed aggregate over lateral UNNEST should emit"
+    );
 }
 
 /// An `ASOF JOIN` feeding a materialized view must plan and emit, matching
@@ -4079,16 +4082,34 @@ async fn asof_join_in_materialized_view_emits_backward_match() {
     )
     .unwrap();
 
-    assert!(poll_mv(&db, "enriched", 2).await >= 2, "ASOF join in an MV should emit matches");
-    let batches = db.ctx.sql("SELECT price FROM enriched ORDER BY price").await.unwrap().collect().await.unwrap();
+    assert!(
+        poll_mv(&db, "enriched", 2).await >= 2,
+        "ASOF join in an MV should emit matches"
+    );
+    let batches = db
+        .ctx
+        .sql("SELECT price FROM enriched ORDER BY price")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
     let prices: Vec<f64> = batches
         .iter()
         .flat_map(|b| {
-            let col = b.column(0).as_any().downcast_ref::<arrow::array::Float64Array>().unwrap();
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap();
             (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
         })
         .collect();
-    assert_eq!(prices, vec![10.0, 20.0], "backward ASOF should pick the latest quote at-or-before each trade");
+    assert_eq!(
+        prices,
+        vec![10.0, 20.0],
+        "backward ASOF should pick the latest quote at-or-before each trade"
+    );
 }
 
 /// Regression: a windowed aggregate over a SELECT-list `UNNEST` (in a
@@ -4134,7 +4155,10 @@ async fn windowed_aggregate_over_projection_unnest_emits() {
         )
         .unwrap();
 
-    assert!(poll_mv(&db, "word_counts", 1).await >= 1, "projection-unnest MV should emit");
+    assert!(
+        poll_mv(&db, "word_counts", 1).await >= 1,
+        "projection-unnest MV should emit"
+    );
     let batches = db
         .ctx
         .sql("SELECT n FROM word_counts WHERE w = 'a'")

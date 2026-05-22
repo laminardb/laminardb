@@ -228,7 +228,13 @@ pub(crate) fn rewrite_asof_joins_for_planning(sql: &str) -> Option<String> {
             }
         }
     }
-    changed.then(|| stmts.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))
+    changed.then(|| {
+        stmts
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
 }
 
 /// Resolve the source table name from a `TableFactor::Table`.

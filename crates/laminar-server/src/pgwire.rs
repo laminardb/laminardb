@@ -854,10 +854,14 @@ fn list_text_elements(col: &dyn arrow_array::Array, row: usize) -> Vec<Option<St
     let values = col.as_list::<i32>().value(row);
     if matches!(values.data_type(), DataType::LargeUtf8) {
         let s = values.as_string::<i64>();
-        (0..s.len()).map(|i| (!s.is_null(i)).then(|| s.value(i).to_owned())).collect()
+        (0..s.len())
+            .map(|i| (!s.is_null(i)).then(|| s.value(i).to_owned()))
+            .collect()
     } else {
         let s = values.as_string::<i32>();
-        (0..s.len()).map(|i| (!s.is_null(i)).then(|| s.value(i).to_owned())).collect()
+        (0..s.len())
+            .map(|i| (!s.is_null(i)).then(|| s.value(i).to_owned()))
+            .collect()
     }
 }
 
@@ -1938,9 +1942,15 @@ mod tests {
             pg_text_array_literal(&[Some("en".into()), Some("ja".into())]),
             r#"{"en","ja"}"#
         );
-        assert_eq!(pg_text_array_literal(&[None, Some("x".into())]), r#"{NULL,"x"}"#);
+        assert_eq!(
+            pg_text_array_literal(&[None, Some("x".into())]),
+            r#"{NULL,"x"}"#
+        );
         // Embedded quote and backslash are escaped, not left ambiguous.
-        assert_eq!(pg_text_array_literal(&[Some("a\"b\\c".into())]), r#"{"a\"b\\c"}"#);
+        assert_eq!(
+            pg_text_array_literal(&[Some("a\"b\\c".into())]),
+            r#"{"a\"b\\c"}"#
+        );
     }
 
     #[tokio::test]
@@ -2319,10 +2329,17 @@ mod integration_tests {
             .await
             .expect("create mv");
         db.start().await.expect("db starts");
-        let (addr, handle) =
-            super::serve(Arc::clone(&db), "127.0.0.1:0", HashMap::new(), false, None, 256, 10)
-                .await
-                .expect("serve");
+        let (addr, handle) = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            None,
+            256,
+            10,
+        )
+        .await
+        .expect("serve");
         let mut client = connect(addr).await;
         let txn = client.transaction().await.expect("begin");
 
@@ -2354,10 +2371,16 @@ mod integration_tests {
             .expect("query_portal");
         pusher.await.expect("pusher");
 
-        let mut symbols: Vec<String> =
-            rows.iter().map(|r| r.get::<_, &str>(0).to_string()).collect();
+        let mut symbols: Vec<String> = rows
+            .iter()
+            .map(|r| r.get::<_, &str>(0).to_string())
+            .collect();
         symbols.sort();
-        assert_eq!(symbols, ["AAPL", "MSFT"], "both emitted rows arrive over pgwire");
+        assert_eq!(
+            symbols,
+            ["AAPL", "MSFT"],
+            "both emitted rows arrive over pgwire"
+        );
 
         handle.abort();
     }
@@ -2372,15 +2395,26 @@ mod integration_tests {
         use arrow_array::{Int64Array, RecordBatch};
 
         let db = Arc::new(LaminarDB::open().expect("db opens"));
-        db.execute("CREATE SOURCE feed (id BIGINT)").await.expect("create source");
-        db.execute("CREATE MATERIALIZED VIEW tagged AS SELECT id, make_array('en','ja') AS tags FROM feed")
+        db.execute("CREATE SOURCE feed (id BIGINT)")
             .await
-            .expect("create mv");
+            .expect("create source");
+        db.execute(
+            "CREATE MATERIALIZED VIEW tagged AS SELECT id, make_array('en','ja') AS tags FROM feed",
+        )
+        .await
+        .expect("create mv");
         db.start().await.expect("db starts");
-        let (addr, handle) =
-            super::serve(Arc::clone(&db), "127.0.0.1:0", HashMap::new(), false, None, 256, 10)
-                .await
-                .expect("serve");
+        let (addr, handle) = super::serve(
+            Arc::clone(&db),
+            "127.0.0.1:0",
+            HashMap::new(),
+            false,
+            None,
+            256,
+            10,
+        )
+        .await
+        .expect("serve");
         let mut client = connect(addr).await;
         let txn = client.transaction().await.expect("begin");
         let stmt = txn.prepare("SUBSCRIBE tagged").await.expect("prepare");
@@ -2391,9 +2425,11 @@ mod integration_tests {
             async move {
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 let src = db.source_untyped("feed").expect("source handle");
-                let batch =
-                    RecordBatch::try_new(src.schema().clone(), vec![Arc::new(Int64Array::from(vec![1_i64]))])
-                        .expect("batch");
+                let batch = RecordBatch::try_new(
+                    src.schema().clone(),
+                    vec![Arc::new(Int64Array::from(vec![1_i64]))],
+                )
+                .expect("batch");
                 src.push_arrow(batch).expect("push");
             }
         });
@@ -2406,7 +2442,11 @@ mod integration_tests {
 
         assert_eq!(rows.len(), 1);
         let tags: Vec<String> = rows[0].get(1);
-        assert_eq!(tags, vec!["en".to_string(), "ja".to_string()], "TEXT[] decoded over the binary wire");
+        assert_eq!(
+            tags,
+            vec!["en".to_string(), "ja".to_string()],
+            "TEXT[] decoded over the binary wire"
+        );
 
         handle.abort();
     }

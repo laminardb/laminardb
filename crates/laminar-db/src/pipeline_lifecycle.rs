@@ -27,7 +27,12 @@ pub(crate) async fn plan_output_schema(
         let rewritten = crate::sql_analysis::rewrite_asof_joins_for_planning(sql)?;
         ctx.state().create_logical_plan(&rewritten).await.ok()?
     };
-    let fields: Vec<_> = plan.schema().fields().iter().map(|f| (**f).clone()).collect();
+    let fields: Vec<_> = plan
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| (**f).clone())
+        .collect();
     Some(Arc::new(arrow_schema::Schema::new(fields)))
 }
 

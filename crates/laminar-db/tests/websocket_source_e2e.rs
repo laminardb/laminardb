@@ -104,6 +104,9 @@ async fn websocket_source_decodes_nested_json_into_materialized_view() {
     rows.sort_by_key(|r| r.0);
     assert_eq!(rows.len(), 2, "only open orders survive the filter");
     // Nested dot-path decode (meta.region) + nested string-array decode (tags).
-    assert_eq!(rows[0], (1, "us".to_string(), vec!["a".to_string(), "b".to_string()]));
+    assert_eq!(
+        rows[0],
+        (1, "us".to_string(), vec!["a".to_string(), "b".to_string()])
+    );
     assert_eq!(rows[1], (2, "eu".to_string(), vec!["b".to_string()]));
 }
