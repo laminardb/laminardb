@@ -4112,6 +4112,87 @@ async fn asof_join_in_materialized_view_emits_backward_match() {
     );
 }
 
+/// Regression: `COUNT(DISTINCT)` must survive a checkpoint that lands while a
+/// window is still open. `Accumulator::state()` drains the DISTINCT set, and
+/// the window-checkpoint path calls it on the *live* accumulator — so before
+/// the rebuild-from-snapshot fix, a window spanning a checkpoint lost every
+/// distinct value seen before it (`COUNT(*)` was unaffected).
+#[tokio::test]
+async fn count_distinct_survives_midwindow_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = crate::LaminarConfig {
+        storage_dir: Some(dir.path().to_path_buf()),
+        checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let db = LaminarDB::open_with_config(cfg).unwrap();
+    db.execute(
+        "CREATE SOURCE src (author VARCHAR, ts TIMESTAMP, \
+         WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW ct AS \
+         SELECT TUMBLE(ts, INTERVAL '5' SECOND) AS bucket, \
+         COUNT(*) AS n, COUNT(DISTINCT author) AS uniq \
+         FROM src GROUP BY TUMBLE(ts, INTERVAL '5' SECOND) EMIT ON WINDOW CLOSE",
+    )
+    .await
+    .unwrap();
+    db.start().await.unwrap();
+    let h = db.source_untyped("src").unwrap();
+    let schema = h.schema().clone();
+    let push = |author: &str, ts: i64| {
+        h.push_arrow(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(vec![author])),
+                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![ts])),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    };
+    // author a, then a checkpoint mid-window, then author b; tick@6s closes
+    // [0,5s). The window [0,5s) saw two distinct authors across the checkpoint.
+    push("a", 100_000);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    db.checkpoint().await.unwrap();
+    push("b", 200_000);
+    push("z", 6_000_000);
+    poll_mv(&db, "ct", 1).await;
+    let batches = db
+        .ctx
+        .sql("SELECT n, uniq FROM ct WHERE n > 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let uniq: i64 = batches
+        .iter()
+        .flat_map(|b| {
+            let u = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+            (0..b.num_rows()).map(|i| u.value(i)).collect::<Vec<_>>()
+        })
+        .max()
+        .expect("the [0,5s) window must emit");
+    assert_eq!(
+        uniq, 2,
+        "checkpoint must not drop distinct values seen before it"
+    );
+}
+
 /// Regression: a windowed aggregate over a SELECT-list `UNNEST` (in a
 /// subquery) must emit. The unnest is invisible to FROM-based source
 /// detection, so `single_source_table` must still treat it as multi-source —

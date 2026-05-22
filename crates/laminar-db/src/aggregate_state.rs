@@ -179,6 +179,37 @@ impl AggFuncSpec {
     }
 }
 
+/// Snapshot an accumulator's state for a checkpoint and rebuild it in place.
+///
+/// `Accumulator::state()` may drain internal collections (e.g. the DISTINCT
+/// hash set) — `DataFusion` only requires it to be valid once, since partial
+/// accumulators are discarded after `state()`. The window/group checkpoint
+/// paths call it on the *live* accumulator that keeps running, so we rebuild
+/// it from the snapshot (the same `create_accumulator` + `merge_batch`
+/// round-trip used on restore). Returns the IPC-encoded state.
+pub(crate) fn snapshot_and_rebuild(
+    acc: &mut Box<dyn datafusion_expr::Accumulator>,
+    spec: &AggFuncSpec,
+) -> Result<Vec<u8>, DbError> {
+    let state = acc
+        .state()
+        .map_err(|e| DbError::Pipeline(format!("accumulator state: {e}")))?;
+    let ipc = scalars_to_ipc(&state)?;
+    let arrays: Vec<ArrayRef> = state
+        .iter()
+        .map(|sv| {
+            sv.to_array()
+                .map_err(|e| DbError::Pipeline(format!("scalar to array: {e}")))
+        })
+        .collect::<Result<_, _>>()?;
+    let mut rebuilt = spec.create_accumulator()?;
+    rebuilt
+        .merge_batch(&arrays)
+        .map_err(|e| DbError::Pipeline(format!("accumulator rebuild: {e}")))?;
+    *acc = rebuilt;
+    Ok(ipc)
+}
+
 pub(crate) struct IncrementalAggState {
     pre_agg_sql: String,
     num_group_cols: usize,
@@ -1140,11 +1171,8 @@ impl IncrementalAggState {
                 row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
             let key_ipc = scalars_to_ipc(&sv_key)?;
             let mut acc_states = Vec::with_capacity(entry.accs.len());
-            for acc in &mut entry.accs {
-                let state = acc
-                    .state()
-                    .map_err(|e| DbError::Pipeline(format!("accumulator state: {e}")))?;
-                acc_states.push(scalars_to_ipc(&state)?);
+            for (i, acc) in entry.accs.iter_mut().enumerate() {
+                acc_states.push(snapshot_and_rebuild(acc, &self.agg_specs[i])?);
             }
             groups.push(GroupCheckpoint {
                 key: key_ipc,
