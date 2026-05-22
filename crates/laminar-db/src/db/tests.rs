@@ -4247,6 +4247,22 @@ async fn open_subscription_resolves_unknown_name_to_error() {
     assert!(matches!(err, DbError::StreamNotFound(_)));
 }
 
+/// A SOURCE is not subscribable: only streams/MVs defined over it publish to
+/// the registry, so subscribing to the source directly must error (not hang
+/// forever), reusing the StreamNotFound path.
+#[tokio::test]
+async fn open_subscription_rejects_bare_source() {
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE raw (id BIGINT, val VARCHAR)")
+        .await
+        .unwrap();
+    let err = db
+        .open_subscription("raw", None, crate::subscription::SubscribeStart::Tail)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DbError::StreamNotFound(_)), "got {err:?}");
+}
+
 #[tokio::test]
 async fn open_subscription_resolves_named_stream() {
     let db = LaminarDB::open().unwrap();
@@ -4305,10 +4321,15 @@ async fn open_subscription_with_invalid_filter_errors_at_open() {
     db.execute("CREATE SOURCE trades (symbol VARCHAR)")
         .await
         .unwrap();
+    // Subscribe against an MV (filterable schema resolved at CREATE); a bare
+    // source isn't subscribable.
+    db.execute("CREATE MATERIALIZED VIEW priced AS SELECT symbol FROM trades")
+        .await
+        .unwrap();
 
     let err = db
         .open_subscription(
-            "trades",
+            "priced",
             Some("nonexistent_col > 1"),
             crate::subscription::SubscribeStart::Tail,
         )

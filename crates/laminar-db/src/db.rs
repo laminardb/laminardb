@@ -1065,8 +1065,11 @@ impl LaminarDB {
     /// sink placeholder (`Schema::empty`) — a `WHERE` clause can't compile
     /// against that and must be rejected.
     ///
-    /// Lookup order: MV registry → catalog source → `start()`-resolved
-    /// stream output → `StreamEntry` sink (placeholder).
+    /// Lookup order: MV registry → `start()`-resolved stream output →
+    /// `StreamEntry` sink (placeholder). A bare SOURCE is intentionally not
+    /// resolved: only streams/MVs defined over it publish to the registry, so
+    /// subscribing to the source directly would block forever — it falls
+    /// through to `None`, which the caller surfaces as `StreamNotFound`.
     #[must_use]
     pub fn lookup_subscription_schema(
         &self,
@@ -1074,9 +1077,6 @@ impl LaminarDB {
     ) -> Option<(arrow_schema::SchemaRef, bool)> {
         if let Some(mv) = self.mv_registry.lock().get(name).cloned() {
             return Some((mv.schema, true));
-        }
-        if let Some(src) = self.catalog.get_source(name) {
-            return Some((Arc::clone(&src.schema), true));
         }
         if let Some(schema) = self.stream_schemas.read().get(name).cloned() {
             return Some((schema, true));
