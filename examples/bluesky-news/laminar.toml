@@ -29,10 +29,8 @@ CREATE SOURCE bsky_jetstream_raw (
 );
 
 -- Subscribable raw feed: English post creates.
--- langs stays in the WHERE filter but out of the projection: a TEXT[] column
--- can't be encoded in the pgwire binary format that asyncpg/JDBC request.
 CREATE STREAM bsky_posts AS
-SELECT event_time_us, author_did, text
+SELECT event_time_us, author_did, text, langs
 FROM bsky_jetstream_raw
 WHERE collection = 'app.bsky.feed.post'
   AND operation  = 'create'
