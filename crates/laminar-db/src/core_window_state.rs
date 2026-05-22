@@ -1642,6 +1642,7 @@ impl CoreWindowState {
                             acc_states.push(crate::aggregate_state::snapshot_and_rebuild(
                                 acc,
                                 &self.agg_specs[i],
+                                false,
                             )?);
                         }
                         group_checkpoints.push(GroupCheckpoint {
@@ -1679,6 +1680,7 @@ impl CoreWindowState {
                             acc_states.push(crate::aggregate_state::snapshot_and_rebuild(
                                 acc,
                                 &self.agg_specs[i],
+                                false,
                             )?);
                         }
                         sessions.push(SessionCheckpoint {

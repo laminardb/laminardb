@@ -185,11 +185,14 @@ impl AggFuncSpec {
 /// hash set) — `DataFusion` only requires it to be valid once, since partial
 /// accumulators are discarded after `state()`. The window/group checkpoint
 /// paths call it on the *live* accumulator that keeps running, so we rebuild
-/// it from the snapshot (the same `create_accumulator` + `merge_batch`
-/// round-trip used on restore). Returns the IPC-encoded state.
+/// it from the snapshot (the same constructor + `merge_batch` round-trip used
+/// on restore). `retractable` must match how this accumulator was created —
+/// changelog/`__weight` groups use the retractable accumulator, so rebuilding
+/// it as a plain one would drop retraction handling. Returns the IPC state.
 pub(crate) fn snapshot_and_rebuild(
     acc: &mut Box<dyn datafusion_expr::Accumulator>,
     spec: &AggFuncSpec,
+    retractable: bool,
 ) -> Result<Vec<u8>, DbError> {
     let state = acc
         .state()
@@ -202,7 +205,11 @@ pub(crate) fn snapshot_and_rebuild(
                 .map_err(|e| DbError::Pipeline(format!("scalar to array: {e}")))
         })
         .collect::<Result<_, _>>()?;
-    let mut rebuilt = spec.create_accumulator()?;
+    let mut rebuilt = if retractable {
+        spec.create_retractable_accumulator()?
+    } else {
+        spec.create_accumulator()?
+    };
     rebuilt
         .merge_batch(&arrays)
         .map_err(|e| DbError::Pipeline(format!("accumulator rebuild: {e}")))?;
@@ -1170,9 +1177,10 @@ impl IncrementalAggState {
             let sv_key =
                 row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
             let key_ipc = scalars_to_ipc(&sv_key)?;
+            let retractable = self.weight_col_idx.is_some();
             let mut acc_states = Vec::with_capacity(entry.accs.len());
             for (i, acc) in entry.accs.iter_mut().enumerate() {
-                acc_states.push(snapshot_and_rebuild(acc, &self.agg_specs[i])?);
+                acc_states.push(snapshot_and_rebuild(acc, &self.agg_specs[i], retractable)?);
             }
             groups.push(GroupCheckpoint {
                 key: key_ipc,
@@ -2714,6 +2722,90 @@ mod tests {
             match regions.value(i) {
                 "US" => assert_eq!(counts.value(i), 1, "US count should be 1 after retraction"),
                 "EU" => assert_eq!(counts.value(i), 1, "EU count should remain 1"),
+                other => panic!("unexpected region: {other}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn changelog_retractable_survives_checkpoint() {
+        // checkpoint_groups() rebuilds each live accumulator from its snapshot.
+        // For a changelog (`__weight`) aggregate the live accumulator is the
+        // retractable variant; rebuilding it as a plain one would silently drop
+        // retraction. Prove a retract still works *after* a mid-stream checkpoint.
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("amount", DataType::Int64, false),
+            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["X"])),
+                Arc::new(arrow::array::Int64Array::from(vec![1])),
+                Arc::new(arrow::array::Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        ctx.register_table("upstream", Arc::new(mem)).unwrap();
+
+        let mut state = IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT region, COUNT(*) AS cnt FROM upstream GROUP BY region",
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(state.weight_col_idx.is_some());
+
+        let pre_agg_schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, true),
+            Field::new("__agg_input_1", DataType::Boolean, true),
+            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+        ]));
+        let mk = |regions: Vec<&str>, weights: Vec<i64>| {
+            let n = regions.len();
+            RecordBatch::try_new(
+                Arc::clone(&pre_agg_schema),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(regions)),
+                    Arc::new(arrow::array::BooleanArray::from(vec![true; n])),
+                    Arc::new(arrow::array::Int64Array::from(weights)),
+                ],
+            )
+            .unwrap()
+        };
+
+        state
+            .process_batch(&mk(vec!["US", "US", "EU"], vec![1, 1, 1]), 1000)
+            .unwrap();
+        let _ = state.emit().unwrap();
+
+        // Mid-stream checkpoint — must keep the live accumulators retractable.
+        let _ = state.checkpoint_groups().unwrap();
+
+        // Retract one US row; a downgraded plain accumulator could not.
+        state
+            .process_batch(&mk(vec!["US"], vec![-1]), 2000)
+            .unwrap();
+        let r = state.emit().unwrap();
+        let regions = r[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let counts = r[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        for i in 0..r[0].num_rows() {
+            match regions.value(i) {
+                "US" => assert_eq!(counts.value(i), 1, "US count must be 1 after retract"),
+                "EU" => assert_eq!(counts.value(i), 1),
                 other => panic!("unexpected region: {other}"),
             }
         }
