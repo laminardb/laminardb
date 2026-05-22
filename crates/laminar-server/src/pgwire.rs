@@ -1931,6 +1931,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pg_text_array_literal_quotes_nulls_and_escapes() {
+        assert_eq!(pg_text_array_literal(&[]), "{}");
+        assert_eq!(
+            pg_text_array_literal(&[Some("en".into()), Some("ja".into())]),
+            r#"{"en","ja"}"#
+        );
+        assert_eq!(pg_text_array_literal(&[None, Some("x".into())]), r#"{NULL,"x"}"#);
+        // Embedded quote and backslash are escaped, not left ambiguous.
+        assert_eq!(pg_text_array_literal(&[Some("a\"b\\c".into())]), r#"{"a\"b\\c"}"#);
+    }
+
     #[tokio::test]
     async fn select_one_dispatches() {
         let db = LaminarDB::open().unwrap();
