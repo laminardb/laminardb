@@ -1087,7 +1087,8 @@ impl LaminarDB {
         None
     }
 
-    /// Open a SUBSCRIBE portal against a named MV, source, or stream.
+    /// Open a SUBSCRIBE portal against a named MV or resolved stream. A bare
+    /// SOURCE is not subscribable (surfaced as `StreamNotFound`).
     /// `filter_sql` is rejected on streams (their schema is opaque).
     ///
     /// # Errors

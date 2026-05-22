@@ -197,7 +197,8 @@ pub(crate) fn snapshot_and_rebuild(
     let state = acc
         .state()
         .map_err(|e| DbError::Pipeline(format!("accumulator state: {e}")))?;
-    let ipc = scalars_to_ipc(&state)?;
+    // `state()` already drained the accumulator; rebuild it before serializing
+    // so a `scalars_to_ipc` failure can't leave it empty for the next cycle.
     let arrays: Vec<ArrayRef> = state
         .iter()
         .map(|sv| {
@@ -214,6 +215,7 @@ pub(crate) fn snapshot_and_rebuild(
         .merge_batch(&arrays)
         .map_err(|e| DbError::Pipeline(format!("accumulator rebuild: {e}")))?;
     *acc = rebuilt;
+    let ipc = scalars_to_ipc(&state)?;
     Ok(ipc)
 }
 
