@@ -10,6 +10,7 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
 
+use laminar_sql::parser::join_parser::AsofSqlDirection;
 use laminar_sql::translator::AsofJoinTranslatorConfig;
 
 use crate::asof_batch::{execute_asof_join_with_state, AsofBufferCheckpoint, AsofRightBuffer};
@@ -67,24 +68,6 @@ impl GraphOperator for AsofJoinOperator {
             &self.config.right_time_column,
         )?;
 
-        // Right rows are needed until no future left event can match them.
-        // Future left events have ts >= left_wm, so right rows at
-        // ts < left_wm - tolerance are unreachable. Crossed logic:
-        // right eviction depends on LEFT watermark.
-        let max_lookback_ms = self.config.tolerance.map_or(i64::MAX, |d| {
-            i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
-        });
-        let left_wm = watermarks.first().copied().unwrap_or(i64::MIN);
-        let cutoff = left_wm.saturating_sub(max_lookback_ms);
-        if cutoff > self.last_evicted_watermark {
-            self.right_buffer.evict_before(cutoff)?;
-            self.last_evicted_watermark = cutoff;
-        }
-
-        if left_batches.is_empty() {
-            return Ok(Vec::new());
-        }
-
         // Capture the right schema from the first batch we see, so a later
         // cycle with an empty right buffer can still emit left rows with null
         // right columns instead of dropping them.
@@ -94,18 +77,53 @@ impl GraphOperator for AsofJoinOperator {
             }
         }
 
-        let joined = execute_asof_join_with_state(
-            left_batches,
-            &self.right_buffer,
-            &self.config,
-            self.right_schema.as_ref(),
-        )?;
+        // Join before evicting: a batch can carry rows below its own watermark
+        // (they set it) whose backward/nearest match still needs older right
+        // rows. Eviction (below) only constrains future cycles.
+        let output = if left_batches.is_empty() {
+            Vec::new()
+        } else {
+            let joined = execute_asof_join_with_state(
+                left_batches,
+                &self.right_buffer,
+                &self.config,
+                self.right_schema.as_ref(),
+            )?;
+            if joined.num_rows() == 0 {
+                Vec::new()
+            } else {
+                self.projection.apply(vec![joined]).await?
+            }
+        };
 
-        if joined.num_rows() == 0 {
-            return Ok(Vec::new());
+        // Prune the right buffer to what a future left (ts >= left_wm) can still
+        // match. Backward/Nearest keep the latest right <= left_wm per key; a
+        // bounded tolerance also drops rows below left_wm - tolerance. Forward
+        // drops everything below left_wm. Driving this off the watermark (not a
+        // tolerance-derived cutoff) is what bounds memory with no tolerance,
+        // where the old `left_wm - i64::MAX` cutoff was always i64::MIN.
+        let left_wm = watermarks.first().copied().unwrap_or(i64::MIN);
+        if left_wm > self.last_evicted_watermark {
+            match self.config.direction {
+                AsofSqlDirection::Forward => {
+                    self.right_buffer.evict_before(left_wm)?;
+                }
+                AsofSqlDirection::Backward | AsofSqlDirection::Nearest => {
+                    self.right_buffer.evict_superseded(left_wm)?;
+                    if let Some(tol) = self
+                        .config
+                        .tolerance
+                        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+                    {
+                        self.right_buffer
+                            .evict_before(left_wm.saturating_sub(tol))?;
+                    }
+                }
+            }
+            self.last_evicted_watermark = left_wm;
         }
 
-        self.projection.apply(vec![joined]).await
+        Ok(output)
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
