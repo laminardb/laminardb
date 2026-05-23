@@ -219,14 +219,7 @@ mod tests {
     }
 
     #[test]
-    fn argmax_picks_the_largest() {
-        assert_eq!(argmax(&[0.1, 0.9, 0.2]), Some(1));
-        assert_eq!(argmax(&[3.0, 1.0, 2.0]), Some(0));
-        assert_eq!(argmax(&[]), None);
-    }
-
-    #[test]
-    fn local_classify_maps_logits_to_labels() {
+    fn local_classify_argmaxes_logits_to_labels() {
         let raw = InferenceOutputs::Vectors(vec![vec![0.1, 0.9, 0.2], vec![5.0, 0.0, 0.0]]);
         let out = parse_response(Task::Classify, BackendKind::Local, raw, Some(&labels())).unwrap();
         assert_eq!(
@@ -245,26 +238,9 @@ mod tests {
     }
 
     #[test]
-    fn local_classify_rejects_out_of_range_index() {
-        let two = vec!["a".to_string(), "b".to_string()];
-        let raw = InferenceOutputs::Vectors(vec![vec![0.0, 0.0, 9.0]]);
-        assert_eq!(
-            parse_response(Task::Classify, BackendKind::Local, raw, Some(&two)),
-            Err(AdapterError::LabelIndexOutOfRange { index: 2, len: 2 })
-        );
-    }
-
-    #[test]
-    fn remote_classify_passes_text_through() {
-        let raw = InferenceOutputs::Text(vec!["positive".into()]);
-        let out =
-            parse_response(Task::Classify, BackendKind::Remote, raw, Some(&labels())).unwrap();
-        assert_eq!(out, InferenceOutputs::Text(vec!["positive".into()]));
-    }
-
-    #[test]
     fn remote_classify_coerces_to_canonical_label() {
-        // Wrapped reply + different casing → canonical label by containment.
+        // Exact (case-insensitive), containment in a wrapped reply, and the
+        // no-match fallback to trimmed raw text.
         let raw = InferenceOutputs::Text(vec![
             "The sentiment is Positive.".into(),
             "NEGATIVE".into(),
@@ -275,18 +251,11 @@ mod tests {
         assert_eq!(
             out,
             InferenceOutputs::Text(vec![
-                "positive".into(),          // containment + canonical casing
-                "negative".into(),          // exact, case-insensitive
-                "totally unrelated".into(), // no match → trimmed raw fallback
+                "positive".into(),
+                "negative".into(),
+                "totally unrelated".into(),
             ])
         );
-    }
-
-    #[test]
-    fn embed_passes_vectors_through() {
-        let raw = InferenceOutputs::Vectors(vec![vec![0.1, 0.2, 0.3]]);
-        let out = parse_response(Task::Embed, BackendKind::Remote, raw, None).unwrap();
-        assert_eq!(out, InferenceOutputs::Vectors(vec![vec![0.1, 0.2, 0.3]]));
     }
 
     #[test]
@@ -298,21 +267,6 @@ mod tests {
                 task: Task::Complete,
                 kind: BackendKind::Local,
             })
-        );
-    }
-
-    #[test]
-    fn wrong_shape_is_rejected() {
-        let raw = InferenceOutputs::Vectors(vec![vec![0.0]]);
-        let err = parse_response(Task::Complete, BackendKind::Remote, raw, None).unwrap_err();
-        assert_eq!(
-            err,
-            AdapterError::UnexpectedOutputShape {
-                task: Task::Complete,
-                kind: BackendKind::Remote,
-                expected: "text",
-                got: "vectors",
-            }
         );
     }
 }

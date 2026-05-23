@@ -1,12 +1,11 @@
 //! The single transport abstraction over a model backend.
 //!
-//! An [`InferenceProvider`] does I/O only: it takes a homogeneous batch of
-//! inputs and returns a homogeneous batch of outputs plus usage accounting. It
-//! knows nothing about SQL tasks or output columns — framing a request and
-//! turning the response into a task's output column is the adapter's job (a
-//! later batch). Three implementors are planned: Anthropic, an
-//! OpenAI-compatible provider (OpenAI / Azure / vLLM / local servers via
-//! `base_url`), and the local tract provider.
+//! An [`InferenceProvider`] does I/O only: a homogeneous batch of inputs in, a
+//! homogeneous batch of outputs plus usage out. It knows nothing about SQL tasks
+//! or output columns — framing a request and turning the response into a task's
+//! output column is the adapter's job. Implementors: Anthropic, an
+//! OpenAI-compatible provider (OpenAI / Azure / vLLM via `base_url`), and local
+//! tract.
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -29,12 +28,8 @@ pub struct InferenceRequest {
 }
 
 /// Knobs that shape a request and contribute to the cache's `params_version`,
-/// so the same text under different parameters never collides in the cache.
-///
-/// Only the labels seam is contract-level today. Task- and backend-specific
-/// knobs (generation `max_tokens` / `temperature`, extraction schema,
-/// translation target) are added here as the tasks and backends that consume
-/// them are implemented — not front-run.
+/// so the same text under different parameters never collides. Generation knobs
+/// (`max_tokens`, `temperature`, …) are added here as backends consume them.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct InferenceParams {
     /// Candidate label set for classification (required for remote classify;

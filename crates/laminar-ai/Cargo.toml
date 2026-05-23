@@ -56,3 +56,5 @@ local = ["dep:tract-onnx", "dep:tokenizers", "dep:serde_json", "dep:tokio", "dep
 
 [dev-dependencies]
 tokio = { workspace = true }
+# Scratch model cache for the local-backend integration test.
+tempfile = { workspace = true }

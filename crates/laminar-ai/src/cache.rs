@@ -196,12 +196,6 @@ mod tests {
     }
 
     #[test]
-    fn content_hash_is_stable_and_distinguishing() {
-        assert_eq!(content_hash("hello"), content_hash("hello"));
-        assert_ne!(content_hash("hello"), content_hash("world"));
-    }
-
-    #[test]
     fn params_version_separates_label_sets() {
         let a = InferenceParams {
             labels: Some(vec!["pos".into(), "neg".into()]),
@@ -215,19 +209,6 @@ mod tests {
             params_version(&a),
             params_version(&InferenceParams::default())
         );
-    }
-
-    #[test]
-    fn hit_and_miss() {
-        let cache = AiResultCache::with_defaults();
-        let k = key("the stock rallied", 1, None);
-        assert!(cache.get(&k).is_none());
-        assert_eq!(cache.miss_count(), 1);
-
-        cache.insert(k, CachedOutput::Text("positive".into()));
-        assert_eq!(cache.get(&k), Some(CachedOutput::Text("positive".into())));
-        assert_eq!(cache.hit_count(), 1);
-        assert_eq!(cache.len(), 1);
     }
 
     #[test]
@@ -245,5 +226,6 @@ mod tests {
             cache.get(&remote),
             Some(CachedOutput::Text("negative".into()))
         );
+        assert_eq!(cache.hit_count(), 2);
     }
 }

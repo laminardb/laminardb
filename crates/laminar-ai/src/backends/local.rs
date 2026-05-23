@@ -5,12 +5,13 @@
 //! on `spawn_blocking`, off the Ring 1 task, under a deadline so a pathological
 //! model can never stall the inference worker (and the watermark behind it).
 //!
-//! A `source` resolves to a directory holding `model.onnx` + `tokenizer.json`
-//! (+ optional `config.json` for labels): `hf:org/repo` → `<cache_dir>/org/repo`,
-//! `file://<path>` or a bare path used as-is. A missing `hf:` repo is downloaded
-//! from the Hugging Face CDN on first use (public repos only). Note: classifier
-//! labels are read from `config.json` at startup, so a model that downloads
-//! lazily must instead carry an explicit `labels` argument until it is cached.
+//! A `source` resolves to a directory laid out like a Hugging Face export —
+//! `onnx/model.onnx` + `tokenizer.json` (+ optional `config.json` for labels):
+//! `hf:org/repo` → `<cache_dir>/org/repo`, `file://<path>` or a bare path used
+//! as-is. A missing `hf:` repo is downloaded from the Hugging Face CDN on first
+//! use (public repos only). Note: classifier labels are read from `config.json`
+//! at startup, so a model that downloads lazily must instead carry an explicit
+//! `labels` argument until it is cached.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -97,22 +98,26 @@ async fn download_if_missing(
     repo: &str,
     dir: &Path,
 ) -> Result<(), ProviderError> {
-    if dir.join("model.onnx").exists() && dir.join("tokenizer.json").exists() {
+    if onnx_path(dir).exists() && dir.join("tokenizer.json").exists() {
         return Ok(());
     }
-    tokio::fs::create_dir_all(dir)
-        .await
-        .map_err(|e| ProviderError::Transport(format!("create {}: {e}", dir.display())))?;
-    for (file, required) in [
-        ("model.onnx", true),
+    // Paths mirror the repo layout (the graph lives under `onnx/`); config.json
+    // is optional and only feeds label derivation.
+    for (rel, required) in [
+        ("onnx/model.onnx", true),
         ("tokenizer.json", true),
         ("config.json", false),
     ] {
-        let dest = dir.join(file);
+        let dest = dir.join(rel);
         if dest.exists() {
             continue;
         }
-        let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                ProviderError::Transport(format!("create {}: {e}", parent.display()))
+            })?;
+        }
+        let url = format!("https://huggingface.co/{repo}/resolve/main/{rel}");
         let resp = http
             .get(&url)
             .send()
@@ -216,22 +221,46 @@ impl InferenceProvider for LocalProvider {
     }
 }
 
+/// The model graph: the `onnx/model.onnx` that Optimum / transformers.js exports
+/// produce, falling back to a flat `model.onnx` for a hand-placed directory.
+fn onnx_path(dir: &Path) -> PathBuf {
+    let nested = dir.join("onnx").join("model.onnx");
+    if nested.exists() {
+        nested
+    } else {
+        dir.join("model.onnx")
+    }
+}
+
 fn load_model(dir: &Path) -> Result<LoadedModel, ProviderError> {
-    let onnx_path = dir.join("model.onnx");
+    let onnx = onnx_path(dir);
     let tokenizer_path = dir.join("tokenizer.json");
-    if !onnx_path.exists() || !tokenizer_path.exists() {
+    if !onnx.exists() || !tokenizer_path.exists() {
         return Err(ProviderError::Transport(format!(
-            "local model files not found in {} (expected model.onnx + tokenizer.json)",
+            "local model files not found in {} (expected onnx/model.onnx + tokenizer.json)",
             dir.display()
         )));
     }
-    let model = tract_onnx::onnx()
-        .model_for_path(&onnx_path)
+    let mut model = tract_onnx::onnx()
+        .model_for_path(&onnx)
         .map_err(|e| ProviderError::Transport(format!("load onnx: {e}")))?;
     let input_arity = model.inputs.len();
+    // Declare each input as i64 [batch_size, sequence_length] using the model's
+    // own dim symbols. Transformer exports bake those symbols into intermediate
+    // shapes; matching them lets tract analyse the dynamic attention broadcast
+    // and embedding gather, while runtime tensors concretise them per call.
+    let batch = model.sym("batch_size");
+    let seq = model.sym("sequence_length");
+    let fact =
+        InferenceFact::dt_shape(i64::datum_type(), tvec![TDim::from(batch), TDim::from(seq)]);
+    for ix in 0..input_arity {
+        model
+            .set_input_fact(ix, fact.clone())
+            .map_err(|e| ProviderError::Transport(format!("set input fact: {e}")))?;
+    }
     let plan = model
         .into_optimized()
-        .map_err(|e| ProviderError::Transport(format!("optimize onnx: {e}")))?
+        .map_err(|e| ProviderError::Transport(format!("optimize onnx: {e:#}")))?
         .into_runnable()
         .map_err(|e| ProviderError::Transport(format!("plan onnx: {e}")))?;
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
@@ -344,5 +373,44 @@ mod tests {
         let data = [1.0, 2.0, 3.0, 4.0, 100.0, 100.0];
         let pooled = mean_pool(&data, 3, 2, &[1, 1, 0]);
         assert_eq!(pooled, vec![2.0, 3.0]); // mean of rows 0 and 1 only
+    }
+
+    /// End-to-end against a real export: resolve the `onnx/` layout, download
+    /// from the Hugging Face CDN, tokenize, and drive tract.
+    ///
+    /// This pins a known limitation rather than success: tract 0.21 cannot
+    /// analyse the dynamically-built attention-mask broadcast (`Expand` to
+    /// `[batch, 1, 1, seq]`) that stock BERT/DistilBERT/MiniLM ONNX exports
+    /// emit, so `into_optimized` fails. The download, tokenizer, and adapter
+    /// path are all exercised up to that point. Flip the assertion to a real
+    /// classification check once the backend can run these models (a tract that
+    /// folds the broadcast, an `onnxsim`-preprocessed export, or another engine).
+    /// Network + ~17 MB download, so opt-in.
+    #[tokio::test]
+    #[ignore = "downloads a model from the Hugging Face CDN; run with --ignored"]
+    async fn loads_a_real_onnx_community_export() {
+        use crate::provider::InferenceParams;
+
+        let cache = tempfile::tempdir().expect("tempdir");
+        let provider = LocalProvider::new(cache.path());
+        let source = "hf:onnx-community/bert-tiny-finetuned-sms-spam-detection-ONNX";
+        let request = InferenceRequest {
+            task: Task::Classify,
+            model: source.to_string(),
+            inputs: vec!["WIN a FREE prize now!!!".into()],
+            params: InferenceParams::default(),
+        };
+
+        let err = provider
+            .infer_batch(request)
+            .await
+            .expect_err("see doc comment");
+        let message = err.to_string();
+        assert!(
+            message.contains("optimize onnx"),
+            "expected a tract analysis failure, got: {message}"
+        );
+        // The download + onnx/ layout resolution still ran: the graph is on disk.
+        assert!(onnx_path(&model_dir(cache.path(), source)).exists());
     }
 }
