@@ -873,11 +873,12 @@ impl IncrementalEowcState {
                 )?;
                 let key_ipc = scalars_to_ipc(&sv_key)?;
                 let mut acc_states = Vec::with_capacity(accs.len());
-                for acc in accs {
-                    let state = acc
-                        .state()
-                        .map_err(|e| DbError::Pipeline(format!("accumulator state: {e}")))?;
-                    acc_states.push(scalars_to_ipc(&state)?);
+                for (i, acc) in accs.iter_mut().enumerate() {
+                    acc_states.push(crate::aggregate_state::snapshot_and_rebuild(
+                        acc,
+                        &self.agg_specs[i],
+                        false,
+                    )?);
                 }
                 group_checkpoints.push(GroupCheckpoint {
                     key: key_ipc,

@@ -148,6 +148,11 @@ fn collect_tables_counting(set_expr: &SetExpr, tables: &mut Vec<String>) {
                     collect_factor_counting(&join.relation, tables);
                 }
             }
+            // UNNEST in the projection expands rows just like a FROM-clause
+            // UNNEST; the single-source fast path can't, so force the full plan.
+            if projection_has_unnest(&select.projection) {
+                tables.push("\u{0}non_table_factor".to_string());
+            }
         }
         SetExpr::SetOperation { left, right, .. } => {
             collect_tables_counting(left.as_ref(), tables);
@@ -158,6 +163,15 @@ fn collect_tables_counting(set_expr: &SetExpr, tables: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// True if any projection item is (or wraps) an `UNNEST(..)`. Checked on the
+/// serialized item, so it's robust to the parser's UNNEST representation; a
+/// false positive only forces the safe full-plan path.
+fn projection_has_unnest(items: &[SelectItem]) -> bool {
+    items
+        .iter()
+        .any(|item| item.to_string().to_ascii_lowercase().contains("unnest("))
 }
 
 fn collect_factor_counting(factor: &TableFactor, tables: &mut Vec<String>) {
@@ -176,8 +190,51 @@ fn collect_factor_counting(factor: &TableFactor, tables: &mut Vec<String>) {
                 collect_factor_counting(&join.relation, tables);
             }
         }
-        _ => {}
+        // A non-table factor (lateral UNNEST, TVF, ...) can't be evaluated by
+        // the single-source fast path; count it so the query uses the full
+        // per-cycle plan instead of silently dropping the factor.
+        _ => tables.push("\u{0}non_table_factor".to_string()),
     }
+}
+
+/// Rewrite `ASOF JOIN … MATCH_CONDITION(..)` to a `LEFT JOIN … ON ..` for
+/// schema resolution: `DataFusion` can't lower `AsOf`, and the match condition
+/// picks the matching right row at runtime, not the columns. Left keeps the
+/// right side nullable. `None` if there is no ASOF join.
+pub(crate) fn rewrite_asof_joins_for_planning(sql: &str) -> Option<String> {
+    use sqlparser::ast::{JoinConstraint, JoinOperator};
+
+    let dialect = GenericDialect {};
+    let mut stmts = Parser::parse_sql(&dialect, sql).ok()?;
+    let mut changed = false;
+    for stmt in &mut stmts {
+        if let Statement::Query(query) = stmt {
+            if let SetExpr::Select(select) = query.body.as_mut() {
+                for twj in &mut select.from {
+                    for join in &mut twj.joins {
+                        if !matches!(join.join_operator, JoinOperator::AsOf { .. }) {
+                            continue;
+                        }
+                        let op = std::mem::replace(
+                            &mut join.join_operator,
+                            JoinOperator::Inner(JoinConstraint::None),
+                        );
+                        if let JoinOperator::AsOf { constraint, .. } = op {
+                            join.join_operator = JoinOperator::LeftOuter(constraint);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    changed.then(|| {
+        stmts
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
 }
 
 /// Resolve the source table name from a `TableFactor::Table`.

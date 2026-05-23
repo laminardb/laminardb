@@ -3970,6 +3970,293 @@ async fn test_nullif_float_with_int_literal_runs_without_error() {
     );
 }
 
+/// Regression: a windowed aggregate over a lateral `UNNEST` must emit.
+/// `single_source_table` ignored the UNNEST factor, so the compiled fast path
+/// skipped it and the aggregate saw no rows (planned clean, emitted nothing).
+#[tokio::test]
+async fn windowed_aggregate_over_lateral_unnest_emits() {
+    let db = LaminarDB::open().unwrap();
+    db.execute(
+        "CREATE SOURCE events (msg VARCHAR, ts TIMESTAMP, \
+         WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW tag_counts AS \
+         SELECT TUMBLE(ts, INTERVAL '5' SECOND) AS bucket, tag, COUNT(*) AS n \
+         FROM events, UNNEST(make_array('alpha','beta','gamma')) AS t(tag) \
+         WHERE strpos(msg, tag) > 0 \
+         GROUP BY TUMBLE(ts, INTERVAL '5' SECOND), tag \
+         EMIT ON WINDOW CLOSE",
+    )
+    .await
+    .unwrap();
+    db.start().await.unwrap();
+
+    let handle = db.source_untyped("events").unwrap();
+    let schema = handle.schema().clone();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(arrow::array::StringArray::from(vec![
+                "alpha and beta",
+                "gamma only",
+                "no match here",
+                "tick", // next-window event advances the watermark to close [0,5s)
+            ])),
+            Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                100_000, 200_000, 300_000, 6_000_000,
+            ])),
+        ],
+    )
+    .unwrap();
+    handle.push_arrow(batch).unwrap();
+
+    let rows = poll_mv(&db, "tag_counts", 1).await;
+    assert!(
+        rows >= 1,
+        "windowed aggregate over lateral UNNEST should emit"
+    );
+}
+
+/// An `ASOF JOIN` feeding a materialized view must plan and emit, matching
+/// each left row to the latest right row at-or-before its timestamp (per key).
+/// `DataFusion` can't lower `AsOf`, so schema resolution rewrites it to a plain
+/// join; execution uses the ASOF operator.
+#[tokio::test]
+async fn asof_join_in_materialized_view_emits_backward_match() {
+    let db = LaminarDB::open().unwrap();
+    db.execute(
+        "CREATE SOURCE quotes (sym VARCHAR, price DOUBLE, qts TIMESTAMP, \
+         WATERMARK FOR qts AS qts - INTERVAL '0' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE SOURCE trades (sym VARCHAR, tts TIMESTAMP, \
+         WATERMARK FOR tts AS tts - INTERVAL '0' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW enriched AS \
+         SELECT t.sym, q.price \
+         FROM trades t ASOF JOIN quotes q \
+         MATCH_CONDITION(t.tts >= q.qts) \
+         ON t.sym = q.sym",
+    )
+    .await
+    .unwrap();
+    db.start().await.unwrap();
+
+    let q = db.source_untyped("quotes").unwrap();
+    q.push_arrow(
+        RecordBatch::try_new(
+            q.schema().clone(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["x", "x", "x"])),
+                Arc::new(arrow::array::Float64Array::from(vec![10.0, 20.0, 30.0])),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                    1_000_000, 5_000_000, 8_000_000,
+                ])),
+            ],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let t = db.source_untyped("trades").unwrap();
+    t.push_arrow(
+        RecordBatch::try_new(
+            t.schema().clone(),
+            vec![
+                // trade@3s -> latest quote qts<=3s = 10.0; trade@7s -> 20.0.
+                Arc::new(arrow::array::StringArray::from(vec!["x", "x"])),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                    3_000_000, 7_000_000,
+                ])),
+            ],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        poll_mv(&db, "enriched", 2).await >= 2,
+        "ASOF join in an MV should emit matches"
+    );
+    let batches = db
+        .ctx
+        .sql("SELECT price FROM enriched ORDER BY price")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let prices: Vec<f64> = batches
+        .iter()
+        .flat_map(|b| {
+            let col = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+                .unwrap();
+            (0..col.len()).map(|i| col.value(i)).collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        prices,
+        vec![10.0, 20.0],
+        "backward ASOF should pick the latest quote at-or-before each trade"
+    );
+}
+
+/// Regression: `COUNT(DISTINCT)` must survive a checkpoint that lands while a
+/// window is still open. `Accumulator::state()` drains the DISTINCT set, and
+/// the window-checkpoint path calls it on the *live* accumulator — so before
+/// the rebuild-from-snapshot fix, a window spanning a checkpoint lost every
+/// distinct value seen before it (`COUNT(*)` was unaffected).
+#[tokio::test]
+async fn count_distinct_survives_midwindow_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = crate::LaminarConfig {
+        storage_dir: Some(dir.path().to_path_buf()),
+        checkpoint: Some(laminar_core::streaming::StreamCheckpointConfig {
+            interval_ms: None,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let db = LaminarDB::open_with_config(cfg).unwrap();
+    db.execute(
+        "CREATE SOURCE src (author VARCHAR, ts TIMESTAMP, \
+         WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW ct AS \
+         SELECT TUMBLE(ts, INTERVAL '5' SECOND) AS bucket, \
+         COUNT(*) AS n, COUNT(DISTINCT author) AS uniq \
+         FROM src GROUP BY TUMBLE(ts, INTERVAL '5' SECOND) EMIT ON WINDOW CLOSE",
+    )
+    .await
+    .unwrap();
+    db.start().await.unwrap();
+    let h = db.source_untyped("src").unwrap();
+    let schema = h.schema().clone();
+    let push = |author: &str, ts: i64| {
+        h.push_arrow(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(arrow::array::StringArray::from(vec![author])),
+                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![ts])),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    };
+    // author a, then a checkpoint mid-window, then author b; tick@6s closes
+    // [0,5s). The window [0,5s) saw two distinct authors across the checkpoint.
+    push("a", 100_000);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    db.checkpoint().await.unwrap();
+    push("b", 200_000);
+    push("z", 6_000_000);
+    poll_mv(&db, "ct", 1).await;
+    let batches = db
+        .ctx
+        .sql("SELECT n, uniq FROM ct WHERE n > 1")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let uniq: i64 = batches
+        .iter()
+        .flat_map(|b| {
+            let u = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+            (0..b.num_rows()).map(|i| u.value(i)).collect::<Vec<_>>()
+        })
+        .max()
+        .expect("the [0,5s) window must emit");
+    assert_eq!(
+        uniq, 2,
+        "checkpoint must not drop distinct values seen before it"
+    );
+}
+
+/// Regression: a windowed aggregate over a SELECT-list `UNNEST` (in a
+/// subquery) must emit. The unnest is invisible to FROM-based source
+/// detection, so `single_source_table` must still treat it as multi-source —
+/// otherwise the compiled fast path skips the expansion and emits nothing.
+#[tokio::test]
+async fn windowed_aggregate_over_projection_unnest_emits() {
+    let db = LaminarDB::open().unwrap();
+    db.execute(
+        "CREATE SOURCE docs (text VARCHAR, ts TIMESTAMP, \
+         WATERMARK FOR ts AS ts - INTERVAL '0' SECOND)",
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "CREATE MATERIALIZED VIEW word_counts AS \
+         SELECT TUMBLE(ts, INTERVAL '5' SECOND) AS bucket, w, COUNT(*) AS n \
+         FROM (SELECT ts, unnest(string_to_array(text, ' ')) AS w FROM docs) \
+         WHERE w <> '' \
+         GROUP BY TUMBLE(ts, INTERVAL '5' SECOND), w \
+         EMIT ON WINDOW CLOSE",
+    )
+    .await
+    .unwrap();
+    db.start().await.unwrap();
+
+    let handle = db.source_untyped("docs").unwrap();
+    let schema = handle.schema().clone();
+    handle
+        .push_arrow(
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    // [0,5s): "a b", "a c" -> a=2, b=1, c=1. "tick" closes it.
+                    Arc::new(arrow::array::StringArray::from(vec!["a b", "a c", "tick"])),
+                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![
+                        100_000, 200_000, 6_000_000,
+                    ])),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    assert!(
+        poll_mv(&db, "word_counts", 1).await >= 1,
+        "projection-unnest MV should emit"
+    );
+    let batches = db
+        .ctx
+        .sql("SELECT n FROM word_counts WHERE w = 'a'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let n = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(n, 2, "word 'a' appears in both docs within the window");
+}
+
 #[tokio::test]
 async fn open_subscription_resolves_unknown_name_to_error() {
     let db = LaminarDB::open().unwrap();
@@ -3978,6 +4265,22 @@ async fn open_subscription_resolves_unknown_name_to_error() {
         .await
         .unwrap_err();
     assert!(matches!(err, DbError::StreamNotFound(_)));
+}
+
+/// A SOURCE is not subscribable: only streams/MVs defined over it publish to
+/// the registry, so subscribing to the source directly must error (not hang
+/// forever), reusing the `StreamNotFound` path.
+#[tokio::test]
+async fn open_subscription_rejects_bare_source() {
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE raw (id BIGINT, val VARCHAR)")
+        .await
+        .unwrap();
+    let err = db
+        .open_subscription("raw", None, crate::subscription::SubscribeStart::Tail)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DbError::StreamNotFound(_)), "got {err:?}");
 }
 
 #[tokio::test]
@@ -4038,10 +4341,15 @@ async fn open_subscription_with_invalid_filter_errors_at_open() {
     db.execute("CREATE SOURCE trades (symbol VARCHAR)")
         .await
         .unwrap();
+    // Subscribe against an MV (filterable schema resolved at CREATE); a bare
+    // source isn't subscribable.
+    db.execute("CREATE MATERIALIZED VIEW priced AS SELECT symbol FROM trades")
+        .await
+        .unwrap();
 
     let err = db
         .open_subscription(
-            "trades",
+            "priced",
             Some("nonexistent_col > 1"),
             crate::subscription::SubscribeStart::Tail,
         )

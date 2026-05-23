@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use arrow_array::builder::{
     BooleanBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder,
-    Int8Builder, LargeBinaryBuilder, LargeStringBuilder, StringBuilder,
+    Int8Builder, LargeBinaryBuilder, LargeStringBuilder, ListBuilder, StringBuilder,
     TimestampMicrosecondBuilder, TimestampMillisecondBuilder, TimestampNanosecondBuilder,
     TimestampSecondBuilder, UInt16Builder, UInt32Builder, UInt64Builder, UInt8Builder,
 };
@@ -658,6 +658,7 @@ impl_column_builder!(UInt64Builder, arrow_array::UInt64Array);
 impl_column_builder!(Float32Builder, arrow_array::Float32Array);
 impl_column_builder!(Float64Builder, arrow_array::Float64Array);
 impl_column_builder!(StringBuilder, arrow_array::StringArray);
+impl_column_builder!(ListBuilder<StringBuilder>, arrow_array::ListArray);
 impl_column_builder!(LargeStringBuilder, arrow_array::LargeStringArray);
 impl_column_builder!(LargeBinaryBuilder, arrow_array::LargeBinaryArray);
 impl_column_builder!(TimestampSecondBuilder, arrow_array::TimestampSecondArray);
@@ -718,6 +719,9 @@ fn create_builder(data_type: &DataType, capacity: usize) -> Box<dyn ColumnBuilde
             let builder =
                 TimestampNanosecondBuilder::with_capacity(capacity).with_timezone_opt(tz.clone());
             Box::new(builder)
+        }
+        DataType::List(field) if matches!(field.data_type(), DataType::Utf8) => {
+            Box::new(ListBuilder::new(StringBuilder::new()))
         }
         // Fallback: serialize as JSON string.
         _ => Box::new(StringBuilder::with_capacity(capacity, capacity * 32)),
@@ -866,6 +870,33 @@ fn append_value(
             match extract_timestamp(value, config, *unit, numeric_ts_unit) {
                 Ok(ts) => append_timestamp(builder, *unit, ts),
                 Err(e) => handle_mismatch(builder, config, mismatch_count, &e)?,
+            }
+        }
+        DataType::List(field) if matches!(field.data_type(), DataType::Utf8) => {
+            if let Some(items) = value.as_array() {
+                let b = builder
+                    .as_any_mut()
+                    .downcast_mut::<ListBuilder<StringBuilder>>()
+                    .unwrap();
+                for item in items {
+                    if let Some(s) = item.as_str() {
+                        b.values().append_value(s);
+                    } else if item.is_null() {
+                        b.values().append_null();
+                    } else {
+                        b.values().append_value(value_to_string(item));
+                    }
+                }
+                b.append(true);
+            } else {
+                // A non-array value for a list column is a type mismatch; honor
+                // the Null/Coerce/Reject policy like the scalar arms above.
+                handle_mismatch(
+                    builder,
+                    config,
+                    mismatch_count,
+                    &format!("expected array, got {}", json_type_name(value)),
+                )?;
             }
         }
         // Unsupported types: serialize as JSON string.
@@ -1975,6 +2006,59 @@ mod tests {
             42
         );
         assert!(batch.column(1).is_null(0));
+    }
+
+    #[test]
+    fn test_json_column_path_to_nested_string_array() {
+        use arrow_array::Array;
+        use arrow_schema::Field;
+        let schema = make_schema(vec![(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        )]);
+        let mut col_paths = HashMap::new();
+        col_paths.insert("tags".into(), vec!["record".into(), "tags".into()]);
+        let config = JsonDecoderConfig {
+            json_column_paths: col_paths,
+            ..Default::default()
+        };
+        let decoder = JsonDecoder::with_config(schema, config);
+        let records = vec![json_record(r#"{"record":{"tags":["en","es"]}}"#)];
+        let batch = decoder.decode_batch(&records).unwrap();
+
+        let list = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .expect("List column");
+        let vals = list.value(0);
+        let strs = vals.as_string::<i32>();
+        assert_eq!(strs.len(), 2);
+        assert_eq!(strs.value(0), "en");
+        assert_eq!(strs.value(1), "es");
+    }
+
+    #[test]
+    fn test_list_column_non_array_honors_reject_strategy() {
+        use arrow_schema::Field;
+        let schema = make_schema(vec![(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        )]);
+        let config = JsonDecoderConfig {
+            type_mismatch: TypeMismatchStrategy::Reject,
+            ..Default::default()
+        };
+        let decoder = JsonDecoder::with_config(schema, config);
+        // A scalar where the list column expects an array must be rejected, not
+        // silently coerced to NULL.
+        let records = vec![json_record(r#"{"tags": "en"}"#)];
+        let result = decoder.decode_batch(&records);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("type mismatch"));
     }
 
     // ── json.explode tests ──────────────────────────────────────

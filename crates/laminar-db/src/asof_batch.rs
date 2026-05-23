@@ -489,6 +489,7 @@ pub(crate) fn execute_asof_join_with_state(
     left_batches: &[RecordBatch],
     right_buffer: &AsofRightBuffer,
     config: &AsofJoinTranslatorConfig,
+    right_schema_hint: Option<&SchemaRef>,
 ) -> Result<RecordBatch, DbError> {
     if left_batches.is_empty() {
         return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
@@ -499,20 +500,26 @@ pub(crate) fn execute_asof_join_with_state(
         .map_err(|e| DbError::query_pipeline_arrow("ASOF join (left)", &e))?;
 
     let Some(right) = right_buffer.right_concat.clone() else {
-        // No right data buffered yet. Left join emits all with nulls; inner emits nothing.
+        // No right data buffered. A Left join emits left rows with null right
+        // columns — but only once the right schema is known (captured from an
+        // earlier batch). Keeping those columns is essential: a downstream
+        // projection that references a right column (e.g. a spike ratio over a
+        // slow-warming baseline) fails to plan if they're dropped. Until the
+        // right schema is known, emit nothing rather than a malformed batch.
         if config.join_type == AsofSqlJoinType::Left {
-            let right_schema = Arc::new(Schema::empty());
-            let output_schema = build_output_schema(&left_schema, &right_schema, config);
-            let left_indices: Vec<usize> = (0..left.num_rows()).collect();
-            let right_indices: Vec<Option<usize>> = vec![None; left.num_rows()];
-            return build_output_batch(
-                &left,
-                &RecordBatch::new_empty(right_schema),
-                &left_indices,
-                &right_indices,
-                &output_schema,
-                config,
-            );
+            if let Some(right_schema) = right_schema_hint {
+                let output_schema = build_output_schema(&left_schema, right_schema, config);
+                let left_indices: Vec<usize> = (0..left.num_rows()).collect();
+                let right_indices: Vec<Option<usize>> = vec![None; left.num_rows()];
+                return build_output_batch(
+                    &left,
+                    &RecordBatch::new_empty(right_schema.clone()),
+                    &left_indices,
+                    &right_indices,
+                    &output_schema,
+                    config,
+                );
+            }
         }
         return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
     };
@@ -746,6 +753,29 @@ mod tests {
             .unwrap();
         assert_eq!(quote_ts.value(0), 90); // trade@100 → quote@90
         assert_eq!(quote_ts.value(1), 180); // trade@200 → quote@180
+    }
+
+    #[test]
+    fn asof_empty_right_buffer_keeps_right_columns() {
+        let config = backward_config(); // Left join
+        let empty = AsofRightBuffer::default();
+
+        // Warm-up: right schema unknown yet -> emit nothing, not a left-only
+        // batch (which would break a downstream projection over a right column).
+        let out = execute_asof_join_with_state(&[trades_batch()], &empty, &config, None).unwrap();
+        assert_eq!(out.num_rows(), 0);
+
+        // Right schema known -> emit left rows with the right columns all null,
+        // so a projection referencing e.g. `quote_ts` still resolves.
+        let right_schema = quotes_batch().schema();
+        let out =
+            execute_asof_join_with_state(&[trades_batch()], &empty, &config, Some(&right_schema))
+                .unwrap();
+        assert_eq!(out.num_rows(), trades_batch().num_rows());
+        let qts = out
+            .column_by_name("quote_ts")
+            .expect("right column must be kept");
+        assert_eq!(qts.null_count(), out.num_rows(), "unmatched right is null");
     }
 
     #[test]
