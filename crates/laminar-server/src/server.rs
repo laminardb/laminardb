@@ -152,6 +152,12 @@ pub async fn run_server(
         .state_backend(state_backend)
         .vnode_registry(vnode_registry);
 
+    // Build the AI subsystem from `[ai]`/`[models]` and install it. Without
+    // configured models this is a no-op and `ai_*` functions fail at plan time.
+    if let Some(ai_runtime) = crate::ai::build_ai_runtime(&config)? {
+        builder = builder.ai(ai_runtime);
+    }
+
     let db = builder
         .build()
         .await
@@ -662,6 +668,8 @@ mod tests {
             discovery: None,
             coordination: None,
             node_id: None,
+            ai: Default::default(),
+            models: Default::default(),
         };
         execute_config_ddl(&db, &config)
             .await
@@ -697,6 +705,8 @@ mod tests {
             discovery: None,
             coordination: None,
             node_id: None,
+            ai: Default::default(),
+            models: Default::default(),
         };
         let err = execute_config_ddl(&db, &config).await.unwrap_err();
         let msg = err.to_string();

@@ -40,6 +40,22 @@ pub(crate) trait GraphOperator: Send {
     fn estimated_state_bytes(&self) -> usize {
         0
     }
+
+    /// Optional ceiling on this operator's output watermark. The graph holds the
+    /// output watermark at `min(input_wm, hold)` so rows the operator has not yet
+    /// emitted (e.g. async AI enrichment still in flight) are not treated as late
+    /// by a downstream window. `None` = no hold. Default: no hold.
+    fn watermark_hold(&self) -> Option<i64> {
+        None
+    }
+
+    /// Whether the operator can accept new input this cycle. When `false`, the
+    /// graph leaves this node's input buffered — so the source backpressures via
+    /// the existing input-buffer gate — and still steps the operator with empty
+    /// input so it can drain and emit. Default: always accept.
+    fn wants_input(&self) -> bool {
+        true
+    }
 }
 
 pub(crate) struct OperatorCheckpoint {
@@ -226,6 +242,15 @@ pub(crate) struct OperatorGraph {
     /// Covers both source tables (from `register_source_schema`) and
     /// intermediate tables (created lazily on first operator output).
     live_handles: FxHashMap<String, LiveSourceHandle>,
+    /// Assembled AI subsystem (registry + providers + cache + call log).
+    /// `None` unless `[ai]`/`[models]` are configured.
+    ai_runtime: Option<Arc<laminar_ai::AiRuntime>>,
+    /// Main runtime handle for spawning AI inference workers off the compute
+    /// thread. Set together with `ai_runtime`.
+    ai_handle: Option<tokio::runtime::Handle>,
+    /// Plan-time AI routing errors collected during `add_query` (which returns
+    /// `()`); surfaced by [`take_build_errors`](Self::take_build_errors) at start.
+    build_errors: Vec<DbError>,
     /// Cluster-mode row-shuffle config for streaming aggregates.
     /// `None` outside cluster mode; threaded to `SqlQueryOperator` so
     /// pre-aggregate rows can be hash-routed to vnode owners.
@@ -265,6 +290,35 @@ impl OperatorGraph {
             depends_on_stream: FxHashSet::default(),
             order_configs: FxHashMap::default(),
             live_handles: FxHashMap::default(),
+            ai_runtime: None,
+            ai_handle: None,
+            build_errors: Vec::new(),
+        }
+    }
+
+    /// Install the assembled AI subsystem and the main runtime handle its
+    /// inference workers spawn on. The handle MUST be the main multi-threaded
+    /// runtime, never the compute runtime.
+    pub fn set_ai_runtime(
+        &mut self,
+        runtime: Arc<laminar_ai::AiRuntime>,
+        handle: tokio::runtime::Handle,
+    ) {
+        self.ai_runtime = Some(runtime);
+        self.ai_handle = Some(handle);
+    }
+
+    /// Take the first plan-time AI routing error collected during query
+    /// construction, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first recorded [`DbError`] (e.g. unknown model, unsupported
+    /// task, malformed AI query).
+    pub fn take_build_errors(&mut self) -> Result<(), DbError> {
+        match self.build_errors.drain(..).next() {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     }
 
@@ -680,12 +734,40 @@ impl OperatorGraph {
         idle_ttl_ms: Option<u64>,
         join_config: Option<Vec<laminar_sql::translator::JoinOperatorConfig>>,
     ) {
+        use laminar_sql::translator::JoinOperatorConfig;
+
+        // AI routing: a query with one `ai_*(...)` call becomes an
+        // AiInferenceOperator over its source table, applying the residual
+        // projection. Resolution/validation errors are recorded and surfaced
+        // at start (this fn returns `()`).
+        let ai_calls = crate::sql_analysis::detect_ai_functions(&sql);
+        if ai_calls.len() > 1 {
+            self.build_errors.push(DbError::InvalidOperation(
+                "v0.1 supports at most one AI function per query".to_string(),
+            ));
+            return;
+        }
+        if ai_calls.len() == 1 {
+            match crate::sql_analysis::plan_ai_query(&sql) {
+                Some(plan) => {
+                    if let Err(e) = self.build_ai_operator_node(&name, &plan) {
+                        self.build_errors.push(e);
+                    }
+                }
+                None => self.build_errors.push(DbError::InvalidOperation(
+                    "an AI function must be a top-level SELECT item with an `AS` alias over a \
+                     single (un-joined) source"
+                        .to_string(),
+                )),
+            }
+            return;
+        }
+
         // The planner's vec lets us short-circuit re-parsing for queries
         // that have no specialized join step (or no joins at all).
         // TemporalProbe is parsed off the token stream rather than the
         // sqlparser AST, so it is never present in `join_config` and
         // always needs its own detector pass.
-        use laminar_sql::translator::JoinOperatorConfig;
         let needs_specialized_detection = join_config.as_ref().is_none_or(|jcs| {
             jcs.iter().any(|c| {
                 matches!(
@@ -871,6 +953,106 @@ impl OperatorGraph {
         // Register as output
         self.output_map.insert(Arc::from(name.as_str()), node_id);
         self.topo_dirty = true;
+    }
+
+    /// Build an [`AiInferenceOperator`](crate::operator::ai_inference) for a
+    /// planned AI query and wire it as a single-input node over the source table.
+    fn build_ai_operator_node(
+        &mut self,
+        name: &str,
+        plan: &crate::sql_analysis::AiQueryPlan,
+    ) -> Result<(), DbError> {
+        use crate::operator::ai_inference::{AiInferenceOperator, AiOperatorConfig};
+
+        let handle = self.ai_handle.clone().ok_or_else(|| {
+            DbError::InvalidOperation("AI runtime handle is not configured".to_string())
+        })?;
+        let ctx = self.ctx.clone();
+
+        // All runtime-dependent work happens here; the immutable `ai_runtime`
+        // borrow ends before the `&mut self` node creation below.
+        let (operator, table_refs): (Box<dyn GraphOperator>, FxHashSet<String>) = {
+            let runtime = self.ai_runtime.as_ref().ok_or_else(|| {
+                DbError::InvalidOperation(
+                    "AI functions require `[ai]` providers and `[models]` configuration"
+                        .to_string(),
+                )
+            })?;
+
+            // Plan-time validation (task support + labels seam).
+            crate::sql_analysis::validate_ai_calls(
+                runtime.registry(),
+                std::slice::from_ref(&plan.call),
+            )?;
+
+            let model_name = match &plan.call.model {
+                Some(m) => m.clone(),
+                None => runtime
+                    .registry()
+                    .default_for(plan.call.task)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        DbError::InvalidOperation(format!(
+                            "no model given for task '{}' and no [ai.defaults] default is \
+                             configured",
+                            plan.call.task
+                        ))
+                    })?,
+            };
+            let resolved = runtime
+                .resolve(&model_name)
+                .map_err(|e| DbError::InvalidOperation(e.to_string()))?;
+
+            let output_column = plan.call.output_alias.clone().ok_or_else(|| {
+                DbError::InvalidOperation("AI function requires an `AS` alias".to_string())
+            })?;
+            let labels = plan.call.labels.clone().or_else(|| resolved.labels.clone());
+
+            let config = AiOperatorConfig {
+                task: plan.call.task,
+                kind: resolved.kind,
+                model_id: resolved.model_id,
+                model: resolved.provider_model.clone(),
+                input_column: plan.call.input.clone(),
+                output_column,
+                labels,
+            };
+            let operator: Box<dyn GraphOperator> = Box::new(AiInferenceOperator::new(
+                name,
+                config,
+                Some(Arc::from(plan.projection_sql.as_str())),
+                ctx,
+                resolved.provider,
+                Arc::clone(runtime.cache()),
+                Arc::clone(runtime.call_log()),
+                &handle,
+            ));
+            let mut table_refs = FxHashSet::default();
+            table_refs.insert(plan.source_table.clone());
+            (operator, table_refs)
+        };
+
+        // Wire as a single-input node reading the source table (no joins).
+        self.ensure_query_source_nodes(None, None, None, None, &table_refs);
+        let node_id = self.nodes.len();
+        self.nodes.push(GraphNode {
+            name: Arc::from(name),
+            operator,
+            input_port_count: 1,
+            output_routes: Vec::new(),
+            removed: false,
+        });
+        self.input_bufs.push(vec![Vec::new(); 1]);
+        self.input_buf_bytes.push(vec![0; 1]);
+        self.input_sources.push(vec![usize::MAX; 1]);
+        self.output_watermarks.push(i64::MIN);
+        let depends = self.wire_query_edges(node_id, None, None, None, None, None, &table_refs);
+        if depends {
+            self.depends_on_stream.insert(node_id);
+        }
+        self.output_map.insert(Arc::from(name), node_id);
+        self.topo_dirty = true;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1138,8 +1320,18 @@ impl OperatorGraph {
         current_watermark: i64,
         results: &mut FxHashMap<Arc<str>, Vec<RecordBatch>>,
     ) -> Result<(), DbError> {
-        let mut inputs = std::mem::take(&mut self.input_bufs[node_id]);
-        let mut input_bytes = std::mem::take(&mut self.input_buf_bytes[node_id]);
+        // If the operator is backpressured (wants_input == false), leave its
+        // input buffered so the upstream gate throttles the source, and step it
+        // with empty input so it can still drain and emit.
+        let accept = self.nodes[node_id].operator.wants_input();
+        let (mut inputs, mut input_bytes) = if accept {
+            (
+                std::mem::take(&mut self.input_bufs[node_id]),
+                std::mem::take(&mut self.input_buf_bytes[node_id]),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         let port_count = self.nodes[node_id].input_port_count;
         let watermarks: smallvec::SmallVec<[i64; 2]> = (0..port_count)
@@ -1155,17 +1347,26 @@ impl OperatorGraph {
 
         let output_result = self.nodes[node_id]
             .operator
-            .process(&inputs, &watermarks)
+            .process(
+                if accept { inputs.as_slice() } else { &[][..] },
+                &watermarks,
+            )
             .await;
 
         // Source nodes (input_sources = [usize::MAX]) have output_watermarks
         // pre-seeded from per-source watermarks in execute_cycle. Don't overwrite.
         if !self.source_node_ids.contains(&node_id) {
-            let wm = watermarks
+            let mut wm = watermarks
                 .iter()
                 .copied()
                 .min()
                 .unwrap_or(current_watermark);
+            // Hold the watermark behind any rows the operator has buffered but
+            // not yet emitted (e.g. in-flight AI enrichment), so a downstream
+            // window doesn't close past them.
+            if let Some(hold) = self.nodes[node_id].operator.watermark_hold() {
+                wm = wm.min(hold);
+            }
             self.output_watermarks[node_id] = wm;
             if let Some(ref prom) = self.prom {
                 prom.stream_watermark_ms
@@ -1176,19 +1377,22 @@ impl OperatorGraph {
 
         let batches = match output_result {
             Ok(b) => {
-                // Reuse the existing outer Vecs and their inner capacities;
-                // the operator borrowed inputs, so the RecordBatches are
-                // still in place. clear() preserves capacity.
-                for v in &mut inputs {
-                    v.clear();
+                // When backpressured (!accept) the input was never taken, so
+                // leave the buffer intact. Otherwise reuse the outer Vecs and
+                // their capacities; the operator borrowed inputs, so the
+                // RecordBatches are still in place. clear() preserves capacity.
+                if accept {
+                    for v in &mut inputs {
+                        v.clear();
+                    }
+                    input_bytes.fill(0);
+                    self.input_bufs[node_id] = inputs;
+                    self.input_buf_bytes[node_id] = input_bytes;
                 }
-                input_bytes.fill(0);
-                self.input_bufs[node_id] = inputs;
-                self.input_buf_bytes[node_id] = input_bytes;
                 b
             }
             Err(e) => {
-                if self.depends_on_stream.contains(&node_id) {
+                if accept && self.depends_on_stream.contains(&node_id) {
                     // Put batches back so they're retried next cycle.
                     self.input_bufs[node_id] = inputs;
                     self.input_buf_bytes[node_id] = input_bytes;
@@ -1198,6 +1402,9 @@ impl OperatorGraph {
                         "Query deferred (upstream not ready); batches preserved for retry"
                     );
                     return Ok(());
+                }
+                if !accept {
+                    return Err(e);
                 }
                 for v in &mut inputs {
                     v.clear();
@@ -1672,6 +1879,141 @@ mod tests {
         // Only GOOG (price=2800) passes the filter
         let total_rows: usize = filtered.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows, 1);
+    }
+
+    // --- AI routing (B5.3b) ---
+
+    struct PosProvider;
+
+    #[async_trait]
+    impl laminar_ai::InferenceProvider for PosProvider {
+        async fn infer_batch(
+            &self,
+            request: laminar_ai::InferenceRequest,
+        ) -> Result<laminar_ai::InferenceResponse, laminar_ai::ProviderError> {
+            Ok(laminar_ai::InferenceResponse {
+                outputs: laminar_ai::InferenceOutputs::Text(vec![
+                    "pos".to_string();
+                    request.inputs.len()
+                ]),
+                usage: laminar_ai::Usage::ZERO,
+            })
+        }
+        fn name(&self) -> &'static str {
+            "pos"
+        }
+    }
+
+    fn stub_ai_runtime() -> Arc<laminar_ai::AiRuntime> {
+        use laminar_ai::{ModelBackend, ModelEntry, ModelRegistry, Task};
+        let mut registry = ModelRegistry::new();
+        registry
+            .register(ModelEntry {
+                id: "m".into(),
+                tasks: vec![Task::Classify],
+                backend: ModelBackend::Remote {
+                    provider: "p".into(),
+                    model: "stub-model".into(),
+                },
+            })
+            .unwrap();
+        let providers = [(
+            "p".to_string(),
+            Arc::new(PosProvider) as Arc<dyn laminar_ai::InferenceProvider>,
+        )];
+        Arc::new(laminar_ai::AiRuntime::new(
+            registry,
+            providers,
+            None,
+            Arc::new(laminar_ai::AiResultCache::with_defaults()),
+            Arc::new(laminar_ai::AiCallLog::with_defaults()),
+        ))
+    }
+
+    fn docs_batch() -> RecordBatch {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1])),
+                Arc::new(StringArray::from(vec!["great quarter"])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ai_routing_enriches_rows() {
+        let ctx = laminar_sql::create_session_context();
+        laminar_sql::register_streaming_functions(&ctx);
+        let mut graph = OperatorGraph::new(ctx);
+        graph.set_ai_runtime(stub_ai_runtime(), tokio::runtime::Handle::current());
+        graph.register_source_schema("docs".to_string(), docs_batch().schema());
+
+        graph.add_query(
+            "labeled".to_string(),
+            "SELECT id, ai_classify(text, model => 'm', labels => ARRAY['pos','neg']) AS label \
+             FROM docs"
+                .to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        graph
+            .take_build_errors()
+            .expect("AI query should route cleanly");
+
+        // Cycle 1: the row misses the cache and is handed to the worker.
+        let mut sources = FxHashMap::default();
+        sources.insert(Arc::from("docs"), vec![docs_batch()]);
+        let _ = graph.execute_cycle(&sources, i64::MAX, None).await.unwrap();
+
+        // Let the off-thread worker finish, then drain on a later cycle.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let empty = FxHashMap::default();
+        let results = graph.execute_cycle(&empty, i64::MAX, None).await.unwrap();
+
+        let out = &results[&(Arc::from("labeled") as Arc<str>)];
+        let rows: usize = out.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, 1, "the enriched row should be emitted");
+        // Output schema is the residual projection: (id, label).
+        let batch = out.iter().find(|b| b.num_rows() > 0).unwrap();
+        let label = batch
+            .column(batch.schema().index_of("label").unwrap())
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(label.value(0), "pos");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ai_routing_unknown_model_fails_at_build() {
+        let ctx = laminar_sql::create_session_context();
+        laminar_sql::register_streaming_functions(&ctx);
+        let mut graph = OperatorGraph::new(ctx);
+        graph.set_ai_runtime(stub_ai_runtime(), tokio::runtime::Handle::current());
+
+        graph.add_query(
+            "bad".to_string(),
+            "SELECT ai_classify(text, model => 'ghost', labels => ARRAY['a']) AS label FROM docs"
+                .to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            graph.take_build_errors().is_err(),
+            "unknown model must fail"
+        );
     }
 
     #[tokio::test]

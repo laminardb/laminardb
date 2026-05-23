@@ -2,6 +2,7 @@
 
 #![allow(clippy::disallowed_types)] // cold path: server startup and config only
 
+mod ai;
 #[cfg(feature = "cluster-unstable")]
 mod cluster;
 #[cfg(feature = "cluster-unstable")]

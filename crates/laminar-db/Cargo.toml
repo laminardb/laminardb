@@ -38,6 +38,7 @@ azure = ["laminar-storage/azure"]
 
 [dependencies]
 laminar-core = { path = "../laminar-core", version = "0.23.0" }
+laminar-ai = { path = "../laminar-ai", version = "0.23.0" }
 laminar-sql = { path = "../laminar-sql", version = "0.23.0" }
 laminar-storage = { path = "../laminar-storage", version = "0.23.0" }
 laminar-connectors = { path = "../laminar-connectors", version = "0.23.0" }

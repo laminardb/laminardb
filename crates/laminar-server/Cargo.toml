@@ -22,6 +22,8 @@ laminar-core = { path = "../laminar-core", version = "0.23.0" }
 laminar-storage = { path = "../laminar-storage", version = "0.23.0" }
 laminar-db = { path = "../laminar-db", version = "0.23.0", features = ["api"] }
 laminar-sql = { path = "../laminar-sql", version = "0.23.0" }
+# Remote AI backends (HTTP) for building the AI runtime from `[ai]`/`[models]`.
+laminar-ai = { path = "../laminar-ai", version = "0.23.0", features = ["remote"] }
 
 # For pgwire dispatch on parsed AST
 sqlparser = { workspace = true }

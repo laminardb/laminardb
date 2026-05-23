@@ -1,0 +1,49 @@
+[package]
+name = "laminar-ai"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://laminardb.io/api/laminar_ai"
+description = "Backend-agnostic AI inference for LaminarDB - model registry, provider trait, result cache, and local/remote backends"
+
+[dependencies]
+# Error handling
+thiserror = { workspace = true }
+
+# Async trait objects (dyn InferenceProvider)
+async-trait = { workspace = true }
+
+# Result cache (S3-FIFO in-memory), same crate the lookup/schema caches use.
+foyer = { workspace = true }
+
+# Content hashing for cache keys — xxh3-128 (not cryptographic; a fast,
+# collision-negligible key for a result cache, cheaper than SHA-256 near the
+# compute thread).
+xxhash-rust = { workspace = true }
+
+# Call-log buffer mutex (no poisoning; clippy bans std::sync::Mutex).
+parking_lot = { workspace = true }
+
+# --- remote backend (feature = "remote") ---
+# HTTP transport; matches the version laminar-connectors already compiles
+# (rustls, no openssl). serde(_json) for request/response bodies; tokio for
+# timeout/sleep; futures for bounded-concurrent per-row dispatch.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+
+[features]
+default = []
+# Remote LLM backends (OpenAI-compatible, Anthropic) over HTTP. `local` (tract +
+# tokenizers) lands in a later step. Default build carries zero ML/HTTP weight.
+remote = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:tokio", "dep:futures"]
+# Local ONNX backend (tract + tokenizers) — deps added when the backend lands.
+local = []
+
+[dev-dependencies]
+tokio = { workspace = true }

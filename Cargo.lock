@@ -4774,6 +4774,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "laminar-ai"
+version = "0.23.0"
+dependencies = [
+ "async-trait",
+ "foyer",
+ "futures",
+ "parking_lot 0.12.5",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "laminar-connectors"
 version = "0.23.0"
 dependencies = [
@@ -4899,6 +4915,7 @@ dependencies = [
  "futures",
  "futures-util",
  "indexmap 2.13.0",
+ "laminar-ai",
  "laminar-connectors",
  "laminar-core",
  "laminar-derive",
@@ -4954,6 +4971,7 @@ dependencies = [
  "futures",
  "gethostname",
  "humantime-serde",
+ "laminar-ai",
  "laminar-core",
  "laminar-db",
  "laminar-sql",

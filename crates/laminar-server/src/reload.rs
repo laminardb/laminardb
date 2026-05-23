@@ -417,6 +417,8 @@ mod tests {
             coordination: None,
             node_id: None,
             sql: None,
+            ai: Default::default(),
+            models: Default::default(),
         }
     }
 
