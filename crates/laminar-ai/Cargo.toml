@@ -41,7 +41,8 @@ futures = { workspace = true, optional = true }
 # Pure-Rust ONNX inference (no C++). tokenizers uses the pure-Rust fancy-regex
 # backend (not onig/C or esaxx/C++); the BERT/DistilBERT family only needs the
 # core WordPiece path. serde_json reads the model's config.json (id2label);
-# tokio for spawn_blocking off the Ring 1 task.
+# tokio for spawn_blocking + the inference deadline; reqwest fetches absent
+# `hf:` repos from the Hugging Face CDN.
 tract-onnx = { version = "0.21", optional = true }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"], optional = true }
 
@@ -50,8 +51,8 @@ default = []
 # Remote LLM backends (OpenAI-compatible, Anthropic) over HTTP. Default build
 # carries zero ML/HTTP weight.
 remote = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:tokio", "dep:futures"]
-# Local ONNX backend (tract + HF tokenizers).
-local = ["dep:tract-onnx", "dep:tokenizers", "dep:serde_json", "dep:tokio"]
+# Local ONNX backend (tract + HF tokenizers; reqwest for hf: model fetch).
+local = ["dep:tract-onnx", "dep:tokenizers", "dep:serde_json", "dep:tokio", "dep:reqwest"]
 
 [dev-dependencies]
 tokio = { workspace = true }

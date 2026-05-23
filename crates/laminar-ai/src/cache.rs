@@ -72,8 +72,10 @@ pub fn params_version(params: &InferenceParams) -> u64 {
 /// Configuration for [`AiResultCache`].
 #[derive(Debug, Clone, Copy)]
 pub struct AiResultCacheConfig {
-    /// Maximum number of cached row outputs.
-    pub capacity: usize,
+    /// Memory budget in bytes. Entries are weighted by payload size, so this
+    /// bounds memory directly — an entry count would not, since an embedding
+    /// vector is orders of magnitude larger than a one-word label.
+    pub capacity_bytes: usize,
     /// Number of shards for concurrent access (power of 2).
     pub shards: usize,
 }
@@ -81,10 +83,20 @@ pub struct AiResultCacheConfig {
 impl Default for AiResultCacheConfig {
     fn default() -> Self {
         Self {
-            capacity: 64 * 1024,
+            capacity_bytes: 64 * 1024 * 1024,
             shards: 16,
         }
     }
+}
+
+/// Weight of one cache entry: its payload bytes plus fixed key/bookkeeping
+/// overhead, so tiny entries still count against the budget.
+fn entry_weight(_key: &AiCacheKey, value: &CachedOutput) -> usize {
+    let payload = match value {
+        CachedOutput::Text(s) => s.len(),
+        CachedOutput::Vector(v) => v.len() * std::mem::size_of::<f32>(),
+    };
+    payload + std::mem::size_of::<AiCacheKey>() + 32
 }
 
 /// foyer-backed in-memory cache of per-row inference results.
@@ -101,8 +113,9 @@ impl AiResultCache {
     /// Create a cache with the given configuration.
     #[must_use]
     pub fn new(config: AiResultCacheConfig) -> Self {
-        let cache = CacheBuilder::new(config.capacity)
+        let cache = CacheBuilder::new(config.capacity_bytes)
             .with_shards(config.shards)
+            .with_weighter(entry_weight)
             .build();
         Self {
             cache,

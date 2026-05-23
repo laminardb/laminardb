@@ -2,16 +2,20 @@
 //! BERT / DistilBERT / MiniLM family: classification/sentiment yield logits
 //! (the adapter argmaxes), embedding yields a mean-pooled vector. Generative
 //! tasks are rejected. A model is loaded once per source and cached; tract runs
-//! on `spawn_blocking`, off the Ring 1 task.
+//! on `spawn_blocking`, off the Ring 1 task, under a deadline so a pathological
+//! model can never stall the inference worker (and the watermark behind it).
 //!
-//! A `source` resolves to a directory holding `model.onnx` + `tokenizer.json`:
-//! `hf:org/repo` → `<cache_dir>/org/repo`, `file://<path>` or a bare path are
-//! used as-is. Fetching `hf:` repos is not done here — the files must already be
-//! present (download is a follow-up).
+//! A `source` resolves to a directory holding `model.onnx` + `tokenizer.json`
+//! (+ optional `config.json` for labels): `hf:org/repo` → `<cache_dir>/org/repo`,
+//! `file://<path>` or a bare path used as-is. A missing `hf:` repo is downloaded
+//! from the Hugging Face CDN on first use (public repos only). Note: classifier
+//! labels are read from `config.json` at startup, so a model that downloads
+//! lazily must instead carry an explicit `labels` argument until it is cached.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -24,41 +28,114 @@ use crate::registry::Task;
 
 type Plan = TypedRunnableModel<TypedModel>;
 
+/// Per-batch deadline for the synchronous tract forward pass. Bounds the
+/// inference worker (and the held watermark) against a wedged model. On timeout
+/// the blocking thread is abandoned — it cannot be cancelled — and the batch
+/// fails, releasing the hold.
+const INFERENCE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// A loaded model: the tract plan, its tokenizer, and its input arity (2 or 3:
 /// `input_ids`, `attention_mask`, and optionally `token_type_ids`).
 struct LoadedModel {
     plan: Plan,
     tokenizer: tokenizers::Tokenizer,
-    inputs: usize,
+    input_arity: usize,
 }
 
 /// Local ONNX provider, backed by a model cache directory.
 pub struct LocalProvider {
     cache_dir: PathBuf,
     loaded: Mutex<HashMap<String, Arc<LoadedModel>>>,
+    http: reqwest::Client,
 }
 
 impl LocalProvider {
     /// Create a provider that resolves models under `cache_dir`.
     #[must_use]
     pub fn new(cache_dir: impl Into<PathBuf>) -> Self {
+        // A connect deadline plus a generous total cap bounds a hung download
+        // without killing a legitimately large model fetch.
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(600))
+            .build()
+            .unwrap_or_default();
         Self {
             cache_dir: cache_dir.into(),
             loaded: Mutex::new(HashMap::new()),
+            http,
         }
     }
 
-    /// Load a model (once), caching the result.
-    fn load(&self, source: &str) -> Result<Arc<LoadedModel>, ProviderError> {
+    /// Resolve a model to a loaded, cached plan: serve from cache, else download
+    /// (for an absent `hf:` repo) and compile on the blocking pool.
+    async fn ensure_model(&self, source: &str) -> Result<Arc<LoadedModel>, ProviderError> {
         if let Some(model) = self.loaded.lock().get(source) {
             return Ok(Arc::clone(model));
         }
-        let loaded = Arc::new(load_model(&model_dir(&self.cache_dir, source))?);
+        let dir = model_dir(&self.cache_dir, source);
+        if let Some(repo) = source.strip_prefix("hf:") {
+            download_if_missing(&self.http, repo, &dir).await?;
+        }
+        // Compiling the ONNX graph is heavy, blocking work — keep it off Ring 1.
+        let loaded = tokio::task::spawn_blocking(move || load_model(&dir))
+            .await
+            .map_err(|e| ProviderError::Transport(format!("model load task: {e}")))??;
+        let loaded = Arc::new(loaded);
         self.loaded
             .lock()
             .insert(source.to_string(), Arc::clone(&loaded));
         Ok(loaded)
     }
+}
+
+/// Download `model.onnx`, `tokenizer.json` (required) and `config.json`
+/// (optional — labels only) from the Hugging Face CDN if they are not already
+/// present. Public repos only; no auth.
+async fn download_if_missing(
+    http: &reqwest::Client,
+    repo: &str,
+    dir: &Path,
+) -> Result<(), ProviderError> {
+    if dir.join("model.onnx").exists() && dir.join("tokenizer.json").exists() {
+        return Ok(());
+    }
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|e| ProviderError::Transport(format!("create {}: {e}", dir.display())))?;
+    for (file, required) in [
+        ("model.onnx", true),
+        ("tokenizer.json", true),
+        ("config.json", false),
+    ] {
+        let dest = dir.join(file);
+        if dest.exists() {
+            continue;
+        }
+        let url = format!("https://huggingface.co/{repo}/resolve/main/{file}");
+        let resp = http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| ProviderError::Transport(format!("download {url}: {e}")))?;
+        if !resp.status().is_success() {
+            if !required {
+                continue;
+            }
+            return Err(ProviderError::Transport(format!(
+                "download {url}: HTTP {}",
+                resp.status()
+            )));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ProviderError::Transport(format!("download {url}: {e}")))?;
+        tokio::fs::write(&dest, &bytes)
+            .await
+            .map_err(|e| ProviderError::Transport(format!("write {}: {e}", dest.display())))?;
+    }
+    Ok(())
 }
 
 /// On-disk directory for a model `source`: `hf:org/repo` → `<cache_dir>/org/repo`,
@@ -112,13 +189,22 @@ impl InferenceProvider for LocalProvider {
         ) {
             return Err(ProviderError::UnsupportedTask(request.task));
         }
-        let loaded = self.load(&request.model)?;
+        let loaded = self.ensure_model(&request.model).await?;
         let task = request.task;
         let inputs = request.inputs;
-        // tract is synchronous CPU work — keep it off the Ring 1 task.
-        let outputs = tokio::task::spawn_blocking(move || run(&loaded, task, &inputs))
-            .await
-            .map_err(|e| ProviderError::Transport(format!("local inference task: {e}")))??;
+        // tract is synchronous CPU work — keep it off the Ring 1 task, under a
+        // deadline so a wedged model cannot stall the worker indefinitely.
+        let run = tokio::task::spawn_blocking(move || run(&loaded, task, &inputs));
+        let outputs = match tokio::time::timeout(INFERENCE_TIMEOUT, run).await {
+            Ok(joined) => {
+                joined.map_err(|e| ProviderError::Transport(format!("inference task: {e}")))??
+            }
+            Err(_) => {
+                return Err(ProviderError::Timeout(
+                    u64::try_from(INFERENCE_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+                ))
+            }
+        };
         Ok(InferenceResponse {
             outputs,
             usage: Usage::ZERO,
@@ -142,7 +228,7 @@ fn load_model(dir: &Path) -> Result<LoadedModel, ProviderError> {
     let model = tract_onnx::onnx()
         .model_for_path(&onnx_path)
         .map_err(|e| ProviderError::Transport(format!("load onnx: {e}")))?;
-    let inputs = model.inputs.len();
+    let input_arity = model.inputs.len();
     let plan = model
         .into_optimized()
         .map_err(|e| ProviderError::Transport(format!("optimize onnx: {e}")))?
@@ -153,7 +239,7 @@ fn load_model(dir: &Path) -> Result<LoadedModel, ProviderError> {
     Ok(LoadedModel {
         plan,
         tokenizer,
-        inputs,
+        input_arity,
     })
 }
 
@@ -182,7 +268,7 @@ fn run(
                 .map(|a| a.into_tensor().into())
         };
         let mut tensors: TVec<TValue> = tvec!(tensor(ids)?, tensor(mask.clone())?);
-        if loaded.inputs >= 3 {
+        if loaded.input_arity >= 3 {
             tensors.push(tensor(vec![0i64; seq])?);
         }
 
