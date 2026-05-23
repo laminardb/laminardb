@@ -9,9 +9,10 @@
 //! registry but cannot be resolved to a runnable backend.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use laminar_ai::backends::{AnthropicProvider, OpenAiProvider};
+use laminar_ai::backends::{local, AnthropicProvider, LocalProvider, OpenAiProvider};
 use laminar_ai::{
     AiCallLog, AiResultCache, AiRuntime, InferenceProvider, ModelBackend, ModelEntry,
     ModelRegistry, Task,
@@ -37,6 +38,19 @@ pub(crate) fn build_ai_runtime(
     if config.models.is_empty() {
         return Ok(None);
     }
+
+    // The local backend is configured by a provider whose (inferred) kind is
+    // "local" carrying a cache_dir. It serves every local model.
+    let local_cache_dir: Option<PathBuf> = config
+        .ai
+        .providers
+        .iter()
+        .find(|(name, cfg)| provider_kind(name, cfg) == "local")
+        .and_then(|(_, cfg)| cfg.cache_dir.clone())
+        .map(PathBuf::from);
+    let local_provider: Option<Arc<dyn InferenceProvider>> = local_cache_dir
+        .clone()
+        .map(|dir| Arc::new(LocalProvider::new(dir)) as Arc<dyn InferenceProvider>);
 
     let mut providers: HashMap<String, Arc<dyn InferenceProvider>> = HashMap::new();
     for (name, provider) in &config.ai.providers {
@@ -65,12 +79,17 @@ pub(crate) fn build_ai_runtime(
                     build_err(format!("model '{name}': remote model requires a model id"))
                 })?,
             },
-            "local" => ModelBackend::Local {
-                source: model.source.clone().ok_or_else(|| {
+            "local" => {
+                let source = model.source.clone().ok_or_else(|| {
                     build_err(format!("model '{name}': local model requires a source"))
-                })?,
-                labels: None,
-            },
+                })?;
+                // Auto-derive classifier labels from the model's config.json.
+                let labels = local_cache_dir
+                    .as_ref()
+                    .map(|dir| local::load_labels(dir, &source))
+                    .filter(|l| !l.is_empty());
+                ModelBackend::Local { source, labels }
+            }
             other => {
                 return Err(build_err(format!(
                     "model '{name}': kind must be 'local' or 'remote', got '{other}'"
@@ -96,19 +115,27 @@ pub(crate) fn build_ai_runtime(
     let cache = Arc::new(AiResultCache::with_defaults());
     let call_log = Arc::new(AiCallLog::new(CALL_LOG_CAPACITY));
     Ok(Some(Arc::new(AiRuntime::new(
-        registry, providers, None, cache, call_log,
+        registry,
+        providers,
+        local_provider,
+        cache,
+        call_log,
     ))))
 }
 
-/// Build one provider client. Returns `None` for the local backend (not yet
-/// wired) so local models still register without a runnable provider.
+/// A provider's transport kind: its explicit `kind`, else inferred from the name.
+fn provider_kind<'a>(name: &'a str, cfg: &'a ProviderConfig) -> &'a str {
+    cfg.kind.as_deref().unwrap_or(name)
+}
+
+/// Build one remote provider client. Returns `None` for the local backend (it is
+/// the runtime's separate `local_provider`, not an entry in the providers map).
 #[allow(clippy::result_large_err)]
 fn build_provider(
     name: &str,
     cfg: &ProviderConfig,
 ) -> Result<Option<Arc<dyn InferenceProvider>>, ServerError> {
-    // `kind`, or inferred from the provider name.
-    match cfg.kind.as_deref().unwrap_or(name) {
+    match provider_kind(name, cfg) {
         "local" => Ok(None),
         "anthropic" => {
             let key = resolve_key(name, cfg)?;

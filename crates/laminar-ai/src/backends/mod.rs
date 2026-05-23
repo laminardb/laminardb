@@ -11,6 +11,8 @@
 
 #[cfg(feature = "remote")]
 pub mod anthropic;
+#[cfg(feature = "local")]
+pub mod local;
 #[cfg(feature = "remote")]
 pub mod openai;
 #[cfg(feature = "remote")]
@@ -18,5 +20,7 @@ mod remote;
 
 #[cfg(feature = "remote")]
 pub use anthropic::AnthropicProvider;
+#[cfg(feature = "local")]
+pub use local::LocalProvider;
 #[cfg(feature = "remote")]
 pub use openai::OpenAiProvider;
