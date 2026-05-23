@@ -416,6 +416,28 @@ impl AsofRightBuffer {
         Ok(())
     }
 
+    /// Keep, per key, the latest right row at or below `watermark` plus every
+    /// newer row; drop the rest. A future left (`ts >= watermark`) backward- or
+    /// nearest-matches the latest right `<= its ts`, which is never older than
+    /// the latest right `<= watermark`, so older rows are unreachable. Unlike
+    /// [`Self::evict_before`] this retains the boundary row, making it safe with
+    /// no tolerance.
+    pub fn evict_superseded(&mut self, watermark: i64) -> Result<(), DbError> {
+        for btree in self.index.values_mut() {
+            // Greatest ts <= watermark; keep it and everything newer, drop the
+            // rest. `split_off(&keep_ts)` returns the `>= keep_ts` tail.
+            if let Some((&keep_ts, _)) = btree.range(..=watermark).next_back() {
+                *btree = btree.split_off(&keep_ts);
+            }
+        }
+        self.index.retain(|_, btree| !btree.is_empty());
+
+        if self.ingest_count >= ASOF_COMPACTION_THRESHOLD {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
     fn compact(&mut self) -> Result<(), DbError> {
         let Some(ref batch) = self.right_concat else {
             return Ok(());
@@ -1083,5 +1105,114 @@ mod tests {
         assert_eq!(symbols.value(0), "AAPL");
         assert!(result.column(0).is_null(1)); // null key row
         assert!(result.column(3).is_null(1)); // right-side quote_ts is null
+    }
+
+    /// Single-key quote row matching `quotes_batch`'s schema, at timestamp `ts`.
+    fn quote_at(symbol: &str, ts: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("quote_ts", DataType::Int64, false),
+            Field::new("bid", DataType::Float64, false),
+            Field::new("ask", DataType::Float64, false),
+        ]));
+        #[allow(clippy::cast_precision_loss)]
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![symbol])),
+                Arc::new(Int64Array::from(vec![ts])),
+                Arc::new(Float64Array::from(vec![ts as f64])),
+                Arc::new(Float64Array::from(vec![ts as f64 + 1.0])),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Single-key trade row matching `trades_batch`'s schema, at timestamp `ts`.
+    fn trade_at(symbol: &str, ts: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("trade_ts", DataType::Int64, false),
+            Field::new("price", DataType::Float64, false),
+        ]));
+        #[allow(clippy::cast_precision_loss)]
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![symbol])),
+                Arc::new(Int64Array::from(vec![ts])),
+                Arc::new(Float64Array::from(vec![ts as f64])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn asof_no_tolerance_evicts_superseded_right() {
+        // Backward, no tolerance. Three right rows for one key at t=1,2,3.
+        let config = backward_config();
+        let mut buf = AsofRightBuffer::default();
+        for ts in [1_i64, 2, 3] {
+            buf.ingest(&[quote_at("AAPL", ts)], "symbol", "quote_ts")
+                .unwrap();
+        }
+        assert_eq!(buf.index.values().next().unwrap().len(), 3);
+
+        // Advance the left watermark to 3: any future left L >= 3 backward-
+        // matches the latest right <= L, which is >= the latest right <= 3.
+        // So only t=3 is reachable; t=1 and t=2 are superseded.
+        buf.evict_superseded(3).unwrap();
+        let btree = buf.index.values().next().unwrap();
+        assert_eq!(btree.len(), 1, "only the latest <= watermark is kept");
+        assert!(btree.contains_key(&3));
+
+        // A future left at t=5 still backward-matches the retained right at t=3.
+        let out =
+            execute_asof_join_with_state(&[trade_at("AAPL", 5)], &buf, &config, None).unwrap();
+        let quote_ts = out
+            .column_by_name("quote_ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(quote_ts.value(0), 3);
+    }
+
+    #[test]
+    fn asof_evict_superseded_then_compact_remaps_offsets() {
+        // The riskiest path: sparse per-key eviction followed by compaction,
+        // which rebuilds `right_concat` and must remap the surviving index
+        // offsets. Ingest past ASOF_COMPACTION_THRESHOLD so eviction compacts.
+        let mut buf = AsofRightBuffer::default();
+        for ts in 1..=40_i64 {
+            buf.ingest(&[quote_at("AAPL", ts)], "symbol", "quote_ts")
+                .unwrap();
+        }
+
+        // Keep only t=39 (latest <= 39) and t=40 (newer than the watermark).
+        buf.evict_superseded(39).unwrap();
+        assert!(
+            buf.ingest_count < ASOF_COMPACTION_THRESHOLD,
+            "compact() should have run and reset ingest_count"
+        );
+        let btree = buf.index.values().next().unwrap();
+        assert_eq!(btree.len(), 2);
+        assert_eq!(
+            buf.right_concat.as_ref().unwrap().num_rows(),
+            2,
+            "data buffer shrinks with the index"
+        );
+
+        // After remapping, matches still resolve against the compacted buffer.
+        let config = backward_config();
+        let out =
+            execute_asof_join_with_state(&[trade_at("AAPL", 100)], &buf, &config, None).unwrap();
+        let quote_ts = out
+            .column_by_name("quote_ts")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(quote_ts.value(0), 40); // backward match = latest <= 100
     }
 }
