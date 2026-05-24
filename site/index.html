@@ -258,6 +258,7 @@
       <nav class="nav-links" aria-label="Main navigation">
         <a href="#quick-start">Quick Start</a>
         <a href="#connectors">Connectors</a>
+        <a href="#ai">AI Functions</a>
         <a href="#comparison">Comparison</a>
         <a href="#status">Status</a>
         <a href="#faq">FAQ</a>
@@ -276,6 +277,7 @@
       <div class="mobile-menu">
         <a href="#quick-start">Quick Start</a>
         <a href="#connectors">Connectors</a>
+        <a href="#ai">AI Functions</a>
         <a href="#comparison">Comparison</a>
         <a href="#status">Status</a>
         <a href="#faq">FAQ</a>
@@ -715,6 +717,151 @@ CREATE SINK lake INTO DELTA_LAKE (
           <a href="https://laminardb.io/api/laminar_connectors/connector/trait.SinkConnector.html" target="_blank" rel="noopener">SinkConnector</a>
           traits.
         </p>
+      </div>
+    </section>
+
+    <!-- AI Functions -->
+    <section id="ai">
+      <div class="container">
+        <h2>AI Functions <span class="label-planned" style="vertical-align: middle; margin-left: 8px;">v0.1 · PR #395</span></h2>
+        <p class="section-desc">
+          Call AI models inline in streaming SQL. Each function names a model resolved from a
+          registry; whether it runs against a remote LLM over HTTP or a local ONNX encoder
+          in-process is hidden behind the function.
+        </p>
+
+        <div class="code-block">
+          <div class="code-header">
+            <span style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--text-dim);">sentiment.sql</span>
+            <button class="copy-btn" aria-label="Copy code">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+              Copy
+            </button>
+          </div>
+          <div class="code-body">
+            <div class="tab-panel active">
+              <pre><code class="language-sql">-- Score headlines as they arrive, in one continuous query
+CREATE STREAM flagged AS
+SELECT id, headline,
+       ai_sentiment(headline, model =&gt; 'finbert') AS sentiment
+FROM news;
+
+-- Zero/few-shot classification with explicit labels
+SELECT id,
+       ai_classify(body, model =&gt; 'intent-mini',
+                   labels =&gt; ARRAY['question', 'complaint', 'praise']) AS intent
+FROM tickets;
+
+-- Embedding vectors for downstream similarity
+SELECT id, ai_embed(chunk, model =&gt; 'minilm') AS vector
+FROM documents;</code></pre>
+            </div>
+          </div>
+        </div>
+
+        <h3 style="margin-top: 2.5rem; margin-bottom: 1rem;">Functions</h3>
+        <div class="connector-table-wrapper">
+          <table class="connector-table">
+            <thead>
+              <tr>
+                <th>Function</th>
+                <th>Task</th>
+                <th>Backend</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>ai_classify</td>
+                <td>Zero/few-shot classification (<code>labels =&gt; ARRAY[…]</code>)</td>
+                <td><span class="status-impl">Remote or local</span></td>
+              </tr>
+              <tr>
+                <td>ai_sentiment</td>
+                <td>Sentiment</td>
+                <td><span class="status-impl">Remote or local</span></td>
+              </tr>
+              <tr>
+                <td>ai_embed</td>
+                <td>Embedding vector</td>
+                <td><span class="status-impl">Remote or local</span></td>
+              </tr>
+              <tr>
+                <td>ai_complete</td>
+                <td>Text completion</td>
+                <td>Remote only</td>
+              </tr>
+              <tr>
+                <td>ai_summarize</td>
+                <td>Summarization</td>
+                <td>Remote only</td>
+              </tr>
+              <tr>
+                <td>ai_translate</td>
+                <td>Translation</td>
+                <td>Remote only</td>
+              </tr>
+              <tr>
+                <td>ai_gen</td>
+                <td>Open-ended generation</td>
+                <td>Remote only</td>
+              </tr>
+              <tr>
+                <td>ai_extract</td>
+                <td>Structured extraction</td>
+                <td>Remote only</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p style="margin-top: 1rem; font-size: 0.85rem; color: var(--text-dim);">
+          Local models are encoder-only (BERT / DistilBERT / MiniLM family) and cover
+          classify, sentiment, and embed. Generative tasks require a remote provider.
+        </p>
+
+        <div class="deploy-grid" style="margin-top: 2.5rem;">
+          <div class="deploy-card">
+            <h3>Off the hot path</h3>
+            <p>
+              The streaming pipeline never blocks on a model call. The operator serves cache
+              hits inline and hands misses to a background worker; enriched rows emit in a
+              later cycle.
+            </p>
+            <p>
+              In-flight rows survive checkpoint and restore, and the watermark is held so
+              async-enriched rows are not dropped as late.
+            </p>
+          </div>
+          <div class="deploy-card">
+            <h3>Cached results</h3>
+            <p>
+              Inference results are cached by <code>(content, model, params)</code>, so repeated
+              inputs are served without another model call.
+            </p>
+            <p>The cache is byte-bounded.</p>
+          </div>
+          <div class="deploy-card">
+            <h3>Dual backend, per call</h3>
+            <p>
+              The backend is chosen per call by model name from config: a remote LLM over HTTP
+              (OpenAI-compatible, Anthropic) or a local ONNX encoder.
+            </p>
+            <p>
+              Local inference uses ONNX Runtime, loaded dynamically at runtime — install
+              ONNX Runtime <code>&ge; 1.24</code> and set <code>ORT_DYLIB_PATH</code> or put it on the
+              search path.
+            </p>
+          </div>
+        </div>
+
+        <h3 style="margin-top: 2.5rem; margin-bottom: 1rem;">Configuration</h3>
+        <div class="text-block">
+          <p>
+            Models and providers are declared under <code>[ai.providers.*]</code>,
+            <code>[models.*]</code>, and <code>[ai.defaults]</code>. API keys are referenced by
+            environment-variable name — never stored in config. The catalog views
+            <code>laminar.models</code> and <code>laminar.ai_calls</code> are SELECT-able.
+          </p>
+        </div>
       </div>
     </section>
 
