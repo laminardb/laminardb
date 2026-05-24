@@ -707,16 +707,21 @@ mod ai {
 
         for arg in &list.args {
             match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(value)) if !seen_input => {
-                    seen_input = true;
-                    // The operator looks the input up by column name in the source
-                    // batch, so only a plain column reference is supported —
-                    // stringifying an arbitrary expression would fail that lookup.
-                    match column_name(value) {
-                        Some(col) => input = Some(col),
-                        None => parse_errors.push(format!(
-                            "AI function input must be a simple column reference, got `{value}`"
-                        )),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(value)) => {
+                    if seen_input {
+                        parse_errors
+                            .push("AI functions take a single positional input column".to_string());
+                    } else {
+                        seen_input = true;
+                        // The operator looks the input up by column name in the
+                        // source batch, so only a plain column reference is
+                        // supported — an arbitrary expression would fail lookup.
+                        match column_name(value) {
+                            Some(col) => input = Some(col),
+                            None => parse_errors.push(format!(
+                                "AI function input must be a simple column reference, got `{value}`"
+                            )),
+                        }
                     }
                 }
                 FunctionArg::Named {
@@ -735,9 +740,13 @@ mod ai {
                             "`labels` argument must be an array of string literals".to_string(),
                         ),
                     },
-                    _ => {}
+                    other => {
+                        parse_errors.push(format!("unsupported AI function argument `{other}`"));
+                    }
                 },
-                _ => {}
+                other => {
+                    parse_errors.push(format!("unsupported AI function argument: {other}"));
+                }
             }
         }
 
@@ -949,6 +958,8 @@ mod ai {
                 "SELECT ai_classify(model => 'finbert') AS x FROM s",
                 "SELECT ai_classify(headline, model => 123) AS x FROM s",
                 "SELECT ai_classify(headline, model => 'finbert', labels => 'up') AS x FROM s",
+                "SELECT ai_classify(headline, extra, model => 'finbert') AS x FROM s",
+                "SELECT ai_classify(headline, model => 'finbert', who => 'me') AS x FROM s",
             ];
             for sql in cases {
                 let calls = detect_ai_functions(sql);

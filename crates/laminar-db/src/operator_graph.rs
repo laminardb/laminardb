@@ -856,15 +856,9 @@ impl OperatorGraph {
         // name in place if a query referenced it before it was registered (so
         // downstream edges stay valid), else append a fresh node — see
         // `place_operator_node`. Source nodes are ensured first so their indices
-        // are stable when wiring edges.
-        //
-        // The placeholder path predates temporal joins and never applied
-        // `temporal_config`; preserve that by suppressing it when replacing one.
-        let temporal_config = if self.source_map.contains_key(name.as_str()) {
-            None
-        } else {
-            temporal_config
-        };
+        // are stable when wiring edges. The placeholder and fresh paths wire
+        // identically, including `temporal_config`, so an out-of-order temporal
+        // join is wired the same as one registered in order.
         self.ensure_query_source_nodes(
             temporal_probe_config.as_ref(),
             asof_config.as_ref(),
