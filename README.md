@@ -87,6 +87,8 @@ conn.close()
 | Standalone | `laminardb` binary. TOML config, REST API, Prometheus metrics, hot reload. |
 | Distributed | `--features delta`. Multi-node scaffolding (gossip, Raft, gRPC). Not production-ready. |
 
+**Prebuilt server binaries** for Linux (gnu/musl), macOS (Intel/Apple Silicon), and Windows are attached to every [GitHub release](https://github.com/laminardb/laminardb/releases/latest) — download, extract, and run `laminardb --config laminardb.toml`. No build toolchain required.
+
 Built on [Apache Arrow](https://arrow.apache.org/) and [DataFusion](https://datafusion.apache.org/). Embedded is the primary target.
 
 ---
@@ -197,6 +199,30 @@ DECLARE c CURSOR FOR SUBSCRIBE … ; FETCH n FROM c -- cursored consumption
 `retain_history` keeps a bounded ring of recent committed epochs in memory; combined with `SUBSCRIBE … AS OF EPOCH n`, a client can resume from the last epoch it saw and reconnect without gaps.
 
 All aggregation functions from DataFusion 52 are available: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `FIRST_VALUE`, `LAST_VALUE`, `STDDEV`, `PERCENTILE_CONT`, `APPROX_COUNT_DISTINCT`, `LAG`, `LEAD`, `ROW_NUMBER`, and 40+ more. JSON extraction, array/struct/map functions, and `UNNEST` are also supported.
+
+---
+
+## AI Functions
+
+Call models inline in streaming SQL. Each function names a model from a registry; the model's backend — a **remote LLM** over HTTP or a **local ONNX encoder** run in-process — is hidden behind the function.
+
+| Function | Task | Backends |
+|----------|------|----------|
+| `ai_classify(text, model => …, labels => ARRAY[…])` | Zero/few-shot classification | remote · local |
+| `ai_sentiment(text, model => …)` | Sentiment | remote · local |
+| `ai_embed(text, model => …)` | Embedding vector | remote · local |
+| `ai_extract` / `ai_complete` / `ai_summarize` / `ai_translate` / `ai_gen` | Generation / extraction | remote |
+
+```sql
+CREATE STREAM flagged AS
+SELECT id, headline,
+       ai_sentiment(headline, model => 'finbert') AS sentiment
+FROM news;
+```
+
+Inference runs **off the hot path**: the operator serves cache hits inline and hands misses to a background worker, so the streaming pipeline never blocks on a model call. Results are cached by `(content, model, params)`. Models, providers, and per-task defaults are configured in `[ai.providers.*]` / `[models.*]` / `[ai.defaults]`.
+
+Local models are encoder-only (BERT / DistilBERT / MiniLM family) and run on **ONNX Runtime**, which is loaded at runtime — install ONNX Runtime ≥ 1.24 and set `ORT_DYLIB_PATH` (or put the library on the search path). Generative tasks require a remote provider. See the [server configuration guide](crates/laminar-server/README.md#ai-functions) for the full setup.
 
 ---
 

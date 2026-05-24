@@ -465,6 +465,9 @@ impl LaminarDB {
         if let Some(ref prom) = *self.engine_metrics.lock() {
             graph.set_metrics(Arc::clone(prom));
         }
+        if let (Some(runtime), Some(handle)) = (&self.ai_runtime, &self.ai_handle) {
+            graph.set_ai_runtime(Arc::clone(runtime), handle.clone());
+        }
 
         // Install the cluster row-shuffle config if all the pieces are
         // present (registry, sender, receiver, controller). Without any
@@ -508,6 +511,9 @@ impl LaminarDB {
                 reg.join_config.clone(),
             );
         }
+        // Surface any plan-time AI routing errors (unknown model, unsupported
+        // task, malformed AI query) collected during `add_query`.
+        graph.take_build_errors()?;
 
         // Register temporal join tables as Versioned in the lookup registry
         // so that temporal join operators can use persistent versioned state.

@@ -94,6 +94,11 @@ pub struct LaminarDB {
     /// Min of all source watermarks.
     pub(crate) pipeline_watermark: Arc<std::sync::atomic::AtomicI64>,
     pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
+    /// Assembled AI subsystem (registry + providers + cache + call log).
+    /// `None` unless `[ai]`/`[models]` are configured. Set once in the builder.
+    pub(crate) ai_runtime: Option<Arc<laminar_ai::AiRuntime>>,
+    /// Main runtime handle the AI inference workers spawn on. Set with `ai_runtime`.
+    pub(crate) ai_handle: Option<tokio::runtime::Handle>,
     /// Live-DDL channel to the running coordinator. `None` outside `start..shutdown`.
     pub(crate) control_tx: parking_lot::Mutex<Option<ControlMsgTx>>,
     pub(crate) mv_store: Arc<parking_lot::RwLock<crate::mv_store::MvStore>>,
@@ -279,6 +284,8 @@ impl LaminarDB {
             session_properties: parking_lot::Mutex::new(HashMap::new()),
             pipeline_watermark: Arc::new(std::sync::atomic::AtomicI64::new(i64::MIN)),
             lookup_registry,
+            ai_runtime: None,
+            ai_handle: None,
             control_tx: parking_lot::Mutex::new(None),
             mv_store: Arc::new(parking_lot::RwLock::new(crate::mv_store::MvStore::new())),
             #[cfg(feature = "cluster-unstable")]
@@ -299,6 +306,24 @@ impl LaminarDB {
             subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
             stream_schemas: parking_lot::RwLock::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// Install the AI subsystem and the runtime handle its inference workers
+    /// spawn on. Called by the builder before the engine is shared; the handle
+    /// must be the main multi-threaded runtime.
+    pub(crate) fn set_ai_runtime(
+        &mut self,
+        runtime: Arc<laminar_ai::AiRuntime>,
+        handle: tokio::runtime::Handle,
+    ) {
+        // Register the laminar.models / laminar.ai_calls catalog views. A
+        // failure here is non-fatal — inference still works, the views just
+        // aren't queryable.
+        if let Err(e) = crate::ai_catalog::register_ai_catalog(&self.ctx, &runtime) {
+            tracing::warn!(error = %e, "failed to register laminar.* AI catalog views");
+        }
+        self.ai_runtime = Some(runtime);
+        self.ai_handle = Some(handle);
     }
 
     #[cfg(feature = "cluster-unstable")]

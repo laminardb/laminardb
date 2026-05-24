@@ -10,14 +10,17 @@ use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use datafusion_expr::LogicalPlan;
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, SelectItem, SetExpr, Statement, TableFactor,
-    WildcardAdditionalOptions,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName, ObjectNamePart,
+    SelectItem, SetExpr, Statement, TableFactor, WildcardAdditionalOptions,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Location, Token, TokenWithSpan};
 
+use laminar_ai::{BackendKind, ModelRegistry, Task};
 use laminar_sql::parser::join_parser::analyze_joins;
+
+use crate::error::DbError;
 #[cfg(test)]
 use laminar_sql::parser::{EmitClause, EmitStrategy as SqlEmitStrategy};
 use laminar_sql::translator::{
@@ -538,6 +541,510 @@ pub(crate) fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>,
 
     (Some(config), Some(projection_sql))
 }
+
+// ---------------------------------------------------------------------------
+// AI function detection (plan-time seam)
+// ---------------------------------------------------------------------------
+
+/// AI-function detection, plan-time validation, and query planning. Consumed by
+/// `add_query` routing in `operator_graph`.
+mod ai {
+    use super::{
+        BackendKind, DbError, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident,
+        ModelRegistry, ObjectName, ObjectNamePart, SelectItem, SetExpr, Statement, TableFactor,
+        Task,
+    };
+
+    /// The temp table the AI operator registers its enriched batches under for
+    /// the residual projection.
+    pub(crate) const AI_TMP_TABLE: &str = "__ai_tmp";
+
+    /// A query that contains exactly one `ai_*` call: the detected call plus the
+    /// residual projection to run over the operator's enriched output, and the
+    /// single source table the operator reads.
+    pub(crate) struct AiQueryPlan {
+        /// The detected AI call.
+        pub call: AiCallSpec,
+        /// Residual SQL over [`AI_TMP_TABLE`] with the `ai_*` projection item
+        /// rewritten to its alias column.
+        pub projection_sql: String,
+        /// The source table the AI operator reads from.
+        pub source_table: String,
+    }
+
+    /// Plan a query for AI routing. Returns `Some` only when the query has
+    /// exactly one `ai_*` call, written with an `AS` alias, over a single
+    /// (un-joined) source table — the supported shape for v0.1. Multiple AI
+    /// calls, a missing alias, or joins return `None` (the caller rejects or
+    /// routes normally).
+    pub(crate) fn plan_ai_query(sql: &str) -> Option<AiQueryPlan> {
+        let statements = laminar_sql::parse_streaming_sql(sql).ok()?;
+        let mut statement = match statements.into_iter().next()? {
+            laminar_sql::parser::StreamingStatement::Standard(boxed) => *boxed,
+            _ => return None,
+        };
+        let Statement::Query(query) = &mut statement else {
+            return None;
+        };
+        let SetExpr::Select(select) = query.body.as_mut() else {
+            return None;
+        };
+        if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+            return None;
+        }
+        let source_table = match &select.from[0].relation {
+            TableFactor::Table { name, .. } => name.to_string(),
+            _ => return None,
+        };
+
+        // Find the single AI-call projection item.
+        let mut found: Option<(usize, AiCallSpec)> = None;
+        for (index, item) in select.projection.iter().enumerate() {
+            let (expr, alias) = match item {
+                SelectItem::UnnamedExpr(expr) => (expr, None),
+                SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
+                _ => continue,
+            };
+            if let Some(spec) = ai_call_from_expr(expr, alias) {
+                if found.is_some() {
+                    return None; // more than one AI call — unsupported in v0.1
+                }
+                found = Some((index, spec));
+            }
+        }
+        let (index, call) = found?;
+
+        // Rewrite: the AI projection item becomes a plain alias column, and the
+        // FROM table becomes the enriched temp table. Reuse the original alias
+        // `Ident` (an alias is required) so quoted aliases stay quoted.
+        let SelectItem::ExprWithAlias { alias, .. } = &select.projection[index] else {
+            return None;
+        };
+        let alias = alias.clone();
+        select.projection[index] = SelectItem::UnnamedExpr(Expr::Identifier(alias));
+        if let TableFactor::Table { name, .. } = &mut select.from[0].relation {
+            *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(AI_TMP_TABLE))]);
+        }
+        let projection_sql = statement.to_string();
+
+        Some(AiQueryPlan {
+            call,
+            projection_sql,
+            source_table,
+        })
+    }
+
+    /// One detected `ai_*(...)` call in a query's SELECT projection.
+    #[derive(Debug, Clone, PartialEq)]
+    pub(crate) struct AiCallSpec {
+        /// The task implied by the function name.
+        pub task: Task,
+        /// The model named via `model => '<name>'`, or `None` to use the task default.
+        pub model: Option<String>,
+        /// The candidate label set from `labels => [...]`, if supplied.
+        pub labels: Option<Vec<String>>,
+        /// The input column name (a simple identifier). Empty if the first
+        /// argument was missing or not a plain column — a parse error.
+        pub input: String,
+        /// The projection alias, if the call was written `... AS <alias>`.
+        pub output_alias: Option<String>,
+        /// Argument-shape errors found while parsing (bad input, wrong argument
+        /// types). Non-empty means the call is malformed; surfaced by
+        /// [`validate_ai_calls`] as a build error rather than silently ignored.
+        pub parse_errors: Vec<String>,
+    }
+
+    /// Detect `ai_*` calls in the top-level SELECT projection of `sql`.
+    ///
+    /// Only top-level projection calls are recognised in v0.1 (e.g.
+    /// `SELECT ai_classify(text, model => 'finbert') AS label FROM s`); an `ai_*`
+    /// nested inside another expression or in `WHERE` is left for the marker UDF to
+    /// reject. Returns an empty vec if the SQL does not parse or has no AI calls.
+    pub(crate) fn detect_ai_functions(sql: &str) -> Vec<AiCallSpec> {
+        let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
+            return Vec::new();
+        };
+        let Some(laminar_sql::parser::StreamingStatement::Standard(stmt)) = statements.first()
+        else {
+            return Vec::new();
+        };
+        let Statement::Query(query) = stmt.as_ref() else {
+            return Vec::new();
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return Vec::new();
+        };
+
+        let mut calls = Vec::new();
+        for item in &select.projection {
+            let (expr, alias) = match item {
+                SelectItem::UnnamedExpr(expr) => (expr, None),
+                SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
+                _ => continue,
+            };
+            if let Some(spec) = ai_call_from_expr(expr, alias) {
+                calls.push(spec);
+            }
+        }
+        calls
+    }
+
+    /// Extract an [`AiCallSpec`] from a projection expression if it is an `ai_*` call.
+    fn ai_call_from_expr(expr: &Expr, alias: Option<String>) -> Option<AiCallSpec> {
+        let Expr::Function(func) = expr else {
+            return None;
+        };
+        let task = task_from_ai_function(&func.name.to_string().to_ascii_lowercase())?;
+        let FunctionArguments::List(list) = &func.args else {
+            return None;
+        };
+
+        let mut input: Option<String> = None;
+        let mut seen_input = false;
+        let mut model: Option<String> = None;
+        let mut labels: Option<Vec<String>> = None;
+        let mut parse_errors: Vec<String> = Vec::new();
+
+        for arg in &list.args {
+            match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(value)) => {
+                    if seen_input {
+                        parse_errors
+                            .push("AI functions take a single positional input column".to_string());
+                    } else {
+                        seen_input = true;
+                        // The operator looks the input up by column name in the
+                        // source batch, so only a plain column reference is
+                        // supported — an arbitrary expression would fail lookup.
+                        match column_name(value) {
+                            Some(col) => input = Some(col),
+                            None => parse_errors.push(format!(
+                                "AI function input must be a simple column reference, got `{value}`"
+                            )),
+                        }
+                    }
+                }
+                FunctionArg::Named {
+                    name,
+                    arg: FunctionArgExpr::Expr(value),
+                    ..
+                } => match name.value.to_ascii_lowercase().as_str() {
+                    "model" => match string_literal(value) {
+                        Some(s) => model = Some(s),
+                        None => parse_errors
+                            .push("`model` argument must be a string literal".to_string()),
+                    },
+                    "labels" => match string_array_literal(value) {
+                        Some(v) => labels = Some(v),
+                        None => parse_errors.push(
+                            "`labels` argument must be an array of string literals".to_string(),
+                        ),
+                    },
+                    other => {
+                        parse_errors.push(format!("unsupported AI function argument `{other}`"));
+                    }
+                },
+                other => {
+                    parse_errors.push(format!("unsupported AI function argument: {other}"));
+                }
+            }
+        }
+
+        if !seen_input {
+            parse_errors
+                .push("AI function requires a column reference as its first argument".to_string());
+        }
+
+        Some(AiCallSpec {
+            task,
+            model,
+            labels,
+            input: input.unwrap_or_default(),
+            output_alias: alias,
+            parse_errors,
+        })
+    }
+
+    /// A plain column reference (`col`), which the operator can look up in the
+    /// source batch. Anything else (a function call, arithmetic, a qualified
+    /// name) is unsupported as AI input in v0.1.
+    fn column_name(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Identifier(ident) => Some(ident.value.clone()),
+            _ => None,
+        }
+    }
+
+    /// Map an `ai_*` function name to its task. Must stay in step with the marker
+    /// list in `laminar-sql`'s `ai_udf`.
+    fn task_from_ai_function(name: &str) -> Option<Task> {
+        match name {
+            "ai_classify" => Some(Task::Classify),
+            "ai_sentiment" => Some(Task::Sentiment),
+            "ai_embed" => Some(Task::Embed),
+            "ai_extract" => Some(Task::Extract),
+            "ai_complete" => Some(Task::Complete),
+            "ai_summarize" => Some(Task::Summarize),
+            "ai_translate" => Some(Task::Translate),
+            "ai_gen" => Some(Task::Gen),
+            _ => None,
+        }
+    }
+
+    /// A single- or double-quoted string literal value.
+    fn string_literal(expr: &Expr) -> Option<String> {
+        let Expr::Value(value) = expr else {
+            return None;
+        };
+        match &value.value {
+            sqlparser::ast::Value::SingleQuotedString(s)
+            | sqlparser::ast::Value::DoubleQuotedString(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    /// An array literal of string values (`['a', 'b']` or `ARRAY['a', 'b']`).
+    fn string_array_literal(expr: &Expr) -> Option<Vec<String>> {
+        let Expr::Array(array) = expr else {
+            return None;
+        };
+        array.elem.iter().map(string_literal).collect()
+    }
+
+    /// Validate every detected AI call against the model registry. Fails the query
+    /// at plan time for an unknown model, a model that cannot perform the task, or a
+    /// labels-seam violation.
+    pub(crate) fn validate_ai_calls(
+        registry: &ModelRegistry,
+        calls: &[AiCallSpec],
+    ) -> Result<(), DbError> {
+        for call in calls {
+            validate_ai_call(registry, call)?;
+        }
+        Ok(())
+    }
+
+    fn validate_ai_call(registry: &ModelRegistry, call: &AiCallSpec) -> Result<(), DbError> {
+        if let Some(err) = call.parse_errors.first() {
+            return Err(DbError::InvalidOperation(err.clone()));
+        }
+
+        let model_name = match &call.model {
+            Some(name) => name.clone(),
+            None => registry
+                .default_for(call.task)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    DbError::InvalidOperation(format!(
+                        "no model given for task '{}' and no [ai.defaults] default is configured",
+                        call.task
+                    ))
+                })?,
+        };
+
+        let entry = registry
+            .validate(&model_name, call.task)
+            .map_err(|e| DbError::InvalidOperation(e.to_string()))?;
+
+        // The labels seam: ONNX classifiers carry labels intrinsically; remote
+        // classifiers take them as the candidate set at call time.
+        match entry.kind() {
+            BackendKind::Local => {
+                if let Some(requested) = &call.labels {
+                    let model_labels = entry.labels().ok_or_else(|| {
+                        DbError::InvalidOperation(format!(
+                            "local model '{model_name}' exposes no labels to validate against"
+                        ))
+                    })?;
+                    if let Some(unknown) = requested
+                        .iter()
+                        .find(|label| !model_labels.iter().any(|known| known == *label))
+                    {
+                        return Err(DbError::InvalidOperation(format!(
+                            "label '{unknown}' is not among local model '{model_name}' labels \
+                         {model_labels:?}"
+                        )));
+                    }
+                }
+            }
+            BackendKind::Remote => {
+                if matches!(call.task, Task::Classify | Task::Sentiment) && call.labels.is_none() {
+                    return Err(DbError::InvalidOperation(format!(
+                    "remote classification with model '{model_name}' requires a 'labels' argument"
+                )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod ai_detection_tests {
+        use super::{detect_ai_functions, validate_ai_calls, AiCallSpec};
+        use laminar_ai::{ModelBackend, ModelEntry, ModelRegistry, Task};
+
+        fn spec(task: Task, model: Option<&str>, labels: Option<Vec<&str>>) -> AiCallSpec {
+            AiCallSpec {
+                task,
+                model: model.map(str::to_string),
+                labels: labels.map(|ls| ls.into_iter().map(str::to_string).collect()),
+                input: "x".to_string(),
+                output_alias: None,
+                parse_errors: Vec::new(),
+            }
+        }
+
+        fn registry() -> ModelRegistry {
+            let mut reg = ModelRegistry::new();
+            reg.register(ModelEntry {
+                id: "finbert".into(),
+                tasks: vec![Task::Classify, Task::Sentiment],
+                backend: ModelBackend::Local {
+                    source: "hf:onnx-community/finbert".into(),
+                    labels: Some(vec!["positive".into(), "negative".into(), "neutral".into()]),
+                },
+            })
+            .unwrap();
+            reg.register(ModelEntry {
+                id: "haiku".into(),
+                tasks: vec![Task::Classify, Task::Complete],
+                backend: ModelBackend::Remote {
+                    provider: "anthropic".into(),
+                    model: "claude-haiku-4-5-20251001".into(),
+                },
+            })
+            .unwrap();
+            reg.set_default(Task::Sentiment, "finbert");
+            reg
+        }
+
+        #[test]
+        fn detects_single_classify_with_model_and_alias() {
+            let calls = detect_ai_functions(
+                "SELECT id, ai_classify(headline, model => 'finbert') AS label FROM news",
+            );
+            assert_eq!(calls.len(), 1);
+            let call = &calls[0];
+            assert_eq!(call.task, Task::Classify);
+            assert_eq!(call.model.as_deref(), Some("finbert"));
+            assert_eq!(call.input, "headline");
+            assert_eq!(call.output_alias.as_deref(), Some("label"));
+            assert!(call.labels.is_none());
+        }
+
+        #[test]
+        fn detects_labels_array() {
+            let calls = detect_ai_functions(
+                "SELECT ai_classify(text, model => 'haiku', labels => ARRAY['up','down']) FROM s",
+            );
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0].labels,
+                Some(vec!["up".to_string(), "down".to_string()])
+            );
+        }
+
+        #[test]
+        fn ignores_queries_without_ai_functions() {
+            assert!(detect_ai_functions("SELECT a, b FROM s").is_empty());
+        }
+
+        #[test]
+        fn malformed_arguments_are_rejected() {
+            // Non-column input, missing input, and wrong-typed model/labels each
+            // record a parse error that validation surfaces (not silently dropped).
+            let cases = [
+                "SELECT ai_classify(UPPER(headline), model => 'finbert') AS x FROM s",
+                "SELECT ai_classify(model => 'finbert') AS x FROM s",
+                "SELECT ai_classify(headline, model => 123) AS x FROM s",
+                "SELECT ai_classify(headline, model => 'finbert', labels => 'up') AS x FROM s",
+                "SELECT ai_classify(headline, extra, model => 'finbert') AS x FROM s",
+                "SELECT ai_classify(headline, model => 'finbert', who => 'me') AS x FROM s",
+            ];
+            for sql in cases {
+                let calls = detect_ai_functions(sql);
+                assert_eq!(calls.len(), 1, "{sql}");
+                assert!(!calls[0].parse_errors.is_empty(), "{sql}");
+                assert!(validate_ai_calls(&registry(), &calls).is_err(), "{sql}");
+            }
+        }
+
+        #[test]
+        fn plan_rewrites_projection_over_tmp_table() {
+            let plan = super::plan_ai_query(
+                "SELECT id, ai_classify(headline, model => 'finbert') AS label FROM news WHERE id > 0",
+            )
+            .expect("single aliased AI call is plannable");
+            assert_eq!(plan.source_table, "news");
+            assert_eq!(plan.call.output_alias.as_deref(), Some("label"));
+            let sql = plan.projection_sql.to_lowercase();
+            assert!(sql.contains("__ai_tmp"), "{sql}");
+            assert!(!sql.contains("ai_classify"), "{sql}");
+            assert!(sql.contains("label"));
+            assert!(sql.contains("where id > 0"), "{sql}");
+        }
+
+        #[test]
+        fn plan_requires_alias_and_single_call() {
+            assert!(super::plan_ai_query("SELECT ai_classify(t, model => 'm') FROM s").is_none());
+            assert!(super::plan_ai_query(
+                "SELECT ai_classify(a, model => 'm') AS x, ai_embed(b, model => 'e') AS y FROM s"
+            )
+            .is_none());
+            assert!(super::plan_ai_query("SELECT a FROM s").is_none());
+        }
+
+        #[test]
+        fn unknown_model_is_rejected() {
+            let calls = [spec(Task::Classify, Some("ghost"), Some(vec!["a"]))];
+            assert!(validate_ai_calls(&registry(), &calls).is_err());
+        }
+
+        #[test]
+        fn unsupported_task_is_rejected() {
+            let calls = [spec(Task::Summarize, Some("finbert"), None)];
+            assert!(validate_ai_calls(&registry(), &calls).is_err());
+        }
+
+        #[test]
+        fn local_labels_must_be_a_subset() {
+            let bad = [spec(Task::Classify, Some("finbert"), Some(vec!["bullish"]))];
+            assert!(validate_ai_calls(&registry(), &bad).is_err());
+            let ok = [spec(
+                Task::Classify,
+                Some("finbert"),
+                Some(vec!["positive"]),
+            )];
+            assert!(validate_ai_calls(&registry(), &ok).is_ok());
+        }
+
+        #[test]
+        fn local_labels_are_optional() {
+            let calls = [spec(Task::Classify, Some("finbert"), None)];
+            assert!(validate_ai_calls(&registry(), &calls).is_ok());
+        }
+
+        #[test]
+        fn remote_classification_requires_labels() {
+            let without = [spec(Task::Classify, Some("haiku"), None)];
+            assert!(validate_ai_calls(&registry(), &without).is_err());
+            let with = [spec(Task::Classify, Some("haiku"), Some(vec!["a", "b"]))];
+            assert!(validate_ai_calls(&registry(), &with).is_ok());
+        }
+
+        #[test]
+        fn default_model_resolves_or_fails() {
+            // Sentiment has a default (finbert).
+            let defaulted = [spec(Task::Sentiment, None, None)];
+            assert!(validate_ai_calls(&registry(), &defaulted).is_ok());
+            // Embed has no default.
+            let no_default = [spec(Task::Embed, None, None)];
+            assert!(validate_ai_calls(&registry(), &no_default).is_err());
+        }
+    }
+}
+
+pub(crate) use ai::{detect_ai_functions, plan_ai_query, validate_ai_calls, AiQueryPlan};
 
 pub(crate) fn detect_temporal_query(
     sql: &str,

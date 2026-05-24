@@ -1,5 +1,7 @@
 //! DataFusion integration for SQL processing.
 
+/// Marker UDFs for the `ai_*` SQL functions (rewritten by the AI operator).
+pub mod ai_udf;
 mod bridge;
 mod channel_source;
 /// Cross-instance hash repartition for distributed GROUP BY. Gated on
@@ -43,6 +45,7 @@ pub mod watermark_udf;
 /// Window function UDFs (TUMBLE, HOP, SESSION, CUMULATE)
 pub mod window_udf;
 
+pub use ai_udf::{ai_function_markers, AiFunctionMarker};
 pub use bridge::{BridgeSendError, BridgeSender, BridgeStream, BridgeTrySendError, StreamBridge};
 pub use channel_source::ChannelStreamSource;
 pub use complex_type_lambda::{
@@ -198,6 +201,9 @@ fn register_non_watermark_udfs(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::new_from_impl(CumulateWindowStart::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(CumulateWindowEnd::new()));
     ctx.register_udf(ScalarUDF::new_from_impl(ProcTimeUdf::new()));
+    for marker in ai_function_markers() {
+        ctx.register_udf(marker);
+    }
     register_json_functions(ctx);
     register_json_extensions(ctx);
     register_complex_type_functions(ctx);

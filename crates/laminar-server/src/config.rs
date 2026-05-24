@@ -205,6 +205,8 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
     }
 
+    validate_ai(config, &mut errors);
+
     if !errors.is_empty() {
         return Err(ConfigError::ValidationErrors { errors });
     }
@@ -235,6 +237,12 @@ pub struct ServerConfig {
     pub discovery: Option<DiscoverySection>,
     pub coordination: Option<CoordinationSection>,
     pub node_id: Option<String>,
+    /// `[ai]` — AI provider wiring and per-task default models.
+    #[serde(default)]
+    pub ai: AiSection,
+    /// `[models.<name>]` — the AI model registry (top-level, per the contract).
+    #[serde(default)]
+    pub models: std::collections::HashMap<String, ModelConfig>,
 }
 
 /// `[server]` section.
@@ -355,6 +363,149 @@ impl Default for CheckpointSection {
             interval: default_checkpoint_interval(),
             max_retained: default_max_retained(),
             storage: std::collections::HashMap::new(),
+        }
+    }
+}
+
+fn default_ai_max_concurrency() -> usize {
+    8
+}
+
+/// `[ai]` — provider wiring and per-task defaults. Models live in the top-level
+/// `[models.*]` tables, per the configuration contract.
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+pub struct AiSection {
+    /// `[ai.providers.<name>]` — transport endpoints.
+    #[serde(default)]
+    pub providers: std::collections::HashMap<String, ProviderConfig>,
+    /// `[ai.defaults]` — task name → default model name (e.g. `classify = "finbert"`).
+    #[serde(default)]
+    pub defaults: std::collections::HashMap<String, String>,
+}
+
+/// `[ai.providers.<name>]`.
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+pub struct ProviderConfig {
+    /// Transport kind: `anthropic`, `openai`, or `local`. Inferred from the
+    /// provider name when omitted (for the canonical names).
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Name of the environment variable holding the API key (remote providers).
+    /// The key itself is never stored in config.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Base URL (remote). Defaults per kind when omitted.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Maximum concurrent requests issued per batch (remote).
+    #[serde(default = "default_ai_max_concurrency")]
+    pub max_concurrency: usize,
+    /// Model cache directory or `object_store` URI (local provider).
+    #[serde(default)]
+    pub cache_dir: Option<String>,
+}
+
+/// `[models.<name>]`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ModelConfig {
+    /// `local` or `remote`.
+    pub kind: String,
+    /// One task (`task = "classify"`) or several (`task = ["classify", "extract"]`).
+    pub task: TaskSpec,
+    /// Remote: the provider name (a key in `[ai.providers]`).
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Remote: the provider-specific model id.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Local: the weight source (`hf:org/repo` or a file/`object_store` URI).
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// A model's task list, written as a single string or an array.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(untagged)]
+pub enum TaskSpec {
+    /// A single task.
+    One(String),
+    /// Several tasks.
+    Many(Vec<String>),
+}
+
+impl TaskSpec {
+    /// The task names as a list.
+    #[must_use]
+    pub fn tasks(&self) -> Vec<String> {
+        match self {
+            TaskSpec::One(t) => vec![t.clone()],
+            TaskSpec::Many(ts) => ts.clone(),
+        }
+    }
+}
+
+/// Structural validation of the `[ai]` / `[models]` config — references resolve
+/// and required fields are present. Semantic checks (task names, label seam)
+/// happen when the registry is built.
+fn validate_ai(config: &ServerConfig, errors: &mut Vec<String>) {
+    for (name, model) in &config.models {
+        match model.kind.as_str() {
+            "remote" => {
+                match &model.provider {
+                    Some(p) if config.ai.providers.contains_key(p) => {}
+                    Some(p) => errors.push(format!("model '{name}': unknown provider '{p}'")),
+                    None => {
+                        errors.push(format!(
+                            "model '{name}': remote model requires a 'provider'"
+                        ));
+                    }
+                }
+                if model.model.is_none() {
+                    errors.push(format!(
+                        "model '{name}': remote model requires a 'model' id"
+                    ));
+                }
+            }
+            "local" => {
+                if model.source.is_none() {
+                    errors.push(format!("model '{name}': local model requires a 'source'"));
+                }
+            }
+            other => errors.push(format!(
+                "model '{name}': kind must be 'local' or 'remote', got '{other}'"
+            )),
+        }
+        if model.task.tasks().is_empty() {
+            errors.push(format!("model '{name}': at least one task is required"));
+        }
+    }
+
+    for (name, provider) in &config.ai.providers {
+        // Mirror runtime kind resolution exactly (explicit `kind`, else the
+        // provider name) so validation can't disagree with how the provider is
+        // actually built — a `cache_dir` on a remote provider must not excuse a
+        // missing key.
+        let kind = provider.kind.as_deref().unwrap_or(name.as_str());
+        if kind == "local" {
+            // A local provider must carry a cache_dir, or no LocalProvider can be
+            // built and local models would fail at runtime — reject it now.
+            if provider.cache_dir.is_none() {
+                errors.push(format!(
+                    "provider '{name}': local provider requires a 'cache_dir'"
+                ));
+            }
+        } else if provider.api_key_env.is_none() {
+            errors.push(format!(
+                "provider '{name}': remote provider requires 'api_key_env'"
+            ));
+        }
+    }
+
+    for (task, model_name) in &config.ai.defaults {
+        if !config.models.contains_key(model_name) {
+            errors.push(format!(
+                "ai.defaults.{task} references unknown model '{model_name}'"
+            ));
         }
     }
 }
@@ -555,6 +706,124 @@ fn default_heartbeat_interval() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const AI_TOML: &str = r#"
+[server]
+
+[ai.providers.anthropic]
+api_key_env = "LAMINAR_ANTHROPIC_API_KEY"
+base_url = "https://api.anthropic.com"
+max_concurrency = 8
+
+[ai.providers.openai]
+api_key_env = "LAMINAR_OPENAI_API_KEY"
+base_url = "https://api.openai.com/v1"
+
+[ai.providers.local]
+cache_dir = "/var/lib/laminar/models"
+
+[models.finbert]
+kind = "local"
+source = "hf:onnx-community/finbert"
+task = "classify"
+
+[models.haiku]
+kind = "remote"
+provider = "anthropic"
+model = "claude-haiku-4-5-20251001"
+task = ["classify", "extract", "complete"]
+
+[ai.defaults]
+classify = "finbert"
+complete = "haiku"
+"#;
+
+    #[test]
+    fn parses_ai_section_and_models() {
+        let config: ServerConfig = toml::from_str(AI_TOML).unwrap();
+        assert_eq!(config.ai.providers.len(), 3);
+        assert_eq!(
+            config.ai.providers["anthropic"].api_key_env.as_deref(),
+            Some("LAMINAR_ANTHROPIC_API_KEY")
+        );
+        assert_eq!(config.ai.providers["openai"].max_concurrency, 8);
+        assert_eq!(
+            config.ai.providers["local"].cache_dir.as_deref(),
+            Some("/var/lib/laminar/models")
+        );
+        assert_eq!(config.models["finbert"].task.tasks(), vec!["classify"]);
+        assert_eq!(
+            config.models["haiku"].task.tasks(),
+            vec!["classify", "extract", "complete"]
+        );
+        assert_eq!(config.ai.defaults["classify"], "finbert");
+        validate_config(&config).unwrap();
+    }
+
+    #[test]
+    fn rejects_local_provider_without_cache_dir() {
+        let toml = r#"
+[server]
+[ai.providers.local]
+[models.m]
+kind = "local"
+source = "hf:x/y"
+task = "classify"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        assert!(validate_config(&config).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_provider_and_default() {
+        let toml = r#"
+[server]
+[ai.providers.anthropic]
+api_key_env = "K"
+[models.bad]
+kind = "remote"
+provider = "ghost"
+model = "x"
+task = "classify"
+[ai.defaults]
+classify = "missing"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        let err = validate_config(&config).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("unknown provider 'ghost'"), "{msg}");
+        assert!(msg.contains("unknown model 'missing'"), "{msg}");
+    }
+
+    #[test]
+    fn rejects_remote_provider_without_api_key_env() {
+        let toml = r#"
+[server]
+[ai.providers.openai]
+base_url = "http://localhost:8000/v1"
+[models.m]
+kind = "remote"
+provider = "openai"
+model = "x"
+task = "embed"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        let err = validate_config(&config).unwrap_err();
+        assert!(format!("{err:?}").contains("requires 'api_key_env'"));
+    }
+
+    #[test]
+    fn local_model_requires_source() {
+        let toml = r#"
+[server]
+[models.m]
+kind = "local"
+task = "classify"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        let err = validate_config(&config).unwrap_err();
+        assert!(format!("{err:?}").contains("requires a 'source'"));
+    }
 
     #[test]
     fn test_parse_minimal_config() {
@@ -985,6 +1254,8 @@ alice = "wonderland-key"
             coordination: None,
             node_id: None,
             sql: None,
+            ai: Default::default(),
+            models: Default::default(),
         };
 
         assert_eq!(config.server.mode, "embedded");

@@ -113,6 +113,7 @@ impl HavingSqlCache {
     }
 }
 
+pub(crate) mod ai_inference;
 pub(crate) mod asof_join;
 pub(crate) mod eowc_query;
 pub(crate) mod interval_join;

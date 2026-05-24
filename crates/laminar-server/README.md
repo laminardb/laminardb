@@ -116,6 +116,52 @@ topic = "avg-prices"
 format = "json"
 ```
 
+## AI Functions
+
+SQL functions (`ai_classify`, `ai_sentiment`, `ai_embed`, `ai_complete`, …) run a
+named model resolved from a registry. A model is either **remote** (an LLM over
+HTTP) or **local** (an ONNX encoder run in-process). Configure providers, models,
+and per-task defaults:
+
+```toml
+[ai.providers.openai]              # kind inferred from the name (openai/anthropic/local)
+api_key_env = "OPENAI_API_KEY"     # env var holding the key — the key is never stored in config
+
+[ai.providers.local]
+kind = "local"
+cache_dir = "./models"             # where local models are cached / downloaded
+
+[models.sentiment]
+kind = "local"
+task = "sentiment"
+# downloaded from the Hugging Face CDN on first use; labels come from its config.json
+source = "hf:onnx-community/distilbert-base-uncased-finetuned-sst-2-english-ONNX"
+
+[models.writer]
+kind = "remote"
+task = ["complete", "summarize"]
+provider = "openai"
+model = "gpt-4o-mini"
+
+[ai.defaults]                      # task → default model when a call omits `model => '…'`
+sentiment = "sentiment"
+complete = "writer"
+```
+
+**Local models require ONNX Runtime at runtime.** The `local` backend loads the
+ONNX Runtime shared library dynamically rather than bundling it, so the build
+stays independent of the host toolchain. Install ONNX Runtime **1.24 or newer**
+and make the library loadable — on the system search path, or via `ORT_DYLIB_PATH`:
+
+```bash
+export ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so   # onnxruntime.dll on Windows
+```
+
+Local models are encoder-only (BERT / DistilBERT / MiniLM family) for `classify`,
+`sentiment`, and `embed`; generative tasks require a remote provider. If the
+library is absent, local inference returns an error while the rest of the server —
+including remote AI — runs normally.
+
 ## REST API
 
 | Method | Path | Description |

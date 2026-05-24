@@ -26,6 +26,8 @@
 #![allow(clippy::module_name_repetitions)]
 
 mod aggregate_state;
+mod ai_catalog;
+mod ai_worker;
 mod asof_batch;
 mod builder;
 mod catalog;

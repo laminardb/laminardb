@@ -69,6 +69,8 @@ pub struct LaminarDbBuilder {
     /// Override for `target_partitions`; cluster mode sets this to
     /// `vnode_count`. Default 1 for single-instance streaming.
     target_partitions: Option<usize>,
+    /// Assembled AI subsystem; installed when `[ai]`/`[models]` are configured.
+    ai_runtime: Option<std::sync::Arc<laminar_ai::AiRuntime>>,
 }
 
 impl LaminarDbBuilder {
@@ -99,7 +101,17 @@ impl LaminarDbBuilder {
             vnode_registry: None,
             physical_optimizer_rules: Vec::new(),
             target_partitions: None,
+            ai_runtime: None,
         }
+    }
+
+    /// Install the assembled AI subsystem (model registry + provider clients +
+    /// result cache + call log). Without it, `ai_*` SQL functions fail at plan
+    /// time. Built from server `[ai]`/`[models]` configuration.
+    #[must_use]
+    pub fn ai(mut self, runtime: std::sync::Arc<laminar_ai::AiRuntime>) -> Self {
+        self.ai_runtime = Some(runtime);
+        self
     }
 
     /// Override `target_partitions`; requires a distributed-aware
@@ -450,12 +462,25 @@ impl LaminarDbBuilder {
         // Apply profile defaults for fields the user hasn't set.
         self.profile.apply_defaults(&mut self.config);
 
-        let db = LaminarDB::open_with_config_and_vars_and_rules(
+        let mut db = LaminarDB::open_with_config_and_vars_and_rules(
             self.config,
             self.config_vars,
             &self.physical_optimizer_rules,
             self.target_partitions,
         )?;
+        if let Some(runtime) = self.ai_runtime {
+            // The inference workers spawn on the current runtime. `build` is
+            // normally awaited on the main multi-threaded runtime; if it's driven
+            // by a non-Tokio executor there is no handle, so fail clearly instead
+            // of panicking.
+            let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+                DbError::InvalidOperation(
+                    "LaminarDB::build() with an AI runtime must run inside a Tokio runtime"
+                        .to_string(),
+                )
+            })?;
+            db.set_ai_runtime(runtime, handle);
+        }
         for callback in self.connector_callbacks {
             callback(db.connector_registry());
         }

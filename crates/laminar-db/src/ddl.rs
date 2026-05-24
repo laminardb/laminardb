@@ -15,6 +15,18 @@ use crate::db::{parse_duration_str, LaminarDB};
 use crate::error::DbError;
 use crate::handle::{DdlInfo, ExecuteResult};
 
+/// Reject object names in the reserved `laminar` namespace, which is owned by
+/// the system catalog (`laminar.models`, `laminar.ai_calls`).
+fn reject_reserved_namespace(name: &str) -> Result<(), DbError> {
+    if name.starts_with("laminar.") {
+        return Err(DbError::InvalidOperation(format!(
+            "'{name}' uses the reserved 'laminar' namespace (system catalog views \
+             laminar.models / laminar.ai_calls live there)"
+        )));
+    }
+    Ok(())
+}
+
 impl LaminarDB {
     /// Handle CREATE SOURCE statement.
     #[allow(clippy::too_many_lines)]
@@ -36,6 +48,7 @@ impl LaminarDB {
 
         // IF NOT EXISTS: short-circuit before discovery runs any network I/O.
         let source_name = create.name.to_string();
+        reject_reserved_namespace(&source_name)?;
         if create.if_not_exists && self.catalog.get_source(&source_name).is_some() {
             return Ok(ExecuteResult::Ddl(DdlInfo {
                 statement_type: "CREATE SOURCE".to_string(),
@@ -314,6 +327,7 @@ impl LaminarDB {
         create: &sqlparser::ast::CreateTable,
     ) -> Result<ExecuteResult, DbError> {
         let name = create.name.to_string();
+        reject_reserved_namespace(&name)?;
 
         // Build Arrow schema from column definitions
         let fields: Vec<arrow::datatypes::Field> = create
@@ -651,6 +665,7 @@ impl LaminarDB {
         retention_bytes: Option<u64>,
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
+        reject_reserved_namespace(&name_str)?;
         self.catalog.register_stream(&name_str)?;
 
         if let Some(bytes) = retention_bytes {
@@ -914,6 +929,7 @@ impl LaminarDB {
         query_sql: &str,
     ) -> Result<ExecuteResult, DbError> {
         let name_str = name.to_string();
+        reject_reserved_namespace(&name_str)?;
 
         // Check if the MV already exists
         {
