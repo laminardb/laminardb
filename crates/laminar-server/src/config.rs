@@ -481,10 +481,12 @@ fn validate_ai(config: &ServerConfig, errors: &mut Vec<String>) {
     }
 
     for (name, provider) in &config.ai.providers {
-        let is_local = provider.cache_dir.is_some()
-            || provider.kind.as_deref() == Some("local")
-            || name == "local";
-        if !is_local && provider.api_key_env.is_none() {
+        // Mirror runtime kind resolution exactly (explicit `kind`, else the
+        // provider name) so validation can't disagree with how the provider is
+        // actually built — a `cache_dir` on a remote provider must not excuse a
+        // missing key.
+        let kind = provider.kind.as_deref().unwrap_or(name.as_str());
+        if kind != "local" && provider.api_key_env.is_none() {
             errors.push(format!(
                 "provider '{name}': remote provider requires 'api_key_env'"
             ));

@@ -469,9 +469,17 @@ impl LaminarDbBuilder {
             self.target_partitions,
         )?;
         if let Some(runtime) = self.ai_runtime {
-            // `build` is async, so `Handle::current()` is the main multi-threaded
-            // runtime — exactly what the inference workers must spawn on.
-            db.set_ai_runtime(runtime, tokio::runtime::Handle::current());
+            // The inference workers spawn on the current runtime. `build` is
+            // normally awaited on the main multi-threaded runtime; if it's driven
+            // by a non-Tokio executor there is no handle, so fail clearly instead
+            // of panicking.
+            let handle = tokio::runtime::Handle::try_current().map_err(|_| {
+                DbError::InvalidOperation(
+                    "LaminarDB::build() with an AI runtime must run inside a Tokio runtime"
+                        .to_string(),
+                )
+            })?;
+            db.set_ai_runtime(runtime, handle);
         }
         for callback in self.connector_callbacks {
             callback(db.connector_registry());

@@ -1034,18 +1034,39 @@ impl OperatorGraph {
 
         // Wire as a single-input node reading the source table (no joins).
         self.ensure_query_source_nodes(None, None, None, None, &table_refs);
-        let node_id = self.nodes.len();
-        self.nodes.push(GraphNode {
-            name: Arc::from(name),
-            operator,
-            input_port_count: 1,
-            output_routes: Vec::new(),
-            removed: false,
-        });
-        self.input_bufs.push(vec![Vec::new(); 1]);
-        self.input_buf_bytes.push(vec![0; 1]);
-        self.input_sources.push(vec![usize::MAX; 1]);
-        self.output_watermarks.push(i64::MIN);
+        // If a SourcePassthrough placeholder exists for this name (a downstream
+        // query referenced it before it was created), replace it in place so the
+        // placeholder's node id and outbound edges stay valid and downstream
+        // nodes receive our output. Mirrors the non-AI path in `add_query`;
+        // without it, out-of-order registration leaves consumers wired to the
+        // stale placeholder.
+        let node_id = if let Some(&placeholder_id) = self.source_map.get(name) {
+            self.nodes[placeholder_id].operator = operator;
+            self.nodes[placeholder_id].input_port_count = 1;
+            self.input_bufs[placeholder_id] = vec![Vec::new(); 1];
+            self.input_buf_bytes[placeholder_id] = vec![0; 1];
+            self.input_sources[placeholder_id] = vec![usize::MAX; 1];
+            self.source_map.remove(name);
+            self.source_node_ids.remove(&placeholder_id);
+            for &(target, _) in &self.nodes[placeholder_id].output_routes {
+                self.depends_on_stream.insert(target);
+            }
+            placeholder_id
+        } else {
+            let id = self.nodes.len();
+            self.nodes.push(GraphNode {
+                name: Arc::from(name),
+                operator,
+                input_port_count: 1,
+                output_routes: Vec::new(),
+                removed: false,
+            });
+            self.input_bufs.push(vec![Vec::new(); 1]);
+            self.input_buf_bytes.push(vec![0; 1]);
+            self.input_sources.push(vec![usize::MAX; 1]);
+            self.output_watermarks.push(i64::MIN);
+            id
+        };
         let depends = self.wire_query_edges(node_id, None, None, None, None, None, &table_refs);
         if depends {
             self.depends_on_stream.insert(node_id);

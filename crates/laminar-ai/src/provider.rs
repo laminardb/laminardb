@@ -4,8 +4,8 @@
 //! homogeneous batch of outputs plus usage out. It knows nothing about SQL tasks
 //! or output columns — framing a request and turning the response into a task's
 //! output column is the adapter's job. Implementors: Anthropic, an
-//! OpenAI-compatible provider (OpenAI / Azure / vLLM via `base_url`), and local
-//! tract.
+//! OpenAI-compatible provider (OpenAI / Azure / vLLM via `base_url`), and a
+//! local ONNX Runtime provider.
 
 use async_trait::async_trait;
 use thiserror::Error;

@@ -639,10 +639,15 @@ mod ai {
         pub model: Option<String>,
         /// The candidate label set from `labels => [...]`, if supplied.
         pub labels: Option<Vec<String>>,
-        /// SQL text of the input argument (the text column or expression).
+        /// The input column name (a simple identifier). Empty if the first
+        /// argument was missing or not a plain column — a parse error.
         pub input: String,
         /// The projection alias, if the call was written `... AS <alias>`.
         pub output_alias: Option<String>,
+        /// Argument-shape errors found while parsing (bad input, wrong argument
+        /// types). Non-empty means the call is malformed; surfaced by
+        /// [`validate_ai_calls`] as a build error rather than silently ignored.
+        pub parse_errors: Vec<String>,
     }
 
     /// Detect `ai_*` calls in the top-level SELECT projection of `sql`.
@@ -691,25 +696,50 @@ mod ai {
         };
 
         let mut input: Option<String> = None;
+        let mut seen_input = false;
         let mut model: Option<String> = None;
         let mut labels: Option<Vec<String>> = None;
+        let mut parse_errors: Vec<String> = Vec::new();
 
         for arg in &list.args {
             match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(value)) if input.is_none() => {
-                    input = Some(value.to_string());
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(value)) if !seen_input => {
+                    seen_input = true;
+                    // The operator looks the input up by column name in the source
+                    // batch, so only a plain column reference is supported —
+                    // stringifying an arbitrary expression would fail that lookup.
+                    match column_name(value) {
+                        Some(col) => input = Some(col),
+                        None => parse_errors.push(format!(
+                            "AI function input must be a simple column reference, got `{value}`"
+                        )),
+                    }
                 }
                 FunctionArg::Named {
                     name,
                     arg: FunctionArgExpr::Expr(value),
                     ..
                 } => match name.value.to_ascii_lowercase().as_str() {
-                    "model" => model = string_literal(value),
-                    "labels" => labels = string_array_literal(value),
+                    "model" => match string_literal(value) {
+                        Some(s) => model = Some(s),
+                        None => parse_errors
+                            .push("`model` argument must be a string literal".to_string()),
+                    },
+                    "labels" => match string_array_literal(value) {
+                        Some(v) => labels = Some(v),
+                        None => parse_errors.push(
+                            "`labels` argument must be an array of string literals".to_string(),
+                        ),
+                    },
                     _ => {}
                 },
                 _ => {}
             }
+        }
+
+        if !seen_input {
+            parse_errors
+                .push("AI function requires a column reference as its first argument".to_string());
         }
 
         Some(AiCallSpec {
@@ -718,7 +748,18 @@ mod ai {
             labels,
             input: input.unwrap_or_default(),
             output_alias: alias,
+            parse_errors,
         })
+    }
+
+    /// A plain column reference (`col`), which the operator can look up in the
+    /// source batch. Anything else (a function call, arithmetic, a qualified
+    /// name) is unsupported as AI input in v0.1.
+    fn column_name(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Identifier(ident) => Some(ident.value.clone()),
+            _ => None,
+        }
     }
 
     /// Map an `ai_*` function name to its task. Must stay in step with the marker
@@ -771,6 +812,10 @@ mod ai {
     }
 
     fn validate_ai_call(registry: &ModelRegistry, call: &AiCallSpec) -> Result<(), DbError> {
+        if let Some(err) = call.parse_errors.first() {
+            return Err(DbError::InvalidOperation(err.clone()));
+        }
+
         let model_name = match &call.model {
             Some(name) => name.clone(),
             None => registry
@@ -832,6 +877,7 @@ mod ai {
                 labels: labels.map(|ls| ls.into_iter().map(str::to_string).collect()),
                 input: "x".to_string(),
                 output_alias: None,
+                parse_errors: Vec::new(),
             }
         }
 
@@ -888,6 +934,24 @@ mod ai {
         #[test]
         fn ignores_queries_without_ai_functions() {
             assert!(detect_ai_functions("SELECT a, b FROM s").is_empty());
+        }
+
+        #[test]
+        fn malformed_arguments_are_rejected() {
+            // Non-column input, missing input, and wrong-typed model/labels each
+            // record a parse error that validation surfaces (not silently dropped).
+            let cases = [
+                "SELECT ai_classify(UPPER(headline), model => 'finbert') AS x FROM s",
+                "SELECT ai_classify(model => 'finbert') AS x FROM s",
+                "SELECT ai_classify(headline, model => 123) AS x FROM s",
+                "SELECT ai_classify(headline, model => 'finbert', labels => 'up') AS x FROM s",
+            ];
+            for sql in cases {
+                let calls = detect_ai_functions(sql);
+                assert_eq!(calls.len(), 1, "{sql}");
+                assert!(!calls[0].parse_errors.is_empty(), "{sql}");
+                assert!(validate_ai_calls(&registry(), &calls).is_err(), "{sql}");
+            }
         }
 
         #[test]

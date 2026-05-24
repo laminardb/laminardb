@@ -51,6 +51,9 @@ struct LoadedModel {
 pub struct LocalProvider {
     cache_dir: PathBuf,
     loaded: Mutex<HashMap<String, Arc<LoadedModel>>>,
+    /// Serializes the download-and-compile path so concurrent misses for the
+    /// same model don't fetch and build it more than once.
+    load_lock: tokio::sync::Mutex<()>,
     http: reqwest::Client,
 }
 
@@ -68,6 +71,7 @@ impl LocalProvider {
         Self {
             cache_dir: cache_dir.into(),
             loaded: Mutex::new(HashMap::new()),
+            load_lock: tokio::sync::Mutex::new(()),
             http,
         }
     }
@@ -75,6 +79,12 @@ impl LocalProvider {
     /// Resolve a model to a loaded, cached plan: serve from cache, else download
     /// (for an absent `hf:` repo) and compile on the blocking pool.
     async fn ensure_model(&self, source: &str) -> Result<Arc<LoadedModel>, ProviderError> {
+        if let Some(model) = self.loaded.lock().get(source) {
+            return Ok(Arc::clone(model));
+        }
+        // Hold the load lock across download+compile and re-check the cache: a
+        // concurrent miss may have finished loading this model while we waited.
+        let _load = self.load_lock.lock().await;
         if let Some(model) = self.loaded.lock().get(source) {
             return Ok(Arc::clone(model));
         }
@@ -106,7 +116,8 @@ async fn download_if_missing(
         return Ok(());
     }
     // Paths mirror the repo layout (the graph lives under `onnx/`); config.json
-    // is optional and only feeds label derivation.
+    // is optional and only feeds label derivation, so any failure to fetch it —
+    // transport error or a 404 — is non-fatal.
     for (rel, required) in [
         ("onnx/model.onnx", true),
         ("tokenizer.json", true),
@@ -116,34 +127,46 @@ async fn download_if_missing(
         if dest.exists() {
             continue;
         }
-        if let Some(parent) = dest.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                ProviderError::Transport(format!("create {}: {e}", parent.display()))
-            })?;
-        }
         let url = format!("https://huggingface.co/{repo}/resolve/main/{rel}");
-        let resp = http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Transport(format!("download {url}: {e}")))?;
-        if !resp.status().is_success() {
-            if !required {
-                continue;
-            }
-            return Err(ProviderError::Transport(format!(
-                "download {url}: HTTP {}",
-                resp.status()
-            )));
+        match download_file(http, &url, &dest).await {
+            Err(e) if required => return Err(e),
+            // Success, or an optional file (config.json) we couldn't fetch — skip.
+            Ok(()) | Err(_) => {}
         }
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| ProviderError::Transport(format!("download {url}: {e}")))?;
-        tokio::fs::write(&dest, &bytes)
-            .await
-            .map_err(|e| ProviderError::Transport(format!("write {}: {e}", dest.display())))?;
     }
+    Ok(())
+}
+
+/// Fetch one file from `url` into `dest`, creating parent directories. Errors on
+/// transport failure, a non-success status, or a write failure.
+async fn download_file(
+    http: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+) -> Result<(), ProviderError> {
+    let resp = http
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| ProviderError::Transport(format!("download {url}: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(ProviderError::Transport(format!(
+            "download {url}: HTTP {}",
+            resp.status()
+        )));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| ProviderError::Transport(format!("download {url}: {e}")))?;
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| ProviderError::Transport(format!("create {}: {e}", parent.display())))?;
+    }
+    tokio::fs::write(dest, &bytes)
+        .await
+        .map_err(|e| ProviderError::Transport(format!("write {}: {e}", dest.display())))?;
     Ok(())
 }
 

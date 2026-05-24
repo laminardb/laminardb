@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use foyer::{Cache, CacheBuilder};
 
 use crate::provider::InferenceParams;
+use crate::registry::Task;
 
 /// Cache key. All fields are `Copy`, so lookups need no allocation and no
 /// borrowed-key indirection.
@@ -31,6 +32,10 @@ pub struct AiCacheKey {
     pub content_hash: u128,
     /// Stable integer id of the model.
     pub model_id: u32,
+    /// The task — a model can serve several (e.g. classify and sentiment), and
+    /// they produce different outputs for the same input, so it must key the
+    /// cache or results would collide across tasks.
+    pub task: Task,
     /// Hash of the request parameters that affect the output.
     pub params_version: u64,
 }
@@ -191,6 +196,7 @@ mod tests {
         AiCacheKey {
             content_hash: content_hash(content),
             model_id,
+            task: Task::Sentiment,
             params_version: params_version(&params),
         }
     }

@@ -39,13 +39,21 @@ pub(crate) fn build_ai_runtime(
         return Ok(None);
     }
 
-    // The local backend is configured by a provider whose (inferred) kind is
-    // "local" carrying a cache_dir. It serves every local model.
-    let local_cache_dir: Option<PathBuf> = config
+    // One local provider serves every local model. More than one is ambiguous
+    // (which cache_dir wins?), and picking via HashMap iteration order would be
+    // nondeterministic — so require exactly zero or one.
+    let mut locals = config
         .ai
         .providers
         .iter()
-        .find(|(name, cfg)| provider_kind(name, cfg) == "local")
+        .filter(|(name, cfg)| provider_kind(name, cfg) == "local");
+    let local = locals.next();
+    if locals.next().is_some() {
+        return Err(build_err(
+            "more than one local AI provider configured; only one is supported".to_string(),
+        ));
+    }
+    let local_cache_dir: Option<PathBuf> = local
         .and_then(|(_, cfg)| cfg.cache_dir.clone())
         .map(PathBuf::from);
     let local_provider: Option<Arc<dyn InferenceProvider>> = local_cache_dir

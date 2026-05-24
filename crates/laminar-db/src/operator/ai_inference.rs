@@ -101,8 +101,11 @@ pub(crate) struct AiInferenceOperator {
     pending: FxHashMap<u64, PendingBatch>,
     /// Work items the worker was too busy to accept; retried next cycle.
     unsubmitted: VecDeque<WorkItem>,
-    /// Input batches awaiting (re-)ingestion — filled on restore.
-    replay: VecDeque<RecordBatch>,
+    /// Input batches awaiting (re-)ingestion, each with the watermark it was
+    /// originally ingested under — filled on restore so recovered rows re-ingest
+    /// at their original watermark, not a newer one (else they'd be dropped as
+    /// late downstream).
+    replay: VecDeque<(i64, RecordBatch)>,
     next_batch_id: u64,
     /// In-flight cap; above this, [`wants_input`](Self::wants_input) is false.
     max_in_flight: usize,
@@ -202,6 +205,7 @@ impl AiInferenceOperator {
                 let key = AiCacheKey {
                     content_hash: content_hash(text),
                     model_id: self.model_id,
+                    task: self.task,
                     params_version: self.params_version,
                 };
                 if let Some(cached) = self.cache.get(&key) {
@@ -370,8 +374,8 @@ impl GraphOperator for AiInferenceOperator {
         while let Ok(result) = self.result_rx.try_recv() {
             self.apply_result(&result, &mut enriched)?;
         }
-        while let Some(batch) = self.replay.pop_front() {
-            self.ingest(batch, watermark, &mut enriched)?;
+        while let Some((replay_watermark, batch)) = self.replay.pop_front() {
+            self.ingest(batch, replay_watermark, &mut enriched)?;
         }
         for batch in inputs.first().map_or(&[][..], Vec::as_slice) {
             self.ingest(batch.clone(), watermark, &mut enriched)?;
@@ -390,12 +394,16 @@ impl GraphOperator for AiInferenceOperator {
                 DbError::Pipeline(format!("ai operator: checkpoint serialization: {e}"))
             })
         };
-        let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(self.pending.len() + self.replay.len());
+        // Each entry keeps the watermark its batch was ingested under, so on
+        // restore the rows re-ingest at the same watermark and aren't dropped as
+        // late by a downstream window.
+        let mut blobs: Vec<(i64, Vec<u8>)> =
+            Vec::with_capacity(self.pending.len() + self.replay.len());
         for pb in self.pending.values() {
-            blobs.push(serialize(&pb.batch)?);
+            blobs.push((pb.ingest_watermark, serialize(&pb.batch)?));
         }
-        for batch in &self.replay {
-            blobs.push(serialize(batch)?);
+        for (watermark, batch) in &self.replay {
+            blobs.push((*watermark, serialize(batch)?));
         }
 
         let data = rkyv::to_bytes::<rkyv::rancor::Error>(&blobs)
@@ -405,17 +413,17 @@ impl GraphOperator for AiInferenceOperator {
     }
 
     fn restore(&mut self, checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
-        let blobs: Vec<Vec<u8>> =
-            rkyv::from_bytes::<Vec<Vec<u8>>, rkyv::rancor::Error>(&checkpoint.data)
+        let blobs: Vec<(i64, Vec<u8>)> =
+            rkyv::from_bytes::<Vec<(i64, Vec<u8>)>, rkyv::rancor::Error>(&checkpoint.data)
                 .map_err(|e| DbError::Pipeline(format!("ai operator: checkpoint decode: {e}")))?;
         self.pending.clear();
         self.unsubmitted.clear();
         self.replay.clear();
-        for blob in &blobs {
+        for (watermark, blob) in &blobs {
             let batch = deserialize_batch_stream(blob).map_err(|e| {
                 DbError::Pipeline(format!("ai operator: checkpoint deserialization: {e}"))
             })?;
-            self.replay.push_back(batch);
+            self.replay.push_back((*watermark, batch));
         }
         Ok(())
     }
@@ -429,7 +437,7 @@ impl GraphOperator for AiInferenceOperator {
         let replay: usize = self
             .replay
             .iter()
-            .map(RecordBatch::get_array_memory_size)
+            .map(|(_, b)| b.get_array_memory_size())
             .sum();
         let unsubmitted: usize = self
             .unsubmitted
@@ -632,6 +640,7 @@ mod tests {
         let key = AiCacheKey {
             content_hash: content_hash("hello"),
             model_id: 1,
+            task: Task::Classify, // must match config()'s task or the hit becomes a miss
             params_version: params_version(&InferenceParams { labels: None }),
         };
         cache.insert(key, CachedOutput::Text("cached".to_string()));
@@ -677,7 +686,7 @@ mod tests {
             calls: Arc::new(AtomicU64::new(0)),
         }));
         let first = op
-            .process(&[vec![text_batch(&["pending row"])]], &[0])
+            .process(&[vec![text_batch(&["pending row"])]], &[100])
             .await
             .unwrap();
         assert!(first.is_empty(), "row should still be in flight");
@@ -690,9 +699,13 @@ mod tests {
         }));
         restored.restore(checkpoint).unwrap();
 
-        let _ = restored.process(&[], &[0]).await.unwrap(); // re-ingests + submits
+        // Re-ingest at a far later watermark than the row first arrived under.
+        let _ = restored.process(&[], &[10_000]).await.unwrap();
+        // The recovered row must still hold the watermark at its original ingest
+        // time (100), not the current one, or a downstream window drops it late.
+        assert_eq!(restored.watermark_hold(), Some(100));
         tokio::time::sleep(Duration::from_millis(250)).await;
-        let out = restored.process(&[], &[0]).await.unwrap();
+        let out = restored.process(&[], &[10_000]).await.unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(
             label_column(&out[0]),
