@@ -852,64 +852,19 @@ impl OperatorGraph {
             1
         };
 
-        // If a SourcePassthrough placeholder exists with this query's name
-        // (created by an earlier add_query whose SQL referenced this name
-        // before we were registered), replace it in place. The placeholder's
-        // node ID and existing outbound edges stay valid — downstream nodes
-        // that already wired to the placeholder automatically receive our
-        // output. This handles HashMap-order-independent query registration.
-        if let Some(&placeholder_id) = self.source_map.get(name.as_str()) {
-            self.nodes[placeholder_id].operator = operator;
-            self.nodes[placeholder_id].input_port_count = input_port_count;
-            self.input_bufs[placeholder_id] = vec![Vec::new(); input_port_count];
-            self.input_buf_bytes[placeholder_id] = vec![0; input_port_count];
-            self.input_sources[placeholder_id] = vec![usize::MAX; input_port_count];
-            self.source_map.remove(name.as_str());
-            // Clear source classification so output_watermarks updates per run.
-            self.source_node_ids.remove(&placeholder_id);
-
-            let node_id = placeholder_id;
-
-            self.ensure_query_source_nodes(
-                temporal_probe_config.as_ref(),
-                asof_config.as_ref(),
-                stream_join_config.as_ref(),
-                // Placeholder path was missing temporal_config handling;
-                // the normal path handles it, so pass None here to keep
-                // behaviour identical to the old code.
-                None,
-                &table_refs,
-            );
-            let depends = self.wire_query_edges(
-                node_id,
-                temporal_probe_config.as_ref(),
-                asof_config.as_ref(),
-                stream_join_config.as_ref(),
-                stream_join_detection.as_ref(),
-                None,
-                &table_refs,
-            );
-            if depends {
-                self.depends_on_stream.insert(node_id);
-            }
-
-            // Mark downstream nodes as depends_on_stream
-            for &(target, _) in &self.nodes[node_id].output_routes {
-                self.depends_on_stream.insert(target);
-            }
-
-            if let Some(oc) = order_config {
-                self.order_configs.insert(node_id, oc);
-            }
-            self.output_map.insert(Arc::from(name.as_str()), node_id);
-            self.topo_dirty = true;
-            return;
-        }
-
-        // Normal path: no placeholder to replace.
-
-        // Ensure source nodes exist BEFORE creating the operator node so
-        // that source node indices are stable when building edges.
+        // Install the operator: replace a SourcePassthrough placeholder for this
+        // name in place if a query referenced it before it was registered (so
+        // downstream edges stay valid), else append a fresh node — see
+        // `place_operator_node`. Source nodes are ensured first so their indices
+        // are stable when wiring edges.
+        //
+        // The placeholder path predates temporal joins and never applied
+        // `temporal_config`; preserve that by suppressing it when replacing one.
+        let temporal_config = if self.source_map.contains_key(name.as_str()) {
+            None
+        } else {
+            temporal_config
+        };
         self.ensure_query_source_nodes(
             temporal_probe_config.as_ref(),
             asof_config.as_ref(),
@@ -917,21 +872,7 @@ impl OperatorGraph {
             temporal_config.as_ref(),
             &table_refs,
         );
-
-        let node_id = self.nodes.len();
-        self.nodes.push(GraphNode {
-            name: Arc::from(name.as_str()),
-            operator,
-            input_port_count,
-            output_routes: Vec::new(),
-            removed: false,
-        });
-        self.input_bufs.push(vec![Vec::new(); input_port_count]);
-        self.input_buf_bytes.push(vec![0; input_port_count]);
-        self.input_sources.push(vec![usize::MAX; input_port_count]);
-        self.output_watermarks.push(i64::MIN);
-
-        // Create edges from table refs
+        let node_id = self.place_operator_node(name.as_str(), operator, input_port_count);
         let depends = self.wire_query_edges(
             node_id,
             temporal_probe_config.as_ref(),
@@ -944,15 +885,56 @@ impl OperatorGraph {
         if depends {
             self.depends_on_stream.insert(node_id);
         }
-
-        // Store order config for Top-K post-filtering
         if let Some(oc) = order_config {
             self.order_configs.insert(node_id, oc);
         }
-
-        // Register as output
         self.output_map.insert(Arc::from(name.as_str()), node_id);
         self.topo_dirty = true;
+    }
+
+    /// Install an operator for `name`, returning its node id. If a
+    /// `SourcePassthrough` placeholder exists for the name (a downstream query
+    /// referenced it before it was created), replace it in place so the
+    /// placeholder's node id and outbound edges stay valid and downstream nodes
+    /// receive this operator's output; otherwise append a fresh node. Callers
+    /// must still ensure source nodes and wire edges around this. The caller
+    /// owns ordering: ensure source nodes before, wire after.
+    fn place_operator_node(
+        &mut self,
+        name: &str,
+        operator: Box<dyn GraphOperator>,
+        input_port_count: usize,
+    ) -> usize {
+        if let Some(&id) = self.source_map.get(name) {
+            self.nodes[id].operator = operator;
+            self.nodes[id].input_port_count = input_port_count;
+            self.input_bufs[id] = vec![Vec::new(); input_port_count];
+            self.input_buf_bytes[id] = vec![0; input_port_count];
+            self.input_sources[id] = vec![usize::MAX; input_port_count];
+            self.source_map.remove(name);
+            // No longer a source: let its output watermark advance per run.
+            self.source_node_ids.remove(&id);
+            // Downstream nodes already wired to the placeholder now depend on a
+            // real (possibly stream-fed) query.
+            for &(target, _) in &self.nodes[id].output_routes {
+                self.depends_on_stream.insert(target);
+            }
+            id
+        } else {
+            let id = self.nodes.len();
+            self.nodes.push(GraphNode {
+                name: Arc::from(name),
+                operator,
+                input_port_count,
+                output_routes: Vec::new(),
+                removed: false,
+            });
+            self.input_bufs.push(vec![Vec::new(); input_port_count]);
+            self.input_buf_bytes.push(vec![0; input_port_count]);
+            self.input_sources.push(vec![usize::MAX; input_port_count]);
+            self.output_watermarks.push(i64::MIN);
+            id
+        }
     }
 
     /// Build an [`AiInferenceOperator`](crate::operator::ai_inference) for a
@@ -1032,41 +1014,11 @@ impl OperatorGraph {
             (operator, table_refs)
         };
 
-        // Wire as a single-input node reading the source table (no joins).
+        // Wire as a single-input node reading the source table (no joins),
+        // replacing a placeholder in place if a downstream query referenced this
+        // name before it was created.
         self.ensure_query_source_nodes(None, None, None, None, &table_refs);
-        // If a SourcePassthrough placeholder exists for this name (a downstream
-        // query referenced it before it was created), replace it in place so the
-        // placeholder's node id and outbound edges stay valid and downstream
-        // nodes receive our output. Mirrors the non-AI path in `add_query`;
-        // without it, out-of-order registration leaves consumers wired to the
-        // stale placeholder.
-        let node_id = if let Some(&placeholder_id) = self.source_map.get(name) {
-            self.nodes[placeholder_id].operator = operator;
-            self.nodes[placeholder_id].input_port_count = 1;
-            self.input_bufs[placeholder_id] = vec![Vec::new(); 1];
-            self.input_buf_bytes[placeholder_id] = vec![0; 1];
-            self.input_sources[placeholder_id] = vec![usize::MAX; 1];
-            self.source_map.remove(name);
-            self.source_node_ids.remove(&placeholder_id);
-            for &(target, _) in &self.nodes[placeholder_id].output_routes {
-                self.depends_on_stream.insert(target);
-            }
-            placeholder_id
-        } else {
-            let id = self.nodes.len();
-            self.nodes.push(GraphNode {
-                name: Arc::from(name),
-                operator,
-                input_port_count: 1,
-                output_routes: Vec::new(),
-                removed: false,
-            });
-            self.input_bufs.push(vec![Vec::new(); 1]);
-            self.input_buf_bytes.push(vec![0; 1]);
-            self.input_sources.push(vec![usize::MAX; 1]);
-            self.output_watermarks.push(i64::MIN);
-            id
-        };
+        let node_id = self.place_operator_node(name, operator, 1);
         let depends = self.wire_query_edges(node_id, None, None, None, None, None, &table_refs);
         if depends {
             self.depends_on_stream.insert(node_id);
