@@ -1,9 +1,11 @@
-//! Local ONNX inference via tract (pure Rust). Encoder models only — the
-//! BERT / DistilBERT / MiniLM family: classification/sentiment yield logits
-//! (the adapter argmaxes), embedding yields a mean-pooled vector. Generative
-//! tasks are rejected. A model is loaded once per source and cached; tract runs
-//! on `spawn_blocking`, off the Ring 1 task, under a deadline so a pathological
-//! model can never stall the inference worker (and the watermark behind it).
+//! Local inference via ONNX Runtime (`ort`, loaded dynamically). Encoder models
+//! only — the BERT / DistilBERT / MiniLM family: classification/sentiment yield
+//! logits (the adapter argmaxes), embedding yields a mean-pooled vector.
+//! Generative tasks are rejected. A model is loaded once per source and cached;
+//! the forward pass runs on `spawn_blocking`, off the Ring 1 task, under a
+//! deadline so a pathological model can never stall the worker (and the
+//! watermark behind it). ONNX Runtime is loaded at runtime, so `onnxruntime.dll`
+//! / `.so` (ORT >= 1.24) must be on the search path or named by `ORT_DYLIB_PATH`.
 //!
 //! A `source` resolves to a directory laid out like a Hugging Face export —
 //! `onnx/model.onnx` + `tokenizer.json` (+ optional `config.json` for labels):
@@ -13,34 +15,36 @@
 //! at startup, so a model that downloads lazily must instead carry an explicit
 //! `labels` argument until it is cached.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use ort::session::{Session, SessionInputValue};
+use ort::value::Tensor;
 use parking_lot::Mutex;
-use tract_onnx::prelude::*;
 
 use crate::provider::{
     InferenceOutputs, InferenceProvider, InferenceRequest, InferenceResponse, ProviderError, Usage,
 };
 use crate::registry::Task;
 
-type Plan = TypedRunnableModel<TypedModel>;
-
-/// Per-batch deadline for the synchronous tract forward pass. Bounds the
+/// Per-batch deadline for the synchronous ONNX Runtime forward pass. Bounds the
 /// inference worker (and the held watermark) against a wedged model. On timeout
 /// the blocking thread is abandoned — it cannot be cancelled — and the batch
 /// fails, releasing the hold.
 const INFERENCE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// A loaded model: the tract plan, its tokenizer, and its input arity (2 or 3:
-/// `input_ids`, `attention_mask`, and optionally `token_type_ids`).
+/// A loaded model: an ONNX Runtime session, its tokenizer, and the model's input
+/// names (`input_ids`, `attention_mask`, and optionally `token_type_ids`) that
+/// drive how each row is fed. `Session::run` takes `&mut`, so it sits behind a
+/// mutex — a model serves one batch at a time.
 struct LoadedModel {
-    plan: Plan,
+    session: Mutex<Session>,
     tokenizer: tokenizers::Tokenizer,
-    input_arity: usize,
+    input_names: Vec<String>,
 }
 
 /// Local ONNX provider, backed by a model cache directory.
@@ -241,34 +245,21 @@ fn load_model(dir: &Path) -> Result<LoadedModel, ProviderError> {
             dir.display()
         )));
     }
-    let mut model = tract_onnx::onnx()
-        .model_for_path(&onnx)
+    let session = Session::builder()
+        .map_err(|e| ProviderError::Transport(format!("ort init: {e}")))?
+        .commit_from_file(&onnx)
         .map_err(|e| ProviderError::Transport(format!("load onnx: {e}")))?;
-    let input_arity = model.inputs.len();
-    // Declare each input as i64 [batch_size, sequence_length] using the model's
-    // own dim symbols. Transformer exports bake those symbols into intermediate
-    // shapes; matching them lets tract analyse the dynamic attention broadcast
-    // and embedding gather, while runtime tensors concretise them per call.
-    let batch = model.sym("batch_size");
-    let seq = model.sym("sequence_length");
-    let fact =
-        InferenceFact::dt_shape(i64::datum_type(), tvec![TDim::from(batch), TDim::from(seq)]);
-    for ix in 0..input_arity {
-        model
-            .set_input_fact(ix, fact.clone())
-            .map_err(|e| ProviderError::Transport(format!("set input fact: {e}")))?;
-    }
-    let plan = model
-        .into_optimized()
-        .map_err(|e| ProviderError::Transport(format!("optimize onnx: {e:#}")))?
-        .into_runnable()
-        .map_err(|e| ProviderError::Transport(format!("plan onnx: {e}")))?;
+    let input_names = session
+        .inputs()
+        .iter()
+        .map(|i| i.name().to_string())
+        .collect();
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| ProviderError::Transport(format!("load tokenizer: {e}")))?;
     Ok(LoadedModel {
-        plan,
+        session: Mutex::new(session),
         tokenizer,
-        input_arity,
+        input_names,
     })
 }
 
@@ -277,6 +268,7 @@ fn run(
     task: Task,
     inputs: &[String],
 ) -> Result<InferenceOutputs, ProviderError> {
+    let mut session = loaded.session.lock();
     let mut vectors = Vec::with_capacity(inputs.len());
     for text in inputs {
         let encoding = loaded
@@ -289,35 +281,46 @@ fn run(
             .iter()
             .map(|&u| i64::from(u))
             .collect();
-        let seq = ids.len();
+        let seq = i64::try_from(ids.len()).unwrap_or(i64::MAX);
 
-        let tensor = |values: Vec<i64>| -> Result<TValue, ProviderError> {
-            tract_ndarray::Array2::from_shape_vec((1, seq), values)
-                .map_err(|e| ProviderError::Transport(format!("build tensor: {e}")))
-                .map(|a| a.into_tensor().into())
-        };
-        let mut tensors: TVec<TValue> = tvec!(tensor(ids)?, tensor(mask.clone())?);
-        if loaded.input_arity >= 3 {
-            tensors.push(tensor(vec![0i64; seq])?);
+        // Feed each input the model declares (batch of 1, [1, seq]); BERT adds
+        // token_type_ids (all zero, single segment), DistilBERT omits it.
+        let mut feeds: Vec<(Cow<str>, SessionInputValue)> =
+            Vec::with_capacity(loaded.input_names.len());
+        for name in &loaded.input_names {
+            let row = match name.as_str() {
+                "input_ids" => ids.clone(),
+                "attention_mask" => mask.clone(),
+                "token_type_ids" => vec![0i64; ids.len()],
+                other => {
+                    return Err(ProviderError::BadResponse(format!(
+                        "model expects unsupported input '{other}'"
+                    )))
+                }
+            };
+            let tensor = Tensor::from_array((vec![1i64, seq], row))
+                .map_err(|e| ProviderError::Transport(format!("build tensor: {e}")))?;
+            feeds.push((Cow::Owned(name.clone()), SessionInputValue::from(tensor)));
         }
 
-        let result = loaded
-            .plan
-            .run(tensors)
+        let outputs = session
+            .run(feeds)
             .map_err(|e| ProviderError::Transport(format!("inference: {e}")))?;
-        let out = result[0]
-            .to_array_view::<f32>()
+        let (shape, data) = outputs[0]
+            .try_extract_tensor::<f32>()
             .map_err(|e| ProviderError::BadResponse(format!("read output: {e}")))?;
-        let data: Vec<f32> = out.iter().copied().collect();
 
-        if task == Task::Embed && out.ndim() == 3 {
+        if task == Task::Embed && shape.len() == 3 {
             // last_hidden_state [1, seq, hidden] → mean-pool over real tokens.
-            vectors.push(mean_pool(&data, out.shape()[1], out.shape()[2], &mask));
+            let seq_out = usize::try_from(shape[1]).unwrap_or(0);
+            let hidden = usize::try_from(shape[2]).unwrap_or(0);
+            vectors.push(mean_pool(data, seq_out, hidden, &mask));
         } else {
             // classify/sentiment logits, or a pre-pooled embedding.
-            vectors.push(data);
+            vectors.push(data.to_vec());
         }
     }
+    drop(session);
     Ok(InferenceOutputs::Vectors(vectors))
 }
 
@@ -375,42 +378,54 @@ mod tests {
         assert_eq!(pooled, vec![2.0, 3.0]); // mean of rows 0 and 1 only
     }
 
-    /// End-to-end against a real export: resolve the `onnx/` layout, download
-    /// from the Hugging Face CDN, tokenize, and drive tract.
+    /// End-to-end against a real export: resolve the `onnx/` layout, download a
+    /// DistilBERT SST-2 sentiment classifier from the Hugging Face CDN, tokenize,
+    /// run it through ONNX Runtime, and check the argmax labels match the
+    /// sentiment of clearly positive and negative inputs.
     ///
-    /// This pins a known limitation rather than success: tract 0.21 cannot
-    /// analyse the dynamically-built attention-mask broadcast (`Expand` to
-    /// `[batch, 1, 1, seq]`) that stock BERT/DistilBERT/MiniLM ONNX exports
-    /// emit, so `into_optimized` fails. The download, tokenizer, and adapter
-    /// path are all exercised up to that point. Flip the assertion to a real
-    /// classification check once the backend can run these models (a tract that
-    /// folds the broadcast, an `onnxsim`-preprocessed export, or another engine).
-    /// Network + ~17 MB download, so opt-in.
+    /// Opt-in: network + a ~268 MB model download, and ONNX Runtime must be
+    /// loadable at runtime (`ORT_DYLIB_PATH=/path/to/onnxruntime.dll`, ORT >= 1.24).
     #[tokio::test]
-    #[ignore = "downloads a model from the Hugging Face CDN; run with --ignored"]
-    async fn loads_a_real_onnx_community_export() {
+    #[ignore = "downloads a model + needs ORT_DYLIB_PATH; run with --ignored"]
+    async fn classifies_with_a_real_onnx_community_model() {
+        use crate::adapter::parse_response;
         use crate::provider::InferenceParams;
+        use crate::registry::BackendKind;
 
         let cache = tempfile::tempdir().expect("tempdir");
         let provider = LocalProvider::new(cache.path());
-        let source = "hf:onnx-community/bert-tiny-finetuned-sms-spam-detection-ONNX";
+        let source = "hf:onnx-community/distilbert-base-uncased-finetuned-sst-2-english-ONNX";
         let request = InferenceRequest {
             task: Task::Classify,
             model: source.to_string(),
-            inputs: vec!["WIN a FREE prize now!!!".into()],
+            inputs: vec![
+                "this film was absolutely wonderful, I loved every minute".into(),
+                "a complete waste of time, dull and disappointing".into(),
+            ],
             params: InferenceParams::default(),
         };
 
-        let err = provider
-            .infer_batch(request)
-            .await
-            .expect_err("see doc comment");
-        let message = err.to_string();
+        let response = provider.infer_batch(request).await.expect("inference");
+        let InferenceOutputs::Vectors(rows) = &response.outputs else {
+            panic!("local classify returns logits");
+        };
+        let labels = load_labels(cache.path(), source);
+        assert!(!labels.is_empty(), "id2label should load from config.json");
+        assert_eq!(rows.len(), 2);
         assert!(
-            message.contains("optimize onnx"),
-            "expected a tract analysis failure, got: {message}"
+            rows.iter().all(|r| r.len() == labels.len()),
+            "logit dimension must equal the label count",
         );
-        // The download + onnx/ layout resolution still ran: the graph is on disk.
-        assert!(onnx_path(&model_dir(cache.path(), source)).exists());
+
+        let InferenceOutputs::Text(out) = parse_response(
+            Task::Classify,
+            BackendKind::Local,
+            response.outputs,
+            Some(&labels),
+        )
+        .expect("adapt") else {
+            panic!("argmax yields labels");
+        };
+        assert_eq!(out, vec!["POSITIVE".to_string(), "NEGATIVE".to_string()]);
     }
 }
