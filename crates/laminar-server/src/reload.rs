@@ -142,6 +142,16 @@ pub fn diff_configs(old: &ServerConfig, new: &ServerConfig) -> ConfigDiff {
         diff.warnings
             .push("node_id changed — requires restart".to_string());
     }
+    // The AI runtime (providers, models, defaults) is built once at startup and
+    // isn't hot-swappable, so changes need a restart rather than being ignored.
+    if old.ai != new.ai {
+        diff.warnings
+            .push("[ai] section changed — requires restart".to_string());
+    }
+    if old.models != new.models {
+        diff.warnings
+            .push("[models] section changed — requires restart".to_string());
+    }
 
     diff
 }
@@ -562,10 +572,14 @@ mod tests {
         let mut new = empty_config();
         new.server.bind = "0.0.0.0:9999".to_string();
         new.state = laminar_core::state::StateBackendConfig::local("./data/state");
+        new.ai
+            .defaults
+            .insert("classify".to_string(), "m".to_string());
         let diff = diff_configs(&old, &new);
         assert!(diff.is_empty()); // no reloadable changes
         assert!(diff.warnings.iter().any(|w| w.contains("[server]")));
         assert!(diff.warnings.iter().any(|w| w.contains("[state]")));
+        assert!(diff.warnings.iter().any(|w| w.contains("[ai]")));
     }
 
     #[test]

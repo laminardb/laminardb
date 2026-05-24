@@ -486,7 +486,15 @@ fn validate_ai(config: &ServerConfig, errors: &mut Vec<String>) {
         // actually built — a `cache_dir` on a remote provider must not excuse a
         // missing key.
         let kind = provider.kind.as_deref().unwrap_or(name.as_str());
-        if kind != "local" && provider.api_key_env.is_none() {
+        if kind == "local" {
+            // A local provider must carry a cache_dir, or no LocalProvider can be
+            // built and local models would fail at runtime — reject it now.
+            if provider.cache_dir.is_none() {
+                errors.push(format!(
+                    "provider '{name}': local provider requires a 'cache_dir'"
+                ));
+            }
+        } else if provider.api_key_env.is_none() {
             errors.push(format!(
                 "provider '{name}': remote provider requires 'api_key_env'"
             ));
@@ -750,6 +758,20 @@ complete = "haiku"
         );
         assert_eq!(config.ai.defaults["classify"], "finbert");
         validate_config(&config).unwrap();
+    }
+
+    #[test]
+    fn rejects_local_provider_without_cache_dir() {
+        let toml = r#"
+[server]
+[ai.providers.local]
+[models.m]
+kind = "local"
+source = "hf:x/y"
+task = "classify"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        assert!(validate_config(&config).is_err());
     }
 
     #[test]

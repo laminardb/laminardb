@@ -613,11 +613,15 @@ mod ai {
             }
         }
         let (index, call) = found?;
-        let alias = call.output_alias.clone()?; // an alias is required
 
         // Rewrite: the AI projection item becomes a plain alias column, and the
-        // FROM table becomes the enriched temp table.
-        select.projection[index] = SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(&alias)));
+        // FROM table becomes the enriched temp table. Reuse the original alias
+        // `Ident` (an alias is required) so quoted aliases stay quoted.
+        let SelectItem::ExprWithAlias { alias, .. } = &select.projection[index] else {
+            return None;
+        };
+        let alias = alias.clone();
+        select.projection[index] = SelectItem::UnnamedExpr(Expr::Identifier(alias));
         if let TableFactor::Table { name, .. } = &mut select.from[0].relation {
             *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(AI_TMP_TABLE))]);
         }
