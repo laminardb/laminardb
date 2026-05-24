@@ -201,8 +201,8 @@ impl InferenceProvider for LocalProvider {
         let loaded = self.ensure_model(&request.model).await?;
         let task = request.task;
         let inputs = request.inputs;
-        // tract is synchronous CPU work — keep it off the Ring 1 task, under a
-        // deadline so a wedged model cannot stall the worker indefinitely.
+        // The forward pass is synchronous CPU work — keep it off the Ring 1 task,
+        // under a deadline so a wedged model cannot stall the worker indefinitely.
         let run = tokio::task::spawn_blocking(move || run(&loaded, task, &inputs));
         let outputs = match tokio::time::timeout(INFERENCE_TIMEOUT, run).await {
             Ok(joined) => {
