@@ -659,6 +659,13 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
     fn filter_late_rows(&self, source_name: &str, batch: &RecordBatch) -> Option<RecordBatch> {
         if let Some(wm_state) = self.watermark_states.get(source_name) {
+            // A processing-time watermark is wall-clock, not derived from the event
+            // column — every real (past) timestamp is "older than" it, so filtering
+            // would drop all rows. Windows still close on the wall-clock watermark;
+            // window-level late handling applies downstream.
+            if wm_state.generator.is_processing_time() {
+                return Some(batch.clone());
+            }
             let current_wm = wm_state.generator.current_watermark();
             if current_wm > i64::MIN {
                 let before = batch.num_rows();
