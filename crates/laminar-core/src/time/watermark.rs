@@ -30,6 +30,15 @@ pub trait WatermarkGenerator: Send {
     /// Returns `Some(Watermark)` if the watermark advanced, `None` if the timestamp
     /// was not higher than the current watermark.
     fn advance_watermark(&mut self, timestamp: i64) -> Option<Watermark>;
+
+    /// Whether the watermark is processing-time based (wall clock), rather than
+    /// derived from the event-time column. Such a watermark lives in a different
+    /// time domain than the event timestamps, so comparing the two to drop "late"
+    /// rows would discard every event — callers skip source-side late-filtering
+    /// when this is `true`. Defaults to `false` (event-time generators).
+    fn is_processing_time(&self) -> bool {
+        false
+    }
 }
 
 /// Default `max_future_skew_ms`: 5 min.
@@ -284,6 +293,10 @@ impl<G: WatermarkGenerator> WatermarkGenerator for PeriodicGenerator<G> {
             self.last_emit_time = Instant::now();
         }
         wm
+    }
+
+    fn is_processing_time(&self) -> bool {
+        self.inner.is_processing_time()
     }
 }
 
@@ -707,6 +720,11 @@ impl WatermarkGenerator for ProcessingTimeGenerator {
             None
         }
     }
+
+    #[inline]
+    fn is_processing_time(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -719,6 +737,21 @@ mod tests {
         let wm = gen.on_event(1000);
         assert_eq!(wm, Some(Watermark::new(900)));
         assert_eq!(gen.current_watermark(), 900);
+    }
+
+    #[test]
+    fn processing_time_domain_is_reported_for_late_filter_skip() {
+        // Source-side late-filtering keys off this: a wall-clock watermark must
+        // not be compared against event-time timestamps, or it drops every row.
+        assert!(ProcessingTimeGenerator::new().is_processing_time());
+        assert!(!BoundedOutOfOrdernessGenerator::new(100).is_processing_time());
+        // The periodic wrapper reports its inner generator's time domain.
+        let p = Duration::from_millis(1);
+        assert!(PeriodicGenerator::new(ProcessingTimeGenerator::new(), p).is_processing_time());
+        assert!(
+            !PeriodicGenerator::new(BoundedOutOfOrdernessGenerator::new(100), p)
+                .is_processing_time()
+        );
     }
 
     #[test]

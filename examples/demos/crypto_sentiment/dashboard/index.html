@@ -1,0 +1,311 @@
+<!doctype html>
+<!--
+  Thin client: draws what the LaminarDB views emit over SSE (via bridge.py) and
+  computes nothing — no windowing, correlation, or scoring lives here.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LaminarDB — streaming SQL + AI functions</title>
+<style>
+  :root {
+    --bg:#090c12; --bg2:#0c1018; --panel:#121826; --panel2:#0f1420;
+    --ink:#e9eef6; --muted:#8a97a8; --faint:#5b6676;
+    --line:#1c2433; --line2:#283246;
+    --price:#f0b429; --sent:#46d3f0; --pos:#3fb950; --neg:#ff5d52;
+    --accent:#7c5cff;
+  }
+  * { box-sizing:border-box; }
+  html,body { height:100%; }
+  body {
+    margin:0; color:var(--ink);
+    background:
+      radial-gradient(1200px 500px at 80% -10%, #14203a55, transparent 60%),
+      radial-gradient(900px 500px at 0% 0%, #1a2b2f44, transparent 55%),
+      linear-gradient(180deg,var(--bg),var(--bg2));
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  code,.mono { font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; }
+
+  /* ── header ── */
+  header { padding:20px 28px 8px; display:flex; align-items:flex-start; gap:18px; flex-wrap:wrap; }
+  .brand { display:flex; align-items:center; gap:11px; }
+  .logo { width:34px; height:34px; flex:0 0 auto; }
+  .wordmark { font-size:20px; font-weight:700; letter-spacing:.2px; }
+  .wordmark .db { background:linear-gradient(90deg,#5ee0ff,#7c5cff); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .tag { color:var(--muted); font-size:12.5px; margin-top:1px; }
+  .spacer { flex:1 1 auto; }
+  .status { font-size:12px; color:var(--muted); white-space:nowrap; padding-top:6px; }
+  .status::before { content:"●"; margin-right:6px; color:var(--faint); }
+  .status.live::before { color:var(--pos); animation:pulse 1.8s ease-in-out infinite; }
+  .status.down::before { color:var(--neg); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+
+  .badges { display:flex; gap:8px; flex-wrap:wrap; padding:6px 28px 4px; }
+  .badge { font-size:11.5px; color:var(--ink); background:var(--panel); border:1px solid var(--line2);
+           border-radius:999px; padding:4px 11px; display:inline-flex; align-items:center; gap:7px; }
+  .badge b { color:#bcd1ff; font-weight:600; }
+  .badge .k { width:7px; height:7px; border-radius:50%; }
+
+  /* ── kpi tiles ── */
+  .kpis { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; padding:14px 28px 4px; }
+  .kpi { background:linear-gradient(180deg,var(--panel),var(--panel2)); border:1px solid var(--line);
+         border-radius:14px; padding:14px 16px; }
+  .kpi .lab { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.9px; }
+  .kpi .val { font-size:30px; font-weight:700; line-height:1.15; margin-top:6px; transition:color .25s; }
+  .kpi .val.mono { font-family:ui-monospace,Menlo,Consolas,monospace; letter-spacing:-.5px; }
+  .kpi .src { font-size:10.5px; color:var(--faint); margin-top:4px; }
+  .kpi .src code { color:var(--muted); }
+
+  /* ── main grid ── */
+  .grid { display:grid; grid-template-columns:1.85fr 1fr; gap:14px; padding:14px 28px; align-items:start; }
+  .panel { background:linear-gradient(180deg,var(--panel),var(--panel2)); border:1px solid var(--line);
+           border-radius:14px; padding:16px 18px; }
+  .panel h2 { margin:0 0 4px; font-size:11px; font-weight:600; color:var(--muted);
+              text-transform:uppercase; letter-spacing:.9px; display:flex; gap:8px; align-items:center; }
+  .panel .hint { font-size:11px; color:var(--faint); margin:0 0 10px; }
+  canvas { width:100%; height:330px; display:block; }
+  .legend { display:flex; gap:20px; font-size:12px; margin-top:10px; color:var(--muted); }
+  .legend .dot { display:inline-block; width:10px; height:10px; border-radius:3px; margin-right:7px; vertical-align:middle; }
+
+  /* ── ai feed ── */
+  .feed { max-height:392px; overflow:auto; margin:-4px -6px 0; padding:0 6px; }
+  .feed::-webkit-scrollbar { width:8px; } .feed::-webkit-scrollbar-thumb { background:var(--line2); border-radius:8px; }
+  .post { padding:9px 2px; border-bottom:1px solid var(--line); display:flex; gap:10px; align-items:flex-start;
+          animation:slidein .35s ease; }
+  @keyframes slidein { from{opacity:0; transform:translateY(-6px)} to{opacity:1; transform:none} }
+  .pill { flex:0 0 auto; min-width:52px; text-align:center; padding:2px 8px; border-radius:7px;
+          font-size:12.5px; font-weight:700; font-family:ui-monospace,Menlo,Consolas,monospace; }
+  .post .txt { color:#cfd8e6; font-size:12.5px; word-break:break-word; }
+  .feed-empty { color:var(--faint); font-size:12.5px; padding:14px 2px; }
+
+  /* ── pipeline strip ── */
+  .pipe { margin:2px 28px 8px; padding:14px 16px; background:linear-gradient(180deg,var(--panel),var(--panel2));
+          border:1px solid var(--line); border-radius:14px; }
+  .pipe .h { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.9px; margin-bottom:11px; }
+  .flow { display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
+  .stage { background:#0b1120; border:1px solid var(--line2); border-radius:9px; padding:7px 11px;
+           font-family:ui-monospace,Menlo,Consolas,monospace; font-size:11.5px; color:#cdd8ea; white-space:nowrap; }
+  .stage .s { color:var(--faint); }
+  .stage.ai { border-color:#5e4fae; background:linear-gradient(180deg,#171336,#120f29); color:#cdbcff; }
+  .stage.ai b { color:#c0aaff; }
+  .arrow { color:var(--faint); font-size:13px; }
+  .stage em { color:var(--sent); font-style:normal; }
+  .stage i { color:var(--price); font-style:normal; }
+
+  footer { padding:8px 28px 26px; color:var(--muted); font-size:12px; }
+  footer b { color:var(--ink); } footer code { color:#bcd1ff; }
+  .nodata { color:var(--faint); text-align:center; padding-top:140px; font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 40 40" fill="none">
+      <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0" stop-color="#5ee0ff"/><stop offset="1" stop-color="#7c5cff"/></linearGradient></defs>
+      <path d="M4 13c8-6 24 6 32 0" stroke="url(#g)" stroke-width="3" stroke-linecap="round"/>
+      <path d="M4 21c8-6 24 6 32 0" stroke="url(#g)" stroke-width="3" stroke-linecap="round" opacity=".7"/>
+      <path d="M4 29c8-6 24 6 32 0" stroke="url(#g)" stroke-width="3" stroke-linecap="round" opacity=".4"/>
+    </svg>
+    <div>
+      <div class="wordmark">Laminar<span class="db">DB</span></div>
+      <div class="tag">streaming SQL &middot; AI functions &middot; exactly one config file</div>
+    </div>
+  </div>
+  <div class="spacer"></div>
+  <span class="status" id="status">connecting…</span>
+</header>
+
+<div class="badges">
+  <span class="badge"><span class="k" style="background:var(--accent)"></span><b>ai_sentiment()</b> scored in-engine</span>
+  <span class="badge"><span class="k" style="background:var(--pos)"></span>local <b>ONNX</b> &middot; on-device &middot; 0 bytes leave the host</span>
+  <span class="badge"><span class="k" style="background:var(--sent)"></span>remote LLM = one config line</span>
+  <span class="badge"><span class="k" style="background:var(--price)"></span>BTC trades + Bluesky firehose, live</span>
+</div>
+
+<div class="kpis">
+  <div class="kpi">
+    <div class="lab">BTC / USDT</div>
+    <div class="val mono" id="kPrice" style="color:var(--price)">—</div>
+    <div class="src">avg per minute &middot; <code>price_1m.price</code></div>
+  </div>
+  <div class="kpi">
+    <div class="lab">mean sentiment</div>
+    <div class="val mono" id="kSent">—</div>
+    <div class="src">−1 … +1 &middot; <code>sentiment_1m.mean_sentiment</code></div>
+  </div>
+  <div class="kpi">
+    <div class="lab">price ↔ sentiment corr</div>
+    <div class="val mono" id="kCorr">—</div>
+    <div class="src">sliding 30 buckets &middot; <code>CORR() OVER …</code></div>
+  </div>
+  <div class="kpi">
+    <div class="lab">posts scored</div>
+    <div class="val mono" id="kPosts" style="color:var(--accent)">0</div>
+    <div class="src">this session &middot; <code>ai_sentiment(text)</code></div>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="panel">
+    <h2>BTC price &amp; crowd sentiment <span style="color:var(--faint);text-transform:none;letter-spacing:0;font-weight:400">— two scales: do they move together? the correlation tile quantifies it</span></h2>
+    <canvas id="chart" width="980" height="330"></canvas>
+    <div class="legend">
+      <span><span class="dot" style="background:var(--price)"></span><b>BTC price</b> — USDT, left axis</span>
+      <span><span class="dot" style="background:var(--sent)"></span><b>mean sentiment</b> — −1…+1, right axis</span>
+      <span style="color:var(--faint)">each point = one row of <code class="mono">sentiment_price_1m</code>, per 1-min window</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2><span style="color:var(--accent)">●</span> ai_sentiment() — live scores</h2>
+    <p class="hint">each crypto post, scored by a local ONNX model as it streams</p>
+    <div class="feed" id="feed"><div class="feed-empty" id="feedEmpty">waiting for the firehose… scored posts will stream here.</div></div>
+  </div>
+</div>
+
+<div class="pipe">
+  <div class="h">what runs inside LaminarDB — one SQL pipeline</div>
+  <div class="flow">
+    <span class="stage"><span class="s">SOURCE</span> btcusdt@trade</span>
+    <span class="arrow">→</span>
+    <span class="stage"><span class="s">SOURCE</span> bluesky firehose</span>
+    <span class="arrow">→</span>
+    <span class="stage">WHERE text ILIKE <i>'%btc%'</i></span>
+    <span class="arrow">→</span>
+    <span class="stage ai"><b>ai_sentiment(text)</b> <span class="s">↳ local ONNX</span></span>
+    <span class="arrow">→</span>
+    <span class="stage">TUMBLE <em>1&nbsp;min</em></span>
+    <span class="arrow">→</span>
+    <span class="stage">JOIN <span class="s">ON bucket</span></span>
+    <span class="arrow">→</span>
+    <span class="stage">CORR() <span class="s">OVER 30</span></span>
+  </div>
+</div>
+
+<footer>
+  Every number on this page is emitted by a LaminarDB view — the page formats and draws, nothing else.
+  Sentiment is scored by <b>ai_sentiment()</b> on a local <b>ONNX</b> model, so the post text never leaves the host;
+  pointing at a remote LLM is a one-line config change. Latest bucket <b id="footBucket">—</b>.
+  Audit the calls with <code>SELECT * FROM laminar.ai_calls</code>.
+</footer>
+
+<script>
+// ── Pure rendering. Receives rows; never derives a statistic. ──────────────
+const bars = [];                 // {bucket_start, price, mean_sentiment, posts, corr_30}
+const MAX_BARS = 120;
+let postsSeen = 0;
+const fmt = (v, d = 2) => (v === null || v === undefined ? "—" : Number(v).toFixed(d));
+const sentColor = s => (s == null ? "var(--muted)" : s >= 0 ? "var(--pos)" : "var(--neg)");
+const kfmt = v => (Math.abs(v) >= 1000 ? (v / 1000).toFixed(1).replace(/\.0$/, "") + "k" : Math.round(v).toString());
+const hhmm = s => { const m = String(s || "").match(/(\d{1,2}:\d{2})/); return m ? m[1] : ""; };
+
+function pushBar(row) {
+  bars.push(row);
+  while (bars.length > MAX_BARS) bars.shift();
+  const last = bars[bars.length - 1];
+  setVal("kPrice", last.price == null ? "—" : Number(last.price).toLocaleString(undefined,{maximumFractionDigits:0}));
+  const sv = document.getElementById("kSent"); sv.textContent = fmt(last.mean_sentiment, 3); sv.style.color = sentColor(last.mean_sentiment);
+  const cv = document.getElementById("kCorr"); cv.textContent = fmt(last.corr_30, 3); cv.style.color = sentColor(last.corr_30);
+  document.getElementById("footBucket").textContent = last.bucket_start ?? "—";
+  draw();
+}
+function setVal(id, t) { document.getElementById(id).textContent = t; }
+
+function addPost(p) {
+  const feed = document.getElementById("feed");
+  const empty = document.getElementById("feedEmpty"); if (empty) empty.remove();
+  const s = p.sentiment, color = sentColor(s), label = s == null ? "null" : (s >= 0 ? "+" : "") + fmt(s, 2);
+  const el = document.createElement("div");
+  el.className = "post";
+  el.innerHTML = `<span class="pill" style="background:${color}1f;color:${color}"></span><span class="txt"></span>`;
+  el.querySelector(".pill").textContent = label;
+  el.querySelector(".txt").textContent = (p.text || "").replace(/\s+/g, " ").slice(0, 150);
+  feed.prepend(el);
+  while (feed.childNodes.length > 40) feed.removeChild(feed.lastChild);
+  setVal("kPosts", (++postsSeen).toLocaleString());
+}
+
+function draw() {
+  const c = document.getElementById("chart"), ctx = c.getContext("2d");
+  const dpr = window.devicePixelRatio || 1, cssW = c.clientWidth || 980, cssH = 330;
+  if (c.width !== Math.round(cssW * dpr)) { c.width = Math.round(cssW * dpr); c.height = Math.round(cssH * dpr); }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const W = cssW, H = cssH, padL = 54, padR = 46, padT = 16, padB = 26;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  ctx.clearRect(0, 0, W, H);
+  ctx.textBaseline = "middle";
+
+  if (bars.length < 2) {
+    ctx.fillStyle = "#5b6676"; ctx.font = "13px ui-monospace,Menlo,monospace"; ctx.textAlign = "center";
+    ctx.fillText("awaiting the first closed 1-minute window…", W / 2, H / 2);
+    return;
+  }
+
+  const prices = bars.map(b => b.price).filter(v => v != null);
+  const pMin = Math.min(...prices), pMax = Math.max(...prices);
+  const xFor = i => padL + plotW * (i / (bars.length - 1));
+  const yP = v => padT + plotH * (1 - (v - pMin) / (pMax - pMin || 1)); // left scale: price
+  const yS = v => padT + plotH * (1 - (v + 1) / 2);                     // right scale: sentiment −1…+1
+
+  // horizontal gridlines
+  ctx.strokeStyle = "#172033"; ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) { const y = padT + plotH * i / 4; ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y); ctx.stroke(); }
+
+  // left axis — price ticks (gold)
+  ctx.font = "11px ui-monospace,Menlo,monospace"; ctx.fillStyle = "#c8a24c"; ctx.textAlign = "right";
+  [pMax, (pMax + pMin) / 2, pMin].forEach(v => ctx.fillText(kfmt(v), padL - 8, yP(v)));
+  // right axis — sentiment ticks (cyan)
+  ctx.fillStyle = "#5fb6cf"; ctx.textAlign = "left";
+  [["+1", 1], ["0", 0], ["−1", -1]].forEach(([t, v]) => ctx.fillText(t, padL + plotW + 8, yS(v)));
+
+  // sentiment zero baseline
+  ctx.strokeStyle = "#22304a"; ctx.setLineDash([3, 4]); ctx.beginPath(); ctx.moveTo(padL, yS(0)); ctx.lineTo(padL + plotW, yS(0)); ctx.stroke(); ctx.setLineDash([]);
+
+  // sentiment area + line (cyan, right axis)
+  ctx.beginPath(); let started = false;
+  bars.forEach((b, i) => { if (b.mean_sentiment == null) return; const x = xFor(i), y = yS(b.mean_sentiment);
+    started ? ctx.lineTo(x, y) : (ctx.moveTo(x, y), started = true); });
+  if (started) {
+    ctx.lineTo(xFor(bars.length - 1), yS(0)); ctx.lineTo(xFor(0), yS(0)); ctx.closePath();
+    ctx.fillStyle = "rgba(70,211,240,.10)"; ctx.fill();
+  }
+  drawLine(b => b.mean_sentiment, yS, "#46d3f0", 2);
+  // price line (gold, left axis, glow)
+  ctx.shadowColor = "rgba(240,180,41,.35)"; ctx.shadowBlur = 8;
+  drawLine(b => b.price, yP, "#f0b429", 2.4);
+  ctx.shadowBlur = 0;
+  // latest-point dots
+  const li = bars.length - 1;
+  if (bars[li].price != null) { ctx.fillStyle = "#f0b429"; ctx.beginPath(); ctx.arc(xFor(li), yP(bars[li].price), 3.5, 0, 7); ctx.fill(); }
+  if (bars[li].mean_sentiment != null) { ctx.fillStyle = "#46d3f0"; ctx.beginPath(); ctx.arc(xFor(li), yS(bars[li].mean_sentiment), 3.5, 0, 7); ctx.fill(); }
+
+  // x-axis — time labels (start / mid / end)
+  ctx.fillStyle = "#5b6676"; ctx.textBaseline = "alphabetic";
+  [[0, "left", padL], [(bars.length - 1) >> 1, "center", xFor((bars.length - 1) >> 1)], [bars.length - 1, "right", padL + plotW]]
+    .forEach(([idx, al, x]) => { ctx.textAlign = al; ctx.fillText(hhmm(bars[idx].bucket_start), x, H - 7); });
+
+  function drawLine(get, yf, color, w) {
+    ctx.strokeStyle = color; ctx.lineWidth = w; ctx.beginPath(); let s = false;
+    bars.forEach((b, i) => { const v = get(b); if (v == null) return; const x = xFor(i), y = yf(v);
+      s ? ctx.lineTo(x, y) : (ctx.moveTo(x, y), s = true); });
+    ctx.stroke();
+  }
+}
+
+function setStatus(s, cls) { const el = document.getElementById("status"); el.textContent = s; el.className = "status " + cls; }
+
+// ── Transport: SSE from bridge.py. ─────────────────────────────────────────
+const es = new EventSource("/events");
+es.addEventListener("bar", e => pushBar(JSON.parse(e.data)));
+es.addEventListener("post", e => addPost(JSON.parse(e.data)));
+es.onopen = () => setStatus("live", "live");
+es.onerror = () => setStatus("reconnecting…", "down");
+window.addEventListener("resize", draw);
+draw();
+</script>
+</body>
+</html>

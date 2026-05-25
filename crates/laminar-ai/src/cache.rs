@@ -49,6 +49,8 @@ pub enum CachedOutput {
     Text(String),
     /// A numeric vector output (embedding).
     Vector(Vec<f32>),
+    /// A scalar score output (`ai_sentiment`, continuous in `[-1, 1]`).
+    Score(f64),
 }
 
 /// xxh3-128 of the input content. Not cryptographic; a fast, collision-negligible
@@ -100,6 +102,7 @@ fn entry_weight(_key: &AiCacheKey, value: &CachedOutput) -> usize {
     let payload = match value {
         CachedOutput::Text(s) => s.len(),
         CachedOutput::Vector(v) => v.len() * std::mem::size_of::<f32>(),
+        CachedOutput::Score(_) => std::mem::size_of::<f64>(),
     };
     payload + std::mem::size_of::<AiCacheKey>() + 32
 }

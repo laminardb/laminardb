@@ -4,15 +4,19 @@
 //! Secrets are resolved here, at startup: `api_key_env` names an environment
 //! variable, never the key itself. A provider's transport is its `kind` (or,
 //! when omitted, inferred from the provider name): `anthropic`, `local`, or
-//! otherwise an OpenAI-compatible endpoint (`openai`, Azure, vLLM, …). The
-//! local backend is not wired yet, so local providers/models build into the
-//! registry but cannot be resolved to a runnable backend.
+//! otherwise an OpenAI-compatible endpoint (`openai`, Azure, vLLM, …). A single
+//! `local` provider (its `cache_dir`) backs every local model; remote providers
+//! are keyed by name and matched to each remote model's `provider`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use laminar_ai::backends::{local, AnthropicProvider, LocalProvider, OpenAiProvider};
+use std::num::NonZeroU32;
+
+use laminar_ai::backends::{
+    local, AnthropicProvider, LocalProvider, OpenAiProvider, RateLimitedProvider,
+};
 use laminar_ai::{
     AiCallLog, AiResultCache, AiRuntime, InferenceProvider, ModelBackend, ModelEntry,
     ModelRegistry, Task,
@@ -143,17 +147,18 @@ fn build_provider(
     name: &str,
     cfg: &ProviderConfig,
 ) -> Result<Option<Arc<dyn InferenceProvider>>, ServerError> {
-    match provider_kind(name, cfg) {
-        "local" => Ok(None),
+    let base: Arc<dyn InferenceProvider> = match provider_kind(name, cfg) {
+        "local" => return Ok(None),
         "anthropic" => {
             let key = resolve_key(name, cfg)?;
             let base_url = cfg
                 .base_url
                 .clone()
                 .unwrap_or_else(|| "https://api.anthropic.com".to_string());
-            let client = AnthropicProvider::new(base_url, key, cfg.max_concurrency)
-                .map_err(|e| build_err(e.to_string()))?;
-            Ok(Some(Arc::new(client) as Arc<dyn InferenceProvider>))
+            Arc::new(
+                AnthropicProvider::new(base_url, key, cfg.max_concurrency)
+                    .map_err(|e| build_err(e.to_string()))?,
+            )
         }
         // OpenAI-compatible (openai, Azure, vLLM, local servers via base_url).
         _ => {
@@ -162,10 +167,23 @@ fn build_provider(
                 .base_url
                 .clone()
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-            let client = OpenAiProvider::new(base_url, key, cfg.max_concurrency)
-                .map_err(|e| build_err(e.to_string()))?;
-            Ok(Some(Arc::new(client) as Arc<dyn InferenceProvider>))
+            Arc::new(
+                OpenAiProvider::new(base_url, key, cfg.max_concurrency)
+                    .map_err(|e| build_err(e.to_string()))?,
+            )
         }
+    };
+    Ok(Some(maybe_rate_limit(base, cfg)))
+}
+
+/// Pace a provider to `requests_per_second` when configured, else leave it as-is.
+fn maybe_rate_limit(
+    provider: Arc<dyn InferenceProvider>,
+    cfg: &ProviderConfig,
+) -> Arc<dyn InferenceProvider> {
+    match cfg.requests_per_second.and_then(NonZeroU32::new) {
+        Some(rps) => Arc::new(RateLimitedProvider::new(provider, rps)),
+        None => provider,
     }
 }
 
@@ -215,6 +233,29 @@ task = "classify"
 "#,
         );
         assert!(build_ai_runtime(&config).unwrap().is_some());
+    }
+
+    /// The shipped crypto-sentiment demo config parses, validates, and builds a
+    /// runtime whose `sentiment` default resolves to the local backend — the demo
+    /// is wired to a local ONNX model and must stay that way.
+    #[test]
+    fn crypto_sentiment_demo_builds_a_local_runtime() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/demos/crypto_sentiment/pipeline.toml");
+        let config = crate::config::load_config(&path).expect("demo config parses and validates");
+        let runtime = build_ai_runtime(&config)
+            .expect("AI runtime builds")
+            .expect("the demo configures a model");
+        assert_eq!(
+            runtime.registry().default_for(laminar_ai::Task::Sentiment),
+            Some("sentiment"),
+            "ai_sentiment resolves to the configured default"
+        );
+        assert_eq!(
+            runtime.resolve("sentiment").unwrap().kind,
+            laminar_ai::BackendKind::Local,
+            "the demo scores sentiment on a local model"
+        );
     }
 
     #[test]

@@ -400,6 +400,10 @@ pub struct ProviderConfig {
     /// Maximum concurrent requests issued per batch (remote).
     #[serde(default = "default_ai_max_concurrency")]
     pub max_concurrency: usize,
+    /// Steady requests-per-second cap (remote). When set, calls are paced by a
+    /// token bucket — bursts are shaped, not sent unbounded. Unset = no limit.
+    #[serde(default)]
+    pub requests_per_second: Option<u32>,
     /// Model cache directory or `object_store` URI (local provider).
     #[serde(default)]
     pub cache_dir: Option<String>,

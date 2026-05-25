@@ -27,13 +27,16 @@ pub(crate) fn add_usage(a: Usage, b: Usage) -> Usage {
 /// backstop. `Embed` never reaches here (it uses the embeddings endpoint).
 pub(crate) fn chat_prompt(task: Task, input: &str, labels: Option<&[String]>) -> (String, String) {
     let system = match task {
-        Task::Classify | Task::Sentiment => {
+        Task::Classify => {
             let options = labels.map(|l| l.join(", ")).unwrap_or_default();
             format!(
                 "You are a text classifier. Reply with exactly one of these labels and \
                  nothing else: {options}."
             )
         }
+        Task::Sentiment => "You are a sentiment scorer. Reply with only a number from -1 \
+             (most negative) through 0 (neutral) to 1 (most positive), and nothing else."
+            .to_string(),
         Task::Summarize => "Summarize the text concisely. Reply with the summary only.".to_string(),
         Task::Translate => "Translate the text. Reply with the translation only.".to_string(),
         Task::Extract => {

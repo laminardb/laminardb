@@ -27,7 +27,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, Float32Builder, ListBuilder, RecordBatch, StringArray, StringBuilder,
+    Array, ArrayRef, Float32Builder, Float64Builder, ListBuilder, RecordBatch, StringArray,
+    StringBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
@@ -328,16 +329,19 @@ impl AiInferenceOperator {
         batch: &RecordBatch,
         outputs: &[Option<CachedOutput>],
     ) -> Result<RecordBatch, DbError> {
-        let (array, field) = if self.task == Task::Embed {
-            (
+        let (array, field) = match self.task {
+            Task::Embed => (
                 build_embedding_array(outputs)?,
                 Field::new(&self.output_column, embedding_type(), true),
-            )
-        } else {
-            (
+            ),
+            Task::Sentiment => (
+                build_score_array(outputs)?,
+                Field::new(&self.output_column, DataType::Float64, true),
+            ),
+            _ => (
                 build_text_array(outputs)?,
                 Field::new(&self.output_column, DataType::Utf8, true),
-            )
+            ),
         };
 
         let mut fields: Vec<Field> = batch
@@ -472,9 +476,27 @@ fn build_text_array(outputs: &[Option<CachedOutput>]) -> Result<ArrayRef, DbErro
         match output {
             Some(CachedOutput::Text(s)) => builder.append_value(s),
             None => builder.append_null(),
-            Some(CachedOutput::Vector(_)) => {
+            Some(CachedOutput::Vector(_) | CachedOutput::Score(_)) => {
                 return Err(DbError::InvalidOperation(
-                    "ai operator: expected text output, got a vector".to_string(),
+                    "ai operator: expected text output, got a vector/score".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+/// Build the `Float64` score column for `ai_sentiment`. A null input or a
+/// failed inference yields a null score.
+fn build_score_array(outputs: &[Option<CachedOutput>]) -> Result<ArrayRef, DbError> {
+    let mut builder = Float64Builder::new();
+    for output in outputs {
+        match output {
+            Some(CachedOutput::Score(v)) => builder.append_value(*v),
+            None => builder.append_null(),
+            Some(CachedOutput::Text(_) | CachedOutput::Vector(_)) => {
+                return Err(DbError::InvalidOperation(
+                    "ai operator: expected a score output, got text/vector".to_string(),
                 ));
             }
         }
@@ -491,9 +513,9 @@ fn build_embedding_array(outputs: &[Option<CachedOutput>]) -> Result<ArrayRef, D
                 builder.append(true);
             }
             None => builder.append(false),
-            Some(CachedOutput::Text(_)) => {
+            Some(CachedOutput::Text(_) | CachedOutput::Score(_)) => {
                 return Err(DbError::InvalidOperation(
-                    "ai operator: expected a vector output, got text".to_string(),
+                    "ai operator: expected a vector output, got text/score".to_string(),
                 ));
             }
         }

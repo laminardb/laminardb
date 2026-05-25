@@ -1,0 +1,140 @@
+# Crypto price × Bluesky sentiment — one pipeline, scored and correlated in the
+# engine. Sentiment runs on a LOCAL ONNX model: no API key, no inference-time
+# network call. ONNX Runtime is loaded dynamically, so point ORT_DYLIB_PATH at an
+# onnxruntime shared library (>= 1.24); the model weights are fetched once on
+# first use and then served from disk. Bring it up with the normal run path:
+#
+#     ORT_DYLIB_PATH=/path/to/onnxruntime.so laminardb --config pipeline.toml
+#
+# Everything below runs in LaminarDB. The dashboard (dashboard/) only draws what
+# these views emit — it computes nothing.
+#
+# Processing-time model: `WATERMARK FOR ts AS PROCTIME()` closes the 1-minute
+# windows on the server's wall clock. Both feeds are non-replayable WebSockets,
+# so delivery is at-most-once (the right contract for live monitoring).
+
+sql = """
+-- ── Sources ──────────────────────────────────────────────────────────────
+
+-- Binance BTCUSDT trades. p/q arrive as JSON strings; the decoder coerces them
+-- to DOUBLE. T is the trade time (epoch millis) → the wall-clock minute key.
+CREATE SOURCE binance_trades (
+    sym VARCHAR,
+    price DOUBLE,
+    qty DOUBLE,
+    ts TIMESTAMP,
+    WATERMARK FOR ts AS PROCTIME()
+) FROM WEBSOCKET (
+    url = 'wss://stream.binance.com:9443/ws/btcusdt@trade',
+    format = 'json',
+    'json.column.sym' = 's',
+    'json.column.price' = 'p',
+    'json.column.qty' = 'q',
+    'json.column.ts' = 'T',
+    'json.column.ts.epoch_unit' = 'millis'
+) FORMAT JSON;
+
+-- Bluesky Jetstream posts. time_us is the relay's server time (epoch micros);
+-- device `createdAt` clocks run minutes off and would poison a tight bucket.
+CREATE SOURCE bluesky_posts (
+    did VARCHAR,
+    operation VARCHAR,
+    text VARCHAR,
+    ts TIMESTAMP,
+    WATERMARK FOR ts AS PROCTIME()
+) FROM WEBSOCKET (
+    url = 'wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.post',
+    format = 'json',
+    'json.column.did' = 'did',
+    'json.column.operation' = 'commit.operation',
+    'json.column.text' = 'commit.record.text',
+    'json.column.ts' = 'time_us',
+    'json.column.ts.epoch_unit' = 'micros'
+) FORMAT JSON;
+
+-- ── Crypto filter, before scoring ────────────────────────────────────────
+-- Drop non-crypto posts here so ai_sentiment never spends a call on them.
+CREATE STREAM bsky_crypto_raw AS
+SELECT did, text, ts
+FROM bluesky_posts
+WHERE operation = 'create'
+  AND text IS NOT NULL
+  AND ( text ILIKE '%bitcoin%' OR text ILIKE '%btc%' OR text ILIKE '%ethereum%'
+        OR text ILIKE '%$btc%' OR text ILIKE '%$eth%' );
+
+-- ── Sentiment scored inline (Ring 1), returns a DOUBLE in [-1, 1] ─────────
+-- One ai_sentiment call per row, batched + deduped through the AI operator and
+-- the foyer cache; every call is visible in laminar.ai_calls.
+CREATE STREAM bsky_crypto AS
+SELECT did, text, ts, ai_sentiment(text) AS sentiment
+FROM bsky_crypto_raw;
+
+-- ── 1-minute processing-time windows, both sides ─────────────────────────
+CREATE MATERIALIZED VIEW price_1m AS
+SELECT
+    TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket_start,
+    AVG(price) AS price,
+    MAX(price) AS high,
+    MIN(price) AS low,
+    SUM(qty)   AS volume,
+    COUNT(*)   AS trades
+FROM binance_trades
+GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE)
+EMIT ON WINDOW CLOSE;
+
+CREATE MATERIALIZED VIEW sentiment_1m AS
+SELECT
+    TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket_start,
+    AVG(sentiment) AS mean_sentiment,
+    COUNT(*)       AS posts
+FROM bsky_crypto
+GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE)
+EMIT ON WINDOW CLOSE;
+
+-- ── Join on the shared bucket, then rolling correlation ──────────────────
+-- The join matches a minute on both sides as their windows close in the same
+-- cycle (no watermark dependency). The correlation is computed in-engine over
+-- the last 30 one-minute bars, carrying the cross-moments (the engine's
+-- sliding CORR), not rolled up from per-bucket values.
+CREATE MATERIALIZED VIEW sentiment_price_join AS
+SELECT
+    p.bucket_start    AS bucket_start,
+    p.price           AS price,
+    s.mean_sentiment  AS mean_sentiment,
+    s.posts           AS posts
+FROM price_1m p
+JOIN sentiment_1m s ON p.bucket_start = s.bucket_start;
+
+CREATE MATERIALIZED VIEW sentiment_price_1m AS
+SELECT
+    bucket_start,
+    price,
+    mean_sentiment,
+    posts,
+    CORR(price, mean_sentiment) OVER (ORDER BY bucket_start ROWS 29 PRECEDING) AS corr_30
+FROM sentiment_price_join;
+"""
+
+# ── AI runtime ───────────────────────────────────────────────────────────
+# Local ONNX sentiment scorer. FinBERT — BERT fine-tuned on financial text —
+# classifies positive / negative / neutral; the engine softmaxes its logits to a
+# signed score in [-1, 1], reading the labels from the model's own config.json.
+# Weights download once into cache_dir, then load from disk on every restart.
+[ai.providers.local]
+cache_dir = "./models"
+
+[models.sentiment]
+kind = "local"
+source = "hf:Xenova/finbert"
+task = "sentiment"
+
+[ai.defaults]
+sentiment = "sentiment"
+
+# ── Server ───────────────────────────────────────────────────────────────
+# Tail any view live over pgwire, e.g.  psql -h 127.0.0.1 -p 5432
+#   SUBSCRIBE sentiment_price_1m;
+#   SUBSCRIBE bsky_crypto;
+[server]
+bind        = "127.0.0.1:7777"
+pgwire_bind = "127.0.0.1:5432"

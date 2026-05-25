@@ -117,10 +117,12 @@ pub(crate) mod ai_inference;
 pub(crate) mod asof_join;
 pub(crate) mod eowc_query;
 pub(crate) mod interval_join;
+pub(crate) mod process_time_join;
 pub(crate) mod sql_query;
 pub(crate) mod temporal_filter;
 pub(crate) mod temporal_join;
 pub(crate) mod temporal_probe_join;
+pub(crate) mod window_frame;
 
 pub(crate) async fn try_compile_post_projection(
     ctx: &SessionContext,

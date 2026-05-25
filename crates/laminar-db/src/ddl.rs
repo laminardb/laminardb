@@ -656,7 +656,7 @@ impl LaminarDB {
         }))
     }
 
-    pub(crate) fn handle_create_stream(
+    pub(crate) async fn handle_create_stream(
         &self,
         name: &sqlparser::ast::ObjectName,
         query: &StreamingStatement,
@@ -714,6 +714,32 @@ impl LaminarDB {
                 order_config: plan_order.clone(),
                 join_config: plan_joins.clone(),
             });
+        }
+
+        // Register the stream's output schema as a planning placeholder so MVs and
+        // streams created later resolve `FROM <this stream>`. The running pipeline
+        // reads stream output through the operator graph, not this provider — it
+        // exists only for plan-time name resolution (start() also seeds these for
+        // any not yet present). Best-effort: a stream whose schema can't yet be
+        // planned still registers in the catalog and runs.
+        if let Some(schema) =
+            crate::pipeline_lifecycle::plan_output_schema(&self.ctx, &query_sql).await
+        {
+            use datafusion::datasource::empty::EmptyTable;
+            let _ = self.ctx.deregister_table(&name_str);
+            if let Err(e) = self
+                .ctx
+                .register_table(&name_str, Arc::new(EmptyTable::new(schema)))
+            {
+                // Roll back the catalog + connector registration so a failed
+                // CREATE STREAM doesn't leave the stream half-registered.
+                self.catalog.drop_stream(&name_str);
+                self.connector_manager.lock().unregister_stream(&name_str);
+                self.subscription_registry.drop_name(&name_str);
+                return Err(DbError::Pipeline(format!(
+                    "could not register stream '{name_str}' for downstream planning: {e}"
+                )));
+            }
         }
 
         // If the pipeline is already running, send via control channel so
