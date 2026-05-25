@@ -276,6 +276,13 @@ pub enum WindowFrameFunction {
     FirstValue,
     /// LAST_VALUE(col) OVER (... ROWS BETWEEN ...)
     LastValue,
+    /// CORR(x, y) OVER (... ROWS BETWEEN ...) — Pearson correlation over the
+    /// frame. Bivariate; `column` holds the first argument.
+    Corr,
+    /// COVAR_SAMP(x, y) OVER (... ROWS BETWEEN ...) — sample covariance.
+    CovarSamp,
+    /// COVAR_POP(x, y) OVER (... ROWS BETWEEN ...) — population covariance.
+    CovarPop,
 }
 
 impl WindowFrameFunction {
@@ -290,6 +297,9 @@ impl WindowFrameFunction {
             Self::Count => "COUNT",
             Self::FirstValue => "FIRST_VALUE",
             Self::LastValue => "LAST_VALUE",
+            Self::Corr => "CORR",
+            Self::CovarSamp => "COVAR_SAMP",
+            Self::CovarPop => "COVAR_POP",
         }
     }
 }
@@ -456,6 +466,9 @@ fn extract_window_frame_function(
         "COUNT" => WindowFrameFunction::Count,
         "FIRST_VALUE" => WindowFrameFunction::FirstValue,
         "LAST_VALUE" => WindowFrameFunction::LastValue,
+        "CORR" => WindowFrameFunction::Corr,
+        "COVAR_SAMP" | "COVAR" => WindowFrameFunction::CovarSamp,
+        "COVAR_POP" => WindowFrameFunction::CovarPop,
         _ => return None,
     };
 
@@ -809,6 +822,20 @@ mod tests {
             analysis.functions[4].function_type,
             WindowFrameFunction::Count
         );
+    }
+
+    #[test]
+    fn test_frame_corr_bivariate() {
+        let sql = "SELECT CORR(price, sentiment) OVER (ORDER BY bucket \
+                    ROWS 30 PRECEDING) AS c FROM joined";
+        let stmt = parse_stmt(sql);
+        let analysis = analyze_window_frames(&stmt).unwrap();
+        assert_eq!(
+            analysis.functions[0].function_type,
+            WindowFrameFunction::Corr
+        );
+        assert_eq!(analysis.functions[0].start_bound, FrameBound::Preceding(30));
+        assert_eq!(analysis.order_columns, vec!["bucket".to_string()]);
     }
 
     #[test]

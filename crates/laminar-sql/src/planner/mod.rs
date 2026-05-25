@@ -62,6 +62,10 @@ pub struct StreamingPlanner {
     sinks: HashMap<String, SinkInfo>,
     /// Registered lookup tables
     lookup_tables: HashMap<String, LookupTableInfo>,
+    /// Names of windowed views/streams (created with a windowed aggregation).
+    /// Their output is bounded per window close, so an equi-join between two of
+    /// them is a processing-time batch join, not an unbounded stream-stream join.
+    windowed_views: std::collections::HashSet<String>,
 }
 
 /// Information about a registered source
@@ -143,6 +147,7 @@ impl StreamingPlanner {
             sources: HashMap::new(),
             sinks: HashMap::new(),
             lookup_tables: HashMap::new(),
+            windowed_views: std::collections::HashSet::new(),
         }
     }
 
@@ -279,6 +284,12 @@ impl StreamingPlanner {
         // Analyze the query for streaming features
         let query_plan = self.analyze_query(&stmt, emit_clause)?;
 
+        // A windowed aggregation emits a bounded set per window close, so record
+        // this view as a valid (bounded) input to a later processing-time join.
+        if query_plan.window_config.is_some() {
+            self.windowed_views.insert(object_name_to_string(name));
+        }
+
         Ok(StreamingPlan::Query(QueryPlan {
             name: Some(object_name_to_string(name)),
             window_config: query_plan.window_config,
@@ -307,7 +318,11 @@ impl StreamingPlanner {
                 })?;
 
                 if let Some(ref multi) = join_analysis {
-                    reject_unbounded_streaming_join(multi, &self.lookup_tables)?;
+                    reject_unbounded_streaming_join(
+                        multi,
+                        &self.lookup_tables,
+                        &self.windowed_views,
+                    )?;
                 }
 
                 // Check for ORDER BY
@@ -358,8 +373,12 @@ impl StreamingPlanner {
                         None => None,
                     };
 
-                    let join_config =
-                        join_analysis.map(|m| JoinOperatorConfig::from_multi_analysis(&m));
+                    // A windowed-view equi-join carries no join_config: it routes
+                    // to the processing-time join, re-detected in `add_query`.
+                    // (A config here would suppress that detection.)
+                    let join_config = join_analysis
+                        .filter(|m| !is_windowed_view_join(m, &self.windowed_views))
+                        .map(|m| JoinOperatorConfig::from_multi_analysis(&m));
 
                     return Ok(StreamingPlan::Query(QueryPlan {
                         name: None,
@@ -409,8 +428,17 @@ impl StreamingPlanner {
                 if let Some(multi) = analyze_joins(select).map_err(|e| {
                     PlanningError::InvalidQuery(format!("Join analysis failed: {e}"))
                 })? {
-                    reject_unbounded_streaming_join(&multi, &self.lookup_tables)?;
-                    analysis.join_config = Some(JoinOperatorConfig::from_multi_analysis(&multi));
+                    reject_unbounded_streaming_join(
+                        &multi,
+                        &self.lookup_tables,
+                        &self.windowed_views,
+                    )?;
+                    // A windowed-view equi-join routes to the processing-time join
+                    // (re-detected in `add_query`); a config here would suppress it.
+                    if !is_windowed_view_join(&multi, &self.windowed_views) {
+                        analysis.join_config =
+                            Some(JoinOperatorConfig::from_multi_analysis(&multi));
+                    }
                 }
             }
         }
@@ -633,6 +661,7 @@ fn object_name_to_string(name: &ObjectName) -> String {
 fn reject_unbounded_streaming_join(
     multi: &MultiJoinAnalysis,
     lookup_tables: &HashMap<String, LookupTableInfo>,
+    windowed_views: &std::collections::HashSet<String>,
 ) -> Result<(), PlanningError> {
     for step in &multi.joins {
         if step.is_bounded() {
@@ -640,7 +669,11 @@ fn reject_unbounded_streaming_join(
         }
         let left_lookup = lookup_tables.contains_key(&step.left_table);
         let right_lookup = lookup_tables.contains_key(&step.right_table);
-        if !left_lookup && !right_lookup {
+        // A join between two windowed views is bounded per cycle (each emits
+        // aligned closed windows) — it runs as a processing-time batch join.
+        let both_windowed =
+            windowed_views.contains(&step.left_table) && windowed_views.contains(&step.right_table);
+        if !left_lookup && !right_lookup && !both_windowed {
             return Err(PlanningError::InvalidQuery(format!(
                 "unbounded join between streaming sources '{}' and '{}'; \
                  add a temporal predicate or use a lookup table",
@@ -649,6 +682,21 @@ fn reject_unbounded_streaming_join(
         }
     }
     Ok(())
+}
+
+/// A single non-temporal equi-join between two windowed views — the
+/// processing-time batch-join shape (`create_operator` builds it from the
+/// re-detected config, so its `join_config` is left empty here).
+fn is_windowed_view_join(
+    multi: &MultiJoinAnalysis,
+    windowed_views: &std::collections::HashSet<String>,
+) -> bool {
+    multi.joins.len() == 1
+        && multi.joins.iter().all(|j| {
+            !j.is_bounded()
+                && windowed_views.contains(&j.left_table)
+                && windowed_views.contains(&j.right_table)
+        })
 }
 
 /// Planning errors
@@ -875,6 +923,37 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("unbounded join"), "got: {msg}");
         assert!(msg.contains("lookup table"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_plan_allows_join_between_windowed_views() {
+        let mut planner = StreamingPlanner::new();
+        // Two windowed views register as bounded inputs.
+        for sql in [
+            "CREATE STREAM price_1m AS SELECT TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, \
+             AVG(p) AS price FROM trades GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE)",
+            "CREATE STREAM sent_1m AS SELECT TUMBLE(ts, INTERVAL '1' MINUTE) AS bucket, \
+             AVG(s) AS ms FROM posts GROUP BY TUMBLE(ts, INTERVAL '1' MINUTE)",
+        ] {
+            let st = StreamingParser::parse_sql(sql).unwrap();
+            planner.plan(&st[0]).unwrap();
+        }
+        // The equi-join between them is accepted (not rejected as unbounded) and
+        // carries no join_config, so add_query routes it to the process-time join.
+        let st = StreamingParser::parse_sql(
+            "CREATE STREAM joined AS SELECT a.bucket, a.price, b.ms \
+             FROM price_1m a JOIN sent_1m b ON a.bucket = b.bucket",
+        )
+        .unwrap();
+        match planner.plan(&st[0]).unwrap() {
+            StreamingPlan::Query(qp) => {
+                assert!(
+                    qp.join_config.is_none(),
+                    "windowed-view join carries no join_config"
+                );
+            }
+            other => panic!("expected a Query plan, got {other:?}"),
+        }
     }
 
     #[test]

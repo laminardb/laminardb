@@ -40,13 +40,19 @@ pub struct InferenceParams {
 
 /// Per-row outputs of a batch. Homogeneous for a given request: a classify or
 /// generate batch yields text; an embed batch — or a local classifier's raw
-/// logits awaiting softmax in the adapter — yields numeric vectors.
+/// logits awaiting softmax in the adapter — yields numeric vectors; a sentiment
+/// batch yields one scalar score per row (the adapter's output, never a raw
+/// provider shape).
 #[derive(Debug, Clone, PartialEq)]
 pub enum InferenceOutputs {
     /// One text output per input row.
     Text(Vec<String>),
     /// One numeric vector per input row (embeddings, or classifier logits).
     Vectors(Vec<Vec<f32>>),
+    /// One scalar score per input row. Produced by the adapter for
+    /// `ai_sentiment` (continuous, in `[-1, 1]`); providers never return this
+    /// shape directly.
+    Scores(Vec<f64>),
 }
 
 impl InferenceOutputs {
@@ -56,6 +62,7 @@ impl InferenceOutputs {
         match self {
             InferenceOutputs::Text(v) => v.len(),
             InferenceOutputs::Vectors(v) => v.len(),
+            InferenceOutputs::Scores(v) => v.len(),
         }
     }
 

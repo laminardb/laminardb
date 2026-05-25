@@ -1,0 +1,152 @@
+<!doctype html>
+<!--
+  Crypto × Sentiment — thin client. It DRAWS what the engine emits; it computes
+  nothing. Price, sentiment, the rolling correlation, and the post score all
+  arrive over SSE from bridge.py (which tails the views over pgwire). No
+  aggregation, windowing, correlation, or scoring lives here — that is the
+  engine's job (grep this file: none of those words appear in logic).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BTC price × crypto sentiment — LaminarDB</title>
+<style>
+  :root {
+    --bg: #0b0e14; --panel: #121722; --ink: #e6edf3; --muted: #8b98a9;
+    --price: #f0b429; --sent: #4cc9f0; --grid: #1d2533; --pos: #3fb950; --neg: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  header { padding: 18px 24px 10px; }
+  h1 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: .2px; }
+  .sub { color: var(--muted); font-size: 12px; margin-top: 3px; }
+  .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; padding: 12px 24px 24px; }
+  .panel { background: var(--panel); border: 1px solid var(--grid); border-radius: 10px; padding: 14px 16px; }
+  .panel h2 { margin: 0 0 10px; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .8px; }
+  canvas { width: 100%; height: 320px; display: block; }
+  .legend { display: flex; gap: 18px; font-size: 12px; margin-top: 8px; color: var(--muted); }
+  .legend b { font-weight: 600; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .corr-num { font-size: 46px; font-weight: 700; line-height: 1.1; }
+  .corr-meta { color: var(--muted); font-size: 12px; }
+  .feed { max-height: 360px; overflow: auto; }
+  .post { padding: 8px 0; border-bottom: 1px solid var(--grid); }
+  .post .txt { color: var(--ink); }
+  .post .score { font-weight: 700; }
+  .pill { display:inline-block; min-width: 52px; text-align:center; padding: 1px 7px; border-radius: 6px; font-size: 12px; }
+  footer { padding: 8px 24px 28px; color: var(--muted); font-size: 12px; }
+  footer b { color: var(--ink); }
+  .status { float: right; font-size: 12px; color: var(--muted); }
+  .status.live::before { content: "●"; color: var(--pos); margin-right: 6px; }
+  .status.down::before { content: "●"; color: var(--neg); margin-right: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <span class="status" id="status">connecting…</span>
+  <h1>BTC price × crypto-post sentiment</h1>
+  <div class="sub">All numbers are emitted by LaminarDB views. This page only formats and draws them.</div>
+</header>
+
+<div class="grid">
+  <div class="panel">
+    <h2>price (avg/min) &amp; mean sentiment — per 1-minute bucket</h2>
+    <canvas id="chart" width="900" height="320"></canvas>
+    <div class="legend">
+      <span><span class="dot" style="background:var(--price)"></span><b>BTC price</b> (USDT)</span>
+      <span><span class="dot" style="background:var(--sent)"></span><b>mean sentiment</b> (−1…+1)</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>rolling correlation — CORR over 30 buckets</h2>
+    <div class="corr-num" id="corr">—</div>
+    <div class="corr-meta" id="corrMeta">from <code>sentiment_price_1m.corr_30</code></div>
+    <h2 style="margin-top:18px">scored crypto posts</h2>
+    <div class="feed" id="feed"></div>
+  </div>
+</div>
+
+<footer>
+  Source view <b>sentiment_price_1m</b> — latest <b id="footBucket">—</b>:
+  price <b id="footPrice">—</b>, mean sentiment <b id="footSent">—</b>, corr_30 <b id="footCorr">—</b>.
+  Sentiment scored by <b>ai_sentiment()</b> inside the pipeline (see <code>laminar.ai_calls</code>).
+</footer>
+
+<script>
+// ── Pure rendering. Receives rows; never derives a statistic. ──────────────
+const bars = [];          // {bucket_start, price, mean_sentiment, corr_30}
+const MAX_BARS = 120;
+const fmt = (v, d = 2) => (v === null || v === undefined ? "—" : Number(v).toFixed(d));
+
+function pushBar(row) {
+  bars.push(row);
+  while (bars.length > MAX_BARS) bars.shift();
+  draw();
+  const last = bars[bars.length - 1];
+  document.getElementById("corr").textContent = fmt(last.corr_30, 3);
+  document.getElementById("corr").style.color =
+    last.corr_30 == null ? "var(--muted)" : last.corr_30 >= 0 ? "var(--pos)" : "var(--neg)";
+  document.getElementById("footBucket").textContent = last.bucket_start ?? "—";
+  document.getElementById("footPrice").textContent = fmt(last.price);
+  document.getElementById("footSent").textContent = fmt(last.mean_sentiment, 3);
+  document.getElementById("footCorr").textContent = fmt(last.corr_30, 3);
+}
+
+function addPost(p) {
+  const feed = document.getElementById("feed");
+  const el = document.createElement("div");
+  el.className = "post";
+  const s = p.sentiment;
+  const color = s == null ? "var(--muted)" : s >= 0 ? "var(--pos)" : "var(--neg)";
+  const label = s == null ? "null" : fmt(s, 2);
+  el.innerHTML =
+    `<span class="pill score" style="background:${color}22;color:${color}">${label}</span> ` +
+    `<span class="txt"></span>`;
+  el.querySelector(".txt").textContent = (p.text || "").slice(0, 140);
+  feed.prepend(el);
+  while (feed.childNodes.length > 40) feed.removeChild(feed.lastChild);
+}
+
+function draw() {
+  const c = document.getElementById("chart"), ctx = c.getContext("2d");
+  const W = c.width, H = c.height, pad = 34;
+  ctx.clearRect(0, 0, W, H);
+  if (bars.length < 2) return;
+  const prices = bars.map(b => b.price).filter(v => v != null);
+  const pMin = Math.min(...prices), pMax = Math.max(...prices);
+  const series = (key, color, lo, hi) => {
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+    let started = false;
+    bars.forEach((b, i) => {
+      const v = b[key]; if (v == null) return;
+      const x = pad + (W - 2 * pad) * (i / (bars.length - 1));
+      const y = H - pad - (H - 2 * pad) * ((v - lo) / (hi - lo || 1));
+      if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  };
+  ctx.strokeStyle = "var(--grid)";
+  series("price", getComputedStyle(document.documentElement).getPropertyValue("--price"), pMin, pMax);
+  series("mean_sentiment", getComputedStyle(document.documentElement).getPropertyValue("--sent"), -1, 1);
+}
+
+function setStatus(s, cls) {
+  const el = document.getElementById("status");
+  el.textContent = s; el.className = "status " + cls;
+}
+
+// ── Transport: SSE from bridge.py (or simulate.py). ───────────────────────
+const es = new EventSource("/events");
+es.addEventListener("bar", e => pushBar(JSON.parse(e.data)));
+es.addEventListener("post", e => addPost(JSON.parse(e.data)));
+es.onopen = () => setStatus("live", "live");
+es.onerror = () => setStatus("disconnected", "down");
+window.addEventListener("resize", draw);
+</script>
+</body>
+</html>

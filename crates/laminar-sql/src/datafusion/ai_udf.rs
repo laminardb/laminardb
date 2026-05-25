@@ -90,14 +90,15 @@ impl ScalarUDFImpl for AiFunctionMarker {
 
 /// Build the eight `ai_*` marker UDFs, ready to register on a session context.
 ///
-/// Discriminative and text-generating tasks return `Utf8` (a label or text);
-/// `ai_embed` returns a `List<Float32>` embedding.
+/// Text-generating and discriminative-label tasks return `Utf8`; `ai_sentiment`
+/// returns a `Float64` score in `[-1, 1]`; `ai_embed` returns a `List<Float32>`
+/// embedding.
 #[must_use]
 pub fn ai_function_markers() -> Vec<ScalarUDF> {
     let embedding = DataType::List(Arc::new(Field::new("item", DataType::Float32, true)));
     let specs: [(&'static str, DataType); 8] = [
         ("ai_classify", DataType::Utf8),
-        ("ai_sentiment", DataType::Utf8),
+        ("ai_sentiment", DataType::Float64),
         ("ai_embed", embedding),
         ("ai_extract", DataType::Utf8),
         ("ai_complete", DataType::Utf8),
@@ -125,6 +126,9 @@ mod tests {
 
         let classify = markers.iter().find(|m| m.name() == "ai_classify").unwrap();
         assert_eq!(classify.return_type(&[]).unwrap(), DataType::Utf8);
+
+        let sentiment = markers.iter().find(|m| m.name() == "ai_sentiment").unwrap();
+        assert_eq!(sentiment.return_type(&[]).unwrap(), DataType::Float64);
 
         let embed = markers.iter().find(|m| m.name() == "ai_embed").unwrap();
         assert!(matches!(embed.return_type(&[]).unwrap(), DataType::List(_)));

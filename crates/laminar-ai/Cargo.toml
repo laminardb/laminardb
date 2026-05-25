@@ -37,6 +37,10 @@ serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 
+# Client-side rate limiting (token bucket / GCRA) for remote providers — the
+# standard maintained Rust limiter, rather than a hand-rolled bucket.
+governor = { version = "0.8", optional = true }
+
 # --- local backend (feature = "local") ---
 # ONNX Runtime via `ort`. tract (pure Rust) cannot analyse the dynamic
 # attention-mask broadcast in stock HuggingFace encoder exports; ort runs them
@@ -54,7 +58,7 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 default = []
 # Remote LLM backends (OpenAI-compatible, Anthropic) over HTTP. Default build
 # carries zero ML/HTTP weight.
-remote = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:tokio", "dep:futures"]
+remote = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:tokio", "dep:futures", "dep:governor"]
 # Local ONNX backend (ort/ONNX Runtime + HF tokenizers; reqwest for hf: fetch).
 local = ["dep:ort", "dep:tokenizers", "dep:serde_json", "dep:tokio", "dep:reqwest"]
 

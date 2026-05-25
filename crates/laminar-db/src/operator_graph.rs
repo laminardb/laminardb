@@ -15,8 +15,9 @@ use crate::config::BackpressurePolicy;
 use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
 use crate::sql_analysis::{
-    apply_topk_filter, detect_asof_query, detect_stream_join_query, detect_temporal_probe_query,
-    detect_temporal_query, extract_table_references, StreamJoinDetection,
+    apply_topk_filter, detect_asof_query, detect_processtime_join, detect_stream_join_query,
+    detect_temporal_probe_query, detect_temporal_query, extract_table_references,
+    StreamJoinDetection,
 };
 use laminar_sql::parser::EmitClause;
 use laminar_sql::translator::{
@@ -763,6 +764,15 @@ impl OperatorGraph {
             return;
         }
 
+        // Window-frame routing: a single-source query with a `… OVER (ORDER BY k
+        // ROWS N PRECEDING)` frame (e.g. CORR) becomes a WindowFrameOperator that
+        // retains bounded history and delegates the frame computation to
+        // DataFusion. Detected off the SQL like the AI/join paths.
+        if let Some(plan) = crate::sql_analysis::plan_frame_query(&sql) {
+            self.build_frame_operator_node(&name, &plan);
+            return;
+        }
+
         // The planner's vec lets us short-circuit re-parsing for queries
         // that have no specialized join step (or no joins at all).
         // TemporalProbe is parsed off the token stream rather than the
@@ -795,7 +805,10 @@ impl OperatorGraph {
             };
         let stream_join_detection =
             if temporal_probe_config.is_none() && needs_specialized_detection {
-                detect_stream_join_query(&sql)
+                // Interval join (time-bounded) first; else a plain equi-join as a
+                // processing-time join. `create_operator` distinguishes them by
+                // whether the config has time columns.
+                detect_stream_join_query(&sql).or_else(|| detect_processtime_join(&sql))
             } else {
                 None
             };
@@ -1022,7 +1035,39 @@ impl OperatorGraph {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Build a [`WindowFrameOperator`](crate::operator::window_frame) for a
+    /// planned frame query and wire it as a single-input node over the source.
+    fn build_frame_operator_node(
+        &mut self,
+        name: &str,
+        plan: &crate::sql_analysis::FrameQueryPlan,
+    ) {
+        let operator: Box<dyn GraphOperator> =
+            Box::new(crate::operator::window_frame::WindowFrameOperator::new(
+                name,
+                crate::operator::window_frame::MomentFrameConfig {
+                    func: plan.func,
+                    x_column: plan.x_column.clone(),
+                    y_column: plan.y_column.clone(),
+                    output_column: plan.output_alias.clone(),
+                    retain: plan.retain,
+                },
+                Arc::from(plan.projection_sql.as_str()),
+                self.ctx.clone(),
+            ));
+        let mut table_refs = FxHashSet::default();
+        table_refs.insert(plan.source_table.clone());
+        self.ensure_query_source_nodes(None, None, None, None, &table_refs);
+        let node_id = self.place_operator_node(name, operator, 1);
+        let depends = self.wire_query_edges(node_id, None, None, None, None, None, &table_refs);
+        if depends {
+            self.depends_on_stream.insert(node_id);
+        }
+        self.output_map.insert(Arc::from(name), node_id);
+        self.topo_dirty = true;
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn create_operator(
         &self,
         name: &str,
@@ -1069,6 +1114,16 @@ impl OperatorGraph {
         }
 
         if let Some(cfg) = stream_join_config {
+            // No time columns ⇒ plain equi-join → per-cycle batch join; with
+            // time columns ⇒ interval join.
+            if cfg.left_time_column.is_empty() && cfg.right_time_column.is_empty() {
+                return Box::new(operator::process_time_join::ProcessTimeJoinOperator::new(
+                    name,
+                    cfg.clone(),
+                    projection_sql.map(Arc::from),
+                    self.ctx.clone(),
+                ));
+            }
             return Box::new(operator::interval_join::IntervalJoinOperator::new(
                 name,
                 cfg.clone(),
@@ -1980,6 +2035,101 @@ mod tests {
         assert!(
             graph.take_build_errors().is_err(),
             "unknown model must fail"
+        );
+    }
+
+    /// End-to-end through the real graph: `ai_sentiment` lifts to the AI
+    /// operator, the worker scores on Ring 1, and the emitted column is a
+    /// numeric `Float64` (not a label) — the demo's hero path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ai_sentiment_emits_a_double_score() {
+        use laminar_ai::{
+            AiCallLog, AiResultCache, AiRuntime, InferenceOutputs, InferenceProvider,
+            InferenceRequest, InferenceResponse, ModelBackend, ModelEntry, ModelRegistry,
+            ProviderError, Task, Usage,
+        };
+
+        struct ScoreProvider;
+        #[async_trait::async_trait]
+        impl InferenceProvider for ScoreProvider {
+            async fn infer_batch(
+                &self,
+                req: InferenceRequest,
+            ) -> Result<InferenceResponse, ProviderError> {
+                // A compliant sentiment model replies with a bare number.
+                Ok(InferenceResponse {
+                    outputs: InferenceOutputs::Text(vec!["0.8".to_string(); req.inputs.len()]),
+                    usage: Usage::ZERO,
+                })
+            }
+            fn name(&self) -> &'static str {
+                "score"
+            }
+        }
+
+        let mut registry = ModelRegistry::new();
+        registry
+            .register(ModelEntry {
+                id: "m".into(),
+                tasks: vec![Task::Sentiment],
+                backend: ModelBackend::Remote {
+                    provider: "p".into(),
+                    model: "stub".into(),
+                },
+            })
+            .unwrap();
+        let call_log = Arc::new(AiCallLog::with_defaults());
+        let runtime = Arc::new(AiRuntime::new(
+            registry,
+            [(
+                "p".to_string(),
+                Arc::new(ScoreProvider) as Arc<dyn InferenceProvider>,
+            )],
+            None,
+            Arc::new(AiResultCache::with_defaults()),
+            Arc::clone(&call_log),
+        ));
+
+        let ctx = laminar_sql::create_session_context();
+        laminar_sql::register_streaming_functions(&ctx);
+        let mut graph = OperatorGraph::new(ctx);
+        graph.set_ai_runtime(runtime, tokio::runtime::Handle::current());
+        graph.register_source_schema("docs".to_string(), docs_batch().schema());
+
+        graph.add_query(
+            "scored".to_string(),
+            "SELECT id, ai_sentiment(text, model => 'm') AS sentiment FROM docs".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        graph
+            .take_build_errors()
+            .expect("ai_sentiment should route cleanly");
+
+        let mut sources = FxHashMap::default();
+        sources.insert(Arc::from("docs"), vec![docs_batch()]);
+        let _ = graph.execute_cycle(&sources, i64::MAX, None).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let results = graph
+            .execute_cycle(&FxHashMap::default(), i64::MAX, None)
+            .await
+            .unwrap();
+
+        let out = &results[&(Arc::from("scored") as Arc<str>)];
+        let batch = out.iter().find(|b| b.num_rows() > 0).expect("a scored row");
+        let col = batch.column(batch.schema().index_of("sentiment").unwrap());
+        let scores = col
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .expect("sentiment is a Float64 score, not a label");
+        assert!((scores.value(0) - 0.8).abs() < 1e-9);
+        assert_eq!(
+            call_log.total_recorded(),
+            1,
+            "the call is in laminar.ai_calls"
         );
     }
 

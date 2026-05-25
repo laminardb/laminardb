@@ -21,6 +21,7 @@ use laminar_ai::{BackendKind, ModelRegistry, Task};
 use laminar_sql::parser::join_parser::analyze_joins;
 
 use crate::error::DbError;
+use crate::operator::window_frame::MomentFn;
 #[cfg(test)]
 use laminar_sql::parser::{EmitClause, EmitStrategy as SqlEmitStrategy};
 use laminar_sql::translator::{
@@ -868,7 +869,9 @@ mod ai {
                 }
             }
             BackendKind::Remote => {
-                if matches!(call.task, Task::Classify | Task::Sentiment) && call.labels.is_none() {
+                // Remote classification needs a candidate set; remote sentiment is
+                // numeric (the model returns a score), so it needs no labels.
+                if call.task == Task::Classify && call.labels.is_none() {
                     return Err(DbError::InvalidOperation(format!(
                     "remote classification with model '{model_name}' requires a 'labels' argument"
                 )));
@@ -907,7 +910,7 @@ mod ai {
             .unwrap();
             reg.register(ModelEntry {
                 id: "haiku".into(),
-                tasks: vec![Task::Classify, Task::Complete],
+                tasks: vec![Task::Classify, Task::Complete, Task::Sentiment],
                 backend: ModelBackend::Remote {
                     provider: "anthropic".into(),
                     model: "claude-haiku-4-5-20251001".into(),
@@ -1033,6 +1036,13 @@ mod ai {
         }
 
         #[test]
+        fn remote_sentiment_needs_no_labels() {
+            // Sentiment is numeric — a remote model scores it without a candidate set.
+            let calls = [spec(Task::Sentiment, Some("haiku"), None)];
+            assert!(validate_ai_calls(&registry(), &calls).is_ok());
+        }
+
+        #[test]
         fn default_model_resolves_or_fails() {
             // Sentiment has a default (finbert).
             let defaulted = [spec(Task::Sentiment, None, None)];
@@ -1045,6 +1055,186 @@ mod ai {
 }
 
 pub(crate) use ai::{detect_ai_functions, plan_ai_query, validate_ai_calls, AiQueryPlan};
+
+/// Private table a window-frame operator registers its enriched batch under; the
+/// residual projection reads from it. (Mirrors the AI path's `__ai_tmp`.)
+pub(crate) const FRAME_TMP_TABLE: &str = "__frame_tmp";
+
+/// A single-source query carrying one bivariate moment frame
+/// (`CORR`/`COVAR_SAMP`/`COVAR_POP` `OVER (ORDER BY k ROWS N PRECEDING)`). The
+/// call is lifted out — the operator computes it from carried moments — and
+/// replaced by its alias in the residual projection.
+pub(crate) struct FrameQueryPlan {
+    pub func: MomentFn,
+    pub x_column: String,
+    pub y_column: String,
+    pub output_alias: String,
+    /// Residual SELECT over [`FRAME_TMP_TABLE`] with the stat call replaced by
+    /// its alias column.
+    pub projection_sql: String,
+    pub source_table: String,
+    /// `max(PRECEDING)` — rows of preceding history to retain per new row.
+    pub retain: usize,
+}
+
+/// Plan a query for window-frame routing. Returns `Some` only for the v0.1
+/// supported shape: a single (un-joined) source, exactly one bivariate moment
+/// call (`CORR`/`COVAR_SAMP`/`COVAR_POP`) `OVER (ORDER BY … ROWS N PRECEDING) AS
+/// alias`, no `PARTITION BY`, no `FOLLOWING` bound (streaming cannot buffer the
+/// future). Anything else returns `None` (routed normally).
+pub(crate) fn plan_frame_query(sql: &str) -> Option<FrameQueryPlan> {
+    let statements = laminar_sql::parse_streaming_sql(sql).ok()?;
+    let mut statement = match statements.into_iter().next()? {
+        laminar_sql::parser::StreamingStatement::Standard(boxed) => *boxed,
+        _ => return None,
+    };
+
+    // Validate the frame shape (single ordered series, preceding bounds only).
+    let analysis = laminar_sql::parser::analytic_parser::analyze_window_frames(&statement)?;
+    if !analysis.partition_columns.is_empty() || analysis.has_following() {
+        return None;
+    }
+    let retain = usize::try_from(analysis.max_preceding()).ok()?;
+    if retain == 0 {
+        return None;
+    }
+
+    let Statement::Query(query) = &mut statement else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_mut() else {
+        return None;
+    };
+    if select.from.len() != 1 || !select.from[0].joins.is_empty() {
+        return None;
+    }
+    let source_table = match &select.from[0].relation {
+        TableFactor::Table { name, .. } => name.to_string(),
+        _ => return None,
+    };
+
+    // Find the single bivariate-moment OVER (...) AS alias projection item.
+    let mut found: Option<(usize, MomentFn, String, String, String)> = None;
+    for (index, item) in select.projection.iter().enumerate() {
+        let SelectItem::ExprWithAlias { expr, alias } = item else {
+            continue;
+        };
+        if let Some((func, x, y)) = moment_call(expr) {
+            if found.is_some() {
+                return None; // more than one frame call — unsupported in v0.1
+            }
+            found = Some((index, func, x, y, alias.value.clone()));
+        }
+    }
+    let (index, func, x_column, y_column, output_alias) = found?;
+
+    // Rewrite: the stat call AS alias → the bare alias column; FROM → temp table.
+    select.projection[index] =
+        SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(output_alias.clone())));
+    if let TableFactor::Table { name, .. } = &mut select.from[0].relation {
+        *name = ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
+            FRAME_TMP_TABLE,
+        ))]);
+    }
+
+    Some(FrameQueryPlan {
+        func,
+        x_column,
+        y_column,
+        output_alias,
+        projection_sql: statement.to_string(),
+        source_table,
+        retain,
+    })
+}
+
+/// The statistic and two plain-column arguments of a bivariate moment call with
+/// an `OVER` clause (`CORR`/`COVAR_SAMP`/`COVAR_POP`), or `None` otherwise.
+fn moment_call(expr: &Expr) -> Option<(MomentFn, String, String)> {
+    let Expr::Function(func) = expr else {
+        return None;
+    };
+    func.over.as_ref()?;
+    let kind = match func.name.to_string().to_ascii_uppercase().as_str() {
+        "CORR" => MomentFn::Corr,
+        "COVAR_SAMP" | "COVAR" => MomentFn::CovarSamp,
+        "COVAR_POP" => MomentFn::CovarPop,
+        _ => return None,
+    };
+    let (x, y) = bivariate_column_args(func)?;
+    Some((kind, x, y))
+}
+
+/// The two plain-column arguments of a 2-arg function call, or `None`.
+fn bivariate_column_args(func: &sqlparser::ast::Function) -> Option<(String, String)> {
+    let FunctionArguments::List(list) = &func.args else {
+        return None;
+    };
+    let cols: Vec<String> = list
+        .args
+        .iter()
+        .filter_map(|arg| match arg {
+            FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Identifier(id))) => {
+                Some(id.value.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    match cols.as_slice() {
+        [x, y] => Some((x.clone(), y.clone())),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod frame_plan_tests {
+    use super::plan_frame_query;
+
+    #[test]
+    fn detects_corr_frame_and_rewrites_to_alias() {
+        let plan = plan_frame_query(
+            "SELECT bucket_start, close, mean_sentiment, \
+             CORR(close, mean_sentiment) OVER (ORDER BY bucket_start ROWS 30 PRECEDING) AS corr_30 \
+             FROM sentiment_price_join",
+        )
+        .expect("frame plan");
+        assert_eq!(plan.x_column, "close");
+        assert_eq!(plan.y_column, "mean_sentiment");
+        assert_eq!(plan.output_alias, "corr_30");
+        assert_eq!(plan.retain, 30);
+        assert_eq!(plan.source_table, "sentiment_price_join");
+        // The CORR term is gone; the residual reads the alias from the temp table.
+        assert!(!plan.projection_sql.to_uppercase().contains("CORR("));
+        assert!(plan.projection_sql.contains("corr_30"));
+        assert!(plan.projection_sql.contains("__frame_tmp"));
+    }
+
+    #[test]
+    fn detects_processtime_equijoin() {
+        let d = super::detect_processtime_join(
+            "SELECT p.bucket AS bucket, p.price AS price, s.ms AS ms \
+             FROM price_b p JOIN sent_b s ON p.bucket = s.bucket",
+        )
+        .expect("plain INNER equi-join routes to the processing-time join");
+        // No time columns is the marker `create_operator` keys on.
+        assert!(d.config.left_time_column.is_empty() && d.config.right_time_column.is_empty());
+        assert_eq!(d.config.left_key, "bucket");
+        assert_eq!(d.config.right_key, "bucket");
+        assert_eq!(d.config.left_table, "price_b");
+        assert_eq!(d.config.right_table, "sent_b");
+    }
+
+    #[test]
+    fn rejects_partition_by_and_non_frame_queries() {
+        // PARTITION BY is out of v0.1 scope.
+        assert!(plan_frame_query(
+            "SELECT CORR(a, b) OVER (PARTITION BY g ORDER BY t ROWS 5 PRECEDING) AS c FROM s"
+        )
+        .is_none());
+        // No window frame → not a frame query.
+        assert!(plan_frame_query("SELECT a, b FROM s").is_none());
+    }
+}
 
 pub(crate) fn detect_temporal_query(
     sql: &str,
@@ -1442,6 +1632,88 @@ pub(crate) fn detect_stream_join_query(sql: &str) -> Option<StreamJoinDetection>
         projection_sql,
         left_pre_filter: pre_filters.as_ref().and_then(|f| f.left_sql.clone()),
         right_pre_filter: pre_filters.as_ref().and_then(|f| f.right_sql.clone()),
+    })
+}
+
+/// Detect a processing-time equi-join: a single `INNER` `a JOIN b ON a.k = b.k`
+/// with no temporal predicate. It routes to a per-cycle batch join that matches
+/// the current cycle's emissions from both sides — what aligns two windowed
+/// views closing the same bucket on processing time. Returns the same shape as
+/// [`detect_stream_join_query`] but with **empty time columns**, which is how
+/// `create_operator` tells the two join operators apart.
+pub(crate) fn detect_processtime_join(sql: &str) -> Option<StreamJoinDetection> {
+    use laminar_sql::parser::join_parser::JoinType;
+
+    let statements = laminar_sql::parse_streaming_sql(sql).ok()?;
+    let laminar_sql::parser::StreamingStatement::Standard(stmt) = statements.first()? else {
+        return None;
+    };
+    let Statement::Query(query) = stmt.as_ref() else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let multi = analyze_joins(select).ok()??;
+
+    // v0.1: exactly one INNER equi-join step, no temporal predicate, distinct
+    // tables (self-joins would collide on the suffixed output schema).
+    if multi.joins.len() != 1 {
+        return None;
+    }
+    let step = &multi.joins[0];
+    // A no-time-bound equi-join is tagged `is_lookup_join` by `analyze_joins`
+    // (it can't tell a windowed-view join from a stream/dim lookup); real lookup
+    // joins never reach this detector — the planner emits a Lookup config, which
+    // turns `needs_specialized_detection` off in `add_query`. So accept it here.
+    if step.time_bound.is_some()
+        || step.is_asof_join
+        || step.is_temporal_join
+        || !matches!(step.join_type, JoinType::Inner)
+    {
+        return None;
+    }
+    // Build the StreamStream config directly from the analysis (going through
+    // `from_analysis` would yield a Lookup config for this shape). Empty time
+    // columns are the processing-time marker `create_operator` keys on.
+    let config = StreamJoinConfig {
+        left_key: step.left_key_column.clone(),
+        right_key: step.right_key_column.clone(),
+        left_time_column: String::new(),
+        right_time_column: String::new(),
+        left_table: step.left_table.clone(),
+        right_table: step.right_table.clone(),
+        time_bound: std::time::Duration::ZERO,
+        join_type: StreamJoinType::Inner,
+    };
+    if config.left_key.is_empty()
+        || config.right_key.is_empty()
+        || config.left_table == config.right_table
+    {
+        return None;
+    }
+
+    let where_clause = select
+        .selection
+        .as_ref()
+        .map(|expr| {
+            let rewritten = rewrite_stream_join_expr(
+                expr,
+                step.left_alias.as_deref(),
+                step.right_alias.as_deref(),
+                &config,
+                None,
+            );
+            format!(" WHERE {rewritten}")
+        })
+        .unwrap_or_default();
+    let projection_sql = build_stream_join_projection_sql(select, step, &config, &where_clause);
+
+    Some(StreamJoinDetection {
+        config,
+        projection_sql,
+        left_pre_filter: None,
+        right_pre_filter: None,
     })
 }
 

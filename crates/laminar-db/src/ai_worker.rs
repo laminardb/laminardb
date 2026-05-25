@@ -158,6 +158,7 @@ fn to_cached(outputs: InferenceOutputs) -> Vec<CachedOutput> {
     match outputs {
         InferenceOutputs::Text(values) => values.into_iter().map(CachedOutput::Text).collect(),
         InferenceOutputs::Vectors(values) => values.into_iter().map(CachedOutput::Vector).collect(),
+        InferenceOutputs::Scores(values) => values.into_iter().map(CachedOutput::Score).collect(),
     }
 }
 

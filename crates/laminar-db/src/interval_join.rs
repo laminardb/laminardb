@@ -339,7 +339,11 @@ impl IntervalJoinState {
 }
 
 /// Build the merged output schema from left and right schemas.
-fn build_output_schema(
+/// The joined output schema: left fields, then right fields suffixed with
+/// `_{right_table}`. Shared with the processing-time join so both produce the
+/// column names the residual projection (built by `build_stream_join_projection_sql`)
+/// expects.
+pub(crate) fn build_output_schema(
     left_schema: &SchemaRef,
     right_schema: &SchemaRef,
     config: &StreamJoinConfig,

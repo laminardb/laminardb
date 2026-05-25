@@ -16,6 +16,8 @@ pub mod local;
 #[cfg(feature = "remote")]
 pub mod openai;
 #[cfg(feature = "remote")]
+pub mod rate_limited;
+#[cfg(feature = "remote")]
 mod remote;
 
 #[cfg(feature = "remote")]
@@ -24,3 +26,5 @@ pub use anthropic::AnthropicProvider;
 pub use local::LocalProvider;
 #[cfg(feature = "remote")]
 pub use openai::OpenAiProvider;
+#[cfg(feature = "remote")]
+pub use rate_limited::RateLimitedProvider;

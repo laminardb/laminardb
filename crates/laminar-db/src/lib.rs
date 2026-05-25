@@ -90,6 +90,11 @@ mod table_provider;
 mod table_store;
 mod temporal_probe;
 
+// End-to-end tests for the crypto-sentiment demo pipeline, backed by wiremock.
+// In-crate (not tests/) so it can drive the OperatorGraph directly.
+#[cfg(test)]
+mod e2e_crypto_sentiment;
+
 /// C FFI layer for LaminarDB.
 ///
 /// Enable with the `ffi` feature flag:
