@@ -8,21 +8,19 @@ aggregation, windowing, correlation, and sentiment scoring already happened in
 the engine; this is transport only.
 
     pip install "psycopg[binary]"
-    python bridge.py                      # tail the live server on :5432
-    python bridge.py --simulate           # synthetic feed, for screen-recording
-                                          #   (a recording aid; NOT the shipped path)
+    python bridge.py            # tail the live LaminarDB views over pgwire
 
 Then open http://127.0.0.1:8088/.
 """
 import argparse
 import json
-import math
 import queue
-import random
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+import psycopg
 
 HERE = Path(__file__).resolve().parent
 SUBSCRIBERS: "set[queue.Queue]" = set()
@@ -39,10 +37,8 @@ def publish(event: str, payload: dict) -> None:
             q.put(msg)
 
 
-# ── pgwire feed (the shipped path) ─────────────────────────────────────────
+# ── pgwire feed ─────────────────────────────────────────────────────────────
 def tail_view(dsn: str, sql: str, event: str, columns: list[str]) -> None:
-    import psycopg  # imported lazily so --simulate needs no driver
-
     while True:
         try:
             with psycopg.connect(dsn, autocommit=True) as conn:
@@ -66,35 +62,6 @@ def run_pgwire(host: str, port: int) -> None:
     ]
     for sql, event, cols in feeds:
         threading.Thread(target=tail_view, args=(dsn, sql, event, cols), daemon=True).start()
-
-
-# ── synthetic feed (recording aid only) ────────────────────────────────────
-def run_simulate() -> None:
-    print("[bridge] SIMULATED feed — recording aid, not the shipped demo path")
-
-    def loop() -> None:
-        t, price, posts = 0, 64000.0, [
-            "BTC breaking out, this looks strong", "another red day for bitcoin, brutal",
-            "ethereum merge talk heating up", "$btc just chopping sideways tbh",
-            "loaded more $eth, conviction high", "bitcoin dominance creeping up again",
-        ]
-        while True:
-            t += 1
-            price += random.uniform(-120, 120)
-            sentiment = max(-1.0, min(1.0, 0.4 * math.sin(t / 6) + random.uniform(-0.3, 0.3)))
-            corr = max(-1.0, min(1.0, math.sin(t / 9)))
-            publish("bar", {
-                "bucket_start": time.strftime("%H:%M:00"), "price": round(price, 2),
-                "mean_sentiment": round(sentiment, 3), "posts": random.randint(3, 25),
-                "corr_30": round(corr, 3),
-            })
-            for _ in range(random.randint(1, 3)):
-                publish("post", {"did": "did:plc:demo",
-                                 "text": random.choice(posts),
-                                 "sentiment": round(max(-1, min(1, sentiment + random.uniform(-0.4, 0.4))), 2)})
-            time.sleep(2)
-
-    threading.Thread(target=loop, daemon=True).start()
 
 
 # ── SSE + static server ─────────────────────────────────────────────────────
@@ -131,17 +98,12 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--simulate", action="store_true", help="synthetic feed (recording aid)")
     ap.add_argument("--pg-host", default="127.0.0.1")
     ap.add_argument("--pg-port", type=int, default=5432)
     ap.add_argument("--http-port", type=int, default=8088)
     args = ap.parse_args()
 
-    if args.simulate:
-        run_simulate()
-    else:
-        run_pgwire(args.pg_host, args.pg_port)
-
+    run_pgwire(args.pg_host, args.pg_port)
     print(f"[bridge] dashboard on http://127.0.0.1:{args.http_port}/")
     ThreadingHTTPServer(("127.0.0.1", args.http_port), Handler).serve_forever()
 

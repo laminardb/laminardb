@@ -154,12 +154,12 @@
 
 <div class="grid">
   <div class="panel">
-    <h2>BTC price &amp; crowd sentiment <span style="color:var(--faint);text-transform:none;letter-spacing:0;font-weight:400">— 1-minute buckets, emitted on window close</span></h2>
+    <h2>BTC price &amp; crowd sentiment <span style="color:var(--faint);text-transform:none;letter-spacing:0;font-weight:400">— two scales: do they move together? the correlation tile quantifies it</span></h2>
     <canvas id="chart" width="980" height="330"></canvas>
     <div class="legend">
-      <span><span class="dot" style="background:var(--price)"></span><b>BTC price</b> (USDT)</span>
-      <span><span class="dot" style="background:var(--sent)"></span><b>mean sentiment</b> (−1…+1)</span>
-      <span style="color:var(--faint)">every point is a row from <code class="mono">sentiment_price_1m</code></span>
+      <span><span class="dot" style="background:var(--price)"></span><b>BTC price</b> — USDT, left axis</span>
+      <span><span class="dot" style="background:var(--sent)"></span><b>mean sentiment</b> — −1…+1, right axis</span>
+      <span style="color:var(--faint)">each point = one row of <code class="mono">sentiment_price_1m</code>, per 1-min window</span>
     </div>
   </div>
 
@@ -203,6 +203,8 @@ const MAX_BARS = 120;
 let postsSeen = 0;
 const fmt = (v, d = 2) => (v === null || v === undefined ? "—" : Number(v).toFixed(d));
 const sentColor = s => (s == null ? "var(--muted)" : s >= 0 ? "var(--pos)" : "var(--neg)");
+const kfmt = v => (Math.abs(v) >= 1000 ? (v / 1000).toFixed(1).replace(/\.0$/, "") + "k" : Math.round(v).toString());
+const hhmm = s => { const m = String(s || "").match(/(\d{1,2}:\d{2})/); return m ? m[1] : ""; };
 
 function pushBar(row) {
   bars.push(row);
@@ -232,52 +234,67 @@ function addPost(p) {
 
 function draw() {
   const c = document.getElementById("chart"), ctx = c.getContext("2d");
-  // crisp on HiDPI
   const dpr = window.devicePixelRatio || 1, cssW = c.clientWidth || 980, cssH = 330;
-  if (c.width !== cssW * dpr) { c.width = cssW * dpr; c.height = cssH * dpr; }
+  if (c.width !== Math.round(cssW * dpr)) { c.width = Math.round(cssW * dpr); c.height = Math.round(cssH * dpr); }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  const W = cssW, H = cssH, padL = 8, padR = 8, padT = 14, padB = 20;
+  const W = cssW, H = cssH, padL = 54, padR = 46, padT = 16, padB = 26;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
   ctx.clearRect(0, 0, W, H);
+  ctx.textBaseline = "middle";
 
   if (bars.length < 2) {
     ctx.fillStyle = "#5b6676"; ctx.font = "13px ui-monospace,Menlo,monospace"; ctx.textAlign = "center";
     ctx.fillText("awaiting the first closed 1-minute window…", W / 2, H / 2);
     return;
   }
-  // gridlines
-  ctx.strokeStyle = "#1a2231"; ctx.lineWidth = 1;
-  for (let i = 0; i <= 4; i++) { const y = padT + (H - padT - padB) * i / 4; ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke(); }
-  // sentiment zero baseline
-  const yFor = (v, lo, hi) => H - padB - (H - padT - padB) * ((v - lo) / (hi - lo || 1));
-  const zeroY = yFor(0, -1, 1);
-  ctx.strokeStyle = "#22304a"; ctx.setLineDash([3, 4]); ctx.beginPath(); ctx.moveTo(padL, zeroY); ctx.lineTo(W - padR, zeroY); ctx.stroke(); ctx.setLineDash([]);
 
   const prices = bars.map(b => b.price).filter(v => v != null);
   const pMin = Math.min(...prices), pMax = Math.max(...prices);
-  const xFor = i => padL + (W - padL - padR) * (i / (bars.length - 1));
+  const xFor = i => padL + plotW * (i / (bars.length - 1));
+  const yP = v => padT + plotH * (1 - (v - pMin) / (pMax - pMin || 1)); // left scale: price
+  const yS = v => padT + plotH * (1 - (v + 1) / 2);                     // right scale: sentiment −1…+1
 
-  // sentiment area + line (cyan)
+  // horizontal gridlines
+  ctx.strokeStyle = "#172033"; ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) { const y = padT + plotH * i / 4; ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + plotW, y); ctx.stroke(); }
+
+  // left axis — price ticks (gold)
+  ctx.font = "11px ui-monospace,Menlo,monospace"; ctx.fillStyle = "#c8a24c"; ctx.textAlign = "right";
+  [pMax, (pMax + pMin) / 2, pMin].forEach(v => ctx.fillText(kfmt(v), padL - 8, yP(v)));
+  // right axis — sentiment ticks (cyan)
+  ctx.fillStyle = "#5fb6cf"; ctx.textAlign = "left";
+  [["+1", 1], ["0", 0], ["−1", -1]].forEach(([t, v]) => ctx.fillText(t, padL + plotW + 8, yS(v)));
+
+  // sentiment zero baseline
+  ctx.strokeStyle = "#22304a"; ctx.setLineDash([3, 4]); ctx.beginPath(); ctx.moveTo(padL, yS(0)); ctx.lineTo(padL + plotW, yS(0)); ctx.stroke(); ctx.setLineDash([]);
+
+  // sentiment area + line (cyan, right axis)
   ctx.beginPath(); let started = false;
-  bars.forEach((b, i) => { if (b.mean_sentiment == null) return; const x = xFor(i), y = yFor(b.mean_sentiment, -1, 1);
+  bars.forEach((b, i) => { if (b.mean_sentiment == null) return; const x = xFor(i), y = yS(b.mean_sentiment);
     started ? ctx.lineTo(x, y) : (ctx.moveTo(x, y), started = true); });
   if (started) {
-    const lastI = bars.length - 1;
-    ctx.lineTo(xFor(lastI), zeroY); ctx.lineTo(xFor(0), zeroY); ctx.closePath();
+    ctx.lineTo(xFor(bars.length - 1), yS(0)); ctx.lineTo(xFor(0), yS(0)); ctx.closePath();
     ctx.fillStyle = "rgba(70,211,240,.10)"; ctx.fill();
   }
-  line("mean_sentiment", "#46d3f0", -1, 1, 2);
-  // price line (gold, glow)
+  drawLine(b => b.mean_sentiment, yS, "#46d3f0", 2);
+  // price line (gold, left axis, glow)
   ctx.shadowColor = "rgba(240,180,41,.35)"; ctx.shadowBlur = 8;
-  line("price", "#f0b429", pMin, pMax, 2.4);
+  drawLine(b => b.price, yP, "#f0b429", 2.4);
   ctx.shadowBlur = 0;
-  // latest price dot
-  const li = bars.length - 1; if (bars[li].price != null) {
-    ctx.fillStyle = "#f0b429"; ctx.beginPath(); ctx.arc(xFor(li), yFor(bars[li].price, pMin, pMax), 3.5, 0, 7); ctx.fill();
-  }
-  function line(key, color, lo, hi, w) {
-    ctx.strokeStyle = color; ctx.lineWidth = w; ctx.beginPath(); let st = false;
-    bars.forEach((b, i) => { const v = b[key]; if (v == null) return; const x = xFor(i), y = yFor(v, lo, hi);
-      st ? ctx.lineTo(x, y) : (ctx.moveTo(x, y), st = true); });
+  // latest-point dots
+  const li = bars.length - 1;
+  if (bars[li].price != null) { ctx.fillStyle = "#f0b429"; ctx.beginPath(); ctx.arc(xFor(li), yP(bars[li].price), 3.5, 0, 7); ctx.fill(); }
+  if (bars[li].mean_sentiment != null) { ctx.fillStyle = "#46d3f0"; ctx.beginPath(); ctx.arc(xFor(li), yS(bars[li].mean_sentiment), 3.5, 0, 7); ctx.fill(); }
+
+  // x-axis — time labels (start / mid / end)
+  ctx.fillStyle = "#5b6676"; ctx.textBaseline = "alphabetic";
+  [[0, "left", padL], [(bars.length - 1) >> 1, "center", xFor((bars.length - 1) >> 1)], [bars.length - 1, "right", padL + plotW]]
+    .forEach(([idx, al, x]) => { ctx.textAlign = al; ctx.fillText(hhmm(bars[idx].bucket_start), x, H - 7); });
+
+  function drawLine(get, yf, color, w) {
+    ctx.strokeStyle = color; ctx.lineWidth = w; ctx.beginPath(); let s = false;
+    bars.forEach((b, i) => { const v = get(b); if (v == null) return; const x = xFor(i), y = yf(v);
+      s ? ctx.lineTo(x, y) : (ctx.moveTo(x, y), s = true); });
     ctx.stroke();
   }
 }

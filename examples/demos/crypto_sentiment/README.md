@@ -56,16 +56,14 @@ SELECT * FROM laminar.ai_calls ORDER BY timestamp_ms DESC;
 
 ```sh
 pip install "psycopg[binary]"
-python dashboard/bridge.py            # tails the live server, serves the page
+python dashboard/bridge.py            # SUBSCRIBEs to the views over pgwire, serves the page
 # open http://127.0.0.1:8088/
 ```
 
-Record the layout before wiring live data with the synthetic feed (a recording
-aid, not the shipped path):
-
-```sh
-python dashboard/bridge.py --simulate
-```
+`bridge.py` is pure transport: it `SUBSCRIBE`s to `sentiment_price_1m` and
+`bsky_crypto` over the Postgres wire protocol and forwards each row to the
+browser as a Server-Sent Event. It computes nothing — every number is the
+engine's.
 
 ## The degradation demo (worth showing on camera)
 
