@@ -82,18 +82,24 @@ class Handler(BaseHTTPRequestHandler):
                 while True:
                     self.wfile.write(q.get().encode())
                     self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
+            except OSError:
+                # Client went away (browser tab closed, SSE reconnect, reload).
+                # Covers BrokenPipe/ConnectionReset/ConnectionAborted (the last is
+                # what Windows raises) — all expected, not worth a traceback.
                 pass
             finally:
                 with LOCK:
                     SUBSCRIBERS.discard(q)
         else:
             body = (HERE / "index.html").read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except OSError:
+                pass
 
 
 def main() -> None:
