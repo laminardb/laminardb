@@ -1,10 +1,7 @@
 <!doctype html>
 <!--
-  Crypto × Sentiment — thin client. It DRAWS what the engine emits; it computes
-  nothing. Price, sentiment, the rolling correlation, and every post score
-  arrive over SSE from bridge.py (which tails the LaminarDB views over pgwire).
-  No aggregation, windowing, correlation, or scoring lives here — that is the
-  engine's job. (grep this file: none of those words appear in logic.)
+  Thin client: draws what the LaminarDB views emit over SSE (via bridge.py) and
+  computes nothing — no windowing, correlation, or scoring lives here.
 -->
 <html lang="en">
 <head>

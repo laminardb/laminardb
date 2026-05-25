@@ -75,11 +75,21 @@ impl SideBuffer {
         {
             self.chunks.pop_front();
         }
+        // Memory backstop: keep the newest MAX_BUFFERED_ROWS, slicing the oldest
+        // chunk rather than dropping a whole (possibly large) batch wholesale.
         let mut rows: usize = self.chunks.iter().map(|(_, b)| b.num_rows()).sum();
         while rows > MAX_BUFFERED_ROWS {
-            match self.chunks.pop_front() {
-                Some((_, b)) => rows -= b.num_rows(),
+            let overage = rows - MAX_BUFFERED_ROWS;
+            let front_rows = match self.chunks.front() {
+                Some((_, b)) => b.num_rows(),
                 None => break,
+            };
+            if front_rows <= overage {
+                self.chunks.pop_front();
+                rows -= front_rows;
+            } else if let Some((_, front)) = self.chunks.front_mut() {
+                *front = front.slice(overage, front_rows - overage); // drop oldest `overage`
+                rows -= overage;
             }
         }
     }

@@ -284,10 +284,14 @@ impl StreamingPlanner {
         // Analyze the query for streaming features
         let query_plan = self.analyze_query(&stmt, emit_clause)?;
 
-        // A windowed aggregation emits a bounded set per window close, so record
-        // this view as a valid (bounded) input to a later processing-time join.
+        // A windowed aggregation is a bounded input to a processing-time join.
+        // Insert *and* remove so a CREATE OR REPLACE that makes the view
+        // non-windowed clears the stale entry (else a join on it skips the guard).
+        let view_name = object_name_to_string(name);
         if query_plan.window_config.is_some() {
-            self.windowed_views.insert(object_name_to_string(name));
+            self.windowed_views.insert(view_name);
+        } else {
+            self.windowed_views.remove(&view_name);
         }
 
         Ok(StreamingPlan::Query(QueryPlan {

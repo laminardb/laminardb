@@ -34,7 +34,10 @@ def publish(event: str, payload: dict) -> None:
     msg = f"event: {event}\ndata: {json.dumps(payload, default=str)}\n\n"
     with LOCK:
         for q in list(SUBSCRIBERS):
-            q.put(msg)
+            try:
+                q.put_nowait(msg)
+            except queue.Full:
+                pass  # slow client: drop this update rather than grow unbounded
 
 
 # ── pgwire feed ─────────────────────────────────────────────────────────────
@@ -75,12 +78,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            q: queue.Queue = queue.Queue()
+            q: queue.Queue = queue.Queue(maxsize=1000)
             with LOCK:
                 SUBSCRIBERS.add(q)
             try:
                 while True:
-                    self.wfile.write(q.get().encode())
+                    try:
+                        msg = q.get(timeout=15)
+                    except queue.Empty:
+                        msg = ": keepalive\n\n"  # heartbeat; also surfaces a dead idle client
+                    self.wfile.write(msg.encode())
                     self.wfile.flush()
             except OSError:
                 # Client went away (browser tab closed, SSE reconnect, reload).

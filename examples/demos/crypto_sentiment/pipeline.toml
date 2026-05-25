@@ -9,14 +9,9 @@
 # Everything below runs in LaminarDB. The dashboard (dashboard/) only draws what
 # these views emit — it computes nothing.
 #
-# Time model: processing-time. `WATERMARK FOR ts AS PROCTIME()` advances each
-# window on the server's wall clock, so 1-minute buckets close on processing
-# time with no event-time skew to tune. `ts` carries each feed's own server
-# timestamp purely so a row lands in the wall-clock minute it arrived in.
-#
-# Delivery: both feeds are non-replayable WebSockets, so the pipeline is
-# at-most-once. That is the right contract for live monitoring; checkpoint
-# interval is tunable. (No exactly-once claim.)
+# Processing-time model: `WATERMARK FOR ts AS PROCTIME()` closes the 1-minute
+# windows on the server's wall clock. Both feeds are non-replayable WebSockets,
+# so delivery is at-most-once (the right contract for live monitoring).
 
 sql = """
 -- ── Sources ──────────────────────────────────────────────────────────────
@@ -116,7 +111,7 @@ SELECT
     price,
     mean_sentiment,
     posts,
-    CORR(price, mean_sentiment) OVER (ORDER BY bucket_start ROWS 30 PRECEDING) AS corr_30
+    CORR(price, mean_sentiment) OVER (ORDER BY bucket_start ROWS 29 PRECEDING) AS corr_30
 FROM sentiment_price_join;
 """
 

@@ -727,13 +727,19 @@ impl LaminarDB {
         {
             use datafusion::datasource::empty::EmptyTable;
             let _ = self.ctx.deregister_table(&name_str);
-            self.ctx
+            if let Err(e) = self
+                .ctx
                 .register_table(&name_str, Arc::new(EmptyTable::new(schema)))
-                .map_err(|e| {
-                    DbError::Pipeline(format!(
-                        "could not register stream '{name_str}' for downstream planning: {e}"
-                    ))
-                })?;
+            {
+                // Roll back the catalog + connector registration so a failed
+                // CREATE STREAM doesn't leave the stream half-registered.
+                self.catalog.drop_stream(&name_str);
+                self.connector_manager.lock().unregister_stream(&name_str);
+                self.subscription_registry.drop_name(&name_str);
+                return Err(DbError::Pipeline(format!(
+                    "could not register stream '{name_str}' for downstream planning: {e}"
+                )));
+            }
         }
 
         // If the pipeline is already running, send via control channel so

@@ -98,8 +98,30 @@ fn sentiment_values(batches: &[RecordBatch]) -> Vec<Option<f64>> {
     out
 }
 
-/// Feed one cycle, then sleep and drain a second cycle so the Ring-1 worker's
-/// results are applied. Returns the drained `query` output.
+/// Drain empty cycles until `query` emits rows or a deadline — polls the async
+/// Ring-1 worker instead of a fixed sleep that flakes under CI load.
+async fn drain_until(graph: &mut OperatorGraph, query: &str) -> Vec<RecordBatch> {
+    let key = Arc::from(query) as Arc<str>;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let results = graph
+            .execute_cycle(&FxHashMap::default(), i64::MAX, None)
+            .await
+            .unwrap();
+        if let Some(out) = results.get(&key) {
+            if out.iter().map(RecordBatch::num_rows).sum::<usize>() > 0 {
+                return out.clone();
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Vec::new();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Feed one cycle, then drain until the Ring-1 worker's results land. Returns the
+/// drained `query` output.
 async fn score_and_drain(
     graph: &mut OperatorGraph,
     source: &str,
@@ -109,15 +131,7 @@ async fn score_and_drain(
     let mut sources = FxHashMap::default();
     sources.insert(Arc::from(source), vec![batch]);
     let _ = graph.execute_cycle(&sources, i64::MAX, None).await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let results = graph
-        .execute_cycle(&FxHashMap::default(), i64::MAX, None)
-        .await
-        .unwrap();
-    results
-        .get(&(Arc::from(query) as Arc<str>))
-        .cloned()
-        .unwrap_or_default()
+    drain_until(graph, query).await
 }
 
 fn build_scoring_graph(runtime: Arc<AiRuntime>) -> OperatorGraph {
@@ -247,16 +261,11 @@ async fn ai_degrades_to_null_on_provider_500() {
         "price feed keeps flowing while the provider is down"
     );
 
-    // Let the 500s exhaust retries + backoff, then drain.
-    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
-    let drained = graph
-        .execute_cycle(&FxHashMap::default(), i64::MAX, None)
-        .await
-        .expect("pipeline survives a provider outage");
-
-    let scored = &drained[&(Arc::from("scored") as Arc<str>)];
+    // Poll until the 500s exhaust retries + backoff and the null score is emitted
+    // (the pipeline must survive the provider outage and still produce a row).
+    let scored = drain_until(&mut graph, "scored").await;
     assert_eq!(
-        sentiment_values(scored),
+        sentiment_values(&scored),
         vec![None],
         "terminal failure → null score"
     );
