@@ -1,7 +1,10 @@
 # Crypto price × Bluesky sentiment — one pipeline, scored and correlated in the
-# engine. Bring it up with the normal server run path:
+# engine. Sentiment runs on a LOCAL ONNX model: no API key, no inference-time
+# network call. ONNX Runtime is loaded dynamically, so point ORT_DYLIB_PATH at an
+# onnxruntime shared library (>= 1.24); the model weights are fetched once on
+# first use and then served from disk. Bring it up with the normal run path:
 #
-#     ANTHROPIC_API_KEY=sk-... laminardb --config pipeline.toml
+#     ORT_DYLIB_PATH=/path/to/onnxruntime.so laminardb --config pipeline.toml
 #
 # Everything below runs in LaminarDB. The dashboard (dashboard/) only draws what
 # these views emit — it computes nothing.
@@ -118,16 +121,16 @@ FROM sentiment_price_join;
 """
 
 # ── AI runtime ───────────────────────────────────────────────────────────
-# Remote sentiment scorer. Bursts of crypto posts are shaped by the token
-# bucket; the API key is read from the named env var, never stored here.
-[ai.providers.anthropic]
-api_key_env = "ANTHROPIC_API_KEY"
-requests_per_second = 10
+# Local ONNX sentiment scorer. The model is a DistilBERT SST-2 classifier; the
+# engine softmaxes its logits to a signed score in [-1, 1] and derives the
+# positive/negative labels from the model's own config.json. Weights download
+# once into cache_dir, then load from disk on every restart.
+[ai.providers.local]
+cache_dir = "./models"
 
 [models.sentiment]
-kind = "remote"
-provider = "anthropic"
-model = "claude-haiku-4-5-20251001"
+kind = "local"
+source = "hf:onnx-community/distilbert-base-uncased-finetuned-sst-2-english-ONNX"
 task = "sentiment"
 
 [ai.defaults]

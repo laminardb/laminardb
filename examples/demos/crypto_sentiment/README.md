@@ -8,9 +8,9 @@ What the engine does, end to end, from one [`pipeline.toml`](pipeline.toml):
 
 - **Two WebSocket sources**, processing-time (wall-clock windows, no event-time
   skew to tune): Binance `btcusdt@trade` and the Bluesky Jetstream.
-- **`ai_sentiment(text) → DOUBLE`** scored inline on a stream, on Ring 1 (never
-  blocking the hot path), batched and deduped through the foyer cache, rate-shaped
-  by a token bucket, every call recorded in `laminar.ai_calls`.
+- **`ai_sentiment(text) → DOUBLE`** scored inline on a stream by a local ONNX
+  model on Ring 1 (never blocking the hot path), batched and deduped through the
+  foyer cache, every call recorded in `laminar.ai_calls`.
 - **1-minute tumbling windows** on each side (price OHLC-ish; mean sentiment + post count).
 - **An MV-to-MV join** on `bucket_start`, emitting as both minutes close.
 - **A rolling `CORR(price, mean_sentiment)` over 30 buckets**, computed in-engine
@@ -25,10 +25,16 @@ correlation all run in the stream engine, correctly, from one config file.
 
 ## Run it
 
-Live (needs network + an Anthropic key for the sentiment scorer):
+Sentiment runs on a **local ONNX model** — no API key, no inference-time network
+call. ONNX Runtime is loaded dynamically, so you supply the shared library
+(>= 1.24) via `ORT_DYLIB_PATH`; the DistilBERT SST-2 weights (~268 MB) download
+once from the Hugging Face CDN into `./models`, then load from disk on restart.
+The positive/negative labels come from the model's own `config.json`, so the
+first cold-cache run scores correctly — no pre-staging, no restart.
 
 ```sh
-export ANTHROPIC_API_KEY=sk-...
+# onnxruntime >= 1.24 (ONNX Runtime release, or your package manager)
+export ORT_DYLIB_PATH=/path/to/libonnxruntime.so   # onnxruntime.dll on Windows
 laminardb --config pipeline.toml
 ```
 
@@ -63,12 +69,13 @@ python dashboard/bridge.py --simulate
 
 ## The degradation demo (worth showing on camera)
 
-Kill the sentiment provider mid-run (revoke the key, or block the endpoint). The
-AI operator emits a **null** score on terminal failure — it never panics and
-never stalls Ring 0. `mean_sentiment` goes null for the affected minutes, the
-`corr_30` readout blanks, **and the price line and the post feed keep flowing.**
-`laminar.ai_calls` records the failures (`status = 'error'`). When the provider
-returns, scoring resumes. Timeout is 60s, with 2 retries on transient errors.
+Make the scorer fail mid-run — point `ORT_DYLIB_PATH` at a missing library, or
+feed a model whose forward pass blows the 60 s inference deadline. The AI
+operator emits a **null** score on terminal failure — it never panics and never
+stalls Ring 0. `mean_sentiment` goes null for the affected minutes, the `corr_30`
+readout blanks, **and the price line and the post feed keep flowing.**
+`laminar.ai_calls` records the failures (`status = 'error'`). When the model is
+reachable again, scoring resumes.
 
 ## Why the UI is trustworthy
 

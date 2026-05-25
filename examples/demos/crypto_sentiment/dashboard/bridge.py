@@ -31,7 +31,9 @@ LOCK = threading.Lock()
 
 def publish(event: str, payload: dict) -> None:
     """Fan a row out to every connected browser, unchanged."""
-    msg = f"event: {event}\ndata: {json.dumps(payload)}\n\n"
+    # default=str renders the views' TIMESTAMP columns (Python datetimes) and any
+    # Decimal as strings — json.dumps rejects both natively.
+    msg = f"event: {event}\ndata: {json.dumps(payload, default=str)}\n\n"
     with LOCK:
         for q in list(SUBSCRIBERS):
             q.put(msg)

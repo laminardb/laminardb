@@ -1,12 +1,12 @@
-//! End-to-end tests for the crypto-sentiment demo, backed by wiremock.
+//! End-to-end tests for the crypto-sentiment pipeline, backed by wiremock.
 //!
 //! wiremock (HTTP) backs the **Anthropic provider**, so these tests drive the
 //! *real* `AnthropicProvider` HTTP path — request build, 500/retry, response
 //! parse — not a stub. The Binance/Jetstream feeds are non-replayable
 //! websockets whose transport is exercised in `laminar-connectors`; here their
-//! traces are hand-built source batches fed through the graph, which is what
-//! the demo's engine composition actually consumes. The analytically-exact
-//! correlation check lives with the operator, in `operator::window_frame::tests`.
+//! traces are hand-built source batches fed through the graph, which is what the
+//! engine composition actually consumes. The analytically-exact correlation
+//! check lives with the operator, in `operator::window_frame::tests`.
 
 use std::sync::Arc;
 
@@ -270,16 +270,14 @@ async fn ai_degrades_to_null_on_provider_500() {
     );
 }
 
-// Item 10: a plain INNER equi-join routes to the `ProcessTimeJoinOperator`
-// (FIR-E), a stateless per-cycle batch join — so each bucket that closes in its
-// own cycle joins correctly, with no watermark. (The cached DataFusion HashJoin
-// could not: it memoized its build side across cycles, so a later bucket never
-// matched.)
+// A plain INNER equi-join is a stateful processing-time join: it buffers each
+// side and matches when the second side arrives, so two windowed views that
+// close the same bucket in DIFFERENT cycles (e.g. when an upstream AI operator's
+// watermark-hold delays one side) still join — with no watermark.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn join_aligns_on_bucket_per_cycle() {
+async fn join_matches_buckets_closing_in_different_cycles() {
     // Two hand-built bucketed streams (the shape price_1m / sentiment_1m emit):
-    // one row per closed minute. The equi-join on the bucket key matches them
-    // per cycle, on processing time, with no watermark dependency.
+    // one row per closed minute, arriving on the bucket key at different times.
     let ctx = laminar_sql::create_session_context();
     laminar_sql::register_streaming_functions(&ctx);
     let mut graph = OperatorGraph::new(ctx);
@@ -335,21 +333,16 @@ async fn join_aligns_on_bucket_per_cycle() {
             .map_or(0, |v| v.iter().map(RecordBatch::num_rows).sum::<usize>())
     };
 
-    // Each minute closes in its own cycle (the demo's pattern): both sides emit
-    // one bucket per cycle. A correct processing-time join matches each.
+    // Cycle 1: only the price side closes bucket 1 (the sentiment side is still
+    // being scored). The join buffers it and emits nothing yet.
     let mut c1 = FxHashMap::default();
     c1.insert(Arc::from("price_b"), vec![price_row(1, 100.0)]);
-    c1.insert(Arc::from("sent_b"), vec![sent_row(1, 0.5)]);
     let r1 = graph.execute_cycle(&c1, i64::MAX, None).await.unwrap();
-    assert_eq!(count(&r1), 1, "cycle 1 joins bucket 1");
+    assert_eq!(count(&r1), 0, "no match until the second side closes");
 
+    // Cycle 2: the sentiment side closes bucket 1 — the buffered price matches.
     let mut c2 = FxHashMap::default();
-    c2.insert(Arc::from("price_b"), vec![price_row(2, 200.0)]);
-    c2.insert(Arc::from("sent_b"), vec![sent_row(2, -0.5)]);
+    c2.insert(Arc::from("sent_b"), vec![sent_row(1, 0.5)]);
     let r2 = graph.execute_cycle(&c2, i64::MAX, None).await.unwrap();
-    assert_eq!(
-        count(&r2),
-        1,
-        "cycle 2 must join bucket 2 (per-cycle, no watermark)"
-    );
+    assert_eq!(count(&r2), 1, "bucket 1 joins across cycles");
 }

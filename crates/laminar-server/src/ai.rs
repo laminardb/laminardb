@@ -4,9 +4,9 @@
 //! Secrets are resolved here, at startup: `api_key_env` names an environment
 //! variable, never the key itself. A provider's transport is its `kind` (or,
 //! when omitted, inferred from the provider name): `anthropic`, `local`, or
-//! otherwise an OpenAI-compatible endpoint (`openai`, Azure, vLLM, …). The
-//! local backend is not wired yet, so local providers/models build into the
-//! registry but cannot be resolved to a runnable backend.
+//! otherwise an OpenAI-compatible endpoint (`openai`, Azure, vLLM, …). A single
+//! `local` provider (its `cache_dir`) backs every local model; remote providers
+//! are keyed by name and matched to each remote model's `provider`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -233,6 +233,29 @@ task = "classify"
 "#,
         );
         assert!(build_ai_runtime(&config).unwrap().is_some());
+    }
+
+    /// The shipped crypto-sentiment demo config parses, validates, and builds a
+    /// runtime whose `sentiment` default resolves to the local backend — the demo
+    /// is wired to a local ONNX model and must stay that way.
+    #[test]
+    fn crypto_sentiment_demo_builds_a_local_runtime() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/demos/crypto_sentiment/pipeline.toml");
+        let config = crate::config::load_config(&path).expect("demo config parses and validates");
+        let runtime = build_ai_runtime(&config)
+            .expect("AI runtime builds")
+            .expect("the demo configures a model");
+        assert_eq!(
+            runtime.registry().default_for(laminar_ai::Task::Sentiment),
+            Some("sentiment"),
+            "ai_sentiment resolves to the configured default"
+        );
+        assert_eq!(
+            runtime.resolve("sentiment").unwrap().kind,
+            laminar_ai::BackendKind::Local,
+            "the demo scores sentiment on a local model"
+        );
     }
 
     #[test]
