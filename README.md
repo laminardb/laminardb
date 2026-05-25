@@ -3,6 +3,7 @@
 [![docs.rs](https://docs.rs/laminar-db/badge.svg)](https://docs.rs/laminar-db)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.95%2B-orange)](https://www.rust-lang.org)
+[![Docker Hub](https://img.shields.io/badge/docker-laminardb%2Flaminardb--server-2496ed?logo=docker&logoColor=white)](https://hub.docker.com/r/laminardb/laminardb-server)
 [![Website](https://img.shields.io/badge/website-laminardb.io-blue)](https://laminardb.io)
 
 # LaminarDB
@@ -84,10 +85,30 @@ conn.close()
 | Mode | How |
 |------|-----|
 | Embedded | `cargo add laminar-db`. Runs in-process. |
-| Standalone | `laminardb` binary. TOML config, REST API, Prometheus metrics, hot reload. |
-| Distributed | `--features delta`. Multi-node scaffolding (gossip, Raft, gRPC). Not production-ready. |
+| Standalone | `laminardb` binary. TOML config, REST API, Postgres wire protocol, Prometheus metrics, hot reload. |
 
-**Prebuilt server binaries** for Linux (gnu/musl), macOS (Intel/Apple Silicon), and Windows are attached to every [GitHub release](https://github.com/laminardb/laminardb/releases/latest) — download, extract, and run `laminardb --config laminardb.toml`. No build toolchain required.
+### Prebuilt binaries
+
+Every [GitHub release](https://github.com/laminardb/laminardb/releases/latest) attaches static `laminardb-server` binaries — no build toolchain required. Targets: **Linux** x86_64/aarch64 (`gnu` and `musl`), **macOS** Intel and Apple Silicon, **Windows** x86_64.
+
+```bash
+# Resolve the latest tag, download, extract, run
+VERSION=$(curl -s https://api.github.com/repos/laminardb/laminardb/releases/latest | grep tag_name | cut -d '"' -f4)
+curl -LO "https://github.com/laminardb/laminardb/releases/download/${VERSION}/laminardb-server-x86_64-unknown-linux-gnu-${VERSION}.tar.gz"
+tar xzf laminardb-server-*.tar.gz
+./laminardb --config laminardb.toml
+```
+
+### Docker
+
+Multi-arch images are published to **Docker Hub** and **GHCR** on every release:
+
+```bash
+docker run -p 8080:8080 laminardb/laminardb-server:latest          # Docker Hub
+docker run -p 8080:8080 ghcr.io/laminardb/laminardb-server:latest  # GHCR
+```
+
+The image ships a default config at `/etc/laminardb/laminardb.toml` (mount your own over it) and persists state in `/var/lib/laminardb`. A full `docker compose` stack — server plus Redpanda, Prometheus, and Grafana — is in [`docker-compose.yml`](docker-compose.yml).
 
 Built on [Apache Arrow](https://arrow.apache.org/) and [DataFusion](https://datafusion.apache.org/). Embedded is the primary target.
 
@@ -104,7 +125,6 @@ Standard SQL with streaming extensions. Built on DataFusion 52.
 | Tumbling | `TUMBLE(ts, INTERVAL '1' MINUTE)` | ✅ |
 | Sliding / Hopping | `HOP(ts, INTERVAL '10' SECOND, INTERVAL '5' SECOND)` | ✅ |
 | Session | `SESSION(ts, INTERVAL '30' SECOND)` | ✅ |
-| Cumulate | `CUMULATE(ts, INTERVAL '1' MINUTE, INTERVAL '1' HOUR)` | 🔧 Parsed, not yet in streaming pipeline |
 
 ```sql
 -- 1-minute OHLC bars
@@ -133,16 +153,31 @@ EMIT ON WINDOW CLOSE;
 |------|-------------|--------|
 | Inner / Left / Right / Full | Standard SQL joins | ✅ |
 | Left Semi / Anti | Existence checks | ✅ |
-| ASOF | Point-in-time lookup (backward, forward, nearest) | ✅ |
+| Interval (stream-stream) | Time-bounded join, `ts BETWEEN other.ts - INTERVAL … AND other.ts + INTERVAL …` | ✅ |
+| ASOF | Point-in-time lookup — backward (`>=`), forward, or `NEAREST` | ✅ |
+| Temporal Probe | Fan each left row out across fixed time offsets (e.g. markout curves) | ✅ |
+| Temporal | Versioned join with time-validity (`FOR SYSTEM_TIME AS OF`) | ✅ |
 | Lookup | Enrichment against reference tables (Postgres, Parquet) | ✅ |
-| Stream-Stream | Time-bounded joins between two streams | ✅ |
-| Temporal | Versioned joins with time-validity semantics (`FOR SYSTEM_TIME AS OF`) | ✅ |
 
 ```sql
 -- ASOF join: latest trade price for each order
 SELECT o.*, t.price AS last_trade_price
 FROM orders o
 ASOF JOIN trades t ON o.symbol = t.symbol AND o.ts >= t.ts;
+
+-- Interval join: match orders to fills within a 10-second window
+SELECT o.order_id, f.fill_price
+FROM orders o
+INNER JOIN fills f
+ON o.order_id = f.order_id
+AND f.ts BETWEEN o.ts AND o.ts + INTERVAL '10' SECOND;
+
+-- Temporal probe join: sample a reference price at fixed horizons after each trade
+SELECT t.symbol, p.offset_ms, mid AS ref_price
+FROM trades t
+TEMPORAL PROBE JOIN prices r
+    ON (symbol) TIMESTAMPS (ts, ts)
+    RANGE FROM 0s TO 30s STEP 5s AS p;
 
 -- Lookup join against external Postgres table
 CREATE LOOKUP TABLE instruments FROM POSTGRES (
@@ -419,7 +454,6 @@ Criterion suites live under `crates/laminar-core/benches/`, `crates/laminar-db/b
 | `otel` | OpenTelemetry OTLP/gRPC source (traces, metrics, logs) |
 | `parquet-lookup` | Parquet lookup source for reference tables |
 | `api` / `ffi` | C FFI layer with Arrow C Data Interface |
-| `delta` | Distributed mode scaffolding (gossip, Raft, gRPC). Not production-ready. |
 
 ---
 

@@ -90,9 +90,9 @@
         "url": "https://laminardb.io",
         "codeRepository": "https://github.com/laminardb/laminardb",
         "programmingLanguage": ["Rust", "Python", "SQL"],
-        "softwareVersion": "0.20.0",
+        "softwareVersion": "0.23.0",
         "softwareRequirements": "Rust 1.85 or newer (for embedded use)",
-        "dateModified": "2026-04-09",
+        "dateModified": "2026-05-25",
         "author": { "@id": "https://laminardb.io/#org" },
         "publisher": { "@id": "https://laminardb.io/#org" },
         "offers": {
@@ -164,15 +164,7 @@
             "name": "Is LaminarDB production-ready?",
             "acceptedAnswer": {
               "@type": "Answer",
-              "text": "LaminarDB is pre-1.0, currently at version 0.20.0. Single-node embedded and standalone server deployments are stable, including exactly-once sinks via barrier checkpoints. Multi-node cluster mode is on the roadmap but not yet functional."
-            }
-          },
-          {
-            "@type": "Question",
-            "name": "How does LaminarDB compare to Apache Flink?",
-            "acceptedAnswer": {
-              "@type": "Answer",
-              "text": "LaminarDB targets low-latency single-node workloads with an embedded or lightweight server deployment. Apache Flink scales horizontally across clusters and has a mature connector ecosystem, but carries a JVM runtime and significant operational overhead. Choose Flink for cluster-scale throughput; choose LaminarDB for sub-microsecond latency and embedded use."
+              "text": "LaminarDB is pre-1.0. Single-node embedded and standalone server deployments are stable, including exactly-once sinks via barrier checkpoints."
             }
           },
           {
@@ -252,14 +244,14 @@
           <path d="M4 32 C12 32,14 30,22 30 C30 30,32 34,36 34" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
         </svg>
         <span>LaminarDB</span>
-        <span class="version-badge" data-version="tag">v0.20.0</span>
+        <span class="version-badge" data-version="tag">v0.23.0</span>
       </a>
 
       <nav class="nav-links" aria-label="Main navigation">
         <a href="#quick-start">Quick Start</a>
         <a href="#connectors">Connectors</a>
         <a href="#ai">AI Functions</a>
-        <a href="#comparison">Comparison</a>
+        <a href="#why-laminar">Why LaminarDB</a>
         <a href="#status">Status</a>
         <a href="#faq">FAQ</a>
         <a href="docs/">Docs</a>
@@ -278,7 +270,7 @@
         <a href="#quick-start">Quick Start</a>
         <a href="#connectors">Connectors</a>
         <a href="#ai">AI Functions</a>
-        <a href="#comparison">Comparison</a>
+        <a href="#why-laminar">Why LaminarDB</a>
         <a href="#status">Status</a>
         <a href="#faq">FAQ</a>
         <a href="docs/">Docs</a>
@@ -387,7 +379,6 @@ db.start().await?;</code></pre>
             <strong>Deployment.</strong>
             Embed it in Rust (<code>cargo add laminar-db</code>) or Python (<code>pip install laminardb</code>).
             Or run the standalone <code>laminardb</code> binary with Kafka, CDC, and Delta Lake connectors.
-            Cluster mode is on the roadmap but not yet functional.
           </p>
           <p>
             It is not a message broker and it is not a general-purpose database.
@@ -448,6 +439,7 @@ db.start().await?;</code></pre>
           <div class="code-header">
             <div class="code-tabs">
               <button class="code-tab active" data-tab="qs-rust">Rust Library</button>
+              <button class="code-tab" data-tab="qs-python">Python</button>
               <button class="code-tab" data-tab="qs-sql">SQL Examples</button>
               <button class="code-tab" data-tab="qs-server">Standalone Server</button>
               <button class="code-tab" data-tab="qs-kafka">Kafka Pipeline</button>
@@ -459,7 +451,7 @@ db.start().await?;</code></pre>
           </div>
           <div class="code-body">
             <div class="tab-panel active" id="qs-rust">
-              <pre><code class="language-rust">// Cargo.toml: laminar-db = "0.20", tokio = { version = "1", features = ["full"] }
+              <pre><code class="language-rust">// Cargo.toml: laminar-db = "0.23", tokio = { version = "1", features = ["full"] }
 
 use laminar_db::LaminarDB;
 
@@ -494,6 +486,35 @@ async fn main() -&gt; anyhow::Result&lt;()&gt; {
 
     Ok(())
 }</code></pre>
+            </div>
+
+            <div class="tab-panel" id="qs-python">
+              <pre><code class="language-python"># pip install laminardb
+
+import laminardb
+
+conn = laminardb.open(":memory:")
+
+conn.execute("""
+    CREATE SOURCE events (key VARCHAR, value DOUBLE, ts TIMESTAMP)
+""")
+
+conn.execute("""
+    CREATE STREAM summary AS
+    SELECT key, COUNT(*) AS total, AVG(value) AS avg
+    FROM events
+    GROUP BY key, TUMBLE(ts, INTERVAL '1' MINUTE)
+    EMIT ON WINDOW CLOSE
+""")
+
+# Push events in, then query results back
+conn.insert("events", [
+    {"key": "sensor-1", "value": 42.0, "ts": 1700000000000},
+    {"key": "sensor-1", "value": 44.0, "ts": 1700000001000},
+])
+
+conn.sql("SELECT * FROM summary").show()
+conn.close()</code></pre>
             </div>
 
             <div class="tab-panel" id="qs-sql">
@@ -554,10 +575,12 @@ curl -LO "https://github.com/laminardb/laminardb/releases/download/${VERSION}/la
 # Option 2: Build from source
 cargo install laminar-server
 
-# Option 3: Docker
-docker compose up
+# Option 3: Docker (multi-arch, on Docker Hub and GHCR)
+docker run -p 8080:8080 laminardb/laminardb-server:latest
+# or: docker run -p 8080:8080 ghcr.io/laminardb/laminardb-server:latest
+# full stack (server + Redpanda + Prometheus + Grafana): docker compose up
 
-# Run
+# Run the binary
 ./laminardb --config laminardb.toml</code></pre>
             </div>
 
@@ -723,7 +746,7 @@ CREATE SINK lake INTO DELTA_LAKE (
     <!-- AI Functions -->
     <section id="ai">
       <div class="container">
-        <h2>AI Functions <span class="label-planned" style="vertical-align: middle; margin-left: 8px;">v0.1 · PR #395</span></h2>
+        <h2>AI Functions</h2>
         <p class="section-desc">
           Call AI models inline in streaming SQL. Each function names a model resolved from a
           registry; whether it runs against a remote LLM over HTTP or a local ONNX encoder
@@ -885,7 +908,9 @@ FROM documents;</code></pre>
             <p>
               <a href="https://github.com/laminardb/laminardb/releases/latest" target="_blank" rel="noopener">Download pre-compiled binaries</a>
               for Linux (x86_64, aarch64, musl), macOS (x86_64, Apple Silicon), and Windows.
-              Or <code>cargo install laminar-server</code>. Docker image and Helm chart available.
+              Or <code>cargo install laminar-server</code>, or pull the
+              <a href="https://hub.docker.com/r/laminardb/laminardb-server" target="_blank" rel="noopener">Docker image</a>
+              (<code>docker run -p 8080:8080 laminardb/laminardb-server</code>). Helm chart available.
             </p>
             <p>
               TOML configuration with <code>${ENV_VAR}</code> substitution.
@@ -893,156 +918,65 @@ FROM documents;</code></pre>
             </p>
             <p>Typical uses: CDC pipelines, stream-to-lakehouse, event routing.</p>
           </div>
-          <div class="deploy-card">
-            <h3>Cluster</h3>
-            <span class="label-planned">Planned</span>
-            <p>
-              Multi-node deployment is on the roadmap and not yet functional.
-              The server has scaffolding for cluster mode; inter-node coordination
-              and state replication are still being designed.
-            </p>
-            <p><a href="https://github.com/laminardb/laminardb/issues" target="_blank" rel="noopener">Open issues for cluster work</a></p>
-          </div>
         </div>
       </div>
     </section>
 
-    <!-- Comparison -->
-    <section id="comparison">
+    <!-- Why LaminarDB -->
+    <section id="why-laminar">
       <div class="container">
-        <h2>How it compares</h2>
+        <h2>Why LaminarDB</h2>
         <p class="section-desc">
-          LaminarDB targets low-latency, single-node workloads. Cluster mode is on the roadmap.
+          One engine for streaming SQL — from an embedded library to a standalone server.
         </p>
 
-        <div class="comparison-wrapper">
-          <table class="comparison-table">
-            <thead>
-              <tr>
-                <th></th>
-                <th class="hl">LaminarDB</th>
-                <th>Apache Flink</th>
-                <th>Kafka Streams</th>
-                <th>Arroyo</th>
-                <th>kdb+</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td>Type</td>
-                <td class="hl">SQL engine</td>
-                <td>Distributed framework</td>
-                <td>Stream library (JVM)</td>
-                <td>Distributed engine</td>
-                <td>Timeseries DB</td>
-              </tr>
-              <tr>
-                <td>Language</td>
-                <td class="hl">Rust + Python</td>
-                <td>Java / Scala</td>
-                <td>Java</td>
-                <td>Rust</td>
-                <td>q/k (proprietary)</td>
-              </tr>
-              <tr>
-                <td>SQL</td>
-                <td class="hl">DataFusion</td>
-                <td>Flink SQL</td>
-                <td>None</td>
-                <td>DataFusion</td>
-                <td>q language</td>
-              </tr>
-              <tr>
-                <td>Deployment</td>
-                <td class="hl">Embedded, server, cluster (planned)</td>
-                <td class="win">Cluster (YARN/K8s)</td>
-                <td>In-app (JVM)</td>
-                <td class="win">Kubernetes</td>
-                <td>Single process</td>
-              </tr>
-              <tr>
-                <td>Latency target</td>
-                <td class="hl">10&ndash;16ns state lookup</td>
-                <td>~10ms</td>
-                <td>~1ms</td>
-                <td>~10ms</td>
-                <td>&lt;1&micro;s</td>
-              </tr>
-              <tr>
-                <td>Horizontal scale</td>
-                <td class="hl">No (single node)</td>
-                <td class="win">Yes</td>
-                <td class="win">Via Kafka partitions</td>
-                <td class="win">Yes</td>
-                <td>No</td>
-              </tr>
-              <tr>
-                <td>Exactly-once</td>
-                <td class="hl">Barrier checkpoints</td>
-                <td>Barrier checkpoints</td>
-                <td>Kafka transactions</td>
-                <td>Barrier checkpoints</td>
-                <td>N/A</td>
-              </tr>
-              <tr>
-                <td>Connectors</td>
-                <td class="hl">Kafka, CDC, Delta, Iceberg, OTel, WS, Files</td>
-                <td class="win">100+</td>
-                <td>Kafka only</td>
-                <td class="win">15+</td>
-                <td>Custom</td>
-              </tr>
-              <tr>
-                <td>Ops overhead</td>
-                <td class="hl">None (lib) / low</td>
-                <td>High (cluster, JVM)</td>
-                <td>Low</td>
-                <td>Medium (K8s)</td>
-                <td>Low</td>
-              </tr>
-              <tr>
-                <td>License</td>
-                <td class="hl">Apache 2.0</td>
-                <td>Apache 2.0</td>
-                <td>Apache 2.0</td>
-                <td>Apache 2.0</td>
-                <td>Proprietary</td>
-              </tr>
-              <tr>
-                <td>Maturity</td>
-                <td class="hl">Pre-1.0 (<span data-version="tag">v0.20.0</span>)</td>
-                <td class="win">Production (10+ yrs)</td>
-                <td class="win">Production (8+ yrs)</td>
-                <td class="win">Production (~2 yrs)</td>
-                <td class="win">Production (30+ yrs)</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-
-        <p class="comparison-note">
-          Bold cells mark a clear competitor advantage.
-          LaminarDB leads on latency and deployment flexibility, and trails on maturity,
-          horizontal scale, and ecosystem breadth.
-        </p>
-
-        <h3 style="margin-bottom: 1rem;">When to choose something else</h3>
-        <div class="alternatives">
-          <div class="alt-card">
-            <h4>Apache Flink</h4>
-            <p>Pick Flink when you need cluster-scale throughput, a mature connector ecosystem, or complex event processing. The trade-off is a heavyweight JVM footprint and significant operational overhead.</p>
+        <div class="deploy-grid">
+          <div class="deploy-card">
+            <h3>Microsecond latency</h3>
+            <p>
+              A dedicated compute thread with zero allocations on the data path.
+              State lookups land in 10&ndash;16ns, and a single core sustains over a million
+              events per second.
+            </p>
           </div>
-          <div class="alt-card">
-            <h4>Kafka Streams</h4>
-            <p>Pick Kafka Streams for strict Kafka-in / Kafka-out workloads inside an existing JVM service. It is the simplest fit in that niche, though it has no SQL layer.</p>
+          <div class="deploy-card">
+            <h3>Starts embedded</h3>
+            <p>
+              <code>cargo add laminar-db</code> or <code>pip install laminardb</code> and the
+              engine runs in your process. No JVM, no broker, nothing to operate.
+              Move to the standalone server when you need it.
+            </p>
           </div>
-          <div class="alt-card">
-            <h4>Arroyo</h4>
-            <p>Distributed streaming in Rust with a web UI, built on Kubernetes. Shares the DataFusion SQL foundation with LaminarDB and solves the cluster-scale side of the problem.</p>
+          <div class="deploy-card">
+            <h3>Real streaming SQL</h3>
+            <p>
+              Tumbling, sliding, hopping, and session windows; ASOF, temporal, interval,
+              and lookup joins; <code>EMIT</code> control and watermarks — built on Apache
+              Arrow and DataFusion.
+            </p>
           </div>
-          <div class="alt-card">
-            <h4>kdb+</h4>
-            <p>Finance teams with q/k expertise get sub-microsecond timeseries analytics and thirty years of production track record. Licensing is the main barrier.</p>
+          <div class="deploy-card">
+            <h3>Exactly-once</h3>
+            <p>
+              Barrier checkpoints with two-phase commit. State and source offsets persist to
+              object storage, and recovery restores both together.
+            </p>
+          </div>
+          <div class="deploy-card">
+            <h3>Connects to everything</h3>
+            <p>
+              Kafka, PostgreSQL / MySQL / MongoDB CDC, Delta Lake, Iceberg, OpenTelemetry,
+              WebSocket, and files. Every connector is feature-gated, so you compile only
+              what you use.
+            </p>
+          </div>
+          <div class="deploy-card">
+            <h3>AI in the query</h3>
+            <p>
+              Call models inline in streaming SQL with <code>ai_classify</code>,
+              <code>ai_sentiment</code>, and <code>ai_embed</code> — backed by a remote LLM or a
+              local ONNX encoder, off the hot path.
+            </p>
           </div>
         </div>
       </div>
@@ -1107,39 +1041,33 @@ FROM documents;</code></pre>
     <!-- Status -->
     <section id="status">
       <div class="container">
-        <h2>Status</h2>
+        <h2>What works today</h2>
         <p class="section-desc">
-          Current version: <strong data-version="bare">0.20.0</strong> (pre-1.0).
-          <a href="https://github.com/laminardb/laminardb/releases" target="_blank" rel="noopener">Releases</a> &middot;
-          <a href="https://github.com/laminardb/laminardb/issues" target="_blank" rel="noopener">Issues</a>
+          Current version: <strong data-version="bare">0.23.0</strong> (pre-1.0).
+          <a href="https://github.com/laminardb/laminardb/releases" target="_blank" rel="noopener">Releases</a>
         </p>
 
         <div class="status-grid">
           <div class="status-col stable">
-            <h3>Stable</h3>
+            <h3>Engine &amp; SQL</h3>
             <ul>
               <li>Streaming engine (StreamingCoordinator, operator graph, state stores)</li>
               <li>Window functions (tumbling, sliding/hopping, session)</li>
               <li>Joins (interval, ASOF, temporal, temporal probe, lookup, semi/anti)</li>
-              <li>Connectors: Kafka, PG/MySQL/MongoDB CDC, Delta Lake, Iceberg, OTel, WebSocket, Files</li>
+              <li>Materialized view result storage and queryability</li>
+              <li>AI functions in streaming SQL (remote LLM / local ONNX)</li>
               <li>Barrier-based checkpointing with 2PC exactly-once</li>
+            </ul>
+          </div>
+          <div class="status-col stable">
+            <h3>Connectivity &amp; operations</h3>
+            <ul>
+              <li>Connectors: Kafka, PG/MySQL/MongoDB CDC, Delta Lake, Iceberg, OTel, WebSocket, Files</li>
               <li>Object store checkpoints (file, S3, Azure, GCS)</li>
               <li>Standalone server with REST API, Prometheus metrics, hot-reload</li>
+              <li>SUBSCRIBE over the PostgreSQL wire protocol (psql, psycopg, JDBC)</li>
               <li>Push-based WebSocket stream subscriptions</li>
               <li>Docker (multi-arch) and Helm chart deployment</li>
-            </ul>
-          </div>
-          <div class="status-col experimental">
-            <h3>Experimental</h3>
-            <ul>
-              <li>Materialized view result storage and queryability</li>
-            </ul>
-          </div>
-          <div class="status-col unimplemented">
-            <h3>Not yet implemented</h3>
-            <ul>
-              <li>Cluster / multi-node deployment (planned)</li>
-              <li>PostgreSQL wire protocol (planned)</li>
             </ul>
           </div>
         </div>
@@ -1165,11 +1093,7 @@ FROM documents;</code></pre>
           </details>
           <details>
             <summary>Is LaminarDB production-ready?</summary>
-            <p>LaminarDB is pre-1.0, currently at version 0.20.0. Single-node embedded and standalone server deployments are stable, including exactly-once sinks via barrier checkpoints. Multi-node cluster mode is on the roadmap but not yet functional.</p>
-          </details>
-          <details>
-            <summary>How does LaminarDB compare to Apache Flink?</summary>
-            <p>LaminarDB targets low-latency single-node workloads with an embedded or lightweight server deployment. Apache Flink scales horizontally across clusters and has a mature connector ecosystem, but carries a JVM runtime and significant operational overhead. Choose Flink for cluster-scale throughput; choose LaminarDB for sub-microsecond latency and embedded use.</p>
+            <p>LaminarDB is pre-1.0. Single-node embedded and standalone server deployments are stable, including exactly-once sinks via barrier checkpoints.</p>
           </details>
           <details>
             <summary>Can I use LaminarDB from Python?</summary>
@@ -1229,7 +1153,7 @@ FROM documents;</code></pre>
         <div class="footer-left">
           LaminarDB &middot;
           <a href="https://github.com/laminardb/laminardb/blob/main/LICENSE" target="_blank" rel="noopener">Apache 2.0</a> &middot;
-          <span data-version="tag">v0.20.0</span>
+          <span data-version="tag">v0.23.0</span>
         </div>
         <div class="footer-links">
           <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
@@ -1246,6 +1170,7 @@ FROM documents;</code></pre>
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-rust.min.js"></script>
   <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
   <script defer src="js/main.js"></script>
   
   
