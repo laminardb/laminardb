@@ -8,9 +8,9 @@ What the engine does, end to end, from one [`pipeline.toml`](pipeline.toml):
 
 - **Two WebSocket sources**, processing-time (wall-clock windows, no event-time
   skew to tune): Binance `btcusdt@trade` and the Bluesky Jetstream.
-- **`ai_sentiment(text) → DOUBLE`** scored inline on a stream by a local ONNX
-  model on Ring 1 (never blocking the hot path), batched and deduped through the
-  foyer cache, every call recorded in `laminar.ai_calls`.
+- **`ai_sentiment(text) → DOUBLE`** scored inline on a stream by **FinBERT**, a
+  finance-tuned BERT running locally (ONNX) on Ring 1 (never blocking the hot
+  path), batched and deduped through the foyer cache, every call in `laminar.ai_calls`.
 - **1-minute tumbling windows** on each side (price OHLC-ish; mean sentiment + post count).
 - **An MV-to-MV join** on `bucket_start`, emitting as both minutes close.
 - **A rolling `CORR(price, mean_sentiment)` over 30 buckets**, computed in-engine
@@ -25,12 +25,12 @@ correlation all run in the stream engine, correctly, from one config file.
 
 ## Run it
 
-Sentiment runs on a **local ONNX model** — no API key, no inference-time network
-call. ONNX Runtime is loaded dynamically, so you supply the shared library
-(>= 1.24) via `ORT_DYLIB_PATH`; the DistilBERT SST-2 weights (~268 MB) download
-once from the Hugging Face CDN into `./models`, then load from disk on restart.
-The positive/negative labels come from the model's own `config.json`, so the
-first cold-cache run scores correctly — no pre-staging, no restart.
+Sentiment runs on a **local ONNX model** (FinBERT) — no API key, no inference-time
+network call. ONNX Runtime is loaded dynamically, so you supply the shared library
+(>= 1.24) via `ORT_DYLIB_PATH`; the FinBERT weights (~440 MB) download once from
+the Hugging Face CDN into `./models`, then load from disk on restart. The labels
+come from the model's own `config.json`, so the first cold-cache run scores
+correctly — no pre-staging, no restart.
 
 ```sh
 # onnxruntime >= 1.24 (ONNX Runtime release, or your package manager)

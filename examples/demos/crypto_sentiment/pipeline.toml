@@ -121,16 +121,16 @@ FROM sentiment_price_join;
 """
 
 # ── AI runtime ───────────────────────────────────────────────────────────
-# Local ONNX sentiment scorer. The model is a DistilBERT SST-2 classifier; the
-# engine softmaxes its logits to a signed score in [-1, 1] and derives the
-# positive/negative labels from the model's own config.json. Weights download
-# once into cache_dir, then load from disk on every restart.
+# Local ONNX sentiment scorer. FinBERT — BERT fine-tuned on financial text —
+# classifies positive / negative / neutral; the engine softmaxes its logits to a
+# signed score in [-1, 1], reading the labels from the model's own config.json.
+# Weights download once into cache_dir, then load from disk on every restart.
 [ai.providers.local]
 cache_dir = "./models"
 
 [models.sentiment]
 kind = "local"
-source = "hf:onnx-community/distilbert-base-uncased-finetuned-sst-2-english-ONNX"
+source = "hf:Xenova/finbert"
 task = "sentiment"
 
 [ai.defaults]
