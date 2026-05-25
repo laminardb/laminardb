@@ -1,23 +1,24 @@
-//! Sliding-window covariance/correlation operator (moment-carrying).
+//! Sliding-window covariance/correlation operator.
 //!
 //! Streams the bivariate statistics over a `ROWS N PRECEDING` frame — `CORR`,
 //! `COVAR_SAMP`, `COVAR_POP` — that the batch engine can't slide: `DataFusion`'s
 //! accumulators for them have no `retract_batch`, so they are rejected as
-//! sliding-window accumulators. All three derive from the *same* carried moments
-//! `(n, Σx, Σy, Σxx, Σyy, Σxy)`; only the final formula differs. The operator
-//! recomputes them per window over a bounded retained buffer, appends the result
-//! column, and re-projects. (`AVG`/`SUM`/… over frames are a separate concern —
-//! `DataFusion` slides those itself.)
+//! sliding-window accumulators. All three derive from the *same* window moments;
+//! only the final formula differs. The operator recomputes them per window over a
+//! bounded retained buffer — two-pass and mean-centered, which stays accurate for
+//! large-magnitude series where the textbook `nΣxy − ΣxΣy` form loses precision to
+//! cancellation — appends the result column, and re-projects. (`AVG`/`SUM`/… over
+//! frames are a separate concern — `DataFusion` slides those itself.)
 //!
-//! v0.1 (enforced by `plan_frame_query`): one bivariate call over a single
-//! ordered series (no `PARTITION BY`), preceding bounds only. Rows are assumed to
+//! Supports one bivariate call over a single ordered series (no `PARTITION BY`),
+//! preceding bounds only (enforced by `plan_frame_query`). Rows are assumed to
 //! arrive in `ORDER BY` order (true for processing-time buckets), so the buffer
 //! is already ordered and the new arrivals are its tail.
 
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Float64Array, Float64Builder, RecordBatch};
-use arrow::compute::concat_batches;
+use arrow::compute::{cast, concat_batches};
 use arrow::datatypes::{DataType, Field, Schema};
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
@@ -41,17 +42,16 @@ pub(crate) enum MomentFn {
 }
 
 impl MomentFn {
-    /// Finalize the statistic from a window's carried moments, or `None` when the
-    /// frame has too few complete pairs (or zero variance, for `CORR`).
-    fn finalize(self, n: f64, sx: f64, sy: f64, sxx: f64, syy: f64, sxy: f64) -> Option<f64> {
-        let cov_num = n * sxy - sx * sy; // = n² · covariance
+    /// Finalize from a window's centered moments — `cxx = Σ(x−x̄)²`, `cyy = Σ(y−ȳ)²`,
+    /// `cxy = Σ(x−x̄)(y−ȳ)` over `n` complete pairs. `None` when the frame has too
+    /// few pairs (or zero variance, for `CORR`).
+    fn finalize(self, n: f64, cxx: f64, cyy: f64, cxy: f64) -> Option<f64> {
         match self {
             MomentFn::Corr => {
-                let (den_x, den_y) = (n * sxx - sx * sx, n * syy - sy * sy);
-                (n >= 2.0 && den_x > 0.0 && den_y > 0.0).then(|| cov_num / (den_x * den_y).sqrt())
+                (n >= 2.0 && cxx > 0.0 && cyy > 0.0).then(|| cxy / (cxx * cyy).sqrt())
             }
-            MomentFn::CovarSamp => (n >= 2.0).then(|| cov_num / (n * (n - 1.0))),
-            MomentFn::CovarPop => (n >= 1.0).then(|| cov_num / (n * n)),
+            MomentFn::CovarSamp => (n >= 2.0).then(|| cxy / (n - 1.0)),
+            MomentFn::CovarPop => (n >= 1.0).then(|| cxy / n),
         }
     }
 }
@@ -100,33 +100,52 @@ impl WindowFrameOperator {
         }
     }
 
-    fn f64_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Float64Array, DbError> {
-        batch
-            .column_by_name(name)
-            .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
-            .ok_or_else(|| {
-                DbError::InvalidOperation(format!(
-                    "window frame: argument '{name}' must be a non-null-typed Float64 column"
-                ))
-            })
+    /// The named column coerced to `Float64`. `CORR`/`COVAR` operate on any
+    /// numeric input (as they do in `DataFusion`, which we bypass), so an integer
+    /// or `Float32` column is cast up; only a genuinely non-numeric column errors.
+    fn f64_column(batch: &RecordBatch, name: &str) -> Result<Float64Array, DbError> {
+        let column = batch.column_by_name(name).ok_or_else(|| {
+            DbError::InvalidOperation(format!("window frame: argument '{name}' not found"))
+        })?;
+        let casted = cast(column, &DataType::Float64).map_err(|e| {
+            DbError::InvalidOperation(format!(
+                "window frame: argument '{name}' is not numeric: {e}"
+            ))
+        })?;
+        Ok(casted
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("cast to Float64 yields a Float64Array")
+            .clone())
     }
 
-    /// The statistic over the window `lo..=hi` of `x`/`y`, from carried moments.
+    /// The statistic over the window `lo..=hi` of `x`/`y`. Two passes — means,
+    /// then centered moments — so the result stays precise for large magnitudes.
     fn stat_window(&self, x: &Float64Array, y: &Float64Array, lo: usize, hi: usize) -> Option<f64> {
-        let (mut n, mut sx, mut sy, mut sxx, mut syy, mut sxy) = (0.0_f64, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let (mut n, mut sx, mut sy) = (0.0_f64, 0.0, 0.0);
         for i in lo..=hi {
             if x.is_null(i) || y.is_null(i) {
                 continue;
             }
-            let (xi, yi) = (x.value(i), y.value(i));
             n += 1.0;
-            sx += xi;
-            sy += yi;
-            sxx += xi * xi;
-            syy += yi * yi;
-            sxy += xi * yi;
+            sx += x.value(i);
+            sy += y.value(i);
         }
-        self.config.func.finalize(n, sx, sy, sxx, syy, sxy)
+        if n < 1.0 {
+            return None;
+        }
+        let (mx, my) = (sx / n, sy / n);
+        let (mut cxx, mut cyy, mut cxy) = (0.0_f64, 0.0, 0.0);
+        for i in lo..=hi {
+            if x.is_null(i) || y.is_null(i) {
+                continue;
+            }
+            let (dx, dy) = (x.value(i) - mx, y.value(i) - my);
+            cxx += dx * dx;
+            cyy += dy * dy;
+            cxy += dx * dy;
+        }
+        self.config.func.finalize(n, cxx, cyy, cxy)
     }
 
     /// Append the per-new-row statistic column to the `new` batch.
@@ -140,7 +159,7 @@ impl WindowFrameOperator {
         for j in 0..k {
             let hi = first_new + j;
             let lo = hi.saturating_sub(self.config.retain);
-            match self.stat_window(x, y, lo, hi) {
+            match self.stat_window(&x, &y, lo, hi) {
                 Some(v) => builder.append_value(v),
                 None => builder.append_null(),
             }

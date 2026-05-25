@@ -2040,7 +2040,7 @@ mod tests {
 
     /// End-to-end through the real graph: `ai_sentiment` lifts to the AI
     /// operator, the worker scores on Ring 1, and the emitted column is a
-    /// numeric `Float64` (not a label) — the demo's hero path.
+    /// numeric `Float64`, not a label.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ai_sentiment_emits_a_double_score() {
         use laminar_ai::{

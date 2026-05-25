@@ -1077,9 +1077,9 @@ pub(crate) struct FrameQueryPlan {
     pub retain: usize,
 }
 
-/// Plan a query for window-frame routing. Returns `Some` only for the v0.1
-/// supported shape: a single (un-joined) source, exactly one bivariate moment
-/// call (`CORR`/`COVAR_SAMP`/`COVAR_POP`) `OVER (ORDER BY … ROWS N PRECEDING) AS
+/// Plan a query for window-frame routing. Returns `Some` only for the supported
+/// shape: a single (un-joined) source, exactly one bivariate moment call
+/// (`CORR`/`COVAR_SAMP`/`COVAR_POP`) `OVER (ORDER BY … ROWS N PRECEDING) AS
 /// alias`, no `PARTITION BY`, no `FOLLOWING` bound (streaming cannot buffer the
 /// future). Anything else returns `None` (routed normally).
 pub(crate) fn plan_frame_query(sql: &str) -> Option<FrameQueryPlan> {
@@ -1121,7 +1121,7 @@ pub(crate) fn plan_frame_query(sql: &str) -> Option<FrameQueryPlan> {
         };
         if let Some((func, x, y)) = moment_call(expr) {
             if found.is_some() {
-                return None; // more than one frame call — unsupported in v0.1
+                return None; // only one frame call is supported
             }
             found = Some((index, func, x, y, alias.value.clone()));
         }
@@ -1226,7 +1226,7 @@ mod frame_plan_tests {
 
     #[test]
     fn rejects_partition_by_and_non_frame_queries() {
-        // PARTITION BY is out of v0.1 scope.
+        // PARTITION BY is not supported.
         assert!(plan_frame_query(
             "SELECT CORR(a, b) OVER (PARTITION BY g ORDER BY t ROWS 5 PRECEDING) AS c FROM s"
         )
@@ -1656,8 +1656,8 @@ pub(crate) fn detect_processtime_join(sql: &str) -> Option<StreamJoinDetection> 
     };
     let multi = analyze_joins(select).ok()??;
 
-    // v0.1: exactly one INNER equi-join step, no temporal predicate, distinct
-    // tables (self-joins would collide on the suffixed output schema).
+    // Exactly one INNER equi-join step, no temporal predicate, distinct tables
+    // (self-joins would collide on the suffixed output schema).
     if multi.joins.len() != 1 {
         return None;
     }
