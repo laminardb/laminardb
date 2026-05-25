@@ -11,9 +11,10 @@
 //! `onnx/model.onnx` + `tokenizer.json` (+ optional `config.json` for labels):
 //! `hf:org/repo` → `<cache_dir>/org/repo`, `file://<path>` or a bare path used
 //! as-is. A missing `hf:` repo is downloaded from the Hugging Face CDN on first
-//! use (public repos only). Note: classifier labels are read from `config.json`
-//! at startup, so a model that downloads lazily must instead carry an explicit
-//! `labels` argument until it is cached.
+//! use (public repos only). Classifier labels come from the model's own
+//! `config.json` `id2label`; [`LocalProvider::intrinsic_labels`] resolves them on
+//! demand, so a model that downloads lazily scores correctly once it is cached —
+//! no restart, no externally supplied label list.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -45,6 +46,8 @@ struct LoadedModel {
     session: Mutex<Session>,
     tokenizer: tokenizers::Tokenizer,
     input_names: Vec<String>,
+    /// `config.json` `id2label`, read once at load; empty if absent.
+    labels: Vec<String>,
 }
 
 /// Local ONNX provider, backed by a model cache directory.
@@ -246,6 +249,17 @@ impl InferenceProvider for LocalProvider {
     fn name(&self) -> &'static str {
         "local"
     }
+
+    fn intrinsic_labels(&self, model: &str) -> Option<Vec<String>> {
+        // Served from the loaded model (read once at load); only an unloaded model
+        // — i.e. before its first inference — touches disk here.
+        let labels = self
+            .loaded
+            .lock()
+            .get(model)
+            .map_or_else(|| load_labels(&self.cache_dir, model), |m| m.labels.clone());
+        (!labels.is_empty()).then_some(labels)
+    }
 }
 
 /// The model graph: the `onnx/model.onnx` that Optimum / transformers.js exports
@@ -279,10 +293,15 @@ fn load_model(dir: &Path) -> Result<LoadedModel, ProviderError> {
         .collect();
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| ProviderError::Transport(format!("load tokenizer: {e}")))?;
+    let labels = std::fs::read_to_string(dir.join("config.json"))
+        .ok()
+        .map(|text| parse_id2label(&text))
+        .unwrap_or_default();
     Ok(LoadedModel {
         session: Mutex::new(session),
         tokenizer,
         input_names,
+        labels,
     })
 }
 
@@ -391,6 +410,28 @@ mod tests {
             vec!["negative", "neutral", "positive"]
         );
         assert!(parse_id2label("{}").is_empty());
+    }
+
+    #[test]
+    fn intrinsic_labels_read_from_a_cached_models_config() {
+        let cache = tempfile::tempdir().expect("tempdir");
+        let provider = LocalProvider::new(cache.path());
+        let source = "hf:org/repo";
+
+        // Absent until the model (its config.json) is on disk.
+        assert!(provider.intrinsic_labels(source).is_none());
+
+        let dir = model_dir(cache.path(), source);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"id2label": {"0": "NEGATIVE", "1": "POSITIVE"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            provider.intrinsic_labels(source),
+            Some(vec!["NEGATIVE".into(), "POSITIVE".into()])
+        );
     }
 
     #[test]

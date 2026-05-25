@@ -142,7 +142,14 @@ async fn run_request(
         .await
         .map_err(|e| e.to_string())?;
     let usage = response.usage;
-    let parsed = parse_response(ctx.task, ctx.kind, response.outputs, ctx.labels.as_deref())
+    // Labels known at startup win; otherwise fall back to the backend's intrinsic
+    // labels, now resolvable since the call above ensured the model is on disk —
+    // this is what lets a lazily downloaded local classifier score.
+    let labels = ctx
+        .labels
+        .clone()
+        .or_else(|| ctx.provider.intrinsic_labels(&ctx.model));
+    let parsed = parse_response(ctx.task, ctx.kind, response.outputs, labels.as_deref())
         .map_err(|e| e.to_string())?;
     if parsed.len() != expected_rows {
         return Err(format!(

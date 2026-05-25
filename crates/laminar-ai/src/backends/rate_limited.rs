@@ -48,6 +48,10 @@ impl InferenceProvider for RateLimitedProvider {
     fn name(&self) -> &'static str {
         self.inner.name()
     }
+
+    fn intrinsic_labels(&self, model: &str) -> Option<Vec<String>> {
+        self.inner.intrinsic_labels(model)
+    }
 }
 
 #[cfg(test)]

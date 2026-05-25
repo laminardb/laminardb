@@ -123,6 +123,15 @@ pub trait InferenceProvider: Send + Sync {
     /// Stable backend-kind identity for logging and the `laminar.ai_calls`
     /// log (e.g. `anthropic`, `openai`, `local`). Constant per implementor.
     fn name(&self) -> &'static str;
+
+    /// Classifier labels intrinsic to a model, discovered from its own metadata.
+    /// Returns `None` for backends that have none (remote providers, embedding
+    /// models). A local classifier returns its `config.json` `id2label` once the
+    /// model is on disk — the seam that lets a lazily downloaded classifier score
+    /// without the labels having been known at startup. The default is `None`.
+    fn intrinsic_labels(&self, _model: &str) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// Errors a provider can return for a batch call.
