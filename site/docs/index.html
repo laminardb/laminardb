@@ -29,7 +29,7 @@
         "description": "Complete configuration reference for the LaminarDB standalone server: TOML fields, REST API endpoints, connector properties, checkpoint configuration, hot reload, Prometheus metrics, and join semantics. Every field verified against the source code.",
         "url": "https://laminardb.io/docs/",
         "inLanguage": "en",
-        "dateModified": "2026-04-09",
+        "dateModified": "2026-05-25",
         "isPartOf": { "@id": "https://laminardb.io/#website" },
         "about": { "@id": "https://laminardb.io/#software" },
         "author": { "@id": "https://laminardb.io/#org" },
@@ -428,7 +428,7 @@
           <path d="M4 32 C12 32,14 30,22 30 C30 30,32 34,36 34" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
         </svg>
         <span>LaminarDB</span>
-        <span class="version-badge" data-version="tag">v0.20.0</span>
+        <span class="version-badge" data-version="tag">v0.23.0</span>
       </a>
 
       <nav class="nav-links" aria-label="Main navigation">
@@ -504,23 +504,25 @@
         The <code>laminardb</code> binary reads a TOML configuration file, constructs streaming pipelines, and serves a REST API with Prometheus metrics.
         Every field on this page is verified against
         <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs</a>.
-        Last updated: 9 April 2026.
+        Last updated: 25 May 2026.
       </p>
 
       <h3>Install</h3>
       <div class="toml-block">
         <div class="toml-header">Install &amp; run</div>
-        <pre><code class="language-bash"># Pre-built binary (Linux x86_64)
-curl -LO "https://github.com/laminardb/laminardb/releases/latest/download/laminardb-server-x86_64-unknown-linux-gnu-v0.20.0.tar.gz"
+        <pre><code class="language-bash"># Pre-built binary (Linux x86_64) — resolve the latest release tag
+VERSION=$(curl -s https://api.github.com/repos/laminardb/laminardb/releases/latest | grep tag_name | cut -d '"' -f4)
+curl -LO "https://github.com/laminardb/laminardb/releases/download/${VERSION}/laminardb-server-x86_64-unknown-linux-gnu-${VERSION}.tar.gz"
 tar xzf laminardb-server-*.tar.gz
 
 # Or build from source
 cargo install laminar-server
 
-# Or Docker
-docker run -d -p 8080:8080 ghcr.io/laminardb/laminardb-server:latest
+# Or Docker (multi-arch — Docker Hub or GHCR)
+docker run -d -p 8080:8080 laminardb/laminardb-server:latest
+# docker run -d -p 8080:8080 ghcr.io/laminardb/laminardb-server:latest
 
-# Run
+# Run the binary
 ./laminardb --config laminardb.toml</code></pre>
       </div>
 
@@ -549,7 +551,7 @@ docker run -d -p 8080:8080 ghcr.io/laminardb/laminardb-server:latest
             <td class="field-name">mode</td>
             <td class="field-type">String</td>
             <td class="field-default">"embedded"</td>
-            <td>"embedded" (single-node) or "delta" (multi-node, coming soon)</td>
+            <td>"embedded" (single-node)</td>
           </tr>
           <tr>
             <td class="field-name">bind</td>
@@ -705,11 +707,6 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
           <span class="endpoint-method method-post">POST</span>
           <span class="endpoint-path">/api/v1/reload</span>
           <span class="endpoint-desc">Hot-reload configuration</span>
-        </div>
-        <div class="endpoint-row">
-          <span class="endpoint-method method-get">GET</span>
-          <span class="endpoint-path">/api/v1/cluster</span>
-          <span class="endpoint-desc">Cluster status (delta mode only)</span>
         </div>
         <div class="endpoint-row">
           <span class="endpoint-method method-post">POST</span>
@@ -1740,7 +1737,7 @@ writer.id = "vwap-writer"</code></pre>
         <div class="footer-left">
           LaminarDB &middot;
           <a href="https://github.com/laminardb/laminardb/blob/main/LICENSE" target="_blank" rel="noopener">Apache 2.0</a> &middot;
-          <span data-version="tag">v0.20.0</span>
+          <span data-version="tag">v0.23.0</span>
         </div>
         <div class="footer-links">
           <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
