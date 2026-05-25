@@ -826,13 +826,16 @@ impl LaminarDB {
                 query_sql,
                 retention_bytes,
                 ..
-            } => self.handle_create_stream(
-                name,
-                query,
-                emit_clause.as_ref(),
-                query_sql,
-                *retention_bytes,
-            ),
+            } => {
+                self.handle_create_stream(
+                    name,
+                    query,
+                    emit_clause.as_ref(),
+                    query_sql,
+                    *retention_bytes,
+                )
+                .await
+            }
             StreamingStatement::CreateContinuousQuery { .. }
             | StreamingStatement::CreateLookupTable(_)
             | StreamingStatement::DropLookupTable { .. } => self.handle_query(sql).await,

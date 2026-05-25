@@ -154,6 +154,27 @@ async fn test_describe_table() {
     }
 }
 
+/// An MV (and a stream) must resolve a `FROM <stream>` reference at DDL time —
+/// `CREATE STREAM` registers a planning placeholder for its output schema, so a
+/// chain source → stream → stream → MV plans without "table not found". (The
+/// crypto-sentiment demo is exactly this shape.)
+#[tokio::test]
+async fn mv_resolves_a_chain_of_streams() {
+    let db = LaminarDB::open().unwrap();
+    db.execute("CREATE SOURCE src (id BIGINT, txt VARCHAR, ts TIMESTAMP)")
+        .await
+        .unwrap();
+    db.execute("CREATE STREAM filtered AS SELECT id, txt, ts FROM src WHERE txt IS NOT NULL")
+        .await
+        .unwrap();
+    db.execute("CREATE STREAM tagged AS SELECT id, txt, ts FROM filtered")
+        .await
+        .unwrap();
+    db.execute("CREATE MATERIALIZED VIEW agg AS SELECT COUNT(*) AS c FROM tagged")
+        .await
+        .expect("MV resolves a stream built on another stream");
+}
+
 #[tokio::test]
 async fn test_describe_materialized_view() {
     let db = LaminarDB::open().unwrap();
