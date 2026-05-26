@@ -65,7 +65,7 @@ python dashboard/bridge.py            # SUBSCRIBEs to the views over pgwire, ser
 browser as a Server-Sent Event. It computes nothing — every number is the
 engine's.
 
-## The degradation demo (worth showing on camera)
+## The degradation demo 
 
 Make the scorer fail mid-run — point `ORT_DYLIB_PATH` at a missing library, or
 feed a model whose forward pass blows the 60 s inference deadline. The AI
