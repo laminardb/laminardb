@@ -3742,7 +3742,12 @@ async fn test_connectorless_source_does_not_break_pipeline() {
 
 /// Poll an MV until it has at least `min_rows` rows, or timeout.
 async fn poll_mv(db: &LaminarDB, mv: &str, min_rows: usize) -> usize {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    // 10s, not 2s: under `nextest --all-features` the CI runner is CPU-starved
+    // and an MV can take >2s of wall-clock to emit even though it emits in
+    // ~0.1s locally. The early-return on `rows >= min_rows` keeps the happy
+    // path fast; the longer deadline only gives genuinely-slow runs room to
+    // finish instead of flaking (e.g. asof_join_in_materialized_view_*).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let df = db.ctx.sql(&format!("SELECT * FROM {mv}")).await.unwrap();
         let batches = df.collect().await.unwrap();
