@@ -94,8 +94,11 @@ LABEL org.opencontainers.image.version="${VERSION}"
 LABEL org.opencontainers.image.revision="${GIT_SHA}"
 LABEL org.opencontainers.image.created="${BUILD_DATE}"
 
-# Install minimal runtime dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install minimal runtime dependencies.
+# `apt-get upgrade` pulls security-patched versions of base-image packages
+# (e.g. gnutls) so the Trivy scan doesn't flag CVEs that Debian has already
+# fixed but the stale base layer still carries.
+RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
     ca-certificates \
     libssl3 \
     tini \

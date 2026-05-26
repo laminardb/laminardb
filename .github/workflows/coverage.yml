@@ -18,11 +18,23 @@ jobs:
       CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v6
+      # The --all-features build under -C instrument-coverage (run 3x in this
+      # job) overflowed the runner disk ("No space left on device" -> ld bus
+      # error). Use the same aggressive cleanup + swap as the CI Test job.
       - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-          df -h /
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+      - name: Set swap space
+        uses: pierotofy/set-swap-space@v1.0
+        with:
+          swap-size-gb: 10
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
