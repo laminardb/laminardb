@@ -82,6 +82,11 @@ pub mod lookup;
 /// Lakehouse connectors (Delta Lake, Iceberg).
 pub mod lakehouse;
 
+/// Sink-agnostic changelog collapse for upsert sinks (Z-set / CDC → key-unique
+/// `_op` batch). Pulled in by upsert-capable sink features (e.g. `delta-lake`).
+#[cfg(feature = "changelog-collapse")]
+pub mod changelog;
+
 /// Cloud storage infrastructure (credential resolution, validation, secret masking).
 pub mod storage;
 

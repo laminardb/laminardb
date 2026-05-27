@@ -34,6 +34,21 @@ External system connectors for LaminarDB. Each connector implements the `SourceC
 | WebSocket Client | `websocket` | Push to external server | Implemented |
 | Files | `files` | CSV, JSON, Parquet, rolling file output | Implemented |
 
+### Upsert sinks and changelog collapse
+
+An upsert sink (`write.mode = 'upsert'`) holds the current per-key state of its
+table. Its source changelog (a Z-set `__weight` column from an aggregating MV,
+or an `_op` column from CDC) can carry many events per key in one epoch, so the
+sink collapses each epoch to one row per merge key before the MERGE — keeping it
+cardinality-safe and stripping the `__weight`/`_op`/`_ts_ms` metadata from the
+table. The collapse (`changelog` module) is shared by Delta upsert and Iceberg
+MOR. Two requirements:
+
+- **`merge.key.columns` must be unique over the sink's input** — collapse errors
+  loudly if two live rows share a key, rather than dropping data.
+- **Partition or Z-order the table by the merge key** for copy-on-write MERGE
+  performance (each commit then rewrites only the touched files).
+
 ## Key Modules
 
 | Module | Purpose |
@@ -80,6 +95,7 @@ External system connectors for LaminarDB. Each connector implements the `SourceC
 | `postgres-sink` | PostgreSQL sink via tokio-postgres |
 | `mysql-cdc` | MySQL CDC via mysql_async (rustls, no OpenSSL) |
 | `mongodb-cdc` | MongoDB CDC source and sink via mongodb crate |
+| `changelog-collapse` | Sink-agnostic Z-set/CDC changelog collapse for upsert sinks (pulled in by `delta-lake`) |
 | `delta-lake` | Delta Lake sink/source via deltalake crate |
 | `delta-lake-s3` | S3 storage backend for Delta Lake |
 | `delta-lake-azure` | Azure storage backend for Delta Lake |

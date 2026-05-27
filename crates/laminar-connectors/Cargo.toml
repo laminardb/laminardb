@@ -115,8 +115,12 @@ postgres-sink = ["dep:tokio-postgres", "dep:postgres-types", "dep:deadpool-postg
 mysql-cdc = ["dep:mysql_async", "dep:tokio-stream"]
 # MongoDB CDC source and sink
 mongodb-cdc = ["dep:mongodb", "dep:tokio-stream", "dep:futures-util"]
+# Sink-agnostic Z-set/CDC changelog collapse for upsert sinks (pure Arrow, just
+# pulls arrow-row). Kept separate from delta-lake so the helper compiles and
+# tests without the deltalake stack, and so Iceberg MOR can opt in independently.
+changelog-collapse = ["dep:arrow-row"]
 # Delta Lake
-delta-lake = ["dep:deltalake", "dep:url", "dep:datafusion", "deltalake/datafusion", "dep:tokio-util", "dep:tokio-stream", "dep:arrow-row"]
+delta-lake = ["dep:deltalake", "dep:url", "dep:datafusion", "deltalake/datafusion", "dep:tokio-util", "dep:tokio-stream", "changelog-collapse"]
 delta-lake-s3 = ["delta-lake", "deltalake/s3"]
 delta-lake-azure = ["delta-lake", "deltalake/azure"]
 delta-lake-gcs = ["delta-lake", "deltalake/gcs"]

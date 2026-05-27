@@ -8,6 +8,9 @@
 #![allow(unsafe_code)]
 
 pub mod alloc;
+/// Z-set changelog `__weight` column name, shared between the MV producer and
+/// upsert-sink consumers.
+pub mod changelog;
 /// Distributed checkpoint barrier protocol.
 pub mod checkpoint;
 /// Structured error code registry (`LDB-NNNN`) and Ring 0 hot path error type.

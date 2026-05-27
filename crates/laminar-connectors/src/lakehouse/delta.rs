@@ -42,6 +42,28 @@ use super::delta_config::{DeltaLakeSinkConfig, DeltaWriteMode};
 use super::delta_metrics::DeltaLakeSinkMetrics;
 use crate::connector::DeliveryGuarantee;
 
+/// Counts `(upserts, deletes)` in a collapsed changelog batch's `_op` column.
+/// A row is a delete iff `_op == "D"`; everything else (including a missing or
+/// null op) counts as an upsert. Used only for collapse observability.
+#[cfg(feature = "delta-lake")]
+fn count_collapsed_ops(batch: &RecordBatch) -> (u64, u64) {
+    let Ok(idx) = batch.schema().index_of("_op") else {
+        return (0, 0);
+    };
+    let Some(ops) = batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<arrow_array::StringArray>()
+    else {
+        return (0, 0);
+    };
+    let deletes = (0..ops.len())
+        .filter(|&i| !ops.is_null(i) && ops.value(i) == "D")
+        .count() as u64;
+    let upserts = ops.len() as u64 - deletes;
+    (upserts, deletes)
+}
+
 /// Delta Lake sink connector.
 ///
 /// Writes Arrow `RecordBatch` to Delta Lake tables with ACID transactions,
@@ -184,10 +206,19 @@ impl DeltaLakeSink {
     }
 
     /// Creates a new Delta Lake sink with an explicit schema.
+    ///
+    /// In upsert mode the changelog metadata columns (`_op`, `_ts_ms`,
+    /// `__weight`) are stripped, matching the deferred first-write path, so the
+    /// target table holds only user data regardless of how the schema arrives.
     #[must_use]
     pub fn with_schema(config: DeltaLakeSinkConfig, schema: SchemaRef) -> Self {
+        let write_mode = config.write_mode;
         let mut sink = Self::new(config, None);
-        sink.schema = Some(schema);
+        sink.schema = Some(if write_mode == DeltaWriteMode::Upsert {
+            Self::target_schema(&schema, write_mode)
+        } else {
+            schema
+        });
         sink
     }
 
@@ -378,17 +409,19 @@ impl DeltaLakeSink {
         false
     }
 
-    /// Returns the target table schema, stripping metadata columns (`_op`, etc.)
-    /// in upsert mode so the Delta table isn't created with changelog columns.
-    /// CDC metadata columns stripped from the target Delta table schema.
-    const CDC_METADATA_COLUMNS: &'static [&'static str] = &["_op", "_ts_ms"];
+    /// Changelog metadata columns stripped from the target Delta table schema
+    /// in upsert mode, so the table holds only user data — not the CDC `_op`/
+    /// `_ts_ms` envelope or the Z-set `__weight` column. `collapse_changelog`
+    /// strips the same columns from the MERGE source, keeping the two in sync.
+    const CHANGELOG_METADATA_COLUMNS: &'static [&'static str] =
+        &["_op", "_ts_ms", laminar_core::changelog::WEIGHT_COLUMN];
 
     fn target_schema(batch_schema: &SchemaRef, write_mode: DeltaWriteMode) -> SchemaRef {
         if write_mode == DeltaWriteMode::Upsert {
             let fields: Vec<_> = batch_schema
                 .fields()
                 .iter()
-                .filter(|f| !Self::CDC_METADATA_COLUMNS.contains(&f.name().as_str()))
+                .filter(|f| !Self::CHANGELOG_METADATA_COLUMNS.contains(&f.name().as_str()))
                 .cloned()
                 .collect();
             Arc::new(arrow_schema::Schema::new(fields))
@@ -596,17 +629,36 @@ impl DeltaLakeSink {
             return Ok(WriteResult::new(0, 0));
         }
 
-        // Pre-concat upsert batches so conflict retries don't redo the
-        // O(rows × cols) copy each attempt. Append/overwrite passes the Vec
-        // straight to delta-rs, which handles multi-batch internally.
-        if self.config.write_mode == DeltaWriteMode::Upsert && self.staged_batches.len() > 1 {
-            let schema = self.staged_batches[0].schema();
-            let combined = arrow_select::concat::concat_batches(&schema, &self.staged_batches)
-                .map_err(|e| {
-                    ConnectorError::Internal(format!("failed to concat staged batches: {e}"))
-                })?;
+        // For upsert, concat the whole epoch and collapse the changelog to one
+        // row per merge key BEFORE the MERGE. This (a) makes the MERGE
+        // cardinality-safe — delta-rs rejects multiple source rows matching one
+        // target row, which every aggregate retract+insert would otherwise
+        // trigger — and (b) strips the Z-set `__weight` column the MERGE does
+        // not understand. Pre-concatenating also means conflict retries don't
+        // redo the O(rows × cols) copy each attempt. Append/overwrite passes
+        // the Vec straight to delta-rs, which handles multi-batch internally.
+        if self.config.write_mode == DeltaWriteMode::Upsert {
+            let combined = if self.staged_batches.len() == 1 {
+                self.staged_batches[0].clone()
+            } else {
+                let schema = self.staged_batches[0].schema();
+                arrow_select::concat::concat_batches(&schema, &self.staged_batches).map_err(
+                    |e| ConnectorError::Internal(format!("failed to concat staged batches: {e}")),
+                )?
+            };
+            let rows_in = combined.num_rows() as u64;
+            let collapse_start = Instant::now();
+            let collapsed =
+                crate::changelog::collapse_changelog(&combined, &self.config.merge_key_columns)?;
+            let (upserts_out, deletes_out) = count_collapsed_ops(&collapsed);
+            self.metrics.observe_collapse(
+                rows_in,
+                upserts_out,
+                deletes_out,
+                collapse_start.elapsed().as_secs_f64(),
+            );
             self.staged_batches.clear();
-            self.staged_batches.push(combined);
+            self.staged_batches.push(collapsed);
         }
 
         let total_rows = self.staged_rows;
@@ -2128,5 +2180,178 @@ mod tests {
         let debug = format!("{sink:?}");
         assert!(debug.contains("DeltaLakeSink"));
         assert!(debug.contains("delta_test_nonexistent_8f3a"));
+    }
+
+    // ── End-to-end upsert collapse (aggregating-MV changelog → Delta table) ──
+
+    /// A Z-set changelog batch shaped like aggregating-MV output:
+    /// `[region: Utf8, total: Int64, __weight: Int64]`.
+    #[cfg(feature = "delta-lake")]
+    fn zset_changelog(rows: &[(&str, i64, i64)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("total", DataType::Int64, false),
+            Field::new(
+                laminar_core::changelog::WEIGHT_COLUMN,
+                DataType::Int64,
+                false,
+            ),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Drive one full epoch through the exactly-once sink lifecycle.
+    #[cfg(feature = "delta-lake")]
+    async fn run_epoch(sink: &mut DeltaLakeSink, epoch: u64, batch: &RecordBatch) {
+        sink.begin_epoch(epoch).await.unwrap();
+        sink.write_batch(batch).await.unwrap();
+        sink.pre_commit(epoch).await.unwrap();
+        sink.commit_epoch(epoch).await.unwrap();
+    }
+
+    /// Read the table back and return its current `(region, total)` rows, sorted.
+    #[cfg(feature = "delta-lake")]
+    async fn read_regions(path: &str) -> Vec<(String, i64)> {
+        let ctx = datafusion::prelude::SessionContext::new();
+        crate::lakehouse::delta_table_provider::register_delta_table(
+            &ctx,
+            "t",
+            path,
+            std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+        let batches = ctx
+            .sql("SELECT region, total FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        for b in &batches {
+            // DataFusion may return strings as Utf8View; cast to the concrete
+            // types we downcast to.
+            let region_arr = arrow_cast::cast(
+                b.column(b.schema().index_of("region").unwrap()),
+                &DataType::Utf8,
+            )
+            .unwrap();
+            let total_arr = arrow_cast::cast(
+                b.column(b.schema().index_of("total").unwrap()),
+                &DataType::Int64,
+            )
+            .unwrap();
+            let regions = region_arr.as_any().downcast_ref::<StringArray>().unwrap();
+            let totals = total_arr.as_any().downcast_ref::<Int64Array>().unwrap();
+            for i in 0..b.num_rows() {
+                out.push((regions.value(i).to_string(), totals.value(i)));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// An aggregating MV emits a Z-set changelog; the upsert sink must collapse
+    /// it into the table's current per-key state — surviving value updates,
+    /// group disappearance, and multiple updates to one key within a single
+    /// epoch (the case that triggers a delta-rs cardinality violation without
+    /// collapse).
+    #[cfg(feature = "delta-lake")]
+    #[tokio::test]
+    async fn upsert_collapses_aggregating_mv_to_current_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_dir = dir.path().join("agg");
+        // delta-rs' local object store requires the table directory to exist.
+        std::fs::create_dir_all(&table_dir).unwrap();
+        let path = table_dir.to_string_lossy().to_string();
+
+        let mut cfg = DeltaLakeSinkConfig::new(&path);
+        cfg.write_mode = DeltaWriteMode::Upsert;
+        cfg.merge_key_columns = vec!["region".to_string()];
+        // Exactly-once buffers the whole epoch and flushes once at commit, so
+        // each epoch's changelog is collapsed together (deterministic).
+        cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
+
+        // No explicit schema: the schema (and table) is derived from the first
+        // batch, exactly like the production pipeline — exercising the
+        // `target_schema` strip of `__weight`.
+        let mut sink = DeltaLakeSink::new(cfg, None);
+        sink.open(&ConnectorConfig::new("delta-lake"))
+            .await
+            .unwrap();
+
+        // Epoch 1: two brand-new groups.
+        run_epoch(
+            &mut sink,
+            1,
+            &zset_changelog(&[("east", 10, 1), ("west", 5, 1)]),
+        )
+        .await;
+        assert_eq!(
+            read_regions(&path).await,
+            vec![("east".into(), 10), ("west".into(), 5)]
+        );
+
+        // Epoch 2: update east (retract 10 + insert 30), drop west, add north.
+        run_epoch(
+            &mut sink,
+            2,
+            &zset_changelog(&[
+                ("east", 10, -1),
+                ("east", 30, 1),
+                ("west", 5, -1),
+                ("north", 7, 1),
+            ]),
+        )
+        .await;
+        assert_eq!(
+            read_regions(&path).await,
+            vec![("east".into(), 30), ("north".into(), 7)]
+        );
+
+        // Epoch 3: two consecutive updates to "east" in one epoch. Without
+        // collapse this is multiple source rows for one merge key → delta-rs
+        // cardinality violation. With collapse it folds to the final value.
+        run_epoch(
+            &mut sink,
+            3,
+            &zset_changelog(&[
+                ("east", 30, -1),
+                ("east", 40, 1),
+                ("east", 40, -1),
+                ("east", 55, 1),
+            ]),
+        )
+        .await;
+        assert_eq!(
+            read_regions(&path).await,
+            vec![("east".into(), 55), ("north".into(), 7)]
+        );
+
+        // The target table never carried the Z-set weight column.
+        assert!(sink.schema.as_ref().unwrap().index_of("__weight").is_err());
+
+        // Collapse observability fired across the three epochs.
+        let m = sink.sink_metrics();
+        assert_eq!(m.collapse_rows_in.get(), 10);
+        assert!(m.collapse_deletes_out.get() >= 1, "west was dropped");
+        assert!(m.collapse_upserts_out.get() >= 4);
+
+        sink.close().await.unwrap();
     }
 }
