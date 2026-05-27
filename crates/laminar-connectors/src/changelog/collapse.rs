@@ -49,6 +49,11 @@ pub fn collapse_changelog(
     }
     let schema = batch.schema();
     for k in merge_key {
+        if is_metadata_column(k) {
+            return Err(ConnectorError::ConfigurationError(format!(
+                "merge key column '{k}' is reserved changelog metadata and cannot be a merge key"
+            )));
+        }
         if schema.index_of(k).is_err() {
             return Err(ConnectorError::ConfigurationError(format!(
                 "merge key column '{k}' is not present in the changelog output schema"
