@@ -64,6 +64,14 @@ pub async fn register_delta_table(
     // Open the existing table.
     let table = delta_io::open_or_create_table(table_uri, storage_options, None).await?;
 
+    // Register the table's object store with the session so scans can resolve
+    // non-local URLs (s3://, az://, gs://); without it, reading an
+    // object-store-backed table fails with "No suitable object store found".
+    // (Local-filesystem tables use DataFusion's built-in store.)
+    table
+        .update_datafusion_session(&ctx.state())
+        .map_err(|e| ConnectorError::Internal(format!("register Delta object store: {e}")))?;
+
     // Build a DeltaTableProvider (which implements TableProvider) from the table.
     let provider =
         table.table_provider().build().await.map_err(|e| {
