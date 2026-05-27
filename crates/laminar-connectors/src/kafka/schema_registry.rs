@@ -1445,9 +1445,12 @@ mod tests {
 
     #[test]
     fn test_cache_ttl_expiration() {
+        // TTL generous enough that scheduler jitter between insert and the
+        // immediate `is_some()` check can't expire the entry early — a 50ms
+        // window flaked under parallel test load on busy CI runners.
         let config = SchemaRegistryCacheConfig {
             max_entries: 100,
-            ttl: Some(Duration::from_millis(50)),
+            ttl: Some(Duration::from_millis(1000)),
         };
         let client = SchemaRegistryClient::with_cache_config("http://localhost:8081", None, config);
 
@@ -1455,7 +1458,7 @@ mod tests {
         assert!(client.cache_get(1).is_some());
 
         // Wait for TTL to expire.
-        std::thread::sleep(Duration::from_millis(60));
+        std::thread::sleep(Duration::from_millis(1200));
         // Lazy TTL: expired entry returns None on access.
         assert!(client.cache_get(1).is_none());
     }

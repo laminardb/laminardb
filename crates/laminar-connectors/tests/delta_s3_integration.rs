@@ -5,6 +5,7 @@
 //! the lib test binary — bundling them there overflowed the coverage build's
 //! linker (`--all-features` + instrumentation). Ignored by default; needs Docker.
 #![cfg(feature = "delta-lake-s3")]
+#![allow(clippy::disallowed_types)] // test code: std::HashMap is fine
 
 use std::collections::HashMap;
 use std::sync::Arc;
