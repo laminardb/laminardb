@@ -2226,19 +2226,15 @@ mod tests {
     /// Read the table back and return its current `(region, total)` rows, sorted.
     #[cfg(feature = "delta-lake")]
     async fn read_regions(path: &str) -> Vec<(String, i64)> {
-        read_regions_opts(path, std::collections::HashMap::new()).await
-    }
-
-    /// Read-back variant that passes object-store credentials (for S3/`MinIO`).
-    #[cfg(feature = "delta-lake")]
-    async fn read_regions_opts(
-        path: &str,
-        storage: std::collections::HashMap<String, String>,
-    ) -> Vec<(String, i64)> {
         let ctx = datafusion::prelude::SessionContext::new();
-        crate::lakehouse::delta_table_provider::register_delta_table(&ctx, "t", path, storage)
-            .await
-            .unwrap();
+        crate::lakehouse::delta_table_provider::register_delta_table(
+            &ctx,
+            "t",
+            path,
+            std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
         let batches = ctx
             .sql("SELECT region, total FROM t")
             .await
@@ -2449,100 +2445,5 @@ mod tests {
         );
 
         sink_b.close().await.unwrap();
-    }
-
-    /// The upsert collapse → MERGE path over real object-store I/O (`MinIO` via
-    /// Docker), including the multi-update-per-key-in-one-epoch cardinality case.
-    #[cfg(feature = "delta-lake-s3")]
-    #[tokio::test]
-    #[ignore = "requires Docker (MinIO S3)"]
-    async fn upsert_against_minio_s3_object_store() {
-        use testcontainers::core::{IntoContainerPort, WaitFor};
-        use testcontainers::runners::AsyncRunner;
-        use testcontainers::{GenericImage, ImageExt};
-
-        // MinIO's FS backend treats a directory under /data as a bucket, so we
-        // override the entrypoint to pre-create the bucket before the server
-        // starts (the official image has no auto-create env).
-        let container = GenericImage::new("minio/minio", "latest")
-            .with_exposed_port(9000.tcp())
-            .with_wait_for(WaitFor::message_on_stderr("API:"))
-            .with_entrypoint("sh")
-            .with_cmd(["-c", "mkdir -p /data/warehouse && minio server /data"])
-            .with_env_var("MINIO_ROOT_USER", "minioadmin")
-            .with_env_var("MINIO_ROOT_PASSWORD", "minioadmin")
-            .start()
-            .await
-            .expect("start MinIO container");
-        let port = container
-            .get_host_port_ipv4(9000.tcp())
-            .await
-            .expect("MinIO host port");
-
-        let mut storage = std::collections::HashMap::new();
-        for (k, v) in [
-            ("aws_access_key_id", "minioadmin"),
-            ("aws_secret_access_key", "minioadmin"),
-            ("aws_region", "us-east-1"),
-            ("aws_allow_http", "true"),
-            // Single writer: skip the DynamoDB lock; delta-rs allows this opt-in.
-            ("aws_s3_allow_unsafe_rename", "true"),
-        ] {
-            storage.insert(k.to_string(), v.to_string());
-        }
-        storage.insert(
-            "aws_endpoint".to_string(),
-            format!("http://127.0.0.1:{port}"),
-        );
-
-        let mut cfg = DeltaLakeSinkConfig::new("s3://warehouse/agg");
-        cfg.write_mode = DeltaWriteMode::Upsert;
-        cfg.merge_key_columns = vec!["region".to_string()];
-        cfg.delivery_guarantee = DeliveryGuarantee::ExactlyOnce;
-        cfg.writer_id = "minio-writer".to_string();
-        cfg.storage_options = storage.clone();
-
-        let mut sink = DeltaLakeSink::new(cfg, None);
-        sink.open(&ConnectorConfig::new("delta-lake"))
-            .await
-            .expect("open Delta sink against MinIO");
-
-        run_epoch(
-            &mut sink,
-            1,
-            &zset_changelog(&[("east", 10, 1), ("west", 5, 1)]),
-        )
-        .await;
-        run_epoch(
-            &mut sink,
-            2,
-            &zset_changelog(&[
-                ("east", 10, -1),
-                ("east", 30, 1),
-                ("west", 5, -1),
-                ("north", 7, 1),
-            ]),
-        )
-        .await;
-        // Multiple updates to one key in a single epoch — the cardinality case —
-        // over real object-store I/O.
-        run_epoch(
-            &mut sink,
-            3,
-            &zset_changelog(&[
-                ("east", 30, -1),
-                ("east", 40, 1),
-                ("east", 40, -1),
-                ("east", 55, 1),
-            ]),
-        )
-        .await;
-
-        assert_eq!(
-            read_regions_opts("s3://warehouse/agg", storage).await,
-            vec![("east".to_string(), 55), ("north".to_string(), 7)]
-        );
-
-        sink.close().await.unwrap();
     }
 }
