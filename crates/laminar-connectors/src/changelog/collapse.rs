@@ -87,6 +87,12 @@ fn index_of_all(batch: &RecordBatch, columns: &[String]) -> Vec<usize> {
         .collect()
 }
 
+/// Changelog metadata columns, excluded from the collapsed output's user
+/// columns (`_op` is re-emitted normalized; `__weight`/`_ts_ms` are dropped).
+fn is_metadata_column(name: &str) -> bool {
+    name == "_op" || name == "_ts_ms" || name == WEIGHT_COLUMN
+}
+
 /// Z-set collapse: consolidate by full row, then pick one row per merge key.
 fn collapse_zset(
     batch: &RecordBatch,
@@ -100,9 +106,10 @@ fn collapse_zset(
         .downcast_ref::<Int64Array>()
         .ok_or_else(|| ConnectorError::Internal(format!("{WEIGHT_COLUMN} column is not Int64")))?;
 
-    // Output (user) columns = every column except `__weight`.
+    // User columns = every column except changelog metadata.
+    let schema = batch.schema();
     let user_indices: Vec<usize> = (0..batch.num_columns())
-        .filter(|&i| i != weight_idx)
+        .filter(|&i| !is_metadata_column(schema.field(i).name()))
         .collect();
 
     // 1. Consolidate identical full rows, summing weights; keep net-nonzero.
@@ -230,10 +237,9 @@ fn collapse_cdc(batch: &RecordBatch, merge_key: &[String]) -> Result<RecordBatch
         })
         .collect();
 
-    // CDC output retains all user columns; drop the original `_op` (we re-emit
-    // a normalized one).
+    // User columns = every column except changelog metadata.
     let user_indices: Vec<usize> = (0..batch.num_columns())
-        .filter(|&i| schema.field(i).name() != "_op")
+        .filter(|&i| !is_metadata_column(schema.field(i).name()))
         .collect();
 
     build_output(batch, &user_indices, &selected, &ops)
@@ -530,6 +536,35 @@ mod tests {
         assert_eq!(out.num_rows(), 2);
         assert!(out.schema().index_of("_op").is_ok());
         assert_eq!(col_str(&out, "_op"), vec!["U", "U"]);
+    }
+
+    #[test]
+    fn cdc_strips_ts_ms_and_emits_single_op() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("_ts_ms", DataType::Int64, false),
+            Field::new("_op", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![100, 200])),
+                Arc::new(StringArray::from(vec!["I", "U"])),
+            ],
+        )
+        .unwrap();
+        let out = collapse_changelog(&batch, &keys(&["id"])).unwrap();
+        assert!(out.schema().index_of("_ts_ms").is_err(), "_ts_ms stripped");
+        assert_eq!(
+            out.schema()
+                .fields()
+                .iter()
+                .filter(|f| f.name() == "_op")
+                .count(),
+            1,
+            "exactly one _op column"
+        );
     }
 
     #[test]

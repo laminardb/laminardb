@@ -41,8 +41,9 @@ table. Its source changelog (a Z-set `__weight` column from an aggregating MV,
 or an `_op` column from CDC) can carry many events per key in one epoch, so the
 sink collapses each epoch to one row per merge key before the MERGE — keeping it
 cardinality-safe and stripping the `__weight`/`_op`/`_ts_ms` metadata from the
-table. The collapse (`changelog` module) is shared by Delta upsert and Iceberg
-MOR. Two requirements:
+table. The collapse (`changelog` module) backs Delta upsert today and is
+sink-agnostic by design, for future reuse by an Iceberg MOR sink. Two
+requirements:
 
 - **`merge.key.columns` must be unique over the sink's input** — collapse errors
   loudly if two live rows share a key, rather than dropping data.
