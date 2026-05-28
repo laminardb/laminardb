@@ -710,54 +710,23 @@ fn rewrite_lookup_select_item(item: &SelectItem, ctx: &LookupRewriteCtx) -> Stri
 }
 
 fn rewrite_lookup_expr(expr: &Expr, ctx: &LookupRewriteCtx) -> String {
-    match expr {
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            let table = parts[0].value.as_str();
-            let col = parts[1].value.as_str();
-            if ctx.is_stream(table) {
-                col.to_string()
-            } else if ctx.is_lookup(table) {
-                ctx.lookup_name(col)
-            } else {
-                expr.to_string()
-            }
+    rewrite_join_expr(expr, &|e: &Expr| {
+        let Expr::CompoundIdentifier(parts) = e else {
+            return None;
+        };
+        if parts.len() != 2 {
+            return None;
         }
-        Expr::Identifier(ident) => ident.value.clone(),
-        Expr::BinaryOp { left, op, right } => {
-            format!(
-                "{} {op} {}",
-                rewrite_lookup_expr(left, ctx),
-                rewrite_lookup_expr(right, ctx)
-            )
-        }
-        Expr::UnaryOp { op, expr: inner } => format!("{op} {}", rewrite_lookup_expr(inner, ctx)),
-        Expr::Nested(inner) => format!("({})", rewrite_lookup_expr(inner, ctx)),
-        Expr::Function(func) => {
-            let name = &func.name;
-            let args: Vec<String> = match &func.args {
-                sqlparser::ast::FunctionArguments::List(list) => list
-                    .args
-                    .iter()
-                    .map(|arg| match arg {
-                        sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(e),
-                        ) => rewrite_lookup_expr(e, ctx),
-                        other => other.to_string(),
-                    })
-                    .collect(),
-                other => vec![other.to_string()],
-            };
-            format!("{name}({})", args.join(", "))
-        }
-        Expr::Cast {
-            expr: inner,
-            data_type,
-            ..
-        } => {
-            format!("CAST({} AS {data_type})", rewrite_lookup_expr(inner, ctx))
-        }
-        _ => expr.to_string(),
-    }
+        let table = parts[0].value.as_str();
+        let col = parts[1].value.as_str();
+        Some(if ctx.is_stream(table) {
+            col.to_string()
+        } else if ctx.is_lookup(table) {
+            ctx.lookup_name(col)
+        } else {
+            e.to_string()
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2241,6 +2210,66 @@ pub(crate) fn apply_topk_filter(batches: &[RecordBatch], k: usize) -> Vec<Record
 }
 
 // ---------------------------------------------------------------------------
+// Private: shared join-projection expression rewriter
+// ---------------------------------------------------------------------------
+
+/// Rewrite an expression to SQL text over a flattened join temp table.
+///
+/// `leaf` resolves the per-join-type leaves (qualified column references),
+/// returning `None` to fall through to the generic recursion over the
+/// structural variants. This is the single recursion shared by the ASOF,
+/// temporal, stream-stream, and lookup rewriters, which differ only in how they
+/// resolve a `t.col` reference.
+fn rewrite_join_expr<F: Fn(&Expr) -> Option<String>>(expr: &Expr, leaf: &F) -> String {
+    if let Some(s) = leaf(expr) {
+        return s;
+    }
+    let r = |e: &Expr| rewrite_join_expr(e, leaf);
+    match expr {
+        Expr::BinaryOp { left, op, right } => format!("{} {op} {}", r(left), r(right)),
+        Expr::UnaryOp { op, expr: inner } => format!("{op} {}", r(inner)),
+        Expr::Nested(inner) => format!("({})", r(inner)),
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => format!("CAST({} AS {data_type})", r(inner)),
+        Expr::IsNull(inner) => format!("{} IS NULL", r(inner)),
+        Expr::IsNotNull(inner) => format!("{} IS NOT NULL", r(inner)),
+        Expr::Between {
+            expr: inner,
+            negated,
+            low,
+            high,
+        } => {
+            let (e, l, h) = (r(inner), r(low), r(high));
+            if *negated {
+                format!("{e} NOT BETWEEN {l} AND {h}")
+            } else {
+                format!("{e} BETWEEN {l} AND {h}")
+            }
+        }
+        Expr::Function(func) => {
+            let args: Vec<String> = match &func.args {
+                sqlparser::ast::FunctionArguments::List(list) => list
+                    .args
+                    .iter()
+                    .map(|arg| match arg {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ) => r(e),
+                        other => other.to_string(),
+                    })
+                    .collect(),
+                other => vec![other.to_string()],
+            };
+            format!("{}({})", func.name, args.join(", "))
+        }
+        _ => expr.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Private: ASOF projection rewriting
 // ---------------------------------------------------------------------------
 
@@ -2316,90 +2345,34 @@ fn rewrite_expr(
     right_alias: Option<&str>,
     config: &AsofJoinTranslatorConfig,
 ) -> String {
-    match expr {
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            let table = parts[0].value.as_str();
-            let column = parts[1].value.as_str();
-
-            let is_left = Some(table) == left_alias || table == config.left_table;
-            let is_right = Some(table) == right_alias || table == config.right_table;
-
-            if is_left {
-                column.to_string()
-            } else if is_right {
-                // Check if this right column might be disambiguated.
-                // The key column is excluded from the right side entirely,
-                // and other duplicate columns get suffixed.
-                // We suffix if the column name matches a "well-known" left-side
-                // column that could collide — specifically the key column
-                // (already excluded) or columns sharing the same name.
-                // We use a heuristic: if the right column name equals the
-                // left time column, suffix it.
-                if column == config.left_time_column && column != config.right_time_column {
-                    // Left and right time columns have different names — no collision
-                    column.to_string()
-                } else if column == config.key_column {
-                    // Key column: just use the bare name (from left side)
-                    column.to_string()
-                } else {
-                    // For other right-side columns, check if the column name
-                    // matches any "standard" left-side column name.
-                    // Since we don't have the full schema here, use a
-                    // conservative approach: only suffix the right time column
-                    // when it matches the left time column name.
-                    if column == config.left_time_column && column == config.right_time_column {
-                        // Same name for time columns — right side is suffixed
-                        format!("{}_{}", column, config.right_table)
-                    } else {
-                        column.to_string()
-                    }
-                }
+    rewrite_join_expr(expr, &|e: &Expr| {
+        let Expr::CompoundIdentifier(parts) = e else {
+            return None;
+        };
+        if parts.len() != 2 {
+            return None;
+        }
+        let table = parts[0].value.as_str();
+        let column = parts[1].value.as_str();
+        let is_left = Some(table) == left_alias || table == config.left_table;
+        let is_right = Some(table) == right_alias || table == config.right_table;
+        Some(if is_left {
+            column.to_string()
+        } else if is_right {
+            // Right-side columns keep their bare name, except a non-key time
+            // column that shares the left time column's name, which is suffixed.
+            if column == config.left_time_column
+                && column == config.right_time_column
+                && column != config.key_column
+            {
+                format!("{}_{}", column, config.right_table)
             } else {
-                expr.to_string()
+                column.to_string()
             }
-        }
-        Expr::BinaryOp { left, op, right } => {
-            let l = rewrite_expr(left, left_alias, right_alias, config);
-            let r = rewrite_expr(right, left_alias, right_alias, config);
-            format!("{l} {op} {r}")
-        }
-        Expr::UnaryOp { op, expr: inner } => {
-            let e = rewrite_expr(inner, left_alias, right_alias, config);
-            format!("{op} {e}")
-        }
-        Expr::Nested(inner) => {
-            let e = rewrite_expr(inner, left_alias, right_alias, config);
-            format!("({e})")
-        }
-        Expr::Function(func) => {
-            // Rewrite function arguments
-            let name = &func.name;
-            let args: Vec<String> = match &func.args {
-                sqlparser::ast::FunctionArguments::List(arg_list) => arg_list
-                    .args
-                    .iter()
-                    .map(|arg| match arg {
-                        sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(e),
-                        ) => rewrite_expr(e, left_alias, right_alias, config),
-                        other => other.to_string(),
-                    })
-                    .collect(),
-                other => vec![other.to_string()],
-            };
-            format!("{name}({})", args.join(", "))
-        }
-        Expr::Cast {
-            expr: inner,
-            data_type,
-            ..
-        } => {
-            let e = rewrite_expr(inner, left_alias, right_alias, config);
-            format!("CAST({e} AS {data_type})")
-        }
-        // For any other expression variant, fall back to sqlparser's Display
-        _ => expr.to_string(),
-    }
+        } else {
+            e.to_string()
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2461,60 +2434,23 @@ fn rewrite_temporal_expr(
     right_alias: Option<&str>,
     config: &TemporalJoinTranslatorConfig,
 ) -> String {
-    match expr {
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            let table = parts[0].value.as_str();
-            let column = parts[1].value.as_str();
-
-            let is_left = Some(table) == left_alias || table == config.stream_table;
-            let is_right = Some(table) == right_alias || table == config.table_name;
-
-            if is_left || is_right {
-                column.to_string()
-            } else {
-                expr.to_string()
-            }
+    rewrite_join_expr(expr, &|e: &Expr| {
+        let Expr::CompoundIdentifier(parts) = e else {
+            return None;
+        };
+        if parts.len() != 2 {
+            return None;
         }
-        Expr::BinaryOp { left, op, right } => {
-            let l = rewrite_temporal_expr(left, left_alias, right_alias, config);
-            let r = rewrite_temporal_expr(right, left_alias, right_alias, config);
-            format!("{l} {op} {r}")
-        }
-        Expr::UnaryOp { op, expr: inner } => {
-            let e = rewrite_temporal_expr(inner, left_alias, right_alias, config);
-            format!("{op} {e}")
-        }
-        Expr::Nested(inner) => {
-            let e = rewrite_temporal_expr(inner, left_alias, right_alias, config);
-            format!("({e})")
-        }
-        Expr::Function(func) => {
-            let name = &func.name;
-            let args: Vec<String> = match &func.args {
-                sqlparser::ast::FunctionArguments::List(arg_list) => arg_list
-                    .args
-                    .iter()
-                    .map(|arg| match arg {
-                        sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(e),
-                        ) => rewrite_temporal_expr(e, left_alias, right_alias, config),
-                        other => other.to_string(),
-                    })
-                    .collect(),
-                other => vec![other.to_string()],
-            };
-            format!("{name}({})", args.join(", "))
-        }
-        Expr::Cast {
-            expr: inner,
-            data_type,
-            ..
-        } => {
-            let e = rewrite_temporal_expr(inner, left_alias, right_alias, config);
-            format!("CAST({e} AS {data_type})")
-        }
-        _ => expr.to_string(),
-    }
+        let table = parts[0].value.as_str();
+        let column = parts[1].value.as_str();
+        let is_left = Some(table) == left_alias || table == config.stream_table;
+        let is_right = Some(table) == right_alias || table == config.table_name;
+        Some(if is_left || is_right {
+            column.to_string()
+        } else {
+            e.to_string()
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2697,7 +2633,6 @@ fn render_residual_joins(
 /// `_<right_table>` suffix that `IntervalJoinState` adds. With
 /// `tmp_qual = Some("__interval_tmp")` the rewritten names are also
 /// prefixed to disambiguate from downstream tables in residual joins.
-#[allow(clippy::too_many_lines)]
 fn rewrite_stream_join_expr(
     expr: &sqlparser::ast::Expr,
     left_alias: Option<&str>,
@@ -2705,99 +2640,31 @@ fn rewrite_stream_join_expr(
     config: &StreamJoinConfig,
     tmp_qual: Option<&str>,
 ) -> String {
-    match expr {
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            let table = &parts[0].value;
-            let col = &parts[1].value;
-            let is_left = table == &config.left_table || left_alias.is_some_and(|a| a == table);
-            let is_right = table == &config.right_table || right_alias.is_some_and(|a| a == table);
-            if is_left || is_right {
-                let bare = if is_right {
-                    format!("{col}_{}", config.right_table)
-                } else {
-                    col.clone()
-                };
-                if let Some(q) = tmp_qual {
-                    format!("{q}.{bare}")
-                } else {
-                    bare
-                }
+    rewrite_join_expr(expr, &|e: &Expr| {
+        let Expr::CompoundIdentifier(parts) = e else {
+            return None;
+        };
+        if parts.len() != 2 {
+            return None;
+        }
+        let table = &parts[0].value;
+        let col = &parts[1].value;
+        let is_left = table == &config.left_table || left_alias.is_some_and(|a| a == table);
+        let is_right = table == &config.right_table || right_alias.is_some_and(|a| a == table);
+        Some(if is_left || is_right {
+            let bare = if is_right {
+                format!("{col}_{}", config.right_table)
             } else {
-                expr.to_string()
-            }
-        }
-        Expr::BinaryOp { left, op, right } => {
-            let l = rewrite_stream_join_expr(left, left_alias, right_alias, config, tmp_qual);
-            let r = rewrite_stream_join_expr(right, left_alias, right_alias, config, tmp_qual);
-            format!("{l} {op} {r}")
-        }
-        Expr::UnaryOp { op, expr: inner } => {
-            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
-            format!("{op} {r}")
-        }
-        Expr::Nested(inner) => {
-            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
-            format!("({r})")
-        }
-        Expr::Cast {
-            expr: inner,
-            data_type,
-            ..
-        } => {
-            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
-            format!("CAST({r} AS {data_type})")
-        }
-        Expr::IsNull(inner) => {
-            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
-            format!("{r} IS NULL")
-        }
-        Expr::IsNotNull(inner) => {
-            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
-            format!("{r} IS NOT NULL")
-        }
-        Expr::Between {
-            expr: inner,
-            negated,
-            low,
-            high,
-        } => {
-            let e = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
-            let l = rewrite_stream_join_expr(low, left_alias, right_alias, config, tmp_qual);
-            let h = rewrite_stream_join_expr(high, left_alias, right_alias, config, tmp_qual);
-            if *negated {
-                format!("{e} NOT BETWEEN {l} AND {h}")
-            } else {
-                format!("{e} BETWEEN {l} AND {h}")
-            }
-        }
-        Expr::Function(func) => {
-            let name = &func.name;
-            let args_str = match &func.args {
-                sqlparser::ast::FunctionArguments::List(arg_list) => {
-                    let rewritten_args: Vec<String> = arg_list
-                        .args
-                        .iter()
-                        .map(|arg| match arg {
-                            sqlparser::ast::FunctionArg::Unnamed(
-                                sqlparser::ast::FunctionArgExpr::Expr(e),
-                            ) => rewrite_stream_join_expr(
-                                e,
-                                left_alias,
-                                right_alias,
-                                config,
-                                tmp_qual,
-                            ),
-                            other => other.to_string(),
-                        })
-                        .collect();
-                    rewritten_args.join(", ")
-                }
-                other => other.to_string(),
+                col.clone()
             };
-            format!("{name}({args_str})")
-        }
-        _ => expr.to_string(),
-    }
+            match tmp_qual {
+                Some(q) => format!("{q}.{bare}"),
+                None => bare,
+            }
+        } else {
+            e.to_string()
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
