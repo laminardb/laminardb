@@ -544,6 +544,223 @@ pub(crate) fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>,
 }
 
 // ---------------------------------------------------------------------------
+// Lookup-enrich detection (on-demand / partial lookup joins → GraphOperator)
+// ---------------------------------------------------------------------------
+
+use crate::operator::lookup_enrich::{disambiguated_lookup_name, LookupEnrichConfig};
+
+/// Detect a `partial`/`none` lookup-enrich join: a single equi-join whose right
+/// table is a registered partial lookup table. Returns the operator config plus
+/// the residual projection over `__lookup_enrich_tmp`. `partial_cols` maps a
+/// partial lookup table to its column names; `source_schemas` supplies the
+/// stream side's columns for collision disambiguation.
+///
+/// v1 constraints (else returns `None`, so the existing `DataFusion` path runs):
+/// single join step, single-column key, stream on the left, INNER/LEFT only,
+/// and the stream schema must be known.
+pub(crate) fn detect_lookup_enrich_query(
+    sql: &str,
+    partial_cols: &FxHashMap<String, Vec<String>>,
+    source_schemas: &FxHashMap<String, SchemaRef>,
+) -> (Option<LookupEnrichConfig>, Option<String>) {
+    use laminar_sql::datafusion::lookup_join::LookupJoinType;
+    use laminar_sql::parser::join_parser::JoinType;
+
+    if partial_cols.is_empty() {
+        return (None, None);
+    }
+    let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
+        return (None, None);
+    };
+    let Some(laminar_sql::parser::StreamingStatement::Standard(stmt)) = statements.first() else {
+        return (None, None);
+    };
+    let Statement::Query(query) = stmt.as_ref() else {
+        return (None, None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return (None, None);
+    };
+    let Ok(Some(multi)) = analyze_joins(select) else {
+        return (None, None);
+    };
+    if multi.joins.len() != 1 {
+        return (None, None);
+    }
+    let j = &multi.joins[0];
+    if j.is_asof_join
+        || j.is_temporal_join
+        || j.time_bound.is_some()
+        || !j.additional_key_columns.is_empty()
+    {
+        return (None, None);
+    }
+    // v1: stream on the left, partial lookup table on the right.
+    let lookup_table = j.right_table.clone();
+    let Some(lookup_cols) = partial_cols.get(&lookup_table) else {
+        return (None, None);
+    };
+    let stream_table = j.left_table.clone();
+    let Some(stream_schema) = source_schemas.get(&stream_table) else {
+        return (None, None);
+    };
+    let stream_cols: Vec<String> = stream_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let join_type = match j.join_type {
+        JoinType::Inner => LookupJoinType::Inner,
+        JoinType::Left => LookupJoinType::LeftOuter,
+        _ => return (None, None),
+    };
+    let projection_sql = build_lookup_projection_sql(
+        select,
+        j,
+        &stream_table,
+        &lookup_table,
+        &stream_cols,
+        lookup_cols,
+    );
+    let config = LookupEnrichConfig {
+        table_name: lookup_table,
+        key_columns: vec![j.left_key_column.clone()],
+        join_type,
+    };
+    (Some(config), Some(projection_sql))
+}
+
+/// Context for rewriting a SELECT to read from the flattened
+/// `__lookup_enrich_tmp` table.
+struct LookupRewriteCtx<'a> {
+    stream_alias: Option<&'a str>,
+    stream_table: &'a str,
+    lookup_alias: Option<&'a str>,
+    lookup_table: &'a str,
+    stream_cols: &'a [String],
+    lookup_cols: &'a [String],
+}
+
+impl LookupRewriteCtx<'_> {
+    fn is_stream(&self, table: &str) -> bool {
+        Some(table) == self.stream_alias || table == self.stream_table
+    }
+    fn is_lookup(&self, table: &str) -> bool {
+        Some(table) == self.lookup_alias || table == self.lookup_table
+    }
+    fn lookup_name(&self, col: &str) -> String {
+        disambiguated_lookup_name(col, self.stream_cols, self.lookup_table)
+    }
+}
+
+fn build_lookup_projection_sql(
+    select: &sqlparser::ast::Select,
+    analysis: &laminar_sql::parser::join_parser::JoinAnalysis,
+    stream_table: &str,
+    lookup_table: &str,
+    stream_cols: &[String],
+    lookup_cols: &[String],
+) -> String {
+    let ctx = LookupRewriteCtx {
+        stream_alias: analysis.left_alias.as_deref(),
+        stream_table,
+        lookup_alias: analysis.right_alias.as_deref(),
+        lookup_table,
+        stream_cols,
+        lookup_cols,
+    };
+    let items: Vec<String> = select
+        .projection
+        .iter()
+        .map(|item| rewrite_lookup_select_item(item, &ctx))
+        .collect();
+    let where_clause = select
+        .selection
+        .as_ref()
+        .map(|e| format!(" WHERE {}", rewrite_lookup_expr(e, &ctx)));
+    format!(
+        "SELECT {} FROM __lookup_enrich_tmp{}",
+        items.join(", "),
+        where_clause.unwrap_or_default()
+    )
+}
+
+fn rewrite_lookup_select_item(item: &SelectItem, ctx: &LookupRewriteCtx) -> String {
+    match item {
+        SelectItem::UnnamedExpr(expr) => rewrite_lookup_expr(expr, ctx),
+        SelectItem::ExprWithAlias { expr, alias } => {
+            format!("{} AS {alias}", rewrite_lookup_expr(expr, ctx))
+        }
+        SelectItem::Wildcard(WildcardAdditionalOptions { .. }) => "*".to_string(),
+        SelectItem::QualifiedWildcard(name, _) => {
+            let table = name.to_string();
+            if ctx.is_stream(&table) {
+                ctx.stream_cols.join(", ")
+            } else if ctx.is_lookup(&table) {
+                ctx.lookup_cols
+                    .iter()
+                    .map(|c| ctx.lookup_name(c))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                format!("{table}.*")
+            }
+        }
+    }
+}
+
+fn rewrite_lookup_expr(expr: &Expr, ctx: &LookupRewriteCtx) -> String {
+    match expr {
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let table = parts[0].value.as_str();
+            let col = parts[1].value.as_str();
+            if ctx.is_stream(table) {
+                col.to_string()
+            } else if ctx.is_lookup(table) {
+                ctx.lookup_name(col)
+            } else {
+                expr.to_string()
+            }
+        }
+        Expr::Identifier(ident) => ident.value.clone(),
+        Expr::BinaryOp { left, op, right } => {
+            format!(
+                "{} {op} {}",
+                rewrite_lookup_expr(left, ctx),
+                rewrite_lookup_expr(right, ctx)
+            )
+        }
+        Expr::UnaryOp { op, expr: inner } => format!("{op} {}", rewrite_lookup_expr(inner, ctx)),
+        Expr::Nested(inner) => format!("({})", rewrite_lookup_expr(inner, ctx)),
+        Expr::Function(func) => {
+            let name = &func.name;
+            let args: Vec<String> = match &func.args {
+                sqlparser::ast::FunctionArguments::List(list) => list
+                    .args
+                    .iter()
+                    .map(|arg| match arg {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ) => rewrite_lookup_expr(e, ctx),
+                        other => other.to_string(),
+                    })
+                    .collect(),
+                other => vec![other.to_string()],
+            };
+            format!("{name}({})", args.join(", "))
+        }
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => {
+            format!("CAST({} AS {data_type})", rewrite_lookup_expr(inner, ctx))
+        }
+        _ => expr.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AI function detection (plan-time seam)
 // ---------------------------------------------------------------------------
 
@@ -3236,6 +3453,75 @@ mod temporal_filter_recognition_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lookup_fixtures() -> (FxHashMap<String, Vec<String>>, FxHashMap<String, SchemaRef>) {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let mut partial = FxHashMap::default();
+        partial.insert(
+            "customers".to_string(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+        let mut schemas = FxHashMap::default();
+        schemas.insert(
+            "orders".to_string(),
+            Arc::new(Schema::new(vec![
+                Field::new("order_id", DataType::Int64, false),
+                Field::new("customer_id", DataType::Int64, true),
+                Field::new("name", DataType::Utf8, true),
+            ])) as SchemaRef,
+        );
+        (partial, schemas)
+    }
+
+    #[test]
+    fn lookup_enrich_detects_and_rewrites() {
+        let (partial, schemas) = lookup_fixtures();
+        let sql =
+            "SELECT o.order_id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id";
+        let (cfg, proj) = detect_lookup_enrich_query(sql, &partial, &schemas);
+        let cfg = cfg.expect("partial lookup join should be detected");
+        assert_eq!(cfg.table_name, "customers");
+        assert_eq!(cfg.key_columns, vec!["customer_id".to_string()]);
+        let proj = proj.unwrap();
+        assert!(proj.contains("__lookup_enrich_tmp"));
+        // Qualifiers stripped; `c.name` collides with stream `name` → suffixed.
+        assert!(proj.contains("order_id"));
+        assert!(
+            proj.contains("name_customers"),
+            "collision not suffixed: {proj}"
+        );
+        assert!(
+            !proj.contains("o."),
+            "stream qualifier not stripped: {proj}"
+        );
+        assert!(
+            !proj.contains("c."),
+            "lookup qualifier not stripped: {proj}"
+        );
+    }
+
+    #[test]
+    fn lookup_enrich_rewrites_where_clause() {
+        let (partial, schemas) = lookup_fixtures();
+        let sql = "SELECT o.order_id FROM orders o JOIN customers c ON o.customer_id = c.id \
+                   WHERE c.name = 'vip'";
+        let (_, proj) = detect_lookup_enrich_query(sql, &partial, &schemas);
+        let proj = proj.unwrap();
+        // `c.name` in WHERE rewrites to the suffixed flattened column.
+        assert!(proj.contains("WHERE name_customers = 'vip'"), "{proj}");
+    }
+
+    #[test]
+    fn lookup_enrich_skips_non_partial_table() {
+        let (_partial, schemas) = lookup_fixtures();
+        let empty = FxHashMap::default();
+        let sql = "SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id";
+        let (cfg, _) = detect_lookup_enrich_query(sql, &empty, &schemas);
+        assert!(
+            cfg.is_none(),
+            "no partial tables → must fall through to DataFusion"
+        );
+    }
 
     #[test]
     fn extract_table_refs_plain() {

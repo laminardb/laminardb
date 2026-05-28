@@ -500,6 +500,28 @@ impl LaminarDB {
             }
         }
 
+        // Partial (on-demand) lookup tables: route their enrichment joins to the
+        // async-decoupled operator. A table is partial iff it refreshes Manually
+        // — the same condition the on-demand phase below uses to register it as
+        // `RegisteredLookup::Partial`. Map each to its column names so the
+        // operator can disambiguate colliding output columns.
+        let partial_lookup_tables: rustc_hash::FxHashMap<String, Vec<String>> = table_regs
+            .values()
+            .filter(|r| matches!(r.refresh, Some(RefreshMode::Manual)))
+            .filter_map(|r| {
+                let schema = self.table_store.read().table_schema(&r.name)?;
+                let cols = schema.fields().iter().map(|f| f.name().clone()).collect();
+                Some((r.name.clone(), cols))
+            })
+            .collect();
+        graph.set_partial_lookup_tables(partial_lookup_tables);
+        // Ring-1 workers (lookup-enrich fetch, AI) spawn on the main runtime.
+        graph.set_runtime_handle(
+            self.ai_handle
+                .clone()
+                .unwrap_or_else(tokio::runtime::Handle::current),
+        );
+
         for reg in stream_regs.values() {
             graph.add_query(
                 reg.name.clone(),

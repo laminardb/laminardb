@@ -246,9 +246,12 @@ pub(crate) struct OperatorGraph {
     /// Assembled AI subsystem (registry + providers + cache + call log).
     /// `None` unless `[ai]`/`[models]` are configured.
     ai_runtime: Option<Arc<laminar_ai::AiRuntime>>,
-    /// Main runtime handle for spawning AI inference workers off the compute
-    /// thread. Set together with `ai_runtime`.
-    ai_handle: Option<tokio::runtime::Handle>,
+    /// Main (multi-threaded) runtime handle for spawning Ring-1 workers (AI
+    /// inference, lookup-enrich fetch) off the compute thread.
+    main_runtime_handle: Option<tokio::runtime::Handle>,
+    /// Partial (on-demand) lookup tables → their column names. Drives routing of
+    /// lookup-enrich joins to the async operator and output-column disambiguation.
+    partial_lookup_tables: FxHashMap<String, Vec<String>>,
     /// Plan-time AI routing errors collected during `add_query` (which returns
     /// `()`); surfaced by [`take_build_errors`](Self::take_build_errors) at start.
     build_errors: Vec<DbError>,
@@ -292,7 +295,8 @@ impl OperatorGraph {
             order_configs: FxHashMap::default(),
             live_handles: FxHashMap::default(),
             ai_runtime: None,
-            ai_handle: None,
+            main_runtime_handle: None,
+            partial_lookup_tables: FxHashMap::default(),
             build_errors: Vec::new(),
         }
     }
@@ -306,7 +310,20 @@ impl OperatorGraph {
         handle: tokio::runtime::Handle,
     ) {
         self.ai_runtime = Some(runtime);
-        self.ai_handle = Some(handle);
+        self.main_runtime_handle = Some(handle);
+    }
+
+    /// Install the main runtime handle Ring-1 workers spawn on (independent of
+    /// AI; the lookup-enrich operator needs it too). MUST be the main
+    /// multi-threaded runtime, never the compute runtime.
+    pub fn set_runtime_handle(&mut self, handle: tokio::runtime::Handle) {
+        self.main_runtime_handle = Some(handle);
+    }
+
+    /// Register partial (on-demand) lookup tables and their column names so
+    /// `add_query` can route lookup-enrich joins to the async operator.
+    pub fn set_partial_lookup_tables(&mut self, tables: FxHashMap<String, Vec<String>>) {
+        self.partial_lookup_tables = tables;
     }
 
     /// Take the first plan-time AI routing error collected during query
@@ -816,10 +833,30 @@ impl OperatorGraph {
         let stream_join_projection_sql = stream_join_detection
             .as_ref()
             .map(|d| d.projection_sql.clone());
+
+        // Lookup-enrich: a partial/on-demand lookup join, hoisted to the
+        // async-decoupled operator. Only when no other specialized join matched
+        // and at least one partial lookup table is registered.
+        let (lookup_enrich_config, lookup_projection_sql) = if temporal_probe_config.is_none()
+            && asof_config.is_none()
+            && temporal_config.is_none()
+            && stream_join_config.is_none()
+            && !self.partial_lookup_tables.is_empty()
+        {
+            crate::sql_analysis::detect_lookup_enrich_query(
+                &sql,
+                &self.partial_lookup_tables,
+                &self.source_schemas,
+            )
+        } else {
+            (None, None)
+        };
+
         let projection_sql = projection_sql
             .or(temporal_probe_projection_sql)
             .or(temporal_projection_sql)
-            .or(stream_join_projection_sql);
+            .or(stream_join_projection_sql)
+            .or(lookup_projection_sql);
 
         // Warn for undetected JOIN+BETWEEN
         if stream_join_config.is_none() && asof_config.is_none() && temporal_config.is_none() {
@@ -834,7 +871,12 @@ impl OperatorGraph {
             }
         }
 
-        let table_refs = extract_table_references(&sql);
+        let mut table_refs = extract_table_references(&sql);
+        // The lookup-enrich operator reads its lookup table from the registry,
+        // not as a graph input — drop it so only the stream side is wired.
+        if let Some(cfg) = &lookup_enrich_config {
+            table_refs.remove(&cfg.table_name);
+        }
 
         // Store temporal join config
         if let Some(ref tc) = temporal_config {
@@ -851,6 +893,7 @@ impl OperatorGraph {
             temporal_config.as_ref(),
             stream_join_config.as_ref(),
             temporal_probe_config.as_ref(),
+            lookup_enrich_config,
             projection_sql.as_deref(),
             idle_ttl_ms,
         );
@@ -953,7 +996,7 @@ impl OperatorGraph {
     ) -> Result<(), DbError> {
         use crate::operator::ai_inference::{AiInferenceOperator, AiOperatorConfig};
 
-        let handle = self.ai_handle.clone().ok_or_else(|| {
+        let handle = self.main_runtime_handle.clone().ok_or_else(|| {
             DbError::InvalidOperation("AI runtime handle is not configured".to_string())
         })?;
         let ctx = self.ctx.clone();
@@ -1078,10 +1121,26 @@ impl OperatorGraph {
         temporal_config: Option<&TemporalJoinTranslatorConfig>,
         stream_join_config: Option<&laminar_sql::translator::StreamJoinConfig>,
         temporal_probe_config: Option<&laminar_sql::translator::TemporalProbeConfig>,
+        lookup_enrich_config: Option<crate::operator::lookup_enrich::LookupEnrichConfig>,
         projection_sql: Option<&str>,
         idle_ttl_ms: Option<u64>,
     ) -> Box<dyn GraphOperator> {
         use crate::operator;
+
+        // On-demand lookup-enrich join → async-decoupled operator. Falls through
+        // to the DataFusion lookup path if the registry/runtime handle is absent.
+        if let Some(cfg) = lookup_enrich_config {
+            if let (Some(reg), Some(handle)) = (&self.lookup_registry, &self.main_runtime_handle) {
+                return Box::new(operator::lookup_enrich::LookupEnrichOperator::new(
+                    name,
+                    cfg,
+                    projection_sql.map(Arc::from),
+                    self.ctx.clone(),
+                    Arc::clone(reg),
+                    handle.clone(),
+                ));
+            }
+        }
 
         if let Some(cfg) = temporal_probe_config {
             return Box::new(

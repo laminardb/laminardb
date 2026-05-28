@@ -152,15 +152,81 @@ with predicate pushdown — Implemented"); none of those three properties hold.
   timeout. (Full non-blocking + retry + metrics arrive in Phase 1.)
 
 ### Phase 1 — Async-decouple the on-demand lookup join (keystone, AD-1)
-- New `crates/laminar-db/src/operator/lookup_enrich.rs` `GraphOperator` + a
-  `crates/laminar-db/src/lookup_worker.rs` Ring-1 worker (clone the `ai_worker.rs` shape:
-  `WorkItem`/`WorkResult`/`WorkerContext`, bounded submit/result channels).
-- Router change: `partial`/`none` lookup joins planned as this graph node instead of
-  `PartialLookupJoinExec`; `full` stays on the DataFusion `LookupJoinExec`.
-- Implement `watermark_hold` (oldest in-flight ingest watermark), `wants_input` (in-flight
-  cap → source backpressure), `checkpoint`/`restore` of in-flight + unsubmitted batches,
-  `estimated_state_bytes`.
-- Negative caching with its own TTL (closes problem #4).
+
+**DONE 2026-05-28 — fully wired + tested.** `partial`/`none` lookup joins now route to the
+async-decoupled `LookupEnrichOperator` (`operator/lookup_enrich.rs`): cache hits inline, misses
+to a Ring-1 worker (30s fetch timeout), `watermark_hold` + `wants_input` backpressure,
+checkpoint/restore of in-flight, negative-cache tombstones, retry-on-error (no NULL-fill).
+Routing via `detect_lookup_enrich_query` (`sql_analysis.rs`) + the full residual-projection
+rewriter with collision-aware suffixing (`{col}_{lookup_table}`), shared with the operator's
+`output_schema`. `create_operator` branch; partial-table set + main runtime handle threaded
+through `OperatorGraph` from `pipeline_lifecycle`. 7 tests (4 operator + 3 detector incl.
+collision in SELECT/WHERE), clippy clean, 721 lib tests green. `full`/snapshot lookups keep the
+DataFusion path. v1 limits: single join step, single-column key, stream-on-left, INNER/LEFT,
+stream schema known (else falls through to DataFusion).
+
+**Implemented wiring (was the spec; kept for the record):**
+1. **Partial-table metadata into `OperatorGraph`.** Add `partial_lookup_tables:
+   HashMap<String, Vec<String>>` (table → column names) + setter; populate in
+   `pipeline_lifecycle` from `table_regs` where `refresh == RefreshMode::Manual` **before** the
+   `add_query` loop (mirrors exactly the on-demand phase that registers those tables as
+   `Partial`, ~`:1104`). Reuse the existing `ai_handle` (main runtime handle) for the worker
+   (rename field `ai_handle` → `main_runtime_handle` for clarity; private, ~3 sites).
+2. **`detect_lookup_enrich_query(sql, &partial_cols, &source_schemas)`** in `sql_analysis.rs`,
+   mirroring `detect_asof_query`: `analyze_joins` → find a plain equi-join (not asof/temporal,
+   no `time_bound`) whose left **or** right table ∈ `partial_cols`. Lookup side = that table;
+   stream side = the other. Build `LookupEnrichConfig { table_name, key_columns=[stream key],
+   join_type: Inner|LeftOuter }`. Return `None` (→ DataFusion fallback) for join types other
+   than Inner/Left.
+3. **Residual-projection rewriter** `build_lookup_projection_sql` + `rewrite_lookup_expr`
+   mirroring `build_projection_sql`/`rewrite_expr` (recursive over Identifier /
+   CompoundIdentifier / BinaryOp / UnaryOp / Nested / Function / Cast / `_ => to_string()`).
+   **Collision rule (must match the operator exactly):** stream col → bare name; lookup col →
+   bare name unless its name ∈ stream column names → `{col}_{lookup_table}`. Reads from
+   `__lookup_enrich_tmp`.
+4. **Operator `output_schema` must apply the SAME suffix rule** (it has both schemas at
+   runtime): a lookup field whose name collides with a stream field is renamed
+   `{name}_{lookup_table}`. This is the one coordination point — rewriter (plan-time) and
+   operator (runtime) must agree, so factor the rule into a shared helper.
+5. **`create_operator` branch** routing `LookupEnrichConfig` → `LookupEnrichOperator::new(...,
+   lookup_registry, main_runtime_handle)`; **`add_query`** calls the detector and threads the
+   config + `projection_sql`. `full`/snapshot tables (not in `partial_cols`) keep the existing
+   DataFusion `LookupJoinExec` path.
+6. **Test:** end-to-end MV with a partial lookup join (projected SELECT) enriches correctly,
+   incl. a key-name-collision case exercising the suffix rule.
+
+Until wired, `clippy -D warnings` flags the module as dead — do not commit before the branch
+lands.
+
+**Verified integration (2026-05-28):** routing follows the existing **dedicated-join
+pattern** (asof/temporal/interval), NOT an AI-style AST rewrite. A `partial`/`none` lookup
+join today is detected by the `lookup_join_rewrite` optimizer rule
+(`planner/lookup_join.rs`) → `LookupJoinNode` → `PartialLookupJoinExec`, all inside a
+`SqlQueryOperator`'s DataFusion plan. We hoist it to a dedicated `GraphOperator` so misses can
+be served across cycles (DataFusion's pull model cannot "serve hits now, fetch misses later").
+
+Reuse (no hand-rolling, no new infra):
+- Worker = `ai_worker.rs` shape (`run_worker` loop, bounded submit/result `mpsc`); swap
+  `provider.infer_batch` → `LookupSourceDyn::query_batch`.
+- Operator = `AiInferenceOperator` shape (`PendingBatch`, `ingest`/`apply_result`/`submit`/
+  `flush_unsubmitted`, `watermark_hold`, `wants_input`, `checkpoint`/`restore`,
+  `estimated_state_bytes`).
+- State = the existing `PartialLookupState` from `lookup_registry` (foyer cache +
+  `key_sort_fields` + `source`); key encoding via the existing `RowConverter`; row assembly
+  lifted from `probe_partial_batch_with_fallback` (stream cols + lookup cols, inner-drop /
+  left-NULL); residual via `ProjectingJoinState` like the other join operators.
+
+Work (one cohesive change; cannot be partially landed without dead/unwired code):
+1. Planner: emit a `LookupEnrichConfig` (table, join keys, join type) + residual
+   `projection_sql` from the lookup-join detection, mirroring asof/temporal config extraction.
+2. `operator/lookup_enrich.rs` + `lookup_worker.rs`.
+3. `create_operator` branch routing `partial`/`none` lookup joins to the new operator
+   (passing `lookup_registry` + the main runtime `Handle`, already plumbed for AI). `full`
+   stays on DataFusion `LookupJoinExec` (pure in-memory probe).
+4. Off-thread bounded retry + Prometheus metrics (deferred here from Phase 0; prom access is
+   natural in laminar-db).
+5. Negative caching (problem #4): tombstone = zero-row batch in the foyer cache; S3-FIFO
+   eviction gives bounded staleness — no explicit TTL machinery in v1 (full TTL is Phase 2).
 - **Exit:** misses run off the compute thread; cache hits stay inline (< 500ns); a slow
   source reduces throughput, never freezes watermarks; in-flight survives checkpoint/restore.
 

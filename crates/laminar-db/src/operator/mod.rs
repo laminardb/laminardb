@@ -117,6 +117,7 @@ pub(crate) mod ai_inference;
 pub(crate) mod asof_join;
 pub(crate) mod eowc_query;
 pub(crate) mod interval_join;
+pub(crate) mod lookup_enrich;
 pub(crate) mod process_time_join;
 pub(crate) mod sql_query;
 pub(crate) mod temporal_filter;
