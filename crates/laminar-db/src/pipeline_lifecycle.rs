@@ -1130,7 +1130,8 @@ impl LaminarDB {
             let Some(reg) = table_regs.get(name.as_str()) else {
                 continue;
             };
-            let max_entries = reg.cache_max_entries.unwrap_or(65_536);
+            // 64 MiB default budget; the cache is byte-weighted, not entry-counted.
+            let capacity_bytes = reg.cache_max_bytes.unwrap_or(64 * 1024 * 1024);
             let Some(schema) = self.table_store.read().table_schema(name) else {
                 continue;
             };
@@ -1153,7 +1154,7 @@ impl LaminarDB {
             let cache = Arc::new(laminar_core::lookup::foyer_cache::FoyerMemoryCache::new(
                 0,
                 laminar_core::lookup::foyer_cache::FoyerMemoryCacheConfig {
-                    capacity: max_entries,
+                    capacity_bytes,
                     shards: 16,
                 },
             ));
@@ -1190,7 +1191,7 @@ impl LaminarDB {
             *mode = RefreshMode::SnapshotPlusCdc;
             tracing::info!(
                 table = %name,
-                max_entries,
+                capacity_bytes,
                 pk = %pk_csv,
                 "registered on-demand lookup table (partial cache)"
             );

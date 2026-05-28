@@ -483,7 +483,7 @@ impl LaminarDB {
                     format,
                     format_options,
                     refresh: refresh_mode,
-                    cache_max_entries,
+                    cache_max_bytes: None,
                 });
             }
         }

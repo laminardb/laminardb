@@ -623,7 +623,12 @@ impl LaminarDB {
             }
         }
 
-        let cache_max = info.properties.cache_memory.map(cache_entries_from_memory);
+        // The on-demand lookup cache is byte-weighted; carry the user's
+        // cache_memory budget through as bytes (no lossy entry-count conversion).
+        let cache_max_bytes = info
+            .properties
+            .cache_memory
+            .map(|m| usize::try_from(m.as_bytes()).unwrap_or(usize::MAX));
 
         self.connector_manager
             .lock()
@@ -635,7 +640,7 @@ impl LaminarDB {
                 format: info.raw_options.get("format").cloned(),
                 format_options,
                 refresh,
-                cache_max_entries: cache_max,
+                cache_max_bytes,
             });
 
         Ok(())

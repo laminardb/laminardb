@@ -231,11 +231,15 @@ Work (one cohesive change; cannot be partially landed without dead/unwired code)
   source reduces throughput, never freezes watermarks; in-flight survives checkpoint/restore.
 
 ### Phase 2 — Cache semantics
-- Byte-weighted foyer bound via `with_weighter` (reuse the AI result-cache migration);
-  `lookup.cache.max-bytes` replaces entry-count default. (Closes problem #5 memory bound.)
-- TTL on positive entries → lazy re-fetch on next probe after expiry (no background refresh
-  machinery); CDC invalidation already wired.
-- **Exit:** cache memory is byte-bounded; stale entries expire and re-fetch on demand.
+- **DONE 2026-05-28 — byte-weighted bound.** `FoyerMemoryCache` is now byte-weighted
+  (`with_weighter` = `RecordBatch::get_array_memory_size`, `capacity_bytes` budget, 64 MiB
+  default), mirroring the AI result cache. The user's `cache_memory` budget flows through as
+  bytes (no lossy entry-count conversion); the dead `cache_max_entries` registration field was
+  removed. Closes problem #5 (entry-count bound could OOM on wide rows).
+- **TTL (remaining):** TTL on positive entries → lazy re-fetch on next probe after expiry. Needs
+  a TTL config knob to be properly wired (store `(Instant, RecordBatch)`, check on `get`); not
+  done yet — negative tombstones + CDC invalidation + byte eviction bound staleness for now.
+- **Exit:** cache memory is byte-bounded (done); TTL-based expiry pending.
 - **Deferred (not v1):** foyer hybrid RAM→SSD tier. The clustered store + file-skipping
   (Phase 3) *is* the cold tier; a local SSD tier is a warm-key latency optimization to add
   only if RAM-miss → store latency proves too high in practice.

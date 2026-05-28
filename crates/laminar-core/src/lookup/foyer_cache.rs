@@ -57,8 +57,10 @@ impl Equivalent<LookupCacheKey> for LookupCacheKeyRef<'_> {
 /// Configuration for [`FoyerMemoryCache`].
 #[derive(Debug, Clone, Copy)]
 pub struct FoyerMemoryCacheConfig {
-    /// Maximum number of entries in the cache.
-    pub capacity: usize,
+    /// Memory budget in bytes. Entries are weighted by their `RecordBatch`
+    /// array size, so a few wide rows can't blow the bound the way an
+    /// entry-count limit would.
+    pub capacity_bytes: usize,
     /// Number of shards for concurrent access (should be a power of 2).
     pub shards: usize,
 }
@@ -66,7 +68,7 @@ pub struct FoyerMemoryCacheConfig {
 impl Default for FoyerMemoryCacheConfig {
     fn default() -> Self {
         Self {
-            capacity: 256 * 1024, // 256K entries
+            capacity_bytes: 64 * 1024 * 1024, // 64 MiB
             shards: 16,
         }
     }
@@ -92,8 +94,11 @@ impl FoyerMemoryCache {
     /// Create a new cache with the given configuration.
     #[must_use]
     pub fn new(table_id: u32, config: FoyerMemoryCacheConfig) -> Self {
-        let cache = CacheBuilder::new(config.capacity)
+        let cache = CacheBuilder::new(config.capacity_bytes)
             .with_shards(config.shards)
+            // Weigh entries by payload bytes (min 1 so tombstones count) so the
+            // bound is memory, not entry count.
+            .with_weighter(|_k: &LookupCacheKey, v: &RecordBatch| v.get_array_memory_size().max(1))
             .build();
 
         Self {
@@ -225,7 +230,7 @@ mod tests {
         FoyerMemoryCache::new(
             table_id,
             FoyerMemoryCacheConfig {
-                capacity: 64,
+                capacity_bytes: 64 * 1024,
                 shards: 4,
             },
         )
@@ -249,19 +254,25 @@ mod tests {
 
     #[test]
     fn test_foyer_cache_eviction() {
+        // Tiny byte budget: inserting many batches must evict (the bound is
+        // bytes, so the cache can't hold all 200 entries).
         let cache = FoyerMemoryCache::new(
             1,
             FoyerMemoryCacheConfig {
-                capacity: 8,
+                capacity_bytes: 512,
                 shards: 1,
             },
         );
 
-        for i in 0..20u8 {
+        for i in 0..200u8 {
             cache.insert(&[i], test_batch(&format!("v{i}")));
         }
 
-        assert!(cache.len() <= 8, "len {} > capacity 8", cache.len());
+        assert!(
+            cache.len() < 200,
+            "byte bound did not evict: len {}",
+            cache.len()
+        );
     }
 
     #[test]
@@ -324,7 +335,7 @@ mod tests {
     #[test]
     fn test_foyer_cache_default_config() {
         let config = FoyerMemoryCacheConfig::default();
-        assert_eq!(config.capacity, 256 * 1024);
+        assert_eq!(config.capacity_bytes, 64 * 1024 * 1024);
         assert_eq!(config.shards, 16);
     }
 

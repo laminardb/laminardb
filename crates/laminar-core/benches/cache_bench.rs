@@ -29,7 +29,8 @@ fn populated_cache(n: usize) -> FoyerMemoryCache {
     let cache = FoyerMemoryCache::new(
         1,
         FoyerMemoryCacheConfig {
-            capacity: n * 2,
+            // Generous byte budget so the working set is never evicted mid-bench.
+            capacity_bytes: n.saturating_mul(8 * 1024),
             shards: 16,
         },
     );

@@ -55,7 +55,9 @@ pub(crate) struct TableRegistration {
     pub format: Option<String>,
     pub format_options: HashMap<String, String>,
     pub refresh: Option<RefreshMode>,
-    pub cache_max_entries: Option<usize>,
+    /// Byte budget for the on-demand lookup `FoyerMemoryCache` (partial mode).
+    /// `None` falls back to the cache's default.
+    pub cache_max_bytes: Option<usize>,
 }
 
 /// Lowercase + replace underscores with hyphens.
@@ -530,7 +532,7 @@ mod tests {
             format: Some("JSON".to_string()),
             format_options: HashMap::new(),
             refresh: None,
-            cache_max_entries: None,
+            cache_max_bytes: None,
         });
         assert_eq!(mgr.table_names().len(), 1);
         assert!(mgr.has_external_connectors());
@@ -547,7 +549,7 @@ mod tests {
             format: None,
             format_options: HashMap::new(),
             refresh: None,
-            cache_max_entries: None,
+            cache_max_bytes: None,
         });
         assert!(mgr.unregister_table("t"));
         assert!(!mgr.unregister_table("t"));
@@ -565,7 +567,7 @@ mod tests {
             format: None,
             format_options: HashMap::new(),
             refresh: None,
-            cache_max_entries: None,
+            cache_max_bytes: None,
         });
         assert_eq!(mgr.registration_count(), 1);
         mgr.clear();
@@ -709,7 +711,7 @@ mod tests {
             format: Some("JSON".to_string()),
             format_options: HashMap::new(),
             refresh: None,
-            cache_max_entries: None,
+            cache_max_bytes: None,
         };
         let config = build_table_config(&reg).unwrap();
         assert_eq!(config.connector_type(), "kafka");
@@ -727,7 +729,7 @@ mod tests {
             format: None,
             format_options: HashMap::new(),
             refresh: None,
-            cache_max_entries: None,
+            cache_max_bytes: None,
         };
         let err = build_table_config(&reg).unwrap_err();
         assert!(err.to_string().contains("no connector type"));

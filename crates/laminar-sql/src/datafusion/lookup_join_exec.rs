@@ -1990,7 +1990,7 @@ mod tests {
         Arc::new(FoyerMemoryCache::new(
             1,
             FoyerMemoryCacheConfig {
-                capacity: 64,
+                capacity_bytes: 64 * 1024,
                 shards: 4,
             },
         ))
