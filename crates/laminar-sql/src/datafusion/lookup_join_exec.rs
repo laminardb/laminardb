@@ -43,6 +43,10 @@ use tokio::sync::Semaphore;
 
 use super::lookup_join::{LookupJoinNode, LookupJoinType};
 
+/// Deadline for a cache-miss source fetch. The fetch is awaited inline on the
+/// single compute thread, so without a bound a hung source wedges the pipeline.
+const LOOKUP_SOURCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 // ── Registry ─────────────────────────────────────────────────────
 
 /// Thread-safe registry of lookup table entries (snapshot or partial).
@@ -1227,7 +1231,7 @@ impl datafusion::physical_plan::ExecutionPlanProperties for PartialLookupJoinExe
 /// Probes the foyer cache for each row in `stream_batch`, falling back
 /// to the async source for cache misses. Inserts source results into
 /// the cache before building the output.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn probe_partial_batch_with_fallback(
     stream_batch: &RecordBatch,
     converter: &RowConverter,
@@ -1284,23 +1288,36 @@ async fn probe_partial_batch_with_fallback(
                 .map_err(|_| DataFusionError::Internal("fetch semaphore closed".into()))?;
 
             let key_refs: Vec<&[u8]> = miss_keys.iter().map(|(_, k)| k.as_slice()).collect();
-            let source_results = source.query_batch(&key_refs, &[], &[]).await;
 
-            match source_results {
-                Ok(results) => {
-                    for ((idx, key_bytes), maybe_batch) in miss_keys.iter().zip(results) {
-                        if let Some(batch) = maybe_batch {
-                            foyer_cache.insert(key_bytes, batch.clone());
-                            lookup_batches[*idx] = Some(batch);
-                        }
-                    }
+            // Propagate fetch failures instead of silently serving cache-only
+            // results: returning Err replays the cycle rather than dropping
+            // inner-join matches or NULL-filling left-join rows.
+            let results = match tokio::time::timeout(
+                LOOKUP_SOURCE_TIMEOUT,
+                source.query_batch(&key_refs, &[], &[]),
+            )
+            .await
+            {
+                Ok(Ok(results)) => results,
+                Ok(Err(e)) => {
+                    return Err(DataFusionError::Execution(format!(
+                        "lookup source query failed ({} keys): {e}",
+                        miss_keys.len()
+                    )));
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        missed_keys = miss_keys.len(),
-                        "partial lookup: source fallback failed, serving cache-only results"
-                    );
+                Err(_elapsed) => {
+                    return Err(DataFusionError::Execution(format!(
+                        "lookup source query timed out after {LOOKUP_SOURCE_TIMEOUT:?} \
+                         ({} keys)",
+                        miss_keys.len()
+                    )));
+                }
+            };
+
+            for ((idx, key_bytes), maybe_batch) in miss_keys.iter().zip(results) {
+                if let Some(batch) = maybe_batch {
+                    foyer_cache.insert(key_bytes, batch.clone());
+                    lookup_batches[*idx] = Some(batch);
                 }
             }
         }
@@ -2218,7 +2235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_source_error_graceful_degradation() {
+    async fn partial_source_error_propagates() {
         use laminar_core::lookup::source::LookupError;
         use laminar_core::lookup::source::LookupSourceDyn;
 
@@ -2258,11 +2275,16 @@ mod tests {
         )
         .unwrap();
 
+        // A source error must propagate (fail the cycle → replay), NOT silently
+        // serve cache-only results that drop/NULL-fill the missed rows.
         let ctx = Arc::new(TaskContext::default());
-        let batches: Vec<RecordBatch> = exec.execute(0, ctx).unwrap().try_collect().await.unwrap();
-        let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        // All rows preserved in left outer, but all lookup columns null
-        assert_eq!(total, 4);
+        let result: std::result::Result<Vec<RecordBatch>, _> =
+            exec.execute(0, ctx).unwrap().try_collect().await;
+        let err = result.expect_err("source error must propagate, not degrade silently");
+        assert!(
+            err.to_string().contains("lookup source query failed"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
