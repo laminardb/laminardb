@@ -251,7 +251,10 @@ impl IncrementalAggState {
 }
 
 /// Name of the Z-set weight column appended to changelog output.
-pub(crate) const WEIGHT_COLUMN: &str = "__weight";
+///
+/// Re-exported from the shared changelog contract in `laminar-core` so the MV
+/// producer and the upsert-sink consumers agree on the column name.
+pub(crate) use laminar_core::changelog::WEIGHT_COLUMN;
 
 /// Build a weighted `RecordBatch` from collected keys, values, and weights.
 fn build_weighted_batch(

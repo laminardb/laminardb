@@ -38,6 +38,19 @@ pub struct DeltaLakeSinkMetrics {
     /// End-to-end flush duration histogram (concat → write → checkpoint).
     /// Buckets cover 5ms up to ~160s (0.005 * 2^15).
     pub flush_duration: Histogram,
+
+    /// Total changelog rows entering collapse (pre-dedup, per upsert flush).
+    pub collapse_rows_in: IntCounter,
+
+    /// Total upsert rows emitted by collapse (`_op = U`).
+    pub collapse_upserts_out: IntCounter,
+
+    /// Total delete rows emitted by collapse (`_op = D`).
+    pub collapse_deletes_out: IntCounter,
+
+    /// Changelog-collapse duration histogram (per upsert flush).
+    /// Buckets cover 100µs up to ~3.3s (0.0001 * 2^15).
+    pub collapse_duration: Histogram,
 }
 
 impl DeltaLakeSinkMetrics {
@@ -64,6 +77,25 @@ impl DeltaLakeSinkMetrics {
                 metric = "delta_sink_flush_duration_seconds",
                 error = %e,
                 "failed to register delta lake flush_duration histogram"
+            );
+        }
+
+        let collapse_duration = Histogram::with_opts(
+            HistogramOpts::new(
+                "delta_sink_collapse_duration_seconds",
+                "Changelog collapse duration per upsert flush (Z-set/CDC dedup)",
+            )
+            .buckets(prometheus::exponential_buckets(0.0001, 2.0, 16).unwrap()),
+        )
+        .unwrap();
+        if let Err(e) = handle
+            .registry()
+            .register(Box::new(collapse_duration.clone()))
+        {
+            tracing::warn!(
+                metric = "delta_sink_collapse_duration_seconds",
+                error = %e,
+                "failed to register delta lake collapse_duration histogram"
             );
         }
 
@@ -100,6 +132,19 @@ impl DeltaLakeSinkMetrics {
                 "Retry attempts kicked off (conflict + timeout)",
             ),
             flush_duration,
+            collapse_rows_in: handle.counter(
+                "delta_sink_collapse_rows_in_total",
+                "Changelog rows entering collapse (pre-dedup)",
+            ),
+            collapse_upserts_out: handle.counter(
+                "delta_sink_collapse_upserts_out_total",
+                "Upsert rows emitted by collapse (_op = U)",
+            ),
+            collapse_deletes_out: handle.counter(
+                "delta_sink_collapse_deletes_out_total",
+                "Delete rows emitted by collapse (_op = D)",
+            ),
+            collapse_duration,
         }
     }
 
@@ -160,6 +205,15 @@ impl DeltaLakeSinkMetrics {
     /// Records a completed flush duration (seconds).
     pub fn observe_flush_duration(&self, seconds: f64) {
         self.flush_duration.observe(seconds);
+    }
+
+    /// Records one changelog-collapse pass: `rows_in` rows folded down to
+    /// `upserts_out` upserts and `deletes_out` deletes in `seconds`.
+    pub fn observe_collapse(&self, rows_in: u64, upserts_out: u64, deletes_out: u64, seconds: f64) {
+        self.collapse_rows_in.inc_by(rows_in);
+        self.collapse_upserts_out.inc_by(upserts_out);
+        self.collapse_deletes_out.inc_by(deletes_out);
+        self.collapse_duration.observe(seconds);
     }
 }
 
