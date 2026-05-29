@@ -4,9 +4,12 @@
 //! per fetch, so all missed keys of a probe fold into one index-served round
 //! trip. [`KeyAligner`] handles key decode and result realignment.
 //!
-//! v1 limits: single-column key (matches the lookup-enrich operator), and the
-//! connection is `NoTls` (client TLS is a connector-wide follow-up the CDC
-//! source and sink share).
+//! TLS is server-auth via `rustls`: set `sslmode` (`disable` (default) /
+//! `require` / `verify-ca` / `verify-full` / `prefer`) and optionally
+//! `sslrootcert` (CA PEM path; otherwise the Mozilla webpki roots are trusted).
+//! Any TLS mode verifies the server certificate — there is deliberately no
+//! insecure skip-verify. v1 limits: single-column key, and server-auth only
+//! (mTLS client certs are not yet wired).
 
 #[cfg(feature = "postgres-cdc")]
 use std::collections::HashMap;
@@ -272,11 +275,73 @@ fn build_pool(props: &HashMap<String, String>, pool_size: usize) -> Result<Pool,
     }
 
     cfg.pool = Some(deadpool_postgres::PoolConfig::new(pool_size.max(1)));
-    cfg.create_pool(
-        Some(deadpool_postgres::Runtime::Tokio1),
-        tokio_postgres::NoTls,
-    )
-    .map_err(|e| LookupError::Connection(format!("create pool: {e}")))
+    let runtime = Some(deadpool_postgres::Runtime::Tokio1);
+
+    // `create_pool` is generic over the TLS connector but erases it into the
+    // same `Pool` type, so the two arms unify.
+    if tls_enabled(props)? {
+        let connector = build_rustls_connector(props)?;
+        cfg.create_pool(runtime, connector)
+            .map_err(|e| LookupError::Connection(format!("create pool: {e}")))
+    } else {
+        cfg.create_pool(runtime, tokio_postgres::NoTls)
+            .map_err(|e| LookupError::Connection(format!("create pool: {e}")))
+    }
+}
+
+/// Whether the configured `sslmode`/`ssl.mode` requests TLS. Absent or
+/// `disable` → no TLS (backward compatible); a TLS mode → verified TLS.
+#[cfg(feature = "postgres-cdc")]
+fn tls_enabled(props: &HashMap<String, String>) -> Result<bool, LookupError> {
+    let Some(mode) = props.get("sslmode").or_else(|| props.get("ssl.mode")) else {
+        return Ok(false);
+    };
+    match mode.to_ascii_lowercase().as_str() {
+        "disable" => Ok(false),
+        "require" | "prefer" | "verify-ca" | "verify-full" => Ok(true),
+        other => Err(LookupError::Connection(format!(
+            "unsupported sslmode '{other}' (use disable/require/prefer/verify-ca/verify-full)"
+        ))),
+    }
+}
+
+/// Build a server-auth rustls TLS connector. Roots come from `sslrootcert`
+/// (CA PEM) if set, otherwise the Mozilla webpki roots; the server certificate
+/// is always verified (no insecure skip-verify).
+#[cfg(feature = "postgres-cdc")]
+fn build_rustls_connector(
+    props: &HashMap<String, String>,
+) -> Result<tokio_postgres_rustls::MakeRustlsConnect, LookupError> {
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+
+    // Idempotent process-wide install; matches the rest of the workspace.
+    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    let mut roots = RootCertStore::empty();
+    if let Some(ca_path) = props.get("sslrootcert").or_else(|| props.get("ssl.ca")) {
+        let pem = std::fs::read(ca_path)
+            .map_err(|e| LookupError::Connection(format!("read sslrootcert '{ca_path}': {e}")))?;
+        let certs = rustls_pemfile::certs(&mut std::io::Cursor::new(pem))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| LookupError::Connection(format!("parse sslrootcert: {e}")))?;
+        if certs.is_empty() {
+            return Err(LookupError::Connection(
+                "sslrootcert contained no certificates".into(),
+            ));
+        }
+        for cert in certs {
+            roots
+                .add(cert)
+                .map_err(|e| LookupError::Connection(format!("add CA cert: {e}")))?;
+        }
+    } else {
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+
+    let client_cfg = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(client_cfg))
 }
 
 /// Convert `tokio_postgres` rows into one Arrow `RecordBatch` via the
@@ -386,5 +451,26 @@ mod tests {
             PostgresLookupSource::build_any_param(&arrow_array::Date32Array::from(vec![1]))
                 .is_err()
         );
+    }
+
+    fn props(kv: &[(&str, &str)]) -> HashMap<String, String> {
+        kv.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect()
+    }
+
+    #[test]
+    fn tls_mode_parsing() {
+        assert!(!tls_enabled(&HashMap::new()).unwrap()); // absent → no TLS
+        assert!(!tls_enabled(&props(&[("sslmode", "disable")])).unwrap());
+        assert!(tls_enabled(&props(&[("sslmode", "require")])).unwrap());
+        assert!(tls_enabled(&props(&[("ssl.mode", "verify-full")])).unwrap());
+        assert!(tls_enabled(&props(&[("sslmode", "bogus")])).is_err());
+    }
+
+    #[test]
+    fn tls_connector_builds_with_roots_and_rejects_bad_ca() {
+        // Default webpki roots: builds without a CA file.
+        assert!(build_rustls_connector(&HashMap::new()).is_ok());
+        // An explicit but missing CA path is a clear error, not a panic.
+        assert!(build_rustls_connector(&props(&[("sslrootcert", "/no/such/ca.pem")])).is_err());
     }
 }

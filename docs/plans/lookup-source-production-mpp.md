@@ -290,9 +290,11 @@ Work (one cohesive change; cannot be partially landed without dead/unwired code)
     no-pool/`NoTls`/`SELECT *` reference stub — `deadpool` pool + parameterized
     `WHERE pk = ANY($1)`; schema from a prepared zero-row probe; native pg type map with
     rich types (numeric/date/timestamp/uuid/json) rendered as text. `register_lookup_source("postgres", ...)`.
-    Fixes the README mismatch (README updated). **TLS still `NoTls`** (deferred — a
-    connector-wide gap the CDC source and sink share; `tokio-postgres-rustls` is in the
-    workspace but not yet wired into laminar-connectors).
+    Fixes the README mismatch (README updated). **Server-auth TLS DONE** (`rustls` via
+    `tokio-postgres-rustls`): `sslmode` (disable/require/prefer/verify-ca/verify-full) +
+    optional `sslrootcert` (CA PEM; else webpki roots). Always verifies — no insecure
+    skip-verify; mTLS client certs not yet wired. (The CDC control-plane connect + sink still
+    `NoTls` — a separate, still-open gap; the helper here is local to the lookup, not yet shared.)
   - **MongoDB** (`mongodb/lookup.rs`): new `MongoLookupSource` — `find({ pk: { $in: [...] } })`,
     projects each document into the table's **declared** Arrow schema. Required threading the
     declared schema into the factory: `LookupSourceFactory::build` + `create_lookup_source`
@@ -305,7 +307,7 @@ Work (one cohesive change; cannot be partially landed without dead/unwired code)
 - `arrow-row` is now pulled by the `iceberg`/`postgres-cdc`/`mongodb-cdc` features (was only via
   `delta-lake`→`changelog-collapse`).
 - **Exit:** Delta, Iceberg, Postgres, MongoDB all serve on-demand lookups with key-filtered
-  pushdown + pooling (PG); per-backend live integration tests + Postgres TLS remain.
+  pushdown + pooling + server-auth TLS (PG); per-backend live integration tests remain.
 
 ### Consolidation + test strategy (2026-05-29) — supersedes the per-phase mechanics above
 

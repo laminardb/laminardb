@@ -32,7 +32,7 @@ batches all missed keys of a probe into one pushed-down, key-filtered fetch
 |---------|-------------|-----------|-------|
 | Delta Lake | `delta-lake` | `WHERE pk IN (...)` (file/partition pruning) | Warns if not clustered on the key |
 | Iceberg | `iceberg` | Native scan `with_filter(pk IN ...)` (manifest pruning) | Reloads snapshot per fetch |
-| PostgreSQL | `postgres-cdc` | Pooled (`deadpool`) `WHERE pk = ANY($1)` | Single-column key; `NoTls` (TLS is a planned connector-wide follow-up) |
+| PostgreSQL | `postgres-cdc` | Pooled (`deadpool`) `WHERE pk = ANY($1)` | Single-column key; server-auth TLS via `sslmode` + optional `sslrootcert` |
 | MongoDB | `mongodb-cdc` | `find({ pk: { $in: [...] } })` | Projects documents into the declared schema |
 
 Misses run off the compute thread (the lookup-enrich operator is async-decoupled),
