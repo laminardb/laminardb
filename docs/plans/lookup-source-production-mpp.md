@@ -245,13 +245,26 @@ Work (one cohesive change; cannot be partially landed without dead/unwired code)
   only if RAM-miss → store latency proves too high in practice.
 
 ### Phase 3 — Vectorized + file-skipping source path (AD-4)
-- Rewrite `DeltaLookupSource::query` as a single `WHERE pk IN (<keys>)` (or join against an
-  ephemeral keys batch) per fetch; wire `predicates`/`projection` through `PushdownAdapter`
-  (`crates/laminar-core/src/lookup/source.rs:150`). (Closes problem #2.)
-- Validate at `CREATE LOOKUP TABLE` time that the table is partitioned/clustered on the key;
-  emit a loud warning (or error, configurable) if not, since unclustered = full scan/key.
-- Verify (test + metric) that IN-list pushdown actually prunes manifests/files.
-- **Exit:** N missed keys = 1 pruned scan; per-key cost is O(matching files), documented.
+- **DONE 2026-05-29 — batched fetch + clustering warning.** `DeltaLookupSource::query`
+  (`crates/laminar-connectors/src/lookup/delta_lookup.rs`) now issues **one** batched scan per
+  chunk of ≤`MAX_KEYS_PER_QUERY` (1024) keys instead of one `WHERE pk = x LIMIT 1` + `execute_stream`
+  per key (closes problem #2: N keys = ⌈N/1024⌉ pruned scans, was N full-scans). A single-column PK
+  folds into `"pk" IN (...)`; a composite PK becomes an OR of per-key AND-groups; both de-dup keys
+  to keep SQL compact. Results are realigned to the input key order by re-encoding each fetched
+  row's PK columns with the **same** `RowConverter` used to decode the input keys (`index_batch_by_key`),
+  so a key always maps to its own row regardless of scan order; duplicate input keys each resolve.
+  `open()` now emits a best-effort `tracing::warn!` if none of the key columns is a Delta partition
+  column (Z-ORDER isn't visible in metadata, so warning-not-error) via the new
+  `delta_io::get_partition_columns`. 5 tests (open/miss + batched-align/dup/empty), clippy clean
+  (`-D warnings`, delta-lake feature), 554 connectors lib tests green.
+- **Predicates/projection pushdown — deferred (not blocking).** The Phase-1 operator
+  (`lookup_enrich.rs`) calls `query_batch` with **empty** predicates/projection, and the operator's
+  row assembly assumes the full source schema, so projection pushdown needs operator↔source schema
+  coordination first. Left as ignored args (capabilities still advertise `false`) until the operator
+  actually pushes them; wiring them now would be dead plumbing.
+- **Exit:** N missed keys = ⌈N/chunk⌉ scans (done); per-key cost is O(matching files) **iff** the
+  table is clustered on the key (now warned, not enforced). Manifest-prune verification via a
+  large-table integration test deferred.
 
 ### Phase 4 — Backend coverage (all four as on-demand `LookupSource`)
 - **Iceberg:** `IcebergLookupSource` mirroring the Delta IN-list + projection path
