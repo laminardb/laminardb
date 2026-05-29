@@ -15,7 +15,7 @@ use std::time::Duration;
 use arrow::array::{new_null_array, Array, ArrayRef, RecordBatch, UInt32Array};
 use arrow::compute::{concat, take};
 use arrow::row::RowConverter;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
 use rustc_hash::FxHashMap;
@@ -123,6 +123,10 @@ struct Resolved {
     cache: Arc<FoyerMemoryCache>,
     converter: RowConverter,
     key_indices: Vec<usize>,
+    /// `(lookup key column, expected type)` per key, used to fail fast with a
+    /// clear message if the input join-key type differs from the lookup
+    /// primary-key type (otherwise the row-encoder errors cryptically later).
+    key_checks: Vec<(String, DataType)>,
     lookup_schema: SchemaRef,
     /// `None` = cache-only mode (no source); misses resolve to not-found.
     submit_tx: Option<mpsc::Sender<WorkItem>>,
@@ -187,6 +191,7 @@ impl LookupEnrichOperator {
         let PartialLookupState {
             foyer_cache,
             schema,
+            key_columns,
             key_sort_fields,
             source,
             ..
@@ -194,6 +199,17 @@ impl LookupEnrichOperator {
 
         let converter = RowConverter::new(key_sort_fields.clone())
             .map_err(|e| DbError::Pipeline(format!("lookup-enrich: row converter: {e}")))?;
+
+        // Expected input join-key types = the lookup table's primary-key types.
+        let key_checks: Vec<(String, DataType)> = key_columns
+            .iter()
+            .map(|name| {
+                let dt = schema
+                    .field_with_name(name)
+                    .map_or(DataType::Null, |f| f.data_type().clone());
+                (name.clone(), dt)
+            })
+            .collect();
 
         let (submit_tx, result_rx, worker) = match source {
             Some(src) => {
@@ -211,6 +227,7 @@ impl LookupEnrichOperator {
             cache: Arc::clone(foyer_cache),
             converter,
             key_indices: Vec::new(),
+            key_checks,
             lookup_schema: Arc::clone(schema),
             submit_tx,
             result_rx,
@@ -235,7 +252,9 @@ impl LookupEnrichOperator {
     ) -> Result<(), DbError> {
         let resolved = self.resolved.as_mut().expect("resolved before ingest");
 
-        // Resolve key-column indices against the actual input schema once.
+        // Resolve key-column indices against the actual input schema once, and
+        // fail fast if the input join-key type does not match the lookup
+        // primary-key type (the row-encoder would otherwise error cryptically).
         if resolved.key_indices.is_empty() {
             resolved.key_indices = self
                 .key_columns
@@ -246,6 +265,20 @@ impl LookupEnrichOperator {
                     })
                 })
                 .collect::<Result<_, _>>()?;
+
+            for (i, &col_idx) in resolved.key_indices.iter().enumerate() {
+                let actual = batch.column(col_idx).data_type();
+                if let Some((lookup_key, expected)) = resolved.key_checks.get(i) {
+                    if actual != expected {
+                        return Err(DbError::Pipeline(format!(
+                            "lookup-enrich: join key type mismatch — input column '{}' is \
+                             {actual:?}, but lookup table '{}' key '{lookup_key}' is {expected:?}; \
+                             the join key and lookup primary key must have the same type",
+                            self.key_columns[i], self.table_name
+                        )));
+                    }
+                }
+            }
         }
 
         let key_cols: Vec<ArrayRef> = resolved
@@ -627,7 +660,7 @@ mod tests {
 
     /// Source returning a fixed map id -> name, counting calls.
     struct MapSource {
-        rows: std::collections::HashMap<i64, &'static str>,
+        rows: FxHashMap<i64, &'static str>,
         calls: std::sync::atomic::AtomicUsize,
     }
 
@@ -693,6 +726,37 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn join_key_type_mismatch_errors_clearly() {
+        let source = Arc::new(MapSource {
+            rows: FxHashMap::default(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut op = operator_with(LookupJoinType::Inner, source);
+
+        // Input `customer_id` is Int32, but the lookup key `id` is Int64.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Int64, false),
+            Field::new("customer_id", DataType::Int32, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(arrow::array::Int32Array::from(vec![Some(7)])),
+            ],
+        )
+        .unwrap();
+
+        let err = op
+            .process(&[vec![batch]], &[0])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("type mismatch"), "got: {err}");
+        assert!(err.contains("customer_id") && err.contains("Int32") && err.contains("Int64"));
+    }
+
     /// Drive `process` until the held batch resolves and emits (the worker runs
     /// on another task, so a miss emits a cycle or two later).
     async fn run_until_output(
@@ -741,7 +805,7 @@ mod tests {
     #[tokio::test]
     async fn negative_cache_avoids_refetch() {
         let source = Arc::new(MapSource {
-            rows: std::collections::HashMap::new(), // every key misses
+            rows: FxHashMap::default(), // every key misses
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
         let calls = Arc::clone(&source) as Arc<dyn LookupSourceDyn>;
