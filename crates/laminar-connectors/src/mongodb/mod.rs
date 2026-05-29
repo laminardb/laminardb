@@ -3,6 +3,7 @@
 pub mod change_event;
 pub mod config;
 pub mod large_event;
+pub mod lookup;
 pub mod metrics;
 pub mod resume_token;
 pub mod sink;
@@ -52,6 +53,54 @@ pub fn register_mongodb_cdc_source(registry: &ConnectorRegistry) {
             ))
         }),
     );
+
+    // On-demand (partial cache mode) lookup source: find({ pk: { $in: [...] } }).
+    registry.register_lookup_source("mongodb", Arc::new(MongoLookupFactory));
+}
+
+struct MongoLookupFactory;
+
+#[async_trait::async_trait]
+impl crate::registry::LookupSourceFactory for MongoLookupFactory {
+    async fn build(
+        &self,
+        config: crate::config::ConnectorConfig,
+        declared_schema: Option<arrow_schema::SchemaRef>,
+    ) -> Result<Arc<dyn laminar_core::lookup::source::LookupSourceDyn>, crate::error::ConnectorError>
+    {
+        use crate::mongodb::lookup::{MongoLookupSource, MongoLookupSourceConfig};
+
+        let schema = declared_schema.ok_or_else(|| {
+            crate::error::ConnectorError::ConfigurationError(
+                "mongodb lookup source requires a declared table schema".into(),
+            )
+        })?;
+
+        let pk_columns: Vec<String> = config
+            .get("_primary_key_columns")
+            .unwrap_or("")
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if pk_columns.is_empty() {
+            return Err(crate::error::ConnectorError::ConfigurationError(
+                "mongodb lookup source requires primary key columns".into(),
+            ));
+        }
+
+        let src = MongoDbSourceConfig::from_config(&config)?;
+        let lookup_config = MongoLookupSourceConfig {
+            connection_uri: src.connection_uri,
+            database: src.database,
+            collection: src.collection,
+            primary_key_columns: pk_columns,
+            schema,
+        };
+
+        let source = MongoLookupSource::open(lookup_config).await?;
+        Ok(Arc::new(source) as Arc<dyn laminar_core::lookup::source::LookupSourceDyn>)
+    }
 }
 
 /// Registers the `MongoDB` sink connector with the given registry.

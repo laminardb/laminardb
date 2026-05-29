@@ -18,8 +18,26 @@ External system connectors for LaminarDB. Each connector implements the `SourceC
 | Delta Lake Source | `delta-lake` | Version polling via deltalake crate | Implemented |
 | Iceberg Source | `iceberg` | REST/Glue/Hive catalog, incremental reads | Implemented |
 | File Auto-Loader | `files` | Directory watch, glob pattern discovery, Parquet/CSV/JSON | Implemented |
-| Postgres Lookup | `postgres-cdc` | Pool-backed lookup source with predicate pushdown | Implemented |
 | Parquet Lookup | `parquet-lookup` | Static / slowly-changing dimension table source | Implemented |
+
+### On-demand lookup sources (partial cache mode)
+
+`CREATE LOOKUP TABLE ... WITH (cache_mode = 'partial' | 'none')` caches the hot
+working set in a byte-bounded RAM cache and fetches cache misses on demand —
+the only model that addresses dimension tables larger than memory. Each backend
+batches all missed keys of a probe into one pushed-down, key-filtered fetch
+(`pk IN (...)` / `= ANY($1)` / `$in`) and realigns results to the input order.
+
+| Backend | Feature Flag | Miss fetch | Notes |
+|---------|-------------|-----------|-------|
+| Delta Lake | `delta-lake` | `WHERE pk IN (...)` (file/partition pruning) | Warns if not clustered on the key |
+| Iceberg | `iceberg` | Native scan `with_filter(pk IN ...)` (manifest pruning) | Reloads snapshot per fetch |
+| PostgreSQL | `postgres-cdc` | Pooled (`deadpool`) `WHERE pk = ANY($1)` | Single-column key; `NoTls` (TLS is a planned connector-wide follow-up) |
+| MongoDB | `mongodb-cdc` | `find({ pk: { $in: [...] } })` | Projects documents into the declared schema |
+
+Misses run off the compute thread (the lookup-enrich operator is async-decoupled),
+results are byte-bounded with optional TTL (`cache.ttl`), and a source error
+backpressures rather than dropping rows.
 
 ### Sink Connectors
 

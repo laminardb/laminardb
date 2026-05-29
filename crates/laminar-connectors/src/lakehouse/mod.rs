@@ -117,6 +117,7 @@ impl crate::registry::LookupSourceFactory for DeltaLookupFactory {
     async fn build(
         &self,
         config: crate::config::ConnectorConfig,
+        _declared_schema: Option<arrow_schema::SchemaRef>,
     ) -> Result<Arc<dyn laminar_core::lookup::source::LookupSourceDyn>, crate::error::ConnectorError>
     {
         use crate::lakehouse::delta_source_config::DeltaSourceConfig;
@@ -246,6 +247,7 @@ impl crate::registry::LookupSourceFactory for IcebergLookupFactory {
     async fn build(
         &self,
         config: crate::config::ConnectorConfig,
+        _declared_schema: Option<arrow_schema::SchemaRef>,
     ) -> Result<Arc<dyn laminar_core::lookup::source::LookupSourceDyn>, crate::error::ConnectorError>
     {
         use crate::lakehouse::iceberg_config::IcebergCatalogConfig;

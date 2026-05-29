@@ -90,6 +90,7 @@ impl crate::registry::LookupSourceFactory for PostgresLookupFactory {
     async fn build(
         &self,
         config: crate::config::ConnectorConfig,
+        _declared_schema: Option<arrow_schema::SchemaRef>,
     ) -> Result<Arc<dyn laminar_core::lookup::source::LookupSourceDyn>, crate::error::ConnectorError>
     {
         use crate::lookup::postgres_lookup::{PostgresLookupSource, PostgresLookupSourceConfig};

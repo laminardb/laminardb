@@ -114,7 +114,7 @@ postgres-sink = ["dep:tokio-postgres", "dep:postgres-types", "dep:deadpool-postg
 # mysql-cdc: Business logic + mysql_async driver with rustls (no OpenSSL required)
 mysql-cdc = ["dep:mysql_async", "dep:tokio-stream"]
 # MongoDB CDC source and sink
-mongodb-cdc = ["dep:mongodb", "dep:tokio-stream", "dep:futures-util"]
+mongodb-cdc = ["dep:mongodb", "dep:tokio-stream", "dep:futures-util", "dep:arrow-row"]
 # Sink-agnostic Z-set/CDC changelog collapse for upsert sinks (pure Arrow, just
 # pulls arrow-row). Kept separate from delta-lake so the helper compiles and
 # tests without the deltalake stack, and so Iceberg MOR can opt in independently.

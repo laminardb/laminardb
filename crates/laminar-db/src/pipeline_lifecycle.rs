@@ -1163,7 +1163,11 @@ impl LaminarDB {
             // the registry factory (no cross-crate type dependency).
             let lookup_source = if let Ok(mut config) = build_table_config(reg) {
                 config.set("_primary_key_columns", pk_csv.as_str());
-                match self.connector_registry.create_lookup_source(config).await {
+                match self
+                    .connector_registry
+                    .create_lookup_source(config, Some(Arc::clone(&schema)))
+                    .await
+                {
                     Some(Ok(src)) => Some(src),
                     Some(Err(e)) => {
                         tracing::warn!(
