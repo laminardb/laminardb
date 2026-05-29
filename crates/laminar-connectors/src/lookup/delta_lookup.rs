@@ -573,6 +573,111 @@ mod tests {
         assert_eq!(source.query_count(), 1);
     }
 
+    /// Recursively sum a named execution-plan metric across the plan tree.
+    fn sum_plan_metric(
+        plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        name: &str,
+    ) -> usize {
+        let mut total = plan
+            .metrics()
+            .and_then(|m| m.sum_by_name(name))
+            .map_or(0, |v| v.as_usize());
+        for child in plan.children() {
+            total += sum_plan_metric(child, name);
+        }
+        total
+    }
+
+    async fn create_partitioned_delta_table(path: &str, ids: &[i64], names: &[&str]) {
+        use crate::lakehouse::delta_io;
+        use deltalake::protocol::SaveMode;
+
+        // Pass no schema so the table is created on first write *with* the
+        // partition columns (a pre-created table can't be repartitioned).
+        let table = delta_io::open_or_create_table(path, HashMap::new(), None)
+            .await
+            .unwrap();
+        delta_io::write_batches(
+            table,
+            vec![test_batch(ids, names)],
+            "test-writer",
+            1,
+            SaveMode::Append,
+            Some(&["id".to_string()]), // partition (== cluster) on the lookup key
+            false,
+            None,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The Phase 3 exit criterion: a batched `WHERE pk IN (...)` must prune
+    /// non-matching partition files, so per-key cost is O(matching files) on a
+    /// table clustered on the key — not O(table).
+    #[tokio::test]
+    async fn test_batch_query_prunes_partition_files() {
+        use datafusion::physical_plan::collect;
+
+        let temp_dir = TempDir::new().unwrap();
+        let table_path = temp_dir.path().to_str().unwrap();
+
+        // 8 distinct keys → 8 partition directories (one Parquet file each).
+        create_partitioned_delta_table(
+            table_path,
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+            &["a", "b", "c", "d", "e", "f", "g", "h"],
+        )
+        .await;
+
+        // 1) Correctness across multiple partition files via the source.
+        let config = DeltaLookupSourceConfig {
+            table_path: table_path.to_string(),
+            storage_options: HashMap::new(),
+            primary_key_columns: vec!["id".into()],
+            table_name: "lk".to_string(),
+        };
+        let source = DeltaLookupSource::open(config).await.unwrap();
+        let keys = int_keys(&[5, 2, 100]);
+        let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        let results = source.query(&key_refs, &[], &[]).await.unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_some(), "key 5 should hit");
+        assert!(results[1].is_some(), "key 2 should hit");
+        assert!(results[2].is_none(), "key 100 should miss");
+
+        // 2) Pruning: the IN-list query reads only the matching partition files.
+        // (Mirrors exactly the SQL shape `DeltaLookupSource::query` generates.)
+        let ctx = SessionContext::new();
+        crate::lakehouse::delta_table_provider::register_delta_table(
+            &ctx,
+            "lk",
+            table_path,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+        let plan = ctx
+            .sql("SELECT * FROM \"lk\" WHERE \"id\" IN (2, 5)")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        // Execute so scan metrics populate.
+        let _ = collect(Arc::clone(&plan), ctx.task_ctx()).await.unwrap();
+
+        // The `next` Delta provider reports files actually read via
+        // `count_files_scanned`; pruning shows as scanned < total (8).
+        let scanned = sum_plan_metric(&plan, "count_files_scanned");
+        assert!(scanned > 0, "scan read no files (metric not found?)");
+        assert!(
+            scanned < 8,
+            "IN-list did not prune: scanned all {scanned} of 8 files"
+        );
+    }
+
     #[tokio::test]
     async fn test_batch_query_empty_keys() {
         let temp_dir = TempDir::new().unwrap();

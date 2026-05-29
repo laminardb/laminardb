@@ -269,9 +269,15 @@ Work (one cohesive change; cannot be partially landed without dead/unwired code)
   row assembly assumes the full source schema, so projection pushdown needs operator↔source schema
   coordination first. Left as ignored args (capabilities still advertise `false`) until the operator
   actually pushes them; wiring them now would be dead plumbing.
-- **Exit:** N missed keys = ⌈N/chunk⌉ scans (done); per-key cost is O(matching files) **iff** the
-  table is clustered on the key (now warned, not enforced). Manifest-prune verification via a
-  large-table integration test deferred.
+- **Manifest-prune verification — DONE 2026-05-29.** `test_batch_query_prunes_partition_files`
+  creates a Delta table partitioned on the key (8 keys → 8 partition files), verifies cross-partition
+  correctness through `DeltaLookupSource`, then runs the generated `WHERE "id" IN (2, 5)` shape and
+  asserts the `next` provider's `count_files_scanned` metric is `< 8` — i.e. the IN-list genuinely
+  skips non-matching partition files (per-key cost = O(matching files), not O(table)). Note: the
+  registered provider is delta-rs's **`next` `DeltaScan`** (`table_provider().build()`), whose
+  metric is `count_files_scanned` (no `files_pruned`); pruning shows as scanned < total.
+- **Exit:** N missed keys = ⌈N/chunk⌉ scans (done); per-key cost is O(matching files) on a
+  key-clustered table, **verified** by the prune test; clustering is warned (not enforced).
 
 ### Phase 4 — Backend coverage (all four as on-demand `LookupSource`)
 - **Iceberg:** `IcebergLookupSource` mirroring the Delta IN-list + projection path
