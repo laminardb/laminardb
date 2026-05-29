@@ -109,7 +109,7 @@ libc = { workspace = true, optional = true }
 default = []
 testing = []
 kafka = ["dep:rdkafka", "dep:arrow-avro", "dep:reqwest"]
-postgres-cdc = ["dep:tokio-postgres", "dep:pgwire-replication", "dep:deadpool-postgres"]
+postgres-cdc = ["dep:tokio-postgres", "dep:pgwire-replication", "dep:deadpool-postgres", "dep:arrow-row"]
 postgres-sink = ["dep:tokio-postgres", "dep:postgres-types", "dep:deadpool-postgres", "dep:pgpq", "dep:futures-util"]
 # mysql-cdc: Business logic + mysql_async driver with rustls (no OpenSSL required)
 mysql-cdc = ["dep:mysql_async", "dep:tokio-stream"]

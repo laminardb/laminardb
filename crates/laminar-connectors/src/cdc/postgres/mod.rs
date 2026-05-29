@@ -78,6 +78,59 @@ pub fn register_postgres_cdc_source(registry: &ConnectorRegistry) {
             ))
         }),
     );
+
+    // On-demand (partial cache mode) lookup source: pooled + WHERE pk = ANY($1).
+    registry.register_lookup_source("postgres", Arc::new(PostgresLookupFactory));
+}
+
+struct PostgresLookupFactory;
+
+#[async_trait::async_trait]
+impl crate::registry::LookupSourceFactory for PostgresLookupFactory {
+    async fn build(
+        &self,
+        config: crate::config::ConnectorConfig,
+    ) -> Result<Arc<dyn laminar_core::lookup::source::LookupSourceDyn>, crate::error::ConnectorError>
+    {
+        use crate::lookup::postgres_lookup::{PostgresLookupSource, PostgresLookupSourceConfig};
+
+        let pk_columns: Vec<String> = config
+            .get("_primary_key_columns")
+            .unwrap_or("")
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if pk_columns.is_empty() {
+            return Err(crate::error::ConnectorError::ConfigurationError(
+                "postgres lookup source requires primary key columns".into(),
+            ));
+        }
+
+        let table = config
+            .get("table")
+            .ok_or_else(|| {
+                crate::error::ConnectorError::ConfigurationError(
+                    "postgres lookup source requires a 'table' property".into(),
+                )
+            })?
+            .to_string();
+
+        let pool_size = config
+            .get("pool_size")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(4);
+
+        let lookup_config = PostgresLookupSourceConfig {
+            properties: config.properties().clone(),
+            table,
+            primary_key_columns: pk_columns,
+            pool_size,
+        };
+
+        let source = PostgresLookupSource::open(lookup_config).await?;
+        Ok(Arc::new(source) as Arc<dyn laminar_core::lookup::source::LookupSourceDyn>)
+    }
 }
 
 fn postgres_cdc_config_keys() -> Vec<ConfigKeySpec> {
