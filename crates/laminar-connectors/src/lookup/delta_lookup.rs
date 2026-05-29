@@ -1,35 +1,30 @@
 //! Delta Lake on-demand lookup source for cache-miss fallback.
 //!
-//! Implements `LookupSource` backed by a `DataFusion` `TableProvider`.
-//! Used as the `source` field in `PartialLookupState` for tables too
-//! large to snapshot into memory.
+//! Implements `LookupSource` backed by a `DataFusion` `TableProvider`. A
+//! batched, typed `pk IN (...)` filter folds all missed keys of a probe into
+//! one file-/partition-pruned scan; [`KeyAligner`] handles key decode and
+//! result realignment.
 
-#[cfg(feature = "delta-lake")]
-use std::collections::HashMap;
-#[cfg(feature = "delta-lake")]
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "delta-lake")]
 use std::sync::Arc;
 
 #[cfg(feature = "delta-lake")]
-use arrow_array::{Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch};
 #[cfg(feature = "delta-lake")]
-use arrow_row::{RowConverter, SortField};
+use arrow_row::SortField;
 #[cfg(feature = "delta-lake")]
 use arrow_schema::SchemaRef;
 #[cfg(feature = "delta-lake")]
-use datafusion::prelude::SessionContext;
+use datafusion::common::ScalarValue;
+#[cfg(feature = "delta-lake")]
+use datafusion::prelude::{col, Expr, SessionContext};
 
 #[cfg(feature = "delta-lake")]
 use laminar_core::lookup::predicate::Predicate;
 #[cfg(feature = "delta-lake")]
 use laminar_core::lookup::source::{ColumnId, LookupError, LookupSource, LookupSourceCapabilities};
-
-/// Maximum keys folded into a single batched lookup query. Larger key sets
-/// are chunked into multiple `WHERE pk IN (...)` scans so the generated SQL
-/// (and any IN-list the planner materialises) stays bounded.
 #[cfg(feature = "delta-lake")]
-const MAX_KEYS_PER_QUERY: usize = 1024;
+use laminar_core::lookup::KeyAligner;
 
 /// Configuration for [`DeltaLookupSource`].
 #[cfg(feature = "delta-lake")]
@@ -49,12 +44,9 @@ pub struct DeltaLookupSourceConfig {
 #[cfg(feature = "delta-lake")]
 pub struct DeltaLookupSource {
     ctx: Arc<SessionContext>,
-    config: DeltaLookupSourceConfig,
+    table_name: String,
     schema: SchemaRef,
-    pk_sort_fields: Vec<SortField>,
-    query_count: AtomicU64,
-    row_count: AtomicU64,
-    error_count: AtomicU64,
+    aligner: KeyAligner,
 }
 
 #[cfg(feature = "delta-lake")]
@@ -63,15 +55,10 @@ impl DeltaLookupSource {
     ///
     /// # Errors
     ///
-    /// Returns `LookupError` if the table cannot be opened or registered.
+    /// Returns `LookupError` if the table cannot be opened/registered or a
+    /// primary key column is missing from the schema.
     pub async fn open(config: DeltaLookupSourceConfig) -> Result<Self, LookupError> {
-        if config.primary_key_columns.is_empty() {
-            return Err(LookupError::Internal(
-                "primary_key_columns must not be empty".into(),
-            ));
-        }
         let ctx = SessionContext::new();
-
         crate::lakehouse::delta_table_provider::register_delta_table(
             &ctx,
             &config.table_name,
@@ -87,203 +74,131 @@ impl DeltaLookupSource {
             .map_err(|e| LookupError::Internal(format!("get table: {e}")))?;
         let schema: SchemaRef = Arc::new(table.schema().as_arrow().clone());
 
-        let pk_sort_fields: Vec<SortField> = config
-            .primary_key_columns
-            .iter()
-            .map(|col_name| {
-                let idx = schema.index_of(col_name).map_err(|_| {
-                    LookupError::Internal(format!("pk column not found: {col_name}"))
-                })?;
-                Ok(SortField::new(schema.field(idx).data_type().clone()))
-            })
-            .collect::<Result<Vec<_>, LookupError>>()?;
+        let pk_sort_fields = pk_sort_fields(&schema, &config.primary_key_columns)?;
+        let aligner = KeyAligner::new(pk_sort_fields, config.primary_key_columns.clone())?;
 
-        // Clustering awareness: an on-demand lookup is only cheap if the
-        // dimension is partitioned/clustered on the lookup key, so a miss
-        // fetch prunes to O(matching files) instead of full-scanning. Delta
-        // exposes partition columns in metadata but not Z-ORDER clustering, so
-        // this is a best-effort warning (never an error): if none of the key
-        // columns is a partition column, the table *may* still be Z-ordered,
-        // but if it is not, every miss full-scans the table.
-        if let Ok(table) = crate::lakehouse::delta_io::open_or_create_table(
-            &config.table_path,
-            config.storage_options.clone(),
-            None,
-        )
-        .await
-        {
-            let partition_columns = crate::lakehouse::delta_io::get_partition_columns(&table);
-            let key_is_partitioned = config
-                .primary_key_columns
-                .iter()
-                .any(|k| partition_columns.contains(k));
-            if !key_is_partitioned {
-                tracing::warn!(
-                    table = %config.table_path,
-                    primary_key = ?config.primary_key_columns,
-                    partition_columns = ?partition_columns,
-                    "delta lookup table is not partitioned on the lookup key; unless it is \
-                     Z-ORDER clustered on the key, every cache-miss fetch will full-scan the \
-                     table. Cluster the dimension on the lookup key for bounded per-fetch cost."
-                );
-            }
-        }
+        warn_if_unclustered(&config).await;
 
         Ok(Self {
             ctx: Arc::new(ctx),
-            config,
+            table_name: config.table_name,
             schema,
-            pk_sort_fields,
-            query_count: AtomicU64::new(0),
-            row_count: AtomicU64::new(0),
-            error_count: AtomicU64::new(0),
+            aligner,
         })
     }
+}
 
-    /// Format one PK cell as a SQL literal, or `None` when the cell is NULL
-    /// (the caller turns that into `IS NULL`).
-    fn format_cell(
-        col_name: &str,
-        array: &dyn Array,
-        row: usize,
-    ) -> Result<Option<String>, LookupError> {
-        use arrow_cast::display::{ArrayFormatter, FormatOptions};
-        use arrow_schema::DataType;
+/// Resolve the `RowConverter` sort fields for the primary-key columns.
+#[cfg(feature = "delta-lake")]
+fn pk_sort_fields(
+    schema: &SchemaRef,
+    pk_columns: &[String],
+) -> Result<Vec<SortField>, LookupError> {
+    pk_columns
+        .iter()
+        .map(|name| {
+            let idx = schema
+                .index_of(name)
+                .map_err(|_| LookupError::Internal(format!("pk column not found: {name}")))?;
+            Ok(SortField::new(schema.field(idx).data_type().clone()))
+        })
+        .collect()
+}
 
-        if array.is_null(row) {
-            return Ok(None);
-        }
-        let formatter = ArrayFormatter::try_new(array, &FormatOptions::default())
-            .map_err(|e| LookupError::Internal(format!("format pk: {e}")))?;
-        let value = formatter.value(row).to_string();
-        match array.data_type() {
-            // Numeric and boolean: unquoted literals.
-            dt if dt.is_numeric() || matches!(dt, DataType::Boolean) => Ok(Some(value)),
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-                let escaped = value.replace('\'', "''");
-                Ok(Some(format!("'{escaped}'")))
-            }
-            DataType::Date32 | DataType::Date64 | DataType::Timestamp(..) => {
-                Ok(Some(format!("'{value}'")))
-            }
-            dt => Err(LookupError::Internal(format!(
-                "unsupported PK data type for lookup: {dt} (column \"{col_name}\")"
-            ))),
-        }
-    }
+/// Build a typed `pk IN (...)` (single column) or OR-of-AND-groups (composite)
+/// filter from the decoded primary-key columns. Using typed `Expr` literals
+/// (not string SQL) keeps type handling and escaping correct.
+#[cfg(feature = "delta-lake")]
+fn build_in_list_filter(
+    pk_columns: &[String],
+    pk_arrays: &[ArrayRef],
+) -> Result<Expr, LookupError> {
+    let n = if pk_arrays.is_empty() {
+        0
+    } else {
+        pk_arrays[0].len()
+    };
+    let scalar = |arr: &ArrayRef, row: usize| {
+        ScalarValue::try_from_array(arr, row)
+            .map(|sv| Expr::Literal(sv, None))
+            .map_err(|e| LookupError::Internal(format!("scalar from key: {e}")))
+    };
 
-    /// Build a single SQL WHERE clause covering every key in `pk_arrays`
-    /// (column-major; each array has `n_keys` rows). A single-column PK folds
-    /// into one `"pk" IN (...)` list so the planner can prune manifests/files;
-    /// a composite PK becomes an OR of per-key AND-groups. Duplicate keys are
-    /// de-duplicated so the generated SQL stays compact.
-    fn build_batch_where_clause(
-        &self,
-        pk_arrays: &[Arc<dyn Array>],
-        n_keys: usize,
-    ) -> Result<String, LookupError> {
-        let pk_cols = &self.config.primary_key_columns;
-
-        if pk_cols.len() == 1 {
-            let col = &pk_cols[0];
-            let array = pk_arrays[0].as_ref();
-            let mut seen = std::collections::HashSet::new();
-            let mut lits: Vec<String> = Vec::new();
-            let mut has_null = false;
-            for row in 0..n_keys {
-                match Self::format_cell(col, array, row)? {
-                    Some(lit) => {
-                        if seen.insert(lit.clone()) {
-                            lits.push(lit);
-                        }
-                    }
-                    None => has_null = true,
-                }
-            }
-            let mut clause = String::new();
-            if !lits.is_empty() {
-                clause = format!("\"{col}\" IN ({})", lits.join(", "));
-            }
-            if has_null {
-                let null_cond = format!("\"{col}\" IS NULL");
-                clause = if clause.is_empty() {
-                    null_cond
-                } else {
-                    format!("{clause} OR {null_cond}")
-                };
-            }
-            // n_keys > 0 guarantees at least one branch fired.
-            return Ok(clause);
-        }
-
-        let mut seen = std::collections::HashSet::new();
-        let mut groups: Vec<String> = Vec::new();
-        for row in 0..n_keys {
-            let mut conds = Vec::with_capacity(pk_cols.len());
-            for (ci, col) in pk_cols.iter().enumerate() {
-                match Self::format_cell(col, pk_arrays[ci].as_ref(), row)? {
-                    Some(lit) => conds.push(format!("\"{col}\" = {lit}")),
-                    None => conds.push(format!("\"{col}\" IS NULL")),
-                }
-            }
-            let group = format!("({})", conds.join(" AND "));
-            if seen.insert(group.clone()) {
-                groups.push(group);
+    if pk_columns.len() == 1 {
+        let column = col(&pk_columns[0]);
+        let arr = &pk_arrays[0];
+        let mut lits = Vec::new();
+        let mut has_null = false;
+        for row in 0..n {
+            if arr.is_null(row) {
+                has_null = true;
+            } else {
+                lits.push(scalar(arr, row)?);
             }
         }
-        Ok(groups.join(" OR "))
-    }
-
-    /// Re-encode the PK columns of a fetched batch with the same `RowConverter`
-    /// used to decode the input keys, so each returned row can be matched back
-    /// to the exact key bytes that requested it.
-    fn index_batch_by_key(
-        &self,
-        converter: &RowConverter,
-        batch: &RecordBatch,
-        batch_idx: usize,
-        index: &mut HashMap<Vec<u8>, (usize, usize)>,
-    ) -> Result<(), LookupError> {
-        let pk_cols: Vec<Arc<dyn Array>> = self
-            .config
-            .primary_key_columns
-            .iter()
-            .map(|name| {
-                let idx = batch.schema().index_of(name).map_err(|_| {
-                    LookupError::Internal(format!("pk column not found in result: {name}"))
-                })?;
-                Ok(Arc::clone(batch.column(idx)))
-            })
-            .collect::<Result<_, LookupError>>()?;
-
-        let rows = converter
-            .convert_columns(&pk_cols)
-            .map_err(|e| LookupError::Internal(format!("encode result keys: {e}")))?;
-
-        for row in 0..batch.num_rows() {
-            let key = rows.row(row).as_ref().to_vec();
-            // First row wins per key (mirrors the old `LIMIT 1` semantics).
-            index.entry(key).or_insert((batch_idx, row));
+        let mut filter = (!lits.is_empty()).then(|| column.clone().in_list(lits, false));
+        if has_null {
+            let is_null = column.is_null();
+            filter = Some(match filter {
+                Some(f) => f.or(is_null),
+                None => is_null,
+            });
         }
-        Ok(())
+        return filter.ok_or_else(|| LookupError::Internal("no keys to look up".into()));
     }
 
-    /// Total queries executed.
-    #[must_use]
-    pub fn query_count(&self) -> u64 {
-        self.query_count.load(Ordering::Relaxed)
+    let mut groups: Vec<Expr> = Vec::with_capacity(n);
+    for row in 0..n {
+        let mut conj: Option<Expr> = None;
+        for (ci, name) in pk_columns.iter().enumerate() {
+            let term = if pk_arrays[ci].is_null(row) {
+                col(name).is_null()
+            } else {
+                col(name).eq(scalar(&pk_arrays[ci], row)?)
+            };
+            conj = Some(match conj {
+                Some(c) => c.and(term),
+                None => term,
+            });
+        }
+        if let Some(c) = conj {
+            groups.push(c);
+        }
     }
+    let mut it = groups.into_iter();
+    it.next()
+        .map(|first| it.fold(first, Expr::or))
+        .ok_or_else(|| LookupError::Internal("no keys to look up".into()))
+}
 
-    /// Total rows returned.
-    #[must_use]
-    pub fn row_count(&self) -> u64 {
-        self.row_count.load(Ordering::Relaxed)
-    }
-
-    /// Total query errors.
-    #[must_use]
-    pub fn error_count(&self) -> u64 {
-        self.error_count.load(Ordering::Relaxed)
+/// Best-effort clustering diagnostic: an on-demand lookup is only cheap if the
+/// dimension is partitioned/clustered on the key. Delta exposes partition
+/// columns (not Z-ORDER), so this is a warning, never an error.
+#[cfg(feature = "delta-lake")]
+async fn warn_if_unclustered(config: &DeltaLookupSourceConfig) {
+    let Ok(table) = crate::lakehouse::delta_io::open_or_create_table(
+        &config.table_path,
+        config.storage_options.clone(),
+        None,
+    )
+    .await
+    else {
+        return;
+    };
+    let partition_columns = crate::lakehouse::delta_io::get_partition_columns(&table);
+    if !config
+        .primary_key_columns
+        .iter()
+        .any(|k| partition_columns.contains(k))
+    {
+        tracing::warn!(
+            table = %config.table_path,
+            primary_key = ?config.primary_key_columns,
+            partition_columns = ?partition_columns,
+            "delta lookup table is not partitioned on the lookup key; unless it is \
+             Z-ORDER clustered on the key, every cache-miss fetch will full-scan the \
+             table. Cluster the dimension on the lookup key for bounded per-fetch cost."
+        );
     }
 }
 
@@ -296,77 +211,29 @@ impl LookupSource for DeltaLookupSource {
         _projection: &[ColumnId],
     ) -> Result<Vec<Option<RecordBatch>>, LookupError> {
         if keys.is_empty() {
-            self.query_count.fetch_add(1, Ordering::Relaxed);
             return Ok(Vec::new());
         }
+        let pk_arrays = self.aligner.decode_keys(keys)?;
+        let filter = build_in_list_filter(self.aligner.pk_columns(), &pk_arrays)?;
 
-        let converter = RowConverter::new(self.pk_sort_fields.clone())
-            .map_err(|e| LookupError::Internal(format!("row converter: {e}")))?;
-        let parser = converter.parser();
+        let batches = self
+            .ctx
+            .table(&self.table_name)
+            .await
+            .map_err(|e| LookupError::Query(format!("open delta table: {e}")))?
+            .filter(filter)
+            .map_err(|e| LookupError::Query(format!("apply lookup filter: {e}")))?
+            .collect()
+            .await
+            .map_err(|e| LookupError::Query(format!("collect lookup results: {e}")))?;
 
-        // Map each distinct input key to the single fetched row that satisfies
-        // it. Misses simply never appear in the index. `chunk` keeps the IN-list
-        // (and the materialised batches) bounded for very large key sets.
-        let mut index: HashMap<Vec<u8>, (usize, usize)> = HashMap::new();
-        let mut fetched: Vec<RecordBatch> = Vec::new();
-
-        for chunk in keys.chunks(MAX_KEYS_PER_QUERY) {
-            let parsed = chunk.iter().map(|k| parser.parse(k));
-            let pk_arrays = converter
-                .convert_rows(parsed)
-                .map_err(|e| LookupError::Internal(format!("decode keys: {e}")))?;
-
-            let where_clause = self.build_batch_where_clause(&pk_arrays, chunk.len())?;
-            let sql = format!(
-                "SELECT * FROM \"{}\" WHERE {}",
-                self.config.table_name, where_clause
-            );
-
-            let df = self.ctx.sql(&sql).await.map_err(|e| {
-                self.error_count.fetch_add(1, Ordering::Relaxed);
-                LookupError::Query(format!("delta lookup query failed: {e}"))
-            })?;
-            let batches = df.collect().await.map_err(|e| {
-                self.error_count.fetch_add(1, Ordering::Relaxed);
-                LookupError::Query(format!("collect lookup results: {e}"))
-            })?;
-
-            for batch in batches {
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let batch_idx = fetched.len();
-                self.index_batch_by_key(&converter, &batch, batch_idx, &mut index)?;
-                fetched.push(batch);
-            }
-        }
-
-        // Align outputs to the input key order; duplicate input keys each get
-        // their own single-row slice of the shared fetched batch.
-        let mut hits = 0u64;
-        let results: Vec<Option<RecordBatch>> = keys
-            .iter()
-            .map(|key| {
-                index.get(*key).map(|&(bi, row)| {
-                    hits += 1;
-                    fetched[bi].slice(row, 1)
-                })
-            })
-            .collect();
-
-        self.row_count.fetch_add(hits, Ordering::Relaxed);
-        self.query_count.fetch_add(1, Ordering::Relaxed);
-        Ok(results)
+        self.aligner.align(keys, &batches)
     }
 
     fn capabilities(&self) -> LookupSourceCapabilities {
         LookupSourceCapabilities {
-            supports_predicate_pushdown: false,
-            supports_projection_pushdown: false,
-            // Genuinely batched now: N keys fold into ceil(N / MAX_KEYS_PER_QUERY)
-            // pruned scans. 0 = the caller need not pre-chunk; we chunk internally.
             supports_batch_lookup: true,
-            max_batch_size: 0,
+            ..LookupSourceCapabilities::none()
         }
     }
 
@@ -381,10 +248,10 @@ impl LookupSource for DeltaLookupSource {
 
     async fn health_check(&self) -> Result<(), LookupError> {
         self.ctx
-            .table(&self.config.table_name)
+            .table(&self.table_name)
             .await
-            .map_err(|e| LookupError::Connection(format!("health check: {e}")))?;
-        Ok(())
+            .map(|_| ())
+            .map_err(|e| LookupError::Connection(format!("health check: {e}")))
     }
 }
 
@@ -392,6 +259,7 @@ impl LookupSource for DeltaLookupSource {
 mod tests {
     use super::*;
     use arrow_array::{Int64Array, StringArray};
+    use arrow_row::RowConverter;
     use arrow_schema::{DataType, Field, Schema};
     use std::collections::HashMap;
     use tempfile::TempDir;
@@ -414,15 +282,23 @@ mod tests {
         .unwrap()
     }
 
+    fn int_keys(ids: &[i64]) -> Vec<Vec<u8>> {
+        let converter = RowConverter::new(vec![SortField::new(DataType::Int64)]).unwrap();
+        let rows = converter
+            .convert_columns(&[Arc::new(Int64Array::from(ids.to_vec()))])
+            .unwrap();
+        (0..ids.len())
+            .map(|i| rows.row(i).as_ref().to_vec())
+            .collect()
+    }
+
     async fn create_delta_table(path: &str, batches: Vec<RecordBatch>) {
         use crate::lakehouse::delta_io;
         use deltalake::protocol::SaveMode;
 
-        let schema = test_schema();
-        let table = delta_io::open_or_create_table(path, HashMap::new(), Some(&schema))
+        let table = delta_io::open_or_create_table(path, HashMap::new(), Some(&test_schema()))
             .await
             .unwrap();
-
         delta_io::write_batches(
             table,
             batches,
@@ -439,141 +315,114 @@ mod tests {
         .unwrap();
     }
 
-    #[tokio::test]
-    async fn test_open_and_query() {
-        let temp_dir = TempDir::new().unwrap();
-        let table_path = temp_dir.path().to_str().unwrap();
-
-        create_delta_table(table_path, vec![test_batch(&[1, 2, 3], &["A", "B", "C"])]).await;
-
-        let config = DeltaLookupSourceConfig {
-            table_path: table_path.to_string(),
+    async fn open_source(path: &str, table_name: &str) -> DeltaLookupSource {
+        DeltaLookupSource::open(DeltaLookupSourceConfig {
+            table_path: path.to_string(),
             storage_options: HashMap::new(),
             primary_key_columns: vec!["id".into()],
-            table_name: "test_lookup".to_string(),
-        };
-        let source = DeltaLookupSource::open(config).await.unwrap();
+            table_name: table_name.to_string(),
+        })
+        .await
+        .unwrap()
+    }
 
-        let converter = RowConverter::new(vec![SortField::new(DataType::Int64)]).unwrap();
-        let key_col = Arc::new(Int64Array::from(vec![2i64]));
-        let rows = converter.convert_columns(&[key_col]).unwrap();
-        let key_bytes = rows.row(0);
-
-        let results = source.query(&[key_bytes.as_ref()], &[], &[]).await.unwrap();
-        assert_eq!(results.len(), 1);
-        let batch = results[0].as_ref().unwrap();
-        assert_eq!(batch.num_rows(), 1);
-
-        let id_col = batch
+    fn id_at(batch: &RecordBatch) -> i64 {
+        batch
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
-            .unwrap();
-        assert_eq!(id_col.value(0), 2);
-        assert_eq!(source.query_count(), 1);
-        assert_eq!(source.row_count(), 1);
+            .unwrap()
+            .value(0)
     }
 
     #[tokio::test]
-    async fn test_query_miss() {
+    async fn batched_lookup_aligns_hits_and_misses() {
         let temp_dir = TempDir::new().unwrap();
-        let table_path = temp_dir.path().to_str().unwrap();
+        let path = temp_dir.path().to_str().unwrap();
+        create_delta_table(path, vec![test_batch(&[1, 2, 3], &["A", "B", "C"])]).await;
+        let source = open_source(path, "lk").await;
 
-        create_delta_table(table_path, vec![test_batch(&[1], &["A"])]).await;
-
-        let config = DeltaLookupSourceConfig {
-            table_path: table_path.to_string(),
-            storage_options: HashMap::new(),
-            primary_key_columns: vec!["id".into()],
-            table_name: "test_miss".to_string(),
-        };
-        let source = DeltaLookupSource::open(config).await.unwrap();
-
-        let converter = RowConverter::new(vec![SortField::new(DataType::Int64)]).unwrap();
-        let key_col = Arc::new(Int64Array::from(vec![999i64]));
-        let rows = converter.convert_columns(&[key_col]).unwrap();
-        let key_bytes = rows.row(0);
-
-        let results = source.query(&[key_bytes.as_ref()], &[], &[]).await.unwrap();
-        assert_eq!(results.len(), 1);
-        assert!(results[0].is_none());
-        assert_eq!(source.row_count(), 0);
-    }
-
-    fn int_keys(ids: &[i64]) -> Vec<Vec<u8>> {
-        let converter = RowConverter::new(vec![SortField::new(DataType::Int64)]).unwrap();
-        let col = Arc::new(Int64Array::from(ids.to_vec()));
-        let rows = converter.convert_columns(&[col]).unwrap();
-        (0..ids.len())
-            .map(|i| rows.row(i).as_ref().to_vec())
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn test_batch_query_aligns_results_to_keys() {
-        let temp_dir = TempDir::new().unwrap();
-        let table_path = temp_dir.path().to_str().unwrap();
-
-        create_delta_table(table_path, vec![test_batch(&[1, 2, 3], &["A", "B", "C"])]).await;
-
-        let config = DeltaLookupSourceConfig {
-            table_path: table_path.to_string(),
-            storage_options: HashMap::new(),
-            primary_key_columns: vec!["id".into()],
-            table_name: "test_batch".to_string(),
-        };
-        let source = DeltaLookupSource::open(config).await.unwrap();
-
-        // Out-of-table-order, with a miss in the middle, in a single batch.
+        // Out-of-table-order with a miss; one batched fetch.
         let keys = int_keys(&[3, 1, 999, 2]);
         let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
-
         let results = source.query(&key_refs, &[], &[]).await.unwrap();
+
         assert_eq!(results.len(), 4);
-
-        let id_of = |b: &RecordBatch| {
-            b.column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .unwrap()
-                .value(0)
-        };
-        assert_eq!(id_of(results[0].as_ref().unwrap()), 3);
-        assert_eq!(id_of(results[1].as_ref().unwrap()), 1);
-        assert!(results[2].is_none(), "999 should miss");
-        assert_eq!(id_of(results[3].as_ref().unwrap()), 2);
-
-        // One batched query, three hits.
-        assert_eq!(source.query_count(), 1);
-        assert_eq!(source.row_count(), 3);
+        assert_eq!(id_at(results[0].as_ref().unwrap()), 3);
+        assert_eq!(id_at(results[1].as_ref().unwrap()), 1);
+        assert!(results[2].is_none());
+        assert_eq!(id_at(results[3].as_ref().unwrap()), 2);
     }
 
+    /// The Phase 3 exit criterion: a batched `pk IN (...)` must prune
+    /// non-matching partition files (per-key cost O(matching files), not
+    /// O(table)) on a table clustered on the key.
     #[tokio::test]
-    async fn test_batch_query_duplicate_keys_each_resolve() {
+    async fn in_list_prunes_partition_files() {
+        use datafusion::physical_plan::collect;
+
         let temp_dir = TempDir::new().unwrap();
-        let table_path = temp_dir.path().to_str().unwrap();
+        let path = temp_dir.path().to_str().unwrap();
 
-        create_delta_table(table_path, vec![test_batch(&[1, 2], &["A", "B"])]).await;
+        // 8 distinct keys → 8 partition directories (one Parquet file each).
+        {
+            use crate::lakehouse::delta_io;
+            use deltalake::protocol::SaveMode;
+            let t = delta_io::open_or_create_table(path, HashMap::new(), None)
+                .await
+                .unwrap();
+            delta_io::write_batches(
+                t,
+                vec![test_batch(
+                    &[0, 1, 2, 3, 4, 5, 6, 7],
+                    &["a", "b", "c", "d", "e", "f", "g", "h"],
+                )],
+                "w",
+                1,
+                SaveMode::Append,
+                Some(&["id".to_string()]),
+                false,
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        }
 
-        let config = DeltaLookupSourceConfig {
-            table_path: table_path.to_string(),
-            storage_options: HashMap::new(),
-            primary_key_columns: vec!["id".into()],
-            table_name: "test_dup".to_string(),
-        };
-        let source = DeltaLookupSource::open(config).await.unwrap();
-
-        let keys = int_keys(&[1, 1, 2]);
+        // Correctness across partition files via the source.
+        let source = open_source(path, "lk").await;
+        let keys = int_keys(&[5, 2, 100]);
         let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
-
         let results = source.query(&key_refs, &[], &[]).await.unwrap();
-        assert_eq!(results.len(), 3);
-        assert!(results.iter().all(Option::is_some));
-        // Duplicate key 1 resolves twice — both aligned outputs present.
-        assert_eq!(source.query_count(), 1);
+        assert!(results[0].is_some() && results[1].is_some() && results[2].is_none());
+
+        // Pruning: the IN-list query reads fewer than all 8 files. (`next`
+        // provider reports files read via `count_files_scanned`.)
+        let ctx = SessionContext::new();
+        crate::lakehouse::delta_table_provider::register_delta_table(
+            &ctx,
+            "lk",
+            path,
+            HashMap::new(),
+        )
+        .await
+        .unwrap();
+        let plan = ctx
+            .sql("SELECT * FROM \"lk\" WHERE \"id\" IN (2, 5)")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let _ = collect(Arc::clone(&plan), ctx.task_ctx()).await.unwrap();
+        let scanned = sum_plan_metric(&plan, "count_files_scanned");
+        assert!(
+            scanned > 0 && scanned < 8,
+            "expected pruning, scanned={scanned}"
+        );
     }
 
-    /// Recursively sum a named execution-plan metric across the plan tree.
     fn sum_plan_metric(
         plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>,
         name: &str,
@@ -586,114 +435,5 @@ mod tests {
             total += sum_plan_metric(child, name);
         }
         total
-    }
-
-    async fn create_partitioned_delta_table(path: &str, ids: &[i64], names: &[&str]) {
-        use crate::lakehouse::delta_io;
-        use deltalake::protocol::SaveMode;
-
-        // Pass no schema so the table is created on first write *with* the
-        // partition columns (a pre-created table can't be repartitioned).
-        let table = delta_io::open_or_create_table(path, HashMap::new(), None)
-            .await
-            .unwrap();
-        delta_io::write_batches(
-            table,
-            vec![test_batch(ids, names)],
-            "test-writer",
-            1,
-            SaveMode::Append,
-            Some(&["id".to_string()]), // partition (== cluster) on the lookup key
-            false,
-            None,
-            false,
-            None,
-        )
-        .await
-        .unwrap();
-    }
-
-    /// The Phase 3 exit criterion: a batched `WHERE pk IN (...)` must prune
-    /// non-matching partition files, so per-key cost is O(matching files) on a
-    /// table clustered on the key — not O(table).
-    #[tokio::test]
-    async fn test_batch_query_prunes_partition_files() {
-        use datafusion::physical_plan::collect;
-
-        let temp_dir = TempDir::new().unwrap();
-        let table_path = temp_dir.path().to_str().unwrap();
-
-        // 8 distinct keys → 8 partition directories (one Parquet file each).
-        create_partitioned_delta_table(
-            table_path,
-            &[0, 1, 2, 3, 4, 5, 6, 7],
-            &["a", "b", "c", "d", "e", "f", "g", "h"],
-        )
-        .await;
-
-        // 1) Correctness across multiple partition files via the source.
-        let config = DeltaLookupSourceConfig {
-            table_path: table_path.to_string(),
-            storage_options: HashMap::new(),
-            primary_key_columns: vec!["id".into()],
-            table_name: "lk".to_string(),
-        };
-        let source = DeltaLookupSource::open(config).await.unwrap();
-        let keys = int_keys(&[5, 2, 100]);
-        let key_refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
-        let results = source.query(&key_refs, &[], &[]).await.unwrap();
-        assert_eq!(results.len(), 3);
-        assert!(results[0].is_some(), "key 5 should hit");
-        assert!(results[1].is_some(), "key 2 should hit");
-        assert!(results[2].is_none(), "key 100 should miss");
-
-        // 2) Pruning: the IN-list query reads only the matching partition files.
-        // (Mirrors exactly the SQL shape `DeltaLookupSource::query` generates.)
-        let ctx = SessionContext::new();
-        crate::lakehouse::delta_table_provider::register_delta_table(
-            &ctx,
-            "lk",
-            table_path,
-            HashMap::new(),
-        )
-        .await
-        .unwrap();
-        let plan = ctx
-            .sql("SELECT * FROM \"lk\" WHERE \"id\" IN (2, 5)")
-            .await
-            .unwrap()
-            .create_physical_plan()
-            .await
-            .unwrap();
-        // Execute so scan metrics populate.
-        let _ = collect(Arc::clone(&plan), ctx.task_ctx()).await.unwrap();
-
-        // The `next` Delta provider reports files actually read via
-        // `count_files_scanned`; pruning shows as scanned < total (8).
-        let scanned = sum_plan_metric(&plan, "count_files_scanned");
-        assert!(scanned > 0, "scan read no files (metric not found?)");
-        assert!(
-            scanned < 8,
-            "IN-list did not prune: scanned all {scanned} of 8 files"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_batch_query_empty_keys() {
-        let temp_dir = TempDir::new().unwrap();
-        let table_path = temp_dir.path().to_str().unwrap();
-
-        create_delta_table(table_path, vec![test_batch(&[1], &["A"])]).await;
-
-        let config = DeltaLookupSourceConfig {
-            table_path: table_path.to_string(),
-            storage_options: HashMap::new(),
-            primary_key_columns: vec!["id".into()],
-            table_name: "test_empty".to_string(),
-        };
-        let source = DeltaLookupSource::open(config).await.unwrap();
-
-        let results = source.query(&[], &[], &[]).await.unwrap();
-        assert!(results.is_empty());
     }
 }

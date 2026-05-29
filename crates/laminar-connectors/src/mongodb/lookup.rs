@@ -1,27 +1,21 @@
 //! `MongoDB` on-demand lookup source for cache-miss fallback.
 //!
-//! Implements `LookupSource` via a multi-get on the indexed key:
-//! `find({ <pk>: { $in: [keys] } })`. N missed keys fold into one round trip.
-//! Because `MongoDB` is schemaless, the source projects each returned document
-//! into the table's **declared** Arrow schema (from `CREATE LOOKUP TABLE`),
-//! and realigns results to the input key order by re-encoding the projected
-//! key column with the same `RowConverter` used to decode the input keys.
+//! Implements `LookupSource` via a multi-get on the indexed key
+//! (`find({ pk: { $in: [keys] } })`), so all missed keys of a probe fold into
+//! one round trip. `MongoDB` is schemaless, so the source projects each
+//! returned document into the table's **declared** Arrow schema (from
+//! `CREATE LOOKUP TABLE`); [`KeyAligner`] handles key decode and realignment.
 //!
-//! v1 limits: single-column key; supported declared column types are
-//! Int32/Int64/Float64/Boolean/Utf8 (other types render as a JSON/string
-//! fallback or NULL).
+//! v1 limits: single-column key; declared column types Int32/Int64/Float64/
+//! Boolean/Utf8 (others render as a string/JSON fallback or NULL).
 
-#[cfg(feature = "mongodb-cdc")]
-use std::collections::HashMap;
-#[cfg(feature = "mongodb-cdc")]
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "mongodb-cdc")]
 use std::sync::Arc;
 
 #[cfg(feature = "mongodb-cdc")]
 use arrow_array::{Array, RecordBatch};
 #[cfg(feature = "mongodb-cdc")]
-use arrow_row::{RowConverter, SortField};
+use arrow_row::SortField;
 #[cfg(feature = "mongodb-cdc")]
 use arrow_schema::{DataType, SchemaRef};
 #[cfg(feature = "mongodb-cdc")]
@@ -33,6 +27,8 @@ use mongodb::Client;
 use laminar_core::lookup::predicate::Predicate;
 #[cfg(feature = "mongodb-cdc")]
 use laminar_core::lookup::source::{ColumnId, LookupError, LookupSource, LookupSourceCapabilities};
+#[cfg(feature = "mongodb-cdc")]
+use laminar_core::lookup::KeyAligner;
 
 /// Configuration for [`MongoLookupSource`].
 #[cfg(feature = "mongodb-cdc")]
@@ -58,10 +54,7 @@ pub struct MongoLookupSource {
     collection: String,
     pk_field: String,
     schema: SchemaRef,
-    pk_sort_fields: Vec<SortField>,
-    query_count: AtomicU64,
-    row_count: AtomicU64,
-    error_count: AtomicU64,
+    aligner: KeyAligner,
 }
 
 #[cfg(feature = "mongodb-cdc")]
@@ -87,6 +80,7 @@ impl MongoLookupSource {
         let pk_sort_fields = vec![SortField::new(
             config.schema.field(pk_idx).data_type().clone(),
         )];
+        let aligner = KeyAligner::new(pk_sort_fields, config.primary_key_columns)?;
 
         let client_options = mongodb::options::ClientOptions::parse(&config.connection_uri)
             .await
@@ -100,10 +94,7 @@ impl MongoLookupSource {
             collection: config.collection,
             pk_field,
             schema: config.schema,
-            pk_sort_fields,
-            query_count: AtomicU64::new(0),
-            row_count: AtomicU64::new(0),
-            error_count: AtomicU64::new(0),
+            aligner,
         })
     }
 
@@ -147,7 +138,7 @@ impl MongoLookupSource {
         Ok(Some(bson))
     }
 
-    /// Project fetched documents into a single Arrow `RecordBatch` matching the
+    /// Project fetched documents into one Arrow `RecordBatch` matching the
     /// declared schema. Missing/incompatible fields become NULL.
     fn docs_to_batch(&self, docs: &[Document]) -> Result<RecordBatch, LookupError> {
         use arrow_array::builder::{
@@ -189,8 +180,7 @@ impl MongoLookupSource {
                     Arc::new(b.finish())
                 }
                 _ => {
-                    // Utf8 (and any non-native declared type): render the value
-                    // as a string (extended-JSON for non-scalars).
+                    // Utf8 (and any non-native declared type): extended-JSON text.
                     let mut b = StringBuilder::with_capacity(docs.len(), docs.len() * 16);
                     for d in docs {
                         match d.get(name) {
@@ -206,45 +196,6 @@ impl MongoLookupSource {
         RecordBatch::try_new(Arc::clone(&self.schema), columns)
             .map_err(|e| LookupError::Internal(format!("arrow batch construction: {e}")))
     }
-
-    /// Re-encode the PK column of a fetched batch so each row maps to its key.
-    fn index_batch_by_key(
-        &self,
-        converter: &RowConverter,
-        batch: &RecordBatch,
-        index: &mut HashMap<Vec<u8>, usize>,
-    ) -> Result<(), LookupError> {
-        let idx = batch.schema().index_of(&self.pk_field).map_err(|_| {
-            LookupError::Internal(format!("pk column not found in result: {}", self.pk_field))
-        })?;
-        let pk_cols = [Arc::clone(batch.column(idx))];
-        let rows = converter
-            .convert_columns(&pk_cols)
-            .map_err(|e| LookupError::Internal(format!("encode result keys: {e}")))?;
-        for row in 0..batch.num_rows() {
-            let key = rows.row(row).as_ref().to_vec();
-            index.entry(key).or_insert(row);
-        }
-        Ok(())
-    }
-
-    /// Total queries executed.
-    #[must_use]
-    pub fn query_count(&self) -> u64 {
-        self.query_count.load(Ordering::Relaxed)
-    }
-
-    /// Total rows returned.
-    #[must_use]
-    pub fn row_count(&self) -> u64 {
-        self.row_count.load(Ordering::Relaxed)
-    }
-
-    /// Total query errors.
-    #[must_use]
-    pub fn error_count(&self) -> u64 {
-        self.error_count.load(Ordering::Relaxed)
-    }
 }
 
 #[cfg(feature = "mongodb-cdc")]
@@ -258,19 +209,10 @@ impl LookupSource for MongoLookupSource {
         use tokio_stream::StreamExt;
 
         if keys.is_empty() {
-            self.query_count.fetch_add(1, Ordering::Relaxed);
             return Ok(Vec::new());
         }
 
-        let converter = RowConverter::new(self.pk_sort_fields.clone())
-            .map_err(|e| LookupError::Internal(format!("row converter: {e}")))?;
-        let parser = converter.parser();
-
-        // Decode keys into a single PK column, then build the $in array.
-        let parsed = keys.iter().map(|k| parser.parse(k));
-        let pk_arrays = converter
-            .convert_rows(parsed)
-            .map_err(|e| LookupError::Internal(format!("decode keys: {e}")))?;
+        let pk_arrays = self.aligner.decode_keys(keys)?;
         let pk_array = pk_arrays[0].as_ref();
         let mut in_values: Vec<Bson> = Vec::with_capacity(keys.len());
         for row in 0..pk_array.len() {
@@ -285,52 +227,27 @@ impl LookupSource for MongoLookupSource {
             .database(&self.database)
             .collection::<Document>(&self.collection);
 
-        let mut cursor = collection.find(filter).await.map_err(|e| {
-            self.error_count.fetch_add(1, Ordering::Relaxed);
-            LookupError::Query(format!("mongodb find: {e}"))
-        })?;
-
+        let mut cursor = collection
+            .find(filter)
+            .await
+            .map_err(|e| LookupError::Query(format!("mongodb find: {e}")))?;
         let mut docs: Vec<Document> = Vec::new();
         while let Some(next) = cursor.next().await {
-            let doc = next.map_err(|e| {
-                self.error_count.fetch_add(1, Ordering::Relaxed);
-                LookupError::Query(format!("mongodb cursor: {e}"))
-            })?;
-            docs.push(doc);
+            docs.push(next.map_err(|e| LookupError::Query(format!("mongodb cursor: {e}")))?);
         }
 
-        let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
-        let batch = if docs.is_empty() {
-            None
+        let batches = if docs.is_empty() {
+            Vec::new()
         } else {
-            let b = self.docs_to_batch(&docs)?;
-            self.index_batch_by_key(&converter, &b, &mut index)?;
-            Some(b)
+            vec![self.docs_to_batch(&docs)?]
         };
-
-        let mut hits = 0u64;
-        let results: Vec<Option<RecordBatch>> = keys
-            .iter()
-            .map(|key| {
-                index.get(*key).map(|&row| {
-                    hits += 1;
-                    // `batch` is Some whenever `index` is non-empty.
-                    batch.as_ref().expect("batch present").slice(row, 1)
-                })
-            })
-            .collect();
-
-        self.row_count.fetch_add(hits, Ordering::Relaxed);
-        self.query_count.fetch_add(1, Ordering::Relaxed);
-        Ok(results)
+        self.aligner.align(keys, &batches)
     }
 
     fn capabilities(&self) -> LookupSourceCapabilities {
         LookupSourceCapabilities {
-            supports_predicate_pushdown: false,
-            supports_projection_pushdown: false,
             supports_batch_lookup: true,
-            max_batch_size: 0,
+            ..LookupSourceCapabilities::none()
         }
     }
 
@@ -377,8 +294,7 @@ fn bson_as_f64(b: Option<&Bson>) -> Option<f64> {
     }
 }
 
-/// Render a BSON value as a string column cell (scalars verbatim, others as
-/// extended JSON).
+/// Render a BSON value as a string cell (scalars verbatim, others as JSON).
 #[cfg(feature = "mongodb-cdc")]
 fn bson_to_string(b: &Bson) -> String {
     match b {
@@ -398,45 +314,33 @@ mod tests {
     use arrow_array::{Int64Array, StringArray};
 
     #[test]
-    fn test_cell_to_bson_types() {
-        let ints = Int64Array::from(vec![7i64]);
+    fn cell_to_bson_types_and_null() {
         assert_eq!(
-            MongoLookupSource::cell_to_bson(&ints, 0).unwrap(),
+            MongoLookupSource::cell_to_bson(&Int64Array::from(vec![7i64]), 0).unwrap(),
             Some(Bson::Int64(7))
         );
-        let strs = StringArray::from(vec!["k"]);
         assert_eq!(
-            MongoLookupSource::cell_to_bson(&strs, 0).unwrap(),
+            MongoLookupSource::cell_to_bson(&StringArray::from(vec!["k"]), 0).unwrap(),
             Some(Bson::String("k".into()))
+        );
+        let nullable = Int64Array::from(vec![None, Some(1)]);
+        assert!(MongoLookupSource::cell_to_bson(&nullable, 0)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn cell_to_bson_rejects_unsupported_type() {
+        assert!(
+            MongoLookupSource::cell_to_bson(&arrow_array::Date32Array::from(vec![1]), 0).is_err()
         );
     }
 
     #[test]
-    fn test_cell_to_bson_null_is_none() {
-        let arr = Int64Array::from(vec![None, Some(1)]);
-        assert!(MongoLookupSource::cell_to_bson(&arr, 0).unwrap().is_none());
-        assert!(MongoLookupSource::cell_to_bson(&arr, 1).unwrap().is_some());
-    }
-
-    #[test]
-    fn test_cell_to_bson_unsupported_errors() {
-        let arr = arrow_array::Date32Array::from(vec![1]);
-        assert!(MongoLookupSource::cell_to_bson(&arr, 0).is_err());
-    }
-
-    #[test]
-    fn test_bson_numeric_coercion() {
-        assert_eq!(bson_as_i64(Some(&Bson::Int32(3))), Some(3));
+    fn bson_numeric_coercion() {
         assert_eq!(bson_as_i64(Some(&Bson::Double(3.9))), Some(3));
         assert_eq!(bson_as_f64(Some(&Bson::Int64(5))), Some(5.0));
         assert_eq!(bson_as_i64(Some(&Bson::String("x".into()))), None);
         assert_eq!(bson_as_i64(None), None);
-    }
-
-    #[test]
-    fn test_bson_to_string() {
-        assert_eq!(bson_to_string(&Bson::String("hi".into())), "hi");
-        assert_eq!(bson_to_string(&Bson::Int32(42)), "42");
-        assert_eq!(bson_to_string(&Bson::Boolean(true)), "true");
     }
 }

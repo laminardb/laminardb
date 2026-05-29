@@ -1,23 +1,17 @@
 //! Iceberg on-demand lookup source for cache-miss fallback.
 //!
-//! Implements `LookupSource` backed by the native Iceberg table scan with
-//! predicate pushdown. Mirrors [`super::delta_lookup`]: a batched
-//! `pk IN (...)` filter folds N missed keys into one (file-/manifest-pruned)
-//! scan, and results are realigned to the input key order by re-encoding the
-//! fetched rows' primary-key columns with the same `RowConverter` used to
-//! decode the input keys.
+//! Implements `LookupSource` via the native Iceberg scan with a batched
+//! `pk IN (...)` filter pushed down (`with_filter`), so all missed keys of a
+//! probe fold into one manifest-pruned scan. [`KeyAligner`] handles key decode
+//! and result realignment.
 
-#[cfg(feature = "iceberg")]
-use std::collections::HashMap;
-#[cfg(feature = "iceberg")]
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "iceberg")]
 use std::sync::Arc;
 
 #[cfg(feature = "iceberg")]
-use arrow_array::{Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, RecordBatch};
 #[cfg(feature = "iceberg")]
-use arrow_row::{RowConverter, SortField};
+use arrow_row::SortField;
 #[cfg(feature = "iceberg")]
 use arrow_schema::SchemaRef;
 #[cfg(feature = "iceberg")]
@@ -31,14 +25,11 @@ use iceberg::Catalog;
 use laminar_core::lookup::predicate::Predicate;
 #[cfg(feature = "iceberg")]
 use laminar_core::lookup::source::{ColumnId, LookupError, LookupSource, LookupSourceCapabilities};
+#[cfg(feature = "iceberg")]
+use laminar_core::lookup::KeyAligner;
 
 #[cfg(feature = "iceberg")]
 use crate::lakehouse::iceberg_config::IcebergCatalogConfig;
-
-/// Maximum keys folded into a single batched scan; larger key sets are chunked
-/// so the pushed-down `IN` predicate stays bounded.
-#[cfg(feature = "iceberg")]
-const MAX_KEYS_PER_QUERY: usize = 1024;
 
 /// Configuration for [`IcebergLookupSource`].
 #[cfg(feature = "iceberg")]
@@ -56,12 +47,8 @@ pub struct IcebergLookupSource {
     catalog: Arc<dyn Catalog>,
     namespace: String,
     table_name: String,
-    primary_key_columns: Vec<String>,
     schema: SchemaRef,
-    pk_sort_fields: Vec<SortField>,
-    query_count: AtomicU64,
-    row_count: AtomicU64,
-    error_count: AtomicU64,
+    aligner: KeyAligner,
 }
 
 #[cfg(feature = "iceberg")]
@@ -73,16 +60,9 @@ impl IcebergLookupSource {
     /// Returns `LookupError` if the catalog/table cannot be opened or a primary
     /// key column is missing from the table schema.
     pub async fn open(config: IcebergLookupSourceConfig) -> Result<Self, LookupError> {
-        if config.primary_key_columns.is_empty() {
-            return Err(LookupError::Internal(
-                "primary_key_columns must not be empty".into(),
-            ));
-        }
-
         let catalog = crate::lakehouse::iceberg_io::build_catalog(&config.catalog)
             .await
             .map_err(|e| LookupError::Connection(format!("iceberg catalog: {e}")))?;
-
         let table = crate::lakehouse::iceberg_io::load_table(
             catalog.as_ref(),
             &config.catalog.namespace,
@@ -97,32 +77,28 @@ impl IcebergLookupSource {
                 .map_err(|e| LookupError::Internal(format!("iceberg schema to arrow: {e}")))?,
         );
 
-        let pk_sort_fields: Vec<SortField> = config
+        let pk_sort_fields = config
             .primary_key_columns
             .iter()
-            .map(|col_name| {
-                let idx = schema.index_of(col_name).map_err(|_| {
-                    LookupError::Internal(format!("pk column not found: {col_name}"))
-                })?;
+            .map(|name| {
+                let idx = schema
+                    .index_of(name)
+                    .map_err(|_| LookupError::Internal(format!("pk column not found: {name}")))?;
                 Ok(SortField::new(schema.field(idx).data_type().clone()))
             })
             .collect::<Result<Vec<_>, LookupError>>()?;
+        let aligner = KeyAligner::new(pk_sort_fields, config.primary_key_columns)?;
 
         Ok(Self {
             catalog,
             namespace: config.catalog.namespace,
             table_name: config.catalog.table_name,
-            primary_key_columns: config.primary_key_columns,
             schema,
-            pk_sort_fields,
-            query_count: AtomicU64::new(0),
-            row_count: AtomicU64::new(0),
-            error_count: AtomicU64::new(0),
+            aligner,
         })
     }
 
-    /// Convert one PK cell into an Iceberg [`Datum`], or `None` when NULL (the
-    /// caller turns that into an `IS NULL` predicate).
+    /// Convert one PK cell into an Iceberg [`Datum`], or `None` when NULL.
     fn cell_to_datum(
         col_name: &str,
         array: &dyn Array,
@@ -166,12 +142,12 @@ impl IcebergLookupSource {
         Ok(Some(datum))
     }
 
-    /// Build a single Iceberg predicate covering every key in `pk_arrays`
-    /// (column-major; each array has `n_keys` rows). A single-column PK folds
-    /// into `pk IN (...)`; a composite PK becomes an OR of per-key AND-groups.
+    /// Build a single Iceberg predicate over the decoded key columns: a
+    /// single-column PK folds into `pk IN (...)`; a composite PK becomes an OR
+    /// of per-key AND-groups.
     fn build_key_predicate(
         pk_cols: &[String],
-        pk_arrays: &[Arc<dyn Array>],
+        pk_arrays: &[ArrayRef],
         n_keys: usize,
     ) -> Result<IcebergPredicate, LookupError> {
         if pk_cols.len() == 1 {
@@ -185,11 +161,8 @@ impl IcebergLookupSource {
                     None => has_null = true,
                 }
             }
-            let mut pred: Option<IcebergPredicate> = if datums.is_empty() {
-                None
-            } else {
-                Some(Reference::new(col.clone()).is_in(datums))
-            };
+            let mut pred: Option<IcebergPredicate> =
+                (!datums.is_empty()).then(|| Reference::new(col.clone()).is_in(datums));
             if has_null {
                 let null_pred = Reference::new(col.clone()).is_null();
                 pred = Some(match pred {
@@ -218,59 +191,9 @@ impl IcebergLookupSource {
             }
         }
         let mut it = groups.into_iter();
-        let first = it
-            .next()
-            .ok_or_else(|| LookupError::Internal("no keys to look up".into()))?;
-        Ok(it.fold(first, IcebergPredicate::or))
-    }
-
-    /// Re-encode the PK columns of a fetched batch with the same `RowConverter`
-    /// used to decode the input keys, so each row maps back to its key bytes.
-    fn index_batch_by_key(
-        &self,
-        converter: &RowConverter,
-        batch: &RecordBatch,
-        batch_idx: usize,
-        index: &mut HashMap<Vec<u8>, (usize, usize)>,
-    ) -> Result<(), LookupError> {
-        let pk_cols: Vec<Arc<dyn Array>> = self
-            .primary_key_columns
-            .iter()
-            .map(|name| {
-                let idx = batch.schema().index_of(name).map_err(|_| {
-                    LookupError::Internal(format!("pk column not found in result: {name}"))
-                })?;
-                Ok(Arc::clone(batch.column(idx)))
-            })
-            .collect::<Result<_, LookupError>>()?;
-
-        let rows = converter
-            .convert_columns(&pk_cols)
-            .map_err(|e| LookupError::Internal(format!("encode result keys: {e}")))?;
-
-        for row in 0..batch.num_rows() {
-            let key = rows.row(row).as_ref().to_vec();
-            index.entry(key).or_insert((batch_idx, row));
-        }
-        Ok(())
-    }
-
-    /// Total queries executed.
-    #[must_use]
-    pub fn query_count(&self) -> u64 {
-        self.query_count.load(Ordering::Relaxed)
-    }
-
-    /// Total rows returned.
-    #[must_use]
-    pub fn row_count(&self) -> u64 {
-        self.row_count.load(Ordering::Relaxed)
-    }
-
-    /// Total query errors.
-    #[must_use]
-    pub fn error_count(&self) -> u64 {
-        self.error_count.load(Ordering::Relaxed)
+        it.next()
+            .map(|first| it.fold(first, IcebergPredicate::or))
+            .ok_or_else(|| LookupError::Internal("no keys to look up".into()))
     }
 }
 
@@ -285,15 +208,14 @@ impl LookupSource for IcebergLookupSource {
         use tokio_stream::StreamExt;
 
         if keys.is_empty() {
-            self.query_count.fetch_add(1, Ordering::Relaxed);
             return Ok(Vec::new());
         }
 
-        let converter = RowConverter::new(self.pk_sort_fields.clone())
-            .map_err(|e| LookupError::Internal(format!("row converter: {e}")))?;
-        let parser = converter.parser();
+        let pk_arrays = self.aligner.decode_keys(keys)?;
+        let predicate =
+            Self::build_key_predicate(self.aligner.pk_columns(), &pk_arrays, keys.len())?;
 
-        // Reload the table once per query so lookups see the latest snapshot
+        // Reload the table per query so lookups see the latest snapshot
         // (eventually-consistent freshness; the cache layer adds TTL on top).
         let table = crate::lakehouse::iceberg_io::load_table(
             self.catalog.as_ref(),
@@ -301,72 +223,33 @@ impl LookupSource for IcebergLookupSource {
             &self.table_name,
         )
         .await
-        .map_err(|e| {
-            self.error_count.fetch_add(1, Ordering::Relaxed);
-            LookupError::Query(format!("load iceberg table: {e}"))
-        })?;
+        .map_err(|e| LookupError::Query(format!("load iceberg table: {e}")))?;
 
-        let mut index: HashMap<Vec<u8>, (usize, usize)> = HashMap::new();
-        let mut fetched: Vec<RecordBatch> = Vec::new();
+        let scan = table
+            .scan()
+            .with_filter(predicate)
+            .select_all()
+            .build()
+            .map_err(|e| LookupError::Query(format!("build iceberg scan: {e}")))?;
+        let stream = scan
+            .to_arrow()
+            .await
+            .map_err(|e| LookupError::Query(format!("iceberg scan to arrow: {e}")))?;
 
-        for chunk in keys.chunks(MAX_KEYS_PER_QUERY) {
-            let parsed = chunk.iter().map(|k| parser.parse(k));
-            let pk_arrays = converter
-                .convert_rows(parsed)
-                .map_err(|e| LookupError::Internal(format!("decode keys: {e}")))?;
-            let predicate =
-                Self::build_key_predicate(&self.primary_key_columns, &pk_arrays, chunk.len())?;
-
-            let scan = table
-                .scan()
-                .with_filter(predicate)
-                .select_all()
-                .build()
-                .map_err(|e| {
-                    self.error_count.fetch_add(1, Ordering::Relaxed);
-                    LookupError::Query(format!("build iceberg scan: {e}"))
-                })?;
-            let stream = scan.to_arrow().await.map_err(|e| {
-                self.error_count.fetch_add(1, Ordering::Relaxed);
-                LookupError::Query(format!("iceberg scan to arrow: {e}"))
-            })?;
-            let mut stream = std::pin::pin!(stream);
-            while let Some(result) = stream.next().await {
-                let batch = result.map_err(|e| {
-                    self.error_count.fetch_add(1, Ordering::Relaxed);
-                    LookupError::Query(format!("read iceberg batch: {e}"))
-                })?;
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                let batch_idx = fetched.len();
-                self.index_batch_by_key(&converter, &batch, batch_idx, &mut index)?;
-                fetched.push(batch);
-            }
+        let mut batches = Vec::new();
+        let mut stream = std::pin::pin!(stream);
+        while let Some(result) = stream.next().await {
+            batches
+                .push(result.map_err(|e| LookupError::Query(format!("read iceberg batch: {e}")))?);
         }
 
-        let mut hits = 0u64;
-        let results: Vec<Option<RecordBatch>> = keys
-            .iter()
-            .map(|key| {
-                index.get(*key).map(|&(bi, row)| {
-                    hits += 1;
-                    fetched[bi].slice(row, 1)
-                })
-            })
-            .collect();
-
-        self.row_count.fetch_add(hits, Ordering::Relaxed);
-        self.query_count.fetch_add(1, Ordering::Relaxed);
-        Ok(results)
+        self.aligner.align(keys, &batches)
     }
 
     fn capabilities(&self) -> LookupSourceCapabilities {
         LookupSourceCapabilities {
-            supports_predicate_pushdown: false,
-            supports_projection_pushdown: false,
             supports_batch_lookup: true,
-            max_batch_size: 0,
+            ..LookupSourceCapabilities::none()
         }
     }
 
@@ -396,27 +279,8 @@ mod tests {
     use super::*;
     use arrow_array::{Int64Array, StringArray};
 
-    fn int_pk_arrays(ids: &[i64]) -> Vec<Arc<dyn Array>> {
-        vec![Arc::new(Int64Array::from(ids.to_vec()))]
-    }
-
     #[test]
-    fn test_cell_to_datum_int_and_string() {
-        let ints = Int64Array::from(vec![42i64]);
-        let datum = IcebergLookupSource::cell_to_datum("id", &ints, 0)
-            .unwrap()
-            .unwrap();
-        assert_eq!(format!("{datum}"), "42");
-
-        let strs = StringArray::from(vec!["abc"]);
-        let datum = IcebergLookupSource::cell_to_datum("name", &strs, 0)
-            .unwrap()
-            .unwrap();
-        assert!(format!("{datum}").contains("abc"));
-    }
-
-    #[test]
-    fn test_cell_to_datum_null_is_none() {
+    fn cell_to_datum_null_and_unsupported() {
         let arr = Int64Array::from(vec![None, Some(1)]);
         assert!(IcebergLookupSource::cell_to_datum("id", &arr, 0)
             .unwrap()
@@ -424,52 +288,47 @@ mod tests {
         assert!(IcebergLookupSource::cell_to_datum("id", &arr, 1)
             .unwrap()
             .is_some());
+        // Binary keys are not supported as Iceberg predicates.
+        let bin = arrow_array::BinaryArray::from(vec![b"x".as_ref()]);
+        assert!(IcebergLookupSource::cell_to_datum("k", &bin, 0).is_err());
     }
 
     #[test]
-    fn test_cell_to_datum_unsupported_type_errors() {
-        // Binary keys are not supported as Iceberg lookup predicates.
-        let arr = arrow_array::BinaryArray::from(vec![b"x".as_ref()]);
-        assert!(IcebergLookupSource::cell_to_datum("k", &arr, 0).is_err());
-    }
-
-    #[test]
-    fn test_build_predicate_single_col_in_list() {
+    fn single_col_predicate_is_in_list() {
         let cols = vec!["id".to_string()];
-        let arrays = int_pk_arrays(&[1, 2, 3]);
-        let pred = IcebergLookupSource::build_key_predicate(&cols, &arrays, 3).unwrap();
-        let s = format!("{pred}");
-        // A single-column key folds into an IN predicate over the three values.
-        assert!(
-            s.to_uppercase().contains("IN"),
-            "expected IN predicate: {s}"
-        );
-        assert!(s.contains("id"), "predicate should reference id: {s}");
+        let arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![1, 2, 3]))];
+        let s = format!(
+            "{}",
+            IcebergLookupSource::build_key_predicate(&cols, &arrays, 3).unwrap()
+        )
+        .to_uppercase();
+        assert!(s.contains("IN") && s.contains("id".to_uppercase().as_str()));
     }
 
     #[test]
-    fn test_build_predicate_composite_col_or_of_and() {
+    fn composite_predicate_is_or_of_and() {
         let cols = vec!["a".to_string(), "b".to_string()];
-        let arrays: Vec<Arc<dyn Array>> = vec![
+        let arrays: Vec<ArrayRef> = vec![
             Arc::new(Int64Array::from(vec![1, 2])),
             Arc::new(StringArray::from(vec!["x", "y"])),
         ];
-        let pred = IcebergLookupSource::build_key_predicate(&cols, &arrays, 2).unwrap();
-        let s = format!("{pred}").to_uppercase();
-        // Composite key → (a = .. AND b = ..) OR (a = .. AND b = ..)
-        assert!(s.contains("AND"), "expected AND-groups: {s}");
-        assert!(s.contains("OR"), "expected OR across keys: {s}");
+        let s = format!(
+            "{}",
+            IcebergLookupSource::build_key_predicate(&cols, &arrays, 2).unwrap()
+        )
+        .to_uppercase();
+        assert!(s.contains("AND") && s.contains("OR"));
     }
 
     #[test]
-    fn test_build_predicate_with_null_key() {
+    fn null_key_adds_is_null_term() {
         let cols = vec!["id".to_string()];
-        let arrays: Vec<Arc<dyn Array>> = vec![Arc::new(Int64Array::from(vec![Some(1), None]))];
-        let pred = IcebergLookupSource::build_key_predicate(&cols, &arrays, 2).unwrap();
-        let s = format!("{pred}").to_uppercase();
-        assert!(
-            s.contains("NULL"),
-            "null key should add an IS NULL term: {s}"
-        );
+        let arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![Some(1), None]))];
+        let s = format!(
+            "{}",
+            IcebergLookupSource::build_key_predicate(&cols, &arrays, 2).unwrap()
+        )
+        .to_uppercase();
+        assert!(s.contains("NULL"));
     }
 }

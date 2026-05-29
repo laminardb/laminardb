@@ -1,27 +1,22 @@
 //! `PostgreSQL` on-demand lookup source for cache-miss fallback.
 //!
-//! A real `LookupSource` (not the `SELECT *`/`NoTls`/no-pool reference stub):
-//! a `deadpool`-pooled client issues a single parameterized
-//! `WHERE pk = ANY($1)` per fetch — N missed keys fold into one index-served
-//! round trip — and results are realigned to the input key order by
-//! re-encoding each returned row's primary-key column with the same
-//! `RowConverter` used to decode the input keys.
+//! A `deadpool`-pooled client issues one parameterized `WHERE pk = ANY($1)`
+//! per fetch, so all missed keys of a probe fold into one index-served round
+//! trip. [`KeyAligner`] handles key decode and result realignment.
 //!
 //! v1 limits: single-column key (matches the lookup-enrich operator), and the
-//! connection is `NoTls` (client TLS is a connector-wide follow-up, tracked in
-//! the lookup-source plan — the CDC source and sink share the same gap).
+//! connection is `NoTls` (client TLS is a connector-wide follow-up the CDC
+//! source and sink share).
 
 #[cfg(feature = "postgres-cdc")]
 use std::collections::HashMap;
-#[cfg(feature = "postgres-cdc")]
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "postgres-cdc")]
 use std::sync::Arc;
 
 #[cfg(feature = "postgres-cdc")]
 use arrow_array::{Array, RecordBatch};
 #[cfg(feature = "postgres-cdc")]
-use arrow_row::{RowConverter, SortField};
+use arrow_row::SortField;
 #[cfg(feature = "postgres-cdc")]
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 #[cfg(feature = "postgres-cdc")]
@@ -33,13 +28,15 @@ use tokio_postgres::types::{ToSql, Type};
 use laminar_core::lookup::predicate::Predicate;
 #[cfg(feature = "postgres-cdc")]
 use laminar_core::lookup::source::{ColumnId, LookupError, LookupSource, LookupSourceCapabilities};
+#[cfg(feature = "postgres-cdc")]
+use laminar_core::lookup::KeyAligner;
 
 /// Configuration for [`PostgresLookupSource`].
 #[cfg(feature = "postgres-cdc")]
 #[derive(Debug, Clone)]
 pub struct PostgresLookupSourceConfig {
-    /// libpq-style connection settings, keyed (host/port/database/user/password
-    /// or a pre-formed `connection` string).
+    /// libpq-style connection settings (host/port/database/user/password or a
+    /// pre-formed `connection` string).
     pub properties: HashMap<String, String>,
     /// Table name (optionally schema-qualified).
     pub table: String,
@@ -53,13 +50,9 @@ pub struct PostgresLookupSourceConfig {
 #[cfg(feature = "postgres-cdc")]
 pub struct PostgresLookupSource {
     pool: Pool,
-    pk_column: String,
     select_sql: String,
     schema: SchemaRef,
-    pk_sort_fields: Vec<SortField>,
-    query_count: AtomicU64,
-    row_count: AtomicU64,
-    error_count: AtomicU64,
+    aligner: KeyAligner,
 }
 
 #[cfg(feature = "postgres-cdc")]
@@ -80,22 +73,20 @@ impl PostgresLookupSource {
         let pk_column = config.primary_key_columns[0].clone();
 
         let pool = build_pool(&config.properties, config.pool_size)?;
-
-        // Read column metadata via a prepared zero-row statement.
         let select_sql = format!(
             "SELECT * FROM {} WHERE \"{}\" = ANY($1)",
             config.table, pk_column
         );
+
+        // Read column metadata via a prepared zero-row statement.
         let client = pool
             .get()
             .await
             .map_err(|e| LookupError::Connection(format!("postgres pool: {e}")))?;
-        let probe = format!("SELECT * FROM {} LIMIT 0", config.table);
         let stmt = client
-            .prepare(&probe)
+            .prepare(&format!("SELECT * FROM {} LIMIT 0", config.table))
             .await
             .map_err(|e| LookupError::Connection(format!("prepare schema probe: {e}")))?;
-
         let fields: Vec<Field> = stmt
             .columns()
             .iter()
@@ -107,22 +98,18 @@ impl PostgresLookupSource {
             LookupError::Internal(format!("pk column not found in table: {pk_column}"))
         })?;
         let pk_sort_fields = vec![SortField::new(schema.field(pk_idx).data_type().clone())];
+        let aligner = KeyAligner::new(pk_sort_fields, config.primary_key_columns)?;
 
         Ok(Self {
             pool,
-            pk_column,
             select_sql,
             schema,
-            pk_sort_fields,
-            query_count: AtomicU64::new(0),
-            row_count: AtomicU64::new(0),
-            error_count: AtomicU64::new(0),
+            aligner,
         })
     }
 
     /// Build the `ANY($1)` array parameter from the decoded PK column. NULL
-    /// keys are dropped (a NULL never `= ANY`, so they correctly resolve to a
-    /// miss in the alignment step).
+    /// keys are dropped (a NULL never `= ANY`, so they resolve to a miss).
     fn build_any_param(pk_array: &dyn Array) -> Result<Box<dyn ToSql + Sync + Send>, LookupError> {
         use arrow_array::{
             BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
@@ -135,80 +122,46 @@ impl PostgresLookupSource {
                 .downcast_ref::<T>()
                 .ok_or_else(|| LookupError::Internal("pk column downcast failed".into()))
         }
+        fn non_null<A: Array, T>(a: &A, get: impl Fn(usize) -> T) -> Vec<T> {
+            (0..a.len()).filter(|&i| !a.is_null(i)).map(get).collect()
+        }
 
-        let n = pk_array.len();
         let param: Box<dyn ToSql + Sync + Send> = match pk_array.data_type() {
             DataType::Int16 => {
                 let a = downcast::<Int16Array>(pk_array)?;
-                let v: Vec<i16> = (0..n)
-                    .filter(|&i| !a.is_null(i))
-                    .map(|i| a.value(i))
-                    .collect();
-                Box::new(v)
+                Box::new(non_null(a, |i| a.value(i)))
             }
             DataType::Int32 => {
                 let a = downcast::<Int32Array>(pk_array)?;
-                let v: Vec<i32> = (0..n)
-                    .filter(|&i| !a.is_null(i))
-                    .map(|i| a.value(i))
-                    .collect();
-                Box::new(v)
+                Box::new(non_null(a, |i| a.value(i)))
             }
             DataType::Int64 => {
                 let a = downcast::<Int64Array>(pk_array)?;
-                let v: Vec<i64> = (0..n)
-                    .filter(|&i| !a.is_null(i))
-                    .map(|i| a.value(i))
-                    .collect();
-                Box::new(v)
+                Box::new(non_null(a, |i| a.value(i)))
             }
             DataType::Float32 => {
                 let a = downcast::<Float32Array>(pk_array)?;
-                let v: Vec<f32> = (0..n)
-                    .filter(|&i| !a.is_null(i))
-                    .map(|i| a.value(i))
-                    .collect();
-                Box::new(v)
+                Box::new(non_null(a, |i| a.value(i)))
             }
             DataType::Float64 => {
                 let a = downcast::<Float64Array>(pk_array)?;
-                let v: Vec<f64> = (0..n)
-                    .filter(|&i| !a.is_null(i))
-                    .map(|i| a.value(i))
-                    .collect();
-                Box::new(v)
+                Box::new(non_null(a, |i| a.value(i)))
             }
             DataType::Boolean => {
                 let a = downcast::<BooleanArray>(pk_array)?;
-                let v: Vec<bool> = (0..n)
-                    .filter(|&i| !a.is_null(i))
-                    .map(|i| a.value(i))
-                    .collect();
-                Box::new(v)
+                Box::new(non_null(a, |i| a.value(i)))
             }
             DataType::Utf8 => {
                 let a = downcast::<StringArray>(pk_array)?;
-                let v: Vec<String> = (0..n)
-                    .filter(|&i| !a.is_null(i))
-                    .map(|i| a.value(i).to_string())
-                    .collect();
-                Box::new(v)
+                Box::new(non_null(a, |i| a.value(i).to_string()))
             }
             DataType::LargeUtf8 => {
                 let a = downcast::<LargeStringArray>(pk_array)?;
-                let v: Vec<String> = (0..n)
-                    .filter(|&i| !a.is_null(i))
-                    .map(|i| a.value(i).to_string())
-                    .collect();
-                Box::new(v)
+                Box::new(non_null(a, |i| a.value(i).to_string()))
             }
             DataType::Utf8View => {
                 let a = downcast::<StringViewArray>(pk_array)?;
-                let v: Vec<String> = (0..n)
-                    .filter(|&i| !a.is_null(i))
-                    .map(|i| a.value(i).to_string())
-                    .collect();
-                Box::new(v)
+                Box::new(non_null(a, |i| a.value(i).to_string()))
             }
             dt => {
                 return Err(LookupError::Internal(format!(
@@ -217,47 +170,6 @@ impl PostgresLookupSource {
             }
         };
         Ok(param)
-    }
-
-    /// Re-encode the PK column of a fetched batch with the same `RowConverter`
-    /// used to decode the input keys, so each row maps back to its key bytes.
-    fn index_batch_by_key(
-        &self,
-        converter: &RowConverter,
-        batch: &RecordBatch,
-        batch_idx: usize,
-        index: &mut HashMap<Vec<u8>, (usize, usize)>,
-    ) -> Result<(), LookupError> {
-        let idx = batch.schema().index_of(&self.pk_column).map_err(|_| {
-            LookupError::Internal(format!("pk column not found in result: {}", self.pk_column))
-        })?;
-        let pk_cols = [Arc::clone(batch.column(idx))];
-        let rows = converter
-            .convert_columns(&pk_cols)
-            .map_err(|e| LookupError::Internal(format!("encode result keys: {e}")))?;
-        for row in 0..batch.num_rows() {
-            let key = rows.row(row).as_ref().to_vec();
-            index.entry(key).or_insert((batch_idx, row));
-        }
-        Ok(())
-    }
-
-    /// Total queries executed.
-    #[must_use]
-    pub fn query_count(&self) -> u64 {
-        self.query_count.load(Ordering::Relaxed)
-    }
-
-    /// Total rows returned.
-    #[must_use]
-    pub fn row_count(&self) -> u64 {
-        self.row_count.load(Ordering::Relaxed)
-    }
-
-    /// Total query errors.
-    #[must_use]
-    pub fn error_count(&self) -> u64 {
-        self.error_count.load(Ordering::Relaxed)
     }
 }
 
@@ -270,64 +182,34 @@ impl LookupSource for PostgresLookupSource {
         _projection: &[ColumnId],
     ) -> Result<Vec<Option<RecordBatch>>, LookupError> {
         if keys.is_empty() {
-            self.query_count.fetch_add(1, Ordering::Relaxed);
             return Ok(Vec::new());
         }
 
-        let converter = RowConverter::new(self.pk_sort_fields.clone())
-            .map_err(|e| LookupError::Internal(format!("row converter: {e}")))?;
-        let parser = converter.parser();
-
-        // Decode all keys into a single PK column, then one ANY($1) round trip.
-        let parsed = keys.iter().map(|k| parser.parse(k));
-        let pk_arrays = converter
-            .convert_rows(parsed)
-            .map_err(|e| LookupError::Internal(format!("decode keys: {e}")))?;
+        let pk_arrays = self.aligner.decode_keys(keys)?;
         let param = Self::build_any_param(pk_arrays[0].as_ref())?;
 
-        let client = self.pool.get().await.map_err(|e| {
-            self.error_count.fetch_add(1, Ordering::Relaxed);
-            LookupError::Connection(format!("postgres pool: {e}"))
-        })?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| LookupError::Connection(format!("postgres pool: {e}")))?;
         let pg_rows = client
             .query(&self.select_sql, &[&*param])
             .await
-            .map_err(|e| {
-                self.error_count.fetch_add(1, Ordering::Relaxed);
-                LookupError::Query(format!("postgres lookup query: {e}"))
-            })?;
+            .map_err(|e| LookupError::Query(format!("postgres lookup query: {e}")))?;
 
-        let mut index: HashMap<Vec<u8>, (usize, usize)> = HashMap::new();
-        let fetched: Vec<RecordBatch> = if pg_rows.is_empty() {
+        let batches = if pg_rows.is_empty() {
             Vec::new()
         } else {
-            let batch = rows_to_batch(&self.schema, &pg_rows)?;
-            self.index_batch_by_key(&converter, &batch, 0, &mut index)?;
-            vec![batch]
+            vec![rows_to_batch(&self.schema, &pg_rows)?]
         };
-
-        let mut hits = 0u64;
-        let results: Vec<Option<RecordBatch>> = keys
-            .iter()
-            .map(|key| {
-                index.get(*key).map(|&(bi, row)| {
-                    hits += 1;
-                    fetched[bi].slice(row, 1)
-                })
-            })
-            .collect();
-
-        self.row_count.fetch_add(hits, Ordering::Relaxed);
-        self.query_count.fetch_add(1, Ordering::Relaxed);
-        Ok(results)
+        self.aligner.align(keys, &batches)
     }
 
     fn capabilities(&self) -> LookupSourceCapabilities {
         LookupSourceCapabilities {
-            supports_predicate_pushdown: false,
-            supports_projection_pushdown: false,
             supports_batch_lookup: true,
-            max_batch_size: 0,
+            ..LookupSourceCapabilities::none()
         }
     }
 
@@ -354,9 +236,8 @@ impl LookupSource for PostgresLookupSource {
     }
 }
 
-/// Build a `deadpool` pool from libpq-style properties. Accepts either
-/// individual `host`/`port`/`database`/`user`/`password` keys or a pre-formed
-/// `connection`/`connection_string` (parsed via `tokio_postgres::Config`).
+/// Build a `deadpool` pool from libpq-style properties (individual keys or a
+/// pre-formed `connection`/`connection_string` parsed via `tokio_postgres`).
 #[cfg(feature = "postgres-cdc")]
 fn build_pool(props: &HashMap<String, String>, pool_size: usize) -> Result<Pool, LookupError> {
     let mut cfg = deadpool_postgres::Config::new();
@@ -368,16 +249,12 @@ fn build_pool(props: &HashMap<String, String>, pool_size: usize) -> Result<Pool,
         let pg: tokio_postgres::Config = conn
             .parse()
             .map_err(|e| LookupError::Connection(format!("parse connection string: {e}")))?;
-        if let Some(host) = pg.get_hosts().iter().find_map(|h| match h {
+        cfg.host = pg.get_hosts().iter().find_map(|h| match h {
             tokio_postgres::config::Host::Tcp(s) => Some(s.clone()),
             #[allow(unreachable_patterns)]
             _ => None,
-        }) {
-            cfg.host = Some(host);
-        }
-        if let Some(port) = pg.get_ports().first() {
-            cfg.port = Some(*port);
-        }
+        });
+        cfg.port = pg.get_ports().first().copied();
         cfg.dbname = pg.get_dbname().map(str::to_string);
         cfg.user = pg.get_user().map(str::to_string);
         cfg.password = pg
@@ -402,7 +279,7 @@ fn build_pool(props: &HashMap<String, String>, pool_size: usize) -> Result<Pool,
     .map_err(|e| LookupError::Connection(format!("create pool: {e}")))
 }
 
-/// Convert `tokio_postgres` rows into a single Arrow `RecordBatch` using the
+/// Convert `tokio_postgres` rows into one Arrow `RecordBatch` via the
 /// pre-derived schema.
 #[cfg(feature = "postgres-cdc")]
 fn rows_to_batch(
@@ -427,13 +304,12 @@ fn rows_to_batch(
             DataType::Int64 => Arc::new(Int64Array::from(collect_col::<i64>(rows, name)?)),
             DataType::Float32 => Arc::new(Float32Array::from(collect_col::<f32>(rows, name)?)),
             DataType::Float64 => Arc::new(Float64Array::from(collect_col::<f64>(rows, name)?)),
+            // Everything else (Decimal/Date/Timestamp/UUID/JSON) renders as text.
             _ => {
-                // Everything else is rendered as text (Decimal/Date/Timestamp/
-                // UUID/JSON via Postgres' text output through a String cast).
-                let mut vals: Vec<Option<String>> = Vec::with_capacity(rows.len());
-                for row in rows {
-                    vals.push(row.try_get::<_, Option<String>>(name).unwrap_or(None));
-                }
+                let vals: Vec<Option<String>> = rows
+                    .iter()
+                    .map(|r| r.try_get::<_, Option<String>>(name).unwrap_or(None))
+                    .collect();
                 Arc::new(StringArray::from(vals))
             }
         };
@@ -461,8 +337,7 @@ where
 }
 
 /// Map a `tokio_postgres` type to an Arrow `DataType`. Native columnar types
-/// map directly; richer types (Decimal/Date/Timestamp/UUID/JSON) fall back to
-/// text so they survive the round trip.
+/// map directly; richer types fall back to text so they survive the round trip.
 #[cfg(feature = "postgres-cdc")]
 fn pg_type_to_arrow(pg_type: &Type) -> DataType {
     match *pg_type {
@@ -482,11 +357,10 @@ mod tests {
     use arrow_array::{Int64Array, StringArray};
 
     #[test]
-    fn test_pg_type_map() {
-        assert_eq!(pg_type_to_arrow(&Type::BOOL), DataType::Boolean);
-        assert_eq!(pg_type_to_arrow(&Type::INT4), DataType::Int32);
+    fn pg_type_map_native_and_text_fallback() {
         assert_eq!(pg_type_to_arrow(&Type::INT8), DataType::Int64);
         assert_eq!(pg_type_to_arrow(&Type::FLOAT8), DataType::Float64);
+        assert_eq!(pg_type_to_arrow(&Type::BOOL), DataType::Boolean);
         // Rich types render as text.
         assert_eq!(pg_type_to_arrow(&Type::TIMESTAMP), DataType::Utf8);
         assert_eq!(pg_type_to_arrow(&Type::NUMERIC), DataType::Utf8);
@@ -494,44 +368,23 @@ mod tests {
     }
 
     #[test]
-    fn test_build_any_param_supported_types() {
-        let ints = Int64Array::from(vec![1i64, 2, 3]);
-        assert!(PostgresLookupSource::build_any_param(&ints).is_ok());
-        let strs = StringArray::from(vec!["a", "b"]);
-        assert!(PostgresLookupSource::build_any_param(&strs).is_ok());
-    }
-
-    #[test]
-    fn test_build_any_param_drops_nulls() {
-        // NULL keys are dropped from the ANY array (they can never match).
-        let ints = Int64Array::from(vec![Some(1i64), None, Some(3)]);
-        assert!(PostgresLookupSource::build_any_param(&ints).is_ok());
-    }
-
-    #[test]
-    fn test_build_any_param_unsupported_type_errors() {
-        let arr = arrow_array::Date32Array::from(vec![1]);
-        assert!(PostgresLookupSource::build_any_param(&arr).is_err());
-    }
-
-    #[test]
-    fn test_build_pool_from_parts() {
-        let mut props = HashMap::new();
-        props.insert("host".into(), "localhost".into());
-        props.insert("port".into(), "5432".into());
-        props.insert("database".into(), "db".into());
-        props.insert("user".into(), "u".into());
-        // Pool creation is lazy (no connection yet), so this should succeed.
-        assert!(build_pool(&props, 4).is_ok());
-    }
-
-    #[test]
-    fn test_build_pool_from_connection_string() {
-        let mut props = HashMap::new();
-        props.insert(
-            "connection".into(),
-            "host=db.example.com port=5433 user=svc dbname=prod".into(),
+    fn any_param_built_for_supported_types_skipping_nulls() {
+        assert!(
+            PostgresLookupSource::build_any_param(&Int64Array::from(vec![
+                Some(1i64),
+                None,
+                Some(3)
+            ]))
+            .is_ok()
         );
-        assert!(build_pool(&props, 4).is_ok());
+        assert!(PostgresLookupSource::build_any_param(&StringArray::from(vec!["a", "b"])).is_ok());
+    }
+
+    #[test]
+    fn any_param_rejects_unsupported_type() {
+        assert!(
+            PostgresLookupSource::build_any_param(&arrow_array::Date32Array::from(vec![1]))
+                .is_err()
+        );
     }
 }
