@@ -307,6 +307,45 @@ Work (one cohesive change; cannot be partially landed without dead/unwired code)
 - **Exit:** Delta, Iceberg, Postgres, MongoDB all serve on-demand lookups with key-filtered
   pushdown + pooling (PG); per-backend live integration tests + Postgres TLS remain.
 
+### Consolidation + test strategy (2026-05-29) — supersedes the per-phase mechanics above
+
+A principal review flagged AI-generation residue across the four sources; the cleanup landed:
+- **`laminar-core::lookup::KeyAligner`** now owns the `RowConverter` and does key decode +
+  result realignment. It replaced the per-source `RowConverter`, `index_batch_by_key`, and the
+  copy-pasted realign loop (so the earlier "`index_batch_by_key`" / "⌈N/1024⌉ chunk" wording above
+  is historical). The alignment invariant is tested **once** in `KeyAligner`, not 4×.
+- The `query_count`/`row_count`/`error_count` atomics were **deleted** from all four sources — they
+  were never read by any production consumer. (Re-introduce only when wired to Prometheus in Phase 6.)
+- **Delta** now builds a typed DataFusion `Expr` (`col(pk).in_list(...)`) instead of a hand-rolled
+  `WHERE`-string with manual quote-escaping — type-correct and injection-free, matching Iceberg.
+- The inconsistent internal `MAX_KEYS_PER_QUERY` chunking was removed (the operator already bounds
+  probe batch size).
+- **Type-match guard** (`d67575bf`): the lookup-enrich operator fails fast with a clear message when
+  the input join-key type differs from the lookup PK type (previously a cryptic Arrow error deep in
+  the hot path on the first batch). Correction to the earlier "silent wrong answer" framing — the
+  encoder *errored*; it was just late and cryptic.
+
+**Why no automated end-to-end test (deliberate, not an oversight):** seeding a Delta table from a
+laminar-db test requires naming `deltalake::protocol::SaveMode`, i.e. adding `deltalake` as a
+laminar-db **dev-dependency** — and Cargo has no feature-gated dev-deps, so it would compile the
+whole delta-rs stack on *every* `cargo test -p laminar-db` (default, no features). The sink-seed
+alternative is async-commit + worker-timing flaky. Both are disproportionate. The wiring is instead
+covered by composition: `detect_lookup_enrich_query` (sql_analysis unit tests) + the operator
+behaviour tests against a real `LookupSourceDyn` (`MapSource`: miss→fetch→enrich, inner-drop/left-null,
+negative cache) + the type-match guard test + the trivial `create_operator` branch + per-backend
+predicate/param unit tests. The only unexercised link is a *real backend's* `open()`+scan through
+`start()` — pure integration, left as a gated future test.
+
+**Manual verification recipe (run when touching the on-demand path):**
+```sql
+-- with: cargo run -p laminar-server --features delta-lake  (point at a key-clustered Delta table)
+CREATE LOOKUP TABLE dim (id BIGINT NOT NULL, name VARCHAR, PRIMARY KEY (id))
+  WITH ('connector'='delta-lake', 'table.path'='/path/to/dim', 'strategy'='on_demand');
+CREATE SOURCE events (id BIGINT, amt BIGINT, ts BIGINT, WATERMARK FOR ts AS ts);
+CREATE STREAM out AS SELECT events.id, events.amt, dim.name
+  FROM events JOIN dim ON events.id = dim.id;        -- expect enriched rows; misses dropped (INNER)
+```
+
 ---
 
 ## Track B — Distributed MPP scale-out
