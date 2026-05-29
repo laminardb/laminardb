@@ -127,7 +127,7 @@ delta-lake-gcs = ["delta-lake", "deltalake/gcs"]
 delta-lake-unity = ["delta-lake", "deltalake/unity-experimental", "dep:reqwest"]
 delta-lake-glue = ["delta-lake", "delta-lake-s3", "deltalake/glue", "dep:deltalake-catalog-glue"]
 # Apache Iceberg
-iceberg = ["dep:iceberg", "dep:iceberg-catalog-rest", "dep:iceberg-storage-opendal", "dep:tokio-stream", "dep:parquet"]
+iceberg = ["dep:iceberg", "dep:iceberg-catalog-rest", "dep:iceberg-storage-opendal", "dep:tokio-stream", "dep:parquet", "dep:arrow-row"]
 # Parquet file lookup source
 parquet-lookup = ["dep:parquet", "dep:object_store"]
 # WebSocket source and sink
