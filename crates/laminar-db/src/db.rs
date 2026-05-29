@@ -630,6 +630,13 @@ impl LaminarDB {
             .cache_memory
             .map(|m| usize::try_from(m.as_bytes()).unwrap_or(usize::MAX));
 
+        // cache_ttl is specified in seconds; carry it as a Duration so the
+        // partial lookup cache expires stale entries lazily on read.
+        let cache_ttl = info
+            .properties
+            .cache_ttl
+            .map(std::time::Duration::from_secs);
+
         self.connector_manager
             .lock()
             .register_table(crate::connector_manager::TableRegistration {
@@ -641,6 +648,7 @@ impl LaminarDB {
                 format_options,
                 refresh,
                 cache_max_bytes,
+                cache_ttl,
             });
 
         Ok(())

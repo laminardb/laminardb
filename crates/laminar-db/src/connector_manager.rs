@@ -58,6 +58,10 @@ pub(crate) struct TableRegistration {
     /// Byte budget for the on-demand lookup `FoyerMemoryCache` (partial mode).
     /// `None` falls back to the cache's default.
     pub cache_max_bytes: Option<usize>,
+    /// Time-to-live for on-demand lookup cache entries (partial mode). After
+    /// this duration an entry is lazily re-fetched on the next probe. `None`
+    /// means entries live until byte-eviction / CDC invalidation.
+    pub cache_ttl: Option<std::time::Duration>,
 }
 
 /// Lowercase + replace underscores with hyphens.
@@ -533,6 +537,7 @@ mod tests {
             format_options: HashMap::new(),
             refresh: None,
             cache_max_bytes: None,
+            cache_ttl: None,
         });
         assert_eq!(mgr.table_names().len(), 1);
         assert!(mgr.has_external_connectors());
@@ -550,6 +555,7 @@ mod tests {
             format_options: HashMap::new(),
             refresh: None,
             cache_max_bytes: None,
+            cache_ttl: None,
         });
         assert!(mgr.unregister_table("t"));
         assert!(!mgr.unregister_table("t"));
@@ -568,6 +574,7 @@ mod tests {
             format_options: HashMap::new(),
             refresh: None,
             cache_max_bytes: None,
+            cache_ttl: None,
         });
         assert_eq!(mgr.registration_count(), 1);
         mgr.clear();
@@ -712,6 +719,7 @@ mod tests {
             format_options: HashMap::new(),
             refresh: None,
             cache_max_bytes: None,
+            cache_ttl: None,
         };
         let config = build_table_config(&reg).unwrap();
         assert_eq!(config.connector_type(), "kafka");
@@ -730,6 +738,7 @@ mod tests {
             format_options: HashMap::new(),
             refresh: None,
             cache_max_bytes: None,
+            cache_ttl: None,
         };
         let err = build_table_config(&reg).unwrap_err();
         assert!(err.to_string().contains("no connector type"));

@@ -536,11 +536,14 @@ pub fn lookup_to_ddl(lookup: &LookupConfig) -> Result<String, ServerError> {
     let mut opts = Vec::new();
     opts.push(format!("'connector' = '{}'", lookup.connector));
     opts.push(format!("'strategy' = '{}'", lookup.strategy));
+    // Note: the lookup-table parser keys cache options on the dotted form
+    // (`cache.memory` / `cache.ttl`); emitting `cache_memory` / `cache_ttl`
+    // here would be silently ignored by validate_properties.
     if lookup.cache.size_bytes != 100 * 1024 * 1024 {
-        opts.push(format!("'cache_memory' = '{}'", lookup.cache.size_bytes));
+        opts.push(format!("'cache.memory' = '{}'", lookup.cache.size_bytes));
     }
     if lookup.cache.ttl.as_secs() != 300 {
-        opts.push(format!("'cache_ttl' = '{}'", lookup.cache.ttl.as_secs()));
+        opts.push(format!("'cache.ttl' = '{}'", lookup.cache.ttl.as_secs()));
     }
     for (key, value) in &lookup.properties {
         opts.push(format!("'{}' = '{}'", key, toml_value_to_sql(value)));

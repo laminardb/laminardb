@@ -1156,6 +1156,7 @@ impl LaminarDB {
                 laminar_core::lookup::foyer_cache::FoyerMemoryCacheConfig {
                     capacity_bytes,
                     shards: 16,
+                    ttl: reg.cache_ttl,
                 },
             ));
             // Try to create a lookup source for cache-miss fallback via
@@ -1192,6 +1193,7 @@ impl LaminarDB {
             tracing::info!(
                 table = %name,
                 capacity_bytes,
+                ttl = ?reg.cache_ttl,
                 pk = %pk_csv,
                 "registered on-demand lookup table (partial cache)"
             );

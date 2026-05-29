@@ -236,10 +236,17 @@ Work (one cohesive change; cannot be partially landed without dead/unwired code)
   default), mirroring the AI result cache. The user's `cache_memory` budget flows through as
   bytes (no lossy entry-count conversion); the dead `cache_max_entries` registration field was
   removed. Closes problem #5 (entry-count bound could OOM on wide rows).
-- **TTL (remaining):** TTL on positive entries → lazy re-fetch on next probe after expiry. Needs
-  a TTL config knob to be properly wired (store `(Instant, RecordBatch)`, check on `get`); not
-  done yet — negative tombstones + CDC invalidation + byte eviction bound staleness for now.
-- **Exit:** cache memory is byte-bounded (done); TTL-based expiry pending.
+- **TTL — DONE 2026-05-29.** `FoyerMemoryCacheConfig.ttl: Option<Duration>` + lazy expiry on
+  `get_cached`: entries store `inserted_at: Instant` (new private `CachedBatch` value type), and a
+  read past the TTL drops the entry and reports a miss so the caller re-fetches. Wired end-to-end:
+  `CREATE LOOKUP TABLE ... WITH ('cache.ttl' = '<secs>')` → `LookupTableProperties.cache_ttl` →
+  new `TableRegistration.cache_ttl: Option<Duration>` (db.rs) → `FoyerMemoryCacheConfig.ttl`
+  (pipeline_lifecycle). `None` = entries live until byte-eviction / CDC invalidation (prior
+  behaviour). Also fixed a latent server bug: the server's generated DDL emitted `cache_memory`/
+  `cache_ttl` (underscore) but the parser keys on the dotted `cache.memory`/`cache.ttl`, so both
+  were silently dropped — server now emits the dotted form. 3 new cache tests (zero-ttl, hit→expire,
+  no-ttl-survives); 12 foyer + 271 core + 721 db tests green, clippy `-D warnings` clean.
+- **Exit:** cache memory is byte-bounded (done); TTL-based lazy expiry (done).
 - **Deferred (not v1):** foyer hybrid RAM→SSD tier. The clustered store + file-skipping
   (Phase 3) *is* the cold tier; a local SSD tier is a warm-key latency optimization to add
   only if RAM-miss → store latency proves too high in practice.

@@ -9,6 +9,7 @@
 
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
 use equivalent::Equivalent;
@@ -63,6 +64,12 @@ pub struct FoyerMemoryCacheConfig {
     pub capacity_bytes: usize,
     /// Number of shards for concurrent access (should be a power of 2).
     pub shards: usize,
+    /// Optional time-to-live. An entry older than `ttl` is treated as a miss
+    /// on the next [`get`](FoyerMemoryCache::get) (lazy expiry) and dropped, so
+    /// the caller re-fetches from the source. `None` = entries live until the
+    /// byte bound evicts them (eventual freshness via eviction + CDC
+    /// invalidation only).
+    pub ttl: Option<Duration>,
 }
 
 impl Default for FoyerMemoryCacheConfig {
@@ -70,8 +77,17 @@ impl Default for FoyerMemoryCacheConfig {
         Self {
             capacity_bytes: 64 * 1024 * 1024, // 64 MiB
             shards: 16,
+            ttl: None,
         }
     }
+}
+
+/// A cached value plus the instant it was inserted, so lazy TTL expiry can be
+/// checked on read without a background sweeper.
+#[derive(Clone)]
+struct CachedBatch {
+    batch: RecordBatch,
+    inserted_at: Instant,
 }
 
 /// foyer-backed in-memory lookup table cache.
@@ -84,8 +100,9 @@ impl Default for FoyerMemoryCacheConfig {
 /// `foyer::Cache` is internally sharded and lock-free on the read path.
 /// `FoyerMemoryCache` is `Send + Sync`.
 pub struct FoyerMemoryCache {
-    cache: Cache<LookupCacheKey, RecordBatch>,
+    cache: Cache<LookupCacheKey, CachedBatch>,
     table_id: u32,
+    ttl: Option<Duration>,
     hits: AtomicU64,
     misses: AtomicU64,
 }
@@ -98,12 +115,15 @@ impl FoyerMemoryCache {
             .with_shards(config.shards)
             // Weigh entries by payload bytes (min 1 so tombstones count) so the
             // bound is memory, not entry count.
-            .with_weighter(|_k: &LookupCacheKey, v: &RecordBatch| v.get_array_memory_size().max(1))
+            .with_weighter(|_k: &LookupCacheKey, v: &CachedBatch| {
+                v.batch.get_array_memory_size().max(1)
+            })
             .build();
 
         Self {
             cache,
             table_id,
+            ttl: config.ttl,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
         }
@@ -156,13 +176,28 @@ impl FoyerMemoryCache {
     }
 
     /// Look up a key in the in-memory cache only (Ring 0, < 500ns).
+    ///
+    /// When a TTL is configured, an entry older than the TTL is dropped and
+    /// reported as a miss (lazy expiry), so the caller re-fetches a fresh value
+    /// from the source.
     pub fn get_cached(&self, key: &[u8]) -> LookupResult {
         let ref_key = LookupCacheKeyRef {
             table_id: self.table_id,
             key,
         };
         if let Some(entry) = self.cache.get(&ref_key) {
-            let value = entry.value().clone();
+            // Lazy TTL: an expired entry counts as a miss and is evicted so the
+            // byte budget is reclaimed without waiting for S3-FIFO pressure.
+            if self
+                .ttl
+                .is_some_and(|ttl| entry.value().inserted_at.elapsed() >= ttl)
+            {
+                drop(entry);
+                self.cache.remove(&ref_key);
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                return LookupResult::NotFound;
+            }
+            let value = entry.value().batch.clone();
             self.hits.fetch_add(1, Ordering::Relaxed);
             LookupResult::Hit(value)
         } else {
@@ -176,10 +211,16 @@ impl FoyerMemoryCache {
         self.get_cached(key)
     }
 
-    /// Insert or update a cached entry.
+    /// Insert or update a cached entry. The TTL clock starts now.
     pub fn insert(&self, key: &[u8], value: RecordBatch) {
         let cache_key = self.make_key(key);
-        self.cache.insert(cache_key, value);
+        self.cache.insert(
+            cache_key,
+            CachedBatch {
+                batch: value,
+                inserted_at: Instant::now(),
+            },
+        );
     }
 
     /// Invalidate a cached entry.
@@ -207,6 +248,7 @@ impl std::fmt::Debug for FoyerMemoryCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FoyerMemoryCache")
             .field("table_id", &self.table_id)
+            .field("ttl", &self.ttl)
             .field("entries", &self.cache.entries())
             .field("hits", &self.hits.load(Ordering::Relaxed))
             .field("misses", &self.misses.load(Ordering::Relaxed))
@@ -232,6 +274,7 @@ mod tests {
             FoyerMemoryCacheConfig {
                 capacity_bytes: 64 * 1024,
                 shards: 4,
+                ttl: None,
             },
         )
     }
@@ -261,6 +304,7 @@ mod tests {
             FoyerMemoryCacheConfig {
                 capacity_bytes: 512,
                 shards: 1,
+                ttl: None,
             },
         );
 
@@ -337,6 +381,50 @@ mod tests {
         let config = FoyerMemoryCacheConfig::default();
         assert_eq!(config.capacity_bytes, 64 * 1024 * 1024);
         assert_eq!(config.shards, 16);
+        assert!(config.ttl.is_none());
+    }
+
+    fn ttl_cache(ttl: Duration) -> FoyerMemoryCache {
+        FoyerMemoryCache::new(
+            1,
+            FoyerMemoryCacheConfig {
+                capacity_bytes: 64 * 1024,
+                shards: 4,
+                ttl: Some(ttl),
+            },
+        )
+    }
+
+    #[test]
+    fn test_ttl_zero_expires_immediately() {
+        // A zero TTL means every entry is already expired on the next read.
+        let cache = ttl_cache(Duration::ZERO);
+        cache.insert(b"k", test_batch("v"));
+        assert!(cache.get_cached(b"k").is_not_found());
+        // The expired entry was evicted, not just skipped.
+        assert!(cache.is_empty());
+        assert_eq!(cache.miss_count(), 1);
+    }
+
+    #[test]
+    fn test_ttl_hit_then_expire() {
+        let cache = ttl_cache(Duration::from_millis(20));
+        cache.insert(b"k", test_batch("v"));
+        // Fresh: still a hit.
+        assert!(cache.get_cached(b"k").is_hit());
+        std::thread::sleep(Duration::from_millis(40));
+        // Past the TTL: lazy-expired to a miss.
+        assert!(cache.get_cached(b"k").is_not_found());
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_no_ttl_entry_survives() {
+        // Without a TTL, an entry stays a hit regardless of age.
+        let cache = small_cache(1);
+        cache.insert(b"k", test_batch("v"));
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(cache.get_cached(b"k").is_hit());
     }
 
     #[test]
