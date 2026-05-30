@@ -4,12 +4,13 @@
 //! per fetch, so all missed keys of a probe fold into one index-served round
 //! trip. [`KeyAligner`] handles key decode and result realignment.
 //!
-//! TLS is server-auth via `rustls`: set `sslmode` (`disable` (default) /
-//! `require` / `verify-ca` / `verify-full` / `prefer`) and optionally
-//! `sslrootcert` (CA PEM path; otherwise the Mozilla webpki roots are trusted).
-//! Any TLS mode verifies the server certificate — there is deliberately no
-//! insecure skip-verify. v1 limits: single-column key, and server-auth only
-//! (mTLS client certs are not yet wired).
+//! TLS is server-auth via `rustls`: `sslmode = disable` (default) leaves the
+//! connection plaintext; `require` / `verify-ca` / `verify-full` all enable
+//! TLS with full server-certificate verification (chain + hostname) against
+//! `sslrootcert` (CA PEM) or, absent that, the Mozilla webpki roots. There is
+//! deliberately no insecure skip-verify, and the weaker libpq variants are not
+//! emulated (the three modes are aliases for "verified TLS"). v1 limits:
+//! single-column key, server-auth only (no mTLS client certs).
 
 #[cfg(feature = "postgres-cdc")]
 use std::collections::HashMap;
@@ -290,7 +291,9 @@ fn build_pool(props: &HashMap<String, String>, pool_size: usize) -> Result<Pool,
 }
 
 /// Whether the configured `sslmode`/`ssl.mode` requests TLS. Absent or
-/// `disable` → no TLS (backward compatible); a TLS mode → verified TLS.
+/// `disable` → no TLS (backward compatible); `require`/`verify-ca`/`verify-full`
+/// → verified TLS. `prefer` (opportunistic fallback) is rejected because a
+/// pooled static connector cannot implement its plaintext fallback.
 #[cfg(feature = "postgres-cdc")]
 fn tls_enabled(props: &HashMap<String, String>) -> Result<bool, LookupError> {
     let Some(mode) = props.get("sslmode").or_else(|| props.get("ssl.mode")) else {
@@ -298,9 +301,9 @@ fn tls_enabled(props: &HashMap<String, String>) -> Result<bool, LookupError> {
     };
     match mode.to_ascii_lowercase().as_str() {
         "disable" => Ok(false),
-        "require" | "prefer" | "verify-ca" | "verify-full" => Ok(true),
+        "require" | "verify-ca" | "verify-full" => Ok(true),
         other => Err(LookupError::Connection(format!(
-            "unsupported sslmode '{other}' (use disable/require/prefer/verify-ca/verify-full)"
+            "unsupported sslmode '{other}' (use disable/require/verify-ca/verify-full)"
         ))),
     }
 }
