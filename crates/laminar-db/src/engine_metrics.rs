@@ -80,6 +80,14 @@ pub struct EngineMetrics {
     pub sink_precommit_duration: Histogram,
     /// Sink commit round-trip (2PC phase 2).
     pub sink_commit_duration: Histogram,
+    /// On-demand lookup cache hits (served without a source fetch). Label: `table`.
+    pub lookup_cache_hits: IntCounterVec,
+    /// On-demand lookup cache misses (not in cache). Label: `table`.
+    pub lookup_cache_misses: IntCounterVec,
+    /// On-demand lookup source fetch errors/timeouts. Label: `table`.
+    pub lookup_source_errors: IntCounterVec,
+    /// On-demand lookup rows awaiting a source fetch. Label: `table`.
+    pub lookup_in_flight_rows: IntGaugeVec,
 }
 
 impl EngineMetrics {
@@ -264,6 +272,33 @@ impl EngineMetrics {
             sink_commit_duration: reg!(Histogram::with_opts(
                 HistogramOpts::new("sink_commit_duration_seconds", "Sink commit latency")
                     .buckets(prometheus::exponential_buckets(0.005, 2.0, 15).unwrap()),
+            )
+            .unwrap()),
+            // Labels are bound to the registered lookup tables, so cardinality is finite.
+            lookup_cache_hits: reg!(IntCounterVec::new(
+                Opts::new("lookup_cache_hits_total", "On-demand lookup cache hits"),
+                &["table"],
+            )
+            .unwrap()),
+            lookup_cache_misses: reg!(IntCounterVec::new(
+                Opts::new("lookup_cache_misses_total", "On-demand lookup cache misses"),
+                &["table"],
+            )
+            .unwrap()),
+            lookup_source_errors: reg!(IntCounterVec::new(
+                Opts::new(
+                    "lookup_source_errors_total",
+                    "On-demand lookup source fetch errors"
+                ),
+                &["table"],
+            )
+            .unwrap()),
+            lookup_in_flight_rows: reg!(IntGaugeVec::new(
+                Opts::new(
+                    "lookup_in_flight_rows",
+                    "On-demand lookup rows awaiting a source fetch"
+                ),
+                &["table"],
             )
             .unwrap()),
         }

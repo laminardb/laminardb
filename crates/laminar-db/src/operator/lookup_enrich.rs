@@ -29,6 +29,7 @@ use laminar_core::serialization::{deserialize_batch_stream, serialize_batch_stre
 use laminar_sql::datafusion::lookup_join::LookupJoinType;
 use laminar_sql::datafusion::{LookupTableRegistry, PartialLookupState, RegisteredLookup};
 
+use crate::engine_metrics::EngineMetrics;
 use crate::error::DbError;
 use crate::operator::ProjectingJoinState;
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
@@ -148,6 +149,8 @@ pub(crate) struct LookupEnrichOperator {
     replay: VecDeque<(i64, RecordBatch)>,
     next_batch_id: u64,
     max_in_flight: usize,
+    /// Per-table cache/source/in-flight metrics, when the engine has a registry.
+    metrics: Option<Arc<EngineMetrics>>,
 }
 
 impl LookupEnrichOperator {
@@ -158,6 +161,7 @@ impl LookupEnrichOperator {
         ctx: SessionContext,
         registry: Arc<LookupTableRegistry>,
         runtime: Handle,
+        metrics: Option<Arc<EngineMetrics>>,
     ) -> Self {
         Self {
             table_name: config.table_name,
@@ -172,6 +176,33 @@ impl LookupEnrichOperator {
             replay: VecDeque::new(),
             next_batch_id: 0,
             max_in_flight: MAX_IN_FLIGHT_ROWS,
+            metrics,
+        }
+    }
+
+    /// Record per-batch cache effectiveness, if metrics are wired.
+    fn record_cache(&self, hits: u64, misses: u64) {
+        if let Some(m) = &self.metrics {
+            if hits > 0 {
+                m.lookup_cache_hits
+                    .with_label_values(&[&self.table_name])
+                    .inc_by(hits);
+            }
+            if misses > 0 {
+                m.lookup_cache_misses
+                    .with_label_values(&[&self.table_name])
+                    .inc_by(misses);
+            }
+        }
+    }
+
+    /// Publish the current in-flight row count to the gauge, if metrics are wired.
+    fn publish_in_flight(&self) {
+        if let Some(m) = &self.metrics {
+            let rows = i64::try_from(self.in_flight_rows()).unwrap_or(i64::MAX);
+            m.lookup_in_flight_rows
+                .with_label_values(&[&self.table_name])
+                .set(rows);
         }
     }
 
@@ -295,6 +326,7 @@ impl LookupEnrichOperator {
         let mut slots: Vec<Slot> = Vec::with_capacity(n);
         let mut miss_rows: Vec<usize> = Vec::new();
         let mut miss_keys: Vec<Vec<u8>> = Vec::new();
+        let (mut hits, mut misses) = (0u64, 0u64);
 
         for row in 0..n {
             // SQL NULL never equi-matches.
@@ -305,17 +337,28 @@ impl LookupEnrichOperator {
             let key = rows.row(row);
             match resolved.cache.get(key.as_ref()).into_batch() {
                 // Zero-row batch = negative-cache tombstone (known miss).
-                Some(b) if b.num_rows() == 0 => slots.push(Slot::Resolved(None)),
-                Some(b) => slots.push(Slot::Resolved(Some(b))),
+                Some(b) if b.num_rows() == 0 => {
+                    hits += 1;
+                    slots.push(Slot::Resolved(None));
+                }
+                Some(b) => {
+                    hits += 1;
+                    slots.push(Slot::Resolved(Some(b)));
+                }
                 None if resolved.submit_tx.is_some() => {
+                    misses += 1;
                     slots.push(Slot::Pending);
                     miss_rows.push(row);
                     miss_keys.push(key.as_ref().to_vec());
                 }
                 // Cache-only mode: an absent key is a miss.
-                None => slots.push(Slot::Resolved(None)),
+                None => {
+                    misses += 1;
+                    slots.push(Slot::Resolved(None));
+                }
             }
         }
+        self.record_cache(hits, misses);
 
         if miss_rows.is_empty() {
             out.push(self.build_output(&batch, &slots)?);
@@ -362,6 +405,11 @@ impl LookupEnrichOperator {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!(table = %self.table_name, error = %e, "lookup-enrich: fetch failed, retrying");
+                if let Some(m) = &self.metrics {
+                    m.lookup_source_errors
+                        .with_label_values(&[&self.table_name])
+                        .inc();
+                }
                 self.unsubmitted.push_back(WorkItem {
                     batch_id: result.batch_id,
                     row_indices: result.row_indices,
@@ -547,6 +595,7 @@ impl GraphOperator for LookupEnrichOperator {
             }
         }
 
+        self.publish_in_flight();
         self.projection.apply(enriched).await
     }
 
@@ -700,6 +749,14 @@ mod tests {
         join_type: LookupJoinType,
         source: Arc<dyn LookupSourceDyn>,
     ) -> LookupEnrichOperator {
+        operator_with_metrics(join_type, source, None)
+    }
+
+    fn operator_with_metrics(
+        join_type: LookupJoinType,
+        source: Arc<dyn LookupSourceDyn>,
+        metrics: Option<Arc<EngineMetrics>>,
+    ) -> LookupEnrichOperator {
         let registry = Arc::new(LookupTableRegistry::new());
         registry.register_partial(
             "customers",
@@ -723,6 +780,7 @@ mod tests {
             laminar_sql::create_session_context(),
             registry,
             Handle::current(),
+            metrics,
         )
     }
 
@@ -755,6 +813,30 @@ mod tests {
             .to_string();
         assert!(err.contains("type mismatch"), "got: {err}");
         assert!(err.contains("customer_id") && err.contains("Int32") && err.contains("Int64"));
+    }
+
+    #[tokio::test]
+    async fn metrics_count_cold_misses_then_warm_hits() {
+        let registry = prometheus::Registry::new();
+        let metrics = Arc::new(EngineMetrics::new(&registry));
+        let source = Arc::new(MapSource {
+            rows: [(1, "Alice")].into_iter().collect(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut op = operator_with_metrics(
+            LookupJoinType::LeftOuter,
+            source,
+            Some(Arc::clone(&metrics)),
+        );
+        let m = |c: &prometheus::IntCounterVec| c.with_label_values(&["customers"]).get();
+
+        // Cold cache: both keys miss and go to the source.
+        run_until_output(&mut op, stream_batch(&[10, 11], &[Some(1), Some(99)])).await;
+        assert_eq!(m(&metrics.lookup_cache_misses), 2);
+
+        // Warm cache: the same keys are now served from cache (value + tombstone).
+        run_until_output(&mut op, stream_batch(&[12, 13], &[Some(1), Some(99)])).await;
+        assert_eq!(m(&metrics.lookup_cache_hits), 2);
     }
 
     /// Drive `process` until the held batch resolves and emits (the worker runs

@@ -1138,6 +1138,7 @@ impl OperatorGraph {
                     self.ctx.clone(),
                     Arc::clone(reg),
                     handle.clone(),
+                    self.prom.clone(),
                 ));
             }
         }

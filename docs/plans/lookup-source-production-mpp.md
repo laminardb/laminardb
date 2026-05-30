@@ -291,8 +291,9 @@ Work (one cohesive change; cannot be partially landed without dead/unwired code)
     `WHERE pk = ANY($1)`; schema from a prepared zero-row probe; native pg type map with
     rich types (numeric/date/timestamp/uuid/json) rendered as text. `register_lookup_source("postgres", ...)`.
     Fixes the README mismatch (README updated). **Server-auth TLS DONE** (`rustls` via
-    `tokio-postgres-rustls`): `sslmode` (disable/require/prefer/verify-ca/verify-full) +
-    optional `sslrootcert` (CA PEM; else webpki roots). Always verifies — no insecure
+    `tokio-postgres-rustls`): `sslmode` = disable (plaintext) | require/verify-ca/verify-full
+    (all = verified TLS, chain+hostname) + optional `sslrootcert` (CA PEM; else webpki roots).
+    `prefer` is rejected (a static pooled connector can't do its plaintext fallback). No insecure
     skip-verify; mTLS client certs not yet wired. (The CDC control-plane connect + sink still
     `NoTls` — a separate, still-open gap; the helper here is local to the lookup, not yet shared.)
   - **MongoDB** (`mongodb/lookup.rs`): new `MongoLookupSource` — `find({ pk: { $in: [...] } })`,
@@ -370,8 +371,17 @@ CREATE STREAM out AS SELECT events.id, events.amt, dim.name
   cache affinity; throughput scales with node count; rebalance preserves correctness.
 
 ### Phase 6 — Ops hardening
-- Per-lookup-table Prometheus metrics: hit ratio, miss QPS, source p50/p99, in-flight,
-  error rate, cache bytes, negative-hit ratio, cross-node shuffle depth.
+- **Core metrics DONE 2026-05-30** (the lookup path previously emitted *zero* metrics). Four
+  per-table (`table` label) series on the central `EngineMetrics` (server-scraped `/metrics`),
+  incremented by `LookupEnrichOperator` — registry threaded via `OperatorGraph.prom` →
+  `create_operator` → operator (the same path checkpoint/window state use):
+  `lookup_cache_hits_total`, `lookup_cache_misses_total` (batch-aggregated `inc_by`, not per-row),
+  `lookup_source_errors_total` (worker fetch error/timeout), `lookup_in_flight_rows` (gauge, set per
+  `process`). Hit ratio + miss QPS are derived in PromQL — not stored. 1 test (cold→miss, warm→hit
+  through the async worker). This wires the observability the consolidation deliberately deferred
+  (the deleted per-source counters were unwired; these go to the real scrape surface).
+- **Deferred (not core):** source fetch p50/p99 histogram, negative-hit ratio, cache-bytes gauge,
+  cross-node shuffle depth (Phase 5 only) — add when a latency/eviction question actually arises.
 - Capacity/runbook docs: clustering requirement, cache sizing, per-node throughput model,
   and a corrected connector capability table (replaces the inaccurate README claims).
 - **Only if needed:** a per-source circuit breaker — defer unless timeout + bounded retry +
