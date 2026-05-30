@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
 use rustc_hash::FxHashMap;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex, Notify, RwLock};
@@ -271,6 +272,11 @@ pub struct ShuffleReceiver {
     /// Notifies a parked `recv()` when the receiver is returned by a
     /// previous waiter — so the next caller can pick it up.
     rx_returned: Arc<Notify>,
+    /// Per-stage holdover so several sharded operators can share one receiver:
+    /// [`Self::drain_vnode_data_for`] buckets frames it pulls for other stages
+    /// here instead of dropping them. A stage whose operator is dropped mid-run
+    /// leaks its bucket until the receiver is dropped — fine under cluster-unstable.
+    staged: parking_lot::Mutex<FxHashMap<String, Vec<RecordBatch>>>,
 }
 
 impl Drop for ShuffleReceiver {
@@ -340,6 +346,7 @@ impl ShuffleReceiver {
             peer_tasks,
             rx: parking_lot::Mutex::new(Some(rx)),
             rx_returned: Arc::new(Notify::new()),
+            staged: parking_lot::Mutex::new(FxHashMap::default()),
         })
     }
 
@@ -390,6 +397,25 @@ impl ShuffleReceiver {
             out.push(msg);
         }
         out
+    }
+
+    /// Non-blocking drain of the [`ShuffleMessage::VnodeData`] batches addressed
+    /// to `stage`. Frames for other stages are bucketed in `staged` for their
+    /// own drainer; non-`VnodeData` frames are dropped (the row-shuffle path
+    /// never sends them). Empty if the queue is empty or a `recv()` holds it.
+    pub fn drain_vnode_data_for(&self, stage: &str) -> Vec<RecordBatch> {
+        let mut staged = self.staged.lock();
+        {
+            let mut slot = self.rx.lock();
+            if let Some(rx) = slot.as_mut() {
+                while let Ok((_from, msg)) = rx.try_recv() {
+                    if let ShuffleMessage::VnodeData(s, _vnode, batch) = msg {
+                        staged.entry(s).or_default().push(batch);
+                    }
+                }
+            }
+        }
+        staged.remove(stage).unwrap_or_default()
     }
 
     async fn accept_loop(

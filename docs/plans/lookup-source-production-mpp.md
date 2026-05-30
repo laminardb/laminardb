@@ -354,21 +354,44 @@ CREATE STREAM out AS SELECT events.id, events.amt, dim.name
 ## Track B — Distributed MPP scale-out
 
 ### Phase 5 — Key-shard the probe side across the cluster (AD-2, behind `cluster-unstable`)
-- Insert a join-side repartition analogous to `ClusterRepartitionExec`: hash the stream
-  rows' lookup-key columns over `VnodeRegistry` (xxh3 % vnode_count,
-  `state/vnode.rs`), route to the node owning the key's vnode via `ShuffleSender`, receive
-  via `ShuffleReceiver`, align checkpoint barriers with `BarrierTracker`
-  (`crates/laminar-core/src/shuffle/`).
-- Per-node: the Phase-1 operator + Phase-2 tiered cache + Phase-3 IN-list source. Each node
-  owns a key range → cache affinity (hot key cached on one node, not replicated N×), bounded
-  total cache, and N× aggregate lookup throughput.
-- Rollout staging (per AD-2): (a) per-node-independent lookups (no shuffle, each node caches
-  what its source partitions feed it) ships first and already multiplies throughput;
-  (b) key-affinity shuffle adds cache efficiency.
-- Rebalance/fencing reuse the existing control plane (`crates/laminar-db/src/rebalance.rs`,
-  vnode `assignment_version` fence).
-- **Exit:** a lookup-join MV runs across N nodes, key-sharded, barrier-consistent, with
-  cache affinity; throughput scales with node count; rebalance preserves correctness.
+
+**DONE 2026-05-30.** Phase 1 hoisted the lookup join out of DataFusion, and the production
+cross-node shuffle is the in-operator `shuffle_pre_agg_batches` (not the test-only
+`ClusterRepartitionExec`), so Phase 5 mirrors *that*: a key-shuffle inside
+`LookupEnrichOperator::process`. Each row's lookup-key columns hash to a vnode (shared
+`laminar_core::shuffle::row_vnodes`); rows this node doesn't own ship to the owner via
+`ShuffleSender`, rows peers ship here drain via the new `ShuffleReceiver::drain_vnode_data_for`,
+and the local set is enriched. **Forward-only** — any node can look up any key (AD-2: the shuffle
+is cache affinity, not correctness), so enriched rows continue downstream on the owner and a
+downstream aggregate re-shuffles on its own key. Single-node is a pass-through. Wired via
+`create_operator` → `attach_cluster_shuffle` with the same `ClusterShuffleConfig` the agg path uses.
+
+Stage (a) (per-node-independent lookups) was already free — every node runs its own operator over
+its source partition. Stage (b) (this work) adds the key-affinity shuffle so each node caches only
+its owned key range.
+
+**Per-stage addressing.** The `ShuffleReceiver` is shared per node, so a lookup shuffle and an agg
+shuffle in one pipeline (enrich → aggregate) would drain the same queue and cross-feed mismatched
+schemas. Fixed by tagging `VnodeData` with the operator/MV name and demuxing by stage in
+`drain_vnode_data_for`; this also fixes the latent agg-agg cross-feed. The agg path moved to the
+staged send/drain. Row→vnode hashing and slicing are now shared (`shuffle::routing`) across all
+three shuffle paths instead of copy-pasted.
+
+**Consistency = agg-path parity, not stronger.** Best-effort per-cycle drain, fail-the-cycle on an
+unassigned vnode (never silent drop), inline `send_to` await (a socket write, TCP-backpressured).
+**No barrier alignment** — in-flight-on-wire rows at a checkpoint are the same at-least-once gap the
+agg shuffle has; strict cross-node alignment is a shared open item in the cluster-production-readiness
+plan. Rebalance needs no cache migration: the operator reads `owner(v)` fresh, so a moved vnode
+re-routes and the new owner rebuilds its cache.
+
+Test: `cluster_key_shuffle_routes_remote_keys_to_owner` — two operators over loopback shuffle;
+asserts each key enriches only on its owner (node 2's via the shuffle). Clippy clean with/without
+`cluster-unstable`.
+
+- **Exit:** key-sharded lookup-join MV across N nodes with cache affinity; barrier-consistency is
+  best-effort (agg parity), strict alignment deferred.
+- **Deferred:** full cluster e2e through DDL (needs a feature-gated dev-dep connector, as in Phase 4);
+  strict barrier alignment; inbound-backpressure tuning under a slow owner.
 
 ### Phase 6 — Ops hardening
 - **Core metrics DONE 2026-05-30** (the lookup path previously emitted *zero* metrics). Four

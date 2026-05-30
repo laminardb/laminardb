@@ -9,18 +9,10 @@
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-#[cfg(feature = "cluster-unstable")]
-use arrow::compute::take;
-#[cfg(feature = "cluster-unstable")]
-use arrow::row::{RowConverter, SortField};
-#[cfg(feature = "cluster-unstable")]
-use arrow_array::UInt32Array;
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
 #[cfg(feature = "cluster-unstable")]
 use laminar_core::shuffle::ShuffleMessage;
-#[cfg(feature = "cluster-unstable")]
-use laminar_core::state::key_hash;
 
 use crate::aggregate_state::{
     apply_compiled_having, AggStateCheckpoint, CompiledProjection, IncrementalAggState,
@@ -471,31 +463,10 @@ async fn shuffle_pre_agg_batches(
         seen.dedup();
 
         for v in seen {
-            let indices: UInt32Array = row_vn
-                .iter()
-                .enumerate()
-                .filter_map(
-                    |(i, &rv)| {
-                        if rv == v {
-                            u32::try_from(i).ok()
-                        } else {
-                            None
-                        }
-                    },
-                )
-                .collect();
-            if indices.is_empty() {
+            let Some(slice) = laminar_core::shuffle::slice_batch_by_vnode(&batch, &row_vn, v)
+            else {
                 continue;
-            }
-            let cols: Vec<arrow_array::ArrayRef> = batch
-                .columns()
-                .iter()
-                .map(|c| take(c, &indices, None))
-                .collect::<Result<_, _>>()
-                .map_err(|e| DbError::Pipeline(format!("[{op_name}] row-shuffle take: {e}")))?;
-            let slice = RecordBatch::try_new(batch.schema(), cols)
-                .map_err(|e| DbError::Pipeline(format!("[{op_name}] row-shuffle rebuild: {e}")))?;
-
+            };
             let owner = cfg.registry.owner(v);
             if owner == cfg.self_id {
                 local.push(slice);
@@ -510,7 +481,10 @@ async fn shuffle_pre_agg_batches(
                     slice.num_rows()
                 )));
             } else {
-                let msg = ShuffleMessage::VnodeData(v, slice);
+                // Tag with this query's name so a receiver shared with
+                // another sharded operator (e.g. a lookup-enrich join)
+                // demuxes our rows to us, not to it.
+                let msg = ShuffleMessage::VnodeData(op_name.to_string(), v, slice);
                 // Fail the cycle on send error; dropping silently would
                 // let source offsets advance past un-delivered rows.
                 cfg.sender.send_to(owner.0, &msg).await.map_err(|e| {
@@ -523,52 +497,29 @@ async fn shuffle_pre_agg_batches(
         }
     }
 
-    // Drain every currently-available remote row into this cycle. Bound
-    // by channel depth; never blocks. Messages that arrive after we
-    // drain land in the next cycle.
-    for (_from, msg) in cfg.receiver.drain_available() {
-        if let ShuffleMessage::VnodeData(_vnode, batch) = msg {
-            if batch.num_rows() > 0 {
-                local.push(batch);
-            }
+    // Drain this query's currently-available remote rows into this cycle.
+    // The receiver demuxes by stage, so a co-resident sharded operator
+    // (e.g. a lookup-enrich join) doesn't steal our rows. Bound by channel
+    // depth; never blocks. Rows that arrive after we drain land next cycle.
+    for batch in cfg.receiver.drain_vnode_data_for(op_name) {
+        if batch.num_rows() > 0 {
+            local.push(batch);
         }
     }
 
     Ok(local)
 }
 
-/// Compute the vnode id for each row by hashing the leading
-/// `num_group_cols` columns with the same `arrow::row` + `key_hash`
-/// encoding [`ClusterRepartitionExec`] uses. `num_group_cols == 0`
-/// collapses to a constant vnode (global aggregate — everyone hashes
-/// to 0 which round-robin assigns to the first peer).
+/// Vnode per row, hashing the leading `num_group_cols` group columns.
+/// `num_group_cols == 0` is a global aggregate — every row hashes to vnode 0
+/// so a single owner produces output.
 #[cfg(feature = "cluster-unstable")]
 fn hash_rows_to_vnodes(batch: &RecordBatch, num_group_cols: usize, vnode_count: u32) -> Vec<u32> {
     if num_group_cols == 0 || batch.num_rows() == 0 {
         return vec![0; batch.num_rows()];
     }
-    let cols: Vec<arrow_array::ArrayRef> = (0..num_group_cols)
-        .map(|i| arrow_array::Array::slice(batch.column(i).as_ref(), 0, batch.num_rows()))
-        .collect();
-    // `Array::slice` above returns `Arc<dyn Array>` — turn it into the
-    // `Vec<ArrayRef>` RowConverter expects. (Defensive copy-free clone.)
-    let cols: Vec<arrow_array::ArrayRef> = cols.into_iter().collect();
-    let fields: Vec<SortField> = cols
-        .iter()
-        .map(|c| SortField::new(c.data_type().clone()))
-        .collect();
-    let converter = RowConverter::new(fields).expect("RowConverter for hash key");
-    let rows = converter
-        .convert_columns(&cols)
-        .expect("convert_columns for hash key");
-
-    (0..batch.num_rows())
-        .map(|row| {
-            #[allow(clippy::cast_possible_truncation)]
-            let v = (key_hash(rows.row(row).as_ref()) % u64::from(vnode_count)) as u32;
-            v
-        })
-        .collect()
+    let columns: Vec<usize> = (0..num_group_cols).collect();
+    laminar_core::shuffle::row_vnodes(batch, &columns, vnode_count)
 }
 
 #[async_trait]

@@ -109,7 +109,7 @@ async fn phase_a_routes_rows_to_owning_instance() {
     let mut b_keys: Vec<i64> = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     while let Ok(Some((_from, msg))) = tokio::time::timeout_at(deadline, recv_b.recv()).await {
-        if let laminar_core::shuffle::ShuffleMessage::VnodeData(_vnode, b) = msg {
+        if let laminar_core::shuffle::ShuffleMessage::VnodeData(_stage, _vnode, b) = msg {
             let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
             b_keys.extend(col.values().iter().copied());
         }

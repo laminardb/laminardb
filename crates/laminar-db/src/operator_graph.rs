@@ -1131,7 +1131,8 @@ impl OperatorGraph {
         // to the DataFusion lookup path if the registry/runtime handle is absent.
         if let Some(cfg) = lookup_enrich_config {
             if let (Some(reg), Some(handle)) = (&self.lookup_registry, &self.main_runtime_handle) {
-                return Box::new(operator::lookup_enrich::LookupEnrichOperator::new(
+                #[cfg_attr(not(feature = "cluster-unstable"), allow(unused_mut))]
+                let mut op = operator::lookup_enrich::LookupEnrichOperator::new(
                     name,
                     cfg,
                     projection_sql.map(Arc::from),
@@ -1139,7 +1140,14 @@ impl OperatorGraph {
                     Arc::clone(reg),
                     handle.clone(),
                     self.prom.clone(),
-                ));
+                );
+                // In cluster mode, key-shard the probe side across nodes for
+                // cache affinity (same shuffle config the aggregate path uses).
+                #[cfg(feature = "cluster-unstable")]
+                if let Some(ref sc) = self.cluster_shuffle {
+                    op.attach_cluster_shuffle(sc.clone());
+                }
+                return Box::new(op);
             }
         }
 

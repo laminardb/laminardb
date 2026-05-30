@@ -10,8 +10,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::{Arc, OnceLock};
 
-use arrow::compute::take;
-use arrow_array::{RecordBatch, UInt32Array};
+use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -351,55 +350,6 @@ impl ExecutionPlan for ClusterRepartitionExec {
     }
 }
 
-/// Per-row vnode, hashed via `arrow::row::RowConverter` on the key
-/// columns (works for any Arrow type).
-fn row_vnodes(batch: &RecordBatch, hash_columns: &[usize], vnode_count: u32) -> Vec<u32> {
-    use arrow::row::{RowConverter, SortField};
-    use laminar_core::state::key_hash;
-
-    let cols: Vec<_> = hash_columns
-        .iter()
-        .map(|&i| Arc::clone(batch.column(i)))
-        .collect();
-    let fields: Vec<_> = cols
-        .iter()
-        .map(|c| SortField::new(c.data_type().clone()))
-        .collect();
-    let converter = RowConverter::new(fields).expect("row converter");
-    let rows = converter.convert_columns(&cols).expect("convert rows");
-
-    (0..batch.num_rows())
-        .map(|row| {
-            #[allow(clippy::cast_possible_truncation)]
-            let v = (key_hash(rows.row(row).as_ref()) % u64::from(vnode_count)) as u32;
-            v
-        })
-        .collect()
-}
-
-fn slice_for_vnode(batch: &RecordBatch, vnodes: &[u32], target_vnode: u32) -> Option<RecordBatch> {
-    let indices: UInt32Array = vnodes
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &v)| {
-            if v == target_vnode {
-                u32::try_from(i).ok()
-            } else {
-                None
-            }
-        })
-        .collect();
-    if indices.is_empty() {
-        return None;
-    }
-    let new_cols = batch
-        .columns()
-        .iter()
-        .map(|c| take(c, &indices, None).expect("take"))
-        .collect::<Vec<_>>();
-    Some(RecordBatch::try_new(batch.schema(), new_cols).expect("rebuild"))
-}
-
 /// Drains data batches and barriers (local + peer), routes data to
 /// local partitions or peer senders, and publishes aligned-epoch ids
 /// on `aligned_tx`.
@@ -459,13 +409,16 @@ async fn route_input_stream(
                 if let Some(Ok(batch)) = next {
                     if batch.num_rows() == 0 { continue; }
                     if partition_txs.is_none() { continue; }
-                    let row_vn = row_vnodes(&batch, &hash_columns, vnode_count);
+                    let row_vn =
+                        laminar_core::shuffle::row_vnodes(&batch, &hash_columns, vnode_count);
                     let mut seen = row_vn.clone();
                     seen.sort_unstable();
                     seen.dedup();
                     let mut downstream_dropped = false;
                     for v in seen {
-                        let Some(slice) = slice_for_vnode(&batch, &row_vn, v) else {
+                        let Some(slice) =
+                            laminar_core::shuffle::slice_batch_by_vnode(&batch, &row_vn, v)
+                        else {
                             continue;
                         };
                         let owner = registry.owner(v);
@@ -480,8 +433,13 @@ async fn route_input_stream(
                                 }
                             }
                         } else if !owner.is_unassigned() {
+                            // This exec owns its receiver and routes purely by
+                            // vnode in `dispatch_inbound`, so the stage tag is
+                            // unused here — an empty stage keeps the frame valid.
                             let msg = laminar_core::shuffle::ShuffleMessage::VnodeData(
-                                v, slice,
+                                String::new(),
+                                v,
+                                slice,
                             );
                             // Drop on unreachable peer.
                             let _ = sender.send_to(owner.0, &msg).await;
@@ -513,7 +471,7 @@ async fn dispatch_inbound(
     use laminar_core::shuffle::ShuffleMessage;
     while let Some((from, msg)) = receiver.recv().await {
         match msg {
-            ShuffleMessage::VnodeData(vnode, batch) => {
+            ShuffleMessage::VnodeData(_stage, vnode, batch) => {
                 if batch.num_rows() == 0 {
                     continue;
                 }

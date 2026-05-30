@@ -33,18 +33,27 @@ async fn two_nodes_exchange_data_bidirectionally() {
 
     // A → B: three pre-routed batches.
     send_a
-        .send_to(2, &ShuffleMessage::VnodeData(0, batch(vec![1, 2, 3])))
+        .send_to(
+            2,
+            &ShuffleMessage::VnodeData("s".into(), 0, batch(vec![1, 2, 3])),
+        )
         .await
         .unwrap();
     send_a
-        .send_to(2, &ShuffleMessage::VnodeData(0, batch(vec![4, 5, 6])))
+        .send_to(
+            2,
+            &ShuffleMessage::VnodeData("s".into(), 0, batch(vec![4, 5, 6])),
+        )
         .await
         .unwrap();
     // B → A: one Hello (handshake already happened — this is just a
     // reachable frame in the reverse direction).
     send_b.send_to(1, &ShuffleMessage::Hello(2)).await.unwrap();
     send_a
-        .send_to(2, &ShuffleMessage::VnodeData(0, batch(vec![7, 8, 9])))
+        .send_to(
+            2,
+            &ShuffleMessage::VnodeData("s".into(), 0, batch(vec![7, 8, 9])),
+        )
         .await
         .unwrap();
 
@@ -70,7 +79,7 @@ async fn two_nodes_exchange_data_bidirectionally() {
     let values: Vec<Vec<i64>> = from_a_to_b
         .into_iter()
         .map(|m| match m {
-            ShuffleMessage::VnodeData(_, b) => b
+            ShuffleMessage::VnodeData(_, _, b) => b
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()

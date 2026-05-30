@@ -21,7 +21,9 @@ pub(crate) const TAG_BARRIER: u8 = 0x02;
 /// exchanged in each direction.
 pub(crate) const TAG_HELLO: u8 = 0x04;
 /// Pre-routed data: the sender has classified the batch's rows as
-/// all belonging to `vnode` so the receiver skips re-hashing.
+/// all belonging to `vnode` so the receiver skips re-hashing. Tagged
+/// with the logical stage so a node sharing one receiver across
+/// several sharded operators can demux frames to the right one.
 pub(crate) const TAG_VNODE_DATA: u8 = 0x05;
 /// Graceful-close signal with a short UTF-8 reason string.
 pub(crate) const TAG_CLOSE: u8 = 0xFF;
@@ -33,8 +35,11 @@ pub enum ShuffleMessage {
     Barrier(CheckpointBarrier),
     /// Peer identifying itself during the connection handshake.
     Hello(u64),
-    /// A batch of rows pre-routed to `vnode`.
-    VnodeData(u32, RecordBatch),
+    /// A batch of rows pre-routed to `vnode`, tagged with the logical
+    /// `stage` (the operator / MV name) it belongs to. The stage lets a
+    /// receiver shared by multiple sharded operators demux frames to the
+    /// correct one instead of cross-feeding them.
+    VnodeData(String, u32, RecordBatch),
     /// Sender announcing graceful shutdown with a brief reason.
     Close(String),
 }
@@ -61,10 +66,19 @@ where
             (TAG_BARRIER, buf)
         }
         ShuffleMessage::Hello(node_id) => (TAG_HELLO, node_id.to_le_bytes().to_vec()),
-        ShuffleMessage::VnodeData(vnode, batch) => {
+        ShuffleMessage::VnodeData(stage, vnode, batch) => {
             let ipc = serialize_batch_stream(batch)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            let mut buf = Vec::with_capacity(4 + ipc.len());
+            let stage_bytes = stage.as_bytes();
+            let stage_len = u16::try_from(stage_bytes.len()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "shuffle stage name exceeds 65535 bytes",
+                )
+            })?;
+            let mut buf = Vec::with_capacity(2 + stage_bytes.len() + 4 + ipc.len());
+            buf.extend_from_slice(&stage_len.to_le_bytes());
+            buf.extend_from_slice(stage_bytes);
             buf.extend_from_slice(&vnode.to_le_bytes());
             buf.extend_from_slice(&ipc);
             (TAG_VNODE_DATA, buf)
@@ -159,16 +173,30 @@ where
             Ok(ShuffleMessage::Hello(node_id))
         }
         TAG_VNODE_DATA => {
-            if payload.len() < 4 {
+            if payload.len() < 2 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("vnode-data payload {} bytes, expected ≥4", payload.len()),
+                    format!("vnode-data payload {} bytes, expected ≥2", payload.len()),
                 ));
             }
-            let vnode = u32::from_le_bytes(payload[..4].try_into().unwrap());
-            let batch = deserialize_batch_stream(&payload[4..])
+            let stage_len = u16::from_le_bytes(payload[..2].try_into().unwrap()) as usize;
+            let vnode_at = 2 + stage_len;
+            if payload.len() < vnode_at + 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "vnode-data payload {} bytes too short for stage_len {stage_len} + vnode",
+                        payload.len()
+                    ),
+                ));
+            }
+            let stage = String::from_utf8(payload[2..vnode_at].to_vec()).map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("vnode-data stage: {e}"))
+            })?;
+            let vnode = u32::from_le_bytes(payload[vnode_at..vnode_at + 4].try_into().unwrap());
+            let batch = deserialize_batch_stream(&payload[vnode_at + 4..])
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-            Ok(ShuffleMessage::VnodeData(vnode, batch))
+            Ok(ShuffleMessage::VnodeData(stage, vnode, batch))
         }
         TAG_CLOSE => {
             let reason = String::from_utf8(payload).map_err(|e| {
@@ -219,11 +247,15 @@ mod tests {
     async fn vnode_data_roundtrip() {
         let (mut a, mut b) = duplex(64 * 1024);
         let batch = sample_batch();
-        write_message(&mut a, &ShuffleMessage::VnodeData(42, batch.clone()))
-            .await
-            .unwrap();
+        write_message(
+            &mut a,
+            &ShuffleMessage::VnodeData("totals".into(), 42, batch.clone()),
+        )
+        .await
+        .unwrap();
         match read_message(&mut b).await.unwrap() {
-            ShuffleMessage::VnodeData(v, got) => {
+            ShuffleMessage::VnodeData(stage, v, got) => {
+                assert_eq!(stage, "totals");
                 assert_eq!(v, 42);
                 assert_eq!(got, batch);
             }
@@ -263,9 +295,12 @@ mod tests {
         let batch1 = sample_batch();
         let barrier = CheckpointBarrier::new(1, 1);
 
-        write_message(&mut a, &ShuffleMessage::VnodeData(0, batch1.clone()))
-            .await
-            .unwrap();
+        write_message(
+            &mut a,
+            &ShuffleMessage::VnodeData("s".into(), 0, batch1.clone()),
+        )
+        .await
+        .unwrap();
         write_message(&mut a, &ShuffleMessage::Barrier(barrier))
             .await
             .unwrap();
@@ -275,7 +310,7 @@ mod tests {
 
         assert!(matches!(
             read_message(&mut b).await.unwrap(),
-            ShuffleMessage::VnodeData(0, _),
+            ShuffleMessage::VnodeData(_, 0, _),
         ));
         assert_eq!(
             read_message(&mut b).await.unwrap(),
