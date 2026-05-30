@@ -418,6 +418,19 @@ impl ShuffleReceiver {
         staged.remove(stage).unwrap_or_default()
     }
 
+    /// Empty the per-stage holdover, returning every buffered `(stage, batch)`.
+    /// Checkpoint barrier alignment uses this to fold rows that earlier
+    /// `drain_vnode_data_for` calls pulled off the wire but whose stage's
+    /// operator had not yet consumed them — they are pre-barrier rows that must
+    /// enter the snapshot.
+    pub fn drain_all_staged(&self) -> Vec<(String, RecordBatch)> {
+        let mut staged = self.staged.lock();
+        staged
+            .drain()
+            .flat_map(|(stage, batches)| batches.into_iter().map(move |b| (stage.clone(), b)))
+            .collect()
+    }
+
     async fn accept_loop(
         listener: TcpListener,
         tx: mpsc::Sender<(ShufflePeerId, ShuffleMessage)>,

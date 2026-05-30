@@ -57,6 +57,20 @@ pub(crate) trait GraphOperator: Send {
     fn wants_input(&self) -> bool {
         true
     }
+
+    /// Fold a peer-shipped shuffle batch into operator state outside the normal
+    /// `process` path. Checkpoint barrier alignment calls this for rows that
+    /// arrived between cycles so they enter the snapshot. Default: no-op (for
+    /// operators that don't consume the cross-node shuffle). `watermark` is the
+    /// checkpoint watermark.
+    #[cfg(feature = "cluster-unstable")]
+    async fn ingest_shuffle(
+        &mut self,
+        _batch: RecordBatch,
+        _watermark: i64,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
 }
 
 pub(crate) struct OperatorCheckpoint {
@@ -260,6 +274,13 @@ pub(crate) struct OperatorGraph {
     /// pre-aggregate rows can be hash-routed to vnode owners.
     #[cfg(feature = "cluster-unstable")]
     cluster_shuffle: Option<crate::operator::sql_query::ClusterShuffleConfig>,
+    /// Shuffle frames pulled during checkpoint barrier alignment that belong to
+    /// the *next* epoch (a peer raced ahead) — folded into state at the start of
+    /// the next alignment. See `align_shuffle_barriers`.
+    #[cfg(feature = "cluster-unstable")]
+    #[allow(dead_code)]
+    // wired into the checkpoint path in Phase 2 (see docs/plans/cross-node-shuffle-barrier-alignment.md)
+    pending_shuffle: Vec<(String, RecordBatch)>,
 }
 
 impl OperatorGraph {
@@ -286,6 +307,8 @@ impl OperatorGraph {
             max_state_bytes: None,
             #[cfg(feature = "cluster-unstable")]
             cluster_shuffle: None,
+            #[cfg(feature = "cluster-unstable")]
+            pending_shuffle: Vec::new(),
             ctx,
             prom: None,
             lookup_registry: None,
@@ -1717,6 +1740,143 @@ impl OperatorGraph {
         Ok(results)
     }
 
+    /// Route one peer-shipped shuffle batch to the operator named `stage`.
+    /// Unknown stage (no such live operator) is dropped.
+    #[cfg(feature = "cluster-unstable")]
+    #[allow(dead_code)] // wired into the checkpoint path in Phase 2
+    async fn ingest_to_stage(
+        &mut self,
+        stage: &str,
+        batch: RecordBatch,
+        watermark: i64,
+    ) -> Result<(), DbError> {
+        if let Some(idx) = self.find_node(stage) {
+            self.nodes[idx]
+                .operator
+                .ingest_shuffle(batch, watermark)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Chandy–Lamport barrier alignment on the cross-node shuffle, run just
+    /// before `snapshot_state` so the snapshot captures every pre-checkpoint row
+    /// shipped by a peer. Fans out `Barrier(checkpoint_id)` to peers, then drains
+    /// the receiver until every peer's barrier is observed: pre-barrier
+    /// `VnodeData` folds into operator state via `ingest_shuffle`; a frame from a
+    /// peer that already sent its barrier (next-epoch data) is buffered and folded
+    /// at the start of the next alignment. A no-op when there is no cross-node
+    /// shuffle. See `docs/plans/cross-node-shuffle-barrier-alignment.md`.
+    ///
+    /// # Errors
+    /// Fails the checkpoint (caller retries) if alignment times out or the
+    /// receiver closes — the deliberate degradation under a straggling peer.
+    #[cfg(feature = "cluster-unstable")]
+    #[allow(dead_code)] // wired into the checkpoint path in Phase 2
+    pub(crate) async fn align_shuffle_barriers(
+        &mut self,
+        checkpoint_id: u64,
+        watermark: i64,
+    ) -> Result<(), DbError> {
+        use laminar_core::checkpoint::barrier::CheckpointBarrier;
+        use laminar_core::shuffle::{BarrierTracker, ShuffleMessage};
+
+        const ALIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+        let Some(cfg) = self.cluster_shuffle.clone() else {
+            return Ok(());
+        };
+
+        // Frames buffered as "next epoch" during the previous checkpoint are this
+        // checkpoint's data — fold them in before we snapshot.
+        for (stage, batch) in std::mem::take(&mut self.pending_shuffle) {
+            self.ingest_to_stage(&stage, batch, watermark).await?;
+        }
+
+        // Peers: every other node that owns a vnode (frozen from the registry,
+        // matching the aggregate shuffle's view).
+        let mut peer_set: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for v in 0..cfg.registry.vnode_count() {
+            let owner = cfg.registry.owner(v);
+            if !owner.is_unassigned() && owner != cfg.self_id {
+                peer_set.insert(owner.0);
+            }
+        }
+        let peers: Vec<u64> = peer_set.into_iter().collect();
+        if peers.is_empty() {
+            return Ok(()); // no cross-node shuffle to align
+        }
+
+        // Rows already pulled into the receiver's per-stage holdover are pre-barrier.
+        for (stage, batch) in cfg.receiver.drain_all_staged() {
+            self.ingest_to_stage(&stage, batch, watermark).await?;
+        }
+
+        let barrier = CheckpointBarrier::new(checkpoint_id, 0);
+        cfg.sender
+            .fan_out_barrier(&peers, barrier)
+            .await
+            .map_err(|e| DbError::Pipeline(format!("shuffle barrier fan-out: {e}")))?;
+
+        let tracker = BarrierTracker::new(peers.len() + 1);
+        let peer_port: FxHashMap<u64, usize> =
+            peers.iter().enumerate().map(|(i, &p)| (p, i + 1)).collect();
+        tracker.observe(0, barrier); // our own input
+        let mut barriered: FxHashSet<u64> = FxHashSet::default();
+
+        loop {
+            match tokio::time::timeout(ALIGN_TIMEOUT, cfg.receiver.recv()).await {
+                Err(_) => {
+                    return Err(DbError::Pipeline(format!(
+                        "shuffle barrier alignment timed out for checkpoint {checkpoint_id}"
+                    )));
+                }
+                Ok(None) => {
+                    return Err(DbError::Pipeline(
+                        "shuffle receiver closed during barrier alignment".into(),
+                    ));
+                }
+                Ok(Some((from, ShuffleMessage::Barrier(b))))
+                    if b.checkpoint_id == checkpoint_id =>
+                {
+                    barriered.insert(from);
+                    if let Some(&port) = peer_port.get(&from) {
+                        if tracker.observe(port, b).is_some() {
+                            break; // all peers aligned
+                        }
+                    }
+                }
+                Ok(Some((from, ShuffleMessage::VnodeData(stage, _vnode, batch)))) => {
+                    if barriered.contains(&from) {
+                        self.pending_shuffle.push((stage, batch)); // next epoch
+                    } else {
+                        self.ingest_to_stage(&stage, batch, watermark).await?;
+                    }
+                }
+                Ok(Some(_)) => {} // Hello / Close / stale barrier
+            }
+        }
+        Ok(())
+    }
+
+    /// Append a node with a given operator (test-only, for exercising
+    /// `align_shuffle_barriers` without the full query-build path).
+    #[cfg(all(test, feature = "cluster-unstable"))]
+    pub(crate) fn push_test_node(&mut self, name: &str, operator: Box<dyn GraphOperator>) {
+        self.nodes.push(GraphNode {
+            name: Arc::from(name),
+            operator,
+            input_port_count: 1,
+            output_routes: Vec::new(),
+            removed: false,
+        });
+        self.input_bufs.push(vec![Vec::new()]);
+        self.input_buf_bytes.push(vec![0]);
+        self.input_sources.push(vec![usize::MAX]);
+        self.output_watermarks.push(i64::MIN);
+        self.topo_dirty = true;
+    }
+
     // &mut self: some accumulators need &mut for state()
     pub fn snapshot_state(&mut self) -> Result<Option<GraphCheckpoint>, DbError> {
         let mut operators = OperatorStateMap::new();
@@ -1807,6 +1967,105 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    /// Records the batches handed to `ingest_shuffle`.
+    #[cfg(feature = "cluster-unstable")]
+    struct RecordingOperator(Arc<parking_lot::Mutex<Vec<RecordBatch>>>);
+
+    #[cfg(feature = "cluster-unstable")]
+    #[async_trait]
+    impl GraphOperator for RecordingOperator {
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Ok(Vec::new())
+        }
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+        fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+            Ok(())
+        }
+        async fn ingest_shuffle(
+            &mut self,
+            batch: RecordBatch,
+            _watermark: i64,
+        ) -> Result<(), DbError> {
+            self.0.lock().push(batch);
+            Ok(())
+        }
+    }
+
+    /// A peer ships a row + its barrier; alignment folds the row into the target
+    /// operator (so it would enter the snapshot) and completes once the peer's
+    /// barrier is observed.
+    #[cfg(feature = "cluster-unstable")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn align_shuffle_barriers_folds_peer_rows_then_aligns() {
+        use laminar_core::checkpoint::barrier::CheckpointBarrier;
+        use laminar_core::shuffle::{ShuffleMessage, ShuffleReceiver, ShuffleSender};
+        use laminar_core::state::{NodeId, VnodeRegistry};
+
+        // 2 vnodes: node 1 owns vnode 0, node 2 owns vnode 1 (so node 1's peer = {2}).
+        let registry = Arc::new(VnodeRegistry::new(2));
+        registry.set_assignment(vec![NodeId(1), NodeId(2)].into());
+
+        let recv1 = Arc::new(
+            ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        let recv2 = Arc::new(
+            ShuffleReceiver::bind(2, "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        let send1 = ShuffleSender::new(1);
+        send1.register_peer(2, recv2.local_addr()).await;
+        let send2 = ShuffleSender::new(2);
+        send2.register_peer(1, recv1.local_addr()).await;
+
+        let recorded = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
+        graph.push_test_node("out", Box::new(RecordingOperator(Arc::clone(&recorded))));
+        graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
+            registry,
+            sender: Arc::new(send1),
+            receiver: Arc::clone(&recv1),
+            self_id: NodeId(1),
+        });
+
+        // Peer (node 2) ships a row for stage "out", then its barrier for cp 7.
+        let batch = test_batch();
+        send2
+            .send_to(
+                1,
+                &ShuffleMessage::VnodeData("out".into(), 0, batch.clone()),
+            )
+            .await
+            .unwrap();
+        send2
+            .send_to(1, &ShuffleMessage::Barrier(CheckpointBarrier::new(7, 0)))
+            .await
+            .unwrap();
+
+        graph.align_shuffle_barriers(7, 0).await.unwrap();
+
+        // Node 1 must have fanned its own barrier out to node 2.
+        let (from, msg) = recv2.recv().await.unwrap();
+        assert_eq!(from, 1);
+        assert!(matches!(msg, ShuffleMessage::Barrier(b) if b.checkpoint_id == 7));
+
+        let got = recorded.lock();
+        assert_eq!(
+            got.len(),
+            1,
+            "peer's pre-barrier row folded into the operator"
+        );
+        assert_eq!(got[0].num_rows(), batch.num_rows());
     }
 
     #[test]

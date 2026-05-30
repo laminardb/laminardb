@@ -796,6 +796,15 @@ impl GraphOperator for LookupEnrichOperator {
     fn wants_input(&self) -> bool {
         self.in_flight_rows() < self.max_in_flight
     }
+
+    #[cfg(feature = "cluster-unstable")]
+    async fn ingest_shuffle(&mut self, batch: RecordBatch, watermark: i64) -> Result<(), DbError> {
+        // Peer-shipped rows are already owned by this node. Queue them on the
+        // replay path — which bypasses the shuffle and is itself checkpointed —
+        // so they enter this snapshot and re-ingest idempotently on restore.
+        self.replay.push_back((watermark, batch));
+        Ok(())
+    }
 }
 
 #[cfg(test)]

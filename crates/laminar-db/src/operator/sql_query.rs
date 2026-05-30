@@ -666,4 +666,17 @@ impl GraphOperator for SqlQueryOperator {
             _ => 0,
         }
     }
+
+    #[cfg(feature = "cluster-unstable")]
+    async fn ingest_shuffle(&mut self, batch: RecordBatch, watermark: i64) -> Result<(), DbError> {
+        // A peer's pre-aggregate rows — fold them into the accumulator so they
+        // enter this snapshot, exactly as the per-cycle shuffle drain does.
+        if matches!(self.state, QueryState::Uninit) {
+            self.lazy_init().await?;
+        }
+        if let QueryState::Agg(ref mut agg) = self.state {
+            agg.process_batch(&batch, watermark)?;
+        }
+        Ok(())
+    }
 }
