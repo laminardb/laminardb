@@ -1,5 +1,6 @@
 //! SQL analysis and join detection utilities.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -10,8 +11,8 @@ use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use datafusion_expr::LogicalPlan;
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName, ObjectNamePart,
-    SelectItem, SetExpr, Statement, TableFactor, WildcardAdditionalOptions,
+    visit_expressions, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
+    ObjectNamePart, SelectItem, SetExpr, Statement, TableFactor, WildcardAdditionalOptions,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -79,6 +80,117 @@ pub(crate) fn extract_table_references(sql: &str) -> FxHashSet<String> {
         tables.insert(config.right_table.clone());
     }
     tables
+}
+
+/// Column indices of `schema` to fetch for partial lookup `table`, given the
+/// stream `queries` — for projection pushdown. The result is the union of every
+/// column any query referencing `table` uses, plus `pk_cols` (the source
+/// realigns results by the key, so the key must always come back).
+///
+/// Returns an empty vec meaning "fetch all columns": when a referencing query
+/// is anything but a plain wildcard-free `SELECT` (so we can't be sure which
+/// columns it needs), or when the union already covers the whole schema. The
+/// cache is shared per table, so this is deliberately a *superset* — fetching a
+/// spare column is harmless; missing one is not.
+pub(crate) fn compute_lookup_projection(
+    schema: &SchemaRef,
+    pk_cols: &[String],
+    table: &str,
+    queries: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Vec<u32> {
+    let mut referenced: FxHashSet<String> = pk_cols.iter().cloned().collect();
+    for sql in queries {
+        let sql = sql.as_ref();
+        if !extract_table_references(sql).contains(table) {
+            continue;
+        }
+        match collect_referenced_columns(sql) {
+            Some(cols) => referenced.extend(cols),
+            None => return Vec::new(), // can't narrow safely → fetch all
+        }
+    }
+
+    let indices: Vec<u32> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| referenced.contains(f.name()))
+        .map(|(i, _)| u32::try_from(i).expect("column index fits u32"))
+        .collect();
+
+    // Full coverage → empty keeps the source and operator on the simple path.
+    if indices.len() == schema.fields().len() {
+        Vec::new()
+    } else {
+        indices
+    }
+}
+
+/// Column names referenced by `sql`, or `None` when it isn't a plain
+/// wildcard-free `SELECT` over base tables (subquery, `SELECT *`, set op, …) —
+/// shapes where we can't enumerate referenced columns without risking an
+/// under-count. Identifier collection uses sqlparser's exhaustive
+/// `visit_expressions`, so no expression branch is missed.
+fn collect_referenced_columns(sql: &str) -> Option<FxHashSet<String>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql).ok()?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let is_wildcard = |item: &SelectItem| {
+        matches!(
+            item,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+        )
+    };
+    if select.projection.iter().any(is_wildcard) {
+        return None;
+    }
+    // Only plain base-table relations; a derived/subquery factor could hide a
+    // wildcard that yields no identifier expression.
+    for twj in &select.from {
+        if !matches!(twj.relation, TableFactor::Table { .. }) {
+            return None;
+        }
+        if twj
+            .joins
+            .iter()
+            .any(|j| !matches!(j.relation, TableFactor::Table { .. }))
+        {
+            return None;
+        }
+    }
+
+    let mut cols = FxHashSet::default();
+    let mut complex = false;
+    let _ = visit_expressions(query.as_ref(), |expr| {
+        match expr {
+            Expr::Identifier(id) => {
+                cols.insert(id.value.clone());
+            }
+            Expr::CompoundIdentifier(parts) => {
+                if let Some(last) = parts.last() {
+                    cols.insert(last.value.clone());
+                }
+            }
+            // A subquery elsewhere (WHERE/SELECT) could reference columns via a
+            // wildcard we can't see — bail rather than under-count.
+            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
+                complex = true;
+                return ControlFlow::Break(());
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    });
+    if complex {
+        None
+    } else {
+        Some(cols)
+    }
 }
 
 /// Unlike [`extract_table_references`] (which deduplicates), this counts every
@@ -3338,6 +3450,50 @@ mod tests {
             ])) as SchemaRef,
         );
         (partial, schemas)
+    }
+
+    fn dim_schema() -> SchemaRef {
+        use arrow::datatypes::{DataType, Field, Schema};
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("email", DataType::Utf8, true),
+            Field::new("region", DataType::Utf8, true),
+        ]))
+    }
+
+    #[test]
+    fn lookup_projection_unions_referenced_columns_plus_key() {
+        let pk = vec!["id".to_string()];
+        // q1 selects dim.name; q2 filters on dim.region. Union + key = id,name,region.
+        let q1 = "SELECT o.x, d.name FROM orders o JOIN dim d ON o.k = d.id";
+        let q2 = "SELECT o.y FROM orders o JOIN dim d ON o.k = d.id WHERE d.region = 'US'";
+        let proj = compute_lookup_projection(&dim_schema(), &pk, "dim", [q1, q2]);
+        assert_eq!(
+            proj,
+            vec![0, 1, 3],
+            "id(0)+name(1)+region(3); email(2) dropped"
+        );
+    }
+
+    #[test]
+    fn lookup_projection_bails_to_full_on_wildcard() {
+        let pk = vec!["id".to_string()];
+        let q = "SELECT * FROM orders o JOIN dim d ON o.k = d.id";
+        assert!(
+            compute_lookup_projection(&dim_schema(), &pk, "dim", [q]).is_empty(),
+            "a wildcard references every column, so fetch all"
+        );
+    }
+
+    #[test]
+    fn lookup_projection_empty_when_all_columns_used() {
+        let pk = vec!["id".to_string()];
+        let q = "SELECT d.name, d.email, d.region FROM orders o JOIN dim d ON o.k = d.id";
+        assert!(
+            compute_lookup_projection(&dim_schema(), &pk, "dim", [q]).is_empty(),
+            "full coverage collapses to empty (= fetch all)"
+        );
     }
 
     #[test]

@@ -24,7 +24,9 @@ use iceberg::Catalog;
 #[cfg(feature = "iceberg")]
 use laminar_core::lookup::predicate::Predicate;
 #[cfg(feature = "iceberg")]
-use laminar_core::lookup::source::{ColumnId, LookupError, LookupSource, LookupSourceCapabilities};
+use laminar_core::lookup::source::{
+    projection_names, ColumnId, LookupError, LookupSource, LookupSourceCapabilities,
+};
 #[cfg(feature = "iceberg")]
 use laminar_core::lookup::KeyAligner;
 
@@ -203,7 +205,7 @@ impl LookupSource for IcebergLookupSource {
         &self,
         keys: &[&[u8]],
         _predicates: &[Predicate],
-        _projection: &[ColumnId],
+        projection: &[ColumnId],
     ) -> Result<Vec<Option<RecordBatch>>, LookupError> {
         use tokio_stream::StreamExt;
 
@@ -225,10 +227,15 @@ impl LookupSource for IcebergLookupSource {
         .await
         .map_err(|e| LookupError::Query(format!("load iceberg table: {e}")))?;
 
-        let scan = table
-            .scan()
-            .with_filter(predicate)
-            .select_all()
+        // Projection pushdown: select only the requested columns (always incl.
+        // the key, so realignment still works), else every column.
+        let mut builder = table.scan().with_filter(predicate);
+        builder = if projection.is_empty() {
+            builder.select_all()
+        } else {
+            builder.select(projection_names(&self.schema, projection)?)
+        };
+        let scan = builder
             .build()
             .map_err(|e| LookupError::Query(format!("build iceberg scan: {e}")))?;
         let stream = scan
@@ -249,6 +256,7 @@ impl LookupSource for IcebergLookupSource {
     fn capabilities(&self) -> LookupSourceCapabilities {
         LookupSourceCapabilities {
             supports_batch_lookup: true,
+            supports_projection_pushdown: true,
             ..LookupSourceCapabilities::none()
         }
     }

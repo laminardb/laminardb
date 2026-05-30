@@ -82,7 +82,9 @@ datafusion-common = "52.0"
 datafusion-expr = "52.0"
 datafusion-sql = "52.0"
 datafusion-optimizer = "52.0"
-sqlparser = "0.59"
+# `visitor` enables sqlparser's exhaustive `visit_expressions` AST walker, used
+# to collect referenced columns for lookup projection pushdown.
+sqlparser = { version = "0.59", features = ["visitor"] }
 
 # Async
 tokio-stream = "0.1"

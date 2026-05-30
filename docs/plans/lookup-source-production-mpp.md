@@ -264,11 +264,25 @@ Work (one cohesive change; cannot be partially landed without dead/unwired code)
   column (Z-ORDER isn't visible in metadata, so warning-not-error) via the new
   `delta_io::get_partition_columns`. 5 tests (open/miss + batched-align/dup/empty), clippy clean
   (`-D warnings`, delta-lake feature), 554 connectors lib tests green.
-- **Predicates/projection pushdown — deferred (not blocking).** The Phase-1 operator
-  (`lookup_enrich.rs`) calls `query_batch` with **empty** predicates/projection, and the operator's
-  row assembly assumes the full source schema, so projection pushdown needs operator↔source schema
-  coordination first. Left as ignored args (capabilities still advertise `false`) until the operator
-  actually pushes them; wiring them now would be dead plumbing.
+- **Projection pushdown — DONE 2026-05-30.** A per-table projection (a *superset* of every column
+  any query references, plus the key — the cache is shared per table so it can't be per-query) is
+  computed in `pipeline_lifecycle` via `compute_lookup_projection` (`sql_analysis.rs`), which unions
+  referenced columns using sqlparser's exhaustive `visit_expressions` (the `visitor` feature) and
+  bails to "fetch all" on a wildcard / subquery / unparseable shape (can't under-count safely). It
+  rides in a new `PartialLookupState.projection: Vec<ColumnId>`; the operator projects its
+  `lookup_schema = schema.project(projection)` and the worker passes it to `query_batch`. All four
+  backends honor it (Delta `select_columns`, Iceberg scan `.select`, Postgres `SELECT <cols>`, Mongo
+  projection doc) via the shared `laminar_core::lookup::source::projection_names`, returning the
+  projected schema; `KeyAligner` realigns by PK *name*, so the key being in the projection is all
+  that's required. `supports_projection_pushdown` now `true`. Tests: 3 analysis (union / wildcard-bail
+  / full-collapse) + 1 operator coordination (projected schema in, no spare column out).
+- **Predicate pushdown — deferred (deliberate).** For a *keyed point-lookup* the key IN-list already
+  prunes files/rows, so a residual predicate only filters the ~1 row fetched — and `PushdownAdapter`
+  already evaluates such predicates locally. Extracting lookup-side predicates from SQL for that
+  marginal gain isn't worth the surface; `supports_predicate_pushdown` stays `false`.
+- **Per-backend live projection tests — deferred** (same constraint as Phase 4: real
+  Delta/Iceberg/PG/Mongo need gated dev-deps / live services). The shared `projection_names` + the
+  operator-contract test cover the wiring.
 - **Manifest-prune verification — DONE 2026-05-29.** `test_batch_query_prunes_partition_files`
   creates a Delta table partitioned on the key (8 keys → 8 partition files), verifies cross-partition
   correctness through `DeltaLookupSource`, then runs the generated `WHERE "id" IN (2, 5)` shape and

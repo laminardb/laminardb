@@ -1182,6 +1182,15 @@ impl LaminarDB {
                 None
             };
 
+            // Projection pushdown: fetch only the columns any query references
+            // (a per-table superset, since the cache is shared), plus the key.
+            let projection = crate::sql_analysis::compute_lookup_projection(
+                &schema,
+                &pk_cols,
+                name.as_str(),
+                stream_regs.values().map(|r| r.query_sql.as_str()),
+            );
+
             self.lookup_registry.register_partial(
                 name,
                 laminar_sql::datafusion::PartialLookupState {
@@ -1191,6 +1200,7 @@ impl LaminarDB {
                     key_sort_fields,
                     source: lookup_source,
                     fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
+                    projection,
                 },
             );
             *mode = RefreshMode::SnapshotPlusCdc;

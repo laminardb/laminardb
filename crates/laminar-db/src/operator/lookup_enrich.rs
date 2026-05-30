@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use laminar_core::lookup::foyer_cache::FoyerMemoryCache;
-use laminar_core::lookup::source::LookupSourceDyn;
+use laminar_core::lookup::source::{ColumnId, LookupSourceDyn};
 use laminar_core::serialization::{deserialize_batch_stream, serialize_batch_stream};
 use laminar_sql::datafusion::lookup_join::LookupJoinType;
 use laminar_sql::datafusion::{LookupTableRegistry, PartialLookupState, RegisteredLookup};
@@ -77,6 +77,7 @@ struct WorkResult {
 
 async fn run_worker(
     source: Arc<dyn LookupSourceDyn>,
+    projection: Vec<ColumnId>,
     mut submit_rx: mpsc::Receiver<WorkItem>,
     result_tx: mpsc::Sender<WorkResult>,
 ) {
@@ -84,7 +85,7 @@ async fn run_worker(
         let key_refs: Vec<&[u8]> = item.keys.iter().map(Vec::as_slice).collect();
         let outputs = match tokio::time::timeout(
             FETCH_TIMEOUT,
-            source.query_batch(&key_refs, &[], &[]),
+            source.query_batch(&key_refs, &[], &projection),
         )
         .await
         {
@@ -253,6 +254,7 @@ impl LookupEnrichOperator {
             key_columns,
             key_sort_fields,
             source,
+            projection,
             ..
         } = state.as_ref();
 
@@ -270,13 +272,27 @@ impl LookupEnrichOperator {
             })
             .collect();
 
+        // The worker fetches only the projected columns, so the joined-in lookup
+        // rows carry the projected schema. Empty projection = the full schema.
+        let lookup_schema: SchemaRef = if projection.is_empty() {
+            Arc::clone(schema)
+        } else {
+            let idx: Vec<usize> = projection.iter().map(|&c| c as usize).collect();
+            Arc::new(schema.project(&idx).map_err(|e| {
+                DbError::Pipeline(format!("lookup-enrich: project lookup schema: {e}"))
+            })?)
+        };
+
         let (submit_tx, result_rx, worker) = match source {
             Some(src) => {
                 let (submit_tx, submit_rx) = mpsc::channel(SUBMIT_CAPACITY);
                 let (result_tx, result_rx) = mpsc::channel(RESULT_CAPACITY);
-                let handle = self
-                    .runtime
-                    .spawn(run_worker(Arc::clone(src), submit_rx, result_tx));
+                let handle = self.runtime.spawn(run_worker(
+                    Arc::clone(src),
+                    projection.clone(),
+                    submit_rx,
+                    result_tx,
+                ));
                 (Some(submit_tx), Some(result_rx), Some(handle))
             }
             None => (None, None, None),
@@ -287,7 +303,7 @@ impl LookupEnrichOperator {
             converter,
             key_indices: Vec::new(),
             key_checks,
-            lookup_schema: Arc::clone(schema),
+            lookup_schema,
             submit_tx,
             result_rx,
             _worker: worker,
@@ -838,12 +854,14 @@ mod tests {
             &self,
             keys: &[&[u8]],
             _predicates: &[laminar_core::lookup::predicate::Predicate],
-            _projection: &[laminar_core::lookup::source::ColumnId],
+            projection: &[laminar_core::lookup::source::ColumnId],
         ) -> Result<Vec<Option<RecordBatch>>, LookupError> {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let converter = RowConverter::new(vec![SortField::new(DataType::Int64)]).unwrap();
             let parser = converter.parser();
+            // Honor projection like a real backend: return only those columns.
+            let proj: Vec<usize> = projection.iter().map(|&c| c as usize).collect();
             Ok(keys
                 .iter()
                 .map(|k| {
@@ -854,7 +872,14 @@ mod tests {
                         .downcast_ref::<Int64Array>()
                         .unwrap()
                         .value(0);
-                    self.rows.get(&id).map(|name| lookup_row(id, name))
+                    self.rows.get(&id).map(|name| {
+                        let full = lookup_row(id, name);
+                        if proj.is_empty() {
+                            full
+                        } else {
+                            full.project(&proj).unwrap()
+                        }
+                    })
                 })
                 .collect())
         }
@@ -886,6 +911,7 @@ mod tests {
                 key_sort_fields: vec![SortField::new(DataType::Int64)],
                 source: Some(source),
                 fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
+                projection: Vec::new(),
             },
         );
         LookupEnrichOperator::new(
@@ -1021,6 +1047,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn projection_pushdown_enriches_with_projected_schema() {
+        // The table registers projection=[0] (id only), so the lookup side
+        // contributes "id" and never "name" — the operator's joined schema must
+        // match what the (projection-honoring) source returns.
+        let registry = Arc::new(LookupTableRegistry::new());
+        registry.register_partial(
+            "customers",
+            PartialLookupState {
+                foyer_cache: Arc::new(FoyerMemoryCache::with_defaults(0)),
+                schema: lookup_schema(), // id, name
+                key_columns: vec!["id".into()],
+                key_sort_fields: vec![SortField::new(DataType::Int64)],
+                source: Some(Arc::new(MapSource {
+                    rows: [(1, "Alice")].into_iter().collect(),
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }) as Arc<dyn LookupSourceDyn>),
+                fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
+                projection: vec![0],
+            },
+        );
+        let mut op = LookupEnrichOperator::new(
+            "enrich",
+            LookupEnrichConfig {
+                table_name: "customers".into(),
+                key_columns: vec!["customer_id".into()],
+                join_type: LookupJoinType::Inner,
+            },
+            None,
+            laminar_sql::create_session_context(),
+            registry,
+            Handle::current(),
+            None,
+        );
+        let out = run_until_output(&mut op, stream_batch(&[100], &[Some(1)])).await;
+        assert_eq!(out.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        let batch = out.iter().find(|b| b.num_rows() > 0).unwrap();
+        let names: Vec<String> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "id"),
+            "projected key present: {names:?}"
+        );
+        assert!(
+            names.iter().all(|n| n != "name"),
+            "unprojected column absent: {names:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn null_key_never_matches() {
         let source = Arc::new(MapSource {
             rows: [(1, "Alice")].into_iter().collect(),
@@ -1063,6 +1142,7 @@ mod tests {
                     calls: std::sync::atomic::AtomicUsize::new(0),
                 }) as Arc<dyn LookupSourceDyn>),
                 fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
+                projection: Vec::new(),
             },
         );
         let mut op = LookupEnrichOperator::new(

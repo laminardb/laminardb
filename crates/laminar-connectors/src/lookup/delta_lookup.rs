@@ -22,7 +22,9 @@ use datafusion::prelude::{col, Expr, SessionContext};
 #[cfg(feature = "delta-lake")]
 use laminar_core::lookup::predicate::Predicate;
 #[cfg(feature = "delta-lake")]
-use laminar_core::lookup::source::{ColumnId, LookupError, LookupSource, LookupSourceCapabilities};
+use laminar_core::lookup::source::{
+    projection_names, ColumnId, LookupError, LookupSource, LookupSourceCapabilities,
+};
 #[cfg(feature = "delta-lake")]
 use laminar_core::lookup::KeyAligner;
 
@@ -208,7 +210,7 @@ impl LookupSource for DeltaLookupSource {
         &self,
         keys: &[&[u8]],
         _predicates: &[Predicate],
-        _projection: &[ColumnId],
+        projection: &[ColumnId],
     ) -> Result<Vec<Option<RecordBatch>>, LookupError> {
         if keys.is_empty() {
             return Ok(Vec::new());
@@ -216,13 +218,24 @@ impl LookupSource for DeltaLookupSource {
         let pk_arrays = self.aligner.decode_keys(keys)?;
         let filter = build_in_list_filter(self.aligner.pk_columns(), &pk_arrays)?;
 
-        let batches = self
+        let mut df = self
             .ctx
             .table(&self.table_name)
             .await
             .map_err(|e| LookupError::Query(format!("open delta table: {e}")))?
             .filter(filter)
-            .map_err(|e| LookupError::Query(format!("apply lookup filter: {e}")))?
+            .map_err(|e| LookupError::Query(format!("apply lookup filter: {e}")))?;
+        // Projection pushdown: select only the requested columns (the optimizer
+        // pushes this into the Parquet scan). The projection always carries the
+        // key columns, so realignment still works.
+        if !projection.is_empty() {
+            let names = projection_names(&self.schema, projection)?;
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            df = df
+                .select_columns(&refs)
+                .map_err(|e| LookupError::Query(format!("apply lookup projection: {e}")))?;
+        }
+        let batches = df
             .collect()
             .await
             .map_err(|e| LookupError::Query(format!("collect lookup results: {e}")))?;
@@ -233,6 +246,7 @@ impl LookupSource for DeltaLookupSource {
     fn capabilities(&self) -> LookupSourceCapabilities {
         LookupSourceCapabilities {
             supports_batch_lookup: true,
+            supports_projection_pushdown: true,
             ..LookupSourceCapabilities::none()
         }
     }

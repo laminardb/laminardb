@@ -38,7 +38,7 @@ use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::Expr;
 use futures::StreamExt;
 use laminar_core::lookup::foyer_cache::FoyerMemoryCache;
-use laminar_core::lookup::source::LookupSourceDyn;
+use laminar_core::lookup::source::{ColumnId, LookupSourceDyn};
 use tokio::sync::Semaphore;
 
 use super::lookup_join::{LookupJoinNode, LookupJoinType};
@@ -112,6 +112,10 @@ pub struct PartialLookupState {
     pub source: Option<Arc<dyn LookupSourceDyn>>,
     /// Limits concurrent source queries to avoid overloading the source.
     pub fetch_semaphore: Arc<Semaphore>,
+    /// Column indices (into `schema`) to fetch from the source — the union of
+    /// every column any query references, plus the key. Empty = fetch all.
+    /// Per-table (the cache is shared across queries), so it must be a superset.
+    pub projection: Vec<ColumnId>,
 }
 
 impl LookupTableRegistry {
@@ -2155,6 +2159,7 @@ mod tests {
                 key_sort_fields,
                 source: None,
                 fetch_semaphore: Arc::new(Semaphore::new(64)),
+                projection: Vec::new(),
             },
         );
 

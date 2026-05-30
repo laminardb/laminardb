@@ -26,7 +26,9 @@ use mongodb::Client;
 #[cfg(feature = "mongodb-cdc")]
 use laminar_core::lookup::predicate::Predicate;
 #[cfg(feature = "mongodb-cdc")]
-use laminar_core::lookup::source::{ColumnId, LookupError, LookupSource, LookupSourceCapabilities};
+use laminar_core::lookup::source::{
+    projection_names, ColumnId, LookupError, LookupSource, LookupSourceCapabilities,
+};
 #[cfg(feature = "mongodb-cdc")]
 use laminar_core::lookup::KeyAligner;
 
@@ -138,15 +140,16 @@ impl MongoLookupSource {
         Ok(Some(bson))
     }
 
-    /// Project fetched documents into one Arrow `RecordBatch` matching the
-    /// declared schema. Missing/incompatible fields become NULL.
-    fn docs_to_batch(&self, docs: &[Document]) -> Result<RecordBatch, LookupError> {
+    /// Project fetched documents into one Arrow `RecordBatch` matching
+    /// `schema` (the full declared schema, or its projection). Missing or
+    /// incompatible fields become NULL.
+    fn docs_to_batch(schema: &SchemaRef, docs: &[Document]) -> Result<RecordBatch, LookupError> {
         use arrow_array::builder::{
             BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
         };
 
-        let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(self.schema.fields().len());
-        for field in self.schema.fields() {
+        let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
+        for field in schema.fields() {
             let name = field.name().as_str();
             let array: Arc<dyn Array> = match field.data_type() {
                 DataType::Int32 => {
@@ -193,7 +196,7 @@ impl MongoLookupSource {
             };
             columns.push(array);
         }
-        RecordBatch::try_new(Arc::clone(&self.schema), columns)
+        RecordBatch::try_new(Arc::clone(schema), columns)
             .map_err(|e| LookupError::Internal(format!("arrow batch construction: {e}")))
     }
 }
@@ -204,7 +207,7 @@ impl LookupSource for MongoLookupSource {
         &self,
         keys: &[&[u8]],
         _predicates: &[Predicate],
-        _projection: &[ColumnId],
+        projection: &[ColumnId],
     ) -> Result<Vec<Option<RecordBatch>>, LookupError> {
         use tokio_stream::StreamExt;
 
@@ -227,8 +230,27 @@ impl LookupSource for MongoLookupSource {
             .database(&self.database)
             .collection::<Document>(&self.collection);
 
-        let mut cursor = collection
-            .find(filter)
+        // Projection pushdown: ask Mongo for only the requested fields (always
+        // incl. the key), and build the batch in the matching projected schema.
+        let mut find = collection.find(filter);
+        let out_schema = if projection.is_empty() {
+            Arc::clone(&self.schema)
+        } else {
+            let names = projection_names(&self.schema, projection)?;
+            let mut proj_doc = Document::new();
+            for name in &names {
+                proj_doc.insert(name.clone(), 1);
+            }
+            find = find.projection(proj_doc);
+            let idx: Vec<usize> = projection.iter().map(|&c| c as usize).collect();
+            Arc::new(
+                self.schema
+                    .project(&idx)
+                    .map_err(|e| LookupError::Internal(format!("project mongodb schema: {e}")))?,
+            )
+        };
+
+        let mut cursor = find
             .await
             .map_err(|e| LookupError::Query(format!("mongodb find: {e}")))?;
         let mut docs: Vec<Document> = Vec::new();
@@ -239,7 +261,7 @@ impl LookupSource for MongoLookupSource {
         let batches = if docs.is_empty() {
             Vec::new()
         } else {
-            vec![self.docs_to_batch(&docs)?]
+            vec![Self::docs_to_batch(&out_schema, &docs)?]
         };
         self.aligner.align(keys, &batches)
     }
@@ -247,6 +269,7 @@ impl LookupSource for MongoLookupSource {
     fn capabilities(&self) -> LookupSourceCapabilities {
         LookupSourceCapabilities {
             supports_batch_lookup: true,
+            supports_projection_pushdown: true,
             ..LookupSourceCapabilities::none()
         }
     }

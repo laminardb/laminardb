@@ -31,7 +31,9 @@ use tokio_postgres::types::{ToSql, Type};
 #[cfg(feature = "postgres-cdc")]
 use laminar_core::lookup::predicate::Predicate;
 #[cfg(feature = "postgres-cdc")]
-use laminar_core::lookup::source::{ColumnId, LookupError, LookupSource, LookupSourceCapabilities};
+use laminar_core::lookup::source::{
+    projection_names, ColumnId, LookupError, LookupSource, LookupSourceCapabilities,
+};
 #[cfg(feature = "postgres-cdc")]
 use laminar_core::lookup::KeyAligner;
 
@@ -55,6 +57,10 @@ pub struct PostgresLookupSourceConfig {
 pub struct PostgresLookupSource {
     pool: Pool,
     select_sql: String,
+    /// Quoted table name and key column, kept to build a projected `SELECT`
+    /// when a query pushes down a column projection.
+    table: String,
+    pk_column: String,
     schema: SchemaRef,
     aligner: KeyAligner,
 }
@@ -107,6 +113,8 @@ impl PostgresLookupSource {
         Ok(Self {
             pool,
             select_sql,
+            table: config.table,
+            pk_column,
             schema,
             aligner,
         })
@@ -183,7 +191,7 @@ impl LookupSource for PostgresLookupSource {
         &self,
         keys: &[&[u8]],
         _predicates: &[Predicate],
-        _projection: &[ColumnId],
+        projection: &[ColumnId],
     ) -> Result<Vec<Option<RecordBatch>>, LookupError> {
         if keys.is_empty() {
             return Ok(Vec::new());
@@ -192,20 +200,44 @@ impl LookupSource for PostgresLookupSource {
         let pk_arrays = self.aligner.decode_keys(keys)?;
         let param = Self::build_any_param(pk_arrays[0].as_ref())?;
 
+        // Projection pushdown: SELECT only the requested columns (always incl.
+        // the key, so the row maps back); else the prebuilt `SELECT *`. The
+        // result schema follows so `rows_to_batch` reads the right columns.
+        let (sql, out_schema) = if projection.is_empty() {
+            (self.select_sql.clone(), Arc::clone(&self.schema))
+        } else {
+            let cols = projection_names(&self.schema, projection)?
+                .iter()
+                .map(|n| format!("\"{n}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "SELECT {cols} FROM {} WHERE \"{}\" = ANY($1)",
+                self.table, self.pk_column
+            );
+            let idx: Vec<usize> = projection.iter().map(|&c| c as usize).collect();
+            let proj_schema = Arc::new(
+                self.schema
+                    .project(&idx)
+                    .map_err(|e| LookupError::Internal(format!("project postgres schema: {e}")))?,
+            );
+            (sql, proj_schema)
+        };
+
         let client = self
             .pool
             .get()
             .await
             .map_err(|e| LookupError::Connection(format!("postgres pool: {e}")))?;
         let pg_rows = client
-            .query(&self.select_sql, &[&*param])
+            .query(&sql, &[&*param])
             .await
             .map_err(|e| LookupError::Query(format!("postgres lookup query: {e}")))?;
 
         let batches = if pg_rows.is_empty() {
             Vec::new()
         } else {
-            vec![rows_to_batch(&self.schema, &pg_rows)?]
+            vec![rows_to_batch(&out_schema, &pg_rows)?]
         };
         self.aligner.align(keys, &batches)
     }
@@ -213,6 +245,7 @@ impl LookupSource for PostgresLookupSource {
     fn capabilities(&self) -> LookupSourceCapabilities {
         LookupSourceCapabilities {
             supports_batch_lookup: true,
+            supports_projection_pushdown: true,
             ..LookupSourceCapabilities::none()
         }
     }
