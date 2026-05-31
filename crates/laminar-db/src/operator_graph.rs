@@ -1734,7 +1734,6 @@ impl OperatorGraph {
     /// Route one peer-shipped shuffle batch to the operator named `stage`.
     /// Unknown stage (no such live operator) is dropped.
     #[cfg(feature = "cluster-unstable")]
-    #[allow(dead_code)] // wired into the checkpoint path in Phase 2
     async fn ingest_to_stage(
         &mut self,
         stage: &str,
@@ -1766,11 +1765,11 @@ impl OperatorGraph {
     /// Fails the checkpoint (caller retries) on timeout or a closed receiver —
     /// the deliberate degradation under a straggling peer.
     #[cfg(feature = "cluster-unstable")]
-    #[allow(dead_code)] // wired into the checkpoint path in Phase 2
     pub(crate) async fn align_shuffle_barriers(
         &mut self,
         checkpoint_id: u64,
         watermark: i64,
+        live: &[u64],
     ) -> Result<(), DbError> {
         use laminar_core::checkpoint::barrier::CheckpointBarrier;
         use laminar_core::shuffle::{BarrierTracker, ShuffleMessage};
@@ -1780,9 +1779,26 @@ impl OperatorGraph {
         let Some(cfg) = self.cluster_shuffle.clone() else {
             return Ok(());
         };
-        let peers = laminar_core::state::peer_owners(&cfg.registry, cfg.self_id);
-        if peers.is_empty() {
-            return Ok(()); // no cross-node shuffle to align
+        // Fan-out set: nodes we ship rows to (other vnode owners). Wait set:
+        // nodes that ship to us — the live producers, but only if we own a vnode
+        // (a node owning none, e.g. drained, receives nothing yet still ships, so
+        // the two sets differ under skewed assignment). Producers = live
+        // membership, not the owners.
+        let output_peers: Vec<u64> = laminar_core::state::peer_owners(&cfg.registry, cfg.self_id)
+            .iter()
+            .map(|n| n.0)
+            .collect();
+        let input_peers: Vec<u64> =
+            if laminar_core::state::owned_vnodes(&cfg.registry, cfg.self_id).is_empty() {
+                Vec::new()
+            } else {
+                live.iter()
+                    .copied()
+                    .filter(|&id| id != cfg.self_id.0)
+                    .collect()
+            };
+        if output_peers.is_empty() && input_peers.is_empty() {
+            return Ok(()); // not part of any cross-node shuffle
         }
 
         // Rows already pulled into the receiver's per-stage holdover are
@@ -1791,20 +1807,37 @@ impl OperatorGraph {
             self.ingest_to_stage(&stage, batch, watermark).await?;
         }
 
-        let peer_ids: Vec<u64> = peers.iter().map(|n| n.0).collect();
         let barrier = CheckpointBarrier::new(checkpoint_id, 0);
-        cfg.sender
-            .fan_out_barrier(&peer_ids, barrier)
-            .await
-            .map_err(|e| DbError::Pipeline(format!("shuffle barrier fan-out: {e}")))?;
+        if !output_peers.is_empty() {
+            cfg.sender
+                .fan_out_barrier(&output_peers, barrier)
+                .await
+                .map_err(|e| DbError::Pipeline(format!("shuffle barrier fan-out: {e}")))?;
+        }
+        if input_peers.is_empty() {
+            return Ok(()); // we receive from no peer — nothing to align on
+        }
 
-        let tracker = BarrierTracker::new(peers.len() + 1);
-        let peer_port: FxHashMap<u64, usize> = peers
+        let tracker = BarrierTracker::new(input_peers.len() + 1);
+        let peer_port: FxHashMap<u64, usize> = input_peers
             .iter()
             .enumerate()
-            .map(|(i, n)| (n.0, i + 1))
+            .map(|(i, &p)| (p, i + 1))
             .collect();
         tracker.observe(0, barrier); // our own input
+
+        // A peer that fanned its barrier out before we entered alignment had it
+        // stashed by the per-cycle drain (which would otherwise drop it) — observe
+        // those before blocking on the live wire.
+        for (from, b) in cfg.receiver.drain_staged_barriers() {
+            if b.checkpoint_id == checkpoint_id {
+                if let Some(&port) = peer_port.get(&from) {
+                    if tracker.observe(port, b).is_some() {
+                        return Ok(()); // all peers already aligned
+                    }
+                }
+            }
+        }
 
         loop {
             match tokio::time::timeout(ALIGN_TIMEOUT, cfg.receiver.recv()).await {
@@ -2029,7 +2062,7 @@ mod tests {
             .await
             .unwrap();
 
-        graph.align_shuffle_barriers(7, 0).await.unwrap();
+        graph.align_shuffle_barriers(7, 0, &[1, 2]).await.unwrap();
 
         // Node 1 must have fanned its own barrier out to node 2.
         let (from, msg) = recv2.recv().await.unwrap();

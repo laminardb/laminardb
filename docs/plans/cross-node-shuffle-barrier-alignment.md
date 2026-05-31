@@ -155,13 +155,29 @@ Checked against current systems and the recent literature; the approach is mains
    Clippy `-D warnings` clean with and without `cluster-unstable`. The method carries a temporary
    `#[allow(dead_code)]` + "wired in the follow-up" pointer until step 2 lands — it is exercised by
    the test, not dead, but has no production caller yet.
-2. **Wiring (NEXT — separate, reviewed change). Recommendation: the leader 2PC reorder
-   (Prepare-triggered alignment), not a separate round.** Call `align_shuffle_barriers` before
-   `snapshot_state` in `capture_and_serialize_operator_state`, threading the cross-cluster
-   `checkpoint_id` (leader: generated at announce; follower: `ann.checkpoint_id`). Hoist the leader's
-   `Prepare` announce ahead of capture so the flow is **announce `Prepare` → align → capture → await
-   quorum** (followers already do **observe `Prepare` → align → capture → ack**). Removes the
-   `#[allow(dead_code)]`. Rationale below.
+2. **Wiring via the leader 2PC reorder (Prepare-triggered) — DONE 2026-05-31.** The leader now
+   announces `Prepare` *early* (`CheckpointCoordinator::announce_prepare`, before capture) so the
+   flow is **announce `Prepare` → align → capture → await quorum**; followers do **observe `Prepare`
+   → align → capture → ack**. `await_prepare_quorum` re-announces the identical `Prepare`
+   idempotently (followers dedup by epoch). Wired in `PipelineCallback` at all three checkpoint
+   paths (`force_capture_and_checkpoint`, `checkpoint_with_barrier`, `maybe_follower_checkpoint`)
+   via `align_shuffle_for_leader` (leader) / inline `graph.align_shuffle_barriers(ann.checkpoint_id)`
+   (follower). On leader alignment failure it announces `Abort` so prepared followers don't block.
+   `#[allow(dead_code)]` removed.
+   - **Bug 1 (e2e smoke caught it):** the per-cycle `drain_vnode_data_for` was *dropping* `Barrier`
+     frames, so a peer's barrier arriving before the recipient entered alignment was lost → timeout.
+     Fixed by stashing barriers (`ShuffleReceiver::{drain_vnode_data_for stashes, drain_staged_barriers
+     drains}`); alignment observes the stash before the live wire.
+   - **Bug 2 (rebalance test caught it): the fan-out set and the wait set are not the same under
+     skewed ownership.** A node fans its barrier to the nodes it *ships to* (other vnode owners =
+     `peer_owners`), but must wait for barriers from the nodes that *ship to it* — every live producer,
+     gated by "do I own any vnode." A drained node (owns nothing) still ships to the owner, so the
+     owner must wait for it even though it isn't a `peer_owner`. Using `peer_owners` for both
+     deadlocked `checkpoint_after_rotation_carries_new_version` (all vnodes → leader: the leader had
+     no owner-peers so skipped alignment while the follower waited on a barrier the leader never sent).
+     Fix: `output = peer_owners(self)`; `input = owned_vnodes(self).is_empty() ? [] : live − self`,
+     where `live` is the controller's membership (passed in — control-plane stays out of the shuffle
+     config). `cluster_e2e_smoke` 30 s-timeout→pass; `cluster_rebalance_flow` + `cluster_2pc_flow` green.
 3. **Recovery safety:** confirm ingested-at-checkpoint rows restore without loss or double-count.
    With alignment the origin's offset-advance and the owner's ingest land in the same checkpoint, so
    no double-count (agg) and idempotent replay (lookup) — to be proven with a restore test.

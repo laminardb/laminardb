@@ -177,6 +177,9 @@ impl ConnectorPipelineCallback {
 
         self.sync_sinks_and_drain_events().await;
 
+        #[cfg(feature = "cluster-unstable")]
+        self.align_shuffle_for_leader().await?;
+
         let operator_states = self
             .capture_and_serialize_operator_state()
             .await
@@ -245,6 +248,23 @@ impl ConnectorPipelineCallback {
         }
         self.last_follower_epoch = Some(ann.epoch);
 
+        // Drain + align the cross-node shuffle on the leader's checkpoint id so
+        // the snapshot includes peers' pre-checkpoint rows.
+        {
+            let live: Vec<u64> = controller.live_instances().iter().map(|n| n.0).collect();
+            let wm = self
+                .pipeline_watermark
+                .load(std::sync::atomic::Ordering::Acquire);
+            if let Err(e) = self
+                .graph
+                .align_shuffle_barriers(ann.checkpoint_id, wm, &live)
+                .await
+            {
+                tracing::warn!(error = %e, "follower shuffle alignment failed — skipping");
+                return None;
+            }
+        }
+
         let operator_states = match self.capture_and_serialize_operator_state().await {
             Ok(s) => s,
             Err(e) => {
@@ -308,6 +328,39 @@ impl ConnectorPipelineCallback {
                 None
             }
         }
+    }
+
+    /// Leader-side cross-node shuffle barrier alignment, run *before* capture so
+    /// the snapshot includes peers' pre-checkpoint rows. Prepare-triggered: the
+    /// leader announces `Prepare` early here (so followers begin aligning), then
+    /// aligns. No-op when not the leader or there is no cross-node shuffle. On
+    /// alignment failure it signals `Abort` so prepared followers don't block.
+    #[cfg(feature = "cluster-unstable")]
+    async fn align_shuffle_for_leader(&mut self) -> Result<(), DbError> {
+        let (checkpoint_id, live) = {
+            let mut guard = self.coordinator.lock().await;
+            match guard.as_mut() {
+                Some(coord) => (coord.announce_prepare().await, coord.live_node_ids()),
+                None => (None, Vec::new()),
+            }
+        };
+        let Some(checkpoint_id) = checkpoint_id else {
+            return Ok(());
+        };
+        let wm = self
+            .pipeline_watermark
+            .load(std::sync::atomic::Ordering::Acquire);
+        if let Err(e) = self
+            .graph
+            .align_shuffle_barriers(checkpoint_id, wm, &live)
+            .await
+        {
+            if let Some(coord) = self.coordinator.lock().await.as_ref() {
+                coord.announce_abort(checkpoint_id).await;
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
     async fn capture_and_serialize_operator_state(
@@ -976,6 +1029,14 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 name.clone(),
                 source_to_connector_checkpoint(&source.checkpoint()),
             );
+        }
+
+        // Drain + align the cross-node shuffle before capture so peers'
+        // pre-barrier rows enter the snapshot (announces Prepare early).
+        #[cfg(feature = "cluster-unstable")]
+        if let Err(e) = self.align_shuffle_for_leader().await {
+            tracing::warn!(error = %e, "shuffle barrier alignment failed");
+            return BarrierOutcome::Failed;
         }
 
         // Capture stream executor aggregate state — now consistent because

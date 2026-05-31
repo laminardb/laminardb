@@ -757,6 +757,46 @@ impl CheckpointCoordinator {
         }
     }
 
+    /// Leader-only: announce `Prepare` *early* — before operator capture — so
+    /// peers can start cross-node shuffle barrier alignment. Returns the
+    /// checkpoint id every node aligns on (the same one `checkpoint_inner` will
+    /// use, since `next_checkpoint_id` is stable until commit), or `None` if not
+    /// the leader. `await_prepare_quorum` later re-announces the identical
+    /// `Prepare` idempotently, and followers dedup by epoch.
+    #[cfg(feature = "cluster-unstable")]
+    pub async fn announce_prepare(&self) -> Option<u64> {
+        use laminar_core::cluster::control::Phase;
+        let cc = self.cluster_controller.as_ref()?;
+        if !cc.is_leader() {
+            return None;
+        }
+        let checkpoint_id = self.next_checkpoint_id;
+        self.announce_if_leader(self.epoch, checkpoint_id, Phase::Prepare, None)
+            .await;
+        Some(checkpoint_id)
+    }
+
+    /// Leader-only: announce `Abort` for an early-announced checkpoint whose
+    /// shuffle alignment failed, so followers already prepared on the `Prepare`
+    /// don't block until their decision timeout.
+    #[cfg(feature = "cluster-unstable")]
+    pub async fn announce_abort(&self, checkpoint_id: u64) {
+        use laminar_core::cluster::control::Phase;
+        self.announce_if_leader(self.epoch, checkpoint_id, Phase::Abort, None)
+            .await;
+    }
+
+    /// Live cluster node ids (the controller's view), for the caller to derive
+    /// the shuffle barrier-alignment peer set. Empty without a controller.
+    #[cfg(feature = "cluster-unstable")]
+    #[must_use]
+    pub fn live_node_ids(&self) -> Vec<u64> {
+        self.cluster_controller
+            .as_ref()
+            .map(|cc| cc.live_instances().iter().map(|n| n.0).collect())
+            .unwrap_or_default()
+    }
+
     /// Announce PREPARE and block for follower acks. Returns `None` on
     /// quorum or no-op (not leader); `Some(msg)` with the failure.
     /// When quorum is reached, the `Ok` path writes the cluster-wide

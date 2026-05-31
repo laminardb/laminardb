@@ -277,6 +277,11 @@ pub struct ShuffleReceiver {
     /// here instead of dropping them. A stage whose operator is dropped mid-run
     /// leaks its bucket until the receiver is dropped — fine under cluster-unstable.
     staged: parking_lot::Mutex<FxHashMap<String, Vec<RecordBatch>>>,
+    /// Checkpoint barriers `drain_vnode_data_for` pulled off the wire during a
+    /// normal cycle (a peer fanned its barrier out before this node entered
+    /// alignment). Stashed rather than dropped so `drain_staged_barriers` can
+    /// hand them to the aligning checkpoint — otherwise alignment waits forever.
+    staged_barriers: parking_lot::Mutex<Vec<(ShufflePeerId, CheckpointBarrier)>>,
 }
 
 impl Drop for ShuffleReceiver {
@@ -347,6 +352,7 @@ impl ShuffleReceiver {
             rx: parking_lot::Mutex::new(Some(rx)),
             rx_returned: Arc::new(Notify::new()),
             staged: parking_lot::Mutex::new(FxHashMap::default()),
+            staged_barriers: parking_lot::Mutex::new(Vec::new()),
         })
     }
 
@@ -401,21 +407,35 @@ impl ShuffleReceiver {
 
     /// Non-blocking drain of the [`ShuffleMessage::VnodeData`] batches addressed
     /// to `stage`. Frames for other stages are bucketed in `staged` for their
-    /// own drainer; non-`VnodeData` frames are dropped (the row-shuffle path
-    /// never sends them). Empty if the queue is empty or a `recv()` holds it.
+    /// own drainer; `Barrier` frames are stashed in `staged_barriers` for the
+    /// aligning checkpoint (never dropped — see the field doc). Empty if the
+    /// queue is empty or a `recv()` holds it.
     pub fn drain_vnode_data_for(&self, stage: &str) -> Vec<RecordBatch> {
         let mut staged = self.staged.lock();
         {
             let mut slot = self.rx.lock();
             if let Some(rx) = slot.as_mut() {
-                while let Ok((_from, msg)) = rx.try_recv() {
-                    if let ShuffleMessage::VnodeData(s, _vnode, batch) = msg {
-                        staged.entry(s).or_default().push(batch);
+                while let Ok((from, msg)) = rx.try_recv() {
+                    match msg {
+                        ShuffleMessage::VnodeData(s, _vnode, batch) => {
+                            staged.entry(s).or_default().push(batch);
+                        }
+                        ShuffleMessage::Barrier(b) => {
+                            self.staged_barriers.lock().push((from, b));
+                        }
+                        _ => {} // Hello / Close
                     }
                 }
             }
         }
         staged.remove(stage).unwrap_or_default()
+    }
+
+    /// Take the checkpoint barriers stashed by [`Self::drain_vnode_data_for`]
+    /// (peers that fanned their barrier out before this node began aligning).
+    /// Barrier alignment observes these before draining the live wire.
+    pub fn drain_staged_barriers(&self) -> Vec<(ShufflePeerId, CheckpointBarrier)> {
+        std::mem::take(&mut self.staged_barriers.lock())
     }
 
     /// Empty the per-stage holdover, returning every buffered `(stage, batch)`.
