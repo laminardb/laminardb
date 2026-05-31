@@ -22,7 +22,7 @@ use datafusion_common::DataFusionError;
 use futures::stream::{self, StreamExt};
 use laminar_core::checkpoint::barrier::CheckpointBarrier;
 use laminar_core::shuffle::{BarrierTracker, ShufflePeerId, ShuffleReceiver, ShuffleSender};
-use laminar_core::state::{owned_vnodes, NodeId, VnodeRegistry};
+use laminar_core::state::{owned_vnodes, peer_owners, NodeId, VnodeRegistry};
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
@@ -93,17 +93,12 @@ impl ClusterRepartitionExec {
         }
         let vnode_to_partition = owned.iter().enumerate().map(|(i, &v)| (v, i)).collect();
 
-        // Enumerate distinct peers from the registry (everyone who
-        // owns at least one vnode and isn't us). Frozen at construction
-        // — dynamic membership is deferred work.
-        let mut peer_set: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-        for v in 0..registry.vnode_count() {
-            let o = registry.owner(v);
-            if !o.is_unassigned() && o != self_id {
-                peer_set.insert(o.0);
-            }
-        }
-        let peers: Vec<ShufflePeerId> = peer_set.into_iter().collect();
+        // Distinct peers from the registry (everyone owning a vnode but us),
+        // frozen at construction — dynamic membership is deferred work.
+        let peers: Vec<ShufflePeerId> = peer_owners(&registry, self_id)
+            .iter()
+            .map(|n| n.0)
+            .collect();
 
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),

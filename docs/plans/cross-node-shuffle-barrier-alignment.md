@@ -43,14 +43,18 @@ Deadlock-free: every node fans out *before* it blocks on the drain, so the barri
 on the wire; and the `ShuffleReceiver`'s accept/per-peer tasks run on the **main** runtime, not
 the compute thread, so they keep delivering frames while compute awaits.
 
-### The one real subtlety: post-barrier frames
+### Post-barrier frames: precluded by full-membership commit (no buffer)
 
-The receiver multiplexes all peers into one queue, so after peer P's `Barrier(C)` we may still
-pull P's `VnodeData` for epoch **C+1** (P kept processing). Those must **not** enter checkpoint C.
-The receiver already attributes every frame to its peer id, so during alignment we **buffer**
-frames from already-barriered peers and re-feed them on the next cycle, routing into state only
-frames from not-yet-barriered peers. This is the Chandy–Lamport "channel state" rule; it is the
-part most easily gotten wrong.
+In general Chandy–Lamport, after peer P's `Barrier(C)` you can still pull P's epoch-`C+1`
+`VnodeData` (P kept processing), which must not enter checkpoint C — the "channel state" rule,
+normally handled by per-peer buffering. **This engine doesn't need it:** `wait_for_quorum`
+requires *every* live follower to ack (full-membership commit, not majority), and a node resumes
+the next epoch only after it observes `Commit` — which the leader sends only once all have acked
+(hence all have aligned). So no peer ships `C+1` while any node is still aligning `C`. We therefore
+just fold every `VnodeData` until aligned, with no post-barrier buffer. **Precondition, documented
+at the call site:** a future move to majority quorum (for straggler tolerance) would reintroduce
+the case and require per-peer post-barrier buffering. (An earlier draft buffered defensively; the
+review cut it as unreachable under the actual quorum policy.)
 
 ### One barrier per peer covers all stages
 
@@ -116,10 +120,11 @@ Checked against current systems and the recent literature; the approach is mains
   called from `PipelineCallback::capture_and_serialize_operator_state` (3 callers: leader
   `force_capture_and_checkpoint`, follower `maybe_follower_checkpoint`, and the barrier path).
   Alignment must run on the graph immediately before `snapshot_state`.
-- **Resume timing confirms the post-barrier buffer is load-bearing:** `follower_checkpoint` blocks
-  until **commit**, and the leader commits on a *quorum* of acks. With quorum < full membership, a
-  fast peer can commit and resume (ship epoch C+1 rows) while a straggler is still aligning C — so
-  C+1 frames can arrive mid-alignment and must be buffered, not folded into C (else double-count).
+- **Resume timing → no post-barrier buffer needed.** `follower_checkpoint` blocks until **commit**,
+  and `wait_for_quorum` requires *every* live follower (full membership, not a majority). A peer
+  resumes the next epoch only after `Commit`, which the leader sends only once all have acked (all
+  aligned) — so no peer ships epoch C+1 while any node is still aligning C. Alignment folds every
+  `VnodeData` with no buffer; a future majority quorum would change this (see the subtlety section).
 - **`staged` holdover must also be drained.** `drain_vnode_data_for` buckets other stages' frames
   into the receiver's `staged` map; a backpressured operator can leave pre-barrier rows there
   between cycles. Alignment must drain `staged` (new `ShuffleReceiver::drain_all_staged`) in
@@ -140,33 +145,57 @@ Checked against current systems and the recent literature; the approach is mains
 
 1. **Foundation + alignment mechanism — DONE 2026-05-30 (mechanism only; not yet wired).**
    `GraphOperator::ingest_shuffle` (cfg `cluster-unstable`; agg → `process_batch`, lookup-enrich →
-   `replay`); `OperatorGraph::align_shuffle_barriers` (fan-out + `BarrierTracker` drain + per-stage
-   routing via `ingest_to_stage`) + the post-barrier `pending_shuffle` buffer folded at the next
-   alignment; `ShuffleReceiver::drain_all_staged` to fold the per-stage holdover. Reuses
-   `fan_out_barrier` + `BarrierTracker` + `ShuffleMessage::Barrier` (no new transport). Verified by
+   `replay`); `OperatorGraph::align_shuffle_barriers` (fan-out via shared `state::peer_owners` +
+   `BarrierTracker` drain + per-stage routing via `ingest_to_stage`); `ShuffleReceiver::drain_all_staged`
+   to fold the per-stage holdover. No post-barrier buffer (precluded by full-membership commit; see
+   the subtlety section). Reuses `fan_out_barrier` + `BarrierTracker` + `ShuffleMessage::Barrier`
+   (no new transport). Verified by
    `align_shuffle_barriers_folds_peer_rows_then_aligns` (2-node loopback: a peer ships a row + its
    barrier; alignment folds the row into the target operator and completes on the peer's barrier).
    Clippy `-D warnings` clean with and without `cluster-unstable`. The method carries a temporary
    `#[allow(dead_code)]` + "wired in the follow-up" pointer until step 2 lands — it is exercised by
    the test, not dead, but has no production caller yet.
-2. **Wiring (NEXT — separate, reviewed change; chosen approach: TBD).** Call `align_shuffle_barriers`
-   before `snapshot_state` in `capture_and_serialize_operator_state`, threading the cross-cluster
-   `checkpoint_id`. Per the integration findings this needs either the **leader 2PC reorder**
-   (announce `Prepare` → align → capture) or a **separate pre-2PC align round** to avoid leader
-   deadlock — the deliberate, sign-off-gated protocol change. Removes the `#[allow(dead_code)]`.
+2. **Wiring (NEXT — separate, reviewed change). Recommendation: the leader 2PC reorder
+   (Prepare-triggered alignment), not a separate round.** Call `align_shuffle_barriers` before
+   `snapshot_state` in `capture_and_serialize_operator_state`, threading the cross-cluster
+   `checkpoint_id` (leader: generated at announce; follower: `ann.checkpoint_id`). Hoist the leader's
+   `Prepare` announce ahead of capture so the flow is **announce `Prepare` → align → capture → await
+   quorum** (followers already do **observe `Prepare` → align → capture → ack**). Removes the
+   `#[allow(dead_code)]`. Rationale below.
 3. **Recovery safety:** confirm ingested-at-checkpoint rows restore without loss or double-count.
    With alignment the origin's offset-advance and the owner's ingest land in the same checkpoint, so
    no double-count (agg) and idempotent replay (lookup) — to be proven with a restore test.
 4. **Test:** a 2-node harness test that ships rows A→B, checkpoints mid-flight, restores, and
    asserts no row loss (and no duplication) across the shuffle boundary. (Needs step 2 wired.)
 
+## Phase 2 recommendation: reorder (Prepare-triggered), not a separate round
+
+Grounded in the architecture + how production systems do it:
+
+- **It's how real systems work.** In Flink/RisingWave/Arroyo the *checkpoint-coordination signal*
+  is what triggers barrier propagation + alignment at exchanges — there is no second coordination
+  round. Here the cross-cluster signal is the 2PC `Prepare` announcement; making it trigger the
+  shuffle barrier fan-out + alignment makes the shuffle barrier the exact cross-node analog of
+  Flink's in-band barrier. One coordination flow, reusing the existing `Prepare`/ack/`Commit` 2PC.
+- **A separate pre-2PC align round is a redundant second protocol** — extra round-trips and a
+  parallel coordination mechanism duplicating what the 2PC already does. It only looked "safer"
+  because it avoids editing the 2PC; in aggregate it is *more* moving parts, not fewer.
+- **The reorder is localized and is exactly what removes the deadlock.** The only change is hoisting
+  the leader's `Prepare` announce ahead of capture; the deadlock (leader blocks on follower barriers
+  before followers see `Prepare`) is resolved precisely by announcing first. Followers are already
+  `Prepare`-triggered.
+- **Preserves the simplifications above.** Full-membership commit (no post-barrier buffer) and the
+  per-node-pair single barrier both still hold under the reorder. If straggler tolerance later
+  motivates majority quorum / unaligned checkpoints (per CheckMate / Flink FLIP-76), that is a
+  separate, larger change — and *then* the post-barrier buffer returns.
+
 ## Risks / open questions
 
-- **Agg double-count on replay.** If a pre-C row is both ingested into A's snapshot *and* re-fed
-  by source-offset replay on restore, the additive agg double-counts. The fix hinges on whether
-  source offsets are advanced before or after the shipped row is accounted — Phase 3 must settle
-  this (likely: the shuffled row's *origin* source offset must not commit until the row is
-  durably in the owner's snapshot; or the agg keys dedup). This is the crux correctness question.
+- **Agg double-count — resolved by alignment, not an open risk.** Alignment makes the origin's
+  offset-advance and the owner's ingest land in the *same* checkpoint: A sends a row before it fans
+  out `Barrier(C)`, so B folds it before B's C-snapshot while A's C-snapshot commits the offset past
+  it. Restore from C → A doesn't re-read it, B has it. No double-count; lookup replay is idempotent
+  besides. (Phase 3 still proves this with a restore test.)
 - **Alignment latency** stalls the checkpoint until the slowest peer fans out — bounded by the
   checkpoint cadence; acceptable, but a hung peer needs a timeout (fail the checkpoint, retry).
 - **Interaction with lookup-enrich's async worker:** in-flight fetches are already checkpointed;

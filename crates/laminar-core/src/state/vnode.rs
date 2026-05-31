@@ -242,6 +242,19 @@ pub fn owned_vnodes(registry: &VnodeRegistry, owner: NodeId) -> Vec<u32> {
         .collect()
 }
 
+/// Distinct assigned nodes other than `self_id`, sorted by id — the peer set a
+/// node fans checkpoint barriers and shuffle data out to.
+#[must_use]
+pub fn peer_owners(registry: &VnodeRegistry, self_id: NodeId) -> Vec<NodeId> {
+    let mut peers: Vec<NodeId> = (0..registry.vnode_count())
+        .map(|v| registry.owner(v))
+        .filter(|o| !o.is_unassigned() && *o != self_id)
+        .collect();
+    peers.sort_unstable();
+    peers.dedup();
+    peers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

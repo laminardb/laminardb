@@ -274,13 +274,6 @@ pub(crate) struct OperatorGraph {
     /// pre-aggregate rows can be hash-routed to vnode owners.
     #[cfg(feature = "cluster-unstable")]
     cluster_shuffle: Option<crate::operator::sql_query::ClusterShuffleConfig>,
-    /// Shuffle frames pulled during checkpoint barrier alignment that belong to
-    /// the *next* epoch (a peer raced ahead) — folded into state at the start of
-    /// the next alignment. See `align_shuffle_barriers`.
-    #[cfg(feature = "cluster-unstable")]
-    #[allow(dead_code)]
-    // wired into the checkpoint path in Phase 2 (see docs/plans/cross-node-shuffle-barrier-alignment.md)
-    pending_shuffle: Vec<(String, RecordBatch)>,
 }
 
 impl OperatorGraph {
@@ -307,8 +300,6 @@ impl OperatorGraph {
             max_state_bytes: None,
             #[cfg(feature = "cluster-unstable")]
             cluster_shuffle: None,
-            #[cfg(feature = "cluster-unstable")]
-            pending_shuffle: Vec::new(),
             ctx,
             prom: None,
             lookup_registry: None,
@@ -1759,18 +1750,21 @@ impl OperatorGraph {
         Ok(())
     }
 
-    /// Chandy–Lamport barrier alignment on the cross-node shuffle, run just
-    /// before `snapshot_state` so the snapshot captures every pre-checkpoint row
-    /// shipped by a peer. Fans out `Barrier(checkpoint_id)` to peers, then drains
-    /// the receiver until every peer's barrier is observed: pre-barrier
-    /// `VnodeData` folds into operator state via `ingest_shuffle`; a frame from a
-    /// peer that already sent its barrier (next-epoch data) is buffered and folded
-    /// at the start of the next alignment. A no-op when there is no cross-node
+    /// Chandy–Lamport alignment of the cross-node shuffle, run just before
+    /// `snapshot_state` so the snapshot captures every pre-checkpoint row a peer
+    /// shipped. Fans out `Barrier(checkpoint_id)` to peers, then drains the
+    /// receiver — folding each `VnodeData` into its operator via `ingest_shuffle`
+    /// — until every peer's barrier is observed. No-op without a cross-node
     /// shuffle. See `docs/plans/cross-node-shuffle-barrier-alignment.md`.
     ///
+    /// Relies on **full-membership commit** (`wait_for_quorum` requires every
+    /// live follower): no peer resumes the next epoch until all have aligned, so
+    /// no next-epoch frame can arrive mid-alignment. A move to majority quorum
+    /// would reintroduce that case and need per-peer post-barrier buffering.
+    ///
     /// # Errors
-    /// Fails the checkpoint (caller retries) if alignment times out or the
-    /// receiver closes — the deliberate degradation under a straggling peer.
+    /// Fails the checkpoint (caller retries) on timeout or a closed receiver —
+    /// the deliberate degradation under a straggling peer.
     #[cfg(feature = "cluster-unstable")]
     #[allow(dead_code)] // wired into the checkpoint path in Phase 2
     pub(crate) async fn align_shuffle_barriers(
@@ -1786,43 +1780,31 @@ impl OperatorGraph {
         let Some(cfg) = self.cluster_shuffle.clone() else {
             return Ok(());
         };
-
-        // Frames buffered as "next epoch" during the previous checkpoint are this
-        // checkpoint's data — fold them in before we snapshot.
-        for (stage, batch) in std::mem::take(&mut self.pending_shuffle) {
-            self.ingest_to_stage(&stage, batch, watermark).await?;
-        }
-
-        // Peers: every other node that owns a vnode (frozen from the registry,
-        // matching the aggregate shuffle's view).
-        let mut peer_set: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-        for v in 0..cfg.registry.vnode_count() {
-            let owner = cfg.registry.owner(v);
-            if !owner.is_unassigned() && owner != cfg.self_id {
-                peer_set.insert(owner.0);
-            }
-        }
-        let peers: Vec<u64> = peer_set.into_iter().collect();
+        let peers = laminar_core::state::peer_owners(&cfg.registry, cfg.self_id);
         if peers.is_empty() {
             return Ok(()); // no cross-node shuffle to align
         }
 
-        // Rows already pulled into the receiver's per-stage holdover are pre-barrier.
+        // Rows already pulled into the receiver's per-stage holdover are
+        // pre-barrier (the per-cycle drain carries no barriers).
         for (stage, batch) in cfg.receiver.drain_all_staged() {
             self.ingest_to_stage(&stage, batch, watermark).await?;
         }
 
+        let peer_ids: Vec<u64> = peers.iter().map(|n| n.0).collect();
         let barrier = CheckpointBarrier::new(checkpoint_id, 0);
         cfg.sender
-            .fan_out_barrier(&peers, barrier)
+            .fan_out_barrier(&peer_ids, barrier)
             .await
             .map_err(|e| DbError::Pipeline(format!("shuffle barrier fan-out: {e}")))?;
 
         let tracker = BarrierTracker::new(peers.len() + 1);
-        let peer_port: FxHashMap<u64, usize> =
-            peers.iter().enumerate().map(|(i, &p)| (p, i + 1)).collect();
+        let peer_port: FxHashMap<u64, usize> = peers
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.0, i + 1))
+            .collect();
         tracker.observe(0, barrier); // our own input
-        let mut barriered: FxHashSet<u64> = FxHashSet::default();
 
         loop {
             match tokio::time::timeout(ALIGN_TIMEOUT, cfg.receiver.recv()).await {
@@ -1839,19 +1821,14 @@ impl OperatorGraph {
                 Ok(Some((from, ShuffleMessage::Barrier(b))))
                     if b.checkpoint_id == checkpoint_id =>
                 {
-                    barriered.insert(from);
                     if let Some(&port) = peer_port.get(&from) {
                         if tracker.observe(port, b).is_some() {
                             break; // all peers aligned
                         }
                     }
                 }
-                Ok(Some((from, ShuffleMessage::VnodeData(stage, _vnode, batch)))) => {
-                    if barriered.contains(&from) {
-                        self.pending_shuffle.push((stage, batch)); // next epoch
-                    } else {
-                        self.ingest_to_stage(&stage, batch, watermark).await?;
-                    }
+                Ok(Some((_from, ShuffleMessage::VnodeData(stage, _vnode, batch)))) => {
+                    self.ingest_to_stage(&stage, batch, watermark).await?;
                 }
                 Ok(Some(_)) => {} // Hello / Close / stale barrier
             }
