@@ -174,6 +174,8 @@ pub fn create_streaming_context_with_validator(mode: StreamingValidatorMode) -> 
         let mut rules: Vec<
             Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>,
         > = vec![Arc::new(StreamingPhysicalValidator::new(mode))];
+        #[cfg(feature = "cluster-unstable")]
+        rules.push(Arc::new(cluster_repartition::DistributedJoinRule));
         rules.extend(default_state.physical_optimizers().iter().cloned());
 
         let state = SessionStateBuilder::new()

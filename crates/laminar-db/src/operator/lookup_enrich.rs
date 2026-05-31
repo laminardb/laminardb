@@ -801,7 +801,7 @@ impl GraphOperator for LookupEnrichOperator {
     }
 
     #[cfg(feature = "cluster-unstable")]
-    async fn ingest_shuffle(&mut self, batch: RecordBatch, watermark: i64) -> Result<(), DbError> {
+    async fn ingest_shuffle(&mut self, _stage: &str, batch: RecordBatch, watermark: i64) -> Result<(), DbError> {
         // Peer-shipped rows are already owned by this node. Queue them on the
         // replay path — which bypasses the shuffle and is itself checkpointed —
         // so they enter this snapshot and re-ingest idempotently on restore.

@@ -479,3 +479,132 @@ async fn dispatch_inbound(
         }
     }
 }
+
+#[cfg(feature = "cluster-unstable")]
+use datafusion::physical_plan::joins::HashJoinExec;
+#[cfg(feature = "cluster-unstable")]
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+#[cfg(feature = "cluster-unstable")]
+use datafusion_common::config::ConfigOptions;
+
+#[cfg(feature = "cluster-unstable")]
+static CLUSTER_CONTEXT: parking_lot::RwLock<Option<ClusterContext>> = parking_lot::RwLock::new(None);
+
+#[cfg(feature = "cluster-unstable")]
+#[derive(Clone)]
+struct ClusterContext {
+    registry: Arc<VnodeRegistry>,
+    sender: Arc<ShuffleSender>,
+    receiver: Arc<ShuffleReceiver>,
+    self_id: NodeId,
+}
+
+#[cfg(feature = "cluster-unstable")]
+/// Set the global cluster context for the distributed physical optimizer rules.
+pub fn set_cluster_context(
+    registry: Arc<VnodeRegistry>,
+    sender: Arc<ShuffleSender>,
+    receiver: Arc<ShuffleReceiver>,
+    self_id: NodeId,
+) {
+    *CLUSTER_CONTEXT.write() = Some(ClusterContext {
+        registry,
+        sender,
+        receiver,
+        self_id,
+    });
+}
+
+#[cfg(feature = "cluster-unstable")]
+#[derive(Debug)]
+/// Physical optimizer rule that wraps HashJoinExec inputs in ClusterRepartitionExec.
+pub struct DistributedJoinRule;
+
+#[cfg(feature = "cluster-unstable")]
+impl PhysicalOptimizerRule for DistributedJoinRule {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let ctx_opt = CLUSTER_CONTEXT.read().clone();
+        let Some(ctx) = ctx_opt else {
+            return Ok(plan);
+        };
+        optimize_plan(plan, &ctx.registry, &ctx.sender, &ctx.receiver, ctx.self_id)
+    }
+
+    fn name(&self) -> &str {
+        "DistributedJoinRule"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "cluster-unstable")]
+fn optimize_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    registry: &Arc<VnodeRegistry>,
+    sender: &Arc<ShuffleSender>,
+    receiver: &Arc<ShuffleReceiver>,
+    self_id: NodeId,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let new_children: Result<Vec<Arc<dyn ExecutionPlan>>> = plan
+        .children()
+        .into_iter()
+        .map(|child| optimize_plan(child.clone(), registry, sender, receiver, self_id))
+        .collect();
+    let new_children = new_children?;
+
+    if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
+        let left = new_children[0].clone();
+        let right = new_children[1].clone();
+
+        let mut left_keys = Vec::new();
+        let mut right_keys = Vec::new();
+        for (l_col, r_col) in hash_join.on() {
+            if let Some(col) = l_col.as_any().downcast_ref::<datafusion::physical_expr::expressions::Column>() {
+                left_keys.push(col.index());
+            } else {
+                return Err(datafusion::error::DataFusionError::Internal(
+                    "HashJoinExec: left key is not a Column expression".to_string()
+                ));
+            }
+            if let Some(col) = r_col.as_any().downcast_ref::<datafusion::physical_expr::expressions::Column>() {
+                right_keys.push(col.index());
+            } else {
+                return Err(datafusion::error::DataFusionError::Internal(
+                    "HashJoinExec: right key is not a Column expression".to_string()
+                ));
+            }
+        }
+
+        let new_left = Arc::new(ClusterRepartitionExec::try_new(
+            left,
+            left_keys,
+            Arc::clone(registry),
+            Arc::clone(sender),
+            Arc::clone(receiver),
+            self_id,
+        )?);
+
+        let new_right = Arc::new(ClusterRepartitionExec::try_new(
+            right,
+            right_keys,
+            Arc::clone(registry),
+            Arc::clone(sender),
+            Arc::clone(receiver),
+            self_id,
+        )?);
+
+        return plan.clone().with_new_children(vec![new_left, new_right]);
+    }
+
+    if new_children.is_empty() {
+        Ok(plan)
+    } else {
+        plan.with_new_children(new_children)
+    }
+}

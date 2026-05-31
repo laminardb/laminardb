@@ -292,6 +292,12 @@ impl LaminarDB {
                 .with_config(session_config)
                 .with_default_features()
                 .with_query_planner(query_planner);
+            #[cfg(feature = "cluster-unstable")]
+            {
+                state_builder = state_builder.with_physical_optimizer_rule(Arc::new(
+                    laminar_sql::datafusion::cluster_repartition::DistributedJoinRule,
+                ));
+            }
             for rule in extra_optimizer_rules {
                 state_builder = state_builder.with_physical_optimizer_rule(Arc::clone(rule));
             }
@@ -381,6 +387,7 @@ impl LaminarDB {
     #[cfg(feature = "cluster-unstable")]
     pub(crate) fn set_shuffle_sender(&self, sender: Arc<laminar_core::shuffle::ShuffleSender>) {
         *self.shuffle_sender.lock() = Some(sender);
+        self.update_sql_cluster_context();
     }
 
     #[cfg(feature = "cluster-unstable")]
@@ -389,6 +396,30 @@ impl LaminarDB {
         receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
     ) {
         *self.shuffle_receiver.lock() = Some(receiver);
+        self.update_sql_cluster_context();
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    fn update_sql_cluster_context(&self) {
+        if let (Some(registry), Some(sender), Some(receiver)) = (
+            self.vnode_registry.lock().as_ref(),
+            self.shuffle_sender.lock().as_ref(),
+            self.shuffle_receiver.lock().as_ref(),
+        ) {
+            let self_id = self
+                .cluster_controller
+                .lock()
+                .as_ref()
+                .map_or(laminar_core::state::NodeId(0), |c| {
+                    laminar_core::state::NodeId(c.instance_id().0)
+                });
+            laminar_sql::datafusion::cluster_repartition::set_cluster_context(
+                Arc::clone(registry),
+                Arc::clone(sender),
+                Arc::clone(receiver),
+                self_id,
+            );
+        }
     }
 
     #[cfg(feature = "cluster-unstable")]
@@ -633,6 +664,7 @@ impl LaminarDB {
         controller: Arc<laminar_core::cluster::control::ClusterController>,
     ) {
         *self.cluster_controller.lock() = Some(controller);
+        self.update_sql_cluster_context();
     }
 
     pub(crate) fn set_state_backend(&self, backend: Arc<dyn laminar_core::state::StateBackend>) {
@@ -641,6 +673,8 @@ impl LaminarDB {
 
     pub(crate) fn set_vnode_registry(&self, registry: Arc<laminar_core::state::VnodeRegistry>) {
         *self.vnode_registry.lock() = Some(registry);
+        #[cfg(feature = "cluster-unstable")]
+        self.update_sql_cluster_context();
     }
 
     /// The underlying `DataFusion` `SessionContext`.

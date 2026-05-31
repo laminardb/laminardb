@@ -66,6 +66,7 @@ pub(crate) trait GraphOperator: Send {
     #[cfg(feature = "cluster-unstable")]
     async fn ingest_shuffle(
         &mut self,
+        _stage: &str,
         _batch: RecordBatch,
         _watermark: i64,
     ) -> Result<(), DbError> {
@@ -1331,19 +1332,31 @@ impl OperatorGraph {
             // No time columns ⇒ plain equi-join → per-cycle batch join; with
             // time columns ⇒ interval join.
             if cfg.left_time_column.is_empty() && cfg.right_time_column.is_empty() {
-                return Box::new(operator::process_time_join::ProcessTimeJoinOperator::new(
+                #[cfg_attr(not(feature = "cluster-unstable"), allow(unused_mut))]
+                let mut op = operator::process_time_join::ProcessTimeJoinOperator::new(
                     name,
                     cfg.clone(),
                     projection_sql.map(Arc::from),
                     self.ctx.clone(),
-                ));
+                );
+                #[cfg(feature = "cluster-unstable")]
+                if let Some(ref sc) = self.cluster_shuffle {
+                    op.attach_cluster_shuffle(sc.clone());
+                }
+                return Box::new(op);
             }
-            return Box::new(operator::interval_join::IntervalJoinOperator::new(
+            #[cfg_attr(not(feature = "cluster-unstable"), allow(unused_mut))]
+            let mut op = operator::interval_join::IntervalJoinOperator::new(
                 name,
                 cfg.clone(),
                 projection_sql.map(Arc::from),
                 self.ctx.clone(),
-            ));
+            );
+            #[cfg(feature = "cluster-unstable")]
+            if let Some(ref sc) = self.cluster_shuffle {
+                op.attach_cluster_shuffle(sc.clone());
+            }
+            return Box::new(op);
         }
 
         // Non-windowed `now()` is only valid as the recognised retracting
@@ -1878,10 +1891,14 @@ impl OperatorGraph {
         batch: RecordBatch,
         watermark: i64,
     ) -> Result<(), DbError> {
-        if let Some(idx) = self.find_node(stage) {
+        let node_name = stage
+            .strip_suffix("::left")
+            .or_else(|| stage.strip_suffix("::right"))
+            .unwrap_or(stage);
+        if let Some(idx) = self.find_node(node_name) {
             self.nodes[idx]
                 .operator
-                .ingest_shuffle(batch, watermark)
+                .ingest_shuffle(stage, batch, watermark)
                 .await?;
         }
         Ok(())
@@ -2178,6 +2195,7 @@ mod tests {
         }
         async fn ingest_shuffle(
             &mut self,
+            _stage: &str,
             batch: RecordBatch,
             _watermark: i64,
         ) -> Result<(), DbError> {
