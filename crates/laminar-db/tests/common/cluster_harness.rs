@@ -220,6 +220,7 @@ impl ClusterEngineHarness {
                 Arc::clone(&node.vnode_registry),
                 Arc::clone(&node.rebalance_shutdown),
                 cfg,
+                Some(Arc::clone(&nh.controller)),
             );
             let controller = laminar_db::rebalance::spawn_rebalance_controller(
                 Arc::clone(&node.db),

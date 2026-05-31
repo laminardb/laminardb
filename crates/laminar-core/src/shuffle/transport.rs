@@ -600,17 +600,24 @@ mod grpc {
                         .as_any()
                         .downcast_ref::<arrow_array::UInt32Array>()
                         .ok_or_else(|| {
-                            tonic::Status::invalid_argument("vnode metadata column is not UInt32Array")
+                            tonic::Status::invalid_argument(
+                                "vnode metadata column is not UInt32Array",
+                            )
                         })?;
                     let row_vnodes: Vec<u32> = vnode_array.values().to_vec();
 
                     let mut projection: Vec<usize> = (0..schema.fields().len()).collect();
                     projection.remove(col_idx);
                     let batch_without_vnode = batch.project(&projection).map_err(|e| {
-                        tonic::Status::internal(format!("Failed to project out vnode metadata: {e}"))
+                        tonic::Status::internal(format!(
+                            "Failed to project out vnode metadata: {e}"
+                        ))
                     })?;
 
-                    let slices = crate::shuffle::routing::slice_batch_by_vnodes(&batch_without_vnode, &row_vnodes);
+                    let slices = crate::shuffle::routing::slice_batch_by_vnodes(
+                        &batch_without_vnode,
+                        &row_vnodes,
+                    );
                     let mut send_failed = false;
                     for (v, slice) in slices {
                         let sub_msg = ShuffleMessage::VnodeData(stage.clone(), v, slice);
@@ -622,7 +629,11 @@ mod grpc {
                     if send_failed {
                         break;
                     }
-                } else if tx.send((peer, ShuffleMessage::VnodeData(stage, default_vnode, batch))).await.is_err() {
+                } else if tx
+                    .send((peer, ShuffleMessage::VnodeData(stage, default_vnode, batch)))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             } else if tx.send((peer, msg)).await.is_err() {

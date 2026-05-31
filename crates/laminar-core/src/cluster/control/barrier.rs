@@ -187,7 +187,14 @@ struct GrpcState {
     #[allow(dead_code)]
     incoming_tx: crossfire::MAsyncTx<BarrierFlavor>,
     pending_acks: Arc<parking_lot::Mutex<FxHashMap<u64, tokio::sync::oneshot::Sender<BarrierAck>>>>,
-    clients: Arc<parking_lot::Mutex<FxHashMap<NodeId, barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>>>>,
+    clients: Arc<
+        parking_lot::Mutex<
+            FxHashMap<
+                NodeId,
+                barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>,
+            >,
+        >,
+    >,
     server_handle: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
@@ -244,19 +251,19 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         }
 
         match tokio::time::timeout(Duration::from_secs(30), rx).await {
-            Ok(Ok(ack)) => {
-                Ok(tonic::Response::new(barrier_v1::Ack {
-                    epoch: ack.epoch,
-                    ok: ack.ok,
-                    error: ack.error,
-                    local_watermark_ms: ack.local_watermark_ms,
-                }))
-            }
+            Ok(Ok(ack)) => Ok(tonic::Response::new(barrier_v1::Ack {
+                epoch: ack.epoch,
+                ok: ack.ok,
+                error: ack.error,
+                local_watermark_ms: ack.local_watermark_ms,
+            })),
             Ok(Err(_)) => Err(tonic::Status::internal("Ack sender dropped")),
             Err(_) => {
                 let mut guard = self.pending_acks.lock();
                 guard.remove(&req.epoch);
-                Err(tonic::Status::deadline_exceeded("Follower checkpoint prepare timed out"))
+                Err(tonic::Status::deadline_exceeded(
+                    "Follower checkpoint prepare timed out",
+                ))
             }
         }
     }
@@ -311,7 +318,14 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
 #[cfg(feature = "cluster-unstable")]
 async fn get_barrier_client(
     peer: NodeId,
-    pool: &Arc<parking_lot::Mutex<FxHashMap<NodeId, barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>>>>,
+    pool: &Arc<
+        parking_lot::Mutex<
+            FxHashMap<
+                NodeId,
+                barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>,
+            >,
+        >,
+    >,
     kv: &Arc<dyn ClusterKv>,
 ) -> Option<barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>> {
     {
@@ -375,15 +389,19 @@ impl BarrierCoordinator {
     /// # Errors
     /// Returns an error string on bind or socket address retrieval failures.
     #[cfg(feature = "cluster-unstable")]
-    pub async fn start_server(&self, bind_addr: std::net::SocketAddr) -> Result<std::net::SocketAddr, String> {
+    pub async fn start_server(
+        &self,
+        bind_addr: std::net::SocketAddr,
+    ) -> Result<std::net::SocketAddr, String> {
+        use barrier_v1::barrier_sync_server::BarrierSyncServer;
         use std::net::TcpListener;
         use tonic::transport::Server;
-        use barrier_v1::barrier_sync_server::BarrierSyncServer;
 
         let listener = TcpListener::bind(bind_addr).map_err(|e| e.to_string())?;
         let local_addr = listener.local_addr().map_err(|e| e.to_string())?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-        let tokio_listener = tokio::net::TcpListener::from_std(listener).map_err(|e| e.to_string())?;
+        let tokio_listener =
+            tokio::net::TcpListener::from_std(listener).map_err(|e| e.to_string())?;
 
         let (incoming_tx, incoming_rx) = crossfire::mpsc::bounded_async::<BarrierAnnouncement>(128);
         let pending_acks = Arc::new(parking_lot::Mutex::new(FxHashMap::default()));
@@ -413,7 +431,9 @@ impl BarrierCoordinator {
 
         *self.grpc.lock() = Some(grpc_state);
 
-        self.kv.write(BARRIER_ADDR_KEY, local_addr.to_string()).await;
+        self.kv
+            .write(BARRIER_ADDR_KEY, local_addr.to_string())
+            .await;
 
         Ok(local_addr)
     }
@@ -439,7 +459,9 @@ impl BarrierCoordinator {
                         let kv = Arc::clone(&self.kv);
                         let ann_clone = ann.clone();
                         futures.push(async move {
-                            if let Some(mut client) = get_barrier_client(peer, &clients_pool, &kv).await {
+                            if let Some(mut client) =
+                                get_barrier_client(peer, &clients_pool, &kv).await
+                            {
                                 match ann_clone.phase {
                                     Phase::Commit => {
                                         let req = barrier_v1::CommitRequest {
@@ -497,7 +519,10 @@ impl BarrierCoordinator {
                         notify: &state.incoming_rx_returned,
                         rx: Some(rx),
                     };
-                    let rx = guard.rx.as_mut().ok_or_else(|| "Receiver dropped".to_string())?;
+                    let rx = guard
+                        .rx
+                        .as_mut()
+                        .ok_or_else(|| "Receiver dropped".to_string())?;
                     match rx.recv().await {
                         Ok(ann) => return Ok(Some(ann)),
                         Err(_) => return Ok(None),
@@ -551,11 +576,16 @@ impl BarrierCoordinator {
         {
             let grpc_opt = self.grpc.lock().clone();
             if let Some(state) = grpc_opt {
-                let checkpoint_id = match self.kv.scan(ANNOUNCEMENT_KEY).await.into_iter()
-                    .find(|(_, json)| {
-                        serde_json::from_str::<BarrierAnnouncement>(json)
-                            .is_ok_and(|a| a.epoch == epoch)
-                    }) {
+                let checkpoint_id =
+                    match self
+                        .kv
+                        .scan(ANNOUNCEMENT_KEY)
+                        .await
+                        .into_iter()
+                        .find(|(_, json)| {
+                            serde_json::from_str::<BarrierAnnouncement>(json)
+                                .is_ok_and(|a| a.epoch == epoch)
+                        }) {
                         Some((_, json)) => serde_json::from_str::<BarrierAnnouncement>(&json)
                             .map_or(0, |a| a.checkpoint_id),
                         None => 0,
@@ -583,7 +613,12 @@ impl BarrierCoordinator {
                                 if ack.ok {
                                     Ok((peer, ack.local_watermark_ms))
                                 } else {
-                                    Err((peer, ack.error.unwrap_or_else(|| "Unknown prepare failure".to_string())))
+                                    Err((
+                                        peer,
+                                        ack.error.unwrap_or_else(|| {
+                                            "Unknown prepare failure".to_string()
+                                        }),
+                                    ))
                                 }
                             }
                             Ok(Err(e)) => Err((peer, e.to_string())),
@@ -735,39 +770,53 @@ mod tests {
                 assert_eq!(ann.checkpoint_id, 42);
                 assert_eq!(ann.phase, Phase::Prepare);
 
-                follower_coord.ack(&BarrierAck {
-                    epoch: 1,
-                    ok: true,
-                    error: None,
-                    local_watermark_ms: Some(100),
-                }).await.unwrap();
+                follower_coord
+                    .ack(&BarrierAck {
+                        epoch: 1,
+                        ok: true,
+                        error: None,
+                        local_watermark_ms: Some(100),
+                    })
+                    .await
+                    .unwrap();
 
                 let commit_ann = follower_coord.observe(NodeId(1)).await.unwrap().unwrap();
                 assert_eq!(commit_ann.phase, Phase::Commit);
                 assert_eq!(commit_ann.min_watermark_ms, Some(100));
             });
 
-            leader_coord.announce(&BarrierAnnouncement {
-                epoch: 1,
-                checkpoint_id: 42,
-                phase: Phase::Prepare,
-                flags: 0,
-                min_watermark_ms: None,
-            }).await.unwrap();
+            leader_coord
+                .announce(&BarrierAnnouncement {
+                    epoch: 1,
+                    checkpoint_id: 42,
+                    phase: Phase::Prepare,
+                    flags: 0,
+                    min_watermark_ms: None,
+                })
+                .await
+                .unwrap();
 
-            let outcome = leader_coord.wait_for_quorum(1, &[NodeId(2)], Duration::from_secs(5)).await;
+            let outcome = leader_coord
+                .wait_for_quorum(1, &[NodeId(2)], Duration::from_secs(5))
+                .await;
             match outcome {
-                QuorumOutcome::Reached { acks, min_follower_watermark_ms } => {
+                QuorumOutcome::Reached {
+                    acks,
+                    min_follower_watermark_ms,
+                } => {
                     assert_eq!(acks, vec![NodeId(2)]);
                     assert_eq!(min_follower_watermark_ms, Some(100));
 
-                    leader_coord.announce(&BarrierAnnouncement {
-                        epoch: 1,
-                        checkpoint_id: 42,
-                        phase: Phase::Commit,
-                        flags: 0,
-                        min_watermark_ms: min_follower_watermark_ms,
-                    }).await.unwrap();
+                    leader_coord
+                        .announce(&BarrierAnnouncement {
+                            epoch: 1,
+                            checkpoint_id: 42,
+                            phase: Phase::Commit,
+                            flags: 0,
+                            min_watermark_ms: min_follower_watermark_ms,
+                        })
+                        .await
+                        .unwrap();
                 }
                 other => panic!("expected Reached, got {other:?}"),
             }

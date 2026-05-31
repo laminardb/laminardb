@@ -74,10 +74,7 @@ pub fn slice_batch_by_vnode(
 /// Panics if `take` or rebuild fails — only on internal-invariant violations.
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
-pub fn slice_batch_by_vnodes(
-    batch: &RecordBatch,
-    row_vnodes: &[u32],
-) -> Vec<(u32, RecordBatch)> {
+pub fn slice_batch_by_vnodes(batch: &RecordBatch, row_vnodes: &[u32]) -> Vec<(u32, RecordBatch)> {
     if batch.num_rows() == 0 {
         return Vec::new();
     }
@@ -115,10 +112,7 @@ pub fn slice_batch_by_targets(
     row_vnodes: &[u32],
     registry: &VnodeRegistry,
     self_id: NodeId,
-) -> (
-    FxHashMap<u32, RecordBatch>,
-    FxHashMap<NodeId, RecordBatch>,
-) {
+) -> (FxHashMap<u32, RecordBatch>, FxHashMap<NodeId, RecordBatch>) {
     if batch.num_rows() == 0 {
         return (FxHashMap::default(), FxHashMap::default());
     }

@@ -129,6 +129,22 @@ pub struct LaminarDB {
     #[cfg(feature = "cluster-unstable")]
     pub(crate) assignment_snapshot_store:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>>,
+    /// Cluster-wide catalog manifest store (`catalog/manifest.json` on the
+    /// shared object store). Persisted on each successful checkpoint and
+    /// replayed at boot so a node rebuilds MVs/sources it lacks locally.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) catalog_manifest_store:
+        parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::CatalogManifestStore>>>,
+    /// Committed per-vnode state staged by [`Self::adopt_assignment_snapshot`]
+    /// for vnodes this node newly acquired in a rebalance. Operators that
+    /// adopt the per-vnode state backend drain this on their next cycle to
+    /// resume from the last committed epoch instead of empty state.
+    ///
+    /// `Arc`-wrapped so the same handle is shared with the `OperatorGraph`
+    /// (via [`ClusterShuffleConfig`](crate::operator::sql_query::ClusterShuffleConfig)),
+    /// which drains and applies the staged slices into live operators each cycle.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) rehydrated_vnode_state: Arc<parking_lot::Mutex<HashMap<u32, RehydratedVnode>>>,
     /// Hands `db.checkpoint()` requests to the pipeline callback so it can capture
     /// operator state before the manifest is packed. When `None`, falls back to
     /// the direct coordinator path — only valid for stateless engines.
@@ -175,6 +191,38 @@ pub(crate) fn filter_late_rows(
 }
 
 pub(crate) use laminar_core::time::parse_duration_str;
+
+/// Committed state for a single vnode, staged during rebalance adoption
+/// so newly-acquired vnodes resume from the last committed epoch.
+#[cfg(feature = "cluster-unstable")]
+#[derive(Debug, Clone)]
+pub struct RehydratedVnode {
+    /// Committed epoch the partial was read from.
+    pub epoch: u64,
+    /// The vnode's `partial.bin` bytes at `epoch`.
+    pub bytes: bytes::Bytes,
+}
+
+/// Summary of a single [`LaminarDB::adopt_assignment_snapshot`] call.
+///
+/// Returned so the rebalance control plane can log and meter what each
+/// adoption moved — in particular the vnodes this node gained and how
+/// much of their committed state it rehydrated from durable storage.
+#[cfg(feature = "cluster-unstable")]
+#[derive(Debug, Default)]
+pub struct SnapshotAdoption {
+    /// `false` when the snapshot was stale (≤ the current registry
+    /// version) or no registry was installed — nothing changed.
+    pub adopted: bool,
+    /// The snapshot version this call considered.
+    pub version: u64,
+    /// Vnodes this node owns now but did not before this rotation.
+    pub newly_acquired: Vec<u32>,
+    /// How many of `newly_acquired` had committed state read back.
+    pub rehydrated: usize,
+    /// Committed epoch the rehydration read from, if any.
+    pub rehydration_epoch: Option<u64>,
+}
 
 impl LaminarDB {
     /// Create an embedded in-memory database with default settings.
@@ -302,6 +350,10 @@ impl LaminarDB {
             decision_store: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster-unstable")]
             assignment_snapshot_store: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster-unstable")]
+            catalog_manifest_store: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster-unstable")]
+            rehydrated_vnode_state: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             force_ckpt_tx: parking_lot::Mutex::new(None),
             subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
             stream_schemas: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -355,45 +407,224 @@ impl LaminarDB {
         *self.assignment_snapshot_store.lock() = Some(store);
     }
 
+    /// Install the shared catalog manifest store. Enables catalog-manifest
+    /// persistence (on checkpoint) and boot-time replay.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) fn set_catalog_manifest_store(
+        &self,
+        store: Arc<laminar_core::cluster::control::CatalogManifestStore>,
+    ) {
+        *self.catalog_manifest_store.lock() = Some(store);
+    }
+
+    /// Publish this node's current catalog DDL to the shared
+    /// `catalog/manifest.json`. Best-effort and cluster-only — a failure is
+    /// logged, never propagated, since the manifest is an availability aid,
+    /// not a correctness gate. Called after each successful checkpoint.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) async fn persist_catalog_manifest(&self) {
+        let Some(store) = self.catalog_manifest_store.lock().clone() else {
+            return;
+        };
+        let entries: Vec<laminar_core::cluster::control::CatalogManifestEntry> = self
+            .connector_manager
+            .lock()
+            .ordered_ddl()
+            .into_iter()
+            .map(|(name, ddl)| laminar_core::cluster::control::CatalogManifestEntry { name, ddl })
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64);
+        let manifest = laminar_core::cluster::control::CatalogManifest {
+            // Wall-clock as a monotonic-in-practice diagnostic version; the
+            // object is overwritten in place, so the value is informational.
+            version: now_ms.unsigned_abs(),
+            updated_at_ms: now_ms,
+            entries,
+        };
+        if let Err(e) = store.save(&manifest).await {
+            tracing::warn!(error = %e, "catalog manifest persist failed");
+        }
+    }
+
+    /// Replay catalog DDL from the shared `catalog/manifest.json`, recreating
+    /// any object this node doesn't already have locally. Best-effort and
+    /// cluster-only; runs at boot before the pipeline starts so the operator
+    /// graph for rebalanced-in MVs exists. A per-entry replay failure is
+    /// logged and skipped — the node still serves the objects that did rebuild.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) async fn restore_catalog_from_manifest(&self) {
+        let Some(store) = self.catalog_manifest_store.lock().clone() else {
+            return;
+        };
+        let manifest = match store.load().await {
+            Ok(Some(m)) => m,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "catalog manifest load failed — skipping replay");
+                return;
+            }
+        };
+        for entry in &manifest.entries {
+            if self.catalog_object_exists(&entry.name) {
+                continue;
+            }
+            match self.execute(&entry.ddl).await {
+                Ok(_) => tracing::info!(name = %entry.name, "replayed catalog DDL from manifest"),
+                Err(e) => tracing::warn!(
+                    name = %entry.name, error = %e,
+                    "catalog manifest replay failed for object"
+                ),
+            }
+        }
+    }
+
+    /// Whether a catalog object with `name` is already registered locally
+    /// (any of source/sink/stream/table). Drives idempotent manifest replay.
+    #[cfg(feature = "cluster-unstable")]
+    fn catalog_object_exists(&self, name: &str) -> bool {
+        let mgr = self.connector_manager.lock();
+        mgr.sources().contains_key(name)
+            || mgr.sinks().contains_key(name)
+            || mgr.streams().contains_key(name)
+            || mgr.tables().contains_key(name)
+    }
+
     /// Adopt a new vnode assignment snapshot atomically across the registry,
-    /// state-backend fence, and coordinator. Idempotent for versions ≤ the
+    /// state-backend fence, and coordinator, then rehydrate committed state
+    /// for any vnodes this node newly acquired. Idempotent for versions ≤ the
     /// current registry version.
+    ///
+    /// Rehydration (the durable read of newly-acquired vnodes' partials) runs
+    /// *after* the coordinator lock is released so a slow object store can't
+    /// stall the checkpoint cadence; the recovered bytes are staged in
+    /// [`Self::rehydrated_vnode_state`] for operators to drain.
     #[cfg(feature = "cluster-unstable")]
     pub async fn adopt_assignment_snapshot(
         &self,
         snapshot: laminar_core::cluster::control::AssignmentSnapshot,
-    ) {
+    ) -> SnapshotAdoption {
         let Some(registry) = self.vnode_registry.lock().clone() else {
-            return;
+            return SnapshotAdoption::default();
         };
         if snapshot.version <= registry.assignment_version() {
-            return;
+            return SnapshotAdoption {
+                adopted: false,
+                version: snapshot.version,
+                ..SnapshotAdoption::default()
+            };
         }
         let vnode_count = registry.vnode_count();
         let new_assignment: Arc<[laminar_core::state::NodeId]> =
             snapshot.to_vnode_vec(vnode_count).into();
 
-        // Hold the coord mutex so registry + fence updates land between epochs.
+        let self_id = self
+            .cluster_controller
+            .lock()
+            .as_ref()
+            .map_or(laminar_core::state::NodeId(0), |c| {
+                laminar_core::state::NodeId(c.instance_id().0)
+            });
+
+        // Hold the coord mutex so registry + fence updates land between
+        // epochs. Snapshot the owned set on both sides of the swap to
+        // derive exactly which vnodes this node gained.
         let mut guard = self.coordinator.lock().await;
+        let old_owned = laminar_core::state::owned_vnodes(&registry, self_id);
         registry.set_assignment_and_version(new_assignment, snapshot.version);
+        let new_owned = laminar_core::state::owned_vnodes(&registry, self_id);
         if let Some(backend) = self.state_backend.lock().clone() {
             backend.set_authoritative_version(snapshot.version);
         }
         if let Some(coord) = guard.as_mut() {
             coord.set_assignment_version(snapshot.version);
-            let self_id = self
-                .cluster_controller
-                .lock()
-                .as_ref()
-                .map_or(laminar_core::state::NodeId(0), |c| {
-                    laminar_core::state::NodeId(c.instance_id().0)
-                });
-            coord.set_vnode_set(laminar_core::state::owned_vnodes(&registry, self_id));
+            coord.set_vnode_set(new_owned.clone());
             coord.set_gate_vnode_set((0..vnode_count).collect());
         }
         drop(guard);
 
-        tracing::info!(version = snapshot.version, "adopted assignment snapshot",);
+        // Newly-acquired vnodes = new \ old.
+        let old_set: std::collections::HashSet<u32> = old_owned.into_iter().collect();
+        let newly_acquired: Vec<u32> = new_owned
+            .into_iter()
+            .filter(|v| !old_set.contains(v))
+            .collect();
+
+        // Mark every newly-acquired vnode `Restoring` up front — before the
+        // (possibly slow) durable read below — so the operator suppresses
+        // emission for their keys from the moment the shuffle starts routing
+        // their rows here. Vnodes with no durable state are flipped back to
+        // `Active` immediately after the read; the ones we stage stay
+        // `Restoring` until the graph merges their state in.
+        if !newly_acquired.is_empty() {
+            registry.mark_restoring(&newly_acquired);
+        }
+
+        let mut adoption = SnapshotAdoption {
+            adopted: true,
+            version: snapshot.version,
+            newly_acquired: newly_acquired.clone(),
+            rehydrated: 0,
+            rehydration_epoch: None,
+        };
+
+        // Pull the last committed state for the gained vnodes off the
+        // shared durable backend so they don't resume from empty state.
+        // Clone the Arc out first so the (non-Send) lock guard is dropped
+        // before the rehydration await.
+        let backend = self.state_backend.lock().clone();
+        if let (false, Some(backend)) = (newly_acquired.is_empty(), backend) {
+            let report = crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
+                .rehydrate(&newly_acquired)
+                .await;
+            adoption.rehydrated = report.restored.len();
+            adoption.rehydration_epoch = report.epoch;
+            // Vnodes with no durable state to apply serve immediately — flip
+            // them back to `Active` so their emission isn't gated forever. The
+            // graph flips the staged ones once it merges their state in.
+            let no_state: Vec<u32> = newly_acquired
+                .iter()
+                .copied()
+                .filter(|v| !report.restored.contains_key(v))
+                .collect();
+            if !no_state.is_empty() {
+                registry.mark_active(&no_state);
+            }
+            if let Some(epoch) = report.epoch {
+                let mut staged = self.rehydrated_vnode_state.lock();
+                for (vnode, bytes) in report.restored {
+                    staged.insert(vnode, RehydratedVnode { epoch, bytes });
+                }
+            }
+        } else if !newly_acquired.is_empty() {
+            // No backend / nothing to rehydrate — clear the Restoring marks we
+            // optimistically set so emission isn't gated with no state coming.
+            registry.mark_active(&newly_acquired);
+        }
+
+        tracing::info!(
+            version = snapshot.version,
+            newly_acquired = adoption.newly_acquired.len(),
+            rehydrated = adoption.rehydrated,
+            rehydration_epoch = ?adoption.rehydration_epoch,
+            "adopted assignment snapshot",
+        );
+        adoption
+    }
+
+    /// Snapshot of committed per-vnode state staged for newly-acquired
+    /// vnodes during the most recent rebalance adoptions. Keyed by vnode.
+    /// Drained by operators that adopt the per-vnode state backend; exposed
+    /// for inspection and tests.
+    #[cfg(feature = "cluster-unstable")]
+    #[must_use]
+    pub fn rehydrated_vnode_state(&self) -> HashMap<u32, RehydratedVnode> {
+        self.rehydrated_vnode_state.lock().clone()
     }
 
     #[cfg(feature = "cluster-unstable")]
@@ -840,21 +1071,34 @@ impl LaminarDB {
                 retention_bytes,
                 ..
             } => {
-                self.handle_create_stream(
-                    name,
-                    query,
-                    emit_clause.as_ref(),
-                    query_sql,
-                    *retention_bytes,
-                )
-                .await
+                let result = self
+                    .handle_create_stream(
+                        name,
+                        query,
+                        emit_clause.as_ref(),
+                        query_sql,
+                        *retention_bytes,
+                    )
+                    .await?;
+                if let ExecuteResult::Ddl(ref info) = result {
+                    self.connector_manager
+                        .lock()
+                        .store_ddl(&info.object_name, sql);
+                }
+                Ok(result)
             }
             StreamingStatement::CreateContinuousQuery { .. }
             | StreamingStatement::CreateLookupTable(_)
             | StreamingStatement::DropLookupTable { .. } => self.handle_query(sql).await,
             StreamingStatement::Standard(stmt) => {
                 if let sqlparser::ast::Statement::CreateTable(ct) = stmt.as_ref() {
-                    self.handle_create_table(ct)
+                    let result = self.handle_create_table(ct)?;
+                    if let ExecuteResult::Ddl(ref info) = result {
+                        self.connector_manager
+                            .lock()
+                            .store_ddl(&info.object_name, sql);
+                    }
+                    Ok(result)
                 } else if let sqlparser::ast::Statement::Drop {
                     object_type: sqlparser::ast::ObjectType::Table,
                     names,
@@ -945,16 +1189,23 @@ impl LaminarDB {
                 query_sql,
                 ..
             } => {
-                self.handle_create_materialized_view(
-                    sql,
-                    name,
-                    query,
-                    emit_clause.clone(),
-                    *or_replace,
-                    *if_not_exists,
-                    query_sql,
-                )
-                .await
+                let result = self
+                    .handle_create_materialized_view(
+                        sql,
+                        name,
+                        query,
+                        emit_clause.clone(),
+                        *or_replace,
+                        *if_not_exists,
+                        query_sql,
+                    )
+                    .await?;
+                if let ExecuteResult::Ddl(ref info) = result {
+                    self.connector_manager
+                        .lock()
+                        .store_ddl(&info.object_name, sql);
+                }
+                Ok(result)
             }
             StreamingStatement::AlterSource { name, operation } => {
                 self.handle_alter_source(name, operation)
@@ -1818,29 +2069,38 @@ impl LaminarDB {
         // the manifest has an empty `operator_states` map and restart
         // loses everything the `IncrementalAggState` accumulators held.
         let tx = self.force_ckpt_tx.lock().clone();
-        if let Some(tx) = tx {
+        let result = if let Some(tx) = tx {
             let (reply_tx, reply_rx) = crossfire::oneshot::oneshot();
             tx.send(reply_tx).await.map_err(|_| {
                 DbError::Checkpoint(
                     "pipeline callback receiver closed — engine may be shutting down".into(),
                 )
             })?;
-            return reply_rx.await.map_err(|_| {
+            reply_rx.await.map_err(|_| {
                 DbError::Checkpoint("pipeline callback dropped oneshot before replying".into())
+            })?
+        } else {
+            // Fallback: no running pipeline (e.g., engine built but not yet
+            // started). Drive the coordinator directly. Operator state will
+            // be empty, but restart from this manifest is still well-defined
+            // because there's nothing to restore anyway.
+            let mut guard = self.coordinator.lock().await;
+            let coord = guard.as_mut().ok_or_else(|| {
+                DbError::Checkpoint("coordinator not initialized — call start() first".to_string())
             })?;
+            coord
+                .checkpoint(crate::checkpoint_coordinator::CheckpointRequest::default())
+                .await
+        };
+
+        // Refresh the shared catalog manifest on every successful checkpoint so
+        // a node joining later can rebuild this node's MVs/sources. Best-effort.
+        #[cfg(feature = "cluster-unstable")]
+        if matches!(&result, Ok(r) if r.success) {
+            self.persist_catalog_manifest().await;
         }
 
-        // Fallback: no running pipeline (e.g., engine built but not yet
-        // started). Drive the coordinator directly. Operator state will
-        // be empty, but restart from this manifest is still well-defined
-        // because there's nothing to restore anyway.
-        let mut guard = self.coordinator.lock().await;
-        let coord = guard.as_mut().ok_or_else(|| {
-            DbError::Checkpoint("coordinator not initialized — call start() first".to_string())
-        })?;
-        coord
-            .checkpoint(crate::checkpoint_coordinator::CheckpointRequest::default())
-            .await
+        result
     }
 
     /// Returns checkpoint performance statistics.

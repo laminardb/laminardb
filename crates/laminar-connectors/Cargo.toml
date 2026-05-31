@@ -14,7 +14,7 @@ description = "External system connectors for LaminarDB - Kafka, CDC, lookup tab
 laminar-core = { path = "../laminar-core", version = "0.23.0" }
 
 # Kafka
-rdkafka = { version = "0.39", features = ["cmake-build", "ssl-vendored"], optional = true }
+rdkafka = { version = "0.39", features = ["cmake-build", "ssl"], optional = true }
 arrow-avro = { version = "57.2", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
 

@@ -17,6 +17,7 @@ use crate::cluster::discovery::{NodeId, NodeInfo, NodeState};
 /// Facade composing the cluster-control primitives.
 pub struct ClusterController {
     instance_id: NodeId,
+    kv: Arc<dyn ClusterKv>,
     barrier: BarrierCoordinator,
     snapshot: Option<Arc<AssignmentSnapshotStore>>,
     members_rx: watch::Receiver<Vec<NodeInfo>>,
@@ -47,7 +48,8 @@ impl ClusterController {
     ) -> Self {
         Self {
             instance_id,
-            barrier: BarrierCoordinator::new(kv),
+            barrier: BarrierCoordinator::new(Arc::clone(&kv)),
+            kv,
             snapshot,
             members_rx,
             cluster_min_watermark: Arc::new(AtomicI64::new(i64::MIN)),
@@ -137,12 +139,31 @@ impl ClusterController {
         self.members_rx.clone()
     }
 
+    /// Write the current assignment snapshot version to gossip KV.
+    pub async fn announce_snapshot_version(&self, version: u64) {
+        self.kv
+            .write("control:snapshot-version", version.to_string())
+            .await;
+    }
+
+    /// Read the snapshot version from all peers in gossip KV and return the maximum version.
+    pub async fn read_snapshot_version(&self) -> Option<u64> {
+        let scans = self.kv.scan("control:snapshot-version").await;
+        scans
+            .into_iter()
+            .filter_map(|(_, v)| v.parse::<u64>().ok())
+            .max()
+    }
+
     /// Start the direct gRPC barrier sync server.
     ///
     /// # Errors
     /// Propagates [`BarrierCoordinator::start_server`] errors.
     #[cfg(feature = "cluster-unstable")]
-    pub async fn start_barrier_server(&self, bind_addr: std::net::SocketAddr) -> Result<std::net::SocketAddr, String> {
+    pub async fn start_barrier_server(
+        &self,
+        bind_addr: std::net::SocketAddr,
+    ) -> Result<std::net::SocketAddr, String> {
         self.barrier.start_server(bind_addr).await
     }
 

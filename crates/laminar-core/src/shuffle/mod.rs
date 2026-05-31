@@ -11,7 +11,9 @@ pub mod transport;
 
 pub use barrier_tracker::BarrierTracker;
 pub use message::ShuffleMessage;
-pub use routing::{row_vnodes, slice_batch_by_vnode, slice_batch_by_vnodes, slice_batch_by_targets};
+pub use routing::{
+    row_vnodes, slice_batch_by_targets, slice_batch_by_vnode, slice_batch_by_vnodes,
+};
 #[cfg(feature = "cluster-unstable")]
 pub use transport::SHUFFLE_ADDR_KEY;
 pub use transport::{ShufflePeerId, ShuffleReceiver, ShuffleSender};

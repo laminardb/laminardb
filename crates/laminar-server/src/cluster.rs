@@ -457,6 +457,18 @@ pub async fn start_cluster(
         builder = builder.assignment_snapshot_store(snap_store);
     }
 
+    // Install the catalog manifest store on the same shared object store, so
+    // a booting node can replay catalog DDL (MVs/sources) it lacks and each
+    // successful checkpoint republishes the catalog for nodes that join later.
+    if let Some(catalog_os) = config.state.build_object_store().map_err(|e| {
+        ClusterStartupError::EngineConstruction(format!("catalog manifest store: {e}"))
+    })? {
+        let catalog_store = Arc::new(laminar_core::cluster::control::CatalogManifestStore::new(
+            catalog_os,
+        ));
+        builder = builder.catalog_manifest_store(catalog_store);
+    }
+
     // Shuffle fabric. ShuffleReceiver publishes its bound address into
     // the gossip KV so peer ShuffleSenders discover it on first send.
     // Without this wiring, streaming aggregates never cross node
@@ -519,6 +531,7 @@ pub async fn start_cluster(
             Arc::clone(&vnode_registry),
             Arc::clone(&rebalance_shutdown),
             cfg,
+            Some(Arc::clone(controller)),
         ));
         rebalance_tasks.push(laminar_db::rebalance::spawn_rebalance_controller(
             Arc::clone(&db),

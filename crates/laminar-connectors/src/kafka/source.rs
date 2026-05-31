@@ -122,6 +122,21 @@ pub struct KafkaSource {
     /// Updated once per `poll_batch()` cycle (not per message).
     offset_snapshot: Arc<Mutex<OffsetTracker>>,
 
+    /// Cluster vnode assignment, set in cluster mode via
+    /// [`set_vnode_assignment`](SourceConnector::set_vnode_assignment). When
+    /// present, `open()` uses engine-controlled manual `assign()` of the
+    /// partitions this node owns (`partition % vnode_count`) instead of
+    /// consumer-group `subscribe()`, and the reader re-binds when the
+    /// assignment version rotates. `None` → legacy broker-driven subscribe.
+    vnode_assignment: Option<(
+        Arc<laminar_core::state::VnodeRegistry>,
+        laminar_core::state::NodeId,
+    )>,
+    /// `(topic, partition_count)` captured at `open()` when vnode-assigned, so
+    /// the reader can recompute owned partitions on assignment rotation without
+    /// re-fetching metadata (partition counts are stable).
+    vnode_topic_meta: Vec<(Arc<str>, i32)>,
+
     /// Last Avro writer schema from the schema registry, used to diff
     /// successive versions for evolution detection.
     last_avro_schema: Option<SchemaRef>,
@@ -232,6 +247,8 @@ impl KafkaSource {
             high_watermarks_rx: None,
             reader_paused: Arc::new(AtomicBool::new(false)),
             offset_snapshot: Arc::new(Mutex::new(OffsetTracker::new())),
+            vnode_assignment: None,
+            vnode_topic_meta: Vec::new(),
             last_avro_schema: None,
             poll_payload_buf: Vec::new(),
             poll_payload_offsets: Vec::new(),
@@ -404,6 +421,14 @@ impl KafkaSource {
         });
 
         // -- Reader task: message consumption, backpressure, revoke pruning --
+        // Engine-controlled re-assignment inputs (cluster mode; `None` otherwise).
+        let vnode_reassign = self
+            .vnode_assignment
+            .as_ref()
+            .map(|(r, s)| (Arc::clone(r), *s));
+        let vnode_topic_meta = self.vnode_topic_meta.clone();
+        let reassign_snapshot = Arc::clone(&self.offset_snapshot);
+        let reassign_default_offset = startup_default_offset(&self.config.startup_mode);
         let mut reader_shutdown = shutdown_rx;
         let reader_handle = tokio::spawn(async move {
             let mut cached_topic: Arc<str> = Arc::from("");
@@ -411,8 +436,44 @@ impl KafkaSource {
                 std::collections::HashSet::new();
             let mut is_paused = false;
             let mut last_revoke_gen: u64 = 0;
+            // Track the vnode assignment generation; open() already assigned at
+            // the current version, so only a later rotation triggers a rebind.
+            let mut last_assignment_version = vnode_reassign
+                .as_ref()
+                .map_or(0, |(r, _)| r.assignment_version());
 
             loop {
+                // Engine-controlled re-assignment: when the vnode assignment
+                // rotates, rebind to the partitions this node now owns, seeking
+                // each to its tracked offset (manual assign gets no broker
+                // rebalance callback to do this for us).
+                if let Some((registry, self_id)) = &vnode_reassign {
+                    let version = registry.assignment_version();
+                    if version != last_assignment_version {
+                        last_assignment_version = version;
+                        let offsets = lock_or_recover(&reassign_snapshot).clone();
+                        let tpl = build_vnode_assignment_tpl(
+                            registry,
+                            *self_id,
+                            &vnode_topic_meta,
+                            &offsets,
+                            reassign_default_offset,
+                        );
+                        match consumer.assign(&tpl) {
+                            Ok(()) => info!(
+                                version,
+                                owned_partitions = tpl.count(),
+                                "Kafka source re-assigned partitions after vnode rotation"
+                            ),
+                            Err(e) => warn!(
+                                version,
+                                error = %e,
+                                "Kafka source partition re-assignment failed"
+                            ),
+                        }
+                    }
+                }
+
                 // Prune seen_partitions on revoke so HWM task stops querying them.
                 let current_gen = revoke_generation.load(Ordering::Acquire);
                 if current_gen != last_revoke_gen {
@@ -557,9 +618,64 @@ impl KafkaSource {
     }
 }
 
+/// Build the manual-`assign()` partition list for a vnode-assigned Kafka
+/// source: the partitions this node owns (`partition % vnode_count`), each
+/// positioned at its checkpointed offset + 1 when known (resume after the last
+/// consumed record), else `default_offset`.
+fn build_vnode_assignment_tpl(
+    registry: &laminar_core::state::VnodeRegistry,
+    self_id: laminar_core::state::NodeId,
+    topic_meta: &[(Arc<str>, i32)],
+    offsets: &OffsetTracker,
+    default_offset: rdkafka::Offset,
+) -> TopicPartitionList {
+    let mut tpl = TopicPartitionList::new();
+    for (topic, count) in topic_meta {
+        for partition in crate::partition_assignment::owned_partitions(*count, registry, self_id) {
+            let offset = match offsets.get(topic.as_ref(), partition) {
+                Some(o) => rdkafka::Offset::Offset(o + 1),
+                None => default_offset,
+            };
+            if let Err(e) = tpl.add_partition_offset(topic.as_ref(), partition, offset) {
+                warn!(
+                    topic = %topic, partition, error = %e,
+                    "failed to add vnode-owned partition to assignment"
+                );
+            }
+        }
+    }
+    tpl
+}
+
+/// rdkafka start position for a partition that has no checkpointed offset under
+/// engine-controlled assignment, derived from the configured startup mode.
+fn startup_default_offset(mode: &StartupMode) -> rdkafka::Offset {
+    match mode {
+        StartupMode::Earliest => rdkafka::Offset::Beginning,
+        StartupMode::Latest => rdkafka::Offset::End,
+        // GroupOffsets resumes from committed offsets (falling back to
+        // `auto.offset.reset`); Specific/Timestamp aren't combined with vnode
+        // assignment, so they also defer to the stored position.
+        _ => rdkafka::Offset::Stored,
+    }
+}
+
 #[async_trait]
 #[allow(clippy::too_many_lines)] // poll_batch has legitimate complexity (backpressure + deser + poison pill fallback)
 impl SourceConnector for KafkaSource {
+    fn set_vnode_assignment(
+        &mut self,
+        registry: Arc<laminar_core::state::VnodeRegistry>,
+        self_id: laminar_core::state::NodeId,
+    ) {
+        info!(
+            self_id = self_id.0,
+            vnode_count = registry.vnode_count(),
+            "Kafka source: engine-controlled partition→vnode assignment enabled"
+        );
+        self.vnode_assignment = Some((registry, self_id));
+    }
+
     async fn open(&mut self, config: &ConnectorConfig) -> Result<(), ConnectorError> {
         self.state = ConnectorState::Initializing;
 
@@ -633,120 +749,185 @@ impl SourceConnector for KafkaSource {
                 ConnectorError::ConnectionFailed(format!("failed to create consumer: {e}"))
             })?;
 
-        // Subscribe to topics (list or regex pattern).
-        match &kafka_config.subscription {
-            TopicSubscription::Topics(topics) => {
-                let topic_refs: Vec<&str> = topics.iter().map(String::as_str).collect();
-                consumer.subscribe(&topic_refs).map_err(|e| {
-                    ConnectorError::ConnectionFailed(format!("failed to subscribe: {e}"))
-                })?;
-            }
-            TopicSubscription::Pattern(pattern) => {
-                // rdkafka requires a ^ prefix for regex patterns
-                let regex_pattern = if pattern.starts_with('^') {
-                    pattern.clone()
-                } else {
-                    format!("^{pattern}")
-                };
-                consumer.subscribe(&[&regex_pattern]).map_err(|e| {
-                    ConnectorError::ConnectionFailed(format!("failed to subscribe to pattern: {e}"))
-                })?;
-            }
-        }
-
-        // Apply startup mode positioning before starting the reader.
-        match &kafka_config.startup_mode {
-            // GroupOffsets/Earliest/Latest are handled via auto.offset.reset in to_rdkafka_config().
-            StartupMode::GroupOffsets | StartupMode::Earliest | StartupMode::Latest => {}
-            StartupMode::SpecificOffsets(offsets) => {
-                let mut tpl = rdkafka::TopicPartitionList::new();
-                let topics = match &kafka_config.subscription {
-                    TopicSubscription::Topics(t) => t.clone(),
-                    TopicSubscription::Pattern(_) => Vec::new(),
-                };
-                for topic in &topics {
-                    for (&partition, &offset) in offsets {
-                        if let Err(e) = tpl.add_partition_offset(
-                            topic,
-                            partition,
-                            rdkafka::Offset::Offset(offset),
-                        ) {
-                            tracing::warn!(
-                                %topic, partition, offset,
-                                error = %e,
-                                "failed to add specific offset to partition list"
-                            );
-                        }
-                    }
+        // Engine-controlled partition assignment (cluster mode): bind each
+        // partition to a vnode (`partition % vnode_count`) and manually
+        // `assign()` only those this node owns, instead of consumer-group
+        // `subscribe()`. Manual assign bypasses the broker rebalance callbacks,
+        // so partitions are positioned here directly (checkpointed offset, else
+        // the startup default). The reader loop re-binds on assignment rotation.
+        let vnode = self
+            .vnode_assignment
+            .as_ref()
+            .map(|(r, s)| (Arc::clone(r), *s));
+        let vnode_assigned = if let Some((registry, self_id)) = vnode {
+            if let TopicSubscription::Topics(topics) = &kafka_config.subscription {
+                let mut topic_meta: Vec<(Arc<str>, i32)> = Vec::with_capacity(topics.len());
+                for topic in topics {
+                    let md = consumer
+                        .fetch_metadata(Some(topic), std::time::Duration::from_secs(10))
+                        .map_err(|e| {
+                            ConnectorError::ConnectionFailed(format!(
+                                "metadata fetch for '{topic}': {e}"
+                            ))
+                        })?;
+                    let count = md
+                        .topics()
+                        .iter()
+                        .find(|t| t.name() == topic.as_str())
+                        .map_or(0usize, |t| t.partitions().len());
+                    topic_meta.push((
+                        Arc::from(topic.as_str()),
+                        i32::try_from(count).unwrap_or(i32::MAX),
+                    ));
                 }
-                if tpl.count() > 0 {
-                    consumer.assign(&tpl).map_err(|e| {
+                let default_offset = startup_default_offset(&kafka_config.startup_mode);
+                let tpl = build_vnode_assignment_tpl(
+                    &registry,
+                    self_id,
+                    &topic_meta,
+                    &self.offsets,
+                    default_offset,
+                );
+                let owned = tpl.count();
+                consumer.assign(&tpl).map_err(|e| {
+                    ConnectorError::ConnectionFailed(format!("vnode partition assign failed: {e}"))
+                })?;
+                self.vnode_topic_meta = topic_meta;
+                info!(
+                    owned_partitions = owned,
+                    "Kafka source assigned vnode-owned partitions (engine-controlled)"
+                );
+                true
+            } else {
+                warn!(
+                    "vnode-aware assignment is unsupported with topic patterns — \
+                     falling back to consumer-group subscribe()"
+                );
+                false
+            }
+        } else {
+            false
+        };
+
+        // Subscribe to topics (list or regex pattern). Skipped when the engine
+        // manually assigned partitions above.
+        if !vnode_assigned {
+            match &kafka_config.subscription {
+                TopicSubscription::Topics(topics) => {
+                    let topic_refs: Vec<&str> = topics.iter().map(String::as_str).collect();
+                    consumer.subscribe(&topic_refs).map_err(|e| {
+                        ConnectorError::ConnectionFailed(format!("failed to subscribe: {e}"))
+                    })?;
+                }
+                TopicSubscription::Pattern(pattern) => {
+                    // rdkafka requires a ^ prefix for regex patterns
+                    let regex_pattern = if pattern.starts_with('^') {
+                        pattern.clone()
+                    } else {
+                        format!("^{pattern}")
+                    };
+                    consumer.subscribe(&[&regex_pattern]).map_err(|e| {
                         ConnectorError::ConnectionFailed(format!(
-                            "failed to assign specific offsets: {e}"
+                            "failed to subscribe to pattern: {e}"
                         ))
                     })?;
-                    info!(
-                        partition_count = tpl.count(),
-                        "assigned consumer to specific offsets"
-                    );
                 }
             }
-            StartupMode::Timestamp(ts_ms) => {
-                // rdkafka requires assignment before offsets_for_times.
-                // Wait briefly for partition assignment from the group coordinator,
-                // then seek each assigned partition to the target timestamp.
-                let mut tpl = rdkafka::TopicPartitionList::new();
-                let topics = match &kafka_config.subscription {
-                    TopicSubscription::Topics(t) => t.clone(),
-                    TopicSubscription::Pattern(_) => Vec::new(),
-                };
-                // Query metadata to discover partition count per topic.
-                if let Ok(metadata) = consumer.fetch_metadata(
-                    topics.first().map(String::as_str),
-                    std::time::Duration::from_secs(10),
-                ) {
-                    for topic_meta in metadata.topics() {
-                        for partition_meta in topic_meta.partitions() {
+
+            // Apply startup mode positioning before starting the reader.
+            match &kafka_config.startup_mode {
+                // GroupOffsets/Earliest/Latest are handled via auto.offset.reset in to_rdkafka_config().
+                StartupMode::GroupOffsets | StartupMode::Earliest | StartupMode::Latest => {}
+                StartupMode::SpecificOffsets(offsets) => {
+                    let mut tpl = rdkafka::TopicPartitionList::new();
+                    let topics = match &kafka_config.subscription {
+                        TopicSubscription::Topics(t) => t.clone(),
+                        TopicSubscription::Pattern(_) => Vec::new(),
+                    };
+                    for topic in &topics {
+                        for (&partition, &offset) in offsets {
                             if let Err(e) = tpl.add_partition_offset(
-                                topic_meta.name(),
-                                partition_meta.id(),
-                                rdkafka::Offset::Offset(*ts_ms),
+                                topic,
+                                partition,
+                                rdkafka::Offset::Offset(offset),
                             ) {
                                 tracing::warn!(
-                                    topic = topic_meta.name(),
-                                    partition = partition_meta.id(),
+                                    %topic, partition, offset,
                                     error = %e,
-                                    "failed to add timestamp offset to partition list"
+                                    "failed to add specific offset to partition list"
+                                );
+                            }
+                        }
+                    }
+                    if tpl.count() > 0 {
+                        consumer.assign(&tpl).map_err(|e| {
+                            ConnectorError::ConnectionFailed(format!(
+                                "failed to assign specific offsets: {e}"
+                            ))
+                        })?;
+                        info!(
+                            partition_count = tpl.count(),
+                            "assigned consumer to specific offsets"
+                        );
+                    }
+                }
+                StartupMode::Timestamp(ts_ms) => {
+                    // rdkafka requires assignment before offsets_for_times.
+                    // Wait briefly for partition assignment from the group coordinator,
+                    // then seek each assigned partition to the target timestamp.
+                    let mut tpl = rdkafka::TopicPartitionList::new();
+                    let topics = match &kafka_config.subscription {
+                        TopicSubscription::Topics(t) => t.clone(),
+                        TopicSubscription::Pattern(_) => Vec::new(),
+                    };
+                    // Query metadata to discover partition count per topic.
+                    if let Ok(metadata) = consumer.fetch_metadata(
+                        topics.first().map(String::as_str),
+                        std::time::Duration::from_secs(10),
+                    ) {
+                        for topic_meta in metadata.topics() {
+                            for partition_meta in topic_meta.partitions() {
+                                if let Err(e) = tpl.add_partition_offset(
+                                    topic_meta.name(),
+                                    partition_meta.id(),
+                                    rdkafka::Offset::Offset(*ts_ms),
+                                ) {
+                                    tracing::warn!(
+                                        topic = topic_meta.name(),
+                                        partition = partition_meta.id(),
+                                        error = %e,
+                                        "failed to add timestamp offset to partition list"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    if tpl.count() > 0 {
+                        match consumer.offsets_for_times(tpl, std::time::Duration::from_secs(10)) {
+                            Ok(resolved) => {
+                                consumer.assign(&resolved).map_err(|e| {
+                                    ConnectorError::ConnectionFailed(format!(
+                                        "failed to assign timestamp offsets: {e}"
+                                    ))
+                                })?;
+                                info!(
+                                    timestamp_ms = ts_ms,
+                                    partition_count = resolved.count(),
+                                    "assigned consumer to timestamp offsets"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    timestamp_ms = ts_ms,
+                                    "failed to resolve timestamp offsets, falling back to group offsets"
                                 );
                             }
                         }
                     }
                 }
-                if tpl.count() > 0 {
-                    match consumer.offsets_for_times(tpl, std::time::Duration::from_secs(10)) {
-                        Ok(resolved) => {
-                            consumer.assign(&resolved).map_err(|e| {
-                                ConnectorError::ConnectionFailed(format!(
-                                    "failed to assign timestamp offsets: {e}"
-                                ))
-                            })?;
-                            info!(
-                                timestamp_ms = ts_ms,
-                                partition_count = resolved.count(),
-                                "assigned consumer to timestamp offsets"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                error = %e,
-                                timestamp_ms = ts_ms,
-                                "failed to resolve timestamp offsets, falling back to group offsets"
-                            );
-                        }
-                    }
-                }
             }
-        }
+        } // end `if !vnode_assigned`
 
         self.consumer = Some(consumer);
         self.state = ConnectorState::Running;

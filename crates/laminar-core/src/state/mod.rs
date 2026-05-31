@@ -16,5 +16,6 @@ pub use config::{
 pub use in_process::InProcessBackend;
 pub use object_store::ObjectStoreBackend;
 pub use vnode::{
-    key_hash, owned_vnodes, peer_owners, round_robin_assignment, NodeId, VnodeRegistry,
+    key_hash, owned_vnodes, peer_owners, round_robin_assignment, NodeId, VnodeLifecycleState,
+    VnodeRegistry,
 };

@@ -320,6 +320,20 @@ pub trait SourceConnector: Send {
     /// Called during recovery before polling resumes.
     async fn restore(&mut self, checkpoint: &SourceCheckpoint) -> Result<(), ConnectorError>;
 
+    /// Install the cluster vnode assignment so a partitioned source can bind
+    /// its input partitions to vnodes (`partition % vnode_count`) and consume
+    /// only those it owns, re-binding when the assignment rotates. Called by
+    /// the cluster startup wiring before [`open`](Self::open).
+    ///
+    /// Default: no-op — single-node deployments and sources without a natural
+    /// partitioning ignore it. Only the Kafka source overrides it today.
+    fn set_vnode_assignment(
+        &mut self,
+        _registry: Arc<laminar_core::state::VnodeRegistry>,
+        _self_id: laminar_core::state::NodeId,
+    ) {
+    }
+
     /// Close the connection and release resources.
     async fn close(&mut self) -> Result<(), ConnectorError>;
 

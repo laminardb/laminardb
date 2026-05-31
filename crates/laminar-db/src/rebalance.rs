@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
-use crate::db::LaminarDB;
+use crate::db::{LaminarDB, SnapshotAdoption};
 
 /// Tunables for the rebalance control plane.
 #[derive(Debug, Clone, Copy)]
@@ -55,6 +55,24 @@ impl RebalanceConfig {
     }
 }
 
+/// Surface the rehydration outcome of an adopted snapshot. A node that
+/// gained vnodes pulled their last committed state off the shared backend
+/// in [`LaminarDB::adopt_assignment_snapshot`]; log what moved so operators
+/// have an audit trail of every rebalance-driven state transfer.
+fn log_adoption(source: &str, adoption: &SnapshotAdoption) {
+    if adoption.newly_acquired.is_empty() {
+        return;
+    }
+    info!(
+        source,
+        version = adoption.version,
+        newly_acquired = adoption.newly_acquired.len(),
+        rehydrated = adoption.rehydrated,
+        rehydration_epoch = ?adoption.rehydration_epoch,
+        "rehydrated newly-acquired vnodes after rebalance",
+    );
+}
+
 /// Spawn the per-node snapshot watcher. Exits on `shutdown`.
 pub fn spawn_snapshot_watcher(
     db: Arc<LaminarDB>,
@@ -62,6 +80,7 @@ pub fn spawn_snapshot_watcher(
     registry: Arc<VnodeRegistry>,
     shutdown: Arc<Notify>,
     config: RebalanceConfig,
+    controller: Option<Arc<ClusterController>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(config.watcher_poll);
@@ -74,13 +93,26 @@ pub fn spawn_snapshot_watcher(
                 _ = ticker.tick() => {}
             }
             let local = registry.assignment_version();
-            match store.load().await {
-                Ok(Some(snap)) if snap.version > local => {
-                    debug!(local, remote = snap.version, "adopting newer assignment");
-                    db.adopt_assignment_snapshot(snap).await;
+
+            let mut remote_newer = true;
+            if let Some(ref c) = controller {
+                if let Some(gossiped_version) = c.read_snapshot_version().await {
+                    if gossiped_version <= local {
+                        remote_newer = false;
+                    }
                 }
-                Ok(_) => {}
-                Err(e) => warn!(error = %e, "snapshot watcher: load failed"),
+            }
+
+            if remote_newer {
+                match store.load().await {
+                    Ok(Some(snap)) if snap.version > local => {
+                        debug!(local, remote = snap.version, "adopting newer assignment");
+                        let adoption = db.adopt_assignment_snapshot(snap).await;
+                        log_adoption("watcher", &adoption);
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(error = %e, "snapshot watcher: load failed"),
+                }
             }
         }
     })
@@ -131,7 +163,7 @@ pub fn spawn_rebalance_controller(
                     break;
                 }
                 let live = controller.live_instances();
-                match try_rebalance(&db, &store, &registry, &live, config).await {
+                match try_rebalance(&db, &controller, &store, &registry, &live, config).await {
                     Ok(Some(v)) => {
                         info!(version = v, "rotated assignment");
                         break;
@@ -158,6 +190,7 @@ pub fn spawn_rebalance_controller(
 /// no change is needed.
 async fn try_rebalance(
     db: &Arc<LaminarDB>,
+    controller: &Arc<ClusterController>,
     store: &Arc<AssignmentSnapshotStore>,
     registry: &Arc<VnodeRegistry>,
     live: &[NodeId],
@@ -200,7 +233,9 @@ async fn try_rebalance(
     {
         RotateOutcome::Rotated => {
             let v = proposal.version;
-            db.adopt_assignment_snapshot(proposal).await;
+            let adoption = db.adopt_assignment_snapshot(proposal).await;
+            log_adoption("rebalance", &adoption);
+            controller.announce_snapshot_version(v).await;
             // Keep the current plus one prior as slack for in-flight
             // readers — `prune_before(v - 1)` retains `[v-1, v]`.
             let prune = v.saturating_sub(1);
@@ -211,7 +246,9 @@ async fn try_rebalance(
         }
         RotateOutcome::Conflict(winner) => {
             let v = winner.version;
-            db.adopt_assignment_snapshot(winner).await;
+            let adoption = db.adopt_assignment_snapshot(winner).await;
+            log_adoption("rebalance-conflict", &adoption);
+            controller.announce_snapshot_version(v).await;
             Ok(Some(v))
         }
     }

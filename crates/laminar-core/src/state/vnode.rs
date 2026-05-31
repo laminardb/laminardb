@@ -14,7 +14,7 @@
 //! need a vnode ID for an event call [`VnodeRegistry::vnode_for_key`].
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -56,11 +56,42 @@ impl fmt::Display for NodeId {
     }
 }
 
+/// Per-vnode lifecycle state. Distinct from ownership: a vnode this node
+/// owns can still be [`Restoring`](Self::Restoring) while its committed
+/// state is being rehydrated from durable storage after a rebalance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VnodeLifecycleState {
+    /// Fully owned and serving — state is consistent.
+    Active,
+    /// Newly acquired in a rebalance; durable state is still being
+    /// applied. Operators suppress emission for keys in this vnode until
+    /// it flips back to [`Active`](Self::Active).
+    Restoring,
+}
+
+impl VnodeLifecycleState {
+    const ACTIVE: u8 = 0;
+    const RESTORING: u8 = 1;
+
+    const fn to_u8(self) -> u8 {
+        match self {
+            Self::Active => Self::ACTIVE,
+            Self::Restoring => Self::RESTORING,
+        }
+    }
+}
+
 /// Runtime registry of vnode topology and assignment.
 pub struct VnodeRegistry {
     vnode_count: u32,
     assignment: RwLock<Arc<[NodeId]>>,
     assignment_version: AtomicU64,
+    /// Per-vnode lifecycle, indexed by vnode id. `0` = `Active`,
+    /// `1` = `Restoring`. Lock-free: rebalance flips individual entries
+    /// and the hot emission gate reads them without taking a lock. Not
+    /// serialized — rebuilt (all `Active`) from the `AssignmentSnapshot`
+    /// on boot, so adding it never touches a wire format.
+    lifecycle: Arc<[AtomicU8]>,
 }
 
 impl std::fmt::Debug for VnodeRegistry {
@@ -92,6 +123,7 @@ impl VnodeRegistry {
             vnode_count,
             assignment: RwLock::new(assignment),
             assignment_version: AtomicU64::new(1),
+            lifecycle: new_lifecycle(vnode_count),
         }
     }
 
@@ -111,6 +143,7 @@ impl VnodeRegistry {
             vnode_count,
             assignment: RwLock::new(assignment),
             assignment_version: AtomicU64::new(1),
+            lifecycle: new_lifecycle(vnode_count),
         }
     }
 
@@ -191,6 +224,72 @@ impl VnodeRegistry {
         let h = (key_hash(key) % u64::from(self.vnode_count)) as u32;
         h
     }
+
+    /// Mark `vnodes` as [`Restoring`](VnodeLifecycleState::Restoring).
+    ///
+    /// Called during a rebalance for the vnodes a node newly acquires,
+    /// before their committed state has been applied. Out-of-range ids
+    /// are ignored.
+    pub fn mark_restoring(&self, vnodes: &[u32]) {
+        self.set_lifecycle(vnodes, VnodeLifecycleState::Restoring);
+    }
+
+    /// Mark `vnodes` as [`Active`](VnodeLifecycleState::Active).
+    ///
+    /// Called once a newly-acquired vnode's state has been applied (or
+    /// immediately for vnodes that had no durable state to restore).
+    /// Out-of-range ids are ignored.
+    pub fn mark_active(&self, vnodes: &[u32]) {
+        self.set_lifecycle(vnodes, VnodeLifecycleState::Active);
+    }
+
+    fn set_lifecycle(&self, vnodes: &[u32], state: VnodeLifecycleState) {
+        let byte = state.to_u8();
+        for &v in vnodes {
+            if let Some(slot) = self.lifecycle.get(v as usize) {
+                slot.store(byte, Ordering::Release);
+            }
+        }
+    }
+
+    /// Whether `vnode` is currently [`Restoring`](VnodeLifecycleState::Restoring).
+    /// Out-of-range ids are reported as not restoring.
+    #[must_use]
+    pub fn is_restoring(&self, vnode: u32) -> bool {
+        self.lifecycle
+            .get(vnode as usize)
+            .is_some_and(|s| s.load(Ordering::Acquire) == VnodeLifecycleState::RESTORING)
+    }
+
+    /// Whether any vnode is currently restoring. Cheap pre-check the
+    /// emission gate uses to skip per-row work in the common case.
+    #[must_use]
+    pub fn any_restoring(&self) -> bool {
+        self.lifecycle
+            .iter()
+            .any(|s| s.load(Ordering::Acquire) == VnodeLifecycleState::RESTORING)
+    }
+
+    /// Vnodes currently [`Restoring`](VnodeLifecycleState::Restoring), ascending.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // index < vnode_count, which is u32
+    pub fn restoring_vnodes(&self) -> Vec<u32> {
+        self.lifecycle
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                (s.load(Ordering::Acquire) == VnodeLifecycleState::RESTORING).then_some(i as u32)
+            })
+            .collect()
+    }
+}
+
+/// Build a fresh lifecycle array with every vnode [`Active`].
+fn new_lifecycle(vnode_count: u32) -> Arc<[AtomicU8]> {
+    std::iter::repeat_with(|| AtomicU8::new(VnodeLifecycleState::ACTIVE))
+        .take(vnode_count as usize)
+        .collect::<Vec<_>>()
+        .into()
 }
 
 /// Hash a key to a 64-bit value. Used to derive vnode IDs and for any
@@ -365,5 +464,51 @@ mod tests {
     #[should_panic(expected = "at least one peer")]
     fn round_robin_rejects_empty_peer_list() {
         let _ = round_robin_assignment(4, &[]);
+    }
+
+    #[test]
+    fn vnodes_start_active() {
+        let r = VnodeRegistry::new(4);
+        assert!(!r.any_restoring());
+        for v in 0..4 {
+            assert!(!r.is_restoring(v));
+        }
+        assert!(r.restoring_vnodes().is_empty());
+    }
+
+    #[test]
+    fn mark_restoring_and_active_round_trip() {
+        let r = VnodeRegistry::new(4);
+        r.mark_restoring(&[1, 3]);
+        assert!(r.any_restoring());
+        assert!(r.is_restoring(1));
+        assert!(r.is_restoring(3));
+        assert!(!r.is_restoring(0));
+        assert_eq!(r.restoring_vnodes(), vec![1, 3]);
+
+        r.mark_active(&[1]);
+        assert!(!r.is_restoring(1));
+        assert_eq!(r.restoring_vnodes(), vec![3]);
+
+        r.mark_active(&[3]);
+        assert!(!r.any_restoring());
+    }
+
+    #[test]
+    fn lifecycle_ignores_out_of_range() {
+        let r = VnodeRegistry::new(2);
+        r.mark_restoring(&[5, 99]); // no panic
+        assert!(!r.is_restoring(5));
+        assert!(!r.any_restoring());
+    }
+
+    #[test]
+    fn lifecycle_independent_of_assignment() {
+        // Reassigning ownership must not clear lifecycle state — the two
+        // are orthogonal and the caller drives the Restoring→Active flip.
+        let r = VnodeRegistry::new(4);
+        r.mark_restoring(&[2]);
+        r.set_assignment(vec![NodeId(1), NodeId(1), NodeId(1), NodeId(1)].into());
+        assert!(r.is_restoring(2));
     }
 }

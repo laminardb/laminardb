@@ -623,8 +623,12 @@ impl LookupEnrichOperator {
                 }
             }
 
-            let (local_slices, remote_slices) =
-                laminar_core::shuffle::slice_batch_by_targets(batch, &vnodes, &cfg.registry, cfg.self_id);
+            let (local_slices, remote_slices) = laminar_core::shuffle::slice_batch_by_targets(
+                batch,
+                &vnodes,
+                &cfg.registry,
+                cfg.self_id,
+            );
 
             for (_v, slice) in local_slices {
                 local.push(slice);

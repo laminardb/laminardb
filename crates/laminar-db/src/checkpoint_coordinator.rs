@@ -206,6 +206,15 @@ pub struct CheckpointCoordinator {
     /// Vnodes the leader's durability gate checks. In cluster mode the
     /// full registry; single-instance mirrors `vnode_set`.
     gate_vnode_set: Vec<u32>,
+    /// Per-vnode operator-state slices for the in-flight checkpoint,
+    /// `vnode → (operator_name → bytes)`. Set fresh before each checkpoint
+    /// by the pipeline callback from `OperatorGraph::snapshot_state_by_vnode`;
+    /// folded into each owned vnode's `partial.bin` by
+    /// [`write_vnode_partials`](Self::write_vnode_partials). Empty in
+    /// single-instance mode (the partial is then just a durability marker).
+    #[allow(clippy::disallowed_types)] // matches the graph snapshot shape
+    pending_vnode_states:
+        std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>>,
     /// `Some` in cluster mode, `None` in single-instance / embedded.
     #[cfg(feature = "cluster-unstable")]
     cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
@@ -271,6 +280,7 @@ impl CheckpointCoordinator {
             cluster_min_watermark: None,
             vnode_set: Vec::new(),
             gate_vnode_set: Vec::new(),
+            pending_vnode_states: std::collections::HashMap::new(),
             #[cfg(feature = "cluster-unstable")]
             cluster_controller: None,
             cached_sorted_sink_names: None,
@@ -316,6 +326,21 @@ impl CheckpointCoordinator {
     /// the other followers').
     pub fn set_local_watermark_ms(&mut self, watermark: Option<i64>) {
         self.local_watermark_ms = watermark;
+    }
+
+    /// Stage the per-vnode operator-state slices for the next checkpoint.
+    ///
+    /// Each owned vnode's slice is folded into its `partial.bin` by
+    /// [`write_vnode_partials`](Self::write_vnode_partials) so a node that
+    /// later acquires the vnode can rehydrate exactly that vnode's state.
+    /// Call once per checkpoint (even with an empty map) so a prior epoch's
+    /// slices never leak forward.
+    #[allow(clippy::disallowed_types)]
+    pub fn set_pending_vnode_states(
+        &mut self,
+        states: std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>>,
+    ) {
+        self.pending_vnode_states = states;
     }
 
     /// Vnodes this instance owns; drives marker writes. Also the
@@ -568,41 +593,60 @@ impl CheckpointCoordinator {
         }
     }
 
-    /// Writes a per-vnode durability marker so the leader's
+    /// Writes each owned vnode's `partial.bin` so the leader's
     /// `epoch_complete` gate returns true and sinks can commit.
     ///
-    /// Fires every vnode marker concurrently via `try_join_all`.
-    /// The serial version was O(`vnode_count` × per-write latency) —
-    /// ~256 awaits on a typical cluster, trivial CPU but each a
-    /// scheduling hop (and on remote object-store backends each
-    /// write is tens to hundreds of ms). Concurrent dispatch
-    /// collapses that to one round-trip's worth of wall time.
-    async fn write_vnode_markers(&self, epoch: u64, checkpoint_id: u64) -> Result<(), DbError> {
+    /// The payload is a [`VnodePartial`](crate::vnode_partial::VnodePartial)
+    /// carrying the operator-state slices staged via
+    /// [`set_pending_vnode_states`](Self::set_pending_vnode_states) for that
+    /// vnode — real, rehydratable state rather than the old `ckpt:{id}`
+    /// marker. A vnode with no staged state writes an empty `VnodePartial`,
+    /// which still seals the durability gate (presence is all the gate checks).
+    ///
+    /// Fires every vnode write concurrently via `try_join_all`: the serial
+    /// version was O(`vnode_count` × per-write latency) — trivial CPU but each
+    /// a scheduling hop (and tens-to-hundreds of ms on a remote object store).
+    async fn write_vnode_partials(&self, epoch: u64, checkpoint_id: u64) -> Result<(), DbError> {
         let Some(ref backend) = self.state_backend else {
             return Ok(());
         };
         if self.vnode_set.is_empty() {
             return Ok(());
         }
-        let payload = bytes::Bytes::from(format!("ckpt:{checkpoint_id}").into_bytes());
-        // Stamp every marker with the current assignment generation.
-        // Zero means the host hasn't wired a version (single-instance
-        // path) and the fence is a no-op.
+        // Stamp every write with the current assignment generation. Zero
+        // means the host hasn't wired a version (single-instance path) and
+        // the fence is a no-op.
         let caller_version = self.assignment_version;
-        let writes = self.vnode_set.iter().map(|&v| {
-            let backend = Arc::clone(backend);
-            let payload = payload.clone();
-            async move {
+        let writes = self
+            .vnode_set
+            .iter()
+            .map(|&v| {
+                let backend = Arc::clone(backend);
+                let operators = self
+                    .pending_vnode_states
+                    .get(&v)
+                    .map(|ops| ops.iter().map(|(n, b)| (n.clone(), b.to_vec())).collect())
+                    .unwrap_or_default();
+                let partial = crate::vnode_partial::VnodePartial {
+                    checkpoint_id,
+                    operators,
+                };
+                partial
+                    .encode()
+                    .map(|bytes| (v, backend, bytes::Bytes::from(bytes)))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|(v, backend, payload)| async move {
                 backend
                     .write_partial(v, epoch, caller_version, payload)
                     .await
                     .map_err(|e| {
                         DbError::Checkpoint(format!(
-                            "[LDB-6024] vnode marker write failed (vnode={v}, epoch={epoch}): {e}"
+                            "[LDB-6024] vnode partial write failed (vnode={v}, epoch={epoch}): {e}"
                         ))
                     })
-            }
-        });
+            });
         futures::future::try_join_all(writes).await.map(|_| ())
     }
 
@@ -1250,7 +1294,7 @@ impl CheckpointCoordinator {
 
         self.phase = CheckpointPhase::Persisting;
         self.save_manifest(Arc::new(manifest), state_data).await?;
-        self.write_vnode_markers(epoch, checkpoint_id).await?;
+        self.write_vnode_partials(epoch, checkpoint_id).await?;
         Ok(())
     }
 
@@ -1408,10 +1452,10 @@ impl CheckpointCoordinator {
             });
         }
 
-        // Bridge: publish per-vnode durability markers so the gate below
-        // has something to check. Replace with real per-operator partial
-        // writes when operators adopt the state backend directly.
-        if let Err(e) = self.write_vnode_markers(epoch, checkpoint_id).await {
+        // Publish each owned vnode's partial (operator-state slice + commit
+        // marker in one blob) so the durability gate below has something to
+        // check and a future owner can rehydrate the vnode's state.
+        if let Err(e) = self.write_vnode_partials(epoch, checkpoint_id).await {
             self.phase = CheckpointPhase::Idle;
             self.checkpoints_failed += 1;
             let duration = start.elapsed();
@@ -1424,13 +1468,13 @@ impl CheckpointCoordinator {
                     "[LDB-6025] sink rollback failed after marker write failure",
                 );
             }
-            error!(checkpoint_id, epoch, error = %e, "vnode marker write failed");
+            error!(checkpoint_id, epoch, error = %e, "vnode partial write failed");
             return Ok(CheckpointResult {
                 success: false,
                 checkpoint_id,
                 epoch,
                 duration,
-                error: Some(format!("vnode marker write failed: {e}")),
+                error: Some(format!("vnode partial write failed: {e}")),
             });
         }
 
@@ -2849,7 +2893,7 @@ mod tests {
             "out-of-range vnode must fail the checkpoint"
         );
         let err = result.error.expect("failure produces an error message");
-        assert!(err.contains("vnode marker write failed"), "got: {err}");
+        assert!(err.contains("vnode partial write failed"), "got: {err}");
     }
 
     #[tokio::test]

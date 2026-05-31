@@ -89,6 +89,7 @@ mod table_cache_mode;
 mod table_provider;
 mod table_store;
 mod temporal_probe;
+mod vnode_partial;
 
 // End-to-end tests for the crypto-sentiment demo pipeline, backed by wiremock.
 // In-crate (not tests/) so it can drive the OperatorGraph directly.
@@ -124,7 +125,11 @@ pub use handle::{
 };
 pub use metrics::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
 pub use profile::{Profile, ProfileError};
-pub use recovery_manager::{RecoveredState, RecoveryManager};
+pub use recovery_manager::{RecoveredState, RecoveryManager, VnodeRehydration, VnodeRehydrator};
+
+/// Rebalance-driven state-rehydration types (cluster mode).
+#[cfg(feature = "cluster-unstable")]
+pub use db::{RehydratedVnode, SnapshotAdoption};
 
 /// Re-export the connector registry for custom connector registration.
 pub use laminar_connectors::registry::ConnectorRegistry;

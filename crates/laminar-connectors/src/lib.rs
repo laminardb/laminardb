@@ -59,6 +59,11 @@ pub mod schema;
 /// Connector registry with factory pattern.
 pub mod registry;
 
+/// Engine-controlled partition → vnode ownership for partitioned sources
+/// (Kafka). Pure mapping logic, ungated so it builds and is tested without a
+/// native Kafka/OpenSSL toolchain.
+pub mod partition_assignment;
+
 /// Testing utilities (mock connectors, helpers).
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

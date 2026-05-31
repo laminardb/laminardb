@@ -55,6 +55,10 @@ pub struct LaminarDbBuilder {
     #[cfg(feature = "cluster-unstable")]
     assignment_snapshot_store:
         Option<std::sync::Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>,
+    /// Catalog-manifest store for cluster-wide DDL replay on boot/rebalance.
+    #[cfg(feature = "cluster-unstable")]
+    catalog_manifest_store:
+        Option<std::sync::Arc<laminar_core::cluster::control::CatalogManifestStore>>,
     /// Optional state backend. When paired with `vnode_registry`, the
     /// coordinator writes per-vnode durability markers each checkpoint
     /// and consults `epoch_complete` before committing sinks.
@@ -97,6 +101,8 @@ impl LaminarDbBuilder {
             decision_store: None,
             #[cfg(feature = "cluster-unstable")]
             assignment_snapshot_store: None,
+            #[cfg(feature = "cluster-unstable")]
+            catalog_manifest_store: None,
             state_backend: None,
             vnode_registry: None,
             physical_optimizer_rules: Vec::new(),
@@ -218,6 +224,17 @@ impl LaminarDbBuilder {
         store: std::sync::Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
     ) -> Self {
         self.assignment_snapshot_store = Some(store);
+        self
+    }
+
+    /// Install the catalog-manifest store for cluster-wide DDL replay.
+    #[cfg(feature = "cluster-unstable")]
+    #[must_use]
+    pub fn catalog_manifest_store(
+        mut self,
+        store: std::sync::Arc<laminar_core::cluster::control::CatalogManifestStore>,
+    ) -> Self {
+        self.catalog_manifest_store = Some(store);
         self
     }
 
@@ -509,6 +526,10 @@ impl LaminarDbBuilder {
         #[cfg(feature = "cluster-unstable")]
         if let Some(store) = self.assignment_snapshot_store {
             db.set_assignment_snapshot_store(store);
+        }
+        #[cfg(feature = "cluster-unstable")]
+        if let Some(store) = self.catalog_manifest_store {
+            db.set_catalog_manifest_store(store);
         }
         if let Some(backend) = self.state_backend {
             db.set_state_backend(backend);

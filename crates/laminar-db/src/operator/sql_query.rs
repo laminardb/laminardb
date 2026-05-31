@@ -355,6 +355,9 @@ impl SqlQueryOperator {
             ));
         };
 
+        #[cfg(feature = "cluster-unstable")]
+        let num_group_cols = agg_state.num_group_cols();
+
         let mut eviction = if self.emit_changelog {
             agg_state.evict_idle(watermark)?
         } else {
@@ -376,12 +379,67 @@ impl SqlQueryOperator {
             }
         }
 
-        if eviction.is_empty() {
-            Ok(batches)
+        let result = if eviction.is_empty() {
+            batches
         } else {
             eviction.extend(batches);
-            Ok(eviction)
+            eviction
+        };
+
+        #[cfg(feature = "cluster-unstable")]
+        return self.suppress_restoring_output(result, num_group_cols);
+        #[cfg(not(feature = "cluster-unstable"))]
+        Ok(result)
+    }
+
+    /// Drop output rows whose group key hashes to a vnode currently
+    /// [`Restoring`](laminar_core::state::VnodeLifecycleState::Restoring), so a
+    /// downstream MV/sink never observes a transiently-incomplete aggregate
+    /// for a vnode whose committed state hasn't been merged in yet. The vnode
+    /// flips back to `Active` (and its rows resume emitting) once the graph
+    /// applies its rehydrated slice. No-op when nothing is restoring — the
+    /// common case, gated by a single atomic scan.
+    #[cfg(feature = "cluster-unstable")]
+    fn suppress_restoring_output(
+        &self,
+        batches: Vec<RecordBatch>,
+        num_group_cols: usize,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let Some(ref cfg) = self.cluster_shuffle else {
+            return Ok(batches);
+        };
+        if !cfg.registry.any_restoring() {
+            return Ok(batches);
         }
+        let vnode_count = cfg.registry.vnode_count();
+        let mut out = Vec::with_capacity(batches.len());
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let vnodes: Vec<u32> = if num_group_cols == 0 {
+                vec![0; batch.num_rows()]
+            } else {
+                let cols: Vec<usize> = (0..num_group_cols).collect();
+                laminar_core::shuffle::row_vnodes(&batch, &cols, vnode_count)
+            };
+            let keep: Vec<bool> = vnodes
+                .iter()
+                .map(|&v| !cfg.registry.is_restoring(v))
+                .collect();
+            let kept = keep.iter().filter(|&&k| k).count();
+            if kept == batch.num_rows() {
+                out.push(batch);
+            } else if kept > 0 {
+                let mask = arrow::array::BooleanArray::from(keep);
+                let filtered = arrow::compute::filter_record_batch(&batch, &mask).map_err(|e| {
+                    DbError::Pipeline(format!("restoring-vnode emission filter: {e}"))
+                })?;
+                out.push(filtered);
+            }
+            // kept == 0 → entire batch suppressed; drop it.
+        }
+        Ok(out)
     }
 
     /// Apply a HAVING predicate via SQL. First call builds a
@@ -467,8 +525,12 @@ async fn shuffle_pre_agg_batches(
             }
         }
 
-        let (local_slices, remote_slices) =
-            laminar_core::shuffle::slice_batch_by_targets(&batch, &row_vn, &cfg.registry, cfg.self_id);
+        let (local_slices, remote_slices) = laminar_core::shuffle::slice_batch_by_targets(
+            &batch,
+            &row_vn,
+            &cfg.registry,
+            cfg.self_id,
+        );
 
         for (_v, slice) in local_slices {
             local.push(slice);
@@ -664,6 +726,75 @@ impl GraphOperator for SqlQueryOperator {
         }
         if let QueryState::Agg(ref mut agg) = self.state {
             agg.process_batch(&batch, watermark)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    #[allow(clippy::disallowed_types)] // cold checkpoint path; vnode-keyed map
+    fn checkpoint_by_vnode(
+        &mut self,
+        vnode_count: u32,
+    ) -> Result<Option<std::collections::HashMap<u32, bytes::Bytes>>, DbError> {
+        let QueryState::Agg(ref mut agg_state) = self.state else {
+            return Ok(None);
+        };
+        let per_vnode = agg_state.checkpoint_groups_by_vnode(vnode_count)?;
+        if per_vnode.is_empty() {
+            return Ok(None);
+        }
+        let mut out = std::collections::HashMap::with_capacity(per_vnode.len());
+        for (vnode, cp) in per_vnode {
+            let data = rkyv::to_bytes::<rkyv::rancor::Error>(&cp)
+                .map(|v| v.to_vec())
+                .map_err(|e| {
+                    DbError::Pipeline(format!(
+                        "per-vnode checkpoint serialization for '{}': {e}",
+                        self.op_name
+                    ))
+                })?;
+            out.insert(vnode, bytes::Bytes::from(data));
+        }
+        Ok(Some(out))
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    fn apply_vnode_state(&mut self, vnode: u32, bytes: &[u8]) -> Result<(), DbError> {
+        let cp: AggStateCheckpoint =
+            rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(bytes).map_err(|e| {
+                DbError::Pipeline(format!(
+                    "per-vnode state deserialization for '{}' vnode {vnode}: {e}",
+                    self.op_name
+                ))
+            })?;
+        match self.state {
+            QueryState::Agg(ref mut agg_state) => {
+                let merged = agg_state.merge_groups(&cp)?;
+                tracing::debug!(
+                    query = %self.op_name, vnode, groups = merged,
+                    "applied rehydrated vnode aggregate state"
+                );
+            }
+            QueryState::Uninit => {
+                // Not yet initialized (rare — an owning node is normally
+                // running). Fold into the pending restore; vnodes are disjoint
+                // so concatenating their group lists is safe.
+                match self.pending_restore {
+                    Some(ref mut existing) if existing.fingerprint == cp.fingerprint => {
+                        existing.groups.extend(cp.groups);
+                        existing.last_emitted.extend(cp.last_emitted);
+                    }
+                    Some(_) => tracing::warn!(
+                        query = %self.op_name, vnode,
+                        "pending restore fingerprint mismatch — dropping rehydrated slice"
+                    ),
+                    None => self.pending_restore = Some(cp),
+                }
+            }
+            _ => tracing::warn!(
+                query = %self.op_name, vnode,
+                "ignoring rehydrated vnode state for non-aggregate query"
+            ),
         }
         Ok(())
     }

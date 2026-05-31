@@ -2,6 +2,7 @@
 //! barrier coordination.
 
 pub mod barrier;
+pub mod catalog_manifest;
 pub mod controller;
 pub mod leader;
 pub mod snapshot;
@@ -16,6 +17,9 @@ pub use controller::ClusterController;
 // 2PC). Callers that already qualify with `cluster::control::…` keep
 // working.
 pub use crate::checkpoint_decision::{CheckpointDecisionStore, DecisionError};
+pub use catalog_manifest::{
+    CatalogManifest, CatalogManifestEntry, CatalogManifestError, CatalogManifestStore,
+};
 pub use leader::leader_of;
 pub use snapshot::{AssignmentSnapshot, AssignmentSnapshotStore, RotateOutcome, SnapshotError};
 

@@ -71,6 +71,30 @@ pub(crate) trait GraphOperator: Send {
     ) -> Result<(), DbError> {
         Ok(())
     }
+
+    /// Serialize this operator's state partitioned by vnode, for cross-node
+    /// rehydration. Returns `Some(map)` from operators that key their state by
+    /// a value the cluster shuffle routes (the aggregation fast-path); `None`
+    /// (default) for operators that aren't vnode-partitionable — those recover
+    /// from the whole-node manifest blob instead. The per-vnode bytes are the
+    /// same encoding the operator's own restore/apply path consumes.
+    #[cfg(feature = "cluster-unstable")]
+    #[allow(clippy::disallowed_types)] // cold checkpoint path; vnode-keyed map
+    fn checkpoint_by_vnode(
+        &mut self,
+        _vnode_count: u32,
+    ) -> Result<Option<std::collections::HashMap<u32, bytes::Bytes>>, DbError> {
+        Ok(None)
+    }
+
+    /// Merge one vnode's rehydrated state slice (produced by
+    /// [`checkpoint_by_vnode`](Self::checkpoint_by_vnode) on whichever node
+    /// last owned the vnode) into this operator. Default no-op for operators
+    /// that don't partition by vnode.
+    #[cfg(feature = "cluster-unstable")]
+    fn apply_vnode_state(&mut self, _vnode: u32, _bytes: &[u8]) -> Result<(), DbError> {
+        Ok(())
+    }
 }
 
 pub(crate) struct OperatorCheckpoint {
@@ -274,6 +298,15 @@ pub(crate) struct OperatorGraph {
     /// pre-aggregate rows can be hash-routed to vnode owners.
     #[cfg(feature = "cluster-unstable")]
     cluster_shuffle: Option<crate::operator::sql_query::ClusterShuffleConfig>,
+    /// Shared handle to the DB's staged per-vnode rehydration map. Drained at
+    /// the start of each cycle by [`apply_rehydrated_vnodes`](Self::apply_rehydrated_vnodes):
+    /// vnodes this node newly acquired in a rebalance have their committed
+    /// state merged into the matching operators before they process new rows.
+    /// `None` outside cluster mode.
+    #[cfg(feature = "cluster-unstable")]
+    #[allow(clippy::disallowed_types)] // shares the DB's std-HashMap-typed handle
+    rehydrated_vnode_state:
+        Option<Arc<parking_lot::Mutex<std::collections::HashMap<u32, crate::db::RehydratedVnode>>>>,
 }
 
 impl OperatorGraph {
@@ -300,6 +333,8 @@ impl OperatorGraph {
             max_state_bytes: None,
             #[cfg(feature = "cluster-unstable")]
             cluster_shuffle: None,
+            #[cfg(feature = "cluster-unstable")]
+            rehydrated_vnode_state: None,
             ctx,
             prom: None,
             lookup_registry: None,
@@ -433,6 +468,103 @@ impl OperatorGraph {
         config: crate::operator::sql_query::ClusterShuffleConfig,
     ) {
         self.cluster_shuffle = Some(config);
+    }
+
+    /// Share the DB's staged per-vnode rehydration map so the graph can drain
+    /// and apply rebalanced state into operators each cycle.
+    #[cfg(feature = "cluster-unstable")]
+    #[allow(clippy::disallowed_types)] // shares the DB's std-HashMap-typed handle
+    pub fn set_rehydration_handle(
+        &mut self,
+        staged: Arc<parking_lot::Mutex<std::collections::HashMap<u32, crate::db::RehydratedVnode>>>,
+    ) {
+        self.rehydrated_vnode_state = Some(staged);
+    }
+
+    /// Drain the staged rehydration map for vnodes this node currently owns and
+    /// merge each operator's committed slice into the matching live operator,
+    /// then flip those vnodes `Restoring → Active`.
+    ///
+    /// Runs at the start of every [`execute_cycle`](Self::execute_cycle) so a
+    /// newly-acquired vnode's state is in place before the operators process
+    /// the cycle's rows. Best-effort: a slice that fails to decode or apply is
+    /// logged and skipped, and the vnode still flips to `Active` (it serves
+    /// from whatever state did apply, exactly like a vnode with no durable
+    /// state). Cheap no-op when nothing is staged.
+    #[cfg(feature = "cluster-unstable")]
+    fn apply_rehydrated_vnodes(&mut self) {
+        // Clone owned handles out so no borrow of `self` survives into the
+        // `self.nodes.iter_mut()` dispatch below.
+        let (registry, self_id, staged_arc) = match (
+            self.cluster_shuffle.as_ref(),
+            self.rehydrated_vnode_state.as_ref(),
+        ) {
+            (Some(cfg), Some(staged)) => {
+                (Arc::clone(&cfg.registry), cfg.self_id, Arc::clone(staged))
+            }
+            _ => return,
+        };
+
+        // Drain only the staged vnodes we currently own (ownership may have
+        // changed again since the snapshot was staged).
+        let drained: Vec<(u32, crate::db::RehydratedVnode)> = {
+            let mut guard = staged_arc.lock();
+            if guard.is_empty() {
+                return;
+            }
+            let owned: FxHashSet<u32> = laminar_core::state::owned_vnodes(&registry, self_id)
+                .into_iter()
+                .collect();
+            let keys: Vec<u32> = guard
+                .keys()
+                .copied()
+                .filter(|v| owned.contains(v))
+                .collect();
+            keys.into_iter()
+                .filter_map(|v| guard.remove(&v).map(|r| (v, r)))
+                .collect()
+        };
+        if drained.is_empty() {
+            return;
+        }
+
+        for (vnode, rehydrated) in drained {
+            match crate::vnode_partial::VnodePartial::decode(&rehydrated.bytes) {
+                Ok(partial) => {
+                    for (op_name, bytes) in &partial.operators {
+                        if let Some(node) = self
+                            .nodes
+                            .iter_mut()
+                            .find(|n| !n.removed && &*n.name == op_name.as_str())
+                        {
+                            if let Err(e) = node.operator.apply_vnode_state(vnode, bytes) {
+                                tracing::warn!(
+                                    operator = %op_name, vnode, error = %e,
+                                    "failed to apply rehydrated vnode state"
+                                );
+                            }
+                        } else {
+                            tracing::debug!(
+                                operator = %op_name, vnode,
+                                "no live operator for rehydrated slice (topology drift)"
+                            );
+                        }
+                    }
+                    tracing::info!(
+                        vnode,
+                        epoch = rehydrated.epoch,
+                        operators = partial.operators.len(),
+                        "applied rehydrated vnode state"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    vnode, error = %e,
+                    "rehydrated partial decode failed — vnode resumes from current state"
+                ),
+            }
+            // The vnode is now serving regardless of apply outcome.
+            registry.mark_active(&[vnode]);
+        }
     }
 
     fn is_downstream_at_capacity(&self, node_id: usize) -> bool {
@@ -1599,6 +1731,12 @@ impl OperatorGraph {
         current_watermark: i64,
         source_watermarks: Option<&FxHashMap<Arc<str>, i64>>,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
+        // Merge any rebalanced-in vnode state into operators before they see
+        // this cycle's rows, so the snapshot a new owner resumes from is in
+        // place first.
+        #[cfg(feature = "cluster-unstable")]
+        self.apply_rehydrated_vnodes();
+
         if self.topo_dirty {
             self.compute_topo_order();
         }
@@ -1905,6 +2043,45 @@ impl OperatorGraph {
             version: 1,
             operators,
         }))
+    }
+
+    /// Per-vnode operator-state snapshot for cross-node rehydration.
+    ///
+    /// Returns `vnode → (operator_name → vnode-slice bytes)` for every operator
+    /// that opts into per-vnode checkpointing (see
+    /// [`GraphOperator::checkpoint_by_vnode`]). Empty outside cluster mode (no
+    /// shuffle config means no vnode topology to partition by). The vnode count
+    /// is taken from the registry the cluster shuffle was wired with, so the
+    /// partition matches the routing that delivered each key here.
+    #[cfg(feature = "cluster-unstable")]
+    #[allow(clippy::disallowed_types)] // std HashMap matches the trait/CheckpointRequest shape
+    pub fn snapshot_state_by_vnode(
+        &mut self,
+    ) -> Result<
+        std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>>,
+        DbError,
+    > {
+        let vnode_count = match &self.cluster_shuffle {
+            Some(cfg) => cfg.registry.vnode_count(),
+            None => return Ok(std::collections::HashMap::new()),
+        };
+        let mut out: std::collections::HashMap<
+            u32,
+            std::collections::HashMap<String, bytes::Bytes>,
+        > = std::collections::HashMap::new();
+        for node in &mut self.nodes {
+            if node.removed {
+                continue;
+            }
+            if let Some(per_vnode) = node.operator.checkpoint_by_vnode(vnode_count)? {
+                for (vnode, bytes) in per_vnode {
+                    out.entry(vnode)
+                        .or_default()
+                        .insert(node.name.to_string(), bytes);
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn restore_state(&mut self, checkpoint: &GraphCheckpoint) -> Result<usize, DbError> {

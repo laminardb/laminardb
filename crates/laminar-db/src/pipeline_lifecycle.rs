@@ -178,6 +178,13 @@ impl LaminarDB {
             }
         }
 
+        // Rebuild any catalog objects this node lacks from the shared manifest
+        // before wiring the pipeline — replaying DDL here is the same pre-start
+        // path users take when they CREATE before start(). Best-effort/no-op
+        // outside cluster mode or with no manifest stored.
+        #[cfg(feature = "cluster-unstable")]
+        self.restore_catalog_from_manifest().await;
+
         match self.start_inner().await {
             Ok(()) => {
                 DbState::Running.store(&self.state);
@@ -488,6 +495,9 @@ impl LaminarDB {
                     receiver,
                     self_id,
                 });
+                // Share the DB's staged rehydration map so the graph applies
+                // rebalanced-in vnode state into operators each cycle.
+                graph.set_rehydration_handle(Arc::clone(&self.rehydrated_vnode_state));
             }
         }
 
@@ -652,7 +662,8 @@ impl LaminarDB {
                 config.set("_arrow_schema".to_string(), schema_str);
             }
 
-            let source = self
+            #[cfg_attr(not(feature = "cluster-unstable"), allow(unused_mut))]
+            let mut source = self
                 .connector_registry
                 .create_source(&config, prom_registry.as_deref())
                 .map_err(|e| {
@@ -662,6 +673,19 @@ impl LaminarDB {
                         config.connector_type()
                     ))
                 })?;
+            // Cluster mode: hand the source the vnode topology so a partitioned
+            // source (Kafka) consumes only the partitions this node owns and
+            // re-binds on rotation. No-op for non-partitioned sources.
+            #[cfg(feature = "cluster-unstable")]
+            if let (Some(registry), Some(self_id)) = (
+                self.vnode_registry.lock().clone(),
+                self.cluster_controller
+                    .lock()
+                    .as_ref()
+                    .map(|c| laminar_core::state::NodeId(c.instance_id().0)),
+            ) {
+                source.set_vnode_assignment(registry, self_id);
+            }
             let supports_replay = source.supports_replay();
             if !supports_replay {
                 tracing::warn!(

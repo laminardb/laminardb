@@ -211,12 +211,14 @@ impl ConnectorPipelineCallback {
             source_offset_overrides: HashMap::new(),
         };
 
+        let vnode_states = self.capture_vnode_states();
         let mut guard = self.coordinator.lock().await;
         let coord = guard.as_mut().ok_or_else(|| {
             DbError::Checkpoint(
                 "coordinator not initialized when force_capture_and_checkpoint ran".into(),
             )
         })?;
+        coord.set_pending_vnode_states(vnode_states);
         // Seed leader-side local watermark so `await_prepare_quorum`
         // can fold it into the cluster-wide min.
         let wm = self
@@ -300,8 +302,10 @@ impl ConnectorPipelineCallback {
             source_offset_overrides: source_overrides,
         };
 
+        let vnode_states = self.capture_vnode_states();
         let mut guard = self.coordinator.lock().await;
         let coord = (*guard).as_mut()?;
+        coord.set_pending_vnode_states(vnode_states);
         // Stamp this instance's current pipeline watermark into the
         // coordinator so the next `BarrierAck` carries it. i64::MIN
         // means unset; don't propagate — leader treats us as non-blocking.
@@ -395,6 +399,35 @@ impl ConnectorPipelineCallback {
         operator_states.extend(mv_states);
 
         Ok(operator_states)
+    }
+
+    /// Per-vnode operator-state slices for the in-flight checkpoint
+    /// (`vnode → operator_name → bytes`), staged on the coordinator so each
+    /// owned vnode's `partial.bin` carries real, rehydratable state. Empty
+    /// outside cluster mode. Best-effort: a snapshot error logs and yields an
+    /// empty map — the partial then carries no operator state for that epoch,
+    /// exactly as the legacy marker did, so the checkpoint still succeeds.
+    #[allow(clippy::disallowed_types)] // matches the coordinator/graph map shape
+    fn capture_vnode_states(
+        &mut self,
+    ) -> std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>> {
+        #[cfg(feature = "cluster-unstable")]
+        {
+            match self.graph.snapshot_state_by_vnode() {
+                Ok(map) => map,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "per-vnode state snapshot failed — partials carry no state this epoch"
+                    );
+                    std::collections::HashMap::new()
+                }
+            }
+        }
+        #[cfg(not(feature = "cluster-unstable"))]
+        {
+            std::collections::HashMap::new()
+        }
     }
 
     /// Wait for every sink to finish processing previously-enqueued
@@ -947,11 +980,13 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             source_offset_overrides: source_overrides,
         };
 
+        let vnode_states = self.capture_vnode_states();
         let mut committed = None;
         if force {
             // Blocking checkpoint at shutdown.
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
+                coord.set_pending_vnode_states(vnode_states);
                 match coord.checkpoint_with_offsets(request).await {
                     Ok(result) if result.success => {
                         tracing::info!(epoch = result.epoch, "Final pipeline checkpoint saved");
@@ -974,6 +1009,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             // parallelism to exploit with tokio::spawn).
             let mut guard = self.coordinator.lock().await;
             if let Some(ref mut coord) = *guard {
+                coord.set_pending_vnode_states(vnode_states);
                 match coord.checkpoint_with_offsets(request).await {
                     Ok(result) if result.success => {
                         tracing::info!(
@@ -1069,6 +1105,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             source_overrides.insert(name.clone(), source_to_connector_checkpoint(cp));
         }
 
+        let vnode_states = self.capture_vnode_states();
         let mut guard = self.coordinator.lock().await;
         let request = crate::checkpoint_coordinator::CheckpointRequest {
             operator_states,
@@ -1081,6 +1118,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         };
 
         if let Some(ref mut coord) = *guard {
+            coord.set_pending_vnode_states(vnode_states);
             match coord.checkpoint_with_offsets(request).await {
                 Ok(result) if result.success => {
                     tracing::info!(

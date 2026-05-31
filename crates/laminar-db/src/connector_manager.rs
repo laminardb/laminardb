@@ -167,6 +167,10 @@ pub struct ConnectorManager {
     tables: HashMap<String, TableRegistration>,
     /// Original DDL text for SHOW CREATE, keyed by object name.
     ddl_store: HashMap<String, String>,
+    /// Object names in creation order. Pairs with `ddl_store` to emit the
+    /// catalog manifest in a dependency-safe replay order (a view selecting
+    /// from another is created after it). Names are removed on DROP.
+    ddl_order: Vec<String>,
 }
 
 impl ConnectorManager {
@@ -178,17 +182,46 @@ impl ConnectorManager {
             streams: HashMap::new(),
             tables: HashMap::new(),
             ddl_store: HashMap::new(),
+            ddl_order: Vec::new(),
         }
     }
 
-    /// Store DDL text for SHOW CREATE.
+    /// Store DDL text for SHOW CREATE and the catalog manifest. Preserves
+    /// first-seen creation order; a re-`CREATE` (e.g. OR REPLACE) updates the
+    /// text in place without reordering.
     pub fn store_ddl(&mut self, name: &str, ddl: &str) {
-        self.ddl_store.insert(name.to_string(), ddl.to_string());
+        if self
+            .ddl_store
+            .insert(name.to_string(), ddl.to_string())
+            .is_none()
+        {
+            self.ddl_order.push(name.to_string());
+        }
     }
 
     /// Retrieve stored DDL text.
     pub fn get_ddl(&self, name: &str) -> Option<&str> {
         self.ddl_store.get(name).map(String::as_str)
+    }
+
+    /// Forget an object's DDL (on DROP) so it leaves the catalog manifest.
+    pub fn remove_ddl(&mut self, name: &str) {
+        if self.ddl_store.remove(name).is_some() {
+            self.ddl_order.retain(|n| n != name);
+        }
+    }
+
+    /// All stored DDL as `(name, ddl)` in creation order — the catalog
+    /// manifest's replay sequence.
+    pub fn ordered_ddl(&self) -> Vec<(String, String)> {
+        self.ddl_order
+            .iter()
+            .filter_map(|name| {
+                self.ddl_store
+                    .get(name)
+                    .map(|ddl| (name.clone(), ddl.clone()))
+            })
+            .collect()
     }
 
     /// Register a source.
@@ -208,16 +241,19 @@ impl ConnectorManager {
 
     /// Returns `true` if it existed.
     pub fn unregister_source(&mut self, name: &str) -> bool {
+        self.remove_ddl(name);
         self.sources.remove(name).is_some()
     }
 
     /// Returns `true` if it existed.
     pub fn unregister_sink(&mut self, name: &str) -> bool {
+        self.remove_ddl(name);
         self.sinks.remove(name).is_some()
     }
 
     /// Returns `true` if it existed.
     pub fn unregister_stream(&mut self, name: &str) -> bool {
+        self.remove_ddl(name);
         self.streams.remove(name).is_some()
     }
 
@@ -228,6 +264,7 @@ impl ConnectorManager {
 
     /// Returns `true` if it existed.
     pub fn unregister_table(&mut self, name: &str) -> bool {
+        self.remove_ddl(name);
         self.tables.remove(name).is_some()
     }
 
@@ -295,6 +332,7 @@ impl ConnectorManager {
         self.streams.clear();
         self.tables.clear();
         self.ddl_store.clear();
+        self.ddl_order.clear();
     }
 }
 
@@ -312,6 +350,7 @@ impl std::fmt::Debug for ConnectorManager {
             .field("streams", &self.streams.len())
             .field("tables", &self.tables.len())
             .field("ddl_entries", &self.ddl_store.len())
+            .field("ddl_order", &self.ddl_order.len())
             .finish()
     }
 }
