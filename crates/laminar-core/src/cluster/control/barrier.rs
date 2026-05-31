@@ -1,5 +1,5 @@
-//! Cross-instance barrier protocol over a gossip KV. Leader announces,
-//! followers ack, leader polls for quorum.
+//! Cross-instance barrier protocol. Direct gRPC leader-to-follower calls
+//! under `cluster-unstable`, falling back to gossip-KV announce/ack/poll.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -16,6 +16,10 @@ pub const ANNOUNCEMENT_KEY: &str = "control:barrier";
 
 /// KV key for a follower's barrier ack.
 pub const ACK_KEY: &str = "control:barrier-ack";
+
+/// Gossip KV key used by follower barrier servers to advertise their bound address.
+#[cfg(feature = "cluster-unstable")]
+pub const BARRIER_ADDR_KEY: &str = "barrier:addr";
 
 /// Barrier phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,9 +164,178 @@ impl ClusterKv for InMemoryKv {
     }
 }
 
-/// Cross-instance barrier coordination over a [`ClusterKv`].
+#[cfg(feature = "cluster-unstable")]
+#[allow(
+    clippy::doc_markdown,
+    clippy::default_trait_access,
+    clippy::missing_const_for_fn,
+    clippy::must_use_candidate,
+    clippy::too_many_lines,
+    missing_docs
+)]
+pub(crate) mod barrier_v1 {
+    tonic::include_proto!("laminar.barrier.v1");
+}
+
+#[cfg(feature = "cluster-unstable")]
+type BarrierFlavor = crossfire::mpsc::Array<BarrierAnnouncement>;
+
+#[cfg(feature = "cluster-unstable")]
+struct GrpcState {
+    incoming_rx: parking_lot::Mutex<Option<crossfire::AsyncRx<BarrierFlavor>>>,
+    incoming_rx_returned: Arc<tokio::sync::Notify>,
+    #[allow(dead_code)]
+    incoming_tx: crossfire::MAsyncTx<BarrierFlavor>,
+    pending_acks: Arc<parking_lot::Mutex<FxHashMap<u64, tokio::sync::oneshot::Sender<BarrierAck>>>>,
+    clients: Arc<parking_lot::Mutex<FxHashMap<NodeId, barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>>>>,
+    server_handle: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+}
+
+#[cfg(feature = "cluster-unstable")]
+struct RxReturnGuard<'a> {
+    slot: &'a parking_lot::Mutex<Option<crossfire::AsyncRx<BarrierFlavor>>>,
+    notify: &'a tokio::sync::Notify,
+    rx: Option<crossfire::AsyncRx<BarrierFlavor>>,
+}
+
+#[cfg(feature = "cluster-unstable")]
+impl Drop for RxReturnGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(rx) = self.rx.take() {
+            *self.slot.lock() = Some(rx);
+            self.notify.notify_one();
+        }
+    }
+}
+
+#[cfg(feature = "cluster-unstable")]
+struct GrpcBarrierServer {
+    incoming_tx: crossfire::MAsyncTx<BarrierFlavor>,
+    pending_acks: Arc<parking_lot::Mutex<FxHashMap<u64, tokio::sync::oneshot::Sender<BarrierAck>>>>,
+}
+
+#[cfg(feature = "cluster-unstable")]
+#[tonic::async_trait]
+impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
+    async fn prepare(
+        &self,
+        request: tonic::Request<barrier_v1::PrepareRequest>,
+    ) -> Result<tonic::Response<barrier_v1::Ack>, tonic::Status> {
+        let req = request.into_inner();
+        let (tx, rx) = tokio::sync::oneshot::channel::<BarrierAck>();
+
+        {
+            let mut guard = self.pending_acks.lock();
+            guard.insert(req.epoch, tx);
+        }
+
+        let ann = BarrierAnnouncement {
+            epoch: req.epoch,
+            checkpoint_id: req.checkpoint_id,
+            phase: Phase::Prepare,
+            flags: req.flags,
+            min_watermark_ms: None,
+        };
+
+        if self.incoming_tx.send(ann).await.is_err() {
+            let mut guard = self.pending_acks.lock();
+            guard.remove(&req.epoch);
+            return Err(tonic::Status::aborted("Follower coordinator shutdown"));
+        }
+
+        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(ack)) => {
+                Ok(tonic::Response::new(barrier_v1::Ack {
+                    epoch: ack.epoch,
+                    ok: ack.ok,
+                    error: ack.error,
+                    local_watermark_ms: ack.local_watermark_ms,
+                }))
+            }
+            Ok(Err(_)) => Err(tonic::Status::internal("Ack sender dropped")),
+            Err(_) => {
+                let mut guard = self.pending_acks.lock();
+                guard.remove(&req.epoch);
+                Err(tonic::Status::deadline_exceeded("Follower checkpoint prepare timed out"))
+            }
+        }
+    }
+
+    async fn commit(
+        &self,
+        request: tonic::Request<barrier_v1::CommitRequest>,
+    ) -> Result<tonic::Response<barrier_v1::Ack>, tonic::Status> {
+        let req = request.into_inner();
+        let ann = BarrierAnnouncement {
+            epoch: req.epoch,
+            checkpoint_id: req.checkpoint_id,
+            phase: Phase::Commit,
+            flags: req.flags,
+            min_watermark_ms: req.min_watermark_ms,
+        };
+        if self.incoming_tx.send(ann).await.is_err() {
+            return Err(tonic::Status::aborted("Follower coordinator shutdown"));
+        }
+        Ok(tonic::Response::new(barrier_v1::Ack {
+            epoch: req.epoch,
+            ok: true,
+            error: None,
+            local_watermark_ms: None,
+        }))
+    }
+
+    async fn abort(
+        &self,
+        request: tonic::Request<barrier_v1::AbortRequest>,
+    ) -> Result<tonic::Response<barrier_v1::Ack>, tonic::Status> {
+        let req = request.into_inner();
+        let ann = BarrierAnnouncement {
+            epoch: req.epoch,
+            checkpoint_id: req.checkpoint_id,
+            phase: Phase::Abort,
+            flags: req.flags,
+            min_watermark_ms: None,
+        };
+        if self.incoming_tx.send(ann).await.is_err() {
+            return Err(tonic::Status::aborted("Follower coordinator shutdown"));
+        }
+        Ok(tonic::Response::new(barrier_v1::Ack {
+            epoch: req.epoch,
+            ok: true,
+            error: None,
+            local_watermark_ms: None,
+        }))
+    }
+}
+
+#[cfg(feature = "cluster-unstable")]
+async fn get_barrier_client(
+    peer: NodeId,
+    pool: &Arc<parking_lot::Mutex<FxHashMap<NodeId, barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>>>>,
+    kv: &Arc<dyn ClusterKv>,
+) -> Option<barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>> {
+    {
+        let guard = pool.lock();
+        if let Some(client) = guard.get(&peer) {
+            return Some(client.clone());
+        }
+    }
+
+    let addr_str = kv.read_from(peer, BARRIER_ADDR_KEY).await?;
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr_str}")).ok()?;
+    let channel = endpoint.connect_lazy();
+    let client = barrier_v1::barrier_sync_client::BarrierSyncClient::new(channel);
+
+    let mut guard = pool.lock();
+    guard.insert(peer, client.clone());
+    Some(client)
+}
+
+/// Cross-instance barrier coordination.
 pub struct BarrierCoordinator {
     kv: Arc<dyn ClusterKv>,
+    #[cfg(feature = "cluster-unstable")]
+    grpc: Arc<parking_lot::Mutex<Option<Arc<GrpcState>>>>,
 }
 
 impl std::fmt::Debug for BarrierCoordinator {
@@ -171,11 +344,78 @@ impl std::fmt::Debug for BarrierCoordinator {
     }
 }
 
+impl Drop for BarrierCoordinator {
+    fn drop(&mut self) {
+        #[cfg(feature = "cluster-unstable")]
+        {
+            let grpc_opt = self.grpc.lock().take();
+            if let Some(state) = grpc_opt {
+                let handle_opt = state.server_handle.lock().take();
+                if let Some(handle) = handle_opt {
+                    handle.abort();
+                }
+            }
+        }
+    }
+}
+
 impl BarrierCoordinator {
     /// Wrap a KV implementation.
     #[must_use]
     pub fn new(kv: Arc<dyn ClusterKv>) -> Self {
-        Self { kv }
+        Self {
+            kv,
+            #[cfg(feature = "cluster-unstable")]
+            grpc: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    /// Bind and run the follower's direct gRPC barrier sync server.
+    ///
+    /// # Errors
+    /// Returns an error string on bind or socket address retrieval failures.
+    #[cfg(feature = "cluster-unstable")]
+    pub async fn start_server(&self, bind_addr: std::net::SocketAddr) -> Result<std::net::SocketAddr, String> {
+        use std::net::TcpListener;
+        use tonic::transport::Server;
+        use barrier_v1::barrier_sync_server::BarrierSyncServer;
+
+        let listener = TcpListener::bind(bind_addr).map_err(|e| e.to_string())?;
+        let local_addr = listener.local_addr().map_err(|e| e.to_string())?;
+        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+        let tokio_listener = tokio::net::TcpListener::from_std(listener).map_err(|e| e.to_string())?;
+
+        let (incoming_tx, incoming_rx) = crossfire::mpsc::bounded_async::<BarrierAnnouncement>(128);
+        let pending_acks = Arc::new(parking_lot::Mutex::new(FxHashMap::default()));
+        let clients = Arc::new(parking_lot::Mutex::new(FxHashMap::default()));
+
+        let server_impl = GrpcBarrierServer {
+            incoming_tx: incoming_tx.clone(),
+            pending_acks: Arc::clone(&pending_acks),
+        };
+
+        let server_task = tokio::spawn(async move {
+            let incoming_stream = tokio_stream::wrappers::TcpListenerStream::new(tokio_listener);
+            let _ = Server::builder()
+                .add_service(BarrierSyncServer::new(server_impl))
+                .serve_with_incoming(incoming_stream)
+                .await;
+        });
+
+        let grpc_state = Arc::new(GrpcState {
+            incoming_rx: parking_lot::Mutex::new(Some(incoming_rx)),
+            incoming_rx_returned: Arc::new(tokio::sync::Notify::new()),
+            incoming_tx,
+            pending_acks,
+            clients,
+            server_handle: Arc::new(parking_lot::Mutex::new(Some(server_task))),
+        });
+
+        *self.grpc.lock() = Some(grpc_state);
+
+        self.kv.write(BARRIER_ADDR_KEY, local_addr.to_string()).await;
+
+        Ok(local_addr)
     }
 
     /// Leader-side announce.
@@ -183,6 +423,55 @@ impl BarrierCoordinator {
     /// # Errors
     /// Returns a string on JSON encode failure.
     pub async fn announce(&self, ann: &BarrierAnnouncement) -> Result<(), String> {
+        #[cfg(feature = "cluster-unstable")]
+        {
+            let grpc_opt = self.grpc.lock().clone();
+            if let Some(state) = grpc_opt {
+                if ann.phase == Phase::Commit || ann.phase == Phase::Abort {
+                    let mut expected = Vec::new();
+                    for (node_id, _) in self.kv.scan(BARRIER_ADDR_KEY).await {
+                        expected.push(node_id);
+                    }
+
+                    let mut futures = Vec::new();
+                    for peer in expected {
+                        let clients_pool = Arc::clone(&state.clients);
+                        let kv = Arc::clone(&self.kv);
+                        let ann_clone = ann.clone();
+                        futures.push(async move {
+                            if let Some(mut client) = get_barrier_client(peer, &clients_pool, &kv).await {
+                                match ann_clone.phase {
+                                    Phase::Commit => {
+                                        let req = barrier_v1::CommitRequest {
+                                            epoch: ann_clone.epoch,
+                                            checkpoint_id: ann_clone.checkpoint_id,
+                                            flags: ann_clone.flags,
+                                            min_watermark_ms: ann_clone.min_watermark_ms,
+                                        };
+                                        let _ = client.commit(req).await;
+                                    }
+                                    Phase::Abort => {
+                                        let req = barrier_v1::AbortRequest {
+                                            epoch: ann_clone.epoch,
+                                            checkpoint_id: ann_clone.checkpoint_id,
+                                            flags: ann_clone.flags,
+                                        };
+                                        let _ = client.abort(req).await;
+                                    }
+                                    Phase::Prepare => {}
+                                }
+                            }
+                        });
+                    }
+                    futures::future::join_all(futures).await;
+                }
+
+                let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;
+                self.kv.write(ANNOUNCEMENT_KEY, json).await;
+                return Ok(());
+            }
+        }
+
         let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;
         self.kv.write(ANNOUNCEMENT_KEY, json).await;
         Ok(())
@@ -193,6 +482,30 @@ impl BarrierCoordinator {
     /// # Errors
     /// Returns a string on JSON decode failure.
     pub async fn observe(&self, leader: NodeId) -> Result<Option<BarrierAnnouncement>, String> {
+        #[cfg(feature = "cluster-unstable")]
+        {
+            let grpc_opt = self.grpc.lock().clone();
+            if let Some(state) = grpc_opt {
+                loop {
+                    let taken = { state.incoming_rx.lock().take() };
+                    let Some(rx) = taken else {
+                        state.incoming_rx_returned.notified().await;
+                        continue;
+                    };
+                    let mut guard = RxReturnGuard {
+                        slot: &state.incoming_rx,
+                        notify: &state.incoming_rx_returned,
+                        rx: Some(rx),
+                    };
+                    let rx = guard.rx.as_mut().ok_or_else(|| "Receiver dropped".to_string())?;
+                    match rx.recv().await {
+                        Ok(ann) => return Ok(Some(ann)),
+                        Err(_) => return Ok(None),
+                    }
+                }
+            }
+        }
+
         match self.kv.read_from(leader, ANNOUNCEMENT_KEY).await {
             Some(json) => serde_json::from_str(&json)
                 .map(Some)
@@ -206,18 +519,129 @@ impl BarrierCoordinator {
     /// # Errors
     /// Returns a string on JSON encode failure.
     pub async fn ack(&self, ack: &BarrierAck) -> Result<(), String> {
+        #[cfg(feature = "cluster-unstable")]
+        {
+            let grpc_opt = self.grpc.lock().clone();
+            if let Some(state) = grpc_opt {
+                let tx_opt = {
+                    let mut guard = state.pending_acks.lock();
+                    guard.remove(&ack.epoch)
+                };
+                if let Some(tx) = tx_opt {
+                    let _ = tx.send(ack.clone());
+                }
+                return Ok(());
+            }
+        }
+
         let json = serde_json::to_string(ack).map_err(|e| e.to_string())?;
         self.kv.write(ACK_KEY, json).await;
         Ok(())
     }
 
-    /// Leader-side: poll acks every 50 ms until quorum or `deadline`.
+    /// Leader-side: wait until quorum or `deadline`.
+    #[allow(clippy::too_many_lines)]
     pub async fn wait_for_quorum(
         &self,
         epoch: u64,
         expected: &[NodeId],
         deadline: Duration,
     ) -> QuorumOutcome {
+        #[cfg(feature = "cluster-unstable")]
+        {
+            let grpc_opt = self.grpc.lock().clone();
+            if let Some(state) = grpc_opt {
+                let checkpoint_id = match self.kv.scan(ANNOUNCEMENT_KEY).await.into_iter()
+                    .find(|(_, json)| {
+                        serde_json::from_str::<BarrierAnnouncement>(json)
+                            .is_ok_and(|a| a.epoch == epoch)
+                    }) {
+                        Some((_, json)) => serde_json::from_str::<BarrierAnnouncement>(&json)
+                            .map_or(0, |a| a.checkpoint_id),
+                        None => 0,
+                    };
+
+                let mut futures = Vec::new();
+                for &peer in expected {
+                    let clients_pool = Arc::clone(&state.clients);
+                    let kv = Arc::clone(&self.kv);
+                    futures.push(async move {
+                        let client_opt = get_barrier_client(peer, &clients_pool, &kv).await;
+                        let Some(mut client) = client_opt else {
+                            return Err((peer, "Discovery failed".to_string()));
+                        };
+
+                        let req = barrier_v1::PrepareRequest {
+                            epoch,
+                            checkpoint_id,
+                            flags: 0,
+                        };
+
+                        match tokio::time::timeout(deadline, client.prepare(req)).await {
+                            Ok(Ok(response)) => {
+                                let ack = response.into_inner();
+                                if ack.ok {
+                                    Ok((peer, ack.local_watermark_ms))
+                                } else {
+                                    Err((peer, ack.error.unwrap_or_else(|| "Unknown prepare failure".to_string())))
+                                }
+                            }
+                            Ok(Err(e)) => Err((peer, e.to_string())),
+                            Err(_) => Err((peer, "Timeout".to_string())),
+                        }
+                    });
+                }
+
+                let results = futures::future::join_all(futures).await;
+
+                let mut successful = Vec::new();
+                let mut failures = Vec::new();
+                let mut min_follower_wm: Option<i64> = None;
+                let mut timed_out = Vec::new();
+
+                for res in results {
+                    match res {
+                        Ok((peer, wm)) => {
+                            successful.push(peer);
+                            if let Some(w) = wm {
+                                min_follower_wm = Some(match min_follower_wm {
+                                    Some(cur) => cur.min(w),
+                                    None => w,
+                                });
+                            }
+                        }
+                        Err((peer, msg)) => {
+                            if msg.contains("Timeout") || msg.contains("deadline exceeded") {
+                                timed_out.push(peer);
+                            } else {
+                                failures.push((peer, msg));
+                            }
+                        }
+                    }
+                }
+
+                if !failures.is_empty() {
+                    return QuorumOutcome::Failed { failures };
+                }
+
+                if !timed_out.is_empty() || successful.len() < expected.len() {
+                    let got = successful;
+                    let mut missing = timed_out;
+                    for &peer in expected {
+                        if !got.contains(&peer) && !missing.contains(&peer) {
+                            missing.push(peer);
+                        }
+                    }
+                    return QuorumOutcome::TimedOut { got, missing };
+                }
+
+                return QuorumOutcome::Reached {
+                    acks: successful,
+                    min_follower_watermark_ms: min_follower_wm,
+                };
+            }
+        }
+
         let start = Instant::now();
         let expected_set: FxHashSet<NodeId> = expected.iter().copied().collect();
         let mut successful: Vec<NodeId> = Vec::new();
@@ -286,6 +710,72 @@ mod tests {
         Arc::new(InMemoryKv::new(id))
     }
 
+    #[cfg(all(test, feature = "cluster-unstable"))]
+    mod grpc_tests {
+        use super::*;
+        use std::net::SocketAddr;
+
+        #[tokio::test]
+        async fn test_grpc_barrier_flow() {
+            let leader_kv = kv(NodeId(1));
+            let follower_kv = kv(NodeId(2));
+            let leader_coord = BarrierCoordinator::new(leader_kv.clone());
+            let follower_coord = BarrierCoordinator::new(follower_kv.clone());
+
+            let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            let leader_addr = leader_coord.start_server(addr).await.unwrap();
+            let bound_addr = follower_coord.start_server(addr).await.unwrap();
+
+            leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, bound_addr.to_string());
+            follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());
+
+            let follower_task = tokio::spawn(async move {
+                let ann = follower_coord.observe(NodeId(1)).await.unwrap().unwrap();
+                assert_eq!(ann.epoch, 1);
+                assert_eq!(ann.checkpoint_id, 42);
+                assert_eq!(ann.phase, Phase::Prepare);
+
+                follower_coord.ack(&BarrierAck {
+                    epoch: 1,
+                    ok: true,
+                    error: None,
+                    local_watermark_ms: Some(100),
+                }).await.unwrap();
+
+                let commit_ann = follower_coord.observe(NodeId(1)).await.unwrap().unwrap();
+                assert_eq!(commit_ann.phase, Phase::Commit);
+                assert_eq!(commit_ann.min_watermark_ms, Some(100));
+            });
+
+            leader_coord.announce(&BarrierAnnouncement {
+                epoch: 1,
+                checkpoint_id: 42,
+                phase: Phase::Prepare,
+                flags: 0,
+                min_watermark_ms: None,
+            }).await.unwrap();
+
+            let outcome = leader_coord.wait_for_quorum(1, &[NodeId(2)], Duration::from_secs(5)).await;
+            match outcome {
+                QuorumOutcome::Reached { acks, min_follower_watermark_ms } => {
+                    assert_eq!(acks, vec![NodeId(2)]);
+                    assert_eq!(min_follower_watermark_ms, Some(100));
+
+                    leader_coord.announce(&BarrierAnnouncement {
+                        epoch: 1,
+                        checkpoint_id: 42,
+                        phase: Phase::Commit,
+                        flags: 0,
+                        min_watermark_ms: min_follower_watermark_ms,
+                    }).await.unwrap();
+                }
+                other => panic!("expected Reached, got {other:?}"),
+            }
+
+            follower_task.await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn leader_announces_follower_observes() {
         let leader_kv = kv(NodeId(1));
@@ -315,7 +805,6 @@ mod tests {
     #[tokio::test]
     async fn quorum_reached_when_all_ack_success() {
         let k = kv(NodeId(1));
-        // Simulate followers' acks being gossiped in.
         let ack_json = serde_json::to_string(&BarrierAck {
             epoch: 7,
             ok: true,
@@ -357,7 +846,6 @@ mod tests {
         })
         .unwrap();
         k.seed(NodeId(2), ACK_KEY, ack_json);
-        // NodeId(3) never acks.
 
         let coord = BarrierCoordinator::new(k);
         let outcome = coord
@@ -409,8 +897,6 @@ mod tests {
     #[tokio::test]
     async fn wrong_epoch_ack_is_ignored() {
         let k = kv(NodeId(1));
-        // NodeId(2) acks a DIFFERENT epoch — stale ack, should not
-        // count.
         let stale = serde_json::to_string(&BarrierAck {
             epoch: 9,
             ok: true,

@@ -1,6 +1,9 @@
 # Plan: Cross-node checkpoint barrier alignment for the row-shuffle
 
-- **Status:** Proposed (not started). 2026-05-30.
+- **Status:** Phases 1 (mechanism) + 2 (2PC wiring) DONE + committed (`8dbed398`, `6085a11e`).
+  Phase 3 closed 2026-05-31: the no-loss-at-snapshot guarantee is proven deterministically at the
+  unit layer and the wiring live; a black-box restore-with-in-flight test is deliberately not added
+  (vacuous + partly blocked — see Phasing step 3). Alignment is complete for what's testable today.
 - **Scope:** Close the at-least-once gap the cluster row-shuffle leaves at a checkpoint,
   for **both** the aggregate shuffle (`shuffle_pre_agg_batches`, `operator/sql_query.rs`) and
   the lookup-enrich key-shuffle (`shuffle_input`, `operator/lookup_enrich.rs`). Behind
@@ -178,11 +181,39 @@ Checked against current systems and the recent literature; the approach is mains
      Fix: `output = peer_owners(self)`; `input = owned_vnodes(self).is_empty() ? [] : live − self`,
      where `live` is the controller's membership (passed in — control-plane stays out of the shuffle
      config). `cluster_e2e_smoke` 30 s-timeout→pass; `cluster_rebalance_flow` + `cluster_2pc_flow` green.
-3. **Recovery safety:** confirm ingested-at-checkpoint rows restore without loss or double-count.
-   With alignment the origin's offset-advance and the owner's ingest land in the same checkpoint, so
-   no double-count (agg) and idempotent replay (lookup) — to be proven with a restore test.
-4. **Test:** a 2-node harness test that ships rows A→B, checkpoints mid-flight, restores, and
-   asserts no row loss (and no duplication) across the shuffle boundary. (Needs step 2 wired.)
+3. **Recovery safety — PROVEN at the unit layer; a black-box restore test is the wrong tool (2026-05-31).**
+   The no-loss-at-snapshot property is "a peer's pre-barrier row is folded into operator state before
+   alignment completes, so it enters the snapshot." That is exactly what
+   `align_shuffle_barriers_folds_peer_rows_then_aligns` asserts **deterministically** (it stages the
+   in-flight `VnodeData` + `Barrier` directly, runs `align_shuffle_barriers`, and checks the fold).
+   With alignment the origin's offset-advance and the owner's ingest land in the same checkpoint → no
+   double-count (agg) and idempotent replay (lookup). Tracing the restore path (below) confirmed a
+   2-node harness restore test would be **vacuous as a regression test and is partly blocked**, so it
+   is deliberately **not** added:
+   - **It can't deterministically create the in-flight window.** Alignment only changes behavior when
+     rows are shipped-but-undrained at the *exact* snapshot instant. The harness exposes no hook to
+     hold a follower's per-cycle `drain_vnode_data_for`, so the follower drains on its own cycle and
+     folds the rows into its accumulator **regardless of alignment** — the test would pass with or
+     without the fix. The unit test injects the frame directly, which is the only way to pin the
+     window; the integration layer can't, so it adds no regression value.
+   - **The MV result store isn't rehydrated on restart.** `db.start()` → `pipeline_lifecycle`
+     restores the agg **accumulators** (`graph.restore_from_bytes` at `pipeline_lifecycle.rs:993`,
+     loud `LDB-6029` on failure), but the **queryable MV results** repopulate only when the operator
+     next emits, and an incremental agg emits only *changed* groups — so a passive `read_mv_sums`
+     after restart returns empty/partial irrespective of alignment. (This is what sank the removed
+     `cluster_e2e_failures::restart_recovers_sum_aggregate`.) Cluster shared-backend vnode partials
+     are never read back on cold start either (`read_partial` is absent from `recovery_manager`; the
+     accumulators come back via the local manifest, not the shared partials). Surfacing recovered
+     state through the MV would need a forced per-key re-emit, which only adds confounds.
+   - **Wiring is already covered live.** `cluster_e2e_smoke` proves an aligned 2PC checkpoint commits
+     with correct cross-node sums; `cluster_2pc_flow` + `cluster_rebalance_flow` cover the 2PC and
+     rotation paths. Phases 1–2 (mechanism + wiring) carry the alignment guarantee end-to-end up to
+     the snapshot; the durable-restore leg is bounded by the separate, unimplemented "rebuild MV
+     results / read shared partials on cold start" capability — out of scope for this plan.
+   **Future (if a durable cluster-recovery guarantee is wanted):** the right investment is a test seam
+   (a hook to hold a follower's drain, or to inject an in-flight `VnodeData` at checkpoint) plus
+   MV-result rehydration on restart — *then* a non-vacuous restore-with-in-flight test becomes
+   possible. Tracked as cluster cold-restart recovery, not here.
 
 ## Phase 2 recommendation: reorder (Prepare-triggered), not a separate round
 
@@ -220,6 +251,11 @@ Grounded in the architecture + how production systems do it:
 
 ## Exit
 
-A 2-node lookup/agg shuffle MV checkpointed while rows are in flight restores with **no loss and
-no duplication** across the shuffle boundary; single-node and the per-cycle hot path are
-unchanged; a hung peer fails the checkpoint (retry) rather than hanging.
+**Met for what this plan covers.** A peer's in-flight pre-barrier rows are folded into the snapshot
+before alignment completes (`align_shuffle_barriers_folds_peer_rows_then_aligns`, deterministic); an
+aligned 2PC checkpoint commits with correct cross-node sums (`cluster_e2e_smoke`); single-node and
+the per-cycle hot path are unchanged; a hung peer fails the checkpoint (30 s timeout → retry) rather
+than hanging. The end-to-end "restores with no loss/dup" assertion is bounded by a separate
+unimplemented capability (rebuild MV results / read shared partials on cold restart) and a missing
+test seam to force the in-flight window — see Phasing step 3; not pursued here as it would be a
+vacuous regression test.

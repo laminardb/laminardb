@@ -137,6 +137,15 @@ impl ClusterController {
         self.members_rx.clone()
     }
 
+    /// Start the direct gRPC barrier sync server.
+    ///
+    /// # Errors
+    /// Propagates [`BarrierCoordinator::start_server`] errors.
+    #[cfg(feature = "cluster-unstable")]
+    pub async fn start_barrier_server(&self, bind_addr: std::net::SocketAddr) -> Result<std::net::SocketAddr, String> {
+        self.barrier.start_server(bind_addr).await
+    }
+
     /// Leader-side announce.
     ///
     /// # Errors

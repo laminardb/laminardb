@@ -614,28 +614,27 @@ impl LookupEnrichOperator {
             // cache slot agree — the owner is the node that caches it.
             let key_indices = &self.resolved.as_ref().expect("resolved").key_indices;
             let vnodes = laminar_core::shuffle::row_vnodes(batch, key_indices, vnode_count);
-            let mut seen = vnodes.clone();
-            seen.sort_unstable();
-            seen.dedup();
-            for v in seen {
-                let Some(slice) = laminar_core::shuffle::slice_batch_by_vnode(batch, &vnodes, v)
-                else {
-                    continue;
-                };
+            for &v in &vnodes {
                 let owner = cfg.registry.owner(v);
-                if owner == cfg.self_id {
-                    local.push(slice);
-                } else if owner.is_unassigned() {
+                if owner.is_unassigned() {
                     return Err(DbError::Pipeline(format!(
-                        "lookup-enrich: shuffle vnode {v} is unassigned — refusing to drop {} rows",
-                        slice.num_rows()
+                        "lookup-enrich: shuffle vnode {v} is unassigned — refusing to drop rows"
                     )));
-                } else {
-                    outbound.push((
-                        owner.0,
-                        ShuffleMessage::VnodeData(self.op_name.to_string(), v, slice),
-                    ));
                 }
+            }
+
+            let (local_slices, remote_slices) =
+                laminar_core::shuffle::slice_batch_by_targets(batch, &vnodes, &cfg.registry, cfg.self_id);
+
+            for (_v, slice) in local_slices {
+                local.push(slice);
+            }
+
+            for (owner, slice) in remote_slices {
+                outbound.push((
+                    owner.0,
+                    ShuffleMessage::VnodeData(self.op_name.to_string(), 0, slice),
+                ));
             }
         }
 

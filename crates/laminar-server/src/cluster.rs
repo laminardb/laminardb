@@ -382,6 +382,20 @@ pub async fn start_cluster(
                     snapshot_store.clone(),
                     members_rx,
                 ));
+                #[cfg(feature = "cluster-unstable")]
+                {
+                    let bind: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+                    match controller.start_barrier_server(bind).await {
+                        Ok(bound) => {
+                            info!("Barrier sync gRPC server listening on {}", bound);
+                        }
+                        Err(e) => {
+                            return Err(ClusterStartupError::EngineConstruction(format!(
+                                "barrier sync server bind: {e}"
+                            )));
+                        }
+                    }
+                }
                 info!(
                     "ClusterController installed (leader={})",
                     controller.is_leader()

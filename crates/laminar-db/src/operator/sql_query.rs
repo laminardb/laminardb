@@ -458,42 +458,30 @@ async fn shuffle_pre_agg_batches(
             continue;
         }
         let row_vn = hash_rows_to_vnodes(&batch, num_group_cols, vnode_count);
-        let mut seen = row_vn.clone();
-        seen.sort_unstable();
-        seen.dedup();
-
-        for v in seen {
-            let Some(slice) = laminar_core::shuffle::slice_batch_by_vnode(&batch, &row_vn, v)
-            else {
-                continue;
-            };
+        for &v in &row_vn {
             let owner = cfg.registry.owner(v);
-            if owner == cfg.self_id {
-                local.push(slice);
-            } else if owner.is_unassigned() {
-                // Fail the cycle rather than drop the slice. Silently
-                // discarding leaves source offsets to advance past rows
-                // that never reached a peer, producing phantom loss at
-                // the checkpoint boundary.
+            if owner.is_unassigned() {
                 return Err(DbError::Pipeline(format!(
-                    "[{op_name}] row-shuffle: vnode {v} is unassigned — \
-                     refusing to drop {} rows",
-                    slice.num_rows()
+                    "[{op_name}] row-shuffle: vnode {v} is unassigned — refusing to drop rows"
                 )));
-            } else {
-                // Tag with this query's name so a receiver shared with
-                // another sharded operator (e.g. a lookup-enrich join)
-                // demuxes our rows to us, not to it.
-                let msg = ShuffleMessage::VnodeData(op_name.to_string(), v, slice);
-                // Fail the cycle on send error; dropping silently would
-                // let source offsets advance past un-delivered rows.
-                cfg.sender.send_to(owner.0, &msg).await.map_err(|e| {
-                    DbError::Pipeline(format!(
-                        "[{op_name}] row-shuffle send_to peer {}: {e}",
-                        owner.0
-                    ))
-                })?;
             }
+        }
+
+        let (local_slices, remote_slices) =
+            laminar_core::shuffle::slice_batch_by_targets(&batch, &row_vn, &cfg.registry, cfg.self_id);
+
+        for (_v, slice) in local_slices {
+            local.push(slice);
+        }
+
+        for (owner, slice) in remote_slices {
+            let msg = ShuffleMessage::VnodeData(op_name.to_string(), 0, slice);
+            cfg.sender.send_to(owner.0, &msg).await.map_err(|e| {
+                DbError::Pipeline(format!(
+                    "[{op_name}] row-shuffle send_to peer {}: {e}",
+                    owner.0
+                ))
+            })?;
         }
     }
 

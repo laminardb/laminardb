@@ -406,40 +406,33 @@ async fn route_input_stream(
                     if partition_txs.is_none() { continue; }
                     let row_vn =
                         laminar_core::shuffle::row_vnodes(&batch, &hash_columns, vnode_count);
-                    let mut seen = row_vn.clone();
-                    seen.sort_unstable();
-                    seen.dedup();
+                    let (local_slices, remote_slices) =
+                        laminar_core::shuffle::slice_batch_by_targets(&batch, &row_vn, &registry, self_id);
                     let mut downstream_dropped = false;
-                    for v in seen {
-                        let Some(slice) =
-                            laminar_core::shuffle::slice_batch_by_vnode(&batch, &row_vn, v)
-                        else {
-                            continue;
-                        };
-                        let owner = registry.owner(v);
-                        if owner == self_id {
-                            if let Some(&idx) = vnode_to_partition.get(&v) {
-                                let send_res = partition_txs.as_ref().unwrap()[idx]
-                                    .send(slice)
-                                    .await;
-                                if send_res.is_err() {
-                                    downstream_dropped = true;
-                                    break;
-                                }
+
+                    for (v, slice) in local_slices {
+                        if let Some(&idx) = vnode_to_partition.get(&v) {
+                            let send_res = partition_txs.as_ref().unwrap()[idx]
+                                .send(slice)
+                                .await;
+                            if send_res.is_err() {
+                                downstream_dropped = true;
+                                break;
                             }
-                        } else if !owner.is_unassigned() {
-                            // This exec owns its receiver and routes purely by
-                            // vnode in `dispatch_inbound`, so the stage tag is
-                            // unused here — an empty stage keeps the frame valid.
+                        }
+                    }
+
+                    if !downstream_dropped {
+                        for (owner, slice) in remote_slices {
                             let msg = laminar_core::shuffle::ShuffleMessage::VnodeData(
                                 String::new(),
-                                v,
+                                0,
                                 slice,
                             );
-                            // Drop on unreachable peer.
                             let _ = sender.send_to(owner.0, &msg).await;
                         }
                     }
+
                     if downstream_dropped {
                         partition_txs = None;
                         input = None;

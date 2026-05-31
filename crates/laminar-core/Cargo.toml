@@ -16,6 +16,7 @@ default = []
 # not yet implemented. Do not enable in production.
 cluster-unstable = [
     "dep:chitchat", "dep:tokio-util", "dep:anyhow", "dep:futures",
+    "dep:tonic", "dep:tonic-prost", "dep:prost",
 ]
 [dependencies]
 # Performance critical - no allocations on hot path
@@ -60,10 +61,24 @@ anyhow = { workspace = true, optional = true }
 # FaultyObjectStore (BoxStream type). Cluster-unstable only.
 futures = { workspace = true, optional = true }
 
+# gRPC transport for cross-node shuffle + barrier sync (cluster-unstable).
+# The generated client/server stubs are compiled only under that feature;
+# `tonic-prost` supplies the ProstCodec the generated code instantiates.
+tonic = { version = "0.14", optional = true }
+tonic-prost = { version = "0.14", optional = true }
+prost = { version = "0.14", optional = true }
+
 # Observability
 tracing = { workspace = true }
 
 crossfire = { workspace = true }
+
+[build-dependencies]
+# Generates the gRPC client/server stubs from proto/*.proto. Build-dependencies
+# can't be feature-gated, so this is always present, but the codegen in build.rs
+# runs only when CARGO_FEATURE_CLUSTER_UNSTABLE is set — a default build needs
+# no protoc and skips generation entirely.
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
 criterion = { workspace = true }
