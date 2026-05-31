@@ -40,6 +40,8 @@ clap = { version = "4.6", features = ["derive", "env"] }
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
+# CancellationToken for the cluster leader-lease renewal loop (cluster-unstable).
+tokio-util = { workspace = true, optional = true }
 crossfire = { workspace = true }
 
 # Logging
@@ -169,5 +171,6 @@ cluster-unstable = [
     "laminar-db/cluster-unstable",
     "dep:uuid",
     "dep:xxhash-rust",
+    "dep:tokio-util",
 ]
 vendored-openssl = ["dep:openssl"]

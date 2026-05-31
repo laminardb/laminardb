@@ -33,6 +33,13 @@ impl DiscoveryImpl {
         }
     }
 
+    async fn announce(&self, info: NodeInfo) -> Result<(), DiscoveryError> {
+        match self {
+            Self::Static(d) => d.announce(info).await,
+            Self::Gossip(d) => d.announce(info).await,
+        }
+    }
+
     fn membership_watch(&self) -> watch::Receiver<Vec<NodeInfo>> {
         match self {
             Self::Static(d) => d.membership_watch(),
@@ -157,6 +164,19 @@ pub struct ClusterHandle {
     api_handle: tokio::task::JoinHandle<()>,
     watcher_handle: Option<tokio::task::JoinHandle<()>>,
     membership_handle: tokio::task::JoinHandle<()>,
+    /// This node's own membership record. Cloned and re-announced with
+    /// [`NodeState::Draining`] on shutdown so peers stop routing to us.
+    local_node: NodeInfo,
+    /// Cluster control plane (gossip discovery only). `begin_drain` is
+    /// called on shutdown so the leader excludes us from vnode
+    /// assignment.
+    cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    /// Durable vnode assignment snapshot. Polled on shutdown to block
+    /// until the leader has reassigned every vnode we own.
+    snapshot_store: Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>,
+    /// Cancels the leader-lease renewal loop on shutdown so a draining
+    /// node stops renewing and its lease expires promptly.
+    lease_shutdown_token: Option<tokio_util::sync::CancellationToken>,
     /// Snapshot watcher + leader rebalance controller tasks. Empty
     /// if the deployment has no `AssignmentSnapshotStore` (non-cluster
     /// or pre-configured legacy).
@@ -174,6 +194,48 @@ impl ClusterHandle {
             .map_err(|e| ClusterStartupError::Discovery(format!("signal handler: {e}")))?;
 
         info!("Received shutdown signal, shutting down cluster node...");
+
+        // Graceful drain. Discovery and the rebalance control plane must
+        // stay alive here: peers need to observe our Draining state and
+        // the leader needs to rotate our vnodes away before we tear down.
+        //
+        // 1. Announce Draining so peers stop routing to us and the
+        //    leader's `assignable_instances` drops us from assignment.
+        let mut draining = self.local_node.clone();
+        draining.state = NodeState::Draining;
+        if let Err(e) = self.discovery.announce(draining).await {
+            warn!("Failed to announce draining state: {e}");
+        }
+
+        // 2. Flip the local draining flag so that if we are the leader,
+        //    our own rebalance controller excludes us from assignment.
+        if let Some(controller) = &self.cluster_controller {
+            controller.begin_drain();
+        }
+
+        // 3. Block until the leader has reassigned every vnode we own,
+        //    bounded so a stuck cluster can't wedge shutdown forever.
+        if let Some(store) = &self.snapshot_store {
+            let me = laminar_core::state::NodeId(self.local_node.id.0);
+            let drained = laminar_db::rebalance::wait_until_drained(
+                store,
+                me,
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(30),
+            )
+            .await;
+            if drained {
+                info!("Drain complete: all owned vnodes reassigned");
+            } else {
+                warn!("Drain timed out after 30s; proceeding with shutdown");
+            }
+        }
+
+        // 4. Stop renewing the leader lease so it expires promptly and a
+        //    surviving node can take over without waiting out the TTL.
+        if let Some(token) = &self.lease_shutdown_token {
+            token.cancel();
+        }
 
         // Tell rebalance tasks to exit at their next select point.
         // Fire all aborts before awaiting any so a slow responder
@@ -544,6 +606,37 @@ pub async fn start_cluster(
         info!("Rebalance control plane started");
     }
 
+    // Fenced leader lease. Standalone split-brain hardening: a stale
+    // leader whose lease has expired loses the CAS to the next acquirer
+    // and stops renewing, while the new owner advances the monotonic
+    // fencing token. Runs whenever a shared object store is available
+    // (the lease lives in the same cluster-wide bucket as state). The
+    // renewal loop is cancelled on shutdown via the returned token.
+    let lease_shutdown_token: Option<tokio_util::sync::CancellationToken> =
+        match config.state.build_object_store().map_err(|e| {
+            ClusterStartupError::EngineConstruction(format!("leader lease store: {e}"))
+        })? {
+            Some(lease_os) => {
+                use laminar_core::cluster::control::{
+                    LeaderLeaseConfig, LeaderLeaseManager, LeaderLeaseStore,
+                };
+                let lease_cfg = LeaderLeaseConfig::default();
+                let ttl_ms = lease_cfg.ttl.as_millis() as i64;
+                let lease_store = Arc::new(LeaderLeaseStore::new(lease_os, ttl_ms));
+                let manager = LeaderLeaseManager::new(lease_store, node_id, lease_cfg);
+                let token = tokio_util::sync::CancellationToken::new();
+                // Detached renewal loop; it returns once `token` is cancelled
+                // during graceful shutdown.
+                let _lease_handle = manager.spawn(token.clone());
+                info!(
+                    "Leader lease manager started (ttl={}s)",
+                    lease_cfg.ttl.as_secs()
+                );
+                Some(token)
+            }
+            None => None,
+        };
+
     let (app_state, api_handle) =
         server::start_http_api(Arc::clone(&db), registry, config_path.clone(), config)
             .await
@@ -562,6 +655,10 @@ pub async fn start_cluster(
         api_handle,
         watcher_handle,
         membership_handle,
+        local_node,
+        cluster_controller,
+        snapshot_store,
+        lease_shutdown_token,
         rebalance_tasks,
         rebalance_shutdown,
     })
