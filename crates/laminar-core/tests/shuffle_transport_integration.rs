@@ -1,6 +1,8 @@
 //! Connection-pool + handshake coverage for `ShuffleSender` /
 //! `ShuffleReceiver` over loopback TCP.
 
+#![cfg(feature = "cluster-unstable")]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;

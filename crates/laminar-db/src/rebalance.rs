@@ -9,7 +9,7 @@ use std::time::Duration;
 use laminar_core::cluster::control::{
     AssignmentSnapshot, AssignmentSnapshotStore, ClusterController, RotateOutcome,
 };
-use laminar_core::state::{round_robin_assignment, NodeId, VnodeRegistry};
+use laminar_core::state::{rendezvous_assignment, NodeId, VnodeRegistry};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
@@ -202,7 +202,7 @@ async fn try_rebalance(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "no snapshot on store — boot seed missing".to_string())?;
 
-    let new_assignment = round_robin_assignment(registry.vnode_count(), live);
+    let new_assignment = rendezvous_assignment(registry.vnode_count(), live);
     let new_vnodes = AssignmentSnapshot::vnodes_from_vec(&new_assignment);
     if new_vnodes == current.vnodes {
         return Ok(None);

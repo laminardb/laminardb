@@ -10,7 +10,7 @@ use std::time::Duration;
 use laminar_core::cluster::control::{BarrierAnnouncement, Phase};
 use laminar_core::cluster::testing::MiniCluster;
 use laminar_core::state::{
-    owned_vnodes, round_robin_assignment, NodeId, ObjectStoreBackend, VnodeRegistry,
+    owned_vnodes, rendezvous_assignment, NodeId, ObjectStoreBackend, VnodeRegistry,
 };
 use laminar_db::checkpoint_coordinator::{
     CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
@@ -88,7 +88,7 @@ async fn two_node_minio_leader_commits_follower_mirrors() {
         NodeId(leader_node.instance_id.0),
         NodeId(follower_node.instance_id.0),
     ];
-    registry.set_assignment(round_robin_assignment(4, &peers));
+    registry.set_assignment(rendezvous_assignment(4, &peers));
 
     let leader_owned = owned_vnodes(&registry, NodeId(leader_node.instance_id.0));
     let follower_owned = owned_vnodes(&registry, NodeId(follower_node.instance_id.0));

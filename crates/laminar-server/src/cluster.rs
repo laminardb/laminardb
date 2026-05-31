@@ -597,7 +597,7 @@ async fn resolve_vnode_assignment(
     ClusterStartupError,
 > {
     use laminar_core::cluster::control::{AssignmentSnapshot, AssignmentSnapshotStore};
-    use laminar_core::state::{round_robin_assignment, NodeId, VnodeRegistry};
+    use laminar_core::state::{rendezvous_assignment, NodeId, VnodeRegistry};
 
     let vnode_count = state_cfg.vnode_capacity();
     let peer_ids: Vec<NodeId> = peers
@@ -605,7 +605,7 @@ async fn resolve_vnode_assignment(
         .map(|p| NodeId(p.id.0))
         .chain(std::iter::once(NodeId(self_id.0)))
         .collect();
-    let assignment: Arc<[NodeId]> = round_robin_assignment(vnode_count, &peer_ids);
+    let assignment: Arc<[NodeId]> = rendezvous_assignment(vnode_count, &peer_ids);
 
     let maybe_store = state_cfg
         .build_object_store()

@@ -41,11 +41,11 @@ pub fn owned_partitions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use laminar_core::state::round_robin_assignment;
+    use laminar_core::state::rendezvous_assignment;
     use std::sync::Arc;
 
     fn registry_with(vnode_count: u32, owners: &[NodeId]) -> VnodeRegistry {
-        let assignment = round_robin_assignment(vnode_count, owners);
+        let assignment = rendezvous_assignment(vnode_count, owners);
         let r = VnodeRegistry::new(vnode_count);
         r.set_assignment(assignment);
         r

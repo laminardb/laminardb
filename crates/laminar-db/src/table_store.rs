@@ -14,9 +14,7 @@ use std::collections::HashMap;
 use arrow::array::{Array, RecordBatch, StringArray};
 use arrow::datatypes::SchemaRef;
 
-#[cfg(test)]
-use laminar_core::operator::table_cache::{collect_cache_metrics, TableCacheMetrics};
-use laminar_core::operator::table_cache::{TableLruCache, TableXorFilter};
+
 
 use crate::error::DbError;
 use crate::table_backend::TableBackend;
@@ -38,13 +36,9 @@ struct TableState {
     ready: bool,
     /// Connector type backing this table, if any.
     connector: Option<String>,
-    /// Cache mode for this table (used by test-only `lookup()` path).
+    /// Cache mode for this table.
     #[cfg_attr(not(test), allow(dead_code))]
     cache_mode: TableCacheMode,
-    /// LRU cache (only used in Partial mode).
-    lru_cache: Option<TableLruCache>,
-    /// Xor filter for negative lookup short-circuiting.
-    xor_filter: TableXorFilter,
 }
 
 /// Primary-key-based reference table store.
@@ -102,11 +96,6 @@ impl TableStore {
             ))
         })?;
 
-        let lru_cache = match &cache_mode {
-            TableCacheMode::Partial { max_entries } => Some(TableLruCache::new(*max_entries)),
-            _ => None,
-        };
-
         self.tables.insert(
             name.to_string(),
             TableState {
@@ -118,8 +107,6 @@ impl TableStore {
                 ready: false,
                 connector: None,
                 cache_mode,
-                lru_cache,
-                xor_filter: TableXorFilter::new(),
             },
         );
         Ok(())
@@ -202,10 +189,6 @@ impl TableStore {
 
         for i in 0..count {
             let key = extract_pk_string(pk_col, i);
-            // Invalidate LRU cache entry so stale data isn't served
-            if let Some(ref mut lru) = state.lru_cache {
-                lru.invalidate(&key);
-            }
             let row = batch.slice(i, 1);
             let existed = state.backend.put(&key, row)?;
             if !existed {
@@ -217,13 +200,9 @@ impl TableStore {
     }
 
     /// Delete a row by primary key. Returns `true` if the key existed.
-    /// Invalidates the LRU cache entry if present.
     #[cfg(test)]
     pub fn delete(&mut self, name: &str, key: &str) -> bool {
         if let Some(state) = self.tables.get_mut(name) {
-            if let Some(ref mut lru) = state.lru_cache {
-                lru.invalidate(key);
-            }
             match state.backend.remove(key) {
                 Ok(true) => {
                     state.row_count = state.row_count.saturating_sub(1);
@@ -237,39 +216,13 @@ impl TableStore {
     }
 
     /// Look up a single row by primary key.
-    ///
-    /// In **Full** / **None** mode: direct backend lookup (unchanged behavior).
-    /// In **Partial** mode: xor filter -> LRU cache -> backend -> populate LRU.
     #[cfg(test)]
     pub fn lookup(&mut self, name: &str, key: &str) -> Option<RecordBatch> {
         let state = self.tables.get_mut(name)?;
-
-        match state.cache_mode {
-            TableCacheMode::Full | TableCacheMode::None => state.backend.get(key).ok().flatten(),
-            TableCacheMode::Partial { .. } => {
-                // Step 1: Xor filter check — if definitely absent, short-circuit
-                if !state.xor_filter.contains(key) {
-                    return None;
-                }
-
-                // Step 2: LRU cache check
-                if let Some(lru) = &mut state.lru_cache {
-                    if let Some(batch) = lru.get(key) {
-                        return Some(batch.clone());
-                    }
-                }
-
-                // Step 3: Backing store lookup -> populate LRU on hit
-                let batch = state.backend.get(key).ok().flatten()?;
-                if let Some(lru) = &mut state.lru_cache {
-                    lru.insert(key.to_string(), batch.clone());
-                }
-                Some(batch)
-            }
-        }
+        state.backend.get(key).ok().flatten()
     }
 
-    /// Upsert a batch and rebuild the xor filter in a single lock scope.
+    /// Upsert a batch in a single lock scope.
     ///
     /// Returns the upserted row count.
     ///
@@ -281,27 +234,17 @@ impl TableStore {
         name: &str,
         batch: &RecordBatch,
     ) -> Result<usize, DbError> {
-        let count = self.upsert(name, batch)?;
-        self.rebuild_xor_filter(name);
-        Ok(count)
+        self.upsert(name, batch)
     }
 
-    /// Rebuild the xor filter for a table from all current keys.
-    pub fn rebuild_xor_filter(&mut self, name: &str) {
-        if let Some(state) = self.tables.get_mut(name) {
-            let keys = state.backend.keys().unwrap_or_default();
-            state.xor_filter.rebuild(&keys);
-        }
-    }
+    /// Rebuild the cache/indices (no-op since removing hand-rolled caches).
+    #[allow(clippy::unused_self)]
+    pub fn rebuild_xor_filter(&mut self, _name: &str) {}
 
-    /// Get cache metrics for a table.
+    /// Get the cache mode for a table.
     #[cfg(test)]
-    pub fn cache_metrics(&self, name: &str) -> Option<TableCacheMetrics> {
-        let state = self.tables.get(name)?;
-        state
-            .lru_cache
-            .as_ref()
-            .map(|lru| collect_cache_metrics(lru, &state.xor_filter))
+    pub fn cache_mode(&self, name: &str) -> Option<&TableCacheMode> {
+        self.tables.get(name).map(|t| &t.cache_mode)
     }
 
     /// Concatenate all rows into a single `RecordBatch`.
@@ -541,180 +484,7 @@ mod tests {
         assert!(!store.is_persistent("t"));
     }
 
-    #[test]
-    fn test_partial_cache_lookup_populates_lru() {
-        let mut store = TableStore::new();
-        store
-            .create_table_with_cache(
-                "t",
-                test_schema(),
-                "id",
-                TableCacheMode::Partial { max_entries: 100 },
-            )
-            .unwrap();
 
-        let batch = make_batch(&[1, 2, 3], &["A", "B", "C"], &[1.0, 2.0, 3.0]);
-        store.upsert("t", &batch).unwrap();
-        store.rebuild_xor_filter("t");
-
-        // First lookup: cache miss -> backing store hit -> populates LRU
-        let row = store.lookup("t", "1").unwrap();
-        assert_eq!(row.num_rows(), 1);
-
-        // Second lookup: should be an LRU hit
-        let row = store.lookup("t", "1").unwrap();
-        assert_eq!(row.num_rows(), 1);
-
-        let metrics = store.cache_metrics("t").unwrap();
-        assert_eq!(metrics.cache_gets, 2);
-        // First get is a miss (not in LRU yet), second is a hit
-        assert_eq!(metrics.cache_hits, 1);
-    }
-
-    #[test]
-    fn test_partial_cache_xor_short_circuits() {
-        let mut store = TableStore::new();
-        store
-            .create_table_with_cache(
-                "t",
-                test_schema(),
-                "id",
-                TableCacheMode::Partial { max_entries: 100 },
-            )
-            .unwrap();
-
-        let batch = make_batch(&[1], &["A"], &[1.0]);
-        store.upsert("t", &batch).unwrap();
-        store.rebuild_xor_filter("t");
-
-        // Lookup a key that doesn't exist — xor filter should short-circuit
-        assert!(store.lookup("t", "999").is_none());
-
-        let _metrics = store.cache_metrics("t").unwrap();
-        // The xor filter may or may not short-circuit for this particular key
-        // (0.4% FPR means ~99.6% chance it short-circuits), but the important
-        // thing is that the lookup returns None.
-    }
-
-    #[test]
-    fn test_partial_cache_eviction() {
-        let mut store = TableStore::new();
-        store
-            .create_table_with_cache(
-                "t",
-                test_schema(),
-                "id",
-                TableCacheMode::Partial { max_entries: 2 },
-            )
-            .unwrap();
-
-        let batch = make_batch(&[1, 2, 3], &["A", "B", "C"], &[1.0, 2.0, 3.0]);
-        store.upsert("t", &batch).unwrap();
-        store.rebuild_xor_filter("t");
-
-        // Access all three keys — LRU can only hold 2
-        store.lookup("t", "1");
-        store.lookup("t", "2");
-        store.lookup("t", "3");
-
-        let metrics = store.cache_metrics("t").unwrap();
-        assert_eq!(metrics.cache_entries, 2);
-        assert_eq!(metrics.cache_max_entries, 2);
-        assert!(metrics.cache_evictions >= 1);
-    }
-
-    #[test]
-    fn test_partial_cache_upsert_invalidates_lru() {
-        let mut store = TableStore::new();
-        store
-            .create_table_with_cache(
-                "t",
-                test_schema(),
-                "id",
-                TableCacheMode::Partial { max_entries: 100 },
-            )
-            .unwrap();
-
-        let batch1 = make_batch(&[1], &["Old"], &[1.0]);
-        store.upsert("t", &batch1).unwrap();
-        store.rebuild_xor_filter("t");
-
-        // Populate LRU
-        store.lookup("t", "1");
-
-        // Upsert new value — should invalidate LRU entry
-        let batch2 = make_batch(&[1], &["New"], &[2.0]);
-        store.upsert("t", &batch2).unwrap();
-
-        // Lookup should return the new value
-        let row = store.lookup("t", "1").unwrap();
-        let names = row
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        assert_eq!(names.value(0), "New");
-    }
-
-    #[test]
-    fn test_partial_cache_delete_invalidates_lru() {
-        let mut store = TableStore::new();
-        store
-            .create_table_with_cache(
-                "t",
-                test_schema(),
-                "id",
-                TableCacheMode::Partial { max_entries: 100 },
-            )
-            .unwrap();
-
-        let batch = make_batch(&[1], &["A"], &[1.0]);
-        store.upsert("t", &batch).unwrap();
-        store.rebuild_xor_filter("t");
-
-        // Populate LRU
-        store.lookup("t", "1");
-
-        // Delete the key — should invalidate LRU
-        assert!(store.delete("t", "1"));
-
-        // Note: xor filter still says "might exist" (stale), but backing
-        // store returns None. The filter will be rebuilt after next snapshot/CDC.
-    }
-
-    #[test]
-    fn test_rebuild_xor_filter() {
-        let mut store = TableStore::new();
-        store
-            .create_table_with_cache(
-                "t",
-                test_schema(),
-                "id",
-                TableCacheMode::Partial { max_entries: 100 },
-            )
-            .unwrap();
-
-        // Initially filter is not built
-        let state = store.tables.get("t").unwrap();
-        assert!(!state.xor_filter.is_built());
-
-        // After rebuild with data
-        let batch = make_batch(&[1, 2], &["A", "B"], &[1.0, 2.0]);
-        store.upsert("t", &batch).unwrap();
-        store.rebuild_xor_filter("t");
-
-        let state = store.tables.get("t").unwrap();
-        assert!(state.xor_filter.is_built());
-    }
-
-    #[test]
-    fn test_full_mode_no_lru() {
-        let mut store = TableStore::new();
-        store.create_table("t", test_schema(), "id").unwrap();
-
-        // Full mode should have no LRU cache or metrics
-        assert!(store.cache_metrics("t").is_none());
-    }
 
     #[test]
     fn test_create_table_with_cache_rejects_duplicate() {
@@ -736,26 +506,7 @@ mod tests {
         assert!(matches!(result, Err(DbError::TableAlreadyExists(_))));
     }
 
-    #[test]
-    fn test_partial_cache_without_xor_filter() {
-        let mut store = TableStore::new();
-        store
-            .create_table_with_cache(
-                "t",
-                test_schema(),
-                "id",
-                TableCacheMode::Partial { max_entries: 100 },
-            )
-            .unwrap();
 
-        let batch = make_batch(&[1], &["A"], &[1.0]);
-        store.upsert("t", &batch).unwrap();
-
-        // Without rebuilding xor filter, lookup should still work
-        // (filter is permissive when not built)
-        let row = store.lookup("t", "1").unwrap();
-        assert_eq!(row.num_rows(), 1);
-    }
 
     #[test]
     fn test_row_count_tracks_upserts_and_deletes() {

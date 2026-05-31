@@ -2205,9 +2205,9 @@ async fn test_create_table_partial_with_max_entries() {
 
     let ts = db.table_store.read();
     assert!(ts.has_table("customers"));
-    // Verify the cache metrics report the correct max_entries
-    let metrics = ts.cache_metrics("customers").unwrap();
-    assert_eq!(metrics.cache_max_entries, 10000);
+    // Verify the cache mode reports the correct max_entries
+    let mode = ts.cache_mode("customers").unwrap();
+    assert_eq!(mode.max_entries(), Some(10000));
 }
 
 #[tokio::test]

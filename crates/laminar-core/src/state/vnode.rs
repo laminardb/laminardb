@@ -302,31 +302,43 @@ pub fn key_hash(key: &[u8]) -> u64 {
     xxhash_rust::xxh3::xxh3_64(key)
 }
 
-/// Build a vnode-to-owner assignment by round-robin across sorted peers.
+/// Build a vnode-to-owner assignment using Rendezvous Hashing (Highest Random Weight).
 ///
-/// Deterministic for a given `(vnode_count, peers)` input — every node
-/// computing this independently agrees, given the same peer list. Uses
-/// sort-by-id + modulo: vnode `v` → `peers[v % peers.len()]` after
-/// sorting. Simple and fine for uniform key distributions.
-///
-/// **Not** consistent hashing — a peer join/leave reshuffles every
-/// vnode. Acceptable for the current phase since reassignment happens
-/// only at cluster start; dynamic rebalance is deferred work.
+/// Deterministic for a given `(vnode_count, peers)` input. Minimizes partition
+/// reshuffling on membership changes (node joins/leaves).
 ///
 /// # Panics
 /// Panics if `peers` is empty.
 #[must_use]
-pub fn round_robin_assignment(vnode_count: u32, peers: &[NodeId]) -> Arc<[NodeId]> {
+pub fn rendezvous_assignment(vnode_count: u32, peers: &[NodeId]) -> Arc<[NodeId]> {
     assert!(
         !peers.is_empty(),
-        "round_robin_assignment needs at least one peer"
+        "rendezvous_assignment needs at least one peer"
     );
-    let mut sorted: Vec<NodeId> = peers.to_vec();
-    sorted.sort_by_key(|n| n.0);
-    (0..vnode_count)
-        .map(|v| sorted[(v as usize) % sorted.len()])
-        .collect::<Vec<_>>()
-        .into()
+    let mut sorted_peers = peers.to_vec();
+    sorted_peers.sort_by_key(|n| n.0);
+
+    let mut assignment = Vec::with_capacity(vnode_count as usize);
+    for v in 0..vnode_count {
+        let mut max_weight = 0;
+        let mut selected_node = sorted_peers[0];
+
+        for &node in &sorted_peers {
+            // Hash the combination of vnode ID and node ID
+            let mut buf = [0u8; 16];
+            buf[0..8].copy_from_slice(&u64::from(v).to_le_bytes());
+            buf[8..16].copy_from_slice(&node.0.to_le_bytes());
+            let weight = xxhash_rust::xxh3::xxh3_64(&buf);
+
+            // Highest weight wins, tie-break by NodeId
+            if weight > max_weight || (weight == max_weight && node.0 > selected_node.0) {
+                max_weight = weight;
+                selected_node = node;
+            }
+        }
+        assignment.push(selected_node);
+    }
+    assignment.into()
 }
 
 /// Vnodes currently assigned to `owner`.
@@ -431,39 +443,56 @@ mod tests {
     }
 
     #[test]
-    fn round_robin_is_deterministic_and_balanced() {
-        // 8 vnodes, 3 peers → 3+3+2 distribution after modulo.
+    fn rendezvous_is_deterministic() {
         let peers = vec![NodeId(7), NodeId(3), NodeId(5)];
-        let assignment = round_robin_assignment(8, &peers);
-        // Sorted: [3, 5, 7]. vnode v owned by sorted[v % 3].
-        assert_eq!(
-            &*assignment,
-            &[
-                NodeId(3),
-                NodeId(5),
-                NodeId(7),
-                NodeId(3),
-                NodeId(5),
-                NodeId(7),
-                NodeId(3),
-                NodeId(5),
-            ][..]
-        );
+        let assignment = rendezvous_assignment(8, &peers);
         // Input order doesn't matter.
         let reversed = vec![NodeId(3), NodeId(5), NodeId(7)];
-        assert_eq!(round_robin_assignment(8, &reversed), assignment);
+        assert_eq!(rendezvous_assignment(8, &reversed), assignment);
     }
 
     #[test]
-    fn round_robin_single_peer_owns_everything() {
-        let assignment = round_robin_assignment(4, &[NodeId(99)]);
+    fn rendezvous_single_peer_owns_everything() {
+        let assignment = rendezvous_assignment(4, &[NodeId(99)]);
         assert!(assignment.iter().all(|&n| n == NodeId(99)));
     }
 
     #[test]
-    #[should_panic(expected = "at least one peer")]
-    fn round_robin_rejects_empty_peer_list() {
-        let _ = round_robin_assignment(4, &[]);
+    #[should_panic(expected = "needs at least one peer")]
+    fn rendezvous_rejects_empty_peer_list() {
+        let _ = rendezvous_assignment(4, &[]);
+    }
+
+    #[test]
+    fn rendezvous_minimizes_state_movement() {
+        let peers3 = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let peers4 = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+
+        let a3 = rendezvous_assignment(256, &peers3);
+        let a4 = rendezvous_assignment(256, &peers4);
+
+        let mut moved = 0;
+        let mut moved_between_existing = 0;
+
+        for v in 0..256 {
+            let o3 = a3[v as usize];
+            let o4 = a4[v as usize];
+            if o3 != o4 {
+                moved += 1;
+                if o4 != NodeId(4) {
+                    moved_between_existing += 1;
+                }
+            }
+        }
+
+        assert_eq!(moved_between_existing, 0, "No vnode should move between existing peers on a node join");
+        assert!(moved > 40 && moved < 90, "Expected roughly 25% of vnodes to move to the new peer, got {}", moved);
+
+        for v in 0..256 {
+            if a3[v as usize] != a4[v as usize] {
+                assert_eq!(a4[v as usize], NodeId(4));
+            }
+        }
     }
 
     #[test]

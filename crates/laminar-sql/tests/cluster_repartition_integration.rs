@@ -15,7 +15,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionConfig;
 use futures::StreamExt;
 use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
-use laminar_core::state::{round_robin_assignment, NodeId, VnodeRegistry};
+use laminar_core::state::{rendezvous_assignment, NodeId, VnodeRegistry};
 use laminar_sql::datafusion::cluster_repartition::ClusterRepartitionExec;
 
 fn schema() -> Arc<Schema> {
@@ -53,7 +53,7 @@ async fn phase_a_routes_rows_to_owning_instance() {
     // hash to even index after sort, B owns the odds.
     let registry = Arc::new(VnodeRegistry::new(4));
     let peers = [NodeId(1), NodeId(2)];
-    registry.set_assignment(round_robin_assignment(4, &peers));
+    registry.set_assignment(rendezvous_assignment(4, &peers));
 
     // Wire the shuffle fabric: A has a sender targeting B's receiver,
     // and its own receiver that B would send to. Loopback TCP.
