@@ -162,7 +162,12 @@ pub fn spawn_rebalance_controller(
                 if !controller.is_leader() {
                     break;
                 }
-                let live = controller.live_instances();
+                // Use assignable (Active, non-draining) instances so
+                // Draining/Suspected nodes are never handed vnodes. The
+                // weak leader gate above still uses live membership;
+                // `LeaderLeaseManager` is the fencing authority for split-
+                // brain hardening (kept standalone, see leader_lease.rs).
+                let live = controller.assignable_instances();
                 match try_rebalance(&db, &controller, &store, &registry, &live, config).await {
                     Ok(Some(v)) => {
                         info!(version = v, "rotated assignment");
@@ -184,6 +189,39 @@ pub fn spawn_rebalance_controller(
             }
         }
     })
+}
+
+/// Poll the durable assignment snapshot until `me` owns no vnodes (its
+/// state has been reassigned elsewhere) or `deadline` elapses. Returns
+/// true if fully drained. Used by a draining node to know when it is
+/// safe to exit.
+pub async fn wait_until_drained(
+    store: &AssignmentSnapshotStore,
+    me: NodeId,
+    poll: Duration,
+    deadline: Duration,
+) -> bool {
+    let start = tokio::time::Instant::now();
+    loop {
+        match store.load().await {
+            // No snapshot at all → nothing owns us → drained.
+            Ok(None) => return true,
+            Ok(Some(snap)) => {
+                if !snap.vnodes.values().any(|owner| *owner == me) {
+                    return true;
+                }
+            }
+            Err(e) => warn!(error = %e, "wait_until_drained: snapshot load failed"),
+        }
+        if start.elapsed() >= deadline {
+            return false;
+        }
+        let remaining = deadline.saturating_sub(start.elapsed());
+        tokio::time::sleep(poll.min(remaining)).await;
+        if start.elapsed() >= deadline {
+            return false;
+        }
+    }
 }
 
 /// `Ok(Some(version))` on rotation (ours or a peer's), `Ok(None)` if
@@ -251,5 +289,67 @@ async fn try_rebalance(
             controller.announce_snapshot_version(v).await;
             Ok(Some(v))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    use object_store::memory::InMemory;
+    use object_store::ObjectStore;
+
+    fn store() -> AssignmentSnapshotStore {
+        let mem: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        AssignmentSnapshotStore::new(mem)
+    }
+
+    #[tokio::test]
+    async fn wait_until_drained_false_while_owning_vnodes() {
+        let s = store();
+        let me = NodeId(1);
+        let mut vnodes = BTreeMap::new();
+        vnodes.insert(0, me);
+        vnodes.insert(1, NodeId(2));
+        let snap = AssignmentSnapshot::empty().next(vnodes);
+        s.save_if_absent(&snap).await.unwrap();
+
+        let drained = wait_until_drained(
+            &s,
+            me,
+            Duration::from_millis(20),
+            Duration::from_millis(120),
+        )
+        .await;
+        assert!(!drained, "still owns vnode 0 → not drained");
+    }
+
+    #[tokio::test]
+    async fn wait_until_drained_true_when_owning_none() {
+        let s = store();
+        let me = NodeId(1);
+        let mut vnodes = BTreeMap::new();
+        vnodes.insert(0, NodeId(2));
+        vnodes.insert(1, NodeId(3));
+        let snap = AssignmentSnapshot::empty().next(vnodes);
+        s.save_if_absent(&snap).await.unwrap();
+
+        let drained =
+            wait_until_drained(&s, me, Duration::from_millis(20), Duration::from_secs(5)).await;
+        assert!(drained, "owns no vnode → drained quickly");
+    }
+
+    #[tokio::test]
+    async fn wait_until_drained_true_when_no_snapshot() {
+        let s = store();
+        let drained = wait_until_drained(
+            &s,
+            NodeId(1),
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(drained, "no snapshot → treated as drained");
     }
 }

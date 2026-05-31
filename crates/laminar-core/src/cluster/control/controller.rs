@@ -1,7 +1,7 @@
 //! Facade over `ClusterKv` + `BarrierCoordinator` + membership watch.
 //! `None` on `CheckpointCoordinator` means single-instance mode.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +12,7 @@ use super::barrier::{
 };
 use super::leader::leader_of;
 use super::snapshot::AssignmentSnapshotStore;
-use crate::cluster::discovery::{NodeId, NodeInfo, NodeState};
+use crate::cluster::discovery::{assignable_node_ids, NodeId, NodeInfo, NodeState};
 
 /// Facade composing the cluster-control primitives.
 pub struct ClusterController {
@@ -27,6 +27,10 @@ pub struct ClusterController {
     /// their local watermark so event-time decisions stay consistent
     /// across the cluster.
     cluster_min_watermark: Arc<AtomicI64>,
+    /// Set once this node begins graceful drain. While set, the node
+    /// excludes itself from [`Self::assignable_instances`] so the next
+    /// rotation sheds its vnodes elsewhere before it exits.
+    draining: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for ClusterController {
@@ -53,6 +57,7 @@ impl ClusterController {
             snapshot,
             members_rx,
             cluster_min_watermark: Arc::new(AtomicI64::new(i64::MIN)),
+            draining: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -128,6 +133,32 @@ impl ClusterController {
             .map(|m| m.id)
             .collect();
         ids.push(self.instance_id);
+        ids
+    }
+
+    /// Mark this node as draining. Idempotent.
+    pub fn begin_drain(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether this node is draining.
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
+    /// Node ids eligible to own vnodes: `Active` peers, plus self unless
+    /// this node is draining. Mirrors how [`Self::live_instances`] folds
+    /// self in, but filters non-`Active` peers (see [`assignable_node_ids`])
+    /// so Joining/Suspected/Draining/Left nodes never receive vnodes.
+    #[must_use]
+    pub fn assignable_instances(&self) -> Vec<NodeId> {
+        let mut ids = assignable_node_ids(&self.members_rx.borrow());
+        if !self.is_draining() && !self.instance_id.is_unassigned() {
+            ids.push(self.instance_id);
+        }
+        ids.sort_unstable();
+        ids.dedup();
         ids
     }
 
@@ -280,6 +311,22 @@ mod tests {
     fn solo_instance_is_leader() {
         let c = ctl(42, vec![]);
         assert!(c.is_leader());
+    }
+
+    #[test]
+    fn assignable_instances_excludes_draining_peer_and_self_on_drain() {
+        let mut draining_peer = info(5);
+        draining_peer.state = NodeState::Draining;
+        let c = ctl(1, vec![info(3), draining_peer]);
+
+        // Active peers + self; the Draining peer is shed.
+        assert_eq!(c.assignable_instances(), vec![NodeId(1), NodeId(3)]);
+        assert!(!c.is_draining());
+
+        // After begin_drain, self drops out too.
+        c.begin_drain();
+        assert!(c.is_draining());
+        assert_eq!(c.assignable_instances(), vec![NodeId(3)]);
     }
 
     #[tokio::test]

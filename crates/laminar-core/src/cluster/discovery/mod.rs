@@ -107,6 +107,22 @@ pub struct NodeInfo {
     pub last_heartbeat_ms: i64,
 }
 
+/// Node ids eligible to own vnodes: only `Active` nodes. Joining,
+/// Suspected, Draining, and Left are excluded so a draining or failing
+/// node sheds its vnodes on the next rotation.
+#[must_use]
+pub fn assignable_node_ids(members: &[NodeInfo]) -> Vec<NodeId> {
+    let mut ids: Vec<NodeId> = members
+        .iter()
+        .filter(|m| matches!(m.state, NodeState::Active))
+        .map(|m| m.id)
+        .filter(|id| !id.is_unassigned())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 /// A membership change event.
 #[derive(Debug, Clone)]
 pub enum MembershipEvent {
@@ -206,6 +222,40 @@ mod tests {
         assert_eq!(NodeState::Active.to_string(), "active");
         assert_eq!(NodeState::Suspected.to_string(), "suspected");
         assert_eq!(NodeState::Draining.to_string(), "draining");
+    }
+
+    fn info_with(id: u64, state: NodeState) -> NodeInfo {
+        NodeInfo {
+            id: NodeId(id),
+            name: format!("n{id}"),
+            rpc_address: String::new(),
+            raft_address: String::new(),
+            state,
+            metadata: NodeMetadata::default(),
+            last_heartbeat_ms: 0,
+        }
+    }
+
+    #[test]
+    fn assignable_includes_only_active_sorted_deduped() {
+        let members = vec![
+            info_with(5, NodeState::Active),
+            info_with(2, NodeState::Joining),
+            info_with(3, NodeState::Suspected),
+            info_with(4, NodeState::Draining),
+            info_with(6, NodeState::Left),
+            info_with(1, NodeState::Active),
+            info_with(1, NodeState::Active), // dup
+        ];
+        assert_eq!(assignable_node_ids(&members), vec![NodeId(1), NodeId(5)]);
+    }
+
+    #[test]
+    fn assignable_drops_unassigned() {
+        let mut unassigned = info_with(7, NodeState::Active);
+        unassigned.id = NodeId::UNASSIGNED;
+        let members = vec![unassigned, info_with(7, NodeState::Active)];
+        assert_eq!(assignable_node_ids(&members), vec![NodeId(7)]);
     }
 
     #[test]

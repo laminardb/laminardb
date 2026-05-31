@@ -485,8 +485,15 @@ mod tests {
             }
         }
 
-        assert_eq!(moved_between_existing, 0, "No vnode should move between existing peers on a node join");
-        assert!(moved > 40 && moved < 90, "Expected roughly 25% of vnodes to move to the new peer, got {}", moved);
+        assert_eq!(
+            moved_between_existing, 0,
+            "No vnode should move between existing peers on a node join"
+        );
+        assert!(
+            moved > 40 && moved < 90,
+            "Expected roughly 25% of vnodes to move to the new peer, got {}",
+            moved
+        );
 
         for v in 0..256 {
             if a3[v as usize] != a4[v as usize] {

@@ -53,12 +53,18 @@ mod tests {
 
     #[test]
     fn partitions_split_by_modulo_across_two_nodes() {
-        // 4 vnodes, nodes 1 and 2. round_robin → vnode owners [1,2,1,2].
+        // 4 vnodes, nodes 1 and 2.
         let r = registry_with(4, &[NodeId(1), NodeId(2)]);
         // 8 partitions: p % 4 → vnode → owner.
-        // p:0→v0(n1) 1→v1(n2) 2→v2(n1) 3→v3(n2) 4→v0(n1) 5→v1(n2) 6→v2(n1) 7→v3(n2)
-        assert_eq!(owned_partitions(8, &r, NodeId(1)), vec![0, 2, 4, 6]);
-        assert_eq!(owned_partitions(8, &r, NodeId(2)), vec![1, 3, 5, 7]);
+        let expected_node1: Vec<i32> = (0..8)
+            .filter(|&p| r.owner((p % 4) as u32) == NodeId(1))
+            .collect();
+        let expected_node2: Vec<i32> = (0..8)
+            .filter(|&p| r.owner((p % 4) as u32) == NodeId(2))
+            .collect();
+
+        assert_eq!(owned_partitions(8, &r, NodeId(1)), expected_node1);
+        assert_eq!(owned_partitions(8, &r, NodeId(2)), expected_node2);
     }
 
     #[test]
@@ -91,10 +97,17 @@ mod tests {
 
     #[test]
     fn fewer_partitions_than_vnodes_leaves_some_nodes_empty() {
-        // 4 vnodes [n1,n2,n1,n2], only 2 partitions → vnodes 0,1 → n1,n2.
+        // 4 vnodes, only 2 partitions.
         let r = registry_with(4, &[NodeId(1), NodeId(2)]);
-        assert_eq!(owned_partitions(2, &r, NodeId(1)), vec![0]);
-        assert_eq!(owned_partitions(2, &r, NodeId(2)), vec![1]);
+        let expected_node1: Vec<i32> = (0..2)
+            .filter(|&p| r.owner((p % 4) as u32) == NodeId(1))
+            .collect();
+        let expected_node2: Vec<i32> = (0..2)
+            .filter(|&p| r.owner((p % 4) as u32) == NodeId(2))
+            .collect();
+
+        assert_eq!(owned_partitions(2, &r, NodeId(1)), expected_node1);
+        assert_eq!(owned_partitions(2, &r, NodeId(2)), expected_node2);
     }
 
     #[test]

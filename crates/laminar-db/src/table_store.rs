@@ -14,8 +14,6 @@ use std::collections::HashMap;
 use arrow::array::{Array, RecordBatch, StringArray};
 use arrow::datatypes::SchemaRef;
 
-
-
 use crate::error::DbError;
 use crate::table_backend::TableBackend;
 use crate::table_cache_mode::TableCacheMode;
@@ -484,8 +482,6 @@ mod tests {
         assert!(!store.is_persistent("t"));
     }
 
-
-
     #[test]
     fn test_create_table_with_cache_rejects_duplicate() {
         let mut store = TableStore::new();
@@ -505,8 +501,6 @@ mod tests {
         );
         assert!(matches!(result, Err(DbError::TableAlreadyExists(_))));
     }
-
-
 
     #[test]
     fn test_row_count_tracks_upserts_and_deletes() {
