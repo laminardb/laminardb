@@ -15,9 +15,9 @@ use datafusion::prelude::SessionContext;
 use laminar_sql::translator::StreamJoinConfig;
 
 #[cfg(feature = "cluster-unstable")]
-use crate::operator::sql_query::ClusterShuffleConfig;
+use crate::key_column::{extract_column_as_timestamps, extract_key_column};
 #[cfg(feature = "cluster-unstable")]
-use crate::key_column::{extract_key_column, extract_column_as_timestamps};
+use crate::operator::sql_query::ClusterShuffleConfig;
 
 use crate::aggregate_state::JoinStateCheckpoint;
 use crate::error::DbError;
@@ -102,7 +102,11 @@ impl IntervalJoinOperator {
             for (owner, slice) in remote_slices {
                 outbound.push((
                     owner.0,
-                    laminar_core::shuffle::ShuffleMessage::VnodeData(stage_name.to_string(), 0, slice),
+                    laminar_core::shuffle::ShuffleMessage::VnodeData(
+                        stage_name.to_string(),
+                        0,
+                        slice,
+                    ),
                 ));
             }
         }
@@ -134,21 +138,26 @@ impl GraphOperator for IntervalJoinOperator {
         watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
         #[cfg(feature = "cluster-unstable")]
-        let (left_batches_local, right_batches_local) = if let Some(ref cfg) = self.cluster_shuffle {
+        let (left_batches_local, right_batches_local) = if let Some(ref cfg) = self.cluster_shuffle
+        {
             let left_stage = format!("{}::left", self.projection.op_name);
             let right_stage = format!("{}::right", self.projection.op_name);
-            let left = self.repartition_side(
-                inputs.first().map_or(&[][..], Vec::as_slice),
-                &self.config.left_key,
-                &left_stage,
-                cfg,
-            ).await?;
-            let right = self.repartition_side(
-                inputs.get(1).map_or(&[][..], Vec::as_slice),
-                &self.config.right_key,
-                &right_stage,
-                cfg,
-            ).await?;
+            let left = self
+                .repartition_side(
+                    inputs.first().map_or(&[][..], Vec::as_slice),
+                    &self.config.left_key,
+                    &left_stage,
+                    cfg,
+                )
+                .await?;
+            let right = self
+                .repartition_side(
+                    inputs.get(1).map_or(&[][..], Vec::as_slice),
+                    &self.config.right_key,
+                    &right_stage,
+                    cfg,
+                )
+                .await?;
             (left, right)
         } else {
             (
@@ -195,31 +204,48 @@ impl GraphOperator for IntervalJoinOperator {
                 let timestamps = extract_column_as_timestamps(&neg, &self.config.left_time_column)?;
                 for (i, &ts) in timestamps.iter().enumerate() {
                     if let Some(kh) = keys.hash_at(i) {
-                        self.state
-                            .left
-                            .remove_by_key_ts(kh, ts, &keys, i, &self.config.left_key)?;
+                        self.state.left.remove_by_key_ts(
+                            kh,
+                            ts,
+                            &keys,
+                            i,
+                            &self.config.left_key,
+                        )?;
                     }
                 }
             }
             let pos = crate::changelog_filter::filter_positive_events(&batch)?;
             if pos.num_rows() > 0 {
-                self.state.left.add_batch(&pos, &self.config.left_key, &self.config.left_time_column)?;
+                self.state.left.add_batch(
+                    &pos,
+                    &self.config.left_key,
+                    &self.config.left_time_column,
+                )?;
             }
         } else if stage == format!("{}::right", op_name) {
             if let Some(neg) = crate::changelog_filter::extract_negative_events(&batch)? {
                 let keys = extract_key_column(&neg, &self.config.right_key)?;
-                let timestamps = extract_column_as_timestamps(&neg, &self.config.right_time_column)?;
+                let timestamps =
+                    extract_column_as_timestamps(&neg, &self.config.right_time_column)?;
                 for (i, &ts) in timestamps.iter().enumerate() {
                     if let Some(kh) = keys.hash_at(i) {
-                        self.state
-                            .right
-                            .remove_by_key_ts(kh, ts, &keys, i, &self.config.right_key)?;
+                        self.state.right.remove_by_key_ts(
+                            kh,
+                            ts,
+                            &keys,
+                            i,
+                            &self.config.right_key,
+                        )?;
                     }
                 }
             }
             let pos = crate::changelog_filter::filter_positive_events(&batch)?;
             if pos.num_rows() > 0 {
-                self.state.right.add_batch(&pos, &self.config.right_key, &self.config.right_time_column)?;
+                self.state.right.add_batch(
+                    &pos,
+                    &self.config.right_key,
+                    &self.config.right_time_column,
+                )?;
             }
         }
         Ok(())

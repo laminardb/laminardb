@@ -481,14 +481,15 @@ async fn dispatch_inbound(
 }
 
 #[cfg(feature = "cluster-unstable")]
-use datafusion::physical_plan::joins::HashJoinExec;
-#[cfg(feature = "cluster-unstable")]
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+#[cfg(feature = "cluster-unstable")]
+use datafusion::physical_plan::joins::HashJoinExec;
 #[cfg(feature = "cluster-unstable")]
 use datafusion_common::config::ConfigOptions;
 
 #[cfg(feature = "cluster-unstable")]
-static CLUSTER_CONTEXT: parking_lot::RwLock<Option<ClusterContext>> = parking_lot::RwLock::new(None);
+static CLUSTER_CONTEXT: parking_lot::RwLock<Option<ClusterContext>> =
+    parking_lot::RwLock::new(None);
 
 #[cfg(feature = "cluster-unstable")]
 #[derive(Clone)]
@@ -565,18 +566,24 @@ fn optimize_plan(
         let mut left_keys = Vec::new();
         let mut right_keys = Vec::new();
         for (l_col, r_col) in hash_join.on() {
-            if let Some(col) = l_col.as_any().downcast_ref::<datafusion::physical_expr::expressions::Column>() {
+            if let Some(col) = l_col
+                .as_any()
+                .downcast_ref::<datafusion::physical_expr::expressions::Column>()
+            {
                 left_keys.push(col.index());
             } else {
                 return Err(datafusion::error::DataFusionError::Internal(
-                    "HashJoinExec: left key is not a Column expression".to_string()
+                    "HashJoinExec: left key is not a Column expression".to_string(),
                 ));
             }
-            if let Some(col) = r_col.as_any().downcast_ref::<datafusion::physical_expr::expressions::Column>() {
+            if let Some(col) = r_col
+                .as_any()
+                .downcast_ref::<datafusion::physical_expr::expressions::Column>()
+            {
                 right_keys.push(col.index());
             } else {
                 return Err(datafusion::error::DataFusionError::Internal(
-                    "HashJoinExec: right key is not a Column expression".to_string()
+                    "HashJoinExec: right key is not a Column expression".to_string(),
                 ));
             }
         }

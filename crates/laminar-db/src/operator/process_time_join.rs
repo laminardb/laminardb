@@ -187,7 +187,11 @@ impl ProcessTimeJoinOperator {
             for (owner, slice) in remote_slices {
                 outbound.push((
                     owner.0,
-                    laminar_core::shuffle::ShuffleMessage::VnodeData(stage_name.to_string(), 0, slice),
+                    laminar_core::shuffle::ShuffleMessage::VnodeData(
+                        stage_name.to_string(),
+                        0,
+                        slice,
+                    ),
                 ));
             }
         }
@@ -296,21 +300,26 @@ impl GraphOperator for ProcessTimeJoinOperator {
         watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
         #[cfg(feature = "cluster-unstable")]
-        let (left_batches_local, right_batches_local) = if let Some(ref cfg) = self.cluster_shuffle {
+        let (left_batches_local, right_batches_local) = if let Some(ref cfg) = self.cluster_shuffle
+        {
             let left_stage = format!("{}::left", self.projection.op_name);
             let right_stage = format!("{}::right", self.projection.op_name);
-            let left = self.repartition_side(
-                inputs.first().map_or(&[][..], Vec::as_slice),
-                &self.config.left_key,
-                &left_stage,
-                cfg,
-            ).await?;
-            let right = self.repartition_side(
-                inputs.get(1).map_or(&[][..], Vec::as_slice),
-                &self.config.right_key,
-                &right_stage,
-                cfg,
-            ).await?;
+            let left = self
+                .repartition_side(
+                    inputs.first().map_or(&[][..], Vec::as_slice),
+                    &self.config.left_key,
+                    &left_stage,
+                    cfg,
+                )
+                .await?;
+            let right = self
+                .repartition_side(
+                    inputs.get(1).map_or(&[][..], Vec::as_slice),
+                    &self.config.right_key,
+                    &right_stage,
+                    cfg,
+                )
+                .await?;
             (left, right)
         } else {
             (
