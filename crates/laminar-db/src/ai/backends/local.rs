@@ -27,10 +27,10 @@ use ort::session::{Session, SessionInputValue};
 use ort::value::Tensor;
 use parking_lot::Mutex;
 
-use crate::provider::{
+use crate::ai::provider::{
     InferenceOutputs, InferenceProvider, InferenceRequest, InferenceResponse, ProviderError, Usage,
 };
-use crate::registry::Task;
+use crate::ai::registry::Task;
 
 /// Per-batch deadline for the synchronous ONNX Runtime forward pass. Bounds the
 /// inference worker (and the held watermark) against a wedged model. On timeout
@@ -452,9 +452,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "downloads a model + needs ORT_DYLIB_PATH; run with --ignored"]
     async fn classifies_with_a_real_onnx_community_model() {
-        use crate::adapter::parse_response;
-        use crate::provider::InferenceParams;
-        use crate::registry::BackendKind;
+        use crate::ai::adapter::parse_response;
+        use crate::ai::provider::InferenceParams;
+        use crate::ai::registry::BackendKind;
 
         let cache = tempfile::tempdir().expect("tempdir");
         let provider = LocalProvider::new(cache.path());

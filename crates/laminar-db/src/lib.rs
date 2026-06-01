@@ -28,6 +28,8 @@
 mod aggregate_state;
 mod ai_catalog;
 mod ai_worker;
+/// AI inference module, containing model registry, provider trait, and backends.
+pub mod ai;
 mod asof_batch;
 mod builder;
 mod catalog;

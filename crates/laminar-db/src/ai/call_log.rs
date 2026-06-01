@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
-use crate::provider::Usage;
-use crate::registry::{BackendKind, Task};
+use crate::ai::provider::Usage;
+use crate::ai::registry::{BackendKind, Task};
 
 /// Outcome of a batch call.
 #[derive(Debug, Clone, PartialEq, Eq)]

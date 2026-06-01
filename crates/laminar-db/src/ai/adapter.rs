@@ -7,8 +7,8 @@
 
 use thiserror::Error;
 
-use crate::provider::InferenceOutputs;
-use crate::registry::{BackendKind, Task};
+use crate::ai::provider::InferenceOutputs;
+use crate::ai::registry::{BackendKind, Task};
 
 /// Errors from adapting a response to a task output.
 #[derive(Debug, Error, PartialEq, Eq)]

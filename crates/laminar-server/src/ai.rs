@@ -14,10 +14,10 @@ use std::sync::Arc;
 
 use std::num::NonZeroU32;
 
-use laminar_ai::backends::{
+use laminar_db::ai::backends::{
     local, AnthropicProvider, LocalProvider, OpenAiProvider, RateLimitedProvider,
 };
-use laminar_ai::{
+use laminar_db::ai::{
     AiCallLog, AiResultCache, AiRuntime, InferenceProvider, ModelBackend, ModelEntry,
     ModelRegistry, Task,
 };
@@ -247,13 +247,13 @@ task = "classify"
             .expect("AI runtime builds")
             .expect("the demo configures a model");
         assert_eq!(
-            runtime.registry().default_for(laminar_ai::Task::Sentiment),
+            runtime.registry().default_for(laminar_db::ai::Task::Sentiment),
             Some("sentiment"),
             "ai_sentiment resolves to the configured default"
         );
         assert_eq!(
             runtime.resolve("sentiment").unwrap().kind,
-            laminar_ai::BackendKind::Local,
+            laminar_db::ai::BackendKind::Local,
             "the demo scores sentiment on a local model"
         );
     }

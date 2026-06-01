@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use foyer::{Cache, CacheBuilder};
 
-use crate::provider::InferenceParams;
-use crate::registry::Task;
+use crate::ai::provider::InferenceParams;
+use crate::ai::registry::Task;
 
 /// Cache key. All fields are `Copy`, so lookups need no allocation and no
 /// borrowed-key indirection.

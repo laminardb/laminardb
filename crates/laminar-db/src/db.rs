@@ -96,7 +96,7 @@ pub struct LaminarDB {
     pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
     /// Assembled AI subsystem (registry + providers + cache + call log).
     /// `None` unless `[ai]`/`[models]` are configured. Set once in the builder.
-    pub(crate) ai_runtime: Option<Arc<laminar_ai::AiRuntime>>,
+    pub(crate) ai_runtime: Option<Arc<crate::ai::AiRuntime>>,
     /// Main runtime handle the AI inference workers spawn on. Set with `ai_runtime`.
     pub(crate) ai_handle: Option<tokio::runtime::Handle>,
     /// Live-DDL channel to the running coordinator. `None` outside `start..shutdown`.
@@ -371,7 +371,7 @@ impl LaminarDB {
     /// must be the main multi-threaded runtime.
     pub(crate) fn set_ai_runtime(
         &mut self,
-        runtime: Arc<laminar_ai::AiRuntime>,
+        runtime: Arc<crate::ai::AiRuntime>,
         handle: tokio::runtime::Handle,
     ) {
         // Register the laminar.models / laminar.ai_calls catalog views. A

@@ -282,7 +282,7 @@ pub(crate) struct OperatorGraph {
     live_handles: FxHashMap<String, LiveSourceHandle>,
     /// Assembled AI subsystem (registry + providers + cache + call log).
     /// `None` unless `[ai]`/`[models]` are configured.
-    ai_runtime: Option<Arc<laminar_ai::AiRuntime>>,
+    ai_runtime: Option<Arc<crate::ai::AiRuntime>>,
     /// Main (multi-threaded) runtime handle for spawning Ring-1 workers (AI
     /// inference, lookup-enrich fetch) off the compute thread.
     main_runtime_handle: Option<tokio::runtime::Handle>,
@@ -354,7 +354,7 @@ impl OperatorGraph {
     /// runtime, never the compute runtime.
     pub fn set_ai_runtime(
         &mut self,
-        runtime: Arc<laminar_ai::AiRuntime>,
+        runtime: Arc<crate::ai::AiRuntime>,
         handle: tokio::runtime::Handle,
     ) {
         self.ai_runtime = Some(runtime);
@@ -2438,17 +2438,17 @@ mod tests {
     struct PosProvider;
 
     #[async_trait]
-    impl laminar_ai::InferenceProvider for PosProvider {
+    impl crate::ai::InferenceProvider for PosProvider {
         async fn infer_batch(
             &self,
-            request: laminar_ai::InferenceRequest,
-        ) -> Result<laminar_ai::InferenceResponse, laminar_ai::ProviderError> {
-            Ok(laminar_ai::InferenceResponse {
-                outputs: laminar_ai::InferenceOutputs::Text(vec![
+            request: crate::ai::InferenceRequest,
+        ) -> Result<crate::ai::InferenceResponse, crate::ai::ProviderError> {
+            Ok(crate::ai::InferenceResponse {
+                outputs: crate::ai::InferenceOutputs::Text(vec![
                     "pos".to_string();
                     request.inputs.len()
                 ]),
-                usage: laminar_ai::Usage::ZERO,
+                usage: crate::ai::Usage::ZERO,
             })
         }
         fn name(&self) -> &'static str {
@@ -2456,8 +2456,8 @@ mod tests {
         }
     }
 
-    fn stub_ai_runtime() -> Arc<laminar_ai::AiRuntime> {
-        use laminar_ai::{ModelBackend, ModelEntry, ModelRegistry, Task};
+    fn stub_ai_runtime() -> Arc<crate::ai::AiRuntime> {
+        use crate::ai::{ModelBackend, ModelEntry, ModelRegistry, Task};
         let mut registry = ModelRegistry::new();
         registry
             .register(ModelEntry {
@@ -2471,14 +2471,14 @@ mod tests {
             .unwrap();
         let providers = [(
             "p".to_string(),
-            Arc::new(PosProvider) as Arc<dyn laminar_ai::InferenceProvider>,
+            Arc::new(PosProvider) as Arc<dyn crate::ai::InferenceProvider>,
         )];
-        Arc::new(laminar_ai::AiRuntime::new(
+        Arc::new(crate::ai::AiRuntime::new(
             registry,
             providers,
             None,
-            Arc::new(laminar_ai::AiResultCache::with_defaults()),
-            Arc::new(laminar_ai::AiCallLog::with_defaults()),
+            Arc::new(crate::ai::AiResultCache::with_defaults()),
+            Arc::new(crate::ai::AiCallLog::with_defaults()),
         ))
     }
 
@@ -2573,7 +2573,7 @@ mod tests {
     /// numeric `Float64`, not a label.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ai_sentiment_emits_a_double_score() {
-        use laminar_ai::{
+        use crate::ai::{
             AiCallLog, AiResultCache, AiRuntime, InferenceOutputs, InferenceProvider,
             InferenceRequest, InferenceResponse, ModelBackend, ModelEntry, ModelRegistry,
             ProviderError, Task, Usage,

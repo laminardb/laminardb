@@ -10,7 +10,7 @@
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::registry::Task;
+use crate::ai::registry::Task;
 
 /// One batch of inputs to run through a model. A request is homogeneous: a
 /// single task, a single model, and one input string per row in order.

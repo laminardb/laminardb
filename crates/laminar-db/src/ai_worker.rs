@@ -12,7 +12,7 @@
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use laminar_ai::{
+use crate::ai::{
     parse_response, AiCacheKey, AiCallLog, AiCallRecord, AiResultCache, BackendKind, CachedOutput,
     CallOutcome, InferenceOutputs, InferenceParams, InferenceProvider, InferenceRequest, Task,
     Usage,

@@ -4860,26 +4860,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "laminar-ai"
-version = "0.23.0"
-dependencies = [
- "async-trait",
- "foyer",
- "futures",
- "governor",
- "ort",
- "parking_lot 0.12.5",
- "reqwest 0.13.2",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokenizers",
- "tokio",
- "xxhash-rust",
-]
-
-[[package]]
 name = "laminar-connectors"
 version = "0.23.0"
 dependencies = [
@@ -5012,19 +4992,22 @@ dependencies = [
  "datafusion-common",
  "datafusion-expr",
  "datafusion-optimizer",
+ "foyer",
  "futures",
  "futures-util",
+ "governor",
  "indexmap 2.13.0",
- "laminar-ai",
  "laminar-connectors",
  "laminar-core",
  "laminar-derive",
  "laminar-sql",
  "object_store 0.13.2",
+ "ort",
  "parking_lot 0.12.5",
  "prometheus",
  "proptest",
  "rdkafka",
+ "reqwest 0.13.2",
  "rkyv 0.8.15",
  "rustc-hash",
  "serde",
@@ -5033,6 +5016,7 @@ dependencies = [
  "sqlparser",
  "tempfile",
  "thiserror 2.0.18",
+ "tokenizers",
  "tokio",
  "tokio-stream",
  "tokio-tungstenite",
@@ -5040,6 +5024,7 @@ dependencies = [
  "tracing-subscriber",
  "trait-variant",
  "wiremock",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -5071,7 +5056,6 @@ dependencies = [
  "futures",
  "gethostname",
  "humantime-serde",
- "laminar-ai",
  "laminar-core",
  "laminar-db",
  "laminar-sql",

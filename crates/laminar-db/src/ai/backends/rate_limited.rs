@@ -13,7 +13,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 
-use crate::provider::{InferenceProvider, InferenceRequest, InferenceResponse, ProviderError};
+use crate::ai::provider::{InferenceProvider, InferenceRequest, InferenceResponse, ProviderError};
 
 /// An [`InferenceProvider`] that paces calls to a steady rate.
 pub struct RateLimitedProvider {
@@ -57,8 +57,8 @@ impl InferenceProvider for RateLimitedProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{InferenceOutputs, InferenceParams, Usage};
-    use crate::registry::Task;
+    use crate::ai::provider::{InferenceOutputs, InferenceParams, Usage};
+    use crate::ai::registry::Task;
     use std::time::Instant;
 
     struct Echo;

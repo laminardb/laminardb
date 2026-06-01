@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 
-use crate::provider::{ProviderError, Usage};
-use crate::registry::Task;
+use crate::ai::provider::{ProviderError, Usage};
+use crate::ai::registry::Task;
 
 /// Sum two usage records, saturating. Used to fold per-row chat usage into a
 /// batch total.

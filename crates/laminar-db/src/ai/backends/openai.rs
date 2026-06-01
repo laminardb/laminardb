@@ -12,11 +12,11 @@ use async_trait::async_trait;
 use futures::stream::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 
-use crate::backends::remote::{add_usage, chat_prompt, post_json};
-use crate::provider::{
+use crate::ai::backends::remote::{add_usage, chat_prompt, post_json};
+use crate::ai::provider::{
     InferenceOutputs, InferenceProvider, InferenceRequest, InferenceResponse, ProviderError, Usage,
 };
-use crate::registry::Task;
+use crate::ai::registry::Task;
 
 const REQUEST_TIMEOUT_MS: u64 = 60_000;
 const MAX_RETRIES: u32 = 2;

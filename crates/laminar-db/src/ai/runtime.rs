@@ -13,10 +13,10 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::cache::AiResultCache;
-use crate::call_log::AiCallLog;
-use crate::provider::InferenceProvider;
-use crate::registry::{BackendKind, ModelBackend, ModelRegistry, RegistryError};
+use crate::ai::cache::AiResultCache;
+use crate::ai::call_log::AiCallLog;
+use crate::ai::provider::InferenceProvider;
+use crate::ai::registry::{BackendKind, ModelBackend, ModelRegistry, RegistryError};
 
 /// Everything the inference operator needs to run one model.
 #[derive(Clone)]
@@ -153,10 +153,10 @@ impl AiRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{
+    use crate::ai::provider::{
         InferenceOutputs, InferenceRequest, InferenceResponse, ProviderError, Usage,
     };
-    use crate::registry::{ModelEntry, Task};
+    use crate::ai::registry::{ModelEntry, Task};
     use async_trait::async_trait;
 
     struct Stub;

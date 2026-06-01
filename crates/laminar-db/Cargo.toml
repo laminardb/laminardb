@@ -35,12 +35,21 @@ cluster-unstable = ["laminar-core/cluster-unstable", "laminar-sql/cluster-unstab
 aws = ["laminar-core/aws"]
 gcs = ["laminar-core/gcs"]
 azure = ["laminar-core/azure"]
+remote = ["dep:reqwest", "dep:governor"]
+local = ["dep:ort", "dep:tokenizers", "dep:reqwest"]
 
 [dependencies]
 laminar-core = { path = "../laminar-core", version = "0.23.0" }
-laminar-ai = { path = "../laminar-ai", version = "0.23.0" }
 laminar-sql = { path = "../laminar-sql", version = "0.23.0" }
 laminar-connectors = { path = "../laminar-connectors", version = "0.23.0" }
+
+# AI Inference Dependencies (Consolidated from laminar-ai)
+foyer = { workspace = true }
+xxhash-rust = { workspace = true, features = ["xxh3"] }
+governor = { version = "0.8", optional = true }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "api-24"], optional = true }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
 
 # Arrow
 arrow = { workspace = true }
@@ -111,7 +120,6 @@ tempfile = { workspace = true }
 # no openssl); the `remote` feature exposes the real AnthropicProvider so the
 # test drives the actual HTTP path (request build, 500/retry, response parse).
 wiremock = "0.6"
-laminar-ai = { path = "../laminar-ai", version = "0.23.0", features = ["remote"] }
 laminar-derive = { path = "../laminar-derive", version = "0.23.0" }
 laminar-connectors = { path = "../laminar-connectors", version = "0.23.0", features = ["testing"] }
 criterion = { workspace = true }

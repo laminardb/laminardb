@@ -18,7 +18,7 @@ use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Location, Token, TokenWithSpan};
 
-use laminar_ai::{BackendKind, ModelRegistry, Task};
+use crate::ai::{BackendKind, ModelRegistry, Task};
 use laminar_sql::parser::join_parser::analyze_joins;
 
 use crate::error::DbError;
@@ -1182,7 +1182,7 @@ mod ai {
     #[cfg(test)]
     mod ai_detection_tests {
         use super::{detect_ai_functions, validate_ai_calls, AiCallSpec};
-        use laminar_ai::{ModelBackend, ModelEntry, ModelRegistry, Task};
+        use crate::ai::{ModelBackend, ModelEntry, ModelRegistry, Task};
 
         fn spec(task: Task, model: Option<&str>, labels: Option<Vec<&str>>) -> AiCallSpec {
             AiCallSpec {

@@ -8,6 +8,8 @@
 //! engine composition actually consumes. The analytically-exact correlation
 //! check lives with the operator, in `operator::window_frame::tests`.
 
+#![cfg(feature = "remote")]
+
 use std::sync::Arc;
 
 use arrow::array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
@@ -17,8 +19,8 @@ use tokio::runtime::Handle;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use laminar_ai::backends::AnthropicProvider;
-use laminar_ai::{
+use crate::ai::backends::AnthropicProvider;
+use crate::ai::{
     AiCallLog, AiResultCache, AiRuntime, CallOutcome, InferenceProvider, ModelBackend, ModelEntry,
     ModelRegistry, Task,
 };

@@ -74,7 +74,7 @@ pub struct LaminarDbBuilder {
     /// `vnode_count`. Default 1 for single-instance streaming.
     target_partitions: Option<usize>,
     /// Assembled AI subsystem; installed when `[ai]`/`[models]` are configured.
-    ai_runtime: Option<std::sync::Arc<laminar_ai::AiRuntime>>,
+    ai_runtime: Option<std::sync::Arc<crate::ai::AiRuntime>>,
 }
 
 impl LaminarDbBuilder {
@@ -115,7 +115,7 @@ impl LaminarDbBuilder {
     /// result cache + call log). Without it, `ai_*` SQL functions fail at plan
     /// time. Built from server `[ai]`/`[models]` configuration.
     #[must_use]
-    pub fn ai(mut self, runtime: std::sync::Arc<laminar_ai::AiRuntime>) -> Self {
+    pub fn ai(mut self, runtime: std::sync::Arc<crate::ai::AiRuntime>) -> Self {
         self.ai_runtime = Some(runtime);
         self
     }
