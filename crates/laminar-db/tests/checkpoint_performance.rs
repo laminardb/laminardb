@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use laminar_db::checkpoint_coordinator::{
     CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
 };
-use laminar_storage::checkpoint_manifest::CheckpointManifest;
-use laminar_storage::checkpoint_store::{CheckpointStore, CheckpointStoreError};
+use laminar_core::storage::checkpoint_manifest::CheckpointManifest;
+use laminar_core::storage::checkpoint_store::{CheckpointStore, CheckpointStoreError};
 use std::time::{Duration, Instant};
 
 /// Simulates a slow I/O store. With the async trait this is a

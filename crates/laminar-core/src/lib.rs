@@ -13,6 +13,8 @@ pub mod alloc;
 pub mod changelog;
 /// Distributed checkpoint barrier protocol.
 pub mod checkpoint;
+/// Compatibility alias for checkpoint storage
+pub use checkpoint as storage;
 /// Structured error code registry (`LDB-NNNN`) and Ring 0 hot path error type.
 pub mod error_codes;
 /// Lookup table types and predicate pushdown.

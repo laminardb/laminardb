@@ -13,7 +13,7 @@ use laminar_core::state::{owned_vnodes, InProcessBackend, NodeId, StateBackend, 
 use laminar_db::checkpoint_coordinator::{
     CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
 };
-use laminar_storage::checkpoint_store::FileSystemCheckpointStore;
+use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
 use tempfile::TempDir;

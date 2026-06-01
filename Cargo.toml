@@ -3,7 +3,6 @@ members = [
     "crates/laminar-core",
     "crates/laminar-ai",
     "crates/laminar-sql",
-    "crates/laminar-storage",
     "crates/laminar-connectors",
     "crates/laminar-server",
     "crates/laminar-derive",

@@ -26,7 +26,7 @@ use laminar_db::pipeline::{
     PipelineCallback, PipelineConfig, SourceRegistration, StreamingCoordinator,
 };
 use laminar_db::recovery_manager::RecoveryManager;
-use laminar_storage::checkpoint_store::FileSystemCheckpointStore;
+use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
 
 /// A callback that tracks barrier checkpoint calls and records state.
 struct BarrierTrackingCallback {
@@ -275,7 +275,7 @@ async fn test_barrier_checkpoint_recovery_round_trip() {
     let mut source_overrides = HashMap::new();
     source_overrides.insert(
         "src_a".to_string(),
-        laminar_storage::checkpoint_manifest::ConnectorCheckpoint {
+        laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint {
             offsets: HashMap::from([("records".into(), "500".into())]),
             epoch: 1,
             metadata: HashMap::new(),
@@ -283,7 +283,7 @@ async fn test_barrier_checkpoint_recovery_round_trip() {
     );
     source_overrides.insert(
         "src_b".to_string(),
-        laminar_storage::checkpoint_manifest::ConnectorCheckpoint {
+        laminar_core::storage::checkpoint_manifest::ConnectorCheckpoint {
             offsets: HashMap::from([("records".into(), "300".into())]),
             epoch: 1,
             metadata: HashMap::new(),

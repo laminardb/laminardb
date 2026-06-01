@@ -15,9 +15,13 @@ default = []
 # work, but Raft consensus, inter-node RPC, and rebalance-on-membership are
 # not yet implemented. Do not enable in production.
 cluster-unstable = [
-    "dep:chitchat", "dep:tokio-util", "dep:anyhow", "dep:futures",
+    "dep:chitchat", "dep:tokio-util", "dep:anyhow",
     "dep:tonic", "dep:tonic-prost", "dep:prost",
 ]
+aws = ["object_store/aws"]
+gcs = ["object_store/gcp"]
+azure = ["object_store/azure"]
+
 [dependencies]
 # Performance critical - no allocations on hot path
 rustc-hash = { workspace = true }
@@ -29,6 +33,8 @@ object_store = { workspace = true }
 xxhash-rust = { workspace = true, features = ["xxh3"] }
 equivalent = "1"
 smallvec = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
 
 # Arrow for columnar data
 arrow = { workspace = true }
@@ -58,8 +64,8 @@ tokio-util = { workspace = true, optional = true }
 # testing module; activated by the cluster-unstable feature.
 anyhow = { workspace = true, optional = true }
 # futures is needed for the object_store::ObjectStore impl on
-# FaultyObjectStore (BoxStream type). Cluster-unstable only.
-futures = { workspace = true, optional = true }
+# FaultyObjectStore (BoxStream type).
+futures = { workspace = true }
 
 # gRPC transport for cross-node shuffle + barrier sync (cluster-unstable).
 # The generated client/server stubs are compiled only under that feature;

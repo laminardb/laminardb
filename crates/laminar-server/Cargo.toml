@@ -19,7 +19,6 @@ path = "src/main.rs"
 # server only needs the unified facade plus laminar-core for things like
 # metrics types referenced directly.
 laminar-core = { path = "../laminar-core", version = "0.23.0" }
-laminar-storage = { path = "../laminar-storage", version = "0.23.0" }
 laminar-db = { path = "../laminar-db", version = "0.23.0", features = ["api"] }
 laminar-sql = { path = "../laminar-sql", version = "0.23.0" }
 # Remote + local AI backends for building the AI runtime from `[ai]`/`[models]`.

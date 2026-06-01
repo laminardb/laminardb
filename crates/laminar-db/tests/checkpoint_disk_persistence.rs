@@ -5,7 +5,7 @@
 
 use laminar_core::streaming::StreamCheckpointConfig;
 use laminar_db::{LaminarConfig, LaminarDB};
-use laminar_storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
+use laminar_core::storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
 
 /// Build a `LaminarConfig` with checkpoint enabled and `storage_dir`
 /// pointed at the given directory.

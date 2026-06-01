@@ -229,7 +229,7 @@ impl LaminarDB {
 
             let max_retained = cp_config.max_retained.unwrap_or(3);
             let vnode_count = self.vnode_registry.lock().as_ref().map_or(
-                laminar_storage::checkpoint_manifest::DEFAULT_VNODE_COUNT,
+                laminar_core::storage::checkpoint_manifest::DEFAULT_VNODE_COUNT,
                 |r| u16::try_from(r.vnode_count()).unwrap_or(u16::MAX),
             );
 
@@ -242,16 +242,16 @@ impl LaminarDB {
                 .unwrap_or_else(|| std::path::PathBuf::from("./data"));
 
             let (store, decision_backing): (
-                Box<dyn laminar_storage::CheckpointStore>,
+                Box<dyn laminar_core::storage::CheckpointStore>,
                 Arc<dyn object_store::ObjectStore>,
             ) = if let Some(ref url) = self.config.object_store_url {
-                let obj = laminar_storage::object_store_builder::build_object_store(
+                let obj = laminar_core::storage::object_store_builder::build_object_store(
                     url,
                     &self.config.object_store_options,
                 )
                 .map_err(|e| DbError::Config(format!("object store: {e}")))?;
                 let prefix = url_to_checkpoint_prefix(url);
-                let cs = laminar_storage::checkpoint_store::ObjectStoreCheckpointStore::new(
+                let cs = laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
                     Arc::clone(&obj),
                     prefix,
                     max_retained,
@@ -266,7 +266,7 @@ impl LaminarDB {
                     object_store::local::LocalFileSystem::new_with_prefix(&data_dir)
                         .map_err(|e| DbError::Config(format!("local fs: {e}")))?,
                 );
-                let cs = laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(
+                let cs = laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
                     &data_dir,
                     max_retained,
                 )

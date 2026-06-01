@@ -59,7 +59,7 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                 format!(
                     "laminar_server={l},laminar_db={l},laminar_core={l},\
-                     laminar_sql={l},laminar_connectors={l},laminar_storage={l}",
+                     laminar_sql={l},laminar_connectors={l}",
                     l = args.log_level
                 )
                 .into()
@@ -133,11 +133,11 @@ async fn validate_checkpoints_and_exit(config: &config::ServerConfig) -> Result<
 
 fn build_checkpoint_store(
     config: &config::ServerConfig,
-) -> Option<Box<dyn laminar_storage::checkpoint_store::CheckpointStore>> {
+) -> Option<Box<dyn laminar_core::storage::checkpoint_store::CheckpointStore>> {
     let cp = &config.checkpoint;
     let url = &cp.url;
 
-    let obj_store = match laminar_storage::object_store_builder::build_object_store(
+    let obj_store = match laminar_core::storage::object_store_builder::build_object_store(
         url,
         &cp.storage,
     ) {
@@ -154,7 +154,7 @@ fn build_checkpoint_store(
     if url.starts_with("file://") {
         let path = url.strip_prefix("file://").unwrap_or(url);
         Some(Box::new(
-            laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(
+            laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
                 std::path::Path::new(path),
                 3,
             )
@@ -168,7 +168,7 @@ fn build_checkpoint_store(
             .and_then(|rest| rest.split_once('/').map(|(_, p)| format!("{p}/")))
             .unwrap_or_default();
         Some(Box::new(
-            laminar_storage::checkpoint_store::ObjectStoreCheckpointStore::new(
+            laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
                 obj_store, prefix, 3,
             )
             .with_vnode_count(vnode_count),

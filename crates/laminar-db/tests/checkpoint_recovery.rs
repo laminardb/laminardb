@@ -10,10 +10,10 @@ use laminar_db::checkpoint_coordinator::{
     CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
 };
 use laminar_db::recovery_manager::RecoveryManager;
-use laminar_storage::checkpoint_manifest::{
+use laminar_core::storage::checkpoint_manifest::{
     CheckpointManifest, ConnectorCheckpoint, OperatorCheckpoint,
 };
-use laminar_storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
+use laminar_core::storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
 
 fn make_store(dir: &std::path::Path) -> FileSystemCheckpointStore {
     FileSystemCheckpointStore::new(dir, 5)

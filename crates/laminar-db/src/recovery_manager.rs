@@ -1,7 +1,7 @@
 //! Unified recovery manager.
 //!
 //! Single recovery path that loads a
-//! [`CheckpointManifest`](laminar_storage::checkpoint_manifest::CheckpointManifest) and restores
+//! [`CheckpointManifest`](laminar_core::storage::checkpoint_manifest::CheckpointManifest) and restores
 //! ALL state: source offsets, sink epochs, operator states, table offsets,
 //! and watermarks.
 //!
@@ -27,9 +27,9 @@ use std::collections::HashMap;
 
 use bytes::Bytes;
 use laminar_core::state::StateBackend;
-use laminar_storage::checkpoint_manifest::{CheckpointManifest, SinkCommitStatus};
-use laminar_storage::checkpoint_store::CheckpointStore;
-use laminar_storage::ValidationResult;
+use laminar_core::storage::checkpoint_manifest::{CheckpointManifest, SinkCommitStatus};
+use laminar_core::storage::checkpoint_store::CheckpointStore;
+use laminar_core::storage::ValidationResult;
 use tracing::{debug, error, info, warn};
 
 use crate::checkpoint_coordinator::{
@@ -77,7 +77,7 @@ impl RecoveredState {
     #[must_use]
     pub fn operator_states(
         &self,
-    ) -> &HashMap<String, laminar_storage::checkpoint_manifest::OperatorCheckpoint> {
+    ) -> &HashMap<String, laminar_core::storage::checkpoint_manifest::OperatorCheckpoint> {
         &self.manifest.operator_states
     }
 
@@ -418,7 +418,7 @@ impl<'a> RecoveryManager<'a> {
                 // dereference invalid offsets later
                 for name in &external_ops {
                     if let Some(op) = manifest.operator_states.get_mut(name) {
-                        *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
+                        *op = laminar_core::storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
                     }
                 }
                 return false;
@@ -433,7 +433,7 @@ impl<'a> RecoveryManager<'a> {
                 );
                 for name in &external_ops {
                     if let Some(op) = manifest.operator_states.get_mut(name) {
-                        *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
+                        *op = laminar_core::storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
                     }
                 }
                 return false;
@@ -458,7 +458,7 @@ impl<'a> RecoveryManager<'a> {
                     let external_offset = op.external_offset;
                     let external_length = op.external_length;
                     let data = &state_data[start..end];
-                    *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(data);
+                    *op = laminar_core::storage::checkpoint_manifest::OperatorCheckpoint::inline(data);
                     debug!(
                         operator = %name,
                         offset = external_offset,
@@ -475,7 +475,7 @@ impl<'a> RecoveryManager<'a> {
                          range for external operator state — operator will \
                          start with empty state"
                     );
-                    *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
+                    *op = laminar_core::storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
                     all_resolved = false;
                 }
             }
@@ -511,7 +511,7 @@ impl<'a> RecoveryManager<'a> {
         // `DEFAULT_VNODE_COUNT` is a placeholder; the runtime
         // `VnodeRegistry` value is not threaded through recovery yet.
         let validation_errors =
-            manifest.validate(laminar_storage::checkpoint_manifest::DEFAULT_VNODE_COUNT);
+            manifest.validate(laminar_core::storage::checkpoint_manifest::DEFAULT_VNODE_COUNT);
         if !validation_errors.is_empty() {
             for err in &validation_errors {
                 warn!(
@@ -828,8 +828,8 @@ impl<'a> RecoveryManager<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use laminar_storage::checkpoint_manifest::OperatorCheckpoint;
-    use laminar_storage::checkpoint_store::FileSystemCheckpointStore;
+    use laminar_core::storage::checkpoint_manifest::OperatorCheckpoint;
+    use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
 
     fn make_store(dir: &std::path::Path) -> FileSystemCheckpointStore {
         FileSystemCheckpointStore::new(dir, 3)

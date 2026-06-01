@@ -24,7 +24,8 @@ use object_store::{GetOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use crate::checkpoint_manifest::CheckpointManifest;
+use crate::checkpoint::checkpoint_manifest::CheckpointManifest;
+
 
 /// Fsync a file to ensure its contents are durable on disk.
 async fn sync_file(path: &Path) -> Result<(), std::io::Error> {
@@ -189,7 +190,7 @@ fn sha256_hex_chunks(chunks: &[bytes::Bytes]) -> String {
 /// Combined checksum for a mixed (inline + external) manifest:
 /// `sha256(inline_hash_hex || concat(sidecar_chunks))`.
 fn sha256_hex_mixed<'a, I>(
-    states: &std::collections::HashMap<String, crate::checkpoint_manifest::OperatorCheckpoint>,
+    states: &std::collections::HashMap<String, crate::checkpoint::checkpoint_manifest::OperatorCheckpoint>,
     sidecar_chunks: I,
 ) -> String
 where
@@ -207,7 +208,7 @@ where
 /// SHA-256 over inline operator-state entries in sorted-name order,
 /// used as the `state_checksum` when no sidecar exists.
 fn sha256_hex_inline_states(
-    states: &std::collections::HashMap<String, crate::checkpoint_manifest::OperatorCheckpoint>,
+    states: &std::collections::HashMap<String, crate::checkpoint::checkpoint_manifest::OperatorCheckpoint>,
 ) -> String {
     let mut names: Vec<&String> = states.keys().collect();
     names.sort_unstable();
@@ -241,7 +242,7 @@ pub trait CheckpointStore: Send + Sync {
     /// [`crate::checkpoint_manifest::DEFAULT_VNODE_COUNT`] when the
     /// implementation has no configured value.
     fn vnode_count(&self) -> u16 {
-        crate::checkpoint_manifest::DEFAULT_VNODE_COUNT
+        crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT
     }
 
     /// Atomically persists a checkpoint manifest. Implementations must
@@ -531,7 +532,7 @@ pub trait CheckpointStore: Send + Sync {
 /// Stamp `state_checksum` for a save: mixed manifests hash inline+sidecar
 /// together, purely-external hash the sidecar alone.
 fn stamp_checksum(
-    states: &std::collections::HashMap<String, crate::checkpoint_manifest::OperatorCheckpoint>,
+    states: &std::collections::HashMap<String, crate::checkpoint::checkpoint_manifest::OperatorCheckpoint>,
     chunks: Option<&[bytes::Bytes]>,
 ) -> String {
     let chunks = chunks.unwrap_or_default();
@@ -569,7 +570,7 @@ impl FileSystemCheckpointStore {
         Self {
             base_dir: base_dir.into(),
             max_retained,
-            vnode_count: crate::checkpoint_manifest::DEFAULT_VNODE_COUNT,
+            vnode_count: crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT,
         }
     }
 
@@ -931,7 +932,7 @@ impl ObjectStoreCheckpointStore {
             store,
             prefix,
             max_retained,
-            vnode_count: crate::checkpoint_manifest::DEFAULT_VNODE_COUNT,
+            vnode_count: crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT,
         }
     }
 
@@ -1303,7 +1304,7 @@ impl CheckpointStore for ObjectStoreCheckpointStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoint_manifest::{ConnectorCheckpoint, OperatorCheckpoint};
+    use crate::checkpoint::checkpoint_manifest::{ConnectorCheckpoint, OperatorCheckpoint};
     #[allow(clippy::disallowed_types)] // cold path: checkpoint store
     use std::collections::HashMap;
 
@@ -1744,7 +1745,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_obj_update_manifest_overwrites() {
-        use crate::checkpoint_manifest::SinkCommitStatus;
+        use crate::checkpoint::checkpoint_manifest::SinkCommitStatus;
 
         let store = make_obj_store();
 
@@ -1796,7 +1797,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fs_update_manifest_overwrites() {
-        use crate::checkpoint_manifest::SinkCommitStatus;
+        use crate::checkpoint::checkpoint_manifest::SinkCommitStatus;
 
         let dir = tempfile::tempdir().unwrap();
         let store = make_store(dir.path());

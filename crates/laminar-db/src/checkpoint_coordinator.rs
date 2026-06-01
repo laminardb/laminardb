@@ -24,10 +24,10 @@ use std::time::{Duration, Instant};
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::SourceConnector;
 use laminar_core::state::StateBackend;
-use laminar_storage::checkpoint_manifest::{
+use laminar_core::storage::checkpoint_manifest::{
     CheckpointManifest, ConnectorCheckpoint, SinkCommitStatus,
 };
-use laminar_storage::checkpoint_store::CheckpointStore;
+use laminar_core::storage::checkpoint_store::CheckpointStore;
 use tracing::{debug, error, info, warn};
 
 use crate::error::DbError;
@@ -225,7 +225,7 @@ pub struct CheckpointCoordinator {
 /// Highest-loadable manifest — tolerates a torn `latest.txt` pointer.
 async fn load_highest(
     store: &dyn CheckpointStore,
-) -> Result<Option<CheckpointManifest>, laminar_storage::checkpoint_store::CheckpointStoreError> {
+) -> Result<Option<CheckpointManifest>, laminar_core::storage::checkpoint_store::CheckpointStoreError> {
     let ids = store.list_ids().await?;
     for id in ids.iter().rev() {
         if let Ok(Some(m)) = store.load_by_id(*id).await {
@@ -959,7 +959,7 @@ impl CheckpointCoordinator {
         let mut offset: u64 = 0;
         for (name, data) in operator_states {
             let (op_ckpt, maybe_blob) =
-                laminar_storage::checkpoint_manifest::OperatorCheckpoint::from_bytes_shared(
+                laminar_core::storage::checkpoint_manifest::OperatorCheckpoint::from_bytes_shared(
                     data.clone(),
                     threshold,
                     offset,
@@ -1992,7 +1992,7 @@ pub fn connector_to_source_checkpoint(cp: &ConnectorCheckpoint) -> SourceCheckpo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use laminar_storage::checkpoint_store::FileSystemCheckpointStore;
+    use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
 
     async fn make_coordinator(dir: &std::path::Path) -> CheckpointCoordinator {
         let store = Box::new(FileSystemCheckpointStore::new(dir, 3));
@@ -2411,7 +2411,7 @@ mod tests {
             BarrierAnnouncement, ClusterController, ClusterKv, InMemoryKv, Phase, ANNOUNCEMENT_KEY,
         };
         use laminar_core::cluster::discovery::NodeId;
-        use laminar_storage::checkpoint_manifest::SinkCommitStatus;
+        use laminar_core::storage::checkpoint_manifest::SinkCommitStatus;
         use tokio::sync::watch;
 
         let dir = tempfile::tempdir().unwrap();
@@ -2450,7 +2450,7 @@ mod tests {
             Phase, ANNOUNCEMENT_KEY,
         };
         use laminar_core::cluster::discovery::NodeId;
-        use laminar_storage::checkpoint_manifest::SinkCommitStatus;
+        use laminar_core::storage::checkpoint_manifest::SinkCommitStatus;
         use object_store::local::LocalFileSystem;
         use tokio::sync::watch;
 
@@ -2499,7 +2499,7 @@ mod tests {
             Phase, ANNOUNCEMENT_KEY,
         };
         use laminar_core::cluster::discovery::NodeId;
-        use laminar_storage::checkpoint_manifest::SinkCommitStatus;
+        use laminar_core::storage::checkpoint_manifest::SinkCommitStatus;
         use object_store::local::LocalFileSystem;
         use tokio::sync::watch;
 
@@ -2543,7 +2543,7 @@ mod tests {
             ClusterController, ClusterKv, InMemoryKv, ANNOUNCEMENT_KEY,
         };
         use laminar_core::cluster::discovery::NodeId;
-        use laminar_storage::checkpoint_manifest::SinkCommitStatus;
+        use laminar_core::storage::checkpoint_manifest::SinkCommitStatus;
         use tokio::sync::watch;
 
         let dir = tempfile::tempdir().unwrap();
@@ -3093,7 +3093,7 @@ mod tests {
             ..Default::default()
         };
         let store = Box::new(
-            laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(dir.path(), 3),
+            laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(dir.path(), 3),
         );
         let mut coord = CheckpointCoordinator::new(config, store).await.unwrap();
 

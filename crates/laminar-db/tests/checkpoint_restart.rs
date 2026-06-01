@@ -12,7 +12,7 @@ use std::sync::Arc;
 use arrow::array::{Float64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use laminar_core::streaming::StreamCheckpointConfig;
 use laminar_db::{LaminarConfig, LaminarDB};
-use laminar_storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
+use laminar_core::storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
 
 fn config_for(dir: &std::path::Path) -> LaminarConfig {
     LaminarConfig {

@@ -32,15 +32,14 @@ files = ["laminar-connectors/files"]
 otel = ["laminar-connectors/otel"]
 nats = ["laminar-connectors/nats"]
 cluster-unstable = ["laminar-core/cluster-unstable", "laminar-sql/cluster-unstable"]
-aws = ["laminar-storage/aws"]
-gcs = ["laminar-storage/gcs"]
-azure = ["laminar-storage/azure"]
+aws = ["laminar-core/aws"]
+gcs = ["laminar-core/gcs"]
+azure = ["laminar-core/azure"]
 
 [dependencies]
 laminar-core = { path = "../laminar-core", version = "0.23.0" }
 laminar-ai = { path = "../laminar-ai", version = "0.23.0" }
 laminar-sql = { path = "../laminar-sql", version = "0.23.0" }
-laminar-storage = { path = "../laminar-storage", version = "0.23.0" }
 laminar-connectors = { path = "../laminar-connectors", version = "0.23.0" }
 
 # Arrow
