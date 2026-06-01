@@ -196,6 +196,7 @@ struct GrpcState {
         >,
     >,
     server_handle: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    local_addr: std::net::SocketAddr,
 }
 
 #[cfg(feature = "cluster-unstable")]
@@ -427,6 +428,7 @@ impl BarrierCoordinator {
             pending_acks,
             clients,
             server_handle: Arc::new(parking_lot::Mutex::new(Some(server_task))),
+            local_addr,
         });
 
         *self.grpc.lock() = Some(grpc_state);
@@ -449,7 +451,10 @@ impl BarrierCoordinator {
             if let Some(state) = grpc_opt {
                 if ann.phase == Phase::Commit || ann.phase == Phase::Abort {
                     let mut expected = Vec::new();
-                    for (node_id, _) in self.kv.scan(BARRIER_ADDR_KEY).await {
+                    for (node_id, addr) in self.kv.scan(BARRIER_ADDR_KEY).await {
+                        if addr == state.local_addr.to_string() {
+                            continue;
+                        }
                         expected.push(node_id);
                     }
 
@@ -459,33 +464,38 @@ impl BarrierCoordinator {
                         let kv = Arc::clone(&self.kv);
                         let ann_clone = ann.clone();
                         futures.push(async move {
-                            if let Some(mut client) =
-                                get_barrier_client(peer, &clients_pool, &kv).await
-                            {
-                                match ann_clone.phase {
-                                    Phase::Commit => {
-                                        let req = barrier_v1::CommitRequest {
-                                            epoch: ann_clone.epoch,
-                                            checkpoint_id: ann_clone.checkpoint_id,
-                                            flags: ann_clone.flags,
-                                            min_watermark_ms: ann_clone.min_watermark_ms,
-                                        };
-                                        let _ = client.commit(req).await;
-                                    }
-                                    Phase::Abort => {
-                                        let req = barrier_v1::AbortRequest {
-                                            epoch: ann_clone.epoch,
-                                            checkpoint_id: ann_clone.checkpoint_id,
-                                            flags: ann_clone.flags,
-                                        };
-                                        let _ = client.abort(req).await;
-                                    }
-                                    Phase::Prepare => {}
+                            let mut client = get_barrier_client(peer, &clients_pool, &kv)
+                                .await
+                                .ok_or_else(|| format!("failed to get client for peer {}", peer.0))?;
+                            match ann_clone.phase {
+                                Phase::Commit => {
+                                    let req = barrier_v1::CommitRequest {
+                                        epoch: ann_clone.epoch,
+                                        checkpoint_id: ann_clone.checkpoint_id,
+                                        flags: ann_clone.flags,
+                                        min_watermark_ms: ann_clone.min_watermark_ms,
+                                    };
+                                    client.commit(req).await
+                                        .map_err(|e| format!("commit RPC to peer {} failed: {e}", peer.0))?;
                                 }
+                                Phase::Abort => {
+                                    let req = barrier_v1::AbortRequest {
+                                        epoch: ann_clone.epoch,
+                                        checkpoint_id: ann_clone.checkpoint_id,
+                                        flags: ann_clone.flags,
+                                    };
+                                    client.abort(req).await
+                                        .map_err(|e| format!("abort RPC to peer {} failed: {e}", peer.0))?;
+                                }
+                                Phase::Prepare => {}
                             }
+                            Ok::<(), String>(())
                         });
                     }
-                    futures::future::join_all(futures).await;
+                    let results = futures::future::join_all(futures).await;
+                    for res in results {
+                        res?;
+                    }
                 }
 
                 let json = serde_json::to_string(ann).map_err(|e| e.to_string())?;

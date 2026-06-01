@@ -57,10 +57,10 @@ The following issues were identified during code review of the legacy cluster im
 To support distributed clustering, gRPC services are gated under the `cluster-unstable` Cargo feature flag. This ensures the default build compiles cleanly without requiring the `protoc` compiler.
 
 ### Proto Schemas (`crates/laminar-core/proto/`)
-- **[shuffle.proto](file:///C:/Users/sujit/source/laminardb/crates/laminar-core/proto/shuffle.proto)**:
+- **[shuffle.proto](crates/laminar-core/proto/shuffle.proto)**:
   - Defines the client-streaming RPC `ShuffleTransport::Shuffle` to send `ShuffleFrame` payloads.
   - Payloads include a `Hello` handshake, `VnodeData` (Arrow IPC batch bytes), `Barrier` (epoch sync markers), and `Close`.
-- **[barrier.proto](file:///C:/Users/sujit/source/laminardb/crates/laminar-core/proto/barrier.proto)**:
+- **[barrier.proto](crates/laminar-core/proto/barrier.proto)**:
   - Defines the `BarrierSync` service with direct RPC calls from leader to follower:
     - `Prepare(PrepareRequest) -> Ack`
     - `Commit(CommitRequest) -> Ack`

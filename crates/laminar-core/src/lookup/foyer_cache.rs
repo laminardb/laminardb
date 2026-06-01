@@ -186,14 +186,18 @@ impl FoyerMemoryCache {
             key,
         };
         if let Some(entry) = self.cache.get(&ref_key) {
-            // Lazy TTL: an expired entry counts as a miss and is evicted so the
-            // byte budget is reclaimed without waiting for S3-FIFO pressure.
             if self
                 .ttl
                 .is_some_and(|ttl| entry.value().inserted_at.elapsed() >= ttl)
             {
+                let inserted_at = entry.value().inserted_at;
                 drop(entry);
-                self.cache.remove(&ref_key);
+                if let Some(new_entry) = self.cache.get(&ref_key) {
+                    if new_entry.value().inserted_at == inserted_at {
+                        drop(new_entry);
+                        self.cache.remove(&ref_key);
+                    }
+                }
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 return LookupResult::NotFound;
             }

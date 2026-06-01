@@ -993,6 +993,7 @@ pub struct PartialLookupJoinExec {
     lookup_schema: SchemaRef,
     source: Option<Arc<dyn LookupSourceDyn>>,
     fetch_semaphore: Arc<Semaphore>,
+    projection: Vec<ColumnId>,
 }
 
 impl PartialLookupJoinExec {
@@ -1020,6 +1021,7 @@ impl PartialLookupJoinExec {
             output_schema,
             None,
             Arc::new(Semaphore::new(64)),
+            vec![],
         )
     }
 
@@ -1039,6 +1041,7 @@ impl PartialLookupJoinExec {
         output_schema: SchemaRef,
         source: Option<Arc<dyn LookupSourceDyn>>,
         fetch_semaphore: Arc<Semaphore>,
+        projection: Vec<ColumnId>,
     ) -> Result<Self> {
         let output_schema = if join_type == LookupJoinType::LeftOuter {
             let stream_count = input.schema().fields().len();
@@ -1080,6 +1083,7 @@ impl PartialLookupJoinExec {
             lookup_schema,
             source,
             fetch_semaphore,
+            projection,
         })
     }
 }
@@ -1153,6 +1157,7 @@ impl ExecutionPlan for PartialLookupJoinExec {
             lookup_schema: Arc::clone(&self.lookup_schema),
             source: self.source.clone(),
             fetch_semaphore: Arc::clone(&self.fetch_semaphore),
+            projection: self.projection.clone(),
         }))
     }
 
@@ -1171,6 +1176,7 @@ impl ExecutionPlan for PartialLookupJoinExec {
         let lookup_schema = Arc::clone(&self.lookup_schema);
         let source = self.source.clone();
         let fetch_semaphore = Arc::clone(&self.fetch_semaphore);
+        let projection = self.projection.clone();
 
         let output = input_stream.then(move |result| {
             let foyer_cache = Arc::clone(&foyer_cache);
@@ -1180,6 +1186,7 @@ impl ExecutionPlan for PartialLookupJoinExec {
             let lookup_schema = Arc::clone(&lookup_schema);
             let source = source.clone();
             let fetch_semaphore = Arc::clone(&fetch_semaphore);
+            let projection = projection.clone();
             async move {
                 let batch = result?;
                 if batch.num_rows() == 0 {
@@ -1196,6 +1203,7 @@ impl ExecutionPlan for PartialLookupJoinExec {
                     &lookup_schema,
                     source.as_deref(),
                     &fetch_semaphore,
+                    &projection,
                 )
                 .await
             }
@@ -1247,6 +1255,7 @@ async fn probe_partial_batch_with_fallback(
     lookup_schema: &SchemaRef,
     source: Option<&dyn LookupSourceDyn>,
     fetch_semaphore: &Semaphore,
+    projection: &[ColumnId],
 ) -> Result<RecordBatch> {
     let key_cols: Vec<_> = stream_key_indices
         .iter()
@@ -1298,7 +1307,7 @@ async fn probe_partial_batch_with_fallback(
             // inner-join matches or NULL-filling left-join rows.
             let results = match tokio::time::timeout(
                 LOOKUP_SOURCE_TIMEOUT,
-                source.query_batch(&key_refs, &[], &[]),
+                source.query_batch(&key_refs, &[], projection),
             )
             .await
             {
@@ -1317,6 +1326,15 @@ async fn probe_partial_batch_with_fallback(
                     )));
                 }
             };
+
+            if results.len() != miss_keys.len() {
+                return Err(DataFusionError::Execution(format!(
+                    "Lookup source returned mismatched results cardinality. Expected {} results, but got {} results. Miss keys: {:?}",
+                    miss_keys.len(),
+                    results.len(),
+                    miss_keys
+                )));
+            }
 
             for ((idx, key_bytes), maybe_batch) in miss_keys.iter().zip(results) {
                 if let Some(batch) = maybe_batch {
@@ -1436,6 +1454,7 @@ impl ExtensionPlanner for LookupJoinExtensionPlanner {
                     output_schema,
                     partial_state.source.clone(),
                     Arc::clone(&partial_state.fetch_semaphore),
+                    partial_state.projection.clone(),
                 )?;
                 Ok(Some(Arc::new(exec)))
             }
@@ -2224,6 +2243,7 @@ mod tests {
             output_schema(),
             Some(source),
             Arc::new(Semaphore::new(64)),
+            vec![],
         )
         .unwrap();
 
@@ -2278,6 +2298,7 @@ mod tests {
             output_schema(),
             Some(source),
             Arc::new(Semaphore::new(64)),
+            vec![],
         )
         .unwrap();
 

@@ -10,7 +10,20 @@ documentation = "https://laminardb.io/api/laminar_db"
 description = "Unified database facade for LaminarDB"
 
 [features]
-default = []
+default = [
+    "kafka",
+    "postgres-cdc",
+    "postgres-sink",
+    "delta-lake-all",
+    "websocket",
+    "mysql-cdc",
+    "mongodb-cdc",
+    "iceberg",
+    "parquet-lookup",
+    "files",
+    "otel",
+    "nats",
+]
 api = []  # FFI-friendly API module for language bindings
 ffi = ["api", "arrow/ffi"]  # C FFI layer (extern "C" functions, cbindgen headers, Arrow C Data Interface)
 kafka = ["laminar-connectors/kafka"]
@@ -137,7 +150,7 @@ futures-util = { version = "0.3" }
 # (`C:\Program Files\OpenSSL-Win64` by default).
 
 [target.'cfg(not(target_os = "windows"))'.dev-dependencies]
-rdkafka = { version = "0.39", features = ["cmake-build", "ssl-vendored"] }
+rdkafka = { version = "0.39", features = ["cmake-build", "ssl"] }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
 rdkafka = { version = "0.39", features = ["cmake-build"] }

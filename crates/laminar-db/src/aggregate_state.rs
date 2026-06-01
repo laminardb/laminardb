@@ -1309,6 +1309,9 @@ impl IncrementalAggState {
         &mut self,
         vnode_count: u32,
     ) -> Result<std::collections::HashMap<u32, AggStateCheckpoint>, DbError> {
+        if vnode_count == 0 {
+            return Err(DbError::Pipeline("vnode_count must be > 0".to_string()));
+        }
         let fingerprint = self.query_fingerprint();
         let global = self.num_group_cols == 0;
         let retractable = self.weight_col_idx.is_some();

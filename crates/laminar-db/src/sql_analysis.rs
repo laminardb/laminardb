@@ -693,6 +693,20 @@ pub(crate) fn detect_lookup_enrich_query(
     let SetExpr::Select(select) = query.body.as_ref() else {
         return (None, None);
     };
+    let has_group_by = match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
+        _ => false,
+    };
+    if select.distinct.is_some()
+        || has_group_by
+        || select.having.is_some()
+        || query.order_by.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || query.with.is_some()
+    {
+        return (None, None);
+    }
     let Ok(Some(multi)) = analyze_joins(select) else {
         return (None, None);
     };
@@ -2376,6 +2390,38 @@ fn rewrite_join_expr<F: Fn(&Expr) -> Option<String>>(expr: &Expr, leaf: &F) -> S
                 other => vec![other.to_string()],
             };
             format!("{}({})", func.name, args.join(", "))
+        }
+        Expr::InList { expr, list, negated } => {
+            let list_str: Vec<String> = list.iter().map(r).collect();
+            let op = if *negated { "NOT IN" } else { "IN" };
+            format!("{} {op} ({})", r(expr), list_str.join(", "))
+        }
+        Expr::InSubquery { expr, subquery, negated } => {
+            let op = if *negated { "NOT IN" } else { "IN" };
+            format!("{} {op} ({subquery})", r(expr))
+        }
+        Expr::Exists { subquery, negated } => {
+            let op = if *negated { "NOT EXISTS" } else { "EXISTS" };
+            format!("{op} ({subquery})")
+        }
+        Expr::Case { operand, conditions, else_result, .. } => {
+            let operand_str = operand.as_ref().map_or(String::new(), |op| format!("{} ", r(op)));
+            let mut wens = Vec::new();
+            for cw in conditions {
+                wens.push(format!("WHEN {} THEN {}", r(&cw.condition), r(&cw.result)));
+            }
+            let else_str = else_result.as_ref().map_or(String::new(), |el| format!(" ELSE {}", r(el)));
+            format!("CASE {operand_str}{} {else_str} END", wens.join(" "))
+        }
+        Expr::Tuple(exprs) => {
+            let tuple_str: Vec<String> = exprs.iter().map(r).collect();
+            format!("({})", tuple_str.join(", "))
+        }
+        Expr::Collate { expr, collation } => {
+            format!("{} COLLATE {collation}", r(expr))
+        }
+        Expr::Subquery(subquery) => {
+            format!("({subquery})")
         }
         _ => expr.to_string(),
     }

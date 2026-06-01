@@ -66,6 +66,18 @@ pub struct PostgresLookupSource {
 }
 
 #[cfg(feature = "postgres-cdc")]
+fn quote_identifier(name: &str) -> String {
+    if name.contains('.') {
+        name.split('.')
+            .map(|part| format!("\"{}\"", part.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(".")
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
+}
+
+#[cfg(feature = "postgres-cdc")]
 impl PostgresLookupSource {
     /// Opens a pooled connection and derives the table's Arrow schema.
     ///
@@ -84,8 +96,9 @@ impl PostgresLookupSource {
 
         let pool = build_pool(&config.properties, config.pool_size)?;
         let select_sql = format!(
-            "SELECT * FROM {} WHERE \"{}\" = ANY($1)",
-            config.table, pk_column
+            "SELECT * FROM {} WHERE {} = ANY($1)",
+            quote_identifier(&config.table),
+            quote_identifier(&pk_column)
         );
 
         // Read column metadata via a prepared zero-row statement.
@@ -94,7 +107,7 @@ impl PostgresLookupSource {
             .await
             .map_err(|e| LookupError::Connection(format!("postgres pool: {e}")))?;
         let stmt = client
-            .prepare(&format!("SELECT * FROM {} LIMIT 0", config.table))
+            .prepare(&format!("SELECT * FROM {} LIMIT 0", quote_identifier(&config.table)))
             .await
             .map_err(|e| LookupError::Connection(format!("prepare schema probe: {e}")))?;
         let fields: Vec<Field> = stmt
@@ -203,25 +216,37 @@ impl LookupSource for PostgresLookupSource {
         // Projection pushdown: SELECT only the requested columns (always incl.
         // the key, so the row maps back); else the prebuilt `SELECT *`. The
         // result schema follows so `rows_to_batch` reads the right columns.
-        let (sql, out_schema) = if projection.is_empty() {
-            (self.select_sql.clone(), Arc::clone(&self.schema))
+        let (sql, out_schema, project_needed) = if projection.is_empty() {
+            (self.select_sql.clone(), Arc::clone(&self.schema), false)
         } else {
-            let cols = projection_names(&self.schema, projection)?
+            let mut proj_names = projection_names(&self.schema, projection)?;
+            let mut idx: Vec<usize> = projection.iter().map(|&c| c as usize).collect();
+            let mut project_needed = false;
+
+            if !proj_names.contains(&self.pk_column) {
+                proj_names.push(self.pk_column.clone());
+                let pk_idx = self.schema.index_of(&self.pk_column)
+                    .map_err(|e| LookupError::Internal(format!("pk column index: {e}")))?;
+                idx.push(pk_idx);
+                project_needed = true;
+            }
+
+            let cols = proj_names
                 .iter()
-                .map(|n| format!("\"{n}\""))
+                .map(|n| quote_identifier(n))
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!(
-                "SELECT {cols} FROM {} WHERE \"{}\" = ANY($1)",
-                self.table, self.pk_column
+                "SELECT {cols} FROM {} WHERE {} = ANY($1)",
+                quote_identifier(&self.table),
+                quote_identifier(&self.pk_column)
             );
-            let idx: Vec<usize> = projection.iter().map(|&c| c as usize).collect();
             let proj_schema = Arc::new(
                 self.schema
                     .project(&idx)
                     .map_err(|e| LookupError::Internal(format!("project postgres schema: {e}")))?,
             );
-            (sql, proj_schema)
+            (sql, proj_schema, project_needed)
         };
 
         let client = self
@@ -239,7 +264,28 @@ impl LookupSource for PostgresLookupSource {
         } else {
             vec![rows_to_batch(&out_schema, &pg_rows)?]
         };
-        self.aligner.align(keys, &batches)
+        let aligned = self.aligner.align(keys, &batches)?;
+
+        if project_needed {
+            let orig_names = projection_names(&self.schema, projection)?;
+            let mut projected_aligned = Vec::with_capacity(aligned.len());
+            for maybe_batch in aligned {
+                if let Some(batch) = maybe_batch {
+                    let indices: Vec<usize> = orig_names
+                        .iter()
+                        .map(|name| batch.schema().index_of(name).map_err(|e| LookupError::Internal(format!("column not found in aligned schema: {e}"))))
+                        .collect::<Result<Vec<usize>, LookupError>>()?;
+                    let projected = batch.project(&indices)
+                        .map_err(|e| LookupError::Internal(format!("project aligned batch: {e}")))?;
+                    projected_aligned.push(Some(projected));
+                } else {
+                    projected_aligned.push(None);
+                }
+            }
+            Ok(projected_aligned)
+        } else {
+            Ok(aligned)
+        }
     }
 
     fn capabilities(&self) -> LookupSourceCapabilities {
@@ -273,16 +319,81 @@ impl LookupSource for PostgresLookupSource {
     }
 }
 
+#[cfg(feature = "postgres-cdc")]
+fn parse_conn_string_params(conn: &str) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    if conn.starts_with("postgresql://") || conn.starts_with("postgres://") {
+        if let Some(pos) = conn.find('?') {
+            let query = &conn[pos + 1..];
+            for pair in query.split('&') {
+                let mut parts = pair.splitn(2, '=');
+                if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                    params.insert(k.to_string(), v.replace("%2F", "/").replace("%2f", "/"));
+                }
+            }
+        }
+    } else {
+        let mut chars = conn.chars().peekable();
+        while let Some(&c) = chars.peek() {
+            if c.is_whitespace() {
+                chars.next();
+                continue;
+            }
+            let mut key = String::new();
+            while let Some(&c) = chars.peek() {
+                if c == '=' {
+                    chars.next();
+                    break;
+                }
+                if c.is_whitespace() {
+                    break;
+                }
+                key.push(c);
+                chars.next();
+            }
+            if key.is_empty() {
+                break;
+            }
+            let mut val = String::new();
+            if chars.peek() == Some(&'\'') {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    if c == '\'' {
+                        break;
+                    }
+                    val.push(c);
+                }
+            } else {
+                while let Some(&c) = chars.peek() {
+                    if c.is_whitespace() {
+                        break;
+                    }
+                    val.push(c);
+                    chars.next();
+                }
+            }
+            params.insert(key, val);
+        }
+    }
+    params
+}
+
 /// Build a `deadpool` pool from libpq-style properties (individual keys or a
 /// pre-formed `connection`/`connection_string` parsed via `tokio_postgres`).
 #[cfg(feature = "postgres-cdc")]
 fn build_pool(props: &HashMap<String, String>, pool_size: usize) -> Result<Pool, LookupError> {
     let mut cfg = deadpool_postgres::Config::new();
+    let mut merged_props = props.clone();
 
     if let Some(conn) = props
         .get("connection")
         .or_else(|| props.get("connection_string"))
     {
+        let conn_params = parse_conn_string_params(conn);
+        for (k, v) in conn_params {
+            merged_props.insert(k, v);
+        }
+
         let pg: tokio_postgres::Config = conn
             .parse()
             .map_err(|e| LookupError::Connection(format!("parse connection string: {e}")))?;
@@ -313,8 +424,8 @@ fn build_pool(props: &HashMap<String, String>, pool_size: usize) -> Result<Pool,
 
     // `create_pool` is generic over the TLS connector but erases it into the
     // same `Pool` type, so the two arms unify.
-    if tls_enabled(props)? {
-        let connector = build_rustls_connector(props)?;
+    if tls_enabled(&merged_props)? {
+        let connector = build_rustls_connector(&merged_props)?;
         cfg.create_pool(runtime, connector)
             .map_err(|e| LookupError::Connection(format!("create pool: {e}")))
     } else {

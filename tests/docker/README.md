@@ -39,8 +39,8 @@ export OPENSSL_LIB_DIR="C:\\Program Files\\OpenSSL-Win64\\lib\\VC\\x64\\MD"
 export OPENSSL_INCLUDE_DIR="C:\\Program Files\\OpenSSL-Win64\\include"
 ```
 
-before `cargo test`. Without these the `ssl-vendored` feature from
-`laminar-connectors` tries to build OpenSSL from source via Perl, which
+before `cargo test`. Without these the `ssl` feature from
+`laminar-connectors` (or `laminar-db` dev-dependencies) tries to build OpenSSL from source via Perl, which
 fails on the stock Windows toolchain.
 
 ## Tear down

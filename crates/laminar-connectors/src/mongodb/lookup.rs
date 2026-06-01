@@ -79,6 +79,23 @@ impl MongoLookupSource {
         let pk_idx = config.schema.index_of(&pk_field).map_err(|_| {
             LookupError::Internal(format!("pk column not in declared schema: {pk_field}"))
         })?;
+
+        for field in config.schema.fields() {
+            match field.data_type() {
+                DataType::Int32
+                | DataType::Int64
+                | DataType::Float64
+                | DataType::Boolean
+                | DataType::Utf8
+                | DataType::LargeUtf8 => {}
+                dt => {
+                    return Err(LookupError::Internal(format!(
+                        "unsupported field data type in schema for mongodb lookup: {dt}"
+                    )));
+                }
+            }
+        }
+
         let pk_sort_fields = vec![SortField::new(
             config.schema.field(pk_idx).data_type().clone(),
         )];
@@ -146,6 +163,7 @@ impl MongoLookupSource {
     fn docs_to_batch(schema: &SchemaRef, docs: &[Document]) -> Result<RecordBatch, LookupError> {
         use arrow_array::builder::{
             BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
+            LargeStringBuilder,
         };
 
         let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
@@ -182,8 +200,17 @@ impl MongoLookupSource {
                     }
                     Arc::new(b.finish())
                 }
-                _ => {
-                    // Utf8 (and any non-native declared type): extended-JSON text.
+                DataType::LargeUtf8 => {
+                    let mut b = LargeStringBuilder::with_capacity(docs.len(), docs.len() * 16);
+                    for d in docs {
+                        match d.get(name) {
+                            None | Some(Bson::Null) => b.append_null(),
+                            Some(v) => b.append_value(bson_to_string(v)),
+                        }
+                    }
+                    Arc::new(b.finish())
+                }
+                DataType::Utf8 => {
                     let mut b = StringBuilder::with_capacity(docs.len(), docs.len() * 16);
                     for d in docs {
                         match d.get(name) {
@@ -192,6 +219,12 @@ impl MongoLookupSource {
                         }
                     }
                     Arc::new(b.finish())
+                }
+                _ => {
+                    return Err(LookupError::Internal(format!(
+                        "unsupported field data type: {:?}",
+                        field.data_type()
+                    )));
                 }
             };
             columns.push(array);
@@ -233,16 +266,25 @@ impl LookupSource for MongoLookupSource {
         // Projection pushdown: ask Mongo for only the requested fields (always
         // incl. the key), and build the batch in the matching projected schema.
         let mut find = collection.find(filter);
+        let mut project_needed = false;
         let out_schema = if projection.is_empty() {
             Arc::clone(&self.schema)
         } else {
-            let names = projection_names(&self.schema, projection)?;
+            let mut names = projection_names(&self.schema, projection)?;
+            let mut idx: Vec<usize> = projection.iter().map(|&c| c as usize).collect();
+            if !names.contains(&self.pk_field) {
+                names.push(self.pk_field.clone());
+                let pk_idx = self.schema.index_of(&self.pk_field)
+                    .map_err(|e| LookupError::Internal(format!("pk column index: {e}")))?;
+                idx.push(pk_idx);
+                project_needed = true;
+            }
+
             let mut proj_doc = Document::new();
             for name in &names {
                 proj_doc.insert(name.clone(), 1);
             }
             find = find.projection(proj_doc);
-            let idx: Vec<usize> = projection.iter().map(|&c| c as usize).collect();
             Arc::new(
                 self.schema
                     .project(&idx)
@@ -263,7 +305,28 @@ impl LookupSource for MongoLookupSource {
         } else {
             vec![Self::docs_to_batch(&out_schema, &docs)?]
         };
-        self.aligner.align(keys, &batches)
+        let aligned = self.aligner.align(keys, &batches)?;
+
+        if project_needed {
+            let orig_names = projection_names(&self.schema, projection)?;
+            let mut projected_aligned = Vec::with_capacity(aligned.len());
+            for maybe_batch in aligned {
+                if let Some(batch) = maybe_batch {
+                    let indices: Vec<usize> = orig_names
+                        .iter()
+                        .map(|name| batch.schema().index_of(name).map_err(|e| LookupError::Internal(format!("column not found in aligned schema: {e}"))))
+                        .collect::<Result<Vec<usize>, LookupError>>()?;
+                    let projected = batch.project(&indices)
+                        .map_err(|e| LookupError::Internal(format!("project aligned batch: {e}")))?;
+                    projected_aligned.push(Some(projected));
+                } else {
+                    projected_aligned.push(None);
+                }
+            }
+            Ok(projected_aligned)
+        } else {
+            Ok(aligned)
+        }
     }
 
     fn capabilities(&self) -> LookupSourceCapabilities {

@@ -424,12 +424,26 @@ async fn route_input_stream(
 
                     if !downstream_dropped {
                         for (owner, slice) in remote_slices {
-                            let msg = laminar_core::shuffle::ShuffleMessage::VnodeData(
-                                String::new(),
-                                0,
-                                slice,
-                            );
-                            let _ = sender.send_to(owner.0, &msg).await;
+                            let vnode_col = slice
+                                .column(slice.num_columns() - 1)
+                                .as_any()
+                                .downcast_ref::<arrow::array::UInt32Array>()
+                                .expect("vnode col");
+                            let row_vnodes = vnode_col.values().to_vec();
+                            let sub_slices = laminar_core::shuffle::slice_batch_by_vnodes(&slice, &row_vnodes);
+                            for (vnode_id, sub_slice) in sub_slices {
+                                let schema = Arc::new(arrow_schema::Schema::new(
+                                    sub_slice.schema().fields()[..sub_slice.num_columns() - 1].to_vec(),
+                                ));
+                                let columns = sub_slice.columns()[..sub_slice.num_columns() - 1].to_vec();
+                                let sub_slice_clean = RecordBatch::try_new(schema, columns).expect("clean");
+                                let msg = laminar_core::shuffle::ShuffleMessage::VnodeData(
+                                    String::new(),
+                                    vnode_id,
+                                    sub_slice_clean,
+                                );
+                                let _ = sender.send_to(owner.0, &msg).await;
+                            }
                         }
                     }
 

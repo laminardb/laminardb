@@ -112,7 +112,24 @@ xorf = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 
 [features]
-default = []
+default = [
+    "kafka",
+    "postgres-cdc",
+    "postgres-sink",
+    "mysql-cdc",
+    "mongodb-cdc",
+    "nats",
+    "delta-lake",
+    "delta-lake-s3",
+    "delta-lake-azure",
+    "delta-lake-gcs",
+    "delta-lake-unity",
+    "delta-lake-glue",
+    "iceberg",
+    "files",
+    "otel",
+    "parquet-lookup",
+]
 testing = []
 kafka = ["dep:rdkafka", "dep:arrow-avro", "dep:reqwest"]
 postgres-cdc = ["dep:tokio-postgres", "dep:pgwire-replication", "dep:deadpool-postgres", "dep:arrow-row", "dep:tokio-postgres-rustls", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
@@ -152,6 +169,9 @@ testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 criterion = { workspace = true }
 wiremock = "0.6"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
 
 [[bench]]
 name = "mongodb_throughput"

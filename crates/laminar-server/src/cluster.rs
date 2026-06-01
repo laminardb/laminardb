@@ -216,18 +216,22 @@ impl ClusterHandle {
         // 3. Block until the leader has reassigned every vnode we own,
         //    bounded so a stuck cluster can't wedge shutdown forever.
         if let Some(store) = &self.snapshot_store {
-            let me = laminar_core::state::NodeId(self.local_node.id.0);
-            let drained = laminar_db::rebalance::wait_until_drained(
-                store,
-                me,
-                std::time::Duration::from_secs(1),
-                std::time::Duration::from_secs(30),
-            )
-            .await;
-            if drained {
-                info!("Drain complete: all owned vnodes reassigned");
+            if self.cluster_controller.is_some() || !self.rebalance_tasks.is_empty() {
+                let me = laminar_core::state::NodeId(self.local_node.id.0);
+                let drained = laminar_db::rebalance::wait_until_drained(
+                    store,
+                    me,
+                    std::time::Duration::from_secs(1),
+                    std::time::Duration::from_secs(30),
+                )
+                .await;
+                if drained {
+                    info!("Drain complete: all owned vnodes reassigned");
+                } else {
+                    warn!("Drain timed out after 30s; proceeding with shutdown");
+                }
             } else {
-                warn!("Drain timed out after 30s; proceeding with shutdown");
+                info!("Control plane is inactive; skipping drain");
             }
         }
 

@@ -1258,6 +1258,7 @@ impl CheckpointCoordinator {
         epoch: u64,
         checkpoint_id: u64,
     ) -> Result<(), DbError> {
+        self.pending_vnode_states.clear();
         let CheckpointRequest {
             operator_states,
             watermark,
@@ -1309,6 +1310,7 @@ impl CheckpointCoordinator {
         &mut self,
         request: CheckpointRequest,
     ) -> Result<CheckpointResult, DbError> {
+        self.pending_vnode_states.clear();
         let CheckpointRequest {
             operator_states,
             watermark,

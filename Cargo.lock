@@ -4896,6 +4896,7 @@ dependencies = [
  "mysql_async",
  "notify",
  "object_store 0.13.2",
+ "openssl",
  "opentelemetry-proto",
  "parking_lot 0.12.5",
  "parquet",

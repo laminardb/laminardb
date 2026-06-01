@@ -464,9 +464,6 @@ impl LaminarDB {
             .into_iter()
             .map(|(name, ddl)| laminar_core::cluster::control::CatalogManifestEntry { name, ddl })
             .collect();
-        if entries.is_empty() {
-            return;
-        }
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
