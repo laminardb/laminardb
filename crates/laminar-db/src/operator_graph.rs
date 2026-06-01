@@ -184,6 +184,7 @@ struct SqlFilterOperator {
     filter_sql: String,
     ctx: SessionContext,
     tmp_table: String,
+    cache: Option<crate::operator::LiveSqlCache>,
 }
 
 impl SqlFilterOperator {
@@ -196,6 +197,7 @@ impl SqlFilterOperator {
             filter_sql,
             ctx,
             tmp_table,
+            cache: None,
         }
     }
 }
@@ -212,29 +214,25 @@ impl GraphOperator for SqlFilterOperator {
             return Ok(Vec::new());
         }
 
-        let schema = batches[0].schema();
-        let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![batches])
-            .map_err(|e| DbError::Pipeline(format!("pre-filter: {e}")))?;
-
-        let _ = self.ctx.deregister_table(&self.tmp_table);
-        self.ctx
-            .register_table(&self.tmp_table, Arc::new(mem_table))
-            .map_err(|e| DbError::Pipeline(format!("pre-filter: {e}")))?;
-
-        let sql = format!("SELECT * FROM {} WHERE {}", self.tmp_table, self.filter_sql);
-        let result = async {
-            self.ctx
-                .sql(&sql)
-                .await
-                .map_err(|e| DbError::Pipeline(format!("pre-filter: {e}")))?
-                .collect()
-                .await
-                .map_err(|e| DbError::Pipeline(format!("pre-filter: {e}")))
+        if self.cache.is_none() {
+            let schema = batches[0].schema();
+            let sql = format!("SELECT * FROM {} WHERE {}", self.tmp_table, self.filter_sql);
+            let cache = crate::operator::LiveSqlCache::build(
+                &self.ctx,
+                &self.tmp_table,
+                schema,
+                &sql,
+                "pre-filter",
+            )
+            .await?;
+            self.cache = Some(cache);
         }
-        .await;
 
-        let _ = self.ctx.deregister_table(&self.tmp_table);
-        result
+        self.cache
+            .as_ref()
+            .unwrap()
+            .apply(&self.ctx, "pre-filter", batches)
+            .await
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
