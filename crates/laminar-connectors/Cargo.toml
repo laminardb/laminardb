@@ -170,9 +170,6 @@ testcontainers-modules = { version = "0.15", features = ["postgres"] }
 criterion = { workspace = true }
 wiremock = "0.6"
 
-[target.'cfg(target_os = "windows")'.dependencies]
-openssl = { version = "0.10", features = ["vendored"] }
-
 [[bench]]
 name = "mongodb_throughput"
 harness = false

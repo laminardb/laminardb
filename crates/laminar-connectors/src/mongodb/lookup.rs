@@ -162,8 +162,8 @@ impl MongoLookupSource {
     /// incompatible fields become NULL.
     fn docs_to_batch(schema: &SchemaRef, docs: &[Document]) -> Result<RecordBatch, LookupError> {
         use arrow_array::builder::{
-            BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, StringBuilder,
-            LargeStringBuilder,
+            BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, LargeStringBuilder,
+            StringBuilder,
         };
 
         let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
@@ -274,7 +274,9 @@ impl LookupSource for MongoLookupSource {
             let mut idx: Vec<usize> = projection.iter().map(|&c| c as usize).collect();
             if !names.contains(&self.pk_field) {
                 names.push(self.pk_field.clone());
-                let pk_idx = self.schema.index_of(&self.pk_field)
+                let pk_idx = self
+                    .schema
+                    .index_of(&self.pk_field)
                     .map_err(|e| LookupError::Internal(format!("pk column index: {e}")))?;
                 idx.push(pk_idx);
                 project_needed = true;
@@ -314,10 +316,17 @@ impl LookupSource for MongoLookupSource {
                 if let Some(batch) = maybe_batch {
                     let indices: Vec<usize> = orig_names
                         .iter()
-                        .map(|name| batch.schema().index_of(name).map_err(|e| LookupError::Internal(format!("column not found in aligned schema: {e}"))))
+                        .map(|name| {
+                            batch.schema().index_of(name).map_err(|e| {
+                                LookupError::Internal(format!(
+                                    "column not found in aligned schema: {e}"
+                                ))
+                            })
+                        })
                         .collect::<Result<Vec<usize>, LookupError>>()?;
-                    let projected = batch.project(&indices)
-                        .map_err(|e| LookupError::Internal(format!("project aligned batch: {e}")))?;
+                    let projected = batch.project(&indices).map_err(|e| {
+                        LookupError::Internal(format!("project aligned batch: {e}"))
+                    })?;
                     projected_aligned.push(Some(projected));
                 } else {
                     projected_aligned.push(None);

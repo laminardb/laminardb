@@ -2,9 +2,9 @@
 //! Unified checkpoint integration tests.
 
 mod disk_persistence {
+    use laminar_core::storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
     use laminar_core::streaming::StreamCheckpointConfig;
     use laminar_db::{LaminarConfig, LaminarDB};
-    use laminar_core::storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
 
     fn config_with_storage(dir: &std::path::Path) -> LaminarConfig {
         LaminarConfig {
@@ -104,6 +104,7 @@ mod exactly_once {
     use tokio::sync::Notify;
 
     use laminar_connectors::checkpoint::SourceCheckpoint;
+    use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
     use laminar_db::checkpoint_coordinator::{
         CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
     };
@@ -111,7 +112,6 @@ mod exactly_once {
         PipelineCallback, PipelineConfig, SourceRegistration, StreamingCoordinator,
     };
     use laminar_db::recovery_manager::RecoveryManager;
-    use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
 
     /// A callback that tracks barrier checkpoint calls and records state.
     struct BarrierTrackingCallback {
@@ -418,7 +418,9 @@ mod exactly_once {
     async fn test_single_source_barrier_checkpoint() {
         let sources = vec![SourceRegistration {
             name: "only_source".to_string(),
-            connector: Box::new(laminar_connectors::testing::MockSourceConnector::with_batches(100, 5)),
+            connector: Box::new(
+                laminar_connectors::testing::MockSourceConnector::with_batches(100, 5),
+            ),
             config: laminar_connectors::config::ConnectorConfig::new("mock"),
             supports_replay: true,
             restore_checkpoint: None,
@@ -522,11 +524,11 @@ mod exactly_once {
 
 mod performance {
     use async_trait::async_trait;
+    use laminar_core::storage::checkpoint_manifest::CheckpointManifest;
+    use laminar_core::storage::checkpoint_store::{CheckpointStore, CheckpointStoreError};
     use laminar_db::checkpoint_coordinator::{
         CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
     };
-    use laminar_core::storage::checkpoint_manifest::CheckpointManifest;
-    use laminar_core::storage::checkpoint_store::{CheckpointStore, CheckpointStoreError};
     use std::time::{Duration, Instant};
 
     struct SlowCheckpointStore {
@@ -643,14 +645,14 @@ mod performance {
 mod recovery {
     use std::collections::HashMap;
 
-    use laminar_db::checkpoint_coordinator::{
-        CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
-    };
-    use laminar_db::recovery_manager::RecoveryManager;
     use laminar_core::storage::checkpoint_manifest::{
         CheckpointManifest, ConnectorCheckpoint, OperatorCheckpoint,
     };
     use laminar_core::storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
+    use laminar_db::checkpoint_coordinator::{
+        CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
+    };
+    use laminar_db::recovery_manager::RecoveryManager;
 
     fn make_store(dir: &std::path::Path) -> FileSystemCheckpointStore {
         FileSystemCheckpointStore::new(dir, 5)
@@ -947,9 +949,9 @@ mod restart {
     use std::sync::Arc;
 
     use arrow::array::{Float64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+    use laminar_core::storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
     use laminar_core::streaming::StreamCheckpointConfig;
     use laminar_db::{LaminarConfig, LaminarDB};
-    use laminar_core::storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
 
     fn config_for(dir: &std::path::Path) -> LaminarConfig {
         LaminarConfig {

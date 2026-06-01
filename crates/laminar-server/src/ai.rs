@@ -247,7 +247,9 @@ task = "classify"
             .expect("AI runtime builds")
             .expect("the demo configures a model");
         assert_eq!(
-            runtime.registry().default_for(laminar_db::ai::Task::Sentiment),
+            runtime
+                .registry()
+                .default_for(laminar_db::ai::Task::Sentiment),
             Some("sentiment"),
             "ai_sentiment resolves to the configured default"
         );

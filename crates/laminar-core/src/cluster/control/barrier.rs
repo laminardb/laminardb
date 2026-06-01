@@ -466,7 +466,9 @@ impl BarrierCoordinator {
                         futures.push(async move {
                             let mut client = get_barrier_client(peer, &clients_pool, &kv)
                                 .await
-                                .ok_or_else(|| format!("failed to get client for peer {}", peer.0))?;
+                                .ok_or_else(|| {
+                                    format!("failed to get client for peer {}", peer.0)
+                                })?;
                             match ann_clone.phase {
                                 Phase::Commit => {
                                     let req = barrier_v1::CommitRequest {
@@ -475,8 +477,9 @@ impl BarrierCoordinator {
                                         flags: ann_clone.flags,
                                         min_watermark_ms: ann_clone.min_watermark_ms,
                                     };
-                                    client.commit(req).await
-                                        .map_err(|e| format!("commit RPC to peer {} failed: {e}", peer.0))?;
+                                    client.commit(req).await.map_err(|e| {
+                                        format!("commit RPC to peer {} failed: {e}", peer.0)
+                                    })?;
                                 }
                                 Phase::Abort => {
                                     let req = barrier_v1::AbortRequest {
@@ -484,8 +487,9 @@ impl BarrierCoordinator {
                                         checkpoint_id: ann_clone.checkpoint_id,
                                         flags: ann_clone.flags,
                                     };
-                                    client.abort(req).await
-                                        .map_err(|e| format!("abort RPC to peer {} failed: {e}", peer.0))?;
+                                    client.abort(req).await.map_err(|e| {
+                                        format!("abort RPC to peer {} failed: {e}", peer.0)
+                                    })?;
                                 }
                                 Phase::Prepare => {}
                             }

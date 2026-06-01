@@ -695,7 +695,7 @@ pub(crate) fn detect_lookup_enrich_query(
     };
     let has_group_by = match &select.group_by {
         sqlparser::ast::GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
-        _ => false,
+        sqlparser::ast::GroupByExpr::All(_) => false,
     };
     if select.distinct.is_some()
         || has_group_by
@@ -2391,12 +2391,20 @@ fn rewrite_join_expr<F: Fn(&Expr) -> Option<String>>(expr: &Expr, leaf: &F) -> S
             };
             format!("{}({})", func.name, args.join(", "))
         }
-        Expr::InList { expr, list, negated } => {
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
             let list_str: Vec<String> = list.iter().map(r).collect();
             let op = if *negated { "NOT IN" } else { "IN" };
             format!("{} {op} ({})", r(expr), list_str.join(", "))
         }
-        Expr::InSubquery { expr, subquery, negated } => {
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
             let op = if *negated { "NOT IN" } else { "IN" };
             format!("{} {op} ({subquery})", r(expr))
         }
@@ -2404,13 +2412,22 @@ fn rewrite_join_expr<F: Fn(&Expr) -> Option<String>>(expr: &Expr, leaf: &F) -> S
             let op = if *negated { "NOT EXISTS" } else { "EXISTS" };
             format!("{op} ({subquery})")
         }
-        Expr::Case { operand, conditions, else_result, .. } => {
-            let operand_str = operand.as_ref().map_or(String::new(), |op| format!("{} ", r(op)));
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            let operand_str = operand
+                .as_ref()
+                .map_or(String::new(), |op| format!("{} ", r(op)));
             let mut wens = Vec::new();
             for cw in conditions {
                 wens.push(format!("WHEN {} THEN {}", r(&cw.condition), r(&cw.result)));
             }
-            let else_str = else_result.as_ref().map_or(String::new(), |el| format!(" ELSE {}", r(el)));
+            let else_str = else_result
+                .as_ref()
+                .map_or(String::new(), |el| format!(" ELSE {}", r(el)));
             format!("CASE {operand_str}{} {else_str} END", wens.join(" "))
         }
         Expr::Tuple(exprs) => {

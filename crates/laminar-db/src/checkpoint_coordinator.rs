@@ -225,7 +225,8 @@ pub struct CheckpointCoordinator {
 /// Highest-loadable manifest — tolerates a torn `latest.txt` pointer.
 async fn load_highest(
     store: &dyn CheckpointStore,
-) -> Result<Option<CheckpointManifest>, laminar_core::storage::checkpoint_store::CheckpointStoreError> {
+) -> Result<Option<CheckpointManifest>, laminar_core::storage::checkpoint_store::CheckpointStoreError>
+{
     let ids = store.list_ids().await?;
     for id in ids.iter().rev() {
         if let Ok(Some(m)) = store.load_by_id(*id).await {

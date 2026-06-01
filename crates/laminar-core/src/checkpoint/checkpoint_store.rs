@@ -26,7 +26,6 @@ use tracing::warn;
 
 use crate::checkpoint::checkpoint_manifest::CheckpointManifest;
 
-
 /// Fsync a file to ensure its contents are durable on disk.
 async fn sync_file(path: &Path) -> Result<(), std::io::Error> {
     // Must open with write access — Windows requires it for FlushFileBuffers.
@@ -190,7 +189,10 @@ fn sha256_hex_chunks(chunks: &[bytes::Bytes]) -> String {
 /// Combined checksum for a mixed (inline + external) manifest:
 /// `sha256(inline_hash_hex || concat(sidecar_chunks))`.
 fn sha256_hex_mixed<'a, I>(
-    states: &std::collections::HashMap<String, crate::checkpoint::checkpoint_manifest::OperatorCheckpoint>,
+    states: &std::collections::HashMap<
+        String,
+        crate::checkpoint::checkpoint_manifest::OperatorCheckpoint,
+    >,
     sidecar_chunks: I,
 ) -> String
 where
@@ -208,7 +210,10 @@ where
 /// SHA-256 over inline operator-state entries in sorted-name order,
 /// used as the `state_checksum` when no sidecar exists.
 fn sha256_hex_inline_states(
-    states: &std::collections::HashMap<String, crate::checkpoint::checkpoint_manifest::OperatorCheckpoint>,
+    states: &std::collections::HashMap<
+        String,
+        crate::checkpoint::checkpoint_manifest::OperatorCheckpoint,
+    >,
 ) -> String {
     let mut names: Vec<&String> = states.keys().collect();
     names.sort_unstable();
@@ -532,7 +537,10 @@ pub trait CheckpointStore: Send + Sync {
 /// Stamp `state_checksum` for a save: mixed manifests hash inline+sidecar
 /// together, purely-external hash the sidecar alone.
 fn stamp_checksum(
-    states: &std::collections::HashMap<String, crate::checkpoint::checkpoint_manifest::OperatorCheckpoint>,
+    states: &std::collections::HashMap<
+        String,
+        crate::checkpoint::checkpoint_manifest::OperatorCheckpoint,
+    >,
     chunks: Option<&[bytes::Bytes]>,
 ) -> String {
     let chunks = chunks.unwrap_or_default();

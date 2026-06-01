@@ -23,4 +23,3 @@ impl PriorityGuard {
         Self
     }
 }
-

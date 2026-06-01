@@ -133,7 +133,9 @@ mod failures {
     use std::time::Duration;
     use tokio::time::sleep;
 
-    use super::cluster_harness::{input_batch, pick_keys_per_owner, read_mv_sums, ClusterEngineHarness};
+    use super::cluster_harness::{
+        input_batch, pick_keys_per_owner, read_mv_sums, ClusterEngineHarness,
+    };
 
     const VNODE_COUNT: u32 = 4;
     const N_NODES: usize = 2;
@@ -180,7 +182,8 @@ mod failures {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn assignment_snapshot_unifies_cluster_view() {
-        let harness_a = super::cluster_harness::ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
+        let harness_a =
+            super::cluster_harness::ClusterEngineHarness::spawn(N_NODES, VNODE_COUNT).await;
         let assignment_a: Vec<super::cluster_harness::NodeIdView> = harness_a
             .nodes
             .iter()
@@ -364,7 +367,8 @@ mod failures {
         sleep(Duration::from_millis(500)).await;
 
         let post_crash_leader = read_mv_sums(&harness.nodes[0].db, "sums").await;
-        let post_crash_leader_keys: HashSet<i64> = post_crash_leader.iter().map(|(k, _)| *k).collect();
+        let post_crash_leader_keys: HashSet<i64> =
+            post_crash_leader.iter().map(|(k, _)| *k).collect();
 
         let expected_keys: HashSet<i64> = key_buckets[0].1.iter().copied().collect();
         assert_eq!(post_crash_leader_keys, expected_keys);
@@ -701,11 +705,13 @@ mod two_pc {
 
     use laminar_core::cluster::control::{BarrierAnnouncement, CheckpointDecisionStore, Phase};
     use laminar_core::cluster::testing::MiniCluster;
-    use laminar_core::state::{owned_vnodes, InProcessBackend, NodeId, StateBackend, VnodeRegistry};
+    use laminar_core::state::{
+        owned_vnodes, InProcessBackend, NodeId, StateBackend, VnodeRegistry,
+    };
+    use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
     use laminar_db::checkpoint_coordinator::{
         CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
     };
-    use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
     use object_store::local::LocalFileSystem;
     use object_store::ObjectStore;
     use tempfile::TempDir;
@@ -730,7 +736,8 @@ mod two_pc {
 
     fn make_decision_store(dir: &TempDir) -> Arc<CheckpointDecisionStore> {
         let os: Arc<dyn ObjectStore> = Arc::new(
-            LocalFileSystem::new_with_prefix(dir.path()).expect("LocalFileSystem for decision store"),
+            LocalFileSystem::new_with_prefix(dir.path())
+                .expect("LocalFileSystem for decision store"),
         );
         Arc::new(CheckpointDecisionStore::new(os))
     }
@@ -1001,10 +1008,10 @@ mod minio {
     use laminar_core::state::{
         owned_vnodes, rendezvous_assignment, NodeId, ObjectStoreBackend, VnodeRegistry,
     };
+    use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
     use laminar_db::checkpoint_coordinator::{
         CheckpointConfig, CheckpointCoordinator, CheckpointRequest,
     };
-    use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
     use object_store::ObjectStoreExt;
 
     use super::common::{minio_endpoint, minio_store};

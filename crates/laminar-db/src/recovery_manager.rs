@@ -418,7 +418,10 @@ impl<'a> RecoveryManager<'a> {
                 // dereference invalid offsets later
                 for name in &external_ops {
                     if let Some(op) = manifest.operator_states.get_mut(name) {
-                        *op = laminar_core::storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
+                        *op =
+                            laminar_core::storage::checkpoint_manifest::OperatorCheckpoint::inline(
+                                &[],
+                            );
                     }
                 }
                 return false;
@@ -433,7 +436,10 @@ impl<'a> RecoveryManager<'a> {
                 );
                 for name in &external_ops {
                     if let Some(op) = manifest.operator_states.get_mut(name) {
-                        *op = laminar_core::storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
+                        *op =
+                            laminar_core::storage::checkpoint_manifest::OperatorCheckpoint::inline(
+                                &[],
+                            );
                     }
                 }
                 return false;
@@ -458,7 +464,9 @@ impl<'a> RecoveryManager<'a> {
                     let external_offset = op.external_offset;
                     let external_length = op.external_length;
                     let data = &state_data[start..end];
-                    *op = laminar_core::storage::checkpoint_manifest::OperatorCheckpoint::inline(data);
+                    *op = laminar_core::storage::checkpoint_manifest::OperatorCheckpoint::inline(
+                        data,
+                    );
                     debug!(
                         operator = %name,
                         offset = external_offset,
@@ -475,7 +483,8 @@ impl<'a> RecoveryManager<'a> {
                          range for external operator state — operator will \
                          start with empty state"
                     );
-                    *op = laminar_core::storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
+                    *op =
+                        laminar_core::storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
                     all_resolved = false;
                 }
             }
