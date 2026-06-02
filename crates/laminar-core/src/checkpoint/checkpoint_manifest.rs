@@ -3,7 +3,8 @@
 //! Manifests are JSON for debuggability. Large operator state goes into a
 //! separate `state.bin` sidecar referenced by offset/length in the manifest.
 
-#[allow(clippy::disallowed_types)] // cold path: manifest serialization
+#![allow(clippy::disallowed_types)] // cold path: manifest serialization
+
 use std::collections::HashMap;
 
 /// Per-sink commit status tracked during the checkpoint commit phase.

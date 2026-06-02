@@ -4,6 +4,8 @@
 //! that writes manifests as atomic JSON files with a `latest.txt` pointer
 //! for crash-safe recovery.
 //!
+
+#![allow(clippy::disallowed_types)] // cold path: checkpoint metadata operations
 //! ## Disk Layout
 //!
 //! ```text

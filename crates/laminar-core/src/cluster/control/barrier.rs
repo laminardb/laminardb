@@ -221,11 +221,14 @@ impl Drop for RxReturnGuard<'_> {
 }
 
 #[cfg(feature = "cluster-unstable")]
+type ActiveLeaderState = Option<(NodeId, watch::Receiver<Vec<NodeInfo>>)>;
+
+#[cfg(feature = "cluster-unstable")]
 struct GrpcBarrierServer {
     kv: Arc<dyn ClusterKv>,
     incoming_tx: crossfire::MAsyncTx<BarrierFlavor>,
     pending_acks: Arc<parking_lot::Mutex<FxHashMap<u64, tokio::sync::oneshot::Sender<BarrierAck>>>>,
-    leader_election: Arc<parking_lot::Mutex<Option<(NodeId, watch::Receiver<Vec<NodeInfo>>)>>>,
+    leader_election: Arc<parking_lot::Mutex<ActiveLeaderState>>,
 }
 
 #[cfg(feature = "cluster-unstable")]
@@ -414,7 +417,7 @@ pub struct BarrierCoordinator {
     #[cfg(feature = "cluster-unstable")]
     grpc: Arc<parking_lot::Mutex<Option<Arc<GrpcState>>>>,
     #[cfg(feature = "cluster-unstable")]
-    leader_election: Arc<parking_lot::Mutex<Option<(NodeId, watch::Receiver<Vec<NodeInfo>>)>>>,
+    leader_election: Arc<parking_lot::Mutex<ActiveLeaderState>>,
 }
 
 impl std::fmt::Debug for BarrierCoordinator {
