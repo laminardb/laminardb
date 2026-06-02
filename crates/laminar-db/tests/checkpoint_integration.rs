@@ -120,6 +120,7 @@ mod exactly_once {
         force_checkpoints: u64,
         should_trigger: Arc<AtomicBool>,
         total_records_processed: Arc<AtomicU64>,
+        barrier_counter: Option<Arc<AtomicU64>>,
     }
 
     impl BarrierTrackingCallback {
@@ -130,7 +131,13 @@ mod exactly_once {
                 force_checkpoints: 0,
                 should_trigger,
                 total_records_processed: record_counter,
+                barrier_counter: None,
             }
+        }
+
+        fn with_barrier_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+            self.barrier_counter = Some(counter);
+            self
         }
     }
 
@@ -190,6 +197,9 @@ mod exactly_once {
         ) -> laminar_db::pipeline::BarrierOutcome {
             let epoch = self.barrier_checkpoints.len() as u64 + 1;
             self.barrier_checkpoints.push(source_checkpoints);
+            if let Some(ref counter) = self.barrier_counter {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
             laminar_db::pipeline::BarrierOutcome::Committed(epoch)
         }
 
@@ -242,8 +252,10 @@ mod exactly_once {
 
         let should_trigger = Arc::new(AtomicBool::new(true));
         let record_counter = Arc::new(AtomicU64::new(0));
+        let barrier_counter = Arc::new(AtomicU64::new(0));
         let callback =
-            BarrierTrackingCallback::new(Arc::clone(&should_trigger), Arc::clone(&record_counter));
+            BarrierTrackingCallback::new(Arc::clone(&should_trigger), Arc::clone(&record_counter))
+                .with_barrier_counter(Arc::clone(&barrier_counter));
 
         let handle = tokio::spawn(async move {
             coordinator.run(callback).await;
@@ -258,6 +270,12 @@ mod exactly_once {
         assert!(
             total > 0,
             "pipeline should have processed records, got {total}"
+        );
+
+        let barriers = barrier_counter.load(Ordering::Relaxed);
+        assert!(
+            barriers > 0,
+            "pipeline should have committed at least one barrier-aligned checkpoint, got {barriers}"
         );
     }
 

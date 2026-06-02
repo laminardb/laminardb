@@ -1259,7 +1259,6 @@ impl CheckpointCoordinator {
         epoch: u64,
         checkpoint_id: u64,
     ) -> Result<(), DbError> {
-        self.pending_vnode_states.clear();
         let CheckpointRequest {
             operator_states,
             watermark,
@@ -1271,7 +1270,10 @@ impl CheckpointCoordinator {
         } = request;
 
         self.phase = CheckpointPhase::PreCommitting;
-        self.pre_commit_sinks(epoch).await?;
+        if let Err(e) = self.pre_commit_sinks(epoch).await {
+            self.pending_vnode_states.clear();
+            return Err(e);
+        }
 
         let mut manifest = CheckpointManifest::new(checkpoint_id, epoch);
         manifest.source_offsets = source_offset_overrides;
@@ -1295,8 +1297,15 @@ impl CheckpointCoordinator {
         );
 
         self.phase = CheckpointPhase::Persisting;
-        self.save_manifest(Arc::new(manifest), state_data).await?;
-        self.write_vnode_partials(epoch, checkpoint_id).await?;
+        if let Err(e) = self.save_manifest(Arc::new(manifest), state_data).await {
+            self.pending_vnode_states.clear();
+            return Err(e);
+        }
+        if let Err(e) = self.write_vnode_partials(epoch, checkpoint_id).await {
+            self.pending_vnode_states.clear();
+            return Err(e);
+        }
+        self.pending_vnode_states.clear();
         Ok(())
     }
 
@@ -1311,7 +1320,6 @@ impl CheckpointCoordinator {
         &mut self,
         request: CheckpointRequest,
     ) -> Result<CheckpointResult, DbError> {
-        self.pending_vnode_states.clear();
         let CheckpointRequest {
             operator_states,
             watermark,
@@ -1351,6 +1359,7 @@ impl CheckpointCoordinator {
             let duration = start.elapsed();
             self.emit_checkpoint_metrics(false, epoch, duration);
             error!(checkpoint_id, epoch, error = %e, "pre-commit failed");
+            self.pending_vnode_states.clear();
             return Ok(CheckpointResult {
                 success: false,
                 checkpoint_id,
@@ -1407,6 +1416,7 @@ impl CheckpointCoordinator {
                      cap {cap} bytes — checkpoint rejected"
                 );
                 error!(checkpoint_id, epoch, sidecar_bytes, cap, "{msg}");
+                self.pending_vnode_states.clear();
                 return Ok(CheckpointResult {
                     success: false,
                     checkpoint_id,
@@ -1446,6 +1456,7 @@ impl CheckpointCoordinator {
                 );
             }
             error!(checkpoint_id, epoch, error = %e, "[LDB-6008] manifest persist failed");
+            self.pending_vnode_states.clear();
             return Ok(CheckpointResult {
                 success: false,
                 checkpoint_id,
@@ -1472,6 +1483,7 @@ impl CheckpointCoordinator {
                 );
             }
             error!(checkpoint_id, epoch, error = %e, "vnode partial write failed");
+            self.pending_vnode_states.clear();
             return Ok(CheckpointResult {
                 success: false,
                 checkpoint_id,
@@ -1498,6 +1510,7 @@ impl CheckpointCoordinator {
                         "[LDB-6032] sink rollback failed after quorum miss",
                     );
                 }
+                self.pending_vnode_states.clear();
                 return Ok(CheckpointResult {
                     success: false,
                     checkpoint_id,
@@ -1545,6 +1558,7 @@ impl CheckpointCoordinator {
                                 "[LDB-6021] sink rollback failed after durability gate miss",
                             );
                         }
+                        self.pending_vnode_states.clear();
                         return Ok(CheckpointResult {
                             success: false,
                             checkpoint_id,
@@ -1581,6 +1595,7 @@ impl CheckpointCoordinator {
                                 "[LDB-6023] sink rollback failed after durability gate error",
                             );
                         }
+                        self.pending_vnode_states.clear();
                         return Ok(CheckpointResult {
                             success: false,
                             checkpoint_id,
@@ -1635,6 +1650,7 @@ impl CheckpointCoordinator {
                             "[LDB-6039] sink rollback failed after commit marker failure",
                         );
                     }
+                    self.pending_vnode_states.clear();
                     return Ok(CheckpointResult {
                         success: false,
                         checkpoint_id,
@@ -1688,6 +1704,7 @@ impl CheckpointCoordinator {
             self.phase = CheckpointPhase::Idle;
             let duration = start.elapsed();
             self.emit_checkpoint_metrics(false, epoch, duration);
+            self.pending_vnode_states.clear();
             return Ok(CheckpointResult {
                 success: false,
                 checkpoint_id,
@@ -1762,6 +1779,7 @@ impl CheckpointCoordinator {
         // The checkpoint itself succeeded (state persisted, sinks committed).
         // begin_epoch failure for the *next* epoch is reported as a warning
         // but does not retroactively fail the completed checkpoint.
+        self.pending_vnode_states.clear();
         Ok(CheckpointResult {
             success: true,
             checkpoint_id,

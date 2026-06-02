@@ -428,11 +428,17 @@ impl LaminarDB {
                         })?);
                     }
                     "cache_max_bytes" => {
-                        cache_max_bytes = Some(val.parse::<usize>().map_err(|_| {
+                        let bytes = val.parse::<usize>().map_err(|_| {
                             DbError::InvalidOperation(format!(
                                 "Invalid cache_max_bytes '{val}': expected positive integer"
                             ))
-                        })?);
+                        })?;
+                        if bytes == 0 {
+                            return Err(DbError::InvalidOperation(format!(
+                                "Invalid cache_max_bytes '{val}': expected positive integer"
+                            )));
+                        }
+                        cache_max_bytes = Some(bytes);
                     }
                     "cache_ttl" => {
                         let secs = val.parse::<u64>().map_err(|_| {
@@ -440,6 +446,11 @@ impl LaminarDB {
                                 "Invalid cache_ttl '{val}': expected positive integer seconds"
                             ))
                         })?;
+                        if secs == 0 {
+                            return Err(DbError::InvalidOperation(format!(
+                                "Invalid cache_ttl '{val}': expected positive integer seconds"
+                            )));
+                        }
                         cache_ttl = Some(std::time::Duration::from_secs(secs));
                     }
                     "storage" => storage = Some(val),
