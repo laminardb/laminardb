@@ -244,27 +244,26 @@ impl GrpcBarrierServer {
             .map_err(|_| tonic::Status::permission_denied("Invalid leader identity"))?;
         let sender_leader_id = NodeId(leader_id_u64);
 
-        let observed_leader = {
-            let election_guard = self.leader_election.lock();
-            if let Some((instance_id, members_rx)) = &*election_guard {
-                let members = members_rx.borrow();
-                let mut ids: Vec<NodeId> = members
-                    .iter()
-                    .filter(|m| matches!(m.state, NodeState::Active))
-                    .map(|m| m.id)
-                    .collect();
-                ids.push(*instance_id);
-                super::leader_of(&ids)
-            } else {
-                let live_nodes: Vec<NodeId> = self
-                    .kv
-                    .scan(BARRIER_ADDR_KEY)
-                    .await
-                    .into_iter()
-                    .map(|(id, _)| id)
-                    .collect();
-                super::leader_of(&live_nodes)
-            }
+        let election_state = self.leader_election.lock().clone();
+
+        let observed_leader = if let Some((instance_id, members_rx)) = election_state {
+            let members = members_rx.borrow();
+            let mut ids: Vec<NodeId> = members
+                .iter()
+                .filter(|m| matches!(m.state, NodeState::Active))
+                .map(|m| m.id)
+                .collect();
+            ids.push(instance_id);
+            super::leader_of(&ids)
+        } else {
+            let live_nodes: Vec<NodeId> = self
+                .kv
+                .scan(BARRIER_ADDR_KEY)
+                .await
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            super::leader_of(&live_nodes)
         };
 
         if Some(sender_leader_id) != observed_leader {
@@ -452,6 +451,7 @@ impl BarrierCoordinator {
         }
     }
 
+    /// Configure the leader election state used to validate incoming leader identity.
     #[cfg(feature = "cluster-unstable")]
     pub fn set_leader_election(
         &mut self,
