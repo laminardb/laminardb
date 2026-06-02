@@ -332,7 +332,7 @@ impl CheckpointCoordinator {
     /// Stage the per-vnode operator-state slices for the next checkpoint.
     ///
     /// Each owned vnode's slice is folded into its `partial.bin` by
-    /// [`write_vnode_partials`](Self::write_vnode_partials) so a node that
+    /// `write_vnode_partials` so a node that
     /// later acquires the vnode can rehydrate exactly that vnode's state.
     /// Call once per checkpoint (even with an empty map) so a prior epoch's
     /// slices never leak forward.

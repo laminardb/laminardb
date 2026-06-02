@@ -1,7 +1,7 @@
 //! Cross-node shuffle transport over Tonic gRPC client-streaming.
 //!
 //! Each sender opens a client-streaming `Shuffle` RPC per peer and pushes a
-//! forward-only stream of [`ShuffleFrame`]s; the receiver runs the
+//! forward-only stream of `ShuffleFrame`s; the receiver runs the
 //! `ShuffleTransport` service, attributes every stream to the peer announced in
 //! its leading `Hello`, and surfaces decoded [`ShuffleMessage`]s on a bounded
 //! crossfire MPSC queue. Backpressure is the HTTP/2 flow-control window plus

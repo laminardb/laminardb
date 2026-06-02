@@ -41,7 +41,7 @@ pub struct AiCacheKey {
 }
 
 /// One row's cached inference output. Mirrors the per-row shape of
-/// [`crate::provider::InferenceOutputs`] but singular, since the cache is keyed
+/// [`crate::ai::provider::InferenceOutputs`] but singular, since the cache is keyed
 /// per row of input.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CachedOutput {

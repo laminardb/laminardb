@@ -6,8 +6,8 @@
 //! framing (the chat prompt) and any numeric post-processing live in the shared
 //! helpers and the adapter, not in the wire layer.
 //!
-//! [`InferenceRequest`]: crate::provider::InferenceRequest
-//! [`InferenceOutputs`]: crate::provider::InferenceOutputs
+//! [`InferenceRequest`]: crate::ai::provider::InferenceRequest
+//! [`InferenceOutputs`]: crate::ai::provider::InferenceOutputs
 
 #[cfg(feature = "remote")]
 pub mod anthropic;

@@ -1,5 +1,5 @@
 //! Cross-instance shuffle over Tonic gRPC client-streaming: one
-//! client-streaming call per peer pair carrying [`ShuffleMessage`] frames.
+//! client-streaming call per peer pair carrying [`ShuffleMessage`](crate::shuffle::message::ShuffleMessage) frames.
 //! Backpressure is the HTTP/2 flow-control window plus the bounded crossfire
 //! inbound queue on the consuming side. The real transport is compiled under
 //! `cluster-unstable`; the default build keeps a networking-free shim.

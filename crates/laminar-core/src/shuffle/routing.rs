@@ -1,6 +1,6 @@
 //! Row→vnode routing shared by the cluster shuffle paths (the aggregate
 //! row-shuffle, the lookup-enrich key-shuffle, and `ClusterRepartitionExec`).
-//! Hashing matches [`crate::state::vnode_for_key`] so every stage agrees on a
+//! Hashing matches [`crate::state::VnodeRegistry::vnode_for_key`] so every stage agrees on a
 //! key's vnode.
 
 use std::sync::Arc;

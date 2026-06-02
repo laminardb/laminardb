@@ -244,7 +244,7 @@ pub trait CheckpointStore: Send + Sync {
     /// Runtime vnode count that manifests written by this store are
     /// expected to use. Consulted when validating loaded manifests —
     /// a mismatch is reported as a manifest warning. Defaults to
-    /// [`crate::checkpoint_manifest::DEFAULT_VNODE_COUNT`] when the
+    /// [`crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT`] when the
     /// implementation has no configured value.
     fn vnode_count(&self) -> u16 {
         crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT
@@ -570,7 +570,7 @@ impl FileSystemCheckpointStore {
     /// `{base_dir}/checkpoints/`. The directory is created lazily on first save.
     ///
     /// The store's `vnode_count` defaults to
-    /// [`crate::checkpoint_manifest::DEFAULT_VNODE_COUNT`]. Hosts that run
+    /// [`crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT`]. Hosts that run
     /// with a non-default value should chain [`Self::with_vnode_count`] so
     /// manifest validation checks the right invariant.
     #[must_use]
@@ -932,7 +932,7 @@ impl ObjectStoreCheckpointStore {
     /// It should end with `/` or be empty.
     ///
     /// The store's `vnode_count` defaults to
-    /// [`crate::checkpoint_manifest::DEFAULT_VNODE_COUNT`]. Hosts that run
+    /// [`crate::checkpoint::checkpoint_manifest::DEFAULT_VNODE_COUNT`]. Hosts that run
     /// with a non-default value should chain [`Self::with_vnode_count`].
     #[must_use]
     pub fn new(store: Arc<dyn ObjectStore>, prefix: String, max_retained: usize) -> Self {

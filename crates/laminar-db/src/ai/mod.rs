@@ -1,9 +1,9 @@
 //! Backend-agnostic AI inference for `LaminarDB`.
 //!
 //! AI SQL functions (`ai_classify`, `ai_embed`, `ai_complete`, …) are task
-//! contracts with fixed input/output. A named model from the [`ModelRegistry`]
+//! contracts with fixed input/output. A named model from the [`ModelRegistry`](crate::ai::registry::ModelRegistry)
 //! satisfies a contract; the model's backend — local ONNX or a remote LLM — is
-//! hidden behind a single [`InferenceProvider`]. This crate holds the pieces
+//! hidden behind a single [`InferenceProvider`](crate::ai::provider::InferenceProvider). This crate holds the pieces
 //! that know nothing about Ring 0: the registry, the provider trait, request
 //! and response types, and (in later batches) the result cache, call log,
 //! adapters, and concrete backends.

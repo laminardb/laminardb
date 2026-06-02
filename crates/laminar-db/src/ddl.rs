@@ -417,17 +417,17 @@ impl LaminarDB {
                     "refresh" => {
                         refresh_mode = Some(crate::connector_manager::parse_refresh_mode(&val)?);
                     }
-                    "cache_mode" => {
+                    "cache_mode" | "cache.mode" => {
                         cache_mode = Some(crate::table_cache_mode::parse_cache_mode(&val)?);
                     }
-                    "cache_max_entries" => {
+                    "cache_max_entries" | "cache.max_entries" => {
                         cache_max_entries = Some(val.parse::<usize>().map_err(|_| {
                             DbError::InvalidOperation(format!(
                                 "Invalid cache_max_entries '{val}': expected positive integer"
                             ))
                         })?);
                     }
-                    "cache_max_bytes" => {
+                    "cache_max_bytes" | "cache.max_bytes" | "cache.memory" => {
                         let bytes = val.parse::<usize>().map_err(|_| {
                             DbError::InvalidOperation(format!(
                                 "Invalid cache_max_bytes '{val}': expected positive integer"
@@ -440,7 +440,7 @@ impl LaminarDB {
                         }
                         cache_max_bytes = Some(bytes);
                     }
-                    "cache_ttl" => {
+                    "cache_ttl" | "cache.ttl" => {
                         let secs = val.parse::<u64>().map_err(|_| {
                             DbError::InvalidOperation(format!(
                                 "Invalid cache_ttl '{val}': expected positive integer seconds"

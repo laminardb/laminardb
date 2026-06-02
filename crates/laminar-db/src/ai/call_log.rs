@@ -1,7 +1,7 @@
 //! Bounded in-memory log of inference calls, surfaced as `laminar.ai_calls`.
 //!
 //! One record per batch call — local and remote alike. Remote calls carry
-//! tokens and cost; local calls report [`Usage::ZERO`](crate::provider::Usage::ZERO).
+//! tokens and cost; local calls report [`Usage::ZERO`](crate::ai::provider::Usage::ZERO).
 //! The log is written from the Ring 1 inference worker and read by queries
 //! against `laminar.ai_calls`, so it is behind a lock; it is never touched on
 //! Ring 0. The buffer is bounded — the oldest record is dropped once full — and

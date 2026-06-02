@@ -2,7 +2,7 @@
 //!
 //! Implements `LookupSource` via the native Iceberg scan with a batched
 //! `pk IN (...)` filter pushed down (`with_filter`), so all missed keys of a
-//! probe fold into one manifest-pruned scan. [`KeyAligner`] handles key decode
+//! probe fold into one manifest-pruned scan. [`KeyAligner`](laminar_core::lookup::KeyAligner) handles key decode
 //! and result realignment.
 
 #[cfg(feature = "iceberg")]

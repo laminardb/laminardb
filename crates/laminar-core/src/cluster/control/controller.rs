@@ -50,9 +50,12 @@ impl ClusterController {
         snapshot: Option<Arc<AssignmentSnapshotStore>>,
         members_rx: watch::Receiver<Vec<NodeInfo>>,
     ) -> Self {
+        let mut barrier = BarrierCoordinator::new(Arc::clone(&kv));
+        #[cfg(feature = "cluster-unstable")]
+        barrier.set_leader_election(instance_id, members_rx.clone());
         Self {
             instance_id,
-            barrier: BarrierCoordinator::new(Arc::clone(&kv)),
+            barrier,
             kv,
             snapshot,
             members_rx,

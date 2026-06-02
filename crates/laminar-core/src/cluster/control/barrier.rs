@@ -10,6 +10,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::cluster::discovery::NodeId;
+#[cfg(feature = "cluster-unstable")]
+use crate::cluster::discovery::{NodeInfo, NodeState};
+#[cfg(feature = "cluster-unstable")]
+use tokio::sync::watch;
 
 /// KV key for the leader's barrier announcement.
 pub const ANNOUNCEMENT_KEY: &str = "control:barrier";
@@ -221,6 +225,7 @@ struct GrpcBarrierServer {
     kv: Arc<dyn ClusterKv>,
     incoming_tx: crossfire::MAsyncTx<BarrierFlavor>,
     pending_acks: Arc<parking_lot::Mutex<FxHashMap<u64, tokio::sync::oneshot::Sender<BarrierAck>>>>,
+    leader_election: Arc<parking_lot::Mutex<Option<(NodeId, watch::Receiver<Vec<NodeInfo>>)>>>,
 }
 
 #[cfg(feature = "cluster-unstable")]
@@ -239,14 +244,28 @@ impl GrpcBarrierServer {
             .map_err(|_| tonic::Status::permission_denied("Invalid leader identity"))?;
         let sender_leader_id = NodeId(leader_id_u64);
 
-        let live_nodes: Vec<NodeId> = self
-            .kv
-            .scan(BARRIER_ADDR_KEY)
-            .await
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
-        let observed_leader = super::leader_of(&live_nodes);
+        let observed_leader = {
+            let election_guard = self.leader_election.lock();
+            if let Some((instance_id, members_rx)) = &*election_guard {
+                let members = members_rx.borrow();
+                let mut ids: Vec<NodeId> = members
+                    .iter()
+                    .filter(|m| matches!(m.state, NodeState::Active))
+                    .map(|m| m.id)
+                    .collect();
+                ids.push(*instance_id);
+                super::leader_of(&ids)
+            } else {
+                let live_nodes: Vec<NodeId> = self
+                    .kv
+                    .scan(BARRIER_ADDR_KEY)
+                    .await
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                super::leader_of(&live_nodes)
+            }
+        };
 
         if Some(sender_leader_id) != observed_leader {
             return Err(tonic::Status::permission_denied(
@@ -395,6 +414,8 @@ pub struct BarrierCoordinator {
     kv: Arc<dyn ClusterKv>,
     #[cfg(feature = "cluster-unstable")]
     grpc: Arc<parking_lot::Mutex<Option<Arc<GrpcState>>>>,
+    #[cfg(feature = "cluster-unstable")]
+    leader_election: Arc<parking_lot::Mutex<Option<(NodeId, watch::Receiver<Vec<NodeInfo>>)>>>,
 }
 
 impl std::fmt::Debug for BarrierCoordinator {
@@ -426,7 +447,18 @@ impl BarrierCoordinator {
             kv,
             #[cfg(feature = "cluster-unstable")]
             grpc: Arc::new(parking_lot::Mutex::new(None)),
+            #[cfg(feature = "cluster-unstable")]
+            leader_election: Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    pub fn set_leader_election(
+        &mut self,
+        instance_id: NodeId,
+        members_rx: watch::Receiver<Vec<NodeInfo>>,
+    ) {
+        *self.leader_election.lock() = Some((instance_id, members_rx));
     }
 
     #[cfg(feature = "cluster-unstable")]
@@ -469,6 +501,7 @@ impl BarrierCoordinator {
             kv: Arc::clone(&self.kv),
             incoming_tx: incoming_tx.clone(),
             pending_acks: Arc::clone(&pending_acks),
+            leader_election: Arc::clone(&self.leader_election),
         };
 
         let server_task = tokio::spawn(async move {

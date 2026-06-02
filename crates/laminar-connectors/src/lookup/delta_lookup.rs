@@ -2,7 +2,7 @@
 //!
 //! Implements `LookupSource` backed by a `DataFusion` `TableProvider`. A
 //! batched, typed `pk IN (...)` filter folds all missed keys of a probe into
-//! one file-/partition-pruned scan; [`KeyAligner`] handles key decode and
+//! one file-/partition-pruned scan; [`KeyAligner`](laminar_core::lookup::KeyAligner) handles key decode and
 //! result realignment.
 
 #[cfg(feature = "delta-lake")]
