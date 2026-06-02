@@ -398,6 +398,8 @@ impl LaminarDB {
         let mut refresh_mode: Option<laminar_connectors::reference::RefreshMode> = None;
         let mut cache_mode: Option<crate::table_cache_mode::TableCacheMode> = None;
         let mut cache_max_entries: Option<usize> = None;
+        let mut cache_max_bytes: Option<usize> = None;
+        let mut cache_ttl: Option<std::time::Duration> = None;
         let mut storage: Option<String> = None;
 
         let with_options = match &create.table_options {
@@ -424,6 +426,21 @@ impl LaminarDB {
                                 "Invalid cache_max_entries '{val}': expected positive integer"
                             ))
                         })?);
+                    }
+                    "cache_max_bytes" => {
+                        cache_max_bytes = Some(val.parse::<usize>().map_err(|_| {
+                            DbError::InvalidOperation(format!(
+                                "Invalid cache_max_bytes '{val}': expected positive integer"
+                            ))
+                        })?);
+                    }
+                    "cache_ttl" => {
+                        let secs = val.parse::<u64>().map_err(|_| {
+                            DbError::InvalidOperation(format!(
+                                "Invalid cache_ttl '{val}': expected positive integer seconds"
+                            ))
+                        })?;
+                        cache_ttl = Some(std::time::Duration::from_secs(secs));
                     }
                     "storage" => storage = Some(val),
                     kk if kk.starts_with("format.") => {
@@ -483,8 +500,8 @@ impl LaminarDB {
                     format,
                     format_options,
                     refresh: refresh_mode,
-                    cache_max_bytes: None,
-                    cache_ttl: None,
+                    cache_max_bytes,
+                    cache_ttl,
                 });
             }
         }

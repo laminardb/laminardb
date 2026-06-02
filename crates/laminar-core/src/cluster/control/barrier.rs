@@ -218,8 +218,43 @@ impl Drop for RxReturnGuard<'_> {
 
 #[cfg(feature = "cluster-unstable")]
 struct GrpcBarrierServer {
+    kv: Arc<dyn ClusterKv>,
     incoming_tx: crossfire::MAsyncTx<BarrierFlavor>,
     pending_acks: Arc<parking_lot::Mutex<FxHashMap<u64, tokio::sync::oneshot::Sender<BarrierAck>>>>,
+}
+
+#[cfg(feature = "cluster-unstable")]
+impl GrpcBarrierServer {
+    async fn validate_leader(
+        &self,
+        metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<(), tonic::Status> {
+        let leader_id_str = metadata
+            .get("x-leader-id")
+            .ok_or_else(|| tonic::Status::permission_denied("Missing leader identity"))?
+            .to_str()
+            .map_err(|_| tonic::Status::permission_denied("Invalid leader identity"))?;
+        let leader_id_u64 = leader_id_str
+            .parse::<u64>()
+            .map_err(|_| tonic::Status::permission_denied("Invalid leader identity"))?;
+        let sender_leader_id = NodeId(leader_id_u64);
+
+        let live_nodes: Vec<NodeId> = self
+            .kv
+            .scan(BARRIER_ADDR_KEY)
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        let observed_leader = super::leader_of(&live_nodes);
+
+        if Some(sender_leader_id) != observed_leader {
+            return Err(tonic::Status::permission_denied(
+                "Sender is not the observed leader",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "cluster-unstable")]
@@ -229,12 +264,19 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         &self,
         request: tonic::Request<barrier_v1::PrepareRequest>,
     ) -> Result<tonic::Response<barrier_v1::Ack>, tonic::Status> {
+        let validation_res = self.validate_leader(request.metadata()).await;
         let req = request.into_inner();
         let (tx, rx) = tokio::sync::oneshot::channel::<BarrierAck>();
 
         {
             let mut guard = self.pending_acks.lock();
             guard.insert(req.epoch, tx);
+        }
+
+        if let Err(status) = validation_res {
+            let mut guard = self.pending_acks.lock();
+            guard.remove(&req.epoch);
+            return Err(status);
         }
 
         let ann = BarrierAnnouncement {
@@ -273,6 +315,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         &self,
         request: tonic::Request<barrier_v1::CommitRequest>,
     ) -> Result<tonic::Response<barrier_v1::Ack>, tonic::Status> {
+        self.validate_leader(request.metadata()).await?;
         let req = request.into_inner();
         let ann = BarrierAnnouncement {
             epoch: req.epoch,
@@ -296,6 +339,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         &self,
         request: tonic::Request<barrier_v1::AbortRequest>,
     ) -> Result<tonic::Response<barrier_v1::Ack>, tonic::Status> {
+        self.validate_leader(request.metadata()).await?;
         let req = request.into_inner();
         let ann = BarrierAnnouncement {
             epoch: req.epoch,
@@ -385,6 +429,19 @@ impl BarrierCoordinator {
         }
     }
 
+    #[cfg(feature = "cluster-unstable")]
+    async fn local_node_id(&self) -> Option<NodeId> {
+        let grpc_opt = self.grpc.lock().clone();
+        let state = grpc_opt?;
+        let local_addr_str = state.local_addr.to_string();
+        for (node_id, addr) in self.kv.scan(BARRIER_ADDR_KEY).await {
+            if addr == local_addr_str {
+                return Some(node_id);
+            }
+        }
+        None
+    }
+
     /// Bind and run the follower's direct gRPC barrier sync server.
     ///
     /// # Errors
@@ -409,6 +466,7 @@ impl BarrierCoordinator {
         let clients = Arc::new(parking_lot::Mutex::new(FxHashMap::default()));
 
         let server_impl = GrpcBarrierServer {
+            kv: Arc::clone(&self.kv),
             incoming_tx: incoming_tx.clone(),
             pending_acks: Arc::clone(&pending_acks),
         };
@@ -449,6 +507,7 @@ impl BarrierCoordinator {
         {
             let grpc_opt = self.grpc.lock().clone();
             if let Some(state) = grpc_opt {
+                let local_id = self.local_node_id().await;
                 if ann.phase == Phase::Commit || ann.phase == Phase::Abort {
                     let mut expected = Vec::new();
                     for (node_id, addr) in self.kv.scan(BARRIER_ADDR_KEY).await {
@@ -471,22 +530,32 @@ impl BarrierCoordinator {
                                 })?;
                             match ann_clone.phase {
                                 Phase::Commit => {
-                                    let req = barrier_v1::CommitRequest {
+                                    let mut req = tonic::Request::new(barrier_v1::CommitRequest {
                                         epoch: ann_clone.epoch,
                                         checkpoint_id: ann_clone.checkpoint_id,
                                         flags: ann_clone.flags,
                                         min_watermark_ms: ann_clone.min_watermark_ms,
-                                    };
+                                    });
+                                    if let Some(lid) = local_id {
+                                        if let Ok(val) = lid.0.to_string().parse() {
+                                            req.metadata_mut().insert("x-leader-id", val);
+                                        }
+                                    }
                                     client.commit(req).await.map_err(|e| {
                                         format!("commit RPC to peer {} failed: {e}", peer.0)
                                     })?;
                                 }
                                 Phase::Abort => {
-                                    let req = barrier_v1::AbortRequest {
+                                    let mut req = tonic::Request::new(barrier_v1::AbortRequest {
                                         epoch: ann_clone.epoch,
                                         checkpoint_id: ann_clone.checkpoint_id,
                                         flags: ann_clone.flags,
-                                    };
+                                    });
+                                    if let Some(lid) = local_id {
+                                        if let Ok(val) = lid.0.to_string().parse() {
+                                            req.metadata_mut().insert("x-leader-id", val);
+                                        }
+                                    }
                                     client.abort(req).await.map_err(|e| {
                                         format!("abort RPC to peer {} failed: {e}", peer.0)
                                     })?;
@@ -605,6 +674,7 @@ impl BarrierCoordinator {
                         None => 0,
                     };
 
+                let local_id = self.local_node_id().await;
                 let mut futures = Vec::new();
                 for &peer in expected {
                     let clients_pool = Arc::clone(&state.clients);
@@ -615,11 +685,16 @@ impl BarrierCoordinator {
                             return Err((peer, "Discovery failed".to_string()));
                         };
 
-                        let req = barrier_v1::PrepareRequest {
+                        let mut req = tonic::Request::new(barrier_v1::PrepareRequest {
                             epoch,
                             checkpoint_id,
                             flags: 0,
-                        };
+                        });
+                        if let Some(lid) = local_id {
+                            if let Ok(val) = lid.0.to_string().parse() {
+                                req.metadata_mut().insert("x-leader-id", val);
+                            }
+                        }
 
                         match tokio::time::timeout(deadline, client.prepare(req)).await {
                             Ok(Ok(response)) => {

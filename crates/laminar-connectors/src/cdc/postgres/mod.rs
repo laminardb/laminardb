@@ -117,10 +117,16 @@ impl crate::registry::LookupSourceFactory for PostgresLookupFactory {
             })?
             .to_string();
 
-        let pool_size = config
-            .get("pool_size")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(4);
+        let pool_size = if let Some(s) = config.get("pool_size") {
+            s.parse::<usize>().map_err(|e| {
+                crate::error::ConnectorError::ConfigurationError(format!(
+                    "invalid 'pool_size' value '{}': {}",
+                    s, e
+                ))
+            })?
+        } else {
+            4
+        };
 
         let lookup_config = PostgresLookupSourceConfig {
             properties: config.properties().clone(),
