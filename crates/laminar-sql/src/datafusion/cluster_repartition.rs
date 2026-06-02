@@ -549,7 +549,7 @@ impl PhysicalOptimizerRule for DistributedJoinRule {
         optimize_plan(plan, &ctx.registry, &ctx.sender, &ctx.receiver, ctx.self_id)
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "DistributedJoinRule"
     }
 

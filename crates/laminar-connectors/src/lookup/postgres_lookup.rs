@@ -369,7 +369,7 @@ fn parse_conn_string_params(conn: &str) -> HashMap<String, String> {
             let mut val = String::new();
             if chars.peek() == Some(&'\'') {
                 chars.next();
-                while let Some(c) = chars.next() {
+                for c in chars.by_ref() {
                     if c == '\'' {
                         break;
                     }
@@ -393,6 +393,7 @@ fn parse_conn_string_params(conn: &str) -> HashMap<String, String> {
 /// Build a `deadpool` pool from libpq-style properties (individual keys or a
 /// pre-formed `connection`/`connection_string` parsed via `tokio_postgres`).
 #[cfg(feature = "postgres-cdc")]
+#[allow(clippy::match_wildcard_for_single_variants)]
 fn build_pool(props: &HashMap<String, String>, pool_size: usize) -> Result<Pool, LookupError> {
     let mut cfg = deadpool_postgres::Config::new();
     let mut merged_props = props.clone();

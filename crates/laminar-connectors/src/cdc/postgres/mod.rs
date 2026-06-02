@@ -120,8 +120,7 @@ impl crate::registry::LookupSourceFactory for PostgresLookupFactory {
         let pool_size = if let Some(s) = config.get("pool_size") {
             s.parse::<usize>().map_err(|e| {
                 crate::error::ConnectorError::ConfigurationError(format!(
-                    "invalid 'pool_size' value '{}': {}",
-                    s, e
+                    "invalid 'pool_size' value '{s}': {e}"
                 ))
             })?
         } else {
