@@ -480,7 +480,7 @@ mod grpc {
         /// Non-blocking drain of the [`ShuffleMessage::VnodeData`] batches for
         /// `stage`. Frames for other stages are bucketed for their own drainer;
         /// `Barrier` frames are stashed for the aligning checkpoint (never dropped
-        /// — see [`Holdover`]). Empty if the queue is empty or a `recv()` holds it.
+        /// — see `Holdover`). Empty if the queue is empty or a `recv()` holds it.
         #[must_use]
         pub fn drain_vnode_data_for(&self, stage: &str) -> Vec<RecordBatch> {
             let mut staged = self.holdover.staged.lock();
