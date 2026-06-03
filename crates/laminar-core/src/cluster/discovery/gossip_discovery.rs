@@ -229,6 +229,7 @@ impl GossipDiscovery {
     /// Panics via `unwrap` on an internal assertion if called twice
     /// concurrently from the same `GossipDiscovery` — the `started`
     /// flag check makes the second call a no-op.
+    #[allow(clippy::too_many_lines)]
     pub async fn start_with_transport<T>(&mut self, transport: &T) -> Result<(), DiscoveryError>
     where
         T: chitchat::transport::Transport,
@@ -288,7 +289,7 @@ impl GossipDiscovery {
             };
             resolved.unwrap_or_else(|| {
                 std::net::SocketAddr::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                     gossip_addr.port(),
                 )
             })
@@ -361,7 +362,7 @@ impl GossipDiscovery {
                         let live_ids: std::collections::HashSet<&chitchat::ChitchatId> =
                             chitchat_guard.live_nodes().collect();
 
-                        let nodes: Vec<_> = chitchat_guard.node_states().iter().map(|(id, _)| format!("{}(live={})", id.node_id, live_ids.contains(id))).collect();
+                        let nodes: Vec<_> = chitchat_guard.node_states().keys().map(|id| format!("{}(live={})", id.node_id, live_ids.contains(id))).collect();
                         tracing::debug!("Chitchat state nodes: {:?}", nodes);
 
                         // Iterate all known nodes, tagging dead ones

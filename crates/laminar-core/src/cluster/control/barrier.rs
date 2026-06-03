@@ -276,7 +276,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
         {
             let mut completed = self.completed_acks.lock();
             if let Some(ack) = completed.remove(&req.epoch) {
-                validation_res.map_err(|status| status)?;
+                validation_res?;
                 return Ok(tonic::Response::new(barrier_v1::Ack {
                     epoch: ack.epoch,
                     ok: ack.ok,
