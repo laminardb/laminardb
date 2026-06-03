@@ -390,9 +390,9 @@ impl GraphOperator for ProcessTimeJoinOperator {
             return Ok(());
         }
         let op_name = &self.projection.op_name;
-        if stage == format!("{}::left", op_name) {
+        if stage == format!("{op_name}::left") {
             self.left.push(watermark, batch);
-        } else if stage == format!("{}::right", op_name) {
+        } else if stage == format!("{op_name}::right") {
             self.right.push(watermark, batch);
         }
         Ok(())

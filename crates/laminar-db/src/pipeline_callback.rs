@@ -121,6 +121,12 @@ pub(crate) struct ConnectorPipelineCallback {
     /// re-running `follower_checkpoint` on the same announcement.
     #[cfg(feature = "cluster-unstable")]
     pub(crate) last_follower_epoch: Option<u64>,
+    /// Local source barrier injectors to trigger follower-side checkpoints.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) barrier_injectors: Vec<(Arc<str>, laminar_core::checkpoint::CheckpointBarrierInjector)>,
+    /// Pending follower checkpoint announcement from gossip, waiting for local sources to align.
+    #[cfg(feature = "cluster-unstable")]
+    pub(crate) pending_follower_checkpoint: Option<laminar_core::cluster::control::BarrierAnnouncement>,
     /// Inbound channel for `db.checkpoint()` requests. The db sends a
     /// oneshot sender here; on the next cycle the callback captures
     /// operator state (via `checkpoint_with_barrier`-style path) and
@@ -250,6 +256,27 @@ impl ConnectorPipelineCallback {
         }
         self.last_follower_epoch = Some(ann.epoch);
 
+        // Inject barriers into local sources so they flow through this node's
+        // streaming tasks and emit the shuffle barriers required for alignment.
+        for (name, injector) in &self.barrier_injectors {
+            tracing::debug!(
+                source = %name,
+                checkpoint_id = ann.checkpoint_id,
+                "follower injecting checkpoint barrier"
+            );
+            injector.trigger(ann.checkpoint_id, ann.flags);
+        }
+
+        if !self.barrier_injectors.is_empty() {
+            tracing::info!(
+                checkpoint_id = ann.checkpoint_id,
+                epoch = ann.epoch,
+                "follower deferring checkpoint alignment until source barriers flow through"
+            );
+            self.pending_follower_checkpoint = Some(ann);
+            return None;
+        }
+
         // Drain + align the cross-node shuffle on the leader's checkpoint id so
         // the snapshot includes peers' pre-checkpoint rows.
         {
@@ -267,13 +294,6 @@ impl ConnectorPipelineCallback {
             }
         }
 
-        let operator_states = match self.capture_and_serialize_operator_state().await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "follower state capture failed — skipping");
-                return None;
-            }
-        };
         let mut extra_tables = HashMap::with_capacity(self.table_sources.len());
         for (name, source, _) in &self.table_sources {
             extra_tables.insert(
@@ -293,7 +313,7 @@ impl ConnectorPipelineCallback {
             }
         }
         let request = crate::checkpoint_coordinator::CheckpointRequest {
-            operator_states,
+            operator_states: std::collections::HashMap::new(),
             watermark: None,
             table_store_checkpoint_path: None,
             extra_table_offsets: extra_tables,
@@ -330,6 +350,106 @@ impl ConnectorPipelineCallback {
             Err(e) => {
                 tracing::warn!(error = %e, "follower checkpoint errored");
                 None
+            }
+        }
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    async fn run_follower_checkpoint_deferred(
+        &mut self,
+        ann: laminar_core::cluster::control::BarrierAnnouncement,
+        source_checkpoints: FxHashMap<String, SourceCheckpoint>,
+    ) -> crate::pipeline::BarrierOutcome {
+        use crate::checkpoint_coordinator::source_to_connector_checkpoint;
+        use crate::pipeline::BarrierOutcome;
+
+        let Some(ref controller) = self.cluster_controller else {
+            return BarrierOutcome::Failed;
+        };
+
+        // Drain + align the cross-node shuffle on the leader's checkpoint id so
+        // the snapshot includes peers' pre-checkpoint rows.
+        {
+            let live: Vec<u64> = controller.live_instances().iter().map(|n| n.0).collect();
+            let wm = self
+                .pipeline_watermark
+                .load(std::sync::atomic::Ordering::Acquire);
+            if let Err(e) = self
+                .graph
+                .align_shuffle_barriers(ann.checkpoint_id, wm, &live)
+                .await
+            {
+                tracing::warn!(error = %e, "follower shuffle alignment failed — skipping");
+                return BarrierOutcome::Failed;
+            }
+        }
+
+        let operator_states = match self.capture_and_serialize_operator_state().await {
+            Ok(states) => states,
+            Err(e) => {
+                tracing::warn!(error = %e, "follower deferred checkpoint: operator state capture failed");
+                return BarrierOutcome::Failed;
+            }
+        };
+
+        let mut extra_tables = HashMap::with_capacity(self.table_sources.len());
+        for (name, source, _) in &self.table_sources {
+            extra_tables.insert(
+                name.clone(),
+                source_to_connector_checkpoint(&source.checkpoint()),
+            );
+        }
+        let mut per_source_watermarks = HashMap::with_capacity(self.watermark_states.len());
+        for (name, wm_state) in &self.watermark_states {
+            let wm = wm_state.generator.current_watermark();
+            if wm > i64::MIN {
+                per_source_watermarks.insert(name.clone(), wm);
+            }
+        }
+        let mut source_overrides = HashMap::with_capacity(source_checkpoints.len());
+        for (name, cp) in &source_checkpoints {
+            source_overrides.insert(name.clone(), source_to_connector_checkpoint(cp));
+        }
+
+        let request = crate::checkpoint_coordinator::CheckpointRequest {
+            operator_states,
+            watermark: None,
+            table_store_checkpoint_path: None,
+            extra_table_offsets: extra_tables,
+            source_watermarks: per_source_watermarks,
+            pipeline_hash: self.pipeline_hash,
+            source_offset_overrides: source_overrides,
+        };
+
+        let vnode_states = self.capture_vnode_states();
+        let mut guard = self.coordinator.lock().await;
+        let Some(ref mut coord) = *guard else {
+            return BarrierOutcome::Failed;
+        };
+
+        coord.set_pending_vnode_states(vnode_states);
+        let wm = self
+            .pipeline_watermark
+            .load(std::sync::atomic::Ordering::Acquire);
+        coord.set_local_watermark_ms(if wm == i64::MIN { None } else { Some(wm) });
+        let follower_epoch = ann.epoch;
+
+        match coord
+            .follower_checkpoint(request, ann, std::time::Duration::from_secs(30))
+            .await
+        {
+            Ok(true) => {
+                tracing::info!(epoch = follower_epoch, "follower checkpoint committed");
+                self.last_checkpoint = std::time::Instant::now();
+                BarrierOutcome::Committed(follower_epoch)
+            }
+            Ok(false) => {
+                tracing::warn!("follower checkpoint aborted (leader signalled Abort)");
+                BarrierOutcome::Failed
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "follower checkpoint errored");
+                BarrierOutcome::Failed
             }
         }
     }
@@ -799,6 +919,16 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    fn is_leader(&self) -> bool {
+        #[cfg(feature = "cluster-unstable")]
+        {
+            if let Some(ref cc) = self.cluster_controller {
+                return cc.is_leader();
+            }
+        }
+        true
+    }
+
     fn tick_idle_watermark(&mut self) {
         let Some(ref mut trk) = self.tracker else {
             return;
@@ -895,6 +1025,10 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             if let Some(cc) = self.cluster_controller.clone() {
                 if !cc.is_leader() {
                     return self.maybe_follower_checkpoint(cc, source_offsets).await;
+                } else {
+                    // Leader in cluster mode: do not trigger timer-based checkpoints here.
+                    // Periodic checkpoints are driven by barrier injection from the streaming coordinator.
+                    return None;
                 }
             }
         }
@@ -1044,6 +1178,18 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
         use crate::pipeline::{BarrierOutcome, SkipReason};
         let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
+
+        #[cfg(feature = "cluster-unstable")]
+        if let Some(cc) = self.cluster_controller.clone() {
+            if !cc.is_leader() {
+                if let Some(ann) = self.pending_follower_checkpoint.take() {
+                    return self.run_follower_checkpoint_deferred(ann, source_checkpoints).await;
+                } else {
+                    tracing::warn!("follower received checkpoint_with_barrier but pending_follower_checkpoint is None");
+                    return BarrierOutcome::Failed;
+                }
+            }
+        }
 
         if self.prom.cycles.get() == 0 {
             return BarrierOutcome::Skipped(SkipReason::NoCyclesSinceLastCheckpoint);
@@ -1364,6 +1510,23 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                     tracing::warn!(table=%name, error=%e, "Table poll error");
                 }
             }
+        }
+    }
+
+    fn next_checkpoint_id(&self) -> Option<u64> {
+        let guard = self.coordinator.try_lock().ok()?;
+        let coord = guard.as_ref()?;
+        Some(coord.next_checkpoint_id())
+    }
+
+    fn set_barrier_injectors(&mut self, injectors: Vec<(Arc<str>, laminar_core::checkpoint::CheckpointBarrierInjector)>) {
+        #[cfg(feature = "cluster-unstable")]
+        {
+            self.barrier_injectors = injectors;
+        }
+        #[cfg(not(feature = "cluster-unstable"))]
+        {
+            let _ = injectors;
         }
     }
 }

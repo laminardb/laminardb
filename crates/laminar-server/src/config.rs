@@ -611,6 +611,8 @@ pub struct DiscoverySection {
     pub seeds: Vec<String>,
     #[serde(default = "default_gossip_port")]
     pub gossip_port: u16,
+    #[serde(default)]
+    pub advertise_host: Option<String>,
 }
 
 /// `[coordination]` section: delta coordination.

@@ -4951,6 +4951,7 @@ dependencies = [
  "equivalent",
  "foyer",
  "futures",
+ "gethostname",
  "object_store 0.13.2",
  "parking_lot 0.12.5",
  "prost",

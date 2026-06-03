@@ -317,11 +317,27 @@ pub async fn start_cluster(
         bind_addr.as_str()
     };
 
+    let host_trimmed = bind_host.trim_start_matches('[').trim_end_matches(']');
+    let ip_wildcard = host_trimmed == "0.0.0.0" || host_trimmed == "::" || host_trimmed.is_empty();
+    let advertise_host = if let Some(ref host) = cluster_cfg.discovery.advertise_host {
+        host.clone()
+    } else if ip_wildcard {
+        let hostname = gethostname::gethostname();
+        let hostname = hostname.to_string_lossy().into_owned();
+        if hostname.is_empty() {
+            "127.0.0.1".to_string()
+        } else {
+            hostname
+        }
+    } else {
+        bind_host.to_string()
+    };
+
     let local_node = NodeInfo {
         id: node_id,
         name: node_id_str.clone(),
-        rpc_address: format!("{bind_host}:{rpc_port}"),
-        raft_address: format!("{bind_host}:{raft_port}"),
+        rpc_address: format!("{advertise_host}:{rpc_port}"),
+        raft_address: format!("{advertise_host}:{raft_port}"),
         state: NodeState::Joining,
         metadata: NodeMetadata {
             cores: num_cpus(),
@@ -343,7 +359,7 @@ pub async fn start_cluster(
     let mut discovery: DiscoveryImpl = match cluster_cfg.discovery.strategy.as_str() {
         "gossip" => {
             let gossip_config = GossipDiscoveryConfig {
-                gossip_address: format!("0.0.0.0:{}", cluster_cfg.discovery.gossip_port),
+                gossip_address: format!("{bind_host}:{}", cluster_cfg.discovery.gossip_port),
                 seed_nodes: cluster_cfg.discovery.seeds.clone(),
                 gossip_interval: std::time::Duration::from_secs(1),
                 phi_threshold: 8.0,
@@ -351,6 +367,7 @@ pub async fn start_cluster(
                 cluster_id: "laminardb".to_string(),
                 node_id,
                 local_node: local_node.clone(),
+                advertise_host: cluster_cfg.discovery.advertise_host.clone(),
             };
             DiscoveryImpl::Gossip(GossipDiscovery::new(gossip_config))
         }
@@ -362,7 +379,7 @@ pub async fn start_cluster(
                 heartbeat_interval: std::time::Duration::from_secs(1),
                 suspect_threshold: 3,
                 dead_threshold: 10,
-                listen_address: format!("0.0.0.0:{}", cluster_cfg.discovery.gossip_port),
+                listen_address: format!("{bind_host}:{}", cluster_cfg.discovery.gossip_port),
             };
             DiscoveryImpl::Static(StaticDiscovery::new(static_config))
         }
@@ -450,8 +467,10 @@ pub async fn start_cluster(
                 ));
                 #[cfg(feature = "cluster-unstable")]
                 {
-                    let bind: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
-                    match controller.start_barrier_server(bind).await {
+                    let bind: std::net::SocketAddr = format!("{bind_host}:0").parse().map_err(|e| {
+                        ClusterStartupError::EngineConstruction(format!("invalid barrier sync bind host: {e}"))
+                    })?;
+                    match controller.start_barrier_server(bind, Some(advertise_host.clone())).await {
                         Ok(bound) => {
                             info!("Barrier sync gRPC server listening on {}", bound);
                         }
@@ -539,7 +558,7 @@ pub async fn start_cluster(
     // the gossip KV so peer ShuffleSenders discover it on first send.
     // Without this wiring, streaming aggregates never cross node
     // boundaries.
-    let shuffle_receiver = build_shuffle_receiver(&discovery, node_id).await?;
+    let shuffle_receiver = build_shuffle_receiver(&discovery, node_id, bind_host).await?;
     let shuffle_advertise = shuffle_advertise_addr(shuffle_receiver.local_addr(), bind_host);
     let shuffle_sender =
         Arc::new(build_shuffle_sender(node_id.0, &discovery, shuffle_advertise).await);
@@ -651,6 +670,12 @@ pub async fn start_cluster(
     let membership_handle = spawn_membership_watcher(&node_id_str, membership_rx);
     info!("Membership watcher started");
 
+    let mut active = local_node.clone();
+    active.state = NodeState::Active;
+    if let Err(e) = discovery.announce(active.clone()).await {
+        warn!("Failed to announce active state: {e}");
+    }
+
     info!("Cluster node '{node_id_str}' started");
 
     Ok(ClusterHandle {
@@ -659,7 +684,7 @@ pub async fn start_cluster(
         api_handle,
         watcher_handle,
         membership_handle,
-        local_node,
+        local_node: active,
         cluster_controller,
         snapshot_store,
         lease_shutdown_token,
@@ -775,11 +800,14 @@ async fn resolve_vnode_assignment(
 async fn build_shuffle_receiver(
     discovery: &DiscoveryImpl,
     node_id: NodeId,
+    bind_host: &str,
 ) -> Result<Arc<laminar_core::shuffle::ShuffleReceiver>, ClusterStartupError> {
     use laminar_core::cluster::control::{ChitchatKv, ClusterKv};
     use laminar_core::shuffle::ShuffleReceiver;
 
-    let bind: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+    let bind: std::net::SocketAddr = format!("{bind_host}:0").parse().map_err(|e| {
+        ClusterStartupError::EngineConstruction(format!("invalid shuffle bind host: {e}"))
+    })?;
     let recv = if let DiscoveryImpl::Gossip(gossip) = discovery {
         if let Some(handle) = gossip.chitchat_handle() {
             let kv: Arc<dyn ClusterKv> = Arc::new(ChitchatKv::from_handle(handle));

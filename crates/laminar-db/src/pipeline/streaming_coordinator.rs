@@ -453,6 +453,13 @@ impl StreamingCoordinator {
     /// 6. Barrier timeout check
     #[allow(clippy::too_many_lines)]
     pub async fn run<C: PipelineCallback>(mut self, mut callback: C) {
+        let injectors = self
+            .source_handles
+            .iter()
+            .map(|h| (h.name.clone(), h.barrier_injector.clone()))
+            .collect();
+        callback.set_barrier_injectors(injectors);
+
         /// Maximum messages to drain per cycle before yielding for maintenance work.
         const MAX_DRAIN_PER_CYCLE: usize = 10_000;
 
@@ -811,6 +818,11 @@ impl StreamingCoordinator {
                 barrier,
                 checkpoint,
             } => {
+                tracing::debug!(
+                    source_idx,
+                    checkpoint_id = barrier.checkpoint_id,
+                    "coordinator received source barrier"
+                );
                 self.barrier_seen.insert(source_idx);
                 barriers.push((source_idx, barrier, checkpoint));
             }
@@ -842,6 +854,11 @@ impl StreamingCoordinator {
         barrier_checkpoint: &SourceCheckpoint,
         callback: &mut impl PipelineCallback,
     ) {
+        if !self.pending_barrier.active && !callback.is_leader() {
+            self.pending_barrier
+                .reset(barrier.checkpoint_id, self.source_handles.len());
+        }
+
         if !self.pending_barrier.active
             || barrier.checkpoint_id != self.pending_barrier.checkpoint_id
         {
@@ -911,14 +928,15 @@ impl StreamingCoordinator {
             self.broadcast_epoch_committed(epoch, &FxHashMap::default());
         }
 
-        let should_checkpoint = self
-            .config
-            .checkpoint_interval
-            .is_some_and(|interval| self.last_checkpoint.elapsed() >= interval)
-            || self
-                .checkpoint_request_flags
-                .iter()
-                .any(|f| f.swap(false, Ordering::AcqRel));
+        let should_checkpoint = callback.is_leader()
+            && (self
+                .config
+                .checkpoint_interval
+                .is_some_and(|interval| self.last_checkpoint.elapsed() >= interval)
+                || self
+                    .checkpoint_request_flags
+                    .iter()
+                    .any(|f| f.swap(false, Ordering::AcqRel)));
 
         if !should_checkpoint {
             return;
@@ -935,8 +953,14 @@ impl StreamingCoordinator {
         }
 
         // Inject barriers into all source tasks for Chandy-Lamport alignment.
-        let checkpoint_id = self.next_checkpoint_id;
-        self.next_checkpoint_id += 1;
+        let checkpoint_id = if let Some(external_id) = callback.next_checkpoint_id() {
+            self.next_checkpoint_id = external_id + 1;
+            external_id
+        } else {
+            let id = self.next_checkpoint_id;
+            self.next_checkpoint_id += 1;
+            id
+        };
         self.pending_barrier
             .reset(checkpoint_id, self.source_handles.len());
 

@@ -191,6 +191,7 @@ struct GrpcState {
     #[allow(dead_code)]
     incoming_tx: crossfire::MAsyncTx<BarrierFlavor>,
     pending_acks: Arc<parking_lot::Mutex<FxHashMap<u64, tokio::sync::oneshot::Sender<BarrierAck>>>>,
+    completed_acks: Arc<parking_lot::Mutex<FxHashMap<u64, BarrierAck>>>,
     clients: Arc<
         parking_lot::Mutex<
             FxHashMap<
@@ -201,24 +202,10 @@ struct GrpcState {
     >,
     server_handle: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     local_addr: std::net::SocketAddr,
+    advertise_addr: String,
 }
 
-#[cfg(feature = "cluster-unstable")]
-struct RxReturnGuard<'a> {
-    slot: &'a parking_lot::Mutex<Option<crossfire::AsyncRx<BarrierFlavor>>>,
-    notify: &'a tokio::sync::Notify,
-    rx: Option<crossfire::AsyncRx<BarrierFlavor>>,
-}
 
-#[cfg(feature = "cluster-unstable")]
-impl Drop for RxReturnGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(rx) = self.rx.take() {
-            *self.slot.lock() = Some(rx);
-            self.notify.notify_one();
-        }
-    }
-}
 
 #[cfg(feature = "cluster-unstable")]
 type ActiveLeaderState = Option<(NodeId, watch::Receiver<Vec<NodeInfo>>)>;
@@ -228,6 +215,7 @@ struct GrpcBarrierServer {
     kv: Arc<dyn ClusterKv>,
     incoming_tx: crossfire::MAsyncTx<BarrierFlavor>,
     pending_acks: Arc<parking_lot::Mutex<FxHashMap<u64, tokio::sync::oneshot::Sender<BarrierAck>>>>,
+    completed_acks: Arc<parking_lot::Mutex<FxHashMap<u64, BarrierAck>>>,
     leader_election: Arc<parking_lot::Mutex<ActiveLeaderState>>,
 }
 
@@ -287,6 +275,20 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
     ) -> Result<tonic::Response<barrier_v1::Ack>, tonic::Status> {
         let validation_res = self.validate_leader(request.metadata()).await;
         let req = request.into_inner();
+
+        {
+            let mut completed = self.completed_acks.lock();
+            if let Some(ack) = completed.remove(&req.epoch) {
+                validation_res.map_err(|status| status)?;
+                return Ok(tonic::Response::new(barrier_v1::Ack {
+                    epoch: ack.epoch,
+                    ok: ack.ok,
+                    error: ack.error,
+                    local_watermark_ms: ack.local_watermark_ms,
+                }));
+            }
+        }
+
         let (tx, rx) = tokio::sync::oneshot::channel::<BarrierAck>();
 
         {
@@ -338,6 +340,13 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
     ) -> Result<tonic::Response<barrier_v1::Ack>, tonic::Status> {
         self.validate_leader(request.metadata()).await?;
         let req = request.into_inner();
+
+        {
+            let mut completed = self.completed_acks.lock();
+            completed.remove(&req.epoch);
+            completed.retain(|&epoch, _| epoch >= req.epoch);
+        }
+
         let ann = BarrierAnnouncement {
             epoch: req.epoch,
             checkpoint_id: req.checkpoint_id,
@@ -362,6 +371,13 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
     ) -> Result<tonic::Response<barrier_v1::Ack>, tonic::Status> {
         self.validate_leader(request.metadata()).await?;
         let req = request.into_inner();
+
+        {
+            let mut completed = self.completed_acks.lock();
+            completed.remove(&req.epoch);
+            completed.retain(|&epoch, _| epoch >= req.epoch);
+        }
+
         let ann = BarrierAnnouncement {
             epoch: req.epoch,
             checkpoint_id: req.checkpoint_id,
@@ -468,7 +484,7 @@ impl BarrierCoordinator {
     async fn local_node_id(&self) -> Option<NodeId> {
         let grpc_opt = self.grpc.lock().clone();
         let state = grpc_opt?;
-        let local_addr_str = state.local_addr.to_string();
+        let local_addr_str = state.advertise_addr.clone();
         for (node_id, addr) in self.kv.scan(BARRIER_ADDR_KEY).await {
             if addr == local_addr_str {
                 return Some(node_id);
@@ -485,6 +501,7 @@ impl BarrierCoordinator {
     pub async fn start_server(
         &self,
         bind_addr: std::net::SocketAddr,
+        advertise_host: Option<String>,
     ) -> Result<std::net::SocketAddr, String> {
         use barrier_v1::barrier_sync_server::BarrierSyncServer;
         use std::net::TcpListener;
@@ -498,12 +515,14 @@ impl BarrierCoordinator {
 
         let (incoming_tx, incoming_rx) = crossfire::mpsc::bounded_async::<BarrierAnnouncement>(128);
         let pending_acks = Arc::new(parking_lot::Mutex::new(FxHashMap::default()));
+        let completed_acks = Arc::new(parking_lot::Mutex::new(FxHashMap::default()));
         let clients = Arc::new(parking_lot::Mutex::new(FxHashMap::default()));
 
         let server_impl = GrpcBarrierServer {
             kv: Arc::clone(&self.kv),
             incoming_tx: incoming_tx.clone(),
             pending_acks: Arc::clone(&pending_acks),
+            completed_acks: Arc::clone(&completed_acks),
             leader_election: Arc::clone(&self.leader_election),
         };
 
@@ -515,20 +534,36 @@ impl BarrierCoordinator {
                 .await;
         });
 
+        let advertise_addr = if let Some(ref host) = advertise_host {
+            format!("{host}:{}", local_addr.port())
+        } else if local_addr.ip().is_unspecified() {
+            let hostname = gethostname::gethostname();
+            let hostname = hostname.to_string_lossy();
+            if hostname.is_empty() {
+                local_addr.to_string()
+            } else {
+                format!("{hostname}:{}", local_addr.port())
+            }
+        } else {
+            local_addr.to_string()
+        };
+
         let grpc_state = Arc::new(GrpcState {
             incoming_rx: parking_lot::Mutex::new(Some(incoming_rx)),
             incoming_rx_returned: Arc::new(tokio::sync::Notify::new()),
             incoming_tx,
             pending_acks,
+            completed_acks,
             clients,
             server_handle: Arc::new(parking_lot::Mutex::new(Some(server_task))),
             local_addr,
+            advertise_addr: advertise_addr.clone(),
         });
 
         *self.grpc.lock() = Some(grpc_state);
 
         self.kv
-            .write(BARRIER_ADDR_KEY, local_addr.to_string())
+            .write(BARRIER_ADDR_KEY, advertise_addr)
             .await;
 
         Ok(local_addr)
@@ -544,10 +579,58 @@ impl BarrierCoordinator {
             let grpc_opt = self.grpc.lock().clone();
             if let Some(state) = grpc_opt {
                 let local_id = self.local_node_id().await;
-                if ann.phase == Phase::Commit || ann.phase == Phase::Abort {
+                if ann.phase == Phase::Prepare {
                     let mut expected = Vec::new();
                     for (node_id, addr) in self.kv.scan(BARRIER_ADDR_KEY).await {
-                        if addr == state.local_addr.to_string() {
+                        if addr == state.advertise_addr {
+                            continue;
+                        }
+                        expected.push(node_id);
+                    }
+
+                    let expected_clone = expected.clone();
+                    let clients_pool = Arc::clone(&state.clients);
+                    let kv = Arc::clone(&self.kv);
+                    let ann_clone = ann.clone();
+                    tokio::spawn(async move {
+                        let mut futures = Vec::new();
+                        for peer in expected_clone {
+                            let clients_pool = Arc::clone(&clients_pool);
+                            let kv = Arc::clone(&kv);
+                            let ann_clone = ann_clone.clone();
+                            futures.push(async move {
+                                let mut client = get_barrier_client(peer, &clients_pool, &kv)
+                                    .await
+                                    .ok_or_else(|| {
+                                        format!("failed to get client for peer {}", peer.0)
+                                    })?;
+                                let mut req = tonic::Request::new(barrier_v1::PrepareRequest {
+                                    epoch: ann_clone.epoch,
+                                    checkpoint_id: ann_clone.checkpoint_id,
+                                    flags: ann_clone.flags,
+                                });
+                                if let Some(lid) = local_id {
+                                    if let Ok(val) = lid.0.to_string().parse() {
+                                        req.metadata_mut().insert("x-leader-id", val);
+                                    }
+                                }
+                                client.prepare(req).await.map_err(|e| {
+                                    format!("prepare RPC to peer {} failed: {e}", peer.0)
+                                })?;
+                                Ok::<(), String>(())
+                            });
+                        }
+                        let results = futures::future::join_all(futures).await;
+                        for res in results {
+                            if let Err(e) = res {
+                                tracing::warn!("async prepare error during announce: {}", e);
+                            }
+                        }
+                    });
+                } else if ann.phase == Phase::Commit || ann.phase == Phase::Abort {
+                    let mut expected = Vec::new();
+                    for (node_id, addr) in self.kv.scan(BARRIER_ADDR_KEY).await {
+                        if addr == state.advertise_addr {
                             continue;
                         }
                         expected.push(node_id);
@@ -627,24 +710,18 @@ impl BarrierCoordinator {
         {
             let grpc_opt = self.grpc.lock().clone();
             if let Some(state) = grpc_opt {
-                loop {
-                    let taken = { state.incoming_rx.lock().take() };
-                    let Some(rx) = taken else {
-                        state.incoming_rx_returned.notified().await;
-                        continue;
-                    };
-                    let mut guard = RxReturnGuard {
-                        slot: &state.incoming_rx,
-                        notify: &state.incoming_rx_returned,
-                        rx: Some(rx),
-                    };
-                    let rx = guard
-                        .rx
-                        .as_mut()
-                        .ok_or_else(|| "Receiver dropped".to_string())?;
-                    match rx.recv().await {
+                let taken = { state.incoming_rx.lock().take() };
+                if let Some(rx) = taken {
+                    let blocking_rx = rx.into_blocking();
+                    let res = blocking_rx.try_recv();
+                    let async_rx = blocking_rx.into_async();
+                    *state.incoming_rx.lock() = Some(async_rx);
+                    state.incoming_rx_returned.notify_one();
+                    
+                    match res {
                         Ok(ann) => return Ok(Some(ann)),
-                        Err(_) => return Ok(None),
+                        Err(crossfire::TryRecvError::Disconnected) => return Ok(None),
+                        Err(crossfire::TryRecvError::Empty) => {} // fallback to KV check below
                     }
                 }
             }
@@ -667,6 +744,10 @@ impl BarrierCoordinator {
         {
             let grpc_opt = self.grpc.lock().clone();
             if let Some(state) = grpc_opt {
+                {
+                    let mut completed = state.completed_acks.lock();
+                    completed.insert(ack.epoch, ack.clone());
+                }
                 let tx_opt = {
                     let mut guard = state.pending_acks.lock();
                     guard.remove(&ack.epoch)
@@ -883,8 +964,8 @@ mod tests {
             let follower_coord = BarrierCoordinator::new(follower_kv.clone());
 
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let leader_addr = leader_coord.start_server(addr).await.unwrap();
-            let bound_addr = follower_coord.start_server(addr).await.unwrap();
+            let leader_addr = leader_coord.start_server(addr, None).await.unwrap();
+            let bound_addr = follower_coord.start_server(addr, None).await.unwrap();
 
             leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, bound_addr.to_string());
             follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());

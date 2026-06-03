@@ -217,6 +217,15 @@ impl Default for CheckpointBarrierInjector {
     }
 }
 
+impl Clone for CheckpointBarrierInjector {
+    fn clone(&self) -> Self {
+        Self {
+            cmd: Arc::clone(&self.cmd),
+            epoch: AtomicU64::new(self.epoch.load(Ordering::Relaxed)),
+        }
+    }
+}
+
 /// Handle used by source operators to poll for pending barriers.
 ///
 /// Cloned from [`CheckpointBarrierInjector::handle`] and stored in the

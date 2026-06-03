@@ -17,6 +17,7 @@ default = []
 cluster-unstable = [
     "dep:chitchat", "dep:tokio-util", "dep:anyhow",
     "dep:tonic", "dep:tonic-prost", "dep:prost",
+    "dep:gethostname",
 ]
 aws = ["object_store/aws"]
 gcs = ["object_store/gcp"]
@@ -63,6 +64,7 @@ tokio-util = { workspace = true, optional = true }
 # anyhow is needed for the chitchat Transport trait impls in the
 # testing module; activated by the cluster-unstable feature.
 anyhow = { workspace = true, optional = true }
+gethostname = { workspace = true, optional = true }
 # futures is needed for the object_store::ObjectStore impl on
 # FaultyObjectStore (BoxStream type).
 futures = { workspace = true }

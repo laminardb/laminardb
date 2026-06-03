@@ -198,7 +198,7 @@ impl GraphOperator for IntervalJoinOperator {
             return Ok(());
         }
         let op_name = &self.projection.op_name;
-        if stage == format!("{}::left", op_name) {
+        if stage == format!("{op_name}::left") {
             if let Some(neg) = crate::changelog_filter::extract_negative_events(&batch)? {
                 let keys = extract_key_column(&neg, &self.config.left_key)?;
                 let timestamps = extract_column_as_timestamps(&neg, &self.config.left_time_column)?;
@@ -222,7 +222,7 @@ impl GraphOperator for IntervalJoinOperator {
                     &self.config.left_time_column,
                 )?;
             }
-        } else if stage == format!("{}::right", op_name) {
+        } else if stage == format!("{op_name}::right") {
             if let Some(neg) = crate::changelog_filter::extract_negative_events(&batch)? {
                 let keys = extract_key_column(&neg, &self.config.right_key)?;
                 let timestamps =

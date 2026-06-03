@@ -1260,13 +1260,13 @@ impl CheckpointCoordinator {
         checkpoint_id: u64,
     ) -> Result<(), DbError> {
         let CheckpointRequest {
-            operator_states,
-            watermark,
-            table_store_checkpoint_path,
-            extra_table_offsets,
-            source_watermarks,
-            pipeline_hash,
-            source_offset_overrides,
+            operator_states: _,
+            watermark: _,
+            table_store_checkpoint_path: _,
+            extra_table_offsets: _,
+            source_watermarks: _,
+            pipeline_hash: _,
+            source_offset_overrides: _,
         } = request;
 
         self.phase = CheckpointPhase::PreCommitting;
@@ -1275,32 +1275,7 @@ impl CheckpointCoordinator {
             return Err(e);
         }
 
-        let mut manifest = CheckpointManifest::new(checkpoint_id, epoch);
-        manifest.source_offsets = source_offset_overrides;
-        manifest.table_offsets = extra_table_offsets;
-        manifest.sink_epochs = self.collect_sink_epochs();
-        manifest.sink_commit_statuses = self.initial_sink_commit_statuses();
-        manifest.watermark = watermark;
-        manifest.source_watermarks = source_watermarks;
-        manifest.table_store_checkpoint_path = table_store_checkpoint_path;
-        manifest.source_names = {
-            let mut names: Vec<String> = manifest.source_offsets.keys().cloned().collect();
-            names.sort();
-            names
-        };
-        manifest.sink_names = self.sorted_sink_names();
-        manifest.pipeline_hash = pipeline_hash;
-        let state_data = Self::pack_operator_states(
-            &mut manifest,
-            &operator_states,
-            self.config.state_inline_threshold,
-        );
-
         self.phase = CheckpointPhase::Persisting;
-        if let Err(e) = self.save_manifest(Arc::new(manifest), state_data).await {
-            self.pending_vnode_states.clear();
-            return Err(e);
-        }
         if let Err(e) = self.write_vnode_partials(epoch, checkpoint_id).await {
             self.pending_vnode_states.clear();
             return Err(e);

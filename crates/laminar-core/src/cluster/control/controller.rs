@@ -197,8 +197,9 @@ impl ClusterController {
     pub async fn start_barrier_server(
         &self,
         bind_addr: std::net::SocketAddr,
+        advertise_host: Option<String>,
     ) -> Result<std::net::SocketAddr, String> {
-        self.barrier.start_server(bind_addr).await
+        self.barrier.start_server(bind_addr, advertise_host).await
     }
 
     /// Leader-side announce.

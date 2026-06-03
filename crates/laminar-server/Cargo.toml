@@ -155,9 +155,9 @@ files = ["laminar-db/files"]
 otel = ["laminar-db/otel"]
 parquet-lookup = ["laminar-db/parquet-lookup"]
 # Cloud object store backends for checkpoints
-aws = ["laminar-db/aws"]
-gcs = ["laminar-db/gcs"]
-azure = ["laminar-db/azure"]
+aws = ["laminar-db/aws", "laminar-core/aws"]
+gcs = ["laminar-db/gcs", "laminar-core/gcs"]
+azure = ["laminar-db/azure", "laminar-core/azure"]
 # Compile OpenSSL from source — required for musl cross-compilation where
 # system libssl-dev is not available for the target triple.
 # Cluster mode: experimental multi-node support. NOT production-ready —

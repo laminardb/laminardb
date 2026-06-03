@@ -23,3 +23,8 @@ impl PriorityGuard {
         Self
     }
 }
+
+impl Drop for PriorityGuard {
+    #[inline]
+    fn drop(&mut self) {}
+}

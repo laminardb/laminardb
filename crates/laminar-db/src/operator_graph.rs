@@ -1971,6 +1971,14 @@ impl OperatorGraph {
             return Ok(()); // we receive from no peer — nothing to align on
         }
 
+        tracing::info!(
+            checkpoint_id,
+            self_id = cfg.self_id.0,
+            output_peers = ?output_peers,
+            input_peers = ?input_peers,
+            "align_shuffle_barriers: starting alignment"
+        );
+
         let tracker = BarrierTracker::new(input_peers.len() + 1);
         let peer_port: FxHashMap<u64, usize> = input_peers
             .iter()
@@ -1985,7 +1993,16 @@ impl OperatorGraph {
         for (from, b) in cfg.receiver.drain_staged_barriers() {
             if b.checkpoint_id == checkpoint_id {
                 if let Some(&port) = peer_port.get(&from) {
+                    tracing::info!(
+                        checkpoint_id,
+                        from_peer = from,
+                        "align_shuffle_barriers: observed pre-staged peer barrier"
+                    );
                     if tracker.observe(port, b).is_some() {
+                        tracing::info!(
+                            checkpoint_id,
+                            "align_shuffle_barriers: all peers aligned (pre-staged)"
+                        );
                         return Ok(()); // all peers already aligned
                     }
                 }
@@ -2007,8 +2024,17 @@ impl OperatorGraph {
                 Ok(Some((from, ShuffleMessage::Barrier(b))))
                     if b.checkpoint_id == checkpoint_id =>
                 {
+                    tracing::info!(
+                        checkpoint_id,
+                        from_peer = from,
+                        "align_shuffle_barriers: received peer barrier"
+                    );
                     if let Some(&port) = peer_port.get(&from) {
                         if tracker.observe(port, b).is_some() {
+                            tracing::info!(
+                                checkpoint_id,
+                                "align_shuffle_barriers: all peers aligned successfully"
+                            );
                             break; // all peers aligned
                         }
                     }

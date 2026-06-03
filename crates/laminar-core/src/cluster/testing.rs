@@ -483,6 +483,7 @@ impl MiniCluster {
             cluster_id: "minicluster".to_string(),
             node_id: instance_id,
             local_node,
+            advertise_host: None,
         };
         let mut discovery = GossipDiscovery::new(cfg);
         match &self.rules {
@@ -564,6 +565,7 @@ impl MiniCluster {
                 cluster_id: "minicluster".to_string(),
                 node_id: instance_id,
                 local_node,
+                advertise_host: None,
             };
             let mut discovery = GossipDiscovery::new(cfg);
             match &transport {

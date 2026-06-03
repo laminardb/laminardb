@@ -1629,6 +1629,10 @@ impl LaminarDB {
             cluster_controller: self.cluster_controller.lock().clone(),
             #[cfg(feature = "cluster-unstable")]
             last_follower_epoch: None,
+            #[cfg(feature = "cluster-unstable")]
+            barrier_injectors: Vec::new(),
+            #[cfg(feature = "cluster-unstable")]
+            pending_follower_checkpoint: None,
             force_ckpt_rx: Some(force_ckpt_rx),
             subscription_registry: Arc::clone(&self.subscription_registry),
         };
