@@ -1024,13 +1024,12 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         #[cfg(feature = "cluster")]
         if !force {
             if let Some(cc) = self.cluster_controller.clone() {
-                if !cc.is_leader() {
-                    return self.maybe_follower_checkpoint(cc, source_offsets).await;
-                } else {
+                if cc.is_leader() {
                     // Leader in cluster mode: do not trigger timer-based checkpoints here.
                     // Periodic checkpoints are driven by barrier injection from the streaming coordinator.
                     return None;
                 }
+                return self.maybe_follower_checkpoint(cc, source_offsets).await;
             }
         }
 
@@ -1186,10 +1185,9 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                     return self
                         .run_follower_checkpoint_deferred(ann, source_checkpoints)
                         .await;
-                } else {
-                    tracing::warn!("follower received checkpoint_with_barrier but pending_follower_checkpoint is None");
-                    return BarrierOutcome::Failed;
                 }
+                tracing::warn!("follower received checkpoint_with_barrier but pending_follower_checkpoint is None");
+                return BarrierOutcome::Failed;
             }
         }
 

@@ -452,15 +452,15 @@ impl StreamingCoordinator {
     /// 6. Barrier timeout check
     #[allow(clippy::too_many_lines)]
     pub async fn run<C: PipelineCallback>(mut self, mut callback: C) {
+        /// Maximum messages to drain per cycle before yielding for maintenance work.
+        const MAX_DRAIN_PER_CYCLE: usize = 10_000;
+
         let injectors = self
             .source_handles
             .iter()
             .map(|h| (h.name.clone(), h.barrier_injector.clone()))
             .collect();
         callback.set_barrier_injectors(injectors);
-
-        /// Maximum messages to drain per cycle before yielding for maintenance work.
-        const MAX_DRAIN_PER_CYCLE: usize = 10_000;
 
         let batch_window = self.config.batch_window;
         let mut barriers_buf: Vec<(usize, CheckpointBarrier, SourceCheckpoint)> = Vec::new();

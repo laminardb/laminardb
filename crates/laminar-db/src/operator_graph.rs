@@ -1918,6 +1918,7 @@ impl OperatorGraph {
     /// Fails the checkpoint (caller retries) on timeout or a closed receiver —
     /// the deliberate degradation under a straggling peer.
     #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)]
     pub(crate) async fn align_shuffle_barriers(
         &mut self,
         checkpoint_id: u64,
@@ -2056,7 +2057,7 @@ impl OperatorGraph {
                         }
                     }
                 }
-                _ = &mut alignment_timeout => {
+                () = &mut alignment_timeout => {
                     return Err(DbError::Pipeline(format!(
                         "shuffle barrier alignment timed out for checkpoint {checkpoint_id}"
                     )));
