@@ -474,9 +474,9 @@ mod tests {
         let mut moved = 0;
         let mut moved_between_existing = 0;
 
-        for v in 0..256 {
-            let o3 = a3[v as usize];
-            let o4 = a4[v as usize];
+        for v in 0..256usize {
+            let o3 = a3[v];
+            let o4 = a4[v];
             if o3 != o4 {
                 moved += 1;
                 if o4 != NodeId(4) {
@@ -491,13 +491,12 @@ mod tests {
         );
         assert!(
             moved > 40 && moved < 90,
-            "Expected roughly 25% of vnodes to move to the new peer, got {}",
-            moved
+            "Expected roughly 25% of vnodes to move to the new peer, got {moved}"
         );
 
-        for v in 0..256 {
-            if a3[v as usize] != a4[v as usize] {
-                assert_eq!(a4[v as usize], NodeId(4));
+        for v in 0..256usize {
+            if a3[v] != a4[v] {
+                assert_eq!(a4[v], NodeId(4));
             }
         }
     }

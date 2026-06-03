@@ -905,6 +905,16 @@ mod tests {
         use super::*;
         use std::net::SocketAddr;
 
+        async fn wait_observe(coord: &BarrierCoordinator, leader: NodeId) -> BarrierAnnouncement {
+            for _ in 0..100 {
+                if let Some(ann) = coord.observe(leader).await.unwrap() {
+                    return ann;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("timed out waiting for announcement from leader {leader:?}");
+        }
+
         #[tokio::test]
         async fn test_grpc_barrier_flow() {
             let leader_kv = kv(NodeId(1));
@@ -920,7 +930,7 @@ mod tests {
             follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());
 
             let follower_task = tokio::spawn(async move {
-                let ann = follower_coord.observe(NodeId(1)).await.unwrap().unwrap();
+                let ann = wait_observe(&follower_coord, NodeId(1)).await;
                 assert_eq!(ann.epoch, 1);
                 assert_eq!(ann.checkpoint_id, 42);
                 assert_eq!(ann.phase, Phase::Prepare);
@@ -935,7 +945,7 @@ mod tests {
                     .await
                     .unwrap();
 
-                let commit_ann = follower_coord.observe(NodeId(1)).await.unwrap().unwrap();
+                let commit_ann = wait_observe(&follower_coord, NodeId(1)).await;
                 assert_eq!(commit_ann.phase, Phase::Commit);
                 assert_eq!(commit_ann.min_watermark_ms, Some(100));
             });
