@@ -7,7 +7,7 @@
 - **Scope:** Close the at-least-once gap the cluster row-shuffle leaves at a checkpoint,
   for **both** the aggregate shuffle (`shuffle_pre_agg_batches`, `operator/sql_query.rs`) and
   the lookup-enrich key-shuffle (`shuffle_input`, `operator/lookup_enrich.rs`). Behind
-  `cluster-unstable`.
+  `cluster`.
 
 ## Problem
 
@@ -147,7 +147,7 @@ Checked against current systems and the recent literature; the approach is mains
 ## Phasing
 
 1. **Foundation + alignment mechanism — DONE 2026-05-30 (mechanism only; not yet wired).**
-   `GraphOperator::ingest_shuffle` (cfg `cluster-unstable`; agg → `process_batch`, lookup-enrich →
+   `GraphOperator::ingest_shuffle` (cfg `cluster`; agg → `process_batch`, lookup-enrich →
    `replay`); `OperatorGraph::align_shuffle_barriers` (fan-out via shared `state::peer_owners` +
    `BarrierTracker` drain + per-stage routing via `ingest_to_stage`); `ShuffleReceiver::drain_all_staged`
    to fold the per-stage holdover. No post-barrier buffer (precluded by full-membership commit; see
@@ -155,7 +155,7 @@ Checked against current systems and the recent literature; the approach is mains
    (no new transport). Verified by
    `align_shuffle_barriers_folds_peer_rows_then_aligns` (2-node loopback: a peer ships a row + its
    barrier; alignment folds the row into the target operator and completes on the peer's barrier).
-   Clippy `-D warnings` clean with and without `cluster-unstable`. The method carries a temporary
+   Clippy `-D warnings` clean with and without `cluster`. The method carries a temporary
    `#[allow(dead_code)]` + "wired in the follow-up" pointer until step 2 lands — it is exercised by
    the test, not dead, but has no production caller yet.
 2. **Wiring via the leader 2PC reorder (Prepare-triggered) — DONE 2026-05-31.** The leader now

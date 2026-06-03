@@ -1,6 +1,6 @@
 //! Dynamic vnode rebalance control plane.
 
-#![cfg(feature = "cluster-unstable")]
+#![cfg(feature = "cluster")]
 #![allow(clippy::disallowed_types)] // cold path
 
 use std::sync::Arc;

@@ -5,7 +5,7 @@
 
 #![allow(clippy::disallowed_types)] // cold path: gossip discovery coordination
 use std::collections::HashMap;
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::Duration;
@@ -246,7 +246,7 @@ impl GossipDiscovery {
 
         let advertise_addr = if let Some(ref host) = self.config.advertise_host {
             let mut resolved = None;
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             {
                 if let Ok(addrs) = (host.as_str(), gossip_addr.port()).to_socket_addrs() {
                     for addr in addrs {
@@ -261,13 +261,13 @@ impl GossipDiscovery {
                 addr
             } else {
                 return Err(DiscoveryError::Bind(format!(
-                    "failed to resolve configured advertise_host '{host}' (or cluster-unstable feature is disabled)"
+                    "failed to resolve configured advertise_host '{host}' (or cluster feature is disabled)"
                 )));
             }
         } else if gossip_addr.ip().is_unspecified() {
             let resolved = {
                 let mut res = None;
-                #[cfg(feature = "cluster-unstable")]
+                #[cfg(feature = "cluster")]
                 {
                     let hostname = gethostname::gethostname();
                     let hostname_str = hostname.to_string_lossy();

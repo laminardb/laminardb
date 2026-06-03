@@ -45,7 +45,7 @@ impl VnodePartial {
     ///
     /// Only the cluster rehydration path decodes partials; in a non-cluster
     /// build this is exercised solely by unit tests.
-    #[cfg_attr(not(feature = "cluster-unstable"), allow(dead_code))]
+    #[cfg_attr(not(feature = "cluster"), allow(dead_code))]
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, DbError> {
         rkyv::from_bytes::<Self, rkyv::rancor::Error>(bytes)
             .map_err(|e| DbError::Checkpoint(format!("vnode partial deserialization: {e}")))

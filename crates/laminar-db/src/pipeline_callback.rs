@@ -114,20 +114,20 @@ pub(crate) struct ConnectorPipelineCallback {
     /// built with a controller. Used to gate the periodic checkpoint
     /// trigger on `is_leader()` and to run `follower_checkpoint` on
     /// non-leaders.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
     /// Highest epoch a non-leader has already prepared for. Prevents
     /// re-running `follower_checkpoint` on the same announcement.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) last_follower_epoch: Option<u64>,
     /// Local source barrier injectors to trigger follower-side checkpoints.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) barrier_injectors: Vec<(
         Arc<str>,
         laminar_core::checkpoint::CheckpointBarrierInjector,
     )>,
     /// Pending follower checkpoint announcement from gossip, waiting for local sources to align.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) pending_follower_checkpoint:
         Option<laminar_core::cluster::control::BarrierAnnouncement>,
     /// Inbound channel for `db.checkpoint()` requests. The db sends a
@@ -154,7 +154,7 @@ impl ConnectorPipelineCallback {
     /// minimum, when one has been published. A `None` `cluster_wm`
     /// leaves the map untouched — blindly capping to MIN would freeze
     /// every downstream event-time decision and hang the pipeline.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     fn cap_source_watermarks_by_cluster_min(
         source_wms: &mut FxHashMap<Arc<str>, i64>,
         cluster_wm: Option<i64>,
@@ -185,7 +185,7 @@ impl ConnectorPipelineCallback {
 
         self.sync_sinks_and_drain_events().await;
 
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         self.align_shuffle_for_leader().await?;
 
         let operator_states = self
@@ -240,7 +240,7 @@ impl ConnectorPipelineCallback {
         Ok(result)
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     async fn maybe_follower_checkpoint(
         &mut self,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
@@ -356,7 +356,7 @@ impl ConnectorPipelineCallback {
         }
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     async fn run_follower_checkpoint_deferred(
         &mut self,
         ann: laminar_core::cluster::control::BarrierAnnouncement,
@@ -461,7 +461,7 @@ impl ConnectorPipelineCallback {
     /// leader announces `Prepare` early here (so followers begin aligning), then
     /// aligns. No-op when not the leader or there is no cross-node shuffle. On
     /// alignment failure it signals `Abort` so prepared followers don't block.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     async fn align_shuffle_for_leader(&mut self) -> Result<(), DbError> {
         let (checkpoint_id, live) = {
             let mut guard = self.coordinator.lock().await;
@@ -533,7 +533,7 @@ impl ConnectorPipelineCallback {
     fn capture_vnode_states(
         &mut self,
     ) -> std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>> {
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         {
             match self.graph.snapshot_state_by_vnode() {
                 Ok(map) => map,
@@ -546,7 +546,7 @@ impl ConnectorPipelineCallback {
                 }
             }
         }
-        #[cfg(not(feature = "cluster-unstable"))]
+        #[cfg(not(feature = "cluster"))]
         {
             std::collections::HashMap::new()
         }
@@ -651,7 +651,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             }
         }
 
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         {
             let cluster_wm = self
                 .cluster_controller
@@ -922,7 +922,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn is_leader(&self) -> bool {
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         {
             if let Some(ref cc) = self.cluster_controller {
                 return cc.is_leader();
@@ -1021,7 +1021,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         // Followers mirror the leader's epoch via `follower_checkpoint`
         // on observed PREPARE announcements. Forced checkpoints
         // (shutdown) run on whatever instance is shutting down.
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         if !force {
             if let Some(cc) = self.cluster_controller.clone() {
                 if !cc.is_leader() {
@@ -1179,7 +1179,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
         use crate::pipeline::{BarrierOutcome, SkipReason};
 
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         if let Some(cc) = self.cluster_controller.clone() {
             if !cc.is_leader() {
                 if let Some(ann) = self.pending_follower_checkpoint.take() {
@@ -1217,7 +1217,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
         // Drain + align the cross-node shuffle before capture so peers'
         // pre-barrier rows enter the snapshot (announces Prepare early).
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         if let Err(e) = self.align_shuffle_for_leader().await {
             tracing::warn!(error = %e, "shuffle barrier alignment failed");
             return BarrierOutcome::Failed;
@@ -1351,7 +1351,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         // runs `execute_cycle` each idle tick — otherwise a follower with
         // no local source events never drains the shuffle receiver and
         // remote rows sit stranded. Non-cluster path unchanged.
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         {
             if self.cluster_controller.is_some() {
                 return true;
@@ -1527,11 +1527,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             laminar_core::checkpoint::CheckpointBarrierInjector,
         )>,
     ) {
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         {
             self.barrier_injectors = injectors;
         }
-        #[cfg(not(feature = "cluster-unstable"))]
+        #[cfg(not(feature = "cluster"))]
         {
             let _ = injectors;
         }
@@ -1670,7 +1670,7 @@ mod tests {
     /// Consumer-side cap is a no-op when the cluster has not yet
     /// published a minimum watermark — otherwise every event-time
     /// decision would freeze behind the `i64::MIN` sentinel.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[test]
     fn cap_source_watermarks_none_cluster_wm_leaves_map_untouched() {
         let mut wms: FxHashMap<Arc<str>, i64> = FxHashMap::default();
@@ -1686,7 +1686,7 @@ mod tests {
     /// When a cluster-wide minimum is published, sources that have
     /// advanced past it get pulled back to it; sources at or below
     /// the cap are left alone (cap must not push watermarks forward).
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[test]
     fn cap_source_watermarks_lowers_only_sources_above_cluster_min() {
         let mut wms: FxHashMap<Arc<str>, i64> = FxHashMap::default();

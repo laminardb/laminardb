@@ -11,10 +11,8 @@ description = "Core streaming engine for LaminarDB - operators, checkpoint barri
 
 [features]
 default = []
-# Distributed cluster coordination. Unstable: discovery + partition guards
-# work, but Raft consensus, inter-node RPC, and rebalance-on-membership are
-# not yet implemented. Do not enable in production.
-cluster-unstable = [
+# Distributed cluster coordination.
+cluster = [
     "dep:chitchat", "dep:tokio-util", "dep:anyhow",
     "dep:tonic", "dep:tonic-prost", "dep:prost",
     "dep:gethostname",
@@ -62,14 +60,14 @@ async-trait = { workspace = true }
 chitchat = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 # anyhow is needed for the chitchat Transport trait impls in the
-# testing module; activated by the cluster-unstable feature.
+# testing module; activated by the cluster feature.
 anyhow = { workspace = true, optional = true }
 gethostname = { workspace = true, optional = true }
 # futures is needed for the object_store::ObjectStore impl on
 # FaultyObjectStore (BoxStream type).
 futures = { workspace = true }
 
-# gRPC transport for cross-node shuffle + barrier sync (cluster-unstable).
+# gRPC transport for cross-node shuffle + barrier sync (cluster).
 # The generated client/server stubs are compiled only under that feature;
 # `tonic-prost` supplies the ProstCodec the generated code instantiates.
 tonic = { version = "0.14", optional = true }

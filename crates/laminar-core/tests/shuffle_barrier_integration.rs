@@ -2,7 +2,7 @@
 //! aligns once its local + shuffle inputs have both seen the same
 //! checkpoint id.
 
-#![cfg(feature = "cluster-unstable")]
+#![cfg(feature = "cluster")]
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -222,7 +222,7 @@ pub(crate) fn snapshot_and_rebuild(
 /// Convert an accumulator's restored state tuple to the `ArrayRef`s
 /// `Accumulator::merge_batch` expects. Mirrors the inline conversion in
 /// [`IncrementalAggState::restore_groups`].
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 fn scalars_to_arrays(scalars: &[ScalarValue]) -> Result<Vec<ArrayRef>, DbError> {
     scalars
         .iter()
@@ -257,7 +257,7 @@ impl IncrementalAggState {
     /// Number of leading GROUP BY columns in this aggregate's pre-agg
     /// output. Used by the cluster row-shuffle path to know which
     /// columns to hash.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[must_use]
     pub(crate) fn num_group_cols(&self) -> usize {
         self.num_group_cols
@@ -1303,7 +1303,7 @@ impl IncrementalAggState {
     /// union of the returned slices is byte-for-byte the groups that method
     /// would emit. Only vnodes with at least one group (or emitted entry) are
     /// present in the result.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[allow(clippy::disallowed_types)] // cold checkpoint path; vnode-keyed map
     pub(crate) fn checkpoint_groups_by_vnode(
         &mut self,
@@ -1381,7 +1381,7 @@ impl IncrementalAggState {
     /// accumulators merge associatively, the result is correct regardless of
     /// how many rows the operator already processed for these keys before the
     /// rebalanced state arrived. Used by the cross-node vnode rehydration path.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) fn merge_groups(
         &mut self,
         checkpoint: &AggStateCheckpoint,
@@ -3417,7 +3417,7 @@ mod tests {
 /// Per-vnode checkpoint partitioning + merge-apply (the cross-node vnode
 /// rehydration round-trip). Gated to cluster builds since that's where the
 /// new methods compile.
-#[cfg(all(test, feature = "cluster-unstable"))]
+#[cfg(all(test, feature = "cluster"))]
 mod vnode_partition_tests {
     use super::*;
 

@@ -53,7 +53,7 @@ impl ClusterController {
         members_rx: watch::Receiver<Vec<NodeInfo>>,
     ) -> Self {
         let mut barrier = BarrierCoordinator::new(Arc::clone(&kv));
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         barrier.set_leader_election(instance_id, members_rx.clone());
         Self {
             instance_id,
@@ -208,7 +208,7 @@ impl ClusterController {
     ///
     /// # Errors
     /// Propagates [`BarrierCoordinator::start_server`] errors.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub async fn start_barrier_server(
         &self,
         bind_addr: std::net::SocketAddr,

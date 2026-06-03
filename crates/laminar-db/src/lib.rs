@@ -74,7 +74,7 @@ mod pipeline_lifecycle;
 /// Deployment profiles.
 pub mod profile;
 /// Dynamic vnode rebalance control plane.
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 pub mod rebalance;
 /// Unified recovery manager.
 pub mod recovery_manager;
@@ -130,7 +130,7 @@ pub use profile::{Profile, ProfileError};
 pub use recovery_manager::{RecoveredState, RecoveryManager, VnodeRehydration, VnodeRehydrator};
 
 /// Rebalance-driven state-rehydration types (cluster mode).
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 pub use db::{RehydratedVnode, SnapshotAdoption};
 
 /// Re-export the connector registry for custom connector registration.

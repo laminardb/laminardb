@@ -11,7 +11,7 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 use laminar_core::shuffle::ShuffleMessage;
 
 use crate::aggregate_state::{
@@ -49,7 +49,7 @@ enum QueryState {
 /// Row-shuffle ships raw rows, not partial-aggregate state. Cheaper
 /// to implement than two-stage partial aggregation, linearly more
 /// bandwidth-hungry.
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 #[derive(Clone)]
 pub struct ClusterShuffleConfig {
     pub registry: Arc<laminar_core::state::VnodeRegistry>,
@@ -58,7 +58,7 @@ pub struct ClusterShuffleConfig {
     pub self_id: laminar_core::state::NodeId,
 }
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 impl std::fmt::Debug for ClusterShuffleConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClusterShuffleConfig")
@@ -78,7 +78,7 @@ pub(crate) struct SqlQueryOperator {
     having_cache: Option<super::HavingSqlCache>,
     emit_changelog: bool,
     idle_ttl_ms: Option<u64>,
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     cluster_shuffle: Option<ClusterShuffleConfig>,
 }
 
@@ -102,7 +102,7 @@ impl SqlQueryOperator {
             having_cache: None,
             emit_changelog,
             idle_ttl_ms,
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             cluster_shuffle: None,
         }
     }
@@ -111,7 +111,7 @@ impl SqlQueryOperator {
     /// resolves to the aggregate fast-path, each cycle's pre-aggregate
     /// rows are hash-routed across the cluster before reaching
     /// `IncrementalAggState`.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
         self.cluster_shuffle = Some(config);
     }
@@ -327,7 +327,7 @@ impl SqlQueryOperator {
         // group columns, keep local, ship remote via `ShuffleSender`.
         // Drain inbound remote rows from `ShuffleReceiver` and merge
         // into this cycle's input. Single-node path is a no-op.
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         let pre_agg_batches = {
             let num_group_cols = agg_state.num_group_cols();
             shuffle_pre_agg_batches(
@@ -355,7 +355,7 @@ impl SqlQueryOperator {
             ));
         };
 
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         let num_group_cols = agg_state.num_group_cols();
 
         let mut eviction = if self.emit_changelog {
@@ -386,9 +386,9 @@ impl SqlQueryOperator {
             eviction
         };
 
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         return self.suppress_restoring_output(result, num_group_cols);
-        #[cfg(not(feature = "cluster-unstable"))]
+        #[cfg(not(feature = "cluster"))]
         Ok(result)
     }
 
@@ -399,7 +399,7 @@ impl SqlQueryOperator {
     /// flips back to `Active` (and its rows resume emitting) once the graph
     /// applies its rehydrated slice. No-op when nothing is restoring — the
     /// common case, gated by a single atomic scan.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     fn suppress_restoring_output(
         &self,
         batches: Vec<RecordBatch>,
@@ -497,7 +497,7 @@ impl SqlQueryOperator {
 /// agrees on one owner, only that owner produces output.
 ///
 /// Single-node fallback: if `config` is `None` the function is a pass-through.
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 async fn shuffle_pre_agg_batches(
     config: Option<&ClusterShuffleConfig>,
     op_name: &str,
@@ -563,7 +563,7 @@ async fn shuffle_pre_agg_batches(
 /// Vnode per row, hashing the leading `num_group_cols` group columns.
 /// `num_group_cols == 0` is a global aggregate — every row hashes to vnode 0
 /// so a single owner produces output.
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 fn hash_rows_to_vnodes(batch: &RecordBatch, num_group_cols: usize, vnode_count: u32) -> Vec<u32> {
     if num_group_cols == 0 || batch.num_rows() == 0 {
         return vec![0; batch.num_rows()];
@@ -595,7 +595,7 @@ impl GraphOperator for SqlQueryOperator {
                 // has no local input. `execute_agg` handles empty local
                 // input gracefully (pre-agg on empty → empty pre-agg,
                 // shuffle drain supplies any remote rows).
-                #[cfg(feature = "cluster-unstable")]
+                #[cfg(feature = "cluster")]
                 {
                     if self.cluster_shuffle.is_some() {
                         return self.execute_agg(input_batches, watermark).await;
@@ -717,7 +717,7 @@ impl GraphOperator for SqlQueryOperator {
         }
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     async fn ingest_shuffle(
         &mut self,
         _stage: &str,
@@ -735,7 +735,7 @@ impl GraphOperator for SqlQueryOperator {
         Ok(())
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[allow(clippy::disallowed_types)] // cold checkpoint path; vnode-keyed map
     fn checkpoint_by_vnode(
         &mut self,
@@ -763,7 +763,7 @@ impl GraphOperator for SqlQueryOperator {
         Ok(Some(out))
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     fn apply_vnode_state(&mut self, vnode: u32, bytes: &[u8]) -> Result<(), DbError> {
         let cp: AggStateCheckpoint =
             rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(bytes).map_err(|e| {

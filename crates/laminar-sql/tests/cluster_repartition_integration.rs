@@ -1,7 +1,7 @@
 //! End-to-end routing test: rows destined for remote vnodes leave via
 //! `ShuffleSender`; local vnodes land on the matching output partition.
 
-#![cfg(feature = "cluster-unstable")]
+#![cfg(feature = "cluster")]
 #![allow(clippy::disallowed_types)]
 
 use std::sync::Arc;

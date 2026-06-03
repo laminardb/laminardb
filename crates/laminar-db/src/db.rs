@@ -103,7 +103,7 @@ pub struct LaminarDB {
     pub(crate) control_tx: parking_lot::Mutex<Option<ControlMsgTx>>,
     pub(crate) mv_store: Arc<parking_lot::RwLock<crate::mv_store::MvStore>>,
     /// Activates leader/follower checkpoint flow when set. `None` in embedded mode.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) cluster_controller:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::ClusterController>>>,
     /// Pair with `vnode_registry`; the coordinator writes per-vnode durability
@@ -117,22 +117,22 @@ pub struct LaminarDB {
     /// `target_partitions` override; cluster mode sets this to `vnode_count`.
     pub(crate) pipeline_target_partitions: Option<usize>,
     /// Used by `SqlQueryOperator` to row-shuffle pre-aggregate batches to owners.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) shuffle_sender:
         parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleSender>>>,
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) shuffle_receiver:
         parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleReceiver>>>,
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) decision_store:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::CheckpointDecisionStore>>>,
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) assignment_snapshot_store:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>>,
     /// Cluster-wide catalog manifest store (`catalog/manifest.json` on the
     /// shared object store). Persisted on each successful checkpoint and
     /// replayed at boot so a node rebuilds MVs/sources it lacks locally.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) catalog_manifest_store:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::CatalogManifestStore>>>,
     /// Committed per-vnode state staged by [`Self::adopt_assignment_snapshot`]
@@ -143,7 +143,7 @@ pub struct LaminarDB {
     /// `Arc`-wrapped so the same handle is shared with the `OperatorGraph`
     /// (via [`ClusterShuffleConfig`](crate::operator::sql_query::ClusterShuffleConfig)),
     /// which drains and applies the staged slices into live operators each cycle.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) rehydrated_vnode_state: Arc<parking_lot::Mutex<HashMap<u32, RehydratedVnode>>>,
     /// Hands `db.checkpoint()` requests to the pipeline callback so it can capture
     /// operator state before the manifest is packed. When `None`, falls back to
@@ -194,7 +194,7 @@ pub(crate) use laminar_core::time::parse_duration_str;
 
 /// Committed state for a single vnode, staged during rebalance adoption
 /// so newly-acquired vnodes resume from the last committed epoch.
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 #[derive(Debug, Clone)]
 pub struct RehydratedVnode {
     /// Committed epoch the partial was read from.
@@ -208,7 +208,7 @@ pub struct RehydratedVnode {
 /// Returned so the rebalance control plane can log and meter what each
 /// adoption moved — in particular the vnodes this node gained and how
 /// much of their committed state it rehydrated from durable storage.
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 #[derive(Debug, Default)]
 pub struct SnapshotAdoption {
     /// `false` when the snapshot was stale (≤ the current registry
@@ -292,7 +292,7 @@ impl LaminarDB {
                 .with_config(session_config)
                 .with_default_features()
                 .with_query_planner(query_planner);
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             {
                 state_builder = state_builder.with_physical_optimizer_rule(Arc::new(
                     laminar_sql::datafusion::cluster_repartition::DistributedJoinRule,
@@ -312,15 +312,15 @@ impl LaminarDB {
 
         let connector_registry = Arc::new(laminar_connectors::registry::ConnectorRegistry::new());
         Self::register_builtin_connectors(&connector_registry);
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         let mut physical_rules = extra_optimizer_rules.to_vec();
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         {
             physical_rules.push(Arc::new(
                 laminar_sql::datafusion::cluster_repartition::DistributedJoinRule,
             ));
         }
-        #[cfg(not(feature = "cluster-unstable"))]
+        #[cfg(not(feature = "cluster"))]
         let physical_rules = extra_optimizer_rules.to_vec();
 
         Ok(Self {
@@ -352,23 +352,23 @@ impl LaminarDB {
             ai_handle: None,
             control_tx: parking_lot::Mutex::new(None),
             mv_store: Arc::new(parking_lot::RwLock::new(crate::mv_store::MvStore::new())),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             cluster_controller: parking_lot::Mutex::new(None),
             state_backend: parking_lot::Mutex::new(None),
             vnode_registry: parking_lot::Mutex::new(None),
             physical_optimizer_rules: physical_rules.into(),
             pipeline_target_partitions: target_partitions,
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             shuffle_sender: parking_lot::Mutex::new(None),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             shuffle_receiver: parking_lot::Mutex::new(None),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             decision_store: parking_lot::Mutex::new(None),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             assignment_snapshot_store: parking_lot::Mutex::new(None),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             catalog_manifest_store: parking_lot::Mutex::new(None),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             rehydrated_vnode_state: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             force_ckpt_tx: parking_lot::Mutex::new(None),
             subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
@@ -394,13 +394,13 @@ impl LaminarDB {
         self.ai_handle = Some(handle);
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) fn set_shuffle_sender(&self, sender: Arc<laminar_core::shuffle::ShuffleSender>) {
         *self.shuffle_sender.lock() = Some(sender);
         self.update_sql_cluster_context();
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) fn set_shuffle_receiver(
         &self,
         receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
@@ -409,7 +409,7 @@ impl LaminarDB {
         self.update_sql_cluster_context();
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     fn update_sql_cluster_context(&self) {
         if let (Some(registry), Some(sender), Some(receiver)) = (
             self.vnode_registry.lock().as_ref(),
@@ -432,7 +432,7 @@ impl LaminarDB {
         }
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) fn set_decision_store(
         &self,
         store: Arc<laminar_core::cluster::control::CheckpointDecisionStore>,
@@ -440,7 +440,7 @@ impl LaminarDB {
         *self.decision_store.lock() = Some(store);
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) fn set_assignment_snapshot_store(
         &self,
         store: Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
@@ -450,7 +450,7 @@ impl LaminarDB {
 
     /// Install the shared catalog manifest store. Enables catalog-manifest
     /// persistence (on checkpoint) and boot-time replay.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) fn set_catalog_manifest_store(
         &self,
         store: Arc<laminar_core::cluster::control::CatalogManifestStore>,
@@ -462,7 +462,7 @@ impl LaminarDB {
     /// `catalog/manifest.json`. Best-effort and cluster-only — a failure is
     /// logged, never propagated, since the manifest is an availability aid,
     /// not a correctness gate. Called after each successful checkpoint.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) async fn persist_catalog_manifest(&self) {
         let Some(store) = self.catalog_manifest_store.lock().clone() else {
             return;
@@ -495,7 +495,7 @@ impl LaminarDB {
     /// cluster-only; runs at boot before the pipeline starts so the operator
     /// graph for rebalanced-in MVs exists. A per-entry replay failure is
     /// logged and skipped — the node still serves the objects that did rebuild.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) async fn restore_catalog_from_manifest(&self) {
         let Some(store) = self.catalog_manifest_store.lock().clone() else {
             return;
@@ -524,7 +524,7 @@ impl LaminarDB {
 
     /// Whether a catalog object with `name` is already registered locally
     /// (any of source/sink/stream/table). Drives idempotent manifest replay.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     fn catalog_object_exists(&self, name: &str) -> bool {
         let mgr = self.connector_manager.lock();
         mgr.sources().contains_key(name)
@@ -542,7 +542,7 @@ impl LaminarDB {
     /// *after* the coordinator lock is released so a slow object store can't
     /// stall the checkpoint cadence; the recovered bytes are staged in
     /// [`Self::rehydrated_vnode_state`] for operators to drain.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub async fn adopt_assignment_snapshot(
         &self,
         snapshot: laminar_core::cluster::control::AssignmentSnapshot,
@@ -659,13 +659,13 @@ impl LaminarDB {
     /// vnodes during the most recent rebalance adoptions. Keyed by vnode.
     /// Drained by operators that adopt the per-vnode state backend; exposed
     /// for inspection and tests.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[must_use]
     pub fn rehydrated_vnode_state(&self) -> HashMap<u32, RehydratedVnode> {
         self.rehydrated_vnode_state.lock().clone()
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) fn set_cluster_controller(
         &self,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
@@ -680,7 +680,7 @@ impl LaminarDB {
 
     pub(crate) fn set_vnode_registry(&self, registry: Arc<laminar_core::state::VnodeRegistry>) {
         *self.vnode_registry.lock() = Some(registry);
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         self.update_sql_cluster_context();
     }
 
@@ -2104,7 +2104,7 @@ impl LaminarDB {
             ));
         }
 
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         {
             let leader_opt = {
                 let cc_guard = self.cluster_controller.lock();
@@ -2164,7 +2164,7 @@ impl LaminarDB {
 
         // Refresh the shared catalog manifest on every successful checkpoint so
         // a node joining later can rebuild this node's MVs/sources. Best-effort.
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         if matches!(&result, Ok(r) if r.success) {
             self.persist_catalog_manifest().await;
         }
@@ -2172,7 +2172,7 @@ impl LaminarDB {
         result
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     async fn forward_checkpoint_to_leader(
         &self,
         addr: &str,

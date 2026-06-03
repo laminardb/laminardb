@@ -63,7 +63,7 @@ pub(crate) trait GraphOperator: Send {
     /// arrived between cycles so they enter the snapshot. Default: no-op (for
     /// operators that don't consume the cross-node shuffle). `watermark` is the
     /// checkpoint watermark.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     async fn ingest_shuffle(
         &mut self,
         _stage: &str,
@@ -79,7 +79,7 @@ pub(crate) trait GraphOperator: Send {
     /// (default) for operators that aren't vnode-partitionable — those recover
     /// from the whole-node manifest blob instead. The per-vnode bytes are the
     /// same encoding the operator's own restore/apply path consumes.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[allow(clippy::disallowed_types)] // cold checkpoint path; vnode-keyed map
     fn checkpoint_by_vnode(
         &mut self,
@@ -92,7 +92,7 @@ pub(crate) trait GraphOperator: Send {
     /// [`checkpoint_by_vnode`](Self::checkpoint_by_vnode) on whichever node
     /// last owned the vnode) into this operator. Default no-op for operators
     /// that don't partition by vnode.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     fn apply_vnode_state(&mut self, _vnode: u32, _bytes: &[u8]) -> Result<(), DbError> {
         Ok(())
     }
@@ -295,14 +295,14 @@ pub(crate) struct OperatorGraph {
     /// Cluster-mode row-shuffle config for streaming aggregates.
     /// `None` outside cluster mode; threaded to `SqlQueryOperator` so
     /// pre-aggregate rows can be hash-routed to vnode owners.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     cluster_shuffle: Option<crate::operator::sql_query::ClusterShuffleConfig>,
     /// Shared handle to the DB's staged per-vnode rehydration map. Drained at
     /// the start of each cycle by [`apply_rehydrated_vnodes`](Self::apply_rehydrated_vnodes):
     /// vnodes this node newly acquired in a rebalance have their committed
     /// state merged into the matching operators before they process new rows.
     /// `None` outside cluster mode.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[allow(clippy::disallowed_types)] // shares the DB's std-HashMap-typed handle
     rehydrated_vnode_state:
         Option<Arc<parking_lot::Mutex<std::collections::HashMap<u32, crate::db::RehydratedVnode>>>>,
@@ -330,9 +330,9 @@ impl OperatorGraph {
             deferred_scan_offset: 0,
             stats_tick: 0,
             max_state_bytes: None,
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             cluster_shuffle: None,
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             rehydrated_vnode_state: None,
             ctx,
             prom: None,
@@ -461,7 +461,7 @@ impl OperatorGraph {
 
     /// Install the row-shuffle config used by streaming aggregates in
     /// cluster mode.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub fn set_cluster_shuffle(
         &mut self,
         config: crate::operator::sql_query::ClusterShuffleConfig,
@@ -471,7 +471,7 @@ impl OperatorGraph {
 
     /// Share the DB's staged per-vnode rehydration map so the graph can drain
     /// and apply rebalanced state into operators each cycle.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[allow(clippy::disallowed_types)] // shares the DB's std-HashMap-typed handle
     pub fn set_rehydration_handle(
         &mut self,
@@ -490,7 +490,7 @@ impl OperatorGraph {
     /// logged and skipped, and the vnode still flips to `Active` (it serves
     /// from whatever state did apply, exactly like a vnode with no durable
     /// state). Cheap no-op when nothing is staged.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     fn apply_rehydrated_vnodes(&mut self) {
         // Clone owned handles out so no borrow of `self` survives into the
         // `self.nodes.iter_mut()` dispatch below.
@@ -1276,7 +1276,7 @@ impl OperatorGraph {
         // to the DataFusion lookup path if the registry/runtime handle is absent.
         if let Some(cfg) = lookup_enrich_config {
             if let (Some(reg), Some(handle)) = (&self.lookup_registry, &self.main_runtime_handle) {
-                #[cfg_attr(not(feature = "cluster-unstable"), allow(unused_mut))]
+                #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
                 let mut op = operator::lookup_enrich::LookupEnrichOperator::new(
                     name,
                     cfg,
@@ -1288,7 +1288,7 @@ impl OperatorGraph {
                 );
                 // In cluster mode, key-shard the probe side across nodes for
                 // cache affinity (same shuffle config the aggregate path uses).
-                #[cfg(feature = "cluster-unstable")]
+                #[cfg(feature = "cluster")]
                 if let Some(ref sc) = self.cluster_shuffle {
                     op.attach_cluster_shuffle(sc.clone());
                 }
@@ -1330,27 +1330,27 @@ impl OperatorGraph {
             // No time columns ⇒ plain equi-join → per-cycle batch join; with
             // time columns ⇒ interval join.
             if cfg.left_time_column.is_empty() && cfg.right_time_column.is_empty() {
-                #[cfg_attr(not(feature = "cluster-unstable"), allow(unused_mut))]
+                #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
                 let mut op = operator::process_time_join::ProcessTimeJoinOperator::new(
                     name,
                     cfg.clone(),
                     projection_sql.map(Arc::from),
                     self.ctx.clone(),
                 );
-                #[cfg(feature = "cluster-unstable")]
+                #[cfg(feature = "cluster")]
                 if let Some(ref sc) = self.cluster_shuffle {
                     op.attach_cluster_shuffle(sc.clone());
                 }
                 return Box::new(op);
             }
-            #[cfg_attr(not(feature = "cluster-unstable"), allow(unused_mut))]
+            #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
             let mut op = operator::interval_join::IntervalJoinOperator::new(
                 name,
                 cfg.clone(),
                 projection_sql.map(Arc::from),
                 self.ctx.clone(),
             );
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             if let Some(ref sc) = self.cluster_shuffle {
                 op.attach_cluster_shuffle(sc.clone());
             }
@@ -1410,7 +1410,7 @@ impl OperatorGraph {
 
         let emit_changelog = emit_clause.is_some_and(|ec| matches!(ec, EmitClause::Changes));
 
-        #[cfg_attr(not(feature = "cluster-unstable"), allow(unused_mut))]
+        #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
         let mut op = operator::sql_query::SqlQueryOperator::new(
             name,
             sql,
@@ -1419,7 +1419,7 @@ impl OperatorGraph {
             emit_changelog,
             idle_ttl_ms,
         );
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         if let Some(ref cfg) = self.cluster_shuffle {
             op.attach_cluster_shuffle(cfg.clone());
         }
@@ -1745,7 +1745,7 @@ impl OperatorGraph {
         // Merge any rebalanced-in vnode state into operators before they see
         // this cycle's rows, so the snapshot a new owner resumes from is in
         // place first.
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         self.apply_rehydrated_vnodes();
 
         if self.topo_dirty {
@@ -1882,7 +1882,7 @@ impl OperatorGraph {
 
     /// Route one peer-shipped shuffle batch to the operator named `stage`.
     /// Unknown stage (no such live operator) is dropped.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     async fn ingest_to_stage(
         &mut self,
         stage: &str,
@@ -1917,7 +1917,7 @@ impl OperatorGraph {
     /// # Errors
     /// Fails the checkpoint (caller retries) on timeout or a closed receiver —
     /// the deliberate degradation under a straggling peer.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) async fn align_shuffle_barriers(
         &mut self,
         checkpoint_id: u64,
@@ -2068,7 +2068,7 @@ impl OperatorGraph {
 
     /// Append a node with a given operator (test-only, for exercising
     /// `align_shuffle_barriers` without the full query-build path).
-    #[cfg(all(test, feature = "cluster-unstable"))]
+    #[cfg(all(test, feature = "cluster"))]
     pub(crate) fn push_test_node(&mut self, name: &str, operator: Box<dyn GraphOperator>) {
         self.nodes.push(GraphNode {
             name: Arc::from(name),
@@ -2112,7 +2112,7 @@ impl OperatorGraph {
     /// shuffle config means no vnode topology to partition by). The vnode count
     /// is taken from the registry the cluster shuffle was wired with, so the
     /// partition matches the routing that delivered each key here.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[allow(clippy::disallowed_types)] // std HashMap matches the trait/CheckpointRequest shape
     pub fn snapshot_state_by_vnode(
         &mut self,
@@ -2216,10 +2216,10 @@ mod tests {
     }
 
     /// Records the batches handed to `ingest_shuffle`.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     struct RecordingOperator(Arc<parking_lot::Mutex<Vec<RecordBatch>>>);
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[async_trait]
     impl GraphOperator for RecordingOperator {
         async fn process(
@@ -2249,7 +2249,7 @@ mod tests {
     /// A peer ships a row + its barrier; alignment folds the row into the target
     /// operator (so it would enter the snapshot) and completes once the peer's
     /// barrier is observed.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn align_shuffle_barriers_folds_peer_rows_then_aligns() {
         use laminar_core::checkpoint::barrier::CheckpointBarrier;

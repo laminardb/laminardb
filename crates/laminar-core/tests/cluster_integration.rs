@@ -5,11 +5,11 @@
 //! and exercises a specific property. Timeouts are generous to
 //! accommodate gossip propagation variability.
 //!
-//! Feature-gated on `cluster-unstable`. Run with:
-//!     cargo test -p laminar-core --features cluster-unstable \
+//! Feature-gated on `cluster`. Run with:
+//!     cargo test -p laminar-core --features cluster \
 //!         --test cluster_integration
 
-#![cfg(feature = "cluster-unstable")]
+#![cfg(feature = "cluster")]
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

@@ -199,7 +199,7 @@ pub struct CheckpointCoordinator {
     local_watermark_ms: Option<i64>,
     /// Cluster-wide min watermark as of the last committed epoch
     /// (leader-side; fanned out in the Commit announcement).
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     cluster_min_watermark: Option<i64>,
     /// Vnodes this coordinator owns; drives per-vnode marker writes.
     vnode_set: Vec<u32>,
@@ -216,7 +216,7 @@ pub struct CheckpointCoordinator {
     pending_vnode_states:
         std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>>,
     /// `Some` in cluster mode, `None` in single-instance / embedded.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
     /// Cached sorted sink names; invalidated on `register_sink`.
     cached_sorted_sink_names: Option<Vec<String>>,
@@ -277,12 +277,12 @@ impl CheckpointCoordinator {
             assignment_version: 0,
             decision_store: None,
             local_watermark_ms: None,
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             cluster_min_watermark: None,
             vnode_set: Vec::new(),
             gate_vnode_set: Vec::new(),
             pending_vnode_states: std::collections::HashMap::new(),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             cluster_controller: None,
             cached_sorted_sink_names: None,
         })
@@ -290,7 +290,7 @@ impl CheckpointCoordinator {
 
     /// Activates cluster-mode 2PC. Without this the coordinator runs
     /// single-instance semantics.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub fn set_cluster_controller(
         &mut self,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
@@ -687,7 +687,7 @@ impl CheckpointCoordinator {
             None => false,
         };
 
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         let is_leader = self
             .cluster_controller
             .as_ref()
@@ -705,7 +705,7 @@ impl CheckpointCoordinator {
             {
                 warn!(epoch, checkpoint_id, error = %e, "post-recovery manifest update failed");
             }
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             if is_leader {
                 self.announce_if_leader(
                     epoch,
@@ -723,7 +723,7 @@ impl CheckpointCoordinator {
             if let Err(e) = self.rollback_sinks(epoch).await {
                 error!(epoch, checkpoint_id, error = %e, "sink rollback failed during recovery");
             }
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             if is_leader {
                 self.announce_if_leader(
                     epoch,
@@ -736,7 +736,7 @@ impl CheckpointCoordinator {
         }
 
         // Brief pause so the announcement gossips before the next checkpoint tick.
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         if is_leader {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -770,7 +770,7 @@ impl CheckpointCoordinator {
     /// local watermark). Downstream operators read the published
     /// value from [`ClusterController`] so event-time decisions stay
     /// consistent across the cluster.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     async fn announce_if_leader(
         &self,
         epoch: u64,
@@ -808,7 +808,7 @@ impl CheckpointCoordinator {
     /// use, since `next_checkpoint_id` is stable until commit), or `None` if not
     /// the leader. `await_prepare_quorum` later re-announces the identical
     /// `Prepare` idempotently, and followers dedup by epoch.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub async fn announce_prepare(&self) -> Option<u64> {
         use laminar_core::cluster::control::Phase;
         let cc = self.cluster_controller.as_ref()?;
@@ -824,7 +824,7 @@ impl CheckpointCoordinator {
     /// Leader-only: announce `Abort` for an early-announced checkpoint whose
     /// shuffle alignment failed, so followers already prepared on the `Prepare`
     /// don't block until their decision timeout.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub async fn announce_abort(&self, checkpoint_id: u64) {
         use laminar_core::cluster::control::Phase;
         self.announce_if_leader(self.epoch, checkpoint_id, Phase::Abort, None)
@@ -833,7 +833,7 @@ impl CheckpointCoordinator {
 
     /// Live cluster node ids (the controller's view), for the caller to derive
     /// the shuffle barrier-alignment peer set. Empty without a controller.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[must_use]
     pub fn live_node_ids(&self) -> Vec<u64> {
         self.cluster_controller
@@ -848,7 +848,7 @@ impl CheckpointCoordinator {
     /// minimum watermark (leader's local + min of follower acks) into
     /// `self.cluster_min_watermark` so the subsequent `Commit`
     /// announcement can fan it out.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     async fn await_prepare_quorum(&mut self, epoch: u64, checkpoint_id: u64) -> Option<String> {
         use laminar_core::cluster::control::{Phase, QuorumOutcome};
         let cc = self.cluster_controller.as_ref()?;
@@ -1126,7 +1126,7 @@ impl CheckpointCoordinator {
     ///
     /// # Errors
     /// Propagates sink pre-commit, manifest save, or marker-write failures.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub async fn follower_checkpoint(
         &mut self,
         request: CheckpointRequest,
@@ -1215,7 +1215,7 @@ impl CheckpointCoordinator {
 
     /// Commit this follower's sinks for `epoch` and update its
     /// manifest's Pending entries. Returns `true` on clean commit.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     async fn drive_follower_commit(&mut self, epoch: u64, checkpoint_id: u64) -> bool {
         let statuses = self.commit_sinks_tracked(epoch).await;
         let has_failures = statuses
@@ -1252,7 +1252,7 @@ impl CheckpointCoordinator {
     }
 
     /// Pre-commit + save manifest + write vnode markers.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     async fn follower_prepare(
         &mut self,
         request: CheckpointRequest,
@@ -1470,7 +1470,7 @@ impl CheckpointCoordinator {
 
         // Cluster 2PC phase 1: announce PREPARE and wait for followers
         // to snapshot + ack.
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         {
             if let Some(quorum_failure) = self.await_prepare_quorum(epoch, checkpoint_id).await {
                 self.phase = CheckpointPhase::Idle;
@@ -1513,7 +1513,7 @@ impl CheckpointCoordinator {
                             "[LDB-6020] state durability gate returned false — \
                              rolling back sinks",
                         );
-                        #[cfg(feature = "cluster-unstable")]
+                        #[cfg(feature = "cluster")]
                         self.announce_if_leader(
                             epoch,
                             checkpoint_id,
@@ -1550,7 +1550,7 @@ impl CheckpointCoordinator {
                             "[LDB-6022] state backend error during durability gate — \
                              treating as gate miss, rolling back sinks",
                         );
-                        #[cfg(feature = "cluster-unstable")]
+                        #[cfg(feature = "cluster")]
                         self.announce_if_leader(
                             epoch,
                             checkpoint_id,
@@ -1588,13 +1588,13 @@ impl CheckpointCoordinator {
         // reads to distinguish "committed mid-flight" from "never
         // committed". Cluster mode gates on leadership.
         let is_decision_leader = {
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             {
                 self.cluster_controller
                     .as_ref()
                     .is_none_or(|cc| cc.is_leader())
             }
-            #[cfg(not(feature = "cluster-unstable"))]
+            #[cfg(not(feature = "cluster"))]
             {
                 true
             }
@@ -1607,7 +1607,7 @@ impl CheckpointCoordinator {
                         checkpoint_id, epoch, error = %reason,
                         "[LDB-6038] cannot record commit marker — aborting epoch",
                     );
-                    #[cfg(feature = "cluster-unstable")]
+                    #[cfg(feature = "cluster")]
                     self.announce_if_leader(
                         epoch,
                         checkpoint_id,
@@ -1637,7 +1637,7 @@ impl CheckpointCoordinator {
             }
         }
 
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         // Fan out the cluster-wide min watermark computed during
         // `await_prepare_quorum`. Followers consume this from
         // `observe_barrier` and update their consumer-side view.
@@ -2397,7 +2397,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn reconcile_announces_abort_when_no_decision_store() {
         // Fallback path: if no decision store is wired (e.g. legacy
@@ -2438,7 +2438,7 @@ mod tests {
         assert_eq!(ann.checkpoint_id, 42);
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn reconcile_announces_commit_when_marker_present() {
         use laminar_core::cluster::control::{
@@ -2485,7 +2485,7 @@ mod tests {
         assert_eq!(ann.checkpoint_id, 42);
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn reconcile_announces_abort_when_marker_missing() {
         // Decision store is wired but has no marker for this epoch —
@@ -2532,7 +2532,7 @@ mod tests {
         assert_eq!(ann.epoch, 3);
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn reconcile_silent_when_manifest_clean() {
         use laminar_core::cluster::control::{
@@ -2567,7 +2567,7 @@ mod tests {
         assert!(kv.read_from(self_id, ANNOUNCEMENT_KEY).await.is_none());
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn follower_checkpoint_commits_on_leader_commit() {
         use laminar_core::cluster::control::{
@@ -2649,7 +2649,7 @@ mod tests {
         assert_eq!(stored.epoch, 1);
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn follower_checkpoint_rolls_back_on_leader_abort() {
         use laminar_core::cluster::control::{
@@ -2702,7 +2702,7 @@ mod tests {
         assert!(!committed, "follower should roll back on leader's Abort");
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn leader_publishes_cluster_min_watermark_to_controller() {
         // On a solo cluster, `await_prepare_quorum` computes the
@@ -2769,7 +2769,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[tokio::test]
     async fn leader_announces_prepare_and_commit_on_solo_cluster() {
         use laminar_core::cluster::control::{

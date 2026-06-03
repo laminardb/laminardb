@@ -5,8 +5,8 @@ pub mod ai_udf;
 mod bridge;
 mod channel_source;
 /// Cross-instance hash repartition for distributed GROUP BY. Gated on
-/// `cluster-unstable` because it pulls in the shuffle transport.
-#[cfg(feature = "cluster-unstable")]
+/// `cluster` because it pulls in the shuffle transport.
+#[cfg(feature = "cluster")]
 pub mod cluster_repartition;
 /// Lambda higher-order functions for arrays and maps (F-SCHEMA-015 Tier 3)
 pub mod complex_type_lambda;
@@ -174,7 +174,7 @@ pub fn create_streaming_context_with_validator(mode: StreamingValidatorMode) -> 
         let mut rules: Vec<
             Arc<dyn datafusion::physical_optimizer::PhysicalOptimizerRule + Send + Sync>,
         > = vec![Arc::new(StreamingPhysicalValidator::new(mode))];
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         rules.push(Arc::new(cluster_repartition::DistributedJoinRule));
         rules.extend(default_state.physical_optimizers().iter().cloned());
 

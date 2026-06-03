@@ -34,9 +34,9 @@ use crate::error::DbError;
 use crate::operator::ProjectingJoinState;
 use crate::operator_graph::{GraphOperator, OperatorCheckpoint};
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 use crate::operator::sql_query::ClusterShuffleConfig;
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 use laminar_core::shuffle::ShuffleMessage;
 
 const SUBMIT_CAPACITY: usize = 256;
@@ -145,7 +145,7 @@ pub(crate) struct LookupEnrichOperator {
     table_name: String,
     /// This operator's output (MV) name; used as the shuffle stage tag in
     /// cluster mode so peers route this join's rows back to this operator.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     op_name: Arc<str>,
     key_columns: Vec<String>,
     join_type: LookupJoinType,
@@ -165,7 +165,7 @@ pub(crate) struct LookupEnrichOperator {
     /// then runs purely per-node). When set, `process` key-shards incoming
     /// stream rows across the cluster by lookup key before probing the cache,
     /// so each node caches only the key range it owns (cache affinity).
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     cluster_shuffle: Option<ClusterShuffleConfig>,
 }
 
@@ -181,7 +181,7 @@ impl LookupEnrichOperator {
     ) -> Self {
         Self {
             table_name: config.table_name,
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             op_name: Arc::from(name),
             key_columns: config.key_columns,
             join_type: config.join_type,
@@ -195,7 +195,7 @@ impl LookupEnrichOperator {
             next_batch_id: 0,
             max_in_flight: MAX_IN_FLIGHT_ROWS,
             metrics,
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             cluster_shuffle: None,
         }
     }
@@ -204,7 +204,7 @@ impl LookupEnrichOperator {
     /// key-shards incoming stream rows by lookup key across the cluster
     /// (shipping rows whose key-vnode this node does not own to the owner,
     /// and ingesting rows peers ship here) before probing the cache.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
         self.cluster_shuffle = Some(config);
     }
@@ -593,7 +593,7 @@ impl LookupEnrichOperator {
     /// vnode: ship rows this node doesn't own, drain rows peers shipped here,
     /// and return the local set to enrich. Forward-only — any node can look up
     /// any key. `None` config (single node) is a pass-through.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     async fn shuffle_input(
         &mut self,
         batches: &[RecordBatch],
@@ -723,9 +723,9 @@ impl GraphOperator for LookupEnrichOperator {
         // ingest the local + inbound set. Replayed batches above bypass the
         // shuffle — they are already local. Single-node: a straight passthrough.
         let new_input = inputs.first().map_or(&[][..], Vec::as_slice);
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         let to_ingest = self.shuffle_input(new_input).await?;
-        #[cfg(not(feature = "cluster-unstable"))]
+        #[cfg(not(feature = "cluster"))]
         let to_ingest: Vec<RecordBatch> = new_input.to_vec();
         for batch in to_ingest {
             if batch.num_rows() > 0 {
@@ -800,7 +800,7 @@ impl GraphOperator for LookupEnrichOperator {
         self.in_flight_rows() < self.max_in_flight
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     async fn ingest_shuffle(
         &mut self,
         _stage: &str,
@@ -1130,7 +1130,7 @@ mod tests {
     /// A cluster node: owns its vnodes per `assignment`, ships to `peer` at
     /// `peer_addr`, receives on `receiver`, and looks `keys` up in an in-memory
     /// source. Inner join over `customers(id)` on `customer_id`.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     async fn cluster_node(
         self_id: u64,
         peer: u64,
@@ -1187,7 +1187,7 @@ mod tests {
     /// A row whose lookup-key vnode a node doesn't own is shipped to the owner,
     /// enriched there, and emitted there — so every input key surfaces on
     /// exactly one node, the one that owns it.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cluster_key_shuffle_routes_remote_keys_to_owner() {
         use laminar_core::shuffle::ShuffleReceiver;

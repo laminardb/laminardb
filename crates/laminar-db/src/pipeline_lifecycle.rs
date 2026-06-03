@@ -182,7 +182,7 @@ impl LaminarDB {
         // before wiring the pipeline — replaying DDL here is the same pre-start
         // path users take when they CREATE before start(). Best-effort/no-op
         // outside cluster mode or with no manifest stored.
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         self.restore_catalog_from_manifest().await;
 
         match self.start_inner().await {
@@ -287,7 +287,7 @@ impl LaminarDB {
             // Cluster mode: install the controller so the coordinator
             // can consult it for leader / follower role once the
             // barrier-protocol flow change lands.
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             if let Some(controller) = self.cluster_controller.lock().clone() {
                 coord.set_cluster_controller(controller);
             }
@@ -302,7 +302,7 @@ impl LaminarDB {
                 self.vnode_registry.lock().clone(),
             ) {
                 let owner = {
-                    #[cfg(feature = "cluster-unstable")]
+                    #[cfg(feature = "cluster")]
                     {
                         self.cluster_controller
                             .lock()
@@ -311,7 +311,7 @@ impl LaminarDB {
                                 laminar_core::state::NodeId(c.instance_id().0)
                             })
                     }
-                    #[cfg(not(feature = "cluster-unstable"))]
+                    #[cfg(not(feature = "cluster"))]
                     {
                         laminar_core::state::NodeId(0)
                     }
@@ -339,7 +339,7 @@ impl LaminarDB {
             // auto-wire one on the same backing so recovery can read
             // the commit marker.
             let ds = {
-                #[cfg(feature = "cluster-unstable")]
+                #[cfg(feature = "cluster")]
                 {
                     self.decision_store.lock().clone().unwrap_or_else(|| {
                         Arc::new(
@@ -349,7 +349,7 @@ impl LaminarDB {
                         )
                     })
                 }
-                #[cfg(not(feature = "cluster-unstable"))]
+                #[cfg(not(feature = "cluster"))]
                 {
                     Arc::new(
                         laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
@@ -486,7 +486,7 @@ impl LaminarDB {
         // Install the cluster row-shuffle config if all the pieces are
         // present (registry, sender, receiver, controller). Without any
         // one of them, aggregate queries run single-node.
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         {
             let sender = self.shuffle_sender.lock().clone();
             let receiver = self.shuffle_receiver.lock().clone();
@@ -669,7 +669,7 @@ impl LaminarDB {
                 config.set("_arrow_schema".to_string(), schema_str);
             }
 
-            #[cfg_attr(not(feature = "cluster-unstable"), allow(unused_mut))]
+            #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
             let mut source = self
                 .connector_registry
                 .create_source(&config, prom_registry.as_deref())
@@ -683,7 +683,7 @@ impl LaminarDB {
             // Cluster mode: hand the source the vnode topology so a partitioned
             // source (Kafka) consumes only the partitions this node owns and
             // re-binds on rotation. No-op for non-partitioned sources.
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             if let (Some(registry), Some(self_id)) = (
                 self.vnode_registry.lock().clone(),
                 self.cluster_controller
@@ -1001,14 +1001,14 @@ impl LaminarDB {
                         let op_keys: Vec<&String> =
                             recovered.manifest.operator_states.keys().collect();
                         let instance_hint = {
-                            #[cfg(feature = "cluster-unstable")]
+                            #[cfg(feature = "cluster")]
                             {
                                 self.cluster_controller
                                     .lock()
                                     .as_ref()
                                     .map_or(0, |c| c.instance_id().0)
                             }
-                            #[cfg(not(feature = "cluster-unstable"))]
+                            #[cfg(not(feature = "cluster"))]
                             {
                                 0u64
                             }
@@ -1632,13 +1632,13 @@ impl LaminarDB {
             sink_event_rx,
             sink_timed_out: false,
             shutdown_signal: Arc::clone(&self.shutdown_signal),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             cluster_controller: self.cluster_controller.lock().clone(),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             last_follower_epoch: None,
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             barrier_injectors: Vec::new(),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             pending_follower_checkpoint: None,
             force_ckpt_rx: Some(force_ckpt_rx),
             subscription_registry: Arc::clone(&self.subscription_registry),

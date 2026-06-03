@@ -213,7 +213,7 @@ impl ConnectorManager {
 
     /// All stored DDL as `(name, ddl)` in creation order — the catalog
     /// manifest's replay sequence.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub fn ordered_ddl(&self) -> Vec<(String, String)> {
         self.ddl_order
             .iter()

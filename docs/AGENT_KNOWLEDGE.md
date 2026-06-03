@@ -54,7 +54,7 @@ The following issues were identified during code review of the legacy cluster im
 
 ## 3. Tonic gRPC Setup & Code Generation
 
-To support distributed clustering, gRPC services are gated under the `cluster-unstable` Cargo feature flag. This ensures the default build compiles cleanly without requiring the `protoc` compiler.
+To support distributed clustering, gRPC services are gated under the `cluster` Cargo feature flag. This ensures the default build compiles cleanly without requiring the `protoc` compiler.
 
 ### Proto Schemas (`crates/laminar-core/proto/`)
 - **[shuffle.proto](crates/laminar-core/proto/shuffle.proto)**:
@@ -68,7 +68,7 @@ To support distributed clustering, gRPC services are gated under the `cluster-un
 
 ### Build Configuration
 - Code generation is handled in **[build.rs](file:///C:/Users/sujit/source/laminardb/crates/laminar-core/build.rs)** using `tonic-prost-build`.
-- Code generation compiles only when `CARGO_FEATURE_CLUSTER_UNSTABLE` is set (meaning `--features cluster-unstable` is active).
+- Code generation compiles only when `CARGO_FEATURE_CLUSTER_UNSTABLE` is set (meaning `--features cluster` is active).
 
 ---
 
@@ -85,7 +85,7 @@ To support distributed clustering, gRPC services are gated under the `cluster-un
   - Drains a per-peer queue to stream frames via the client-streaming `shuffle` RPC.
   - Automatically reconnects by dropping the peer client on connection or transport errors.
 - **Compatibility**:
-  - Gated behind `#[cfg(feature = "cluster-unstable")]`.
+  - Gated behind `#[cfg(feature = "cluster")]`.
   - When compiled without the feature, a networking-free shim with an identical public API is exposed to avoid breaking `laminar-db` or `laminar-server`.
 
 ---
@@ -98,19 +98,19 @@ The remaining work in the cluster migration plan consists of two main subtasks:
 - **File**: `crates/laminar-core/src/cluster/control/barrier.rs`
 - **Objective**: Replace the gossip-based barrier coordinate/observe/ack logic with direct gRPC client calls.
 - **Technical Steps**:
-  1. Gate gRPC barrier synchronization code under `#[cfg(feature = "cluster-unstable")]` using the generated `BarrierSyncClient` and `BarrierSyncServer` stubs.
+  1. Gate gRPC barrier synchronization code under `#[cfg(feature = "cluster")]` using the generated `BarrierSyncClient` and `BarrierSyncServer` stubs.
   2. Implement the `BarrierSync` gRPC service on the follower. When a follower receives a `Prepare`/`Commit`/`Abort` request, trigger the corresponding local checkpoint operation and return an `Ack` message.
   3. Update `BarrierCoordinator` on the leader to store client connections to known followers.
   4. In `wait_for_quorum`, instead of loop-polling the gossip KV, the leader must dispatch gRPC requests (`Prepare`, `Commit`, or `Abort`) to all expected followers in parallel (e.g. using `futures::future::join_all`).
-  5. Fall back to a local/noop or loopback implementation when compiling without `cluster-unstable` to preserve the default single-node execution mode.
+  5. Fall back to a local/noop or loopback implementation when compiling without `cluster` to preserve the default single-node execution mode.
 
 ### Subtask 5: Verification & Testing
 - **Compilation check**:
   - Validate default build: `cargo check -p laminar-core`
-  - Validate cluster build: `cargo check -p laminar-core --features cluster-unstable`
-  - Ensure zero clippy warnings: `cargo clippy --all-targets --features cluster-unstable -- -D warnings`
+  - Validate cluster build: `cargo check -p laminar-core --features cluster`
+  - Ensure zero clippy warnings: `cargo clippy --all-targets --features cluster -- -D warnings`
 - **Integration testing**:
-  - Run tests with `cargo test --features cluster-unstable` (e.g., test the gRPC shuffle and the new gRPC barrier synchronization).
+  - Run tests with `cargo test --features cluster` (e.g., test the gRPC shuffle and the new gRPC barrier synchronization).
 
 ---
 

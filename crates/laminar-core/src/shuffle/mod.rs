@@ -2,7 +2,7 @@
 //! client-streaming call per peer pair carrying [`ShuffleMessage`](crate::shuffle::message::ShuffleMessage) frames.
 //! Backpressure is the HTTP/2 flow-control window plus the bounded crossfire
 //! inbound queue on the consuming side. The real transport is compiled under
-//! `cluster-unstable`; the default build keeps a networking-free shim.
+//! `cluster`; the default build keeps a networking-free shim.
 
 pub mod barrier_tracker;
 pub mod message;
@@ -14,6 +14,6 @@ pub use message::ShuffleMessage;
 pub use routing::{
     row_vnodes, slice_batch_by_targets, slice_batch_by_vnode, slice_batch_by_vnodes,
 };
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 pub use transport::SHUFFLE_ADDR_KEY;
 pub use transport::{ShufflePeerId, ShuffleReceiver, ShuffleSender};

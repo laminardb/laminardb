@@ -18,9 +18,9 @@ path = "src/main.rs"
 # LaminarDB crates. laminar-db re-exports the rest of the workspace; the
 # server only needs the unified facade plus laminar-core for things like
 # metrics types referenced directly.
-laminar-core = { path = "../laminar-core", version = "0.23.0" }
-laminar-db = { path = "../laminar-db", version = "0.23.0", features = ["api", "remote", "local"] }
-laminar-sql = { path = "../laminar-sql", version = "0.23.0" }
+laminar-core = { path = "../laminar-core", version = "0.24.0" }
+laminar-db = { path = "../laminar-db", version = "0.24.0", features = ["api", "remote", "local"] }
+laminar-sql = { path = "../laminar-sql", version = "0.24.0" }
 
 # For pgwire dispatch on parsed AST
 sqlparser = { workspace = true }
@@ -37,7 +37,7 @@ clap = { version = "4.6", features = ["derive", "env"] }
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }
-# CancellationToken for the cluster leader-lease renewal loop (cluster-unstable).
+# CancellationToken for the cluster leader-lease renewal loop (cluster).
 tokio-util = { workspace = true, optional = true }
 crossfire = { workspace = true }
 
@@ -131,6 +131,7 @@ default = [
     "files",
     "parquet-lookup",
     "otel",
+    "cluster",
 ]
 jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc"]
@@ -160,12 +161,10 @@ gcs = ["laminar-db/gcs", "laminar-core/gcs"]
 azure = ["laminar-db/azure", "laminar-core/azure"]
 # Compile OpenSSL from source — required for musl cross-compilation where
 # system libssl-dev is not available for the target triple.
-# Cluster mode: experimental multi-node support. NOT production-ready —
-# requires Raft, inter-node RPC, and partition-aware routing that are not
-# yet implemented. Gated so the default binary does not advertise it.
-cluster-unstable = [
-    "laminar-core/cluster-unstable",
-    "laminar-db/cluster-unstable",
+# Cluster mode.
+cluster = [
+    "laminar-core/cluster",
+    "laminar-db/cluster",
     "dep:uuid",
     "dep:xxhash-rust",
     "dep:tokio-util",

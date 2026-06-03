@@ -1,10 +1,10 @@
 fn main() {
     // The cross-node gRPC stubs (shuffle transport + barrier sync) are only
-    // needed for the `cluster-unstable` feature, so a default build pulls in
+    // needed for the `cluster` feature, so a default build pulls in
     // neither protoc nor the generated code. Build scripts don't receive
     // `cfg(feature = "...")`; Cargo instead exposes activated features via
     // `CARGO_FEATURE_<NAME>` env vars, so gate on that.
-    if std::env::var_os("CARGO_FEATURE_CLUSTER_UNSTABLE").is_none() {
+    if std::env::var_os("CARGO_FEATURE_CLUSTER").is_none() {
         return;
     }
 

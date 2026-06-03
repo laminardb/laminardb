@@ -28,7 +28,7 @@ pub use leader_lease::{
 };
 pub use snapshot::{AssignmentSnapshot, AssignmentSnapshotStore, RotateOutcome, SnapshotError};
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 pub mod chitchat_kv;
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 pub use chitchat_kv::ChitchatKv;

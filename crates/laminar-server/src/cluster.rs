@@ -461,7 +461,7 @@ pub async fn start_cluster(
                     members_rx,
                 ));
                 controller.set_active(false);
-                #[cfg(feature = "cluster-unstable")]
+                #[cfg(feature = "cluster")]
                 {
                     let bind: std::net::SocketAddr =
                         format!("{bind_host}:0").parse().map_err(|e| {

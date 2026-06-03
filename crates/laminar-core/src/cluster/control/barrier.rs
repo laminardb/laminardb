@@ -1,5 +1,5 @@
 //! Cross-instance barrier protocol. Direct gRPC leader-to-follower calls
-//! under `cluster-unstable`, falling back to gossip-KV announce/ack/poll.
+//! under `cluster`, falling back to gossip-KV announce/ack/poll.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,9 +10,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::cluster::discovery::NodeId;
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 use crate::cluster::discovery::{NodeInfo, NodeState};
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 use tokio::sync::watch;
 
 /// KV key for the leader's barrier announcement.
@@ -22,7 +22,7 @@ pub const ANNOUNCEMENT_KEY: &str = "control:barrier";
 pub const ACK_KEY: &str = "control:barrier-ack";
 
 /// Gossip KV key used by follower barrier servers to advertise their bound address.
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 pub const BARRIER_ADDR_KEY: &str = "barrier:addr";
 
 /// Barrier phase.
@@ -168,7 +168,7 @@ impl ClusterKv for InMemoryKv {
     }
 }
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 #[allow(
     clippy::doc_markdown,
     clippy::default_trait_access,
@@ -181,10 +181,10 @@ pub(crate) mod barrier_v1 {
     tonic::include_proto!("laminar.barrier.v1");
 }
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 type BarrierFlavor = crossfire::mpsc::Array<BarrierAnnouncement>;
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 struct GrpcState {
     incoming_rx: parking_lot::Mutex<Option<crossfire::AsyncRx<BarrierFlavor>>>,
     incoming_rx_returned: Arc<tokio::sync::Notify>,
@@ -204,10 +204,10 @@ struct GrpcState {
     advertise_addr: String,
 }
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 type ActiveLeaderState = Option<(NodeId, watch::Receiver<Vec<NodeInfo>>)>;
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 struct GrpcBarrierServer {
     kv: Arc<dyn ClusterKv>,
     incoming_tx: crossfire::MAsyncTx<BarrierFlavor>,
@@ -216,7 +216,7 @@ struct GrpcBarrierServer {
     leader_election: Arc<parking_lot::Mutex<ActiveLeaderState>>,
 }
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 impl GrpcBarrierServer {
     async fn validate_leader(
         &self,
@@ -263,7 +263,7 @@ impl GrpcBarrierServer {
     }
 }
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 #[tonic::async_trait]
 impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
     async fn prepare(
@@ -394,7 +394,7 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
     }
 }
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 async fn get_barrier_client(
     peer: NodeId,
     pool: &Arc<
@@ -427,9 +427,9 @@ async fn get_barrier_client(
 /// Cross-instance barrier coordination.
 pub struct BarrierCoordinator {
     kv: Arc<dyn ClusterKv>,
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     grpc: Arc<parking_lot::Mutex<Option<Arc<GrpcState>>>>,
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     leader_election: Arc<parking_lot::Mutex<ActiveLeaderState>>,
 }
 
@@ -441,7 +441,7 @@ impl std::fmt::Debug for BarrierCoordinator {
 
 impl Drop for BarrierCoordinator {
     fn drop(&mut self) {
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         {
             let grpc_opt = self.grpc.lock().take();
             if let Some(state) = grpc_opt {
@@ -460,15 +460,15 @@ impl BarrierCoordinator {
     pub fn new(kv: Arc<dyn ClusterKv>) -> Self {
         Self {
             kv,
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             grpc: Arc::new(parking_lot::Mutex::new(None)),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             leader_election: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 
     /// Configure the leader election state used to validate incoming leader identity.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub fn set_leader_election(
         &mut self,
         instance_id: NodeId,
@@ -477,7 +477,7 @@ impl BarrierCoordinator {
         *self.leader_election.lock() = Some((instance_id, members_rx));
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     async fn local_node_id(&self) -> Option<NodeId> {
         let grpc_opt = self.grpc.lock().clone();
         let state = grpc_opt?;
@@ -494,7 +494,7 @@ impl BarrierCoordinator {
     ///
     /// # Errors
     /// Returns an error string on bind or socket address retrieval failures.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub async fn start_server(
         &self,
         bind_addr: std::net::SocketAddr,
@@ -568,7 +568,7 @@ impl BarrierCoordinator {
     /// # Errors
     /// Returns a string on JSON encode failure.
     pub async fn announce(&self, ann: &BarrierAnnouncement) -> Result<(), String> {
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         {
             let grpc_opt = self.grpc.lock().clone();
             if let Some(state) = grpc_opt {
@@ -655,7 +655,7 @@ impl BarrierCoordinator {
     /// # Errors
     /// Returns a string on JSON decode failure.
     pub async fn observe(&self, leader: NodeId) -> Result<Option<BarrierAnnouncement>, String> {
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         {
             let grpc_opt = self.grpc.lock().clone();
             if let Some(state) = grpc_opt {
@@ -689,7 +689,7 @@ impl BarrierCoordinator {
     /// # Errors
     /// Returns a string on JSON encode failure.
     pub async fn ack(&self, ack: &BarrierAck) -> Result<(), String> {
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         {
             let grpc_opt = self.grpc.lock().clone();
             if let Some(state) = grpc_opt {
@@ -721,7 +721,7 @@ impl BarrierCoordinator {
         expected: &[NodeId],
         deadline: Duration,
     ) -> QuorumOutcome {
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         {
             let grpc_opt = self.grpc.lock().clone();
             if let Some(state) = grpc_opt {
@@ -900,7 +900,7 @@ mod tests {
         Arc::new(InMemoryKv::new(id))
     }
 
-    #[cfg(all(test, feature = "cluster-unstable"))]
+    #[cfg(all(test, feature = "cluster"))]
     mod grpc_tests {
         use super::*;
         use std::net::SocketAddr;

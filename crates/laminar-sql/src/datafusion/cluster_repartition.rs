@@ -494,18 +494,18 @@ async fn dispatch_inbound(
     }
 }
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 use datafusion::physical_plan::joins::HashJoinExec;
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 use datafusion_common::config::ConfigOptions;
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 static CLUSTER_CONTEXT: parking_lot::RwLock<Option<ClusterContext>> =
     parking_lot::RwLock::new(None);
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 #[derive(Clone)]
 struct ClusterContext {
     registry: Arc<VnodeRegistry>,
@@ -514,7 +514,7 @@ struct ClusterContext {
     self_id: NodeId,
 }
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 /// Set the global cluster context for the distributed physical optimizer rules.
 pub fn set_cluster_context(
     registry: Arc<VnodeRegistry>,
@@ -530,12 +530,12 @@ pub fn set_cluster_context(
     });
 }
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 #[derive(Debug)]
 /// Physical optimizer rule that wraps HashJoinExec inputs in ClusterRepartitionExec.
 pub struct DistributedJoinRule;
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 impl PhysicalOptimizerRule for DistributedJoinRule {
     fn optimize(
         &self,
@@ -558,7 +558,7 @@ impl PhysicalOptimizerRule for DistributedJoinRule {
     }
 }
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 fn optimize_plan(
     plan: Arc<dyn ExecutionPlan>,
     registry: &Arc<VnodeRegistry>,

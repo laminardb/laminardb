@@ -2,7 +2,7 @@
 
 - **Status:** Proposed (not started). Large multi-phase program.
 - **Date:** 2026-05-28
-- **Scope:** Make `cluster-unstable` a production-grade distributed streaming runtime:
+- **Scope:** Make `cluster` a production-grade distributed streaming runtime:
   partition-aware sources (Kafka first), end-to-end exactly-once across the distributed
   dataflow, fault-tolerant state with failover, then elastic rescale and operational
   hardening.
@@ -46,7 +46,7 @@ All three converge, and LaminarDB is architecturally closest to RisingWave:
 LaminarDB already has the enabling primitives (vnodes, `object_store` state backend, CAS
 fencing, barrier/2PC machinery); the gaps below are wiring, not missing architecture.
 
-## Current state (audited 2026-05-28, `cluster-unstable`)
+## Current state (audited 2026-05-28, `cluster`)
 
 **Real and tested:** chitchat gossip membership + phi-accrual failure detection
 (`crates/laminar-core/src/cluster/discovery/gossip_discovery.rs:253`); weak-by-design leader

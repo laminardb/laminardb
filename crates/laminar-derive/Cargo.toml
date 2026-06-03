@@ -19,5 +19,5 @@ proc-macro2 = "1.0"
 
 [dev-dependencies]
 arrow = { workspace = true }
-laminar-core = { path = "../laminar-core", version = "0.23.0" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.23.0" }
+laminar-core = { path = "../laminar-core", version = "0.24.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.24.0" }

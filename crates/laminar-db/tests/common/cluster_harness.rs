@@ -4,7 +4,7 @@
 //! DDL before [`ClusterEngineHarness::start_all`] so the pipeline
 //! activates with sources and MVs already registered.
 
-#![cfg(feature = "cluster-unstable")]
+#![cfg(feature = "cluster")]
 #![allow(clippy::disallowed_types)]
 #![allow(dead_code)] // not every test binary uses every helper
 

@@ -14,9 +14,9 @@ use datafusion::prelude::SessionContext;
 
 use laminar_sql::translator::StreamJoinConfig;
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 use crate::key_column::{extract_column_as_timestamps, extract_key_column};
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 use crate::operator::sql_query::ClusterShuffleConfig;
 
 use crate::aggregate_state::JoinStateCheckpoint;
@@ -29,7 +29,7 @@ pub(crate) struct IntervalJoinOperator {
     config: StreamJoinConfig,
     state: IntervalJoinState,
     projection: ProjectingJoinState,
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     cluster_shuffle: Option<ClusterShuffleConfig>,
 }
 
@@ -44,17 +44,17 @@ impl IntervalJoinOperator {
             config,
             state: IntervalJoinState::new(),
             projection: ProjectingJoinState::new(name, ctx, projection_sql, "__interval_tmp"),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             cluster_shuffle: None,
         }
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
         self.cluster_shuffle = Some(config);
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     async fn repartition_side(
         &self,
         batches: &[RecordBatch],
@@ -137,7 +137,7 @@ impl GraphOperator for IntervalJoinOperator {
         inputs: &[Vec<RecordBatch>],
         watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         let (left_batches_local, right_batches_local) = if let Some(ref cfg) = self.cluster_shuffle
         {
             let left_stage = format!("{}::left", self.projection.op_name);
@@ -166,7 +166,7 @@ impl GraphOperator for IntervalJoinOperator {
             )
         };
 
-        #[cfg(not(feature = "cluster-unstable"))]
+        #[cfg(not(feature = "cluster"))]
         let (left_batches_local, right_batches_local) = (
             inputs.first().map_or(&[][..], Vec::as_slice).to_vec(),
             inputs.get(1).map_or(&[][..], Vec::as_slice).to_vec(),
@@ -187,7 +187,7 @@ impl GraphOperator for IntervalJoinOperator {
         self.projection.apply(join_result).await
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     async fn ingest_shuffle(
         &mut self,
         stage: &str,

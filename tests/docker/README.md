@@ -79,4 +79,4 @@ runs don't collide.
    — 2-node cluster sharing one MinIO bucket via `ObjectStoreBackend`.
    Verifies the leader's full-registry gate reads follower markers off
    shared storage, and the `_COMMIT` marker lands after the 2PC ack.
-   Run with `cargo test -p laminar-db --test cluster_minio_flow --features cluster-unstable`.
+   Run with `cargo test -p laminar-db --test cluster_minio_flow --features cluster`.

@@ -8,7 +8,7 @@
 //! that bounded queue. See [`super::message`] for the per-frame payloads and
 //! [`crate::serialization`] for the Arrow IPC (de)serialization of `VnodeData`.
 //!
-//! The real gRPC path is compiled under the `cluster-unstable` feature (which
+//! The real gRPC path is compiled under the `cluster` feature (which
 //! pulls in `tonic`/`prost`). A default build keeps the same public API via a
 //! networking-free shim so the types referenced by `laminar-db`/`laminar-server`
 //! signatures still compile without the cluster dependencies.
@@ -30,10 +30,10 @@ pub type ShufflePeerId = u64;
 /// listener's socket address, and by [`ShuffleSender`] to discover peer
 /// addresses on first contact. Value: the bound socket address formatted via
 /// `SocketAddr::to_string()`.
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 pub const SHUFFLE_ADDR_KEY: &str = "shuffle:addr";
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 #[allow(
     clippy::doc_markdown,
     clippy::default_trait_access,
@@ -62,10 +62,10 @@ struct Holdover {
 }
 
 // ===========================================================================
-// gRPC implementation (cluster-unstable).
+// gRPC implementation (cluster).
 // ===========================================================================
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 mod grpc {
     use std::io;
     use std::net::SocketAddr;
@@ -644,19 +644,19 @@ mod grpc {
     }
 }
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 pub use grpc::{ShuffleReceiver, ShuffleSender};
 
 // ===========================================================================
 // Default build: networking-free shim preserving the public API.
 //
-// The cluster shuffle is only exercised under `cluster-unstable`; a default
+// The cluster shuffle is only exercised under `cluster`; a default
 // build references these types only in signatures. The shim keeps the inbound
 // crossfire queue + holdover staging so the surface compiles and behaves sanely
 // (local-only) without pulling in tonic.
 // ===========================================================================
 
-#[cfg(not(feature = "cluster-unstable"))]
+#[cfg(not(feature = "cluster"))]
 mod shim {
     use std::io;
     use std::net::SocketAddr;
@@ -883,10 +883,10 @@ mod shim {
     }
 }
 
-#[cfg(not(feature = "cluster-unstable"))]
+#[cfg(not(feature = "cluster"))]
 pub use shim::{ShuffleReceiver, ShuffleSender};
 
-#[cfg(all(test, feature = "cluster-unstable"))]
+#[cfg(all(test, feature = "cluster"))]
 mod tests {
     use std::io;
     use std::sync::Arc;

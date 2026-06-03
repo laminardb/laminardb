@@ -102,7 +102,7 @@ impl SideBuffer {
     }
 }
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 use crate::operator::sql_query::ClusterShuffleConfig;
 
 pub(crate) struct ProcessTimeJoinOperator {
@@ -111,7 +111,7 @@ pub(crate) struct ProcessTimeJoinOperator {
     right: SideBuffer,
     /// The user's SELECT with the join's columns rewritten over the temp table.
     projection: ProjectingJoinState,
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     cluster_shuffle: Option<ClusterShuffleConfig>,
 }
 
@@ -129,17 +129,17 @@ impl ProcessTimeJoinOperator {
             // The `FROM` name `build_stream_join_projection_sql` emits (shared
             // with the interval join; registered transiently per `apply`).
             projection: ProjectingJoinState::new(name, ctx, projection_sql, "__interval_tmp"),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             cluster_shuffle: None,
         }
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
         self.cluster_shuffle = Some(config);
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     async fn repartition_side(
         &self,
         batches: &[RecordBatch],
@@ -299,7 +299,7 @@ impl GraphOperator for ProcessTimeJoinOperator {
         inputs: &[Vec<RecordBatch>],
         watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         let (left_batches_local, right_batches_local) = if let Some(ref cfg) = self.cluster_shuffle
         {
             let left_stage = format!("{}::left", self.projection.op_name);
@@ -328,7 +328,7 @@ impl GraphOperator for ProcessTimeJoinOperator {
             )
         };
 
-        #[cfg(not(feature = "cluster-unstable"))]
+        #[cfg(not(feature = "cluster"))]
         let (left_batches_local, right_batches_local) = (
             inputs.first().map_or(&[][..], Vec::as_slice).to_vec(),
             inputs.get(1).map_or(&[][..], Vec::as_slice).to_vec(),
@@ -379,7 +379,7 @@ impl GraphOperator for ProcessTimeJoinOperator {
         self.projection.apply(out).await
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     async fn ingest_shuffle(
         &mut self,
         stage: &str,

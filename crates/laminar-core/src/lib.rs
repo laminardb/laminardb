@@ -27,8 +27,8 @@ pub mod state;
 pub mod streaming;
 pub mod time;
 
-/// Distributed cluster coordination. Unstable: gated behind `cluster-unstable`.
-#[cfg(feature = "cluster-unstable")]
+/// Distributed cluster coordination. Unstable: gated behind `cluster`.
+#[cfg(feature = "cluster")]
 pub mod cluster;
 
 /// Per-epoch checkpoint commit marker store. Used by the checkpoint

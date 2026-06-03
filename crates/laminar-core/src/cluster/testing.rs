@@ -20,7 +20,7 @@
 //!
 //! ## Not production API
 //!
-//! Gated on `cluster-unstable`. The APIs here are test helpers;
+//! Gated on `cluster`. The APIs here are test helpers;
 //! expect churn.
 
 use std::net::{SocketAddr, UdpSocket};

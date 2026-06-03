@@ -1,4 +1,4 @@
-#![cfg(feature = "cluster-unstable")]
+#![cfg(feature = "cluster")]
 #![allow(clippy::disallowed_types)]
 //! Unified cluster integration tests.
 

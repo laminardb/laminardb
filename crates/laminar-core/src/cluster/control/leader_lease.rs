@@ -26,7 +26,7 @@ fn lease_path(seq: u64) -> OsPath {
 }
 
 // Used only by the renewal loop, which is cluster-gated.
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
@@ -279,7 +279,7 @@ impl LeaderLeaseManager {
     /// otherwise the `Held` record so followers learn the current
     /// fencing token. Errors are logged and retried next tick. Stops
     /// when `shutdown` is cancelled.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[must_use]
     pub fn spawn(
         self,

@@ -65,7 +65,7 @@ with predicate pushdown — Implemented"); none of those three properties hold.
    (`lookup_join_exec.rs:440,733,1053,1645`). Cross-instance hash shuffle
    (`crates/laminar-sql/src/datafusion/cluster_repartition.rs`, vnode-based over
    `crates/laminar-core/src/state/vnode.rs`) **exists but is aggregation-only** (Partial →
-   FinalPartitioned) and gated behind `cluster-unstable`. Joins do not repartition.
+   FinalPartitioned) and gated behind `cluster`. Joins do not repartition.
 4. **No negative caching.** Misses returning `None` are never cached
    (`lookup_join_exec.rs:1291-1296`); every event with a non-existent key re-queries the
    source forever.
@@ -367,7 +367,7 @@ CREATE STREAM out AS SELECT events.id, events.amt, dim.name
 
 ## Track B — Distributed MPP scale-out
 
-### Phase 5 — Key-shard the probe side across the cluster (AD-2, behind `cluster-unstable`)
+### Phase 5 — Key-shard the probe side across the cluster (AD-2, behind `cluster`)
 
 **DONE 2026-05-30.** Phase 1 hoisted the lookup join out of DataFusion, and the production
 cross-node shuffle is the in-operator `shuffle_pre_agg_batches` (not the test-only
@@ -400,7 +400,7 @@ re-routes and the new owner rebuilds its cache.
 
 Test: `cluster_key_shuffle_routes_remote_keys_to_owner` — two operators over loopback shuffle;
 asserts each key enriches only on its owner (node 2's via the shuffle). Clippy clean with/without
-`cluster-unstable`.
+`cluster`.
 
 - **Exit:** key-sharded lookup-join MV across N nodes with cache affinity; barrier-consistency is
   best-effort (agg parity), strict alignment deferred.
@@ -435,7 +435,7 @@ asserts each key enriches only on its owner (node 2's via the shuffle). Clippy c
 - **Highest risk:** Phase 5 (distributed join repartition) — mitigated by AD-2 (correctness
   doesn't depend on it) and by reusing the already-proven aggregation shuffle substrate
   rather than building new transport.
-- **Dependency:** Track B inherits the maturity of `cluster-unstable`; it should not gate
+- **Dependency:** Track B inherits the maturity of `cluster`; it should not gate
   Track A shipping.
 
 ## Open questions
