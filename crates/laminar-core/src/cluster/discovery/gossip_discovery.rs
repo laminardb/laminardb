@@ -257,18 +257,13 @@ impl GossipDiscovery {
                     }
                 }
             }
-            if resolved.is_none() {
-                tracing::warn!(
-                    "Failed to resolve advertise_host '{}' (or cluster-unstable feature is disabled). Falling back to 127.0.0.1",
-                    host
-                );
+            if let Some(addr) = resolved {
+                addr
+            } else {
+                return Err(DiscoveryError::Bind(format!(
+                    "failed to resolve configured advertise_host '{host}' (or cluster-unstable feature is disabled)"
+                )));
             }
-            resolved.unwrap_or_else(|| {
-                std::net::SocketAddr::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-                    gossip_addr.port(),
-                )
-            })
         } else if gossip_addr.ip().is_unspecified() {
             let resolved = {
                 let mut res = None;

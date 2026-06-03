@@ -4,10 +4,7 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::duration_suboptimal_units)] // MSRV 1.85; from_mins/from_hours are 1.91+
 #![allow(clippy::module_name_repetitions)]
-// Allow unsafe in alloc module for zero-copy optimizations
-#![allow(unsafe_code)]
 
-pub mod alloc;
 /// Z-set changelog `__weight` column name, shared between the MV producer and
 /// upsert-sink consumers.
 pub mod changelog;

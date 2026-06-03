@@ -261,7 +261,9 @@ impl IcebergSink {
 
             let file_path = format!(
                 "{location}/data/{}-{}-{}-{idx}.parquet",
-                self.config.writer_id, self.current_epoch, uuid::Uuid::new_v4(),
+                self.config.writer_id,
+                self.current_epoch,
+                uuid::Uuid::new_v4(),
             );
 
             let output_file = file_io

@@ -150,12 +150,6 @@ pub enum ClusterStartupError {
     EngineConstruction(String),
     #[error("HTTP startup failed: {0}")]
     HttpStartup(String),
-    #[error(
-        "invalid coordination.raft_port={0}: RPC port = raft_port + 1 would \
-         overflow u16; choose a raft_port below {max}",
-        max = u16::MAX
-    )]
-    InvalidRaftPort(u16),
 }
 
 pub struct ClusterHandle {
@@ -443,7 +437,6 @@ pub async fn start_cluster(
         .build()
         .await
         .map_err(|e| ClusterStartupError::EngineConstruction(format!("state backend: {e}")))?;
-    let vnode_count = config.state.vnode_capacity();
 
     // Build the vnode registry. If a shared `AssignmentSnapshot` already
     // exists in the state backend's object store, every node adopts it.

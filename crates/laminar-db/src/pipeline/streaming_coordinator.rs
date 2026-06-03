@@ -28,7 +28,6 @@ use crossfire::{mpsc, AsyncRx};
 use laminar_connectors::checkpoint::SourceCheckpoint;
 use laminar_connectors::connector::{DeliveryGuarantee, SourceBatch};
 use laminar_connectors::error::ConnectorError;
-use laminar_core::alloc::{PriorityClass, PriorityGuard};
 use laminar_core::checkpoint::{CheckpointBarrier, CheckpointBarrierInjector};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -487,8 +486,6 @@ impl StreamingCoordinator {
                 () = tokio::time::sleep(IDLE_TIMEOUT) => None,
             };
 
-            // Step: Drain messages and coalesce batches.
-            let event_priority = PriorityGuard::enter(PriorityClass::EventProcessing);
             self.source_batches_buf.clear();
             self.barrier_seen.clear();
             self.discard_pending_offsets();
@@ -587,8 +584,6 @@ impl StreamingCoordinator {
             #[allow(clippy::cast_possible_truncation)]
             let cycle_elapsed_ns = cycle_start.elapsed().as_nanos() as u64;
 
-            drop(event_priority);
-            let _bg_priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
             let bg_start = Instant::now();
             let bg_budget = self.config.background_budget_ns;
 

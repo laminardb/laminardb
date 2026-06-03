@@ -96,8 +96,16 @@ impl OptimizerRule for LookupJoinRewriteRule {
             .on
             .iter()
             .map(|(left_expr, right_expr)| {
-                let lookup_expr = if lookup_is_right { right_expr } else { left_expr };
-                let stream_expr = if lookup_is_right { left_expr } else { right_expr };
+                let lookup_expr = if lookup_is_right {
+                    right_expr
+                } else {
+                    left_expr
+                };
+                let stream_expr = if lookup_is_right {
+                    left_expr
+                } else {
+                    right_expr
+                };
                 let lookup_column = match lookup_expr {
                     datafusion::logical_expr::Expr::Column(col) => col.name.clone(),
                     other => other.to_string(),

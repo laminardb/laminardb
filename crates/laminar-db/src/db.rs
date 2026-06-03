@@ -2115,7 +2115,10 @@ impl LaminarDB {
                         cc.current_leader().and_then(|leader_id| {
                             let watch = cc.members_watch();
                             let members = watch.borrow();
-                            members.iter().find(|m| m.id == leader_id).map(|m| m.rpc_address.clone())
+                            members
+                                .iter()
+                                .find(|m| m.id == leader_id)
+                                .map(|m| m.rpc_address.clone())
                         })
                     }
                 })
@@ -2190,27 +2193,34 @@ impl LaminarDB {
 
         let mut response_bytes = Vec::new();
         stream.read_to_end(&mut response_bytes).await.map_err(|e| {
-            DbError::Checkpoint(format!("failed to read checkpoint response from leader: {e}"))
+            DbError::Checkpoint(format!(
+                "failed to read checkpoint response from leader: {e}"
+            ))
         })?;
 
         // Find the double CRLF separating headers from body
         let mut header_len = response_bytes.len();
         for i in 0..response_bytes.len().saturating_sub(3) {
-            if response_bytes[i..i+4] == [b'\r', b'\n', b'\r', b'\n'] {
+            if response_bytes[i..i + 4] == [b'\r', b'\n', b'\r', b'\n'] {
                 header_len = i + 4;
                 break;
             }
         }
 
         if header_len >= response_bytes.len() {
-            return Err(DbError::Checkpoint("invalid HTTP response from leader".into()));
+            return Err(DbError::Checkpoint(
+                "invalid HTTP response from leader".into(),
+            ));
         }
 
         let body = &response_bytes[header_len..];
-        let result: crate::checkpoint_coordinator::CheckpointResult = serde_json::from_slice(body).map_err(|e| {
-            let raw = String::from_utf8_lossy(body);
-            DbError::Checkpoint(format!("failed to deserialize leader's response ({raw}): {e}"))
-        })?;
+        let result: crate::checkpoint_coordinator::CheckpointResult = serde_json::from_slice(body)
+            .map_err(|e| {
+                let raw = String::from_utf8_lossy(body);
+                DbError::Checkpoint(format!(
+                    "failed to deserialize leader's response ({raw}): {e}"
+                ))
+            })?;
 
         Ok(result)
     }

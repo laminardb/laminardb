@@ -437,7 +437,8 @@ impl LaminarDB {
             for rule in self.physical_optimizer_rules.iter() {
                 state_builder = state_builder.with_physical_optimizer_rule(Arc::clone(rule));
             }
-            let context = datafusion::prelude::SessionContext::new_with_state(state_builder.build());
+            let context =
+                datafusion::prelude::SessionContext::new_with_state(state_builder.build());
             for rule in self.ctx.state().optimizers() {
                 context.add_optimizer_rule(Arc::clone(rule));
             }

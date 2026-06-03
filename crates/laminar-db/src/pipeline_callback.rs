@@ -10,7 +10,6 @@ use arrow::array::RecordBatch;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use laminar_connectors::checkpoint::SourceCheckpoint;
-use laminar_core::alloc::{PriorityClass, PriorityGuard};
 use laminar_core::streaming;
 use rustc_hash::FxHashMap;
 
@@ -183,7 +182,6 @@ impl ConnectorPipelineCallback {
         &mut self,
     ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
-        let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
 
         self.sync_sinks_and_drain_events().await;
 
@@ -994,7 +992,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         source_offsets: FxHashMap<String, SourceCheckpoint>,
     ) -> Option<u64> {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
-        let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
 
         // Drain any pending `db.checkpoint()` requests first. Each
         // request gets a capture of operator state (the same path the
@@ -1181,7 +1178,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     ) -> crate::pipeline::BarrierOutcome {
         use crate::checkpoint_coordinator::source_to_connector_checkpoint;
         use crate::pipeline::{BarrierOutcome, SkipReason};
-        let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
 
         #[cfg(feature = "cluster-unstable")]
         if let Some(cc) = self.cluster_controller.clone() {
@@ -1366,7 +1362,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
 
     async fn poll_tables(&mut self) {
         use laminar_connectors::reference::RefreshMode;
-        let _priority = PriorityGuard::enter(PriorityClass::BackgroundIo);
 
         for (name, source, mode) in &mut self.table_sources {
             if matches!(mode, RefreshMode::SnapshotOnly | RefreshMode::Manual) {

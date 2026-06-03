@@ -201,7 +201,6 @@ struct GrpcState {
         >,
     >,
     server_handle: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    local_addr: std::net::SocketAddr,
     advertise_addr: String,
 }
 
@@ -554,7 +553,6 @@ impl BarrierCoordinator {
             completed_acks,
             clients,
             server_handle: Arc::new(parking_lot::Mutex::new(Some(server_task))),
-            local_addr,
             advertise_addr: advertise_addr.clone(),
         });
 

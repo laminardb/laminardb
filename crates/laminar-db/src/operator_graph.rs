@@ -1926,8 +1926,8 @@ impl OperatorGraph {
         controller: Option<&laminar_core::cluster::control::ClusterController>,
     ) -> Result<(), DbError> {
         use laminar_core::checkpoint::barrier::CheckpointBarrier;
-        use laminar_core::shuffle::{BarrierTracker, ShuffleMessage};
         use laminar_core::cluster::control::Phase;
+        use laminar_core::shuffle::{BarrierTracker, ShuffleMessage};
 
         const ALIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -2039,7 +2039,7 @@ impl OperatorGraph {
                                 }
                             }
                         }
-                        Some((from, ShuffleMessage::VnodeData(stage, _vnode, batch))) => {
+                        Some((_, ShuffleMessage::VnodeData(stage, _vnode, batch))) => {
                             self.ingest_to_stage(&stage, batch, watermark).await?;
                         }
                         Some(_) => {}
@@ -2299,7 +2299,10 @@ mod tests {
             .await
             .unwrap();
 
-        graph.align_shuffle_barriers(7, 0, &[1, 2], None).await.unwrap();
+        graph
+            .align_shuffle_barriers(7, 0, &[1, 2], None)
+            .await
+            .unwrap();
 
         // Node 1 must have fanned its own barrier out to node 2.
         let (from, msg) = recv2.recv().await.unwrap();

@@ -169,7 +169,10 @@ impl ClusterController {
     #[must_use]
     pub fn assignable_instances(&self) -> Vec<NodeId> {
         let mut ids = assignable_node_ids(&self.members_rx.borrow());
-        if self.active.load(Ordering::SeqCst) && !self.is_draining() && !self.instance_id.is_unassigned() {
+        if self.active.load(Ordering::SeqCst)
+            && !self.is_draining()
+            && !self.instance_id.is_unassigned()
+        {
             ids.push(self.instance_id);
         }
         ids.sort_unstable();
