@@ -429,13 +429,19 @@ impl LaminarDB {
             if let Some(n) = self.pipeline_target_partitions {
                 session_config = session_config.with_target_partitions(n);
             }
+            let query_planner = Arc::clone(self.ctx.state().query_planner());
             let mut state_builder = SessionStateBuilder::new()
                 .with_config(session_config)
-                .with_default_features();
+                .with_default_features()
+                .with_query_planner(query_planner);
             for rule in self.physical_optimizer_rules.iter() {
                 state_builder = state_builder.with_physical_optimizer_rule(Arc::clone(rule));
             }
-            datafusion::prelude::SessionContext::new_with_state(state_builder.build())
+            let context = datafusion::prelude::SessionContext::new_with_state(state_builder.build());
+            for rule in self.ctx.state().optimizers() {
+                context.add_optimizer_rule(Arc::clone(rule));
+            }
+            context
         };
         laminar_sql::register_streaming_functions(&ctx);
 

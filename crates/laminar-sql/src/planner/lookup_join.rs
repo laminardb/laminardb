@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use datafusion::common::{DFSchema, Result};
+use datafusion::common::Result;
 use datafusion::logical_expr::logical_plan::LogicalPlan;
 use datafusion::logical_expr::{Extension, Join, TableScan, UserDefinedLogicalNodeCore};
 use datafusion_common::tree_node::Transformed;
@@ -96,16 +96,15 @@ impl OptimizerRule for LookupJoinRewriteRule {
             .on
             .iter()
             .map(|(left_expr, right_expr)| {
-                if lookup_is_right {
-                    JoinKeyPair {
-                        stream_expr: left_expr.clone(),
-                        lookup_column: right_expr.to_string(),
-                    }
-                } else {
-                    JoinKeyPair {
-                        stream_expr: right_expr.clone(),
-                        lookup_column: left_expr.to_string(),
-                    }
+                let lookup_expr = if lookup_is_right { right_expr } else { left_expr };
+                let stream_expr = if lookup_is_right { left_expr } else { right_expr };
+                let lookup_column = match lookup_expr {
+                    datafusion::logical_expr::Expr::Column(col) => col.name.clone(),
+                    other => other.to_string(),
+                };
+                JoinKeyPair {
+                    stream_expr: stream_expr.clone(),
+                    lookup_column,
                 }
             })
             .collect();
@@ -131,16 +130,7 @@ impl OptimizerRule for LookupJoinRewriteRule {
 
         // Build output schema from stream + lookup
         let stream_schema = stream_plan.schema();
-        let merged_fields: Vec<_> = stream_schema
-            .fields()
-            .iter()
-            .chain(lookup_schema.fields().iter())
-            .cloned()
-            .collect();
-        let output_schema = Arc::new(DFSchema::from_unqualified_fields(
-            merged_fields.into(),
-            HashMap::new(),
-        )?);
+        let output_schema = Arc::new(stream_schema.join(lookup_schema.as_ref())?);
 
         let metadata = LookupTableMetadata {
             connector: info.properties.connector.to_string(),

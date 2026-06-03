@@ -123,10 +123,14 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) last_follower_epoch: Option<u64>,
     /// Local source barrier injectors to trigger follower-side checkpoints.
     #[cfg(feature = "cluster-unstable")]
-    pub(crate) barrier_injectors: Vec<(Arc<str>, laminar_core::checkpoint::CheckpointBarrierInjector)>,
+    pub(crate) barrier_injectors: Vec<(
+        Arc<str>,
+        laminar_core::checkpoint::CheckpointBarrierInjector,
+    )>,
     /// Pending follower checkpoint announcement from gossip, waiting for local sources to align.
     #[cfg(feature = "cluster-unstable")]
-    pub(crate) pending_follower_checkpoint: Option<laminar_core::cluster::control::BarrierAnnouncement>,
+    pub(crate) pending_follower_checkpoint:
+        Option<laminar_core::cluster::control::BarrierAnnouncement>,
     /// Inbound channel for `db.checkpoint()` requests. The db sends a
     /// oneshot sender here; on the next cycle the callback captures
     /// operator state (via `checkpoint_with_barrier`-style path) and
@@ -286,7 +290,7 @@ impl ConnectorPipelineCallback {
                 .load(std::sync::atomic::Ordering::Acquire);
             if let Err(e) = self
                 .graph
-                .align_shuffle_barriers(ann.checkpoint_id, wm, &live)
+                .align_shuffle_barriers(ann.checkpoint_id, wm, &live, Some(&*controller))
                 .await
             {
                 tracing::warn!(error = %e, "follower shuffle alignment failed — skipping");
@@ -376,7 +380,7 @@ impl ConnectorPipelineCallback {
                 .load(std::sync::atomic::Ordering::Acquire);
             if let Err(e) = self
                 .graph
-                .align_shuffle_barriers(ann.checkpoint_id, wm, &live)
+                .align_shuffle_barriers(ann.checkpoint_id, wm, &live, Some(controller))
                 .await
             {
                 tracing::warn!(error = %e, "follower shuffle alignment failed — skipping");
@@ -476,7 +480,7 @@ impl ConnectorPipelineCallback {
             .load(std::sync::atomic::Ordering::Acquire);
         if let Err(e) = self
             .graph
-            .align_shuffle_barriers(checkpoint_id, wm, &live)
+            .align_shuffle_barriers(checkpoint_id, wm, &live, self.cluster_controller.as_deref())
             .await
         {
             if let Some(coord) = self.coordinator.lock().await.as_ref() {
@@ -1183,7 +1187,9 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         if let Some(cc) = self.cluster_controller.clone() {
             if !cc.is_leader() {
                 if let Some(ann) = self.pending_follower_checkpoint.take() {
-                    return self.run_follower_checkpoint_deferred(ann, source_checkpoints).await;
+                    return self
+                        .run_follower_checkpoint_deferred(ann, source_checkpoints)
+                        .await;
                 } else {
                     tracing::warn!("follower received checkpoint_with_barrier but pending_follower_checkpoint is None");
                     return BarrierOutcome::Failed;
@@ -1519,7 +1525,13 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         Some(coord.next_checkpoint_id())
     }
 
-    fn set_barrier_injectors(&mut self, injectors: Vec<(Arc<str>, laminar_core::checkpoint::CheckpointBarrierInjector)>) {
+    fn set_barrier_injectors(
+        &mut self,
+        injectors: Vec<(
+            Arc<str>,
+            laminar_core::checkpoint::CheckpointBarrierInjector,
+        )>,
+    ) {
         #[cfg(feature = "cluster-unstable")]
         {
             self.barrier_injectors = injectors;

@@ -145,6 +145,7 @@ mod tests {
             strategy: "static".to_string(),
             seeds: vec!["node-1:7946".to_string(), "node-2:7946".to_string()],
             gossip_port: 7946,
+            advertise_host: None,
         });
         config.coordination = Some(CoordinationSection {
             strategy: "raft".to_string(),

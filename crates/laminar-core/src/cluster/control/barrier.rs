@@ -205,8 +205,6 @@ struct GrpcState {
     advertise_addr: String,
 }
 
-
-
 #[cfg(feature = "cluster-unstable")]
 type ActiveLeaderState = Option<(NodeId, watch::Receiver<Vec<NodeInfo>>)>;
 
@@ -562,9 +560,7 @@ impl BarrierCoordinator {
 
         *self.grpc.lock() = Some(grpc_state);
 
-        self.kv
-            .write(BARRIER_ADDR_KEY, advertise_addr)
-            .await;
+        self.kv.write(BARRIER_ADDR_KEY, advertise_addr).await;
 
         Ok(local_addr)
     }
@@ -580,53 +576,8 @@ impl BarrierCoordinator {
             if let Some(state) = grpc_opt {
                 let local_id = self.local_node_id().await;
                 if ann.phase == Phase::Prepare {
-                    let mut expected = Vec::new();
-                    for (node_id, addr) in self.kv.scan(BARRIER_ADDR_KEY).await {
-                        if addr == state.advertise_addr {
-                            continue;
-                        }
-                        expected.push(node_id);
-                    }
-
-                    let expected_clone = expected.clone();
-                    let clients_pool = Arc::clone(&state.clients);
-                    let kv = Arc::clone(&self.kv);
-                    let ann_clone = ann.clone();
-                    tokio::spawn(async move {
-                        let mut futures = Vec::new();
-                        for peer in expected_clone {
-                            let clients_pool = Arc::clone(&clients_pool);
-                            let kv = Arc::clone(&kv);
-                            let ann_clone = ann_clone.clone();
-                            futures.push(async move {
-                                let mut client = get_barrier_client(peer, &clients_pool, &kv)
-                                    .await
-                                    .ok_or_else(|| {
-                                        format!("failed to get client for peer {}", peer.0)
-                                    })?;
-                                let mut req = tonic::Request::new(barrier_v1::PrepareRequest {
-                                    epoch: ann_clone.epoch,
-                                    checkpoint_id: ann_clone.checkpoint_id,
-                                    flags: ann_clone.flags,
-                                });
-                                if let Some(lid) = local_id {
-                                    if let Ok(val) = lid.0.to_string().parse() {
-                                        req.metadata_mut().insert("x-leader-id", val);
-                                    }
-                                }
-                                client.prepare(req).await.map_err(|e| {
-                                    format!("prepare RPC to peer {} failed: {e}", peer.0)
-                                })?;
-                                Ok::<(), String>(())
-                            });
-                        }
-                        let results = futures::future::join_all(futures).await;
-                        for res in results {
-                            if let Err(e) = res {
-                                tracing::warn!("async prepare error during announce: {}", e);
-                            }
-                        }
-                    });
+                    // Prepare gRPC calls are initiated by wait_for_quorum.
+                    // Redundant calls here cause duplicate prepare executions and timeouts on followers.
                 } else if ann.phase == Phase::Commit || ann.phase == Phase::Abort {
                     let mut expected = Vec::new();
                     for (node_id, addr) in self.kv.scan(BARRIER_ADDR_KEY).await {
@@ -717,7 +668,7 @@ impl BarrierCoordinator {
                     let async_rx = blocking_rx.into_async();
                     *state.incoming_rx.lock() = Some(async_rx);
                     state.incoming_rx_returned.notify_one();
-                    
+
                     match res {
                         Ok(ann) => return Ok(Some(ann)),
                         Err(crossfire::TryRecvError::Disconnected) => return Ok(None),

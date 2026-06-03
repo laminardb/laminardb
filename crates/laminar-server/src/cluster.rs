@@ -301,9 +301,11 @@ pub async fn start_cluster(
     let bind_addr = &config.server.bind;
     let coordination = &cluster_cfg.coordination;
     let raft_port = coordination.raft_port;
-    let rpc_port = raft_port
-        .checked_add(1)
-        .ok_or(ClusterStartupError::InvalidRaftPort(raft_port))?;
+    let http_port = if let Some(colon) = bind_addr.rfind(':') {
+        bind_addr[colon + 1..].parse::<u16>().unwrap_or(8080)
+    } else {
+        8080
+    };
 
     // Extract the host part from bind address, handling IPv6 (W16 fix).
     // Examples: "127.0.0.1:8080" → "127.0.0.1", "[::1]:8080" → "[::1]"
@@ -336,7 +338,7 @@ pub async fn start_cluster(
     let local_node = NodeInfo {
         id: node_id,
         name: node_id_str.clone(),
-        rpc_address: format!("{advertise_host}:{rpc_port}"),
+        rpc_address: format!("{advertise_host}:{http_port}"),
         raft_address: format!("{advertise_host}:{raft_port}"),
         state: NodeState::Joining,
         metadata: NodeMetadata {
@@ -465,12 +467,19 @@ pub async fn start_cluster(
                     snapshot_store.clone(),
                     members_rx,
                 ));
+                controller.set_active(false);
                 #[cfg(feature = "cluster-unstable")]
                 {
-                    let bind: std::net::SocketAddr = format!("{bind_host}:0").parse().map_err(|e| {
-                        ClusterStartupError::EngineConstruction(format!("invalid barrier sync bind host: {e}"))
-                    })?;
-                    match controller.start_barrier_server(bind, Some(advertise_host.clone())).await {
+                    let bind: std::net::SocketAddr =
+                        format!("{bind_host}:0").parse().map_err(|e| {
+                            ClusterStartupError::EngineConstruction(format!(
+                                "invalid barrier sync bind host: {e}"
+                            ))
+                        })?;
+                    match controller
+                        .start_barrier_server(bind, Some(advertise_host.clone()))
+                        .await
+                    {
                         Ok(bound) => {
                             info!("Barrier sync gRPC server listening on {}", bound);
                         }
@@ -569,7 +578,7 @@ pub async fn start_cluster(
     builder = builder
         .shuffle_sender(Arc::clone(&shuffle_sender))
         .shuffle_receiver(Arc::clone(&shuffle_receiver))
-        .target_partitions(vnode_count as usize);
+        .target_partitions(1);
 
     let db = builder
         .build()
@@ -674,6 +683,9 @@ pub async fn start_cluster(
     active.state = NodeState::Active;
     if let Err(e) = discovery.announce(active.clone()).await {
         warn!("Failed to announce active state: {e}");
+    }
+    if let Some(ref controller) = cluster_controller {
+        controller.set_active(true);
     }
 
     info!("Cluster node '{node_id_str}' started");

@@ -149,7 +149,13 @@ pub trait PipelineCallback: Send + 'static {
     }
 
     /// Register the local source barrier injectors.
-    fn set_barrier_injectors(&mut self, injectors: Vec<(Arc<str>, laminar_core::checkpoint::CheckpointBarrierInjector)>) {
+    fn set_barrier_injectors(
+        &mut self,
+        injectors: Vec<(
+            Arc<str>,
+            laminar_core::checkpoint::CheckpointBarrierInjector,
+        )>,
+    ) {
         let _ = injectors;
     }
 }

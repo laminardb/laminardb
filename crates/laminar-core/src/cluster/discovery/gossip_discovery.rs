@@ -257,6 +257,12 @@ impl GossipDiscovery {
                     }
                 }
             }
+            if resolved.is_none() {
+                tracing::warn!(
+                    "Failed to resolve advertise_host '{}' (or cluster-unstable feature is disabled). Falling back to 127.0.0.1",
+                    host
+                );
+            }
             resolved.unwrap_or_else(|| {
                 std::net::SocketAddr::new(
                     std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
@@ -271,7 +277,9 @@ impl GossipDiscovery {
                     let hostname = gethostname::gethostname();
                     let hostname_str = hostname.to_string_lossy();
                     if !hostname_str.is_empty() {
-                        if let Ok(addrs) = (hostname_str.as_ref(), gossip_addr.port()).to_socket_addrs() {
+                        if let Ok(addrs) =
+                            (hostname_str.as_ref(), gossip_addr.port()).to_socket_addrs()
+                        {
                             for addr in addrs {
                                 if addr.ip().is_ipv4() && !addr.ip().is_loopback() {
                                     res = Some(addr);
@@ -295,7 +303,12 @@ impl GossipDiscovery {
 
         let seed_addrs: Vec<String> = self.config.seed_nodes.clone();
 
-        tracing::info!("Starting gossip discovery: gossip_addr = {}, advertise_addr = {}, seeds = {:?}", gossip_addr, advertise_addr, seed_addrs);
+        tracing::info!(
+            "Starting gossip discovery: gossip_addr = {}, advertise_addr = {}, seeds = {:?}",
+            gossip_addr,
+            advertise_addr,
+            seed_addrs
+        );
 
         // Generation: wall-clock millis. A node that was previously
         // known (same `node_id`) rejoining under the same string
@@ -354,7 +367,7 @@ impl GossipDiscovery {
                             chitchat_guard.live_nodes().collect();
 
                         let nodes: Vec<_> = chitchat_guard.node_states().iter().map(|(id, _)| format!("{}(live={})", id.node_id, live_ids.contains(id))).collect();
-                        tracing::info!("Chitchat state nodes: {:?}", nodes);
+                        tracing::debug!("Chitchat state nodes: {:?}", nodes);
 
                         // Iterate all known nodes, tagging dead ones
                         for (cc_id, state) in chitchat_guard.node_states() {

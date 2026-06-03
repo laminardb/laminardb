@@ -129,7 +129,7 @@ impl std::fmt::Display for CheckpointPhase {
 }
 
 /// Result of a checkpoint attempt.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct CheckpointResult {
     /// Whether the checkpoint succeeded.
     pub success: bool,

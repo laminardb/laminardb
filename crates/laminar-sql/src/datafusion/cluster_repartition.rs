@@ -577,6 +577,10 @@ fn optimize_plan(
         let left = new_children[0].clone();
         let right = new_children[1].clone();
 
+        if *hash_join.partition_mode() == datafusion::physical_plan::joins::PartitionMode::CollectLeft {
+            return plan.clone().with_new_children(vec![left, right]);
+        }
+
         let mut left_keys = Vec::new();
         let mut right_keys = Vec::new();
         for (l_col, r_col) in hash_join.on() {

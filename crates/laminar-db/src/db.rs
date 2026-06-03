@@ -312,6 +312,16 @@ impl LaminarDB {
 
         let connector_registry = Arc::new(laminar_connectors::registry::ConnectorRegistry::new());
         Self::register_builtin_connectors(&connector_registry);
+        #[cfg(feature = "cluster-unstable")]
+        let mut physical_rules = extra_optimizer_rules.to_vec();
+        #[cfg(feature = "cluster-unstable")]
+        {
+            physical_rules.push(Arc::new(
+                laminar_sql::datafusion::cluster_repartition::DistributedJoinRule,
+            ));
+        }
+        #[cfg(not(feature = "cluster-unstable"))]
+        let physical_rules = extra_optimizer_rules.to_vec();
 
         Ok(Self {
             catalog,
@@ -346,7 +356,7 @@ impl LaminarDB {
             cluster_controller: parking_lot::Mutex::new(None),
             state_backend: parking_lot::Mutex::new(None),
             vnode_registry: parking_lot::Mutex::new(None),
-            physical_optimizer_rules: extra_optimizer_rules.to_vec().into(),
+            physical_optimizer_rules: physical_rules.into(),
             pipeline_target_partitions: target_partitions,
             #[cfg(feature = "cluster-unstable")]
             shuffle_sender: parking_lot::Mutex::new(None),
@@ -2094,6 +2104,31 @@ impl LaminarDB {
             ));
         }
 
+        #[cfg(feature = "cluster-unstable")]
+        {
+            let leader_opt = {
+                let cc_guard = self.cluster_controller.lock();
+                cc_guard.as_ref().and_then(|cc| {
+                    if cc.is_leader() {
+                        None
+                    } else {
+                        cc.current_leader().and_then(|leader_id| {
+                            let watch = cc.members_watch();
+                            let members = watch.borrow();
+                            members.iter().find(|m| m.id == leader_id).map(|m| m.rpc_address.clone())
+                        })
+                    }
+                })
+            };
+            if let Some(leader_rpc) = leader_opt {
+                tracing::info!(
+                    "Forwarding checkpoint request to leader node at HTTP address {}",
+                    leader_rpc
+                );
+                return self.forward_checkpoint_to_leader(&leader_rpc).await;
+            }
+        }
+
         // When the streaming pipeline is live, route through the
         // pipeline callback so it captures operator state (via the same
         // path that the periodic checkpoint timer uses). Without this,
@@ -2132,6 +2167,52 @@ impl LaminarDB {
         }
 
         result
+    }
+
+    #[cfg(feature = "cluster-unstable")]
+    async fn forward_checkpoint_to_leader(
+        &self,
+        addr: &str,
+    ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let mut stream = TcpStream::connect(addr).await.map_err(|e| {
+            DbError::Checkpoint(format!("failed to connect to leader at {addr}: {e}"))
+        })?;
+
+        let req = format!(
+            "POST /api/v1/checkpoint HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.map_err(|e| {
+            DbError::Checkpoint(format!("failed to send checkpoint request to leader: {e}"))
+        })?;
+
+        let mut response_bytes = Vec::new();
+        stream.read_to_end(&mut response_bytes).await.map_err(|e| {
+            DbError::Checkpoint(format!("failed to read checkpoint response from leader: {e}"))
+        })?;
+
+        // Find the double CRLF separating headers from body
+        let mut header_len = response_bytes.len();
+        for i in 0..response_bytes.len().saturating_sub(3) {
+            if response_bytes[i..i+4] == [b'\r', b'\n', b'\r', b'\n'] {
+                header_len = i + 4;
+                break;
+            }
+        }
+
+        if header_len >= response_bytes.len() {
+            return Err(DbError::Checkpoint("invalid HTTP response from leader".into()));
+        }
+
+        let body = &response_bytes[header_len..];
+        let result: crate::checkpoint_coordinator::CheckpointResult = serde_json::from_slice(body).map_err(|e| {
+            let raw = String::from_utf8_lossy(body);
+            DbError::Checkpoint(format!("failed to deserialize leader's response ({raw}): {e}"))
+        })?;
+
+        Ok(result)
     }
 
     /// Returns checkpoint performance statistics.

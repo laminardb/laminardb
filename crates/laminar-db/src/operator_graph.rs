@@ -1923,9 +1923,11 @@ impl OperatorGraph {
         checkpoint_id: u64,
         watermark: i64,
         live: &[u64],
+        controller: Option<&laminar_core::cluster::control::ClusterController>,
     ) -> Result<(), DbError> {
         use laminar_core::checkpoint::barrier::CheckpointBarrier;
         use laminar_core::shuffle::{BarrierTracker, ShuffleMessage};
+        use laminar_core::cluster::control::Phase;
 
         const ALIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -2009,40 +2011,56 @@ impl OperatorGraph {
             }
         }
 
+        let alignment_timeout = tokio::time::sleep(ALIGN_TIMEOUT);
+        tokio::pin!(alignment_timeout);
+        let mut check_interval = tokio::time::interval(std::time::Duration::from_millis(500));
         loop {
-            match tokio::time::timeout(ALIGN_TIMEOUT, cfg.receiver.recv()).await {
-                Err(_) => {
+            tokio::select! {
+                res = cfg.receiver.recv() => {
+                    match res {
+                        None => {
+                            return Err(DbError::Pipeline(
+                                "shuffle receiver closed during barrier alignment".into(),
+                            ));
+                        }
+                        Some((from, ShuffleMessage::Barrier(b))) if b.checkpoint_id == checkpoint_id => {
+                            tracing::info!(
+                                checkpoint_id,
+                                from_peer = from,
+                                "align_shuffle_barriers: received peer barrier"
+                            );
+                            if let Some(&port) = peer_port.get(&from) {
+                                if tracker.observe(port, b).is_some() {
+                                    tracing::info!(
+                                        checkpoint_id,
+                                        "align_shuffle_barriers: all peers aligned successfully"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        Some((from, ShuffleMessage::VnodeData(stage, _vnode, batch))) => {
+                            self.ingest_to_stage(&stage, batch, watermark).await?;
+                        }
+                        Some(_) => {}
+                    }
+                }
+                _ = check_interval.tick() => {
+                    if let Some(ctrl) = controller {
+                        if let Ok(Some(ann)) = ctrl.observe_barrier().await {
+                            if ann.checkpoint_id == checkpoint_id && ann.phase == Phase::Abort {
+                                return Err(DbError::Pipeline(format!(
+                                    "checkpoint {checkpoint_id} was aborted by leader"
+                                )));
+                            }
+                        }
+                    }
+                }
+                _ = &mut alignment_timeout => {
                     return Err(DbError::Pipeline(format!(
                         "shuffle barrier alignment timed out for checkpoint {checkpoint_id}"
                     )));
                 }
-                Ok(None) => {
-                    return Err(DbError::Pipeline(
-                        "shuffle receiver closed during barrier alignment".into(),
-                    ));
-                }
-                Ok(Some((from, ShuffleMessage::Barrier(b))))
-                    if b.checkpoint_id == checkpoint_id =>
-                {
-                    tracing::info!(
-                        checkpoint_id,
-                        from_peer = from,
-                        "align_shuffle_barriers: received peer barrier"
-                    );
-                    if let Some(&port) = peer_port.get(&from) {
-                        if tracker.observe(port, b).is_some() {
-                            tracing::info!(
-                                checkpoint_id,
-                                "align_shuffle_barriers: all peers aligned successfully"
-                            );
-                            break; // all peers aligned
-                        }
-                    }
-                }
-                Ok(Some((_from, ShuffleMessage::VnodeData(stage, _vnode, batch)))) => {
-                    self.ingest_to_stage(&stage, batch, watermark).await?;
-                }
-                Ok(Some(_)) => {} // Hello / Close / stale barrier
             }
         }
         Ok(())
@@ -2281,7 +2299,7 @@ mod tests {
             .await
             .unwrap();
 
-        graph.align_shuffle_barriers(7, 0, &[1, 2]).await.unwrap();
+        graph.align_shuffle_barriers(7, 0, &[1, 2], None).await.unwrap();
 
         // Node 1 must have fanned its own barrier out to node 2.
         let (from, msg) = recv2.recv().await.unwrap();

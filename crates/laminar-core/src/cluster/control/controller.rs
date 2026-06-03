@@ -31,6 +31,8 @@ pub struct ClusterController {
     /// excludes itself from [`Self::assignable_instances`] so the next
     /// rotation sheds its vnodes elsewhere before it exits.
     draining: Arc<AtomicBool>,
+    /// Whether this node has announced itself as Active.
+    active: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for ClusterController {
@@ -61,6 +63,7 @@ impl ClusterController {
             members_rx,
             cluster_min_watermark: Arc::new(AtomicI64::new(i64::MIN)),
             draining: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -114,8 +117,10 @@ impl ClusterController {
             .filter(|m| matches!(m.state, NodeState::Active))
             .map(|m| m.id)
             .collect();
-        // Include ourselves — we're trivially Active from our own view.
-        ids.push(self.instance_id);
+        // Include ourselves if we are active.
+        if self.active.load(Ordering::SeqCst) {
+            ids.push(self.instance_id);
+        }
         leader_of(&ids)
     }
 
@@ -123,6 +128,11 @@ impl ClusterController {
     #[must_use]
     pub fn is_leader(&self) -> bool {
         self.current_leader() == Some(self.instance_id)
+    }
+
+    /// Mark this node's active status.
+    pub fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::SeqCst);
     }
 
     /// Live instance IDs: `Active` peers plus self.
@@ -135,7 +145,9 @@ impl ClusterController {
             .filter(|m| matches!(m.state, NodeState::Active))
             .map(|m| m.id)
             .collect();
-        ids.push(self.instance_id);
+        if self.active.load(Ordering::SeqCst) {
+            ids.push(self.instance_id);
+        }
         ids
     }
 
@@ -157,7 +169,7 @@ impl ClusterController {
     #[must_use]
     pub fn assignable_instances(&self) -> Vec<NodeId> {
         let mut ids = assignable_node_ids(&self.members_rx.borrow());
-        if !self.is_draining() && !self.instance_id.is_unassigned() {
+        if self.active.load(Ordering::SeqCst) && !self.is_draining() && !self.instance_id.is_unassigned() {
             ids.push(self.instance_id);
         }
         ids.sort_unstable();
