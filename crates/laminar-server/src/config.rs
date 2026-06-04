@@ -194,6 +194,20 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
     }
 
+    // Each CORS origin becomes an `Access-Control-Allow-Origin` header value;
+    // reject anything that isn't a valid HTTP header value (e.g. control
+    // characters) before it reaches the router.
+    if let Some(origins) = &config.server.console_cors_allowed_origins {
+        for origin in origins {
+            if origin.parse::<axum::http::HeaderValue>().is_err() {
+                errors.push(format!(
+                    "invalid origin in server.console_cors_allowed_origins: '{}'",
+                    origin
+                ));
+            }
+        }
+    }
+
     // Validate: cluster mode requires discovery and coordination
     if config.server.mode == "cluster" {
         if config.discovery.is_none() {
@@ -1304,6 +1318,31 @@ console_token = "supersecret-token"
             dump.contains("REDACTED"),
             "expected REDACTED marker: {dump}"
         );
+    }
+
+    #[test]
+    fn test_validate_invalid_cors_origin() {
+        // A control character (bell, U+0007) in the origin makes it an invalid
+        // HTTP header value, so config validation must reject it. TOML basic
+        // strings can't carry a raw control byte, so the field is set in Rust.
+        let toml = r#"
+[server]
+"#;
+        let mut config: ServerConfig = toml::from_str(toml).unwrap();
+        config.server.console_cors_allowed_origins =
+            Some(vec!["http://e\u{0007}vil.example.com".to_string()]);
+        let err = validate_config(&config).unwrap_err();
+        match err {
+            ConfigError::ValidationErrors { errors } => {
+                assert!(
+                    errors.iter().any(
+                        |e| e.contains("invalid origin in server.console_cors_allowed_origins")
+                    ),
+                    "errors: {errors:?}"
+                );
+            }
+            _ => panic!("expected ValidationErrors"),
+        }
     }
 
     #[test]

@@ -1907,11 +1907,7 @@ impl LaminarDB {
         let registry = self.mv_registry.lock();
         registry
             .views()
-            .map(|view| crate::handle::MaterializedViewInfo {
-                name: view.name.clone(),
-                sql: view.sql.clone(),
-                state: format!("{:?}", view.state),
-            })
+            .map(crate::handle::MaterializedViewInfo::from)
             .collect()
     }
 

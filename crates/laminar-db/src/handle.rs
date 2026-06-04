@@ -493,6 +493,16 @@ pub struct MaterializedViewInfo {
     pub state: String,
 }
 
+impl From<&laminar_core::mv::MaterializedView> for MaterializedViewInfo {
+    fn from(view: &laminar_core::mv::MaterializedView) -> Self {
+        Self {
+            name: view.name.clone(),
+            sql: view.sql.clone(),
+            state: format!("{:?}", view.state),
+        }
+    }
+}
+
 /// Information about a running query.
 #[derive(Debug, Clone)]
 pub struct QueryInfo {

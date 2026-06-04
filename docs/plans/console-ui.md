@@ -1,6 +1,6 @@
 # Plan: LaminarDB Console UI (Admin / Operator Web UI for Cluster Mode)
 
-- **Status:** Proposed (not started).
+- **Status:** In Progress (Phase 0-3 server APIs implemented, frontend pending).
 - **Date:** 2026-06-03
 - **Scope:** A web console for LaminarDB (cluster mode first, works embedded too) that lets a
   user set up sources, author and run queries against sources/streams/MVs, view results in
@@ -97,11 +97,9 @@ but browsers can't speak pgwire.)
 `SUBSCRIBE` is pgwire-only; `/ws/{name}` only tails an already-registered stream. "Type a
 SELECT, watch it live" has no endpoint.
 
-### G2 — HTTP API has no authentication  ★ security blocker
+### G2 — HTTP API has no authentication  ★ security blocker (gated)
 
-`build_router` applies `CorsLayer::permissive()` (`http.rs:52`) and **no auth** on any route,
-including `POST /sql`, `POST /checkpoint`, `POST /reload`. pgwire has full auth; the HTTP
-control plane has none. A console must not ship the admin API unauthenticated.
+The HTTP API control plane routes are now protected by bearer token / WS query token authentication configured via server.console_token, and CORS origins are gated via server.console_cors_allowed_origins.
 
 ### G3 — Cluster state not exposed
 

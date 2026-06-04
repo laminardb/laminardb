@@ -222,8 +222,13 @@ async fn auth_middleware(
 
     if let Some(expected) = expected {
         let expected = expected.expose();
+        // The `?token=` query parameter exists for browser WebSocket clients,
+        // which can't set the `Authorization` header on the upgrade request.
+        // Restrict it to WS routes (`/ws/…`) so it can't leak into access
+        // logs, referrers, or proxy caches on regular control-plane requests.
+        let is_ws = req.uri().path().starts_with("/ws/");
         let authorized = bearer_token(req.headers()).is_some_and(|t| ct_eq(t, expected))
-            || query_token(req.uri()).is_some_and(|t| ct_eq(&t, expected));
+            || (is_ws && query_token(req.uri()).is_some_and(|t| ct_eq(&t, expected)));
         if !authorized {
             return error_response(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
         }
@@ -1211,8 +1216,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_with_query_token_returns_200() {
-        // WebSocket clients can't set the Authorization header, so the token
-        // is accepted from the query string as well.
+        // WebSocket clients can't set the Authorization header, so the token is
+        // accepted from the query string — but only on `/ws/` routes. A plain
+        // (non-upgrade) GET to a WS route passes auth and is then rejected by
+        // the WebSocket upgrade extractor, so the meaningful assertion is that
+        // auth did not reject it with 401.
+        let state = test_state_with_token("supersecret-token");
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/ws/events?token=supersecret-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_query_token_on_http_returns_401() {
+        // The `?token=` query parameter is honored only on WS upgrade routes.
+        // On a normal HTTP control-plane route it is ignored, so a request
+        // without a bearer header is unauthorized.
         let state = test_state_with_token("supersecret-token");
         let app = build_router(state);
 
@@ -1221,7 +1245,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

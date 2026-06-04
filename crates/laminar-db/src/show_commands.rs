@@ -75,9 +75,10 @@ impl LaminarDB {
         let mut sqls = Vec::new();
         let mut states = Vec::new();
         for view in registry.views() {
-            names.push(view.name.clone());
-            sqls.push(view.sql.clone());
-            states.push(format!("{:?}", view.state));
+            let info = crate::handle::MaterializedViewInfo::from(view);
+            names.push(info.name);
+            sqls.push(info.sql);
+            states.push(info.state);
         }
         let names_ref: Vec<&str> = names.iter().map(String::as_str).collect();
         let sqls_ref: Vec<&str> = sqls.iter().map(String::as_str).collect();
