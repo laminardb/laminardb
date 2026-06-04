@@ -245,6 +245,14 @@ impl LaminarDbBuilder {
         self
     }
 
+    /// Set the bearer token presented when forwarding requests to the cluster
+    /// leader's HTTP API.
+    #[must_use]
+    pub fn http_auth_token(mut self, token: impl Into<String>) -> Self {
+        self.config.http_auth_token = Some(token.into());
+        self
+    }
+
     /// Set the default buffer size for streaming channels.
     #[must_use]
     pub fn buffer_size(mut self, size: usize) -> Self {

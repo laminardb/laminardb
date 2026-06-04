@@ -440,30 +440,34 @@ pub async fn start_cluster(
     let mut builder = LaminarDB::builder();
     builder = builder.profile(Profile::Cluster);
     if let Some(ref token) = config.server.console_token {
-        builder = builder.config_var("server.console_token", token.expose());
+        builder = builder.http_auth_token(token.expose());
     }
 
     if let Some(path) = config.state.local_storage_dir() {
         builder = builder.storage_dir(path);
     }
 
-    // Build state backend + its underlying object store. The object
-    // store is shared with `AssignmentSnapshotStore` below so a single
-    // cluster-wide bucket holds both per-epoch state and the vnode
-    // assignment snapshot.
     let state_backend: Arc<dyn laminar_core::state::StateBackend> = config
         .state
         .build()
         .await
         .map_err(|e| ClusterStartupError::EngineConstruction(format!("state backend: {e}")))?;
 
-    // Build the vnode registry. If a shared `AssignmentSnapshot` already
-    // exists in the state backend's object store, every node adopts it.
-    // Otherwise the first peer to arrive CAS-creates the snapshot from
-    // its local round-robin split; losers of the CAS race re-load and
-    // adopt the winner.
-    let (vnode_registry, snapshot_store) =
-        resolve_vnode_assignment(node_id, &peers, &config.state).await?;
+    // Shared control-plane store for the assignment snapshot and the cluster KV.
+    // Every node must reach it, so it comes from the checkpoint bucket, not the
+    // per-node `[state]` path.
+    let control_store = build_control_store(&config)?;
+
+    // Build the vnode registry. If a shared `AssignmentSnapshot` already exists,
+    // every node adopts it; otherwise the first peer CAS-creates it and losers
+    // re-load and adopt the winner.
+    let (vnode_registry, snapshot_store) = resolve_vnode_assignment(
+        node_id,
+        &peers,
+        config.state.vnode_capacity(),
+        control_store.clone(),
+    )
+    .await?;
 
     // Each arm produces the control-plane KV (chitchat for gossip, object store
     // for static); `install_cluster_controller` does the shared setup.
@@ -472,22 +476,17 @@ pub async fn start_cluster(
         DiscoveryImpl::Gossip(ref gossip) => gossip
             .chitchat_handle()
             .map(|handle| Arc::new(ChitchatKv::from_handle(handle)) as Arc<dyn ClusterKv>),
-        DiscoveryImpl::Static(_) => {
-            let shared_store = config.state.build_object_store().map_err(|e| {
-                ClusterStartupError::EngineConstruction(format!("state object store: {e}"))
-            })?;
-            match shared_store {
-                Some(store) => Some(Arc::new(ObjectStoreClusterKv::new(
-                    node_id,
-                    store,
-                    discovery.membership_watch(),
-                )) as Arc<dyn ClusterKv>),
-                None => {
-                    info!("Static discovery — cluster control plane skipped (no object store).");
-                    None
-                }
+        DiscoveryImpl::Static(_) => match control_store.clone() {
+            Some(store) => Some(Arc::new(ObjectStoreClusterKv::new(
+                node_id,
+                store,
+                discovery.membership_watch(),
+            )) as Arc<dyn ClusterKv>),
+            None => {
+                info!("Static discovery — cluster control plane skipped (no shared object store).");
+                None
             }
-        }
+        },
     };
 
     let cluster_controller = match controller_kv {
@@ -739,7 +738,8 @@ fn num_cpus() -> u32 {
 async fn resolve_vnode_assignment(
     self_id: laminar_core::cluster::discovery::NodeId,
     peers: &[laminar_core::cluster::discovery::NodeInfo],
-    state_cfg: &laminar_core::state::StateBackendConfig,
+    vnode_count: u32,
+    control_store: Option<Arc<dyn object_store::ObjectStore>>,
 ) -> Result<
     (
         Arc<laminar_core::state::VnodeRegistry>,
@@ -750,7 +750,6 @@ async fn resolve_vnode_assignment(
     use laminar_core::cluster::control::{AssignmentSnapshot, AssignmentSnapshotStore};
     use laminar_core::state::{rendezvous_assignment, NodeId, VnodeRegistry};
 
-    let vnode_count = state_cfg.vnode_capacity();
     let peer_ids: Vec<NodeId> = peers
         .iter()
         .map(|p| NodeId(p.id.0))
@@ -758,11 +757,8 @@ async fn resolve_vnode_assignment(
         .collect();
     let assignment: Arc<[NodeId]> = rendezvous_assignment(vnode_count, &peer_ids);
 
-    let maybe_store = state_cfg
-        .build_object_store()
-        .map_err(|e| ClusterStartupError::EngineConstruction(format!("state object store: {e}")))?;
-    let Some(store) = maybe_store else {
-        // Non-durable backend — fall back to node-local round-robin.
+    let Some(store) = control_store else {
+        // No shared store — fall back to node-local round-robin.
         let registry = VnodeRegistry::new(vnode_count);
         registry.set_assignment(Arc::clone(&assignment));
         return Ok((Arc::new(registry), None));
@@ -817,6 +813,28 @@ async fn resolve_vnode_assignment(
     let registry = VnodeRegistry::new(vnode_count);
     registry.set_assignment_and_version(winner.to_vnode_vec(vnode_count).into(), winner.version);
     Ok((Arc::new(registry), Some(snapshot_store)))
+}
+
+/// Build the shared, cluster-wide control-plane object store (assignment
+/// snapshot + `ObjectStoreClusterKv`). It must be reachable by every node, so
+/// it comes from the checkpoint bucket — not the per-node `[state]` path. Falls
+/// back to the state backend's store for single-host/local setups.
+fn build_control_store(
+    config: &ServerConfig,
+) -> Result<Option<Arc<dyn object_store::ObjectStore>>, ClusterStartupError> {
+    if !config.checkpoint.url.is_empty() {
+        let store = laminar_core::storage::object_store_builder::build_object_store(
+            &config.checkpoint.url,
+            &config.checkpoint.storage,
+        )
+        .map_err(|e| {
+            ClusterStartupError::EngineConstruction(format!("control-plane object store: {e}"))
+        })?;
+        return Ok(Some(store));
+    }
+    config.state.build_object_store().map_err(|e| {
+        ClusterStartupError::EngineConstruction(format!("control-plane object store: {e}"))
+    })
 }
 
 /// Build a `ClusterController` from a ready KV handle and start its barrier sync

@@ -123,7 +123,7 @@ pub async fn run_server(
     // Build LaminarDB via builder API
     let mut builder = LaminarDB::builder();
     if let Some(ref token) = config.server.console_token {
-        builder = builder.config_var("server.console_token", token.expose());
+        builder = builder.http_auth_token(token.expose());
     }
 
     let storage_dir = config.state.local_storage_dir();

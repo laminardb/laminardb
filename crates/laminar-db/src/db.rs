@@ -2184,9 +2184,6 @@ impl LaminarDB {
         &self,
         addr: &str,
     ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpStream;
-
         #[derive(serde::Deserialize)]
         struct ForwardedCheckpointResponse {
             success: bool,
@@ -2196,51 +2193,26 @@ impl LaminarDB {
             error: Option<String>,
         }
 
-        let mut stream = TcpStream::connect(addr).await.map_err(|e| {
-            DbError::Checkpoint(format!("failed to connect to leader at {addr}: {e}"))
-        })?;
-
-        let auth_header = if let Some(token) = self.config_vars.get("server.console_token") {
-            format!("Authorization: Bearer {token}\r\n")
-        } else {
-            String::new()
-        };
-
-        let req = format!(
-            "POST /api/v1/checkpoint HTTP/1.1\r\nHost: {addr}\r\n{auth_header}Content-Length: 0\r\nConnection: close\r\n\r\n"
-        );
-        stream.write_all(req.as_bytes()).await.map_err(|e| {
-            DbError::Checkpoint(format!("failed to send checkpoint request to leader: {e}"))
-        })?;
-
-        let mut response_bytes = Vec::new();
-        stream.read_to_end(&mut response_bytes).await.map_err(|e| {
+        let mut req = reqwest::Client::new().post(format!("http://{addr}/api/v1/checkpoint"));
+        if let Some(token) = &self.config.http_auth_token {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().await.map_err(|e| {
             DbError::Checkpoint(format!(
-                "failed to read checkpoint response from leader: {e}"
+                "failed to forward checkpoint to leader at {addr}: {e}"
             ))
         })?;
 
-        // Find the double CRLF separating headers from body
-        let mut header_len = response_bytes.len();
-        for i in 0..response_bytes.len().saturating_sub(3) {
-            if response_bytes[i..i + 4] == [b'\r', b'\n', b'\r', b'\n'] {
-                header_len = i + 4;
-                break;
-            }
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(DbError::Checkpoint(format!(
+                "leader rejected checkpoint ({status}): {body}"
+            )));
         }
 
-        if header_len >= response_bytes.len() {
-            return Err(DbError::Checkpoint(
-                "invalid HTTP response from leader".into(),
-            ));
-        }
-
-        let body = &response_bytes[header_len..];
-        let response: ForwardedCheckpointResponse = serde_json::from_slice(body).map_err(|e| {
-            let raw = String::from_utf8_lossy(body);
-            DbError::Checkpoint(format!(
-                "failed to deserialize leader's response ({raw}): {e}"
-            ))
+        let response: ForwardedCheckpointResponse = resp.json().await.map_err(|e| {
+            DbError::Checkpoint(format!("failed to parse leader checkpoint response: {e}"))
         })?;
 
         Ok(crate::checkpoint_coordinator::CheckpointResult {

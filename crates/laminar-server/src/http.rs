@@ -154,6 +154,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/cluster/vnodes", get(cluster_vnodes))
         .route("/api/v1/cluster/leader", get(cluster_leader))
         .route("/api/v1/cluster/checkpoints", get(cluster_checkpoints))
+        .route("/api/v1/pipeline/stop", post(stop_pipeline))
+        .route("/api/v1/pipeline/start", post(start_pipeline))
+        .route("/api/v1/pipeline/status", get(pipeline_status))
         .route("/ws/{name}", get(ws_upgrade))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -772,6 +775,37 @@ async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
         pipeline_state,
     })
     .into_response()
+}
+
+async fn stop_pipeline(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.db.stop_pipeline().await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "message": "Pipeline suspended successfully" })),
+        )
+            .into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn start_pipeline(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.db.start().await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "message": "Pipeline started successfully" })),
+        )
+            .into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn pipeline_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let pipeline_state = state.db.pipeline_state();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "pipeline_state": pipeline_state })),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------

@@ -184,17 +184,14 @@ pub(crate) mod barrier_v1 {
 #[cfg(feature = "cluster")]
 type BarrierFlavor = crossfire::mpsc::Array<BarrierAnnouncement>;
 
-/// Per-peer barrier gRPC client pool; caches each peer's address so a change
-/// forces a reconnect.
+/// Per-peer barrier gRPC client pool, keyed by `NodeId`. Entries are evicted on
+/// RPC failure so a restarted/moved peer is re-resolved on the next round.
 #[cfg(feature = "cluster")]
 type BarrierClientPool = Arc<
     parking_lot::Mutex<
         FxHashMap<
             NodeId,
-            (
-                String,
-                barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>,
-            ),
+            barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>,
         >,
     >,
 >;
@@ -408,22 +405,16 @@ async fn get_barrier_client(
     pool: &BarrierClientPool,
     kv: &Arc<dyn ClusterKv>,
 ) -> Option<barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>> {
-    let addr_str = kv.read_from(peer, BARRIER_ADDR_KEY).await?;
-    {
-        let guard = pool.lock();
-        if let Some((cached_addr, client)) = guard.get(&peer) {
-            if cached_addr == &addr_str {
-                return Some(client.clone());
-            }
-        }
+    if let Some(client) = pool.lock().get(&peer) {
+        return Some(client.clone());
     }
 
+    let addr_str = kv.read_from(peer, BARRIER_ADDR_KEY).await?;
     let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr_str}")).ok()?;
     let channel = endpoint.connect_lazy();
     let client = barrier_v1::barrier_sync_client::BarrierSyncClient::new(channel);
 
-    let mut guard = pool.lock();
-    guard.insert(peer, (addr_str, client.clone()));
+    pool.lock().insert(peer, client.clone());
     Some(client)
 }
 
@@ -612,9 +603,13 @@ impl BarrierCoordinator {
                                             req.metadata_mut().insert("x-leader-id", val);
                                         }
                                     }
-                                    client.commit(req).await.map_err(|e| {
-                                        format!("commit RPC to peer {} failed: {e}", peer.0)
-                                    })?;
+                                    if let Err(e) = client.commit(req).await {
+                                        clients_pool.lock().remove(&peer);
+                                        return Err(format!(
+                                            "commit RPC to peer {} failed: {e}",
+                                            peer.0
+                                        ));
+                                    }
                                 }
                                 Phase::Abort => {
                                     let mut req = tonic::Request::new(barrier_v1::AbortRequest {
@@ -627,9 +622,13 @@ impl BarrierCoordinator {
                                             req.metadata_mut().insert("x-leader-id", val);
                                         }
                                     }
-                                    client.abort(req).await.map_err(|e| {
-                                        format!("abort RPC to peer {} failed: {e}", peer.0)
-                                    })?;
+                                    if let Err(e) = client.abort(req).await {
+                                        clients_pool.lock().remove(&peer);
+                                        return Err(format!(
+                                            "abort RPC to peer {} failed: {e}",
+                                            peer.0
+                                        ));
+                                    }
                                 }
                                 Phase::Prepare => {}
                             }
@@ -779,8 +778,14 @@ impl BarrierCoordinator {
                                     ))
                                 }
                             }
-                            Ok(Err(e)) => Err((peer, e.to_string())),
-                            Err(_) => Err((peer, "Timeout".to_string())),
+                            Ok(Err(e)) => {
+                                clients_pool.lock().remove(&peer);
+                                Err((peer, e.to_string()))
+                            }
+                            Err(_) => {
+                                clients_pool.lock().remove(&peer);
+                                Err((peer, "Timeout".to_string()))
+                            }
                         }
                     });
                 }

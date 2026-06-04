@@ -1760,6 +1760,39 @@ impl LaminarDB {
         self.close();
         Ok(())
     }
+
+    /// Stop the streaming pipeline (suspend coordinator lifecycle safely).
+    ///
+    /// # Errors
+    /// Returns [`DbError`] if the pipeline cannot be transitioned to stopped.
+    pub async fn stop_pipeline(&self) -> Result<(), DbError> {
+        let state = DbState::load(&self.state);
+        if matches!(
+            state,
+            DbState::Created | DbState::Stopped | DbState::ShuttingDown
+        ) {
+            return Ok(());
+        }
+
+        DbState::ShuttingDown.store(&self.state);
+
+        // Drop force-checkpoint sender
+        *self.force_ckpt_tx.lock() = None;
+
+        self.shutdown_signal.notify_one();
+
+        let handle = self.runtime_handle.lock().take();
+        if let Some(handle) = handle {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), handle).await {
+                Ok(Ok(())) => tracing::info!("Pipeline stopped cleanly"),
+                Ok(Err(e)) => tracing::warn!(error = %e, "Pipeline task panicked during stop"),
+                Err(_) => tracing::warn!("Pipeline stop timed out after 10s"),
+            }
+        }
+
+        DbState::Created.store(&self.state);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
