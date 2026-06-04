@@ -9,18 +9,10 @@
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-#[cfg(feature = "cluster-unstable")]
-use arrow::compute::take;
-#[cfg(feature = "cluster-unstable")]
-use arrow::row::{RowConverter, SortField};
-#[cfg(feature = "cluster-unstable")]
-use arrow_array::UInt32Array;
 use async_trait::async_trait;
 use datafusion::prelude::SessionContext;
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 use laminar_core::shuffle::ShuffleMessage;
-#[cfg(feature = "cluster-unstable")]
-use laminar_core::state::key_hash;
 
 use crate::aggregate_state::{
     apply_compiled_having, AggStateCheckpoint, CompiledProjection, IncrementalAggState,
@@ -57,7 +49,7 @@ enum QueryState {
 /// Row-shuffle ships raw rows, not partial-aggregate state. Cheaper
 /// to implement than two-stage partial aggregation, linearly more
 /// bandwidth-hungry.
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 #[derive(Clone)]
 pub struct ClusterShuffleConfig {
     pub registry: Arc<laminar_core::state::VnodeRegistry>,
@@ -66,7 +58,7 @@ pub struct ClusterShuffleConfig {
     pub self_id: laminar_core::state::NodeId,
 }
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 impl std::fmt::Debug for ClusterShuffleConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClusterShuffleConfig")
@@ -86,7 +78,7 @@ pub(crate) struct SqlQueryOperator {
     having_cache: Option<super::HavingSqlCache>,
     emit_changelog: bool,
     idle_ttl_ms: Option<u64>,
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     cluster_shuffle: Option<ClusterShuffleConfig>,
 }
 
@@ -110,7 +102,7 @@ impl SqlQueryOperator {
             having_cache: None,
             emit_changelog,
             idle_ttl_ms,
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             cluster_shuffle: None,
         }
     }
@@ -119,7 +111,7 @@ impl SqlQueryOperator {
     /// resolves to the aggregate fast-path, each cycle's pre-aggregate
     /// rows are hash-routed across the cluster before reaching
     /// `IncrementalAggState`.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
         self.cluster_shuffle = Some(config);
     }
@@ -335,7 +327,7 @@ impl SqlQueryOperator {
         // group columns, keep local, ship remote via `ShuffleSender`.
         // Drain inbound remote rows from `ShuffleReceiver` and merge
         // into this cycle's input. Single-node path is a no-op.
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         let pre_agg_batches = {
             let num_group_cols = agg_state.num_group_cols();
             shuffle_pre_agg_batches(
@@ -363,6 +355,9 @@ impl SqlQueryOperator {
             ));
         };
 
+        #[cfg(feature = "cluster")]
+        let num_group_cols = agg_state.num_group_cols();
+
         let mut eviction = if self.emit_changelog {
             agg_state.evict_idle(watermark)?
         } else {
@@ -384,12 +379,67 @@ impl SqlQueryOperator {
             }
         }
 
-        if eviction.is_empty() {
-            Ok(batches)
+        let result = if eviction.is_empty() {
+            batches
         } else {
             eviction.extend(batches);
-            Ok(eviction)
+            eviction
+        };
+
+        #[cfg(feature = "cluster")]
+        return self.suppress_restoring_output(result, num_group_cols);
+        #[cfg(not(feature = "cluster"))]
+        Ok(result)
+    }
+
+    /// Drop output rows whose group key hashes to a vnode currently
+    /// [`Restoring`](laminar_core::state::VnodeLifecycleState::Restoring), so a
+    /// downstream MV/sink never observes a transiently-incomplete aggregate
+    /// for a vnode whose committed state hasn't been merged in yet. The vnode
+    /// flips back to `Active` (and its rows resume emitting) once the graph
+    /// applies its rehydrated slice. No-op when nothing is restoring — the
+    /// common case, gated by a single atomic scan.
+    #[cfg(feature = "cluster")]
+    fn suppress_restoring_output(
+        &self,
+        batches: Vec<RecordBatch>,
+        num_group_cols: usize,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let Some(ref cfg) = self.cluster_shuffle else {
+            return Ok(batches);
+        };
+        if !cfg.registry.any_restoring() {
+            return Ok(batches);
         }
+        let vnode_count = cfg.registry.vnode_count();
+        let mut out = Vec::with_capacity(batches.len());
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let vnodes: Vec<u32> = if num_group_cols == 0 {
+                vec![0; batch.num_rows()]
+            } else {
+                let cols: Vec<usize> = (0..num_group_cols).collect();
+                laminar_core::shuffle::row_vnodes(&batch, &cols, vnode_count)
+            };
+            let keep: Vec<bool> = vnodes
+                .iter()
+                .map(|&v| !cfg.registry.is_restoring(v))
+                .collect();
+            let kept = keep.iter().filter(|&&k| k).count();
+            if kept == batch.num_rows() {
+                out.push(batch);
+            } else if kept > 0 {
+                let mask = arrow::array::BooleanArray::from(keep);
+                let filtered = arrow::compute::filter_record_batch(&batch, &mask).map_err(|e| {
+                    DbError::Pipeline(format!("restoring-vnode emission filter: {e}"))
+                })?;
+                out.push(filtered);
+            }
+            // kept == 0 → entire batch suppressed; drop it.
+        }
+        Ok(out)
     }
 
     /// Apply a HAVING predicate via SQL. First call builds a
@@ -447,7 +497,7 @@ impl SqlQueryOperator {
 /// agrees on one owner, only that owner produces output.
 ///
 /// Single-node fallback: if `config` is `None` the function is a pass-through.
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 async fn shuffle_pre_agg_batches(
     config: Option<&ClusterShuffleConfig>,
     op_name: &str,
@@ -466,109 +516,60 @@ async fn shuffle_pre_agg_batches(
             continue;
         }
         let row_vn = hash_rows_to_vnodes(&batch, num_group_cols, vnode_count);
-        let mut seen = row_vn.clone();
-        seen.sort_unstable();
-        seen.dedup();
-
-        for v in seen {
-            let indices: UInt32Array = row_vn
-                .iter()
-                .enumerate()
-                .filter_map(
-                    |(i, &rv)| {
-                        if rv == v {
-                            u32::try_from(i).ok()
-                        } else {
-                            None
-                        }
-                    },
-                )
-                .collect();
-            if indices.is_empty() {
-                continue;
-            }
-            let cols: Vec<arrow_array::ArrayRef> = batch
-                .columns()
-                .iter()
-                .map(|c| take(c, &indices, None))
-                .collect::<Result<_, _>>()
-                .map_err(|e| DbError::Pipeline(format!("[{op_name}] row-shuffle take: {e}")))?;
-            let slice = RecordBatch::try_new(batch.schema(), cols)
-                .map_err(|e| DbError::Pipeline(format!("[{op_name}] row-shuffle rebuild: {e}")))?;
-
+        for &v in &row_vn {
             let owner = cfg.registry.owner(v);
-            if owner == cfg.self_id {
-                local.push(slice);
-            } else if owner.is_unassigned() {
-                // Fail the cycle rather than drop the slice. Silently
-                // discarding leaves source offsets to advance past rows
-                // that never reached a peer, producing phantom loss at
-                // the checkpoint boundary.
+            if owner.is_unassigned() {
                 return Err(DbError::Pipeline(format!(
-                    "[{op_name}] row-shuffle: vnode {v} is unassigned — \
-                     refusing to drop {} rows",
-                    slice.num_rows()
+                    "[{op_name}] row-shuffle: vnode {v} is unassigned — refusing to drop rows"
                 )));
-            } else {
-                let msg = ShuffleMessage::VnodeData(v, slice);
-                // Fail the cycle on send error; dropping silently would
-                // let source offsets advance past un-delivered rows.
-                cfg.sender.send_to(owner.0, &msg).await.map_err(|e| {
-                    DbError::Pipeline(format!(
-                        "[{op_name}] row-shuffle send_to peer {}: {e}",
-                        owner.0
-                    ))
-                })?;
             }
+        }
+
+        let (local_slices, remote_slices) = laminar_core::shuffle::slice_batch_by_targets(
+            &batch,
+            &row_vn,
+            &cfg.registry,
+            cfg.self_id,
+        );
+
+        for (_v, slice) in local_slices {
+            local.push(slice);
+        }
+
+        for (owner, slice) in remote_slices {
+            let msg = ShuffleMessage::VnodeData(op_name.to_string(), 0, slice);
+            cfg.sender.send_to(owner.0, &msg).await.map_err(|e| {
+                DbError::Pipeline(format!(
+                    "[{op_name}] row-shuffle send_to peer {}: {e}",
+                    owner.0
+                ))
+            })?;
         }
     }
 
-    // Drain every currently-available remote row into this cycle. Bound
-    // by channel depth; never blocks. Messages that arrive after we
-    // drain land in the next cycle.
-    for (_from, msg) in cfg.receiver.drain_available() {
-        if let ShuffleMessage::VnodeData(_vnode, batch) = msg {
-            if batch.num_rows() > 0 {
-                local.push(batch);
-            }
+    // Drain this query's currently-available remote rows into this cycle.
+    // The receiver demuxes by stage, so a co-resident sharded operator
+    // (e.g. a lookup-enrich join) doesn't steal our rows. Bound by channel
+    // depth; never blocks. Rows that arrive after we drain land next cycle.
+    for batch in cfg.receiver.drain_vnode_data_for(op_name) {
+        if batch.num_rows() > 0 {
+            local.push(batch);
         }
     }
 
     Ok(local)
 }
 
-/// Compute the vnode id for each row by hashing the leading
-/// `num_group_cols` columns with the same `arrow::row` + `key_hash`
-/// encoding [`ClusterRepartitionExec`] uses. `num_group_cols == 0`
-/// collapses to a constant vnode (global aggregate — everyone hashes
-/// to 0 which round-robin assigns to the first peer).
-#[cfg(feature = "cluster-unstable")]
+/// Vnode per row, hashing the leading `num_group_cols` group columns.
+/// `num_group_cols == 0` is a global aggregate — every row hashes to vnode 0
+/// so a single owner produces output.
+#[cfg(feature = "cluster")]
 fn hash_rows_to_vnodes(batch: &RecordBatch, num_group_cols: usize, vnode_count: u32) -> Vec<u32> {
     if num_group_cols == 0 || batch.num_rows() == 0 {
         return vec![0; batch.num_rows()];
     }
-    let cols: Vec<arrow_array::ArrayRef> = (0..num_group_cols)
-        .map(|i| arrow_array::Array::slice(batch.column(i).as_ref(), 0, batch.num_rows()))
-        .collect();
-    // `Array::slice` above returns `Arc<dyn Array>` — turn it into the
-    // `Vec<ArrayRef>` RowConverter expects. (Defensive copy-free clone.)
-    let cols: Vec<arrow_array::ArrayRef> = cols.into_iter().collect();
-    let fields: Vec<SortField> = cols
-        .iter()
-        .map(|c| SortField::new(c.data_type().clone()))
-        .collect();
-    let converter = RowConverter::new(fields).expect("RowConverter for hash key");
-    let rows = converter
-        .convert_columns(&cols)
-        .expect("convert_columns for hash key");
-
-    (0..batch.num_rows())
-        .map(|row| {
-            #[allow(clippy::cast_possible_truncation)]
-            let v = (key_hash(rows.row(row).as_ref()) % u64::from(vnode_count)) as u32;
-            v
-        })
-        .collect()
+    let columns: Vec<usize> = (0..num_group_cols).collect();
+    laminar_core::shuffle::row_vnodes(batch, &columns, vnode_count)
 }
 
 #[async_trait]
@@ -594,7 +595,7 @@ impl GraphOperator for SqlQueryOperator {
                 // has no local input. `execute_agg` handles empty local
                 // input gracefully (pre-agg on empty → empty pre-agg,
                 // shuffle drain supplies any remote rows).
-                #[cfg(feature = "cluster-unstable")]
+                #[cfg(feature = "cluster")]
                 {
                     if self.cluster_shuffle.is_some() {
                         return self.execute_agg(input_batches, watermark).await;
@@ -714,5 +715,92 @@ impl GraphOperator for SqlQueryOperator {
             QueryState::Agg(ref agg_state) => agg_state.estimated_size_bytes(),
             _ => 0,
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn ingest_shuffle(
+        &mut self,
+        _stage: &str,
+        batch: RecordBatch,
+        watermark: i64,
+    ) -> Result<(), DbError> {
+        // A peer's pre-aggregate rows — fold them into the accumulator so they
+        // enter this snapshot, exactly as the per-cycle shuffle drain does.
+        if matches!(self.state, QueryState::Uninit) {
+            self.lazy_init().await?;
+        }
+        if let QueryState::Agg(ref mut agg) = self.state {
+            agg.process_batch(&batch, watermark)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "cluster")]
+    #[allow(clippy::disallowed_types)] // cold checkpoint path; vnode-keyed map
+    fn checkpoint_by_vnode(
+        &mut self,
+        vnode_count: u32,
+    ) -> Result<Option<std::collections::HashMap<u32, bytes::Bytes>>, DbError> {
+        let QueryState::Agg(ref mut agg_state) = self.state else {
+            return Ok(None);
+        };
+        let per_vnode = agg_state.checkpoint_groups_by_vnode(vnode_count)?;
+        if per_vnode.is_empty() {
+            return Ok(None);
+        }
+        let mut out = std::collections::HashMap::with_capacity(per_vnode.len());
+        for (vnode, cp) in per_vnode {
+            let data = rkyv::to_bytes::<rkyv::rancor::Error>(&cp)
+                .map(|v| v.to_vec())
+                .map_err(|e| {
+                    DbError::Pipeline(format!(
+                        "per-vnode checkpoint serialization for '{}': {e}",
+                        self.op_name
+                    ))
+                })?;
+            out.insert(vnode, bytes::Bytes::from(data));
+        }
+        Ok(Some(out))
+    }
+
+    #[cfg(feature = "cluster")]
+    fn apply_vnode_state(&mut self, vnode: u32, bytes: &[u8]) -> Result<(), DbError> {
+        let cp: AggStateCheckpoint =
+            rkyv::from_bytes::<AggStateCheckpoint, rkyv::rancor::Error>(bytes).map_err(|e| {
+                DbError::Pipeline(format!(
+                    "per-vnode state deserialization for '{}' vnode {vnode}: {e}",
+                    self.op_name
+                ))
+            })?;
+        match self.state {
+            QueryState::Agg(ref mut agg_state) => {
+                let merged = agg_state.merge_groups(&cp)?;
+                tracing::debug!(
+                    query = %self.op_name, vnode, groups = merged,
+                    "applied rehydrated vnode aggregate state"
+                );
+            }
+            QueryState::Uninit => {
+                // Not yet initialized (rare — an owning node is normally
+                // running). Fold into the pending restore; vnodes are disjoint
+                // so concatenating their group lists is safe.
+                match self.pending_restore {
+                    Some(ref mut existing) if existing.fingerprint == cp.fingerprint => {
+                        existing.groups.extend(cp.groups);
+                        existing.last_emitted.extend(cp.last_emitted);
+                    }
+                    Some(_) => tracing::warn!(
+                        query = %self.op_name, vnode,
+                        "pending restore fingerprint mismatch — dropping rehydrated slice"
+                    ),
+                    None => self.pending_restore = Some(cp),
+                }
+            }
+            _ => tracing::warn!(
+                query = %self.op_name, vnode,
+                "ignoring rehydrated vnode state for non-aggregate query"
+            ),
+        }
+        Ok(())
     }
 }

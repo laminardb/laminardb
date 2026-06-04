@@ -11,7 +11,7 @@ description = "External system connectors for LaminarDB - Kafka, CDC, lookup tab
 
 [dependencies]
 # Core dependencies
-laminar-core = { path = "../laminar-core", version = "0.23.0" }
+laminar-core = { path = "../laminar-core", version = "0.24.0" }
 
 # Kafka
 rdkafka = { version = "0.39", features = ["cmake-build", "ssl-vendored"], optional = true }
@@ -24,6 +24,12 @@ postgres-types = { version = "0.2", optional = true, features = ["with-chrono-0_
 pgpq = { version = "0.11", optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
 pgwire-replication = { version = "0.2", optional = true }
+# Client-side TLS for the pooled Postgres lookup source (server-auth; CA via
+# sslrootcert, else webpki roots). aws-lc-rs provider is already in the tree.
+tokio-postgres-rustls = { version = "0.13", optional = true }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["aws-lc-rs", "tls12"] }
+rustls-pemfile = { version = "2", optional = true }
+webpki-roots = { version = "0.26", optional = true }
 # MySQL async driver with rustls (no OpenSSL required)
 mysql_async = { version = "0.36", optional = true, default-features = false, features = ["rustls-tls", "binlog", "minimal-rust"] }
 # MongoDB driver (optional, for mongodb-cdc feature)
@@ -106,15 +112,32 @@ xorf = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 
 [features]
-default = []
+default = [
+    "kafka",
+    "postgres-cdc",
+    "postgres-sink",
+    "mysql-cdc",
+    "mongodb-cdc",
+    "nats",
+    "delta-lake",
+    "delta-lake-s3",
+    "delta-lake-azure",
+    "delta-lake-gcs",
+    "delta-lake-unity",
+    "delta-lake-glue",
+    "iceberg",
+    "files",
+    "otel",
+    "parquet-lookup",
+]
 testing = []
 kafka = ["dep:rdkafka", "dep:arrow-avro", "dep:reqwest"]
-postgres-cdc = ["dep:tokio-postgres", "dep:pgwire-replication", "dep:deadpool-postgres"]
+postgres-cdc = ["dep:tokio-postgres", "dep:pgwire-replication", "dep:deadpool-postgres", "dep:arrow-row", "dep:tokio-postgres-rustls", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
 postgres-sink = ["dep:tokio-postgres", "dep:postgres-types", "dep:deadpool-postgres", "dep:pgpq", "dep:futures-util"]
 # mysql-cdc: Business logic + mysql_async driver with rustls (no OpenSSL required)
 mysql-cdc = ["dep:mysql_async", "dep:tokio-stream"]
 # MongoDB CDC source and sink
-mongodb-cdc = ["dep:mongodb", "dep:tokio-stream", "dep:futures-util"]
+mongodb-cdc = ["dep:mongodb", "dep:tokio-stream", "dep:futures-util", "dep:arrow-row"]
 # Sink-agnostic Z-set/CDC changelog collapse for upsert sinks (pure Arrow, just
 # pulls arrow-row). Kept separate from delta-lake so the helper compiles and
 # tests without the deltalake stack, and so Iceberg MOR can opt in independently.
@@ -127,7 +150,7 @@ delta-lake-gcs = ["delta-lake", "deltalake/gcs"]
 delta-lake-unity = ["delta-lake", "deltalake/unity-experimental", "dep:reqwest"]
 delta-lake-glue = ["delta-lake", "delta-lake-s3", "deltalake/glue", "dep:deltalake-catalog-glue"]
 # Apache Iceberg
-iceberg = ["dep:iceberg", "dep:iceberg-catalog-rest", "dep:iceberg-storage-opendal", "dep:tokio-stream", "dep:parquet"]
+iceberg = ["dep:iceberg", "dep:iceberg-catalog-rest", "dep:iceberg-storage-opendal", "dep:tokio-stream", "dep:parquet", "dep:arrow-row"]
 # Parquet file lookup source
 parquet-lookup = ["dep:parquet", "dep:object_store"]
 # WebSocket source and sink

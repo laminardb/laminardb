@@ -53,7 +53,7 @@ impl SideState {
     }
 
     /// Add a batch and index its rows.
-    fn add_batch(
+    pub(crate) fn add_batch(
         &mut self,
         batch: &RecordBatch,
         key_col_name: &str,
@@ -85,7 +85,7 @@ impl SideState {
     }
 
     /// Remove entries matching `(key_hash, timestamp)` with verified key equality.
-    fn remove_by_key_ts(
+    pub(crate) fn remove_by_key_ts(
         &mut self,
         key_hash: u64,
         ts: i64,
@@ -216,8 +216,8 @@ impl SideState {
 
 /// Complete interval join state for one query.
 pub(crate) struct IntervalJoinState {
-    left: SideState,
-    right: SideState,
+    pub(crate) left: SideState,
+    pub(crate) right: SideState,
     /// Last cutoff used for left-side eviction (derived from right watermark).
     left_evicted_cutoff: i64,
     /// Last cutoff used for right-side eviction (derived from left watermark).

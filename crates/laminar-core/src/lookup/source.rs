@@ -62,6 +62,32 @@ impl LookupSourceCapabilities {
     }
 }
 
+/// Resolve projection column indices to their names in `schema`, in projection
+/// order. An empty projection means "all columns" and returns every name in
+/// schema order. Shared by the lookup backends to turn the `query` projection
+/// into a column selection.
+///
+/// # Errors
+/// Returns [`LookupError::Internal`] if a projection index is out of range.
+pub fn projection_names(
+    schema: &SchemaRef,
+    projection: &[ColumnId],
+) -> Result<Vec<String>, LookupError> {
+    if projection.is_empty() {
+        return Ok(schema.fields().iter().map(|f| f.name().clone()).collect());
+    }
+    projection
+        .iter()
+        .map(|&c| {
+            schema
+                .fields()
+                .get(c as usize)
+                .map(|f| f.name().clone())
+                .ok_or_else(|| LookupError::Internal(format!("projection column {c} out of range")))
+        })
+        .collect()
+}
+
 /// Async data source for lookup table refresh and query.
 ///
 /// This trait uses RPITIT (return-position `impl Trait` in traits,

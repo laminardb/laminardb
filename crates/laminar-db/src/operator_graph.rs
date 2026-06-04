@@ -57,6 +57,45 @@ pub(crate) trait GraphOperator: Send {
     fn wants_input(&self) -> bool {
         true
     }
+
+    /// Fold a peer-shipped shuffle batch into operator state outside the normal
+    /// `process` path. Checkpoint barrier alignment calls this for rows that
+    /// arrived between cycles so they enter the snapshot. Default: no-op (for
+    /// operators that don't consume the cross-node shuffle). `watermark` is the
+    /// checkpoint watermark.
+    #[cfg(feature = "cluster")]
+    async fn ingest_shuffle(
+        &mut self,
+        _stage: &str,
+        _batch: RecordBatch,
+        _watermark: i64,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    /// Serialize this operator's state partitioned by vnode, for cross-node
+    /// rehydration. Returns `Some(map)` from operators that key their state by
+    /// a value the cluster shuffle routes (the aggregation fast-path); `None`
+    /// (default) for operators that aren't vnode-partitionable — those recover
+    /// from the whole-node manifest blob instead. The per-vnode bytes are the
+    /// same encoding the operator's own restore/apply path consumes.
+    #[cfg(feature = "cluster")]
+    #[allow(clippy::disallowed_types)] // cold checkpoint path; vnode-keyed map
+    fn checkpoint_by_vnode(
+        &mut self,
+        _vnode_count: u32,
+    ) -> Result<Option<std::collections::HashMap<u32, bytes::Bytes>>, DbError> {
+        Ok(None)
+    }
+
+    /// Merge one vnode's rehydrated state slice (produced by
+    /// [`checkpoint_by_vnode`](Self::checkpoint_by_vnode) on whichever node
+    /// last owned the vnode) into this operator. Default no-op for operators
+    /// that don't partition by vnode.
+    #[cfg(feature = "cluster")]
+    fn apply_vnode_state(&mut self, _vnode: u32, _bytes: &[u8]) -> Result<(), DbError> {
+        Ok(())
+    }
 }
 
 pub(crate) struct OperatorCheckpoint {
@@ -145,6 +184,7 @@ struct SqlFilterOperator {
     filter_sql: String,
     ctx: SessionContext,
     tmp_table: String,
+    cache: Option<crate::operator::LiveSqlCache>,
 }
 
 impl SqlFilterOperator {
@@ -157,6 +197,7 @@ impl SqlFilterOperator {
             filter_sql,
             ctx,
             tmp_table,
+            cache: None,
         }
     }
 }
@@ -173,29 +214,25 @@ impl GraphOperator for SqlFilterOperator {
             return Ok(Vec::new());
         }
 
-        let schema = batches[0].schema();
-        let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![batches])
-            .map_err(|e| DbError::Pipeline(format!("pre-filter: {e}")))?;
-
-        let _ = self.ctx.deregister_table(&self.tmp_table);
-        self.ctx
-            .register_table(&self.tmp_table, Arc::new(mem_table))
-            .map_err(|e| DbError::Pipeline(format!("pre-filter: {e}")))?;
-
-        let sql = format!("SELECT * FROM {} WHERE {}", self.tmp_table, self.filter_sql);
-        let result = async {
-            self.ctx
-                .sql(&sql)
-                .await
-                .map_err(|e| DbError::Pipeline(format!("pre-filter: {e}")))?
-                .collect()
-                .await
-                .map_err(|e| DbError::Pipeline(format!("pre-filter: {e}")))
+        if self.cache.is_none() {
+            let schema = batches[0].schema();
+            let sql = format!("SELECT * FROM {} WHERE {}", self.tmp_table, self.filter_sql);
+            let cache = crate::operator::LiveSqlCache::build(
+                &self.ctx,
+                &self.tmp_table,
+                schema,
+                &sql,
+                "pre-filter",
+            )
+            .await?;
+            self.cache = Some(cache);
         }
-        .await;
 
-        let _ = self.ctx.deregister_table(&self.tmp_table);
-        result
+        self.cache
+            .as_ref()
+            .unwrap()
+            .apply(&self.ctx, "pre-filter", batches)
+            .await
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
@@ -245,18 +282,30 @@ pub(crate) struct OperatorGraph {
     live_handles: FxHashMap<String, LiveSourceHandle>,
     /// Assembled AI subsystem (registry + providers + cache + call log).
     /// `None` unless `[ai]`/`[models]` are configured.
-    ai_runtime: Option<Arc<laminar_ai::AiRuntime>>,
-    /// Main runtime handle for spawning AI inference workers off the compute
-    /// thread. Set together with `ai_runtime`.
-    ai_handle: Option<tokio::runtime::Handle>,
+    ai_runtime: Option<Arc<crate::ai::AiRuntime>>,
+    /// Main (multi-threaded) runtime handle for spawning Ring-1 workers (AI
+    /// inference, lookup-enrich fetch) off the compute thread.
+    main_runtime_handle: Option<tokio::runtime::Handle>,
+    /// Partial (on-demand) lookup tables → their column names. Drives routing of
+    /// lookup-enrich joins to the async operator and output-column disambiguation.
+    partial_lookup_tables: FxHashMap<String, Vec<String>>,
     /// Plan-time AI routing errors collected during `add_query` (which returns
     /// `()`); surfaced by [`take_build_errors`](Self::take_build_errors) at start.
     build_errors: Vec<DbError>,
     /// Cluster-mode row-shuffle config for streaming aggregates.
     /// `None` outside cluster mode; threaded to `SqlQueryOperator` so
     /// pre-aggregate rows can be hash-routed to vnode owners.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     cluster_shuffle: Option<crate::operator::sql_query::ClusterShuffleConfig>,
+    /// Shared handle to the DB's staged per-vnode rehydration map. Drained at
+    /// the start of each cycle by [`apply_rehydrated_vnodes`](Self::apply_rehydrated_vnodes):
+    /// vnodes this node newly acquired in a rebalance have their committed
+    /// state merged into the matching operators before they process new rows.
+    /// `None` outside cluster mode.
+    #[cfg(feature = "cluster")]
+    #[allow(clippy::disallowed_types)] // shares the DB's std-HashMap-typed handle
+    rehydrated_vnode_state:
+        Option<Arc<parking_lot::Mutex<std::collections::HashMap<u32, crate::db::RehydratedVnode>>>>,
 }
 
 impl OperatorGraph {
@@ -281,8 +330,10 @@ impl OperatorGraph {
             deferred_scan_offset: 0,
             stats_tick: 0,
             max_state_bytes: None,
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             cluster_shuffle: None,
+            #[cfg(feature = "cluster")]
+            rehydrated_vnode_state: None,
             ctx,
             prom: None,
             lookup_registry: None,
@@ -292,7 +343,8 @@ impl OperatorGraph {
             order_configs: FxHashMap::default(),
             live_handles: FxHashMap::default(),
             ai_runtime: None,
-            ai_handle: None,
+            main_runtime_handle: None,
+            partial_lookup_tables: FxHashMap::default(),
             build_errors: Vec::new(),
         }
     }
@@ -302,11 +354,24 @@ impl OperatorGraph {
     /// runtime, never the compute runtime.
     pub fn set_ai_runtime(
         &mut self,
-        runtime: Arc<laminar_ai::AiRuntime>,
+        runtime: Arc<crate::ai::AiRuntime>,
         handle: tokio::runtime::Handle,
     ) {
         self.ai_runtime = Some(runtime);
-        self.ai_handle = Some(handle);
+        self.main_runtime_handle = Some(handle);
+    }
+
+    /// Install the main runtime handle Ring-1 workers spawn on (independent of
+    /// AI; the lookup-enrich operator needs it too). MUST be the main
+    /// multi-threaded runtime, never the compute runtime.
+    pub fn set_runtime_handle(&mut self, handle: tokio::runtime::Handle) {
+        self.main_runtime_handle = Some(handle);
+    }
+
+    /// Register partial (on-demand) lookup tables and their column names so
+    /// `add_query` can route lookup-enrich joins to the async operator.
+    pub fn set_partial_lookup_tables(&mut self, tables: FxHashMap<String, Vec<String>>) {
+        self.partial_lookup_tables = tables;
     }
 
     /// Take the first plan-time AI routing error collected during query
@@ -396,12 +461,109 @@ impl OperatorGraph {
 
     /// Install the row-shuffle config used by streaming aggregates in
     /// cluster mode.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub fn set_cluster_shuffle(
         &mut self,
         config: crate::operator::sql_query::ClusterShuffleConfig,
     ) {
         self.cluster_shuffle = Some(config);
+    }
+
+    /// Share the DB's staged per-vnode rehydration map so the graph can drain
+    /// and apply rebalanced state into operators each cycle.
+    #[cfg(feature = "cluster")]
+    #[allow(clippy::disallowed_types)] // shares the DB's std-HashMap-typed handle
+    pub fn set_rehydration_handle(
+        &mut self,
+        staged: Arc<parking_lot::Mutex<std::collections::HashMap<u32, crate::db::RehydratedVnode>>>,
+    ) {
+        self.rehydrated_vnode_state = Some(staged);
+    }
+
+    /// Drain the staged rehydration map for vnodes this node currently owns and
+    /// merge each operator's committed slice into the matching live operator,
+    /// then flip those vnodes `Restoring → Active`.
+    ///
+    /// Runs at the start of every [`execute_cycle`](Self::execute_cycle) so a
+    /// newly-acquired vnode's state is in place before the operators process
+    /// the cycle's rows. Best-effort: a slice that fails to decode or apply is
+    /// logged and skipped, and the vnode still flips to `Active` (it serves
+    /// from whatever state did apply, exactly like a vnode with no durable
+    /// state). Cheap no-op when nothing is staged.
+    #[cfg(feature = "cluster")]
+    fn apply_rehydrated_vnodes(&mut self) {
+        // Clone owned handles out so no borrow of `self` survives into the
+        // `self.nodes.iter_mut()` dispatch below.
+        let (registry, self_id, staged_arc) = match (
+            self.cluster_shuffle.as_ref(),
+            self.rehydrated_vnode_state.as_ref(),
+        ) {
+            (Some(cfg), Some(staged)) => {
+                (Arc::clone(&cfg.registry), cfg.self_id, Arc::clone(staged))
+            }
+            _ => return,
+        };
+
+        // Drain only the staged vnodes we currently own (ownership may have
+        // changed again since the snapshot was staged).
+        let drained: Vec<(u32, crate::db::RehydratedVnode)> = {
+            let mut guard = staged_arc.lock();
+            if guard.is_empty() {
+                return;
+            }
+            let owned: FxHashSet<u32> = laminar_core::state::owned_vnodes(&registry, self_id)
+                .into_iter()
+                .collect();
+            let keys: Vec<u32> = guard
+                .keys()
+                .copied()
+                .filter(|v| owned.contains(v))
+                .collect();
+            keys.into_iter()
+                .filter_map(|v| guard.remove(&v).map(|r| (v, r)))
+                .collect()
+        };
+        if drained.is_empty() {
+            return;
+        }
+
+        for (vnode, rehydrated) in drained {
+            match crate::vnode_partial::VnodePartial::decode(&rehydrated.bytes) {
+                Ok(partial) => {
+                    for (op_name, bytes) in &partial.operators {
+                        if let Some(node) = self
+                            .nodes
+                            .iter_mut()
+                            .find(|n| !n.removed && &*n.name == op_name.as_str())
+                        {
+                            if let Err(e) = node.operator.apply_vnode_state(vnode, bytes) {
+                                tracing::warn!(
+                                    operator = %op_name, vnode, error = %e,
+                                    "failed to apply rehydrated vnode state"
+                                );
+                            }
+                        } else {
+                            tracing::debug!(
+                                operator = %op_name, vnode,
+                                "no live operator for rehydrated slice (topology drift)"
+                            );
+                        }
+                    }
+                    tracing::info!(
+                        vnode,
+                        epoch = rehydrated.epoch,
+                        operators = partial.operators.len(),
+                        "applied rehydrated vnode state"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    vnode, error = %e,
+                    "rehydrated partial decode failed — vnode resumes from current state"
+                ),
+            }
+            // The vnode is now serving regardless of apply outcome.
+            registry.mark_active(&[vnode]);
+        }
     }
 
     fn is_downstream_at_capacity(&self, node_id: usize) -> bool {
@@ -816,10 +978,30 @@ impl OperatorGraph {
         let stream_join_projection_sql = stream_join_detection
             .as_ref()
             .map(|d| d.projection_sql.clone());
+
+        // Lookup-enrich: a partial/on-demand lookup join, hoisted to the
+        // async-decoupled operator. Only when no other specialized join matched
+        // and at least one partial lookup table is registered.
+        let (lookup_enrich_config, lookup_projection_sql) = if temporal_probe_config.is_none()
+            && asof_config.is_none()
+            && temporal_config.is_none()
+            && stream_join_config.is_none()
+            && !self.partial_lookup_tables.is_empty()
+        {
+            crate::sql_analysis::detect_lookup_enrich_query(
+                &sql,
+                &self.partial_lookup_tables,
+                &self.source_schemas,
+            )
+        } else {
+            (None, None)
+        };
+
         let projection_sql = projection_sql
             .or(temporal_probe_projection_sql)
             .or(temporal_projection_sql)
-            .or(stream_join_projection_sql);
+            .or(stream_join_projection_sql)
+            .or(lookup_projection_sql);
 
         // Warn for undetected JOIN+BETWEEN
         if stream_join_config.is_none() && asof_config.is_none() && temporal_config.is_none() {
@@ -834,7 +1016,12 @@ impl OperatorGraph {
             }
         }
 
-        let table_refs = extract_table_references(&sql);
+        let mut table_refs = extract_table_references(&sql);
+        // The lookup-enrich operator reads its lookup table from the registry,
+        // not as a graph input — drop it so only the stream side is wired.
+        if let Some(cfg) = &lookup_enrich_config {
+            table_refs.remove(&cfg.table_name);
+        }
 
         // Store temporal join config
         if let Some(ref tc) = temporal_config {
@@ -851,6 +1038,7 @@ impl OperatorGraph {
             temporal_config.as_ref(),
             stream_join_config.as_ref(),
             temporal_probe_config.as_ref(),
+            lookup_enrich_config,
             projection_sql.as_deref(),
             idle_ttl_ms,
         );
@@ -953,7 +1141,7 @@ impl OperatorGraph {
     ) -> Result<(), DbError> {
         use crate::operator::ai_inference::{AiInferenceOperator, AiOperatorConfig};
 
-        let handle = self.ai_handle.clone().ok_or_else(|| {
+        let handle = self.main_runtime_handle.clone().ok_or_else(|| {
             DbError::InvalidOperation("AI runtime handle is not configured".to_string())
         })?;
         let ctx = self.ctx.clone();
@@ -1078,10 +1266,35 @@ impl OperatorGraph {
         temporal_config: Option<&TemporalJoinTranslatorConfig>,
         stream_join_config: Option<&laminar_sql::translator::StreamJoinConfig>,
         temporal_probe_config: Option<&laminar_sql::translator::TemporalProbeConfig>,
+        lookup_enrich_config: Option<crate::operator::lookup_enrich::LookupEnrichConfig>,
         projection_sql: Option<&str>,
         idle_ttl_ms: Option<u64>,
     ) -> Box<dyn GraphOperator> {
         use crate::operator;
+
+        // On-demand lookup-enrich join → async-decoupled operator. Falls through
+        // to the DataFusion lookup path if the registry/runtime handle is absent.
+        if let Some(cfg) = lookup_enrich_config {
+            if let (Some(reg), Some(handle)) = (&self.lookup_registry, &self.main_runtime_handle) {
+                #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
+                let mut op = operator::lookup_enrich::LookupEnrichOperator::new(
+                    name,
+                    cfg,
+                    projection_sql.map(Arc::from),
+                    self.ctx.clone(),
+                    Arc::clone(reg),
+                    handle.clone(),
+                    self.prom.clone(),
+                );
+                // In cluster mode, key-shard the probe side across nodes for
+                // cache affinity (same shuffle config the aggregate path uses).
+                #[cfg(feature = "cluster")]
+                if let Some(ref sc) = self.cluster_shuffle {
+                    op.attach_cluster_shuffle(sc.clone());
+                }
+                return Box::new(op);
+            }
+        }
 
         if let Some(cfg) = temporal_probe_config {
             return Box::new(
@@ -1117,19 +1330,31 @@ impl OperatorGraph {
             // No time columns ⇒ plain equi-join → per-cycle batch join; with
             // time columns ⇒ interval join.
             if cfg.left_time_column.is_empty() && cfg.right_time_column.is_empty() {
-                return Box::new(operator::process_time_join::ProcessTimeJoinOperator::new(
+                #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
+                let mut op = operator::process_time_join::ProcessTimeJoinOperator::new(
                     name,
                     cfg.clone(),
                     projection_sql.map(Arc::from),
                     self.ctx.clone(),
-                ));
+                );
+                #[cfg(feature = "cluster")]
+                if let Some(ref sc) = self.cluster_shuffle {
+                    op.attach_cluster_shuffle(sc.clone());
+                }
+                return Box::new(op);
             }
-            return Box::new(operator::interval_join::IntervalJoinOperator::new(
+            #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
+            let mut op = operator::interval_join::IntervalJoinOperator::new(
                 name,
                 cfg.clone(),
                 projection_sql.map(Arc::from),
                 self.ctx.clone(),
-            ));
+            );
+            #[cfg(feature = "cluster")]
+            if let Some(ref sc) = self.cluster_shuffle {
+                op.attach_cluster_shuffle(sc.clone());
+            }
+            return Box::new(op);
         }
 
         // Non-windowed `now()` is only valid as the recognised retracting
@@ -1185,7 +1410,7 @@ impl OperatorGraph {
 
         let emit_changelog = emit_clause.is_some_and(|ec| matches!(ec, EmitClause::Changes));
 
-        #[cfg_attr(not(feature = "cluster-unstable"), allow(unused_mut))]
+        #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
         let mut op = operator::sql_query::SqlQueryOperator::new(
             name,
             sql,
@@ -1194,7 +1419,7 @@ impl OperatorGraph {
             emit_changelog,
             idle_ttl_ms,
         );
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         if let Some(ref cfg) = self.cluster_shuffle {
             op.attach_cluster_shuffle(cfg.clone());
         }
@@ -1517,6 +1742,12 @@ impl OperatorGraph {
         current_watermark: i64,
         source_watermarks: Option<&FxHashMap<Arc<str>, i64>>,
     ) -> Result<FxHashMap<Arc<str>, Vec<RecordBatch>>, DbError> {
+        // Merge any rebalanced-in vnode state into operators before they see
+        // this cycle's rows, so the snapshot a new owner resumes from is in
+        // place first.
+        #[cfg(feature = "cluster")]
+        self.apply_rehydrated_vnodes();
+
         if self.topo_dirty {
             self.compute_topo_order();
         }
@@ -1649,6 +1880,211 @@ impl OperatorGraph {
         Ok(results)
     }
 
+    /// Route one peer-shipped shuffle batch to the operator named `stage`.
+    /// Unknown stage (no such live operator) is dropped.
+    #[cfg(feature = "cluster")]
+    async fn ingest_to_stage(
+        &mut self,
+        stage: &str,
+        batch: RecordBatch,
+        watermark: i64,
+    ) -> Result<(), DbError> {
+        let node_name = stage
+            .strip_suffix("::left")
+            .or_else(|| stage.strip_suffix("::right"))
+            .unwrap_or(stage);
+        if let Some(idx) = self.find_node(node_name) {
+            self.nodes[idx]
+                .operator
+                .ingest_shuffle(stage, batch, watermark)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Chandy–Lamport alignment of the cross-node shuffle, run just before
+    /// `snapshot_state` so the snapshot captures every pre-checkpoint row a peer
+    /// shipped. Fans out `Barrier(checkpoint_id)` to peers, then drains the
+    /// receiver — folding each `VnodeData` into its operator via `ingest_shuffle`
+    /// — until every peer's barrier is observed. No-op without a cross-node
+    /// shuffle. See `docs/plans/cross-node-shuffle-barrier-alignment.md`.
+    ///
+    /// Relies on **full-membership commit** (`wait_for_quorum` requires every
+    /// live follower): no peer resumes the next epoch until all have aligned, so
+    /// no next-epoch frame can arrive mid-alignment. A move to majority quorum
+    /// would reintroduce that case and need per-peer post-barrier buffering.
+    ///
+    /// # Errors
+    /// Fails the checkpoint (caller retries) on timeout or a closed receiver —
+    /// the deliberate degradation under a straggling peer.
+    #[cfg(feature = "cluster")]
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn align_shuffle_barriers(
+        &mut self,
+        checkpoint_id: u64,
+        watermark: i64,
+        live: &[u64],
+        controller: Option<&laminar_core::cluster::control::ClusterController>,
+    ) -> Result<(), DbError> {
+        use laminar_core::checkpoint::barrier::CheckpointBarrier;
+        use laminar_core::cluster::control::Phase;
+        use laminar_core::shuffle::{BarrierTracker, ShuffleMessage};
+
+        const ALIGN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+        let Some(cfg) = self.cluster_shuffle.clone() else {
+            return Ok(());
+        };
+        // Fan-out set: nodes we ship rows to (other vnode owners). Wait set:
+        // nodes that ship to us — the live producers, but only if we own a vnode
+        // (a node owning none, e.g. drained, receives nothing yet still ships, so
+        // the two sets differ under skewed assignment). Producers = live
+        // membership, not the owners.
+        let output_peers: Vec<u64> = laminar_core::state::peer_owners(&cfg.registry, cfg.self_id)
+            .iter()
+            .map(|n| n.0)
+            .collect();
+        let input_peers: Vec<u64> =
+            if laminar_core::state::owned_vnodes(&cfg.registry, cfg.self_id).is_empty() {
+                Vec::new()
+            } else {
+                live.iter()
+                    .copied()
+                    .filter(|&id| id != cfg.self_id.0)
+                    .collect()
+            };
+        if output_peers.is_empty() && input_peers.is_empty() {
+            return Ok(()); // not part of any cross-node shuffle
+        }
+
+        // Rows already pulled into the receiver's per-stage holdover are
+        // pre-barrier (the per-cycle drain carries no barriers).
+        for (stage, batch) in cfg.receiver.drain_all_staged() {
+            self.ingest_to_stage(&stage, batch, watermark).await?;
+        }
+
+        let barrier = CheckpointBarrier::new(checkpoint_id, 0);
+        if !output_peers.is_empty() {
+            cfg.sender
+                .fan_out_barrier(&output_peers, barrier)
+                .await
+                .map_err(|e| DbError::Pipeline(format!("shuffle barrier fan-out: {e}")))?;
+        }
+        if input_peers.is_empty() {
+            return Ok(()); // we receive from no peer — nothing to align on
+        }
+
+        tracing::info!(
+            checkpoint_id,
+            self_id = cfg.self_id.0,
+            output_peers = ?output_peers,
+            input_peers = ?input_peers,
+            "align_shuffle_barriers: starting alignment"
+        );
+
+        let tracker = BarrierTracker::new(input_peers.len() + 1);
+        let peer_port: FxHashMap<u64, usize> = input_peers
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| (p, i + 1))
+            .collect();
+        tracker.observe(0, barrier); // our own input
+
+        // A peer that fanned its barrier out before we entered alignment had it
+        // stashed by the per-cycle drain (which would otherwise drop it) — observe
+        // those before blocking on the live wire.
+        for (from, b) in cfg.receiver.drain_staged_barriers() {
+            if b.checkpoint_id == checkpoint_id {
+                if let Some(&port) = peer_port.get(&from) {
+                    tracing::info!(
+                        checkpoint_id,
+                        from_peer = from,
+                        "align_shuffle_barriers: observed pre-staged peer barrier"
+                    );
+                    if tracker.observe(port, b).is_some() {
+                        tracing::info!(
+                            checkpoint_id,
+                            "align_shuffle_barriers: all peers aligned (pre-staged)"
+                        );
+                        return Ok(()); // all peers already aligned
+                    }
+                }
+            }
+        }
+
+        let alignment_timeout = tokio::time::sleep(ALIGN_TIMEOUT);
+        tokio::pin!(alignment_timeout);
+        let mut check_interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        loop {
+            tokio::select! {
+                res = cfg.receiver.recv() => {
+                    match res {
+                        None => {
+                            return Err(DbError::Pipeline(
+                                "shuffle receiver closed during barrier alignment".into(),
+                            ));
+                        }
+                        Some((from, ShuffleMessage::Barrier(b))) if b.checkpoint_id == checkpoint_id => {
+                            tracing::info!(
+                                checkpoint_id,
+                                from_peer = from,
+                                "align_shuffle_barriers: received peer barrier"
+                            );
+                            if let Some(&port) = peer_port.get(&from) {
+                                if tracker.observe(port, b).is_some() {
+                                    tracing::info!(
+                                        checkpoint_id,
+                                        "align_shuffle_barriers: all peers aligned successfully"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        Some((_, ShuffleMessage::VnodeData(stage, _vnode, batch))) => {
+                            self.ingest_to_stage(&stage, batch, watermark).await?;
+                        }
+                        Some(_) => {}
+                    }
+                }
+                _ = check_interval.tick() => {
+                    if let Some(ctrl) = controller {
+                        if let Ok(Some(ann)) = ctrl.observe_barrier().await {
+                            if ann.checkpoint_id == checkpoint_id && ann.phase == Phase::Abort {
+                                return Err(DbError::Pipeline(format!(
+                                    "checkpoint {checkpoint_id} was aborted by leader"
+                                )));
+                            }
+                        }
+                    }
+                }
+                () = &mut alignment_timeout => {
+                    return Err(DbError::Pipeline(format!(
+                        "shuffle barrier alignment timed out for checkpoint {checkpoint_id}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Append a node with a given operator (test-only, for exercising
+    /// `align_shuffle_barriers` without the full query-build path).
+    #[cfg(all(test, feature = "cluster"))]
+    pub(crate) fn push_test_node(&mut self, name: &str, operator: Box<dyn GraphOperator>) {
+        self.nodes.push(GraphNode {
+            name: Arc::from(name),
+            operator,
+            input_port_count: 1,
+            output_routes: Vec::new(),
+            removed: false,
+        });
+        self.input_bufs.push(vec![Vec::new()]);
+        self.input_buf_bytes.push(vec![0]);
+        self.input_sources.push(vec![usize::MAX]);
+        self.output_watermarks.push(i64::MIN);
+        self.topo_dirty = true;
+    }
+
     // &mut self: some accumulators need &mut for state()
     pub fn snapshot_state(&mut self) -> Result<Option<GraphCheckpoint>, DbError> {
         let mut operators = OperatorStateMap::new();
@@ -1667,6 +2103,45 @@ impl OperatorGraph {
             version: 1,
             operators,
         }))
+    }
+
+    /// Per-vnode operator-state snapshot for cross-node rehydration.
+    ///
+    /// Returns `vnode → (operator_name → vnode-slice bytes)` for every operator
+    /// that opts into per-vnode checkpointing (see
+    /// [`GraphOperator::checkpoint_by_vnode`]). Empty outside cluster mode (no
+    /// shuffle config means no vnode topology to partition by). The vnode count
+    /// is taken from the registry the cluster shuffle was wired with, so the
+    /// partition matches the routing that delivered each key here.
+    #[cfg(feature = "cluster")]
+    #[allow(clippy::disallowed_types)] // std HashMap matches the trait/CheckpointRequest shape
+    pub fn snapshot_state_by_vnode(
+        &mut self,
+    ) -> Result<
+        std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>>,
+        DbError,
+    > {
+        let vnode_count = match &self.cluster_shuffle {
+            Some(cfg) => cfg.registry.vnode_count(),
+            None => return Ok(std::collections::HashMap::new()),
+        };
+        let mut out: std::collections::HashMap<
+            u32,
+            std::collections::HashMap<String, bytes::Bytes>,
+        > = std::collections::HashMap::new();
+        for node in &mut self.nodes {
+            if node.removed {
+                continue;
+            }
+            if let Some(per_vnode) = node.operator.checkpoint_by_vnode(vnode_count)? {
+                for (vnode, bytes) in per_vnode {
+                    out.entry(vnode)
+                        .or_default()
+                        .insert(node.name.to_string(), bytes);
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn restore_state(&mut self, checkpoint: &GraphCheckpoint) -> Result<usize, DbError> {
@@ -1739,6 +2214,109 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    /// Records the batches handed to `ingest_shuffle`.
+    #[cfg(feature = "cluster")]
+    struct RecordingOperator(Arc<parking_lot::Mutex<Vec<RecordBatch>>>);
+
+    #[cfg(feature = "cluster")]
+    #[async_trait]
+    impl GraphOperator for RecordingOperator {
+        async fn process(
+            &mut self,
+            _inputs: &[Vec<RecordBatch>],
+            _watermarks: &[i64],
+        ) -> Result<Vec<RecordBatch>, DbError> {
+            Ok(Vec::new())
+        }
+        fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {
+            Ok(None)
+        }
+        fn restore(&mut self, _checkpoint: OperatorCheckpoint) -> Result<(), DbError> {
+            Ok(())
+        }
+        async fn ingest_shuffle(
+            &mut self,
+            _stage: &str,
+            batch: RecordBatch,
+            _watermark: i64,
+        ) -> Result<(), DbError> {
+            self.0.lock().push(batch);
+            Ok(())
+        }
+    }
+
+    /// A peer ships a row + its barrier; alignment folds the row into the target
+    /// operator (so it would enter the snapshot) and completes once the peer's
+    /// barrier is observed.
+    #[cfg(feature = "cluster")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn align_shuffle_barriers_folds_peer_rows_then_aligns() {
+        use laminar_core::checkpoint::barrier::CheckpointBarrier;
+        use laminar_core::shuffle::{ShuffleMessage, ShuffleReceiver, ShuffleSender};
+        use laminar_core::state::{NodeId, VnodeRegistry};
+
+        // 2 vnodes: node 1 owns vnode 0, node 2 owns vnode 1 (so node 1's peer = {2}).
+        let registry = Arc::new(VnodeRegistry::new(2));
+        registry.set_assignment(vec![NodeId(1), NodeId(2)].into());
+
+        let recv1 = Arc::new(
+            ShuffleReceiver::bind(1, "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        let recv2 = Arc::new(
+            ShuffleReceiver::bind(2, "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        let send1 = ShuffleSender::new(1);
+        send1.register_peer(2, recv2.local_addr()).await;
+        let send2 = ShuffleSender::new(2);
+        send2.register_peer(1, recv1.local_addr()).await;
+
+        let recorded = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut graph = OperatorGraph::new(laminar_sql::create_session_context());
+        graph.push_test_node("out", Box::new(RecordingOperator(Arc::clone(&recorded))));
+        graph.set_cluster_shuffle(crate::operator::sql_query::ClusterShuffleConfig {
+            registry,
+            sender: Arc::new(send1),
+            receiver: Arc::clone(&recv1),
+            self_id: NodeId(1),
+        });
+
+        // Peer (node 2) ships a row for stage "out", then its barrier for cp 7.
+        let batch = test_batch();
+        send2
+            .send_to(
+                1,
+                &ShuffleMessage::VnodeData("out".into(), 0, batch.clone()),
+            )
+            .await
+            .unwrap();
+        send2
+            .send_to(1, &ShuffleMessage::Barrier(CheckpointBarrier::new(7, 0)))
+            .await
+            .unwrap();
+
+        graph
+            .align_shuffle_barriers(7, 0, &[1, 2], None)
+            .await
+            .unwrap();
+
+        // Node 1 must have fanned its own barrier out to node 2.
+        let (from, msg) = recv2.recv().await.unwrap();
+        assert_eq!(from, 1);
+        assert!(matches!(msg, ShuffleMessage::Barrier(b) if b.checkpoint_id == 7));
+
+        let got = recorded.lock();
+        assert_eq!(
+            got.len(),
+            1,
+            "peer's pre-barrier row folded into the operator"
+        );
+        assert_eq!(got[0].num_rows(), batch.num_rows());
     }
 
     #[test]
@@ -1908,17 +2486,17 @@ mod tests {
     struct PosProvider;
 
     #[async_trait]
-    impl laminar_ai::InferenceProvider for PosProvider {
+    impl crate::ai::InferenceProvider for PosProvider {
         async fn infer_batch(
             &self,
-            request: laminar_ai::InferenceRequest,
-        ) -> Result<laminar_ai::InferenceResponse, laminar_ai::ProviderError> {
-            Ok(laminar_ai::InferenceResponse {
-                outputs: laminar_ai::InferenceOutputs::Text(vec![
+            request: crate::ai::InferenceRequest,
+        ) -> Result<crate::ai::InferenceResponse, crate::ai::ProviderError> {
+            Ok(crate::ai::InferenceResponse {
+                outputs: crate::ai::InferenceOutputs::Text(vec![
                     "pos".to_string();
                     request.inputs.len()
                 ]),
-                usage: laminar_ai::Usage::ZERO,
+                usage: crate::ai::Usage::ZERO,
             })
         }
         fn name(&self) -> &'static str {
@@ -1926,8 +2504,8 @@ mod tests {
         }
     }
 
-    fn stub_ai_runtime() -> Arc<laminar_ai::AiRuntime> {
-        use laminar_ai::{ModelBackend, ModelEntry, ModelRegistry, Task};
+    fn stub_ai_runtime() -> Arc<crate::ai::AiRuntime> {
+        use crate::ai::{ModelBackend, ModelEntry, ModelRegistry, Task};
         let mut registry = ModelRegistry::new();
         registry
             .register(ModelEntry {
@@ -1941,14 +2519,14 @@ mod tests {
             .unwrap();
         let providers = [(
             "p".to_string(),
-            Arc::new(PosProvider) as Arc<dyn laminar_ai::InferenceProvider>,
+            Arc::new(PosProvider) as Arc<dyn crate::ai::InferenceProvider>,
         )];
-        Arc::new(laminar_ai::AiRuntime::new(
+        Arc::new(crate::ai::AiRuntime::new(
             registry,
             providers,
             None,
-            Arc::new(laminar_ai::AiResultCache::with_defaults()),
-            Arc::new(laminar_ai::AiCallLog::with_defaults()),
+            Arc::new(crate::ai::AiResultCache::with_defaults()),
+            Arc::new(crate::ai::AiCallLog::with_defaults()),
         ))
     }
 
@@ -2043,7 +2621,7 @@ mod tests {
     /// numeric `Float64`, not a label.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ai_sentiment_emits_a_double_score() {
-        use laminar_ai::{
+        use crate::ai::{
             AiCallLog, AiResultCache, AiRuntime, InferenceOutputs, InferenceProvider,
             InferenceRequest, InferenceResponse, ModelBackend, ModelEntry, ModelRegistry,
             ProviderError, Task, Usage,

@@ -260,8 +260,10 @@ impl IcebergSink {
             let aligned = self.align_batch_to_iceberg_schema(batch)?;
 
             let file_path = format!(
-                "{location}/data/{}-{}-{idx}.parquet",
-                self.config.writer_id, self.current_epoch,
+                "{location}/data/{}-{}-{}-{idx}.parquet",
+                self.config.writer_id,
+                self.current_epoch,
+                uuid::Uuid::new_v4(),
             );
 
             let output_file = file_io

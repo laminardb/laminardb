@@ -38,23 +38,27 @@ pub struct LaminarDbBuilder {
     custom_udafs: Vec<AggregateUDF>,
     /// Cluster control facade installed at cluster-mode startup.
     /// Stays `None` in embedded / single-instance builds.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     cluster_controller: Option<std::sync::Arc<laminar_core::cluster::control::ClusterController>>,
     /// Outbound shuffle handle for cluster-mode streaming aggregates.
     /// Pair with `shuffle_receiver`; without it, streaming aggregates
     /// run single-node even when the cluster controller is installed.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     shuffle_sender: Option<std::sync::Arc<laminar_core::shuffle::ShuffleSender>>,
     /// Inbound shuffle handle for cluster-mode streaming aggregates.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     shuffle_receiver: Option<std::sync::Arc<laminar_core::shuffle::ShuffleReceiver>>,
     /// Commit-marker store for cross-instance 2PC.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     decision_store: Option<std::sync::Arc<laminar_core::cluster::control::CheckpointDecisionStore>>,
     /// Assignment-snapshot store for dynamic rebalance.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     assignment_snapshot_store:
         Option<std::sync::Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>,
+    /// Catalog-manifest store for cluster-wide DDL replay on boot/rebalance.
+    #[cfg(feature = "cluster")]
+    catalog_manifest_store:
+        Option<std::sync::Arc<laminar_core::cluster::control::CatalogManifestStore>>,
     /// Optional state backend. When paired with `vnode_registry`, the
     /// coordinator writes per-vnode durability markers each checkpoint
     /// and consults `epoch_complete` before committing sinks.
@@ -70,7 +74,7 @@ pub struct LaminarDbBuilder {
     /// `vnode_count`. Default 1 for single-instance streaming.
     target_partitions: Option<usize>,
     /// Assembled AI subsystem; installed when `[ai]`/`[models]` are configured.
-    ai_runtime: Option<std::sync::Arc<laminar_ai::AiRuntime>>,
+    ai_runtime: Option<std::sync::Arc<crate::ai::AiRuntime>>,
 }
 
 impl LaminarDbBuilder {
@@ -87,16 +91,18 @@ impl LaminarDbBuilder {
             object_store_options: HashMap::new(),
             custom_udfs: Vec::new(),
             custom_udafs: Vec::new(),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             cluster_controller: None,
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             shuffle_sender: None,
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             shuffle_receiver: None,
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             decision_store: None,
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             assignment_snapshot_store: None,
+            #[cfg(feature = "cluster")]
+            catalog_manifest_store: None,
             state_backend: None,
             vnode_registry: None,
             physical_optimizer_rules: Vec::new(),
@@ -109,7 +115,7 @@ impl LaminarDbBuilder {
     /// result cache + call log). Without it, `ai_*` SQL functions fail at plan
     /// time. Built from server `[ai]`/`[models]` configuration.
     #[must_use]
-    pub fn ai(mut self, runtime: std::sync::Arc<laminar_ai::AiRuntime>) -> Self {
+    pub fn ai(mut self, runtime: std::sync::Arc<crate::ai::AiRuntime>) -> Self {
         self.ai_runtime = Some(runtime);
         self
     }
@@ -162,7 +168,7 @@ impl LaminarDbBuilder {
     /// checkpoint / shuffle semantics inside the engine. Called from
     /// `laminar-server`'s cluster startup path after discovery has
     /// converged.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[must_use]
     pub fn cluster_controller(
         mut self,
@@ -176,7 +182,7 @@ impl LaminarDbBuilder {
     /// aggregates. Rows whose group key hashes to a remote vnode are
     /// shipped through this sender. Pair with [`Self::shuffle_receiver`];
     /// either alone is a no-op.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[must_use]
     pub fn shuffle_sender(
         mut self,
@@ -189,7 +195,7 @@ impl LaminarDbBuilder {
     /// Install the inbound shuffle handle used by cluster-mode streaming
     /// aggregates. Remote partial-aggregate rows arrive here and are
     /// drained into the local accumulator each cycle.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[must_use]
     pub fn shuffle_receiver(
         mut self,
@@ -200,7 +206,7 @@ impl LaminarDbBuilder {
     }
 
     /// Install the commit-marker store for cross-instance 2PC.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[must_use]
     pub fn decision_store(
         mut self,
@@ -211,13 +217,24 @@ impl LaminarDbBuilder {
     }
 
     /// Install the assignment-snapshot store for dynamic rebalance.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[must_use]
     pub fn assignment_snapshot_store(
         mut self,
         store: std::sync::Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
     ) -> Self {
         self.assignment_snapshot_store = Some(store);
+        self
+    }
+
+    /// Install the catalog-manifest store for cluster-wide DDL replay.
+    #[cfg(feature = "cluster")]
+    #[must_use]
+    pub fn catalog_manifest_store(
+        mut self,
+        store: std::sync::Arc<laminar_core::cluster::control::CatalogManifestStore>,
+    ) -> Self {
+        self.catalog_manifest_store = Some(store);
         self
     }
 
@@ -490,25 +507,29 @@ impl LaminarDbBuilder {
         for udaf in self.custom_udafs {
             db.register_custom_udaf(udaf);
         }
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         if let Some(controller) = self.cluster_controller {
             db.set_cluster_controller(controller);
         }
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         if let Some(sender) = self.shuffle_sender {
             db.set_shuffle_sender(sender);
         }
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         if let Some(receiver) = self.shuffle_receiver {
             db.set_shuffle_receiver(receiver);
         }
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         if let Some(store) = self.decision_store {
             db.set_decision_store(store);
         }
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         if let Some(store) = self.assignment_snapshot_store {
             db.set_assignment_snapshot_store(store);
+        }
+        #[cfg(feature = "cluster")]
+        if let Some(store) = self.catalog_manifest_store {
+            db.set_catalog_manifest_store(store);
         }
         if let Some(backend) = self.state_backend {
             db.set_state_backend(backend);

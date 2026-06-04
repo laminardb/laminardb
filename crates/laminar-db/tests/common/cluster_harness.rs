@@ -4,7 +4,7 @@
 //! DDL before [`ClusterEngineHarness::start_all`] so the pipeline
 //! activates with sources and MVs already registered.
 
-#![cfg(feature = "cluster-unstable")]
+#![cfg(feature = "cluster")]
 #![allow(clippy::disallowed_types)]
 #![allow(dead_code)] // not every test binary uses every helper
 
@@ -17,7 +17,7 @@ use laminar_core::cluster::control::{
 use laminar_core::cluster::testing::MiniCluster;
 use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
 use laminar_core::state::{
-    round_robin_assignment, NodeId, ObjectStoreBackend, StateBackend, VnodeRegistry,
+    rendezvous_assignment, NodeId, ObjectStoreBackend, StateBackend, VnodeRegistry,
 };
 use laminar_core::streaming::StreamCheckpointConfig;
 use laminar_db::LaminarDB;
@@ -220,6 +220,7 @@ impl ClusterEngineHarness {
                 Arc::clone(&node.vnode_registry),
                 Arc::clone(&node.rebalance_shutdown),
                 cfg,
+                Some(Arc::clone(&nh.controller)),
             );
             let controller = laminar_db::rebalance::spawn_rebalance_controller(
                 Arc::clone(&node.db),
@@ -313,7 +314,7 @@ async fn resolve_assignment(
         return (snap.to_vnode_vec(vnode_count).into(), snap.version);
     }
 
-    let fresh = round_robin_assignment(vnode_count, peer_ids);
+    let fresh = rendezvous_assignment(vnode_count, peer_ids);
     let snap = AssignmentSnapshot::empty().next(AssignmentSnapshot::vnodes_from_vec(&fresh));
     match store.save_if_absent(&snap).await.expect("save_if_absent") {
         Some(winner) => (fresh, winner.version),

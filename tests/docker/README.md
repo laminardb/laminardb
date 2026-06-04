@@ -39,8 +39,8 @@ export OPENSSL_LIB_DIR="C:\\Program Files\\OpenSSL-Win64\\lib\\VC\\x64\\MD"
 export OPENSSL_INCLUDE_DIR="C:\\Program Files\\OpenSSL-Win64\\include"
 ```
 
-before `cargo test`. Without these the `ssl-vendored` feature from
-`laminar-connectors` tries to build OpenSSL from source via Perl, which
+before `cargo test`. Without these the `ssl` feature from
+`laminar-connectors` (or `laminar-db` dev-dependencies) tries to build OpenSSL from source via Perl, which
 fails on the stock Windows toolchain.
 
 ## Tear down
@@ -79,4 +79,4 @@ runs don't collide.
    — 2-node cluster sharing one MinIO bucket via `ObjectStoreBackend`.
    Verifies the leader's full-registry gate reads follower markers off
    shared storage, and the `_COMMIT` marker lands after the 2PC ack.
-   Run with `cargo test -p laminar-db --test cluster_minio_flow --features cluster-unstable`.
+   Run with `cargo test -p laminar-db --test cluster_minio_flow --features cluster`.

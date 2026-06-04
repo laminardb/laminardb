@@ -38,10 +38,14 @@ use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::Expr;
 use futures::StreamExt;
 use laminar_core::lookup::foyer_cache::FoyerMemoryCache;
-use laminar_core::lookup::source::LookupSourceDyn;
+use laminar_core::lookup::source::{ColumnId, LookupSourceDyn};
 use tokio::sync::Semaphore;
 
 use super::lookup_join::{LookupJoinNode, LookupJoinType};
+
+/// Deadline for a cache-miss source fetch. The fetch is awaited inline on the
+/// single compute thread, so without a bound a hung source wedges the pipeline.
+const LOOKUP_SOURCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 // ── Registry ─────────────────────────────────────────────────────
 
@@ -69,8 +73,6 @@ pub enum RegisteredLookup {
 pub struct LookupSnapshot {
     /// All rows concatenated into a single batch.
     pub batch: RecordBatch,
-    /// Primary key column names used to build the hash index.
-    pub key_columns: Vec<String>,
 }
 
 /// State for a versioned (temporal) lookup table.
@@ -108,6 +110,10 @@ pub struct PartialLookupState {
     pub source: Option<Arc<dyn LookupSourceDyn>>,
     /// Limits concurrent source queries to avoid overloading the source.
     pub fetch_semaphore: Arc<Semaphore>,
+    /// Column indices (into `schema`) to fetch from the source — the union of
+    /// every column any query references, plus the key. Empty = fetch all.
+    /// Per-table (the cache is shared across queries), so it must be a superset.
+    pub projection: Vec<ColumnId>,
 }
 
 impl LookupTableRegistry {
@@ -389,6 +395,7 @@ pub struct LookupJoinExec {
     /// every cycle of a cached physical plan.
     converter: Arc<RowConverter>,
     stream_field_count: usize,
+    projection: Vec<usize>,
 }
 
 impl LookupJoinExec {
@@ -445,6 +452,7 @@ impl LookupJoinExec {
         );
 
         let stream_field_count = input.schema().fields().len();
+        let projection = (0..(stream_field_count + lookup_batch.num_columns())).collect();
 
         Ok(Self {
             input,
@@ -456,7 +464,15 @@ impl LookupJoinExec {
             properties,
             converter,
             stream_field_count,
+            projection,
         })
+    }
+
+    /// Sets the projection list for output columns.
+    #[must_use]
+    pub fn with_projection(mut self, projection: Vec<usize>) -> Self {
+        self.projection = projection;
+        self
     }
 }
 
@@ -527,6 +543,7 @@ impl ExecutionPlan for LookupJoinExec {
             properties: self.properties.clone(),
             converter: Arc::clone(&self.converter),
             stream_field_count: self.stream_field_count,
+            projection: self.projection.clone(),
         }))
     }
 
@@ -543,6 +560,7 @@ impl ExecutionPlan for LookupJoinExec {
         let join_type = self.join_type;
         let schema = self.schema();
         let stream_field_count = self.stream_field_count;
+        let projection = self.projection.clone();
 
         let output = input_stream.map(move |result| {
             let batch = result?;
@@ -558,6 +576,7 @@ impl ExecutionPlan for LookupJoinExec {
                 join_type,
                 &schema,
                 stream_field_count,
+                &projection,
             )
         });
 
@@ -606,6 +625,7 @@ fn probe_batch(
     join_type: LookupJoinType,
     output_schema: &SchemaRef,
     stream_field_count: usize,
+    projection: &[usize],
 ) -> Result<RecordBatch> {
     let key_cols: Vec<_> = stream_key_indices
         .iter()
@@ -650,7 +670,7 @@ fn probe_batch(
 
     // Gather stream-side columns
     let take_stream = UInt32Array::from(stream_indices);
-    let mut columns = Vec::with_capacity(output_schema.fields().len());
+    let mut columns = Vec::with_capacity(stream_field_count + lookup_batch.num_columns());
 
     for col in stream_batch.columns() {
         columns.push(take(col.as_ref(), &take_stream, None)?);
@@ -668,7 +688,18 @@ fn probe_batch(
         "output column count mismatch"
     );
 
-    Ok(RecordBatch::try_new(Arc::clone(output_schema), columns)?)
+    let projected_columns: Vec<_> = projection.iter().map(|&idx| columns[idx].clone()).collect();
+
+    debug_assert_eq!(
+        projected_columns.len(),
+        output_schema.fields().len(),
+        "projected column count mismatch"
+    );
+
+    Ok(RecordBatch::try_new(
+        Arc::clone(output_schema),
+        projected_columns,
+    )?)
 }
 
 // ── Versioned Lookup Join Exec ────────────────────────────────────
@@ -985,6 +1016,7 @@ pub struct PartialLookupJoinExec {
     lookup_schema: SchemaRef,
     source: Option<Arc<dyn LookupSourceDyn>>,
     fetch_semaphore: Arc<Semaphore>,
+    projection: Vec<ColumnId>,
 }
 
 impl PartialLookupJoinExec {
@@ -1012,6 +1044,7 @@ impl PartialLookupJoinExec {
             output_schema,
             None,
             Arc::new(Semaphore::new(64)),
+            vec![],
         )
     }
 
@@ -1031,6 +1064,7 @@ impl PartialLookupJoinExec {
         output_schema: SchemaRef,
         source: Option<Arc<dyn LookupSourceDyn>>,
         fetch_semaphore: Arc<Semaphore>,
+        projection: Vec<ColumnId>,
     ) -> Result<Self> {
         let output_schema = if join_type == LookupJoinType::LeftOuter {
             let stream_count = input.schema().fields().len();
@@ -1072,6 +1106,7 @@ impl PartialLookupJoinExec {
             lookup_schema,
             source,
             fetch_semaphore,
+            projection,
         })
     }
 }
@@ -1145,6 +1180,7 @@ impl ExecutionPlan for PartialLookupJoinExec {
             lookup_schema: Arc::clone(&self.lookup_schema),
             source: self.source.clone(),
             fetch_semaphore: Arc::clone(&self.fetch_semaphore),
+            projection: self.projection.clone(),
         }))
     }
 
@@ -1163,6 +1199,7 @@ impl ExecutionPlan for PartialLookupJoinExec {
         let lookup_schema = Arc::clone(&self.lookup_schema);
         let source = self.source.clone();
         let fetch_semaphore = Arc::clone(&self.fetch_semaphore);
+        let projection = self.projection.clone();
 
         let output = input_stream.then(move |result| {
             let foyer_cache = Arc::clone(&foyer_cache);
@@ -1172,6 +1209,7 @@ impl ExecutionPlan for PartialLookupJoinExec {
             let lookup_schema = Arc::clone(&lookup_schema);
             let source = source.clone();
             let fetch_semaphore = Arc::clone(&fetch_semaphore);
+            let projection = projection.clone();
             async move {
                 let batch = result?;
                 if batch.num_rows() == 0 {
@@ -1188,6 +1226,7 @@ impl ExecutionPlan for PartialLookupJoinExec {
                     &lookup_schema,
                     source.as_deref(),
                     &fetch_semaphore,
+                    &projection,
                 )
                 .await
             }
@@ -1227,7 +1266,7 @@ impl datafusion::physical_plan::ExecutionPlanProperties for PartialLookupJoinExe
 /// Probes the foyer cache for each row in `stream_batch`, falling back
 /// to the async source for cache misses. Inserts source results into
 /// the cache before building the output.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn probe_partial_batch_with_fallback(
     stream_batch: &RecordBatch,
     converter: &RowConverter,
@@ -1239,6 +1278,7 @@ async fn probe_partial_batch_with_fallback(
     lookup_schema: &SchemaRef,
     source: Option<&dyn LookupSourceDyn>,
     fetch_semaphore: &Semaphore,
+    projection: &[ColumnId],
 ) -> Result<RecordBatch> {
     let key_cols: Vec<_> = stream_key_indices
         .iter()
@@ -1284,23 +1324,45 @@ async fn probe_partial_batch_with_fallback(
                 .map_err(|_| DataFusionError::Internal("fetch semaphore closed".into()))?;
 
             let key_refs: Vec<&[u8]> = miss_keys.iter().map(|(_, k)| k.as_slice()).collect();
-            let source_results = source.query_batch(&key_refs, &[], &[]).await;
 
-            match source_results {
-                Ok(results) => {
-                    for ((idx, key_bytes), maybe_batch) in miss_keys.iter().zip(results) {
-                        if let Some(batch) = maybe_batch {
-                            foyer_cache.insert(key_bytes, batch.clone());
-                            lookup_batches[*idx] = Some(batch);
-                        }
-                    }
+            // Propagate fetch failures instead of silently serving cache-only
+            // results: returning Err replays the cycle rather than dropping
+            // inner-join matches or NULL-filling left-join rows.
+            let results = match tokio::time::timeout(
+                LOOKUP_SOURCE_TIMEOUT,
+                source.query_batch(&key_refs, &[], projection),
+            )
+            .await
+            {
+                Ok(Ok(results)) => results,
+                Ok(Err(e)) => {
+                    return Err(DataFusionError::Execution(format!(
+                        "lookup source query failed ({} keys): {e}",
+                        miss_keys.len()
+                    )));
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        missed_keys = miss_keys.len(),
-                        "partial lookup: source fallback failed, serving cache-only results"
-                    );
+                Err(_elapsed) => {
+                    return Err(DataFusionError::Execution(format!(
+                        "lookup source query timed out after {LOOKUP_SOURCE_TIMEOUT:?} \
+                         ({} keys)",
+                        miss_keys.len()
+                    )));
+                }
+            };
+
+            if results.len() != miss_keys.len() {
+                return Err(DataFusionError::Execution(format!(
+                    "Lookup source returned mismatched results cardinality. Expected {} results, but got {} results. Miss keys: {:?}",
+                    miss_keys.len(),
+                    results.len(),
+                    miss_keys
+                )));
+            }
+
+            for ((idx, key_bytes), maybe_batch) in miss_keys.iter().zip(results) {
+                if let Some(batch) = maybe_batch {
+                    foyer_cache.insert(key_bytes, batch.clone());
+                    lookup_batches[*idx] = Some(batch);
                 }
             }
         }
@@ -1351,6 +1413,53 @@ async fn probe_partial_batch_with_fallback(
     );
 
     Ok(RecordBatch::try_new(Arc::clone(output_schema), columns)?)
+}
+
+fn resolve_physical_projection(
+    logical_schema: &datafusion::common::DFSchema,
+    stream_schema: &arrow::datatypes::Schema,
+    lookup_schema: &arrow::datatypes::Schema,
+    lookup_table: &str,
+    lookup_alias: Option<&str>,
+) -> Result<Vec<usize>> {
+    let mut projection = Vec::with_capacity(logical_schema.fields().len());
+    for idx in 0..logical_schema.fields().len() {
+        let (qualifier, field) = logical_schema.qualified_field(idx);
+        let name = field.name();
+        let is_lookup = if let Some(relation) = qualifier {
+            let table = relation.table();
+            table == lookup_table || Some(table) == lookup_alias
+        } else {
+            // No qualifier: fallback to name-based detection.
+            if stream_schema.index_of(name).is_ok() && lookup_schema.index_of(name).is_err() {
+                false
+            } else if lookup_schema.index_of(name).is_ok() && stream_schema.index_of(name).is_err()
+            {
+                true
+            } else {
+                stream_schema.index_of(name).is_ok()
+            }
+        };
+
+        if is_lookup {
+            let lookup_idx = lookup_schema.index_of(name).map_err(|_| {
+                DataFusionError::Plan(format!(
+                    "lookup join projection: output field '{name}' not found in lookup \
+                     schema {lookup_schema:?}"
+                ))
+            })?;
+            projection.push(stream_schema.fields().len() + lookup_idx);
+        } else {
+            let stream_idx = stream_schema.index_of(name).map_err(|_| {
+                DataFusionError::Plan(format!(
+                    "lookup join projection: output field '{name}' not found in stream \
+                     schema {stream_schema:?}"
+                ))
+            })?;
+            projection.push(stream_idx);
+        }
+    }
+    Ok(projection)
 }
 
 // ── Extension Planner ────────────────────────────────────────────
@@ -1415,6 +1524,7 @@ impl ExtensionPlanner for LookupJoinExtensionPlanner {
                     output_schema,
                     partial_state.source.clone(),
                     Arc::clone(&partial_state.fetch_semaphore),
+                    partial_state.projection.clone(),
                 )?;
                 Ok(Some(Arc::new(exec)))
             }
@@ -1450,9 +1560,16 @@ impl ExtensionPlanner for LookupJoinExtensionPlanner {
                     }
                 }
 
-                let mut output_fields = stream_schema.fields().to_vec();
-                output_fields.extend(lookup_batch.schema().fields().iter().cloned());
-                let output_schema = Arc::new(Schema::new(output_fields));
+                let logical_schema = lookup_node.schema();
+                let physical_projection = resolve_physical_projection(
+                    logical_schema,
+                    &stream_schema,
+                    &lookup_schema,
+                    lookup_node.lookup_table_name(),
+                    lookup_node.lookup_alias(),
+                )?;
+
+                let output_schema = Arc::new(Schema::new(logical_schema.fields().to_vec()));
 
                 let exec = LookupJoinExec::try_new(
                     input,
@@ -1461,7 +1578,8 @@ impl ExtensionPlanner for LookupJoinExtensionPlanner {
                     lookup_key_indices,
                     lookup_node.join_type(),
                     output_schema,
-                )?;
+                )?
+                .with_projection(physical_projection);
 
                 Ok(Some(Arc::new(exec)))
             }
@@ -1887,7 +2005,6 @@ mod tests {
             "customers",
             LookupSnapshot {
                 batch: customers_batch(),
-                key_columns: vec!["id".into()],
             },
         );
         assert!(reg.get("customers").is_some());
@@ -1904,7 +2021,6 @@ mod tests {
             "t",
             LookupSnapshot {
                 batch: RecordBatch::new_empty(customers_schema()),
-                key_columns: vec![],
             },
         );
         assert_eq!(reg.get("t").unwrap().batch.num_rows(), 0);
@@ -1913,7 +2029,6 @@ mod tests {
             "t",
             LookupSnapshot {
                 batch: customers_batch(),
-                key_columns: vec![],
             },
         );
         assert_eq!(reg.get("t").unwrap().batch.num_rows(), 3);
@@ -1973,8 +2088,9 @@ mod tests {
         Arc::new(FoyerMemoryCache::new(
             1,
             FoyerMemoryCacheConfig {
-                capacity: 64,
+                capacity_bytes: 64 * 1024,
                 shards: 4,
+                ttl: None,
             },
         ))
     }
@@ -2137,6 +2253,7 @@ mod tests {
                 key_sort_fields,
                 source: None,
                 fetch_semaphore: Arc::new(Semaphore::new(64)),
+                projection: Vec::new(),
             },
         );
 
@@ -2201,6 +2318,7 @@ mod tests {
             output_schema(),
             Some(source),
             Arc::new(Semaphore::new(64)),
+            vec![],
         )
         .unwrap();
 
@@ -2218,7 +2336,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partial_source_error_graceful_degradation() {
+    async fn partial_source_error_propagates() {
         use laminar_core::lookup::source::LookupError;
         use laminar_core::lookup::source::LookupSourceDyn;
 
@@ -2255,14 +2373,20 @@ mod tests {
             output_schema(),
             Some(source),
             Arc::new(Semaphore::new(64)),
+            vec![],
         )
         .unwrap();
 
+        // A source error must propagate (fail the cycle → replay), NOT silently
+        // serve cache-only results that drop/NULL-fill the missed rows.
         let ctx = Arc::new(TaskContext::default());
-        let batches: Vec<RecordBatch> = exec.execute(0, ctx).unwrap().try_collect().await.unwrap();
-        let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
-        // All rows preserved in left outer, but all lookup columns null
-        assert_eq!(total, 4);
+        let result: std::result::Result<Vec<RecordBatch>, _> =
+            exec.execute(0, ctx).unwrap().try_collect().await;
+        let err = result.expect_err("source error must propagate, not degrade silently");
+        assert!(
+            err.to_string().contains("lookup source query failed"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2272,7 +2396,6 @@ mod tests {
             "t",
             LookupSnapshot {
                 batch: customers_batch(),
-                key_columns: vec!["id".into()],
             },
         );
 

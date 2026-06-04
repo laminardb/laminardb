@@ -1,5 +1,6 @@
 //! SQL analysis and join detection utilities.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -10,14 +11,14 @@ use datafusion::physical_plan::PhysicalExpr;
 use datafusion::prelude::SessionContext;
 use datafusion_expr::LogicalPlan;
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName, ObjectNamePart,
-    SelectItem, SetExpr, Statement, TableFactor, WildcardAdditionalOptions,
+    visit_expressions, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName,
+    ObjectNamePart, SelectItem, SetExpr, Statement, TableFactor, WildcardAdditionalOptions,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Location, Token, TokenWithSpan};
 
-use laminar_ai::{BackendKind, ModelRegistry, Task};
+use crate::ai::{BackendKind, ModelRegistry, Task};
 use laminar_sql::parser::join_parser::analyze_joins;
 
 use crate::error::DbError;
@@ -79,6 +80,117 @@ pub(crate) fn extract_table_references(sql: &str) -> FxHashSet<String> {
         tables.insert(config.right_table.clone());
     }
     tables
+}
+
+/// Column indices of `schema` to fetch for partial lookup `table`, given the
+/// stream `queries` — for projection pushdown. The result is the union of every
+/// column any query referencing `table` uses, plus `pk_cols` (the source
+/// realigns results by the key, so the key must always come back).
+///
+/// Returns an empty vec meaning "fetch all columns": when a referencing query
+/// is anything but a plain wildcard-free `SELECT` (so we can't be sure which
+/// columns it needs), or when the union already covers the whole schema. The
+/// cache is shared per table, so this is deliberately a *superset* — fetching a
+/// spare column is harmless; missing one is not.
+pub(crate) fn compute_lookup_projection(
+    schema: &SchemaRef,
+    pk_cols: &[String],
+    table: &str,
+    queries: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Vec<u32> {
+    let mut referenced: FxHashSet<String> = pk_cols.iter().cloned().collect();
+    for sql in queries {
+        let sql = sql.as_ref();
+        if !extract_table_references(sql).contains(table) {
+            continue;
+        }
+        match collect_referenced_columns(sql) {
+            Some(cols) => referenced.extend(cols),
+            None => return Vec::new(), // can't narrow safely → fetch all
+        }
+    }
+
+    let indices: Vec<u32> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| referenced.contains(f.name()))
+        .map(|(i, _)| u32::try_from(i).expect("column index fits u32"))
+        .collect();
+
+    // Full coverage → empty keeps the source and operator on the simple path.
+    if indices.len() == schema.fields().len() {
+        Vec::new()
+    } else {
+        indices
+    }
+}
+
+/// Column names referenced by `sql`, or `None` when it isn't a plain
+/// wildcard-free `SELECT` over base tables (subquery, `SELECT *`, set op, …) —
+/// shapes where we can't enumerate referenced columns without risking an
+/// under-count. Identifier collection uses sqlparser's exhaustive
+/// `visit_expressions`, so no expression branch is missed.
+fn collect_referenced_columns(sql: &str) -> Option<FxHashSet<String>> {
+    let dialect = GenericDialect {};
+    let statements = Parser::parse_sql(&dialect, sql).ok()?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let is_wildcard = |item: &SelectItem| {
+        matches!(
+            item,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+        )
+    };
+    if select.projection.iter().any(is_wildcard) {
+        return None;
+    }
+    // Only plain base-table relations; a derived/subquery factor could hide a
+    // wildcard that yields no identifier expression.
+    for twj in &select.from {
+        if !matches!(twj.relation, TableFactor::Table { .. }) {
+            return None;
+        }
+        if twj
+            .joins
+            .iter()
+            .any(|j| !matches!(j.relation, TableFactor::Table { .. }))
+        {
+            return None;
+        }
+    }
+
+    let mut cols = FxHashSet::default();
+    let mut complex = false;
+    let _ = visit_expressions(query.as_ref(), |expr| {
+        match expr {
+            Expr::Identifier(id) => {
+                cols.insert(id.value.clone());
+            }
+            Expr::CompoundIdentifier(parts) => {
+                if let Some(last) = parts.last() {
+                    cols.insert(last.value.clone());
+                }
+            }
+            // A subquery elsewhere (WHERE/SELECT) could reference columns via a
+            // wildcard we can't see — bail rather than under-count.
+            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
+                complex = true;
+                return ControlFlow::Break(());
+            }
+            _ => {}
+        }
+        ControlFlow::Continue(())
+    });
+    if complex {
+        None
+    } else {
+        Some(cols)
+    }
 }
 
 /// Unlike [`extract_table_references`] (which deduplicates), this counts every
@@ -544,6 +656,206 @@ pub(crate) fn detect_asof_query(sql: &str) -> (Option<AsofJoinTranslatorConfig>,
 }
 
 // ---------------------------------------------------------------------------
+// Lookup-enrich detection (on-demand / partial lookup joins → GraphOperator)
+// ---------------------------------------------------------------------------
+
+use crate::operator::lookup_enrich::{disambiguated_lookup_name, LookupEnrichConfig};
+
+/// Detect a `partial`/`none` lookup-enrich join: a single equi-join whose right
+/// table is a registered partial lookup table. Returns the operator config plus
+/// the residual projection over `__lookup_enrich_tmp`. `partial_cols` maps a
+/// partial lookup table to its column names; `source_schemas` supplies the
+/// stream side's columns for collision disambiguation.
+///
+/// v1 constraints (else returns `None`, so the existing `DataFusion` path runs):
+/// single join step, single-column key, stream on the left, INNER/LEFT only,
+/// and the stream schema must be known.
+pub(crate) fn detect_lookup_enrich_query(
+    sql: &str,
+    partial_cols: &FxHashMap<String, Vec<String>>,
+    source_schemas: &FxHashMap<String, SchemaRef>,
+) -> (Option<LookupEnrichConfig>, Option<String>) {
+    use laminar_sql::datafusion::lookup_join::LookupJoinType;
+    use laminar_sql::parser::join_parser::JoinType;
+
+    if partial_cols.is_empty() {
+        return (None, None);
+    }
+    let Ok(statements) = laminar_sql::parse_streaming_sql(sql) else {
+        return (None, None);
+    };
+    let Some(laminar_sql::parser::StreamingStatement::Standard(stmt)) = statements.first() else {
+        return (None, None);
+    };
+    let Statement::Query(query) = stmt.as_ref() else {
+        return (None, None);
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return (None, None);
+    };
+    let has_group_by = match &select.group_by {
+        sqlparser::ast::GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
+        sqlparser::ast::GroupByExpr::All(_) => false,
+    };
+    if select.distinct.is_some()
+        || has_group_by
+        || select.having.is_some()
+        || query.order_by.is_some()
+        || query.limit_clause.is_some()
+        || query.fetch.is_some()
+        || query.with.is_some()
+    {
+        return (None, None);
+    }
+    let Ok(Some(multi)) = analyze_joins(select) else {
+        return (None, None);
+    };
+    if multi.joins.len() != 1 {
+        return (None, None);
+    }
+    let j = &multi.joins[0];
+    if j.is_asof_join
+        || j.is_temporal_join
+        || j.time_bound.is_some()
+        || !j.additional_key_columns.is_empty()
+    {
+        return (None, None);
+    }
+    // v1: stream on the left, partial lookup table on the right.
+    let lookup_table = j.right_table.clone();
+    let Some(lookup_cols) = partial_cols.get(&lookup_table) else {
+        return (None, None);
+    };
+    let stream_table = j.left_table.clone();
+    let Some(stream_schema) = source_schemas.get(&stream_table) else {
+        return (None, None);
+    };
+    let stream_cols: Vec<String> = stream_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let join_type = match j.join_type {
+        JoinType::Inner => LookupJoinType::Inner,
+        JoinType::Left => LookupJoinType::LeftOuter,
+        _ => return (None, None),
+    };
+    let projection_sql = build_lookup_projection_sql(
+        select,
+        j,
+        &stream_table,
+        &lookup_table,
+        &stream_cols,
+        lookup_cols,
+    );
+    let config = LookupEnrichConfig {
+        table_name: lookup_table,
+        key_columns: vec![j.left_key_column.clone()],
+        join_type,
+    };
+    (Some(config), Some(projection_sql))
+}
+
+/// Context for rewriting a SELECT to read from the flattened
+/// `__lookup_enrich_tmp` table.
+struct LookupRewriteCtx<'a> {
+    stream_alias: Option<&'a str>,
+    stream_table: &'a str,
+    lookup_alias: Option<&'a str>,
+    lookup_table: &'a str,
+    stream_cols: &'a [String],
+    lookup_cols: &'a [String],
+}
+
+impl LookupRewriteCtx<'_> {
+    fn is_stream(&self, table: &str) -> bool {
+        Some(table) == self.stream_alias || table == self.stream_table
+    }
+    fn is_lookup(&self, table: &str) -> bool {
+        Some(table) == self.lookup_alias || table == self.lookup_table
+    }
+    fn lookup_name(&self, col: &str) -> String {
+        disambiguated_lookup_name(col, self.stream_cols, self.lookup_table)
+    }
+}
+
+fn build_lookup_projection_sql(
+    select: &sqlparser::ast::Select,
+    analysis: &laminar_sql::parser::join_parser::JoinAnalysis,
+    stream_table: &str,
+    lookup_table: &str,
+    stream_cols: &[String],
+    lookup_cols: &[String],
+) -> String {
+    let ctx = LookupRewriteCtx {
+        stream_alias: analysis.left_alias.as_deref(),
+        stream_table,
+        lookup_alias: analysis.right_alias.as_deref(),
+        lookup_table,
+        stream_cols,
+        lookup_cols,
+    };
+    let items: Vec<String> = select
+        .projection
+        .iter()
+        .map(|item| rewrite_lookup_select_item(item, &ctx))
+        .collect();
+    let where_clause = select
+        .selection
+        .as_ref()
+        .map(|e| format!(" WHERE {}", rewrite_lookup_expr(e, &ctx)));
+    format!(
+        "SELECT {} FROM __lookup_enrich_tmp{}",
+        items.join(", "),
+        where_clause.unwrap_or_default()
+    )
+}
+
+fn rewrite_lookup_select_item(item: &SelectItem, ctx: &LookupRewriteCtx) -> String {
+    match item {
+        SelectItem::UnnamedExpr(expr) => rewrite_lookup_expr(expr, ctx),
+        SelectItem::ExprWithAlias { expr, alias } => {
+            format!("{} AS {alias}", rewrite_lookup_expr(expr, ctx))
+        }
+        SelectItem::Wildcard(WildcardAdditionalOptions { .. }) => "*".to_string(),
+        SelectItem::QualifiedWildcard(name, _) => {
+            let table = name.to_string();
+            if ctx.is_stream(&table) {
+                ctx.stream_cols.join(", ")
+            } else if ctx.is_lookup(&table) {
+                ctx.lookup_cols
+                    .iter()
+                    .map(|c| ctx.lookup_name(c))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else {
+                format!("{table}.*")
+            }
+        }
+    }
+}
+
+fn rewrite_lookup_expr(expr: &Expr, ctx: &LookupRewriteCtx) -> String {
+    rewrite_join_expr(expr, &|e: &Expr| {
+        let Expr::CompoundIdentifier(parts) = e else {
+            return None;
+        };
+        if parts.len() != 2 {
+            return None;
+        }
+        let table = parts[0].value.as_str();
+        let col = parts[1].value.as_str();
+        Some(if ctx.is_stream(table) {
+            col.to_string()
+        } else if ctx.is_lookup(table) {
+            ctx.lookup_name(col)
+        } else {
+            e.to_string()
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
 // AI function detection (plan-time seam)
 // ---------------------------------------------------------------------------
 
@@ -884,7 +1196,7 @@ mod ai {
     #[cfg(test)]
     mod ai_detection_tests {
         use super::{detect_ai_functions, validate_ai_calls, AiCallSpec};
-        use laminar_ai::{ModelBackend, ModelEntry, ModelRegistry, Task};
+        use crate::ai::{ModelBackend, ModelEntry, ModelRegistry, Task};
 
         fn spec(task: Task, model: Option<&str>, labels: Option<Vec<&str>>) -> AiCallSpec {
             AiCallSpec {
@@ -2024,6 +2336,115 @@ pub(crate) fn apply_topk_filter(batches: &[RecordBatch], k: usize) -> Vec<Record
 }
 
 // ---------------------------------------------------------------------------
+// Private: shared join-projection expression rewriter
+// ---------------------------------------------------------------------------
+
+/// Rewrite an expression to SQL text over a flattened join temp table.
+///
+/// `leaf` resolves the per-join-type leaves (qualified column references),
+/// returning `None` to fall through to the generic recursion over the
+/// structural variants. This is the single recursion shared by the ASOF,
+/// temporal, stream-stream, and lookup rewriters, which differ only in how they
+/// resolve a `t.col` reference.
+fn rewrite_join_expr<F: Fn(&Expr) -> Option<String>>(expr: &Expr, leaf: &F) -> String {
+    if let Some(s) = leaf(expr) {
+        return s;
+    }
+    let r = |e: &Expr| rewrite_join_expr(e, leaf);
+    match expr {
+        Expr::BinaryOp { left, op, right } => format!("{} {op} {}", r(left), r(right)),
+        Expr::UnaryOp { op, expr: inner } => format!("{op} {}", r(inner)),
+        Expr::Nested(inner) => format!("({})", r(inner)),
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => format!("CAST({} AS {data_type})", r(inner)),
+        Expr::IsNull(inner) => format!("{} IS NULL", r(inner)),
+        Expr::IsNotNull(inner) => format!("{} IS NOT NULL", r(inner)),
+        Expr::Between {
+            expr: inner,
+            negated,
+            low,
+            high,
+        } => {
+            let (e, l, h) = (r(inner), r(low), r(high));
+            if *negated {
+                format!("{e} NOT BETWEEN {l} AND {h}")
+            } else {
+                format!("{e} BETWEEN {l} AND {h}")
+            }
+        }
+        Expr::Function(func) => {
+            let args: Vec<String> = match &func.args {
+                sqlparser::ast::FunctionArguments::List(list) => list
+                    .args
+                    .iter()
+                    .map(|arg| match arg {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ) => r(e),
+                        other => other.to_string(),
+                    })
+                    .collect(),
+                other => vec![other.to_string()],
+            };
+            format!("{}({})", func.name, args.join(", "))
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let list_str: Vec<String> = list.iter().map(r).collect();
+            let op = if *negated { "NOT IN" } else { "IN" };
+            format!("{} {op} ({})", r(expr), list_str.join(", "))
+        }
+        Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => {
+            let op = if *negated { "NOT IN" } else { "IN" };
+            format!("{} {op} ({subquery})", r(expr))
+        }
+        Expr::Exists { subquery, negated } => {
+            let op = if *negated { "NOT EXISTS" } else { "EXISTS" };
+            format!("{op} ({subquery})")
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            let operand_str = operand
+                .as_ref()
+                .map_or(String::new(), |op| format!("{} ", r(op)));
+            let mut wens = Vec::new();
+            for cw in conditions {
+                wens.push(format!("WHEN {} THEN {}", r(&cw.condition), r(&cw.result)));
+            }
+            let else_str = else_result
+                .as_ref()
+                .map_or(String::new(), |el| format!(" ELSE {}", r(el)));
+            format!("CASE {operand_str}{} {else_str} END", wens.join(" "))
+        }
+        Expr::Tuple(exprs) => {
+            let tuple_str: Vec<String> = exprs.iter().map(r).collect();
+            format!("({})", tuple_str.join(", "))
+        }
+        Expr::Collate { expr, collation } => {
+            format!("{} COLLATE {collation}", r(expr))
+        }
+        Expr::Subquery(subquery) => {
+            format!("({subquery})")
+        }
+        _ => expr.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Private: ASOF projection rewriting
 // ---------------------------------------------------------------------------
 
@@ -2099,90 +2520,34 @@ fn rewrite_expr(
     right_alias: Option<&str>,
     config: &AsofJoinTranslatorConfig,
 ) -> String {
-    match expr {
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            let table = parts[0].value.as_str();
-            let column = parts[1].value.as_str();
-
-            let is_left = Some(table) == left_alias || table == config.left_table;
-            let is_right = Some(table) == right_alias || table == config.right_table;
-
-            if is_left {
-                column.to_string()
-            } else if is_right {
-                // Check if this right column might be disambiguated.
-                // The key column is excluded from the right side entirely,
-                // and other duplicate columns get suffixed.
-                // We suffix if the column name matches a "well-known" left-side
-                // column that could collide — specifically the key column
-                // (already excluded) or columns sharing the same name.
-                // We use a heuristic: if the right column name equals the
-                // left time column, suffix it.
-                if column == config.left_time_column && column != config.right_time_column {
-                    // Left and right time columns have different names — no collision
-                    column.to_string()
-                } else if column == config.key_column {
-                    // Key column: just use the bare name (from left side)
-                    column.to_string()
-                } else {
-                    // For other right-side columns, check if the column name
-                    // matches any "standard" left-side column name.
-                    // Since we don't have the full schema here, use a
-                    // conservative approach: only suffix the right time column
-                    // when it matches the left time column name.
-                    if column == config.left_time_column && column == config.right_time_column {
-                        // Same name for time columns — right side is suffixed
-                        format!("{}_{}", column, config.right_table)
-                    } else {
-                        column.to_string()
-                    }
-                }
+    rewrite_join_expr(expr, &|e: &Expr| {
+        let Expr::CompoundIdentifier(parts) = e else {
+            return None;
+        };
+        if parts.len() != 2 {
+            return None;
+        }
+        let table = parts[0].value.as_str();
+        let column = parts[1].value.as_str();
+        let is_left = Some(table) == left_alias || table == config.left_table;
+        let is_right = Some(table) == right_alias || table == config.right_table;
+        Some(if is_left {
+            column.to_string()
+        } else if is_right {
+            // Right-side columns keep their bare name, except a non-key time
+            // column that shares the left time column's name, which is suffixed.
+            if column == config.left_time_column
+                && column == config.right_time_column
+                && column != config.key_column
+            {
+                format!("{}_{}", column, config.right_table)
             } else {
-                expr.to_string()
+                column.to_string()
             }
-        }
-        Expr::BinaryOp { left, op, right } => {
-            let l = rewrite_expr(left, left_alias, right_alias, config);
-            let r = rewrite_expr(right, left_alias, right_alias, config);
-            format!("{l} {op} {r}")
-        }
-        Expr::UnaryOp { op, expr: inner } => {
-            let e = rewrite_expr(inner, left_alias, right_alias, config);
-            format!("{op} {e}")
-        }
-        Expr::Nested(inner) => {
-            let e = rewrite_expr(inner, left_alias, right_alias, config);
-            format!("({e})")
-        }
-        Expr::Function(func) => {
-            // Rewrite function arguments
-            let name = &func.name;
-            let args: Vec<String> = match &func.args {
-                sqlparser::ast::FunctionArguments::List(arg_list) => arg_list
-                    .args
-                    .iter()
-                    .map(|arg| match arg {
-                        sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(e),
-                        ) => rewrite_expr(e, left_alias, right_alias, config),
-                        other => other.to_string(),
-                    })
-                    .collect(),
-                other => vec![other.to_string()],
-            };
-            format!("{name}({})", args.join(", "))
-        }
-        Expr::Cast {
-            expr: inner,
-            data_type,
-            ..
-        } => {
-            let e = rewrite_expr(inner, left_alias, right_alias, config);
-            format!("CAST({e} AS {data_type})")
-        }
-        // For any other expression variant, fall back to sqlparser's Display
-        _ => expr.to_string(),
-    }
+        } else {
+            e.to_string()
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2244,60 +2609,23 @@ fn rewrite_temporal_expr(
     right_alias: Option<&str>,
     config: &TemporalJoinTranslatorConfig,
 ) -> String {
-    match expr {
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            let table = parts[0].value.as_str();
-            let column = parts[1].value.as_str();
-
-            let is_left = Some(table) == left_alias || table == config.stream_table;
-            let is_right = Some(table) == right_alias || table == config.table_name;
-
-            if is_left || is_right {
-                column.to_string()
-            } else {
-                expr.to_string()
-            }
+    rewrite_join_expr(expr, &|e: &Expr| {
+        let Expr::CompoundIdentifier(parts) = e else {
+            return None;
+        };
+        if parts.len() != 2 {
+            return None;
         }
-        Expr::BinaryOp { left, op, right } => {
-            let l = rewrite_temporal_expr(left, left_alias, right_alias, config);
-            let r = rewrite_temporal_expr(right, left_alias, right_alias, config);
-            format!("{l} {op} {r}")
-        }
-        Expr::UnaryOp { op, expr: inner } => {
-            let e = rewrite_temporal_expr(inner, left_alias, right_alias, config);
-            format!("{op} {e}")
-        }
-        Expr::Nested(inner) => {
-            let e = rewrite_temporal_expr(inner, left_alias, right_alias, config);
-            format!("({e})")
-        }
-        Expr::Function(func) => {
-            let name = &func.name;
-            let args: Vec<String> = match &func.args {
-                sqlparser::ast::FunctionArguments::List(arg_list) => arg_list
-                    .args
-                    .iter()
-                    .map(|arg| match arg {
-                        sqlparser::ast::FunctionArg::Unnamed(
-                            sqlparser::ast::FunctionArgExpr::Expr(e),
-                        ) => rewrite_temporal_expr(e, left_alias, right_alias, config),
-                        other => other.to_string(),
-                    })
-                    .collect(),
-                other => vec![other.to_string()],
-            };
-            format!("{name}({})", args.join(", "))
-        }
-        Expr::Cast {
-            expr: inner,
-            data_type,
-            ..
-        } => {
-            let e = rewrite_temporal_expr(inner, left_alias, right_alias, config);
-            format!("CAST({e} AS {data_type})")
-        }
-        _ => expr.to_string(),
-    }
+        let table = parts[0].value.as_str();
+        let column = parts[1].value.as_str();
+        let is_left = Some(table) == left_alias || table == config.stream_table;
+        let is_right = Some(table) == right_alias || table == config.table_name;
+        Some(if is_left || is_right {
+            column.to_string()
+        } else {
+            e.to_string()
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2480,7 +2808,6 @@ fn render_residual_joins(
 /// `_<right_table>` suffix that `IntervalJoinState` adds. With
 /// `tmp_qual = Some("__interval_tmp")` the rewritten names are also
 /// prefixed to disambiguate from downstream tables in residual joins.
-#[allow(clippy::too_many_lines)]
 fn rewrite_stream_join_expr(
     expr: &sqlparser::ast::Expr,
     left_alias: Option<&str>,
@@ -2488,99 +2815,31 @@ fn rewrite_stream_join_expr(
     config: &StreamJoinConfig,
     tmp_qual: Option<&str>,
 ) -> String {
-    match expr {
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            let table = &parts[0].value;
-            let col = &parts[1].value;
-            let is_left = table == &config.left_table || left_alias.is_some_and(|a| a == table);
-            let is_right = table == &config.right_table || right_alias.is_some_and(|a| a == table);
-            if is_left || is_right {
-                let bare = if is_right {
-                    format!("{col}_{}", config.right_table)
-                } else {
-                    col.clone()
-                };
-                if let Some(q) = tmp_qual {
-                    format!("{q}.{bare}")
-                } else {
-                    bare
-                }
+    rewrite_join_expr(expr, &|e: &Expr| {
+        let Expr::CompoundIdentifier(parts) = e else {
+            return None;
+        };
+        if parts.len() != 2 {
+            return None;
+        }
+        let table = &parts[0].value;
+        let col = &parts[1].value;
+        let is_left = table == &config.left_table || left_alias.is_some_and(|a| a == table);
+        let is_right = table == &config.right_table || right_alias.is_some_and(|a| a == table);
+        Some(if is_left || is_right {
+            let bare = if is_right {
+                format!("{col}_{}", config.right_table)
             } else {
-                expr.to_string()
-            }
-        }
-        Expr::BinaryOp { left, op, right } => {
-            let l = rewrite_stream_join_expr(left, left_alias, right_alias, config, tmp_qual);
-            let r = rewrite_stream_join_expr(right, left_alias, right_alias, config, tmp_qual);
-            format!("{l} {op} {r}")
-        }
-        Expr::UnaryOp { op, expr: inner } => {
-            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
-            format!("{op} {r}")
-        }
-        Expr::Nested(inner) => {
-            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
-            format!("({r})")
-        }
-        Expr::Cast {
-            expr: inner,
-            data_type,
-            ..
-        } => {
-            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
-            format!("CAST({r} AS {data_type})")
-        }
-        Expr::IsNull(inner) => {
-            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
-            format!("{r} IS NULL")
-        }
-        Expr::IsNotNull(inner) => {
-            let r = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
-            format!("{r} IS NOT NULL")
-        }
-        Expr::Between {
-            expr: inner,
-            negated,
-            low,
-            high,
-        } => {
-            let e = rewrite_stream_join_expr(inner, left_alias, right_alias, config, tmp_qual);
-            let l = rewrite_stream_join_expr(low, left_alias, right_alias, config, tmp_qual);
-            let h = rewrite_stream_join_expr(high, left_alias, right_alias, config, tmp_qual);
-            if *negated {
-                format!("{e} NOT BETWEEN {l} AND {h}")
-            } else {
-                format!("{e} BETWEEN {l} AND {h}")
-            }
-        }
-        Expr::Function(func) => {
-            let name = &func.name;
-            let args_str = match &func.args {
-                sqlparser::ast::FunctionArguments::List(arg_list) => {
-                    let rewritten_args: Vec<String> = arg_list
-                        .args
-                        .iter()
-                        .map(|arg| match arg {
-                            sqlparser::ast::FunctionArg::Unnamed(
-                                sqlparser::ast::FunctionArgExpr::Expr(e),
-                            ) => rewrite_stream_join_expr(
-                                e,
-                                left_alias,
-                                right_alias,
-                                config,
-                                tmp_qual,
-                            ),
-                            other => other.to_string(),
-                        })
-                        .collect();
-                    rewritten_args.join(", ")
-                }
-                other => other.to_string(),
+                col.clone()
             };
-            format!("{name}({args_str})")
-        }
-        _ => expr.to_string(),
-    }
+            match tmp_qual {
+                Some(q) => format!("{q}.{bare}"),
+                None => bare,
+            }
+        } else {
+            e.to_string()
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3236,6 +3495,119 @@ mod temporal_filter_recognition_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lookup_fixtures() -> (FxHashMap<String, Vec<String>>, FxHashMap<String, SchemaRef>) {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let mut partial = FxHashMap::default();
+        partial.insert(
+            "customers".to_string(),
+            vec!["id".to_string(), "name".to_string()],
+        );
+        let mut schemas = FxHashMap::default();
+        schemas.insert(
+            "orders".to_string(),
+            Arc::new(Schema::new(vec![
+                Field::new("order_id", DataType::Int64, false),
+                Field::new("customer_id", DataType::Int64, true),
+                Field::new("name", DataType::Utf8, true),
+            ])) as SchemaRef,
+        );
+        (partial, schemas)
+    }
+
+    fn dim_schema() -> SchemaRef {
+        use arrow::datatypes::{DataType, Field, Schema};
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("email", DataType::Utf8, true),
+            Field::new("region", DataType::Utf8, true),
+        ]))
+    }
+
+    #[test]
+    fn lookup_projection_unions_referenced_columns_plus_key() {
+        let pk = vec!["id".to_string()];
+        // q1 selects dim.name; q2 filters on dim.region. Union + key = id,name,region.
+        let q1 = "SELECT o.x, d.name FROM orders o JOIN dim d ON o.k = d.id";
+        let q2 = "SELECT o.y FROM orders o JOIN dim d ON o.k = d.id WHERE d.region = 'US'";
+        let proj = compute_lookup_projection(&dim_schema(), &pk, "dim", [q1, q2]);
+        assert_eq!(
+            proj,
+            vec![0, 1, 3],
+            "id(0)+name(1)+region(3); email(2) dropped"
+        );
+    }
+
+    #[test]
+    fn lookup_projection_bails_to_full_on_wildcard() {
+        let pk = vec!["id".to_string()];
+        let q = "SELECT * FROM orders o JOIN dim d ON o.k = d.id";
+        assert!(
+            compute_lookup_projection(&dim_schema(), &pk, "dim", [q]).is_empty(),
+            "a wildcard references every column, so fetch all"
+        );
+    }
+
+    #[test]
+    fn lookup_projection_empty_when_all_columns_used() {
+        let pk = vec!["id".to_string()];
+        let q = "SELECT d.name, d.email, d.region FROM orders o JOIN dim d ON o.k = d.id";
+        assert!(
+            compute_lookup_projection(&dim_schema(), &pk, "dim", [q]).is_empty(),
+            "full coverage collapses to empty (= fetch all)"
+        );
+    }
+
+    #[test]
+    fn lookup_enrich_detects_and_rewrites() {
+        let (partial, schemas) = lookup_fixtures();
+        let sql =
+            "SELECT o.order_id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id";
+        let (cfg, proj) = detect_lookup_enrich_query(sql, &partial, &schemas);
+        let cfg = cfg.expect("partial lookup join should be detected");
+        assert_eq!(cfg.table_name, "customers");
+        assert_eq!(cfg.key_columns, vec!["customer_id".to_string()]);
+        let proj = proj.unwrap();
+        assert!(proj.contains("__lookup_enrich_tmp"));
+        // Qualifiers stripped; `c.name` collides with stream `name` → suffixed.
+        assert!(proj.contains("order_id"));
+        assert!(
+            proj.contains("name_customers"),
+            "collision not suffixed: {proj}"
+        );
+        assert!(
+            !proj.contains("o."),
+            "stream qualifier not stripped: {proj}"
+        );
+        assert!(
+            !proj.contains("c."),
+            "lookup qualifier not stripped: {proj}"
+        );
+    }
+
+    #[test]
+    fn lookup_enrich_rewrites_where_clause() {
+        let (partial, schemas) = lookup_fixtures();
+        let sql = "SELECT o.order_id FROM orders o JOIN customers c ON o.customer_id = c.id \
+                   WHERE c.name = 'vip'";
+        let (_, proj) = detect_lookup_enrich_query(sql, &partial, &schemas);
+        let proj = proj.unwrap();
+        // `c.name` in WHERE rewrites to the suffixed flattened column.
+        assert!(proj.contains("WHERE name_customers = 'vip'"), "{proj}");
+    }
+
+    #[test]
+    fn lookup_enrich_skips_non_partial_table() {
+        let (_partial, schemas) = lookup_fixtures();
+        let empty = FxHashMap::default();
+        let sql = "SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id";
+        let (cfg, _) = detect_lookup_enrich_query(sql, &empty, &schemas);
+        assert!(
+            cfg.is_none(),
+            "no partial tables → must fall through to DataFusion"
+        );
+    }
 
     #[test]
     fn extract_table_refs_plain() {

@@ -1,9 +1,7 @@
 [workspace]
 members = [
     "crates/laminar-core",
-    "crates/laminar-ai",
     "crates/laminar-sql",
-    "crates/laminar-storage",
     "crates/laminar-connectors",
     "crates/laminar-server",
     "crates/laminar-derive",
@@ -15,7 +13,7 @@ exclude = [
 resolver = "2"
 
 [workspace.package]
-version = "0.23.0"
+version = "0.24.0"
 authors = ["LaminarDB Contributors"]
 edition = "2021"
 rust-version = "1.95"
@@ -82,7 +80,9 @@ datafusion-common = "52.0"
 datafusion-expr = "52.0"
 datafusion-sql = "52.0"
 datafusion-optimizer = "52.0"
-sqlparser = "0.59"
+# `visitor` enables sqlparser's exhaustive `visit_expressions` AST walker, used
+# to collect referenced columns for lookup projection pushdown.
+sqlparser = { version = "0.59", features = ["visitor"] }
 
 # Async
 tokio-stream = "0.1"

@@ -97,6 +97,14 @@ impl ObjectStoreBackend {
     fn commit_path(epoch: u64) -> OsPath {
         OsPath::from(format!("epoch={epoch}/_COMMIT"))
     }
+
+    /// Parse `N` from a location whose first path segment is `epoch=N`.
+    /// `None` for any sibling object that doesn't follow the layout.
+    /// `str::split` always yields at least one segment.
+    fn epoch_of_first_segment(loc: &str) -> Option<u64> {
+        let first = loc.split('/').next().unwrap_or("");
+        first.strip_prefix("epoch=")?.parse::<u64>().ok()
+    }
 }
 
 #[async_trait]
@@ -150,6 +158,9 @@ impl StateBackend for ObjectStoreBackend {
     }
 
     async fn epoch_complete(&self, epoch: u64, vnodes: &[u32]) -> Result<bool, StateBackendError> {
+        use rustc_hash::FxHashSet;
+        use tokio_stream::StreamExt;
+
         let commit = Self::commit_path(epoch);
         // Fast path: a marker already exists. Previously we returned
         // `Ok(true)` blindly — that swallowed split-brain (two leaders
@@ -161,34 +172,24 @@ impl StateBackend for ObjectStoreBackend {
             Err(e) => return Err(StateBackendError::Io(e.to_string())),
         }
 
-        // Parallel HEAD fan-out. Sequential was O(vnodes × RTT) — on S3
-        // that's ~256 round-trips per commit gate, seconds of latency
-        // for no reason. JoinSet keeps the code dep-free (no `futures`)
-        // while overlapping all lookups.
-        let mut set = tokio::task::JoinSet::new();
         for &v in vnodes {
             self.check_vnode(v)?;
-            let store = Arc::clone(&self.store);
-            let path = Self::partial_path(epoch, v);
-            set.spawn(async move { store.head(&path).await });
         }
-        while let Some(joined) = set.join_next().await {
-            match joined {
-                Ok(Ok(_)) => {}
-                Ok(Err(object_store::Error::NotFound { .. })) => {
-                    set.abort_all();
-                    return Ok(false);
-                }
-                Ok(Err(e)) => {
-                    set.abort_all();
-                    return Err(StateBackendError::Io(e.to_string()));
-                }
-                Err(join_err) => {
-                    set.abort_all();
-                    return Err(StateBackendError::Io(format!(
-                        "epoch_complete HEAD task failed: {join_err}"
-                    )));
-                }
+
+        // List the epoch prefix once, then check every required vnode's
+        // partial is present — one round trip instead of O(vnodes) HEADs.
+        let prefix = OsPath::from(format!("epoch={epoch}/"));
+        let mut entries = self.store.list(Some(&prefix));
+        let mut found_paths: FxHashSet<OsPath> = FxHashSet::default();
+        while let Some(entry) = entries.next().await {
+            let entry = entry.map_err(|e| StateBackendError::Io(e.to_string()))?;
+            found_paths.insert(entry.location);
+        }
+
+        for &v in vnodes {
+            let path = Self::partial_path(epoch, v);
+            if !found_paths.contains(&path) {
+                return Ok(false);
             }
         }
 
@@ -213,18 +214,16 @@ impl StateBackend for ObjectStoreBackend {
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {
         use tokio_stream::StreamExt;
 
+        // NOTE: We list the entire store (None prefix) because epochs are stored as
+        // `epoch={epoch}/...` where the first segment is dynamic. The `object_store` API
+        // enforces segment-based prefix matching, so a prefix like `"epoch="` would match
+        // nothing (it requires an exact match on the segment, e.g., `"epoch=1"`).
         let mut entries = self.store.list(None);
         let mut victims: Vec<OsPath> = Vec::new();
         while let Some(entry) = entries.next().await {
             let entry = entry.map_err(|e| StateBackendError::Io(e.to_string()))?;
-            let loc = entry.location.as_ref();
             // Only `epoch=N/...` entries with N < before are candidates.
-            // `str::split` always yields at least one segment.
-            let first = loc.split('/').next().unwrap_or("");
-            let Some(rest) = first.strip_prefix("epoch=") else {
-                continue;
-            };
-            let Ok(epoch) = rest.parse::<u64>() else {
+            let Some(epoch) = Self::epoch_of_first_segment(entry.location.as_ref()) else {
                 continue;
             };
             if epoch < before {
@@ -243,6 +242,27 @@ impl StateBackend for ObjectStoreBackend {
             }
         }
         Ok(())
+    }
+
+    async fn latest_committed_epoch(&self) -> Result<Option<u64>, StateBackendError> {
+        use tokio_stream::StreamExt;
+
+        // Same listing constraint as `prune_before`: the first path
+        // segment (`epoch=N`) is dynamic, so we scan the whole store and
+        // filter for the `_COMMIT` markers a sealed epoch leaves behind.
+        let mut entries = self.store.list(None);
+        let mut highest: Option<u64> = None;
+        while let Some(entry) = entries.next().await {
+            let entry = entry.map_err(|e| StateBackendError::Io(e.to_string()))?;
+            let loc = entry.location.as_ref();
+            if !loc.ends_with("/_COMMIT") {
+                continue;
+            }
+            if let Some(epoch) = Self::epoch_of_first_segment(loc) {
+                highest = Some(highest.map_or(epoch, |h| h.max(epoch)));
+            }
+        }
+        Ok(highest)
     }
 
     fn set_authoritative_version(&self, version: u64) {
@@ -478,6 +498,36 @@ mod tests {
         let dir = tempdir().unwrap();
         let _: Arc<dyn StateBackend> =
             Arc::new(ObjectStoreBackend::new(make_store(dir.path()), "node-0", 2));
+    }
+
+    #[tokio::test]
+    async fn latest_committed_epoch_tracks_highest_sealed() {
+        let dir = tempdir().unwrap();
+        let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
+
+        // Fresh store: nothing committed.
+        assert_eq!(backend.latest_committed_epoch().await.unwrap(), None);
+
+        // Seal epochs 3 and 7 (out of order) by writing every vnode's
+        // partial and running the CAS commit gate.
+        let vnodes = [0u32, 1];
+        for &epoch in &[3u64, 7] {
+            for v in &vnodes {
+                backend
+                    .write_partial(*v, epoch, 0, Bytes::from_static(b"s"))
+                    .await
+                    .unwrap();
+            }
+            assert!(backend.epoch_complete(epoch, &vnodes).await.unwrap());
+        }
+
+        // Epoch 5 has partials but no commit marker — must be ignored.
+        backend
+            .write_partial(0, 5, 0, Bytes::from_static(b"uncommitted"))
+            .await
+            .unwrap();
+
+        assert_eq!(backend.latest_committed_epoch().await.unwrap(), Some(7));
     }
 
     #[tokio::test]

@@ -63,7 +63,7 @@ pub enum DbError {
     Checkpoint(String),
 
     /// Checkpoint store error (preserves structured source error).
-    CheckpointStore(#[from] laminar_storage::checkpoint_store::CheckpointStoreError),
+    CheckpointStore(#[from] laminar_core::storage::checkpoint_store::CheckpointStoreError),
 
     /// Unresolved config variable
     UnresolvedConfigVar(String),

@@ -23,27 +23,65 @@ use proptest::test_runner::{Config as PropConfig, TestRng, TestRunner};
 // Drain helpers — wait for sources to clear and the coordinator to advance.
 // ---------------------------------------------------------------------------
 
-/// Wait until every source has drained and the coordinator has advanced a
-/// couple of cycles past that point — enough for an IntervalJoinOperator
-/// (cycle N) to feed its post-projection sink (N+1) and reach the
-/// subscription's output queue (N+2).
-async fn await_quiescence(db: &LaminarDB, sources: &[&laminar_db::UntypedSourceHandle]) {
+/// Wait until the pipeline has fully ingested every pushed row and settled.
+///
+/// The earlier version waited a fixed two coordinator cycles after the sources
+/// drained. That is unreliable: this pipeline emits the whole result in a
+/// *single* cycle (the static lookup table is enriched synchronously from a
+/// pre-warmed cache), so `total_cycles` never reaches `baseline + 2` and the
+/// wait degenerated into a fixed 2s timeout. On a fast machine the result was
+/// already emitted before the timeout, but a slow / oversubscribed CI runner
+/// can exhaust the budget *before* that one cycle has even run — the single
+/// drain then captures zero rows (`oracle=1 sut=0`).
+///
+/// Instead we wait on two *positive* signals, with a generous ceiling:
+///   1. the coordinator has ingested at least `expected_ingest` rows — every
+///      row pushed onto the source queues has been pulled into a cycle — and
+///   2. the emitted-row and cycle counters have stopped advancing for a short
+///      stable window, so any enrichment still in flight (lookup / AI) has
+///      resolved and reached the subscription's output queue.
+///
+/// On a healthy machine this returns within a few polls; the long deadline
+/// only matters on a starved runner, where returning early is the very bug
+/// this guards against. The `expected_ingest` guard is essential: without it
+/// the counters look "stable" in the window between the sources draining and
+/// the coordinator actually running the cycle — exactly when a starved runner
+/// would otherwise drain nothing.
+async fn await_quiescence(
+    db: &LaminarDB,
+    sources: &[&laminar_db::UntypedSourceHandle],
+    expected_ingest: u64,
+) {
     const POLL: Duration = Duration::from_millis(20);
-    const STAGE_BUDGET: Duration = Duration::from_secs(2);
+    const DEADLINE: Duration = Duration::from_secs(30);
+    const STABLE_POLLS: u32 = 3;
 
-    let deadline = std::time::Instant::now() + STAGE_BUDGET;
+    let deadline = std::time::Instant::now() + DEADLINE;
+    let mut last = (0u64, 0u64);
+    let mut stable = 0u32;
     while std::time::Instant::now() < deadline {
-        if sources.iter().all(|h| h.pending() == 0) {
-            break;
+        tokio::time::sleep(POLL).await;
+        let m = db.metrics();
+        let consumed = m.total_events_ingested >= expected_ingest;
+        let drained = sources.iter().all(|h| h.pending() == 0);
+        let now = (m.total_events_emitted, m.total_cycles);
+        if consumed && drained && now == last {
+            stable += 1;
+            if stable >= STABLE_POLLS {
+                return;
+            }
+        } else {
+            stable = 0;
         }
-        tokio::time::sleep(POLL).await;
+        last = now;
     }
+}
 
-    let baseline = db.metrics().total_cycles;
-    let deadline = std::time::Instant::now() + STAGE_BUDGET;
-    while std::time::Instant::now() < deadline && db.metrics().total_cycles < baseline + 2 {
-        tokio::time::sleep(POLL).await;
-    }
+/// Total rows across a set of batches — the `expected_ingest` argument for
+/// [`await_quiescence`].
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn total_rows(batches: &[RecordBatch]) -> u64 {
+    batches.iter().map(|b| b.num_rows() as u64).sum()
 }
 
 fn drain_subscription(sub: &mut laminar_db::TypedSubscription<CapturedBatch>) -> Vec<RecordBatch> {
@@ -392,14 +430,17 @@ async fn run_sut_ts(
     let h_a = db.source_untyped("a").map_err(|e| format!("h_a: {e}"))?;
     let h_b = db.source_untyped("b").map_err(|e| format!("h_b: {e}"))?;
 
+    let mut pushed = 0u64;
     for batch in a_batches {
+        pushed += total_rows(std::slice::from_ref(&batch));
         h_a.push_arrow(batch).map_err(|e| format!("push a: {e}"))?;
     }
     for batch in b_batches {
+        pushed += total_rows(std::slice::from_ref(&batch));
         h_b.push_arrow(batch).map_err(|e| format!("push b: {e}"))?;
     }
 
-    await_quiescence(&db, &[&h_a, &h_b]).await;
+    await_quiescence(&db, &[&h_a, &h_b], pushed).await;
     let collected = drain_subscription(&mut sub);
 
     db.shutdown().await.map_err(|e| format!("shutdown: {e}"))?;
@@ -683,9 +724,11 @@ async fn smoke_n2_timestamp_key_between() {
     let mut sub = db.subscribe::<CapturedBatch>("out").unwrap();
     let h_a = db.source_untyped("aa").unwrap();
     let h_b = db.source_untyped("bb").unwrap();
-    h_a.push_arrow(make_aa_ts(&a)).unwrap();
-    h_b.push_arrow(make_bb_ts(&b)).unwrap();
-    await_quiescence(&db, &[&h_a, &h_b]).await;
+    let (ba, bb) = (make_aa_ts(&a), make_bb_ts(&b));
+    let pushed = total_rows(std::slice::from_ref(&ba)) + total_rows(std::slice::from_ref(&bb));
+    h_a.push_arrow(ba).unwrap();
+    h_b.push_arrow(bb).unwrap();
+    await_quiescence(&db, &[&h_a, &h_b], pushed).await;
     let sut = drain_subscription(&mut sub);
     db.shutdown().await.unwrap();
 

@@ -4,15 +4,14 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::duration_suboptimal_units)] // MSRV 1.85; from_mins/from_hours are 1.91+
 #![allow(clippy::module_name_repetitions)]
-// Allow unsafe in alloc module for zero-copy optimizations
-#![allow(unsafe_code)]
 
-pub mod alloc;
 /// Z-set changelog `__weight` column name, shared between the MV producer and
 /// upsert-sink consumers.
 pub mod changelog;
 /// Distributed checkpoint barrier protocol.
 pub mod checkpoint;
+/// Compatibility alias for checkpoint storage
+pub use checkpoint as storage;
 /// Structured error code registry (`LDB-NNNN`) and Ring 0 hot path error type.
 pub mod error_codes;
 /// Lookup table types and predicate pushdown.
@@ -28,8 +27,8 @@ pub mod state;
 pub mod streaming;
 pub mod time;
 
-/// Distributed cluster coordination. Unstable: gated behind `cluster-unstable`.
-#[cfg(feature = "cluster-unstable")]
+/// Distributed cluster coordination. Unstable: gated behind `cluster`.
+#[cfg(feature = "cluster")]
 pub mod cluster;
 
 /// Per-epoch checkpoint commit marker store. Used by the checkpoint

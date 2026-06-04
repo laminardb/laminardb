@@ -88,7 +88,7 @@ impl Profile {
     pub fn validate_features(self) -> Result<(), ProfileError> {
         // Feature gates for durable/cluster were removed — all profiles are
         // always available. Heavy distributed deps (tonic, openraft, chitchat)
-        // are gated on laminar-core's `cluster-unstable` feature, which the
+        // are gated on laminar-core's `cluster` feature, which the
         // server binary enables unconditionally. Library users of laminar-db
         // get lightweight builds without distributed infrastructure.
         match self {

@@ -93,17 +93,18 @@ pub struct LaminarDB {
     pub(crate) session_properties: parking_lot::Mutex<HashMap<String, String>>,
     /// Min of all source watermarks.
     pub(crate) pipeline_watermark: Arc<std::sync::atomic::AtomicI64>,
+    /// The registry of lookup table snapshots.
     pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
     /// Assembled AI subsystem (registry + providers + cache + call log).
     /// `None` unless `[ai]`/`[models]` are configured. Set once in the builder.
-    pub(crate) ai_runtime: Option<Arc<laminar_ai::AiRuntime>>,
+    pub(crate) ai_runtime: Option<Arc<crate::ai::AiRuntime>>,
     /// Main runtime handle the AI inference workers spawn on. Set with `ai_runtime`.
     pub(crate) ai_handle: Option<tokio::runtime::Handle>,
     /// Live-DDL channel to the running coordinator. `None` outside `start..shutdown`.
     pub(crate) control_tx: parking_lot::Mutex<Option<ControlMsgTx>>,
     pub(crate) mv_store: Arc<parking_lot::RwLock<crate::mv_store::MvStore>>,
     /// Activates leader/follower checkpoint flow when set. `None` in embedded mode.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) cluster_controller:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::ClusterController>>>,
     /// Pair with `vnode_registry`; the coordinator writes per-vnode durability
@@ -117,18 +118,34 @@ pub struct LaminarDB {
     /// `target_partitions` override; cluster mode sets this to `vnode_count`.
     pub(crate) pipeline_target_partitions: Option<usize>,
     /// Used by `SqlQueryOperator` to row-shuffle pre-aggregate batches to owners.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) shuffle_sender:
         parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleSender>>>,
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) shuffle_receiver:
         parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleReceiver>>>,
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) decision_store:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::CheckpointDecisionStore>>>,
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) assignment_snapshot_store:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>>,
+    /// Cluster-wide catalog manifest store (`catalog/manifest.json` on the
+    /// shared object store). Persisted on each successful checkpoint and
+    /// replayed at boot so a node rebuilds MVs/sources it lacks locally.
+    #[cfg(feature = "cluster")]
+    pub(crate) catalog_manifest_store:
+        parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::CatalogManifestStore>>>,
+    /// Committed per-vnode state staged by [`Self::adopt_assignment_snapshot`]
+    /// for vnodes this node newly acquired in a rebalance. Operators that
+    /// adopt the per-vnode state backend drain this on their next cycle to
+    /// resume from the last committed epoch instead of empty state.
+    ///
+    /// `Arc`-wrapped so the same handle is shared with the `OperatorGraph`
+    /// (via [`ClusterShuffleConfig`](crate::operator::sql_query::ClusterShuffleConfig)),
+    /// which drains and applies the staged slices into live operators each cycle.
+    #[cfg(feature = "cluster")]
+    pub(crate) rehydrated_vnode_state: Arc<parking_lot::Mutex<HashMap<u32, RehydratedVnode>>>,
     /// Hands `db.checkpoint()` requests to the pipeline callback so it can capture
     /// operator state before the manifest is packed. When `None`, falls back to
     /// the direct coordinator path — only valid for stateless engines.
@@ -175,6 +192,38 @@ pub(crate) fn filter_late_rows(
 }
 
 pub(crate) use laminar_core::time::parse_duration_str;
+
+/// Committed state for a single vnode, staged during rebalance adoption
+/// so newly-acquired vnodes resume from the last committed epoch.
+#[cfg(feature = "cluster")]
+#[derive(Debug, Clone)]
+pub struct RehydratedVnode {
+    /// Committed epoch the partial was read from.
+    pub epoch: u64,
+    /// The vnode's `partial.bin` bytes at `epoch`.
+    pub bytes: bytes::Bytes,
+}
+
+/// Summary of a single [`LaminarDB::adopt_assignment_snapshot`] call.
+///
+/// Returned so the rebalance control plane can log and meter what each
+/// adoption moved — in particular the vnodes this node gained and how
+/// much of their committed state it rehydrated from durable storage.
+#[cfg(feature = "cluster")]
+#[derive(Debug, Default)]
+pub struct SnapshotAdoption {
+    /// `false` when the snapshot was stale (≤ the current registry
+    /// version) or no registry was installed — nothing changed.
+    pub adopted: bool,
+    /// The snapshot version this call considered.
+    pub version: u64,
+    /// Vnodes this node owns now but did not before this rotation.
+    pub newly_acquired: Vec<u32>,
+    /// How many of `newly_acquired` had committed state read back.
+    pub rehydrated: usize,
+    /// Committed epoch the rehydration read from, if any.
+    pub rehydration_epoch: Option<u64>,
+}
 
 impl LaminarDB {
     /// Create an embedded in-memory database with default settings.
@@ -244,6 +293,12 @@ impl LaminarDB {
                 .with_config(session_config)
                 .with_default_features()
                 .with_query_planner(query_planner);
+            #[cfg(feature = "cluster")]
+            {
+                state_builder = state_builder.with_physical_optimizer_rule(Arc::new(
+                    laminar_sql::datafusion::cluster_repartition::DistributedJoinRule,
+                ));
+            }
             for rule in extra_optimizer_rules {
                 state_builder = state_builder.with_physical_optimizer_rule(Arc::clone(rule));
             }
@@ -258,6 +313,16 @@ impl LaminarDB {
 
         let connector_registry = Arc::new(laminar_connectors::registry::ConnectorRegistry::new());
         Self::register_builtin_connectors(&connector_registry);
+        #[cfg(feature = "cluster")]
+        let mut physical_rules = extra_optimizer_rules.to_vec();
+        #[cfg(feature = "cluster")]
+        {
+            physical_rules.push(Arc::new(
+                laminar_sql::datafusion::cluster_repartition::DistributedJoinRule,
+            ));
+        }
+        #[cfg(not(feature = "cluster"))]
+        let physical_rules = extra_optimizer_rules.to_vec();
 
         Ok(Self {
             catalog,
@@ -288,20 +353,24 @@ impl LaminarDB {
             ai_handle: None,
             control_tx: parking_lot::Mutex::new(None),
             mv_store: Arc::new(parking_lot::RwLock::new(crate::mv_store::MvStore::new())),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             cluster_controller: parking_lot::Mutex::new(None),
             state_backend: parking_lot::Mutex::new(None),
             vnode_registry: parking_lot::Mutex::new(None),
-            physical_optimizer_rules: extra_optimizer_rules.to_vec().into(),
+            physical_optimizer_rules: physical_rules.into(),
             pipeline_target_partitions: target_partitions,
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             shuffle_sender: parking_lot::Mutex::new(None),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             shuffle_receiver: parking_lot::Mutex::new(None),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             decision_store: parking_lot::Mutex::new(None),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             assignment_snapshot_store: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster")]
+            catalog_manifest_store: parking_lot::Mutex::new(None),
+            #[cfg(feature = "cluster")]
+            rehydrated_vnode_state: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             force_ckpt_tx: parking_lot::Mutex::new(None),
             subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
             stream_schemas: parking_lot::RwLock::new(std::collections::HashMap::new()),
@@ -313,7 +382,7 @@ impl LaminarDB {
     /// must be the main multi-threaded runtime.
     pub(crate) fn set_ai_runtime(
         &mut self,
-        runtime: Arc<laminar_ai::AiRuntime>,
+        runtime: Arc<crate::ai::AiRuntime>,
         handle: tokio::runtime::Handle,
     ) {
         // Register the laminar.models / laminar.ai_calls catalog views. A
@@ -326,61 +395,28 @@ impl LaminarDB {
         self.ai_handle = Some(handle);
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) fn set_shuffle_sender(&self, sender: Arc<laminar_core::shuffle::ShuffleSender>) {
         *self.shuffle_sender.lock() = Some(sender);
+        self.update_sql_cluster_context();
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     pub(crate) fn set_shuffle_receiver(
         &self,
         receiver: Arc<laminar_core::shuffle::ShuffleReceiver>,
     ) {
         *self.shuffle_receiver.lock() = Some(receiver);
+        self.update_sql_cluster_context();
     }
 
-    #[cfg(feature = "cluster-unstable")]
-    pub(crate) fn set_decision_store(
-        &self,
-        store: Arc<laminar_core::cluster::control::CheckpointDecisionStore>,
-    ) {
-        *self.decision_store.lock() = Some(store);
-    }
-
-    #[cfg(feature = "cluster-unstable")]
-    pub(crate) fn set_assignment_snapshot_store(
-        &self,
-        store: Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
-    ) {
-        *self.assignment_snapshot_store.lock() = Some(store);
-    }
-
-    /// Adopt a new vnode assignment snapshot atomically across the registry,
-    /// state-backend fence, and coordinator. Idempotent for versions ≤ the
-    /// current registry version.
-    #[cfg(feature = "cluster-unstable")]
-    pub async fn adopt_assignment_snapshot(
-        &self,
-        snapshot: laminar_core::cluster::control::AssignmentSnapshot,
-    ) {
-        let Some(registry) = self.vnode_registry.lock().clone() else {
-            return;
-        };
-        if snapshot.version <= registry.assignment_version() {
-            return;
-        }
-        let vnode_count = registry.vnode_count();
-        let new_assignment: Arc<[laminar_core::state::NodeId]> =
-            snapshot.to_vnode_vec(vnode_count).into();
-
-        // Hold the coord mutex so registry + fence updates land between epochs.
-        let mut guard = self.coordinator.lock().await;
-        registry.set_assignment_and_version(new_assignment, snapshot.version);
-        if let Some(backend) = self.state_backend.lock().clone() {
-            backend.set_authoritative_version(snapshot.version);
-        }
-        if let Some(coord) = guard.as_mut() {
-            coord.set_assignment_version(snapshot.version);
+    #[cfg(feature = "cluster")]
+    fn update_sql_cluster_context(&self) {
+        if let (Some(registry), Some(sender), Some(receiver)) = (
+            self.vnode_registry.lock().as_ref(),
+            self.shuffle_sender.lock().as_ref(),
+            self.shuffle_receiver.lock().as_ref(),
+        ) {
             let self_id = self
                 .cluster_controller
                 .lock()
@@ -388,20 +424,255 @@ impl LaminarDB {
                 .map_or(laminar_core::state::NodeId(0), |c| {
                     laminar_core::state::NodeId(c.instance_id().0)
                 });
-            coord.set_vnode_set(laminar_core::state::owned_vnodes(&registry, self_id));
+            laminar_sql::datafusion::cluster_repartition::set_cluster_context(
+                Arc::clone(registry),
+                Arc::clone(sender),
+                Arc::clone(receiver),
+                self_id,
+            );
+        }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn set_decision_store(
+        &self,
+        store: Arc<laminar_core::cluster::control::CheckpointDecisionStore>,
+    ) {
+        *self.decision_store.lock() = Some(store);
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn set_assignment_snapshot_store(
+        &self,
+        store: Arc<laminar_core::cluster::control::AssignmentSnapshotStore>,
+    ) {
+        *self.assignment_snapshot_store.lock() = Some(store);
+    }
+
+    /// Install the shared catalog manifest store. Enables catalog-manifest
+    /// persistence (on checkpoint) and boot-time replay.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn set_catalog_manifest_store(
+        &self,
+        store: Arc<laminar_core::cluster::control::CatalogManifestStore>,
+    ) {
+        *self.catalog_manifest_store.lock() = Some(store);
+    }
+
+    /// Publish this node's current catalog DDL to the shared
+    /// `catalog/manifest.json`. Best-effort and cluster-only — a failure is
+    /// logged, never propagated, since the manifest is an availability aid,
+    /// not a correctness gate. Called after each successful checkpoint.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn persist_catalog_manifest(&self) {
+        let Some(store) = self.catalog_manifest_store.lock().clone() else {
+            return;
+        };
+        let entries: Vec<laminar_core::cluster::control::CatalogManifestEntry> = self
+            .connector_manager
+            .lock()
+            .ordered_ddl()
+            .into_iter()
+            .map(|(name, ddl)| laminar_core::cluster::control::CatalogManifestEntry { name, ddl })
+            .collect();
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64);
+        let manifest = laminar_core::cluster::control::CatalogManifest {
+            // Wall-clock as a monotonic-in-practice diagnostic version; the
+            // object is overwritten in place, so the value is informational.
+            version: now_ms.unsigned_abs(),
+            updated_at_ms: now_ms,
+            entries,
+        };
+        if let Err(e) = store.save(&manifest).await {
+            tracing::warn!(error = %e, "catalog manifest persist failed");
+        }
+    }
+
+    /// Replay catalog DDL from the shared `catalog/manifest.json`, recreating
+    /// any object this node doesn't already have locally. Best-effort and
+    /// cluster-only; runs at boot before the pipeline starts so the operator
+    /// graph for rebalanced-in MVs exists. A per-entry replay failure is
+    /// logged and skipped — the node still serves the objects that did rebuild.
+    #[cfg(feature = "cluster")]
+    pub(crate) async fn restore_catalog_from_manifest(&self) {
+        let Some(store) = self.catalog_manifest_store.lock().clone() else {
+            return;
+        };
+        let manifest = match store.load().await {
+            Ok(Some(m)) => m,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "catalog manifest load failed — skipping replay");
+                return;
+            }
+        };
+        for entry in &manifest.entries {
+            if self.catalog_object_exists(&entry.name) {
+                continue;
+            }
+            match self.execute(&entry.ddl).await {
+                Ok(_) => tracing::info!(name = %entry.name, "replayed catalog DDL from manifest"),
+                Err(e) => tracing::warn!(
+                    name = %entry.name, error = %e,
+                    "catalog manifest replay failed for object"
+                ),
+            }
+        }
+    }
+
+    /// Whether a catalog object with `name` is already registered locally
+    /// (any of source/sink/stream/table). Drives idempotent manifest replay.
+    #[cfg(feature = "cluster")]
+    fn catalog_object_exists(&self, name: &str) -> bool {
+        let mgr = self.connector_manager.lock();
+        mgr.sources().contains_key(name)
+            || mgr.sinks().contains_key(name)
+            || mgr.streams().contains_key(name)
+            || mgr.tables().contains_key(name)
+    }
+
+    /// Adopt a new vnode assignment snapshot atomically across the registry,
+    /// state-backend fence, and coordinator, then rehydrate committed state
+    /// for any vnodes this node newly acquired. Idempotent for versions ≤ the
+    /// current registry version.
+    ///
+    /// Rehydration (the durable read of newly-acquired vnodes' partials) runs
+    /// *after* the coordinator lock is released so a slow object store can't
+    /// stall the checkpoint cadence; the recovered bytes are staged in
+    /// [`Self::rehydrated_vnode_state`] for operators to drain.
+    #[cfg(feature = "cluster")]
+    pub async fn adopt_assignment_snapshot(
+        &self,
+        snapshot: laminar_core::cluster::control::AssignmentSnapshot,
+    ) -> SnapshotAdoption {
+        let Some(registry) = self.vnode_registry.lock().clone() else {
+            return SnapshotAdoption::default();
+        };
+        if snapshot.version <= registry.assignment_version() {
+            return SnapshotAdoption {
+                adopted: false,
+                version: snapshot.version,
+                ..SnapshotAdoption::default()
+            };
+        }
+        let vnode_count = registry.vnode_count();
+        let new_assignment: Arc<[laminar_core::state::NodeId]> =
+            snapshot.to_vnode_vec(vnode_count).into();
+
+        let self_id = self
+            .cluster_controller
+            .lock()
+            .as_ref()
+            .map_or(laminar_core::state::NodeId(0), |c| {
+                laminar_core::state::NodeId(c.instance_id().0)
+            });
+
+        // Hold the coord mutex so registry + fence updates land between
+        // epochs. Snapshot the owned set on both sides of the swap to
+        // derive exactly which vnodes this node gained.
+        let mut guard = self.coordinator.lock().await;
+        let old_owned = laminar_core::state::owned_vnodes(&registry, self_id);
+        registry.set_assignment_and_version(new_assignment, snapshot.version);
+        let new_owned = laminar_core::state::owned_vnodes(&registry, self_id);
+        if let Some(backend) = self.state_backend.lock().clone() {
+            backend.set_authoritative_version(snapshot.version);
+        }
+        if let Some(coord) = guard.as_mut() {
+            coord.set_assignment_version(snapshot.version);
+            coord.set_vnode_set(new_owned.clone());
             coord.set_gate_vnode_set((0..vnode_count).collect());
         }
         drop(guard);
 
-        tracing::info!(version = snapshot.version, "adopted assignment snapshot",);
+        // Newly-acquired vnodes = new \ old.
+        let old_set: std::collections::HashSet<u32> = old_owned.into_iter().collect();
+        let newly_acquired: Vec<u32> = new_owned
+            .into_iter()
+            .filter(|v| !old_set.contains(v))
+            .collect();
+
+        // Mark every newly-acquired vnode `Restoring` up front — before the
+        // (possibly slow) durable read below — so the operator suppresses
+        // emission for their keys from the moment the shuffle starts routing
+        // their rows here. Vnodes with no durable state are flipped back to
+        // `Active` immediately after the read; the ones we stage stay
+        // `Restoring` until the graph merges their state in.
+        if !newly_acquired.is_empty() {
+            registry.mark_restoring(&newly_acquired);
+        }
+
+        let mut adoption = SnapshotAdoption {
+            adopted: true,
+            version: snapshot.version,
+            newly_acquired: newly_acquired.clone(),
+            rehydrated: 0,
+            rehydration_epoch: None,
+        };
+
+        // Pull the last committed state for the gained vnodes off the
+        // shared durable backend so they don't resume from empty state.
+        // Clone the Arc out first so the (non-Send) lock guard is dropped
+        // before the rehydration await.
+        let backend = self.state_backend.lock().clone();
+        if let (false, Some(backend)) = (newly_acquired.is_empty(), backend) {
+            let report = crate::recovery_manager::VnodeRehydrator::new(backend.as_ref())
+                .rehydrate(&newly_acquired)
+                .await;
+            adoption.rehydrated = report.restored.len();
+            adoption.rehydration_epoch = report.epoch;
+            // Vnodes with no durable state to apply serve immediately — flip
+            // them back to `Active` so their emission isn't gated forever. The
+            // graph flips the staged ones once it merges their state in.
+            let no_state: Vec<u32> = newly_acquired
+                .iter()
+                .copied()
+                .filter(|v| !report.restored.contains_key(v))
+                .collect();
+            if !no_state.is_empty() {
+                registry.mark_active(&no_state);
+            }
+            if let Some(epoch) = report.epoch {
+                let mut staged = self.rehydrated_vnode_state.lock();
+                for (vnode, bytes) in report.restored {
+                    staged.insert(vnode, RehydratedVnode { epoch, bytes });
+                }
+            }
+        } else if !newly_acquired.is_empty() {
+            // No backend / nothing to rehydrate — clear the Restoring marks we
+            // optimistically set so emission isn't gated with no state coming.
+            registry.mark_active(&newly_acquired);
+        }
+
+        tracing::info!(
+            version = snapshot.version,
+            newly_acquired = adoption.newly_acquired.len(),
+            rehydrated = adoption.rehydrated,
+            rehydration_epoch = ?adoption.rehydration_epoch,
+            "adopted assignment snapshot",
+        );
+        adoption
     }
 
-    #[cfg(feature = "cluster-unstable")]
+    /// Snapshot of committed per-vnode state staged for newly-acquired
+    /// vnodes during the most recent rebalance adoptions. Keyed by vnode.
+    /// Drained by operators that adopt the per-vnode state backend; exposed
+    /// for inspection and tests.
+    #[cfg(feature = "cluster")]
+    #[must_use]
+    pub fn rehydrated_vnode_state(&self) -> HashMap<u32, RehydratedVnode> {
+        self.rehydrated_vnode_state.lock().clone()
+    }
+
+    #[cfg(feature = "cluster")]
     pub(crate) fn set_cluster_controller(
         &self,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
     ) {
         *self.cluster_controller.lock() = Some(controller);
+        self.update_sql_cluster_context();
     }
 
     pub(crate) fn set_state_backend(&self, backend: Arc<dyn laminar_core::state::StateBackend>) {
@@ -410,6 +681,8 @@ impl LaminarDB {
 
     pub(crate) fn set_vnode_registry(&self, registry: Arc<laminar_core::state::VnodeRegistry>) {
         *self.vnode_registry.lock() = Some(registry);
+        #[cfg(feature = "cluster")]
+        self.update_sql_cluster_context();
     }
 
     /// The underlying `DataFusion` `SessionContext`.
@@ -540,10 +813,7 @@ impl LaminarDB {
         if let Some(batch) = self.table_store.read().to_record_batch(&info.name) {
             self.lookup_registry.register(
                 &info.name,
-                laminar_sql::datafusion::LookupSnapshot {
-                    batch,
-                    key_columns: info.primary_key.clone(),
-                },
+                laminar_sql::datafusion::LookupSnapshot { batch },
             );
         }
 
@@ -623,7 +893,19 @@ impl LaminarDB {
             }
         }
 
-        let cache_max = info.properties.cache_memory.map(cache_entries_from_memory);
+        // The on-demand lookup cache is byte-weighted; carry the user's
+        // cache_memory budget through as bytes (no lossy entry-count conversion).
+        let cache_max_bytes = info
+            .properties
+            .cache_memory
+            .map(|m| usize::try_from(m.as_bytes()).unwrap_or(usize::MAX));
+
+        // cache_ttl is specified in seconds; carry it as a Duration so the
+        // partial lookup cache expires stale entries lazily on read.
+        let cache_ttl = info
+            .properties
+            .cache_ttl
+            .map(std::time::Duration::from_secs);
 
         self.connector_manager
             .lock()
@@ -635,7 +917,8 @@ impl LaminarDB {
                 format: info.raw_options.get("format").cloned(),
                 format_options,
                 refresh,
-                cache_max_entries: cache_max,
+                cache_max_bytes,
+                cache_ttl,
             });
 
         Ok(())
@@ -827,21 +1110,34 @@ impl LaminarDB {
                 retention_bytes,
                 ..
             } => {
-                self.handle_create_stream(
-                    name,
-                    query,
-                    emit_clause.as_ref(),
-                    query_sql,
-                    *retention_bytes,
-                )
-                .await
+                let result = self
+                    .handle_create_stream(
+                        name,
+                        query,
+                        emit_clause.as_ref(),
+                        query_sql,
+                        *retention_bytes,
+                    )
+                    .await?;
+                if let ExecuteResult::Ddl(ref info) = result {
+                    self.connector_manager
+                        .lock()
+                        .store_ddl(&info.object_name, sql);
+                }
+                Ok(result)
             }
             StreamingStatement::CreateContinuousQuery { .. }
             | StreamingStatement::CreateLookupTable(_)
             | StreamingStatement::DropLookupTable { .. } => self.handle_query(sql).await,
             StreamingStatement::Standard(stmt) => {
                 if let sqlparser::ast::Statement::CreateTable(ct) = stmt.as_ref() {
-                    self.handle_create_table(ct)
+                    let result = self.handle_create_table(ct)?;
+                    if let ExecuteResult::Ddl(ref info) = result {
+                        self.connector_manager
+                            .lock()
+                            .store_ddl(&info.object_name, sql);
+                    }
+                    Ok(result)
                 } else if let sqlparser::ast::Statement::Drop {
                     object_type: sqlparser::ast::ObjectType::Table,
                     names,
@@ -932,16 +1228,23 @@ impl LaminarDB {
                 query_sql,
                 ..
             } => {
-                self.handle_create_materialized_view(
-                    sql,
-                    name,
-                    query,
-                    emit_clause.clone(),
-                    *or_replace,
-                    *if_not_exists,
-                    query_sql,
-                )
-                .await
+                let result = self
+                    .handle_create_materialized_view(
+                        sql,
+                        name,
+                        query,
+                        emit_clause.clone(),
+                        *or_replace,
+                        *if_not_exists,
+                        query_sql,
+                    )
+                    .await?;
+                if let ExecuteResult::Ddl(ref info) = result {
+                    self.connector_manager
+                        .lock()
+                        .store_ddl(&info.object_name, sql);
+                }
+                Ok(result)
             }
             StreamingStatement::AlterSource { name, operation } => {
                 self.handle_alter_source(name, operation)
@@ -1734,28 +2037,28 @@ impl LaminarDB {
 
     /// Returns a checkpoint store instance, if checkpointing is configured.
     ///
-    /// Returns an [`ObjectStoreCheckpointStore`](laminar_storage::ObjectStoreCheckpointStore)
+    /// Returns an [`ObjectStoreCheckpointStore`](laminar_core::storage::ObjectStoreCheckpointStore)
     /// when `object_store_url` is set, otherwise a
-    /// [`FileSystemCheckpointStore`](laminar_storage::FileSystemCheckpointStore).
-    pub fn checkpoint_store(&self) -> Option<Box<dyn laminar_storage::CheckpointStore>> {
+    /// [`FileSystemCheckpointStore`](laminar_core::storage::FileSystemCheckpointStore).
+    pub fn checkpoint_store(&self) -> Option<Box<dyn laminar_core::storage::CheckpointStore>> {
         let cp_config = self.config.checkpoint.as_ref()?;
         let max_retained = cp_config.max_retained.unwrap_or(3);
         // Pass the runtime vnode count through so manifest validation
         // checks against the real invariant, not a hardcoded default.
         let vnode_count = self.vnode_registry.lock().as_ref().map_or(
-            laminar_storage::checkpoint_manifest::DEFAULT_VNODE_COUNT,
+            laminar_core::storage::checkpoint_manifest::DEFAULT_VNODE_COUNT,
             |r| u16::try_from(r.vnode_count()).unwrap_or(u16::MAX),
         );
 
         if let Some(ref url) = self.config.object_store_url {
-            let obj_store = laminar_storage::object_store_builder::build_object_store(
+            let obj_store = laminar_core::storage::object_store_builder::build_object_store(
                 url,
                 &self.config.object_store_options,
             )
             .ok()?;
             let prefix = url_to_checkpoint_prefix(url);
             Some(Box::new(
-                laminar_storage::checkpoint_store::ObjectStoreCheckpointStore::new(
+                laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
                     obj_store,
                     prefix,
                     max_retained,
@@ -1769,7 +2072,7 @@ impl LaminarDB {
                 .or_else(|| self.config.storage_dir.clone())
                 .unwrap_or_else(|| std::path::PathBuf::from("./data"));
             Some(Box::new(
-                laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(
+                laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
                     &data_dir,
                     max_retained,
                 )
@@ -1799,35 +2102,125 @@ impl LaminarDB {
             ));
         }
 
+        #[cfg(feature = "cluster")]
+        {
+            let leader_opt = {
+                let cc_guard = self.cluster_controller.lock();
+                cc_guard.as_ref().and_then(|cc| {
+                    if cc.is_leader() {
+                        None
+                    } else {
+                        cc.current_leader().and_then(|leader_id| {
+                            let watch = cc.members_watch();
+                            let members = watch.borrow();
+                            members
+                                .iter()
+                                .find(|m| m.id == leader_id)
+                                .map(|m| m.rpc_address.clone())
+                        })
+                    }
+                })
+            };
+            if let Some(leader_rpc) = leader_opt {
+                tracing::info!(
+                    "Forwarding checkpoint request to leader node at HTTP address {}",
+                    leader_rpc
+                );
+                return self.forward_checkpoint_to_leader(&leader_rpc).await;
+            }
+        }
+
         // When the streaming pipeline is live, route through the
         // pipeline callback so it captures operator state (via the same
         // path that the periodic checkpoint timer uses). Without this,
         // the manifest has an empty `operator_states` map and restart
         // loses everything the `IncrementalAggState` accumulators held.
         let tx = self.force_ckpt_tx.lock().clone();
-        if let Some(tx) = tx {
+        let result = if let Some(tx) = tx {
             let (reply_tx, reply_rx) = crossfire::oneshot::oneshot();
             tx.send(reply_tx).await.map_err(|_| {
                 DbError::Checkpoint(
                     "pipeline callback receiver closed — engine may be shutting down".into(),
                 )
             })?;
-            return reply_rx.await.map_err(|_| {
+            reply_rx.await.map_err(|_| {
                 DbError::Checkpoint("pipeline callback dropped oneshot before replying".into())
+            })?
+        } else {
+            // Fallback: no running pipeline (e.g., engine built but not yet
+            // started). Drive the coordinator directly. Operator state will
+            // be empty, but restart from this manifest is still well-defined
+            // because there's nothing to restore anyway.
+            let mut guard = self.coordinator.lock().await;
+            let coord = guard.as_mut().ok_or_else(|| {
+                DbError::Checkpoint("coordinator not initialized — call start() first".to_string())
             })?;
+            coord
+                .checkpoint(crate::checkpoint_coordinator::CheckpointRequest::default())
+                .await
+        };
+
+        // Refresh the shared catalog manifest on every successful checkpoint so
+        // a node joining later can rebuild this node's MVs/sources. Best-effort.
+        #[cfg(feature = "cluster")]
+        if matches!(&result, Ok(r) if r.success) {
+            self.persist_catalog_manifest().await;
         }
 
-        // Fallback: no running pipeline (e.g., engine built but not yet
-        // started). Drive the coordinator directly. Operator state will
-        // be empty, but restart from this manifest is still well-defined
-        // because there's nothing to restore anyway.
-        let mut guard = self.coordinator.lock().await;
-        let coord = guard.as_mut().ok_or_else(|| {
-            DbError::Checkpoint("coordinator not initialized — call start() first".to_string())
+        result
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn forward_checkpoint_to_leader(
+        &self,
+        addr: &str,
+    ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let mut stream = TcpStream::connect(addr).await.map_err(|e| {
+            DbError::Checkpoint(format!("failed to connect to leader at {addr}: {e}"))
         })?;
-        coord
-            .checkpoint(crate::checkpoint_coordinator::CheckpointRequest::default())
-            .await
+
+        let req = format!(
+            "POST /api/v1/checkpoint HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.map_err(|e| {
+            DbError::Checkpoint(format!("failed to send checkpoint request to leader: {e}"))
+        })?;
+
+        let mut response_bytes = Vec::new();
+        stream.read_to_end(&mut response_bytes).await.map_err(|e| {
+            DbError::Checkpoint(format!(
+                "failed to read checkpoint response from leader: {e}"
+            ))
+        })?;
+
+        // Find the double CRLF separating headers from body
+        let mut header_len = response_bytes.len();
+        for i in 0..response_bytes.len().saturating_sub(3) {
+            if response_bytes[i..i + 4] == [b'\r', b'\n', b'\r', b'\n'] {
+                header_len = i + 4;
+                break;
+            }
+        }
+
+        if header_len >= response_bytes.len() {
+            return Err(DbError::Checkpoint(
+                "invalid HTTP response from leader".into(),
+            ));
+        }
+
+        let body = &response_bytes[header_len..];
+        let result: crate::checkpoint_coordinator::CheckpointResult = serde_json::from_slice(body)
+            .map_err(|e| {
+                let raw = String::from_utf8_lossy(body);
+                DbError::Checkpoint(format!(
+                    "failed to deserialize leader's response ({raw}): {e}"
+                ))
+            })?;
+
+        Ok(result)
     }
 
     /// Returns checkpoint performance statistics.

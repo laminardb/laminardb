@@ -102,12 +102,17 @@ impl SideBuffer {
     }
 }
 
+#[cfg(feature = "cluster")]
+use crate::operator::sql_query::ClusterShuffleConfig;
+
 pub(crate) struct ProcessTimeJoinOperator {
     config: StreamJoinConfig,
     left: SideBuffer,
     right: SideBuffer,
     /// The user's SELECT with the join's columns rewritten over the temp table.
     projection: ProjectingJoinState,
+    #[cfg(feature = "cluster")]
+    cluster_shuffle: Option<ClusterShuffleConfig>,
 }
 
 impl ProcessTimeJoinOperator {
@@ -124,7 +129,89 @@ impl ProcessTimeJoinOperator {
             // The `FROM` name `build_stream_join_projection_sql` emits (shared
             // with the interval join; registered transiently per `apply`).
             projection: ProjectingJoinState::new(name, ctx, projection_sql, "__interval_tmp"),
+            #[cfg(feature = "cluster")]
+            cluster_shuffle: None,
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
+        self.cluster_shuffle = Some(config);
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn repartition_side(
+        &self,
+        batches: &[RecordBatch],
+        key_name: &str,
+        stage_name: &str,
+        cfg: &ClusterShuffleConfig,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let vnode_count = cfg.registry.vnode_count();
+        let mut local: Vec<RecordBatch> = Vec::new();
+        let mut outbound: Vec<(u64, laminar_core::shuffle::ShuffleMessage)> = Vec::new();
+
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let key_idx = batch.schema().index_of(key_name).map_err(|e| {
+                DbError::Pipeline(format!(
+                    "process-time join [{}]: key column '{}' not found in schema: {e}",
+                    self.projection.op_name, key_name
+                ))
+            })?;
+            let key_indices = vec![key_idx];
+            let vnodes = laminar_core::shuffle::row_vnodes(batch, &key_indices, vnode_count);
+            for &v in &vnodes {
+                let owner = cfg.registry.owner(v);
+                if owner.is_unassigned() {
+                    return Err(DbError::Pipeline(format!(
+                        "process-time join [{}]: shuffle vnode {v} is unassigned — refusing to drop rows",
+                        self.projection.op_name
+                    )));
+                }
+            }
+
+            let (local_slices, remote_slices) = laminar_core::shuffle::slice_batch_by_targets(
+                batch,
+                &vnodes,
+                &cfg.registry,
+                cfg.self_id,
+            );
+
+            for (_v, slice) in local_slices {
+                local.push(slice);
+            }
+
+            for (owner, slice) in remote_slices {
+                outbound.push((
+                    owner.0,
+                    laminar_core::shuffle::ShuffleMessage::VnodeData(
+                        stage_name.to_string(),
+                        0,
+                        slice,
+                    ),
+                ));
+            }
+        }
+
+        for (peer, msg) in outbound {
+            cfg.sender.send_to(peer, &msg).await.map_err(|e| {
+                DbError::Pipeline(format!(
+                    "process-time join [{}]: shuffle send to peer {peer}: {e}",
+                    self.projection.op_name
+                ))
+            })?;
+        }
+
+        for batch in cfg.receiver.drain_vnode_data_for(stage_name) {
+            if batch.num_rows() > 0 {
+                local.push(batch);
+            }
+        }
+
+        Ok(local)
     }
 
     /// Inner-join two batches on the equi-key. `None` when either is empty or
@@ -212,8 +299,43 @@ impl GraphOperator for ProcessTimeJoinOperator {
         inputs: &[Vec<RecordBatch>],
         watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
-        let new_left = Self::concat_new(inputs.first().map_or(&[][..], Vec::as_slice))?;
-        let new_right = Self::concat_new(inputs.get(1).map_or(&[][..], Vec::as_slice))?;
+        #[cfg(feature = "cluster")]
+        let (left_batches_local, right_batches_local) = if let Some(ref cfg) = self.cluster_shuffle
+        {
+            let left_stage = format!("{}::left", self.projection.op_name);
+            let right_stage = format!("{}::right", self.projection.op_name);
+            let left = self
+                .repartition_side(
+                    inputs.first().map_or(&[][..], Vec::as_slice),
+                    &self.config.left_key,
+                    &left_stage,
+                    cfg,
+                )
+                .await?;
+            let right = self
+                .repartition_side(
+                    inputs.get(1).map_or(&[][..], Vec::as_slice),
+                    &self.config.right_key,
+                    &right_stage,
+                    cfg,
+                )
+                .await?;
+            (left, right)
+        } else {
+            (
+                inputs.first().map_or(&[][..], Vec::as_slice).to_vec(),
+                inputs.get(1).map_or(&[][..], Vec::as_slice).to_vec(),
+            )
+        };
+
+        #[cfg(not(feature = "cluster"))]
+        let (left_batches_local, right_batches_local) = (
+            inputs.first().map_or(&[][..], Vec::as_slice).to_vec(),
+            inputs.get(1).map_or(&[][..], Vec::as_slice).to_vec(),
+        );
+
+        let new_left = Self::concat_new(&left_batches_local)?;
+        let new_right = Self::concat_new(&right_batches_local)?;
         let wm_left = watermarks.first().copied().unwrap_or(i64::MIN);
         let wm_right = watermarks.get(1).copied().unwrap_or(i64::MIN);
 
@@ -255,6 +377,25 @@ impl GraphOperator for ProcessTimeJoinOperator {
         self.right.evict(wm_left);
 
         self.projection.apply(out).await
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn ingest_shuffle(
+        &mut self,
+        stage: &str,
+        batch: RecordBatch,
+        watermark: i64,
+    ) -> Result<(), DbError> {
+        if self.cluster_shuffle.is_none() {
+            return Ok(());
+        }
+        let op_name = &self.projection.op_name;
+        if stage == format!("{op_name}::left") {
+            self.left.push(watermark, batch);
+        } else if stage == format!("{op_name}::right") {
+            self.right.push(watermark, batch);
+        }
+        Ok(())
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {

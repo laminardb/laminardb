@@ -44,7 +44,6 @@ RUN sed -i '/"examples\//d' Cargo.toml
 # Copy all crate Cargo.toml files (preserving directory structure)
 COPY crates/laminar-core/Cargo.toml crates/laminar-core/Cargo.toml
 COPY crates/laminar-sql/Cargo.toml crates/laminar-sql/Cargo.toml
-COPY crates/laminar-storage/Cargo.toml crates/laminar-storage/Cargo.toml
 COPY crates/laminar-connectors/Cargo.toml crates/laminar-connectors/Cargo.toml
 COPY crates/laminar-server/Cargo.toml crates/laminar-server/Cargo.toml
 COPY crates/laminar-db/Cargo.toml crates/laminar-db/Cargo.toml
@@ -55,7 +54,6 @@ COPY crates/laminar-derive/Cargo.toml crates/laminar-derive/Cargo.toml
 # as Cargo.toml / Cargo.lock don't change.
 RUN mkdir -p crates/laminar-core/src && echo "pub fn _dummy() {}" > crates/laminar-core/src/lib.rs \
     && mkdir -p crates/laminar-sql/src && echo "pub fn _dummy() {}" > crates/laminar-sql/src/lib.rs \
-    && mkdir -p crates/laminar-storage/src && echo "pub fn _dummy() {}" > crates/laminar-storage/src/lib.rs \
     && mkdir -p crates/laminar-connectors/src && echo "pub fn _dummy() {}" > crates/laminar-connectors/src/lib.rs \
     && mkdir -p crates/laminar-db/src && echo "pub fn _dummy() {}" > crates/laminar-db/src/lib.rs \
     && mkdir -p crates/laminar-derive/src && echo "pub fn _dummy() {}" > crates/laminar-derive/src/lib.rs \

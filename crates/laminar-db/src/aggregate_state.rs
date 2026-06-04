@@ -219,6 +219,20 @@ pub(crate) fn snapshot_and_rebuild(
     Ok(ipc)
 }
 
+/// Convert an accumulator's restored state tuple to the `ArrayRef`s
+/// `Accumulator::merge_batch` expects. Mirrors the inline conversion in
+/// [`IncrementalAggState::restore_groups`].
+#[cfg(feature = "cluster")]
+fn scalars_to_arrays(scalars: &[ScalarValue]) -> Result<Vec<ArrayRef>, DbError> {
+    scalars
+        .iter()
+        .map(|sv| {
+            sv.to_array()
+                .map_err(|e| DbError::Pipeline(format!("scalar to array: {e}")))
+        })
+        .collect()
+}
+
 pub(crate) struct IncrementalAggState {
     pre_agg_sql: String,
     num_group_cols: usize,
@@ -243,7 +257,7 @@ impl IncrementalAggState {
     /// Number of leading GROUP BY columns in this aggregate's pre-agg
     /// output. Used by the cluster row-shuffle path to know which
     /// columns to hash.
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[must_use]
     pub(crate) fn num_group_cols(&self) -> usize {
         self.num_group_cols
@@ -1273,6 +1287,162 @@ impl IncrementalAggState {
 
         self.groups = new_groups;
         self.last_emitted = new_last_emitted;
+        Ok(checkpoint.groups.len())
+    }
+
+    /// Partition this state into one [`AggStateCheckpoint`] per vnode.
+    ///
+    /// Each group key is mapped to its vnode with the **same** hashing the
+    /// cluster shuffle uses to route rows
+    /// (`laminar_core::state::key_hash(row_key.as_ref()) % vnode_count`), so a
+    /// vnode's slice here is exactly the set of groups whose rows the shuffle
+    /// delivered to this node. A global aggregate (`num_group_cols == 0`)
+    /// hashes to vnode 0, mirroring the routing fast-path.
+    ///
+    /// Reuses the per-group serialization of [`Self::checkpoint_groups`]; the
+    /// union of the returned slices is byte-for-byte the groups that method
+    /// would emit. Only vnodes with at least one group (or emitted entry) are
+    /// present in the result.
+    #[cfg(feature = "cluster")]
+    #[allow(clippy::disallowed_types)] // cold checkpoint path; vnode-keyed map
+    pub(crate) fn checkpoint_groups_by_vnode(
+        &mut self,
+        vnode_count: u32,
+    ) -> Result<std::collections::HashMap<u32, AggStateCheckpoint>, DbError> {
+        if vnode_count == 0 {
+            return Err(DbError::Pipeline("vnode_count must be > 0".to_string()));
+        }
+        let fingerprint = self.query_fingerprint();
+        let global = self.num_group_cols == 0;
+        let retractable = self.weight_col_idx.is_some();
+        let vnode_of = |row_key: &arrow::row::OwnedRow| -> u32 {
+            if global {
+                0
+            } else {
+                #[allow(clippy::cast_possible_truncation)]
+                let v = (laminar_core::state::key_hash(row_key.as_ref()) % u64::from(vnode_count))
+                    as u32;
+                v
+            }
+        };
+
+        let mut buckets: std::collections::HashMap<u32, AggStateCheckpoint> =
+            std::collections::HashMap::new();
+        let mut new_bucket = || AggStateCheckpoint {
+            fingerprint,
+            groups: Vec::new(),
+            last_emitted: Vec::new(),
+        };
+
+        for (row_key, entry) in &mut self.groups {
+            let vnode = vnode_of(row_key);
+            let sv_key =
+                row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
+            let key_ipc = scalars_to_ipc(&sv_key)?;
+            let mut acc_states = Vec::with_capacity(entry.accs.len());
+            for (i, acc) in entry.accs.iter_mut().enumerate() {
+                acc_states.push(snapshot_and_rebuild(acc, &self.agg_specs[i], retractable)?);
+            }
+            buckets
+                .entry(vnode)
+                .or_insert_with(&mut new_bucket)
+                .groups
+                .push(GroupCheckpoint {
+                    key: key_ipc,
+                    acc_states,
+                    last_updated_ms: entry.last_updated_ms,
+                });
+        }
+
+        if self.emit_changelog {
+            for (row_key, vals) in &self.last_emitted {
+                let vnode = vnode_of(row_key);
+                let sv_key =
+                    row_to_scalar_key_with_types(&self.row_converter, row_key, &self.group_types)?;
+                buckets
+                    .entry(vnode)
+                    .or_insert_with(&mut new_bucket)
+                    .last_emitted
+                    .push(EmittedCheckpoint {
+                        key: scalars_to_ipc(&sv_key)?,
+                        values: scalars_to_ipc(vals)?,
+                    });
+            }
+        }
+
+        Ok(buckets)
+    }
+
+    /// Merge a restored [`AggStateCheckpoint`] into the live state.
+    ///
+    /// Unlike [`Self::restore_groups`] (which replaces wholesale), this folds
+    /// the checkpoint's accumulator states **into** any groups already present
+    /// via `Accumulator::merge_batch`, and inserts the rest. Because standard
+    /// accumulators merge associatively, the result is correct regardless of
+    /// how many rows the operator already processed for these keys before the
+    /// rebalanced state arrived. Used by the cross-node vnode rehydration path.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn merge_groups(
+        &mut self,
+        checkpoint: &AggStateCheckpoint,
+    ) -> Result<usize, DbError> {
+        let current_fp = self.query_fingerprint();
+        if checkpoint.fingerprint != current_fp {
+            return Err(DbError::Pipeline(format!(
+                "merge fingerprint mismatch: saved={}, current={current_fp}",
+                checkpoint.fingerprint,
+            )));
+        }
+
+        for gc in &checkpoint.groups {
+            let sv_key = ipc_to_scalars(&gc.key)?;
+            let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key, &self.group_types)?;
+            match self.groups.entry(row_key) {
+                std::collections::hash_map::Entry::Occupied(mut occ) => {
+                    let entry = occ.get_mut();
+                    for (i, acc) in entry.accs.iter_mut().enumerate() {
+                        if let Some(state_bytes) = gc.acc_states.get(i) {
+                            let state_scalars = ipc_to_scalars(state_bytes)?;
+                            let arrays = scalars_to_arrays(&state_scalars)?;
+                            acc.merge_batch(&arrays).map_err(|e| {
+                                DbError::Pipeline(format!("accumulator merge: {e}"))
+                            })?;
+                        }
+                    }
+                    entry.last_updated_ms = entry.last_updated_ms.max(gc.last_updated_ms);
+                }
+                std::collections::hash_map::Entry::Vacant(vac) => {
+                    let mut accs = Vec::with_capacity(self.agg_specs.len());
+                    for (i, spec) in self.agg_specs.iter().enumerate() {
+                        let mut acc = if self.weight_col_idx.is_some() {
+                            spec.create_retractable_accumulator()?
+                        } else {
+                            spec.create_accumulator()?
+                        };
+                        if let Some(state_bytes) = gc.acc_states.get(i) {
+                            let state_scalars = ipc_to_scalars(state_bytes)?;
+                            let arrays = scalars_to_arrays(&state_scalars)?;
+                            acc.merge_batch(&arrays).map_err(|e| {
+                                DbError::Pipeline(format!("accumulator merge: {e}"))
+                            })?;
+                        }
+                        accs.push(acc);
+                    }
+                    vac.insert(GroupEntry {
+                        accs,
+                        last_updated_ms: gc.last_updated_ms,
+                    });
+                }
+            }
+        }
+
+        for ec in &checkpoint.last_emitted {
+            let sv_key = ipc_to_scalars(&ec.key)?;
+            let row_key = scalar_key_to_owned_row(&self.row_converter, &sv_key, &self.group_types)?;
+            let vals = ipc_to_scalars(&ec.values)?;
+            self.last_emitted.entry(row_key).or_insert(vals);
+        }
+
         Ok(checkpoint.groups.len())
     }
 }
@@ -3241,5 +3411,151 @@ mod tests {
         // "STR" fallback. Arrow IPC preserves Binary natively.
         let sv = ScalarValue::Binary(Some(vec![1, 2, 3]));
         assert_eq!(round_trip(&sv), sv);
+    }
+}
+
+/// Per-vnode checkpoint partitioning + merge-apply (the cross-node vnode
+/// rehydration round-trip). Gated to cluster builds since that's where the
+/// new methods compile.
+#[cfg(all(test, feature = "cluster"))]
+mod vnode_partition_tests {
+    use super::*;
+
+    const VNODES: u32 = 16;
+
+    fn pre_agg_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, true),
+            Field::new("total", DataType::Int64, true),
+            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+        ]))
+    }
+
+    async fn fresh_state() -> IncrementalAggState {
+        let ctx = laminar_sql::create_session_context();
+        // The seed row is for schema inference only — `try_from_sql` plans the
+        // query, it does not fold table rows into the accumulators.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("symbol", DataType::Utf8, false),
+            Field::new("total", DataType::Int64, false),
+            Field::new(WEIGHT_COLUMN, DataType::Int64, false),
+        ]));
+        let seed = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["seed"])),
+                Arc::new(arrow::array::Int64Array::from(vec![0])),
+                Arc::new(arrow::array::Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        let mem = datafusion::datasource::MemTable::try_new(schema, vec![vec![seed]]).unwrap();
+        ctx.register_table("upstream", Arc::new(mem)).unwrap();
+        IncrementalAggState::try_from_sql(
+            &ctx,
+            "SELECT symbol, SUM(total) AS grand_total FROM upstream GROUP BY symbol",
+            false,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    }
+
+    fn feed(state: &mut IncrementalAggState, rows: &[(&str, i64)]) {
+        let syms: Vec<&str> = rows.iter().map(|(s, _)| *s).collect();
+        let tots: Vec<i64> = rows.iter().map(|(_, t)| *t).collect();
+        let n = rows.len();
+        let batch = RecordBatch::try_new(
+            pre_agg_schema(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(syms)),
+                Arc::new(arrow::array::Int64Array::from(tots)),
+                Arc::new(arrow::array::Int64Array::from(vec![1i64; n])),
+            ],
+        )
+        .unwrap();
+        state.process_batch(&batch, 1000).unwrap();
+    }
+
+    fn totals(state: &mut IncrementalAggState) -> std::collections::BTreeMap<String, i64> {
+        let mut out = std::collections::BTreeMap::new();
+        for b in state.emit().unwrap() {
+            let syms = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+            let tots = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap();
+            for i in 0..b.num_rows() {
+                out.insert(syms.value(i).to_string(), tots.value(i));
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn per_vnode_checkpoint_merge_round_trips() {
+        let mut a = fresh_state().await;
+        feed(
+            &mut a,
+            &[
+                ("AAPL", 100),
+                ("GOOG", 200),
+                ("MSFT", 50),
+                ("AMZN", 75),
+                ("META", 25),
+                ("NVDA", 10),
+            ],
+        );
+
+        // Partition by vnode, and the full single-blob checkpoint as a baseline.
+        let by_vnode = a.checkpoint_groups_by_vnode(VNODES).unwrap();
+        let full = a.checkpoint_groups().unwrap();
+
+        // Every group lands in exactly one vnode slice — union == the whole.
+        let partitioned: usize = by_vnode.values().map(|cp| cp.groups.len()).sum();
+        assert_eq!(
+            partitioned,
+            full.groups.len(),
+            "per-vnode slices must cover every group exactly once",
+        );
+
+        // Reassemble on a fresh node by merging each vnode's slice; the
+        // aggregated output must match the original.
+        let mut b = fresh_state().await;
+        for slice in by_vnode.values() {
+            b.merge_groups(slice).unwrap();
+        }
+        assert_eq!(
+            totals(&mut b),
+            totals(&mut a),
+            "merging the per-vnode slices reproduces the original aggregate",
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_is_additive_over_already_processed_rows() {
+        // Mirrors the rebalance race: the new owner processed a few rows for a
+        // key before its committed state was applied. merge_groups must ADD the
+        // restored partial, not replace it.
+        let mut donor = fresh_state().await;
+        feed(&mut donor, &[("AAPL", 100), ("GOOG", 200)]);
+        let by_vnode = donor.checkpoint_groups_by_vnode(VNODES).unwrap();
+
+        let mut acquirer = fresh_state().await;
+        // Post-acquire rows land first…
+        feed(&mut acquirer, &[("AAPL", 5), ("GOOG", 5)]);
+        // …then the committed state is merged in.
+        for slice in by_vnode.values() {
+            acquirer.merge_groups(slice).unwrap();
+        }
+
+        let got = totals(&mut acquirer);
+        assert_eq!(got.get("AAPL"), Some(&105), "100 restored + 5 fresh");
+        assert_eq!(got.get("GOOG"), Some(&205), "200 restored + 5 fresh");
     }
 }

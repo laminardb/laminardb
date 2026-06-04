@@ -10,10 +10,10 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
-use laminar_storage::checkpoint_manifest::{
+use laminar_core::storage::checkpoint_manifest::{
     CheckpointManifest, ConnectorCheckpoint, OperatorCheckpoint,
 };
-use laminar_storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
+use laminar_core::storage::checkpoint_store::{CheckpointStore, FileSystemCheckpointStore};
 
 /// Creates synthetic operator state of the given byte size.
 fn synthetic_state(size_bytes: usize) -> Vec<u8> {

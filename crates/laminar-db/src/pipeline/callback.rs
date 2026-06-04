@@ -94,6 +94,11 @@ pub trait PipelineCallback: Send + 'static {
     /// Get the current pipeline watermark.
     fn current_watermark(&self) -> i64;
 
+    /// Returns `true` if this node is the leader in cluster mode, or if running in single-node mode.
+    fn is_leader(&self) -> bool {
+        true
+    }
+
     /// Per drain cycle: demote sources idle past their timeout so a quiet
     /// input doesn't hold back the combined watermark. Default: no-op.
     fn tick_idle_watermark(&mut self) {}
@@ -136,5 +141,21 @@ pub trait PipelineCallback: Send + 'static {
     /// Forward a durable checkpoint epoch to external SUBSCRIBE consumers.
     fn publish_barrier(&self, epoch: u64, checkpoint_id: u64) {
         let _ = (epoch, checkpoint_id);
+    }
+
+    /// Get the next checkpoint ID if managed externally.
+    fn next_checkpoint_id(&self) -> Option<u64> {
+        None
+    }
+
+    /// Register the local source barrier injectors.
+    fn set_barrier_injectors(
+        &mut self,
+        injectors: Vec<(
+            Arc<str>,
+            laminar_core::checkpoint::CheckpointBarrierInjector,
+        )>,
+    ) {
+        let _ = injectors;
     }
 }

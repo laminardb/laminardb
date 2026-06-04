@@ -1,5 +1,19 @@
 fn main() {
-    // Proto compilation removed — delta.proto deleted in audit cleanup.
-    // If distributed gRPC services are added in the future, re-add proto
-    // compilation here with the `delta` feature gate.
+    // The cross-node gRPC stubs (shuffle transport + barrier sync) are only
+    // needed for the `cluster` feature, so a default build pulls in
+    // neither protoc nor the generated code. Build scripts don't receive
+    // `cfg(feature = "...")`; Cargo instead exposes activated features via
+    // `CARGO_FEATURE_<NAME>` env vars, so gate on that.
+    if std::env::var_os("CARGO_FEATURE_CLUSTER").is_none() {
+        return;
+    }
+
+    println!("cargo:rerun-if-changed=proto/shuffle.proto");
+    println!("cargo:rerun-if-changed=proto/barrier.proto");
+
+    tonic_prost_build::configure()
+        .build_client(true)
+        .build_server(true)
+        .compile_protos(&["proto/shuffle.proto", "proto/barrier.proto"], &["proto"])
+        .expect("failed to compile cluster proto definitions");
 }

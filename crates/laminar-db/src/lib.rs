@@ -26,6 +26,8 @@
 #![allow(clippy::module_name_repetitions)]
 
 mod aggregate_state;
+/// AI inference module, containing model registry, provider trait, and backends.
+pub mod ai;
 mod ai_catalog;
 mod ai_worker;
 mod asof_batch;
@@ -72,7 +74,7 @@ mod pipeline_lifecycle;
 /// Deployment profiles.
 pub mod profile;
 /// Dynamic vnode rebalance control plane.
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 pub mod rebalance;
 /// Unified recovery manager.
 pub mod recovery_manager;
@@ -89,6 +91,7 @@ mod table_cache_mode;
 mod table_provider;
 mod table_store;
 mod temporal_probe;
+mod vnode_partial;
 
 // End-to-end tests for the crypto-sentiment demo pipeline, backed by wiremock.
 // In-crate (not tests/) so it can drive the OperatorGraph directly.
@@ -124,7 +127,11 @@ pub use handle::{
 };
 pub use metrics::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
 pub use profile::{Profile, ProfileError};
-pub use recovery_manager::{RecoveredState, RecoveryManager};
+pub use recovery_manager::{RecoveredState, RecoveryManager, VnodeRehydration, VnodeRehydrator};
+
+/// Rebalance-driven state-rehydration types (cluster mode).
+#[cfg(feature = "cluster")]
+pub use db::{RehydratedVnode, SnapshotAdoption};
 
 /// Re-export the connector registry for custom connector registration.
 pub use laminar_connectors::registry::ConnectorRegistry;

@@ -1,13 +1,19 @@
-//! Cross-instance shuffle: one persistent TCP connection per peer pair,
-//! length-prefixed frames with a 1-byte tag. Backpressure is carried
-//! by the per-partition tokio mpsc on the consuming side.
+//! Cross-instance shuffle over Tonic gRPC client-streaming: one
+//! client-streaming call per peer pair carrying [`ShuffleMessage`](crate::shuffle::message::ShuffleMessage) frames.
+//! Backpressure is the HTTP/2 flow-control window plus the bounded crossfire
+//! inbound queue on the consuming side. The real transport is compiled under
+//! `cluster`; the default build keeps a networking-free shim.
 
 pub mod barrier_tracker;
 pub mod message;
+pub mod routing;
 pub mod transport;
 
 pub use barrier_tracker::BarrierTracker;
 pub use message::ShuffleMessage;
-#[cfg(feature = "cluster-unstable")]
+pub use routing::{
+    row_vnodes, slice_batch_by_targets, slice_batch_by_vnode, slice_batch_by_vnodes,
+};
+#[cfg(feature = "cluster")]
 pub use transport::SHUFFLE_ADDR_KEY;
 pub use transport::{ShufflePeerId, ShuffleReceiver, ShuffleSender};

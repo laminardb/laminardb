@@ -70,3 +70,10 @@ docs/adr/
 # Python artifacts (example clients)
 __pycache__/
 *.pyc
+/models
+.handoff.json
+agent_handoff.json
+.agent-rules.md
+agent_rules.md
+.subtask3-report.md
+/target_new

@@ -33,6 +33,13 @@ impl DiscoveryImpl {
         }
     }
 
+    async fn announce(&self, info: NodeInfo) -> Result<(), DiscoveryError> {
+        match self {
+            Self::Static(d) => d.announce(info).await,
+            Self::Gossip(d) => d.announce(info).await,
+        }
+    }
+
     fn membership_watch(&self) -> watch::Receiver<Vec<NodeInfo>> {
         match self {
             Self::Static(d) => d.membership_watch(),
@@ -143,12 +150,6 @@ pub enum ClusterStartupError {
     EngineConstruction(String),
     #[error("HTTP startup failed: {0}")]
     HttpStartup(String),
-    #[error(
-        "invalid coordination.raft_port={0}: RPC port = raft_port + 1 would \
-         overflow u16; choose a raft_port below {max}",
-        max = u16::MAX
-    )]
-    InvalidRaftPort(u16),
 }
 
 pub struct ClusterHandle {
@@ -157,6 +158,19 @@ pub struct ClusterHandle {
     api_handle: tokio::task::JoinHandle<()>,
     watcher_handle: Option<tokio::task::JoinHandle<()>>,
     membership_handle: tokio::task::JoinHandle<()>,
+    /// This node's own membership record. Cloned and re-announced with
+    /// [`NodeState::Draining`] on shutdown so peers stop routing to us.
+    local_node: NodeInfo,
+    /// Cluster control plane (gossip discovery only). `begin_drain` is
+    /// called on shutdown so the leader excludes us from vnode
+    /// assignment.
+    cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    /// Durable vnode assignment snapshot. Polled on shutdown to block
+    /// until the leader has reassigned every vnode we own.
+    snapshot_store: Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>,
+    /// Cancels the leader-lease renewal loop on shutdown so a draining
+    /// node stops renewing and its lease expires promptly.
+    lease_shutdown_token: Option<tokio_util::sync::CancellationToken>,
     /// Snapshot watcher + leader rebalance controller tasks. Empty
     /// if the deployment has no `AssignmentSnapshotStore` (non-cluster
     /// or pre-configured legacy).
@@ -174,6 +188,52 @@ impl ClusterHandle {
             .map_err(|e| ClusterStartupError::Discovery(format!("signal handler: {e}")))?;
 
         info!("Received shutdown signal, shutting down cluster node...");
+
+        // Graceful drain. Discovery and the rebalance control plane must
+        // stay alive here: peers need to observe our Draining state and
+        // the leader needs to rotate our vnodes away before we tear down.
+        //
+        // 1. Announce Draining so peers stop routing to us and the
+        //    leader's `assignable_instances` drops us from assignment.
+        let mut draining = self.local_node.clone();
+        draining.state = NodeState::Draining;
+        if let Err(e) = self.discovery.announce(draining).await {
+            warn!("Failed to announce draining state: {e}");
+        }
+
+        // 2. Flip the local draining flag so that if we are the leader,
+        //    our own rebalance controller excludes us from assignment.
+        if let Some(controller) = &self.cluster_controller {
+            controller.begin_drain();
+        }
+
+        // 3. Block until the leader has reassigned every vnode we own,
+        //    bounded so a stuck cluster can't wedge shutdown forever.
+        if let Some(store) = &self.snapshot_store {
+            if self.cluster_controller.is_some() || !self.rebalance_tasks.is_empty() {
+                let me = laminar_core::state::NodeId(self.local_node.id.0);
+                let drained = laminar_db::rebalance::wait_until_drained(
+                    store,
+                    me,
+                    std::time::Duration::from_secs(1),
+                    std::time::Duration::from_secs(30),
+                )
+                .await;
+                if drained {
+                    info!("Drain complete: all owned vnodes reassigned");
+                } else {
+                    warn!("Drain timed out after 30s; proceeding with shutdown");
+                }
+            } else {
+                info!("Control plane is inactive; skipping drain");
+            }
+        }
+
+        // 4. Stop renewing the leader lease so it expires promptly and a
+        //    surviving node can take over without waiting out the TTL.
+        if let Some(token) = &self.lease_shutdown_token {
+            token.cancel();
+        }
 
         // Tell rebalance tasks to exit at their next select point.
         // Fire all aborts before awaiting any so a slow responder
@@ -235,9 +295,11 @@ pub async fn start_cluster(
     let bind_addr = &config.server.bind;
     let coordination = &cluster_cfg.coordination;
     let raft_port = coordination.raft_port;
-    let rpc_port = raft_port
-        .checked_add(1)
-        .ok_or(ClusterStartupError::InvalidRaftPort(raft_port))?;
+    let http_port = if let Some(colon) = bind_addr.rfind(':') {
+        bind_addr[colon + 1..].parse::<u16>().unwrap_or(8080)
+    } else {
+        8080
+    };
 
     // Extract the host part from bind address, handling IPv6 (W16 fix).
     // Examples: "127.0.0.1:8080" → "127.0.0.1", "[::1]:8080" → "[::1]"
@@ -251,11 +313,27 @@ pub async fn start_cluster(
         bind_addr.as_str()
     };
 
+    let host_trimmed = bind_host.trim_start_matches('[').trim_end_matches(']');
+    let ip_wildcard = host_trimmed == "0.0.0.0" || host_trimmed == "::" || host_trimmed.is_empty();
+    let advertise_host = if let Some(ref host) = cluster_cfg.discovery.advertise_host {
+        host.clone()
+    } else if ip_wildcard {
+        let hostname = gethostname::gethostname();
+        let hostname = hostname.to_string_lossy().into_owned();
+        if hostname.is_empty() {
+            "127.0.0.1".to_string()
+        } else {
+            hostname
+        }
+    } else {
+        bind_host.to_string()
+    };
+
     let local_node = NodeInfo {
         id: node_id,
         name: node_id_str.clone(),
-        rpc_address: format!("{bind_host}:{rpc_port}"),
-        raft_address: format!("{bind_host}:{raft_port}"),
+        rpc_address: format!("{advertise_host}:{http_port}"),
+        raft_address: format!("{advertise_host}:{raft_port}"),
         state: NodeState::Joining,
         metadata: NodeMetadata {
             cores: num_cpus(),
@@ -277,7 +355,7 @@ pub async fn start_cluster(
     let mut discovery: DiscoveryImpl = match cluster_cfg.discovery.strategy.as_str() {
         "gossip" => {
             let gossip_config = GossipDiscoveryConfig {
-                gossip_address: format!("0.0.0.0:{}", cluster_cfg.discovery.gossip_port),
+                gossip_address: format!("{bind_host}:{}", cluster_cfg.discovery.gossip_port),
                 seed_nodes: cluster_cfg.discovery.seeds.clone(),
                 gossip_interval: std::time::Duration::from_secs(1),
                 phi_threshold: 8.0,
@@ -285,6 +363,7 @@ pub async fn start_cluster(
                 cluster_id: "laminardb".to_string(),
                 node_id,
                 local_node: local_node.clone(),
+                advertise_host: cluster_cfg.discovery.advertise_host.clone(),
             };
             DiscoveryImpl::Gossip(GossipDiscovery::new(gossip_config))
         }
@@ -296,7 +375,7 @@ pub async fn start_cluster(
                 heartbeat_interval: std::time::Duration::from_secs(1),
                 suspect_threshold: 3,
                 dead_threshold: 10,
-                listen_address: format!("0.0.0.0:{}", cluster_cfg.discovery.gossip_port),
+                listen_address: format!("{bind_host}:{}", cluster_cfg.discovery.gossip_port),
             };
             DiscoveryImpl::Static(StaticDiscovery::new(static_config))
         }
@@ -358,7 +437,6 @@ pub async fn start_cluster(
         .build()
         .await
         .map_err(|e| ClusterStartupError::EngineConstruction(format!("state backend: {e}")))?;
-    let vnode_count = config.state.vnode_capacity();
 
     // Build the vnode registry. If a shared `AssignmentSnapshot` already
     // exists in the state backend's object store, every node adopts it.
@@ -382,6 +460,29 @@ pub async fn start_cluster(
                     snapshot_store.clone(),
                     members_rx,
                 ));
+                controller.set_active(false);
+                #[cfg(feature = "cluster")]
+                {
+                    let bind: std::net::SocketAddr =
+                        format!("{bind_host}:0").parse().map_err(|e| {
+                            ClusterStartupError::EngineConstruction(format!(
+                                "invalid barrier sync bind host: {e}"
+                            ))
+                        })?;
+                    match controller
+                        .start_barrier_server(bind, Some(advertise_host.clone()))
+                        .await
+                    {
+                        Ok(bound) => {
+                            info!("Barrier sync gRPC server listening on {}", bound);
+                        }
+                        Err(e) => {
+                            return Err(ClusterStartupError::EngineConstruction(format!(
+                                "barrier sync server bind: {e}"
+                            )));
+                        }
+                    }
+                }
                 info!(
                     "ClusterController installed (leader={})",
                     controller.is_leader()
@@ -443,11 +544,23 @@ pub async fn start_cluster(
         builder = builder.assignment_snapshot_store(snap_store);
     }
 
+    // Install the catalog manifest store on the same shared object store, so
+    // a booting node can replay catalog DDL (MVs/sources) it lacks and each
+    // successful checkpoint republishes the catalog for nodes that join later.
+    if let Some(catalog_os) = config.state.build_object_store().map_err(|e| {
+        ClusterStartupError::EngineConstruction(format!("catalog manifest store: {e}"))
+    })? {
+        let catalog_store = Arc::new(laminar_core::cluster::control::CatalogManifestStore::new(
+            catalog_os,
+        ));
+        builder = builder.catalog_manifest_store(catalog_store);
+    }
+
     // Shuffle fabric. ShuffleReceiver publishes its bound address into
     // the gossip KV so peer ShuffleSenders discover it on first send.
     // Without this wiring, streaming aggregates never cross node
     // boundaries.
-    let shuffle_receiver = build_shuffle_receiver(&discovery, node_id).await?;
+    let shuffle_receiver = build_shuffle_receiver(&discovery, node_id, bind_host).await?;
     let shuffle_advertise = shuffle_advertise_addr(shuffle_receiver.local_addr(), bind_host);
     let shuffle_sender =
         Arc::new(build_shuffle_sender(node_id.0, &discovery, shuffle_advertise).await);
@@ -458,7 +571,7 @@ pub async fn start_cluster(
     builder = builder
         .shuffle_sender(Arc::clone(&shuffle_sender))
         .shuffle_receiver(Arc::clone(&shuffle_receiver))
-        .target_partitions(vnode_count as usize);
+        .target_partitions(1);
 
     let db = builder
         .build()
@@ -505,6 +618,7 @@ pub async fn start_cluster(
             Arc::clone(&vnode_registry),
             Arc::clone(&rebalance_shutdown),
             cfg,
+            Some(Arc::clone(controller)),
         ));
         rebalance_tasks.push(laminar_db::rebalance::spawn_rebalance_controller(
             Arc::clone(&db),
@@ -517,6 +631,37 @@ pub async fn start_cluster(
         info!("Rebalance control plane started");
     }
 
+    // Fenced leader lease. Standalone split-brain hardening: a stale
+    // leader whose lease has expired loses the CAS to the next acquirer
+    // and stops renewing, while the new owner advances the monotonic
+    // fencing token. Runs whenever a shared object store is available
+    // (the lease lives in the same cluster-wide bucket as state). The
+    // renewal loop is cancelled on shutdown via the returned token.
+    let lease_shutdown_token: Option<tokio_util::sync::CancellationToken> =
+        match config.state.build_object_store().map_err(|e| {
+            ClusterStartupError::EngineConstruction(format!("leader lease store: {e}"))
+        })? {
+            Some(lease_os) => {
+                use laminar_core::cluster::control::{
+                    LeaderLeaseConfig, LeaderLeaseManager, LeaderLeaseStore,
+                };
+                let lease_cfg = LeaderLeaseConfig::default();
+                let ttl_ms = lease_cfg.ttl.as_millis() as i64;
+                let lease_store = Arc::new(LeaderLeaseStore::new(lease_os, ttl_ms));
+                let manager = LeaderLeaseManager::new(lease_store, node_id, lease_cfg);
+                let token = tokio_util::sync::CancellationToken::new();
+                // Detached renewal loop; it returns once `token` is cancelled
+                // during graceful shutdown.
+                let _lease_handle = manager.spawn(token.clone());
+                info!(
+                    "Leader lease manager started (ttl={}s)",
+                    lease_cfg.ttl.as_secs()
+                );
+                Some(token)
+            }
+            None => None,
+        };
+
     let (app_state, api_handle) =
         server::start_http_api(Arc::clone(&db), registry, config_path.clone(), config)
             .await
@@ -527,6 +672,15 @@ pub async fn start_cluster(
     let membership_handle = spawn_membership_watcher(&node_id_str, membership_rx);
     info!("Membership watcher started");
 
+    let mut active = local_node.clone();
+    active.state = NodeState::Active;
+    if let Err(e) = discovery.announce(active.clone()).await {
+        warn!("Failed to announce active state: {e}");
+    }
+    if let Some(ref controller) = cluster_controller {
+        controller.set_active(true);
+    }
+
     info!("Cluster node '{node_id_str}' started");
 
     Ok(ClusterHandle {
@@ -535,6 +689,10 @@ pub async fn start_cluster(
         api_handle,
         watcher_handle,
         membership_handle,
+        local_node: active,
+        cluster_controller,
+        snapshot_store,
+        lease_shutdown_token,
         rebalance_tasks,
         rebalance_shutdown,
     })
@@ -570,7 +728,7 @@ async fn resolve_vnode_assignment(
     ClusterStartupError,
 > {
     use laminar_core::cluster::control::{AssignmentSnapshot, AssignmentSnapshotStore};
-    use laminar_core::state::{round_robin_assignment, NodeId, VnodeRegistry};
+    use laminar_core::state::{rendezvous_assignment, NodeId, VnodeRegistry};
 
     let vnode_count = state_cfg.vnode_capacity();
     let peer_ids: Vec<NodeId> = peers
@@ -578,7 +736,7 @@ async fn resolve_vnode_assignment(
         .map(|p| NodeId(p.id.0))
         .chain(std::iter::once(NodeId(self_id.0)))
         .collect();
-    let assignment: Arc<[NodeId]> = round_robin_assignment(vnode_count, &peer_ids);
+    let assignment: Arc<[NodeId]> = rendezvous_assignment(vnode_count, &peer_ids);
 
     let maybe_store = state_cfg
         .build_object_store()
@@ -647,11 +805,14 @@ async fn resolve_vnode_assignment(
 async fn build_shuffle_receiver(
     discovery: &DiscoveryImpl,
     node_id: NodeId,
+    bind_host: &str,
 ) -> Result<Arc<laminar_core::shuffle::ShuffleReceiver>, ClusterStartupError> {
     use laminar_core::cluster::control::{ChitchatKv, ClusterKv};
     use laminar_core::shuffle::ShuffleReceiver;
 
-    let bind: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+    let bind: std::net::SocketAddr = format!("{bind_host}:0").parse().map_err(|e| {
+        ClusterStartupError::EngineConstruction(format!("invalid shuffle bind host: {e}"))
+    })?;
     let recv = if let DiscoveryImpl::Gossip(gossip) = discovery {
         if let Some(handle) = gossip.chitchat_handle() {
             let kv: Arc<dyn ClusterKv> = Arc::new(ChitchatKv::from_handle(handle));

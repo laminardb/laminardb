@@ -14,6 +14,11 @@ use datafusion::prelude::SessionContext;
 
 use laminar_sql::translator::StreamJoinConfig;
 
+#[cfg(feature = "cluster")]
+use crate::key_column::{extract_column_as_timestamps, extract_key_column};
+#[cfg(feature = "cluster")]
+use crate::operator::sql_query::ClusterShuffleConfig;
+
 use crate::aggregate_state::JoinStateCheckpoint;
 use crate::error::DbError;
 use crate::interval_join::{execute_interval_join_cycle, IntervalJoinState};
@@ -24,6 +29,8 @@ pub(crate) struct IntervalJoinOperator {
     config: StreamJoinConfig,
     state: IntervalJoinState,
     projection: ProjectingJoinState,
+    #[cfg(feature = "cluster")]
+    cluster_shuffle: Option<ClusterShuffleConfig>,
 }
 
 impl IntervalJoinOperator {
@@ -37,7 +44,89 @@ impl IntervalJoinOperator {
             config,
             state: IntervalJoinState::new(),
             projection: ProjectingJoinState::new(name, ctx, projection_sql, "__interval_tmp"),
+            #[cfg(feature = "cluster")]
+            cluster_shuffle: None,
         }
+    }
+
+    #[cfg(feature = "cluster")]
+    pub(crate) fn attach_cluster_shuffle(&mut self, config: ClusterShuffleConfig) {
+        self.cluster_shuffle = Some(config);
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn repartition_side(
+        &self,
+        batches: &[RecordBatch],
+        key_name: &str,
+        stage_name: &str,
+        cfg: &ClusterShuffleConfig,
+    ) -> Result<Vec<RecordBatch>, DbError> {
+        let vnode_count = cfg.registry.vnode_count();
+        let mut local: Vec<RecordBatch> = Vec::new();
+        let mut outbound: Vec<(u64, laminar_core::shuffle::ShuffleMessage)> = Vec::new();
+
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let key_idx = batch.schema().index_of(key_name).map_err(|e| {
+                DbError::Pipeline(format!(
+                    "interval join [{}]: key column '{}' not found in schema: {e}",
+                    self.projection.op_name, key_name
+                ))
+            })?;
+            let key_indices = vec![key_idx];
+            let vnodes = laminar_core::shuffle::row_vnodes(batch, &key_indices, vnode_count);
+            for &v in &vnodes {
+                let owner = cfg.registry.owner(v);
+                if owner.is_unassigned() {
+                    return Err(DbError::Pipeline(format!(
+                        "interval join [{}]: shuffle vnode {v} is unassigned — refusing to drop rows",
+                        self.projection.op_name
+                    )));
+                }
+            }
+
+            let (local_slices, remote_slices) = laminar_core::shuffle::slice_batch_by_targets(
+                batch,
+                &vnodes,
+                &cfg.registry,
+                cfg.self_id,
+            );
+
+            for (_v, slice) in local_slices {
+                local.push(slice);
+            }
+
+            for (owner, slice) in remote_slices {
+                outbound.push((
+                    owner.0,
+                    laminar_core::shuffle::ShuffleMessage::VnodeData(
+                        stage_name.to_string(),
+                        0,
+                        slice,
+                    ),
+                ));
+            }
+        }
+
+        for (peer, msg) in outbound {
+            cfg.sender.send_to(peer, &msg).await.map_err(|e| {
+                DbError::Pipeline(format!(
+                    "interval join [{}]: shuffle send to peer {peer}: {e}",
+                    self.projection.op_name
+                ))
+            })?;
+        }
+
+        for batch in cfg.receiver.drain_vnode_data_for(stage_name) {
+            if batch.num_rows() > 0 {
+                local.push(batch);
+            }
+        }
+
+        Ok(local)
     }
 }
 
@@ -48,21 +137,118 @@ impl GraphOperator for IntervalJoinOperator {
         inputs: &[Vec<RecordBatch>],
         watermarks: &[i64],
     ) -> Result<Vec<RecordBatch>, DbError> {
-        let left_batches = inputs.first().map_or(&[][..], Vec::as_slice);
-        let right_batches = inputs.get(1).map_or(&[][..], Vec::as_slice);
+        #[cfg(feature = "cluster")]
+        let (left_batches_local, right_batches_local) = if let Some(ref cfg) = self.cluster_shuffle
+        {
+            let left_stage = format!("{}::left", self.projection.op_name);
+            let right_stage = format!("{}::right", self.projection.op_name);
+            let left = self
+                .repartition_side(
+                    inputs.first().map_or(&[][..], Vec::as_slice),
+                    &self.config.left_key,
+                    &left_stage,
+                    cfg,
+                )
+                .await?;
+            let right = self
+                .repartition_side(
+                    inputs.get(1).map_or(&[][..], Vec::as_slice),
+                    &self.config.right_key,
+                    &right_stage,
+                    cfg,
+                )
+                .await?;
+            (left, right)
+        } else {
+            (
+                inputs.first().map_or(&[][..], Vec::as_slice).to_vec(),
+                inputs.get(1).map_or(&[][..], Vec::as_slice).to_vec(),
+            )
+        };
+
+        #[cfg(not(feature = "cluster"))]
+        let (left_batches_local, right_batches_local) = (
+            inputs.first().map_or(&[][..], Vec::as_slice).to_vec(),
+            inputs.get(1).map_or(&[][..], Vec::as_slice).to_vec(),
+        );
+
         let left_wm = watermarks.first().copied().unwrap_or(i64::MIN);
         let right_wm = watermarks.get(1).copied().unwrap_or(i64::MIN);
 
         let join_result = execute_interval_join_cycle(
             &mut self.state,
-            left_batches,
-            right_batches,
+            &left_batches_local,
+            &right_batches_local,
             &self.config,
             left_wm,
             right_wm,
         )?;
 
         self.projection.apply(join_result).await
+    }
+
+    #[cfg(feature = "cluster")]
+    async fn ingest_shuffle(
+        &mut self,
+        stage: &str,
+        batch: RecordBatch,
+        _watermark: i64,
+    ) -> Result<(), DbError> {
+        if self.cluster_shuffle.is_none() {
+            return Ok(());
+        }
+        let op_name = &self.projection.op_name;
+        if stage == format!("{op_name}::left") {
+            if let Some(neg) = crate::changelog_filter::extract_negative_events(&batch)? {
+                let keys = extract_key_column(&neg, &self.config.left_key)?;
+                let timestamps = extract_column_as_timestamps(&neg, &self.config.left_time_column)?;
+                for (i, &ts) in timestamps.iter().enumerate() {
+                    if let Some(kh) = keys.hash_at(i) {
+                        self.state.left.remove_by_key_ts(
+                            kh,
+                            ts,
+                            &keys,
+                            i,
+                            &self.config.left_key,
+                        )?;
+                    }
+                }
+            }
+            let pos = crate::changelog_filter::filter_positive_events(&batch)?;
+            if pos.num_rows() > 0 {
+                self.state.left.add_batch(
+                    &pos,
+                    &self.config.left_key,
+                    &self.config.left_time_column,
+                )?;
+            }
+        } else if stage == format!("{op_name}::right") {
+            if let Some(neg) = crate::changelog_filter::extract_negative_events(&batch)? {
+                let keys = extract_key_column(&neg, &self.config.right_key)?;
+                let timestamps =
+                    extract_column_as_timestamps(&neg, &self.config.right_time_column)?;
+                for (i, &ts) in timestamps.iter().enumerate() {
+                    if let Some(kh) = keys.hash_at(i) {
+                        self.state.right.remove_by_key_ts(
+                            kh,
+                            ts,
+                            &keys,
+                            i,
+                            &self.config.right_key,
+                        )?;
+                    }
+                }
+            }
+            let pos = crate::changelog_filter::filter_positive_events(&batch)?;
+            if pos.num_rows() > 0 {
+                self.state.right.add_batch(
+                    &pos,
+                    &self.config.right_key,
+                    &self.config.right_time_column,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn checkpoint(&mut self) -> Result<Option<OperatorCheckpoint>, DbError> {

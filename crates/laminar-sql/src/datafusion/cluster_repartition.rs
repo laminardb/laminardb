@@ -10,8 +10,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::{Arc, OnceLock};
 
-use arrow::compute::take;
-use arrow_array::{RecordBatch, UInt32Array};
+use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::error::Result;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -23,7 +22,7 @@ use datafusion_common::DataFusionError;
 use futures::stream::{self, StreamExt};
 use laminar_core::checkpoint::barrier::CheckpointBarrier;
 use laminar_core::shuffle::{BarrierTracker, ShufflePeerId, ShuffleReceiver, ShuffleSender};
-use laminar_core::state::{owned_vnodes, NodeId, VnodeRegistry};
+use laminar_core::state::{owned_vnodes, peer_owners, NodeId, VnodeRegistry};
 use tokio::sync::{mpsc, watch, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
@@ -94,17 +93,12 @@ impl ClusterRepartitionExec {
         }
         let vnode_to_partition = owned.iter().enumerate().map(|(i, &v)| (v, i)).collect();
 
-        // Enumerate distinct peers from the registry (everyone who
-        // owns at least one vnode and isn't us). Frozen at construction
-        // — dynamic membership is deferred work.
-        let mut peer_set: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-        for v in 0..registry.vnode_count() {
-            let o = registry.owner(v);
-            if !o.is_unassigned() && o != self_id {
-                peer_set.insert(o.0);
-            }
-        }
-        let peers: Vec<ShufflePeerId> = peer_set.into_iter().collect();
+        // Distinct peers from the registry (everyone owning a vnode but us),
+        // frozen at construction — dynamic membership is deferred work.
+        let peers: Vec<ShufflePeerId> = peer_owners(&registry, self_id)
+            .iter()
+            .map(|n| n.0)
+            .collect();
 
         let properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
@@ -351,55 +345,6 @@ impl ExecutionPlan for ClusterRepartitionExec {
     }
 }
 
-/// Per-row vnode, hashed via `arrow::row::RowConverter` on the key
-/// columns (works for any Arrow type).
-fn row_vnodes(batch: &RecordBatch, hash_columns: &[usize], vnode_count: u32) -> Vec<u32> {
-    use arrow::row::{RowConverter, SortField};
-    use laminar_core::state::key_hash;
-
-    let cols: Vec<_> = hash_columns
-        .iter()
-        .map(|&i| Arc::clone(batch.column(i)))
-        .collect();
-    let fields: Vec<_> = cols
-        .iter()
-        .map(|c| SortField::new(c.data_type().clone()))
-        .collect();
-    let converter = RowConverter::new(fields).expect("row converter");
-    let rows = converter.convert_columns(&cols).expect("convert rows");
-
-    (0..batch.num_rows())
-        .map(|row| {
-            #[allow(clippy::cast_possible_truncation)]
-            let v = (key_hash(rows.row(row).as_ref()) % u64::from(vnode_count)) as u32;
-            v
-        })
-        .collect()
-}
-
-fn slice_for_vnode(batch: &RecordBatch, vnodes: &[u32], target_vnode: u32) -> Option<RecordBatch> {
-    let indices: UInt32Array = vnodes
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &v)| {
-            if v == target_vnode {
-                u32::try_from(i).ok()
-            } else {
-                None
-            }
-        })
-        .collect();
-    if indices.is_empty() {
-        return None;
-    }
-    let new_cols = batch
-        .columns()
-        .iter()
-        .map(|c| take(c, &indices, None).expect("take"))
-        .collect::<Vec<_>>();
-    Some(RecordBatch::try_new(batch.schema(), new_cols).expect("rebuild"))
-}
-
 /// Drains data batches and barriers (local + peer), routes data to
 /// local partitions or peer senders, and publishes aligned-epoch ids
 /// on `aligned_tx`.
@@ -459,34 +404,49 @@ async fn route_input_stream(
                 if let Some(Ok(batch)) = next {
                     if batch.num_rows() == 0 { continue; }
                     if partition_txs.is_none() { continue; }
-                    let row_vn = row_vnodes(&batch, &hash_columns, vnode_count);
-                    let mut seen = row_vn.clone();
-                    seen.sort_unstable();
-                    seen.dedup();
+                    let row_vn =
+                        laminar_core::shuffle::row_vnodes(&batch, &hash_columns, vnode_count);
+                    let (local_slices, remote_slices) =
+                        laminar_core::shuffle::slice_batch_by_targets(&batch, &row_vn, &registry, self_id);
                     let mut downstream_dropped = false;
-                    for v in seen {
-                        let Some(slice) = slice_for_vnode(&batch, &row_vn, v) else {
-                            continue;
-                        };
-                        let owner = registry.owner(v);
-                        if owner == self_id {
-                            if let Some(&idx) = vnode_to_partition.get(&v) {
-                                let send_res = partition_txs.as_ref().unwrap()[idx]
-                                    .send(slice)
-                                    .await;
-                                if send_res.is_err() {
-                                    downstream_dropped = true;
-                                    break;
-                                }
+
+                    for (v, slice) in local_slices {
+                        if let Some(&idx) = vnode_to_partition.get(&v) {
+                            let send_res = partition_txs.as_ref().unwrap()[idx]
+                                .send(slice)
+                                .await;
+                            if send_res.is_err() {
+                                downstream_dropped = true;
+                                break;
                             }
-                        } else if !owner.is_unassigned() {
-                            let msg = laminar_core::shuffle::ShuffleMessage::VnodeData(
-                                v, slice,
-                            );
-                            // Drop on unreachable peer.
-                            let _ = sender.send_to(owner.0, &msg).await;
                         }
                     }
+
+                    if !downstream_dropped {
+                        for (owner, slice) in remote_slices {
+                            let vnode_col = slice
+                                .column(slice.num_columns() - 1)
+                                .as_any()
+                                .downcast_ref::<arrow::array::UInt32Array>()
+                                .expect("vnode col");
+                            let row_vnodes = vnode_col.values().to_vec();
+                            let sub_slices = laminar_core::shuffle::slice_batch_by_vnodes(&slice, &row_vnodes);
+                            for (vnode_id, sub_slice) in sub_slices {
+                                let schema = Arc::new(arrow_schema::Schema::new(
+                                    sub_slice.schema().fields()[..sub_slice.num_columns() - 1].to_vec(),
+                                ));
+                                let columns = sub_slice.columns()[..sub_slice.num_columns() - 1].to_vec();
+                                let sub_slice_clean = RecordBatch::try_new(schema, columns).expect("clean");
+                                let msg = laminar_core::shuffle::ShuffleMessage::VnodeData(
+                                    String::new(),
+                                    vnode_id,
+                                    sub_slice_clean,
+                                );
+                                let _ = sender.send_to(owner.0, &msg).await;
+                            }
+                        }
+                    }
+
                     if downstream_dropped {
                         partition_txs = None;
                         input = None;
@@ -513,7 +473,7 @@ async fn dispatch_inbound(
     use laminar_core::shuffle::ShuffleMessage;
     while let Some((from, msg)) = receiver.recv().await {
         match msg {
-            ShuffleMessage::VnodeData(vnode, batch) => {
+            ShuffleMessage::VnodeData(_stage, vnode, batch) => {
                 if batch.num_rows() == 0 {
                     continue;
                 }
@@ -531,5 +491,147 @@ async fn dispatch_inbound(
             // reader. Barriers that succeed fall through here.
             _ => {}
         }
+    }
+}
+
+#[cfg(feature = "cluster")]
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
+#[cfg(feature = "cluster")]
+use datafusion::physical_plan::joins::HashJoinExec;
+#[cfg(feature = "cluster")]
+use datafusion_common::config::ConfigOptions;
+
+#[cfg(feature = "cluster")]
+static CLUSTER_CONTEXT: parking_lot::RwLock<Option<ClusterContext>> =
+    parking_lot::RwLock::new(None);
+
+#[cfg(feature = "cluster")]
+#[derive(Clone)]
+struct ClusterContext {
+    registry: Arc<VnodeRegistry>,
+    sender: Arc<ShuffleSender>,
+    receiver: Arc<ShuffleReceiver>,
+    self_id: NodeId,
+}
+
+#[cfg(feature = "cluster")]
+/// Set the global cluster context for the distributed physical optimizer rules.
+pub fn set_cluster_context(
+    registry: Arc<VnodeRegistry>,
+    sender: Arc<ShuffleSender>,
+    receiver: Arc<ShuffleReceiver>,
+    self_id: NodeId,
+) {
+    *CLUSTER_CONTEXT.write() = Some(ClusterContext {
+        registry,
+        sender,
+        receiver,
+        self_id,
+    });
+}
+
+#[cfg(feature = "cluster")]
+#[derive(Debug)]
+/// Physical optimizer rule that wraps HashJoinExec inputs in ClusterRepartitionExec.
+pub struct DistributedJoinRule;
+
+#[cfg(feature = "cluster")]
+impl PhysicalOptimizerRule for DistributedJoinRule {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let ctx_opt = CLUSTER_CONTEXT.read().clone();
+        let Some(ctx) = ctx_opt else {
+            return Ok(plan);
+        };
+        optimize_plan(plan, &ctx.registry, &ctx.sender, &ctx.receiver, ctx.self_id)
+    }
+
+    fn name(&self) -> &'static str {
+        "DistributedJoinRule"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "cluster")]
+fn optimize_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    registry: &Arc<VnodeRegistry>,
+    sender: &Arc<ShuffleSender>,
+    receiver: &Arc<ShuffleReceiver>,
+    self_id: NodeId,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let new_children: Result<Vec<Arc<dyn ExecutionPlan>>> = plan
+        .children()
+        .into_iter()
+        .map(|child| optimize_plan(child.clone(), registry, sender, receiver, self_id))
+        .collect();
+    let new_children = new_children?;
+
+    if let Some(hash_join) = plan.as_any().downcast_ref::<HashJoinExec>() {
+        let left = new_children[0].clone();
+        let right = new_children[1].clone();
+
+        if *hash_join.partition_mode()
+            == datafusion::physical_plan::joins::PartitionMode::CollectLeft
+        {
+            return plan.clone().with_new_children(vec![left, right]);
+        }
+
+        let mut left_keys = Vec::new();
+        let mut right_keys = Vec::new();
+        for (l_col, r_col) in hash_join.on() {
+            if let Some(col) = l_col
+                .as_any()
+                .downcast_ref::<datafusion::physical_expr::expressions::Column>()
+            {
+                left_keys.push(col.index());
+            } else {
+                return Err(datafusion::error::DataFusionError::Internal(
+                    "HashJoinExec: left key is not a Column expression".to_string(),
+                ));
+            }
+            if let Some(col) = r_col
+                .as_any()
+                .downcast_ref::<datafusion::physical_expr::expressions::Column>()
+            {
+                right_keys.push(col.index());
+            } else {
+                return Err(datafusion::error::DataFusionError::Internal(
+                    "HashJoinExec: right key is not a Column expression".to_string(),
+                ));
+            }
+        }
+
+        let new_left = Arc::new(ClusterRepartitionExec::try_new(
+            left,
+            left_keys,
+            Arc::clone(registry),
+            Arc::clone(sender),
+            Arc::clone(receiver),
+            self_id,
+        )?);
+
+        let new_right = Arc::new(ClusterRepartitionExec::try_new(
+            right,
+            right_keys,
+            Arc::clone(registry),
+            Arc::clone(sender),
+            Arc::clone(receiver),
+            self_id,
+        )?);
+
+        return plan.clone().with_new_children(vec![new_left, new_right]);
+    }
+
+    if new_children.is_empty() {
+        Ok(plan)
+    } else {
+        plan.with_new_children(new_children)
     }
 }

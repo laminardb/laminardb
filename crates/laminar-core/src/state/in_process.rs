@@ -12,6 +12,11 @@ use super::backend::{StateBackend, StateBackendError};
 #[derive(Debug)]
 pub struct InProcessBackend {
     partials: RwLock<FxHashMap<(u32, u64), Bytes>>,
+    /// Highest epoch for which [`epoch_complete`](StateBackend::epoch_complete)
+    /// observed every requested vnode present — the in-memory analogue of
+    /// the object-store `_COMMIT` marker, surfaced by
+    /// [`latest_committed_epoch`](StateBackend::latest_committed_epoch).
+    committed_high: RwLock<Option<u64>>,
     vnode_capacity: u32,
 }
 
@@ -21,6 +26,7 @@ impl InProcessBackend {
     pub fn new(vnode_capacity: u32) -> Self {
         Self {
             partials: RwLock::new(FxHashMap::default()),
+            committed_high: RwLock::new(None),
             vnode_capacity,
         }
     }
@@ -70,13 +76,19 @@ impl StateBackend for InProcessBackend {
     }
 
     async fn epoch_complete(&self, epoch: u64, vnodes: &[u32]) -> Result<bool, StateBackendError> {
-        let map = self.partials.read();
-        for &v in vnodes {
-            self.check_vnode(v)?;
-            if !map.contains_key(&(v, epoch)) {
-                return Ok(false);
+        {
+            let map = self.partials.read();
+            for &v in vnodes {
+                self.check_vnode(v)?;
+                if !map.contains_key(&(v, epoch)) {
+                    return Ok(false);
+                }
             }
         }
+        // Every vnode is durable: this epoch is sealed. Record it as the
+        // committed high-water mark so rehydration can find it later.
+        let mut hi = self.committed_high.write();
+        *hi = Some(hi.map_or(epoch, |h| h.max(epoch)));
         Ok(true)
     }
 
@@ -87,6 +99,10 @@ impl StateBackend for InProcessBackend {
             .write()
             .retain(|&(_, epoch), _| epoch >= before);
         Ok(())
+    }
+
+    async fn latest_committed_epoch(&self) -> Result<Option<u64>, StateBackendError> {
+        Ok(*self.committed_high.read())
     }
 }
 
@@ -121,6 +137,35 @@ mod tests {
             .unwrap();
         assert!(b.epoch_complete(1, &vnodes).await.unwrap());
         assert!(!b.epoch_complete(2, &vnodes).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn latest_committed_epoch_follows_epoch_complete() {
+        let b = InProcessBackend::new(4);
+        let vnodes = [0u32, 1];
+        assert_eq!(b.latest_committed_epoch().await.unwrap(), None);
+
+        // A speculative gate that returns false must not advance the mark.
+        b.write_partial(0, 2, 0, Bytes::from_static(b"a"))
+            .await
+            .unwrap();
+        assert!(!b.epoch_complete(2, &vnodes).await.unwrap());
+        assert_eq!(b.latest_committed_epoch().await.unwrap(), None);
+
+        // Complete epoch 2, then epoch 5 — the mark tracks the highest.
+        b.write_partial(1, 2, 0, Bytes::from_static(b"b"))
+            .await
+            .unwrap();
+        assert!(b.epoch_complete(2, &vnodes).await.unwrap());
+        assert_eq!(b.latest_committed_epoch().await.unwrap(), Some(2));
+
+        for v in &vnodes {
+            b.write_partial(*v, 5, 0, Bytes::from_static(b"c"))
+                .await
+                .unwrap();
+        }
+        assert!(b.epoch_complete(5, &vnodes).await.unwrap());
+        assert_eq!(b.latest_committed_epoch().await.unwrap(), Some(5));
     }
 
     #[tokio::test]

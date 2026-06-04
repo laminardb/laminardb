@@ -128,6 +128,24 @@ pub trait StateBackend: Send + Sync + 'static {
     /// implement `Ok(())` explicitly so the choice is visible.
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError>;
 
+    /// Highest epoch sealed by a durable commit marker, or `None` when
+    /// the store holds no committed epoch yet.
+    ///
+    /// This is the epoch a node rehydrates from when it acquires a
+    /// vnode during a rebalance: every owner agreed the epoch's
+    /// per-vnode partials were durable before [`epoch_complete`] sealed
+    /// it, so reading `partial.bin` at this epoch restores the last
+    /// cluster-consistent state rather than starting empty.
+    ///
+    /// Default is `None` — backends that cannot enumerate committed
+    /// epochs report "no committed state" and the caller treats every
+    /// affected vnode as a fresh start.
+    ///
+    /// [`epoch_complete`]: Self::epoch_complete
+    async fn latest_committed_epoch(&self) -> Result<Option<u64>, StateBackendError> {
+        Ok(None)
+    }
+
     /// Raise the backend's authoritative assignment version — the
     /// minimum [`VnodeRegistry::assignment_version`] it will accept on
     /// [`write_partial`](Self::write_partial). Hosts call this on boot

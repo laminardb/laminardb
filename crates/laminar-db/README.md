@@ -10,77 +10,21 @@ Unified database facade for LaminarDB. The main entry point that wires the SQL p
 - **`QueryHandle`** -- Handle to a running streaming query with schema and subscription access.
 - **`SourceHandle<T>`** / **`UntypedSourceHandle`** -- Typed and untyped handles for pushing data into sources.
 - **`TypedSubscription<T>`** -- Subscription to a named stream with automatic RecordBatch-to-struct conversion.
-- **`SubscriptionRegistry`** / **`SubscriptionPortal`** -- Broadcast fan-out and per-consumer pump used by the Postgres-wire `SUBSCRIBE` listener and any in-process consumer that wants a back-pressured tail of a stream. Supports `AS OF EPOCH n` resume when the stream was created `WITH ('retain_history' = '…')`.
+- **`SubscriptionRegistry`** / **`SubscriptionPortal`** -- Broadcast fan-out and per-consumer pump.
 - **`CheckpointCoordinator`** -- Orchestrates two-phase commit checkpoints across all operators and sinks.
 - **`RecoveryManager`** -- Restores operator state, connector offsets, and watermarks from the latest checkpoint.
 - **`Profile`** -- Deployment profile (`BareMetal`, `Embedded`, `Durable`, `Delta`).
 - **`PipelineMetrics`** / **`PipelineCounters`** -- Real-time pipeline observability.
-- **`DbError`** -- Structured error type with `code()` returning stable `LDB-NNNN` codes and `is_transient()` for retry logic.
-
-## Usage
-
-```rust
-use laminar_db::LaminarDB;
-
-let db = LaminarDB::open()?;
-
-// Create a source
-db.execute("CREATE SOURCE trades (
-    symbol VARCHAR, price DOUBLE, ts TIMESTAMP
-)").await?;
-
-// Create a continuous query
-db.execute("CREATE STREAM avg_price AS
-    SELECT symbol, AVG(price) AS avg
-    FROM trades
-    GROUP BY symbol, tumble(ts, INTERVAL '1' MINUTE)
-").await?;
-
-// Push data
-let source = db.source_untyped("trades")?;
-
-// Start the pipeline
-db.start().await?;
-
-// In-process tail of a stream (the same machinery the pgwire SUBSCRIBE
-// listener uses). Frames carry RecordBatches plus an epoch marker so the
-// consumer can resume after a disconnect.
-use laminar_db::subscription::SubscribeStart;
-let mut portal = db
-    .open_subscription("avg_price", None, SubscribeStart::Tail)
-    .await?;
-while let Some(frame) = portal.next_frame().await { /* … */ }
-
-// Shutdown
-db.shutdown().await?;
-```
-
-### Using the Builder
-
-```rust
-let db = LaminarDB::builder()
-    .config_var("KAFKA_BROKERS", "localhost:9092")
-    .buffer_size(131_072)
-    .storage_dir("./data")
-    .profile(Profile::Durable)
-    .register_udf(my_scalar_udf)
-    .register_udaf(my_aggregate_udf)
-    .register_connector(|registry| {
-        registry.register_source("my-source", info, factory);
-    })
-    .build()
-    .await?;
-```
+- **`DbError`** -- Structured error type with stable `LDB-NNNN` codes.
 
 ## Architecture
 
-This crate sits at the top of the dependency graph, integrating all other LaminarDB crates:
+This crate sits at the top of the dependency graph, integrating other LaminarDB crates:
 
 ```
 laminar-db
-  |-- laminar-core        (operators, streaming channels, checkpoint barriers)
+  |-- laminar-core        (operators, streaming channels, checkpoint barriers, storage)
   |-- laminar-sql         (SQL parsing + DataFusion)
-  |-- laminar-storage     (checkpoint manifest + object store persistence)
   |-- laminar-connectors  (external connectors)
 ```
 
@@ -105,7 +49,7 @@ laminar-db
 | `parquet-lookup` | Parquet lookup source for reference tables |
 | `otel` | OpenTelemetry OTLP/gRPC source |
 | `delta` | Full distributed mode scaffolding (gRPC, gossip, Raft). Not production-ready. |
-| `aws` / `gcs` / `azure` | Object-store checkpoint backends (forwards to laminar-storage) |
+| `aws` / `gcs` / `azure` | Object-store checkpoint backends (forwards to laminar-core) |
 
 ## Internal Architecture
 
@@ -119,8 +63,8 @@ The `eowc_state` module provides incremental per-window accumulators that mainta
 
 ## Related Crates
 
-- [`laminar-core`](../laminar-core) -- Operators, streaming channels, window assigners, checkpoint barriers
+- [`laminar-core`](../laminar-core) -- Operators, streaming channels, window assigners, checkpoint barriers, storage
 - [`laminar-sql`](../laminar-sql) -- SQL parser and DataFusion integration
-- [`laminar-storage`](../laminar-storage) -- Checkpoint persistence
 - [`laminar-connectors`](../laminar-connectors) -- External system connectors
 - [`laminar-derive`](../laminar-derive) -- Derive macros for typed data handling
+

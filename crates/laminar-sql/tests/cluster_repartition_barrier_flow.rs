@@ -2,7 +2,7 @@
 //! on both sides aligns both trackers and fires both
 //! `aligned_epoch_watch` channels.
 
-#![cfg(feature = "cluster-unstable")]
+#![cfg(feature = "cluster")]
 #![allow(clippy::disallowed_types)]
 
 use std::sync::Arc;

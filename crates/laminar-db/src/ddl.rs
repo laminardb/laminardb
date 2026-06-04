@@ -398,6 +398,8 @@ impl LaminarDB {
         let mut refresh_mode: Option<laminar_connectors::reference::RefreshMode> = None;
         let mut cache_mode: Option<crate::table_cache_mode::TableCacheMode> = None;
         let mut cache_max_entries: Option<usize> = None;
+        let mut cache_max_bytes: Option<usize> = None;
+        let mut cache_ttl: Option<std::time::Duration> = None;
         let mut storage: Option<String> = None;
 
         let with_options = match &create.table_options {
@@ -415,15 +417,41 @@ impl LaminarDB {
                     "refresh" => {
                         refresh_mode = Some(crate::connector_manager::parse_refresh_mode(&val)?);
                     }
-                    "cache_mode" => {
+                    "cache_mode" | "cache.mode" => {
                         cache_mode = Some(crate::table_cache_mode::parse_cache_mode(&val)?);
                     }
-                    "cache_max_entries" => {
+                    "cache_max_entries" | "cache.max_entries" => {
                         cache_max_entries = Some(val.parse::<usize>().map_err(|_| {
                             DbError::InvalidOperation(format!(
                                 "Invalid cache_max_entries '{val}': expected positive integer"
                             ))
                         })?);
+                    }
+                    "cache_max_bytes" | "cache.max_bytes" | "cache.memory" => {
+                        let bytes = val.parse::<usize>().map_err(|_| {
+                            DbError::InvalidOperation(format!(
+                                "Invalid cache_max_bytes '{val}': expected positive integer"
+                            ))
+                        })?;
+                        if bytes == 0 {
+                            return Err(DbError::InvalidOperation(format!(
+                                "Invalid cache_max_bytes '{val}': expected positive integer"
+                            )));
+                        }
+                        cache_max_bytes = Some(bytes);
+                    }
+                    "cache_ttl" | "cache.ttl" => {
+                        let secs = val.parse::<u64>().map_err(|_| {
+                            DbError::InvalidOperation(format!(
+                                "Invalid cache_ttl '{val}': expected positive integer seconds"
+                            ))
+                        })?;
+                        if secs == 0 {
+                            return Err(DbError::InvalidOperation(format!(
+                                "Invalid cache_ttl '{val}': expected positive integer seconds"
+                            )));
+                        }
+                        cache_ttl = Some(std::time::Duration::from_secs(secs));
                     }
                     "storage" => storage = Some(val),
                     kk if kk.starts_with("format.") => {
@@ -483,16 +511,14 @@ impl LaminarDB {
                     format,
                     format_options,
                     refresh: refresh_mode,
-                    cache_max_entries,
+                    cache_max_bytes,
+                    cache_ttl,
                 });
             }
         }
 
-        // Register with DataFusion using a live ReferenceTableProvider.
-        // Every scan() reads the current snapshot from the TableStore, so
-        // no deregister/re-register is needed after INSERTs. This eliminates
-        // the TOCTOU race in sync_table_to_datafusion that previously caused
-        // concurrent INSERTs to leave the DataFusion catalog stale.
+        // Live ReferenceTableProvider: scan() reads current TableStore rows, so
+        // SELECTs need no re-register after INSERTs (lookup joins use the snapshot).
         {
             let provider = crate::table_provider::ReferenceTableProvider::new(
                 name.clone(),
@@ -1246,12 +1272,17 @@ impl LaminarDB {
         }))
     }
 
-    /// No-op: all tables now use `ReferenceTableProvider` which reads live
-    /// data on every `scan()`. No deregister/re-register needed.
-    ///
-    /// Retained as a function so callers don't need to change.
-    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
-    pub(crate) fn sync_table_to_datafusion(&self, _name: &str) -> Result<(), DbError> {
+    /// Re-publish a lookup table's snapshot after a write so lookup joins don't
+    /// probe stale rows. No-op for non-lookup tables.
+    #[allow(clippy::unnecessary_wraps)] // signature kept fallible for call sites
+    pub(crate) fn sync_table_to_datafusion(&self, name: &str) -> Result<(), DbError> {
+        if self.lookup_registry.get_entry(name).is_none() {
+            return Ok(());
+        }
+        if let Some(batch) = self.table_store.read().to_record_batch(name) {
+            self.lookup_registry
+                .register(name, laminar_sql::datafusion::LookupSnapshot { batch });
+        }
         Ok(())
     }
 }

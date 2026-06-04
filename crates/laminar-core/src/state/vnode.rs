@@ -14,7 +14,7 @@
 //! need a vnode ID for an event call [`VnodeRegistry::vnode_for_key`].
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -56,11 +56,42 @@ impl fmt::Display for NodeId {
     }
 }
 
+/// Per-vnode lifecycle state. Distinct from ownership: a vnode this node
+/// owns can still be [`Restoring`](Self::Restoring) while its committed
+/// state is being rehydrated from durable storage after a rebalance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VnodeLifecycleState {
+    /// Fully owned and serving — state is consistent.
+    Active,
+    /// Newly acquired in a rebalance; durable state is still being
+    /// applied. Operators suppress emission for keys in this vnode until
+    /// it flips back to [`Active`](Self::Active).
+    Restoring,
+}
+
+impl VnodeLifecycleState {
+    const ACTIVE: u8 = 0;
+    const RESTORING: u8 = 1;
+
+    const fn to_u8(self) -> u8 {
+        match self {
+            Self::Active => Self::ACTIVE,
+            Self::Restoring => Self::RESTORING,
+        }
+    }
+}
+
 /// Runtime registry of vnode topology and assignment.
 pub struct VnodeRegistry {
     vnode_count: u32,
     assignment: RwLock<Arc<[NodeId]>>,
     assignment_version: AtomicU64,
+    /// Per-vnode lifecycle, indexed by vnode id. `0` = `Active`,
+    /// `1` = `Restoring`. Lock-free: rebalance flips individual entries
+    /// and the hot emission gate reads them without taking a lock. Not
+    /// serialized — rebuilt (all `Active`) from the `AssignmentSnapshot`
+    /// on boot, so adding it never touches a wire format.
+    lifecycle: Arc<[AtomicU8]>,
 }
 
 impl std::fmt::Debug for VnodeRegistry {
@@ -92,6 +123,7 @@ impl VnodeRegistry {
             vnode_count,
             assignment: RwLock::new(assignment),
             assignment_version: AtomicU64::new(1),
+            lifecycle: new_lifecycle(vnode_count),
         }
     }
 
@@ -111,6 +143,7 @@ impl VnodeRegistry {
             vnode_count,
             assignment: RwLock::new(assignment),
             assignment_version: AtomicU64::new(1),
+            lifecycle: new_lifecycle(vnode_count),
         }
     }
 
@@ -191,6 +224,72 @@ impl VnodeRegistry {
         let h = (key_hash(key) % u64::from(self.vnode_count)) as u32;
         h
     }
+
+    /// Mark `vnodes` as [`Restoring`](VnodeLifecycleState::Restoring).
+    ///
+    /// Called during a rebalance for the vnodes a node newly acquires,
+    /// before their committed state has been applied. Out-of-range ids
+    /// are ignored.
+    pub fn mark_restoring(&self, vnodes: &[u32]) {
+        self.set_lifecycle(vnodes, VnodeLifecycleState::Restoring);
+    }
+
+    /// Mark `vnodes` as [`Active`](VnodeLifecycleState::Active).
+    ///
+    /// Called once a newly-acquired vnode's state has been applied (or
+    /// immediately for vnodes that had no durable state to restore).
+    /// Out-of-range ids are ignored.
+    pub fn mark_active(&self, vnodes: &[u32]) {
+        self.set_lifecycle(vnodes, VnodeLifecycleState::Active);
+    }
+
+    fn set_lifecycle(&self, vnodes: &[u32], state: VnodeLifecycleState) {
+        let byte = state.to_u8();
+        for &v in vnodes {
+            if let Some(slot) = self.lifecycle.get(v as usize) {
+                slot.store(byte, Ordering::Release);
+            }
+        }
+    }
+
+    /// Whether `vnode` is currently [`Restoring`](VnodeLifecycleState::Restoring).
+    /// Out-of-range ids are reported as not restoring.
+    #[must_use]
+    pub fn is_restoring(&self, vnode: u32) -> bool {
+        self.lifecycle
+            .get(vnode as usize)
+            .is_some_and(|s| s.load(Ordering::Acquire) == VnodeLifecycleState::RESTORING)
+    }
+
+    /// Whether any vnode is currently restoring. Cheap pre-check the
+    /// emission gate uses to skip per-row work in the common case.
+    #[must_use]
+    pub fn any_restoring(&self) -> bool {
+        self.lifecycle
+            .iter()
+            .any(|s| s.load(Ordering::Acquire) == VnodeLifecycleState::RESTORING)
+    }
+
+    /// Vnodes currently [`Restoring`](VnodeLifecycleState::Restoring), ascending.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // index < vnode_count, which is u32
+    pub fn restoring_vnodes(&self) -> Vec<u32> {
+        self.lifecycle
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                (s.load(Ordering::Acquire) == VnodeLifecycleState::RESTORING).then_some(i as u32)
+            })
+            .collect()
+    }
+}
+
+/// Build a fresh lifecycle array with every vnode [`Active`].
+fn new_lifecycle(vnode_count: u32) -> Arc<[AtomicU8]> {
+    std::iter::repeat_with(|| AtomicU8::new(VnodeLifecycleState::ACTIVE))
+        .take(vnode_count as usize)
+        .collect::<Vec<_>>()
+        .into()
 }
 
 /// Hash a key to a 64-bit value. Used to derive vnode IDs and for any
@@ -203,31 +302,43 @@ pub fn key_hash(key: &[u8]) -> u64 {
     xxhash_rust::xxh3::xxh3_64(key)
 }
 
-/// Build a vnode-to-owner assignment by round-robin across sorted peers.
+/// Build a vnode-to-owner assignment using Rendezvous Hashing (Highest Random Weight).
 ///
-/// Deterministic for a given `(vnode_count, peers)` input — every node
-/// computing this independently agrees, given the same peer list. Uses
-/// sort-by-id + modulo: vnode `v` → `peers[v % peers.len()]` after
-/// sorting. Simple and fine for uniform key distributions.
-///
-/// **Not** consistent hashing — a peer join/leave reshuffles every
-/// vnode. Acceptable for the current phase since reassignment happens
-/// only at cluster start; dynamic rebalance is deferred work.
+/// Deterministic for a given `(vnode_count, peers)` input. Minimizes partition
+/// reshuffling on membership changes (node joins/leaves).
 ///
 /// # Panics
 /// Panics if `peers` is empty.
 #[must_use]
-pub fn round_robin_assignment(vnode_count: u32, peers: &[NodeId]) -> Arc<[NodeId]> {
+pub fn rendezvous_assignment(vnode_count: u32, peers: &[NodeId]) -> Arc<[NodeId]> {
     assert!(
         !peers.is_empty(),
-        "round_robin_assignment needs at least one peer"
+        "rendezvous_assignment needs at least one peer"
     );
-    let mut sorted: Vec<NodeId> = peers.to_vec();
-    sorted.sort_by_key(|n| n.0);
-    (0..vnode_count)
-        .map(|v| sorted[(v as usize) % sorted.len()])
-        .collect::<Vec<_>>()
-        .into()
+    let mut sorted_peers = peers.to_vec();
+    sorted_peers.sort_by_key(|n| n.0);
+
+    let mut assignment = Vec::with_capacity(vnode_count as usize);
+    for v in 0..vnode_count {
+        let mut max_weight = 0;
+        let mut selected_node = sorted_peers[0];
+
+        for &node in &sorted_peers {
+            // Hash the combination of vnode ID and node ID
+            let mut buf = [0u8; 16];
+            buf[0..8].copy_from_slice(&u64::from(v).to_le_bytes());
+            buf[8..16].copy_from_slice(&node.0.to_le_bytes());
+            let weight = xxhash_rust::xxh3::xxh3_64(&buf);
+
+            // Highest weight wins, tie-break by NodeId
+            if weight > max_weight || (weight == max_weight && node.0 > selected_node.0) {
+                max_weight = weight;
+                selected_node = node;
+            }
+        }
+        assignment.push(selected_node);
+    }
+    assignment.into()
 }
 
 /// Vnodes currently assigned to `owner`.
@@ -240,6 +351,19 @@ pub fn owned_vnodes(registry: &VnodeRegistry, owner: NodeId) -> Vec<u32> {
     (0..registry.vnode_count())
         .filter(|&v| registry.owner(v) == owner)
         .collect()
+}
+
+/// Distinct assigned nodes other than `self_id`, sorted by id — the peer set a
+/// node fans checkpoint barriers and shuffle data out to.
+#[must_use]
+pub fn peer_owners(registry: &VnodeRegistry, self_id: NodeId) -> Vec<NodeId> {
+    let mut peers: Vec<NodeId> = (0..registry.vnode_count())
+        .map(|v| registry.owner(v))
+        .filter(|o| !o.is_unassigned() && *o != self_id)
+        .collect();
+    peers.sort_unstable();
+    peers.dedup();
+    peers
 }
 
 #[cfg(test)]
@@ -319,38 +443,107 @@ mod tests {
     }
 
     #[test]
-    fn round_robin_is_deterministic_and_balanced() {
-        // 8 vnodes, 3 peers → 3+3+2 distribution after modulo.
+    fn rendezvous_is_deterministic() {
         let peers = vec![NodeId(7), NodeId(3), NodeId(5)];
-        let assignment = round_robin_assignment(8, &peers);
-        // Sorted: [3, 5, 7]. vnode v owned by sorted[v % 3].
-        assert_eq!(
-            &*assignment,
-            &[
-                NodeId(3),
-                NodeId(5),
-                NodeId(7),
-                NodeId(3),
-                NodeId(5),
-                NodeId(7),
-                NodeId(3),
-                NodeId(5),
-            ][..]
-        );
+        let assignment = rendezvous_assignment(8, &peers);
         // Input order doesn't matter.
         let reversed = vec![NodeId(3), NodeId(5), NodeId(7)];
-        assert_eq!(round_robin_assignment(8, &reversed), assignment);
+        assert_eq!(rendezvous_assignment(8, &reversed), assignment);
     }
 
     #[test]
-    fn round_robin_single_peer_owns_everything() {
-        let assignment = round_robin_assignment(4, &[NodeId(99)]);
+    fn rendezvous_single_peer_owns_everything() {
+        let assignment = rendezvous_assignment(4, &[NodeId(99)]);
         assert!(assignment.iter().all(|&n| n == NodeId(99)));
     }
 
     #[test]
-    #[should_panic(expected = "at least one peer")]
-    fn round_robin_rejects_empty_peer_list() {
-        let _ = round_robin_assignment(4, &[]);
+    #[should_panic(expected = "needs at least one peer")]
+    fn rendezvous_rejects_empty_peer_list() {
+        let _ = rendezvous_assignment(4, &[]);
+    }
+
+    #[test]
+    fn rendezvous_minimizes_state_movement() {
+        let peers3 = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let peers4 = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+
+        let a3 = rendezvous_assignment(256, &peers3);
+        let a4 = rendezvous_assignment(256, &peers4);
+
+        let mut moved = 0;
+        let mut moved_between_existing = 0;
+
+        for v in 0..256usize {
+            let o3 = a3[v];
+            let o4 = a4[v];
+            if o3 != o4 {
+                moved += 1;
+                if o4 != NodeId(4) {
+                    moved_between_existing += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            moved_between_existing, 0,
+            "No vnode should move between existing peers on a node join"
+        );
+        assert!(
+            moved > 40 && moved < 90,
+            "Expected roughly 25% of vnodes to move to the new peer, got {moved}"
+        );
+
+        for v in 0..256usize {
+            if a3[v] != a4[v] {
+                assert_eq!(a4[v], NodeId(4));
+            }
+        }
+    }
+
+    #[test]
+    fn vnodes_start_active() {
+        let r = VnodeRegistry::new(4);
+        assert!(!r.any_restoring());
+        for v in 0..4 {
+            assert!(!r.is_restoring(v));
+        }
+        assert!(r.restoring_vnodes().is_empty());
+    }
+
+    #[test]
+    fn mark_restoring_and_active_round_trip() {
+        let r = VnodeRegistry::new(4);
+        r.mark_restoring(&[1, 3]);
+        assert!(r.any_restoring());
+        assert!(r.is_restoring(1));
+        assert!(r.is_restoring(3));
+        assert!(!r.is_restoring(0));
+        assert_eq!(r.restoring_vnodes(), vec![1, 3]);
+
+        r.mark_active(&[1]);
+        assert!(!r.is_restoring(1));
+        assert_eq!(r.restoring_vnodes(), vec![3]);
+
+        r.mark_active(&[3]);
+        assert!(!r.any_restoring());
+    }
+
+    #[test]
+    fn lifecycle_ignores_out_of_range() {
+        let r = VnodeRegistry::new(2);
+        r.mark_restoring(&[5, 99]); // no panic
+        assert!(!r.is_restoring(5));
+        assert!(!r.any_restoring());
+    }
+
+    #[test]
+    fn lifecycle_independent_of_assignment() {
+        // Reassigning ownership must not clear lifecycle state — the two
+        // are orthogonal and the caller drives the Restoring→Active flip.
+        let r = VnodeRegistry::new(4);
+        r.mark_restoring(&[2]);
+        r.set_assignment(vec![NodeId(1), NodeId(1), NodeId(1), NodeId(1)].into());
+        assert!(r.is_restoring(2));
     }
 }

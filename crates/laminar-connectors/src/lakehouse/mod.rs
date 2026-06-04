@@ -117,6 +117,7 @@ impl crate::registry::LookupSourceFactory for DeltaLookupFactory {
     async fn build(
         &self,
         config: crate::config::ConnectorConfig,
+        _declared_schema: Option<arrow_schema::SchemaRef>,
     ) -> Result<Arc<dyn laminar_core::lookup::source::LookupSourceDyn>, crate::error::ConnectorError>
     {
         use crate::lakehouse::delta_source_config::DeltaSourceConfig;
@@ -231,6 +232,50 @@ pub fn register_iceberg_source(registry: &ConnectorRegistry) {
             ))
         }),
     );
+
+    // Register lookup source factory for on-demand/partial cache mode.
+    #[cfg(feature = "iceberg")]
+    registry.register_lookup_source("iceberg", Arc::new(IcebergLookupFactory));
+}
+
+#[cfg(feature = "iceberg")]
+struct IcebergLookupFactory;
+
+#[cfg(feature = "iceberg")]
+#[async_trait::async_trait]
+impl crate::registry::LookupSourceFactory for IcebergLookupFactory {
+    async fn build(
+        &self,
+        config: crate::config::ConnectorConfig,
+        _declared_schema: Option<arrow_schema::SchemaRef>,
+    ) -> Result<Arc<dyn laminar_core::lookup::source::LookupSourceDyn>, crate::error::ConnectorError>
+    {
+        use crate::lakehouse::iceberg_config::IcebergCatalogConfig;
+        use crate::lookup::iceberg_lookup::{IcebergLookupSource, IcebergLookupSourceConfig};
+
+        let pk_columns: Vec<String> = config
+            .get("_primary_key_columns")
+            .unwrap_or("")
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if pk_columns.is_empty() {
+            return Err(crate::error::ConnectorError::ConfigurationError(
+                "iceberg lookup source requires primary key columns".into(),
+            ));
+        }
+
+        let catalog = IcebergCatalogConfig::from_config(&config)?;
+        let lookup_config = IcebergLookupSourceConfig {
+            catalog,
+            primary_key_columns: pk_columns,
+        };
+
+        let source = IcebergLookupSource::open(lookup_config).await?;
+        Ok(Arc::new(source) as Arc<dyn laminar_core::lookup::source::LookupSourceDyn>)
+    }
 }
 
 /// Registers all lakehouse sink connectors (Delta Lake, Iceberg).

@@ -22,7 +22,7 @@ use datafusion::logical_expr::Expr;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
 
-use laminar_ai::{AiRuntime, BackendKind, ModelBackend};
+use crate::ai::{AiRuntime, BackendKind, ModelBackend};
 
 use crate::error::DbError;
 
@@ -224,7 +224,7 @@ fn ai_calls_columns(runtime: &AiRuntime) -> Vec<ArrayRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use laminar_ai::{
+    use crate::ai::{
         AiCallLog, AiResultCache, InferenceProvider, ModelBackend, ModelEntry, ModelRegistry, Task,
     };
 
@@ -233,14 +233,14 @@ mod tests {
     impl InferenceProvider for Stub {
         async fn infer_batch(
             &self,
-            request: laminar_ai::InferenceRequest,
-        ) -> Result<laminar_ai::InferenceResponse, laminar_ai::ProviderError> {
-            Ok(laminar_ai::InferenceResponse {
-                outputs: laminar_ai::InferenceOutputs::Text(vec![
+            request: crate::ai::InferenceRequest,
+        ) -> Result<crate::ai::InferenceResponse, crate::ai::ProviderError> {
+            Ok(crate::ai::InferenceResponse {
+                outputs: crate::ai::InferenceOutputs::Text(vec![
                     String::new();
                     request.inputs.len()
                 ]),
-                usage: laminar_ai::Usage::ZERO,
+                usage: crate::ai::Usage::ZERO,
             })
         }
         fn name(&self) -> &'static str {

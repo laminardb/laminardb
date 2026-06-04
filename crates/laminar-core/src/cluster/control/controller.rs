@@ -1,7 +1,7 @@
 //! Facade over `ClusterKv` + `BarrierCoordinator` + membership watch.
 //! `None` on `CheckpointCoordinator` means single-instance mode.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,11 +12,12 @@ use super::barrier::{
 };
 use super::leader::leader_of;
 use super::snapshot::AssignmentSnapshotStore;
-use crate::cluster::discovery::{NodeId, NodeInfo, NodeState};
+use crate::cluster::discovery::{assignable_node_ids, NodeId, NodeInfo, NodeState};
 
 /// Facade composing the cluster-control primitives.
 pub struct ClusterController {
     instance_id: NodeId,
+    kv: Arc<dyn ClusterKv>,
     barrier: BarrierCoordinator,
     snapshot: Option<Arc<AssignmentSnapshotStore>>,
     members_rx: watch::Receiver<Vec<NodeInfo>>,
@@ -26,6 +27,12 @@ pub struct ClusterController {
     /// their local watermark so event-time decisions stay consistent
     /// across the cluster.
     cluster_min_watermark: Arc<AtomicI64>,
+    /// Set once this node begins graceful drain. While set, the node
+    /// excludes itself from [`Self::assignable_instances`] so the next
+    /// rotation sheds its vnodes elsewhere before it exits.
+    draining: Arc<AtomicBool>,
+    /// Whether this node has announced itself as Active.
+    active: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for ClusterController {
@@ -45,12 +52,18 @@ impl ClusterController {
         snapshot: Option<Arc<AssignmentSnapshotStore>>,
         members_rx: watch::Receiver<Vec<NodeInfo>>,
     ) -> Self {
+        let mut barrier = BarrierCoordinator::new(Arc::clone(&kv));
+        #[cfg(feature = "cluster")]
+        barrier.set_leader_election(instance_id, members_rx.clone());
         Self {
             instance_id,
-            barrier: BarrierCoordinator::new(kv),
+            barrier,
+            kv,
             snapshot,
             members_rx,
             cluster_min_watermark: Arc::new(AtomicI64::new(i64::MIN)),
+            draining: Arc::new(AtomicBool::new(false)),
+            active: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -104,8 +117,10 @@ impl ClusterController {
             .filter(|m| matches!(m.state, NodeState::Active))
             .map(|m| m.id)
             .collect();
-        // Include ourselves — we're trivially Active from our own view.
-        ids.push(self.instance_id);
+        // Include ourselves if we are active.
+        if self.active.load(Ordering::SeqCst) {
+            ids.push(self.instance_id);
+        }
         leader_of(&ids)
     }
 
@@ -113,6 +128,11 @@ impl ClusterController {
     #[must_use]
     pub fn is_leader(&self) -> bool {
         self.current_leader() == Some(self.instance_id)
+    }
+
+    /// Mark this node's active status.
+    pub fn set_active(&self, active: bool) {
+        self.active.store(active, Ordering::SeqCst);
     }
 
     /// Live instance IDs: `Active` peers plus self.
@@ -125,7 +145,38 @@ impl ClusterController {
             .filter(|m| matches!(m.state, NodeState::Active))
             .map(|m| m.id)
             .collect();
-        ids.push(self.instance_id);
+        if self.active.load(Ordering::SeqCst) {
+            ids.push(self.instance_id);
+        }
+        ids
+    }
+
+    /// Mark this node as draining. Idempotent.
+    pub fn begin_drain(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether this node is draining.
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
+    /// Node ids eligible to own vnodes: `Active` peers, plus self unless
+    /// this node is draining. Mirrors how [`Self::live_instances`] folds
+    /// self in, but filters non-`Active` peers (see [`assignable_node_ids`])
+    /// so Joining/Suspected/Draining/Left nodes never receive vnodes.
+    #[must_use]
+    pub fn assignable_instances(&self) -> Vec<NodeId> {
+        let mut ids = assignable_node_ids(&self.members_rx.borrow());
+        if self.active.load(Ordering::SeqCst)
+            && !self.is_draining()
+            && !self.instance_id.is_unassigned()
+        {
+            ids.push(self.instance_id);
+        }
+        ids.sort_unstable();
+        ids.dedup();
         ids
     }
 
@@ -135,6 +186,35 @@ impl ClusterController {
     #[must_use]
     pub fn members_watch(&self) -> watch::Receiver<Vec<NodeInfo>> {
         self.members_rx.clone()
+    }
+
+    /// Write the current assignment snapshot version to gossip KV.
+    pub async fn announce_snapshot_version(&self, version: u64) {
+        self.kv
+            .write("control:snapshot-version", version.to_string())
+            .await;
+    }
+
+    /// Read the snapshot version from all peers in gossip KV and return the maximum version.
+    pub async fn read_snapshot_version(&self) -> Option<u64> {
+        let scans = self.kv.scan("control:snapshot-version").await;
+        scans
+            .into_iter()
+            .filter_map(|(_, v)| v.parse::<u64>().ok())
+            .max()
+    }
+
+    /// Start the direct gRPC barrier sync server.
+    ///
+    /// # Errors
+    /// Propagates [`BarrierCoordinator::start_server`] errors.
+    #[cfg(feature = "cluster")]
+    pub async fn start_barrier_server(
+        &self,
+        bind_addr: std::net::SocketAddr,
+        advertise_host: Option<String>,
+    ) -> Result<std::net::SocketAddr, String> {
+        self.barrier.start_server(bind_addr, advertise_host).await
     }
 
     /// Leader-side announce.
@@ -250,6 +330,22 @@ mod tests {
     fn solo_instance_is_leader() {
         let c = ctl(42, vec![]);
         assert!(c.is_leader());
+    }
+
+    #[test]
+    fn assignable_instances_excludes_draining_peer_and_self_on_drain() {
+        let mut draining_peer = info(5);
+        draining_peer.state = NodeState::Draining;
+        let c = ctl(1, vec![info(3), draining_peer]);
+
+        // Active peers + self; the Draining peer is shed.
+        assert_eq!(c.assignable_instances(), vec![NodeId(1), NodeId(3)]);
+        assert!(!c.is_draining());
+
+        // After begin_drain, self drops out too.
+        c.begin_drain();
+        assert!(c.is_draining());
+        assert_eq!(c.assignable_instances(), vec![NodeId(3)]);
     }
 
     #[tokio::test]

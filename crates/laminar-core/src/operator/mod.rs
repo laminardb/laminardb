@@ -78,7 +78,6 @@ impl From<arrow_schema::ArrowError> for OperatorError {
 }
 
 pub mod sliding_window;
-pub mod table_cache;
 pub mod window;
 
 #[cfg(test)]

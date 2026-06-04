@@ -9,5 +9,5 @@ pub mod control;
 
 /// In-process harness for cluster integration tests. Gated because
 /// it pulls in chitchat on loopback UDP.
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 pub mod testing;

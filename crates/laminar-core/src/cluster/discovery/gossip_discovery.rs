@@ -5,6 +5,8 @@
 
 #![allow(clippy::disallowed_types)] // cold path: gossip discovery coordination
 use std::collections::HashMap;
+#[cfg(feature = "cluster")]
+use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,6 +57,8 @@ pub struct GossipDiscoveryConfig {
     pub node_id: NodeId,
     /// This node's info (published via chitchat keys).
     pub local_node: NodeInfo,
+    /// Optional hostname or IP to advertise.
+    pub advertise_host: Option<String>,
 }
 
 impl Default for GossipDiscoveryConfig {
@@ -76,6 +80,7 @@ impl Default for GossipDiscoveryConfig {
                 metadata: NodeMetadata::default(),
                 last_heartbeat_ms: 0,
             },
+            advertise_host: None,
         }
     }
 }
@@ -224,6 +229,7 @@ impl GossipDiscovery {
     /// Panics via `unwrap` on an internal assertion if called twice
     /// concurrently from the same `GossipDiscovery` — the `started`
     /// flag check makes the second call a no-op.
+    #[allow(clippy::too_many_lines)]
     pub async fn start_with_transport<T>(&mut self, transport: &T) -> Result<(), DiscoveryError>
     where
         T: chitchat::transport::Transport,
@@ -233,13 +239,72 @@ impl GossipDiscovery {
         }
 
         let node_id = format!("node-{}", self.config.node_id.0);
-        let gossip_addr = self
+        let gossip_addr: std::net::SocketAddr = self
             .config
             .gossip_address
             .parse()
             .map_err(|e: std::net::AddrParseError| DiscoveryError::Bind(e.to_string()))?;
 
+        let advertise_addr = if let Some(ref host) = self.config.advertise_host {
+            let mut resolved = None;
+            #[cfg(feature = "cluster")]
+            {
+                if let Ok(addrs) = (host.as_str(), gossip_addr.port()).to_socket_addrs() {
+                    for addr in addrs {
+                        if addr.ip().is_ipv4() {
+                            resolved = Some(addr);
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(addr) = resolved {
+                addr
+            } else {
+                return Err(DiscoveryError::Bind(format!(
+                    "failed to resolve configured advertise_host '{host}' (or cluster feature is disabled)"
+                )));
+            }
+        } else if gossip_addr.ip().is_unspecified() {
+            let resolved = {
+                let mut res = None;
+                #[cfg(feature = "cluster")]
+                {
+                    let hostname = gethostname::gethostname();
+                    let hostname_str = hostname.to_string_lossy();
+                    if !hostname_str.is_empty() {
+                        if let Ok(addrs) =
+                            (hostname_str.as_ref(), gossip_addr.port()).to_socket_addrs()
+                        {
+                            for addr in addrs {
+                                if addr.ip().is_ipv4() && !addr.ip().is_loopback() {
+                                    res = Some(addr);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                res
+            };
+            resolved.unwrap_or_else(|| {
+                std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    gossip_addr.port(),
+                )
+            })
+        } else {
+            gossip_addr
+        };
+
         let seed_addrs: Vec<String> = self.config.seed_nodes.clone();
+
+        tracing::info!(
+            "Starting gossip discovery: gossip_addr = {}, advertise_addr = {}, seeds = {:?}",
+            gossip_addr,
+            advertise_addr,
+            seed_addrs
+        );
 
         // Generation: wall-clock millis. A node that was previously
         // known (same `node_id`) rejoining under the same string
@@ -251,7 +316,7 @@ impl GossipDiscovery {
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
 
         let config = chitchat::ChitchatConfig {
-            chitchat_id: chitchat::ChitchatId::new(node_id, generation, gossip_addr),
+            chitchat_id: chitchat::ChitchatId::new(node_id, generation, advertise_addr),
             cluster_id: self.config.cluster_id.clone(),
             gossip_interval: self.config.gossip_interval,
             listen_addr: gossip_addr,
@@ -296,6 +361,9 @@ impl GossipDiscovery {
                         // detector so we only include reachable peers (C3 fix).
                         let live_ids: std::collections::HashSet<&chitchat::ChitchatId> =
                             chitchat_guard.live_nodes().collect();
+
+                        let nodes: Vec<_> = chitchat_guard.node_states().keys().map(|id| format!("{}(live={})", id.node_id, live_ids.contains(id))).collect();
+                        tracing::debug!("Chitchat state nodes: {:?}", nodes);
 
                         // Iterate all known nodes, tagging dead ones
                         for (cc_id, state) in chitchat_guard.node_states() {

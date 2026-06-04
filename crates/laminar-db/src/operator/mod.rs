@@ -117,6 +117,7 @@ pub(crate) mod ai_inference;
 pub(crate) mod asof_join;
 pub(crate) mod eowc_query;
 pub(crate) mod interval_join;
+pub(crate) mod lookup_enrich;
 pub(crate) mod process_time_join;
 pub(crate) mod sql_query;
 pub(crate) mod temporal_filter;
@@ -166,14 +167,23 @@ fn apply_compiled_post_projection(
         .map_err(|e| DbError::Pipeline(format!("post-projection batch: {e}")))
 }
 
+/// Lazily populated caches for the post-projection step. The compiled
+/// `PhysicalExpr` path is preferred; if it can't be built we fall back to a
+/// [`LiveSqlCache`] (built once, re-used every cycle) rather than re-planning.
+#[derive(Default)]
+pub(crate) struct PostProjectionCache {
+    compiled: Option<CompiledPostProjection>,
+    compile_failed: bool,
+    sql_cache: Option<LiveSqlCache>,
+}
+
 /// Post-projection state shared by the four join operators.
 pub(crate) struct ProjectingJoinState {
     pub(crate) op_name: Arc<str>,
     ctx: SessionContext,
     projection_sql: Option<Arc<str>>,
     tmp_table_name: &'static str,
-    compiled: Option<CompiledPostProjection>,
-    compile_failed: bool,
+    cache: PostProjectionCache,
 }
 
 impl ProjectingJoinState {
@@ -188,8 +198,7 @@ impl ProjectingJoinState {
             ctx,
             projection_sql,
             tmp_table_name,
-            compiled: None,
-            compile_failed: false,
+            cache: PostProjectionCache::default(),
         }
     }
 
@@ -202,8 +211,7 @@ impl ProjectingJoinState {
             &self.op_name,
             self.tmp_table_name,
             self.projection_sql.as_deref(),
-            &mut self.compiled,
-            &mut self.compile_failed,
+            &mut self.cache,
             batches,
         )
         .await
@@ -215,8 +223,7 @@ pub(crate) async fn apply_post_projection(
     op_name: &str,
     tmp_table_name: &str,
     proj_sql: Option<&str>,
-    compiled: &mut Option<CompiledPostProjection>,
-    compile_failed: &mut bool,
+    cache: &mut PostProjectionCache,
     batches: Vec<RecordBatch>,
 ) -> Result<Vec<RecordBatch>, DbError> {
     let Some(proj_sql) = proj_sql else {
@@ -228,15 +235,15 @@ pub(crate) async fn apply_post_projection(
     }
 
     // Try compiled path
-    if compiled.is_none() && !*compile_failed {
+    if cache.compiled.is_none() && !cache.compile_failed {
         let schema = batches[0].schema();
         match try_compile_post_projection(ctx, proj_sql, tmp_table_name, &schema).await {
-            Some(c) => *compiled = Some(c),
-            None => *compile_failed = true,
+            Some(c) => cache.compiled = Some(c),
+            None => cache.compile_failed = true,
         }
     }
 
-    if let Some(ref proj) = compiled {
+    if let Some(ref proj) = cache.compiled {
         let mut result = Vec::with_capacity(batches.len());
         for batch in &batches {
             let projected = apply_compiled_post_projection(proj, batch)?;
@@ -247,23 +254,20 @@ pub(crate) async fn apply_post_projection(
         return Ok(result);
     }
 
-    // SQL fallback
-    let schema = batches[0].schema();
-    let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![batches])
-        .map_err(|e| DbError::query_pipeline(op_name, &e))?;
-
-    let _ = ctx.deregister_table(tmp_table_name);
-    ctx.register_table(tmp_table_name, Arc::new(mem_table))
-        .map_err(|e| DbError::query_pipeline(op_name, &e))?;
-
-    let result = ctx
-        .sql(proj_sql)
+    // SQL fallback: build a `LiveSqlCache` once (registers a
+    // `LiveSourceProvider` under `tmp_table_name`, plans `proj_sql`, and
+    // caches the physical plan), then re-use it every cycle by swapping in
+    // fresh batches — avoids re-registering a `MemTable` and re-planning on
+    // each call.
+    if cache.sql_cache.is_none() {
+        let schema = batches[0].schema();
+        cache.sql_cache =
+            Some(LiveSqlCache::build(ctx, tmp_table_name, schema, proj_sql, op_name).await?);
+    }
+    cache
+        .sql_cache
+        .as_ref()
+        .expect("sql_cache built above")
+        .apply(ctx, op_name, batches)
         .await
-        .map_err(|e| DbError::query_pipeline(op_name, &e))?
-        .collect()
-        .await
-        .map_err(|e| DbError::query_pipeline(op_name, &e))?;
-
-    let _ = ctx.deregister_table(tmp_table_name);
-    Ok(result)
 }

@@ -1,7 +1,7 @@
 //! End-to-end routing test: rows destined for remote vnodes leave via
 //! `ShuffleSender`; local vnodes land on the matching output partition.
 
-#![cfg(feature = "cluster-unstable")]
+#![cfg(feature = "cluster")]
 #![allow(clippy::disallowed_types)]
 
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionConfig;
 use futures::StreamExt;
 use laminar_core::shuffle::{ShuffleReceiver, ShuffleSender};
-use laminar_core::state::{round_robin_assignment, NodeId, VnodeRegistry};
+use laminar_core::state::{rendezvous_assignment, NodeId, VnodeRegistry};
 use laminar_sql::datafusion::cluster_repartition::ClusterRepartitionExec;
 
 fn schema() -> Arc<Schema> {
@@ -53,7 +53,7 @@ async fn phase_a_routes_rows_to_owning_instance() {
     // hash to even index after sort, B owns the odds.
     let registry = Arc::new(VnodeRegistry::new(4));
     let peers = [NodeId(1), NodeId(2)];
-    registry.set_assignment(round_robin_assignment(4, &peers));
+    registry.set_assignment(rendezvous_assignment(4, &peers));
 
     // Wire the shuffle fabric: A has a sender targeting B's receiver,
     // and its own receiver that B would send to. Loopback TCP.
@@ -109,7 +109,7 @@ async fn phase_a_routes_rows_to_owning_instance() {
     let mut b_keys: Vec<i64> = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
     while let Ok(Some((_from, msg))) = tokio::time::timeout_at(deadline, recv_b.recv()).await {
-        if let laminar_core::shuffle::ShuffleMessage::VnodeData(_vnode, b) = msg {
+        if let laminar_core::shuffle::ShuffleMessage::VnodeData(_stage, _vnode, b) = msg {
             let col = b.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
             b_keys.extend(col.values().iter().copied());
         }

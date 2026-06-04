@@ -1,7 +1,7 @@
 //! Unified recovery manager.
 //!
 //! Single recovery path that loads a
-//! [`CheckpointManifest`](laminar_storage::checkpoint_manifest::CheckpointManifest) and restores
+//! [`CheckpointManifest`](laminar_core::storage::checkpoint_manifest::CheckpointManifest) and restores
 //! ALL state: source offsets, sink epochs, operator states, table offsets,
 //! and watermarks.
 //!
@@ -25,9 +25,11 @@
 
 use std::collections::HashMap;
 
-use laminar_storage::checkpoint_manifest::{CheckpointManifest, SinkCommitStatus};
-use laminar_storage::checkpoint_store::CheckpointStore;
-use laminar_storage::ValidationResult;
+use bytes::Bytes;
+use laminar_core::state::StateBackend;
+use laminar_core::storage::checkpoint_manifest::{CheckpointManifest, SinkCommitStatus};
+use laminar_core::storage::checkpoint_store::CheckpointStore;
+use laminar_core::storage::ValidationResult;
 use tracing::{debug, error, info, warn};
 
 use crate::checkpoint_coordinator::{
@@ -75,7 +77,7 @@ impl RecoveredState {
     #[must_use]
     pub fn operator_states(
         &self,
-    ) -> &HashMap<String, laminar_storage::checkpoint_manifest::OperatorCheckpoint> {
+    ) -> &HashMap<String, laminar_core::storage::checkpoint_manifest::OperatorCheckpoint> {
         &self.manifest.operator_states
     }
 
@@ -83,6 +85,139 @@ impl RecoveredState {
     #[must_use]
     pub fn table_store_checkpoint_path(&self) -> Option<&str> {
         self.manifest.table_store_checkpoint_path.as_deref()
+    }
+}
+
+/// Outcome of rehydrating a set of vnodes from durable state.
+///
+/// Best-effort by construction: a per-vnode read failure is recorded in
+/// [`errors`](Self::errors) rather than aborting the others, so a single
+/// transient object-store hiccup can't strand an entire rebalance.
+#[derive(Debug, Default)]
+pub struct VnodeRehydration {
+    /// Committed epoch the partials were read from. `None` when the
+    /// backend reported no committed epoch (every requested vnode is
+    /// treated as a fresh start).
+    pub epoch: Option<u64>,
+    /// vnode → restored partial bytes, for vnodes that had durable state
+    /// at [`epoch`](Self::epoch).
+    pub restored: HashMap<u32, Bytes>,
+    /// Requested vnodes with no durable partial — never written, or
+    /// pruned below the committed epoch. These resume from empty state.
+    pub missing: Vec<u32>,
+    /// vnode → error message for reads that failed.
+    pub errors: HashMap<u32, String>,
+}
+
+impl VnodeRehydration {
+    /// Number of vnodes whose state was successfully read back.
+    #[must_use]
+    pub fn restored_count(&self) -> usize {
+        self.restored.len()
+    }
+
+    /// Whether any per-vnode read failed.
+    #[must_use]
+    pub fn has_errors(&self) -> bool {
+        !self.errors.is_empty()
+    }
+}
+
+/// Reads committed per-vnode partial state from a durable
+/// [`StateBackend`] so a node that newly acquires vnodes during a
+/// rebalance resumes from the last committed epoch instead of empty
+/// state.
+///
+/// This is the read half of the rehydration life cycle: it resolves the
+/// highest committed epoch once via
+/// [`StateBackend::latest_committed_epoch`] and pulls each vnode's
+/// `partial.bin` at that epoch. Applying the bytes into live operators is
+/// the caller's responsibility (operators that adopt the per-vnode state
+/// backend consume the staged blobs on their next cycle).
+pub struct VnodeRehydrator<'a> {
+    backend: &'a dyn StateBackend,
+}
+
+impl<'a> VnodeRehydrator<'a> {
+    /// Wrap the durable backend the partials live on.
+    #[must_use]
+    pub fn new(backend: &'a dyn StateBackend) -> Self {
+        Self { backend }
+    }
+
+    /// Read the latest committed partial for each vnode in `vnodes`.
+    ///
+    /// Resolves the highest committed epoch once, then reads each
+    /// vnode's `partial.bin` at that epoch. Best-effort: a read failure
+    /// for one vnode is recorded in [`VnodeRehydration::errors`] and does
+    /// not abort the rest. Returns an empty report (with `epoch = None`,
+    /// every vnode in `missing`) when the store has no committed epoch.
+    pub async fn rehydrate(&self, vnodes: &[u32]) -> VnodeRehydration {
+        let mut report = VnodeRehydration::default();
+        if vnodes.is_empty() {
+            return report;
+        }
+
+        let epoch = match self.backend.latest_committed_epoch().await {
+            Ok(Some(epoch)) => epoch,
+            Ok(None) => {
+                debug!(
+                    vnodes = ?vnodes,
+                    "rehydrate: no committed epoch on backend — vnodes start fresh"
+                );
+                report.missing = vnodes.to_vec();
+                return report;
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "[LDB-6050] rehydrate: latest_committed_epoch failed — \
+                     vnodes start fresh"
+                );
+                report.missing = vnodes.to_vec();
+                return report;
+            }
+        };
+        report.epoch = Some(epoch);
+
+        for &vnode in vnodes {
+            match self.backend.read_partial(vnode, epoch).await {
+                Ok(Some(bytes)) => {
+                    debug!(
+                        vnode,
+                        epoch,
+                        bytes = bytes.len(),
+                        "rehydrated vnode partial"
+                    );
+                    report.restored.insert(vnode, bytes);
+                }
+                Ok(None) => {
+                    debug!(
+                        vnode,
+                        epoch, "rehydrate: no partial for vnode at committed epoch"
+                    );
+                    report.missing.push(vnode);
+                }
+                Err(e) => {
+                    warn!(
+                        vnode,
+                        epoch,
+                        error = %e,
+                        "[LDB-6051] rehydrate: read_partial failed — vnode starts fresh"
+                    );
+                    report.errors.insert(vnode, e.to_string());
+                }
+            }
+        }
+
+        info!(
+            epoch,
+            restored = report.restored.len(),
+            missing = report.missing.len(),
+            errors = report.errors.len(),
+            "vnode rehydration complete"
+        );
+        report
     }
 }
 
@@ -283,7 +418,10 @@ impl<'a> RecoveryManager<'a> {
                 // dereference invalid offsets later
                 for name in &external_ops {
                     if let Some(op) = manifest.operator_states.get_mut(name) {
-                        *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
+                        *op =
+                            laminar_core::storage::checkpoint_manifest::OperatorCheckpoint::inline(
+                                &[],
+                            );
                     }
                 }
                 return false;
@@ -298,7 +436,10 @@ impl<'a> RecoveryManager<'a> {
                 );
                 for name in &external_ops {
                     if let Some(op) = manifest.operator_states.get_mut(name) {
-                        *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
+                        *op =
+                            laminar_core::storage::checkpoint_manifest::OperatorCheckpoint::inline(
+                                &[],
+                            );
                     }
                 }
                 return false;
@@ -323,7 +464,9 @@ impl<'a> RecoveryManager<'a> {
                     let external_offset = op.external_offset;
                     let external_length = op.external_length;
                     let data = &state_data[start..end];
-                    *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(data);
+                    *op = laminar_core::storage::checkpoint_manifest::OperatorCheckpoint::inline(
+                        data,
+                    );
                     debug!(
                         operator = %name,
                         offset = external_offset,
@@ -340,7 +483,8 @@ impl<'a> RecoveryManager<'a> {
                          range for external operator state — operator will \
                          start with empty state"
                     );
-                    *op = laminar_storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
+                    *op =
+                        laminar_core::storage::checkpoint_manifest::OperatorCheckpoint::inline(&[]);
                     all_resolved = false;
                 }
             }
@@ -376,7 +520,7 @@ impl<'a> RecoveryManager<'a> {
         // `DEFAULT_VNODE_COUNT` is a placeholder; the runtime
         // `VnodeRegistry` value is not threaded through recovery yet.
         let validation_errors =
-            manifest.validate(laminar_storage::checkpoint_manifest::DEFAULT_VNODE_COUNT);
+            manifest.validate(laminar_core::storage::checkpoint_manifest::DEFAULT_VNODE_COUNT);
         if !validation_errors.is_empty() {
             for err in &validation_errors {
                 warn!(
@@ -693,8 +837,8 @@ impl<'a> RecoveryManager<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use laminar_storage::checkpoint_manifest::OperatorCheckpoint;
-    use laminar_storage::checkpoint_store::FileSystemCheckpointStore;
+    use laminar_core::storage::checkpoint_manifest::OperatorCheckpoint;
+    use laminar_core::storage::checkpoint_store::FileSystemCheckpointStore;
 
     fn make_store(dir: &std::path::Path) -> FileSystemCheckpointStore {
         FileSystemCheckpointStore::new(dir, 3)
@@ -1067,6 +1211,91 @@ mod tests {
         assert!(
             result.is_none(),
             "should start fresh when all checkpoints have pending sinks"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rehydration_tests {
+    use super::*;
+    use bytes::Bytes;
+    use laminar_core::state::{InProcessBackend, ObjectStoreBackend};
+
+    async fn seal_epoch(backend: &dyn StateBackend, epoch: u64, vnodes: &[u32], tag: &[u8]) {
+        for &v in vnodes {
+            backend
+                .write_partial(v, epoch, 0, Bytes::copy_from_slice(tag))
+                .await
+                .unwrap();
+        }
+        assert!(backend.epoch_complete(epoch, vnodes).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn rehydrate_reads_committed_partials() {
+        let backend = InProcessBackend::new(4);
+        seal_epoch(&backend, 7, &[0, 1, 2], b"v7").await;
+
+        let report = VnodeRehydrator::new(&backend).rehydrate(&[0, 1, 3]).await;
+
+        assert_eq!(report.epoch, Some(7));
+        assert_eq!(report.restored_count(), 2);
+        assert_eq!(report.restored.get(&0).map(|b| &b[..]), Some(&b"v7"[..]));
+        assert_eq!(report.restored.get(&1).map(|b| &b[..]), Some(&b"v7"[..]));
+        // vnode 3 was never written — fresh start, no error.
+        assert_eq!(report.missing, vec![3]);
+        assert!(!report.has_errors());
+    }
+
+    #[tokio::test]
+    async fn rehydrate_reads_latest_committed_epoch() {
+        let backend = InProcessBackend::new(4);
+        seal_epoch(&backend, 3, &[0, 1], b"old").await;
+        seal_epoch(&backend, 9, &[0, 1], b"new").await;
+
+        let report = VnodeRehydrator::new(&backend).rehydrate(&[0, 1]).await;
+
+        assert_eq!(report.epoch, Some(9), "must read the highest sealed epoch");
+        assert_eq!(report.restored.get(&0).map(|b| &b[..]), Some(&b"new"[..]));
+    }
+
+    #[tokio::test]
+    async fn rehydrate_no_committed_epoch_is_fresh() {
+        let backend = InProcessBackend::new(4);
+        let report = VnodeRehydrator::new(&backend).rehydrate(&[0, 1]).await;
+        assert_eq!(report.epoch, None);
+        assert!(report.restored.is_empty());
+        assert_eq!(report.missing, vec![0, 1]);
+    }
+
+    #[tokio::test]
+    async fn rehydrate_empty_request_is_noop() {
+        let backend = InProcessBackend::new(4);
+        seal_epoch(&backend, 1, &[0], b"x").await;
+        let report = VnodeRehydrator::new(&backend).rehydrate(&[]).await;
+        assert_eq!(report.epoch, None);
+        assert!(report.restored.is_empty());
+        assert!(report.missing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rehydrate_over_object_store_backend() {
+        use object_store::local::LocalFileSystem;
+        use object_store::ObjectStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store: std::sync::Arc<dyn ObjectStore> =
+            std::sync::Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let backend = ObjectStoreBackend::new(store, "node-0", 4);
+        seal_epoch(&backend, 5, &[0, 1], b"durable").await;
+
+        let report = VnodeRehydrator::new(&backend).rehydrate(&[0, 1]).await;
+
+        assert_eq!(report.epoch, Some(5));
+        assert_eq!(report.restored_count(), 2);
+        assert_eq!(
+            report.restored.get(&1).map(|b| &b[..]),
+            Some(&b"durable"[..])
         );
     }
 }

@@ -65,7 +65,7 @@ impl AssignmentSnapshot {
 
     /// Convert a `Vec<NodeId>` (one entry per vnode id, dense) into the
     /// `BTreeMap` shape this snapshot uses. Mirrors the layout returned
-    /// by `round_robin_assignment`.
+    /// by `rendezvous_assignment`.
     #[must_use]
     pub fn vnodes_from_vec(assignment: &[NodeId]) -> BTreeMap<u32, NodeId> {
         #[allow(clippy::cast_possible_truncation)]

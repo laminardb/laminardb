@@ -178,6 +178,13 @@ impl LaminarDB {
             }
         }
 
+        // Rebuild any catalog objects this node lacks from the shared manifest
+        // before wiring the pipeline — replaying DDL here is the same pre-start
+        // path users take when they CREATE before start(). Best-effort/no-op
+        // outside cluster mode or with no manifest stored.
+        #[cfg(feature = "cluster")]
+        self.restore_catalog_from_manifest().await;
+
         match self.start_inner().await {
             Ok(()) => {
                 DbState::Running.store(&self.state);
@@ -222,7 +229,7 @@ impl LaminarDB {
 
             let max_retained = cp_config.max_retained.unwrap_or(3);
             let vnode_count = self.vnode_registry.lock().as_ref().map_or(
-                laminar_storage::checkpoint_manifest::DEFAULT_VNODE_COUNT,
+                laminar_core::storage::checkpoint_manifest::DEFAULT_VNODE_COUNT,
                 |r| u16::try_from(r.vnode_count()).unwrap_or(u16::MAX),
             );
 
@@ -235,16 +242,16 @@ impl LaminarDB {
                 .unwrap_or_else(|| std::path::PathBuf::from("./data"));
 
             let (store, decision_backing): (
-                Box<dyn laminar_storage::CheckpointStore>,
+                Box<dyn laminar_core::storage::CheckpointStore>,
                 Arc<dyn object_store::ObjectStore>,
             ) = if let Some(ref url) = self.config.object_store_url {
-                let obj = laminar_storage::object_store_builder::build_object_store(
+                let obj = laminar_core::storage::object_store_builder::build_object_store(
                     url,
                     &self.config.object_store_options,
                 )
                 .map_err(|e| DbError::Config(format!("object store: {e}")))?;
                 let prefix = url_to_checkpoint_prefix(url);
-                let cs = laminar_storage::checkpoint_store::ObjectStoreCheckpointStore::new(
+                let cs = laminar_core::storage::checkpoint_store::ObjectStoreCheckpointStore::new(
                     Arc::clone(&obj),
                     prefix,
                     max_retained,
@@ -259,7 +266,7 @@ impl LaminarDB {
                     object_store::local::LocalFileSystem::new_with_prefix(&data_dir)
                         .map_err(|e| DbError::Config(format!("local fs: {e}")))?,
                 );
-                let cs = laminar_storage::checkpoint_store::FileSystemCheckpointStore::new(
+                let cs = laminar_core::storage::checkpoint_store::FileSystemCheckpointStore::new(
                     &data_dir,
                     max_retained,
                 )
@@ -280,7 +287,7 @@ impl LaminarDB {
             // Cluster mode: install the controller so the coordinator
             // can consult it for leader / follower role once the
             // barrier-protocol flow change lands.
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             if let Some(controller) = self.cluster_controller.lock().clone() {
                 coord.set_cluster_controller(controller);
             }
@@ -295,7 +302,7 @@ impl LaminarDB {
                 self.vnode_registry.lock().clone(),
             ) {
                 let owner = {
-                    #[cfg(feature = "cluster-unstable")]
+                    #[cfg(feature = "cluster")]
                     {
                         self.cluster_controller
                             .lock()
@@ -304,7 +311,7 @@ impl LaminarDB {
                                 laminar_core::state::NodeId(c.instance_id().0)
                             })
                     }
-                    #[cfg(not(feature = "cluster-unstable"))]
+                    #[cfg(not(feature = "cluster"))]
                     {
                         laminar_core::state::NodeId(0)
                     }
@@ -332,7 +339,7 @@ impl LaminarDB {
             // auto-wire one on the same backing so recovery can read
             // the commit marker.
             let ds = {
-                #[cfg(feature = "cluster-unstable")]
+                #[cfg(feature = "cluster")]
                 {
                     self.decision_store.lock().clone().unwrap_or_else(|| {
                         Arc::new(
@@ -342,7 +349,7 @@ impl LaminarDB {
                         )
                     })
                 }
-                #[cfg(not(feature = "cluster-unstable"))]
+                #[cfg(not(feature = "cluster"))]
                 {
                     Arc::new(
                         laminar_core::checkpoint_decision::CheckpointDecisionStore::new(
@@ -422,13 +429,20 @@ impl LaminarDB {
             if let Some(n) = self.pipeline_target_partitions {
                 session_config = session_config.with_target_partitions(n);
             }
+            let query_planner = Arc::clone(self.ctx.state().query_planner());
             let mut state_builder = SessionStateBuilder::new()
                 .with_config(session_config)
-                .with_default_features();
+                .with_default_features()
+                .with_query_planner(query_planner);
             for rule in self.physical_optimizer_rules.iter() {
                 state_builder = state_builder.with_physical_optimizer_rule(Arc::clone(rule));
             }
-            datafusion::prelude::SessionContext::new_with_state(state_builder.build())
+            let context =
+                datafusion::prelude::SessionContext::new_with_state(state_builder.build());
+            for rule in self.ctx.state().optimizers() {
+                context.add_optimizer_rule(Arc::clone(rule));
+            }
+            context
         };
         laminar_sql::register_streaming_functions(&ctx);
 
@@ -472,7 +486,7 @@ impl LaminarDB {
         // Install the cluster row-shuffle config if all the pieces are
         // present (registry, sender, receiver, controller). Without any
         // one of them, aggregate queries run single-node.
-        #[cfg(feature = "cluster-unstable")]
+        #[cfg(feature = "cluster")]
         {
             let sender = self.shuffle_sender.lock().clone();
             let receiver = self.shuffle_receiver.lock().clone();
@@ -488,6 +502,9 @@ impl LaminarDB {
                     receiver,
                     self_id,
                 });
+                // Share the DB's staged rehydration map so the graph applies
+                // rebalanced-in vnode state into operators each cycle.
+                graph.set_rehydration_handle(Arc::clone(&self.rehydrated_vnode_state));
             }
         }
 
@@ -499,6 +516,28 @@ impl LaminarDB {
                 graph.register_source_schema(name.clone(), entry.schema.clone());
             }
         }
+
+        // Partial (on-demand) lookup tables: route their enrichment joins to the
+        // async-decoupled operator. A table is partial iff it refreshes Manually
+        // — the same condition the on-demand phase below uses to register it as
+        // `RegisteredLookup::Partial`. Map each to its column names so the
+        // operator can disambiguate colliding output columns.
+        let partial_lookup_tables: rustc_hash::FxHashMap<String, Vec<String>> = table_regs
+            .values()
+            .filter(|r| matches!(r.refresh, Some(RefreshMode::Manual)))
+            .filter_map(|r| {
+                let schema = self.table_store.read().table_schema(&r.name)?;
+                let cols = schema.fields().iter().map(|f| f.name().clone()).collect();
+                Some((r.name.clone(), cols))
+            })
+            .collect();
+        graph.set_partial_lookup_tables(partial_lookup_tables);
+        // Ring-1 workers (lookup-enrich fetch, AI) spawn on the main runtime.
+        graph.set_runtime_handle(
+            self.ai_handle
+                .clone()
+                .unwrap_or_else(tokio::runtime::Handle::current),
+        );
 
         for reg in stream_regs.values() {
             graph.add_query(
@@ -630,7 +669,8 @@ impl LaminarDB {
                 config.set("_arrow_schema".to_string(), schema_str);
             }
 
-            let source = self
+            #[cfg_attr(not(feature = "cluster"), allow(unused_mut))]
+            let mut source = self
                 .connector_registry
                 .create_source(&config, prom_registry.as_deref())
                 .map_err(|e| {
@@ -640,6 +680,19 @@ impl LaminarDB {
                         config.connector_type()
                     ))
                 })?;
+            // Cluster mode: hand the source the vnode topology so a partitioned
+            // source (Kafka) consumes only the partitions this node owns and
+            // re-binds on rotation. No-op for non-partitioned sources.
+            #[cfg(feature = "cluster")]
+            if let (Some(registry), Some(self_id)) = (
+                self.vnode_registry.lock().clone(),
+                self.cluster_controller
+                    .lock()
+                    .as_ref()
+                    .map(|c| laminar_core::state::NodeId(c.instance_id().0)),
+            ) {
+                source.set_vnode_assignment(registry, self_id);
+            }
             let supports_replay = source.supports_replay();
             if !supports_replay {
                 tracing::warn!(
@@ -948,14 +1001,14 @@ impl LaminarDB {
                         let op_keys: Vec<&String> =
                             recovered.manifest.operator_states.keys().collect();
                         let instance_hint = {
-                            #[cfg(feature = "cluster-unstable")]
+                            #[cfg(feature = "cluster")]
                             {
                                 self.cluster_controller
                                     .lock()
                                     .as_ref()
                                     .map_or(0, |c| c.instance_id().0)
                             }
-                            #[cfg(not(feature = "cluster-unstable"))]
+                            #[cfg(not(feature = "cluster"))]
                             {
                                 0u64
                             }
@@ -1088,13 +1141,8 @@ impl LaminarDB {
             ) {
                 // Already versioned — don't downgrade to Snapshot.
             } else if let Some(batch) = self.table_store.read().to_record_batch(name) {
-                self.lookup_registry.register(
-                    name,
-                    laminar_sql::datafusion::LookupSnapshot {
-                        batch,
-                        key_columns: vec![], // already indexed by primary key
-                    },
-                );
+                self.lookup_registry
+                    .register(name, laminar_sql::datafusion::LookupSnapshot { batch });
             }
         }
 
@@ -1108,7 +1156,8 @@ impl LaminarDB {
             let Some(reg) = table_regs.get(name.as_str()) else {
                 continue;
             };
-            let max_entries = reg.cache_max_entries.unwrap_or(65_536);
+            // 64 MiB default budget; the cache is byte-weighted, not entry-counted.
+            let capacity_bytes = reg.cache_max_bytes.unwrap_or(64 * 1024 * 1024);
             let Some(schema) = self.table_store.read().table_schema(name) else {
                 continue;
             };
@@ -1131,15 +1180,20 @@ impl LaminarDB {
             let cache = Arc::new(laminar_core::lookup::foyer_cache::FoyerMemoryCache::new(
                 0,
                 laminar_core::lookup::foyer_cache::FoyerMemoryCacheConfig {
-                    capacity: max_entries,
+                    capacity_bytes,
                     shards: 16,
+                    ttl: reg.cache_ttl,
                 },
             ));
             // Try to create a lookup source for cache-miss fallback via
             // the registry factory (no cross-crate type dependency).
             let lookup_source = if let Ok(mut config) = build_table_config(reg) {
                 config.set("_primary_key_columns", pk_csv.as_str());
-                match self.connector_registry.create_lookup_source(config).await {
+                match self
+                    .connector_registry
+                    .create_lookup_source(config, Some(Arc::clone(&schema)))
+                    .await
+                {
                     Some(Ok(src)) => Some(src),
                     Some(Err(e)) => {
                         tracing::warn!(
@@ -1154,6 +1208,15 @@ impl LaminarDB {
                 None
             };
 
+            // Projection pushdown: fetch only the columns any query references
+            // (a per-table superset, since the cache is shared), plus the key.
+            let projection = crate::sql_analysis::compute_lookup_projection(
+                &schema,
+                &pk_cols,
+                name.as_str(),
+                stream_regs.values().map(|r| r.query_sql.as_str()),
+            );
+
             self.lookup_registry.register_partial(
                 name,
                 laminar_sql::datafusion::PartialLookupState {
@@ -1163,12 +1226,14 @@ impl LaminarDB {
                     key_sort_fields,
                     source: lookup_source,
                     fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(16)),
+                    projection,
                 },
             );
             *mode = RefreshMode::SnapshotPlusCdc;
             tracing::info!(
                 table = %name,
-                max_entries,
+                capacity_bytes,
+                ttl = ?reg.cache_ttl,
                 pk = %pk_csv,
                 "registered on-demand lookup table (partial cache)"
             );
@@ -1562,10 +1627,14 @@ impl LaminarDB {
             sink_event_rx,
             sink_timed_out: false,
             shutdown_signal: Arc::clone(&self.shutdown_signal),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             cluster_controller: self.cluster_controller.lock().clone(),
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             last_follower_epoch: None,
+            #[cfg(feature = "cluster")]
+            barrier_injectors: Vec::new(),
+            #[cfg(feature = "cluster")]
+            pending_follower_checkpoint: None,
             force_ckpt_rx: Some(force_ckpt_rx),
             subscription_registry: Arc::clone(&self.subscription_registry),
         };

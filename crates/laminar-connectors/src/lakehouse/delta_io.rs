@@ -326,6 +326,18 @@ pub async fn get_last_committed_epoch(table: &DeltaTable, writer_id: &str) -> u6
     }
 }
 
+/// Returns the table's partition columns, or an empty list if the snapshot is
+/// unavailable. Best-effort: used for clustering diagnostics, never for
+/// correctness, so a missing snapshot is not an error.
+#[cfg(feature = "delta-lake")]
+#[must_use]
+pub fn get_partition_columns(table: &DeltaTable) -> Vec<String> {
+    match table.snapshot() {
+        Ok(snapshot) => snapshot.snapshot().metadata().partition_columns().clone(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Extracts the Arrow schema from a Delta Lake table.
 ///
 /// # Arguments

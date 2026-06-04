@@ -37,7 +37,7 @@ use rustc_hash::FxHashMap;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
-use laminar_ai::{
+use crate::ai::{
     content_hash, params_version, AiCacheKey, AiCallLog, AiResultCache, BackendKind, CachedOutput,
     InferenceParams, InferenceProvider, Task,
 };
@@ -529,8 +529,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
+    use crate::ai::{InferenceOutputs, InferenceRequest, InferenceResponse, ProviderError, Usage};
     use async_trait::async_trait;
-    use laminar_ai::{InferenceOutputs, InferenceRequest, InferenceResponse, ProviderError, Usage};
     use tokio::runtime::Handle;
 
     /// Provider that sleeps then echoes `L:<input>` for each row.

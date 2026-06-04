@@ -41,9 +41,15 @@ pub type TableSourceFactory = Arc<
 #[async_trait]
 pub trait LookupSourceFactory: Send + Sync {
     /// Build a lookup source instance from the given config.
+    ///
+    /// `declared_schema` is the table's declared Arrow schema (from the
+    /// `CREATE LOOKUP TABLE` columns), when known. Schema-bearing sources
+    /// (Delta/Iceberg/Postgres) derive their own and ignore it; schemaless
+    /// sources (`MongoDB`) need it to project documents into typed columns.
     async fn build(
         &self,
         config: ConnectorConfig,
+        declared_schema: Option<arrow_schema::SchemaRef>,
     ) -> Result<Arc<dyn laminar_core::lookup::source::LookupSourceDyn>, ConnectorError>;
 }
 
@@ -231,13 +237,14 @@ impl ConnectorRegistry {
     pub async fn create_lookup_source(
         &self,
         config: ConnectorConfig,
+        declared_schema: Option<arrow_schema::SchemaRef>,
     ) -> Option<Result<Arc<dyn laminar_core::lookup::source::LookupSourceDyn>, ConnectorError>>
     {
         let factory = {
             let lookup_sources = self.lookup_sources.read();
             Arc::clone(lookup_sources.get(config.connector_type())?)
         };
-        Some(factory.build(config).await)
+        Some(factory.build(config, declared_schema).await)
     }
 
     /// Returns information about a registered source connector.

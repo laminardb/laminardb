@@ -9,7 +9,7 @@ use tracing::info;
 use laminar_core::streaming::checkpoint::StreamCheckpointConfig;
 use laminar_db::{DbError, EngineMetrics, LaminarDB, Profile};
 
-#[cfg(feature = "cluster-unstable")]
+#[cfg(feature = "cluster")]
 use crate::cluster_config::{ClusterConfig, ClusterConfigError};
 use crate::config::{
     ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
@@ -28,7 +28,7 @@ pub enum ServerHandle {
         pgwire_handle: Option<tokio::task::JoinHandle<()>>,
         watcher_handle: Option<tokio::task::JoinHandle<()>>,
     },
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     Cluster(Box<crate::cluster::ClusterHandle>),
 }
 
@@ -60,7 +60,7 @@ impl ServerHandle {
                 info!("Shutdown complete");
                 Ok(())
             }
-            #[cfg(feature = "cluster-unstable")]
+            #[cfg(feature = "cluster")]
             Self::Cluster(handle) => (*handle)
                 .wait_for_shutdown()
                 .await
@@ -97,8 +97,8 @@ pub async fn run_server(
     config: ServerConfig,
     config_path: PathBuf,
 ) -> Result<ServerHandle, ServerError> {
-    // Cluster mode: gated behind the `cluster-unstable` feature flag.
-    #[cfg(feature = "cluster-unstable")]
+    // Cluster mode: gated behind the `cluster` feature flag.
+    #[cfg(feature = "cluster")]
     {
         let cluster_cfg = ClusterConfig::from_server_config(&config)?;
 
@@ -109,10 +109,10 @@ pub async fn run_server(
             return Ok(ServerHandle::Cluster(Box::new(handle)));
         }
     }
-    #[cfg(not(feature = "cluster-unstable"))]
+    #[cfg(not(feature = "cluster"))]
     if config.server.mode == "cluster" {
         return Err(ServerError::Cluster(
-            "Cluster mode requires the 'cluster-unstable' feature flag. \
+            "Cluster mode requires the 'cluster' feature flag. \
              This mode is not yet production-ready."
                 .to_string(),
         ));
@@ -536,11 +536,14 @@ pub fn lookup_to_ddl(lookup: &LookupConfig) -> Result<String, ServerError> {
     let mut opts = Vec::new();
     opts.push(format!("'connector' = '{}'", lookup.connector));
     opts.push(format!("'strategy' = '{}'", lookup.strategy));
+    // Note: the lookup-table parser keys cache options on the dotted form
+    // (`cache.memory` / `cache.ttl`); emitting `cache_memory` / `cache_ttl`
+    // here would be silently ignored by validate_properties.
     if lookup.cache.size_bytes != 100 * 1024 * 1024 {
-        opts.push(format!("'cache_memory' = '{}'", lookup.cache.size_bytes));
+        opts.push(format!("'cache.memory' = '{}'", lookup.cache.size_bytes));
     }
     if lookup.cache.ttl.as_secs() != 300 {
-        opts.push(format!("'cache_ttl' = '{}'", lookup.cache.ttl.as_secs()));
+        opts.push(format!("'cache.ttl' = '{}'", lookup.cache.ttl.as_secs()));
     }
     for (key, value) in &lookup.properties {
         opts.push(format!("'{}' = '{}'", key, toml_value_to_sql(value)));
@@ -586,7 +589,7 @@ pub enum ServerError {
     Config(#[from] ConfigError),
     #[error("cluster mode error: {0}")]
     Cluster(String),
-    #[cfg(feature = "cluster-unstable")]
+    #[cfg(feature = "cluster")]
     #[error(transparent)]
     ClusterConfig(#[from] ClusterConfigError),
 }

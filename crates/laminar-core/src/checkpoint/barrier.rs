@@ -151,7 +151,7 @@ pub struct CheckpointBarrierInjector {
     /// Packed command: 0 = no pending, otherwise (`checkpoint_id` << 32 | flags).
     cmd: Arc<AtomicU64>,
     /// The epoch counter, incremented each time a barrier is triggered.
-    epoch: AtomicU64,
+    epoch: Arc<AtomicU64>,
 }
 
 impl CheckpointBarrierInjector {
@@ -160,7 +160,7 @@ impl CheckpointBarrierInjector {
     pub fn new() -> Self {
         Self {
             cmd: Arc::new(AtomicU64::new(0)),
-            epoch: AtomicU64::new(0),
+            epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -214,6 +214,15 @@ impl CheckpointBarrierInjector {
 impl Default for CheckpointBarrierInjector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Clone for CheckpointBarrierInjector {
+    fn clone(&self) -> Self {
+        Self {
+            cmd: Arc::clone(&self.cmd),
+            epoch: Arc::clone(&self.epoch),
+        }
     }
 }
 
