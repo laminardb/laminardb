@@ -690,6 +690,27 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 }
             }
         }
+
+        // Ephemeral/dynamic streams (e.g. console live queries) have no
+        // downstream sink, so they aren't in `stream_sources` and the loop
+        // above never forwards them — push their batches to any subscribers.
+        // MVs are skipped here; they reach subscribers via their own path.
+        let mv_read = self.mv_store.read();
+        for (stream_name, batches) in results {
+            let is_static = self
+                .stream_sources
+                .iter()
+                .any(|(name, _)| name == stream_name.as_ref());
+            if is_static || mv_read.has_mv(stream_name.as_ref()) {
+                continue;
+            }
+            for batch in batches {
+                if batch.num_rows() > 0 {
+                    self.subscription_registry
+                        .send_batch(stream_name, batch.clone());
+                }
+            }
+        }
     }
 
     fn update_mv_stores(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {

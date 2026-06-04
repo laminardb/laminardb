@@ -36,6 +36,8 @@ arrow-cast = { workspace = true }
 arrow-json = { workspace = true }
 arrow-schema = { workspace = true }
 parking_lot = { workspace = true }
+object_store = { workspace = true }
+bytes = { workspace = true }
 
 # CLI and configuration
 clap = { version = "4.6", features = ["derive", "env"] }

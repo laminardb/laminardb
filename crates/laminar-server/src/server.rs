@@ -122,6 +122,9 @@ pub async fn run_server(
 
     // Build LaminarDB via builder API
     let mut builder = LaminarDB::builder();
+    if let Some(ref token) = config.server.console_token {
+        builder = builder.config_var("server.console_token", token.expose());
+    }
 
     let storage_dir = config.state.local_storage_dir();
     let has_storage = config.state.is_durable();
@@ -275,7 +278,7 @@ pub(crate) fn apply_checkpoint_config(
     };
     builder = builder.checkpoint(cfg);
 
-    if !checkpoint_url.starts_with("file:///") && !checkpoint_url.is_empty() {
+    if !checkpoint_url.is_empty() {
         builder = builder.object_store_url(checkpoint_url.to_string());
         if !checkpoint.storage.is_empty() {
             builder = builder.object_store_options(checkpoint.storage.clone());

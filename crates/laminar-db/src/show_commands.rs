@@ -11,11 +11,8 @@ use crate::db::LaminarDB;
 use crate::error::DbError;
 
 impl LaminarDB {
-    /// Build a SHOW CHECKPOINT STATUS metadata result.
-    ///
-    /// Exposed publicly so the server's control-plane HTTP API
-    /// (`GET /api/v1/cluster/checkpoints`) can surface checkpoint metadata
-    /// in both single-node and cluster mode.
+    /// Build a SHOW CHECKPOINT STATUS metadata result. Public so the server's
+    /// `GET /api/v1/cluster/checkpoints` endpoint can surface it.
     ///
     /// # Errors
     ///

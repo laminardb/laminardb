@@ -2187,12 +2187,27 @@ impl LaminarDB {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpStream;
 
+        #[derive(serde::Deserialize)]
+        struct ForwardedCheckpointResponse {
+            success: bool,
+            checkpoint_id: u64,
+            epoch: u64,
+            duration_ms: u64,
+            error: Option<String>,
+        }
+
         let mut stream = TcpStream::connect(addr).await.map_err(|e| {
             DbError::Checkpoint(format!("failed to connect to leader at {addr}: {e}"))
         })?;
 
+        let auth_header = if let Some(token) = self.config_vars.get("server.console_token") {
+            format!("Authorization: Bearer {token}\r\n")
+        } else {
+            String::new()
+        };
+
         let req = format!(
-            "POST /api/v1/checkpoint HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            "POST /api/v1/checkpoint HTTP/1.1\r\nHost: {addr}\r\n{auth_header}Content-Length: 0\r\nConnection: close\r\n\r\n"
         );
         stream.write_all(req.as_bytes()).await.map_err(|e| {
             DbError::Checkpoint(format!("failed to send checkpoint request to leader: {e}"))
@@ -2221,15 +2236,20 @@ impl LaminarDB {
         }
 
         let body = &response_bytes[header_len..];
-        let result: crate::checkpoint_coordinator::CheckpointResult = serde_json::from_slice(body)
-            .map_err(|e| {
-                let raw = String::from_utf8_lossy(body);
-                DbError::Checkpoint(format!(
-                    "failed to deserialize leader's response ({raw}): {e}"
-                ))
-            })?;
+        let response: ForwardedCheckpointResponse = serde_json::from_slice(body).map_err(|e| {
+            let raw = String::from_utf8_lossy(body);
+            DbError::Checkpoint(format!(
+                "failed to deserialize leader's response ({raw}): {e}"
+            ))
+        })?;
 
-        Ok(result)
+        Ok(crate::checkpoint_coordinator::CheckpointResult {
+            success: response.success,
+            checkpoint_id: response.checkpoint_id,
+            epoch: response.epoch,
+            duration: std::time::Duration::from_millis(response.duration_ms),
+            error: response.error,
+        })
     }
 
     /// Returns checkpoint performance statistics.

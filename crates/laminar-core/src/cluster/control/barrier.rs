@@ -184,6 +184,21 @@ pub(crate) mod barrier_v1 {
 #[cfg(feature = "cluster")]
 type BarrierFlavor = crossfire::mpsc::Array<BarrierAnnouncement>;
 
+/// Per-peer barrier gRPC client pool; caches each peer's address so a change
+/// forces a reconnect.
+#[cfg(feature = "cluster")]
+type BarrierClientPool = Arc<
+    parking_lot::Mutex<
+        FxHashMap<
+            NodeId,
+            (
+                String,
+                barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>,
+            ),
+        >,
+    >,
+>;
+
 #[cfg(feature = "cluster")]
 struct GrpcState {
     incoming_rx: parking_lot::Mutex<Option<crossfire::AsyncRx<BarrierFlavor>>>,
@@ -192,14 +207,7 @@ struct GrpcState {
     incoming_tx: crossfire::MAsyncTx<BarrierFlavor>,
     pending_acks: Arc<parking_lot::Mutex<FxHashMap<u64, tokio::sync::oneshot::Sender<BarrierAck>>>>,
     completed_acks: Arc<parking_lot::Mutex<FxHashMap<u64, BarrierAck>>>,
-    clients: Arc<
-        parking_lot::Mutex<
-            FxHashMap<
-                NodeId,
-                barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>,
-            >,
-        >,
-    >,
+    clients: BarrierClientPool,
     server_handle: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     advertise_addr: String,
 }
@@ -397,30 +405,25 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
 #[cfg(feature = "cluster")]
 async fn get_barrier_client(
     peer: NodeId,
-    pool: &Arc<
-        parking_lot::Mutex<
-            FxHashMap<
-                NodeId,
-                barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>,
-            >,
-        >,
-    >,
+    pool: &BarrierClientPool,
     kv: &Arc<dyn ClusterKv>,
 ) -> Option<barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>> {
+    let addr_str = kv.read_from(peer, BARRIER_ADDR_KEY).await?;
     {
         let guard = pool.lock();
-        if let Some(client) = guard.get(&peer) {
-            return Some(client.clone());
+        if let Some((cached_addr, client)) = guard.get(&peer) {
+            if cached_addr == &addr_str {
+                return Some(client.clone());
+            }
         }
     }
 
-    let addr_str = kv.read_from(peer, BARRIER_ADDR_KEY).await?;
     let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr_str}")).ok()?;
     let channel = endpoint.connect_lazy();
     let client = barrier_v1::barrier_sync_client::BarrierSyncClient::new(channel);
 
     let mut guard = pool.lock();
-    guard.insert(peer, client.clone());
+    guard.insert(peer, (addr_str, client.clone()));
     Some(client)
 }
 

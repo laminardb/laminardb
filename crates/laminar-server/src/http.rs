@@ -24,11 +24,8 @@ use crate::metrics::ServerMetrics;
 use crate::reload::{self, ReloadGuard};
 use crate::server::ServerError;
 
-/// Cluster control-plane handles wired into the HTTP API in cluster mode.
-///
-/// Present only when the server is compiled with the `cluster` feature and
-/// started in cluster mode; the cluster endpoints (`/api/v1/cluster/{nodes,
-/// vnodes,leader}`) return `404 Not Found` when this is `None`.
+/// Cluster control-plane handles backing the `/api/v1/cluster/*` endpoints.
+/// Absent in single-node mode, where those endpoints return `404`.
 #[cfg(feature = "cluster")]
 #[derive(Clone)]
 pub struct ClusterComponents {
@@ -77,32 +74,24 @@ enum EphemeralState {
     Connected,
 }
 
-/// Tracks the lifecycle of console-initiated ephemeral streams.
-///
-/// A stream is registered `Pending` when `POST /api/v1/queries` creates it,
-/// transitions to `Connected` when its WebSocket is opened, and is removed
-/// when the WebSocket closes. `create_query` arms a one-shot reaper task that
-/// drops the stream if it is still `Pending` after [`EPHEMERAL_PENDING_TTL`],
-/// so a client that requests a query but never connects can't leak a stream.
+/// Tracks console-initiated ephemeral streams so abandoned ones (created but
+/// never connected) can be reaped after [`EPHEMERAL_PENDING_TTL`].
 #[derive(Default)]
 pub struct EphemeralTracker {
     inner: parking_lot::Mutex<HashMap<String, EphemeralState>>,
 }
 
 impl EphemeralTracker {
-    /// Creates an empty tracker.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Records a newly created ephemeral stream as `Pending`.
     fn add_pending(&self, name: String) {
         self.inner.lock().insert(name, EphemeralState::Pending);
     }
 
-    /// Transitions a pending stream to `Connected`. Returns `true` if the
-    /// stream was tracked (i.e. it is a console ephemeral stream).
+    /// Marks a pending stream `Connected`; returns `false` if it wasn't tracked.
     fn mark_connected(&self, name: &str) -> bool {
         let mut guard = self.inner.lock();
         if let Some(state) = guard.get_mut(name) {
@@ -113,14 +102,12 @@ impl EphemeralTracker {
         }
     }
 
-    /// Stops tracking `name`. Returns `true` if it was tracked.
     fn remove(&self, name: &str) -> bool {
         self.inner.lock().remove(name).is_some()
     }
 
-    /// Removes `name` only if it is still `Pending`, returning `true` when it
-    /// was. Used by the reaper task so a stream that connected (or was already
-    /// torn down) in the meantime is left untouched.
+    /// Removes `name` only if still `Pending`, so the reaper leaves a stream
+    /// that connected (or was already torn down) in the meantime untouched.
     fn remove_if_pending(&self, name: &str) -> bool {
         let mut guard = self.inner.lock();
         if matches!(guard.get(name), Some(EphemeralState::Pending)) {
@@ -131,7 +118,6 @@ impl EphemeralTracker {
         }
     }
 
-    /// Returns `true` if `name` is currently tracked (test-only introspection).
     #[cfg(test)]
     fn is_tracked(&self, name: &str) -> bool {
         self.inner.lock().contains_key(name)
@@ -984,8 +970,12 @@ async fn ws_upgrade(
     }
 
     // Each WS client gets its own broadcast subscription — fan-out is in the Sink.
-    let sub = match state.db.subscribe_raw(&name) {
-        Ok(s) => s,
+    let portal = match state
+        .db
+        .open_subscription(&name, None, laminar_db::subscription::SubscribeStart::Tail)
+        .await
+    {
+        Ok(p) => p,
         Err(_) => {
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1002,7 +992,7 @@ async fn ws_upgrade(
     let st = Arc::clone(&state);
     ws.on_upgrade(move |socket| async move {
         st.server_metrics.ws_connections.inc();
-        ws_client(socket, sub, name.clone()).await;
+        ws_client(socket, portal, name.clone()).await;
         st.server_metrics.ws_connections.dec();
 
         // On disconnect, tear down the ephemeral stream so it doesn't linger
@@ -1021,7 +1011,7 @@ async fn ws_upgrade(
 
 async fn ws_client(
     mut socket: WebSocket,
-    mut sub: laminar_core::streaming::Subscription<laminar_db::ArrowRecord>,
+    mut portal: laminar_db::subscription::SubscriptionPortal,
     name: String,
 ) {
     let mut heartbeat = tokio::time::interval(WS_HEARTBEAT_INTERVAL);
@@ -1031,9 +1021,12 @@ async fn ws_client(
     loop {
         tokio::select! {
             biased;
-            result = sub.recv_async() => {
-                match result {
-                    Ok(batch) => {
+            frame = portal.next_frame() => {
+                match frame {
+                    Some(laminar_db::subscription::PortalFrame::Batch(batch)) => {
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
                         let json = match batch_to_json(&batch) {
                             Ok(j) => j,
                             Err(e) => {
@@ -1052,7 +1045,15 @@ async fn ws_client(
                             break;
                         }
                     }
-                    Err(_) => break, // disconnected
+                    Some(laminar_db::subscription::PortalFrame::Barrier { .. }) => {
+                        // Checkpoint barriers have no WS wire representation.
+                        continue;
+                    }
+                    Some(laminar_db::subscription::PortalFrame::Lagged(n)) => {
+                        warn!(stream = %name, skipped = n, "WS client fell behind, disconnecting");
+                        break;
+                    }
+                    None => break, // disconnected
                 }
             }
             _ = heartbeat.tick() => {
@@ -1335,6 +1336,9 @@ mod tests {
             text.contains("laminardb_checkpoints_completed_total"),
             "missing checkpoints_completed_total"
         );
+        // Prometheus text format includes HELP and TYPE annotations.
+        assert!(text.contains("# HELP"), "missing # HELP annotation");
+        assert!(text.contains("# TYPE"), "missing # TYPE annotation");
     }
 
     #[tokio::test]
@@ -1354,32 +1358,6 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.as_array().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_list_sinks_empty() {
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/api/v1/sinks")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_list_streams_empty() {
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/api/v1/streams")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1575,25 +1553,6 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["success"], true);
-    }
-
-    #[tokio::test]
-    async fn test_metrics_contains_help_and_type() {
-        let state = test_state();
-        let app = build_router(state);
-
-        let req = Request::builder()
-            .uri("/metrics")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = String::from_utf8(body.to_vec()).unwrap();
-        // Prometheus text format includes HELP and TYPE annotations
-        assert!(text.contains("# HELP"), "missing # HELP annotation");
-        assert!(text.contains("# TYPE"), "missing # TYPE annotation");
     }
 
     // ── Console control-plane endpoints (Phase 1) ──

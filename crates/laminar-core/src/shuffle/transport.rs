@@ -278,12 +278,11 @@ mod grpc {
             // Purge a dead entry so we reopen the call below.
             self.pool.lock().retain(|p, c| *p != peer || c.is_alive());
 
-            // Copy the cached address out and drop the guard before any await (the
-            // parking_lot guard is !Send and must not span `discover_peer`).
-            let cached = self.peers.lock().get(&peer).copied();
-            let addr = match cached {
-                Some(a) => a,
-                None => self.discover_peer(peer).await.ok_or_else(|| {
+            // Re-resolve on reconnect (peers may restart on a new port); fall
+            // back to a statically registered address when there's no KV.
+            let addr = match self.discover_peer(peer).await {
+                Some(addr) => addr,
+                None => self.peers.lock().get(&peer).copied().ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::NotFound,
                         format!("peer {peer} has no registered shuffle address"),
