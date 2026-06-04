@@ -1902,6 +1902,19 @@ impl LaminarDB {
             .collect()
     }
 
+    /// List all registered materialized views with their SQL and state.
+    pub fn materialized_views(&self) -> Vec<crate::handle::MaterializedViewInfo> {
+        let registry = self.mv_registry.lock();
+        registry
+            .views()
+            .map(|view| crate::handle::MaterializedViewInfo {
+                name: view.name.clone(),
+                sql: view.sql.clone(),
+                state: format!("{:?}", view.state),
+            })
+            .collect()
+    }
+
     /// List all registered streams with their SQL definitions.
     pub fn streams(&self) -> Vec<crate::handle::StreamInfo> {
         let mgr = self.connector_manager.lock();

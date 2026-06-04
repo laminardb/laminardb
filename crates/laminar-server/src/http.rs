@@ -1,8 +1,9 @@
 //! HTTP API for LaminarDB server.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use prometheus::Registry;
 
@@ -16,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 
-use laminar_db::LaminarDB;
+use laminar_db::{ConnectorInfo, LaminarDB};
 
 use crate::config::ServerConfig;
 use crate::metrics::ServerMetrics;
@@ -33,6 +34,120 @@ pub struct AppState {
     pub reload_guard: ReloadGuard,
     pub registry: Arc<Registry>,
     pub server_metrics: ServerMetrics,
+    /// Tracks ephemeral streams created by the console (`POST /api/v1/queries`)
+    /// so abandoned ones can be reaped.
+    pub ephemeral: Arc<EphemeralTracker>,
+}
+
+// ---------------------------------------------------------------------------
+// Ephemeral console streams
+// ---------------------------------------------------------------------------
+
+/// How long an ephemeral console stream may sit `Pending` (created but never
+/// connected to over WebSocket) before the GC task drops it.
+const EPHEMERAL_PENDING_TTL: Duration = Duration::from_secs(30);
+
+/// How often the background GC task sweeps for abandoned ephemeral streams.
+const EPHEMERAL_GC_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Lifecycle state of a console-managed ephemeral stream.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EphemeralState {
+    /// Created by `POST /api/v1/queries`, no WebSocket attached yet.
+    Pending,
+    /// A WebSocket client is (or was) attached.
+    Connected,
+}
+
+struct EphemeralEntry {
+    state: EphemeralState,
+    created_at: Instant,
+}
+
+/// Tracks the lifecycle of console-initiated ephemeral streams.
+///
+/// A stream is registered `Pending` when `POST /api/v1/queries` creates it,
+/// transitions to `Connected` when its WebSocket is opened, and is removed
+/// when the WebSocket closes. The background GC task ([`spawn_ephemeral_gc`])
+/// drops any stream still `Pending` after [`EPHEMERAL_PENDING_TTL`], so a
+/// client that requests a query but never connects can't leak a stream.
+#[derive(Default)]
+pub struct EphemeralTracker {
+    inner: parking_lot::Mutex<HashMap<String, EphemeralEntry>>,
+}
+
+impl EphemeralTracker {
+    /// Creates an empty tracker.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records a newly created ephemeral stream as `Pending`.
+    fn add_pending(&self, name: String) {
+        self.inner.lock().insert(
+            name,
+            EphemeralEntry {
+                state: EphemeralState::Pending,
+                created_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Transitions a pending stream to `Connected`. Returns `true` if the
+    /// stream was tracked (i.e. it is a console ephemeral stream).
+    fn mark_connected(&self, name: &str) -> bool {
+        let mut guard = self.inner.lock();
+        if let Some(entry) = guard.get_mut(name) {
+            entry.state = EphemeralState::Connected;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Stops tracking `name`. Returns `true` if it was tracked.
+    fn remove(&self, name: &str) -> bool {
+        self.inner.lock().remove(name).is_some()
+    }
+
+    /// Returns `true` if `name` is currently tracked (test-only introspection).
+    #[cfg(test)]
+    fn is_tracked(&self, name: &str) -> bool {
+        self.inner.lock().contains_key(name)
+    }
+
+    /// Returns the names of streams still `Pending` past `ttl`.
+    fn expired_pending(&self, ttl: Duration) -> Vec<String> {
+        let guard = self.inner.lock();
+        guard
+            .iter()
+            .filter(|(_, e)| e.state == EphemeralState::Pending && e.created_at.elapsed() >= ttl)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+}
+
+/// Spawns the background task that reaps abandoned ephemeral console streams.
+///
+/// Every [`EPHEMERAL_GC_INTERVAL`] it drops any stream that has been `Pending`
+/// (created but never connected to) for longer than [`EPHEMERAL_PENDING_TTL`].
+pub fn spawn_ephemeral_gc(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(EPHEMERAL_GC_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            for name in state.ephemeral.expired_pending(EPHEMERAL_PENDING_TTL) {
+                let ddl = format!("DROP STREAM IF EXISTS {name}");
+                if let Err(e) = state.db.execute(&ddl).await {
+                    warn!(stream = %name, error = %e, "failed to drop abandoned ephemeral stream");
+                }
+                state.ephemeral.remove(&name);
+                info!(stream = %name, "reaped abandoned ephemeral console stream");
+            }
+        }
+    })
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -53,6 +168,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/sinks", get(list_sinks))
         .route("/api/v1/streams", get(list_streams))
         .route("/api/v1/streams/{name}", get(get_stream))
+        .route("/api/v1/mvs", get(list_mvs))
+        .route("/api/v1/connectors", get(list_connectors))
+        .route("/api/v1/queries", post(create_query))
         .route("/api/v1/checkpoint", post(trigger_checkpoint))
         .route("/api/v1/sql", post(execute_sql))
         .route("/api/v1/reload", post(handle_reload))
@@ -360,6 +478,80 @@ async fn get_stream(
     }
 }
 
+async fn list_mvs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // `MaterializedViewInfo` already serializes to `{name, sql, state}`.
+    Json(state.db.materialized_views())
+}
+
+/// Connector catalog: the registered source and sink connector types and the
+/// configuration keys each accepts. Drives the console's source-creation wizard.
+#[derive(Debug, Serialize)]
+struct ConnectorsResponse {
+    sources: Vec<ConnectorInfo>,
+    sinks: Vec<ConnectorInfo>,
+}
+
+async fn list_connectors(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let registry = state.db.connector_registry();
+    let sources: Vec<ConnectorInfo> = registry
+        .list_sources()
+        .iter()
+        .filter_map(|name| registry.source_info(name))
+        .collect();
+    let sinks: Vec<ConnectorInfo> = registry
+        .list_sinks()
+        .iter()
+        .filter_map(|name| registry.sink_info(name))
+        .collect();
+    Json(ConnectorsResponse { sources, sinks })
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateQueryRequest {
+    sql: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateQueryResponse {
+    stream_id: String,
+    ws_url: String,
+}
+
+/// Generate a unique name for an ephemeral console stream. Combines a
+/// millisecond timestamp with a random suffix so concurrent requests don't
+/// collide. The leading `__console_` marks it as console-managed.
+fn console_stream_name() -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let rand: u32 = rand::random();
+    format!("__console_{ts}_{rand:08x}")
+}
+
+/// Register an ad-hoc live query as an ephemeral stream and return the URL the
+/// console connects its WebSocket to. The stream is reaped on WS disconnect, or
+/// by the GC task if no client connects within [`EPHEMERAL_PENDING_TTL`].
+async fn create_query(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateQueryRequest>,
+) -> impl IntoResponse {
+    let name = console_stream_name();
+    let ddl = format!("CREATE STREAM {name} AS {}", req.sql);
+
+    match state.db.execute(&ddl).await {
+        Ok(_) => {
+            state.ephemeral.add_pending(name.clone());
+            let ws_url = format!("/ws/{name}");
+            Json(CreateQueryResponse {
+                stream_id: name,
+                ws_url,
+            })
+            .into_response()
+        }
+        Err(e) => error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    }
+}
+
 async fn trigger_checkpoint(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.db.checkpoint().await {
         Ok(result) => {
@@ -622,11 +814,26 @@ async fn ws_upgrade(
         }
     };
 
+    // If this is a console-initiated ephemeral stream, transition it to
+    // `Connected` so the GC task won't reap it while a client is attached.
+    let is_console = state.ephemeral.mark_connected(&name);
+
     let st = Arc::clone(&state);
     ws.on_upgrade(move |socket| async move {
         st.server_metrics.ws_connections.inc();
-        ws_client(socket, sub, name).await;
+        ws_client(socket, sub, name.clone()).await;
         st.server_metrics.ws_connections.dec();
+
+        // On disconnect, tear down the ephemeral stream so it doesn't linger
+        // after the console tab that owned it goes away.
+        if is_console {
+            let ddl = format!("DROP STREAM IF EXISTS {name}");
+            if let Err(e) = st.db.execute(&ddl).await {
+                warn!(stream = %name, error = %e, "failed to drop ephemeral stream on disconnect");
+            }
+            st.ephemeral.remove(&name);
+            info!(stream = %name, "dropped ephemeral console stream on disconnect");
+        }
     })
     .into_response()
 }
@@ -737,6 +944,7 @@ mod tests {
 
             registry,
             server_metrics,
+            ephemeral: Arc::new(EphemeralTracker::new()),
         })
     }
 
@@ -776,6 +984,7 @@ mod tests {
             reload_guard: ReloadGuard::new(),
             registry,
             server_metrics,
+            ephemeral: Arc::new(EphemeralTracker::new()),
         })
     }
 
@@ -1143,6 +1352,7 @@ mod tests {
 
             registry,
             server_metrics,
+            ephemeral: Arc::new(EphemeralTracker::new()),
         });
 
         let app = build_router(state.clone());
@@ -1178,5 +1388,270 @@ mod tests {
         // Prometheus text format includes HELP and TYPE annotations
         assert!(text.contains("# HELP"), "missing # HELP annotation");
         assert!(text.contains("# TYPE"), "missing # TYPE annotation");
+    }
+
+    // ── Console control-plane endpoints (Phase 1) ──
+
+    /// POST a SQL statement to `/api/v1/sql`, asserting it succeeds.
+    async fn exec_sql(app: &Router, sql: &str) {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/sql")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({ "sql": sql })).unwrap(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "exec failed: {sql}");
+    }
+
+    #[tokio::test]
+    async fn test_list_mvs_empty() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/mvs")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_mvs_after_create() {
+        let state = test_state();
+        let app = build_router(state);
+
+        exec_sql(&app, "CREATE SOURCE events (id INT, value DOUBLE)").await;
+        // Registers the MV in the registry (see ddl.rs); query execution is not
+        // required for it to be listed.
+        exec_sql(
+            &app,
+            "CREATE MATERIALIZED VIEW event_stats AS SELECT * FROM events",
+        )
+        .await;
+
+        let req = Request::builder()
+            .uri("/api/v1/mvs")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let mvs = json.as_array().expect("mvs should be an array");
+        let found = mvs
+            .iter()
+            .find(|m| m["name"] == "event_stats")
+            .expect("event_stats should be listed");
+        assert_eq!(found["state"], "Running");
+        assert!(
+            found["sql"].as_str().unwrap().contains("event_stats"),
+            "sql should be the full CREATE statement: {found:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_connectors() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/connectors")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Shape is `{sources: [...], sinks: [...]}`; the exact connectors depend
+        // on enabled features, so only assert the structure here.
+        assert!(json["sources"].is_array(), "sources should be an array");
+        assert!(json["sinks"].is_array(), "sinks should be an array");
+    }
+
+    #[tokio::test]
+    async fn test_create_query_returns_stream_id_and_ws_url() {
+        let state = test_state();
+        let app = build_router(state.clone());
+
+        exec_sql(&app, "CREATE SOURCE events (id INT, value DOUBLE)").await;
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/queries")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({ "sql": "SELECT * FROM events" }))
+                    .unwrap(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let stream_id = json["stream_id"].as_str().expect("stream_id present");
+        assert!(
+            stream_id.starts_with("__console_"),
+            "unexpected stream_id: {stream_id}"
+        );
+        assert_eq!(json["ws_url"], format!("/ws/{stream_id}"));
+
+        // The ephemeral stream is registered and tracked as pending.
+        assert!(
+            state.db.streams().iter().any(|s| s.name == stream_id),
+            "ephemeral stream should be registered"
+        );
+        assert!(state.ephemeral.is_tracked(stream_id));
+    }
+
+    #[tokio::test]
+    async fn test_create_query_invalid_sql_returns_400() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/queries")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({ "sql": "NOT VALID SQL BLAH" })).unwrap(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Unit test of the ephemeral-stream lifecycle the WS handler and GC task
+    /// drive: pending → connected, removal, and pending-TTL expiry.
+    #[test]
+    fn test_ephemeral_tracker_lifecycle() {
+        let tracker = EphemeralTracker::new();
+
+        // Unknown stream: not tracked, can't be marked connected.
+        assert!(!tracker.is_tracked("__console_x"));
+        assert!(!tracker.mark_connected("__console_x"));
+
+        // Pending stream is tracked and reported as expired once past the TTL.
+        tracker.add_pending("__console_x".to_string());
+        assert!(tracker.is_tracked("__console_x"));
+        assert_eq!(
+            tracker.expired_pending(Duration::ZERO),
+            vec!["__console_x".to_string()],
+            "a pending stream older than a zero TTL is expired"
+        );
+        assert!(
+            tracker
+                .expired_pending(Duration::from_secs(3600))
+                .is_empty(),
+            "a fresh pending stream is not expired under a long TTL"
+        );
+
+        // Once connected, the GC task must never reap it, regardless of age.
+        assert!(tracker.mark_connected("__console_x"));
+        assert!(
+            tracker.expired_pending(Duration::ZERO).is_empty(),
+            "a connected stream is never expired"
+        );
+
+        // Removal stops tracking.
+        assert!(tracker.remove("__console_x"));
+        assert!(!tracker.is_tracked("__console_x"));
+        assert!(!tracker.remove("__console_x"));
+    }
+
+    /// Bind a real ephemeral-port server so the WebSocket upgrade runs over a
+    /// genuine hyper connection (the `tower::oneshot` harness can't upgrade —
+    /// the request has no `OnUpgrade` extension, so axum rejects with 426).
+    async fn spawn_test_server(state: Arc<AppState>) -> std::net::SocketAddr {
+        let router = build_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        addr
+    }
+
+    /// Send a raw WebSocket upgrade request for `path` and return the first
+    /// chunk of the HTTP response (enough to read the status line).
+    async fn ws_handshake(addr: std::net::SocketAddr, path: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "GET {path} HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Connection: Upgrade\r\n\
+             Upgrade: websocket\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             \r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    }
+
+    #[tokio::test]
+    async fn test_ws_upgrade_switching_protocols() {
+        let state = test_state();
+        let app = build_router(state.clone());
+        exec_sql(&app, "CREATE SOURCE events (id INT, value DOUBLE)").await;
+
+        // Create an ephemeral console stream to connect to.
+        let create = Request::builder()
+            .method("POST")
+            .uri("/api/v1/queries")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({ "sql": "SELECT * FROM events" }))
+                    .unwrap(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(create).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let stream_id = json["stream_id"].as_str().unwrap().to_string();
+
+        let addr = spawn_test_server(state).await;
+        let resp = ws_handshake(addr, &format!("/ws/{stream_id}")).await;
+        assert!(
+            resp.starts_with("HTTP/1.1 101"),
+            "expected 101 Switching Protocols, got: {resp}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ws_upgrade_unknown_stream_returns_404() {
+        // Over a real connection the upgrade extractor succeeds, so the
+        // handler's stream-existence check runs and returns 404.
+        let state = test_state();
+        let addr = spawn_test_server(state).await;
+        let resp = ws_handshake(addr, "/ws/does_not_exist").await;
+        assert!(
+            resp.starts_with("HTTP/1.1 404"),
+            "expected 404 Not Found for unknown stream, got: {resp}"
+        );
     }
 }

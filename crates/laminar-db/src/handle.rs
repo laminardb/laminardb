@@ -479,6 +479,20 @@ pub struct SinkInfo {
     pub name: String,
 }
 
+/// Information about a registered materialized view.
+///
+/// A JSON-serializable projection of a `MaterializedView` for the
+/// control-plane HTTP API (the console relation browser).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MaterializedViewInfo {
+    /// View name.
+    pub name: String,
+    /// SQL definition.
+    pub sql: String,
+    /// Current execution state (e.g. `"Running"`, `"Dropping"`).
+    pub state: String,
+}
+
 /// Information about a running query.
 #[derive(Debug, Clone)]
 pub struct QueryInfo {

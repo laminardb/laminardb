@@ -220,7 +220,7 @@ pub fn parse_port(value: &str) -> Result<u16, ConnectorError> {
 /// Specification for a configuration key.
 ///
 /// Used by connectors to declare their expected configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ConfigKeySpec {
     /// The configuration key name.
     pub key: String,
@@ -264,7 +264,7 @@ impl ConfigKeySpec {
 }
 
 /// Metadata about a connector implementation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ConnectorInfo {
     /// Unique connector type name (e.g., "kafka", "postgres-cdc").
     pub name: String,
