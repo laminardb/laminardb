@@ -517,11 +517,8 @@ impl LaminarDB {
             }
         }
 
-        // Register with DataFusion using a live ReferenceTableProvider.
-        // Every scan() reads the current snapshot from the TableStore, so
-        // no deregister/re-register is needed after INSERTs. This eliminates
-        // the TOCTOU race in sync_table_to_datafusion that previously caused
-        // concurrent INSERTs to leave the DataFusion catalog stale.
+        // Live ReferenceTableProvider: scan() reads current TableStore rows, so
+        // SELECTs need no re-register after INSERTs (lookup joins use the snapshot).
         {
             let provider = crate::table_provider::ReferenceTableProvider::new(
                 name.clone(),
@@ -1275,20 +1272,23 @@ impl LaminarDB {
         }))
     }
 
-    #[allow(clippy::unnecessary_wraps)]
+    /// Re-publish a lookup table's snapshot after a write so lookup joins don't
+    /// probe stale rows. No-op for non-lookup tables.
+    #[allow(clippy::unnecessary_wraps)] // signature kept fallible for call sites
     pub(crate) fn sync_table_to_datafusion(&self, name: &str) -> Result<(), DbError> {
-        if self.lookup_registry.get_entry(name).is_some() {
-            if let Some(batch) = self.table_store.read().to_record_batch(name) {
-                if let Some(pk) = self.table_store.read().primary_key(name) {
-                    self.lookup_registry.register(
-                        name,
-                        laminar_sql::datafusion::LookupSnapshot {
-                            batch,
-                            key_columns: vec![pk.to_string()],
-                        },
-                    );
-                }
-            }
+        if self.lookup_registry.get_entry(name).is_none() {
+            return Ok(());
+        }
+        // One lock keeps batch and PK consistent against a concurrent writer.
+        let ts = self.table_store.read();
+        if let (Some(batch), Some(pk)) = (ts.to_record_batch(name), ts.primary_key(name)) {
+            self.lookup_registry.register(
+                name,
+                laminar_sql::datafusion::LookupSnapshot {
+                    batch,
+                    key_columns: vec![pk.to_string()],
+                },
+            );
         }
         Ok(())
     }
