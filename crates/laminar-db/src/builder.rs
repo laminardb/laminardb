@@ -249,7 +249,7 @@ impl LaminarDbBuilder {
     /// leader's HTTP API.
     #[must_use]
     pub fn http_auth_token(mut self, token: impl Into<String>) -> Self {
-        self.config.http_auth_token = Some(token.into());
+        self.config.http_auth_token = Some(crate::config::SecretString::new(token));
         self
     }
 

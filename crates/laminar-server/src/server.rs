@@ -139,7 +139,7 @@ pub async fn run_server(
         _ => Profile::BareMetal,
     };
     builder = builder.profile(profile);
-    builder = apply_checkpoint_config(builder, &config.checkpoint.url, &config.checkpoint);
+    builder = apply_checkpoint_config(builder, &config.checkpoint.url, &config.checkpoint, false);
 
     // Build the state backend + single-owner vnode registry from config so
     // the checkpoint coordinator's durability gate runs with real markers.
@@ -264,10 +264,16 @@ pub async fn run_server(
 // ---------------------------------------------------------------------------
 
 /// Apply checkpoint settings to a `LaminarDB` builder.
+///
+/// `cluster` routes `file://` checkpoints through the object store so they are
+/// namespaced per node and readable cross-node. Single-node mode keeps `file://`
+/// on the local `FileSystemCheckpointStore` (stable on-disk layout); only
+/// remote schemes (`s3://`, …) go to the object store there.
 pub(crate) fn apply_checkpoint_config(
     mut builder: laminar_db::LaminarDbBuilder,
     checkpoint_url: &str,
     checkpoint: &crate::config::CheckpointSection,
+    cluster: bool,
 ) -> laminar_db::LaminarDbBuilder {
     let cfg = StreamCheckpointConfig {
         interval_ms: Some(checkpoint.interval.as_millis() as u64),
@@ -278,7 +284,8 @@ pub(crate) fn apply_checkpoint_config(
     };
     builder = builder.checkpoint(cfg);
 
-    if !checkpoint_url.is_empty() {
+    let is_file = checkpoint_url.starts_with("file://");
+    if !checkpoint_url.is_empty() && (cluster || !is_file) {
         builder = builder.object_store_url(checkpoint_url.to_string());
         if !checkpoint.storage.is_empty() {
             builder = builder.object_store_options(checkpoint.storage.clone());

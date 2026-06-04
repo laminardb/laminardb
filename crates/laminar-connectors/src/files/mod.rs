@@ -25,13 +25,18 @@ pub use text_decoder::TextLineDecoder;
 /// `files` feature is enabled, and makes `connector = 'files'` available
 /// in `CREATE SOURCE` statements.
 pub fn register_file_source(registry: &ConnectorRegistry) {
+    use crate::config::ConfigKeySpec;
     let info = ConnectorInfo {
         name: "files".to_string(),
         display_name: "File Source (AutoLoader)".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         is_source: true,
         is_sink: false,
-        config_keys: vec![],
+        config_keys: vec![
+            ConfigKeySpec::required("path", "Directory path, glob pattern, or cloud storage URL"),
+            ConfigKeySpec::optional("format", "Data format (csv, tsv, json, jsonl, text, txt, parquet, arrow)", "auto-detect"),
+            ConfigKeySpec::optional("glob_pattern", "Optional glob pattern to filter files by name", "*"),
+        ],
     };
     registry.register_source(
         "files",
@@ -46,13 +51,19 @@ pub fn register_file_source(registry: &ConnectorRegistry) {
 ///
 /// Makes `connector = 'files'` available in `CREATE SINK` statements.
 pub fn register_file_sink(registry: &ConnectorRegistry) {
+    use crate::config::ConfigKeySpec;
     let info = ConnectorInfo {
         name: "files".to_string(),
         display_name: "File Sink".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         is_source: false,
         is_sink: true,
-        config_keys: vec![],
+        config_keys: vec![
+            ConfigKeySpec::required("path", "Output directory path"),
+            ConfigKeySpec::required("format", "Output format (csv, json, text, parquet, arrow)"),
+            ConfigKeySpec::optional("mode", "Write mode (append, rolling)", "rolling"),
+            ConfigKeySpec::optional("prefix", "File name prefix for rolling mode", "part"),
+        ],
     };
     registry.register_sink(
         "files",

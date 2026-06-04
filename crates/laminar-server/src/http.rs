@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use prometheus::Registry;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -777,7 +777,65 @@ async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
     .into_response()
 }
 
-async fn stop_pipeline(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+#[derive(Debug, serde::Deserialize)]
+struct PipelineControlParams {
+    #[serde(default)]
+    local: bool,
+}
+
+/// Fan a fire-and-forget pipeline-control POST out to every peer (so a
+/// cluster-wide start/stop reaches the whole cluster). `local` short-circuits
+/// the fan-out, and it is a no-op outside cluster mode. Peer failures are
+/// logged, not fatal.
+async fn fan_out_pipeline_control(state: &AppState, local: bool, path: &str) {
+    #[cfg(feature = "cluster")]
+    {
+        if local {
+            return;
+        }
+        let Some(cluster) = state.cluster.as_ref() else {
+            return;
+        };
+        let self_id = cluster.controller.as_ref().map(|c| c.instance_id());
+        let peers: Vec<String> = cluster
+            .membership_rx
+            .borrow()
+            .iter()
+            .filter(|m| self_id != Some(m.id))
+            .map(|m| m.rpc_address.clone())
+            .collect();
+        let token = state.current_config.read().server.console_token.clone();
+        let client = reqwest::Client::new();
+        let tasks: Vec<_> = peers
+            .into_iter()
+            .map(|peer| {
+                let client = client.clone();
+                let token = token.clone();
+                let url = format!("http://{peer}{path}");
+                tokio::spawn(async move {
+                    let mut req = client.post(&url);
+                    if let Some(t) = token {
+                        req = req.bearer_auth(t.expose());
+                    }
+                    if let Err(e) = req.send().await {
+                        tracing::warn!("failed to forward pipeline control to {url}: {e}");
+                    }
+                })
+            })
+            .collect();
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
+    #[cfg(not(feature = "cluster"))]
+    let _ = (state, local, path);
+}
+
+async fn stop_pipeline(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<PipelineControlParams>,
+) -> impl IntoResponse {
+    fan_out_pipeline_control(&state, params.local, "/api/v1/pipeline/stop?local=true").await;
     match state.db.stop_pipeline().await {
         Ok(()) => (
             StatusCode::OK,
@@ -788,7 +846,11 @@ async fn stop_pipeline(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     }
 }
 
-async fn start_pipeline(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn start_pipeline(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<PipelineControlParams>,
+) -> impl IntoResponse {
+    fan_out_pipeline_control(&state, params.local, "/api/v1/pipeline/start?local=true").await;
     match state.db.start().await {
         Ok(()) => (
             StatusCode::OK,
@@ -809,7 +871,7 @@ async fn pipeline_status(State(state): State<Arc<AppState>>) -> impl IntoRespons
 }
 
 // ---------------------------------------------------------------------------
-// Pipeline lineage graph (Phase 2)
+// Pipeline lineage graph
 // ---------------------------------------------------------------------------
 
 /// A node in the lineage graph returned by `GET /api/v1/graph`.
@@ -864,7 +926,7 @@ async fn get_graph(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Cluster topology endpoints (Phase 3)
+// Cluster topology endpoints
 // ---------------------------------------------------------------------------
 
 /// 404 returned by the cluster endpoints when the server is not running in
@@ -1589,7 +1651,7 @@ mod tests {
         assert_eq!(json["success"], true);
     }
 
-    // ── Console control-plane endpoints (Phase 1) ──
+    // ── Console control-plane endpoints ──
 
     /// POST a SQL statement to `/api/v1/sql`, asserting it succeeds.
     async fn exec_sql(app: &Router, sql: &str) {
@@ -1857,7 +1919,7 @@ mod tests {
         );
     }
 
-    // ── Lineage graph (Phase 2) + cluster topology (Phase 3) ──
+    // ── Lineage graph + cluster topology ──
 
     #[tokio::test]
     async fn test_get_graph_returns_nodes_and_edges() {

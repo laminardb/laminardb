@@ -1083,7 +1083,7 @@ impl LaminarDB {
 
         let statement = &statements[0];
 
-        match statement {
+        let result = match statement {
             StreamingStatement::CreateSource(create) => {
                 let result = self.handle_create_source(create).await?;
                 if let ExecuteResult::Ddl(ref info) = result {
@@ -1256,7 +1256,16 @@ impl LaminarDB {
                 "DECLARE CURSOR FOR SUBSCRIBE requires the pgwire endpoint, not HTTP /api/v1/sql"
                     .into(),
             )),
+        };
+
+        #[cfg(feature = "cluster")]
+        if let Ok(ExecuteResult::Ddl(ref info)) = &result {
+            if info.statement_type != "CHECKPOINT" {
+                self.persist_catalog_manifest().await;
+            }
         }
+
+        result
     }
 
     /// Handle INSERT INTO statement.
@@ -2195,7 +2204,7 @@ impl LaminarDB {
 
         let mut req = reqwest::Client::new().post(format!("http://{addr}/api/v1/checkpoint"));
         if let Some(token) = &self.config.http_auth_token {
-            req = req.bearer_auth(token);
+            req = req.bearer_auth(token.expose());
         }
         let resp = req.send().await.map_err(|e| {
             DbError::Checkpoint(format!(
@@ -2204,24 +2213,27 @@ impl LaminarDB {
         })?;
 
         let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(DbError::Checkpoint(format!(
-                "leader rejected checkpoint ({status}): {body}"
-            )));
-        }
-
-        let response: ForwardedCheckpointResponse = resp.json().await.map_err(|e| {
-            DbError::Checkpoint(format!("failed to parse leader checkpoint response: {e}"))
+        let body = resp.text().await.map_err(|e| {
+            DbError::Checkpoint(format!("failed to read leader checkpoint response: {e}"))
         })?;
 
-        Ok(crate::checkpoint_coordinator::CheckpointResult {
-            success: response.success,
-            checkpoint_id: response.checkpoint_id,
-            epoch: response.epoch,
-            duration: std::time::Duration::from_millis(response.duration_ms),
-            error: response.error,
-        })
+        // The leader returns a `CheckpointResponse` body even when the
+        // checkpoint itself failed (HTTP 500 + `success: false`), so parse it so
+        // that structured failure reaches the follower. A body that isn't a
+        // `CheckpointResponse` (e.g. a 401 error payload) is an auth/transport
+        // failure — surface the status and body instead.
+        match serde_json::from_str::<ForwardedCheckpointResponse>(&body) {
+            Ok(response) => Ok(crate::checkpoint_coordinator::CheckpointResult {
+                success: response.success,
+                checkpoint_id: response.checkpoint_id,
+                epoch: response.epoch,
+                duration: std::time::Duration::from_millis(response.duration_ms),
+                error: response.error,
+            }),
+            Err(_) => Err(DbError::Checkpoint(format!(
+                "leader rejected checkpoint ({status}): {body}"
+            ))),
+        }
     }
 
     /// Returns checkpoint performance statistics.

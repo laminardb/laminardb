@@ -517,7 +517,7 @@ pub async fn start_cluster(
             format!("{base}/nodes/{node_id_str}/")
         }
     };
-    builder = server::apply_checkpoint_config(builder, &checkpoint_url, &config.checkpoint);
+    builder = server::apply_checkpoint_config(builder, &checkpoint_url, &config.checkpoint, true);
 
     builder = builder
         .state_backend(Arc::clone(&state_backend))
