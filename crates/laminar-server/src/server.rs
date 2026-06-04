@@ -381,9 +381,6 @@ pub(crate) async fn start_http_api(
         #[cfg(feature = "cluster")]
         cluster,
     });
-    // Reap abandoned ephemeral console streams (created via POST /api/v1/queries
-    // but never connected to over WebSocket).
-    http::spawn_ephemeral_gc(Arc::clone(&app_state));
     let router = http::build_router(Arc::clone(&app_state));
     let api_handle = http::serve(router, &bind).await?;
     info!("HTTP API listening on {bind}");

@@ -84,6 +84,7 @@ time = "0.3"
 async-trait = { workspace = true }
 futures = { workspace = true }
 rand = { workspace = true }
+subtle = { workspace = true }
 
 # Config helpers
 regex = { workspace = true }

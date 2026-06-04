@@ -105,6 +105,9 @@ base64 = "0.22"
 # Randomness
 rand = "0.10"
 
+# Constant-time comparison (token validation)
+subtle = "2.6"
+
 # Metrics
 prometheus = { version = "0.14", features = ["process"] }
 

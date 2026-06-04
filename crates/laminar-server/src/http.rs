@@ -65,11 +65,8 @@ pub struct AppState {
 // ---------------------------------------------------------------------------
 
 /// How long an ephemeral console stream may sit `Pending` (created but never
-/// connected to over WebSocket) before the GC task drops it.
+/// connected to over WebSocket) before its one-shot reaper task drops it.
 const EPHEMERAL_PENDING_TTL: Duration = Duration::from_secs(30);
-
-/// How often the background GC task sweeps for abandoned ephemeral streams.
-const EPHEMERAL_GC_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Lifecycle state of a console-managed ephemeral stream.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -80,21 +77,16 @@ enum EphemeralState {
     Connected,
 }
 
-struct EphemeralEntry {
-    state: EphemeralState,
-    created_at: Instant,
-}
-
 /// Tracks the lifecycle of console-initiated ephemeral streams.
 ///
 /// A stream is registered `Pending` when `POST /api/v1/queries` creates it,
 /// transitions to `Connected` when its WebSocket is opened, and is removed
-/// when the WebSocket closes. The background GC task ([`spawn_ephemeral_gc`])
-/// drops any stream still `Pending` after [`EPHEMERAL_PENDING_TTL`], so a
-/// client that requests a query but never connects can't leak a stream.
+/// when the WebSocket closes. `create_query` arms a one-shot reaper task that
+/// drops the stream if it is still `Pending` after [`EPHEMERAL_PENDING_TTL`],
+/// so a client that requests a query but never connects can't leak a stream.
 #[derive(Default)]
 pub struct EphemeralTracker {
-    inner: parking_lot::Mutex<HashMap<String, EphemeralEntry>>,
+    inner: parking_lot::Mutex<HashMap<String, EphemeralState>>,
 }
 
 impl EphemeralTracker {
@@ -106,21 +98,15 @@ impl EphemeralTracker {
 
     /// Records a newly created ephemeral stream as `Pending`.
     fn add_pending(&self, name: String) {
-        self.inner.lock().insert(
-            name,
-            EphemeralEntry {
-                state: EphemeralState::Pending,
-                created_at: Instant::now(),
-            },
-        );
+        self.inner.lock().insert(name, EphemeralState::Pending);
     }
 
     /// Transitions a pending stream to `Connected`. Returns `true` if the
     /// stream was tracked (i.e. it is a console ephemeral stream).
     fn mark_connected(&self, name: &str) -> bool {
         let mut guard = self.inner.lock();
-        if let Some(entry) = guard.get_mut(name) {
-            entry.state = EphemeralState::Connected;
+        if let Some(state) = guard.get_mut(name) {
+            *state = EphemeralState::Connected;
             true
         } else {
             false
@@ -132,43 +118,24 @@ impl EphemeralTracker {
         self.inner.lock().remove(name).is_some()
     }
 
+    /// Removes `name` only if it is still `Pending`, returning `true` when it
+    /// was. Used by the reaper task so a stream that connected (or was already
+    /// torn down) in the meantime is left untouched.
+    fn remove_if_pending(&self, name: &str) -> bool {
+        let mut guard = self.inner.lock();
+        if matches!(guard.get(name), Some(EphemeralState::Pending)) {
+            guard.remove(name);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Returns `true` if `name` is currently tracked (test-only introspection).
     #[cfg(test)]
     fn is_tracked(&self, name: &str) -> bool {
         self.inner.lock().contains_key(name)
     }
-
-    /// Returns the names of streams still `Pending` past `ttl`.
-    fn expired_pending(&self, ttl: Duration) -> Vec<String> {
-        let guard = self.inner.lock();
-        guard
-            .iter()
-            .filter(|(_, e)| e.state == EphemeralState::Pending && e.created_at.elapsed() >= ttl)
-            .map(|(name, _)| name.clone())
-            .collect()
-    }
-}
-
-/// Spawns the background task that reaps abandoned ephemeral console streams.
-///
-/// Every [`EPHEMERAL_GC_INTERVAL`] it drops any stream that has been `Pending`
-/// (created but never connected to) for longer than [`EPHEMERAL_PENDING_TTL`].
-pub fn spawn_ephemeral_gc(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(EPHEMERAL_GC_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            ticker.tick().await;
-            for name in state.ephemeral.expired_pending(EPHEMERAL_PENDING_TTL) {
-                let ddl = format!("DROP STREAM IF EXISTS {name}");
-                if let Err(e) = state.db.execute(&ddl).await {
-                    warn!(stream = %name, error = %e, "failed to drop abandoned ephemeral stream");
-                }
-                state.ephemeral.remove(&name);
-                info!(stream = %name, "reaped abandoned ephemeral console stream");
-            }
-        }
-    })
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -283,17 +250,10 @@ fn query_token(uri: &axum::http::Uri) -> Option<String> {
 }
 
 /// Constant-time string comparison so token validation doesn't leak the secret
-/// through response timing. Length is compared eagerly (already public-ish).
+/// through response timing.
 fn ct_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    use subtle::ConstantTimeEq;
+    a.as_bytes().ct_eq(b.as_bytes()).unwrap_u8() == 1
 }
 
 pub async fn serve(router: Router, bind: &str) -> Result<tokio::task::JoinHandle<()>, ServerError> {
@@ -556,7 +516,8 @@ fn console_stream_name() -> String {
 
 /// Register an ad-hoc live query as an ephemeral stream and return the URL the
 /// console connects its WebSocket to. The stream is reaped on WS disconnect, or
-/// by the GC task if no client connects within [`EPHEMERAL_PENDING_TTL`].
+/// by a one-shot reaper task if no client connects within
+/// [`EPHEMERAL_PENDING_TTL`].
 async fn create_query(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateQueryRequest>,
@@ -567,6 +528,25 @@ async fn create_query(
     match state.db.execute(&ddl).await {
         Ok(_) => {
             state.ephemeral.add_pending(name.clone());
+
+            // Arm a one-shot reaper: if no WebSocket connects within the TTL,
+            // drop the still-`Pending` stream so an abandoned request can't
+            // leak it.
+            let tracker = Arc::clone(&state.ephemeral);
+            let db = Arc::clone(&state.db);
+            let name_clone = name.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(EPHEMERAL_PENDING_TTL).await;
+                if tracker.remove_if_pending(&name_clone) {
+                    let ddl = format!("DROP STREAM IF EXISTS {name_clone}");
+                    if let Err(e) = db.execute(&ddl).await {
+                        warn!(stream = %name_clone, error = %e, "failed to drop abandoned ephemeral stream");
+                    } else {
+                        info!(stream = %name_clone, "reaped abandoned ephemeral console stream");
+                    }
+                }
+            });
+
             let ws_url = format!("/ws/{name}");
             Json(CreateQueryResponse {
                 stream_id: name,
@@ -1741,36 +1721,39 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// Unit test of the ephemeral-stream lifecycle the WS handler and GC task
-    /// drive: pending → connected, removal, and pending-TTL expiry.
+    /// Unit test of the ephemeral-stream lifecycle the WS handler and reaper
+    /// task drive: pending → connected, removal, and pending-only reaping.
     #[test]
     fn test_ephemeral_tracker_lifecycle() {
         let tracker = EphemeralTracker::new();
 
-        // Unknown stream: not tracked, can't be marked connected.
+        // Unknown stream: not tracked, can't be marked connected or reaped.
         assert!(!tracker.is_tracked("__console_x"));
         assert!(!tracker.mark_connected("__console_x"));
+        assert!(!tracker.remove_if_pending("__console_x"));
 
-        // Pending stream is tracked and reported as expired once past the TTL.
+        // A pending stream is tracked and reaped by `remove_if_pending`.
         tracker.add_pending("__console_x".to_string());
         assert!(tracker.is_tracked("__console_x"));
-        assert_eq!(
-            tracker.expired_pending(Duration::ZERO),
-            vec!["__console_x".to_string()],
-            "a pending stream older than a zero TTL is expired"
+        assert!(
+            tracker.remove_if_pending("__console_x"),
+            "a pending stream is reaped"
         );
         assert!(
-            tracker
-                .expired_pending(Duration::from_secs(3600))
-                .is_empty(),
-            "a fresh pending stream is not expired under a long TTL"
+            !tracker.is_tracked("__console_x"),
+            "reaping stops tracking the stream"
         );
 
-        // Once connected, the GC task must never reap it, regardless of age.
+        // Once connected, the reaper must never drop it.
+        tracker.add_pending("__console_x".to_string());
         assert!(tracker.mark_connected("__console_x"));
         assert!(
-            tracker.expired_pending(Duration::ZERO).is_empty(),
-            "a connected stream is never expired"
+            !tracker.remove_if_pending("__console_x"),
+            "a connected stream is never reaped"
+        );
+        assert!(
+            tracker.is_tracked("__console_x"),
+            "a connected stream stays tracked"
         );
 
         // Removal stops tracking.
