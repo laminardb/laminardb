@@ -529,7 +529,7 @@ impl ConnectorPipelineCallback {
     /// outside cluster mode. Best-effort: a snapshot error logs and yields an
     /// empty map — the partial then carries no operator state for that epoch,
     /// exactly as the legacy marker did, so the checkpoint still succeeds.
-    #[allow(clippy::disallowed_types)] // matches the coordinator/graph map shape
+    #[allow(clippy::unused_self, clippy::disallowed_types)] // matches the coordinator/graph map shape
     fn capture_vnode_states(
         &mut self,
     ) -> std::collections::HashMap<u32, std::collections::HashMap<String, bytes::Bytes>> {

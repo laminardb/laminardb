@@ -93,6 +93,7 @@ pub struct LaminarDB {
     pub(crate) session_properties: parking_lot::Mutex<HashMap<String, String>>,
     /// Min of all source watermarks.
     pub(crate) pipeline_watermark: Arc<std::sync::atomic::AtomicI64>,
+    /// The registry of lookup table snapshots.
     pub(crate) lookup_registry: Arc<laminar_sql::datafusion::LookupTableRegistry>,
     /// Assembled AI subsystem (registry + providers + cache + call log).
     /// `None` unless `[ai]`/`[models]` are configured. Set once in the builder.

@@ -397,6 +397,7 @@ pub struct LookupJoinExec {
     /// every cycle of a cached physical plan.
     converter: Arc<RowConverter>,
     stream_field_count: usize,
+    projection: Vec<usize>,
 }
 
 impl LookupJoinExec {
@@ -453,6 +454,7 @@ impl LookupJoinExec {
         );
 
         let stream_field_count = input.schema().fields().len();
+        let projection = (0..(stream_field_count + lookup_batch.num_columns())).collect();
 
         Ok(Self {
             input,
@@ -464,7 +466,15 @@ impl LookupJoinExec {
             properties,
             converter,
             stream_field_count,
+            projection,
         })
+    }
+
+    /// Sets the projection list for output columns.
+    #[must_use]
+    pub fn with_projection(mut self, projection: Vec<usize>) -> Self {
+        self.projection = projection;
+        self
     }
 }
 
@@ -535,6 +545,7 @@ impl ExecutionPlan for LookupJoinExec {
             properties: self.properties.clone(),
             converter: Arc::clone(&self.converter),
             stream_field_count: self.stream_field_count,
+            projection: self.projection.clone(),
         }))
     }
 
@@ -551,6 +562,7 @@ impl ExecutionPlan for LookupJoinExec {
         let join_type = self.join_type;
         let schema = self.schema();
         let stream_field_count = self.stream_field_count;
+        let projection = self.projection.clone();
 
         let output = input_stream.map(move |result| {
             let batch = result?;
@@ -566,6 +578,7 @@ impl ExecutionPlan for LookupJoinExec {
                 join_type,
                 &schema,
                 stream_field_count,
+                &projection,
             )
         });
 
@@ -614,6 +627,7 @@ fn probe_batch(
     join_type: LookupJoinType,
     output_schema: &SchemaRef,
     stream_field_count: usize,
+    projection: &[usize],
 ) -> Result<RecordBatch> {
     let key_cols: Vec<_> = stream_key_indices
         .iter()
@@ -658,7 +672,7 @@ fn probe_batch(
 
     // Gather stream-side columns
     let take_stream = UInt32Array::from(stream_indices);
-    let mut columns = Vec::with_capacity(output_schema.fields().len());
+    let mut columns = Vec::with_capacity(stream_field_count + lookup_batch.num_columns());
 
     for col in stream_batch.columns() {
         columns.push(take(col.as_ref(), &take_stream, None)?);
@@ -676,7 +690,18 @@ fn probe_batch(
         "output column count mismatch"
     );
 
-    Ok(RecordBatch::try_new(Arc::clone(output_schema), columns)?)
+    let projected_columns: Vec<_> = projection.iter().map(|&idx| columns[idx].clone()).collect();
+
+    debug_assert_eq!(
+        projected_columns.len(),
+        output_schema.fields().len(),
+        "projected column count mismatch"
+    );
+
+    Ok(RecordBatch::try_new(
+        Arc::clone(output_schema),
+        projected_columns,
+    )?)
 }
 
 // ── Versioned Lookup Join Exec ────────────────────────────────────
@@ -1392,6 +1417,53 @@ async fn probe_partial_batch_with_fallback(
     Ok(RecordBatch::try_new(Arc::clone(output_schema), columns)?)
 }
 
+fn resolve_physical_projection(
+    logical_schema: &datafusion::common::DFSchema,
+    stream_schema: &arrow::datatypes::Schema,
+    lookup_schema: &arrow::datatypes::Schema,
+    lookup_table: &str,
+    lookup_alias: Option<&str>,
+) -> Result<Vec<usize>> {
+    let mut projection = Vec::with_capacity(logical_schema.fields().len());
+    for idx in 0..logical_schema.fields().len() {
+        let (qualifier, field) = logical_schema.qualified_field(idx);
+        let name = field.name();
+        let is_lookup = if let Some(relation) = qualifier {
+            let table = relation.table();
+            table == lookup_table || Some(table) == lookup_alias
+        } else {
+            // No qualifier: fallback to name-based detection.
+            if stream_schema.index_of(name).is_ok() && lookup_schema.index_of(name).is_err() {
+                false
+            } else if lookup_schema.index_of(name).is_ok() && stream_schema.index_of(name).is_err()
+            {
+                true
+            } else {
+                stream_schema.index_of(name).is_ok()
+            }
+        };
+
+        if is_lookup {
+            let lookup_idx = lookup_schema.index_of(name).map_err(|_| {
+                DataFusionError::Plan(format!(
+                    "lookup join projection: output field '{name}' not found in lookup \
+                     schema {lookup_schema:?}"
+                ))
+            })?;
+            projection.push(stream_schema.fields().len() + lookup_idx);
+        } else {
+            let stream_idx = stream_schema.index_of(name).map_err(|_| {
+                DataFusionError::Plan(format!(
+                    "lookup join projection: output field '{name}' not found in stream \
+                     schema {stream_schema:?}"
+                ))
+            })?;
+            projection.push(stream_idx);
+        }
+    }
+    Ok(projection)
+}
+
 // ── Extension Planner ────────────────────────────────────────────
 
 /// Converts `LookupJoinNode` logical plans to [`LookupJoinExec`]
@@ -1490,9 +1562,16 @@ impl ExtensionPlanner for LookupJoinExtensionPlanner {
                     }
                 }
 
-                let mut output_fields = stream_schema.fields().to_vec();
-                output_fields.extend(lookup_batch.schema().fields().iter().cloned());
-                let output_schema = Arc::new(Schema::new(output_fields));
+                let logical_schema = lookup_node.schema();
+                let physical_projection = resolve_physical_projection(
+                    logical_schema,
+                    &stream_schema,
+                    &lookup_schema,
+                    lookup_node.lookup_table_name(),
+                    lookup_node.lookup_alias(),
+                )?;
+
+                let output_schema = Arc::new(Schema::new(logical_schema.fields().to_vec()));
 
                 let exec = LookupJoinExec::try_new(
                     input,
@@ -1501,7 +1580,8 @@ impl ExtensionPlanner for LookupJoinExtensionPlanner {
                     lookup_key_indices,
                     lookup_node.join_type(),
                     output_schema,
-                )?;
+                )?
+                .with_projection(physical_projection);
 
                 Ok(Some(Arc::new(exec)))
             }

@@ -1275,12 +1275,21 @@ impl LaminarDB {
         }))
     }
 
-    /// No-op: all tables now use `ReferenceTableProvider` which reads live
-    /// data on every `scan()`. No deregister/re-register needed.
-    ///
-    /// Retained as a function so callers don't need to change.
-    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
-    pub(crate) fn sync_table_to_datafusion(&self, _name: &str) -> Result<(), DbError> {
+    #[allow(clippy::unnecessary_wraps)]
+    pub(crate) fn sync_table_to_datafusion(&self, name: &str) -> Result<(), DbError> {
+        if self.lookup_registry.get_entry(name).is_some() {
+            if let Some(batch) = self.table_store.read().to_record_batch(name) {
+                if let Some(pk) = self.table_store.read().primary_key(name) {
+                    self.lookup_registry.register(
+                        name,
+                        laminar_sql::datafusion::LookupSnapshot {
+                            batch,
+                            key_columns: vec![pk.to_string()],
+                        },
+                    );
+                }
+            }
+        }
         Ok(())
     }
 }
