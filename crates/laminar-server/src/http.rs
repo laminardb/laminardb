@@ -13,7 +13,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 
 use laminar_db::LaminarDB;
@@ -36,10 +36,19 @@ pub struct AppState {
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let cors = build_cors_layer(&state);
+
+    // Public, unauthenticated routes: liveness/readiness probes and the
+    // Prometheus scrape endpoint. These must stay reachable without a token so
+    // orchestrators and the metrics scraper keep working.
+    let public = Router::new()
         .route("/health", get(health_check))
         .route("/ready", get(readiness_check))
-        .route("/metrics", get(prometheus_metrics))
+        .route("/metrics", get(prometheus_metrics));
+
+    // Control-plane (`/api/v1/*`) and realtime (`/ws/{name}`) routes, gated by
+    // the console bearer token when one is configured.
+    let protected = Router::new()
         .route("/api/v1/sources", get(list_sources))
         .route("/api/v1/sinks", get(list_sinks))
         .route("/api/v1/streams", get(list_streams))
@@ -49,9 +58,98 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/reload", post(handle_reload))
         .route("/api/v1/cluster", get(cluster_status))
         .route("/ws/{name}", get(ws_upgrade))
-        .layer(CorsLayer::permissive())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
+
+    public
+        .merge(protected)
+        .layer(cors)
         .layer(axum::middleware::from_fn(request_logging))
         .with_state(state)
+}
+
+/// Build the CORS policy from config. With an explicit allow-list of console
+/// origins we restrict `Access-Control-Allow-Origin` to those; otherwise we
+/// fall back to the legacy permissive policy (dev only).
+fn build_cors_layer(state: &AppState) -> CorsLayer {
+    let allowed = state
+        .current_config
+        .read()
+        .server
+        .console_cors_allowed_origins
+        .clone();
+
+    match allowed {
+        Some(origins) => {
+            let values: Vec<axum::http::HeaderValue> =
+                origins.iter().filter_map(|o| o.parse().ok()).collect();
+            CorsLayer::new()
+                .allow_origin(values)
+                .allow_methods(Any)
+                .allow_headers(Any)
+        }
+        None => CorsLayer::permissive(),
+    }
+}
+
+/// Bearer-token gate for the control-plane API. When `server.console_token` is
+/// configured, every request to a protected route must present the token
+/// either as an `Authorization: Bearer <token>` header or as a `?token=<token>`
+/// query parameter (the latter for browser WebSocket clients, which can't set
+/// custom headers on the upgrade request). When no token is configured the
+/// HTTP API is left open — loopback/dev only.
+async fn auth_middleware(
+    State(state): State<Arc<AppState>>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    // Clone the token out and drop the guard before any `.await`; the
+    // parking_lot guard is `!Send` and must not cross `next.run`.
+    let expected = state.current_config.read().server.console_token.clone();
+
+    if let Some(expected) = expected {
+        let expected = expected.expose();
+        let authorized = bearer_token(req.headers()).is_some_and(|t| ct_eq(t, expected))
+            || query_token(req.uri()).is_some_and(|t| ct_eq(&t, expected));
+        if !authorized {
+            return error_response(StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        }
+    }
+
+    next.run(req).await
+}
+
+/// Extract the bearer token from an `Authorization: Bearer <token>` header.
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
+/// Extract the `token` query parameter from a request URI, if present.
+fn query_token(uri: &axum::http::Uri) -> Option<String> {
+    uri.query()?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "token").then(|| value.to_string())
+    })
+}
+
+/// Constant-time string comparison so token validation doesn't leak the secret
+/// through response timing. Length is compared eagerly (already public-ish).
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 pub async fn serve(router: Router, bind: &str) -> Result<tokio::task::JoinHandle<()>, ServerError> {
@@ -640,6 +738,115 @@ mod tests {
             registry,
             server_metrics,
         })
+    }
+
+    /// Like [`test_state`] but with a console bearer token configured, so the
+    /// auth middleware is active on protected routes.
+    fn test_state_with_token(token: &str) -> Arc<AppState> {
+        let registry = Arc::new(crate::metrics::build_registry([
+            ("instance".into(), "test".into()),
+            ("pipeline".into(), "test".into()),
+        ]));
+        let engine_metrics = Arc::new(laminar_db::EngineMetrics::new(&registry));
+        let db = Arc::new(LaminarDB::open().unwrap());
+        db.set_engine_metrics(engine_metrics);
+        let server_metrics = crate::metrics::ServerMetrics::new(&registry);
+        let server = crate::config::ServerSection {
+            console_token: Some(crate::config::Secret::new(token)),
+            ..Default::default()
+        };
+        Arc::new(AppState {
+            db,
+            config_path: PathBuf::from("test.toml"),
+            current_config: parking_lot::RwLock::new(crate::config::ServerConfig {
+                server,
+                state: laminar_core::state::StateBackendConfig::default(),
+                checkpoint: crate::config::CheckpointSection::default(),
+                sources: vec![],
+                lookups: vec![],
+                pipelines: vec![],
+                sinks: vec![],
+                discovery: None,
+                coordination: None,
+                node_id: None,
+                sql: None,
+                ai: Default::default(),
+                models: Default::default(),
+            }),
+            reload_guard: ReloadGuard::new(),
+            registry,
+            server_metrics,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_auth_required_without_token_returns_401() {
+        let state = test_state_with_token("supersecret-token");
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/sources")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_with_valid_bearer_returns_200() {
+        let state = test_state_with_token("supersecret-token");
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/sources")
+            .header("authorization", "Bearer supersecret-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_auth_with_wrong_bearer_returns_401() {
+        let state = test_state_with_token("supersecret-token");
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/sources")
+            .header("authorization", "Bearer not-the-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_with_query_token_returns_200() {
+        // WebSocket clients can't set the Authorization header, so the token
+        // is accepted from the query string as well.
+        let state = test_state_with_token("supersecret-token");
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/sources?token=supersecret-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_public_health_bypasses_auth() {
+        // /health is public even when a console token is configured.
+        let state = test_state_with_token("supersecret-token");
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
