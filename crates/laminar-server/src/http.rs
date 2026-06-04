@@ -117,6 +117,10 @@ struct SqlResponse {
     object_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rows_affected: Option<u64>,
+    /// Result rows as a JSON array (one object per row), for `Query` and
+    /// `Metadata` results. Capped at [`MAX_SQL_RESULT_ROWS`] for `Query`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -284,6 +288,17 @@ async fn trigger_checkpoint(State(state): State<Arc<AppState>>) -> impl IntoResp
     }
 }
 
+/// Hard cap on rows materialized into an HTTP `SELECT` response. Streaming
+/// queries are unbounded; without a cap a single request could consume
+/// arbitrary memory. UIs should paginate via SQL or use the WS subscription
+/// for live tailing.
+const MAX_SQL_RESULT_ROWS: usize = 1000;
+
+/// Wall-clock budget for collecting rows from a streaming `Query` result.
+/// Sparse/empty streams would otherwise block the HTTP request indefinitely;
+/// we return whatever has arrived by the deadline.
+const SQL_RESULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn execute_sql(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SqlRequest>,
@@ -296,22 +311,78 @@ async fn execute_sql(
                     result_type: info.statement_type,
                     object_name: Some(info.object_name),
                     rows_affected: None,
+                    data: None,
                 },
                 ExecuteResult::RowsAffected(n) => SqlResponse {
                     result_type: "rows_affected".to_string(),
                     object_name: None,
                     rows_affected: Some(n),
+                    data: None,
                 },
-                ExecuteResult::Query(_) => SqlResponse {
-                    result_type: "query".to_string(),
-                    object_name: None,
-                    rows_affected: None,
-                },
-                ExecuteResult::Metadata(_) => SqlResponse {
-                    result_type: "metadata".to_string(),
-                    object_name: None,
-                    rows_affected: None,
-                },
+                ExecuteResult::Metadata(batch) => {
+                    let data = match batch_to_json(&batch) {
+                        Ok(json) => json,
+                        Err(e) => {
+                            return error_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("failed to serialize result: {e}"),
+                            )
+                            .into_response();
+                        }
+                    };
+                    SqlResponse {
+                        result_type: "metadata".to_string(),
+                        object_name: None,
+                        rows_affected: None,
+                        data: Some(data),
+                    }
+                }
+                ExecuteResult::Query(mut handle) => {
+                    let mut sub = match handle.subscribe_raw() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return error_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                e.to_string(),
+                            )
+                            .into_response();
+                        }
+                    };
+
+                    // Accumulate rows up to the cap or until the deadline. The
+                    // accumulator lives outside the timed future so partial
+                    // results survive a timeout cancellation.
+                    let mut rows: Vec<serde_json::Value> = Vec::new();
+                    let collect = async {
+                        while rows.len() < MAX_SQL_RESULT_ROWS {
+                            match sub.recv_async().await {
+                                Ok(batch) => match batch_to_json(&batch) {
+                                    Ok(serde_json::Value::Array(batch_rows)) => {
+                                        for row in batch_rows {
+                                            if rows.len() >= MAX_SQL_RESULT_ROWS {
+                                                break;
+                                            }
+                                            rows.push(row);
+                                        }
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        warn!(error = %e, "serialize error for SQL result batch");
+                                    }
+                                },
+                                Err(_) => break, // stream disconnected
+                            }
+                        }
+                    };
+                    let _ = tokio::time::timeout(SQL_RESULT_TIMEOUT, collect).await;
+
+                    SqlResponse {
+                        result_type: "query".to_string(),
+                        object_name: None,
+                        rows_affected: None,
+                        data: Some(serde_json::Value::Array(rows)),
+                    }
+                }
             };
             Json(resp).into_response()
         }
@@ -728,6 +799,51 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["result_type"], "CREATE SOURCE");
+    }
+
+    #[tokio::test]
+    async fn test_execute_sql_metadata_returns_rows() {
+        let state = test_state();
+        let app = build_router(state);
+
+        // Create a source so SHOW SOURCES has a row to return.
+        let create = Request::builder()
+            .method("POST")
+            .uri("/api/v1/sql")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({
+                    "sql": "CREATE SOURCE meta_src (id BIGINT, name VARCHAR)"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // SHOW SOURCES yields an ExecuteResult::Metadata batch — the handler
+        // must serialize it into the `data` field.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/sql")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_string(&serde_json::json!({ "sql": "SHOW SOURCES" })).unwrap(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["result_type"], "metadata");
+        let data = json["data"]
+            .as_array()
+            .expect("data should be a JSON array");
+        assert_eq!(data.len(), 1, "expected the one created source");
+        assert_eq!(data[0]["source_name"], "meta_src");
     }
 
     #[tokio::test]

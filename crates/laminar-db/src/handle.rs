@@ -84,7 +84,13 @@ impl QueryHandle {
         self.active
     }
 
-    pub(crate) fn subscribe_raw(&mut self) -> Result<Subscription<ArrowRecord>, DbError> {
+    /// Take the raw `RecordBatch` subscription for this query.
+    ///
+    /// The subscription is consumed on first call; subsequent calls error.
+    ///
+    /// # Errors
+    /// Returns `DbError::InvalidOperation` if the subscription was already consumed.
+    pub fn subscribe_raw(&mut self) -> Result<Subscription<ArrowRecord>, DbError> {
         self.subscription
             .take()
             .ok_or_else(|| DbError::InvalidOperation("Subscription already consumed".to_string()))
