@@ -12,7 +12,16 @@ use crate::error::DbError;
 
 impl LaminarDB {
     /// Build a SHOW CHECKPOINT STATUS metadata result.
-    pub(crate) async fn build_show_checkpoint_status(&self) -> Result<RecordBatch, DbError> {
+    ///
+    /// Exposed publicly so the server's control-plane HTTP API
+    /// (`GET /api/v1/cluster/checkpoints`) can surface checkpoint metadata
+    /// in both single-node and cluster mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Checkpoint`] if the metadata batch cannot be
+    /// assembled from the latest checkpoint.
+    pub async fn build_show_checkpoint_status(&self) -> Result<RecordBatch, DbError> {
         let store = self.checkpoint_store();
         let (latest, list) = match &store {
             Some(s) => (

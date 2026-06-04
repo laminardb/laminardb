@@ -15,6 +15,8 @@ use crate::config::{
     ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
 };
 use crate::http;
+#[cfg(feature = "cluster")]
+use crate::http::ClusterComponents;
 use crate::metrics::ServerMetrics;
 use crate::reload::ReloadGuard;
 #[cfg(all(test, any(feature = "otel", feature = "kafka")))]
@@ -197,8 +199,16 @@ pub async fn run_server(
             .expect("pgwire_tls_min_version validated at config load");
     let pgwire_max_connections = config.server.pgwire_max_connections;
     let pgwire_max_auth_failures = config.server.pgwire_max_auth_failures_per_min;
-    let (app_state, api_handle) =
-        start_http_api(Arc::clone(&db), registry, config_path.clone(), config).await?;
+    let (app_state, api_handle) = start_http_api(
+        Arc::clone(&db),
+        registry,
+        config_path.clone(),
+        config,
+        // Single-node embedded mode has no cluster control plane.
+        #[cfg(feature = "cluster")]
+        None,
+    )
+    .await?;
     let watcher_handle = spawn_config_watcher(&app_state, config_path);
 
     let pgwire_handle = if let Some(bind) = pgwire_bind {
@@ -345,11 +355,16 @@ pub(crate) async fn execute_config_ddl(
 }
 
 /// Start HTTP API server and return (shared state, join handle).
+///
+/// In cluster mode the caller passes `Some(ClusterComponents)` so the
+/// `/api/v1/cluster/*` endpoints can surface membership, vnode assignments,
+/// and leadership; single-node startup passes `None`.
 pub(crate) async fn start_http_api(
     db: Arc<LaminarDB>,
     registry: Arc<prometheus::Registry>,
     config_path: PathBuf,
     config: ServerConfig,
+    #[cfg(feature = "cluster")] cluster: Option<ClusterComponents>,
 ) -> Result<(Arc<http::AppState>, tokio::task::JoinHandle<()>), ServerError> {
     let bind = config.server.bind.clone();
 
@@ -363,6 +378,8 @@ pub(crate) async fn start_http_api(
         registry,
         server_metrics,
         ephemeral: Arc::new(http::EphemeralTracker::new()),
+        #[cfg(feature = "cluster")]
+        cluster,
     });
     // Reap abandoned ephemeral console streams (created via POST /api/v1/queries
     // but never connected to over WebSocket).

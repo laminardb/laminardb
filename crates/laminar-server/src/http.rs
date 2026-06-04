@@ -17,12 +17,29 @@ use serde::{Deserialize, Serialize};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 
-use laminar_db::{ConnectorInfo, LaminarDB};
+use laminar_db::{ConnectorInfo, LaminarDB, PipelineNodeType};
 
 use crate::config::ServerConfig;
 use crate::metrics::ServerMetrics;
 use crate::reload::{self, ReloadGuard};
 use crate::server::ServerError;
+
+/// Cluster control-plane handles wired into the HTTP API in cluster mode.
+///
+/// Present only when the server is compiled with the `cluster` feature and
+/// started in cluster mode; the cluster endpoints (`/api/v1/cluster/{nodes,
+/// vnodes,leader}`) return `404 Not Found` when this is `None`.
+#[cfg(feature = "cluster")]
+#[derive(Clone)]
+pub struct ClusterComponents {
+    /// Leader-election / membership controller (gossip discovery only).
+    pub controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
+    /// Durable vnode-assignment snapshot store.
+    pub snapshot_store: Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>,
+    /// Live cluster membership feed.
+    pub membership_rx:
+        tokio::sync::watch::Receiver<Vec<laminar_core::cluster::discovery::NodeInfo>>,
+}
 
 pub struct AppState {
     pub db: Arc<LaminarDB>,
@@ -37,6 +54,10 @@ pub struct AppState {
     /// Tracks ephemeral streams created by the console (`POST /api/v1/queries`)
     /// so abandoned ones can be reaped.
     pub ephemeral: Arc<EphemeralTracker>,
+    /// Cluster control-plane handles (cluster mode only). `None` in
+    /// single-node mode; the cluster endpoints 404 when absent.
+    #[cfg(feature = "cluster")]
+    pub cluster: Option<ClusterComponents>,
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +195,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/v1/checkpoint", post(trigger_checkpoint))
         .route("/api/v1/sql", post(execute_sql))
         .route("/api/v1/reload", post(handle_reload))
+        .route("/api/v1/graph", get(get_graph))
         .route("/api/v1/cluster", get(cluster_status))
+        .route("/api/v1/cluster/nodes", get(cluster_nodes))
+        .route("/api/v1/cluster/vnodes", get(cluster_vnodes))
+        .route("/api/v1/cluster/leader", get(cluster_leader))
+        .route("/api/v1/cluster/checkpoints", get(cluster_checkpoints))
         .route("/ws/{name}", get(ws_upgrade))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -778,6 +804,176 @@ async fn cluster_status(State(state): State<Arc<AppState>>) -> impl IntoResponse
 }
 
 // ---------------------------------------------------------------------------
+// Pipeline lineage graph (Phase 2)
+// ---------------------------------------------------------------------------
+
+/// A node in the lineage graph returned by `GET /api/v1/graph`.
+#[derive(Debug, Serialize)]
+struct NodeResponse {
+    name: String,
+    /// `"Source"`, `"Stream"`, or `"Sink"`.
+    node_type: String,
+    sql: Option<String>,
+}
+
+/// A directed edge in the lineage graph returned by `GET /api/v1/graph`.
+#[derive(Debug, Serialize)]
+struct EdgeResponse {
+    from: String,
+    to: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GraphResponse {
+    nodes: Vec<NodeResponse>,
+    edges: Vec<EdgeResponse>,
+}
+
+/// Returns the pipeline lineage graph (sources → streams → sinks) as
+/// `{ "nodes": [...], "edges": [...] }` for the console's lineage view.
+async fn get_graph(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let topology = state.db.pipeline_topology();
+    let nodes = topology
+        .nodes
+        .into_iter()
+        .map(|n| NodeResponse {
+            name: n.name,
+            node_type: match n.node_type {
+                PipelineNodeType::Source => "Source",
+                PipelineNodeType::Stream => "Stream",
+                PipelineNodeType::Sink => "Sink",
+            }
+            .to_string(),
+            sql: n.sql,
+        })
+        .collect();
+    let edges = topology
+        .edges
+        .into_iter()
+        .map(|e| EdgeResponse {
+            from: e.from,
+            to: e.to,
+        })
+        .collect();
+    Json(GraphResponse { nodes, edges }).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Cluster topology endpoints (Phase 3)
+// ---------------------------------------------------------------------------
+
+/// 404 returned by the cluster endpoints when the server is not running in
+/// cluster mode (single-node, or compiled without the `cluster` feature).
+#[cfg(feature = "cluster")]
+const CLUSTER_DISABLED_MSG: &str = "cluster endpoints are only available in cluster mode";
+#[cfg(not(feature = "cluster"))]
+const CLUSTER_DISABLED_MSG: &str = "cluster endpoints require the `cluster` feature";
+
+/// `GET /api/v1/cluster/nodes` — current cluster membership.
+async fn cluster_nodes(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    #[cfg(feature = "cluster")]
+    {
+        let Some(cluster) = state.cluster.as_ref() else {
+            return error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response();
+        };
+        // Clone the snapshot out of the watch guard so it isn't held across
+        // serialization.
+        let nodes: Vec<laminar_core::cluster::discovery::NodeInfo> =
+            cluster.membership_rx.borrow().clone();
+        Json(nodes).into_response()
+    }
+    #[cfg(not(feature = "cluster"))]
+    {
+        let _ = state;
+        error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response()
+    }
+}
+
+/// `GET /api/v1/cluster/vnodes` — the latest vnode→instance assignment
+/// snapshot (or an empty snapshot when none has been written yet).
+async fn cluster_vnodes(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    #[cfg(feature = "cluster")]
+    {
+        use laminar_core::cluster::control::AssignmentSnapshot;
+
+        let Some(cluster) = state.cluster.as_ref() else {
+            return error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response();
+        };
+        let snapshot = match &cluster.snapshot_store {
+            Some(store) => match store.load().await {
+                Ok(Some(snap)) => snap,
+                Ok(None) => AssignmentSnapshot::empty(),
+                Err(e) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("failed to load assignment snapshot: {e}"),
+                    )
+                    .into_response();
+                }
+            },
+            None => AssignmentSnapshot::empty(),
+        };
+        Json(snapshot).into_response()
+    }
+    #[cfg(not(feature = "cluster"))]
+    {
+        let _ = state;
+        error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response()
+    }
+}
+
+/// `GET /api/v1/cluster/leader` — the current leader's `NodeInfo` (if known)
+/// and whether this node is the leader.
+async fn cluster_leader(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    #[cfg(feature = "cluster")]
+    {
+        #[derive(Serialize)]
+        struct LeaderResponse {
+            leader: Option<laminar_core::cluster::discovery::NodeInfo>,
+            is_leader: bool,
+        }
+
+        let Some(cluster) = state.cluster.as_ref() else {
+            return error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response();
+        };
+        let (leader_id, is_leader) = match &cluster.controller {
+            Some(controller) => (controller.current_leader(), controller.is_leader()),
+            None => (None, false),
+        };
+        let leader = leader_id.and_then(|id| {
+            cluster
+                .membership_rx
+                .borrow()
+                .iter()
+                .find(|n| n.id == id)
+                .cloned()
+        });
+        Json(LeaderResponse { leader, is_leader }).into_response()
+    }
+    #[cfg(not(feature = "cluster"))]
+    {
+        let _ = state;
+        error_response(StatusCode::NOT_FOUND, CLUSTER_DISABLED_MSG).into_response()
+    }
+}
+
+/// `GET /api/v1/cluster/checkpoints` — latest checkpoint metadata. Available
+/// in both single-node and cluster mode.
+async fn cluster_checkpoints(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.db.build_show_checkpoint_status().await {
+        Ok(batch) => match batch_to_json(&batch) {
+            Ok(json) => Json(json).into_response(),
+            Err(e) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to serialize checkpoint status: {e}"),
+            )
+            .into_response(),
+        },
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WebSocket stream subscriptions
 // ---------------------------------------------------------------------------
 
@@ -945,6 +1141,8 @@ mod tests {
             registry,
             server_metrics,
             ephemeral: Arc::new(EphemeralTracker::new()),
+            #[cfg(feature = "cluster")]
+            cluster: None,
         })
     }
 
@@ -985,6 +1183,8 @@ mod tests {
             registry,
             server_metrics,
             ephemeral: Arc::new(EphemeralTracker::new()),
+            #[cfg(feature = "cluster")]
+            cluster: None,
         })
     }
 
@@ -1353,6 +1553,8 @@ mod tests {
             registry,
             server_metrics,
             ephemeral: Arc::new(EphemeralTracker::new()),
+            #[cfg(feature = "cluster")]
+            cluster: None,
         });
 
         let app = build_router(state.clone());
@@ -1652,6 +1854,149 @@ mod tests {
         assert!(
             resp.starts_with("HTTP/1.1 404"),
             "expected 404 Not Found for unknown stream, got: {resp}"
+        );
+    }
+
+    // ── Lineage graph (Phase 2) + cluster topology (Phase 3) ──
+
+    #[tokio::test]
+    async fn test_get_graph_returns_nodes_and_edges() {
+        let state = test_state();
+        let app = build_router(state);
+
+        exec_sql(&app, "CREATE SOURCE events (id INT, value DOUBLE)").await;
+        exec_sql(&app, "CREATE STREAM s1 AS SELECT * FROM events").await;
+
+        let req = Request::builder()
+            .uri("/api/v1/graph")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let nodes = json["nodes"].as_array().expect("nodes should be an array");
+        let edges = json["edges"].as_array().expect("edges should be an array");
+
+        let source = nodes
+            .iter()
+            .find(|n| n["name"] == "events")
+            .expect("events source node should be present");
+        assert_eq!(source["node_type"], "Source");
+
+        let stream = nodes
+            .iter()
+            .find(|n| n["name"] == "s1")
+            .expect("s1 stream node should be present");
+        assert_eq!(stream["node_type"], "Stream");
+        assert!(
+            stream["sql"].as_str().unwrap().contains("events"),
+            "stream node should carry its defining SQL: {stream:?}"
+        );
+
+        assert!(
+            edges
+                .iter()
+                .any(|e| e["from"] == "events" && e["to"] == "s1"),
+            "expected an edge events -> s1, got: {edges:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_graph_empty() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/graph")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["nodes"].as_array().unwrap().is_empty());
+        assert!(json["edges"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_cluster_nodes_404_when_not_cluster() {
+        // test_state() leaves `cluster` as None, so the cluster endpoints 404
+        // even when compiled with the `cluster` feature.
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/cluster/nodes")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_cluster_vnodes_404_when_not_cluster() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/cluster/vnodes")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_cluster_leader_404_when_not_cluster() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/cluster/leader")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_cluster_checkpoints_returns_metadata() {
+        // Available in both single-node and cluster mode. With no checkpoint
+        // taken yet it still returns a single metadata row of zeros.
+        let state = test_state();
+        let app = build_router(state);
+
+        let req = Request::builder()
+            .uri("/api/v1/cluster/checkpoints")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let rows = json
+            .as_array()
+            .expect("checkpoint status should be an array");
+        assert_eq!(rows.len(), 1, "expected one checkpoint-status row");
+        let row = &rows[0];
+        assert!(
+            row.get("checkpoint_id").is_some(),
+            "row should carry checkpoint_id: {row:?}"
+        );
+        assert!(
+            row.get("total_checkpoints").is_some(),
+            "row should carry total_checkpoints: {row:?}"
         );
     }
 }

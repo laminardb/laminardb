@@ -662,10 +662,24 @@ pub async fn start_cluster(
             None => None,
         };
 
-    let (app_state, api_handle) =
-        server::start_http_api(Arc::clone(&db), registry, config_path.clone(), config)
-            .await
-            .map_err(|e| ClusterStartupError::HttpStartup(e.to_string()))?;
+    // Wire the cluster control plane into the HTTP API so the console's
+    // `/api/v1/cluster/*` endpoints can report membership, vnode assignment,
+    // and leadership. `controller`/`snapshot_store` may be `None` under static
+    // discovery; the membership feed is always available.
+    let cluster_components = crate::http::ClusterComponents {
+        controller: cluster_controller.clone(),
+        snapshot_store: snapshot_store.clone(),
+        membership_rx: discovery.membership_watch(),
+    };
+    let (app_state, api_handle) = server::start_http_api(
+        Arc::clone(&db),
+        registry,
+        config_path.clone(),
+        config,
+        Some(cluster_components),
+    )
+    .await
+    .map_err(|e| ClusterStartupError::HttpStartup(e.to_string()))?;
     let watcher_handle = server::spawn_config_watcher(&app_state, config_path);
 
     let membership_rx = discovery.membership_watch();
