@@ -1279,16 +1279,9 @@ impl LaminarDB {
         if self.lookup_registry.get_entry(name).is_none() {
             return Ok(());
         }
-        // One lock keeps batch and PK consistent against a concurrent writer.
-        let ts = self.table_store.read();
-        if let (Some(batch), Some(pk)) = (ts.to_record_batch(name), ts.primary_key(name)) {
-            self.lookup_registry.register(
-                name,
-                laminar_sql::datafusion::LookupSnapshot {
-                    batch,
-                    key_columns: vec![pk.to_string()],
-                },
-            );
+        if let Some(batch) = self.table_store.read().to_record_batch(name) {
+            self.lookup_registry
+                .register(name, laminar_sql::datafusion::LookupSnapshot { batch });
         }
         Ok(())
     }

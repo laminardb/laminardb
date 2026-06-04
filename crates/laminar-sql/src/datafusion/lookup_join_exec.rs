@@ -73,8 +73,6 @@ pub enum RegisteredLookup {
 pub struct LookupSnapshot {
     /// All rows concatenated into a single batch.
     pub batch: RecordBatch,
-    /// Primary key column names used to build the hash index.
-    pub key_columns: Vec<String>,
 }
 
 /// State for a versioned (temporal) lookup table.
@@ -2007,7 +2005,6 @@ mod tests {
             "customers",
             LookupSnapshot {
                 batch: customers_batch(),
-                key_columns: vec!["id".into()],
             },
         );
         assert!(reg.get("customers").is_some());
@@ -2024,7 +2021,6 @@ mod tests {
             "t",
             LookupSnapshot {
                 batch: RecordBatch::new_empty(customers_schema()),
-                key_columns: vec![],
             },
         );
         assert_eq!(reg.get("t").unwrap().batch.num_rows(), 0);
@@ -2033,7 +2029,6 @@ mod tests {
             "t",
             LookupSnapshot {
                 batch: customers_batch(),
-                key_columns: vec![],
             },
         );
         assert_eq!(reg.get("t").unwrap().batch.num_rows(), 3);
@@ -2401,7 +2396,6 @@ mod tests {
             "t",
             LookupSnapshot {
                 batch: customers_batch(),
-                key_columns: vec!["id".into()],
             },
         );
 

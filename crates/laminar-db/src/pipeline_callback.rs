@@ -1496,10 +1496,7 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                         if let Some(rb) = maybe_batch {
                             self.lookup_registry.register(
                                 name,
-                                laminar_sql::datafusion::LookupSnapshot {
-                                    batch: rb,
-                                    key_columns: vec![],
-                                },
+                                laminar_sql::datafusion::LookupSnapshot { batch: rb },
                             );
                         }
                     }

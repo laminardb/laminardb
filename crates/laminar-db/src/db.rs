@@ -813,10 +813,7 @@ impl LaminarDB {
         if let Some(batch) = self.table_store.read().to_record_batch(&info.name) {
             self.lookup_registry.register(
                 &info.name,
-                laminar_sql::datafusion::LookupSnapshot {
-                    batch,
-                    key_columns: info.primary_key.clone(),
-                },
+                laminar_sql::datafusion::LookupSnapshot { batch },
             );
         }
 

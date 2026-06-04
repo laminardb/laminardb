@@ -1141,13 +1141,8 @@ impl LaminarDB {
             ) {
                 // Already versioned — don't downgrade to Snapshot.
             } else if let Some(batch) = self.table_store.read().to_record_batch(name) {
-                self.lookup_registry.register(
-                    name,
-                    laminar_sql::datafusion::LookupSnapshot {
-                        batch,
-                        key_columns: vec![], // already indexed by primary key
-                    },
-                );
+                self.lookup_registry
+                    .register(name, laminar_sql::datafusion::LookupSnapshot { batch });
             }
         }
 
