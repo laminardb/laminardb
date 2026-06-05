@@ -123,6 +123,7 @@ pub struct StreamingCoordinator {
     pending_offsets: Vec<Option<SourceCheckpoint>>,
     /// Control channel for live DDL (add/drop stream) from `LaminarDB`.
     control_rx: ControlMsgRx,
+    checkpoint_complete_rx: Option<crossfire::AsyncRx<crossfire::mpsc::Array<(u64, rustc_hash::FxHashMap<String, SourceCheckpoint>)>>>,
 }
 
 /// Tracks in-flight checkpoint barrier alignment.
@@ -434,7 +435,16 @@ impl StreamingCoordinator {
             pending_offsets: vec![None; committed_offsets.len()],
             committed_offsets,
             control_rx,
+            checkpoint_complete_rx: None,
         })
+    }
+
+    pub(crate) fn with_checkpoint_complete_rx(
+        mut self,
+        rx: crossfire::AsyncRx<crossfire::mpsc::Array<(u64, rustc_hash::FxHashMap<String, SourceCheckpoint>)>>,
+    ) -> Self {
+        self.checkpoint_complete_rx = Some(rx);
+        self
     }
 
     /// Run the coordinator loop.
@@ -470,6 +480,17 @@ impl StreamingCoordinator {
             let msg = tokio::select! {
                 biased;
                 () = self.shutdown.notified() => break,
+                Some((epoch, fan_out)) = async {
+                    if let Some(ref mut rx) = self.checkpoint_complete_rx {
+                        rx.recv().await.ok()
+                    } else {
+                        futures::future::pending::<Option<(u64, rustc_hash::FxHashMap<String, SourceCheckpoint>)>>().await
+                    }
+                } => {
+                    self.broadcast_epoch_committed(epoch, &fan_out);
+                    callback.publish_barrier(epoch, epoch);
+                    continue;
+                }
                 msg = self.rx.recv() => {
                     match msg {
                         Ok(m) => {
@@ -885,6 +906,10 @@ impl StreamingCoordinator {
                     // Wire barrier = durable epoch.
                     callback.publish_barrier(epoch, checkpoint_id);
                 }
+                BarrierOutcome::Async => {
+                    self.pending_barrier.active = false;
+                    self.last_checkpoint = Instant::now();
+                }
                 BarrierOutcome::Skipped(reason) => {
                     tracing::debug!(checkpoint_id, reason = %reason, "barrier checkpoint skipped");
                 }
@@ -1094,6 +1119,7 @@ mod tests {
             committed_offsets: vec![None],
             pending_offsets: vec![None],
             control_rx,
+            checkpoint_complete_rx: None,
         };
 
         let callback = MockCallback::new();
@@ -1164,6 +1190,7 @@ mod tests {
             committed_offsets: vec![None],
             pending_offsets: vec![None],
             control_rx,
+            checkpoint_complete_rx: None,
         };
 
         let force_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1236,6 +1263,7 @@ mod tests {
             committed_offsets: vec![None, None],
             pending_offsets: vec![None, None],
             control_rx: control_rx2,
+            checkpoint_complete_rx: None,
         };
 
         let mut callback = MockCallback::new();
@@ -1499,6 +1527,7 @@ mod tests {
             committed_offsets: vec![None],
             pending_offsets: vec![None],
             control_rx,
+            checkpoint_complete_rx: None,
         };
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));

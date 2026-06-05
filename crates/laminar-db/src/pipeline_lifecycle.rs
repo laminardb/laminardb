@@ -1598,6 +1598,9 @@ impl LaminarDB {
         >(crate::db::FORCE_CHECKPOINT_CHANNEL_CAPACITY);
         *self.force_ckpt_tx.lock() = Some(force_ckpt_tx);
 
+        let (checkpoint_complete_tx, checkpoint_complete_rx) =
+            crossfire::mpsc::bounded_async::<(u64, rustc_hash::FxHashMap<String, laminar_connectors::checkpoint::SourceCheckpoint>)>(16);
+
         let static_stream_names: rustc_hash::FxHashSet<Arc<str>> = stream_sources
             .iter()
             .map(|(name, _)| Arc::from(name.as_str()))
@@ -1648,6 +1651,7 @@ impl LaminarDB {
             force_ckpt_rx: Some(force_ckpt_rx),
             subscription_registry: Arc::clone(&self.subscription_registry),
             static_stream_names,
+            checkpoint_complete_tx,
         };
 
         // Start the streaming coordinator on a dedicated compute thread.
@@ -1666,7 +1670,8 @@ impl LaminarDB {
                 Arc::clone(&shutdown),
                 control_rx,
             )
-            .await?;
+            .await?
+            .with_checkpoint_complete_rx(checkpoint_complete_rx);
 
             let (done_tx, done_rx) = crossfire::oneshot::oneshot::<()>();
             let (startup_tx, startup_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();
