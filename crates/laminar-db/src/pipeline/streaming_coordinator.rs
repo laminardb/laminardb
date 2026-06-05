@@ -81,10 +81,10 @@ struct SourceHandle {
     epoch_committed_tx: tokio::sync::watch::Sender<Option<(u64, SourceCheckpoint)>>,
 }
 
+/// `(epoch, per-source fan-out)` sent back when a background checkpoint completes.
+type CheckpointCompletion = (u64, rustc_hash::FxHashMap<String, SourceCheckpoint>);
+
 /// Simplified pipeline coordinator — single tokio task, no core threads.
-///
-/// Replaces `TpcPipelineCoordinator` + `TpcRuntime` + `Reactor` with a
-/// direct source → coordinator → sink pipeline.
 pub struct StreamingCoordinator {
     config: PipelineConfig,
     /// Receives all source messages (batches + barriers).
@@ -123,7 +123,11 @@ pub struct StreamingCoordinator {
     pending_offsets: Vec<Option<SourceCheckpoint>>,
     /// Control channel for live DDL (add/drop stream) from `LaminarDB`.
     control_rx: ControlMsgRx,
-    checkpoint_complete_rx: Option<crossfire::AsyncRx<crossfire::mpsc::Array<(u64, rustc_hash::FxHashMap<String, SourceCheckpoint>)>>>,
+    checkpoint_complete_rx:
+        Option<crossfire::AsyncRx<crossfire::mpsc::Array<CheckpointCompletion>>>,
+    /// True while a background checkpoint persists; gates `maybe_checkpoint` to
+    /// one in-flight checkpoint at a time. Shared with the callback.
+    checkpoint_in_flight: Arc<AtomicBool>,
 }
 
 /// Tracks in-flight checkpoint barrier alignment.
@@ -436,12 +440,20 @@ impl StreamingCoordinator {
             committed_offsets,
             control_rx,
             checkpoint_complete_rx: None,
+            checkpoint_in_flight: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Share the callback's in-flight checkpoint flag so the coordinator holds
+    /// off a new checkpoint while a background persist is still running.
+    pub(crate) fn with_checkpoint_in_flight(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.checkpoint_in_flight = flag;
+        self
     }
 
     pub(crate) fn with_checkpoint_complete_rx(
         mut self,
-        rx: crossfire::AsyncRx<crossfire::mpsc::Array<(u64, rustc_hash::FxHashMap<String, SourceCheckpoint>)>>,
+        rx: crossfire::AsyncRx<crossfire::mpsc::Array<CheckpointCompletion>>,
     ) -> Self {
         self.checkpoint_complete_rx = Some(rx);
         self
@@ -480,11 +492,12 @@ impl StreamingCoordinator {
             let msg = tokio::select! {
                 biased;
                 () = self.shutdown.notified() => break,
+                // A background persist finished (in-flight guard ensures epoch order).
                 Some((epoch, fan_out)) = async {
                     if let Some(ref mut rx) = self.checkpoint_complete_rx {
                         rx.recv().await.ok()
                     } else {
-                        futures::future::pending::<Option<(u64, rustc_hash::FxHashMap<String, SourceCheckpoint>)>>().await
+                        futures::future::pending::<Option<CheckpointCompletion>>().await
                     }
                 } => {
                     self.broadcast_epoch_committed(epoch, &fan_out);
@@ -934,6 +947,9 @@ impl StreamingCoordinator {
         if self.pending_barrier.active {
             return; // Already tracking a barrier.
         }
+        if self.checkpoint_in_flight.load(Ordering::Acquire) {
+            return; // A background checkpoint persist is still running.
+        }
 
         // Always give the callback a chance to run cluster-follower
         // polling. `ConnectorPipelineCallback::maybe_checkpoint` routes
@@ -1120,6 +1136,7 @@ mod tests {
             pending_offsets: vec![None],
             control_rx,
             checkpoint_complete_rx: None,
+            checkpoint_in_flight: Arc::new(AtomicBool::new(false)),
         };
 
         let callback = MockCallback::new();
@@ -1191,6 +1208,7 @@ mod tests {
             pending_offsets: vec![None],
             control_rx,
             checkpoint_complete_rx: None,
+            checkpoint_in_flight: Arc::new(AtomicBool::new(false)),
         };
 
         let force_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1264,6 +1282,7 @@ mod tests {
             pending_offsets: vec![None, None],
             control_rx: control_rx2,
             checkpoint_complete_rx: None,
+            checkpoint_in_flight: Arc::new(AtomicBool::new(false)),
         };
 
         let mut callback = MockCallback::new();
@@ -1528,6 +1547,7 @@ mod tests {
             pending_offsets: vec![None],
             control_rx,
             checkpoint_complete_rx: None,
+            checkpoint_in_flight: Arc::new(AtomicBool::new(false)),
         };
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));

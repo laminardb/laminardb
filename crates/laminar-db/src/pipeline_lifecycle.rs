@@ -1598,8 +1598,12 @@ impl LaminarDB {
         >(crate::db::FORCE_CHECKPOINT_CHANNEL_CAPACITY);
         *self.force_ckpt_tx.lock() = Some(force_ckpt_tx);
 
-        let (checkpoint_complete_tx, checkpoint_complete_rx) =
-            crossfire::mpsc::bounded_async::<(u64, rustc_hash::FxHashMap<String, laminar_connectors::checkpoint::SourceCheckpoint>)>(16);
+        let (checkpoint_complete_tx, checkpoint_complete_rx) = crossfire::mpsc::bounded_async::<(
+            u64,
+            rustc_hash::FxHashMap<String, laminar_connectors::checkpoint::SourceCheckpoint>,
+        )>(16);
+        // Shared in-flight flag: callback sets it per persist, coordinator gates on it.
+        let checkpoint_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let static_stream_names: rustc_hash::FxHashSet<Arc<str>> = stream_sources
             .iter()
@@ -1652,6 +1656,7 @@ impl LaminarDB {
             subscription_registry: Arc::clone(&self.subscription_registry),
             static_stream_names,
             checkpoint_complete_tx,
+            checkpoint_in_flight: Arc::clone(&checkpoint_in_flight),
         };
 
         // Start the streaming coordinator on a dedicated compute thread.
@@ -1671,7 +1676,8 @@ impl LaminarDB {
                 control_rx,
             )
             .await?
-            .with_checkpoint_complete_rx(checkpoint_complete_rx);
+            .with_checkpoint_complete_rx(checkpoint_complete_rx)
+            .with_checkpoint_in_flight(checkpoint_in_flight);
 
             let (done_tx, done_rx) = crossfire::oneshot::oneshot::<()>();
             let (startup_tx, startup_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();

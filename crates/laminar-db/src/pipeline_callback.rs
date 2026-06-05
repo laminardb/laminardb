@@ -139,7 +139,12 @@ pub(crate) struct ConnectorPipelineCallback {
     pub(crate) force_ckpt_rx: Option<crate::db::ForceCheckpointRx>,
     pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
     pub(crate) static_stream_names: rustc_hash::FxHashSet<Arc<str>>,
-    pub(crate) checkpoint_complete_tx: crossfire::MAsyncTx<crossfire::mpsc::Array<(u64, rustc_hash::FxHashMap<String, SourceCheckpoint>)>>,
+    pub(crate) checkpoint_complete_tx: crossfire::MAsyncTx<
+        crossfire::mpsc::Array<(u64, rustc_hash::FxHashMap<String, SourceCheckpoint>)>,
+    >,
+    /// Set while a background checkpoint persists; the coordinator reads it to
+    /// bound concurrent checkpoints to one.
+    pub(crate) checkpoint_in_flight: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ConnectorPipelineCallback {
@@ -1169,20 +1174,33 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 }
             }
         } else {
-            // Periodic checkpoint — run asynchronously in background.
+            // Persist in the background; in-flight flag bounds to one checkpoint at a time.
+            self.checkpoint_in_flight
+                .store(true, std::sync::atomic::Ordering::Release);
             let coordinator_clone = Arc::clone(&self.coordinator);
             let tx = self.checkpoint_complete_tx.clone();
+            let in_flight = Arc::clone(&self.checkpoint_in_flight);
             tokio::spawn(async move {
-                let mut guard = coordinator_clone.lock().await;
-                if let Some(ref mut coord) = *guard {
-                    coord.set_pending_vnode_states(vnode_states);
-                    match coord.checkpoint_with_offsets(request).await {
-                        Ok(result) if result.success => {
-                            let _ = tx.send((result.epoch, rustc_hash::FxHashMap::default())).await;
+                {
+                    let mut guard = coordinator_clone.lock().await;
+                    if let Some(ref mut coord) = *guard {
+                        coord.set_pending_vnode_states(vnode_states);
+                        match coord.checkpoint_with_offsets(request).await {
+                            Ok(result) if result.success => {
+                                let _ = tx
+                                    .send((result.epoch, rustc_hash::FxHashMap::default()))
+                                    .await;
+                            }
+                            Ok(result) => tracing::warn!(
+                                epoch = result.epoch,
+                                error = ?result.error,
+                                "Pipeline checkpoint failed"
+                            ),
+                            Err(e) => tracing::warn!(error = %e, "Checkpoint error"),
                         }
-                        _ => {}
                     }
                 }
+                in_flight.store(false, std::sync::atomic::Ordering::Release);
             });
             committed = None;
         }
@@ -1282,24 +1300,36 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             source_offset_overrides: source_overrides,
         };
 
+        // Persist in the background; in-flight flag bounds to one checkpoint at a time.
+        self.checkpoint_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
         let coordinator_clone = Arc::clone(&self.coordinator);
         let tx = self.checkpoint_complete_tx.clone();
+        let in_flight = Arc::clone(&self.checkpoint_in_flight);
         let fan_out = source_checkpoints.clone();
         let wm = self
             .pipeline_watermark
             .load(std::sync::atomic::Ordering::Acquire);
         tokio::spawn(async move {
-            let mut guard = coordinator_clone.lock().await;
-            if let Some(ref mut coord) = *guard {
-                coord.set_pending_vnode_states(vnode_states);
-                coord.set_local_watermark_ms(if wm == i64::MIN { None } else { Some(wm) });
-                match coord.checkpoint_with_offsets(request).await {
-                    Ok(result) if result.success => {
-                        let _ = tx.send((result.epoch, fan_out)).await;
+            {
+                let mut guard = coordinator_clone.lock().await;
+                if let Some(ref mut coord) = *guard {
+                    coord.set_pending_vnode_states(vnode_states);
+                    coord.set_local_watermark_ms(if wm == i64::MIN { None } else { Some(wm) });
+                    match coord.checkpoint_with_offsets(request).await {
+                        Ok(result) if result.success => {
+                            let _ = tx.send((result.epoch, fan_out)).await;
+                        }
+                        Ok(result) => tracing::warn!(
+                            epoch = result.epoch,
+                            error = ?result.error,
+                            "Barrier-aligned checkpoint failed"
+                        ),
+                        Err(e) => tracing::warn!(error = %e, "Barrier-aligned checkpoint error"),
                     }
-                    _ => {}
                 }
             }
+            in_flight.store(false, std::sync::atomic::Ordering::Release);
         });
         self.last_checkpoint = std::time::Instant::now();
         BarrierOutcome::Async

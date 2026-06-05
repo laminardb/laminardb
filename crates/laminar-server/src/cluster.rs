@@ -920,26 +920,31 @@ async fn build_shuffle_sender(
     };
     let sender = Arc::new(sender);
 
-    // Spawn a background task to watch membership updates and register peers
-    let sender_clone = Arc::clone(&sender);
-    let mut rx = membership_rx;
-    tokio::spawn(async move {
-        loop {
-            let members = rx.borrow().clone();
-            for node in members {
-                if node.id.0 != node_id {
-                    if let Some(addr_str) = node.metadata.tags.get(SHUFFLE_ADDR_KEY) {
-                        if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
+    // Static advertises shuffle addrs in heartbeat metadata; register peers as they appear.
+    if matches!(discovery, DiscoveryImpl::Static(_)) {
+        let sender_clone = Arc::clone(&sender);
+        let mut rx = membership_rx;
+        tokio::spawn(async move {
+            loop {
+                let members = rx.borrow().clone();
+                for node in members {
+                    if node.id.0 != node_id {
+                        if let Some(addr) = node
+                            .metadata
+                            .tags
+                            .get(SHUFFLE_ADDR_KEY)
+                            .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
+                        {
                             sender_clone.register_peer(node.id.0, addr).await;
                         }
                     }
                 }
+                if rx.changed().await.is_err() {
+                    break;
+                }
             }
-            if rx.changed().await.is_err() {
-                break;
-            }
-        }
-    });
+        });
+    }
 
     sender
 }
