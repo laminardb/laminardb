@@ -1761,19 +1761,10 @@ impl LaminarDB {
         Ok(())
     }
 
-    /// Stop the streaming pipeline so it can be started again (leaves it in the
-    /// `Created` state).
-    ///
-    /// # Errors
-    /// Returns [`DbError::InvalidOperation`] if the pipeline is still starting,
-    /// or if the coordinator does not exit within the stop timeout (in which
-    /// case the state is left `ShuttingDown` rather than falsely reported as
-    /// stopped).
+    /// Stop the streaming pipeline.
     pub async fn stop_pipeline(&self) -> Result<(), DbError> {
         match DbState::load(&self.state) {
-            // Nothing to stop.
             DbState::Created | DbState::Stopped => return Ok(()),
-            // A concurrent start is in flight — refuse rather than race it.
             DbState::Starting => {
                 return Err(DbError::InvalidOperation(
                     "cannot stop pipeline while it is starting".into(),
@@ -1784,21 +1775,19 @@ impl LaminarDB {
 
         DbState::ShuttingDown.store(&self.state);
 
-        // Drop the force-checkpoint sender first so any later db.checkpoint()
-        // errors cleanly instead of waiting on a oneshot that never replies.
+        // Clear the force-checkpoint sender.
         *self.force_ckpt_tx.lock() = None;
 
         self.shutdown_signal.notify_one();
 
-        // Take the handle out (dropping the guard) before awaiting it.
+        // Take runtime handle before awaiting.
         let handle = self.runtime_handle.lock().take();
         if let Some(handle) = handle {
             match tokio::time::timeout(std::time::Duration::from_secs(10), handle).await {
                 Ok(Ok(())) => tracing::info!("Pipeline stopped cleanly"),
                 Ok(Err(e)) => tracing::warn!(error = %e, "Pipeline task panicked during stop"),
                 Err(_) => {
-                    // The coordinator is still running; don't claim a clean stop
-                    // or reset to a restartable state behind a live coordinator.
+                    // Coordinator did not exit, keep state as ShuttingDown.
                     tracing::error!("Pipeline stop timed out after 10s; coordinator still running");
                     return Err(DbError::InvalidOperation(
                         "pipeline stop timed out; coordinator did not exit".into(),
@@ -1807,8 +1796,7 @@ impl LaminarDB {
             }
         }
 
-        // The coordinator has exited: drop the now-dead control channel so
-        // management DDL isn't routed through it, then allow a restart.
+        // Drop control channel and reset state to allow restart.
         *self.control_tx.lock() = None;
         DbState::Created.store(&self.state);
         Ok(())

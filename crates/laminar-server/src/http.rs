@@ -41,9 +41,6 @@ pub struct ClusterComponents {
 pub struct AppState {
     pub db: Arc<LaminarDB>,
     pub config_path: PathBuf,
-    /// `parking_lot::RwLock` is correct here — every reader drops the
-    /// guard before awaiting any I/O (see `reload_config`/`cluster_status`/
-    /// watcher.rs). No writer holds the lock across `.await` either.
     pub current_config: parking_lot::RwLock<ServerConfig>,
     pub reload_guard: ReloadGuard,
     pub registry: Arc<Registry>,
@@ -1651,7 +1648,7 @@ mod tests {
         assert_eq!(json["success"], true);
     }
 
-    // ── Console control-plane endpoints ──
+
 
     /// POST a SQL statement to `/api/v1/sql`, asserting it succeeds.
     async fn exec_sql(app: &Router, sql: &str) {
@@ -1919,7 +1916,7 @@ mod tests {
         );
     }
 
-    // ── Lineage graph + cluster topology ──
+
 
     #[tokio::test]
     async fn test_get_graph_returns_nodes_and_edges() {

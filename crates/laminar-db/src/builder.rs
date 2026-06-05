@@ -468,8 +468,7 @@ impl LaminarDbBuilder {
 
         Self::validate_backpressure(&self.config)?;
 
-        // State backend and vnode registry must be paired — half-set
-        // would leave the durability gate silently disabled.
+        // State backend and vnode registry must be paired.
         match (&self.state_backend, &self.vnode_registry) {
             (Some(_), None) => {
                 return Err(DbError::Config(
@@ -494,10 +493,7 @@ impl LaminarDbBuilder {
             self.target_partitions,
         )?;
         if let Some(runtime) = self.ai_runtime {
-            // The inference workers spawn on the current runtime. `build` is
-            // normally awaited on the main multi-threaded runtime; if it's driven
-            // by a non-Tokio executor there is no handle, so fail clearly instead
-            // of panicking.
+            // Inference workers require a running Tokio runtime.
             let handle = tokio::runtime::Handle::try_current().map_err(|_| {
                 DbError::InvalidOperation(
                     "LaminarDB::build() with an AI runtime must run inside a Tokio runtime"
