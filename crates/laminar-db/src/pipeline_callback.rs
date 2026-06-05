@@ -138,6 +138,7 @@ pub(crate) struct ConnectorPipelineCallback {
     /// leader's manifest is useless for restart recovery.
     pub(crate) force_ckpt_rx: Option<crate::db::ForceCheckpointRx>,
     pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
+    pub(crate) static_stream_names: rustc_hash::FxHashSet<Arc<str>>,
 }
 
 impl ConnectorPipelineCallback {
@@ -695,13 +696,20 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         // downstream sink, so they aren't in `stream_sources` and the loop
         // above never forwards them — push their batches to any subscribers.
         // MVs are skipped here; they reach subscribers via their own path.
-        let mv_read = self.mv_store.read();
+        let mv_has_any = self
+            .mv_store_has_any
+            .load(std::sync::atomic::Ordering::Acquire);
+        let mv_read = if mv_has_any {
+            Some(self.mv_store.read())
+        } else {
+            None
+        };
         for (stream_name, batches) in results {
-            let is_static = self
-                .stream_sources
-                .iter()
-                .any(|(name, _)| name == stream_name.as_ref());
-            if is_static || mv_read.has_mv(stream_name.as_ref()) {
+            let is_static = self.static_stream_names.contains(stream_name);
+            let has_mv = mv_read
+                .as_ref()
+                .is_some_and(|r| r.has_mv(stream_name.as_ref()));
+            if is_static || has_mv {
                 continue;
             }
             for batch in batches {

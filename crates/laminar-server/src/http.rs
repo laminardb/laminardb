@@ -317,10 +317,8 @@ struct SqlResponse {
     object_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rows_affected: Option<u64>,
-    /// Result rows as a JSON array (one object per row), for `Query` and
-    /// `Metadata` results. Capped at [`MAX_SQL_RESULT_ROWS`] for `Query`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<serde_json::Value>,
+    data: Option<Box<serde_json::value::RawValue>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -616,7 +614,7 @@ async fn execute_sql(
                     data: None,
                 },
                 ExecuteResult::Metadata(batch) => {
-                    let data = match batch_to_json(&batch) {
+                    let data = match batches_to_json_raw(&[batch]) {
                         Ok(json) => json,
                         Err(e) => {
                             return error_response(
@@ -634,43 +632,41 @@ async fn execute_sql(
                     }
                 }
                 ExecuteResult::Query(mut handle) => {
-                    // A fresh handle has no subscription only when the query
-                    // produced an immediate empty result (e.g. an ASOF query
-                    // over no data) — return an empty row set, not a 500.
-                    let mut rows: Vec<serde_json::Value> = Vec::new();
+                    let mut batches: Vec<arrow_array::RecordBatch> = Vec::new();
+                    let mut total_rows = 0;
                     if let Ok(mut sub) = handle.subscribe_raw() {
-                        // Accumulate rows up to the cap or until the deadline.
-                        // The accumulator lives outside the timed future so
-                        // partial results survive a timeout cancellation.
                         let collect = async {
-                            while rows.len() < MAX_SQL_RESULT_ROWS {
+                            while total_rows < MAX_SQL_RESULT_ROWS {
                                 match sub.recv_async().await {
-                                    Ok(batch) => match batch_to_json(&batch) {
-                                        Ok(serde_json::Value::Array(batch_rows)) => {
-                                            for row in batch_rows {
-                                                if rows.len() >= MAX_SQL_RESULT_ROWS {
-                                                    break;
-                                                }
-                                                rows.push(row);
-                                            }
+                                    Ok(batch) => {
+                                        let needed = MAX_SQL_RESULT_ROWS - total_rows;
+                                        let batch_to_keep = if batch.num_rows() > needed {
+                                            batch.slice(0, needed)
+                                        } else {
+                                            batch
+                                        };
+                                        total_rows += batch_to_keep.num_rows();
+                                        batches.push(batch_to_keep);
+                                        if total_rows >= MAX_SQL_RESULT_ROWS {
+                                            break;
                                         }
-                                        Ok(_) => {}
-                                        Err(e) => {
-                                            warn!(error = %e, "serialize error for SQL result batch");
-                                        }
-                                    },
-                                    Err(_) => break, // stream disconnected
+                                    }
+                                    Err(_) => break,
                                 }
                             }
                         };
                         let _ = tokio::time::timeout(SQL_RESULT_TIMEOUT, collect).await;
                     }
-
+                    let raw_data = if batches.is_empty() {
+                        serde_json::value::RawValue::from_string("[]".to_string()).ok()
+                    } else {
+                        batches_to_json_raw(&batches).ok()
+                    };
                     SqlResponse {
                         result_type: "query".to_string(),
                         object_name: None,
                         rows_affected: None,
-                        data: Some(serde_json::Value::Array(rows)),
+                        data: raw_data,
                     }
                 }
             };
@@ -1033,8 +1029,8 @@ async fn cluster_leader(State(state): State<Arc<AppState>>) -> impl IntoResponse
 /// in both single-node and cluster mode.
 async fn cluster_checkpoints(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.db.build_show_checkpoint_status().await {
-        Ok(batch) => match batch_to_json(&batch) {
-            Ok(json) => Json(json).into_response(),
+        Ok(batch) => match batches_to_json_raw(&[batch]) {
+            Ok(raw) => Json(raw).into_response(),
             Err(e) => error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("failed to serialize checkpoint status: {e}"),
@@ -1086,12 +1082,12 @@ async fn ws_upgrade(
         }
     };
 
-    // If this is a console-initiated ephemeral stream, transition it to
-    // `Connected` so the GC task won't reap it while a client is attached.
-    let is_console = state.ephemeral.mark_connected(&name);
-
     let st = Arc::clone(&state);
     ws.on_upgrade(move |socket| async move {
+        // If this is a console-initiated ephemeral stream, transition it to
+        // `Connected` so the GC task won't reap it while a client is attached.
+        let is_console = st.ephemeral.mark_connected(&name);
+
         st.server_metrics.ws_connections.inc();
         ws_client(socket, portal, name.clone()).await;
         st.server_metrics.ws_connections.dec();
@@ -1128,7 +1124,7 @@ async fn ws_client(
                         if batch.num_rows() == 0 {
                             continue;
                         }
-                        let json = match batch_to_json(&batch) {
+                        let raw_json = match batches_to_json_raw(&[batch]) {
                             Ok(j) => j,
                             Err(e) => {
                                 warn!(stream = %name, error = %e, "serialize error");
@@ -1138,7 +1134,7 @@ async fn ws_client(
                         let out = serde_json::json!({
                             "type": "data",
                             "subscription_id": &name,
-                            "data": json,
+                            "data": raw_json,
                             "sequence": seq,
                         });
                         seq += 1;
@@ -1181,12 +1177,17 @@ async fn ws_client(
     }
 }
 
-fn batch_to_json(batch: &arrow_array::RecordBatch) -> Result<serde_json::Value, String> {
+fn batches_to_json_raw(
+    batches: &[arrow_array::RecordBatch],
+) -> Result<Box<serde_json::value::RawValue>, String> {
     let mut buf = Vec::new();
     let mut writer = arrow_json::ArrayWriter::new(&mut buf);
-    writer.write(batch).map_err(|e| e.to_string())?;
+    for batch in batches {
+        writer.write(batch).map_err(|e| e.to_string())?;
+    }
     writer.finish().map_err(|e| e.to_string())?;
-    Ok(serde_json::from_slice(&buf).unwrap_or(serde_json::Value::Array(vec![])))
+    let s = String::from_utf8(buf).map_err(|e| e.to_string())?;
+    serde_json::value::RawValue::from_string(s).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

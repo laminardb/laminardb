@@ -98,6 +98,7 @@ sqlparser = { workspace = true }
 
 # Async
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
 async-trait = { workspace = true }
 trait-variant = { workspace = true }

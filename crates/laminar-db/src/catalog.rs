@@ -350,8 +350,23 @@ impl SourceCatalog {
     }
 
     pub(crate) fn deactivate_query(&self, id: u64) -> bool {
-        if let Some(entry) = self.queries.write().get_mut(&id) {
+        // Cap retained deactivated queries so finished SELECTs can't accumulate
+        // unboundedly; over the cap, the oldest (lowest id) is dropped.
+        const MAX_INACTIVE_QUERIES: usize = 100;
+        let mut queries = self.queries.write();
+        if let Some(entry) = queries.get_mut(&id) {
+            let was_active = entry.active;
             entry.active = false;
+            if was_active {
+                let inactive_count = queries.values().filter(|q| !q.active).count();
+                if inactive_count > MAX_INACTIVE_QUERIES {
+                    let oldest_inactive_id =
+                        queries.values().filter(|q| !q.active).map(|q| q.id).min();
+                    if let Some(oldest_id) = oldest_inactive_id {
+                        queries.remove(&oldest_id);
+                    }
+                }
+            }
             true
         } else {
             false
@@ -453,6 +468,36 @@ mod tests {
         catalog.deactivate_query(id);
         let queries = catalog.list_queries();
         assert!(!queries[0].2); // inactive
+    }
+
+    #[tokio::test]
+    async fn test_deactivate_query_limit() {
+        let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
+        let mut ids = Vec::new();
+        for i in 0..105 {
+            let sql = format!("SELECT * FROM events_{}", i);
+            ids.push(catalog.register_query(&sql));
+        }
+        for id in &ids {
+            catalog.deactivate_query(*id);
+        }
+        let queries = catalog.list_queries();
+        assert_eq!(queries.len(), 100);
+        let remaining_ids: std::collections::HashSet<u64> = queries.iter().map(|q| q.0).collect();
+        for id in 1..=5 {
+            assert!(
+                !remaining_ids.contains(&id),
+                "Query {} should have been evicted",
+                id
+            );
+        }
+        for id in 6..=105 {
+            assert!(
+                remaining_ids.contains(&id),
+                "Query {} should be remaining",
+                id
+            );
+        }
     }
 
     #[tokio::test]

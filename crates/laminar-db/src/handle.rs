@@ -57,6 +57,7 @@ pub struct QueryHandle {
     pub(crate) sql: String,
     pub(crate) subscription: Option<Subscription<ArrowRecord>>,
     pub(crate) active: bool,
+    pub(crate) cancel_token: tokio_util::sync::CancellationToken,
 }
 
 impl QueryHandle {
@@ -112,6 +113,13 @@ impl QueryHandle {
     pub fn cancel(&mut self) {
         self.active = false;
         self.subscription = None;
+        self.cancel_token.cancel();
+    }
+}
+
+impl Drop for QueryHandle {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
     }
 }
 

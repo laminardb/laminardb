@@ -1771,21 +1771,34 @@ impl LaminarDB {
 
         let subscription = sink.subscribe();
 
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let cancel_token_clone = cancel_token.clone();
+
         let source_clone = source.clone();
+        let catalog = Arc::clone(&self.catalog);
+        let query_id_clone = query_id;
         tokio::spawn(async move {
             use tokio_stream::StreamExt;
             let mut stream = stream;
-            while let Some(result) = stream.next().await {
-                match result {
-                    Ok(batch) => {
-                        if source_clone.push_arrow(batch).is_err() {
-                            break;
+            loop {
+                tokio::select! {
+                    () = cancel_token_clone.cancelled() => {
+                        break;
+                    }
+                    result = stream.next() => {
+                        match result {
+                            Some(Ok(batch)) => {
+                                if source_clone.push_arrow(batch).is_err() {
+                                    break;
+                                }
+                            }
+                            _ => break,
                         }
                     }
-                    Err(_) => break,
                 }
             }
             drop(source_clone);
+            catalog.deactivate_query(query_id_clone);
         });
 
         ExecuteResult::Query(QueryHandle {
@@ -1794,6 +1807,7 @@ impl LaminarDB {
             sql: sql.to_string(),
             subscription: Some(subscription),
             active: true,
+            cancel_token,
         })
     }
 
@@ -1844,12 +1858,14 @@ impl LaminarDB {
 
         if result_batch.num_rows() == 0 {
             let query_id = self.catalog.register_query(original_sql);
+            self.catalog.deactivate_query(query_id);
             return Ok(ExecuteResult::Query(QueryHandle {
                 id: query_id,
                 schema: result_batch.schema(),
                 sql: original_sql.to_string(),
                 subscription: None,
                 active: false,
+                cancel_token: tokio_util::sync::CancellationToken::new(),
             }));
         }
 

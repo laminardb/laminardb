@@ -998,10 +998,18 @@ impl laminar_core::cluster::control::ClusterKv for ObjectStoreClusterKv {
         ids.sort_unstable();
         ids.dedup();
 
+        let futures = ids.into_iter().map(|id| {
+            let key = key.to_string();
+            async move {
+                let val = self.read_from(id, &key).await;
+                (id, val)
+            }
+        });
+        let joined = futures::future::join_all(futures).await;
         let mut results = Vec::new();
-        for id in ids {
-            if let Some(val) = self.read_from(id, key).await {
-                results.push((id, val));
+        for (id, val) in joined {
+            if let Some(v) = val {
+                results.push((id, v));
             }
         }
         results

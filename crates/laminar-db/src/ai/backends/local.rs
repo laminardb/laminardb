@@ -1,20 +1,12 @@
-//! Local inference via ONNX Runtime (`ort`, loaded dynamically). Encoder models
-//! only — the BERT / DistilBERT / MiniLM family: classification/sentiment yield
-//! logits (the adapter argmaxes), embedding yields a mean-pooled vector.
-//! Generative tasks are rejected. A model is loaded once per source and cached;
-//! the forward pass runs on `spawn_blocking`, off the Ring 1 task, under a
-//! deadline so a pathological model can never stall the worker (and the
-//! watermark behind it). ONNX Runtime is loaded at runtime, so `onnxruntime.dll`
-//! / `.so` (ORT >= 1.24) must be on the search path or named by `ORT_DYLIB_PATH`.
-//!
-//! A `source` resolves to a directory laid out like a Hugging Face export —
-//! `onnx/model.onnx` + `tokenizer.json` (+ optional `config.json` for labels):
-//! `hf:org/repo` → `<cache_dir>/org/repo`, `file://<path>` or a bare path used
-//! as-is. A missing `hf:` repo is downloaded from the Hugging Face CDN on first
-//! use (public repos only). Classifier labels come from the model's own
-//! `config.json` `id2label`; [`LocalProvider::intrinsic_labels`] resolves them on
-//! demand, so a model that downloads lazily scores correctly once it is cached —
-//! no restart, no externally supplied label list.
+//! Local inference via ONNX Runtime (`ort`, loaded dynamically): encoder models
+//! only (BERT/DistilBERT/MiniLM) — classify/sentiment return logits, embed
+//! returns a mean-pooled vector; generative tasks are rejected. A model is loaded
+//! once per source and cached; the forward pass runs on `spawn_blocking` under
+//! [`INFERENCE_TIMEOUT`] so a wedged model can't stall the worker. ORT loads at
+//! runtime — `onnxruntime.{dll,so}` (>= 1.24) must be on the search path or named
+//! by `ORT_DYLIB_PATH`. A `source` is `hf:org/repo` (downloaded on first use),
+//! `file://<path>`, or a bare path; labels come from the model's `config.json`
+//! `id2label`.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -253,8 +245,18 @@ fn load_model_from_paths(
         .iter()
         .map(|i| i.name().to_string())
         .collect();
-    let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
+    let mut tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
         .map_err(|e| ProviderError::Transport(format!("load tokenizer: {e}")))?;
+    if tokenizer.get_padding().is_none() {
+        tokenizer.with_padding(Some(tokenizers::PaddingParams {
+            strategy: tokenizers::PaddingStrategy::BatchLongest,
+            direction: tokenizers::PaddingDirection::Right,
+            pad_to_multiple_of: None,
+            pad_id: 0,
+            pad_type_id: 0,
+            pad_token: "[PAD]".to_string(),
+        }));
+    }
     let labels = if let Some(path) = config_path {
         std::fs::read_to_string(path)
             .ok()
@@ -290,59 +292,94 @@ fn run(
     task: Task,
     inputs: &[String],
 ) -> Result<InferenceOutputs, ProviderError> {
+    if inputs.is_empty() {
+        return Ok(InferenceOutputs::Vectors(vec![]));
+    }
+
+    let encodings = loaded
+        .tokenizer
+        .encode_batch(inputs.to_vec(), true)
+        .map_err(|e| ProviderError::BadResponse(format!("tokenize batch: {e}")))?;
+
+    let batch_size = encodings.len();
+    if batch_size == 0 {
+        return Ok(InferenceOutputs::Vectors(vec![]));
+    }
+    let seq = encodings[0].len();
+
+    let mut stacked_ids = Vec::with_capacity(batch_size * seq);
+    let mut stacked_mask = Vec::with_capacity(batch_size * seq);
+    for encoding in &encodings {
+        stacked_ids.extend(encoding.get_ids().iter().map(|&u| i64::from(u)));
+        stacked_mask.extend(encoding.get_attention_mask().iter().map(|&u| i64::from(u)));
+    }
+
+    let batch_size_i64 = i64::try_from(batch_size).unwrap_or(i64::MAX);
+    let seq_i64 = i64::try_from(seq).unwrap_or(i64::MAX);
+    let shape = vec![batch_size_i64, seq_i64];
+
+    let mut feeds: Vec<(Cow<str>, SessionInputValue)> =
+        Vec::with_capacity(loaded.input_names.len());
+    for name in &loaded.input_names {
+        let row = match name.as_str() {
+            "input_ids" => stacked_ids.clone(),
+            "attention_mask" => stacked_mask.clone(),
+            "token_type_ids" => vec![0i64; batch_size * seq],
+            other => {
+                return Err(ProviderError::BadResponse(format!(
+                    "model expects unsupported input '{other}'"
+                )))
+            }
+        };
+        let tensor = Tensor::from_array((shape.clone(), row))
+            .map_err(|e| ProviderError::Transport(format!("build tensor: {e}")))?;
+        feeds.push((Cow::Owned(name.clone()), SessionInputValue::from(tensor)));
+    }
+
     let mut session = loaded.session.lock();
-    let mut vectors = Vec::with_capacity(inputs.len());
-    for text in inputs {
-        let encoding = loaded
-            .tokenizer
-            .encode(text.as_str(), true)
-            .map_err(|e| ProviderError::BadResponse(format!("tokenize: {e}")))?;
-        let ids: Vec<i64> = encoding.get_ids().iter().map(|&u| i64::from(u)).collect();
-        let mask: Vec<i64> = encoding
-            .get_attention_mask()
-            .iter()
-            .map(|&u| i64::from(u))
-            .collect();
-        let seq = i64::try_from(ids.len()).unwrap_or(i64::MAX);
+    let outputs = session
+        .run(feeds)
+        .map_err(|e| ProviderError::Transport(format!("inference: {e}")))?;
+    let (shape, data) = outputs[0]
+        .try_extract_tensor::<f32>()
+        .map_err(|e| ProviderError::BadResponse(format!("read output: {e}")))?;
 
-        // Feed each input the model declares (batch of 1, [1, seq]); BERT adds
-        // token_type_ids (all zero, single segment), DistilBERT omits it.
-        let mut feeds: Vec<(Cow<str>, SessionInputValue)> =
-            Vec::with_capacity(loaded.input_names.len());
-        for name in &loaded.input_names {
-            let row = match name.as_str() {
-                "input_ids" => ids.clone(),
-                "attention_mask" => mask.clone(),
-                "token_type_ids" => vec![0i64; ids.len()],
-                other => {
-                    return Err(ProviderError::BadResponse(format!(
-                        "model expects unsupported input '{other}'"
-                    )))
-                }
-            };
-            let tensor = Tensor::from_array((vec![1i64, seq], row))
-                .map_err(|e| ProviderError::Transport(format!("build tensor: {e}")))?;
-            feeds.push((Cow::Owned(name.clone()), SessionInputValue::from(tensor)));
+    if shape.first().copied().and_then(|d| usize::try_from(d).ok()) != Some(batch_size) {
+        return Err(ProviderError::BadResponse(format!(
+            "expected batch size {batch_size}, got output shape {shape:?}"
+        )));
+    }
+
+    let mut vectors = Vec::with_capacity(batch_size);
+    if task == Task::Embed && shape.len() == 3 {
+        // last_hidden_state [batch_size, seq_out, hidden] → mean-pool over real tokens.
+        let seq_out = usize::try_from(shape[1]).unwrap_or(0);
+        let hidden = usize::try_from(shape[2]).unwrap_or(0);
+        for (i, encoding) in encodings.iter().enumerate() {
+            let start = i * seq_out * hidden;
+            let end = (i + 1) * seq_out * hidden;
+            let slice = &data[start..end];
+            let mask: Vec<i64> = encoding
+                .get_attention_mask()
+                .iter()
+                .map(|&u| i64::from(u))
+                .collect();
+            vectors.push(mean_pool(slice, seq_out, hidden, &mask));
         }
-
-        let outputs = session
-            .run(feeds)
-            .map_err(|e| ProviderError::Transport(format!("inference: {e}")))?;
-        let (shape, data) = outputs[0]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| ProviderError::BadResponse(format!("read output: {e}")))?;
-
-        if task == Task::Embed && shape.len() == 3 {
-            // last_hidden_state [1, seq, hidden] → mean-pool over real tokens.
-            let seq_out = usize::try_from(shape[1]).unwrap_or(0);
-            let hidden = usize::try_from(shape[2]).unwrap_or(0);
-            vectors.push(mean_pool(data, seq_out, hidden, &mask));
-        } else {
-            // classify/sentiment logits, or a pre-pooled embedding.
-            vectors.push(data.to_vec());
+    } else {
+        // classify/sentiment logits, or a pre-pooled embedding.
+        let dim: usize = shape[1..]
+            .iter()
+            .map(|&d| usize::try_from(d).unwrap_or(0))
+            .product();
+        for i in 0..batch_size {
+            let start = i * dim;
+            let end = (i + 1) * dim;
+            let slice = &data[start..end];
+            vectors.push(slice.to_vec());
         }
     }
-    drop(session);
+
     Ok(InferenceOutputs::Vectors(vectors))
 }
 

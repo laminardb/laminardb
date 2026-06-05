@@ -163,7 +163,12 @@ impl LaminarDB {
                     "Cannot start a stopped pipeline. Create a new LaminarDB instance.".into(),
                 ));
             }
-            DbState::Created | DbState::ShuttingDown => {}
+            DbState::ShuttingDown => {
+                return Err(DbError::InvalidOperation(
+                    "cannot start pipeline: shutdown/stop in progress".into(),
+                ));
+            }
+            DbState::Created => {}
         }
 
         DbState::Starting.store(&self.state);
@@ -1593,6 +1598,11 @@ impl LaminarDB {
         >(crate::db::FORCE_CHECKPOINT_CHANNEL_CAPACITY);
         *self.force_ckpt_tx.lock() = Some(force_ckpt_tx);
 
+        let static_stream_names: rustc_hash::FxHashSet<Arc<str>> = stream_sources
+            .iter()
+            .map(|(name, _)| Arc::from(name.as_str()))
+            .collect();
+
         let callback = crate::pipeline_callback::ConnectorPipelineCallback {
             graph,
             stream_sources,
@@ -1637,6 +1647,7 @@ impl LaminarDB {
             pending_follower_checkpoint: None,
             force_ckpt_rx: Some(force_ckpt_rx),
             subscription_registry: Arc::clone(&self.subscription_registry),
+            static_stream_names,
         };
 
         // Start the streaming coordinator on a dedicated compute thread.
