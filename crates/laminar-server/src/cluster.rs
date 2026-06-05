@@ -339,7 +339,7 @@ pub async fn start_cluster(
             .await
             .map_err(|e| ClusterStartupError::EngineConstruction(format!("shuffle bind: {e}")))?,
     );
-    let shuffle_advertise = shuffle_advertise_addr(shuffle_receiver.local_addr(), bind_host);
+    let shuffle_advertise = shuffle_advertise_addr(shuffle_receiver.local_addr(), &advertise_host);
 
     let mut local_node = NodeInfo {
         id: node_id,
@@ -523,17 +523,11 @@ pub async fn start_cluster(
         .state_backend(Arc::clone(&state_backend))
         .vnode_registry(Arc::clone(&vnode_registry));
 
-    // Durable cluster 2PC decision store. Shares the same underlying
-    // object store as the state backend so a single cluster-wide
-    // bucket holds per-epoch state, the assignment snapshot, and the
-    // commit decisions. Without this wiring the leader's `Commit`
-    // announcement is the only cluster-wide commit signal — ephemeral,
-    // so a mid-2PC leader crash produces split state.
-    if let Some(decision_os) = config
-        .state
-        .build_object_store()
-        .map_err(|e| ClusterStartupError::EngineConstruction(format!("decision store: {e}")))?
-    {
+    // Durable cluster 2PC decision store, on the shared control-plane bucket
+    // (not the per-node state path) so commit decisions are cluster-wide.
+    // Without this the leader's `Commit` announcement is the only commit
+    // signal — ephemeral, so a mid-2PC leader crash produces split state.
+    if let Some(decision_os) = control_store.clone() {
         let decision_store =
             Arc::new(laminar_core::cluster::control::CheckpointDecisionStore::new(decision_os));
         builder = builder.decision_store(decision_store);
@@ -549,12 +543,10 @@ pub async fn start_cluster(
         builder = builder.assignment_snapshot_store(snap_store);
     }
 
-    // Install the catalog manifest store on the same shared object store, so
+    // Install the catalog manifest store on the shared control-plane bucket, so
     // a booting node can replay catalog DDL (MVs/sources) it lacks and each
     // successful checkpoint republishes the catalog for nodes that join later.
-    if let Some(catalog_os) = config.state.build_object_store().map_err(|e| {
-        ClusterStartupError::EngineConstruction(format!("catalog manifest store: {e}"))
-    })? {
+    if let Some(catalog_os) = control_store.clone() {
         let catalog_store = Arc::new(laminar_core::cluster::control::CatalogManifestStore::new(
             catalog_os,
         ));
@@ -641,13 +633,10 @@ pub async fn start_cluster(
     // Fenced leader lease. Standalone split-brain hardening: a stale
     // leader whose lease has expired loses the CAS to the next acquirer
     // and stops renewing, while the new owner advances the monotonic
-    // fencing token. Runs whenever a shared object store is available
-    // (the lease lives in the same cluster-wide bucket as state). The
-    // renewal loop is cancelled on shutdown via the returned token.
+    // fencing token. Runs whenever a shared control-plane store is
+    // available. The renewal loop is cancelled on shutdown via the token.
     let lease_shutdown_token: Option<tokio_util::sync::CancellationToken> =
-        match config.state.build_object_store().map_err(|e| {
-            ClusterStartupError::EngineConstruction(format!("leader lease store: {e}"))
-        })? {
+        match control_store.clone() {
             Some(lease_os) => {
                 use laminar_core::cluster::control::{
                     LeaderLeaseConfig, LeaderLeaseManager, LeaderLeaseStore,
@@ -936,16 +925,16 @@ async fn build_shuffle_sender(
 /// Compute the address peers should use to reach our `ShuffleReceiver`.
 ///
 /// The receiver binds to `0.0.0.0:0` (any interface, ephemeral port), so
-/// `local_addr.ip()` is the wildcard — publishing it unchanged leaves
-/// remote senders unable to connect. Swap in the host portion of the
-/// configured server bind, falling back to `gethostname` when bind is
-/// itself a wildcard, keeping the port from the actual bound socket.
-fn shuffle_advertise_addr(local_addr: std::net::SocketAddr, bind_host: &str) -> String {
+/// `local_addr.ip()` is the wildcard — publishing it unchanged leaves remote
+/// senders unable to connect. Use the configured advertise host (matching the
+/// HTTP/barrier endpoints for NAT/container deployments), falling back to
+/// `gethostname` when it is itself a wildcard, keeping the actual bound port.
+fn shuffle_advertise_addr(local_addr: std::net::SocketAddr, advertise_host: &str) -> String {
     let port = local_addr.port();
-    let host = bind_host.trim_start_matches('[').trim_end_matches(']');
+    let host = advertise_host.trim_start_matches('[').trim_end_matches(']');
     let ip_wildcard = host == "0.0.0.0" || host == "::" || host.is_empty();
     if !ip_wildcard {
-        return format!("{bind_host}:{port}");
+        return format!("{advertise_host}:{port}");
     }
     let hostname = gethostname::gethostname();
     let hostname = hostname.to_string_lossy();

@@ -2202,7 +2202,9 @@ impl LaminarDB {
             error: Option<String>,
         }
 
-        let mut req = reqwest::Client::new().post(format!("http://{addr}/api/v1/checkpoint"));
+        let mut req = reqwest::Client::new()
+            .post(format!("http://{addr}/api/v1/checkpoint"))
+            .timeout(std::time::Duration::from_secs(10));
         if let Some(token) = &self.config.http_auth_token {
             req = req.bearer_auth(token.expose());
         }

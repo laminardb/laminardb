@@ -1761,7 +1761,11 @@ impl LaminarDB {
         Ok(())
     }
 
-    /// Stop the streaming pipeline.
+    /// Stop the streaming pipeline so it can be restarted.
+    ///
+    /// # Errors
+    /// Returns [`DbError::InvalidOperation`] if the pipeline is still starting
+    /// or the coordinator does not exit within the stop timeout.
     pub async fn stop_pipeline(&self) -> Result<(), DbError> {
         match DbState::load(&self.state) {
             DbState::Created | DbState::Stopped => return Ok(()),

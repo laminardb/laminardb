@@ -17,7 +17,7 @@ cluster = ["laminar-core/cluster"]
 
 [dependencies]
 # Core dependency
-laminar-core = { path = "../laminar-core", version = "0.24.0" }
+laminar-core = { path = "../laminar-core", version = "0.25.0" }
 
 # Runtime glue for ClusterRepartitionExec's per-partition channels.
 tokio-stream = { workspace = true }

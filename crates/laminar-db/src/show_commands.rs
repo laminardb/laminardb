@@ -21,10 +21,16 @@ impl LaminarDB {
     pub async fn build_show_checkpoint_status(&self) -> Result<RecordBatch, DbError> {
         let store = self.checkpoint_store();
         let (latest, list) = match &store {
-            Some(s) => (
-                s.load_latest().await.ok().flatten(),
-                s.list().await.unwrap_or_default(),
-            ),
+            Some(s) => {
+                let latest = s.load_latest().await.map_err(|e| {
+                    DbError::Checkpoint(format!("failed to load latest checkpoint: {e}"))
+                })?;
+                let list = s
+                    .list()
+                    .await
+                    .map_err(|e| DbError::Checkpoint(format!("failed to list checkpoints: {e}")))?;
+                (latest, list)
+            }
             None => (None, vec![]),
         };
 

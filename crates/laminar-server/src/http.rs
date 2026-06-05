@@ -232,12 +232,19 @@ fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
         .strip_prefix("Bearer ")
 }
 
-/// Extract the `token` query parameter from a request URI, if present.
+/// Extract and percent-decode the `token` query parameter, if present. Browser
+/// WebSocket clients URL-encode the value, so it must be decoded before the
+/// constant-time comparison.
 fn query_token(uri: &axum::http::Uri) -> Option<String> {
-    uri.query()?.split('&').find_map(|pair| {
+    let raw = uri.query()?.split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=')?;
-        (key == "token").then(|| value.to_string())
-    })
+        (key == "token").then_some(value)
+    })?;
+    Some(
+        percent_encoding::percent_decode_str(raw)
+            .decode_utf8_lossy()
+            .into_owned(),
+    )
 }
 
 /// Constant-time string comparison so token validation doesn't leak the secret
@@ -330,14 +337,16 @@ async fn request_logging(
     next: axum::middleware::Next,
 ) -> impl IntoResponse {
     let method = req.method().clone();
-    let uri = req.uri().clone();
+    // Log only the path — the query string can carry the `?token=` secret used
+    // by browser WebSocket clients, which must not land in access logs.
+    let path = req.uri().path().to_owned();
     let start = Instant::now();
 
     let response = next.run(req).await;
 
     let duration_ms = start.elapsed().as_millis();
     let status = response.status();
-    info!("{method} {uri} -> {status} ({duration_ms}ms)");
+    info!("{method} {path} -> {status} ({duration_ms}ms)");
 
     response
 }
@@ -625,43 +634,37 @@ async fn execute_sql(
                     }
                 }
                 ExecuteResult::Query(mut handle) => {
-                    let mut sub = match handle.subscribe_raw() {
-                        Ok(s) => s,
-                        Err(e) => {
-                            return error_response(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                e.to_string(),
-                            )
-                            .into_response();
-                        }
-                    };
-
-                    // Accumulate rows up to the cap or until the deadline. The
-                    // accumulator lives outside the timed future so partial
-                    // results survive a timeout cancellation.
+                    // A fresh handle has no subscription only when the query
+                    // produced an immediate empty result (e.g. an ASOF query
+                    // over no data) — return an empty row set, not a 500.
                     let mut rows: Vec<serde_json::Value> = Vec::new();
-                    let collect = async {
-                        while rows.len() < MAX_SQL_RESULT_ROWS {
-                            match sub.recv_async().await {
-                                Ok(batch) => match batch_to_json(&batch) {
-                                    Ok(serde_json::Value::Array(batch_rows)) => {
-                                        for row in batch_rows {
-                                            if rows.len() >= MAX_SQL_RESULT_ROWS {
-                                                break;
+                    if let Ok(mut sub) = handle.subscribe_raw() {
+                        // Accumulate rows up to the cap or until the deadline.
+                        // The accumulator lives outside the timed future so
+                        // partial results survive a timeout cancellation.
+                        let collect = async {
+                            while rows.len() < MAX_SQL_RESULT_ROWS {
+                                match sub.recv_async().await {
+                                    Ok(batch) => match batch_to_json(&batch) {
+                                        Ok(serde_json::Value::Array(batch_rows)) => {
+                                            for row in batch_rows {
+                                                if rows.len() >= MAX_SQL_RESULT_ROWS {
+                                                    break;
+                                                }
+                                                rows.push(row);
                                             }
-                                            rows.push(row);
                                         }
-                                    }
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        warn!(error = %e, "serialize error for SQL result batch");
-                                    }
-                                },
-                                Err(_) => break, // stream disconnected
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            warn!(error = %e, "serialize error for SQL result batch");
+                                        }
+                                    },
+                                    Err(_) => break, // stream disconnected
+                                }
                             }
-                        }
-                    };
-                    let _ = tokio::time::timeout(SQL_RESULT_TIMEOUT, collect).await;
+                        };
+                        let _ = tokio::time::timeout(SQL_RESULT_TIMEOUT, collect).await;
+                    }
 
                     SqlResponse {
                         result_type: "query".to_string(),
@@ -810,7 +813,9 @@ async fn fan_out_pipeline_control(state: &AppState, local: bool, path: &str) {
                 let token = token.clone();
                 let url = format!("http://{peer}{path}");
                 tokio::spawn(async move {
-                    let mut req = client.post(&url);
+                    let mut req = client
+                        .post(&url)
+                        .timeout(std::time::Duration::from_secs(10));
                     if let Some(t) = token {
                         req = req.bearer_auth(t.expose());
                     }
@@ -832,30 +837,33 @@ async fn stop_pipeline(
     State(state): State<Arc<AppState>>,
     Query(params): Query<PipelineControlParams>,
 ) -> impl IntoResponse {
-    fan_out_pipeline_control(&state, params.local, "/api/v1/pipeline/stop?local=true").await;
-    match state.db.stop_pipeline().await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "message": "Pipeline suspended successfully" })),
-        )
-            .into_response(),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    // Stop locally first; only fan out to peers once this node succeeds, so a
+    // local failure doesn't leave the cluster in a split (some stopped) state.
+    if let Err(e) = state.db.stop_pipeline().await {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
+    fan_out_pipeline_control(&state, params.local, "/api/v1/pipeline/stop?local=true").await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "message": "Pipeline suspended successfully" })),
+    )
+        .into_response()
 }
 
 async fn start_pipeline(
     State(state): State<Arc<AppState>>,
     Query(params): Query<PipelineControlParams>,
 ) -> impl IntoResponse {
-    fan_out_pipeline_control(&state, params.local, "/api/v1/pipeline/start?local=true").await;
-    match state.db.start().await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "message": "Pipeline started successfully" })),
-        )
-            .into_response(),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    // Start locally first; only fan out to peers once this node succeeds.
+    if let Err(e) = state.db.start().await {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
+    fan_out_pipeline_control(&state, params.local, "/api/v1/pipeline/start?local=true").await;
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "message": "Pipeline started successfully" })),
+    )
+        .into_response()
 }
 
 async fn pipeline_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -1648,8 +1656,6 @@ mod tests {
         assert_eq!(json["success"], true);
     }
 
-
-
     /// POST a SQL statement to `/api/v1/sql`, asserting it succeeds.
     async fn exec_sql(app: &Router, sql: &str) {
         let req = Request::builder()
@@ -1915,8 +1921,6 @@ mod tests {
             "expected 404 Not Found for unknown stream, got: {resp}"
         );
     }
-
-
 
     #[tokio::test]
     async fn test_get_graph_returns_nodes_and_edges() {

@@ -34,8 +34,16 @@ pub fn register_file_source(registry: &ConnectorRegistry) {
         is_sink: false,
         config_keys: vec![
             ConfigKeySpec::required("path", "Directory path, glob pattern, or cloud storage URL"),
-            ConfigKeySpec::optional("format", "Data format (csv, tsv, json, jsonl, text, txt, parquet, arrow)", "auto-detect"),
-            ConfigKeySpec::optional("glob_pattern", "Optional glob pattern to filter files by name", "*"),
+            ConfigKeySpec::optional(
+                "format",
+                "Data format (csv, tsv, json, jsonl, text, txt, parquet, arrow)",
+                "auto-detect",
+            ),
+            ConfigKeySpec::optional(
+                "glob_pattern",
+                "Optional glob pattern to filter files by name",
+                "*",
+            ),
         ],
     };
     registry.register_source(

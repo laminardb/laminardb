@@ -378,7 +378,7 @@ db.start().await?;</code></pre>
           <p>
             <strong>Deployment.</strong>
             Embed it in Rust (<code>cargo add laminar-db</code>) or Python (<code>pip install laminardb</code>).
-            Or run the standalone <code>laminardb</code> binary with Kafka, CDC, and Delta Lake connectors.
+            Run the standalone <code>laminardb</code> server. Or deploy as a <strong>multi-node cluster</strong> with gossip discovery, Raft coordination, and dynamic partition rebalancing.
           </p>
           <p>
             It is not a message broker and it is not a general-purpose database.
@@ -421,6 +421,8 @@ db.start().await?;</code></pre>
             <div class="ring-chips">
               <span class="ring-chip">REST API</span>
               <span class="ring-chip">WebSocket</span>
+              <span class="ring-chip">Console UI</span>
+              <span class="ring-chip">Cluster Coordination</span>
               <span class="ring-chip">Metrics</span>
               <span class="ring-chip">Config</span>
             </div>
@@ -918,6 +920,47 @@ FROM documents;</code></pre>
             </p>
             <p>Typical uses: CDC pipelines, stream-to-lakehouse, event routing.</p>
           </div>
+          <div class="deploy-card">
+            <h3>Cluster Mode</h3>
+            <p>
+              Run multi-node deployments with virtual node (vnode) state partitioning.
+              Gossip discovery via Chitchat binds to a <code>gossip_port</code>, and metadata/lease coordination uses Raft on a <code>raft_port</code>.
+            </p>
+            <p>
+              Features dynamic rebalancing when nodes join, drain, or crash. Checkpointing uses distributed two-phase commit (2PC) at a minimum 2s interval with state stored in a shared object store (S3, GCS, Azure Blob, or shared filesystem).
+            </p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Console UI -->
+    <section id="console-ui">
+      <div class="container">
+        <h2>Console UI</h2>
+        <p class="section-desc">
+          Administrative control plane for managing schemas, tracing lineage, and observing cluster membership.
+        </p>
+
+        <div class="deploy-grid">
+          <div class="deploy-card">
+            <h3>SQL &amp; Live Streams</h3>
+            <p>
+              An interactive editor lets you execute DDL and queries. Ad-hoc live queries spawn ephemeral streams on the server, streaming Arrow-encoded records back to the browser via WebSockets.
+            </p>
+          </div>
+          <div class="deploy-card">
+            <h3>Lineage Visualization</h3>
+            <p>
+              View the streaming execution plan as a directed acyclic graph (DAG). The server traces dependencies dynamically across sources, streams, materialized views, and sinks.
+            </p>
+          </div>
+          <div class="deploy-card">
+            <h3>Cluster Monitoring</h3>
+            <p>
+              Inspect membership status (active, draining, suspected), track the active Raft leader lease, monitor checkpoint completion history, and visualize the 256 vnode partition assignments.
+            </p>
+          </div>
         </div>
       </div>
     </section>
@@ -1051,12 +1094,13 @@ FROM documents;</code></pre>
           <div class="status-col stable">
             <h3>Engine &amp; SQL</h3>
             <ul>
-              <li>Streaming engine (StreamingCoordinator, operator graph, state stores)</li>
+              <li>Streaming engine (StreamingCoordinator, operator graph, state stores, vnode partitioning)</li>
               <li>Window functions (tumbling, sliding/hopping, session)</li>
               <li>Joins (interval, ASOF, temporal, temporal probe, lookup, semi/anti)</li>
               <li>Materialized view result storage and queryability</li>
               <li>AI functions in streaming SQL (remote LLM / local ONNX)</li>
-              <li>Barrier-based checkpointing with 2PC exactly-once</li>
+              <li>Barrier-based checkpointing with distributed 2PC exactly-once</li>
+              <li>Multi-node clustering (gossip discovery, Raft coordination, dynamic rebalancing, graceful draining)</li>
             </ul>
           </div>
           <div class="status-col stable">
@@ -1064,8 +1108,9 @@ FROM documents;</code></pre>
             <ul>
               <li>Connectors: Kafka, PG/MySQL/MongoDB CDC, Delta Lake, Iceberg, OTel, WebSocket, Files</li>
               <li>Object store checkpoints (file, S3, Azure, GCS)</li>
-              <li>Standalone server with REST API, Prometheus metrics, hot-reload</li>
+              <li>Standalone server with REST and control-plane APIs, Prometheus metrics, hot-reload</li>
               <li>SUBSCRIBE over the PostgreSQL wire protocol (psql, psycopg, JDBC)</li>
+              <li>Console UI (Vite SPA) for query execution, live tailing, lineage, and cluster stats</li>
               <li>Push-based WebSocket stream subscriptions</li>
               <li>Docker (multi-arch) and Helm chart deployment</li>
             </ul>

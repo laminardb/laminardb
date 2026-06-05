@@ -87,20 +87,20 @@ impl LocalProvider {
             let api = hf_hub::api::tokio::ApiBuilder::from_env()
                 .with_cache_dir(self.cache_dir.clone())
                 .build()
-                .map_err(|e| ProviderError::Transport(format!("failed to initialize hf-hub client: {e}")))?;
+                .map_err(|e| {
+                    ProviderError::Transport(format!("failed to initialize hf-hub client: {e}"))
+                })?;
             let repo = api.model(repo_id.to_string());
 
-            let tokenizer_path = repo
-                .get("tokenizer.json")
-                .await
-                .map_err(|e| ProviderError::Transport(format!("failed to download tokenizer.json: {e}")))?;
+            let tokenizer_path = repo.get("tokenizer.json").await.map_err(|e| {
+                ProviderError::Transport(format!("failed to download tokenizer.json: {e}"))
+            })?;
 
             let onnx_path = match repo.get("onnx/model.onnx").await {
                 Ok(path) => path,
-                Err(_) => repo
-                    .get("model.onnx")
-                    .await
-                    .map_err(|e| ProviderError::Transport(format!("failed to download model.onnx: {e}")))?,
+                Err(_) => repo.get("model.onnx").await.map_err(|e| {
+                    ProviderError::Transport(format!("failed to download model.onnx: {e}"))
+                })?,
             };
 
             let config_path = repo.get("config.json").await.ok();
