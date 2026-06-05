@@ -145,23 +145,22 @@ pub fn model_dir(cache_dir: &Path, source: &str) -> PathBuf {
 /// auto-derive a local classifier's labels.
 #[must_use]
 pub fn load_labels(cache_dir: &Path, source: &str) -> Vec<String> {
+    // A config.json placed directly under the model dir (hand-placed exports,
+    // `file://`/path sources, and the legacy hf cache layout) wins.
+    if let Ok(text) = std::fs::read_to_string(model_dir(cache_dir, source).join("config.json")) {
+        return parse_id2label(&text);
+    }
+    // Otherwise resolve an hf-hub-downloaded model from its cache snapshot.
     if let Some(repo_id) = source.strip_prefix("hf:") {
         let cache = hf_hub::Cache::new(cache_dir.to_path_buf());
         let repo = cache.repo(hf_hub::Repo::model(repo_id.to_string()));
         if let Some(path) = repo.get("config.json") {
-            std::fs::read_to_string(path)
-                .ok()
-                .map(|text| parse_id2label(&text))
-                .unwrap_or_default()
-        } else {
-            Vec::new()
+            if let Ok(text) = std::fs::read_to_string(path) {
+                return parse_id2label(&text);
+            }
         }
-    } else {
-        std::fs::read_to_string(model_dir(cache_dir, source).join("config.json"))
-            .ok()
-            .map(|text| parse_id2label(&text))
-            .unwrap_or_default()
     }
+    Vec::new()
 }
 
 fn parse_id2label(config_json: &str) -> Vec<String> {
