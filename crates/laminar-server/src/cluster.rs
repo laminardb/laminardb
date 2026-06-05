@@ -554,15 +554,13 @@ pub async fn start_cluster(
     }
 
     // Shuffle fabric. ShuffleReceiver was bound at startup.
-    let shuffle_sender = Arc::new(
-        build_shuffle_sender(
-            node_id.0,
-            &discovery,
-            shuffle_advertise.clone(),
-            discovery.membership_watch(),
-        )
-        .await,
-    );
+    let shuffle_sender = build_shuffle_sender(
+        node_id.0,
+        &discovery,
+        shuffle_advertise.clone(),
+        discovery.membership_watch(),
+    )
+    .await;
 
     // Streaming aggregates go through the row-shuffle bridge driven by
     // `IncrementalAggState`; the DataFusion-native aggregate-rewrite
@@ -901,11 +899,11 @@ async fn build_shuffle_sender(
     discovery: &DiscoveryImpl,
     advertise_addr: String,
     membership_rx: watch::Receiver<Vec<NodeInfo>>,
-) -> laminar_core::shuffle::ShuffleSender {
+) -> Arc<laminar_core::shuffle::ShuffleSender> {
     use laminar_core::cluster::control::{ChitchatKv, ClusterKv};
     use laminar_core::shuffle::{ShuffleSender, SHUFFLE_ADDR_KEY};
 
-    match discovery {
+    let sender = match discovery {
         DiscoveryImpl::Gossip(gossip) => {
             if let Some(handle) = gossip.chitchat_handle() {
                 let kv: Arc<dyn ClusterKv> = Arc::new(ChitchatKv::from_handle(handle));
@@ -916,10 +914,34 @@ async fn build_shuffle_sender(
             }
         }
         DiscoveryImpl::Static(_) => {
-            let kv: Arc<dyn ClusterKv> = Arc::new(StaticClusterKv::new(membership_rx));
+            let kv: Arc<dyn ClusterKv> = Arc::new(StaticClusterKv::new(membership_rx.clone()));
             ShuffleSender::with_kv(node_id, kv)
         }
-    }
+    };
+    let sender = Arc::new(sender);
+
+    // Spawn a background task to watch membership updates and register peers
+    let sender_clone = Arc::clone(&sender);
+    let mut rx = membership_rx;
+    tokio::spawn(async move {
+        loop {
+            let members = rx.borrow().clone();
+            for node in members {
+                if node.id.0 != node_id {
+                    if let Some(addr_str) = node.metadata.tags.get(SHUFFLE_ADDR_KEY) {
+                        if let Ok(addr) = addr_str.parse::<std::net::SocketAddr>() {
+                            sender_clone.register_peer(node.id.0, addr).await;
+                        }
+                    }
+                }
+            }
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
+    });
+
+    sender
 }
 
 /// Compute the address peers should use to reach our `ShuffleReceiver`.
