@@ -1767,17 +1767,21 @@ impl LaminarDB {
     /// Returns [`DbError::InvalidOperation`] if the pipeline is still starting
     /// or the coordinator does not exit within the stop timeout.
     pub async fn stop_pipeline(&self) -> Result<(), DbError> {
-        match DbState::load(&self.state) {
-            DbState::Created | DbState::Stopped => return Ok(()),
-            DbState::Starting => {
+        // Atomically claim the stop: only the caller that flips Running ->
+        // ShuttingDown tears down, so a concurrent stop can't race in and mark
+        // the pipeline restartable while the coordinator is still shutting down.
+        match DbState::compare_exchange(DbState::Running, DbState::ShuttingDown, &self.state) {
+            Ok(_) => {}
+            // Already stopped / never started — idempotent no-op.
+            Err(DbState::Created | DbState::Stopped) => return Ok(()),
+            // Starting, or a stop is already in progress — refuse.
+            Err(_) => {
                 return Err(DbError::InvalidOperation(
-                    "cannot stop pipeline while it is starting".into(),
+                    "cannot stop pipeline: not running (starting, or a stop already in progress)"
+                        .into(),
                 ));
             }
-            DbState::Running | DbState::ShuttingDown => {}
         }
-
-        DbState::ShuttingDown.store(&self.state);
 
         // Clear the force-checkpoint sender.
         *self.force_ckpt_tx.lock() = None;

@@ -58,6 +58,25 @@ impl DbState {
     pub(crate) fn store(self, atomic: &std::sync::atomic::AtomicU8) {
         atomic.store(self as u8, std::sync::atomic::Ordering::Release);
     }
+
+    /// Atomically transition `current -> new`; returns the observed state on
+    /// failure so callers can claim an exclusive transition.
+    pub(crate) fn compare_exchange(
+        current: Self,
+        new: Self,
+        atomic: &std::sync::atomic::AtomicU8,
+    ) -> Result<Self, Self> {
+        use std::sync::atomic::Ordering;
+        atomic
+            .compare_exchange(
+                current as u8,
+                new as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|v| Self::from_u8(v).unwrap_or(Self::Stopped))
+            .map_err(|v| Self::from_u8(v).unwrap_or(Self::Stopped))
+    }
 }
 
 fn cache_entries_from_memory(mem: laminar_sql::parser::lookup_table::ByteSize) -> usize {
@@ -509,6 +528,10 @@ impl LaminarDB {
                 return;
             }
         };
+        // Detach the manifest store during replay: `execute` otherwise
+        // re-persists this node's still-partial catalog after every DDL, so a
+        // mid-replay failure would truncate the shared manifest. Reinstalled below.
+        let detached = self.catalog_manifest_store.lock().take();
         for entry in &manifest.entries {
             if self.catalog_object_exists(&entry.name) {
                 continue;
@@ -521,6 +544,7 @@ impl LaminarDB {
                 ),
             }
         }
+        *self.catalog_manifest_store.lock() = detached;
     }
 
     /// Whether a catalog object with `name` is already registered locally
