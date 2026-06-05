@@ -924,7 +924,7 @@ FROM documents;</code></pre>
             <h3>Cluster Mode</h3>
             <p>
               Run multi-node deployments with virtual node (vnode) state partitioning.
-              Gossip discovery via Chitchat binds to a <code>gossip_port</code>, and metadata/lease coordination uses Raft on a <code>raft_port</code>.
+              Gossip discovery via Chitchat binds to a <code>gossip_port</code>, and metadata/lease coordination uses the cluster control plane.
             </p>
             <p>
               Features dynamic rebalancing when nodes join, drain, or crash. Checkpointing uses distributed two-phase commit (2PC) at a minimum 2s interval with state stored in a shared object store (S3, GCS, Azure Blob, or shared filesystem).
