@@ -138,18 +138,28 @@ async fn connect(
     Ok(pool.lock().entry(peer).or_insert(channel).clone())
 }
 
-/// Scan `table_name` on `peer`, concatenating the streamed Arrow IPC chunks;
-/// evicts the pooled channel on transport error.
+/// Lazily-streamed Arrow [`RecordBatch`] chunks from a peer's `RemoteScan`.
+///
+/// Items are produced as the peer's gRPC response stream is polled, so a large
+/// result is never fully materialized on the caller. A per-chunk Arrow IPC
+/// decode failure or a mid-stream transport error surfaces as an `Err` item.
+pub type RemoteBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, String>> + Send>>;
+
+/// Scan `table_name` on `peer`, returning its Arrow IPC chunks as a lazy stream
+/// rather than buffering them into one batch; evicts the pooled channel on
+/// transport error so a restarted peer is re-resolved on the next query.
 ///
 /// # Errors
-/// Discovery, transport, or Arrow IPC (de)serialization failure.
+/// Discovery or transport failure while *establishing* the stream. Failures
+/// that occur once streaming has begun (Arrow IPC decode, dropped connection)
+/// surface as `Err` items on the returned stream rather than from this call.
 pub async fn remote_scan_client(
     pool: &QueryClientPool,
     kv: &Arc<dyn ClusterKv>,
     peer: NodeId,
     table_name: &str,
     projection: Option<Vec<usize>>,
-) -> Result<RecordBatch, String> {
+) -> Result<RemoteBatchStream, String> {
     let channel = connect(pool, kv, peer).await?;
     let mut client = QueryServiceClient::new(channel);
 
@@ -164,7 +174,7 @@ pub async fn remote_scan_client(
         projection,
     };
 
-    let mut stream = match client.remote_scan(request).await {
+    let stream = match client.remote_scan(request).await {
         Ok(resp) => resp.into_inner(),
         Err(e) => {
             pool.lock().remove(&peer);
@@ -172,29 +182,17 @@ pub async fn remote_scan_client(
         }
     };
 
-    let mut batches = Vec::new();
-    loop {
-        match stream.message().await {
-            Ok(Some(resp)) => {
-                batches.push(deserialize_batch_stream(&resp.arrow_ipc).map_err(|e| e.to_string())?);
-            }
-            Ok(None) => break,
-            Err(e) => {
-                pool.lock().remove(&peer);
-                return Err(e.to_string());
-            }
+    // Decode each chunk as it arrives. A mid-stream transport error evicts the
+    // pooled channel so the next query re-resolves a possibly-restarted peer.
+    let pool = Arc::clone(pool);
+    let decoded = stream.map(move |item| match item {
+        Ok(resp) => deserialize_batch_stream(&resp.arrow_ipc).map_err(|e| e.to_string()),
+        Err(e) => {
+            pool.lock().remove(&peer);
+            Err(e.to_string())
         }
-    }
-
-    // Success always yields >=1 chunk, so an empty stream is a transport fault.
-    let Some(first) = batches.first() else {
-        return Err(format!(
-            "peer {} returned no data for '{table_name}'",
-            peer.0
-        ));
-    };
-    let schema = first.schema();
-    arrow::compute::concat_batches(&schema, &batches).map_err(|e| e.to_string())
+    });
+    Ok(Box::pin(decoded))
 }
 
 #[cfg(test)]
@@ -247,7 +245,16 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))]).unwrap()
     }
 
-    // A result larger than one chunk must reassemble in order on the caller.
+    /// Collect every chunk of a remote scan stream, unwrapping any `Err` item.
+    async fn collect_chunks(stream: RemoteBatchStream) -> Vec<RecordBatch> {
+        stream
+            .map(|item| item.expect("remote scan chunk decode failed"))
+            .collect::<Vec<_>>()
+            .await
+    }
+
+    // A result larger than one chunk arrives as multiple batches that reassemble
+    // in stream order on the caller.
     #[tokio::test]
     async fn remote_scan_reassembles_chunks_in_order() {
         let count = i32::try_from(REMOTE_SCAN_CHUNK_ROWS).unwrap() + 100;
@@ -255,9 +262,13 @@ mod tests {
         let peer = NodeId(7);
         let (pool, kv) = serve(peer, int_batch(values.clone())).await;
 
-        let got = remote_scan_client(&pool, &kv, peer, "mv", None)
+        let stream = remote_scan_client(&pool, &kv, peer, "mv", None)
             .await
             .unwrap();
+        let batches = collect_chunks(stream).await;
+        // More rows than one chunk holds, so the result must span several chunks.
+        assert!(batches.len() > 1);
+        let got = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
         let col = got.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
         assert_eq!(col.values(), values.as_slice());
     }
@@ -268,9 +279,11 @@ mod tests {
         let peer = NodeId(7);
         let (pool, kv) = serve(peer, int_batch(vec![])).await;
 
-        let got = remote_scan_client(&pool, &kv, peer, "mv", None)
+        let stream = remote_scan_client(&pool, &kv, peer, "mv", None)
             .await
             .unwrap();
-        assert_eq!(got.num_rows(), 0);
+        let batches = collect_chunks(stream).await;
+        let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total, 0);
     }
 }

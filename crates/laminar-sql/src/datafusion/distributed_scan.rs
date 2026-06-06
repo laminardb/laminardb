@@ -7,6 +7,7 @@ use std::any::Any;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
+use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
@@ -242,25 +243,44 @@ impl ExecutionPlan for DistributedScanExec {
             futures::stream::select_all(local_streams).boxed()
         };
 
-        // Remote slices, fetched concurrently. A peer error fails the whole scan
-        // (consistency over availability); an empty slice is valid, not an error.
+        // Remote slices, fetched concurrently. Each peer streams its rows in
+        // row-bounded chunks, so a large slice is never materialized whole here;
+        // the per-peer chunk streams are flattened into one. A peer error fails
+        // the whole scan (consistency over availability); an empty slice is
+        // valid, not an error.
         let pool = Arc::clone(self.controller.query_client_pool());
         let kv = Arc::clone(self.controller.kv());
         let table = self.table_name.clone();
         let projection = self.projection.clone();
+        let schema = Arc::clone(&self.schema);
         let remote = futures::stream::iter(self.peers.clone())
             .map(move |peer| {
                 let pool = Arc::clone(&pool);
                 let kv = Arc::clone(&kv);
                 let table = table.clone();
                 let projection = projection.clone();
+                let schema = Arc::clone(&schema);
                 async move {
-                    remote_scan_client(&pool, &kv, peer, &table, projection)
-                        .await
-                        .map_err(DataFusionError::Execution)
+                    match remote_scan_client(&pool, &kv, peer, &table, projection).await {
+                        // Adapt laminar-core's String-error Arrow stream into a
+                        // DataFusion record-batch stream of this scan's schema.
+                        Ok(chunks) => Box::pin(RecordBatchStreamAdapter::new(
+                            schema,
+                            chunks.map(|batch| batch.map_err(DataFusionError::Execution)),
+                        )) as SendableRecordBatchStream,
+                        // Couldn't even open the stream: surface as a one-item
+                        // error stream so flatten() propagates the failure.
+                        Err(e) => Box::pin(RecordBatchStreamAdapter::new(
+                            schema,
+                            futures::stream::once(async move {
+                                Err::<RecordBatch, _>(DataFusionError::Execution(e))
+                            }),
+                        )) as SendableRecordBatchStream,
+                    }
                 }
             })
             .buffer_unordered(MAX_CONCURRENT_REMOTE)
+            .flatten()
             .boxed();
 
         // Run local scan and remote peer fetches concurrently.
