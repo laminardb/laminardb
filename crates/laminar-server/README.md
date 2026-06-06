@@ -302,5 +302,4 @@ See [deploy/README.md](../../deploy/README.md) for binary downloads, Docker, and
 
 - [`laminar-db`](../laminar-db) -- Database facade
 - [`laminar-connectors`](../laminar-connectors) -- External system connectors
-- [`laminar-core`](../laminar-core) -- Streaming engine
-- [`laminar-storage`](../laminar-storage) -- Checkpoint storage
+- [`laminar-core`](../laminar-core) -- Streaming engine and checkpoint storage

@@ -142,6 +142,5 @@ registry.register_source("my-source", info, factory_fn);
 
 ## Related Crates
 
-- [`laminar-core`](../laminar-core) -- Streaming channels and sink abstractions
-- [`laminar-storage`](../laminar-storage) -- Checkpoint manifest types
+- [`laminar-core`](../laminar-core) -- Streaming channels, sink abstractions, and checkpoint manifest types
 - [`laminar-db`](../laminar-db) -- Connector manager and checkpoint coordinator

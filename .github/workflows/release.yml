@@ -358,12 +358,6 @@ jobs:
       - name: Wait for index
         run: sleep 30
 
-      - name: Publish laminar-storage
-        run: cargo publish -p laminar-storage --registry crates-io --allow-dirty --no-verify
-        continue-on-error: true
-
-      - name: Wait for index
-        run: sleep 30
 
       - name: Publish laminar-connectors
         run: cargo publish -p laminar-connectors --registry crates-io --allow-dirty --no-verify
