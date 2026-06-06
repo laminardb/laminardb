@@ -2,7 +2,7 @@
 //! only (BERT/DistilBERT/MiniLM) — classify/sentiment return logits, embed
 //! returns a mean-pooled vector; generative tasks are rejected. A model is loaded
 //! once per source and cached; the forward pass runs on `spawn_blocking` under
-//! [`INFERENCE_TIMEOUT`] so a wedged model can't stall the worker. ORT loads at
+//! a deadline so a wedged model can't stall the worker. ORT loads at
 //! runtime — `onnxruntime.{dll,so}` (>= 1.24) must be on the search path or named
 //! by `ORT_DYLIB_PATH`. A `source` is `hf:org/repo` (downloaded on first use),
 //! `file://<path>`, or a bare path; labels come from the model's `config.json`
