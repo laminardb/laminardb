@@ -286,11 +286,8 @@ impl ConnectorPipelineCallback {
             Ok(Some(a)) if a.phase == Phase::Prepare => a,
             _ => return None,
         };
-        if Self::follower_should_skip(
-            self.last_follower_epoch,
-            self.pending_follower_checkpoint.as_ref().map(|p| p.epoch),
-            ann.epoch,
-        ) {
+        let in_flight = self.pending_follower_checkpoint.as_ref().map(|p| p.epoch);
+        if Self::follower_should_skip(self.last_follower_epoch, in_flight, ann.epoch) {
             return None;
         }
 
