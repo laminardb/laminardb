@@ -57,6 +57,7 @@ pub struct QueryHandle {
     pub(crate) sql: String,
     pub(crate) subscription: Option<Subscription<ArrowRecord>>,
     pub(crate) active: bool,
+    pub(crate) cancel_token: tokio_util::sync::CancellationToken,
 }
 
 impl QueryHandle {
@@ -84,7 +85,13 @@ impl QueryHandle {
         self.active
     }
 
-    pub(crate) fn subscribe_raw(&mut self) -> Result<Subscription<ArrowRecord>, DbError> {
+    /// Take the raw `RecordBatch` subscription for this query.
+    ///
+    /// The subscription is consumed on first call; subsequent calls error.
+    ///
+    /// # Errors
+    /// Returns `DbError::InvalidOperation` if the subscription was already consumed.
+    pub fn subscribe_raw(&mut self) -> Result<Subscription<ArrowRecord>, DbError> {
         self.subscription
             .take()
             .ok_or_else(|| DbError::InvalidOperation("Subscription already consumed".to_string()))
@@ -106,6 +113,13 @@ impl QueryHandle {
     pub fn cancel(&mut self) {
         self.active = false;
         self.subscription = None;
+        self.cancel_token.cancel();
+    }
+}
+
+impl Drop for QueryHandle {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
     }
 }
 
@@ -471,6 +485,28 @@ pub struct SourceInfo {
 pub struct SinkInfo {
     /// Name.
     pub name: String,
+}
+
+/// JSON-serializable projection of a `MaterializedView` for the control-plane
+/// HTTP API.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MaterializedViewInfo {
+    /// View name.
+    pub name: String,
+    /// SQL definition.
+    pub sql: String,
+    /// Current execution state (e.g. `"Running"`, `"Dropping"`).
+    pub state: String,
+}
+
+impl From<&laminar_core::mv::MaterializedView> for MaterializedViewInfo {
+    fn from(view: &laminar_core::mv::MaterializedView) -> Self {
+        Self {
+            name: view.name.clone(),
+            sql: view.sql.clone(),
+            state: format!("{:?}", view.state),
+        }
+    }
 }
 
 /// Information about a running query.

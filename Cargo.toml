@@ -13,7 +13,7 @@ exclude = [
 resolver = "2"
 
 [workspace.package]
-version = "0.24.0"
+version = "0.25.0"
 authors = ["LaminarDB Contributors"]
 edition = "2021"
 rust-version = "1.95"
@@ -104,6 +104,9 @@ base64 = "0.22"
 
 # Randomness
 rand = "0.10"
+
+# Constant-time comparison (token validation)
+subtle = "2.6"
 
 # Metrics
 prometheus = { version = "0.14", features = ["process"] }

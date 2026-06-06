@@ -61,6 +61,16 @@ fn warn_late_drops(source: &str, column: &str, watermark_ms: i64, dropped: usize
     );
 }
 
+/// Clears the in-flight checkpoint flag on drop, so a panicking persist task
+/// can't leave it stuck and permanently disable checkpointing.
+struct CheckpointInFlightGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for CheckpointInFlightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 pub(crate) struct ConnectorPipelineCallback {
     pub(crate) graph: crate::operator_graph::OperatorGraph,
     pub(crate) stream_sources: Vec<(String, streaming::Source<crate::catalog::ArrowRecord>)>,
@@ -138,6 +148,13 @@ pub(crate) struct ConnectorPipelineCallback {
     /// leader's manifest is useless for restart recovery.
     pub(crate) force_ckpt_rx: Option<crate::db::ForceCheckpointRx>,
     pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
+    pub(crate) static_stream_names: rustc_hash::FxHashSet<Arc<str>>,
+    pub(crate) checkpoint_complete_tx: crossfire::MAsyncTx<
+        crossfire::mpsc::Array<(u64, rustc_hash::FxHashMap<String, SourceCheckpoint>)>,
+    >,
+    /// Set while a background checkpoint persists; the coordinator reads it to
+    /// bound concurrent checkpoints to one.
+    pub(crate) checkpoint_in_flight: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ConnectorPipelineCallback {
@@ -690,6 +707,34 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 }
             }
         }
+
+        // Ephemeral/dynamic streams (e.g. console live queries) have no
+        // downstream sink, so they aren't in `stream_sources` and the loop
+        // above never forwards them — push their batches to any subscribers.
+        // MVs are skipped here; they reach subscribers via their own path.
+        let mv_has_any = self
+            .mv_store_has_any
+            .load(std::sync::atomic::Ordering::Acquire);
+        let mv_read = if mv_has_any {
+            Some(self.mv_store.read())
+        } else {
+            None
+        };
+        for (stream_name, batches) in results {
+            let is_static = self.static_stream_names.contains(stream_name);
+            let has_mv = mv_read
+                .as_ref()
+                .is_some_and(|r| r.has_mv(stream_name.as_ref()));
+            if is_static || has_mv {
+                continue;
+            }
+            for batch in batches {
+                if batch.num_rows() > 0 {
+                    self.subscription_registry
+                        .send_batch(stream_name, batch.clone());
+                }
+            }
+        }
     }
 
     fn update_mv_stores(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
@@ -1139,32 +1184,33 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
                 }
             }
         } else {
-            // Periodic checkpoint — run inline (single-threaded runtime, no
-            // parallelism to exploit with tokio::spawn).
-            let mut guard = self.coordinator.lock().await;
-            if let Some(ref mut coord) = *guard {
-                coord.set_pending_vnode_states(vnode_states);
-                match coord.checkpoint_with_offsets(request).await {
-                    Ok(result) if result.success => {
-                        tracing::info!(
-                            epoch = result.epoch,
-                            duration_ms = result.duration.as_millis(),
-                            "Pipeline checkpoint completed"
-                        );
-                        committed = Some(result.epoch);
-                    }
-                    Ok(result) => {
-                        tracing::warn!(
+            // Persist in the background; in-flight flag bounds to one checkpoint at a time.
+            self.checkpoint_in_flight
+                .store(true, std::sync::atomic::Ordering::Release);
+            let coordinator_clone = Arc::clone(&self.coordinator);
+            let tx = self.checkpoint_complete_tx.clone();
+            let in_flight = CheckpointInFlightGuard(Arc::clone(&self.checkpoint_in_flight));
+            tokio::spawn(async move {
+                let _in_flight = in_flight; // cleared on drop, even on panic
+                let mut guard = coordinator_clone.lock().await;
+                if let Some(ref mut coord) = *guard {
+                    coord.set_pending_vnode_states(vnode_states);
+                    match coord.checkpoint_with_offsets(request).await {
+                        Ok(result) if result.success => {
+                            let _ = tx
+                                .send((result.epoch, rustc_hash::FxHashMap::default()))
+                                .await;
+                        }
+                        Ok(result) => tracing::warn!(
                             epoch = result.epoch,
                             error = ?result.error,
                             "Pipeline checkpoint failed"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Checkpoint error");
+                        ),
+                        Err(e) => tracing::warn!(error = %e, "Checkpoint error"),
                     }
                 }
-            }
+            });
+            committed = None;
         }
 
         self.last_checkpoint = std::time::Instant::now();
@@ -1252,7 +1298,6 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
         }
 
         let vnode_states = self.capture_vnode_states();
-        let mut guard = self.coordinator.lock().await;
         let request = crate::checkpoint_coordinator::CheckpointRequest {
             operator_states,
             watermark: None,
@@ -1263,32 +1308,37 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
             source_offset_overrides: source_overrides,
         };
 
-        if let Some(ref mut coord) = *guard {
-            coord.set_pending_vnode_states(vnode_states);
-            match coord.checkpoint_with_offsets(request).await {
-                Ok(result) if result.success => {
-                    tracing::info!(
-                        epoch = result.epoch,
-                        duration_ms = result.duration.as_millis(),
-                        "Barrier-aligned checkpoint completed"
-                    );
-                    self.last_checkpoint = std::time::Instant::now();
-                    return BarrierOutcome::Committed(result.epoch);
-                }
-                Ok(result) => {
-                    tracing::warn!(
+        // Persist in the background; in-flight flag bounds to one checkpoint at a time.
+        self.checkpoint_in_flight
+            .store(true, std::sync::atomic::Ordering::Release);
+        let coordinator_clone = Arc::clone(&self.coordinator);
+        let tx = self.checkpoint_complete_tx.clone();
+        let in_flight = CheckpointInFlightGuard(Arc::clone(&self.checkpoint_in_flight));
+        let fan_out = source_checkpoints.clone();
+        let wm = self
+            .pipeline_watermark
+            .load(std::sync::atomic::Ordering::Acquire);
+        tokio::spawn(async move {
+            let _in_flight = in_flight; // cleared on drop, even on panic
+            let mut guard = coordinator_clone.lock().await;
+            if let Some(ref mut coord) = *guard {
+                coord.set_pending_vnode_states(vnode_states);
+                coord.set_local_watermark_ms(if wm == i64::MIN { None } else { Some(wm) });
+                match coord.checkpoint_with_offsets(request).await {
+                    Ok(result) if result.success => {
+                        let _ = tx.send((result.epoch, fan_out)).await;
+                    }
+                    Ok(result) => tracing::warn!(
                         epoch = result.epoch,
                         error = ?result.error,
                         "Barrier-aligned checkpoint failed"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Barrier-aligned checkpoint error");
+                    ),
+                    Err(e) => tracing::warn!(error = %e, "Barrier-aligned checkpoint error"),
                 }
             }
-        }
-
-        BarrierOutcome::Failed
+        });
+        self.last_checkpoint = std::time::Instant::now();
+        BarrierOutcome::Async
     }
 
     fn record_cycle(&self, events_ingested: u64, _batches: u64, elapsed_ns: u64) {

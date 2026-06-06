@@ -15,6 +15,8 @@ use crate::config::{
     ConfigError, LookupConfig, PipelineConfig, ServerConfig, SinkConfig, SourceConfig,
 };
 use crate::http;
+#[cfg(feature = "cluster")]
+use crate::http::ClusterComponents;
 use crate::metrics::ServerMetrics;
 use crate::reload::ReloadGuard;
 #[cfg(all(test, any(feature = "otel", feature = "kafka")))]
@@ -120,6 +122,9 @@ pub async fn run_server(
 
     // Build LaminarDB via builder API
     let mut builder = LaminarDB::builder();
+    if let Some(ref token) = config.server.console_token {
+        builder = builder.http_auth_token(token.expose());
+    }
 
     let storage_dir = config.state.local_storage_dir();
     let has_storage = config.state.is_durable();
@@ -134,7 +139,7 @@ pub async fn run_server(
         _ => Profile::BareMetal,
     };
     builder = builder.profile(profile);
-    builder = apply_checkpoint_config(builder, &config.checkpoint.url, &config.checkpoint);
+    builder = apply_checkpoint_config(builder, &config.checkpoint.url, &config.checkpoint, false);
 
     // Build the state backend + single-owner vnode registry from config so
     // the checkpoint coordinator's durability gate runs with real markers.
@@ -197,8 +202,16 @@ pub async fn run_server(
             .expect("pgwire_tls_min_version validated at config load");
     let pgwire_max_connections = config.server.pgwire_max_connections;
     let pgwire_max_auth_failures = config.server.pgwire_max_auth_failures_per_min;
-    let (app_state, api_handle) =
-        start_http_api(Arc::clone(&db), registry, config_path.clone(), config).await?;
+    let (app_state, api_handle) = start_http_api(
+        Arc::clone(&db),
+        registry,
+        config_path.clone(),
+        config,
+        // Single-node embedded mode has no cluster control plane.
+        #[cfg(feature = "cluster")]
+        None,
+    )
+    .await?;
     let watcher_handle = spawn_config_watcher(&app_state, config_path);
 
     let pgwire_handle = if let Some(bind) = pgwire_bind {
@@ -251,10 +264,16 @@ pub async fn run_server(
 // ---------------------------------------------------------------------------
 
 /// Apply checkpoint settings to a `LaminarDB` builder.
+///
+/// `cluster` routes `file://` checkpoints through the object store so they are
+/// namespaced per node and readable cross-node. Single-node mode keeps `file://`
+/// on the local `FileSystemCheckpointStore` (stable on-disk layout); only
+/// remote schemes (`s3://`, …) go to the object store there.
 pub(crate) fn apply_checkpoint_config(
     mut builder: laminar_db::LaminarDbBuilder,
     checkpoint_url: &str,
     checkpoint: &crate::config::CheckpointSection,
+    cluster: bool,
 ) -> laminar_db::LaminarDbBuilder {
     let cfg = StreamCheckpointConfig {
         interval_ms: Some(checkpoint.interval.as_millis() as u64),
@@ -265,7 +284,8 @@ pub(crate) fn apply_checkpoint_config(
     };
     builder = builder.checkpoint(cfg);
 
-    if !checkpoint_url.starts_with("file:///") && !checkpoint_url.is_empty() {
+    let is_file = checkpoint_url.starts_with("file://");
+    if !checkpoint_url.is_empty() && (cluster || !is_file) {
         builder = builder.object_store_url(checkpoint_url.to_string());
         if !checkpoint.storage.is_empty() {
             builder = builder.object_store_options(checkpoint.storage.clone());
@@ -345,11 +365,16 @@ pub(crate) async fn execute_config_ddl(
 }
 
 /// Start HTTP API server and return (shared state, join handle).
+///
+/// In cluster mode the caller passes `Some(ClusterComponents)` so the
+/// `/api/v1/cluster/*` endpoints can surface membership, vnode assignments,
+/// and leadership; single-node startup passes `None`.
 pub(crate) async fn start_http_api(
     db: Arc<LaminarDB>,
     registry: Arc<prometheus::Registry>,
     config_path: PathBuf,
     config: ServerConfig,
+    #[cfg(feature = "cluster")] cluster: Option<ClusterComponents>,
 ) -> Result<(Arc<http::AppState>, tokio::task::JoinHandle<()>), ServerError> {
     let bind = config.server.bind.clone();
 
@@ -362,6 +387,9 @@ pub(crate) async fn start_http_api(
         reload_guard: ReloadGuard::new(),
         registry,
         server_metrics,
+        ephemeral: Arc::new(http::EphemeralTracker::new()),
+        #[cfg(feature = "cluster")]
+        cluster,
     });
     let router = http::build_router(Arc::clone(&app_state));
     let api_handle = http::serve(router, &bind).await?;

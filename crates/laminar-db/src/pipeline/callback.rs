@@ -39,6 +39,8 @@ impl std::fmt::Display for SkipReason {
 pub enum BarrierOutcome {
     /// Checkpoint committed at the given epoch.
     Committed(u64),
+    /// Checkpoint is processing asynchronously in the background.
+    Async,
     /// Deliberately skipped (see `SkipReason`).
     Skipped(SkipReason),
     /// Attempted and failed; retry on the next interval.

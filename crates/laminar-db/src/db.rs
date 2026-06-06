@@ -58,6 +58,25 @@ impl DbState {
     pub(crate) fn store(self, atomic: &std::sync::atomic::AtomicU8) {
         atomic.store(self as u8, std::sync::atomic::Ordering::Release);
     }
+
+    /// Atomically transition `current -> new`; returns the observed state on
+    /// failure so callers can claim an exclusive transition.
+    pub(crate) fn compare_exchange(
+        current: Self,
+        new: Self,
+        atomic: &std::sync::atomic::AtomicU8,
+    ) -> Result<Self, Self> {
+        use std::sync::atomic::Ordering;
+        atomic
+            .compare_exchange(
+                current as u8,
+                new as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map(|v| Self::from_u8(v).unwrap_or(Self::Stopped))
+            .map_err(|v| Self::from_u8(v).unwrap_or(Self::Stopped))
+    }
 }
 
 fn cache_entries_from_memory(mem: laminar_sql::parser::lookup_table::ByteSize) -> usize {
@@ -509,6 +528,10 @@ impl LaminarDB {
                 return;
             }
         };
+        // Detach the manifest store during replay: `execute` otherwise
+        // re-persists this node's still-partial catalog after every DDL, so a
+        // mid-replay failure would truncate the shared manifest. Reinstalled below.
+        let detached = self.catalog_manifest_store.lock().take();
         for entry in &manifest.entries {
             if self.catalog_object_exists(&entry.name) {
                 continue;
@@ -521,6 +544,7 @@ impl LaminarDB {
                 ),
             }
         }
+        *self.catalog_manifest_store.lock() = detached;
     }
 
     /// Whether a catalog object with `name` is already registered locally
@@ -1083,7 +1107,7 @@ impl LaminarDB {
 
         let statement = &statements[0];
 
-        match statement {
+        let result = match statement {
             StreamingStatement::CreateSource(create) => {
                 let result = self.handle_create_source(create).await?;
                 if let ExecuteResult::Ddl(ref info) = result {
@@ -1256,7 +1280,16 @@ impl LaminarDB {
                 "DECLARE CURSOR FOR SUBSCRIBE requires the pgwire endpoint, not HTTP /api/v1/sql"
                     .into(),
             )),
+        };
+
+        #[cfg(feature = "cluster")]
+        if let Ok(ExecuteResult::Ddl(ref info)) = &result {
+            if info.statement_type != "CHECKPOINT" {
+                self.persist_catalog_manifest().await;
+            }
         }
+
+        result
     }
 
     /// Handle INSERT INTO statement.
@@ -1738,21 +1771,34 @@ impl LaminarDB {
 
         let subscription = sink.subscribe();
 
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        let cancel_token_clone = cancel_token.clone();
+
         let source_clone = source.clone();
+        let catalog = Arc::clone(&self.catalog);
+        let query_id_clone = query_id;
         tokio::spawn(async move {
             use tokio_stream::StreamExt;
             let mut stream = stream;
-            while let Some(result) = stream.next().await {
-                match result {
-                    Ok(batch) => {
-                        if source_clone.push_arrow(batch).is_err() {
-                            break;
+            loop {
+                tokio::select! {
+                    () = cancel_token_clone.cancelled() => {
+                        break;
+                    }
+                    result = stream.next() => {
+                        match result {
+                            Some(Ok(batch)) => {
+                                if source_clone.push_arrow(batch).is_err() {
+                                    break;
+                                }
+                            }
+                            _ => break,
                         }
                     }
-                    Err(_) => break,
                 }
             }
             drop(source_clone);
+            catalog.deactivate_query(query_id_clone);
         });
 
         ExecuteResult::Query(QueryHandle {
@@ -1761,6 +1807,7 @@ impl LaminarDB {
             sql: sql.to_string(),
             subscription: Some(subscription),
             active: true,
+            cancel_token,
         })
     }
 
@@ -1811,12 +1858,14 @@ impl LaminarDB {
 
         if result_batch.num_rows() == 0 {
             let query_id = self.catalog.register_query(original_sql);
+            self.catalog.deactivate_query(query_id);
             return Ok(ExecuteResult::Query(QueryHandle {
                 id: query_id,
                 schema: result_batch.schema(),
                 sql: original_sql.to_string(),
                 subscription: None,
                 active: false,
+                cancel_token: tokio_util::sync::CancellationToken::new(),
             }));
         }
 
@@ -1899,6 +1948,15 @@ impl LaminarDB {
             .list_sinks()
             .into_iter()
             .map(|name| SinkInfo { name })
+            .collect()
+    }
+
+    /// List all registered materialized views with their SQL and state.
+    pub fn materialized_views(&self) -> Vec<crate::handle::MaterializedViewInfo> {
+        let registry = self.mv_registry.lock();
+        registry
+            .views()
+            .map(crate::handle::MaterializedViewInfo::from)
             .collect()
     }
 
@@ -2175,52 +2233,49 @@ impl LaminarDB {
         &self,
         addr: &str,
     ) -> Result<crate::checkpoint_coordinator::CheckpointResult, DbError> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpStream;
+        #[derive(serde::Deserialize)]
+        struct ForwardedCheckpointResponse {
+            success: bool,
+            checkpoint_id: u64,
+            epoch: u64,
+            duration_ms: u64,
+            error: Option<String>,
+        }
 
-        let mut stream = TcpStream::connect(addr).await.map_err(|e| {
-            DbError::Checkpoint(format!("failed to connect to leader at {addr}: {e}"))
-        })?;
-
-        let req = format!(
-            "POST /api/v1/checkpoint HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        );
-        stream.write_all(req.as_bytes()).await.map_err(|e| {
-            DbError::Checkpoint(format!("failed to send checkpoint request to leader: {e}"))
-        })?;
-
-        let mut response_bytes = Vec::new();
-        stream.read_to_end(&mut response_bytes).await.map_err(|e| {
+        let mut req = reqwest::Client::new()
+            .post(format!("http://{addr}/api/v1/checkpoint"))
+            .timeout(std::time::Duration::from_secs(10));
+        if let Some(token) = &self.config.http_auth_token {
+            req = req.bearer_auth(token.expose());
+        }
+        let resp = req.send().await.map_err(|e| {
             DbError::Checkpoint(format!(
-                "failed to read checkpoint response from leader: {e}"
+                "failed to forward checkpoint to leader at {addr}: {e}"
             ))
         })?;
 
-        // Find the double CRLF separating headers from body
-        let mut header_len = response_bytes.len();
-        for i in 0..response_bytes.len().saturating_sub(3) {
-            if response_bytes[i..i + 4] == [b'\r', b'\n', b'\r', b'\n'] {
-                header_len = i + 4;
-                break;
-            }
+        let status = resp.status();
+        let body = resp.text().await.map_err(|e| {
+            DbError::Checkpoint(format!("failed to read leader checkpoint response: {e}"))
+        })?;
+
+        // The leader returns a `CheckpointResponse` body even when the
+        // checkpoint itself failed (HTTP 500 + `success: false`), so parse it so
+        // that structured failure reaches the follower. A body that isn't a
+        // `CheckpointResponse` (e.g. a 401 error payload) is an auth/transport
+        // failure — surface the status and body instead.
+        match serde_json::from_str::<ForwardedCheckpointResponse>(&body) {
+            Ok(response) => Ok(crate::checkpoint_coordinator::CheckpointResult {
+                success: response.success,
+                checkpoint_id: response.checkpoint_id,
+                epoch: response.epoch,
+                duration: std::time::Duration::from_millis(response.duration_ms),
+                error: response.error,
+            }),
+            Err(_) => Err(DbError::Checkpoint(format!(
+                "leader rejected checkpoint ({status}): {body}"
+            ))),
         }
-
-        if header_len >= response_bytes.len() {
-            return Err(DbError::Checkpoint(
-                "invalid HTTP response from leader".into(),
-            ));
-        }
-
-        let body = &response_bytes[header_len..];
-        let result: crate::checkpoint_coordinator::CheckpointResult = serde_json::from_slice(body)
-            .map_err(|e| {
-                let raw = String::from_utf8_lossy(body);
-                DbError::Checkpoint(format!(
-                    "failed to deserialize leader's response ({raw}): {e}"
-                ))
-            })?;
-
-        Ok(result)
     }
 
     /// Returns checkpoint performance statistics.

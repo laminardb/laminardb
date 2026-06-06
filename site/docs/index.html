@@ -449,8 +449,10 @@
     <aside class="docs-sidebar" aria-label="Documentation navigation">
       <h4>Server</h4>
       <a href="#server-config">Server Config</a>
+      <a href="#cluster-config">Cluster Config</a>
       <a href="#state-config">State Store</a>
       <a href="#checkpoint-config">Checkpoints</a>
+      <a href="#console-ui-api">Console UI &amp; Control API</a>
       <a href="#rest-api">REST API</a>
       <a href="#hot-reload">Hot Reload</a>
       <a href="#prometheus">Prometheus Metrics</a>
@@ -542,7 +544,11 @@ docker run -d -p 8080:8080 laminardb/laminardb-server:latest
       <!-- ============================================================ -->
 
       <h2 id="server-config">[server]</h2>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">crates/laminar-server/src/config.rs:201</a></div>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">crates/laminar-server/src/config.rs:244</a></div>
+
+      <p>
+        The <code>[server]</code> section configures standalone server behaviors, control plane security, and pgwire network parameters.
+      </p>
 
       <table class="config-table">
         <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
@@ -551,25 +557,94 @@ docker run -d -p 8080:8080 laminardb/laminardb-server:latest
             <td class="field-name">mode</td>
             <td class="field-type">String</td>
             <td class="field-default">"embedded"</td>
-            <td>"embedded" (single-node)</td>
+            <td>Run mode. <code>"embedded"</code> (standalone single-node) or <code>"cluster"</code> (multi-node deployment).</td>
           </tr>
           <tr>
             <td class="field-name">bind</td>
             <td class="field-type">String</td>
             <td class="field-default">"127.0.0.1:8080"</td>
-            <td>HTTP API bind address</td>
+            <td>HTTP API and Console UI control-plane bind address.</td>
           </tr>
           <tr>
-            <td class="field-name">workers</td>
-            <td class="field-type">usize</td>
-            <td class="field-default">0</td>
-            <td>Worker threads. 0 = auto-detect CPU count.</td>
-          </tr>
-          <tr>
-            <td class="field-name">log_level</td>
+            <td class="field-name">console_token</td>
             <td class="field-type">String</td>
-            <td class="field-default">"info"</td>
-            <td>trace, debug, info, warn, error</td>
+            <td class="field-default">none</td>
+            <td>Bearer token gating HTTP control-plane API access and WebSockets. If omitted, API is unauthenticated.</td>
+          </tr>
+          <tr>
+            <td class="field-name">console_cors_allowed_origins</td>
+            <td class="field-type">Array&lt;String&gt;</td>
+            <td class="field-default">none</td>
+            <td>CORS origins allowed to access control-plane REST/WS endpoints.</td>
+          </tr>
+          <tr>
+            <td class="field-name">pgwire_bind</td>
+            <td class="field-type">String</td>
+            <td class="field-default">none</td>
+            <td>Postgres wire protocol listener bind address. Disabled if omitted.</td>
+          </tr>
+          <tr>
+            <td class="field-name">pgwire_allow_remote</td>
+            <td class="field-type">bool</td>
+            <td class="field-default">false</td>
+            <td>Must be set to <code>true</code> to allow binding pgwire on non-loopback interfaces.</td>
+          </tr>
+          <tr>
+            <td class="field-name">pgwire_users</td>
+            <td class="field-type">Map</td>
+            <td class="field-default">{}</td>
+            <td>A map of usernames to MD5 or plain-text passwords for pgwire client authentication.</td>
+          </tr>
+          <tr>
+            <td class="field-name">pgwire_tls_cert</td>
+            <td class="field-type">String</td>
+            <td class="field-default">none</td>
+            <td>Path to PEM certificate file for pgwire TLS connection support.</td>
+          </tr>
+          <tr>
+            <td class="field-name">pgwire_tls_key</td>
+            <td class="field-type">String</td>
+            <td class="field-default">none</td>
+            <td>Path to PEM private key (PKCS#8/RSA) for pgwire TLS.</td>
+          </tr>
+          <tr>
+            <td class="field-name">pgwire_tls_client_ca</td>
+            <td class="field-type">String</td>
+            <td class="field-default">none</td>
+            <td>Path to PEM CA bundle for enforcing mutual TLS (mTLS) verification.</td>
+          </tr>
+          <tr>
+            <td class="field-name">pgwire_max_connections</td>
+            <td class="field-type">usize</td>
+            <td class="field-default">256</td>
+            <td>Maximum active pgwire sessions before connections are closed.</td>
+          </tr>
+          <tr>
+            <td class="field-name">pgwire_max_auth_failures_per_min</td>
+            <td class="field-type">u32</td>
+            <td class="field-default">10</td>
+            <td>Failed authentications per IP per minute before temporary ban. 0 disables.</td>
+          </tr>
+          <tr>
+            <td class="field-name">pgwire_tls_min_version</td>
+            <td class="field-type">String</td>
+            <td class="field-default">"1.2"</td>
+            <td>Minimum TLS protocol version (<code>"1.2"</code> or <code>"1.3"</code>).</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        <strong>Top-Level Config Keys:</strong>
+      </p>
+      <table class="config-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="field-name">node_id</td>
+            <td class="field-type">String</td>
+            <td class="field-default">none</td>
+            <td>Unique node identity (required if <code>mode = "cluster"</code>; falls back to <code>{hostname}-{port}</code>).</td>
           </tr>
         </tbody>
       </table>
@@ -579,28 +654,196 @@ docker run -d -p 8080:8080 laminardb/laminardb-server:latest
         <pre><code class="language-toml">[server]
 mode = "embedded"
 bind = "0.0.0.0:8080"
-workers = 4
+console_token = "supersecret"
+pgwire_bind = "0.0.0.0:5433"
+pgwire_allow_remote = true
 log_level = "info"</code></pre>
       </div>
 
-      <!-- STATE -->
-      <h2 id="state-config">[state]</h2>
-      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">config.rs:233</a></div>
+      <!-- ============================================================ -->
+      <!-- CLUSTER CONFIG -->
+      <!-- ============================================================ -->
 
+      <h2 id="cluster-config">Cluster Config</h2>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/config.rs" target="_blank" rel="noopener">crates/laminar-server/src/config.rs:641</a></div>
+
+      <p>
+        When <code>mode = "cluster"</code>, the server requires both the <code>[discovery]</code> and <code>[coordination]</code> sections to be defined.
+      </p>
+
+      <h3>[discovery]</h3>
       <table class="config-table">
         <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
           <tr>
-            <td class="field-name">backend</td>
+            <td class="field-name">strategy</td>
             <td class="field-type">String</td>
-            <td class="field-default">"memory"</td>
-            <td>"memory", "mmap", or "disaggregated"</td>
+            <td class="field-required">required</td>
+            <td>Discovery mode. Either <code>"gossip"</code> (Chitchat p2p membership) or <code>"static"</code>.</td>
           </tr>
+          <tr>
+            <td class="field-name">seeds</td>
+            <td class="field-type">Array&lt;String&gt;</td>
+            <td class="field-default">[]</td>
+            <td>Gossip/Static seed peer addresses to join the cluster (e.g. <code>["10.0.0.1:7946", "10.0.0.2:7946"]</code>). Required for static strategy.</td>
+          </tr>
+          <tr>
+            <td class="field-name">gossip_port</td>
+            <td class="field-type">u16</td>
+            <td class="field-default">7946</td>
+            <td>Gossip communications port.</td>
+          </tr>
+          <tr>
+            <td class="field-name">advertise_host</td>
+            <td class="field-type">String</td>
+            <td class="field-default">none</td>
+            <td>The host/IP address this node advertises to peers. Falls back to loopback if DNS resolution fails.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>[coordination]</h3>
+      <table class="config-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="field-name">strategy</td>
+            <td class="field-type">String</td>
+            <td class="field-default">"raft"</td>
+            <td>Consensus coordinator strategy. Currently supports <code>"raft"</code>.</td>
+          </tr>
+          <tr>
+            <td class="field-name">raft_port</td>
+            <td class="field-type">u16</td>
+            <td class="field-default">8888</td>
+            <td>The port used for Raft consensus group communications.</td>
+          </tr>
+          <tr>
+            <td class="field-name">election_timeout</td>
+            <td class="field-type">Duration</td>
+            <td class="field-default">"3s"</td>
+            <td>Raft leader election timeout (supports humantime format).</td>
+          </tr>
+          <tr>
+            <td class="field-name">heartbeat_interval</td>
+            <td class="field-type">Duration</td>
+            <td class="field-default">"500ms"</td>
+            <td>Raft leader heartbeat interval.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="toml-block">
+        <div class="toml-header">laminardb.toml (Cluster sections)</div>
+        <pre><code class="language-toml">node_id = "node-1"
+
+[discovery]
+strategy = "gossip"
+gossip_port = 7946
+advertise_host = "10.0.0.1"
+seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]
+
+[coordination]
+strategy = "raft"
+raft_port = 8888
+election_timeout = "3s"
+heartbeat_interval = "500ms"</code></pre>
+      </div>
+
+      <!-- STATE -->
+      <h2 id="state-config">[state]</h2>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-core/src/state/config.rs" target="_blank" rel="noopener">crates/laminar-core/src/state/config.rs:43</a></div>
+
+      <p>
+        The <code>[state]</code> section configures the engine's query state backend (used for aggregates, joins, and windowing). It is a tagged union using the <code>backend</code> key.
+      </p>
+
+      <h3>In-Process State (Non-durable, in-memory)</h3>
+      <p>Configure with <code>backend = "in_process"</code> (the default).</p>
+      <table class="config-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="field-name">vnode_capacity</td>
+            <td class="field-type">u32</td>
+            <td class="field-default">256</td>
+            <td>Number of virtual nodes to divide the hash ring into.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Local State (Durable, local filesystem)</h3>
+      <p>Configure with <code>backend = "local"</code>.</p>
+      <table class="config-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
           <tr>
             <td class="field-name">path</td>
             <td class="field-type">String</td>
-            <td class="field-default">"./data/state"</td>
-            <td>Persistent state directory (mmap backend)</td>
+            <td class="field-required">required</td>
+            <td>Local directory path where state partitions are stored.</td>
+          </tr>
+          <tr>
+            <td class="field-name">instance_id</td>
+            <td class="field-type">String</td>
+            <td class="field-default">"local"</td>
+            <td>Auditable instance identity written to checkpoint metadata.</td>
+          </tr>
+          <tr>
+            <td class="field-name">vnode_capacity</td>
+            <td class="field-type">u32</td>
+            <td class="field-default">256</td>
+            <td>Number of virtual nodes.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Object Store State (Durable, shared storage)</h3>
+      <p>Configure with <code>backend = "object_store"</code>. Essential for cluster mode deployments.</p>
+      <table class="config-table">
+        <thead><tr><th>Field</th><th>Type</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="field-name">url</td>
+            <td class="field-type">String</td>
+            <td class="field-required">required</td>
+            <td>Shared storage URL (currently <code>"file://..."</code>; cloud schemes such as <code>"s3://"</code>/<code>"gs://"</code>/<code>"az://"</code> are not yet implemented).</td>
+          </tr>
+          <tr>
+            <td class="field-name">instance_id</td>
+            <td class="field-type">String</td>
+            <td class="field-required">required</td>
+            <td>This node's unique ID, used for writer fencing.</td>
+          </tr>
+          <tr>
+            <td class="field-name">vnode_capacity</td>
+            <td class="field-type">u32</td>
+            <td class="field-default">256</td>
+            <td>Total virtual nodes for the cluster layout.</td>
+          </tr>
+          <tr>
+            <td class="field-name">vnodes</td>
+            <td class="field-type">Array&lt;u32&gt;</td>
+            <td class="field-default">none</td>
+            <td>Static list of vnodes assigned to this node (only used for static/non-cluster layouts).</td>
+          </tr>
+          <tr>
+            <td class="field-name">merger_instance</td>
+            <td class="field-type">String</td>
+            <td class="field-default">none</td>
+            <td>The node that compiles partial sink outputs (only used in static modes).</td>
+          </tr>
+          <tr>
+            <td class="field-name">discovery</td>
+            <td class="field-type">String</td>
+            <td class="field-default">"static"</td>
+            <td>Membership discovery mode: <code>"static"</code> or <code>"dynamic"</code> (gossip).</td>
+          </tr>
+          <tr>
+            <td class="field-name">seed_peers</td>
+            <td class="field-type">Array&lt;String&gt;</td>
+            <td class="field-default">[]</td>
+            <td>Seed peer addresses for dynamic chitchat discovery.</td>
           </tr>
         </tbody>
       </table>
@@ -651,6 +894,76 @@ aws_access_key_id = "${AWS_ACCESS_KEY_ID}"
 aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
       </div>
 
+      <!-- CONSOLE UI & CONTROL API -->
+      <h2 id="console-ui-api">Console UI &amp; Control API</h2>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/http.rs" target="_blank" rel="noopener">crates/laminar-server/src/http.rs</a></div>
+
+      <p>
+        The Console UI (Vite-based SPA client) connects to the control-plane APIs exposed by the server. All endpoints are protected by token authentication if <code>server.console_token</code> is configured.
+      </p>
+
+      <h3>Security &amp; Gating</h3>
+      <ul>
+        <li><strong>HTTP Authentication:</strong> Send the configured token in the header: <code>Authorization: Bearer &lt;token&gt;</code>.</li>
+        <li><strong>WebSocket Authentication:</strong> Pass the token as a query parameter: <code>/ws/{name}?token=&lt;token&gt;</code>.</li>
+        <li><strong>CORS Gating:</strong> Restrict client origins using the <code>server.console_cors_allowed_origins</code> array in TOML.</li>
+      </ul>
+
+      <h3>Lineage Dependency Graph</h3>
+      <p>
+        <code>GET /api/v1/graph</code> parses SQL statements and queries the engine schema to return a directed acyclic graph (DAG) of the data pipeline.
+      </p>
+      <div class="toml-block">
+        <div class="toml-header">GET /api/v1/graph Response Format</div>
+        <pre><code class="language-json">{
+  "nodes": [
+    { "id": "trades", "type": "source", "label": "trades" },
+    { "id": "vwap", "type": "stream", "label": "vwap" },
+    { "id": "trade_archive", "type": "sink", "label": "trade_archive" }
+  ],
+  "edges": [
+    { "source": "trades", "target": "vwap" },
+    { "source": "vwap", "target": "trade_archive" }
+  ]
+}</code></pre>
+      </div>
+
+      <h3>Ad-hoc Query &amp; Ephemeral Stream Lifecycle</h3>
+      <p>
+        To run an ad-hoc query and tail it in the browser:
+      </p>
+      <ol>
+        <li>Post the SQL query to <code>POST /api/v1/queries</code>:
+          <pre><code class="language-json">POST /api/v1/queries
+{ "sql": "SELECT symbol, price FROM trades WHERE volume > 1000" }</code></pre>
+        </li>
+        <li>The server registers an ephemeral stream named <code>__console_&lt;uuid&gt;</code> and returns:
+          <pre><code class="language-json">{ "stream_id": "__console_&lt;uuid&gt;", "ws_url": "/ws/__console_&lt;uuid&gt;" }</code></pre>
+        </li>
+        <li>The client connects to the WebSocket at <code>ws_url</code> to receive the data stream.</li>
+        <li>When the WebSocket connection closes or times out, the server automatically <code>DROP</code>s the ephemeral stream and releases resources.</li>
+      </ol>
+
+      <h3>Realtime Telemetry &amp; WebSocket Protocol</h3>
+      <p>
+        WebSocket client connects to <code>GET /ws/{name}</code>. Messages are serialized using Arrow JSON format:
+      </p>
+      <pre><code class="language-json">{
+  "type": "data",
+  "subscription_id": 1,
+  "data": [ { "symbol": "AAPL", "price": 178.5 } ],
+  "sequence": 42
+}</code></pre>
+      <p>A heartbeat ping frame is sent by the server every 15 seconds; the client must respond to prevent connection termination.</p>
+
+      <h3>Cluster Management Endpoints</h3>
+      <ul>
+        <li><code>GET /api/v1/cluster/nodes</code> &mdash; Returns list of cluster members, including their node IDs, network addresses, and states (<code>Active</code>, <code>Draining</code>, <code>Suspected</code>, <code>Left</code>).</li>
+        <li><code>GET /api/v1/cluster/vnodes</code> &mdash; Returns the current assignment map mapping the 256 virtual nodes (vnodes) to active cluster nodes.</li>
+        <li><code>GET /api/v1/cluster/leader</code> &mdash; Returns node details for the active Raft leader lease holder.</li>
+        <li><code>GET /api/v1/cluster/checkpoints</code> &mdash; Returns history and completion metadata of recent coordinator checkpoints.</li>
+      </ul>
+
       <!-- REST API -->
       <h2 id="rest-api">REST API</h2>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/http.rs" target="_blank" rel="noopener">crates/laminar-server/src/http.rs</a></div>
@@ -694,29 +1007,84 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
           <span class="endpoint-desc">Stream detail by name</span>
         </div>
         <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/mvs</span>
+          <span class="endpoint-desc">List materialized views</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/connectors</span>
+          <span class="endpoint-desc">List available connector types and config options</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-post">POST</span>
+          <span class="endpoint-path">/api/v1/queries</span>
+          <span class="endpoint-desc">Create ephemeral query stream for ad-hoc tailing</span>
+        </div>
+        <div class="endpoint-row">
           <span class="endpoint-method method-post">POST</span>
           <span class="endpoint-path">/api/v1/checkpoint</span>
-          <span class="endpoint-desc">Trigger an immediate checkpoint</span>
+          <span class="endpoint-desc">Trigger immediate coordinator checkpoint</span>
         </div>
         <div class="endpoint-row">
           <span class="endpoint-method method-post">POST</span>
           <span class="endpoint-path">/api/v1/sql</span>
-          <span class="endpoint-desc">Execute ad-hoc SQL query</span>
+          <span class="endpoint-desc">Execute DDL/SQL query (returns JSON rows or metadata)</span>
         </div>
         <div class="endpoint-row">
           <span class="endpoint-method method-post">POST</span>
           <span class="endpoint-path">/api/v1/reload</span>
-          <span class="endpoint-desc">Hot-reload configuration</span>
+          <span class="endpoint-desc">Hot-reload configuration and certificates</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/graph</span>
+          <span class="endpoint-desc">Generate pipeline dependency graph (nodes &amp; edges)</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/cluster</span>
+          <span class="endpoint-desc">Retrieve basic engine cluster status</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/cluster/nodes</span>
+          <span class="endpoint-desc">List nodes and their membership state</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/cluster/vnodes</span>
+          <span class="endpoint-desc">Get current vnode instance assignments</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/cluster/leader</span>
+          <span class="endpoint-desc">Get current leader node details</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/cluster/checkpoints</span>
+          <span class="endpoint-desc">List completed checkpoint metadata</span>
         </div>
         <div class="endpoint-row">
           <span class="endpoint-method method-post">POST</span>
-          <span class="endpoint-path">/api/v1/pause</span>
-          <span class="endpoint-desc">Pause pipeline (not yet implemented, returns 501)</span>
+          <span class="endpoint-path">/api/v1/pipeline/start</span>
+          <span class="endpoint-desc">Resume execution of a specific pipeline</span>
         </div>
         <div class="endpoint-row">
           <span class="endpoint-method method-post">POST</span>
-          <span class="endpoint-path">/api/v1/resume</span>
-          <span class="endpoint-desc">Resume pipeline (not yet implemented, returns 501)</span>
+          <span class="endpoint-path">/api/v1/pipeline/stop</span>
+          <span class="endpoint-desc">Stop execution of a specific pipeline</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/api/v1/pipeline/status</span>
+          <span class="endpoint-desc">Query individual pipeline state</span>
+        </div>
+        <div class="endpoint-row">
+          <span class="endpoint-method method-get">GET</span>
+          <span class="endpoint-path">/ws/{name}</span>
+          <span class="endpoint-desc">WebSocket query/stream realtime subscription channel</span>
         </div>
       </div>
 
@@ -1550,9 +1918,17 @@ LEFT JOIN products p
       <h2 id="env-vars">Environment Variables</h2>
 
       <p>
-        All string values in TOML support <code>${VAR}</code> substitution.
+        All string values in the TOML configuration file support <code>${VAR}</code> substitution.
         Use <code>${VAR:-default}</code> for optional variables with fallbacks.
         Missing variables without defaults cause a startup error.
+      </p>
+
+      <p>
+        <strong>SQL Queries:</strong> Because substitution is performed on the raw configuration file contents before parsing, environment variables can be embedded directly within SQL statements defined in the TOML file (such as in <code>[[pipeline]]</code> SQL queries or the top-level <code>sql</code> string).
+      </p>
+
+      <p>
+        <strong>Dynamic Queries:</strong> Environment variables are <strong>not</strong> expanded in queries submitted dynamically after startup (e.g., via the pgwire protocol or the <code>POST /api/v1/sql</code> HTTP endpoint).
       </p>
 
       <div class="toml-block">

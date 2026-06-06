@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use object_store::ObjectStoreExt;
 use tokio::signal;
 use tokio::sync::watch;
 use tracing::{info, warn};
@@ -329,7 +330,18 @@ pub async fn start_cluster(
         bind_host.to_string()
     };
 
-    let local_node = NodeInfo {
+    // Bind ShuffleReceiver first to discover port and publish it in metadata tags.
+    let bind_addr: std::net::SocketAddr = format!("{bind_host}:0").parse().map_err(|e| {
+        ClusterStartupError::EngineConstruction(format!("invalid shuffle bind host: {e}"))
+    })?;
+    let shuffle_receiver = Arc::new(
+        laminar_core::shuffle::ShuffleReceiver::bind(node_id.0, bind_addr)
+            .await
+            .map_err(|e| ClusterStartupError::EngineConstruction(format!("shuffle bind: {e}")))?,
+    );
+    let shuffle_advertise = shuffle_advertise_addr(shuffle_receiver.local_addr(), &advertise_host);
+
+    let mut local_node = NodeInfo {
         id: node_id,
         name: node_id_str.clone(),
         rpc_address: format!("{advertise_host}:{http_port}"),
@@ -345,6 +357,10 @@ pub async fn start_cluster(
         },
         last_heartbeat_ms: 0,
     };
+    local_node.metadata.tags.insert(
+        laminar_core::shuffle::SHUFFLE_ADDR_KEY.to_string(),
+        shuffle_advertise.clone(),
+    );
 
     // 1. Start discovery layer
     info!(
@@ -423,83 +439,72 @@ pub async fn start_cluster(
     // Build LaminarDB with Profile::Cluster
     let mut builder = LaminarDB::builder();
     builder = builder.profile(Profile::Cluster);
+    if let Some(ref token) = config.server.console_token {
+        builder = builder.http_auth_token(token.expose());
+    }
 
     if let Some(path) = config.state.local_storage_dir() {
         builder = builder.storage_dir(path);
     }
 
-    // Build state backend + its underlying object store. The object
-    // store is shared with `AssignmentSnapshotStore` below so a single
-    // cluster-wide bucket holds both per-epoch state and the vnode
-    // assignment snapshot.
     let state_backend: Arc<dyn laminar_core::state::StateBackend> = config
         .state
         .build()
         .await
         .map_err(|e| ClusterStartupError::EngineConstruction(format!("state backend: {e}")))?;
 
-    // Build the vnode registry. If a shared `AssignmentSnapshot` already
-    // exists in the state backend's object store, every node adopts it.
-    // Otherwise the first peer to arrive CAS-creates the snapshot from
-    // its local round-robin split; losers of the CAS race re-load and
-    // adopt the winner.
-    let (vnode_registry, snapshot_store) =
-        resolve_vnode_assignment(node_id, &peers, &config.state).await?;
+    // Shared control-plane store for the assignment snapshot and the cluster KV.
+    // Every node must reach it, so it comes from the checkpoint bucket, not the
+    // per-node `[state]` path.
+    let control_store = build_control_store(&config)?;
 
-    // Construct the ClusterController if we have a chitchat handle
-    // (gossip discovery only — static discovery has no KV tier).
-    let cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>> =
-        if let DiscoveryImpl::Gossip(ref gossip) = discovery {
-            if let Some(handle) = gossip.chitchat_handle() {
-                use laminar_core::cluster::control::{ChitchatKv, ClusterController, ClusterKv};
-                let kv: Arc<dyn ClusterKv> = Arc::new(ChitchatKv::from_handle(handle));
-                let members_rx = discovery.membership_watch();
-                let controller = Arc::new(ClusterController::new(
-                    node_id,
-                    kv,
-                    snapshot_store.clone(),
-                    members_rx,
-                ));
-                controller.set_active(false);
-                #[cfg(feature = "cluster")]
-                {
-                    let bind: std::net::SocketAddr =
-                        format!("{bind_host}:0").parse().map_err(|e| {
-                            ClusterStartupError::EngineConstruction(format!(
-                                "invalid barrier sync bind host: {e}"
-                            ))
-                        })?;
-                    match controller
-                        .start_barrier_server(bind, Some(advertise_host.clone()))
-                        .await
-                    {
-                        Ok(bound) => {
-                            info!("Barrier sync gRPC server listening on {}", bound);
-                        }
-                        Err(e) => {
-                            return Err(ClusterStartupError::EngineConstruction(format!(
-                                "barrier sync server bind: {e}"
-                            )));
-                        }
-                    }
-                }
-                info!(
-                    "ClusterController installed (leader={})",
-                    controller.is_leader()
-                );
-                builder = builder.cluster_controller(Arc::clone(&controller));
-                Some(controller)
-            } else {
+    // Build the vnode registry. If a shared `AssignmentSnapshot` already exists,
+    // every node adopts it; otherwise the first peer CAS-creates it and losers
+    // re-load and adopt the winner.
+    let (vnode_registry, snapshot_store) = resolve_vnode_assignment(
+        node_id,
+        &peers,
+        config.state.vnode_capacity(),
+        control_store.clone(),
+    )
+    .await?;
+
+    // Each arm produces the control-plane KV (chitchat for gossip, object store
+    // for static); `install_cluster_controller` does the shared setup.
+    use laminar_core::cluster::control::{ChitchatKv, ClusterKv};
+    let controller_kv: Option<Arc<dyn ClusterKv>> = match discovery {
+        DiscoveryImpl::Gossip(ref gossip) => gossip
+            .chitchat_handle()
+            .map(|handle| Arc::new(ChitchatKv::from_handle(handle)) as Arc<dyn ClusterKv>),
+        DiscoveryImpl::Static(_) => match control_store.clone() {
+            Some(store) => Some(Arc::new(ObjectStoreClusterKv::new(
+                node_id,
+                store,
+                discovery.membership_watch(),
+            )) as Arc<dyn ClusterKv>),
+            None => {
+                info!("Static discovery — cluster control plane skipped (no shared object store).");
                 None
             }
-        } else {
-            info!(
-                "Static discovery — cluster control plane skipped \
-             (no chitchat KV). Leader/follower barrier protocol \
-             inactive in this mode."
-            );
-            None
-        };
+        },
+    };
+
+    let cluster_controller = match controller_kv {
+        Some(kv) => {
+            let controller = install_cluster_controller(
+                node_id,
+                kv,
+                snapshot_store.clone(),
+                discovery.membership_watch(),
+                bind_host,
+                &advertise_host,
+            )
+            .await?;
+            builder = builder.cluster_controller(Arc::clone(&controller));
+            Some(controller)
+        }
+        None => None,
+    };
 
     // Namespace checkpoints per node for partition migration reads.
     let checkpoint_url = {
@@ -512,23 +517,17 @@ pub async fn start_cluster(
             format!("{base}/nodes/{node_id_str}/")
         }
     };
-    builder = server::apply_checkpoint_config(builder, &checkpoint_url, &config.checkpoint);
+    builder = server::apply_checkpoint_config(builder, &checkpoint_url, &config.checkpoint, true);
 
     builder = builder
         .state_backend(Arc::clone(&state_backend))
         .vnode_registry(Arc::clone(&vnode_registry));
 
-    // Durable cluster 2PC decision store. Shares the same underlying
-    // object store as the state backend so a single cluster-wide
-    // bucket holds per-epoch state, the assignment snapshot, and the
-    // commit decisions. Without this wiring the leader's `Commit`
-    // announcement is the only cluster-wide commit signal — ephemeral,
-    // so a mid-2PC leader crash produces split state.
-    if let Some(decision_os) = config
-        .state
-        .build_object_store()
-        .map_err(|e| ClusterStartupError::EngineConstruction(format!("decision store: {e}")))?
-    {
+    // Durable cluster 2PC decision store, on the shared control-plane bucket
+    // (not the per-node state path) so commit decisions are cluster-wide.
+    // Without this the leader's `Commit` announcement is the only commit
+    // signal — ephemeral, so a mid-2PC leader crash produces split state.
+    if let Some(decision_os) = control_store.clone() {
         let decision_store =
             Arc::new(laminar_core::cluster::control::CheckpointDecisionStore::new(decision_os));
         builder = builder.decision_store(decision_store);
@@ -544,26 +543,24 @@ pub async fn start_cluster(
         builder = builder.assignment_snapshot_store(snap_store);
     }
 
-    // Install the catalog manifest store on the same shared object store, so
+    // Install the catalog manifest store on the shared control-plane bucket, so
     // a booting node can replay catalog DDL (MVs/sources) it lacks and each
     // successful checkpoint republishes the catalog for nodes that join later.
-    if let Some(catalog_os) = config.state.build_object_store().map_err(|e| {
-        ClusterStartupError::EngineConstruction(format!("catalog manifest store: {e}"))
-    })? {
+    if let Some(catalog_os) = control_store.clone() {
         let catalog_store = Arc::new(laminar_core::cluster::control::CatalogManifestStore::new(
             catalog_os,
         ));
         builder = builder.catalog_manifest_store(catalog_store);
     }
 
-    // Shuffle fabric. ShuffleReceiver publishes its bound address into
-    // the gossip KV so peer ShuffleSenders discover it on first send.
-    // Without this wiring, streaming aggregates never cross node
-    // boundaries.
-    let shuffle_receiver = build_shuffle_receiver(&discovery, node_id, bind_host).await?;
-    let shuffle_advertise = shuffle_advertise_addr(shuffle_receiver.local_addr(), bind_host);
-    let shuffle_sender =
-        Arc::new(build_shuffle_sender(node_id.0, &discovery, shuffle_advertise).await);
+    // Shuffle fabric. ShuffleReceiver was bound at startup.
+    let shuffle_sender = build_shuffle_sender(
+        node_id.0,
+        &discovery,
+        shuffle_advertise.clone(),
+        discovery.membership_watch(),
+    )
+    .await;
 
     // Streaming aggregates go through the row-shuffle bridge driven by
     // `IncrementalAggState`; the DataFusion-native aggregate-rewrite
@@ -634,13 +631,10 @@ pub async fn start_cluster(
     // Fenced leader lease. Standalone split-brain hardening: a stale
     // leader whose lease has expired loses the CAS to the next acquirer
     // and stops renewing, while the new owner advances the monotonic
-    // fencing token. Runs whenever a shared object store is available
-    // (the lease lives in the same cluster-wide bucket as state). The
-    // renewal loop is cancelled on shutdown via the returned token.
+    // fencing token. Runs whenever a shared control-plane store is
+    // available. The renewal loop is cancelled on shutdown via the token.
     let lease_shutdown_token: Option<tokio_util::sync::CancellationToken> =
-        match config.state.build_object_store().map_err(|e| {
-            ClusterStartupError::EngineConstruction(format!("leader lease store: {e}"))
-        })? {
+        match control_store.clone() {
             Some(lease_os) => {
                 use laminar_core::cluster::control::{
                     LeaderLeaseConfig, LeaderLeaseManager, LeaderLeaseStore,
@@ -662,10 +656,22 @@ pub async fn start_cluster(
             None => None,
         };
 
-    let (app_state, api_handle) =
-        server::start_http_api(Arc::clone(&db), registry, config_path.clone(), config)
-            .await
-            .map_err(|e| ClusterStartupError::HttpStartup(e.to_string()))?;
+    // Back the `/api/v1/cluster/*` endpoints. controller/snapshot_store may be
+    // None under static discovery; the membership feed is always present.
+    let cluster_components = crate::http::ClusterComponents {
+        controller: cluster_controller.clone(),
+        snapshot_store: snapshot_store.clone(),
+        membership_rx: discovery.membership_watch(),
+    };
+    let (app_state, api_handle) = server::start_http_api(
+        Arc::clone(&db),
+        registry,
+        config_path.clone(),
+        config,
+        Some(cluster_components),
+    )
+    .await
+    .map_err(|e| ClusterStartupError::HttpStartup(e.to_string()))?;
     let watcher_handle = server::spawn_config_watcher(&app_state, config_path);
 
     let membership_rx = discovery.membership_watch();
@@ -719,7 +725,8 @@ fn num_cpus() -> u32 {
 async fn resolve_vnode_assignment(
     self_id: laminar_core::cluster::discovery::NodeId,
     peers: &[laminar_core::cluster::discovery::NodeInfo],
-    state_cfg: &laminar_core::state::StateBackendConfig,
+    vnode_count: u32,
+    control_store: Option<Arc<dyn object_store::ObjectStore>>,
 ) -> Result<
     (
         Arc<laminar_core::state::VnodeRegistry>,
@@ -730,7 +737,6 @@ async fn resolve_vnode_assignment(
     use laminar_core::cluster::control::{AssignmentSnapshot, AssignmentSnapshotStore};
     use laminar_core::state::{rendezvous_assignment, NodeId, VnodeRegistry};
 
-    let vnode_count = state_cfg.vnode_capacity();
     let peer_ids: Vec<NodeId> = peers
         .iter()
         .map(|p| NodeId(p.id.0))
@@ -738,11 +744,8 @@ async fn resolve_vnode_assignment(
         .collect();
     let assignment: Arc<[NodeId]> = rendezvous_assignment(vnode_count, &peer_ids);
 
-    let maybe_store = state_cfg
-        .build_object_store()
-        .map_err(|e| ClusterStartupError::EngineConstruction(format!("state object store: {e}")))?;
-    let Some(store) = maybe_store else {
-        // Non-durable backend — fall back to node-local round-robin.
+    let Some(store) = control_store else {
+        // No shared store — fall back to node-local round-robin.
         let registry = VnodeRegistry::new(vnode_count);
         registry.set_assignment(Arc::clone(&assignment));
         return Ok((Arc::new(registry), None));
@@ -799,78 +802,166 @@ async fn resolve_vnode_assignment(
     Ok((Arc::new(registry), Some(snapshot_store)))
 }
 
-/// Bind the ShuffleReceiver. When gossip discovery is active, publish
-/// the bound address under `SHUFFLE_ADDR_KEY` so peer senders can
-/// discover it on first send.
-async fn build_shuffle_receiver(
-    discovery: &DiscoveryImpl,
+/// Build the shared, cluster-wide control-plane object store (assignment
+/// snapshot + `ObjectStoreClusterKv`). It must be reachable by every node, so
+/// it comes from the checkpoint bucket — not the per-node `[state]` path. Falls
+/// back to the state backend's store for single-host/local setups.
+fn build_control_store(
+    config: &ServerConfig,
+) -> Result<Option<Arc<dyn object_store::ObjectStore>>, ClusterStartupError> {
+    if !config.checkpoint.url.is_empty() {
+        let store = laminar_core::storage::object_store_builder::build_object_store(
+            &config.checkpoint.url,
+            &config.checkpoint.storage,
+        )
+        .map_err(|e| {
+            ClusterStartupError::EngineConstruction(format!("control-plane object store: {e}"))
+        })?;
+        return Ok(Some(store));
+    }
+    config.state.build_object_store().map_err(|e| {
+        ClusterStartupError::EngineConstruction(format!("control-plane object store: {e}"))
+    })
+}
+
+/// Build a `ClusterController` from a ready KV handle and start its barrier sync
+/// server. Shared by the gossip and static discovery paths.
+async fn install_cluster_controller(
     node_id: NodeId,
+    kv: Arc<dyn laminar_core::cluster::control::ClusterKv>,
+    snapshot_store: Option<Arc<laminar_core::cluster::control::AssignmentSnapshotStore>>,
+    members_rx: watch::Receiver<Vec<NodeInfo>>,
     bind_host: &str,
-) -> Result<Arc<laminar_core::shuffle::ShuffleReceiver>, ClusterStartupError> {
-    use laminar_core::cluster::control::{ChitchatKv, ClusterKv};
-    use laminar_core::shuffle::ShuffleReceiver;
+    advertise_host: &str,
+) -> Result<Arc<laminar_core::cluster::control::ClusterController>, ClusterStartupError> {
+    use laminar_core::cluster::control::ClusterController;
+
+    let controller = Arc::new(ClusterController::new(
+        node_id,
+        kv,
+        snapshot_store,
+        members_rx,
+    ));
+    controller.set_active(false);
 
     let bind: std::net::SocketAddr = format!("{bind_host}:0").parse().map_err(|e| {
-        ClusterStartupError::EngineConstruction(format!("invalid shuffle bind host: {e}"))
+        ClusterStartupError::EngineConstruction(format!("invalid barrier sync bind host: {e}"))
     })?;
-    let recv = if let DiscoveryImpl::Gossip(gossip) = discovery {
-        if let Some(handle) = gossip.chitchat_handle() {
-            let kv: Arc<dyn ClusterKv> = Arc::new(ChitchatKv::from_handle(handle));
-            ShuffleReceiver::bind_with_kv(node_id.0, bind, kv)
-                .await
-                .map_err(|e| {
-                    ClusterStartupError::EngineConstruction(format!("shuffle bind: {e}"))
-                })?
-        } else {
-            ShuffleReceiver::bind(node_id.0, bind).await.map_err(|e| {
-                ClusterStartupError::EngineConstruction(format!("shuffle bind: {e}"))
-            })?
-        }
-    } else {
-        ShuffleReceiver::bind(node_id.0, bind)
-            .await
-            .map_err(|e| ClusterStartupError::EngineConstruction(format!("shuffle bind: {e}")))?
-    };
-    Ok(Arc::new(recv))
+    let bound = controller
+        .start_barrier_server(bind, Some(advertise_host.to_string()))
+        .await
+        .map_err(|e| {
+            ClusterStartupError::EngineConstruction(format!("barrier sync server bind: {e}"))
+        })?;
+    info!("Barrier sync gRPC server listening on {bound}");
+    info!(
+        "ClusterController installed (leader={})",
+        controller.is_leader()
+    );
+    Ok(controller)
+}
+
+struct StaticClusterKv {
+    membership_rx: watch::Receiver<Vec<NodeInfo>>,
+}
+
+impl StaticClusterKv {
+    fn new(membership_rx: watch::Receiver<Vec<NodeInfo>>) -> Self {
+        Self { membership_rx }
+    }
+}
+
+#[async_trait::async_trait]
+impl laminar_core::cluster::control::ClusterKv for StaticClusterKv {
+    async fn write(&self, _key: &str, _value: String) {}
+
+    async fn read_from(&self, who: NodeId, key: &str) -> Option<String> {
+        let peers = self.membership_rx.borrow();
+        let peer = peers.iter().find(|p| p.id == who)?;
+        peer.metadata.tags.get(key).cloned()
+    }
+
+    async fn scan(&self, key: &str) -> Vec<(NodeId, String)> {
+        let peers = self.membership_rx.borrow();
+        peers
+            .iter()
+            .filter_map(|p| p.metadata.tags.get(key).map(|v| (p.id, v.clone())))
+            .collect()
+    }
 }
 
 /// Build an outbound shuffle sender. When gossip discovery is active,
 /// publish `advertise_addr` under `SHUFFLE_ADDR_KEY` so peers find us, and
 /// give the sender a KV handle for reverse lookup. Static discovery
-/// has no KV tier, so we hand back a bare sender — peers must be
-/// registered explicitly by whatever sets up the shuffle topology.
+/// uses `StaticClusterKv` to query peer shuffle addresses from TCP heartbeat metadata.
 async fn build_shuffle_sender(
     node_id: u64,
     discovery: &DiscoveryImpl,
     advertise_addr: String,
-) -> laminar_core::shuffle::ShuffleSender {
+    membership_rx: watch::Receiver<Vec<NodeInfo>>,
+) -> Arc<laminar_core::shuffle::ShuffleSender> {
     use laminar_core::cluster::control::{ChitchatKv, ClusterKv};
     use laminar_core::shuffle::{ShuffleSender, SHUFFLE_ADDR_KEY};
 
-    let DiscoveryImpl::Gossip(gossip) = discovery else {
-        return ShuffleSender::new(node_id);
+    let sender = match discovery {
+        DiscoveryImpl::Gossip(gossip) => {
+            if let Some(handle) = gossip.chitchat_handle() {
+                let kv: Arc<dyn ClusterKv> = Arc::new(ChitchatKv::from_handle(handle));
+                kv.write(SHUFFLE_ADDR_KEY, advertise_addr).await;
+                ShuffleSender::with_kv(node_id, kv)
+            } else {
+                ShuffleSender::new(node_id)
+            }
+        }
+        DiscoveryImpl::Static(_) => {
+            let kv: Arc<dyn ClusterKv> = Arc::new(StaticClusterKv::new(membership_rx.clone()));
+            ShuffleSender::with_kv(node_id, kv)
+        }
     };
-    let Some(handle) = gossip.chitchat_handle() else {
-        return ShuffleSender::new(node_id);
-    };
-    let kv: Arc<dyn ClusterKv> = Arc::new(ChitchatKv::from_handle(handle));
-    kv.write(SHUFFLE_ADDR_KEY, advertise_addr).await;
-    ShuffleSender::with_kv(node_id, kv)
+    let sender = Arc::new(sender);
+
+    // Static advertises shuffle addrs in heartbeat metadata; register peers as they appear.
+    if matches!(discovery, DiscoveryImpl::Static(_)) {
+        let sender_clone = Arc::clone(&sender);
+        let mut rx = membership_rx;
+        tokio::spawn(async move {
+            loop {
+                let members = rx.borrow().clone();
+                for node in members {
+                    if node.id.0 != node_id {
+                        if let Some(addr) = node
+                            .metadata
+                            .tags
+                            .get(SHUFFLE_ADDR_KEY)
+                            .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
+                        {
+                            sender_clone.register_peer(node.id.0, addr).await;
+                        }
+                    }
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    sender
 }
 
 /// Compute the address peers should use to reach our `ShuffleReceiver`.
 ///
 /// The receiver binds to `0.0.0.0:0` (any interface, ephemeral port), so
-/// `local_addr.ip()` is the wildcard — publishing it unchanged leaves
-/// remote senders unable to connect. Swap in the host portion of the
-/// configured server bind, falling back to `gethostname` when bind is
-/// itself a wildcard, keeping the port from the actual bound socket.
-fn shuffle_advertise_addr(local_addr: std::net::SocketAddr, bind_host: &str) -> String {
+/// `local_addr.ip()` is the wildcard — publishing it unchanged leaves remote
+/// senders unable to connect. Use the configured advertise host (matching the
+/// HTTP/barrier endpoints for NAT/container deployments), falling back to
+/// `gethostname` when it is itself a wildcard, keeping the actual bound port.
+fn shuffle_advertise_addr(local_addr: std::net::SocketAddr, advertise_host: &str) -> String {
     let port = local_addr.port();
-    let host = bind_host.trim_start_matches('[').trim_end_matches(']');
+    let host = advertise_host.trim_start_matches('[').trim_end_matches(']');
     let ip_wildcard = host == "0.0.0.0" || host == "::" || host.is_empty();
     if !ip_wildcard {
-        return format!("{bind_host}:{port}");
+        return format!("{advertise_host}:{port}");
     }
     let hostname = gethostname::gethostname();
     let hostname = hostname.to_string_lossy();
@@ -878,6 +969,77 @@ fn shuffle_advertise_addr(local_addr: std::net::SocketAddr, bind_host: &str) -> 
         local_addr.to_string()
     } else {
         format!("{hostname}:{port}")
+    }
+}
+
+struct ObjectStoreClusterKv {
+    local_id: NodeId,
+    store: Arc<dyn object_store::ObjectStore>,
+    membership_rx: watch::Receiver<Vec<NodeInfo>>,
+}
+
+impl ObjectStoreClusterKv {
+    fn new(
+        local_id: NodeId,
+        store: Arc<dyn object_store::ObjectStore>,
+        membership_rx: watch::Receiver<Vec<NodeInfo>>,
+    ) -> Self {
+        Self {
+            local_id,
+            store,
+            membership_rx,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl laminar_core::cluster::control::ClusterKv for ObjectStoreClusterKv {
+    async fn write(&self, key: &str, value: String) {
+        let path = object_store::path::Path::from(format!("kv/node={}/{key}", self.local_id.0));
+        let payload = object_store::PutPayload::from(bytes::Bytes::from(value));
+        if let Err(e) = self.store.put(&path, payload).await {
+            warn!("ObjectStoreClusterKv: write failed for key {key}: {e}");
+        }
+    }
+
+    async fn read_from(&self, who: NodeId, key: &str) -> Option<String> {
+        let path = object_store::path::Path::from(format!("kv/node={}/{key}", who.0));
+        match self.store.get(&path).await {
+            Ok(res) => {
+                if let Ok(bytes) = res.bytes().await {
+                    String::from_utf8(bytes.to_vec()).ok()
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        }
+    }
+
+    async fn scan(&self, key: &str) -> Vec<(NodeId, String)> {
+        let mut ids: Vec<NodeId> = {
+            let members = self.membership_rx.borrow();
+            members.iter().map(|m| NodeId(m.id.0)).collect()
+        };
+        ids.push(NodeId(self.local_id.0));
+        ids.sort_unstable();
+        ids.dedup();
+
+        let futures = ids.into_iter().map(|id| {
+            let key = key.to_string();
+            async move {
+                let val = self.read_from(id, &key).await;
+                (id, val)
+            }
+        });
+        let joined = futures::future::join_all(futures).await;
+        let mut results = Vec::new();
+        for (id, val) in joined {
+            if let Some(v) = val {
+                results.push((id, v));
+            }
+        }
+        results
     }
 }
 

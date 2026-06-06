@@ -61,6 +61,8 @@ pub struct CheckpointConfig {
     pub serialization_timeout: Duration,
     /// Cap on total sidecar bytes; `None` = no limit. 80% warn threshold.
     pub max_checkpoint_bytes: Option<usize>,
+    /// Quorum wait timeout for checkpoint coordination.
+    pub quorum_timeout: Duration,
 }
 
 impl Default for CheckpointConfig {
@@ -76,6 +78,7 @@ impl Default for CheckpointConfig {
             serialization_timeout: Duration::from_secs(120),
             state_inline_threshold: 1_048_576,
             max_checkpoint_bytes: None,
+            quorum_timeout: Duration::from_secs(3),
         }
     }
 }
@@ -870,17 +873,52 @@ impl CheckpointCoordinator {
             return None;
         }
 
-        let outcome = cc
-            .wait_for_quorum(epoch, &followers, Duration::from_secs(30))
-            .await;
+        let quorum_timeout = self.config.quorum_timeout;
+        let mut members_rx = cc.members_watch();
+
+        let quorum_fut = cc.wait_for_quorum(epoch, &followers, quorum_timeout);
+        let membership_fut = async {
+            use laminar_core::cluster::discovery::NodeState;
+            loop {
+                {
+                    let members = members_rx.borrow();
+                    for &follower_id in &followers {
+                        let follower_node = members.iter().find(|m| m.id.0 == follower_id.0);
+                        if let Some(node) = follower_node {
+                            if matches!(
+                                node.state,
+                                NodeState::Suspected | NodeState::Left | NodeState::Draining
+                            ) {
+                                return format!(
+                                    "Follower {} transitioned to unhealthy state {:?}",
+                                    follower_id.0, node.state
+                                );
+                            }
+                        } else {
+                            return format!(
+                                "Follower {} missing from cluster membership",
+                                follower_id.0
+                            );
+                        }
+                    }
+                }
+                if members_rx.changed().await.is_err() {
+                    futures::future::pending::<()>().await;
+                }
+            }
+        };
+
+        let outcome = tokio::select! {
+            o = quorum_fut => Ok(o),
+            e = membership_fut => Err(e),
+        };
+
         match outcome {
-            QuorumOutcome::Reached {
+            Ok(QuorumOutcome::Reached {
                 min_follower_watermark_ms,
                 ..
-            } => {
+            }) => {
                 // Fold follower min with the leader's own watermark.
-                // Either may be `None` (unreported) — treated as
-                // "non-blocking" (ignored from the min computation).
                 let merged = match (self.local_watermark_ms, min_follower_watermark_ms) {
                     (Some(a), Some(b)) => Some(a.min(b)),
                     (Some(a), None) => Some(a),
@@ -888,17 +926,12 @@ impl CheckpointCoordinator {
                     (None, None) => None,
                 };
                 self.cluster_min_watermark = merged;
-                // Leader-side mirror: publish to the controller atomic
-                // so this instance's operators see the same value the
-                // followers will pick up via `observe_barrier(Commit)`.
-                // Without this, the leader's event-time decisions lag a
-                // full checkpoint behind its own announcements.
                 if let Some(wm) = merged {
                     cc.publish_cluster_min_watermark(wm);
                 }
                 None
             }
-            QuorumOutcome::TimedOut { missing, .. } => {
+            Ok(QuorumOutcome::TimedOut { missing, .. }) => {
                 self.announce_if_leader(epoch, checkpoint_id, Phase::Abort, None)
                     .await;
                 Some(format!(
@@ -906,7 +939,7 @@ impl CheckpointCoordinator {
                     missing.len()
                 ))
             }
-            QuorumOutcome::Failed { failures } => {
+            Ok(QuorumOutcome::Failed { failures }) => {
                 self.announce_if_leader(epoch, checkpoint_id, Phase::Abort, None)
                     .await;
                 let first = failures.first().map_or("unknown", |(_, msg)| msg.as_str());
@@ -914,6 +947,11 @@ impl CheckpointCoordinator {
                     "follower snapshot failed on {} peer(s): {first}",
                     failures.len()
                 ))
+            }
+            Err(err_msg) => {
+                self.announce_if_leader(epoch, checkpoint_id, Phase::Abort, None)
+                    .await;
+                Some(format!("fail-fast: {err_msg}"))
             }
         }
     }
