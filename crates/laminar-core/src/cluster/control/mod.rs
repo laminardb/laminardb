@@ -36,4 +36,4 @@ pub use chitchat_kv::ChitchatKv;
 #[cfg(feature = "cluster")]
 pub mod query;
 #[cfg(feature = "cluster")]
-pub use query::{remote_scan_client, QueryHandlerSlot, RemoteQueryHandler};
+pub use query::{remote_scan_client, QueryClientPool, QueryHandlerSlot, RemoteQueryHandler};

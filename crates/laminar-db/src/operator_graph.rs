@@ -469,9 +469,8 @@ impl OperatorGraph {
         self.cluster_shuffle = Some(config);
     }
 
-    /// The installed cluster row-shuffle config, if any. Lets the pipeline
-    /// callback reuse the shuffle sender (and learn this node's id) to ship
-    /// subscription output batches to remote subscribing nodes.
+    /// The installed cluster row-shuffle config, if any; lets the pipeline
+    /// callback reuse the shuffle sender to ship subscription output.
     #[cfg(feature = "cluster")]
     pub(crate) fn cluster_shuffle_config(
         &self,

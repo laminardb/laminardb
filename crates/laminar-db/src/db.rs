@@ -140,10 +140,8 @@ pub struct LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) shuffle_sender:
         parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleSender>>>,
-    /// `Arc`-wrapped so the background distributed-subscription router task
-    /// (spawned in [`Self::set_cluster_controller`]) can hold a weak handle and
-    /// lazily read the receiver — it is installed *after* the controller during
-    /// builder assembly.
+    /// `Arc`-wrapped so the subscription-router task can hold a weak handle and
+    /// read the receiver lazily (installed after the controller).
     #[cfg(feature = "cluster")]
     pub(crate) shuffle_receiver:
         Arc<parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleReceiver>>>>,
@@ -174,17 +172,11 @@ pub struct LaminarDB {
     /// the direct coordinator path — only valid for stateless engines.
     pub(crate) force_ckpt_tx: parking_lot::Mutex<Option<ForceCheckpointTx>>,
     pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
-    /// Cluster mode: stream/MV name → set of node ids with a live SUBSCRIBE
-    /// interest, refreshed every ~500ms from gossip by the background router
-    /// task. Producers consult it each cycle to ship output batches to remote
-    /// subscribing nodes over the shuffle fabric. Shared with the pipeline
-    /// callback so the producer side reads the same cache the poller writes.
+    /// Cluster mode: stream/MV name → subscribing node ids, refreshed from
+    /// gossip by the router task and read each cycle by producers.
     #[cfg(feature = "cluster")]
-    pub(crate) active_subs: Arc<
-        parking_lot::RwLock<
-            std::collections::HashMap<String, std::collections::HashSet<u64>>,
-        >,
-    >,
+    pub(crate) active_subs:
+        Arc<parking_lot::RwLock<std::collections::HashMap<String, std::collections::HashSet<u64>>>>,
     /// Stream output schemas resolved at `start()`; consulted by SUBSCRIBE WHERE.
     pub(crate) stream_schemas:
         parking_lot::RwLock<std::collections::HashMap<String, arrow_schema::SchemaRef>>,
@@ -203,6 +195,17 @@ pub(crate) type ForceCheckpointRx =
     crossfire::AsyncRx<crossfire::mpsc::Array<ForceCheckpointReply>>;
 
 pub(crate) const FORCE_CHECKPOINT_CHANNEL_CAPACITY: usize = 64;
+
+/// Subscription-router timer period. Drains run every tick, so this bounds
+/// cross-node SUBSCRIBE delivery latency.
+#[cfg(feature = "cluster")]
+const SUB_ROUTER_TICK: std::time::Duration = std::time::Duration::from_millis(10);
+/// Refresh the gossip interest cache ~every 500ms while subscriptions exist.
+#[cfg(feature = "cluster")]
+const SUB_REFRESH_ACTIVE_TICKS: u64 = 50;
+/// Back off to ~5s when there is no subscription activity anywhere.
+#[cfg(feature = "cluster")]
+const SUB_REFRESH_IDLE_TICKS: u64 = 500;
 
 pub(crate) struct SourceWatermarkState {
     pub(crate) extractor: laminar_core::time::EventTimeExtractor,
@@ -712,9 +715,8 @@ impl LaminarDB {
         &self,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
     ) {
-        // Serve this node's locally-held MV/table rows to peer coordinators.
-        // Weak handles to the stores (not to `self`) avoid a reference cycle,
-        // matching the subscription-router idiom below.
+        // Serve this node's local MV/table rows to peers. Weak store handles
+        // (not `self`) avoid a reference cycle.
         controller.register_query_handler(Arc::new(DbQueryHandler {
             mv_store: Arc::downgrade(&self.mv_store),
             table_store: Arc::downgrade(&self.table_store),
@@ -724,18 +726,9 @@ impl LaminarDB {
         self.update_sql_cluster_context();
     }
 
-    /// Background task driving distributed real-time subscriptions. Two
-    /// cadences on a single 10ms timer:
-    ///
-    /// * every ~500ms it refreshes [`Self::active_subs`] from gossip so
-    ///   producers learn which nodes have a live SUBSCRIBE interest in each
-    ///   stream (key `sub:<name>`, value non-empty means "interested");
-    /// * every tick it drains remote output batches addressed to this node's
-    ///   locally-subscribed streams off the shuffle receiver and republishes
-    ///   them to the local subscription registry.
-    ///
-    /// All handles are weak, so the task never keeps the database alive and
-    /// exits on its own once the `LaminarDB` (and its pipeline) are dropped.
+    /// Router task: refreshes the gossip interest cache (cadence backs off when
+    /// idle) and drains remote `__sub::` batches to local subscribers. Weak
+    /// handles, so it exits once the `LaminarDB` is dropped.
     #[cfg(feature = "cluster")]
     fn spawn_subscription_router(
         &self,
@@ -743,9 +736,8 @@ impl LaminarDB {
     ) {
         use std::collections::{HashMap, HashSet};
 
-        // Spawning requires a running runtime; some unit tests install a
-        // controller outside one. Skip gracefully — distributed routing is a
-        // server-mode concern.
+        // Needs a running runtime; some unit tests install a controller without
+        // one. Skip — distributed routing is server-mode only.
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
@@ -756,83 +748,68 @@ impl LaminarDB {
         let shuffle_receiver = Arc::downgrade(&self.shuffle_receiver);
 
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_millis(10));
+            let mut tick = tokio::time::interval(SUB_ROUTER_TICK);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut ticks: u64 = 0;
-            let mut advertised_subs = HashSet::new();
+            let mut advertised: HashSet<String> = HashSet::new();
+            let mut until_refresh: u64 = 0;
             loop {
                 tick.tick().await;
-                ticks = ticks.wrapping_add(1);
 
                 // Upgrade weak handles; bail once the DB has been dropped.
-                let (
-                    Some(active_subs),
-                    Some(subscription_registry),
-                    Some(receiver_slot),
-                ) = (
+                let (Some(active_subs), Some(registry), Some(receiver_slot)) = (
                     active_subs.upgrade(),
                     subscription_registry.upgrade(),
                     shuffle_receiver.upgrade(),
-                )
-                else {
+                ) else {
                     break;
                 };
 
-                // ~Every 500ms: refresh the stream → subscribing-node-ids cache.
-                if ticks.is_multiple_of(50) {
+                let local_names = registry.active_subscription_names();
+
+                // Refresh the producer-side interest cache when due.
+                if until_refresh == 0 {
                     let mut map: HashMap<String, HashSet<u64>> = HashMap::new();
-                    // Perform a single prefix scan for all subscriptions to avoid
-                    // multiple lock acquisitions/scans in the gossip layer.
                     for (node_id, key, value) in kv.scan_prefix("sub:").await {
                         if !value.is_empty() {
-                            if let Some(stream_name) = key.strip_prefix("sub:") {
-                                map.entry(stream_name.to_string())
-                                    .or_default()
-                                    .insert(node_id.0);
+                            if let Some(name) = key.strip_prefix("sub:") {
+                                map.entry(name.to_string()).or_default().insert(node_id.0);
                             }
                         }
                     }
+                    let idle = map.is_empty() && local_names.is_empty();
                     *active_subs.write() = map;
-                }
-
-                // Check local subscribers and advertise/clear gossip keys.
-                let active_names = subscription_registry.active_subscription_names();
-
-                // Advertise new interests
-                for name in &active_names {
-                    if !advertised_subs.contains(name) {
-                        let kv = Arc::clone(&kv);
-                        let key = format!("sub:{name}");
-                        tokio::spawn(async move {
-                            kv.write(&key, "active".to_string()).await;
-                        });
-                        advertised_subs.insert(name.clone());
-                    }
-                }
-
-                // Clear old interests
-                advertised_subs.retain(|name| {
-                    if !active_names.contains(name) {
-                        let kv = Arc::clone(&kv);
-                        let name_clone = name.clone();
-                        tokio::spawn(async move {
-                            kv.write(&format!("sub:{name_clone}"), String::new()).await;
-                        });
-                        false
+                    until_refresh = if idle {
+                        SUB_REFRESH_IDLE_TICKS
                     } else {
-                        true
-                    }
-                });
+                        SUB_REFRESH_ACTIVE_TICKS
+                    };
+                }
+                until_refresh = until_refresh.saturating_sub(1);
 
-                // Every tick: publish remote batches for locally-subscribed
-                // streams. `drain_vnode_data_for` is non-blocking and demuxes
-                // by stage, so it cooperates with the operator-side drains that
-                // share this receiver.
+                // Advertise newly-added / clear newly-removed local interests
+                // (rare; only on subscription lifecycle changes).
+                for name in &local_names {
+                    if advertised.insert(name.clone()) {
+                        kv.write(&format!("sub:{name}"), "active".to_string()).await;
+                    }
+                }
+                let removed: Vec<String> = advertised
+                    .iter()
+                    .filter(|n| !local_names.contains(*n))
+                    .cloned()
+                    .collect();
+                for name in removed {
+                    kv.write(&format!("sub:{name}"), String::new()).await;
+                    advertised.remove(&name);
+                }
+
+                // Publish remote batches for locally-subscribed streams.
                 let receiver = receiver_slot.lock().clone();
                 if let Some(receiver) = receiver {
-                    for name in active_names {
-                        for batch in receiver.drain_vnode_data_for(&name) {
-                            subscription_registry.send_batch(&name, batch);
+                    for name in &local_names {
+                        let stage = crate::subscription::remote_stage(name);
+                        for batch in receiver.drain_vnode_data_for(&stage) {
+                            registry.send_batch(name, batch);
                         }
                     }
                 }
@@ -2471,10 +2448,8 @@ impl datafusion::execution::context::QueryPlanner for LookupQueryPlanner {
     }
 }
 
-/// Node-local [`RemoteQueryHandler`](laminar_core::cluster::control::RemoteQueryHandler)
-/// backing the cross-node pull path. Serves a materialized view's (or
-/// reference table's) locally-held rows to peer coordinators. Holds weak
-/// handles to the result stores so it never keeps the database alive.
+/// Serves a node's local MV / reference-table rows to peers (pull path). Weak
+/// store handles, so it never keeps the database alive.
 #[cfg(feature = "cluster")]
 struct DbQueryHandler {
     mv_store: std::sync::Weak<parking_lot::RwLock<crate::mv_store::MvStore>>,

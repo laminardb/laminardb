@@ -950,7 +950,10 @@ mod tests {
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
             let slot = || Arc::new(parking_lot::RwLock::new(None));
             let leader_addr = leader_coord.start_server(addr, None, slot()).await.unwrap();
-            let bound_addr = follower_coord.start_server(addr, None, slot()).await.unwrap();
+            let bound_addr = follower_coord
+                .start_server(addr, None, slot())
+                .await
+                .unwrap();
 
             leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, bound_addr.to_string());
             follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());

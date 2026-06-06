@@ -1141,11 +1141,9 @@ impl LaminarDB {
             let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(mv_provider);
 
             let _ = self.ctx.deregister_table(&name_str);
-            self.ctx
-                .register_table(&name_str, provider)
-                .map_err(|e| {
-                    DbError::MaterializedView(format!("Failed to register MV table provider: {e}"))
-                })?;
+            self.ctx.register_table(&name_str, provider).map_err(|e| {
+                DbError::MaterializedView(format!("Failed to register MV table provider: {e}"))
+            })?;
         }
 
         // If the pipeline is already running, hot-add the query. On a

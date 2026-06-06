@@ -33,15 +33,12 @@ pub struct ClusterController {
     draining: Arc<AtomicBool>,
     /// Whether this node has announced itself as Active.
     active: Arc<AtomicBool>,
-    /// Node-local handler serving cross-node `RemoteScan` (pull-path) requests.
-    /// Shared with the control-plane query server so registration and server
-    /// start are order-independent.
+    /// Handler serving cross-node `RemoteScan`, shared with the query server.
     #[cfg(feature = "cluster")]
     query_handler: super::query::QueryHandlerSlot,
-    /// Connection pool for cross-node RemoteScan queries. Caches Tonic channels
-    /// to avoid connection setup overhead.
+    /// Pooled channels to peers for cross-node `RemoteScan`.
     #[cfg(feature = "cluster")]
-    query_client_pool: Arc<parking_lot::Mutex<std::collections::HashMap<NodeId, tonic::transport::Channel>>>,
+    query_client_pool: super::query::QueryClientPool,
 }
 
 impl std::fmt::Debug for ClusterController {
@@ -76,12 +73,11 @@ impl ClusterController {
             #[cfg(feature = "cluster")]
             query_handler: Arc::new(parking_lot::RwLock::new(None)),
             #[cfg(feature = "cluster")]
-            query_client_pool: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            query_client_pool: Arc::new(parking_lot::Mutex::new(rustc_hash::FxHashMap::default())),
         }
     }
 
-    /// Register the node-local handler that serves cross-node `RemoteScan`
-    /// requests on the shared control-plane query server.
+    /// Register the handler serving cross-node `RemoteScan`.
     #[cfg(feature = "cluster")]
     pub fn register_query_handler(&self, handler: Arc<dyn super::query::RemoteQueryHandler>) {
         *self.query_handler.write() = Some(handler);
@@ -90,7 +86,7 @@ impl ClusterController {
     /// Access the connection pool for remote queries.
     #[cfg(feature = "cluster")]
     #[must_use]
-    pub fn query_client_pool(&self) -> &Arc<parking_lot::Mutex<std::collections::HashMap<NodeId, tonic::transport::Channel>>> {
+    pub fn query_client_pool(&self) -> &super::query::QueryClientPool {
         &self.query_client_pool
     }
 
@@ -135,9 +131,8 @@ impl ClusterController {
         self.instance_id
     }
 
-    /// The cluster gossip KV used for coordination. Exposed so higher layers
-    /// (e.g. distributed SUBSCRIBE interest registration) can advertise and
-    /// discover per-stream state alongside the control-plane keys.
+    /// The cluster gossip KV, exposed so higher layers can advertise/discover
+    /// per-stream state alongside the control-plane keys.
     #[must_use]
     pub fn kv(&self) -> &Arc<dyn ClusterKv> {
         &self.kv

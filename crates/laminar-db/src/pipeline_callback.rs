@@ -150,15 +150,16 @@ pub(crate) struct ConnectorPipelineCallback {
     /// leader's manifest is useless for restart recovery.
     pub(crate) force_ckpt_rx: Option<crate::db::ForceCheckpointRx>,
     pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
-    /// Shared cache of stream/MV name → subscribing node ids, written by the
-    /// DB's background gossip poller. Read each cycle to route output batches to
-    /// remote subscribing nodes over the shuffle fabric.
+    /// Stream/MV name → subscribing node ids, written by the gossip poller and
+    /// read each cycle to route output to remote subscribers.
     #[cfg(feature = "cluster")]
-    pub(crate) active_subs: Arc<
-        parking_lot::RwLock<
-            std::collections::HashMap<String, std::collections::HashSet<u64>>,
-        >,
-    >,
+    pub(crate) active_subs:
+        Arc<parking_lot::RwLock<std::collections::HashMap<String, std::collections::HashSet<u64>>>>,
+    /// Ordered single-consumer channel shipping SUBSCRIBE output to remote
+    /// subscribers; one consumer preserves order a per-cycle spawn would not.
+    #[cfg(feature = "cluster")]
+    pub(crate) sub_route:
+        std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<(String, RecordBatch, Vec<u64>)>>,
     pub(crate) static_stream_names: rustc_hash::FxHashSet<Arc<str>>,
     pub(crate) checkpoint_complete_tx: crossfire::MAsyncTx<
         crossfire::mpsc::Array<(u64, rustc_hash::FxHashMap<String, SourceCheckpoint>)>,
@@ -195,11 +196,8 @@ impl ConnectorPipelineCallback {
         }
     }
 
-    /// Ship this cycle's output batches to remote nodes holding a live
-    /// SUBSCRIBE interest. Each such node drains them off its shuffle receiver
-    /// (demuxed by the stream name used as the shuffle stage) and republishes
-    /// them to its local subscribers. No-op without a cluster shuffle config or
-    /// when no remote interest is cached for the produced streams.
+    /// Ship this cycle's output to remote subscribers under the `__sub::<stream>`
+    /// shuffle stage (disjoint from operator stages). No-op without remote interest.
     #[cfg(feature = "cluster")]
     fn route_to_remote_subscribers(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
         use laminar_core::shuffle::ShuffleMessage;
@@ -207,35 +205,44 @@ impl ConnectorPipelineCallback {
         let Some(cfg) = self.graph.cluster_shuffle_config() else {
             return;
         };
-        let active = self.active_subs.read();
-        if active.is_empty() {
-            return;
-        }
         let local_id = cfg.self_id.0;
-        
-        let mut to_send = Vec::new();
-        for (stream_name, batches) in results {
-            let Some(nodes) = active.get(stream_name.as_ref()) else {
-                continue;
-            };
-            let remote: Vec<u64> = nodes.iter().copied().filter(|&id| id != local_id).collect();
-            if remote.is_empty() {
-                continue;
+
+        let mut to_send: Vec<(String, RecordBatch, Vec<u64>)> = Vec::new();
+        {
+            let active = self.active_subs.read();
+            if active.is_empty() {
+                return;
             }
-            for batch in batches {
-                if batch.num_rows() == 0 {
+            for (stream_name, batches) in results {
+                let Some(nodes) = active.get(stream_name.as_ref()) else {
+                    continue;
+                };
+                let remote: Vec<u64> = nodes.iter().copied().filter(|&id| id != local_id).collect();
+                if remote.is_empty() {
                     continue;
                 }
-                to_send.push((stream_name.clone(), batch.clone(), remote.clone()));
+                let stage = crate::subscription::remote_stage(stream_name);
+                for batch in batches {
+                    if batch.num_rows() > 0 {
+                        to_send.push((stage.clone(), batch.clone(), remote.clone()));
+                    }
+                }
             }
         }
+        if to_send.is_empty() {
+            return;
+        }
 
-        if !to_send.is_empty() {
+        // One long-lived consumer drains in order so emission order survives to
+        // the peer; a per-cycle spawn would let later batches overtake earlier.
+        let tx = self.sub_route.get_or_init(|| {
+            let (tx, mut rx) =
+                tokio::sync::mpsc::unbounded_channel::<(String, RecordBatch, Vec<u64>)>();
             let sender = Arc::clone(&cfg.sender);
             tokio::spawn(async move {
-                for (stream_name, batch, remote) in to_send {
-                    let msg = ShuffleMessage::VnodeData(stream_name.to_string(), 0, batch);
-                    for node in remote {
+                while let Some((stage, batch, targets)) = rx.recv().await {
+                    let msg = ShuffleMessage::VnodeData(stage, 0, batch);
+                    for node in targets {
                         if let Err(e) = sender.send_to(node, &msg).await {
                             tracing::warn!(
                                 node,
@@ -246,6 +253,10 @@ impl ConnectorPipelineCallback {
                     }
                 }
             });
+            tx
+        });
+        for item in to_send {
+            let _ = tx.send(item);
         }
     }
 

@@ -1656,6 +1656,8 @@ impl LaminarDB {
             subscription_registry: Arc::clone(&self.subscription_registry),
             #[cfg(feature = "cluster")]
             active_subs: Arc::clone(&self.active_subs),
+            #[cfg(feature = "cluster")]
+            sub_route: std::sync::OnceLock::new(),
             static_stream_names,
             checkpoint_complete_tx,
             checkpoint_in_flight: Arc::clone(&checkpoint_in_flight),

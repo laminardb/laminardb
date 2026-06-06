@@ -7,7 +7,7 @@ use std::sync::Arc;
 use object_store::ObjectStoreExt;
 use tokio::signal;
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use laminar_core::cluster::discovery::{
     Discovery, DiscoveryError, GossipDiscovery, GossipDiscoveryConfig, NodeId, NodeInfo,
@@ -1055,6 +1055,8 @@ impl laminar_core::cluster::control::ClusterKv for ObjectStoreClusterKv {
         results
     }
 
+    // Object stores can't list by key suffix, so this LISTs all of `kv/` and
+    // filters in memory; the router backs off when idle to bound LIST traffic.
     async fn scan_prefix(&self, prefix: &str) -> Vec<(NodeId, String, String)> {
         use futures::StreamExt;
 
@@ -1067,13 +1069,15 @@ impl laminar_core::cluster::control::ClusterKv for ObjectStoreClusterKv {
                 continue;
             };
             let path_str = meta.location.as_ref();
-            if let Some(rest) = path_str.strip_prefix("kv/node=") {
-                if let Some((node_id_str, key)) = rest.split_once('/') {
-                    if key.starts_with(prefix) {
-                        if let Ok(node_id_val) = node_id_str.parse::<u64>() {
-                            keys_to_read.push((NodeId(node_id_val), meta.location.clone(), key.to_string()));
-                        }
-                    }
+            let Some(rest) = path_str.strip_prefix("kv/node=") else {
+                continue;
+            };
+            let Some((node_id_str, key)) = rest.split_once('/') else {
+                continue;
+            };
+            if key.starts_with(prefix) {
+                if let Ok(id) = node_id_str.parse::<u64>() {
+                    keys_to_read.push((NodeId(id), meta.location.clone(), key.to_string()));
                 }
             }
         }
@@ -1081,22 +1085,23 @@ impl laminar_core::cluster::control::ClusterKv for ObjectStoreClusterKv {
         let futures = keys_to_read.into_iter().map(|(node_id, location, key)| {
             let store = Arc::clone(&self.store);
             async move {
-                match store.get(&location).await {
-                    Ok(res) => {
-                        if let Ok(bytes) = res.bytes().await {
-                            if let Ok(value) = String::from_utf8(bytes.to_vec()) {
-                                return Some((node_id, key, value));
-                            }
-                        }
+                let bytes = match store.get(&location).await {
+                    Ok(res) => res.bytes().await.ok()?,
+                    Err(e) => {
+                        debug!("ObjectStoreClusterKv: scan_prefix get failed for {location}: {e}");
+                        return None;
                     }
-                    Err(_) => {}
-                }
-                None
+                };
+                let value = String::from_utf8(bytes.to_vec()).ok()?;
+                Some((node_id, key, value))
             }
         });
 
-        let joined = futures::future::join_all(futures).await;
-        joined.into_iter().flatten().collect()
+        futures::future::join_all(futures)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
     }
 }
 

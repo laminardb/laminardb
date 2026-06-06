@@ -1,12 +1,5 @@
-//! Pull-path distributed scan. In cluster mode each node holds only its
-//! vnode-owned slice of a materialized view's result, so a `SELECT` against
-//! the view must union every node's local rows.
-//!
-//! [`DistributedTableProvider`] wraps the node-local provider (e.g. the MV
-//! provider) and, on `scan`, builds a [`DistributedScanExec`] that reads the
-//! local slice through that inner plan and fetches every peer's slice
-//! concurrently via
-//! [`remote_scan_client`](laminar_core::cluster::control::remote_scan_client).
+//! Pull-path distributed scan: each node holds only its vnode-owned slice of an
+//! MV result, so a `SELECT` unions the local slice with every peer's.
 
 #![allow(clippy::disallowed_types)] // cold path: ad-hoc query planning, not the streaming hot path
 
@@ -31,14 +24,11 @@ use futures::stream::StreamExt;
 use laminar_core::cluster::control::{remote_scan_client, ClusterController};
 use laminar_core::cluster::discovery::NodeId;
 
-/// Concurrent in-flight `RemoteScan` calls per execution. Bounds fan-out so a
-/// large cluster doesn't open one connection per peer at once.
+/// Concurrent in-flight `RemoteScan` calls per execution; bounds fan-out.
 const MAX_CONCURRENT_REMOTE: usize = 16;
 
-/// A `TableProvider` that unions a table's node-local rows with every peer's.
-///
-/// The local rows are read through `inner` (the single-node provider this
-/// wraps); peer rows are pulled over the control-plane query service.
+/// A `TableProvider` unioning a table's node-local rows (via `inner`) with the
+/// rows pulled from every peer.
 pub struct DistributedTableProvider {
     table_name: String,
     schema: SchemaRef,
@@ -90,10 +80,12 @@ impl TableProvider for DistributedTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        // Filters cannot be pushed to peers (RemoteScan carries no predicate),
-        // so claim none — DataFusion wraps a FilterExec above the union, which
-        // filters local and remote rows uniformly.
-        Ok(vec![TableProviderFilterPushDown::Unsupported; filters.len()])
+        // RemoteScan carries no predicate, so claim none; DataFusion's
+        // FilterExec above the union filters local and remote rows uniformly.
+        Ok(vec![
+            TableProviderFilterPushDown::Unsupported;
+            filters.len()
+        ])
     }
 
     async fn scan(
@@ -103,8 +95,7 @@ impl TableProvider for DistributedTableProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Local slice through the wrapped provider. Filters/limit are applied
-        // above the union by DataFusion, so don't push them down here.
+        // Local slice; filters/limit are applied above the union by DataFusion.
         let local = self.inner.scan(state, projection, &[], None).await?;
 
         let me = self.controller.instance_id();
@@ -251,7 +242,8 @@ impl ExecutionPlan for DistributedScanExec {
             futures::stream::select_all(local_streams).boxed()
         };
 
-        // Remote slices: fetch concurrently up to limit.
+        // Remote slices, fetched concurrently. A peer error fails the whole scan
+        // (consistency over availability); an empty slice is valid, not an error.
         let pool = Arc::clone(self.controller.query_client_pool());
         let kv = Arc::clone(self.controller.kv());
         let table = self.table_name.clone();
