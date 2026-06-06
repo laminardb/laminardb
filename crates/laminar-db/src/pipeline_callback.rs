@@ -126,8 +126,10 @@ pub(crate) struct ConnectorPipelineCallback {
     /// non-leaders.
     #[cfg(feature = "cluster")]
     pub(crate) cluster_controller: Option<Arc<laminar_core::cluster::control::ClusterController>>,
-    /// Highest epoch a non-leader has already prepared for. Prevents
-    /// re-running `follower_checkpoint` on the same announcement.
+    /// Highest epoch this non-leader has successfully committed; dedups the
+    /// leader's idempotent `Prepare` re-announcements. Advanced only on commit
+    /// (see [`Self::follower_should_skip`]). In-flight deferred epochs are
+    /// tracked by [`Self::pending_follower_checkpoint`].
     #[cfg(feature = "cluster")]
     pub(crate) last_follower_epoch: Option<u64>,
     /// Local source barrier injectors to trigger follower-side checkpoints.
@@ -257,6 +259,20 @@ impl ConnectorPipelineCallback {
         Ok(result)
     }
 
+    /// Skip a follower `Prepare` for `ann_epoch` only if it is already
+    /// committed (`last_committed`) or already in flight as a deferred
+    /// checkpoint (`in_flight`). A failed checkpoint does not advance
+    /// `last_committed`, and the leader retries the same epoch (it advances
+    /// only on success), so the retry must be reprocessed, not deduped.
+    #[cfg(feature = "cluster")]
+    fn follower_should_skip(
+        last_committed: Option<u64>,
+        in_flight: Option<u64>,
+        ann_epoch: u64,
+    ) -> bool {
+        last_committed.is_some_and(|e| e >= ann_epoch) || in_flight.is_some_and(|e| e >= ann_epoch)
+    }
+
     #[cfg(feature = "cluster")]
     async fn maybe_follower_checkpoint(
         &mut self,
@@ -270,10 +286,13 @@ impl ConnectorPipelineCallback {
             Ok(Some(a)) if a.phase == Phase::Prepare => a,
             _ => return None,
         };
-        if self.last_follower_epoch.is_some_and(|e| e >= ann.epoch) {
+        if Self::follower_should_skip(
+            self.last_follower_epoch,
+            self.pending_follower_checkpoint.as_ref().map(|p| p.epoch),
+            ann.epoch,
+        ) {
             return None;
         }
-        self.last_follower_epoch = Some(ann.epoch);
 
         // Inject barriers into local sources so they flow through this node's
         // streaming tasks and emit the shuffle barriers required for alignment.
@@ -360,6 +379,8 @@ impl ConnectorPipelineCallback {
             Ok(true) => {
                 tracing::info!(epoch = follower_epoch, "follower checkpoint committed");
                 self.last_checkpoint = std::time::Instant::now();
+                // Record only on commit so a failed-then-retried epoch is not deduped.
+                self.last_follower_epoch = Some(follower_epoch);
                 Some(follower_epoch)
             }
             Ok(false) => {
@@ -460,6 +481,10 @@ impl ConnectorPipelineCallback {
             Ok(true) => {
                 tracing::info!(epoch = follower_epoch, "follower checkpoint committed");
                 self.last_checkpoint = std::time::Instant::now();
+                // Record only on commit; the caller already took
+                // `pending_follower_checkpoint`, so a failed deferred checkpoint
+                // leaves no dedup state and the leader's retry is reprocessed.
+                self.last_follower_epoch = Some(follower_epoch);
                 BarrierOutcome::Committed(follower_epoch)
             }
             Ok(false) => {
@@ -1756,5 +1781,67 @@ mod tests {
             Some(800),
             "source below cluster min must NOT be advanced by the cap",
         );
+    }
+
+    /// A committed (or older) epoch re-announced by the leader is deduped.
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn follower_skips_already_committed_or_older_epoch() {
+        assert!(ConnectorPipelineCallback::follower_should_skip(
+            Some(5),
+            None,
+            5
+        ));
+        assert!(ConnectorPipelineCallback::follower_should_skip(
+            Some(5),
+            None,
+            3
+        ));
+    }
+
+    /// A deferred epoch awaiting local barriers (tracked via the in-flight
+    /// arg) is deduped so its injectors aren't re-triggered each cycle.
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn follower_skips_in_flight_deferred_epoch() {
+        assert!(ConnectorPipelineCallback::follower_should_skip(
+            Some(4),
+            Some(5),
+            5
+        ));
+    }
+
+    /// Regression: a failed checkpoint doesn't advance the committed epoch, and
+    /// the leader retries the same epoch, so the retry must be reprocessed —
+    /// not deduped. The old code recorded the epoch before commit and wedged.
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn follower_reprocesses_retry_of_failed_epoch() {
+        // Epoch 5 failed: committed is still 4, nothing in flight, leader retries 5.
+        assert!(!ConnectorPipelineCallback::follower_should_skip(
+            Some(4),
+            None,
+            5
+        ));
+        // Same on a fresh follower whose first epoch failed.
+        assert!(!ConnectorPipelineCallback::follower_should_skip(
+            None, None, 5
+        ));
+    }
+
+    /// A higher epoch is always processed.
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn follower_processes_newer_epoch() {
+        assert!(!ConnectorPipelineCallback::follower_should_skip(
+            Some(5),
+            None,
+            6
+        ));
+        assert!(!ConnectorPipelineCallback::follower_should_skip(
+            Some(5),
+            Some(5),
+            6
+        ));
     }
 }

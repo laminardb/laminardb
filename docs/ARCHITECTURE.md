@@ -81,7 +81,7 @@ and injects/aligns checkpoint barriers (Chandy-Lamport protocol).
 Durability and I/O, runs on the main tokio async runtime (not the compute thread).
 
 **Components:**
-- **Checkpoint Coordinator** -- Orchestrates periodic full-state snapshots with manifest-based persistence via two-phase commit across exactly-once sinks (`laminar-db/src/checkpoint_coordinator.rs`). Manifests are written via filesystem or object store (`laminar-storage/src/checkpoint_store.rs`).
+- **Checkpoint Coordinator** -- Orchestrates periodic full-state snapshots with manifest-based persistence via two-phase commit across exactly-once sinks (`laminar-db/src/checkpoint_coordinator.rs`). Manifests are written via filesystem or object store (`crates/laminar-core/src/checkpoint/checkpoint_store.rs`).
 - **Recovery Manager** -- Loads the latest checkpoint manifest and restores operator state, connector offsets, and watermarks on startup (`laminar-db/src/recovery_manager.rs`).
 - **Connectors** -- External source/sink connectors (Kafka, CDC, Delta Lake, Iceberg, WebSocket, OTEL, Files) run as tokio tasks on the main runtime.
 
@@ -130,16 +130,15 @@ How an event moves through the system:
 ```text
 laminar-core          Core: operators, window assigners, time/watermarks,
                       streaming channels (crossfire), subscriptions,
-                      lookup tables, checkpoint barrier protocol, error codes
+                      lookup tables, checkpoint barrier protocol, error codes,
+                      checkpoint persistence: manifest, checkpoint store
+                      (filesystem + object store), object store builder
                       |
 laminar-sql           SQL parser (streaming extensions), query planner,
                       DataFusion integration, operator config translators,
                       custom UDFs (tumble, hop, session, slide, first_value, last_value),
                       streaming physical optimizer, cooperative scheduling,
                       PROCTIME() UDF, temporal probe join translator
-                      |
-laminar-storage       Checkpoint persistence: manifest, checkpoint store
-                      (filesystem + object store), object store builder
                       |
 laminar-connectors    Kafka source/sink, PostgreSQL CDC/sink, MySQL CDC,
                       MongoDB CDC source/sink, WebSocket source/sink,

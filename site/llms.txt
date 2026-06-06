@@ -24,9 +24,8 @@ LaminarDB is pre-1.0. Single-node embedded and standalone server deployments are
 
 ## Crates
 
-- [laminar-core](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-core/README.md): Operators, windows, streaming channels, checkpoint barriers
+- [laminar-core](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-core/README.md): Operators, windows, streaming channels, checkpoint barriers, storage/checkpoint stores
 - [laminar-sql](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-sql/README.md): SQL parser, planner, DataFusion integration, temporal probe translator
-- [laminar-storage](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-storage/README.md): Checkpoint manifest and store, object store builder
 - [laminar-db](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-db/README.md): Unified facade, StreamingCoordinator, recovery, checkpoint coordinator
 - [laminar-server](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-server/README.md): HTTP and WebSocket server binary
 - [laminar-derive](https://raw.githubusercontent.com/laminardb/laminardb/main/crates/laminar-derive/README.md): Procedural macros for typed records

@@ -567,9 +567,8 @@ cargo run -p binance-ws
 
 ```text
 crates/
-  laminar-core/        Core engine: operators, windows, streaming channels, checkpoint barriers, error codes
+  laminar-core/        Core engine: operators, windows, streaming channels, checkpoint barriers, error codes, storage/checkpoint stores
   laminar-sql/         SQL parser, planner, DataFusion integration, streaming optimizer, watermark pushdown
-  laminar-storage/     Checkpoint manifest and store (filesystem + object store)
   laminar-connectors/  Kafka, CDC (PG/MySQL/Mongo), WebSocket, Files, Delta Lake, Iceberg, OTEL
   laminar-db/          Unified database facade, StreamingCoordinator, checkpoint coordination, recovery, FFI
   laminar-derive/      Derive macros: Record, FromRecordBatch, FromRow, ConnectorConfig

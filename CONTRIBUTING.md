@@ -29,13 +29,12 @@ sudo apt-get install cmake pkg-config libsasl2-dev
 
 ## How the project is organized
 
-LaminarDB is a Rust workspace with 7 crates. Here's what each one does:
+LaminarDB is a Rust workspace with 6 crates. Here's what each one does:
 
 | Crate | What it does |
 |-------|-------------|
-| **laminar-core** | The engine. Operators, window assigners, streaming channels (crossfire), checkpoint barrier protocol, lookup tables, time/watermarks, structured error codes. |
+| **laminar-core** | The engine. Operators, window assigners, streaming channels (crossfire), checkpoint barrier protocol, lookup tables, time/watermarks, structured error codes, checkpoint manifests, and object-store checkpoint persistence. |
 | **laminar-sql** | SQL parser with streaming extensions (EMIT, watermarks, windows, ASOF, temporal probe joins), query planner, DataFusion integration, custom UDFs, streaming physical optimizer. |
-| **laminar-storage** | Checkpoint manifests, filesystem/object-store checkpoint persistence, object-store builder. |
 | **laminar-connectors** | All external connectors: Kafka, PostgreSQL CDC, MySQL CDC, MongoDB CDC, Delta Lake, Iceberg, WebSocket, OpenTelemetry (OTLP/gRPC), files, Postgres/Parquet lookup. Also the schema framework and serde layer. |
 | **laminar-db** | The main entry point. Ties everything together -- `StreamingCoordinator` pipeline, checkpoint coordination, recovery, FFI API. |
 | **laminar-derive** | Proc macros: `Record`, `FromRecordBatch`, `FromRow`, `ConnectorConfig`. |
