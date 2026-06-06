@@ -475,7 +475,7 @@ mod tests {
         let catalog = SourceCatalog::new(1024, BackpressureStrategy::Block);
         let mut ids = Vec::new();
         for i in 0..105 {
-            let sql = format!("SELECT * FROM events_{}", i);
+            let sql = format!("SELECT * FROM events_{i}");
             ids.push(catalog.register_query(&sql));
         }
         for id in &ids {
@@ -487,15 +487,13 @@ mod tests {
         for id in 1..=5 {
             assert!(
                 !remaining_ids.contains(&id),
-                "Query {} should have been evicted",
-                id
+                "Query {id} should have been evicted"
             );
         }
         for id in 6..=105 {
             assert!(
                 remaining_ids.contains(&id),
-                "Query {} should be remaining",
-                id
+                "Query {id} should be remaining"
             );
         }
     }
