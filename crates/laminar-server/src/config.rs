@@ -19,6 +19,9 @@ static ENV_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// NIST baseline; MD5 has no work factor, so length is the only knob.
 const MIN_PGWIRE_PASSWORD_LEN: usize = 12;
 
+/// Minimum length for the console bearer token (HTTP control-plane auth).
+const MIN_CONSOLE_TOKEN_LEN: usize = 8;
+
 /// Load, parse, and validate a LaminarDB configuration file.
 pub fn load_config(path: &Path) -> Result<ServerConfig, ConfigError> {
     let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::FileRead {
@@ -183,6 +186,28 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         }
     }
 
+    if let Some(token) = &config.server.console_token {
+        if token.len() < MIN_CONSOLE_TOKEN_LEN {
+            errors.push(format!(
+                "server.console_token must be at least {MIN_CONSOLE_TOKEN_LEN} characters"
+            ));
+        }
+    }
+
+    // Each CORS origin becomes an `Access-Control-Allow-Origin` header value;
+    // reject anything that isn't a valid HTTP header value (e.g. control
+    // characters) before it reaches the router.
+    if let Some(origins) = &config.server.console_cors_allowed_origins {
+        for origin in origins {
+            if origin.parse::<axum::http::HeaderValue>().is_err() {
+                errors.push(format!(
+                    "invalid origin in server.console_cors_allowed_origins: '{}'",
+                    origin
+                ));
+            }
+        }
+    }
+
     // Validate: cluster mode requires discovery and coordination
     if config.server.mode == "cluster" {
         if config.discovery.is_none() {
@@ -282,6 +307,14 @@ pub struct ServerSection {
     /// disables TLS 1.0/1.1 unconditionally.
     #[serde(default = "default_pgwire_tls_min_version")]
     pub pgwire_tls_min_version: String,
+    /// Bearer token gating the HTTP control-plane (console) API. `None`
+    /// leaves the HTTP API unauthenticated — loopback/dev only.
+    #[serde(default)]
+    pub console_token: Option<Secret>,
+    /// CORS allow-list of console origins. `None` falls back to the legacy
+    /// permissive policy (dev only); set this before exposing the console.
+    #[serde(default)]
+    pub console_cors_allowed_origins: Option<Vec<String>>,
 }
 
 fn default_pgwire_max_connections() -> usize {
@@ -310,6 +343,8 @@ impl Default for ServerSection {
             pgwire_max_connections: default_pgwire_max_connections(),
             pgwire_max_auth_failures_per_min: default_pgwire_max_auth_failures_per_min(),
             pgwire_tls_min_version: default_pgwire_tls_min_version(),
+            console_token: None,
+            console_cors_allowed_origins: None,
         }
     }
 }
@@ -1227,6 +1262,94 @@ alice = "short"
             }
             _ => panic!("expected ValidationErrors"),
         }
+    }
+
+    #[test]
+    fn test_validate_short_console_token() {
+        let toml = r#"
+[server]
+console_token = "abc"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        let err = validate_config(&config).unwrap_err();
+        match err {
+            ConfigError::ValidationErrors { errors } => {
+                assert!(
+                    errors
+                        .iter()
+                        .any(|e| e.contains("server.console_token must be at least 8 characters")),
+                    "errors: {errors:?}"
+                );
+            }
+            _ => panic!("expected ValidationErrors"),
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_well_formed_console_token() {
+        let toml = r#"
+[server]
+console_token = "supersecret-token"
+console_cors_allowed_origins = ["https://console.example.com", "http://localhost:5173"]
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        validate_config(&config).expect("8+ char console token must validate");
+        assert_eq!(config.server.console_token.as_ref().unwrap().len(), 17);
+        assert_eq!(
+            config.server.console_cors_allowed_origins,
+            Some(vec![
+                "https://console.example.com".to_string(),
+                "http://localhost:5173".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_console_token_redacted_in_debug() {
+        let toml = r#"
+[server]
+console_token = "supersecret-token"
+"#;
+        let config: ServerConfig = toml::from_str(toml).unwrap();
+        validate_config(&config).unwrap();
+        let dump = format!("{:?}", config.server);
+        assert!(!dump.contains("supersecret"), "secret leaked: {dump}");
+        assert!(
+            dump.contains("REDACTED"),
+            "expected REDACTED marker: {dump}"
+        );
+    }
+
+    #[test]
+    fn test_validate_invalid_cors_origin() {
+        // A control character (bell, U+0007) in the origin makes it an invalid
+        // HTTP header value, so config validation must reject it. TOML basic
+        // strings can't carry a raw control byte, so the field is set in Rust.
+        let toml = r#"
+[server]
+"#;
+        let mut config: ServerConfig = toml::from_str(toml).unwrap();
+        config.server.console_cors_allowed_origins =
+            Some(vec!["http://e\u{0007}vil.example.com".to_string()]);
+        let err = validate_config(&config).unwrap_err();
+        match err {
+            ConfigError::ValidationErrors { errors } => {
+                assert!(
+                    errors.iter().any(
+                        |e| e.contains("invalid origin in server.console_cors_allowed_origins")
+                    ),
+                    "errors: {errors:?}"
+                );
+            }
+            _ => panic!("expected ValidationErrors"),
+        }
+    }
+
+    #[test]
+    fn test_console_auth_defaults_to_none() {
+        let config = ServerSection::default();
+        assert!(config.console_token.is_none());
+        assert!(config.console_cors_allowed_origins.is_none());
     }
 
     #[test]

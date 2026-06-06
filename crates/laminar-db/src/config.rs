@@ -19,6 +19,30 @@ pub enum BackpressurePolicy {
     Fail,
 }
 
+/// String wrapper whose `Debug` redacts the value, for credentials held in
+/// [`LaminarConfig`].
+#[derive(Clone)]
+pub struct SecretString(String);
+
+impl SecretString {
+    /// Wrap a secret value.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Borrow the underlying secret. Call only at the point of use.
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\"[REDACTED]\"")
+    }
+}
+
 /// Configuration for a `LaminarDB` instance.
 #[derive(Debug, Clone)]
 pub struct LaminarConfig {
@@ -34,6 +58,9 @@ pub struct LaminarConfig {
     pub object_store_url: Option<String>,
     /// Credential/config overrides for the object store.
     pub object_store_options: HashMap<String, String>,
+    /// Bearer token presented when forwarding requests to the cluster leader's
+    /// HTTP API (set when the server gates `/api/v1` with `console_token`).
+    pub http_auth_token: Option<SecretString>,
     /// Delivery guarantee.
     pub delivery_guarantee: DeliveryGuarantee,
     /// Per-operator state limit. At 80% warns, at 100% errors. `None` = unlimited.
@@ -64,6 +91,7 @@ impl Default for LaminarConfig {
             checkpoint: None,
             object_store_url: None,
             object_store_options: HashMap::new(),
+            http_auth_token: None,
             delivery_guarantee: DeliveryGuarantee::default(),
             max_state_bytes_per_operator: None,
             pipeline_channel_capacity: None,

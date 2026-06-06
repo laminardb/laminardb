@@ -121,9 +121,9 @@ pub use db::LaminarDB;
 pub use engine_metrics::EngineMetrics;
 pub use error::DbError;
 pub use handle::{
-    DdlInfo, ExecuteResult, FromBatch, PipelineEdge, PipelineNode, PipelineNodeType,
-    PipelineTopology, QueryHandle, QueryInfo, SinkInfo, SourceHandle, SourceInfo, StreamInfo,
-    TypedSubscription, UntypedSourceHandle,
+    DdlInfo, ExecuteResult, FromBatch, MaterializedViewInfo, PipelineEdge, PipelineNode,
+    PipelineNodeType, PipelineTopology, QueryHandle, QueryInfo, SinkInfo, SourceHandle, SourceInfo,
+    StreamInfo, TypedSubscription, UntypedSourceHandle,
 };
 pub use metrics::{PipelineMetrics, PipelineState, SourceMetrics, StreamMetrics};
 pub use profile::{Profile, ProfileError};
@@ -135,3 +135,7 @@ pub use db::{RehydratedVnode, SnapshotAdoption};
 
 /// Re-export the connector registry for custom connector registration.
 pub use laminar_connectors::registry::ConnectorRegistry;
+
+/// Re-export connector metadata types for the control-plane HTTP API
+/// (connector catalog / source-creation wizard).
+pub use laminar_connectors::config::{ConfigKeySpec, ConnectorInfo};

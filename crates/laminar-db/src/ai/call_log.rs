@@ -77,10 +77,10 @@ impl AiCallLog {
         }
     }
 
-    /// Create a log with a default capacity of 10,000 records.
+    /// Create a log with a default capacity of 2,000 records.
     #[must_use]
     pub fn with_defaults() -> Self {
-        Self::new(10_000)
+        Self::new(2_000)
     }
 
     /// Append a record, evicting the oldest if at capacity.

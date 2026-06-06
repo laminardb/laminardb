@@ -184,6 +184,18 @@ pub(crate) mod barrier_v1 {
 #[cfg(feature = "cluster")]
 type BarrierFlavor = crossfire::mpsc::Array<BarrierAnnouncement>;
 
+/// Per-peer barrier gRPC client pool, keyed by `NodeId`. Entries are evicted on
+/// RPC failure so a restarted/moved peer is re-resolved on the next round.
+#[cfg(feature = "cluster")]
+type BarrierClientPool = Arc<
+    parking_lot::Mutex<
+        FxHashMap<
+            NodeId,
+            barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>,
+        >,
+    >,
+>;
+
 #[cfg(feature = "cluster")]
 struct GrpcState {
     incoming_rx: parking_lot::Mutex<Option<crossfire::AsyncRx<BarrierFlavor>>>,
@@ -192,14 +204,7 @@ struct GrpcState {
     incoming_tx: crossfire::MAsyncTx<BarrierFlavor>,
     pending_acks: Arc<parking_lot::Mutex<FxHashMap<u64, tokio::sync::oneshot::Sender<BarrierAck>>>>,
     completed_acks: Arc<parking_lot::Mutex<FxHashMap<u64, BarrierAck>>>,
-    clients: Arc<
-        parking_lot::Mutex<
-            FxHashMap<
-                NodeId,
-                barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>,
-            >,
-        >,
-    >,
+    clients: BarrierClientPool,
     server_handle: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     advertise_addr: String,
 }
@@ -397,21 +402,11 @@ impl barrier_v1::barrier_sync_server::BarrierSync for GrpcBarrierServer {
 #[cfg(feature = "cluster")]
 async fn get_barrier_client(
     peer: NodeId,
-    pool: &Arc<
-        parking_lot::Mutex<
-            FxHashMap<
-                NodeId,
-                barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>,
-            >,
-        >,
-    >,
+    pool: &BarrierClientPool,
     kv: &Arc<dyn ClusterKv>,
 ) -> Option<barrier_v1::barrier_sync_client::BarrierSyncClient<tonic::transport::Channel>> {
-    {
-        let guard = pool.lock();
-        if let Some(client) = guard.get(&peer) {
-            return Some(client.clone());
-        }
+    if let Some(client) = pool.lock().get(&peer) {
+        return Some(client.clone());
     }
 
     let addr_str = kv.read_from(peer, BARRIER_ADDR_KEY).await?;
@@ -419,8 +414,7 @@ async fn get_barrier_client(
     let channel = endpoint.connect_lazy();
     let client = barrier_v1::barrier_sync_client::BarrierSyncClient::new(channel);
 
-    let mut guard = pool.lock();
-    guard.insert(peer, client.clone());
+    pool.lock().insert(peer, client.clone());
     Some(client)
 }
 
@@ -609,9 +603,13 @@ impl BarrierCoordinator {
                                             req.metadata_mut().insert("x-leader-id", val);
                                         }
                                     }
-                                    client.commit(req).await.map_err(|e| {
-                                        format!("commit RPC to peer {} failed: {e}", peer.0)
-                                    })?;
+                                    if let Err(e) = client.commit(req).await {
+                                        clients_pool.lock().remove(&peer);
+                                        return Err(format!(
+                                            "commit RPC to peer {} failed: {e}",
+                                            peer.0
+                                        ));
+                                    }
                                 }
                                 Phase::Abort => {
                                     let mut req = tonic::Request::new(barrier_v1::AbortRequest {
@@ -624,9 +622,13 @@ impl BarrierCoordinator {
                                             req.metadata_mut().insert("x-leader-id", val);
                                         }
                                     }
-                                    client.abort(req).await.map_err(|e| {
-                                        format!("abort RPC to peer {} failed: {e}", peer.0)
-                                    })?;
+                                    if let Err(e) = client.abort(req).await {
+                                        clients_pool.lock().remove(&peer);
+                                        return Err(format!(
+                                            "abort RPC to peer {} failed: {e}",
+                                            peer.0
+                                        ));
+                                    }
                                 }
                                 Phase::Prepare => {}
                             }
@@ -776,8 +778,14 @@ impl BarrierCoordinator {
                                     ))
                                 }
                             }
-                            Ok(Err(e)) => Err((peer, e.to_string())),
-                            Err(_) => Err((peer, "Timeout".to_string())),
+                            Ok(Err(e)) => {
+                                clients_pool.lock().remove(&peer);
+                                Err((peer, e.to_string()))
+                            }
+                            Err(_) => {
+                                clients_pool.lock().remove(&peer);
+                                Err((peer, "Timeout".to_string()))
+                            }
                         }
                     });
                 }

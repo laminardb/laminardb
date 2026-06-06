@@ -44,17 +44,17 @@ parquet-lookup = ["laminar-connectors/parquet-lookup"]
 files = ["laminar-connectors/files"]
 otel = ["laminar-connectors/otel"]
 nats = ["laminar-connectors/nats"]
-cluster = ["laminar-core/cluster", "laminar-sql/cluster"]
+cluster = ["laminar-core/cluster", "laminar-sql/cluster", "dep:reqwest"]
 aws = ["laminar-core/aws"]
 gcs = ["laminar-core/gcs"]
 azure = ["laminar-core/azure"]
 remote = ["dep:reqwest", "dep:governor"]
-local = ["dep:ort", "dep:tokenizers", "dep:reqwest"]
+local = ["dep:ort", "dep:tokenizers", "dep:reqwest", "dep:hf-hub"]
 
 [dependencies]
-laminar-core = { path = "../laminar-core", version = "0.24.0" }
-laminar-sql = { path = "../laminar-sql", version = "0.24.0" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.24.0" }
+laminar-core = { path = "../laminar-core", version = "0.25.0" }
+laminar-sql = { path = "../laminar-sql", version = "0.25.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.25.0" }
 
 # AI Inference Dependencies (Consolidated from laminar-ai)
 foyer = { workspace = true }
@@ -63,6 +63,10 @@ governor = { version = "0.8", optional = true }
 ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic", "api-24"], optional = true }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
+hf-hub = { version = "0.4", default-features = false, features = [
+    "tokio",
+    "rustls-tls",
+], optional = true }
 
 # Arrow
 arrow = { workspace = true }
@@ -94,6 +98,7 @@ sqlparser = { workspace = true }
 
 # Async
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
 async-trait = { workspace = true }
 trait-variant = { workspace = true }
@@ -133,8 +138,8 @@ tempfile = { workspace = true }
 # no openssl); the `remote` feature exposes the real AnthropicProvider so the
 # test drives the actual HTTP path (request build, 500/retry, response parse).
 wiremock = "0.6"
-laminar-derive = { path = "../laminar-derive", version = "0.24.0" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.24.0", features = ["testing"] }
+laminar-derive = { path = "../laminar-derive", version = "0.25.0" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.25.0", features = ["testing"] }
 criterion = { workspace = true }
 bytes = { workspace = true }
 tracing-subscriber = { workspace = true }

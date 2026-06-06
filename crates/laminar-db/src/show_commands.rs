@@ -11,14 +11,26 @@ use crate::db::LaminarDB;
 use crate::error::DbError;
 
 impl LaminarDB {
-    /// Build a SHOW CHECKPOINT STATUS metadata result.
-    pub(crate) async fn build_show_checkpoint_status(&self) -> Result<RecordBatch, DbError> {
+    /// Build a SHOW CHECKPOINT STATUS metadata result. Public so the server's
+    /// `GET /api/v1/cluster/checkpoints` endpoint can surface it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::Checkpoint`] if the metadata batch cannot be
+    /// assembled from the latest checkpoint.
+    pub async fn build_show_checkpoint_status(&self) -> Result<RecordBatch, DbError> {
         let store = self.checkpoint_store();
         let (latest, list) = match &store {
-            Some(s) => (
-                s.load_latest().await.ok().flatten(),
-                s.list().await.unwrap_or_default(),
-            ),
+            Some(s) => {
+                let latest = s.load_latest().await.map_err(|e| {
+                    DbError::Checkpoint(format!("failed to load latest checkpoint: {e}"))
+                })?;
+                let list = s
+                    .list()
+                    .await
+                    .map_err(|e| DbError::Checkpoint(format!("failed to list checkpoints: {e}")))?;
+                (latest, list)
+            }
             None => (None, vec![]),
         };
 
@@ -66,9 +78,10 @@ impl LaminarDB {
         let mut sqls = Vec::new();
         let mut states = Vec::new();
         for view in registry.views() {
-            names.push(view.name.clone());
-            sqls.push(view.sql.clone());
-            states.push(format!("{:?}", view.state));
+            let info = crate::handle::MaterializedViewInfo::from(view);
+            names.push(info.name);
+            sqls.push(info.sql);
+            states.push(info.state);
         }
         let names_ref: Vec<&str> = names.iter().map(String::as_str).collect();
         let sqls_ref: Vec<&str> = sqls.iter().map(String::as_str).collect();

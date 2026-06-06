@@ -86,6 +86,7 @@ conn.close()
 |------|-----|
 | Embedded | `cargo add laminar-db`. Runs in-process. |
 | Standalone | `laminardb` binary. TOML config, REST API, Postgres wire protocol, Prometheus metrics, hot reload. |
+| Cluster | Multi-node deployment. Gossip discovery, Raft coordination, dynamic partition/vnode rebalance, distributed 2PC checkpointer. |
 
 ### Prebuilt binaries
 
@@ -111,6 +112,55 @@ docker run -p 8080:8080 ghcr.io/laminardb/laminardb-server:latest  # GHCR
 The image ships a default config at `/etc/laminardb/laminardb.toml` (mount your own over it) and persists state in `/var/lib/laminardb`. A full `docker compose` stack — server plus Redpanda, Prometheus, and Grafana — is in [`docker-compose.yml`](docker-compose.yml).
 
 Built on [Apache Arrow](https://arrow.apache.org/) and [DataFusion](https://datafusion.apache.org/). Embedded is the primary target.
+
+---
+
+## Cluster Mode & Setup
+
+LaminarDB supports multi-node cluster deployments. In this mode, streaming pipelines are partitioned across virtual nodes (vnodes), and checkpoint state is distributed across the cluster.
+
+### Architecture & Dynamics
+
+* **Membership & Discovery**: Nodes discover one another using either a gossip-based protocol (Chitchat peer-to-peer membership over a configured `gossip_port`) or a static seeds list.
+* **Coordination**: Raft consensus manages metadata and leases. A consensus group elects a leader, tracks node lease lifecycles, and maintains the partition layout table (`AssignmentSnapshotStore`).
+* **Dynamic Rebalancing**: A total of 256 virtual nodes (vnodes) are dynamically distributed across active cluster nodes. When a new node joins or an existing node departs (or fails), the leader automatically rebalances the vnode assignments. When shutting down gracefully, a node announces a `Draining` state, letting the leader reallocate its vnodes before the node terminates.
+* **Distributed Checkpoints & 2PC**: Checkpoint barriers flow through the distributed operator graph. Exactly-once sink commits are governed by a distributed two-phase commit (2PC) protocol managed by the leader node. Checkpoints require a minimum interval of 2 seconds to ensure manifest durability gates and sink commit coordination.
+* **State Store**: Requires a shared storage backend (`object_store` mode, e.g., S3, GCS, Azure Blob, or a shared filesystem) to allow nodes to read and recover state partitions.
+
+### Cluster Configuration Example
+
+To deploy in cluster mode, configure the `[discovery]` and `[coordination]` sections in `laminardb.toml`, and set `server.mode` to `"cluster"`.
+
+```toml
+[server]
+mode = "cluster"
+bind = "0.0.0.0:8080"
+node_id = "node-1" # Unique node identifier (auto-generated if omitted)
+
+[discovery]
+strategy = "gossip" # "gossip" or "static"
+gossip_port = 7946
+advertise_host = "10.0.0.1"
+seeds = ["10.0.0.1:7946", "10.0.0.2:7946"]
+
+[coordination]
+strategy = "raft"
+raft_port = 8888
+election_timeout = "3s"
+heartbeat_interval = "500ms"
+
+[state]
+backend = "object_store"
+url = "s3://my-bucket/laminardb/state"
+instance_id = "node-1"
+vnode_capacity = 256
+discovery = "dynamic"
+seed_peers = ["10.0.0.1:7946", "10.0.0.2:7946"]
+```
+
+> [!NOTE]
+> If `server.mode` is set to `"embedded"` (the default), no cluster services (Gossip, Raft) are started or bound, avoiding interference with any existing cluster configurations, even if the server binary was built with the cluster feature flag enabled.
+
 
 ---
 
@@ -344,6 +394,42 @@ Enable the listener by setting `pgwire_bind` in `laminardb.toml`. Auth is trust 
 | `SELECT version()` / `SELECT 1` / transaction control | The handful of meta-commands clients issue at startup |
 
 DDL (`CREATE SOURCE`, `CREATE STREAM`, etc.) goes through the HTTP API (`POST /api/v1/sql`). The pgwire surface is intentionally narrow: read-side only.
+
+---
+
+## LaminarDB Console UI
+
+The standalone server embeds HTTP REST and WebSocket control-plane APIs. A separate Vite-based single-page application (SPA) client connects to these endpoints to provide an administrative and monitoring console.
+
+### Control-Plane API Endpoints
+
+The HTTP API binds to `bind` configured under `[server]`. It serves the following control-plane and telemetry endpoints:
+
+* **DDL & SQL Execution**: `POST /api/v1/sql` accepts SQL queries. It returns JSON-formatted results (including Arrow record batches, metadata, and error diagnostics).
+* **Lineage & Dependency Graph**: `GET /api/v1/graph` traces upstream and downstream relationship edges (`source -> stream -> MV -> sink`) to generate dependency DAGs.
+* **Ad-hoc Live Streaming Queries**: `POST /api/v1/queries` registers an ephemeral query stream, returning a unique `ws_url`. The UI opens a WebSocket connection to `GET /ws/{stream_id}` to subscribe to and tail live output. The ephemeral stream is dropped once the WebSocket closes or times out.
+* **Cluster Management**:
+  * `GET /api/v1/cluster/nodes` returns the list of active/draining/suspected nodes.
+  * `GET /api/v1/cluster/vnodes` returns the 256 vnode partition assignments.
+  * `GET /api/v1/cluster/leader` returns the current Raft leader lease holder.
+  * `GET /api/v1/cluster/checkpoints` returns completed checkpoint metadata.
+* **Pipeline Administration**:
+  * `GET /api/v1/sources` | `/api/v1/sinks` | `/api/v1/streams` | `/api/v1/mvs` to inspect existing entities.
+  * `POST /api/v1/pipeline/start` and `POST /api/v1/pipeline/stop` to control individual pipeline run states.
+  * `POST /api/v1/checkpoint` to trigger manual checkpoints.
+  * `POST /api/v1/reload` to trigger configuration and TLS certificate hot-reloading.
+
+Authentication is gated using a token defined by `server.console_token` in headers/query parameters. CORS origins are restricted via `server.console_cors_allowed_origins`.
+
+---
+
+## Environment Variables
+
+LaminarDB standalone server supports environment variable interpolation inside the configuration file.
+
+* **Syntax**: String entries in `laminardb.toml` accept `${VAR_NAME}` for mandatory variables (server fails to start if missing) and `${VAR_NAME:-fallback}` for optional values.
+* **SQL Queries**: Substitution is run on the raw config content at load time. This means environment variables can be embedded inside SQL statements declared in `[[pipeline]]` blocks or the top-level `sql` DDL configuration.
+* **Dynamic Queries**: Environment variables are **not** expanded in SQL commands executed dynamically post-startup (via pgwire or the REST `POST /api/v1/sql` endpoint).
 
 ---
 

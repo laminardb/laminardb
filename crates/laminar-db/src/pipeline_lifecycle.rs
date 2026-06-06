@@ -163,7 +163,12 @@ impl LaminarDB {
                     "Cannot start a stopped pipeline. Create a new LaminarDB instance.".into(),
                 ));
             }
-            DbState::Created | DbState::ShuttingDown => {}
+            DbState::ShuttingDown => {
+                return Err(DbError::InvalidOperation(
+                    "cannot start pipeline: shutdown/stop in progress".into(),
+                ));
+            }
+            DbState::Created => {}
         }
 
         DbState::Starting.store(&self.state);
@@ -1593,6 +1598,18 @@ impl LaminarDB {
         >(crate::db::FORCE_CHECKPOINT_CHANNEL_CAPACITY);
         *self.force_ckpt_tx.lock() = Some(force_ckpt_tx);
 
+        let (checkpoint_complete_tx, checkpoint_complete_rx) = crossfire::mpsc::bounded_async::<(
+            u64,
+            rustc_hash::FxHashMap<String, laminar_connectors::checkpoint::SourceCheckpoint>,
+        )>(16);
+        // Shared in-flight flag: callback sets it per persist, coordinator gates on it.
+        let checkpoint_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let static_stream_names: rustc_hash::FxHashSet<Arc<str>> = stream_sources
+            .iter()
+            .map(|(name, _)| Arc::from(name.as_str()))
+            .collect();
+
         let callback = crate::pipeline_callback::ConnectorPipelineCallback {
             graph,
             stream_sources,
@@ -1637,6 +1654,9 @@ impl LaminarDB {
             pending_follower_checkpoint: None,
             force_ckpt_rx: Some(force_ckpt_rx),
             subscription_registry: Arc::clone(&self.subscription_registry),
+            static_stream_names,
+            checkpoint_complete_tx,
+            checkpoint_in_flight: Arc::clone(&checkpoint_in_flight),
         };
 
         // Start the streaming coordinator on a dedicated compute thread.
@@ -1655,7 +1675,9 @@ impl LaminarDB {
                 Arc::clone(&shutdown),
                 control_rx,
             )
-            .await?;
+            .await?
+            .with_checkpoint_complete_rx(checkpoint_complete_rx)
+            .with_checkpoint_in_flight(checkpoint_in_flight);
 
             let (done_tx, done_rx) = crossfire::oneshot::oneshot::<()>();
             let (startup_tx, startup_rx) = crossfire::oneshot::oneshot::<Result<(), String>>();
@@ -1758,6 +1780,55 @@ impl LaminarDB {
 
         DbState::Stopped.store(&self.state);
         self.close();
+        Ok(())
+    }
+
+    /// Stop the streaming pipeline so it can be restarted.
+    ///
+    /// # Errors
+    /// Returns [`DbError::InvalidOperation`] if the pipeline is still starting
+    /// or the coordinator does not exit within the stop timeout.
+    pub async fn stop_pipeline(&self) -> Result<(), DbError> {
+        // Atomically claim the stop: only the caller that flips Running ->
+        // ShuttingDown tears down, so a concurrent stop can't race in and mark
+        // the pipeline restartable while the coordinator is still shutting down.
+        match DbState::compare_exchange(DbState::Running, DbState::ShuttingDown, &self.state) {
+            Ok(_) => {}
+            // Already stopped / never started — idempotent no-op.
+            Err(DbState::Created | DbState::Stopped) => return Ok(()),
+            // Starting, or a stop is already in progress — refuse.
+            Err(_) => {
+                return Err(DbError::InvalidOperation(
+                    "cannot stop pipeline: not running (starting, or a stop already in progress)"
+                        .into(),
+                ));
+            }
+        }
+
+        // Clear the force-checkpoint sender.
+        *self.force_ckpt_tx.lock() = None;
+
+        self.shutdown_signal.notify_one();
+
+        // Take runtime handle before awaiting.
+        let handle = self.runtime_handle.lock().take();
+        if let Some(handle) = handle {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), handle).await {
+                Ok(Ok(())) => tracing::info!("Pipeline stopped cleanly"),
+                Ok(Err(e)) => tracing::warn!(error = %e, "Pipeline task panicked during stop"),
+                Err(_) => {
+                    // Coordinator did not exit, keep state as ShuttingDown.
+                    tracing::error!("Pipeline stop timed out after 10s; coordinator still running");
+                    return Err(DbError::InvalidOperation(
+                        "pipeline stop timed out; coordinator did not exit".into(),
+                    ));
+                }
+            }
+        }
+
+        // Drop control channel and reset state to allow restart.
+        *self.control_tx.lock() = None;
+        DbState::Created.store(&self.state);
         Ok(())
     }
 }
