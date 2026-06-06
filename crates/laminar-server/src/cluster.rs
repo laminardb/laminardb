@@ -888,6 +888,19 @@ impl laminar_core::cluster::control::ClusterKv for StaticClusterKv {
             .filter_map(|p| p.metadata.tags.get(key).map(|v| (p.id, v.clone())))
             .collect()
     }
+
+    async fn scan_prefix(&self, prefix: &str) -> Vec<(NodeId, String, String)> {
+        let peers = self.membership_rx.borrow();
+        let mut out = Vec::new();
+        for p in peers.iter() {
+            for (key, val) in &p.metadata.tags {
+                if key.starts_with(prefix) {
+                    out.push((p.id, key.clone(), val.clone()));
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Build an outbound shuffle sender. When gossip discovery is active,
@@ -1040,6 +1053,50 @@ impl laminar_core::cluster::control::ClusterKv for ObjectStoreClusterKv {
             }
         }
         results
+    }
+
+    async fn scan_prefix(&self, prefix: &str) -> Vec<(NodeId, String, String)> {
+        use futures::StreamExt;
+
+        let root = object_store::path::Path::from("kv");
+        let mut entries = self.store.list(Some(&root));
+        let mut keys_to_read = Vec::new();
+
+        while let Some(res) = entries.next().await {
+            let Ok(meta) = res else {
+                continue;
+            };
+            let path_str = meta.location.as_ref();
+            if let Some(rest) = path_str.strip_prefix("kv/node=") {
+                if let Some((node_id_str, key)) = rest.split_once('/') {
+                    if key.starts_with(prefix) {
+                        if let Ok(node_id_val) = node_id_str.parse::<u64>() {
+                            keys_to_read.push((NodeId(node_id_val), meta.location.clone(), key.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        let futures = keys_to_read.into_iter().map(|(node_id, location, key)| {
+            let store = Arc::clone(&self.store);
+            async move {
+                match store.get(&location).await {
+                    Ok(res) => {
+                        if let Ok(bytes) = res.bytes().await {
+                            if let Ok(value) = String::from_utf8(bytes.to_vec()) {
+                                return Some((node_id, key, value));
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+                None
+            }
+        });
+
+        let joined = futures::future::join_all(futures).await;
+        joined.into_iter().flatten().collect()
     }
 }
 

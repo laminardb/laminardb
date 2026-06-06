@@ -179,6 +179,15 @@ impl SubscriptionRegistry {
             .map_or(0, |log| log.subscriber_count())
     }
 
+    pub(crate) fn active_subscription_names(&self) -> Vec<String> {
+        self.streams
+            .read()
+            .iter()
+            .filter(|(_, log)| log.subscriber_count() > 0)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     fn get_or_create(&self, name: &str) -> Arc<StreamLog> {
         if let Some(log) = self.streams.read().get(name) {
             return Arc::clone(log);

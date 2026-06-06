@@ -469,6 +469,16 @@ impl OperatorGraph {
         self.cluster_shuffle = Some(config);
     }
 
+    /// The installed cluster row-shuffle config, if any. Lets the pipeline
+    /// callback reuse the shuffle sender (and learn this node's id) to ship
+    /// subscription output batches to remote subscribing nodes.
+    #[cfg(feature = "cluster")]
+    pub(crate) fn cluster_shuffle_config(
+        &self,
+    ) -> Option<&crate::operator::sql_query::ClusterShuffleConfig> {
+        self.cluster_shuffle.as_ref()
+    }
+
     /// Share the DB's staged per-vnode rehydration map so the graph can drain
     /// and apply rebalanced state into operators each cycle.
     #[cfg(feature = "cluster")]

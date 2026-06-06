@@ -12,6 +12,10 @@ pub mod cluster_repartition;
 pub mod complex_type_lambda;
 /// Array, Struct, and Map scalar UDFs (F-SCHEMA-015)
 pub mod complex_type_udf;
+/// Pull-path distributed table scan that unions every node's local rows.
+/// Gated on `cluster` because it pulls in the cross-node query client.
+#[cfg(feature = "cluster")]
+pub mod distributed_scan;
 mod exec;
 /// End-to-end streaming SQL execution
 pub mod execute;
@@ -56,6 +60,8 @@ pub use complex_type_udf::{
     register_complex_type_functions, MapContainsKey, MapFromArrays, MapKeys, MapValues, StructDrop,
     StructExtract, StructMerge, StructRename, StructSet,
 };
+#[cfg(feature = "cluster")]
+pub use distributed_scan::{DistributedScanExec, DistributedTableProvider};
 pub use exec::StreamingScanExec;
 pub use execute::{execute_streaming_sql, DdlResult, QueryResult, StreamingSqlResult};
 pub use format_bridge_udf::{FromJsonUdf, ParseEpochUdf, ParseTimestampUdf, ToJsonUdf};

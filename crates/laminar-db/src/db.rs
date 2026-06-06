@@ -140,9 +140,13 @@ pub struct LaminarDB {
     #[cfg(feature = "cluster")]
     pub(crate) shuffle_sender:
         parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleSender>>>,
+    /// `Arc`-wrapped so the background distributed-subscription router task
+    /// (spawned in [`Self::set_cluster_controller`]) can hold a weak handle and
+    /// lazily read the receiver — it is installed *after* the controller during
+    /// builder assembly.
     #[cfg(feature = "cluster")]
     pub(crate) shuffle_receiver:
-        parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleReceiver>>>,
+        Arc<parking_lot::Mutex<Option<Arc<laminar_core::shuffle::ShuffleReceiver>>>>,
     #[cfg(feature = "cluster")]
     pub(crate) decision_store:
         parking_lot::Mutex<Option<Arc<laminar_core::cluster::control::CheckpointDecisionStore>>>,
@@ -170,6 +174,17 @@ pub struct LaminarDB {
     /// the direct coordinator path — only valid for stateless engines.
     pub(crate) force_ckpt_tx: parking_lot::Mutex<Option<ForceCheckpointTx>>,
     pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
+    /// Cluster mode: stream/MV name → set of node ids with a live SUBSCRIBE
+    /// interest, refreshed every ~500ms from gossip by the background router
+    /// task. Producers consult it each cycle to ship output batches to remote
+    /// subscribing nodes over the shuffle fabric. Shared with the pipeline
+    /// callback so the producer side reads the same cache the poller writes.
+    #[cfg(feature = "cluster")]
+    pub(crate) active_subs: Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<String, std::collections::HashSet<u64>>,
+        >,
+    >,
     /// Stream output schemas resolved at `start()`; consulted by SUBSCRIBE WHERE.
     pub(crate) stream_schemas:
         parking_lot::RwLock<std::collections::HashMap<String, arrow_schema::SchemaRef>>,
@@ -381,7 +396,7 @@ impl LaminarDB {
             #[cfg(feature = "cluster")]
             shuffle_sender: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
-            shuffle_receiver: parking_lot::Mutex::new(None),
+            shuffle_receiver: Arc::new(parking_lot::Mutex::new(None)),
             #[cfg(feature = "cluster")]
             decision_store: parking_lot::Mutex::new(None),
             #[cfg(feature = "cluster")]
@@ -392,6 +407,8 @@ impl LaminarDB {
             rehydrated_vnode_state: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             force_ckpt_tx: parking_lot::Mutex::new(None),
             subscription_registry: Arc::new(crate::subscription::SubscriptionRegistry::new()),
+            #[cfg(feature = "cluster")]
+            active_subs: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             stream_schemas: parking_lot::RwLock::new(std::collections::HashMap::new()),
         })
     }
@@ -695,8 +712,132 @@ impl LaminarDB {
         &self,
         controller: Arc<laminar_core::cluster::control::ClusterController>,
     ) {
+        // Serve this node's locally-held MV/table rows to peer coordinators.
+        // Weak handles to the stores (not to `self`) avoid a reference cycle,
+        // matching the subscription-router idiom below.
+        controller.register_query_handler(Arc::new(DbQueryHandler {
+            mv_store: Arc::downgrade(&self.mv_store),
+            table_store: Arc::downgrade(&self.table_store),
+        }));
+        self.spawn_subscription_router(&controller);
         *self.cluster_controller.lock() = Some(controller);
         self.update_sql_cluster_context();
+    }
+
+    /// Background task driving distributed real-time subscriptions. Two
+    /// cadences on a single 10ms timer:
+    ///
+    /// * every ~500ms it refreshes [`Self::active_subs`] from gossip so
+    ///   producers learn which nodes have a live SUBSCRIBE interest in each
+    ///   stream (key `sub:<name>`, value non-empty means "interested");
+    /// * every tick it drains remote output batches addressed to this node's
+    ///   locally-subscribed streams off the shuffle receiver and republishes
+    ///   them to the local subscription registry.
+    ///
+    /// All handles are weak, so the task never keeps the database alive and
+    /// exits on its own once the `LaminarDB` (and its pipeline) are dropped.
+    #[cfg(feature = "cluster")]
+    fn spawn_subscription_router(
+        &self,
+        controller: &Arc<laminar_core::cluster::control::ClusterController>,
+    ) {
+        use std::collections::{HashMap, HashSet};
+
+        // Spawning requires a running runtime; some unit tests install a
+        // controller outside one. Skip gracefully — distributed routing is a
+        // server-mode concern.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+
+        let kv = Arc::clone(controller.kv());
+        let active_subs = Arc::downgrade(&self.active_subs);
+        let subscription_registry = Arc::downgrade(&self.subscription_registry);
+        let shuffle_receiver = Arc::downgrade(&self.shuffle_receiver);
+
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(10));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut ticks: u64 = 0;
+            let mut advertised_subs = HashSet::new();
+            loop {
+                tick.tick().await;
+                ticks = ticks.wrapping_add(1);
+
+                // Upgrade weak handles; bail once the DB has been dropped.
+                let (
+                    Some(active_subs),
+                    Some(subscription_registry),
+                    Some(receiver_slot),
+                ) = (
+                    active_subs.upgrade(),
+                    subscription_registry.upgrade(),
+                    shuffle_receiver.upgrade(),
+                )
+                else {
+                    break;
+                };
+
+                // ~Every 500ms: refresh the stream → subscribing-node-ids cache.
+                if ticks.is_multiple_of(50) {
+                    let mut map: HashMap<String, HashSet<u64>> = HashMap::new();
+                    // Perform a single prefix scan for all subscriptions to avoid
+                    // multiple lock acquisitions/scans in the gossip layer.
+                    for (node_id, key, value) in kv.scan_prefix("sub:").await {
+                        if !value.is_empty() {
+                            if let Some(stream_name) = key.strip_prefix("sub:") {
+                                map.entry(stream_name.to_string())
+                                    .or_default()
+                                    .insert(node_id.0);
+                            }
+                        }
+                    }
+                    *active_subs.write() = map;
+                }
+
+                // Check local subscribers and advertise/clear gossip keys.
+                let active_names = subscription_registry.active_subscription_names();
+
+                // Advertise new interests
+                for name in &active_names {
+                    if !advertised_subs.contains(name) {
+                        let kv = Arc::clone(&kv);
+                        let key = format!("sub:{name}");
+                        tokio::spawn(async move {
+                            kv.write(&key, "active".to_string()).await;
+                        });
+                        advertised_subs.insert(name.clone());
+                    }
+                }
+
+                // Clear old interests
+                advertised_subs.retain(|name| {
+                    if !active_names.contains(name) {
+                        let kv = Arc::clone(&kv);
+                        let name_clone = name.clone();
+                        tokio::spawn(async move {
+                            kv.write(&format!("sub:{name_clone}"), String::new()).await;
+                        });
+                        false
+                    } else {
+                        true
+                    }
+                });
+
+                // Every tick: publish remote batches for locally-subscribed
+                // streams. `drain_vnode_data_for` is non-blocking and demuxes
+                // by stage, so it cooperates with the operator-side drains that
+                // share this receiver.
+                let receiver = receiver_slot.lock().clone();
+                if let Some(receiver) = receiver {
+                    for name in active_names {
+                        for batch in receiver.drain_vnode_data_for(&name) {
+                            subscription_registry.send_batch(&name, batch);
+                        }
+                    }
+                }
+            }
+        });
     }
 
     pub(crate) fn set_state_backend(&self, backend: Arc<dyn laminar_core::state::StateBackend>) {
@@ -2327,6 +2468,42 @@ impl datafusion::execution::context::QueryPlanner for LookupQueryPlanner {
         planner
             .create_physical_plan(logical_plan, session_state)
             .await
+    }
+}
+
+/// Node-local [`RemoteQueryHandler`](laminar_core::cluster::control::RemoteQueryHandler)
+/// backing the cross-node pull path. Serves a materialized view's (or
+/// reference table's) locally-held rows to peer coordinators. Holds weak
+/// handles to the result stores so it never keeps the database alive.
+#[cfg(feature = "cluster")]
+struct DbQueryHandler {
+    mv_store: std::sync::Weak<parking_lot::RwLock<crate::mv_store::MvStore>>,
+    table_store: std::sync::Weak<parking_lot::RwLock<crate::table_store::TableStore>>,
+}
+
+#[cfg(feature = "cluster")]
+#[async_trait::async_trait]
+impl laminar_core::cluster::control::RemoteQueryHandler for DbQueryHandler {
+    async fn remote_scan(
+        &self,
+        table_name: &str,
+        projection: Option<Vec<usize>>,
+    ) -> Result<arrow::array::RecordBatch, String> {
+        let batch = self
+            .mv_store
+            .upgrade()
+            .and_then(|s| s.read().to_record_batch(table_name))
+            .or_else(|| {
+                self.table_store
+                    .upgrade()
+                    .and_then(|s| s.read().to_record_batch(table_name))
+            })
+            .ok_or_else(|| format!("table '{table_name}' not found"))?;
+
+        match projection {
+            Some(proj) => batch.project(&proj).map_err(|e| e.to_string()),
+            None => Ok(batch),
+        }
     }
 }
 

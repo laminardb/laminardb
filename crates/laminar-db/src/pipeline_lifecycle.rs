@@ -1654,6 +1654,8 @@ impl LaminarDB {
             pending_follower_checkpoint: None,
             force_ckpt_rx: Some(force_ckpt_rx),
             subscription_registry: Arc::clone(&self.subscription_registry),
+            #[cfg(feature = "cluster")]
+            active_subs: Arc::clone(&self.active_subs),
             static_stream_names,
             checkpoint_complete_tx,
             checkpoint_in_flight: Arc::clone(&checkpoint_in_flight),

@@ -82,6 +82,26 @@ impl ClusterKv for ChitchatKv {
         }
         out
     }
+
+    async fn scan_prefix(&self, prefix: &str) -> Vec<(NodeId, String, String)> {
+        let guard = self.chitchat.lock().await;
+        let live: Vec<&chitchat::ChitchatId> = guard.live_nodes().collect();
+        let mut out = Vec::new();
+        for (cc_id, state) in guard.node_states() {
+            if !live.contains(&cc_id) {
+                continue;
+            }
+            let Some(node_id) = decode_chitchat_id(cc_id) else {
+                continue;
+            };
+            for (key, val) in state.key_values() {
+                if key.starts_with(prefix) {
+                    out.push((node_id, key.to_string(), val.to_string()));
+                }
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]

@@ -121,6 +121,8 @@ pub trait ClusterKv: Send + Sync + 'static {
     async fn read_from(&self, who: NodeId, key: &str) -> Option<String>;
     /// Every visible instance's value for `key`.
     async fn scan(&self, key: &str) -> Vec<(NodeId, String)>;
+    /// Every visible instance's key-value pairs where the key starts with the given prefix.
+    async fn scan_prefix(&self, prefix: &str) -> Vec<(NodeId, String, String)>;
 }
 
 /// In-memory KV for tests.
@@ -164,6 +166,15 @@ impl ClusterKv for InMemoryKv {
             .iter()
             .filter(|((_, k), _)| k == key)
             .map(|((n, _), v)| (*n, v.clone()))
+            .collect()
+    }
+
+    async fn scan_prefix(&self, prefix: &str) -> Vec<(NodeId, String, String)> {
+        self.state
+            .lock()
+            .iter()
+            .filter(|((_, k), _)| k.starts_with(prefix))
+            .map(|((n, k), v)| (*n, k.clone(), v.clone()))
             .collect()
     }
 }
@@ -493,7 +504,9 @@ impl BarrierCoordinator {
         &self,
         bind_addr: std::net::SocketAddr,
         advertise_host: Option<String>,
+        query_handler: super::QueryHandlerSlot,
     ) -> Result<std::net::SocketAddr, String> {
+        use super::query::query_service_server;
         use barrier_v1::barrier_sync_server::BarrierSyncServer;
         use std::net::TcpListener;
         use tonic::transport::Server;
@@ -517,10 +530,14 @@ impl BarrierCoordinator {
             leader_election: Arc::clone(&self.leader_election),
         };
 
+        // The pull-path query service shares this control-plane port; peers
+        // reach it at the same address published under `BARRIER_ADDR_KEY`.
+        let query_svc = query_service_server(query_handler);
         let server_task = tokio::spawn(async move {
             let incoming_stream = tokio_stream::wrappers::TcpListenerStream::new(tokio_listener);
             let _ = Server::builder()
                 .add_service(BarrierSyncServer::new(server_impl))
+                .add_service(query_svc)
                 .serve_with_incoming(incoming_stream)
                 .await;
         });
@@ -931,8 +948,9 @@ mod tests {
             let follower_coord = BarrierCoordinator::new(follower_kv.clone());
 
             let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let leader_addr = leader_coord.start_server(addr, None).await.unwrap();
-            let bound_addr = follower_coord.start_server(addr, None).await.unwrap();
+            let slot = || Arc::new(parking_lot::RwLock::new(None));
+            let leader_addr = leader_coord.start_server(addr, None, slot()).await.unwrap();
+            let bound_addr = follower_coord.start_server(addr, None, slot()).await.unwrap();
 
             leader_kv.seed(NodeId(2), BARRIER_ADDR_KEY, bound_addr.to_string());
             follower_kv.seed(NodeId(1), BARRIER_ADDR_KEY, leader_addr.to_string());

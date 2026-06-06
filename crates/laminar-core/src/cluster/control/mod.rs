@@ -32,3 +32,8 @@ pub use snapshot::{AssignmentSnapshot, AssignmentSnapshotStore, RotateOutcome, S
 pub mod chitchat_kv;
 #[cfg(feature = "cluster")]
 pub use chitchat_kv::ChitchatKv;
+
+#[cfg(feature = "cluster")]
+pub mod query;
+#[cfg(feature = "cluster")]
+pub use query::{remote_scan_client, QueryHandlerSlot, RemoteQueryHandler};

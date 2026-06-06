@@ -150,6 +150,15 @@ pub(crate) struct ConnectorPipelineCallback {
     /// leader's manifest is useless for restart recovery.
     pub(crate) force_ckpt_rx: Option<crate::db::ForceCheckpointRx>,
     pub(crate) subscription_registry: Arc<crate::subscription::SubscriptionRegistry>,
+    /// Shared cache of stream/MV name → subscribing node ids, written by the
+    /// DB's background gossip poller. Read each cycle to route output batches to
+    /// remote subscribing nodes over the shuffle fabric.
+    #[cfg(feature = "cluster")]
+    pub(crate) active_subs: Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<String, std::collections::HashSet<u64>>,
+        >,
+    >,
     pub(crate) static_stream_names: rustc_hash::FxHashSet<Arc<str>>,
     pub(crate) checkpoint_complete_tx: crossfire::MAsyncTx<
         crossfire::mpsc::Array<(u64, rustc_hash::FxHashMap<String, SourceCheckpoint>)>,
@@ -183,6 +192,60 @@ impl ConnectorPipelineCallback {
             if cluster_wm < *wm {
                 *wm = cluster_wm;
             }
+        }
+    }
+
+    /// Ship this cycle's output batches to remote nodes holding a live
+    /// SUBSCRIBE interest. Each such node drains them off its shuffle receiver
+    /// (demuxed by the stream name used as the shuffle stage) and republishes
+    /// them to its local subscribers. No-op without a cluster shuffle config or
+    /// when no remote interest is cached for the produced streams.
+    #[cfg(feature = "cluster")]
+    fn route_to_remote_subscribers(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
+        use laminar_core::shuffle::ShuffleMessage;
+
+        let Some(cfg) = self.graph.cluster_shuffle_config() else {
+            return;
+        };
+        let active = self.active_subs.read();
+        if active.is_empty() {
+            return;
+        }
+        let local_id = cfg.self_id.0;
+        
+        let mut to_send = Vec::new();
+        for (stream_name, batches) in results {
+            let Some(nodes) = active.get(stream_name.as_ref()) else {
+                continue;
+            };
+            let remote: Vec<u64> = nodes.iter().copied().filter(|&id| id != local_id).collect();
+            if remote.is_empty() {
+                continue;
+            }
+            for batch in batches {
+                if batch.num_rows() == 0 {
+                    continue;
+                }
+                to_send.push((stream_name.clone(), batch.clone(), remote.clone()));
+            }
+        }
+
+        if !to_send.is_empty() {
+            let sender = Arc::clone(&cfg.sender);
+            tokio::spawn(async move {
+                for (stream_name, batch, remote) in to_send {
+                    let msg = ShuffleMessage::VnodeData(stream_name.to_string(), 0, batch);
+                    for node in remote {
+                        if let Err(e) = sender.send_to(node, &msg).await {
+                            tracing::warn!(
+                                node,
+                                error = %e,
+                                "failed to route subscription batch to remote node"
+                            );
+                        }
+                    }
+                }
+            });
         }
     }
 
@@ -711,6 +774,11 @@ impl crate::pipeline::PipelineCallback for ConnectorPipelineCallback {
     }
 
     fn push_to_streams(&self, results: &FxHashMap<Arc<str>, Vec<RecordBatch>>) {
+        // Cluster mode: ship this cycle's output to any remote nodes holding a
+        // SUBSCRIBE interest before publishing to local subscribers below.
+        #[cfg(feature = "cluster")]
+        self.route_to_remote_subscribers(results);
+
         for (stream_name, src) in &self.stream_sources {
             if let Some(batches) = results.get(stream_name.as_str()) {
                 for batch in batches {
