@@ -270,9 +270,10 @@ impl ExecutionPlan for DistributedScanExec {
             futures::stream::select_all(local_streams).boxed()
         };
 
-        // Metrics surface in EXPLAIN ANALYZE: peer establishment failures and
-        // total rows unioned (local + remote).
+        // Metrics surface in EXPLAIN ANALYZE: peer establishment failures, peers
+        // skipped as unreachable (a partial result), and total rows unioned.
         let peer_failures = MetricBuilder::new(&self.metrics).global_counter("peer_failures");
+        let peers_skipped = MetricBuilder::new(&self.metrics).global_counter("peers_skipped");
         let output_rows = MetricBuilder::new(&self.metrics).output_rows(partition);
 
         // Remote slices fetched concurrently and flattened; each peer streams in
@@ -292,6 +293,7 @@ impl ExecutionPlan for DistributedScanExec {
                 let filter_sql = filter_sql.clone();
                 let schema = Arc::clone(&schema);
                 let peer_failures = peer_failures.clone();
+                let peers_skipped = peers_skipped.clone();
                 async move {
                     match remote_scan_client(&pool, &kv, peer, &table, projection, filter_sql).await
                     {
@@ -301,12 +303,20 @@ impl ExecutionPlan for DistributedScanExec {
                             schema,
                             chunks.map(|batch| batch.map_err(DataFusionError::Execution)),
                         )) as SendableRecordBatchStream,
-                        // Peer unreachable (down / not yet started): skip it rather
-                        // than failing the whole scan.
-                        Ok(None) => Box::pin(RecordBatchStreamAdapter::new(
-                            schema,
-                            futures::stream::empty::<Result<RecordBatch>>(),
-                        )) as SendableRecordBatchStream,
+                        // Peer unreachable (down/pruned): skip rather than fail the
+                        // scan, but count + log so the partial result isn't silent.
+                        Ok(None) => {
+                            peers_skipped.add(1);
+                            tracing::warn!(
+                                peer = peer.0,
+                                table = %table,
+                                "distributed scan: peer unreachable, omitting its slice (partial result)"
+                            );
+                            Box::pin(RecordBatchStreamAdapter::new(
+                                schema,
+                                futures::stream::empty::<Result<RecordBatch>>(),
+                            )) as SendableRecordBatchStream
+                        }
                         // Couldn't even open the stream: surface as a one-item
                         // error stream so flatten() propagates the failure.
                         Err(e) => {
