@@ -67,8 +67,8 @@ log_level = "info"
 # Worker thread count is taken from $TOKIO_WORKER_THREADS. Defaults to logical CPUs.
 
 [state]
-backend = "memory"          # "memory" or "mmap"
-path = "./data/state"       # mmap state directory
+backend = "local"           # "in_process", "local", or "object_store"
+path = "./data/state"       # required when backend = "local"
 
 [checkpoint]
 url = "file:///tmp/laminardb/checkpoints"  # file://, s3://, gs://

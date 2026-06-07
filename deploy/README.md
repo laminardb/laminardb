@@ -74,17 +74,30 @@ See the root `docker-compose.yml` for a full example with Kafka and PostgreSQL.
 
 ## 3. Helm (Kubernetes)
 
-### Install from GHCR OCI registry
+### Option A: Install from GHCR OCI registry (Cloud/Internet Connected)
 
 ```bash
 helm install my-laminardb oci://ghcr.io/laminardb/charts/laminardb \
   --set image.tag=0.20.2
 ```
 
+### Option B: Install from Local Files / Local Tarball (Best for On-Prem / Air-Gapped / Custom AKS)
+
+If your environment restricts accessing external OCI registries:
+
+```bash
+# 1. Clone the repository locally, then run install from the folder:
+helm install my-laminardb deploy/helm/laminardb
+
+# 2. Or package the chart into a tarball to ship it to air-gapped clusters:
+helm package deploy/helm/laminardb
+helm install my-laminardb laminardb-*.tgz
+```
+
 ### Quick start (standalone embedded mode)
 
 ```bash
-helm install my-laminardb oci://ghcr.io/laminardb/charts/laminardb \
+helm install my-laminardb deploy/helm/laminardb \
   -f deploy/helm/laminardb/ci/standalone-values.yaml
 ```
 
@@ -118,7 +131,7 @@ All values are documented in [`helm/laminardb/values.yaml`](helm/laminardb/value
 ### CI test values
 
 - `ci/standalone-values.yaml` - minimal single-node deployment
-- `ci/constellation-values.yaml` - 3-node delta-mode cluster
+- `ci/cluster-values.yaml` - 3-node cluster-mode setup
 - `ci/full-values.yaml` - all features enabled (ingress, monitoring, network policy)
 
 ---

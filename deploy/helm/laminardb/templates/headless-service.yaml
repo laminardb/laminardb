@@ -1,4 +1,5 @@
-{{- if or .Values.headlessService.enabled (eq .Values.laminardb.mode "delta") }}
+{{- $isCluster := or (eq .Values.laminardb.mode "delta") (eq .Values.laminardb.mode "cluster") -}}
+{{- if or .Values.headlessService.enabled $isCluster }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -13,7 +14,7 @@ spec:
       targetPort: http
       protocol: TCP
       name: http
-    {{- if eq .Values.laminardb.mode "delta" }}
+    {{- if $isCluster }}
     - port: {{ .Values.service.gossipPort }}
       targetPort: gossip
       protocol: TCP

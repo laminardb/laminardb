@@ -1,9 +1,9 @@
 replicaCount: 3
 
 laminardb:
-  mode: delta
+  mode: cluster
   logLevel: info
-  delta:
+  cluster:
     discovery:
       strategy: dns
       gossipPort: 7946

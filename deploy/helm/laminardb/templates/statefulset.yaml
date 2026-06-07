@@ -57,12 +57,14 @@ spec:
               containerPort: 5432
               protocol: TCP
             {{- end }}
-            {{- if eq .Values.laminardb.mode "delta" }}
+            {{- $isCluster := or (eq .Values.laminardb.mode "delta") (eq .Values.laminardb.mode "cluster") }}
+            {{- $cluster := .Values.laminardb.cluster | default .Values.laminardb.delta | default dict }}
+            {{- if $isCluster }}
             - name: gossip
-              containerPort: {{ .Values.laminardb.delta.discovery.gossipPort }}
+              containerPort: {{ ($cluster.discovery | default dict).gossipPort | default 7946 }}
               protocol: TCP
             - name: raft
-              containerPort: {{ .Values.laminardb.delta.coordination.raftPort }}
+              containerPort: {{ ($cluster.coordination | default dict).raftPort | default 7947 }}
               protocol: TCP
             {{- end }}
           startupProbe:
@@ -106,6 +108,10 @@ spec:
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          {{- with .Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - name: config
               mountPath: /etc/laminardb

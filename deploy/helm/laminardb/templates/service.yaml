@@ -21,7 +21,7 @@ spec:
       protocol: TCP
       name: pg
     {{- end }}
-    {{- if eq .Values.laminardb.mode "delta" }}
+    {{- if or (eq .Values.laminardb.mode "delta") (eq .Values.laminardb.mode "cluster") }}
     - port: {{ .Values.service.gossipPort }}
       targetPort: gossip
       protocol: TCP

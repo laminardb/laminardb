@@ -119,7 +119,7 @@ iceberg = "0.9.1"
 iceberg-catalog-rest = "0.9.1"
 iceberg-storage-opendal = "0.9.1"
 
-# Constellation (distributed mode)
+# Cluster (distributed mode)
 chitchat = "0.10"
 tokio-util = { version = "0.7", features = ["rt"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

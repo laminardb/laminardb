@@ -9,20 +9,31 @@ data:
     {{- if .Values.laminardb.configOverride }}
     {{ .Values.laminardb.configOverride | nindent 4 }}
     {{- else }}
-    {{- if eq .Values.laminardb.mode "delta" }}
-    node_id = "{{ default "$(HOSTNAME)" .Values.laminardb.delta.nodeId }}"
+    {{- $isCluster := or (eq .Values.laminardb.mode "delta") (eq .Values.laminardb.mode "cluster") }}
+    {{- $cluster := .Values.laminardb.cluster | default .Values.laminardb.delta | default dict }}
+    {{- if $isCluster }}
+    node_id = "{{ default "${HOSTNAME}" $cluster.nodeId }}"
     {{- end }}
 
     [server]
-    mode = "{{ .Values.laminardb.mode }}"
+    mode = "{{ if $isCluster }}cluster{{ else }}{{ .Values.laminardb.mode }}{{ end }}"
     bind = "{{ .Values.laminardb.httpBind }}"
     workers = {{ .Values.laminardb.workers }}
     log_level = "{{ .Values.laminardb.logLevel }}"
 
     [state]
     backend = "{{ .Values.laminardb.state.backend }}"
+    vnode_capacity = {{ .Values.laminardb.state.vnodeCapacity | default 256 }}
+    {{- if eq .Values.laminardb.state.backend "local" }}
     path = "{{ .Values.laminardb.state.path }}"
-    max_size_bytes = {{ .Values.laminardb.state.maxSizeBytes }}
+    instance_id = "{{ default "${HOSTNAME}" .Values.laminardb.state.instanceId }}"
+    {{- else if eq .Values.laminardb.state.backend "object_store" }}
+    url = "{{ .Values.laminardb.state.url }}"
+    instance_id = "{{ default "${HOSTNAME}" .Values.laminardb.state.instanceId }}"
+    {{- if .Values.laminardb.state.vnodes }}
+    vnodes = [{{ range $i, $v := .Values.laminardb.state.vnodes }}{{ if $i }}, {{ end }}{{ $v }}{{ end }}]
+    {{- end }}
+    {{- end }}
 
     [checkpoint]
     url = "{{ .Values.laminardb.checkpoint.url }}"
@@ -30,20 +41,22 @@ data:
     mode = "{{ .Values.laminardb.checkpoint.mode }}"
     snapshot_strategy = "{{ .Values.laminardb.checkpoint.snapshotStrategy }}"
 
-    {{- if eq .Values.laminardb.mode "delta" }}
+    {{- if $isCluster }}
 
     [discovery]
-    strategy = "{{ .Values.laminardb.delta.discovery.strategy }}"
-    gossip_port = {{ .Values.laminardb.delta.discovery.gossipPort }}
-    {{- if .Values.laminardb.delta.discovery.seeds }}
-    seeds = [{{ range $i, $s := .Values.laminardb.delta.discovery.seeds }}{{ if $i }}, {{ end }}"{{ $s }}"{{ end }}]
+    {{- $discovery := $cluster.discovery | default dict }}
+    strategy = "{{ $discovery.strategy }}"
+    gossip_port = {{ $discovery.gossipPort }}
+    {{- if $discovery.seeds }}
+    seeds = [{{ range $i, $s := $discovery.seeds }}{{ if $i }}, {{ end }}"{{ $s }}"{{ end }}]
     {{- end }}
 
     [coordination]
-    strategy = "{{ .Values.laminardb.delta.coordination.strategy }}"
-    raft_port = {{ .Values.laminardb.delta.coordination.raftPort }}
-    election_timeout = "{{ .Values.laminardb.delta.coordination.electionTimeout }}"
-    heartbeat_interval = "{{ .Values.laminardb.delta.coordination.heartbeatInterval }}"
+    {{- $coordination := $cluster.coordination | default dict }}
+    strategy = "{{ $coordination.strategy }}"
+    raft_port = {{ $coordination.raftPort }}
+    election_timeout = "{{ $coordination.electionTimeout }}"
+    heartbeat_interval = "{{ $coordination.heartbeatInterval }}"
     {{- end }}
 
     {{- range .Values.sources }}

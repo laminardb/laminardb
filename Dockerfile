@@ -126,7 +126,7 @@ workers = 0
 log_level = "info"
 
 [state]
-backend = "mmap"
+backend = "local"
 path = "/var/lib/laminardb/state"
 
 [checkpoint]
