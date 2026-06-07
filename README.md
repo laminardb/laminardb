@@ -467,10 +467,10 @@ graph TD
         subgraph Engine["LaminarDB Engine (In-Process / BareMetal)"]
             Coord["Streaming Coordinator ('laminar-compute' thread)"]:::coordClass
             InMemState["In-Memory State Store (FxHashMap)"]:::stateClass
-            Coord <-->|Zero-Copy Read/Write| InMemState
+            Coord <--> InMemState
         end
-        App -->|Push RecordBatches via Direct API| Coord
-        Coord -->|Pull Results via Subscription| App
+        App -->|"Push RecordBatches via Direct API"| Coord
+        Coord -->|"Pull Results via Subscription"| App
     end
 
     style HostApp fill:#eff6ff,stroke:#2563eb,stroke-width:2px,stroke-dasharray: 5 5,color:#1e3a8a
@@ -497,12 +497,12 @@ graph TD
             Checkpoint["Checkpoint Coordinator"]:::recoveryClass
             Recovery["Recovery Manager"]:::recoveryClass
             
-            Coord <-->|"Read/Write State"| InMemState
+            Coord <--> InMemState
             Checkpoint -.->|"Snapshot State"| InMemState
             Recovery -.->|"Restore State"| InMemState
         end
         App -->|"Push RecordBatches"| Coord
-        App <--|"Pull Results"| Coord
+        Coord -->|"Pull Results"| App
     end
     Checkpoint -->|"Write Epoch WAL and Checkpoints"| Storage["Durable Storage (Local Disk / S3 / GCS)"]:::storageClass
     Storage -->|"Restore Manifest and State"| Recovery
@@ -548,9 +548,9 @@ graph TD
         PgWire -->|"SQL DDL and DML Execution"| Coord
     end
     
-    Client1 -->|Port 5432| PgWire
-    Client2 -->|Port 8000| REST
-    Client3 -->|Port 8000 /ws| WS
+    Client1 -->|"Port 5432"| PgWire
+    Client2 -->|"Port 8000"| REST
+    Client3 -->|"Port 8000 /ws"| WS
     Checkpoint -->|"Write Checkpoints"| Storage["Durable Storage (Local Disk / S3)"]:::storageClass
 
     style Server fill:#f8fafc,stroke:#334155,stroke-width:2px,color:#0f172a
@@ -595,9 +595,9 @@ graph TD
     Client -->|"REST / pgwire"| Node2
 
     %% Node Communication
-    Gossip1 <-->|"Peer Discovery"| Gossip2
-    Raft1 <-->|"Metadata and Partition Leases"| Raft2
-    E1 <-->|"gRPC and Arrow-Flight Data Shuffle"| E2
+    Gossip1 ---|"Peer Discovery"| Gossip2
+    Raft1 ---|"Metadata and Partition Leases"| Raft2
+    E1 ---|"gRPC and Arrow-Flight Data Shuffle"| E2
 
     %% Distributed Durability
     Node1 -->|"Coordinated 2-Phase Commit Checkpoints"| SharedStore["Shared Object Store (S3 / GCS / Azure)"]:::storageClass
