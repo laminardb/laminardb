@@ -465,12 +465,12 @@ graph TD
     subgraph HostApp["Host Application Process (Rust/Python/C)"]
         App["Application Logic"]:::appClass
         subgraph Engine["LaminarDB Engine (In-Process / BareMetal)"]
-            Coord["Streaming Coordinator ('laminar-compute' thread)"]:::coordClass
-            InMemState["In-Memory State Store (FxHashMap)"]:::stateClass
+            Coord["Streaming Coordinator<br/>('laminar-compute' thread)"]:::coordClass
+            InMemState["In-Memory State Store<br/>(FxHashMap)"]:::stateClass
             Coord <--> InMemState
         end
-        App -->|"Push RecordBatches via Direct API"| Coord
-        Coord -->|"Pull Results via Subscription"| App
+        App -->|"Push RecordBatches<br/>via Direct API"| Coord
+        Coord -->|"Pull Results<br/>via Subscription"| App
     end
 
     style HostApp fill:#3b82f6,fill-opacity:0.05,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 5 5
@@ -492,8 +492,8 @@ graph TD
         direction TB
         App["Application Logic"]:::appClass
         subgraph Engine["LaminarDB Engine (Embedded Profile)"]
-            Coord["Streaming Coordinator ('laminar-compute' thread)"]:::coordClass
-            InMemState["In-Memory State Store (foyer / FxHashMap)"]:::stateClass
+            Coord["Streaming Coordinator<br/>('laminar-compute' thread)"]:::coordClass
+            InMemState["In-Memory State Store<br/>(foyer / FxHashMap)"]:::stateClass
             Checkpoint["Checkpoint Coordinator"]:::recoveryClass
             Recovery["Recovery Manager"]:::recoveryClass
             
@@ -504,8 +504,8 @@ graph TD
         App -->|"Push RecordBatches"| Coord
         Coord -->|"Pull Results"| App
     end
-    Checkpoint -->|"Write Epoch WAL and Checkpoints"| Storage["Durable Storage (Local Disk / S3 / GCS)"]:::storageClass
-    Storage -->|"Restore Manifest and State"| Recovery
+    Checkpoint -->|"Write Epoch WAL<br/>and Checkpoints"| Storage["Durable Storage (Local Disk / S3 / GCS)"]:::storageClass
+    Storage -->|"Restore Manifest<br/>and State"| Recovery
     
     style HostApp fill:#3b82f6,fill-opacity:0.05,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 5 5
     style Engine fill:#8b5cf6,fill-opacity:0.05,stroke:#8b5cf6,stroke-width:1.5px
@@ -536,16 +536,16 @@ graph TD
         end
         
         subgraph Engine["LaminarDB Engine (Embedded Library)"]
-            Coord["Streaming Coordinator ('laminar-compute')"]:::coordClass
-            State["In-Memory State Store (foyer / FxHashMap)"]:::stateClass
+            Coord["Streaming Coordinator<br/>('laminar-compute')"]:::coordClass
+            State["In-Memory State Store<br/>(foyer / FxHashMap)"]:::stateClass
             Checkpoint["Checkpoint Coordinator"]:::checkpointClass
             Coord <--> State
             Checkpoint -.-> State
         end
         
-        REST -->|"Push Events, DDL, and Admin"| Coord
-        WS -->|"Streaming Subscription Batches"| Coord
-        PgWire -->|"SQL DDL and DML Execution"| Coord
+        REST -->|"Push Events, DDL,<br/>and Admin"| Coord
+        WS -->|"Streaming Subscription<br/>Batches"| Coord
+        PgWire -->|"SQL DDL and<br/>DML Execution"| Coord
     end
     
     Client1 -->|"Port 5432"| PgWire
@@ -575,18 +575,18 @@ graph TD
     subgraph Node1["LaminarDB Node 1 (Coordinator Leader)"]
         direction TB
         E1["Streaming Engine"]:::engineClass
-        Raft1["Raft Consensus (OpenRaft)"]:::raftClass
+        Raft1["Raft Consensus<br/>(OpenRaft)"]:::raftClass
         Gossip1["Chitchat Gossip"]:::gossipClass
-        VNodes1["Virtual Nodes (VNodes 1 - 128)"]:::vnodeClass
+        VNodes1["Virtual Nodes<br/>(VNodes 1 - 128)"]:::vnodeClass
         E1 <--> VNodes1
     end
 
     subgraph Node2["LaminarDB Node 2 (Follower)"]
         direction TB
         E2["Streaming Engine"]:::engineClass
-        Raft2["Raft Consensus (OpenRaft)"]:::raftClass
+        Raft2["Raft Consensus<br/>(OpenRaft)"]:::raftClass
         Gossip2["Chitchat Gossip"]:::gossipClass
-        VNodes2["Virtual Nodes (VNodes 129 - 256)"]:::vnodeClass
+        VNodes2["Virtual Nodes<br/>(VNodes 129 - 256)"]:::vnodeClass
         E2 <--> VNodes2
     end
 
@@ -596,12 +596,12 @@ graph TD
 
     %% Node Communication
     Gossip1 ---|"Peer Discovery"| Gossip2
-    Raft1 ---|"Metadata and Partition Leases"| Raft2
-    E1 ---|"gRPC and Arrow-Flight Data Shuffle"| E2
+    Raft1 ---|"Metadata and<br/>Partition Leases"| Raft2
+    E1 ---|"gRPC and Arrow-Flight<br/>Data Shuffle"| E2
 
     %% Distributed Durability
-    Node1 -->|"Coordinated 2-Phase Commit Checkpoints"| SharedStore["Shared Object Store (S3 / GCS / Azure)"]:::storageClass
-    Node2 -->|"Coordinated 2-Phase Commit Checkpoints"| SharedStore:::storageClass
+    Node1 -->|"Coordinated 2-Phase<br/>Commit Checkpoints"| SharedStore["Shared Object Store (S3 / GCS / Azure)"]:::storageClass
+    Node2 -->|"Coordinated 2-Phase<br/>Commit Checkpoints"| SharedStore:::storageClass
 
     style Node1 fill:#6b7280,fill-opacity:0.05,stroke:#4b5563,stroke-width:1.5px
     style Node2 fill:#6b7280,fill-opacity:0.05,stroke:#4b5563,stroke-width:1.5px
@@ -621,7 +621,7 @@ graph TB
     classDef serviceClass fill:#78716c,fill-opacity:0.15,stroke:#78716c,stroke-width:1px;
     classDef coordClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:2px,font-weight:bold;
 
-    subgraph ComputeRuntime["Dedicated 'laminar-compute' Thread (Single-Threaded Tokio Runtime)"]
+    subgraph ComputeRuntime["Dedicated 'laminar-compute' Thread (Single-Threaded Runtime)"]
         subgraph Coord["Streaming Coordinator (Hot Path)"]
             direction LR
             Proj["Projections & Filters"]:::computeClass
@@ -635,7 +635,7 @@ graph TB
         end
     end
 
-    subgraph MainRuntime["Main Tokio Runtime (Multi-Threaded Work-Stealing)"]
+    subgraph MainRuntime["Main Tokio Runtime (Multi-Threaded)"]
         subgraph Sources["Source Connectors (Tokio Tasks)"]
             S1["Kafka Source"]:::sourceClass
             S2["Postgres CDC"]:::sourceClass
@@ -658,9 +658,9 @@ graph TB
     end
 
     %% Data and Control Paths
-    Sources -->|"tokio::sync::mpsc (Arrow RecordBatches)"| Proj
+    Sources -->|"tokio::sync::mpsc<br/>(Arrow RecordBatches)"| Proj
     Join -->|"Output Batches"| SinkIO
-    CheckpointCoord -.->|"Trigger Checkpoint Barrier"| Sources
+    CheckpointCoord -.->|"Trigger Checkpoint<br/>Barrier"| Sources
     CheckpointCoord -.->|"Offload Serialization"| Serial
 
     style ComputeRuntime fill:#8b5cf6,fill-opacity:0.05,stroke:#8b5cf6,stroke-width:1.5px
