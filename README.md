@@ -457,17 +457,24 @@ Runs entirely in-memory within the host application process. Since it does not p
 
 ```mermaid
 graph TD
+    classDef hostClass fill:#eff6ff,stroke:#2563eb,stroke-width:1px,color:#1e3a8a;
+    classDef appClass fill:#eff6ff,stroke:#2563eb,stroke-width:1px,color:#1e3a8a;
+    classDef coordClass fill:#faf5ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95,font-weight:bold;
+    classDef stateClass fill:#ecfeff,stroke:#0891b2,stroke-width:1px,color:#164e63;
+
     subgraph HostApp["Host Application Process (Rust/Python/C)"]
-        direction TB
-        App["Application Logic"]
+        App["Application Logic"]:::appClass
         subgraph Engine["LaminarDB Engine (In-Process / BareMetal)"]
-            Coord["Streaming Coordinator ('laminar-compute' thread)"]
-            InMemState["In-Memory State Store (FxHashMap)"]
+            Coord["Streaming Coordinator ('laminar-compute' thread)"]:::coordClass
+            InMemState["In-Memory State Store (FxHashMap)"]:::stateClass
             Coord <-->|Zero-Copy Read/Write| InMemState
         end
         App -->|Push RecordBatches via Direct API| Coord
         Coord -->|Pull Results via Subscription| App
     end
+
+    style HostApp fill:#eff6ff,stroke:#2563eb,stroke-width:2px,stroke-dasharray: 5 5,color:#1e3a8a
+    style Engine fill:#faf5ff,stroke:#7c3aed,color:#4c1d95
 ```
 
 ### 2. Embedded Mode (Embedded / Durable Profiles)
@@ -475,14 +482,20 @@ Runs inside the host application process but enables single-node durability. The
 
 ```mermaid
 graph TD
+    classDef appClass fill:#eff6ff,stroke:#2563eb,stroke-width:1px,color:#1e3a8a;
+    classDef coordClass fill:#faf5ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95,font-weight:bold;
+    classDef stateClass fill:#ecfeff,stroke:#0891b2,stroke-width:1px,color:#164e63;
+    classDef recoveryClass fill:#f0fdf4,stroke:#16a34a,stroke-width:1px,color:#14532d;
+    classDef storageClass fill:#fff7ed,stroke:#ea580c,stroke-width:1px,color:#7c2d12;
+
     subgraph HostApp["Host Application Process (Rust/Python/C)"]
         direction TB
-        App["Application Logic"]
+        App["Application Logic"]:::appClass
         subgraph Engine["LaminarDB Engine (Embedded Profile)"]
-            Coord["Streaming Coordinator ('laminar-compute' thread)"]
-            InMemState["In-Memory State Store (foyer / FxHashMap)"]
-            Checkpoint["Checkpoint Coordinator"]
-            Recovery["Recovery Manager"]
+            Coord["Streaming Coordinator ('laminar-compute' thread)"]:::coordClass
+            InMemState["In-Memory State Store (foyer / FxHashMap)"]:::stateClass
+            Checkpoint["Checkpoint Coordinator"]:::recoveryClass
+            Recovery["Recovery Manager"]:::recoveryClass
             
             Coord <-->|Read/Write State| InMemState
             Checkpoint -.->|Snapshot State| InMemState
@@ -491,8 +504,11 @@ graph TD
         App -->|Push RecordBatches| Coord
         App <--|Pull Results| Coord
     end
-    Checkpoint -->|Write Epoch WAL & Checkpoints| Storage["Durable Storage (Local Disk / S3 / GCS)"]
+    Checkpoint -->|Write Epoch WAL & Checkpoints| Storage["Durable Storage (Local Disk / S3 / GCS)"]:::storageClass
     Storage -->|Restore Manifest & State| Recovery
+    
+    style HostApp fill:#eff6ff,stroke:#2563eb,stroke-width:2px,stroke-dasharray: 5 5,color:#1e3a8a
+    style Engine fill:#faf5ff,stroke:#7c3aed,color:#4c1d95
 ```
 
 ### 3. Standalone Server Mode
@@ -500,22 +516,29 @@ Runs as a dedicated native daemon binary (`laminar-server`). It wraps the embedd
 
 ```mermaid
 graph TD
-    Client1["PostgreSQL Clients (pgwire)"]
-    Client2["REST API Clients (HTTP)"]
-    Client3["WebSocket Clients (Subscriptions)"]
+    classDef clientClass fill:#f0fdf4,stroke:#16a34a,stroke-width:1px,color:#14532d;
+    classDef portClass fill:#eff6ff,stroke:#2563eb,stroke-width:1px,color:#1e3a8a;
+    classDef coordClass fill:#faf5ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95,font-weight:bold;
+    classDef stateClass fill:#ecfeff,stroke:#0891b2,stroke-width:1px,color:#164e63;
+    classDef checkpointClass fill:#f5f5f4,stroke:#78716c,stroke-width:1px,color:#44403c;
+    classDef storageClass fill:#fff7ed,stroke:#ea580c,stroke-width:1px,color:#7c2d12;
+
+    Client1["PostgreSQL Clients (pgwire)"]:::clientClass
+    Client2["REST API Clients (HTTP)"]:::clientClass
+    Client3["WebSocket Clients (Subscriptions)"]:::clientClass
     
     subgraph Server["LaminarDB Standalone Server (laminar-server)"]
         direction TB
         subgraph Ports["Interface Listeners"]
-            REST["Axum HTTP REST Listener"]
-            WS["WebSocket Listener"]
-            PgWire["Postgres Wire Listener"]
+            REST["Axum HTTP REST Listener"]:::portClass
+            WS["WebSocket Listener"]:::portClass
+            PgWire["Postgres Wire Listener"]:::portClass
         end
         
         subgraph Engine["LaminarDB Engine (Embedded Library)"]
-            Coord["Streaming Coordinator ('laminar-compute')"]
-            State["In-Memory State Store (foyer / FxHashMap)"]
-            Checkpoint["Checkpoint Coordinator"]
+            Coord["Streaming Coordinator ('laminar-compute')"]:::coordClass
+            State["In-Memory State Store (foyer / FxHashMap)"]:::stateClass
+            Checkpoint["Checkpoint Coordinator"]:::checkpointClass
             Coord <--> State
             Checkpoint -.-> State
         end
@@ -528,7 +551,11 @@ graph TD
     Client1 -->|Port 5432| PgWire
     Client2 -->|Port 8000| REST
     Client3 -->|Port 8000 /ws| WS
-    Checkpoint -->|Write Checkpoints| Storage["Durable Storage (Local Disk / S3)"]
+    Checkpoint -->|Write Checkpoints| Storage["Durable Storage (Local Disk / S3)"]:::storageClass
+
+    style Server fill:#f8fafc,stroke:#334155,stroke-width:2px,color:#0f172a
+    style Ports fill:#eff6ff,stroke:#2563eb,color:#1e3a8a
+    style Engine fill:#faf5ff,stroke:#7c3aed,color:#4c1d95
 ```
 
 ### 4. Cluster Mode (Distributed Deployment)
@@ -536,23 +563,30 @@ Runs as a distributed cluster of cooperative nodes. Nodes discover one another p
 
 ```mermaid
 graph TD
-    Client["Clients / Load Balancer"]
+    classDef clientClass fill:#f0fdf4,stroke:#16a34a,stroke-width:1px,color:#14532d;
+    classDef engineClass fill:#faf5ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95,font-weight:bold;
+    classDef raftClass fill:#eff6ff,stroke:#2563eb,stroke-width:1px,color:#1e3a8a;
+    classDef gossipClass fill:#ecfeff,stroke:#0891b2,stroke-width:1px,color:#164e63;
+    classDef vnodeClass fill:#f5f5f4,stroke:#78716c,stroke-width:1px,color:#44403c;
+    classDef storageClass fill:#fff7ed,stroke:#ea580c,stroke-width:1px,color:#7c2d12;
+
+    Client["Clients / Load Balancer"]:::clientClass
     
     subgraph Node1["LaminarDB Node 1 (Coordinator Leader)"]
         direction TB
-        E1["Streaming Engine"]
-        Raft1["Raft Consensus (OpenRaft)"]
-        Gossip1["Chitchat Gossip"]
-        VNodes1["Virtual Nodes (VNodes 1 - 128)"]
+        E1["Streaming Engine"]:::engineClass
+        Raft1["Raft Consensus (OpenRaft)"]:::raftClass
+        Gossip1["Chitchat Gossip"]:::gossipClass
+        VNodes1["Virtual Nodes (VNodes 1 - 128)"]:::vnodeClass
         E1 <--> VNodes1
     end
 
     subgraph Node2["LaminarDB Node 2 (Follower)"]
         direction TB
-        E2["Streaming Engine"]
-        Raft2["Raft Consensus (OpenRaft)"]
-        Gossip2["Chitchat Gossip"]
-        VNodes2["Virtual Nodes (VNodes 129 - 256)"]
+        E2["Streaming Engine"]:::engineClass
+        Raft2["Raft Consensus (OpenRaft)"]:::raftClass
+        Gossip2["Chitchat Gossip"]:::gossipClass
+        VNodes2["Virtual Nodes (VNodes 129 - 256)"]:::vnodeClass
         E2 <--> VNodes2
     end
 
@@ -566,8 +600,11 @@ graph TD
     E1 <-->|gRPC & Arrow-Flight (Data Shuffle)| E2
 
     %% Distributed Durability
-    Node1 -->|Coordinated 2-Phase Commit Checkpoints| SharedStore["Shared Object Store (S3 / GCS / Azure)"]
-    Node2 -->|Coordinated 2-Phase Commit Checkpoints| SharedStore
+    Node1 -->|Coordinated 2-Phase Commit Checkpoints| SharedStore["Shared Object Store (S3 / GCS / Azure)"]:::storageClass
+    Node2 -->|Coordinated 2-Phase Commit Checkpoints| SharedStore:::storageClass
+
+    style Node1 fill:#f8fafc,stroke:#334155,stroke-width:2px,color:#0f172a
+    style Node2 fill:#f8fafc,stroke:#334155,stroke-width:2px,color:#0f172a
 ```
 
 ### 5. Internal Threading Model (Within a Single Node)
@@ -575,13 +612,22 @@ Within any running engine node, CPU-bound streaming computation is strictly isol
 
 ```mermaid
 graph TB
+    classDef computeClass fill:#faf5ff,stroke:#7c3aed,stroke-width:1px,color:#4c1d95;
+    classDef mainClass fill:#eff6ff,stroke:#2563eb,stroke-width:1px,color:#1e3a8a;
+    classDef blockingClass fill:#fff7ed,stroke:#ea580c,stroke-width:1px,color:#7c2d12;
+    
+    classDef sourceClass fill:#eff6ff,stroke:#2563eb,stroke-width:1px,color:#1e3a8a;
+    classDef sinkClass fill:#f0fdf4,stroke:#16a34a,stroke-width:1px,color:#14532d;
+    classDef serviceClass fill:#f5f5f4,stroke:#78716c,stroke-width:1px,color:#44403c;
+    classDef coordClass fill:#faf5ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95,font-weight:bold;
+
     subgraph ComputeRuntime["Dedicated 'laminar-compute' Thread (Single-Threaded Tokio Runtime)"]
         subgraph Coord["Streaming Coordinator (Hot Path)"]
             direction LR
-            Proj["Projections & Filters"]
-            Window["Window Operators"]
-            Join["Join Operators"]
-            LocalState["Local State (FxHashMap)"]
+            Proj["Projections & Filters"]:::computeClass
+            Window["Window Operators"]:::computeClass
+            Join["Join Operators"]:::computeClass
+            LocalState["Local State (FxHashMap)"]:::computeClass
             
             Proj --> Window --> Join
             Window <--> LocalState
@@ -591,24 +637,24 @@ graph TB
 
     subgraph MainRuntime["Main Tokio Runtime (Multi-Threaded Work-Stealing)"]
         subgraph Sources["Source Connectors (Tokio Tasks)"]
-            S1["Kafka Source"]
-            S2["Postgres CDC"]
-            S3["WebSocket Source"]
+            S1["Kafka Source"]:::sourceClass
+            S2["Postgres CDC"]:::sourceClass
+            S3["WebSocket Source"]:::sourceClass
         end
         
         subgraph Sinks["Sink Connectors (Tokio Tasks)"]
-            SinkIO["Sinks (Kafka, Delta Lake, PG)"]
+            SinkIO["Sinks (Kafka, Delta Lake, PG)"]:::sinkClass
         end
         
         subgraph CoreServices["Background Services"]
-            API["REST & WebSockets API (Axum)"]
-            CheckpointCoord["Checkpoint Coordinator"]
-            Metrics["Prometheus Metrics"]
+            API["REST & WebSockets API (Axum)"]:::serviceClass
+            CheckpointCoord["Checkpoint Coordinator"]:::serviceClass
+            Metrics["Prometheus Metrics"]:::serviceClass
         end
     end
 
     subgraph BlockingPool["Tokio Blocking Thread Pool"]
-        Serial["State Serialization (rkyv to bytes)"]
+        Serial["State Serialization (rkyv to bytes)"]:::blockingClass
     end
 
     %% Data and Control Paths
@@ -616,6 +662,11 @@ graph TB
     Join -->|Output Batches| SinkIO
     CheckpointCoord -.->|Trigger Checkpoint Barrier| Sources
     CheckpointCoord -.->|Offload Serialization| Serial
+
+    style ComputeRuntime fill:#faf5ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95
+    style MainRuntime fill:#eff6ff,stroke:#2563eb,stroke-width:2px,color:#1e3a8a
+    style BlockingPool fill:#fff7ed,stroke:#ea580c,stroke-width:2px,color:#7c2d12
+    style Coord fill:#faf5ff,stroke:#7c3aed,color:#4c1d95
 ```
 
 * **Streaming coordinator.** Single tokio task on a dedicated single-threaded runtime (the `laminar-compute` thread), isolating CPU-bound event processing from I/O on the main runtime. Source connectors push batches in via `tokio::sync::mpsc`; the coordinator runs compiled projections or cached logical plans, routes results to sinks, and manages checkpoint barriers. Compiled single-source projections are sub-microsecond; incremental aggregations and cached-plan queries are microseconds; complex queries fall back to DataFusion.
