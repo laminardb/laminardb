@@ -117,7 +117,7 @@ Built on [Apache Arrow](https://arrow.apache.org/) and [DataFusion](https://data
 
 ## LaminarDB Console
 
-LaminarDB features a dedicated, high-fidelity administrative and operator web console to author, observe, and manage streaming SQL pipelines. 
+LaminarDB features a web console to author, observe, and manage streaming SQL pipelines. 
 
 The console includes:
 * **Interactive SQL Worksheet**: Author and execute streaming SQL queries with support for live subscription tailing over WebSockets.
