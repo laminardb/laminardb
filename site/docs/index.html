@@ -447,6 +447,18 @@
           GitHub
         </a>
       </nav>
+
+      <button class="nav-toggle" aria-label="Toggle menu" aria-expanded="false" aria-controls="mobile-menu">
+        <span></span><span></span><span></span>
+      </button>
+
+      <div class="mobile-menu" id="mobile-menu">
+        <a href="../#features">Features</a>
+        <a href="../#architecture">Architecture</a>
+        <a href="../#quick-start">Quick Start</a>
+        <a href="./">Docs</a>
+        <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
+      </div>
     </div>
   </header>
 
@@ -1275,7 +1287,7 @@ max_out_of_orderness = "5s"</code></pre>
             <td class="field-name">connector</td>
             <td class="field-type">String</td>
             <td><span class="field-required">required</span></td>
-            <td>"kafka", "postgres", "mongodb", "delta-lake", "iceberg", "websocket", "files", "stdout"</td>
+            <td>"kafka", "postgres", "mongodb", "nats", "delta-lake", "iceberg", "websocket", "files", "stdout"</td>
           </tr>
           <tr>
             <td class="field-name">delivery</td>

@@ -7,8 +7,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const mobileMenu = document.querySelector('.mobile-menu');
   if (navToggle && mobileMenu) {
     navToggle.addEventListener('click', () => {
-      navToggle.classList.toggle('open');
+      const isOpen = navToggle.classList.toggle('open');
       mobileMenu.classList.toggle('open');
+      navToggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
     });
   }
 
@@ -25,6 +26,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (mobileMenu) {
           mobileMenu.classList.remove('open');
           navToggle?.classList.remove('open');
+          navToggle?.setAttribute('aria-expanded', 'false');
         }
       }
     });
@@ -53,18 +55,44 @@ document.addEventListener('DOMContentLoaded', () => {
     el.addEventListener('click', () => {
       const cmd = el.querySelector('.cmd')?.textContent;
       if (cmd) {
-        navigator.clipboard.writeText(cmd).then(() => {
-          const hint = el.querySelector('.copy-hint');
+        const hint = el.querySelector('.copy-hint');
+        if (navigator.clipboard) {
+          navigator.clipboard.writeText(cmd)
+            .then(() => {
+              if (hint) {
+                const original = hint.textContent;
+                hint.textContent = 'copied!';
+                hint.style.color = 'var(--green)';
+                setTimeout(() => {
+                  hint.textContent = original;
+                  hint.style.color = '';
+                }, 2000);
+               }
+            })
+            .catch((err) => {
+              console.error('Failed to copy command to clipboard:', err);
+              if (hint) {
+                const original = hint.textContent;
+                hint.textContent = 'copy failed';
+                hint.style.color = 'var(--red)';
+                setTimeout(() => {
+                  hint.textContent = original;
+                  hint.style.color = '';
+                }, 2000);
+              }
+            });
+        } else {
+          console.warn('Clipboard API not available');
           if (hint) {
             const original = hint.textContent;
-            hint.textContent = 'copied!';
-            hint.style.color = 'var(--green)';
+            hint.textContent = 'unsupported';
+            hint.style.color = 'var(--red)';
             setTimeout(() => {
               hint.textContent = original;
               hint.style.color = '';
             }, 2000);
           }
-        });
+        }
       }
     });
 
@@ -85,18 +113,43 @@ document.addEventListener('DOMContentLoaded', () => {
       const activePanel = block.querySelector('.tab-panel.active');
       const code = activePanel ? activePanel.querySelector('code')?.textContent : block.querySelector('code')?.textContent;
       if (code) {
-        navigator.clipboard.writeText(code).then(() => {
-          btn.classList.add('copied');
+        if (navigator.clipboard) {
+          navigator.clipboard.writeText(code)
+            .then(() => {
+              btn.classList.add('copied');
+              const originalHtml = btn.innerHTML;
+              btn.innerHTML = `
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px;"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                Copied
+              `;
+              setTimeout(() => {
+                btn.classList.remove('copied');
+                btn.innerHTML = originalHtml;
+              }, 2000);
+            })
+            .catch((err) => {
+              console.error('Failed to copy code to clipboard:', err);
+              btn.classList.add('copy-error');
+              const originalHtml = btn.innerHTML;
+              btn.innerHTML = `
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px;"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                Failed
+              `;
+              setTimeout(() => {
+                btn.classList.remove('copy-error');
+                btn.innerHTML = originalHtml;
+              }, 2000);
+            });
+        } else {
+          console.warn('Clipboard API not available');
+          btn.classList.add('copy-error');
           const originalHtml = btn.innerHTML;
-          btn.innerHTML = `
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px;"><polyline points="20 6 9 17 4 12"></polyline></svg>
-            Copied
-          `;
+          btn.innerHTML = 'Unsupported';
           setTimeout(() => {
-            btn.classList.remove('copied');
+            btn.classList.remove('copy-error');
             btn.innerHTML = originalHtml;
           }, 2000);
-        });
+        }
       }
     });
   });
@@ -120,7 +173,13 @@ document.addEventListener('DOMContentLoaded', () => {
           Expand Code
         `;
         // Scroll the container back into view if it went off screen
-        container.closest('.code-block').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        const block = container.closest('.code-block');
+        if (block) {
+          const rect = block.getBoundingClientRect();
+          if (rect.top < 0 || rect.bottom > window.innerHeight) {
+            block.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          }
+        }
       }
     });
   });
@@ -133,17 +192,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const bare = tag.replace(/^v/, '');
     document.querySelectorAll('[data-version]').forEach((el) => {
       const fmt = el.getAttribute('data-version');
-      el.textContent = fmt === 'bare' ? bare : tag;
+      if (fmt === 'tag') el.textContent = tag;
+      else if (fmt === 'bare') el.textContent = bare;
     });
-    // Update structured data if present
-    const ld = document.querySelector('script[type="application/ld+json"]');
-    if (ld) {
-      try {
-        const data = JSON.parse(ld.textContent);
-        data.softwareVersion = bare;
-        ld.textContent = JSON.stringify(data, null, 2);
-      } catch (_) { /* ignore */ }
-    }
   }
 
   const cached = sessionStorage.getItem(CACHE_KEY);
@@ -175,18 +226,41 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const particles = [];
     const count = 48;
+    let rafId = null;
+    let isRunning = false;
 
-    window.addEventListener('resize', () => {
+    const resizeHandler = () => {
       width = canvas.width = canvas.offsetWidth;
       height = canvas.height = canvas.offsetHeight;
       particles.forEach(p => {
         p.x = p.progress * width;
         p.baseY = height / 2 + Math.sin(p.progress * Math.PI * 3.5) * 70;
       });
-    });
+    };
+
+    window.addEventListener('resize', resizeHandler);
+
+    // Color structured component helper
+    const parseRgba = (colorStr) => {
+      const match = colorStr.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)/);
+      if (match) {
+        return {
+          r: parseInt(match[1], 10),
+          g: parseInt(match[2], 10),
+          b: parseInt(match[3], 10),
+          a: match[4] !== undefined ? parseFloat(match[4]) : 1.0
+        };
+      }
+      // Fallback
+      return { r: 14, g: 165, b: 233, a: 0.45 };
+    };
+
+    const setAlpha = (colorStr, alpha) => {
+      const c = parseRgba(colorStr);
+      return `rgba(${c.r}, ${c.g}, ${c.b}, ${alpha})`;
+    };
 
     for (let i = 0; i < count; i++) {
-      // Create a grid of points moving as a wave across the horizontal span
       const progress = i / count;
       particles.push({
         progress: progress,
@@ -197,21 +271,19 @@ document.addEventListener('DOMContentLoaded', () => {
         speed: 0.01 + Math.random() * 0.008,
         amplitude: 50 + Math.random() * 30,
         radius: Math.random() * 2.5 + 1.5,
-        // Cyan color and Purple color alternates
         color: i % 2 === 0 ? 'rgba(14, 165, 233, 0.45)' : 'rgba(139, 92, 246, 0.45)'
       });
     }
 
     function animate() {
+      if (!isRunning) return;
       ctx.clearRect(0, 0, width, height);
 
-      // Update particle heights based on wave equation
       particles.forEach(p => {
         p.angle += p.speed;
         p.y = p.baseY + Math.sin(p.angle) * p.amplitude;
       });
 
-      // Draw connecting lines with gradients
       for (let i = 0; i < particles.length; i++) {
         for (let j = i + 1; j < particles.length; j++) {
           const dx = particles[i].x - particles[j].x;
@@ -225,8 +297,8 @@ document.addEventListener('DOMContentLoaded', () => {
             
             const lineGrad = ctx.createLinearGradient(particles[i].x, particles[i].y, particles[j].x, particles[j].y);
             const alpha = (1 - dist / 120) * 0.2;
-            lineGrad.addColorStop(0, particles[i].color.replace('0.45', alpha));
-            lineGrad.addColorStop(1, particles[j].color.replace('0.45', alpha));
+            lineGrad.addColorStop(0, setAlpha(particles[i].color, alpha));
+            lineGrad.addColorStop(1, setAlpha(particles[j].color, alpha));
             
             ctx.strokeStyle = lineGrad;
             ctx.lineWidth = 1.2;
@@ -235,7 +307,6 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       }
 
-      // Draw particle nodes
       particles.forEach(p => {
         ctx.beginPath();
         ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
@@ -243,9 +314,69 @@ document.addEventListener('DOMContentLoaded', () => {
         ctx.fill();
       });
 
-      requestAnimationFrame(animate);
+      rafId = requestAnimationFrame(animate);
     }
-    animate();
+
+    const startAnimation = () => {
+      if (!isRunning) {
+        isRunning = true;
+        animate();
+      }
+    };
+
+    const stopAnimation = () => {
+      if (isRunning) {
+        isRunning = false;
+        if (rafId) {
+          cancelAnimationFrame(rafId);
+          rafId = null;
+        }
+      }
+    };
+
+    const teardown = () => {
+      stopAnimation();
+      window.removeEventListener('resize', resizeHandler);
+      if (observer) {
+        observer.disconnect();
+      }
+    };
+
+    // Lifecycle visibility check
+    const visibilityHandler = () => {
+      if (document.hidden) {
+        stopAnimation();
+      } else if (isCanvasOnScreen) {
+        startAnimation();
+      }
+    };
+    document.addEventListener('visibilitychange', visibilityHandler);
+
+    // Lifecycle IntersectionObserver
+    let isCanvasOnScreen = true;
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        isCanvasOnScreen = entry.isIntersecting;
+        if (isCanvasOnScreen && !document.hidden) {
+          startAnimation();
+        } else {
+          stopAnimation();
+        }
+      });
+    }, { threshold: 0.05 });
+    observer.observe(canvas);
+
+    // Lifecycle DOM removal cleanup using MutationObserver
+    const domObserver = new MutationObserver(() => {
+      if (!document.body.contains(canvas)) {
+        teardown();
+        document.removeEventListener('visibilitychange', visibilityHandler);
+        domObserver.disconnect();
+      }
+    });
+    if (canvas.parentNode) {
+      domObserver.observe(canvas.parentNode, { childList: true });
+    }
   }
 
 });
