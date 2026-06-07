@@ -16,6 +16,7 @@ use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
@@ -144,6 +145,7 @@ pub struct DistributedScanExec {
     peers: Vec<NodeId>,
     schema: SchemaRef,
     properties: PlanProperties,
+    metrics: ExecutionPlanMetricsSet,
 }
 
 impl DistributedScanExec {
@@ -173,6 +175,7 @@ impl DistributedScanExec {
             peers,
             schema,
             properties,
+            metrics: ExecutionPlanMetricsSet::new(),
         }
     }
 }
@@ -215,6 +218,10 @@ impl ExecutionPlan for DistributedScanExec {
 
     fn properties(&self) -> &PlanProperties {
         &self.properties
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -263,6 +270,11 @@ impl ExecutionPlan for DistributedScanExec {
             futures::stream::select_all(local_streams).boxed()
         };
 
+        // Metrics surface in EXPLAIN ANALYZE: peer establishment failures and
+        // total rows unioned (local + remote).
+        let peer_failures = MetricBuilder::new(&self.metrics).global_counter("peer_failures");
+        let output_rows = MetricBuilder::new(&self.metrics).output_rows(partition);
+
         // Remote slices fetched concurrently and flattened; each peer streams in
         // chunks. A peer error fails the whole scan; an empty slice is valid.
         let pool = Arc::clone(self.controller.query_client_pool());
@@ -279,6 +291,7 @@ impl ExecutionPlan for DistributedScanExec {
                 let projection = projection.clone();
                 let filter_sql = filter_sql.clone();
                 let schema = Arc::clone(&schema);
+                let peer_failures = peer_failures.clone();
                 async move {
                     match remote_scan_client(&pool, &kv, peer, &table, projection, filter_sql).await
                     {
@@ -290,12 +303,15 @@ impl ExecutionPlan for DistributedScanExec {
                         )) as SendableRecordBatchStream,
                         // Couldn't even open the stream: surface as a one-item
                         // error stream so flatten() propagates the failure.
-                        Err(e) => Box::pin(RecordBatchStreamAdapter::new(
-                            schema,
-                            futures::stream::once(async move {
-                                Err::<RecordBatch, _>(DataFusionError::Execution(e))
-                            }),
-                        )) as SendableRecordBatchStream,
+                        Err(e) => {
+                            peer_failures.add(1);
+                            Box::pin(RecordBatchStreamAdapter::new(
+                                schema,
+                                futures::stream::once(async move {
+                                    Err::<RecordBatch, _>(DataFusionError::Execution(e))
+                                }),
+                            )) as SendableRecordBatchStream
+                        }
                     }
                 }
             })
@@ -303,8 +319,12 @@ impl ExecutionPlan for DistributedScanExec {
             .flatten()
             .boxed();
 
-        // Run local scan and remote peer fetches concurrently.
-        let stream = futures::stream::select(local, remote);
+        // Run local scan and remote peer fetches concurrently, counting rows.
+        let stream = futures::stream::select(local, remote).inspect(move |r| {
+            if let Ok(batch) = r {
+                output_rows.add(batch.num_rows());
+            }
+        });
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&self.schema),
             stream,

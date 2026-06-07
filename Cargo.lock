@@ -5036,6 +5036,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "prost",
  "rand 0.10.1",
+ "rcgen",
  "rkyv 0.8.16",
  "rustc-hash",
  "serde",

@@ -94,6 +94,8 @@ rand = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 toml = "0.9"
 tempfile = { workspace = true }
+# Mint a throwaway CA + node cert for the control-plane mTLS integration test.
+rcgen = "0.13"
 
 [[bench]]
 name = "window_bench"

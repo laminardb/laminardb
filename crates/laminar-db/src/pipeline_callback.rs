@@ -280,6 +280,7 @@ impl ConnectorPipelineCallback {
         // batch (subscriptions are at-most-once under backpressure) and warn.
         for item in to_send {
             if tx.try_send(item).is_err() {
+                self.prom.remote_subscription_batches_dropped.inc();
                 warn_subscription_route_drop();
             }
         }

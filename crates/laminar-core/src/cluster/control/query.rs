@@ -38,6 +38,12 @@ const REMOTE_SCAN_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// total-call deadline, so large results still stream but a stalled peer fails.
 const REMOTE_SCAN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Attempts to *establish* a peer stream before giving up; transient connect
+/// failures evict the channel and re-resolve the peer between tries.
+const REMOTE_SCAN_MAX_ATTEMPTS: u32 = 3;
+/// Backoff between establishment attempts.
+const REMOTE_SCAN_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Handler slot read per request, so registration and server start are
 /// order-independent.
 pub type QueryHandlerSlot = Arc<parking_lot::RwLock<Option<Arc<dyn RemoteQueryHandler>>>>;
@@ -166,9 +172,6 @@ pub async fn remote_scan_client(
     projection: Option<Vec<usize>>,
     filter_sql: Option<String>,
 ) -> Result<RemoteBatchStream, String> {
-    let channel = connect(pool, kv, peer).await?;
-    let mut client = QueryServiceClient::new(channel);
-
     let projection = projection
         .unwrap_or_default()
         .into_iter()
@@ -181,23 +184,44 @@ pub async fn remote_scan_client(
         filter_sql: filter_sql.unwrap_or_default(),
     };
 
-    // Bound time-to-first-response (not the whole call) so a hung peer can't
-    // block the scan, while a large multi-chunk result is free to take its time.
-    let stream =
-        match tokio::time::timeout(REMOTE_SCAN_IDLE_TIMEOUT, client.remote_scan(request)).await {
-            Ok(Ok(resp)) => resp.into_inner(),
-            Ok(Err(e)) => {
+    // Establish the stream, retrying transient connect failures. Each retry
+    // evicts the pooled channel so `connect` re-resolves a possibly-restarted
+    // peer. Bounds time-to-first-response (not the whole call), so a large
+    // multi-chunk result is free to take its time once streaming.
+    let mut attempt = 0u32;
+    let stream = loop {
+        attempt += 1;
+        let channel = connect(pool, kv, peer).await?;
+        let mut client = QueryServiceClient::new(channel);
+        match tokio::time::timeout(
+            REMOTE_SCAN_IDLE_TIMEOUT,
+            client.remote_scan(request.clone()),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => break resp.into_inner(),
+            Ok(Err(status)) => {
                 pool.lock().remove(&peer);
-                return Err(format!("remote_scan to peer {} failed: {e}", peer.0));
+                let retryable = status.code() == tonic::Code::Unavailable;
+                if retryable && attempt < REMOTE_SCAN_MAX_ATTEMPTS {
+                    tokio::time::sleep(REMOTE_SCAN_RETRY_BACKOFF).await;
+                    continue;
+                }
+                return Err(format!("remote_scan to peer {} failed: {status}", peer.0));
             }
             Err(_) => {
                 pool.lock().remove(&peer);
+                if attempt < REMOTE_SCAN_MAX_ATTEMPTS {
+                    tokio::time::sleep(REMOTE_SCAN_RETRY_BACKOFF).await;
+                    continue;
+                }
                 return Err(format!(
                     "remote_scan to peer {} timed out opening stream",
                     peer.0
                 ));
             }
-        };
+        }
+    };
 
     // Decode each chunk, bounding the gap between chunks (not total scan time);
     // a transport error or stall evicts the pooled channel.
@@ -288,7 +312,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-            let _ = tonic::transport::Server::builder()
+            let mut builder = tonic::transport::Server::builder();
+            // Mirror production: apply control-plane TLS when installed.
+            if let Some(tls) = crate::cluster::control::tls::server_tls() {
+                builder = builder.tls_config(tls.clone()).unwrap();
+            }
+            let _ = builder
                 .add_service(query_service_server(slot))
                 .serve_with_incoming(incoming)
                 .await;
@@ -381,5 +410,51 @@ mod tests {
         let (proj, filter) = seen.lock().clone().expect("handler was called");
         assert_eq!(proj, Some(vec![0]));
         assert_eq!(filter.as_deref(), Some("(\"n\" > 1)"));
+    }
+
+    // End-to-end mTLS: a node serves and dials with a cert chained to the shared
+    // CA, so a successful scan proves both directions verified (the server
+    // requires a client cert; the client verifies the server cert + SAN).
+    //
+    // Ignored because it installs the process-global cluster TLS, which would
+    // make the plaintext tests above use TLS. Run it alone:
+    //   cargo test -p laminar-core --features cluster -- --ignored
+    #[tokio::test]
+    #[ignore = "installs process-global cluster TLS; run with --ignored"]
+    async fn remote_scan_over_mtls() {
+        const SAN: &str = "laminar-cluster";
+
+        // Mint a throwaway CA and one node cert (both server- and client-auth,
+        // SAN = the name the client verifies).
+        let mut ca_params = rcgen::CertificateParams::new(vec!["laminar-test-ca".into()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let mut leaf = rcgen::CertificateParams::new(vec![SAN.into()]).unwrap();
+        leaf.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf_cert = leaf.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
+
+        crate::cluster::control::set_cluster_tls(crate::cluster::control::ClusterTls::from_pem(
+            leaf_cert.pem().as_bytes(),
+            leaf_key.serialize_pem().as_bytes(),
+            ca_cert.pem().as_bytes(),
+            SAN,
+        ));
+
+        let peer = NodeId(7);
+        let (pool, kv) =
+            serve_handler(peer, Arc::new(StaticHandler(int_batch(vec![1, 2, 3])))).await;
+        let stream = remote_scan_client(&pool, &kv, peer, "mv", None, None)
+            .await
+            .unwrap();
+        let batches = collect_chunks(stream).await;
+        let got = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let col = got.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(col.values(), &[1, 2, 3]);
     }
 }
