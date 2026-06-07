@@ -142,8 +142,7 @@ async fn connect(
         .read_from(peer, BARRIER_ADDR_KEY)
         .await
         .ok_or_else(|| format!("no control-plane address for peer {}", peer.0))?;
-    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-        .map_err(|e| e.to_string())?
+    let channel = super::tls::client_endpoint(&addr)?
         .connect_timeout(REMOTE_SCAN_CONNECT_TIMEOUT)
         .connect_lazy();
     Ok(pool.lock().entry(peer).or_insert(channel).clone())
@@ -254,7 +253,7 @@ mod tests {
         }
     }
 
-    /// Records the projection + filter_sql it was called with, so a test can
+    /// Records the projection + `filter_sql` it was called with, so a test can
     /// assert the request carried them over the wire.
     type SeenArgs = Arc<parking_lot::Mutex<Option<(Option<Vec<usize>>, Option<String>)>>>;
     struct RecordingHandler {
@@ -364,10 +363,16 @@ mod tests {
         let peer = NodeId(7);
         let (pool, kv) = serve_handler(peer, handler).await;
 
-        let stream =
-            remote_scan_client(&pool, &kv, peer, "mv", Some(vec![0]), Some("(\"n\" > 1)".into()))
-                .await
-                .unwrap();
+        let stream = remote_scan_client(
+            &pool,
+            &kv,
+            peer,
+            "mv",
+            Some(vec![0]),
+            Some("(\"n\" > 1)".into()),
+        )
+        .await
+        .unwrap();
         let batches = collect_chunks(stream).await;
         let got = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
         let col = got.column(0).as_any().downcast_ref::<Int32Array>().unwrap();

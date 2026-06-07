@@ -78,7 +78,7 @@ mod grpc {
     use parking_lot::Mutex;
     use rustc_hash::FxHashMap;
     use tokio::task::JoinHandle;
-    use tonic::transport::{Channel, Endpoint, Server};
+    use tonic::transport::{Channel, Server};
     use tonic::Request;
 
     use super::shuffle_v1::shuffle_frame;
@@ -308,7 +308,7 @@ mod grpc {
     /// as the first frame. Connecting happens inside the driver task so this stays
     /// non-blocking; a connect failure flips `alive` so the next `send_to` retries.
     fn open_call(local_id: ShufflePeerId, addr: SocketAddr) -> io::Result<PeerConn> {
-        let endpoint = Endpoint::from_shared(format!("http://{addr}"))
+        let endpoint = crate::cluster::control::tls::client_endpoint(&addr.to_string())
             .map_err(io_err)?
             .tcp_nodelay(true);
         let (tx, rx) = mpsc::bounded_async::<ShuffleFrame>(SHUFFLE_SEND_QUEUE);
@@ -402,7 +402,17 @@ mod grpc {
                 Some((item, listener))
             });
             let server = tokio::spawn(async move {
-                let _ = Server::builder()
+                let mut builder = Server::builder();
+                if let Some(tls) = crate::cluster::control::tls::server_tls() {
+                    match builder.tls_config(tls.clone()) {
+                        Ok(b) => builder = b,
+                        Err(e) => {
+                            tracing::error!(error = %e, "cluster shuffle TLS config failed");
+                            return;
+                        }
+                    }
+                }
+                let _ = builder
                     .add_service(ShuffleTransportServer::new(service))
                     .serve_with_incoming(incoming)
                     .await;

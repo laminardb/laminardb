@@ -421,7 +421,7 @@ async fn get_barrier_client(
     }
 
     let addr_str = kv.read_from(peer, BARRIER_ADDR_KEY).await?;
-    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr_str}")).ok()?;
+    let endpoint = super::tls::client_endpoint(&addr_str).ok()?;
     let channel = endpoint.connect_lazy();
     let client = barrier_v1::barrier_sync_client::BarrierSyncClient::new(channel);
 
@@ -535,7 +535,17 @@ impl BarrierCoordinator {
         let query_svc = query_service_server(query_handler);
         let server_task = tokio::spawn(async move {
             let incoming_stream = tokio_stream::wrappers::TcpListenerStream::new(tokio_listener);
-            let _ = Server::builder()
+            let mut builder = Server::builder();
+            if let Some(tls) = super::tls::server_tls() {
+                match builder.tls_config(tls.clone()) {
+                    Ok(b) => builder = b,
+                    Err(e) => {
+                        tracing::error!(error = %e, "cluster control-plane TLS config failed");
+                        return;
+                    }
+                }
+            }
+            let _ = builder
                 .add_service(BarrierSyncServer::new(server_impl))
                 .add_service(query_svc)
                 .serve_with_incoming(incoming_stream)

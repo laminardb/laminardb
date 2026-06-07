@@ -39,3 +39,8 @@ pub mod query;
 pub use query::{
     remote_scan_client, QueryClientPool, QueryHandlerSlot, RemoteBatchStream, RemoteQueryHandler,
 };
+
+#[cfg(feature = "cluster")]
+pub mod tls;
+#[cfg(feature = "cluster")]
+pub use tls::{set_cluster_tls, ClusterTls};

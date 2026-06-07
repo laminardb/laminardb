@@ -146,6 +146,10 @@ mod tests {
             seeds: vec!["node-1:7946".to_string(), "node-2:7946".to_string()],
             gossip_port: 7946,
             advertise_host: None,
+            cluster_tls_cert: None,
+            cluster_tls_key: None,
+            cluster_tls_client_ca: None,
+            cluster_tls_server_name: None,
         });
         config.coordination = Some(CoordinationSection {
             strategy: "raft".to_string(),
