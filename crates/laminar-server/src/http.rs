@@ -319,6 +319,40 @@ struct SqlResponse {
     rows_affected: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<Box<serde_json::value::RawValue>>,
+    /// `true` when the result was capped at `MAX_SQL_RESULT_ROWS` or the
+    /// collection timed out, so `data` is a prefix of the full result. Omitted
+    /// when the result is complete.
+    #[serde(skip_serializing_if = "is_false")]
+    truncated: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde skip_serializing_if signature
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Trim `batches` to at most `cap` rows, returning the trimmed batches and
+/// whether any rows were dropped (i.e. the input held more than `cap`).
+fn cap_result(
+    batches: Vec<arrow_array::RecordBatch>,
+    cap: usize,
+) -> (Vec<arrow_array::RecordBatch>, bool) {
+    let total: usize = batches.iter().map(arrow_array::RecordBatch::num_rows).sum();
+    if total <= cap {
+        return (batches, false);
+    }
+    let mut kept = 0;
+    let mut out = Vec::with_capacity(batches.len());
+    for b in batches {
+        let room = cap - kept;
+        if b.num_rows() >= room {
+            out.push(b.slice(0, room));
+            break;
+        }
+        kept += b.num_rows();
+        out.push(b);
+    }
+    (out, true)
 }
 
 #[derive(Debug, Serialize)]
@@ -606,12 +640,14 @@ async fn execute_sql(
                     object_name: Some(info.object_name),
                     rows_affected: None,
                     data: None,
+                    truncated: false,
                 },
                 ExecuteResult::RowsAffected(n) => SqlResponse {
                     result_type: "rows_affected".to_string(),
                     object_name: None,
                     rows_affected: Some(n),
                     data: None,
+                    truncated: false,
                 },
                 ExecuteResult::Metadata(batch) => {
                     let data = match batches_to_json_raw(&[batch]) {
@@ -629,34 +665,32 @@ async fn execute_sql(
                         object_name: None,
                         rows_affected: None,
                         data: Some(data),
+                        truncated: false,
                     }
                 }
                 ExecuteResult::Query(mut handle) => {
                     let mut batches: Vec<arrow_array::RecordBatch> = Vec::new();
                     let mut total_rows = 0;
+                    let mut timed_out = false;
                     if let Ok(mut sub) = handle.subscribe_raw() {
+                        // Gather one batch *past* the cap so `cap_result` can tell
+                        // "exactly at the cap" (complete) from "more rows exist".
                         let collect = async {
-                            while total_rows < MAX_SQL_RESULT_ROWS {
-                                match sub.recv_async().await {
-                                    Ok(batch) => {
-                                        let needed = MAX_SQL_RESULT_ROWS - total_rows;
-                                        let batch_to_keep = if batch.num_rows() > needed {
-                                            batch.slice(0, needed)
-                                        } else {
-                                            batch
-                                        };
-                                        total_rows += batch_to_keep.num_rows();
-                                        batches.push(batch_to_keep);
-                                        if total_rows >= MAX_SQL_RESULT_ROWS {
-                                            break;
-                                        }
-                                    }
-                                    Err(_) => break,
+                            while let Ok(batch) = sub.recv_async().await {
+                                total_rows += batch.num_rows();
+                                batches.push(batch);
+                                if total_rows > MAX_SQL_RESULT_ROWS {
+                                    break;
                                 }
                             }
                         };
-                        let _ = tokio::time::timeout(SQL_RESULT_TIMEOUT, collect).await;
+                        timed_out = tokio::time::timeout(SQL_RESULT_TIMEOUT, collect)
+                            .await
+                            .is_err();
                     }
+                    // Trim to the cap; `over_cap` true means rows were dropped.
+                    // A timeout also leaves `data` a prefix of the full result.
+                    let (batches, over_cap) = cap_result(batches, MAX_SQL_RESULT_ROWS);
                     let raw_data = if batches.is_empty() {
                         serde_json::value::RawValue::from_string("[]".to_string()).ok()
                     } else {
@@ -667,6 +701,7 @@ async fn execute_sql(
                         object_name: None,
                         rows_affected: None,
                         data: raw_data,
+                        truncated: over_cap || timed_out,
                     }
                 }
             };
@@ -1196,6 +1231,31 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[test]
+    fn cap_result_trims_and_flags() {
+        use arrow_array::{Int32Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
+        let batch = |n: i32| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from((0..n).collect::<Vec<_>>()))],
+            )
+            .unwrap()
+        };
+        let rows = |bs: &[RecordBatch]| bs.iter().map(RecordBatch::num_rows).sum::<usize>();
+
+        // Under the cap: unchanged, not truncated.
+        let (b, t) = cap_result(vec![batch(3)], 5);
+        assert_eq!((rows(&b), t), (3, false));
+        // Exactly at the cap across batches: complete, not truncated.
+        let (b, t) = cap_result(vec![batch(3), batch(2)], 5);
+        assert_eq!((rows(&b), t), (5, false));
+        // Over the cap: trimmed to the cap, truncated.
+        let (b, t) = cap_result(vec![batch(3), batch(4)], 5);
+        assert_eq!((rows(&b), t), (5, true));
+    }
 
     fn test_state() -> Arc<AppState> {
         let registry = Arc::new(crate::metrics::build_registry([
