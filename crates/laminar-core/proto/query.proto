@@ -16,10 +16,8 @@ message RemoteScanRequest {
   string table_name = 1;
   // Optional column projection (field indices); empty means all columns.
   repeated uint32 projection = 2;
-  // Optional pushed-down predicate as a SQL boolean expression over the table's
-  // columns; empty means no filter. Applied by the serving node before
-  // serialization. The coordinator re-applies the filter above the union, so an
-  // over-broad remote result is still correct (pushdown is an optimization).
+  // Optional pushed-down predicate (SQL boolean expr); empty means no filter.
+  // Applied before serialization; the coordinator re-applies it (optimization).
   string filter_sql = 3;
 }
 

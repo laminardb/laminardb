@@ -82,11 +82,8 @@ impl TableProvider for DistributedTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        // A filter we can render to SQL is sent to peers so they filter their
-        // slice before serialization. It's `Inexact`: DataFusion keeps a
-        // FilterExec above the union that re-applies the exact predicate, so an
-        // over-broad remote result is still correct. Filters we can't render
-        // stay `Unsupported` and are evaluated only on the coordinator.
+        // Renderable filters push to peers as `Inexact` (coordinator's FilterExec
+        // re-applies the exact predicate); the rest stay `Unsupported`.
         Ok(filters
             .iter()
             .map(|f| {
@@ -110,9 +107,8 @@ impl TableProvider for DistributedTableProvider {
         // DataFusion (pushdown is `Inexact`), so the local scan stays unfiltered.
         let local = self.inner.scan(state, projection, &[], None).await?;
 
-        // Render the filters we can to one SQL predicate for peers to apply
-        // locally. A filter that doesn't render is simply dropped here (it was
-        // reported `Unsupported`, so the coordinator still evaluates it).
+        // Join renderable filters into one SQL predicate for peers; unrenderable
+        // ones were reported `Unsupported`, so the coordinator still evaluates them.
         let rendered: Vec<String> = filters.iter().filter_map(expr_to_sql).collect();
         let filter_sql = (!rendered.is_empty()).then(|| rendered.join(" AND "));
 
@@ -267,11 +263,8 @@ impl ExecutionPlan for DistributedScanExec {
             futures::stream::select_all(local_streams).boxed()
         };
 
-        // Remote slices, fetched concurrently. Each peer streams its rows in
-        // row-bounded chunks, so a large slice is never materialized whole here;
-        // the per-peer chunk streams are flattened into one. A peer error fails
-        // the whole scan (consistency over availability); an empty slice is
-        // valid, not an error.
+        // Remote slices fetched concurrently and flattened; each peer streams in
+        // chunks. A peer error fails the whole scan; an empty slice is valid.
         let pool = Arc::clone(self.controller.query_client_pool());
         let kv = Arc::clone(self.controller.kv());
         let table = self.table_name.clone();
@@ -319,20 +312,12 @@ impl ExecutionPlan for DistributedScanExec {
     }
 }
 
-/// Render a small, safe subset of DataFusion predicates to a SQL string a peer
-/// can re-compile against its own copy of the table schema; `None` for anything
-/// outside the subset.
-///
-/// Only expressions that round-trip *faithfully* are rendered. Pushdown is
-/// `Inexact`, so the coordinator re-applies the exact predicate above the union:
-/// an over-broad remote result is corrected there, but an under-broad one would
-/// silently drop rows. Every conversion here therefore preserves the original
-/// selectivity exactly, and unconvertible nodes fall back to the coordinator.
+/// Render the faithful-round-trip subset of predicates to SQL for a peer to
+/// re-compile (`None` otherwise); pushdown is `Inexact` so over-broad is safe.
 fn expr_to_sql(expr: &Expr) -> Option<String> {
     match expr {
-        // Emit column names unqualified and double-quoted so the peer resolves
-        // them case-sensitively against its single scanned table; the original
-        // qualifier names the coordinator's table, not the peer's.
+        // Unqualified + double-quoted: the peer resolves against its single
+        // table; the original qualifier names the coordinator's, not the peer's.
         Expr::Column(col) => Some(format!("\"{}\"", col.name.replace('"', "\"\""))),
         Expr::Literal(value, _) => scalar_to_sql(value),
         Expr::BinaryExpr(be) => {
@@ -367,9 +352,8 @@ fn binary_op_to_sql(op: Operator) -> Option<&'static str> {
     })
 }
 
-/// Render a scalar literal to SQL, restricted to types that round-trip exactly
-/// (integers, booleans, strings, finite floats); `None` for everything else so
-/// the filter falls back to coordinator-side evaluation.
+/// Render a scalar literal to SQL, restricted to exact-round-trip types
+/// (integers, booleans, strings, finite floats); `None` otherwise.
 // The integer arms look identical but bind differently-typed locals, so they
 // can't be merged with `|`.
 #[allow(clippy::match_same_arms)]

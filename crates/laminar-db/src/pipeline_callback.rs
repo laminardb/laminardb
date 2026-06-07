@@ -61,6 +61,27 @@ fn warn_late_drops(source: &str, column: &str, watermark_ms: i64, dropped: usize
     );
 }
 
+/// Bounded subscription-routing channel depth; drop-on-full caps memory when a
+/// subscriber peer stalls.
+#[cfg(feature = "cluster")]
+const SUB_ROUTE_CAPACITY: usize = 1024;
+
+/// Throttled (~once/10s) WARN when subscription routing drops a batch under
+/// backpressure, so silent gaps stay diagnosable.
+#[cfg(feature = "cluster")]
+fn warn_subscription_route_drop() {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST_WARN_MS: AtomicI64 = AtomicI64::new(0);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+    if now_ms - LAST_WARN_MS.load(Ordering::Relaxed) < 10_000 {
+        return;
+    }
+    LAST_WARN_MS.store(now_ms, Ordering::Relaxed);
+    tracing::warn!("dropping remote subscription batch: routing queue full (stalled peer?)");
+}
+
 /// Clears the in-flight checkpoint flag on drop, so a panicking persist task
 /// can't leave it stuck and permanently disable checkpointing.
 struct CheckpointInFlightGuard(Arc<std::sync::atomic::AtomicBool>);
@@ -159,7 +180,7 @@ pub(crate) struct ConnectorPipelineCallback {
     /// subscribers; one consumer preserves order a per-cycle spawn would not.
     #[cfg(feature = "cluster")]
     pub(crate) sub_route:
-        std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<(String, RecordBatch, Vec<u64>)>>,
+        std::sync::OnceLock<tokio::sync::mpsc::Sender<(String, RecordBatch, Vec<u64>)>>,
     pub(crate) static_stream_names: rustc_hash::FxHashSet<Arc<str>>,
     pub(crate) checkpoint_complete_tx: crossfire::MAsyncTx<
         crossfire::mpsc::Array<(u64, rustc_hash::FxHashMap<String, SourceCheckpoint>)>,
@@ -237,7 +258,7 @@ impl ConnectorPipelineCallback {
         // the peer; a per-cycle spawn would let later batches overtake earlier.
         let tx = self.sub_route.get_or_init(|| {
             let (tx, mut rx) =
-                tokio::sync::mpsc::unbounded_channel::<(String, RecordBatch, Vec<u64>)>();
+                tokio::sync::mpsc::channel::<(String, RecordBatch, Vec<u64>)>(SUB_ROUTE_CAPACITY);
             let sender = Arc::clone(&cfg.sender);
             tokio::spawn(async move {
                 while let Some((stage, batch, targets)) = rx.recv().await {
@@ -255,8 +276,12 @@ impl ConnectorPipelineCallback {
             });
             tx
         });
+        // Bounded, best-effort: if a stalled peer backs the queue up, drop the
+        // batch (subscriptions are at-most-once under backpressure) and warn.
         for item in to_send {
-            let _ = tx.send(item);
+            if tx.try_send(item).is_err() {
+                warn_subscription_route_drop();
+            }
         }
     }
 

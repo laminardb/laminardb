@@ -1,6 +1,5 @@
 //! In-engine distributed query (pull path): a coordinator fans `RemoteScan` out
-//! to every peer owning part of a table/MV and unions their Arrow batches. The
-//! service shares the `BarrierSync` control-plane port.
+//! to peers owning part of a table/MV and unions their Arrow batches.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -32,6 +31,13 @@ use query_v1::{RemoteScanRequest, RemoteScanResponse};
 /// Rows per streamed `RemoteScan` chunk; bounds any single gRPC message.
 const REMOTE_SCAN_CHUNK_ROWS: usize = 8192;
 
+/// TCP connect timeout for a peer's lazy channel.
+const REMOTE_SCAN_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Idle (per-chunk) timeout for the first response and each chunk — not a
+/// total-call deadline, so large results still stream but a stalled peer fails.
+const REMOTE_SCAN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Handler slot read per request, so registration and server start are
 /// order-independent.
 pub type QueryHandlerSlot = Arc<parking_lot::RwLock<Option<Arc<dyn RemoteQueryHandler>>>>;
@@ -45,11 +51,11 @@ pub type QueryClientPool =
 #[async_trait::async_trait]
 pub trait RemoteQueryHandler: Send + Sync + 'static {
     /// This node's locally-held rows for `table_name`, optionally projected and
-    /// optionally filtered by `filter_sql` (a SQL boolean expression over the
-    /// table's columns) before serialization.
+    /// optionally filtered by `filter_sql` before serialization.
     ///
     /// # Errors
-    /// Unknown table, invalid projection, or an un-compilable `filter_sql`.
+    /// Unknown table or invalid projection. A `filter_sql` that fails to compile
+    /// is skipped (the coordinator re-applies it), not an error.
     async fn remote_scan(
         &self,
         table_name: &str,
@@ -138,26 +144,21 @@ async fn connect(
         .ok_or_else(|| format!("no control-plane address for peer {}", peer.0))?;
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
         .map_err(|e| e.to_string())?
-        .connect_timeout(std::time::Duration::from_secs(3))
+        .connect_timeout(REMOTE_SCAN_CONNECT_TIMEOUT)
         .connect_lazy();
     Ok(pool.lock().entry(peer).or_insert(channel).clone())
 }
 
-/// Lazily-streamed Arrow [`RecordBatch`] chunks from a peer's `RemoteScan`.
-///
-/// Items are produced as the peer's gRPC response stream is polled, so a large
-/// result is never fully materialized on the caller. A per-chunk Arrow IPC
-/// decode failure or a mid-stream transport error surfaces as an `Err` item.
+/// Lazily-streamed Arrow [`RecordBatch`] chunks from a peer's `RemoteScan`; a
+/// decode or mid-stream transport error surfaces as an `Err` item.
 pub type RemoteBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, String>> + Send>>;
 
-/// Scan `table_name` on `peer`, returning its Arrow IPC chunks as a lazy stream
-/// rather than buffering them into one batch; evicts the pooled channel on
-/// transport error so a restarted peer is re-resolved on the next query.
+/// Scan `table_name` on `peer`, returning its Arrow IPC chunks as a lazy stream;
+/// evicts the pooled channel on transport/idle error.
 ///
 /// # Errors
-/// Discovery or transport failure while *establishing* the stream. Failures
-/// that occur once streaming has begun (Arrow IPC decode, dropped connection)
-/// surface as `Err` items on the returned stream rather than from this call.
+/// Discovery/transport/timeout while *establishing* the stream; post-stream
+/// failures (decode, dropped connection, idle timeout) surface as `Err` items.
 pub async fn remote_scan_client(
     pool: &QueryClientPool,
     kv: &Arc<dyn ClusterKv>,
@@ -175,29 +176,55 @@ pub async fn remote_scan_client(
         .map(|p| u32::try_from(p).map_err(|_| format!("projection index {p} out of range")))
         .collect::<Result<Vec<u32>, String>>()?;
 
-    let mut request = tonic::Request::new(RemoteScanRequest {
+    let request = RemoteScanRequest {
         table_name: table_name.to_string(),
         projection,
         filter_sql: filter_sql.unwrap_or_default(),
-    });
-    request.set_timeout(std::time::Duration::from_secs(10));
-
-    let stream = match client.remote_scan(request).await {
-        Ok(resp) => resp.into_inner(),
-        Err(e) => {
-            pool.lock().remove(&peer);
-            return Err(format!("remote_scan to peer {} failed: {e}", peer.0));
-        }
     };
 
-    // Decode each chunk as it arrives. A mid-stream transport error evicts the
-    // pooled channel so the next query re-resolves a possibly-restarted peer.
+    // Bound time-to-first-response (not the whole call) so a hung peer can't
+    // block the scan, while a large multi-chunk result is free to take its time.
+    let stream =
+        match tokio::time::timeout(REMOTE_SCAN_IDLE_TIMEOUT, client.remote_scan(request)).await {
+            Ok(Ok(resp)) => resp.into_inner(),
+            Ok(Err(e)) => {
+                pool.lock().remove(&peer);
+                return Err(format!("remote_scan to peer {} failed: {e}", peer.0));
+            }
+            Err(_) => {
+                pool.lock().remove(&peer);
+                return Err(format!(
+                    "remote_scan to peer {} timed out opening stream",
+                    peer.0
+                ));
+            }
+        };
+
+    // Decode each chunk, bounding the gap between chunks (not total scan time);
+    // a transport error or stall evicts the pooled channel.
     let pool = Arc::clone(pool);
-    let decoded = stream.map(move |item| match item {
-        Ok(resp) => deserialize_batch_stream(&resp.arrow_ipc).map_err(|e| e.to_string()),
-        Err(e) => {
-            pool.lock().remove(&peer);
-            Err(e.to_string())
+    let decoded = futures::stream::unfold(Some(stream), move |state| {
+        let pool = Arc::clone(&pool);
+        async move {
+            let mut stream = state?;
+            match tokio::time::timeout(REMOTE_SCAN_IDLE_TIMEOUT, stream.message()).await {
+                Ok(Ok(Some(resp))) => match deserialize_batch_stream(&resp.arrow_ipc) {
+                    Ok(batch) => Some((Ok(batch), Some(stream))),
+                    Err(e) => Some((Err(e.to_string()), None)),
+                },
+                Ok(Ok(None)) => None,
+                Ok(Err(status)) => {
+                    pool.lock().remove(&peer);
+                    Some((Err(status.to_string()), None))
+                }
+                Err(_) => {
+                    pool.lock().remove(&peer);
+                    Some((
+                        Err(format!("remote_scan to peer {} stalled mid-stream", peer.0)),
+                        None,
+                    ))
+                }
+            }
         }
     });
     Ok(Box::pin(decoded))

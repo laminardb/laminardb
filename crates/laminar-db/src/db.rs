@@ -720,7 +720,9 @@ impl LaminarDB {
         controller.register_query_handler(Arc::new(DbQueryHandler {
             mv_store: Arc::downgrade(&self.mv_store),
             table_store: Arc::downgrade(&self.table_store),
-            ctx: self.ctx.clone(),
+            // Isolated context: a pushed `filter_sql` is compiled with only its
+            // temp table visible, so it can't reference other registered tables.
+            filter_ctx: SessionContext::new(),
         }));
         self.spawn_subscription_router(&controller);
         *self.cluster_controller.lock() = Some(controller);
@@ -2455,9 +2457,9 @@ impl datafusion::execution::context::QueryPlanner for LookupQueryPlanner {
 struct DbQueryHandler {
     mv_store: std::sync::Weak<parking_lot::RwLock<crate::mv_store::MvStore>>,
     table_store: std::sync::Weak<parking_lot::RwLock<crate::table_store::TableStore>>,
-    /// Session context used to compile a pushed-down `filter_sql` predicate
-    /// against the served table's schema before projection.
-    ctx: SessionContext,
+    /// Isolated context for compiling a pushed `filter_sql` (only the temp table
+    /// is visible), so a crafted predicate can't reference other tables.
+    filter_ctx: SessionContext,
 }
 
 #[cfg(feature = "cluster")]
@@ -2480,20 +2482,29 @@ impl laminar_core::cluster::control::RemoteQueryHandler for DbQueryHandler {
             })
             .ok_or_else(|| format!("table '{table_name}' not found"))?;
 
-        // Apply the pushed-down predicate against the full table schema before
-        // projecting, so it can reference columns the projection drops. An empty
-        // result is a valid (schema-only) batch, not an error.
-        let batch = if let Some(sql) = filter_sql {
-            let schema = batch.schema();
-            let expr = crate::filter_compile::compile(&self.ctx, &sql, &schema)
-                .await
-                .map_err(|e| e.to_string())?;
-            match crate::filter_compile::apply(&batch, expr.as_ref()).map_err(|e| e.to_string())? {
-                Some(filtered) => filtered,
-                None => arrow::array::RecordBatch::new_empty(schema),
+        // Apply the pushed predicate before projecting (it may reference dropped
+        // columns); on any failure skip it — the coordinator re-applies it.
+        let batch = match filter_sql {
+            Some(sql) => {
+                let schema = batch.schema();
+                match crate::filter_compile::compile(&self.filter_ctx, &sql, &schema).await {
+                    Ok(expr) => match crate::filter_compile::apply(&batch, expr.as_ref()) {
+                        Ok(Some(filtered)) => filtered,
+                        Ok(None) => arrow::array::RecordBatch::new_empty(schema),
+                        Err(e) => {
+                            tracing::debug!(table = table_name, error = %e,
+                                "remote_scan: skipping pushed filter (apply failed)");
+                            batch
+                        }
+                    },
+                    Err(e) => {
+                        tracing::debug!(table = table_name, error = %e,
+                            "remote_scan: skipping pushed filter (compile failed)");
+                        batch
+                    }
+                }
             }
-        } else {
-            batch
+            None => batch,
         };
 
         match projection {
