@@ -138,6 +138,7 @@ async fn connect(
         .ok_or_else(|| format!("no control-plane address for peer {}", peer.0))?;
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
         .map_err(|e| e.to_string())?
+        .connect_timeout(std::time::Duration::from_secs(3))
         .connect_lazy();
     Ok(pool.lock().entry(peer).or_insert(channel).clone())
 }
@@ -174,11 +175,12 @@ pub async fn remote_scan_client(
         .map(|p| u32::try_from(p).map_err(|_| format!("projection index {p} out of range")))
         .collect::<Result<Vec<u32>, String>>()?;
 
-    let request = RemoteScanRequest {
+    let mut request = tonic::Request::new(RemoteScanRequest {
         table_name: table_name.to_string(),
         projection,
         filter_sql: filter_sql.unwrap_or_default(),
-    };
+    });
+    request.set_timeout(std::time::Duration::from_secs(10));
 
     let stream = match client.remote_scan(request).await {
         Ok(resp) => resp.into_inner(),
