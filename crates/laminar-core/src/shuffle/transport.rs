@@ -78,7 +78,7 @@ mod grpc {
     use parking_lot::Mutex;
     use rustc_hash::FxHashMap;
     use tokio::task::JoinHandle;
-    use tonic::transport::{Channel, Endpoint, Server};
+    use tonic::transport::{Channel, Server};
     use tonic::Request;
 
     use super::shuffle_v1::shuffle_frame;
@@ -308,7 +308,7 @@ mod grpc {
     /// as the first frame. Connecting happens inside the driver task so this stays
     /// non-blocking; a connect failure flips `alive` so the next `send_to` retries.
     fn open_call(local_id: ShufflePeerId, addr: SocketAddr) -> io::Result<PeerConn> {
-        let endpoint = Endpoint::from_shared(format!("http://{addr}"))
+        let endpoint = crate::cluster::control::tls::client_endpoint(&addr.to_string())
             .map_err(io_err)?
             .tcp_nodelay(true);
         let (tx, rx) = mpsc::bounded_async::<ShuffleFrame>(SHUFFLE_SEND_QUEUE);
@@ -401,11 +401,17 @@ mod grpc {
                 };
                 Some((item, listener))
             });
+            // Apply TLS synchronously so a bad cert fails bind() rather than
+            // silently never serving.
+            let mut builder = Server::builder();
+            if let Some(tls) = crate::cluster::control::tls::server_tls() {
+                builder = builder
+                    .tls_config(tls.clone())
+                    .map_err(|e| io::Error::other(format!("cluster shuffle TLS config: {e}")))?;
+            }
+            let router = builder.add_service(ShuffleTransportServer::new(service));
             let server = tokio::spawn(async move {
-                let _ = Server::builder()
-                    .add_service(ShuffleTransportServer::new(service))
-                    .serve_with_incoming(incoming)
-                    .await;
+                let _ = router.serve_with_incoming(incoming).await;
             });
 
             Ok(Self {
@@ -476,30 +482,56 @@ mod grpc {
             out
         }
 
-        /// Non-blocking drain of the [`ShuffleMessage::VnodeData`] batches for
-        /// `stage`. Frames for other stages are bucketed for their own drainer;
-        /// `Barrier` frames are stashed for the aligning checkpoint (never dropped
-        /// — see `Holdover`). Empty if the queue is empty or a `recv()` holds it.
-        #[must_use]
-        pub fn drain_vnode_data_for(&self, stage: &str) -> Vec<RecordBatch> {
-            let mut staged = self.holdover.staged.lock();
-            {
-                let slot = self.rx.lock();
-                if let Some(rx) = slot.as_ref() {
-                    while let Ok((from, msg)) = rx.try_recv() {
-                        match msg {
-                            ShuffleMessage::VnodeData(s, _vnode, batch) => {
-                                staged.entry(s).or_default().push(batch);
-                            }
-                            ShuffleMessage::Barrier(b) => {
-                                self.holdover.staged_barriers.lock().push((from, b));
-                            }
-                            _ => {} // Hello / Close
+        /// Drain the inbound queue into `staged`: bucket `VnodeData` by stage,
+        /// stash `Barrier`s for the aligning checkpoint (never dropped — see
+        /// `Holdover`), discard `Hello`/`Close`.
+        fn drain_inbound_into(&self, staged: &mut FxHashMap<String, Vec<RecordBatch>>) {
+            let slot = self.rx.lock();
+            if let Some(rx) = slot.as_ref() {
+                while let Ok((from, msg)) = rx.try_recv() {
+                    match msg {
+                        ShuffleMessage::VnodeData(s, _vnode, batch) => {
+                            staged.entry(s).or_default().push(batch);
                         }
+                        ShuffleMessage::Barrier(b) => {
+                            self.holdover.staged_barriers.lock().push((from, b));
+                        }
+                        _ => {} // Hello / Close
                     }
                 }
             }
+        }
+
+        /// Non-blocking drain of the [`ShuffleMessage::VnodeData`] batches for
+        /// `stage`; other stages stay bucketed for their own drainer. Empty if the
+        /// queue is empty or a `recv()` holds it.
+        #[must_use]
+        pub fn drain_vnode_data_for(&self, stage: &str) -> Vec<RecordBatch> {
+            let mut staged = self.holdover.staged.lock();
+            self.drain_inbound_into(&mut staged);
             staged.remove(stage).unwrap_or_default()
+        }
+
+        /// Single lock-cycle drain of every staged stage whose key starts with
+        /// `prefix`, lifting those out and leaving operator stages untouched. Lets
+        /// the subscription router pull all `__sub::` batches in one pass.
+        #[must_use]
+        pub fn drain_staged_with_prefix(
+            &self,
+            prefix: &str,
+        ) -> FxHashMap<String, Vec<RecordBatch>> {
+            let mut staged = self.holdover.staged.lock();
+            self.drain_inbound_into(&mut staged);
+            let mut out: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
+            staged.retain(|stage, batches| {
+                if stage.starts_with(prefix) {
+                    out.insert(stage.clone(), std::mem::take(batches));
+                    false
+                } else {
+                    true
+                }
+            });
+            out
         }
 
         /// Stage `batch` under `stage` for a later [`Self::drain_vnode_data_for`] /
@@ -837,6 +869,44 @@ mod shim {
             staged.remove(stage).unwrap_or_default()
         }
 
+        /// Single lock-cycle drain of every staged stage whose key starts with
+        /// `prefix`; other-stage frames are bucketed and barriers stashed (never
+        /// dropped), matching [`Self::drain_vnode_data_for`]. Operator stages are
+        /// left in `staged`; only the matching entries are returned.
+        #[must_use]
+        pub fn drain_staged_with_prefix(
+            &self,
+            prefix: &str,
+        ) -> FxHashMap<String, Vec<RecordBatch>> {
+            let mut staged = self.holdover.staged.lock();
+            {
+                let slot = self.rx.lock();
+                if let Some(rx) = slot.as_ref() {
+                    while let Ok((from, msg)) = rx.try_recv() {
+                        match msg {
+                            ShuffleMessage::VnodeData(s, _vnode, batch) => {
+                                staged.entry(s).or_default().push(batch);
+                            }
+                            ShuffleMessage::Barrier(b) => {
+                                self.holdover.staged_barriers.lock().push((from, b));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let mut out: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
+            staged.retain(|stage, batches| {
+                if stage.starts_with(prefix) {
+                    out.insert(stage.clone(), std::mem::take(batches));
+                    false
+                } else {
+                    true
+                }
+            });
+            out
+        }
+
         /// Stage `batch` under `stage` for a later drain.
         pub fn stage_batch(&self, stage: String, batch: RecordBatch) {
             self.holdover
@@ -1020,5 +1090,93 @@ mod tests {
                 "did not deliver to restarted peer within 30s",
             );
         }
+    }
+
+    /// `drain_staged_with_prefix` lifts `__sub::` stages in one pass while
+    /// leaving operator stages staged for their own drainer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_staged_with_prefix_lifts_subs_and_keeps_operator_stages() {
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use rustc_hash::FxHashMap;
+
+        use crate::checkpoint::barrier::CheckpointBarrier;
+
+        fn batch(values: Vec<i64>) -> RecordBatch {
+            let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap()
+        }
+        fn col(b: &RecordBatch) -> Vec<i64> {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        }
+
+        let recv = bind_on_loopback(2).await;
+        let sender = ShuffleSender::new(1);
+        sender.register_peer(2, recv.local_addr()).await;
+
+        // FIFO over one stream: two subscription stages, one operator stage, then
+        // a trailing barrier. Once the barrier is observed, every prior frame has
+        // been received and bucketed.
+        for (stage, vals) in [
+            ("__sub::alpha", vec![1, 2, 3]),
+            ("__sub::beta", vec![4, 5, 6]),
+            ("op_stage", vec![7, 8, 9]),
+        ] {
+            sender
+                .send_to(2, &ShuffleMessage::VnodeData(stage.into(), 0, batch(vals)))
+                .await
+                .unwrap();
+        }
+        sender
+            .send_to(
+                2,
+                &ShuffleMessage::Barrier(CheckpointBarrier {
+                    checkpoint_id: 7,
+                    epoch: 3,
+                    flags: 0,
+                }),
+            )
+            .await
+            .unwrap();
+
+        // Poll the single-lock-cycle drain until both sub stages and the trailing
+        // barrier have arrived (loopback is near-instant; 2s is a wide margin).
+        let mut subs: FxHashMap<String, Vec<RecordBatch>> = FxHashMap::default();
+        let mut barriers = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while subs.len() < 2 || barriers.is_empty() {
+            for (k, v) in recv.drain_staged_with_prefix("__sub::") {
+                subs.entry(k).or_default().extend(v);
+            }
+            barriers.extend(recv.drain_staged_barriers());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "frames not delivered within 2s",
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // Both subscription stages lifted, with their batches intact.
+        assert_eq!(subs.len(), 2, "only the two __sub:: stages are returned");
+        assert_eq!(col(&subs["__sub::alpha"][0]), vec![1, 2, 3]);
+        assert_eq!(col(&subs["__sub::beta"][0]), vec![4, 5, 6]);
+
+        // The barrier was stashed, not dropped, and attributed to its sender.
+        assert_eq!(barriers.len(), 1);
+        assert_eq!(barriers[0].0, 1, "barrier attributed to sender peer 1");
+        assert_eq!(barriers[0].1.checkpoint_id, 7);
+
+        // The operator stage was left intact for its own drainer.
+        let op = recv.drain_vnode_data_for("op_stage");
+        assert_eq!(op.len(), 1);
+        assert_eq!(col(&op[0]), vec![7, 8, 9]);
+
+        // A second prefix drain finds nothing new.
+        assert!(recv.drain_staged_with_prefix("__sub::").is_empty());
     }
 }

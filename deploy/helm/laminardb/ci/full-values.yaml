@@ -1,17 +1,17 @@
 replicaCount: 3
 
 laminardb:
-  mode: delta
+  mode: cluster
   logLevel: debug
   workers: 4
   state:
-    backend: mmap
-    maxSizeBytes: 10737418240
+    backend: local
+    path: "/var/lib/laminardb/state"
   checkpoint:
     interval: "30s"
     mode: aligned
     snapshotStrategy: incremental
-  delta:
+  cluster:
     discovery:
       strategy: dns
       gossipPort: 7946

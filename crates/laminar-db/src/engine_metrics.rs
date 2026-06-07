@@ -88,6 +88,9 @@ pub struct EngineMetrics {
     pub lookup_source_errors: IntCounterVec,
     /// On-demand lookup rows awaiting a source fetch. Label: `table`.
     pub lookup_in_flight_rows: IntGaugeVec,
+    /// Output batches dropped when a remote subscriber's routing queue is full
+    /// (cluster mode, best-effort delivery under backpressure).
+    pub remote_subscription_batches_dropped: IntCounter,
 }
 
 impl EngineMetrics {
@@ -299,6 +302,11 @@ impl EngineMetrics {
                     "On-demand lookup rows awaiting a source fetch"
                 ),
                 &["table"],
+            )
+            .unwrap()),
+            remote_subscription_batches_dropped: reg!(IntCounter::new(
+                "remote_subscription_batches_dropped_total",
+                "Output batches dropped under remote-subscriber backpressure"
             )
             .unwrap()),
         }

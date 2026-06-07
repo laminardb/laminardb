@@ -231,6 +231,7 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
     }
 
     validate_ai(config, &mut errors);
+    validate_cluster_tls(config, &mut errors);
 
     if !errors.is_empty() {
         return Err(ConfigError::ValidationErrors { errors });
@@ -486,6 +487,45 @@ impl TaskSpec {
 /// Structural validation of the `[ai]` / `[models]` config — references resolve
 /// and required fields are present. Semantic checks (task names, label seam)
 /// happen when the registry is built.
+/// Control-plane mTLS is all-or-nothing: cert, key, client_ca, and server_name
+/// must be set together, and each path must exist.
+fn validate_cluster_tls(config: &ServerConfig, errors: &mut Vec<String>) {
+    let Some(d) = &config.discovery else {
+        return;
+    };
+    let set = [
+        d.cluster_tls_cert.is_some(),
+        d.cluster_tls_key.is_some(),
+        d.cluster_tls_client_ca.is_some(),
+        // A whitespace-only server name is no name.
+        d.cluster_tls_server_name
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty()),
+    ];
+    if !set.iter().any(|s| *s) {
+        return; // TLS disabled
+    }
+    if !set.iter().all(|s| *s) {
+        errors.push(
+            "cluster_tls requires cluster_tls_cert, cluster_tls_key, \
+             cluster_tls_client_ca, and cluster_tls_server_name together"
+                .to_string(),
+        );
+        return;
+    }
+    for (label, path) in [
+        ("cluster_tls_cert", &d.cluster_tls_cert),
+        ("cluster_tls_key", &d.cluster_tls_key),
+        ("cluster_tls_client_ca", &d.cluster_tls_client_ca),
+    ] {
+        if let Some(p) = path {
+            if !p.exists() {
+                errors.push(format!("{label} not found: {}", p.display()));
+            }
+        }
+    }
+}
+
 fn validate_ai(config: &ServerConfig, errors: &mut Vec<String>) {
     for (name, model) in &config.models {
         match model.kind.as_str() {
@@ -648,6 +688,19 @@ pub struct DiscoverySection {
     pub gossip_port: u16,
     #[serde(default)]
     pub advertise_host: Option<String>,
+    /// PEM cert for control-plane (barrier/query/shuffle) mTLS; enable by
+    /// setting cert + key + client_ca + server_name together.
+    #[serde(default)]
+    pub cluster_tls_cert: Option<std::path::PathBuf>,
+    /// PEM private key paired with `cluster_tls_cert`.
+    #[serde(default)]
+    pub cluster_tls_key: Option<std::path::PathBuf>,
+    /// CA that signed every peer cert; verifies both directions (mTLS).
+    #[serde(default)]
+    pub cluster_tls_client_ca: Option<std::path::PathBuf>,
+    /// DNS SAN present in every node cert, verified on connect (peers dial by IP).
+    #[serde(default)]
+    pub cluster_tls_server_name: Option<String>,
 }
 
 /// `[coordination]` section: delta coordination.

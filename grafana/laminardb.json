@@ -193,7 +193,8 @@
       "targets": [
         { "expr": "rate(laminardb_sink_write_failures_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])", "legendFormat": "write failures/s" },
         { "expr": "rate(laminardb_sink_write_timeouts_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])", "legendFormat": "write timeouts/s" },
-        { "expr": "rate(laminardb_sink_task_channel_closed_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])", "legendFormat": "channel closed/s" }
+        { "expr": "rate(laminardb_sink_task_channel_closed_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])", "legendFormat": "channel closed/s" },
+        { "expr": "rate(laminardb_remote_subscription_batches_dropped_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])", "legendFormat": "remote sub queue drops/s" }
       ],
       "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
     },
@@ -400,6 +401,36 @@
             { "expr": "rate(laminardb_mongodb_sink_errors_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])", "legendFormat": "errors/s" }
           ],
           "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
+        },
+        {
+          "title": "On-Demand Lookups",
+          "type": "row",
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 38 },
+          "collapsed": true,
+          "panels": [
+            {
+              "title": "Lookup Cache Hit Rate vs Miss Rate",
+              "type": "timeseries",
+              "datasource": "${DS_PROMETHEUS}",
+              "gridPos": { "h": 8, "w": 12, "x": 0, "y": 39 },
+              "targets": [
+                { "expr": "rate(laminardb_lookup_cache_hits_total{instance=~\"$instance\"}[1m])", "legendFormat": "hits/s ({{`{{table}}`}})" },
+                { "expr": "rate(laminardb_lookup_cache_misses_total{instance=~\"$instance\"}[1m])", "legendFormat": "misses/s ({{`{{table}}`}})" }
+              ],
+              "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
+            },
+            {
+              "title": "Lookup Errors & In-Flight Rows",
+              "type": "timeseries",
+              "datasource": "${DS_PROMETHEUS}",
+              "gridPos": { "h": 8, "w": 12, "x": 12, "y": 39 },
+              "targets": [
+                { "expr": "rate(laminardb_lookup_source_errors_total{instance=~\"$instance\"}[1m])", "legendFormat": "errors/s ({{`{{table}}`}})" },
+                { "expr": "laminardb_lookup_in_flight_rows{instance=~\"$instance\"}", "legendFormat": "in-flight ({{`{{table}}`}})" }
+              ],
+              "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
+            }
+          ]
         }
       ]
     }

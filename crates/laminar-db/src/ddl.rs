@@ -1115,17 +1115,35 @@ impl LaminarDB {
                 .write()
                 .create_mv(&name_str, schema.clone(), mode);
 
-            let provider = crate::table_provider::MvTableProvider::new(
+            let mv_provider = crate::table_provider::MvTableProvider::new(
                 name_str.clone(),
-                schema,
+                schema.clone(),
                 self.mv_store.clone(),
             );
+
+            // In cluster mode each node holds only its vnode-owned slice of the
+            // result; wrap the local provider so reads union every peer's slice.
+            #[cfg(feature = "cluster")]
+            let provider: Arc<dyn datafusion::datasource::TableProvider> =
+                if let Some(controller) = self.cluster_controller.lock().clone() {
+                    Arc::new(
+                        laminar_sql::datafusion::distributed_scan::DistributedTableProvider::new(
+                            name_str.clone(),
+                            schema,
+                            Arc::new(mv_provider),
+                            controller,
+                        ),
+                    )
+                } else {
+                    Arc::new(mv_provider)
+                };
+            #[cfg(not(feature = "cluster"))]
+            let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(mv_provider);
+
             let _ = self.ctx.deregister_table(&name_str);
-            self.ctx
-                .register_table(&name_str, Arc::new(provider))
-                .map_err(|e| {
-                    DbError::MaterializedView(format!("Failed to register MV table provider: {e}"))
-                })?;
+            self.ctx.register_table(&name_str, provider).map_err(|e| {
+                DbError::MaterializedView(format!("Failed to register MV table provider: {e}"))
+            })?;
         }
 
         // If the pipeline is already running, hot-add the query. On a

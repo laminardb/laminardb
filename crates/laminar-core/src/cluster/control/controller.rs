@@ -33,6 +33,12 @@ pub struct ClusterController {
     draining: Arc<AtomicBool>,
     /// Whether this node has announced itself as Active.
     active: Arc<AtomicBool>,
+    /// Handler serving cross-node `RemoteScan`, shared with the query server.
+    #[cfg(feature = "cluster")]
+    query_handler: super::query::QueryHandlerSlot,
+    /// Pooled channels to peers for cross-node `RemoteScan`.
+    #[cfg(feature = "cluster")]
+    query_client_pool: super::query::QueryClientPool,
 }
 
 impl std::fmt::Debug for ClusterController {
@@ -64,7 +70,24 @@ impl ClusterController {
             cluster_min_watermark: Arc::new(AtomicI64::new(i64::MIN)),
             draining: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
+            #[cfg(feature = "cluster")]
+            query_handler: Arc::new(parking_lot::RwLock::new(None)),
+            #[cfg(feature = "cluster")]
+            query_client_pool: Arc::new(parking_lot::Mutex::new(rustc_hash::FxHashMap::default())),
         }
+    }
+
+    /// Register the handler serving cross-node `RemoteScan`.
+    #[cfg(feature = "cluster")]
+    pub fn register_query_handler(&self, handler: Arc<dyn super::query::RemoteQueryHandler>) {
+        *self.query_handler.write() = Some(handler);
+    }
+
+    /// Access the connection pool for remote queries.
+    #[cfg(feature = "cluster")]
+    #[must_use]
+    pub fn query_client_pool(&self) -> &super::query::QueryClientPool {
+        &self.query_client_pool
     }
 
     /// Latest cluster-wide minimum watermark seen by this instance.
@@ -106,6 +129,13 @@ impl ClusterController {
     #[must_use]
     pub fn instance_id(&self) -> NodeId {
         self.instance_id
+    }
+
+    /// The cluster gossip KV, exposed so higher layers can advertise/discover
+    /// per-stream state alongside the control-plane keys.
+    #[must_use]
+    pub fn kv(&self) -> &Arc<dyn ClusterKv> {
+        &self.kv
     }
 
     /// Current leader (lowest id among `Active` peers plus self).
@@ -214,7 +244,9 @@ impl ClusterController {
         bind_addr: std::net::SocketAddr,
         advertise_host: Option<String>,
     ) -> Result<std::net::SocketAddr, String> {
-        self.barrier.start_server(bind_addr, advertise_host).await
+        self.barrier
+            .start_server(bind_addr, advertise_host, Arc::clone(&self.query_handler))
+            .await
     }
 
     /// Leader-side announce.

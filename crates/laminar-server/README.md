@@ -67,8 +67,8 @@ log_level = "info"
 # Worker thread count is taken from $TOKIO_WORKER_THREADS. Defaults to logical CPUs.
 
 [state]
-backend = "memory"          # "memory" or "mmap"
-path = "./data/state"       # mmap state directory
+backend = "local"           # "in_process", "local", or "object_store"
+path = "./data/state"       # required when backend = "local"
 
 [checkpoint]
 url = "file:///tmp/laminardb/checkpoints"  # file://, s3://, gs://
@@ -179,6 +179,8 @@ including remote AI — runs normally.
 | GET | `/api/v1/cluster` | Cluster status (only available when `server.mode = "cluster"`) |
 | GET | `/ws/{name}` | WebSocket upgrade for push-based subscriptions to a stream |
 
+`POST /api/v1/sql` returns at most 1000 result rows (and stops after a 5s collection budget). When the result is larger, the JSON response sets `"truncated": true` and `data` holds the first 1000 rows; the field is omitted when the result is complete. Use SUBSCRIBE (pgwire/WebSocket) to stream unbounded results.
+
 ## Postgres Wire Protocol
 
 When `[server].pgwire_bind` is set, the server also listens for Postgres clients and serves a small subset of the SimpleQuery protocol:
@@ -239,6 +241,22 @@ The server watches `pgwire_tls_cert`, `pgwire_tls_key`, and `pgwire_tls_client_c
 ```bash
 psql "host=127.0.0.1 port=5433 dbname=laminardb user=any" -c "SUBSCRIBE avg_price WHERE symbol = 'AAPL'"
 ```
+
+## Cluster Control-Plane TLS (mTLS)
+
+In `mode = "cluster"`, the inter-node control plane (barrier sync, the distributed-query `RemoteScan` service, and the row shuffle) is plaintext and unauthenticated by default — run it on a trusted/isolated network. To require mutual TLS between nodes, set all four `[discovery]` keys together (omit them for plaintext):
+
+```toml
+[discovery]
+strategy = "gossip"
+seeds = ["node-1:7946", "node-2:7946"]
+cluster_tls_cert = "/etc/laminar/node.crt"        # this node's cert (PEM)
+cluster_tls_key  = "/etc/laminar/node.key"        # its key (PEM, PKCS#8 or RSA)
+cluster_tls_client_ca = "/etc/laminar/cluster-ca.pem"  # CA that signed every node cert
+cluster_tls_server_name = "laminar-cluster"       # DNS SAN present in every node cert
+```
+
+Every node both serves and dials, so the CA verifies **both** directions. Because peers connect by IP, issue all node certs with one shared DNS SAN and set `cluster_tls_server_name` to it (rather than per-node IP SANs). Enabling mTLS is a **coordinated cutover**: a TLS node cannot talk to a plaintext peer, so roll it out to all nodes at once. Cert rotation currently requires a restart (no hot reload on the control plane).
 
 ## Hot Reload
 

@@ -1998,7 +1998,7 @@ workers = 4
 log_level = "info"
 
 [state]
-backend = "memory"
+backend = "in_process"
 
 [checkpoint]
 url = "s3://my-bucket/laminardb/checkpoints"

@@ -18,125 +18,240 @@ data:
       "links": [],
       "panels": [
         {
-          "title": "Pipeline State",
+          "title": "Cluster Status",
+          "type": "row",
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+          "collapsed": false
+        },
+        {
+          "title": "Active Cluster Nodes",
           "type": "stat",
-          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
           "targets": [
             {
-              "expr": "laminardb_pipeline_state_info",
-              "legendFormat": "{{`{{state}}`}}"
+              "expr": "count(laminardb_uptime_seconds)",
+              "legendFormat": "Nodes"
             }
           ],
           "fieldConfig": {
             "defaults": {
-              "mappings": [
-                { "type": "value", "options": { "1": { "text": "Running", "color": "green" } } }
-              ]
+              "unit": "short",
+              "thresholds": {
+                "steps": [
+                  { "color": "red", "value": null },
+                  { "color": "green", "value": 1 }
+                ]
+              }
             }
           }
         },
         {
-          "title": "Uptime",
+          "title": "Global Watermark (epoch ms)",
           "type": "stat",
-          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
           "targets": [
             {
-              "expr": "laminardb_uptime_seconds",
-              "legendFormat": "Uptime"
+              "expr": "min(laminardb_pipeline_watermark)",
+              "legendFormat": "Global Watermark"
             }
           ],
           "fieldConfig": {
-            "defaults": { "unit": "s" }
+            "defaults": {
+              "unit": "dateTimeAsIso"
+            }
           }
         },
         {
-          "title": "Sources / Streams / Sinks",
+          "title": "Total Cluster Ingestion Rate",
           "type": "stat",
-          "gridPos": { "h": 4, "w": 12, "x": 12, "y": 0 },
-          "targets": [
-            { "expr": "laminardb_source_count", "legendFormat": "Sources" },
-            { "expr": "laminardb_stream_count", "legendFormat": "Streams" },
-            { "expr": "laminardb_sink_count", "legendFormat": "Sinks" }
-          ]
-        },
-        {
-          "title": "Events Ingested (rate/s)",
-          "type": "timeseries",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+          "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
           "targets": [
             {
-              "expr": "rate(laminardb_events_ingested_total[1m])",
+              "expr": "sum(rate(laminardb_events_ingested_total[1m]))",
               "legendFormat": "Ingested/s"
             }
           ],
           "fieldConfig": {
-            "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } }
+            "defaults": {
+              "unit": "ops"
+            }
           }
         },
         {
-          "title": "Events Emitted (rate/s)",
-          "type": "timeseries",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+          "title": "Total Cluster Emission Rate",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
           "targets": [
             {
-              "expr": "rate(laminardb_events_emitted_total[1m])",
+              "expr": "sum(rate(laminardb_events_emitted_total[1m]))",
               "legendFormat": "Emitted/s"
             }
           ],
           "fieldConfig": {
-            "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } }
+            "defaults": {
+              "unit": "ops"
+            }
           }
         },
         {
-          "title": "Events Dropped (rate/s)",
+          "title": "Performance & Throughput",
+          "type": "row",
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+          "collapsed": false
+        },
+        {
+          "title": "Ingested Events (Cluster vs Nodes)",
           "type": "timeseries",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
           "targets": [
             {
-              "expr": "rate(laminardb_events_dropped_total[1m])",
-              "legendFormat": "Dropped/s"
+              "expr": "sum(rate(laminardb_events_ingested_total[1m]))",
+              "legendFormat": "Cluster Total"
+            },
+            {
+              "expr": "rate(laminardb_events_ingested_total[1m])",
+              "legendFormat": "Node {{`{{instance}}`}}"
             }
           ],
           "fieldConfig": {
-            "defaults": { "unit": "ops", "custom": { "fillOpacity": 10, "lineStyle": { "fill": "solid" } } }
+            "defaults": {
+              "unit": "ops",
+              "custom": { "fillOpacity": 10 }
+            }
           }
         },
         {
-          "title": "Per-Source Events (rate/s)",
+          "title": "Emitted Events (Cluster vs Nodes)",
           "type": "timeseries",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
           "targets": [
             {
-              "expr": "rate(laminardb_source_events_total[1m])",
-              "legendFormat": "{{`{{source}}`}}"
+              "expr": "sum(rate(laminardb_events_emitted_total[1m]))",
+              "legendFormat": "Cluster Total"
+            },
+            {
+              "expr": "rate(laminardb_events_emitted_total[1m])",
+              "legendFormat": "Node {{`{{instance}}`}}"
             }
           ],
           "fieldConfig": {
-            "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } }
+            "defaults": {
+              "unit": "ops",
+              "custom": { "fillOpacity": 10 }
+            }
           }
         },
         {
-          "title": "Events Total (counters)",
+          "title": "Latency, Congestion & Backpressure",
+          "type": "row",
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+          "collapsed": false
+        },
+        {
+          "title": "Processing Cycle Duration p99 (Node breakdown)",
           "type": "timeseries",
-          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
           "targets": [
-            { "expr": "laminardb_events_ingested_total", "legendFormat": "Ingested" },
-            { "expr": "laminardb_events_emitted_total", "legendFormat": "Emitted" },
-            { "expr": "laminardb_events_dropped_total", "legendFormat": "Dropped" }
+            {
+              "expr": "histogram_quantile(0.99, sum(rate(laminardb_cycle_duration_seconds_bucket[1m])) by (le, instance))",
+              "legendFormat": "Node {{`{{instance}}`}}"
+            }
           ],
           "fieldConfig": {
-            "defaults": { "unit": "short" }
+            "defaults": {
+              "unit": "s",
+              "custom": { "fillOpacity": 10 }
+            }
+          }
+        },
+        {
+          "title": "Congestion (Backpressured Cycles & Remote Subscription Drops)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+          "targets": [
+            {
+              "expr": "sum(rate(laminardb_cycles_backpressured_total[1m])) by (instance)",
+              "legendFormat": "Backpressured {{`{{instance}}`}}"
+            },
+            {
+              "expr": "sum(rate(laminardb_remote_subscription_batches_dropped_total[1m])) by (instance)",
+              "legendFormat": "Subscription Drops {{`{{instance}}`}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": { "fillOpacity": 10 }
+            }
+          }
+        },
+        {
+          "title": "Distributed Checkpoints",
+          "type": "row",
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
+          "collapsed": false
+        },
+        {
+          "title": "Checkpoint Epoch",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 24 },
+          "targets": [
+            {
+              "expr": "max(laminardb_checkpoint_epoch)",
+              "legendFormat": "Epoch"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            }
+          }
+        },
+        {
+          "title": "Checkpoints Progress",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 24 },
+          "targets": [
+            {
+              "expr": "sum(laminardb_checkpoints_completed_total)",
+              "legendFormat": "Completed"
+            },
+            {
+              "expr": "sum(laminardb_checkpoints_failed_total)",
+              "legendFormat": "Failed"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short"
+            }
+          }
+        },
+        {
+          "title": "Checkpoint Sizes",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+          "targets": [
+            {
+              "expr": "sum(laminardb_checkpoint_size_bytes) by (instance)",
+              "legendFormat": "Node {{`{{instance}}`}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "decbytes"
+            }
           }
         }
       ],
       "schemaVersion": 39,
-      "tags": ["laminardb", "streaming"],
+      "tags": ["laminardb", "streaming", "cluster"],
       "templating": { "list": [] },
       "time": { "from": "now-1h", "to": "now" },
       "timepicker": {},
       "timezone": "",
-      "title": "LaminarDB Overview",
-      "uid": "laminardb-overview",
+      "title": "LaminarDB Cluster Dashboard",
+      "uid": "laminardb-cluster-dashboard",
       "version": 1
     }
 {{- end }}

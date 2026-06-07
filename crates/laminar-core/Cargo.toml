@@ -70,7 +70,9 @@ futures = { workspace = true }
 # gRPC transport for cross-node shuffle + barrier sync (cluster).
 # The generated client/server stubs are compiled only under that feature;
 # `tonic-prost` supplies the ProstCodec the generated code instantiates.
-tonic = { version = "0.14", optional = true }
+# `tls-aws-lc` matches the pgwire side's rustls provider, so one process never
+# installs two crypto providers; used for cluster control-plane mTLS.
+tonic = { version = "0.14", optional = true, features = ["tls-aws-lc"] }
 tonic-prost = { version = "0.14", optional = true }
 prost = { version = "0.14", optional = true }
 
@@ -92,6 +94,8 @@ rand = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 toml = "0.9"
 tempfile = { workspace = true }
+# Mint a throwaway CA + node cert for the control-plane mTLS integration test.
+rcgen = "0.13"
 
 [[bench]]
 name = "window_bench"

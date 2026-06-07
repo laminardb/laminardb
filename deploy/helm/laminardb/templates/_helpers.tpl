@@ -68,10 +68,10 @@ checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sh
 
 {{/*
 Determine if we should use StatefulSet (instead of Deployment).
-Use StatefulSet when: persistence is enabled OR delta mode is active.
+Use StatefulSet when: persistence is enabled OR cluster/delta mode is active.
 */}}
 {{- define "laminardb.useStatefulSet" -}}
-{{- if or (and .Values.persistence.state.enabled (not .Values.persistence.state.useEmptyDir)) (and .Values.persistence.checkpoints.enabled) (eq .Values.laminardb.mode "delta") }}
+{{- if or (and .Values.persistence.state.enabled (not .Values.persistence.state.useEmptyDir)) (and .Values.persistence.checkpoints.enabled) (eq .Values.laminardb.mode "delta") (eq .Values.laminardb.mode "cluster") }}
 true
 {{- end }}
 {{- end }}

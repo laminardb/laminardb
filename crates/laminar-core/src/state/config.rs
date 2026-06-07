@@ -62,7 +62,7 @@ pub enum StateBackendConfig {
     },
 
     /// Durable shared-state backend on S3 / GCS / Azure. Used by all
-    /// distributed-embedded and constellation modes.
+    /// distributed-embedded and cluster modes.
     ObjectStore {
         /// Object store URL: `s3://bucket/prefix`, `gs://bucket/prefix`,
         /// etc.

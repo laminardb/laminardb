@@ -32,3 +32,15 @@ pub use snapshot::{AssignmentSnapshot, AssignmentSnapshotStore, RotateOutcome, S
 pub mod chitchat_kv;
 #[cfg(feature = "cluster")]
 pub use chitchat_kv::ChitchatKv;
+
+#[cfg(feature = "cluster")]
+pub mod query;
+#[cfg(feature = "cluster")]
+pub use query::{
+    remote_scan_client, QueryClientPool, QueryHandlerSlot, RemoteBatchStream, RemoteQueryHandler,
+};
+
+#[cfg(feature = "cluster")]
+pub mod tls;
+#[cfg(feature = "cluster")]
+pub use tls::{set_cluster_tls, ClusterTls};

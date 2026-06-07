@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+// In-engine distributed query (pull path): a coordinator fans `RemoteScan` out
+// to peers owning part of a table/MV and unions their Arrow batches. Shares the
+// `BarrierSync` control-plane port.
+package laminar.query.v1;
+
+service QueryService {
+  // Stream the serving node's local rows in row-bounded chunks that form one
+  // Arrow IPC stream (schema in the first chunk only; empty slice = one chunk).
+  rpc RemoteScan(RemoteScanRequest) returns (stream RemoteScanResponse);
+}
+
+message RemoteScanRequest {
+  // Table / materialized-view name to scan on the serving node.
+  string table_name = 1;
+  // Optional column projection (field indices); empty means all columns.
+  repeated uint32 projection = 2;
+  // Optional pushed-down predicate (SQL boolean expr); empty means no filter.
+  // Applied before serialization; the coordinator re-applies it (optimization).
+  string filter_sql = 3;
+}
+
+message RemoteScanResponse {
+  // One slice of a single Arrow IPC stream (schema in the first chunk only);
+  // concatenate a response's chunks in order. See `serialization::BatchStreamEncoder`.
+  bytes arrow_ipc = 1;
+}

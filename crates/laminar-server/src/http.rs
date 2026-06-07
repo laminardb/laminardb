@@ -62,6 +62,10 @@ pub struct AppState {
 /// connected to over WebSocket) before its one-shot reaper task drops it.
 const EPHEMERAL_PENDING_TTL: Duration = Duration::from_secs(30);
 
+/// Cap on concurrent ephemeral console streams (each a real CREATE STREAM
+/// pipeline), so `POST /api/v1/queries` spam can't accumulate live pipelines.
+const MAX_EPHEMERAL_STREAMS: usize = 256;
+
 /// Lifecycle state of a console-managed ephemeral stream.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EphemeralState {
@@ -84,8 +88,15 @@ impl EphemeralTracker {
         Self::default()
     }
 
-    fn add_pending(&self, name: String) {
-        self.inner.lock().insert(name, EphemeralState::Pending);
+    /// Reserve a `Pending` slot, enforcing [`MAX_EPHEMERAL_STREAMS`] under the
+    /// lock; returns `false` (inserting nothing) when already at capacity.
+    fn try_add_pending(&self, name: String) -> bool {
+        let mut guard = self.inner.lock();
+        if guard.len() >= MAX_EPHEMERAL_STREAMS {
+            return false;
+        }
+        guard.insert(name, EphemeralState::Pending);
+        true
     }
 
     /// Marks a pending stream `Connected`; returns `false` if it wasn't tracked.
@@ -319,6 +330,40 @@ struct SqlResponse {
     rows_affected: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<Box<serde_json::value::RawValue>>,
+    /// `true` when the result was capped at `MAX_SQL_RESULT_ROWS` or the
+    /// collection timed out, so `data` is a prefix of the full result. Omitted
+    /// when the result is complete.
+    #[serde(skip_serializing_if = "is_false")]
+    truncated: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde skip_serializing_if signature
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Trim `batches` to at most `cap` rows, returning the trimmed batches and
+/// whether any rows were dropped (i.e. the input held more than `cap`).
+fn cap_result(
+    batches: Vec<arrow_array::RecordBatch>,
+    cap: usize,
+) -> (Vec<arrow_array::RecordBatch>, bool) {
+    let total: usize = batches.iter().map(arrow_array::RecordBatch::num_rows).sum();
+    if total <= cap {
+        return (batches, false);
+    }
+    let mut kept = 0;
+    let mut out = Vec::with_capacity(batches.len());
+    for b in batches {
+        let room = cap - kept;
+        if b.num_rows() >= room {
+            out.push(b.slice(0, room));
+            break;
+        }
+        kept += b.num_rows();
+        out.push(b);
+    }
+    (out, true)
 }
 
 #[derive(Debug, Serialize)]
@@ -521,12 +566,23 @@ async fn create_query(
     Json(req): Json<CreateQueryRequest>,
 ) -> impl IntoResponse {
     let name = console_stream_name();
+
+    // Reserve a slot before any DDL so the cap is enforced up front; released
+    // below if CREATE STREAM fails.
+    if !state.ephemeral.try_add_pending(name.clone()) {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many ephemeral console queries in flight; retry shortly",
+        )
+        .into_response();
+    }
+
+    // Register as a physical CREATE STREAM (reaped on WS disconnect / TTL): the
+    // `/ws/{name}` subscription path can only bind to a catalog-registered stream.
     let ddl = format!("CREATE STREAM {name} AS {}", req.sql);
 
     match state.db.execute(&ddl).await {
         Ok(_) => {
-            state.ephemeral.add_pending(name.clone());
-
             // Arm a one-shot reaper: if no WebSocket connects within the TTL,
             // drop the still-`Pending` stream so an abandoned request can't
             // leak it.
@@ -552,7 +608,11 @@ async fn create_query(
             })
             .into_response()
         }
-        Err(e) => error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => {
+            // The stream was never created, so free the reserved slot.
+            state.ephemeral.remove(&name);
+            error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response()
+        }
     }
 }
 
@@ -606,12 +666,14 @@ async fn execute_sql(
                     object_name: Some(info.object_name),
                     rows_affected: None,
                     data: None,
+                    truncated: false,
                 },
                 ExecuteResult::RowsAffected(n) => SqlResponse {
                     result_type: "rows_affected".to_string(),
                     object_name: None,
                     rows_affected: Some(n),
                     data: None,
+                    truncated: false,
                 },
                 ExecuteResult::Metadata(batch) => {
                     let data = match batches_to_json_raw(&[batch]) {
@@ -629,34 +691,32 @@ async fn execute_sql(
                         object_name: None,
                         rows_affected: None,
                         data: Some(data),
+                        truncated: false,
                     }
                 }
                 ExecuteResult::Query(mut handle) => {
                     let mut batches: Vec<arrow_array::RecordBatch> = Vec::new();
                     let mut total_rows = 0;
+                    let mut timed_out = false;
                     if let Ok(mut sub) = handle.subscribe_raw() {
+                        // Gather one batch *past* the cap so `cap_result` can tell
+                        // "exactly at the cap" (complete) from "more rows exist".
                         let collect = async {
-                            while total_rows < MAX_SQL_RESULT_ROWS {
-                                match sub.recv_async().await {
-                                    Ok(batch) => {
-                                        let needed = MAX_SQL_RESULT_ROWS - total_rows;
-                                        let batch_to_keep = if batch.num_rows() > needed {
-                                            batch.slice(0, needed)
-                                        } else {
-                                            batch
-                                        };
-                                        total_rows += batch_to_keep.num_rows();
-                                        batches.push(batch_to_keep);
-                                        if total_rows >= MAX_SQL_RESULT_ROWS {
-                                            break;
-                                        }
-                                    }
-                                    Err(_) => break,
+                            while let Ok(batch) = sub.recv_async().await {
+                                total_rows += batch.num_rows();
+                                batches.push(batch);
+                                if total_rows > MAX_SQL_RESULT_ROWS {
+                                    break;
                                 }
                             }
                         };
-                        let _ = tokio::time::timeout(SQL_RESULT_TIMEOUT, collect).await;
+                        timed_out = tokio::time::timeout(SQL_RESULT_TIMEOUT, collect)
+                            .await
+                            .is_err();
                     }
+                    // Trim to the cap; `over_cap` true means rows were dropped.
+                    // A timeout also leaves `data` a prefix of the full result.
+                    let (batches, over_cap) = cap_result(batches, MAX_SQL_RESULT_ROWS);
                     let raw_data = if batches.is_empty() {
                         serde_json::value::RawValue::from_string("[]".to_string()).ok()
                     } else {
@@ -667,6 +727,7 @@ async fn execute_sql(
                         object_name: None,
                         rows_affected: None,
                         data: raw_data,
+                        truncated: over_cap || timed_out,
                     }
                 }
             };
@@ -802,28 +863,25 @@ async fn fan_out_pipeline_control(state: &AppState, local: bool, path: &str) {
             .collect();
         let token = state.current_config.read().server.console_token.clone();
         let client = reqwest::Client::new();
-        let tasks: Vec<_> = peers
-            .into_iter()
-            .map(|peer| {
-                let client = client.clone();
-                let token = token.clone();
-                let url = format!("http://{peer}{path}");
-                tokio::spawn(async move {
-                    let mut req = client
-                        .post(&url)
-                        .timeout(std::time::Duration::from_secs(10));
-                    if let Some(t) = token {
-                        req = req.bearer_auth(t.expose());
-                    }
-                    if let Err(e) = req.send().await {
-                        tracing::warn!("failed to forward pipeline control to {url}: {e}");
-                    }
-                })
-            })
-            .collect();
-        for task in tasks {
-            let _ = task.await;
-        }
+        // Fan out concurrently with `join_all`; these are I/O-bound futures with
+        // no CPU work, so there's nothing to gain from spawning a task each.
+        let futures = peers.into_iter().map(|peer| {
+            let client = client.clone();
+            let token = token.clone();
+            let url = format!("http://{peer}{path}");
+            async move {
+                let mut req = client
+                    .post(&url)
+                    .timeout(std::time::Duration::from_secs(10));
+                if let Some(t) = token {
+                    req = req.bearer_auth(t.expose());
+                }
+                if let Err(e) = req.send().await {
+                    tracing::warn!("failed to forward pipeline control to {url}: {e}");
+                }
+            }
+        });
+        futures::future::join_all(futures).await;
     }
     #[cfg(not(feature = "cluster"))]
     let _ = (state, local, path);
@@ -1124,21 +1182,23 @@ async fn ws_client(
                         if batch.num_rows() == 0 {
                             continue;
                         }
-                        let raw_json = match batches_to_json_raw(&[batch]) {
+                        // Embed the already-serialized data array directly in the
+                        // envelope to skip a RawValue parse + reserialize per frame.
+                        let data_json = match batches_to_json_string(&[batch]) {
                             Ok(j) => j,
                             Err(e) => {
                                 warn!(stream = %name, error = %e, "serialize error");
                                 continue;
                             }
                         };
-                        let out = serde_json::json!({
-                            "type": "data",
-                            "subscription_id": &name,
-                            "data": raw_json,
-                            "sequence": seq,
-                        });
+                        // serde-escape the URL-derived name; data_json is valid JSON.
+                        let subid =
+                            serde_json::to_string(&name).unwrap_or_else(|_| "\"\"".to_string());
+                        let out = format!(
+                            "{{\"type\":\"data\",\"subscription_id\":{subid},\"data\":{data_json},\"sequence\":{seq}}}"
+                        );
                         seq += 1;
-                        if socket.send(Message::Text(out.to_string().into())).await.is_err() {
+                        if socket.send(Message::Text(out.into())).await.is_err() {
                             break;
                         }
                     }
@@ -1154,11 +1214,9 @@ async fn ws_client(
                 }
             }
             _ = heartbeat.tick() => {
-                let hb = serde_json::json!({
-                    "type": "heartbeat",
-                    "server_time": chrono::Utc::now().timestamp_millis(),
-                });
-                if socket.send(Message::Text(hb.to_string().into())).await.is_err() {
+                // Native WebSocket Ping for liveness (client auto-Pongs); no
+                // app-level heartbeat message needed.
+                if socket.send(Message::Ping(bytes::Bytes::new())).await.is_err() {
                     break;
                 }
             }
@@ -1177,16 +1235,22 @@ async fn ws_client(
     }
 }
 
-fn batches_to_json_raw(
-    batches: &[arrow_array::RecordBatch],
-) -> Result<Box<serde_json::value::RawValue>, String> {
+/// Serialize Arrow batches to a JSON array string via `arrow_json::ArrayWriter`.
+/// The single serialization pass shared by `batches_to_json_raw` and the WS path.
+fn batches_to_json_string(batches: &[arrow_array::RecordBatch]) -> Result<String, String> {
     let mut buf = Vec::new();
     let mut writer = arrow_json::ArrayWriter::new(&mut buf);
     for batch in batches {
         writer.write(batch).map_err(|e| e.to_string())?;
     }
     writer.finish().map_err(|e| e.to_string())?;
-    let s = String::from_utf8(buf).map_err(|e| e.to_string())?;
+    String::from_utf8(buf).map_err(|e| e.to_string())
+}
+
+fn batches_to_json_raw(
+    batches: &[arrow_array::RecordBatch],
+) -> Result<Box<serde_json::value::RawValue>, String> {
+    let s = batches_to_json_string(batches)?;
     serde_json::value::RawValue::from_string(s).map_err(|e| e.to_string())
 }
 
@@ -1196,6 +1260,31 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[test]
+    fn cap_result_trims_and_flags() {
+        use arrow_array::{Int32Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
+        let batch = |n: i32| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from((0..n).collect::<Vec<_>>()))],
+            )
+            .unwrap()
+        };
+        let rows = |bs: &[RecordBatch]| bs.iter().map(RecordBatch::num_rows).sum::<usize>();
+
+        // Under the cap: unchanged, not truncated.
+        let (b, t) = cap_result(vec![batch(3)], 5);
+        assert_eq!((rows(&b), t), (3, false));
+        // Exactly at the cap across batches: complete, not truncated.
+        let (b, t) = cap_result(vec![batch(3), batch(2)], 5);
+        assert_eq!((rows(&b), t), (5, false));
+        // Over the cap: trimmed to the cap, truncated.
+        let (b, t) = cap_result(vec![batch(3), batch(4)], 5);
+        assert_eq!((rows(&b), t), (5, true));
+    }
 
     fn test_state() -> Arc<AppState> {
         let registry = Arc::new(crate::metrics::build_registry([
@@ -1816,7 +1905,7 @@ mod tests {
         assert!(!tracker.remove_if_pending("__console_x"));
 
         // A pending stream is tracked and reaped by `remove_if_pending`.
-        tracker.add_pending("__console_x".to_string());
+        assert!(tracker.try_add_pending("__console_x".to_string()));
         assert!(tracker.is_tracked("__console_x"));
         assert!(
             tracker.remove_if_pending("__console_x"),
@@ -1828,7 +1917,7 @@ mod tests {
         );
 
         // Once connected, the reaper must never drop it.
-        tracker.add_pending("__console_x".to_string());
+        assert!(tracker.try_add_pending("__console_x".to_string()));
         assert!(tracker.mark_connected("__console_x"));
         assert!(
             !tracker.remove_if_pending("__console_x"),
@@ -1843,6 +1932,34 @@ mod tests {
         assert!(tracker.remove("__console_x"));
         assert!(!tracker.is_tracked("__console_x"));
         assert!(!tracker.remove("__console_x"));
+    }
+
+    /// The cap rejects reservations past [`MAX_EPHEMERAL_STREAMS`]; a freed slot
+    /// is reusable.
+    #[test]
+    fn test_ephemeral_tracker_caps_concurrent_streams() {
+        let tracker = EphemeralTracker::new();
+
+        for i in 0..MAX_EPHEMERAL_STREAMS {
+            assert!(
+                tracker.try_add_pending(format!("__console_{i}")),
+                "reservations below the cap succeed"
+            );
+        }
+
+        // At capacity the next reservation is rejected and inserts nothing.
+        assert!(
+            !tracker.try_add_pending("__console_overflow".to_string()),
+            "reservation at the cap is rejected"
+        );
+        assert!(!tracker.is_tracked("__console_overflow"));
+
+        // Freeing one slot lets exactly one more reservation through.
+        assert!(tracker.remove("__console_0"));
+        assert!(
+            tracker.try_add_pending("__console_overflow".to_string()),
+            "a freed slot is reusable"
+        );
     }
 
     /// Bind a real ephemeral-port server so the WebSocket upgrade runs over a

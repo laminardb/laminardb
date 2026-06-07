@@ -1,4 +1,4 @@
-# -- Number of replicas (use 1 for embedded, >1 for delta/constellation)
+# -- Number of replicas (use 1 for embedded, >1 for cluster mode)
 replicaCount: 1
 
 image:
@@ -18,7 +18,7 @@ fullnameOverride: ""
 
 # -- LaminarDB server configuration
 laminardb:
-  # -- Server mode: "embedded" (single-node) or "delta" (multi-node constellation)
+  # -- Server mode: "embedded" (single-node) or "cluster" (multi-node clustering, "delta" is also supported as an alias)
   mode: embedded
   # -- Log level: trace, debug, info, warn, error
   logLevel: info
@@ -33,12 +33,18 @@ laminardb:
 
   # -- State storage configuration
   state:
-    # -- Backend type: "memory" or "mmap"
-    backend: mmap
-    # -- Path for persistent state
+    # -- Backend type: "in_process", "local", or "object_store"
+    backend: local
+    # -- Path for persistent state (required when backend=local)
     path: /var/lib/laminardb/state
-    # -- Maximum state size in bytes (0 = unlimited)
-    maxSizeBytes: 0
+    # -- URL for shared storage (required when backend=object_store, e.g. "s3://bucket/prefix")
+    url: ""
+    # -- Node identity written into state commit markers (defaults to ${HOSTNAME})
+    instanceId: ""
+    # -- Number of vnodes the backend should size for
+    vnodeCapacity: 256
+    # -- Optional static vnode list (only for object_store backend)
+    vnodes: []
 
   # -- Checkpoint configuration
   checkpoint:
@@ -57,8 +63,8 @@ laminardb:
   # -- If set, this raw TOML string is used as the config file directly.
   configOverride: ""
 
-  # -- Delta mode settings (only when mode=delta)
-  delta:
+  # -- Cluster settings (only when mode=cluster or mode=delta)
+  cluster:
     # -- Node ID (auto-generated from pod name if empty)
     nodeId: ""
     discovery:
@@ -78,6 +84,20 @@ laminardb:
       # -- Raft election timeout
       electionTimeout: "1500ms"
       # -- Raft heartbeat interval
+      heartbeatInterval: "300ms"
+
+  # -- Backwards-compatible alias for cluster settings (use 'cluster' instead)
+  delta:
+    nodeId: ""
+    discovery:
+      strategy: dns
+      dnsName: ""
+      gossipPort: 7946
+      seeds: []
+    coordination:
+      strategy: raft
+      raftPort: 7947
+      electionTimeout: "1500ms"
       heartbeatInterval: "300ms"
 
 # -- Pipeline definitions (rendered into laminardb.toml [[pipeline]] sections)
@@ -171,16 +191,16 @@ service:
   pgPort: 5432
   # -- Enable PostgreSQL wire protocol port
   pgEnabled: false
-  # -- Gossip port for delta mode discovery
+  # -- Gossip port for cluster mode discovery
   gossipPort: 7946
-  # -- Raft port for delta mode coordination
+  # -- Raft port for cluster mode coordination
   raftPort: 7947
   # -- Service annotations
   annotations: {}
 
-# -- Headless service for delta mode DNS discovery
+# -- Headless service for cluster mode DNS discovery
 headlessService:
-  # -- Enable headless service (auto-enabled when mode=delta)
+  # -- Enable headless service (auto-enabled when mode=cluster)
   enabled: false
 
 # -- Ingress configuration (for HTTP API)
@@ -241,7 +261,7 @@ affinity: {}
 # -- Set to true to use Guaranteed QoS class (requests == limits).
 guaranteedQoS: false
 
-# -- Topology spread constraints (useful for delta mode)
+# -- Topology spread constraints (useful for cluster mode)
 topologySpreadConstraints: []
 
 # -- Pod disruption budget
@@ -250,7 +270,7 @@ podDisruptionBudget:
   minAvailable: 1
   # maxUnavailable: 1
 
-# -- Autoscaling (mainly for delta mode)
+# -- Autoscaling (mainly for cluster mode)
 autoscaling:
   enabled: false
   minReplicas: 1
@@ -305,6 +325,13 @@ initContainers: []
 extraEnv: []
 # - name: RUST_LOG
 #   value: "laminardb=debug"
+
+# -- Extra environment variables source (e.g. from ConfigMaps or Secrets)
+extraEnvFrom: []
+# - secretRef:
+#     name: laminardb-secrets
+# - configMapRef:
+#     name: laminardb-config
 
 # -- Extra volumes
 extraVolumes: []

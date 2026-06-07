@@ -916,7 +916,7 @@ mod tests {
         let store = make_store(dir.path());
 
         let mut manifest = CheckpointManifest::new(1, 1);
-        manifest.table_store_checkpoint_path = Some("/data/rocksdb_cp_001".into());
+        manifest.table_store_checkpoint_path = Some("/data/table_store_cp_001".into());
         store.save(&manifest).await.unwrap();
 
         let mgr = RecoveryManager::new(&store);
@@ -924,7 +924,7 @@ mod tests {
 
         assert_eq!(
             result.table_store_checkpoint_path(),
-            Some("/data/rocksdb_cp_001")
+            Some("/data/table_store_cp_001")
         );
     }
 

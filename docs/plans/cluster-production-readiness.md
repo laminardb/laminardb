@@ -105,7 +105,7 @@ aggregation** via a pre-agg row-shuffle bridge (`operator/sql_query.rs:450-538`,
 - **No bespoke RPC framework** — reuse the existing length-prefixed shuffle transport +
   object store + gossip; add TLS via the existing rustls stack used by pgwire.
 - **No new state backend** — extend the existing `object_store` backend to carry real
-  per-vnode state; do not introduce RocksDB/Hummock.
+  per-vnode state; do not introduce complex embedded/external LSM databases.
 
 ## AD-0 — Coordination store (SETTLED 2026-05-28: Hybrid + Postgres)
 

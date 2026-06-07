@@ -10,10 +10,18 @@ fn main() {
 
     println!("cargo:rerun-if-changed=proto/shuffle.proto");
     println!("cargo:rerun-if-changed=proto/barrier.proto");
+    println!("cargo:rerun-if-changed=proto/query.proto");
 
     tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)
-        .compile_protos(&["proto/shuffle.proto", "proto/barrier.proto"], &["proto"])
+        .compile_protos(
+            &[
+                "proto/shuffle.proto",
+                "proto/barrier.proto",
+                "proto/query.proto",
+            ],
+            &["proto"],
+        )
         .expect("failed to compile cluster proto definitions");
 }

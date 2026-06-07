@@ -39,8 +39,8 @@ jobs:
       - name: Template with standalone values
         run: helm template laminardb deploy/helm/laminardb -f deploy/helm/laminardb/ci/standalone-values.yaml
 
-      - name: Template with constellation values
-        run: helm template laminardb deploy/helm/laminardb -f deploy/helm/laminardb/ci/constellation-values.yaml
+      - name: Template with cluster values
+        run: helm template laminardb deploy/helm/laminardb -f deploy/helm/laminardb/ci/cluster-values.yaml
 
       - name: Template with full values
         run: helm template laminardb deploy/helm/laminardb -f deploy/helm/laminardb/ci/full-values.yaml

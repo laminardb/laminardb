@@ -138,7 +138,7 @@ fn spawn_membership_watcher(
 use laminar_db::{LaminarDB, Profile};
 
 use crate::cluster_config::ClusterConfig;
-use crate::config::ServerConfig;
+use crate::config::{DiscoverySection, ServerConfig};
 use crate::server;
 
 #[derive(Debug, thiserror::Error)]
@@ -329,6 +329,9 @@ pub async fn start_cluster(
     } else {
         bind_host.to_string()
     };
+
+    // Install control-plane mTLS (if configured) before any server/client binds.
+    install_cluster_tls(&cluster_cfg.discovery)?;
 
     // Bind ShuffleReceiver first to discover port and publish it in metadata tags.
     let bind_addr: std::net::SocketAddr = format!("{bind_host}:0").parse().map_err(|e| {
@@ -888,6 +891,47 @@ impl laminar_core::cluster::control::ClusterKv for StaticClusterKv {
             .filter_map(|p| p.metadata.tags.get(key).map(|v| (p.id, v.clone())))
             .collect()
     }
+
+    async fn scan_prefix(&self, prefix: &str) -> Vec<(NodeId, String, String)> {
+        let peers = self.membership_rx.borrow();
+        let mut out = Vec::new();
+        for p in peers.iter() {
+            for (key, val) in &p.metadata.tags {
+                if key.starts_with(prefix) {
+                    out.push((p.id, key.clone(), val.clone()));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Load control-plane mTLS material and install it process-wide before any
+/// server/client binds. No-op when unconfigured; validation guarantees the
+/// fields are all-or-nothing.
+fn install_cluster_tls(d: &DiscoverySection) -> Result<(), ClusterStartupError> {
+    let (Some(cert), Some(key), Some(ca), Some(name)) = (
+        &d.cluster_tls_cert,
+        &d.cluster_tls_key,
+        &d.cluster_tls_client_ca,
+        &d.cluster_tls_server_name,
+    ) else {
+        return Ok(());
+    };
+    let read = |p: &std::path::Path| {
+        std::fs::read(p).map_err(|e| {
+            ClusterStartupError::EngineConstruction(format!("read {}: {e}", p.display()))
+        })
+    };
+    let tls = laminar_core::cluster::control::ClusterTls::from_pem(
+        &read(cert)?,
+        &read(key)?,
+        &read(ca)?,
+        name,
+    );
+    laminar_core::cluster::control::set_cluster_tls(tls);
+    info!("cluster control-plane mTLS enabled (server_name={name})");
+    Ok(())
 }
 
 /// Build an outbound shuffle sender. When gossip discovery is active,
@@ -1040,6 +1084,16 @@ impl laminar_core::cluster::control::ClusterKv for ObjectStoreClusterKv {
             }
         }
         results
+    }
+
+    // No-op: routing is disabled here (see `supports_subscription_routing`), so
+    // the router never calls this; polling a bucket twice a second is a cost trap.
+    async fn scan_prefix(&self, _prefix: &str) -> Vec<(NodeId, String, String)> {
+        Vec::new()
+    }
+
+    fn supports_subscription_routing(&self) -> bool {
+        false
     }
 }
 
