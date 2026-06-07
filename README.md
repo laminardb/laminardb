@@ -454,20 +454,7 @@ LaminarDB standalone server supports environment variable interpolation inside t
 
 ```mermaid
 graph TB
-    subgraph MainRuntime["Main Tokio Runtime (Async I/O & Connectors)"]
-        subgraph Sources["Source Connectors"]
-            S1["Kafka Source"]
-            S2["PostgreSQL CDC"]
-            S3["File Source"]
-        end
-        
-        subgraph BackgroundIO["Background I/O & Sinks"]
-            CC["Checkpoint Coordinator (2PC & Manifest Store)"]
-            SinkIO["Sink Writers (Kafka, Delta Lake, PostgreSQL...)"]
-        end
-    end
-
-    subgraph ComputeRuntime["Dedicated 'laminar-compute' Thread (CPU-Bound Processing)"]
+    subgraph ComputeThread["Dedicated 'laminar-compute' Thread (tokio current_thread)"]
         subgraph Coordinator["Streaming Coordinator"]
             direction LR
             Proj["Compiled Projections & Cached Plans"]
@@ -477,26 +464,53 @@ graph TB
             Proj --> Ops
             Ops <--> State
         end
+        
+        CC["Checkpoint Coordinator (2PC State, Epochs)"]
     end
 
-    subgraph ControlPlane["Control Plane & Operations"]
-        direction LR
-        API["Admin API (Axum REST & WebSocket)"]
-        Metrics["Metrics Export (Prometheus)"]
-        Config["Config Manager (Hot Reload)"]
+    subgraph MainRuntime["Main Tokio Runtime (Async Multi-threaded)"]
+        subgraph Sources["Source Connectors"]
+            S1["Kafka Source"]
+            S2["PostgreSQL CDC"]
+            S3["File Source"]
+        end
+        
+        subgraph Sinks["Sink Tasks"]
+            SinkIO["Sink Writers (Kafka, Delta Lake, PostgreSQL...)"]
+        end
+
+        subgraph OffThread["Off-Thread Workers"]
+            AI["AI Inference Tasks"]
+            Lookup["Lookup Enrich Fetch"]
+        end
+        
+        subgraph ControlPlane["Control Plane & Operations"]
+            direction LR
+            API["Admin API (REST & WebSocket)"]
+            Metrics["Metrics Export (Prometheus)"]
+            Config["Config Manager (Hot Reload)"]
+        end
+
+        subgraph Cluster["Cluster Coordination"]
+            direction LR
+            Gossip["Gossip Discovery (Chitchat)"]
+            Raft["Consensus Leases (Raft Metadata)"]
+            Rebalance["VNode Rebalance (256 VNodes)"]
+        end
     end
 
-    subgraph ClusterCoord["Cluster Coordination"]
-        direction LR
-        Gossip["Gossip Discovery (Chitchat P2P)"]
-        Raft["Consensus Leases (Raft Metadata)"]
-        VNodes["Partition Layout (256 VNodes)"]
+    subgraph BlockingPool["Tokio Blocking Thread Pool"]
+        Serial["State Serialization (OperatorGraph to Bytes)"]
     end
 
-    %% Data Flow Connections
+    %% Data Flow & Control Connections
     Sources -->|tokio::sync::mpsc| Proj
     Ops -->|Sink Batches| SinkIO
-    CC -->|Barrier Checkpoint Injection| Coordinator
+    CC -.->|spawn_blocking| Serial
+    CC -->|commit_epoch| SinkIO
+    Ops -.->|spawn on main handle| AI
+    Ops -.->|spawn on main handle| Lookup
+    
     API <-->|DDL / DML Execution| Coordinator
     Config -->|Hot Reload Signal| Coordinator
 ```
