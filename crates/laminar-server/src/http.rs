@@ -62,6 +62,10 @@ pub struct AppState {
 /// connected to over WebSocket) before its one-shot reaper task drops it.
 const EPHEMERAL_PENDING_TTL: Duration = Duration::from_secs(30);
 
+/// Cap on concurrent ephemeral console streams (each a real CREATE STREAM
+/// pipeline), so `POST /api/v1/queries` spam can't accumulate live pipelines.
+const MAX_EPHEMERAL_STREAMS: usize = 256;
+
 /// Lifecycle state of a console-managed ephemeral stream.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EphemeralState {
@@ -84,8 +88,15 @@ impl EphemeralTracker {
         Self::default()
     }
 
-    fn add_pending(&self, name: String) {
-        self.inner.lock().insert(name, EphemeralState::Pending);
+    /// Reserve a `Pending` slot, enforcing [`MAX_EPHEMERAL_STREAMS`] under the
+    /// lock; returns `false` (inserting nothing) when already at capacity.
+    fn try_add_pending(&self, name: String) -> bool {
+        let mut guard = self.inner.lock();
+        if guard.len() >= MAX_EPHEMERAL_STREAMS {
+            return false;
+        }
+        guard.insert(name, EphemeralState::Pending);
+        true
     }
 
     /// Marks a pending stream `Connected`; returns `false` if it wasn't tracked.
@@ -555,14 +566,23 @@ async fn create_query(
     Json(req): Json<CreateQueryRequest>,
 ) -> impl IntoResponse {
     let name = console_stream_name();
+
+    // Reserve a slot before any DDL so the cap is enforced up front; released
+    // below if CREATE STREAM fails.
+    if !state.ephemeral.try_add_pending(name.clone()) {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "too many ephemeral console queries in flight; retry shortly",
+        )
+        .into_response();
+    }
+
     // Register as a physical CREATE STREAM (reaped on WS disconnect / TTL): the
     // `/ws/{name}` subscription path can only bind to a catalog-registered stream.
     let ddl = format!("CREATE STREAM {name} AS {}", req.sql);
 
     match state.db.execute(&ddl).await {
         Ok(_) => {
-            state.ephemeral.add_pending(name.clone());
-
             // Arm a one-shot reaper: if no WebSocket connects within the TTL,
             // drop the still-`Pending` stream so an abandoned request can't
             // leak it.
@@ -588,7 +608,11 @@ async fn create_query(
             })
             .into_response()
         }
-        Err(e) => error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => {
+            // The stream was never created, so free the reserved slot.
+            state.ephemeral.remove(&name);
+            error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response()
+        }
     }
 }
 
@@ -1881,7 +1905,7 @@ mod tests {
         assert!(!tracker.remove_if_pending("__console_x"));
 
         // A pending stream is tracked and reaped by `remove_if_pending`.
-        tracker.add_pending("__console_x".to_string());
+        assert!(tracker.try_add_pending("__console_x".to_string()));
         assert!(tracker.is_tracked("__console_x"));
         assert!(
             tracker.remove_if_pending("__console_x"),
@@ -1893,7 +1917,7 @@ mod tests {
         );
 
         // Once connected, the reaper must never drop it.
-        tracker.add_pending("__console_x".to_string());
+        assert!(tracker.try_add_pending("__console_x".to_string()));
         assert!(tracker.mark_connected("__console_x"));
         assert!(
             !tracker.remove_if_pending("__console_x"),
@@ -1908,6 +1932,34 @@ mod tests {
         assert!(tracker.remove("__console_x"));
         assert!(!tracker.is_tracked("__console_x"));
         assert!(!tracker.remove("__console_x"));
+    }
+
+    /// The cap rejects reservations past [`MAX_EPHEMERAL_STREAMS`]; a freed slot
+    /// is reusable.
+    #[test]
+    fn test_ephemeral_tracker_caps_concurrent_streams() {
+        let tracker = EphemeralTracker::new();
+
+        for i in 0..MAX_EPHEMERAL_STREAMS {
+            assert!(
+                tracker.try_add_pending(format!("__console_{i}")),
+                "reservations below the cap succeed"
+            );
+        }
+
+        // At capacity the next reservation is rejected and inserts nothing.
+        assert!(
+            !tracker.try_add_pending("__console_overflow".to_string()),
+            "reservation at the cap is rejected"
+        );
+        assert!(!tracker.is_tracked("__console_overflow"));
+
+        // Freeing one slot lets exactly one more reservation through.
+        assert!(tracker.remove("__console_0"));
+        assert!(
+            tracker.try_add_pending("__console_overflow".to_string()),
+            "a freed slot is reusable"
+        );
     }
 
     /// Bind a real ephemeral-port server so the WebSocket upgrade runs over a
