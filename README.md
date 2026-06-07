@@ -452,42 +452,53 @@ LaminarDB standalone server supports environment variable interpolation inside t
 
 ## Architecture
 
-```text
-┌──────────────────────────────────────────────────────────────┐
-│                     SOURCE CONNECTORS                        │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐                   │
-│  │  Kafka   │  │ Postgres │  │   File   │  tokio tasks      │
-│  │  Source  │  │   CDC    │  │  Source  │  (main runtime)   │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘                   │
-│       │              │              │                        │
-│       └──── tokio::sync::mpsc ──────┘                         │
-│                      ▼                                        │
-├──────────────────────────────────────────────────────────────┤
-│              STREAMING COORDINATOR                            │
-│  Single tokio task on dedicated `laminar-compute` thread:     │
-│  SQL cycles, compiled projections, cached logical plans,     │
-│  barrier injection and alignment                              │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐    │
-│  │ Compiled │→ │ Operators│→ │  State   │→ │  Sink    │    │
-│  │Projection│  │ (window, │  │ (per-grp │  │ Writers  │    │
-│  │/ Cached  │  │  join,   │  │ FxHashMap│  │          │    │
-│  │  Plans   │  │  filter) │  │ / foyer) │  │          │    │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────┘    │
-├──────────────────────────────────────────────────────────────┤
-│                     BACKGROUND I/O                            │
-│  Main tokio runtime, runs alongside source/sink tasks         │
-│  ┌──────────────┐  ┌──────────────┐                          │
-│  │  Checkpoint  │  │   Sink I/O   │                          │
-│  │ Coordinator  │  │ (Kafka/Delta │                          │
-│  │  (2PC, store)│  │  /Postgres…) │                          │
-│  └──────────────┘  └──────────────┘                          │
-├──────────────────────────────────────────────────────────────┤
-│                      CONTROL PLANE                            │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐                   │
-│  │  Admin   │  │ Metrics  │  │  Config  │                   │
-│  │   API    │  │  Export  │  │ Manager  │                   │
-│  └──────────┘  └──────────┘  └──────────┘                   │
-└──────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph MainRuntime["Main Tokio Runtime (Async I/O & Connectors)"]
+        subgraph Sources["Source Connectors"]
+            S1["Kafka Source"]
+            S2["PostgreSQL CDC"]
+            S3["File Source"]
+        end
+        
+        subgraph BackgroundIO["Background I/O & Sinks"]
+            CC["Checkpoint Coordinator (2PC & Manifest Store)"]
+            SinkIO["Sink Writers (Kafka, Delta Lake, PostgreSQL...)"]
+        end
+    end
+
+    subgraph ComputeRuntime["Dedicated 'laminar-compute' Thread (CPU-Bound Processing)"]
+        subgraph Coordinator["Streaming Coordinator"]
+            direction LR
+            Proj["Compiled Projections & Cached Plans"]
+            Ops["Operators (Window, Join, Filter)"]
+            State["Local State (FxHashMap / foyer)"]
+            
+            Proj --> Ops
+            Ops <--> State
+        end
+    end
+
+    subgraph ControlPlane["Control Plane & Operations"]
+        direction LR
+        API["Admin API (Axum REST & WebSocket)"]
+        Metrics["Metrics Export (Prometheus)"]
+        Config["Config Manager (Hot Reload)"]
+    end
+
+    subgraph ClusterCoord["Cluster Coordination"]
+        direction LR
+        Gossip["Gossip Discovery (Chitchat P2P)"]
+        Raft["Consensus Leases (Raft Metadata)"]
+        VNodes["Partition Layout (256 VNodes)"]
+    end
+
+    %% Data Flow Connections
+    Sources -->|tokio::sync::mpsc| Proj
+    Ops -->|Sink Batches| SinkIO
+    CC -->|Barrier Checkpoint Injection| Coordinator
+    API <-->|DDL / DML Execution| Coordinator
+    Config -->|Hot Reload Signal| Coordinator
 ```
 
 - **Streaming coordinator.** Single tokio task on a dedicated single-threaded runtime (the `laminar-compute` thread), isolating CPU-bound event processing from I/O on the main runtime. Source connectors push batches in via `tokio::sync::mpsc`; the coordinator runs compiled projections or cached logical plans, routes results to sinks, and manages checkpoint barriers. Compiled single-source projections are sub-microsecond; incremental aggregations and cached-plan queries are microseconds; complex queries fall back to DataFusion.
