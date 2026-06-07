@@ -542,7 +542,7 @@ impl BarrierCoordinator {
             let incoming_stream = tokio_stream::wrappers::TcpListenerStream::new(tokio_listener);
             let mut builder = Server::builder();
             if let Some(tls) = super::tls::server_tls() {
-                match builder.tls_config(tls) {
+                match builder.tls_config(tls.clone()) {
                     Ok(b) => builder = b,
                     Err(e) => {
                         tracing::error!(error = %e, "cluster control-plane TLS config failed");

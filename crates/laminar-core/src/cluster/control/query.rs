@@ -108,11 +108,8 @@ impl QueryService for QueryServiceImpl {
             .await
             .map_err(tonic::Status::internal)?;
 
-        // Stream the in-memory slice in row-bounded chunks. The whole result is a
-        // single Arrow IPC stream: one `BatchStreamEncoder` writes the schema into
-        // the first chunk only, so every later chunk carries just the batch bytes
-        // (no per-chunk schema duplication). A zero-row slice is one valid chunk
-        // (schema + empty batch), never a caller error.
+        // Stream the slice in row-bounded chunks as one Arrow IPC stream (schema
+        // in the first chunk only); a zero-row slice is one valid empty chunk.
         let total = batch.num_rows();
         let ranges: Vec<(usize, usize)> = if total == 0 {
             vec![(0, 0)]
@@ -243,10 +240,8 @@ pub async fn remote_scan_client(
         }
     };
 
-    // One `BatchStreamDecoder` for the whole response: a single gRPC message may
-    // complete zero or more batches, so buffer the surplus and drain it before
-    // pulling the next. The idle timeout bounds the gap between chunks, not total
-    // scan time; a transport error or stall evicts the pooled channel.
+    // One decoder for the whole response (a chunk may complete 0+ batches, so
+    // buffer the surplus). Idle timeout bounds the inter-chunk gap, not total time.
     let pool = Arc::clone(pool);
     let decoder = BatchStreamDecoder::new();
     let out = futures::stream::unfold(
@@ -351,7 +346,7 @@ mod tests {
             let mut builder = tonic::transport::Server::builder();
             // Mirror production: apply control-plane TLS when installed.
             if let Some(tls) = crate::cluster::control::tls::server_tls() {
-                builder = builder.tls_config(tls).unwrap();
+                builder = builder.tls_config(tls.clone()).unwrap();
             }
             let _ = builder
                 .add_service(query_service_server(slot))

@@ -1,9 +1,7 @@
 //! Process-wide mutual TLS for the cluster control plane (barrier, query,
-//! shuffle). One identity per node/process, installed at startup and
-//! replaceable at runtime so rotated certificates take effect without a
-//! process restart.
+//! shuffle). One identity per node/process, installed once at startup.
 
-use parking_lot::RwLock;
+use std::sync::OnceLock;
 
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig};
 
@@ -14,9 +12,8 @@ pub struct ClusterTls {
 }
 
 impl ClusterTls {
-    /// Build mTLS configs from PEM: this node's `cert`+`key`, the `ca` that
-    /// signed every peer cert, and the `server_name` SAN to verify peers
-    /// against (peers connect by IP, so all certs share one DNS SAN).
+    /// Build mTLS configs from PEM: this node's `cert`+`key`, the `ca` that signed
+    /// every peer cert, and the `server_name` SAN peers are verified against.
     #[must_use]
     pub fn from_pem(cert: &[u8], key: &[u8], ca: &[u8], server_name: &str) -> Self {
         let identity = Identity::from_pem(cert, key);
@@ -32,33 +29,30 @@ impl ClusterTls {
     }
 }
 
-static CLUSTER_TLS: RwLock<Option<ClusterTls>> = RwLock::new(None);
+static CLUSTER_TLS: OnceLock<ClusterTls> = OnceLock::new();
 
-/// Install (or replace) the process-wide control-plane TLS. Call at startup
-/// before any control-plane server or client is created; safe to call again at
-/// runtime to apply rotated certificates, overwriting the previous material.
-/// New servers and client endpoints pick up the change on their next creation.
+/// Install the process-wide control-plane TLS. Call once at startup before any
+/// control-plane server or client is created; later calls are ignored.
 pub fn set_cluster_tls(tls: ClusterTls) {
-    *CLUSTER_TLS.write() = Some(tls);
+    let _ = CLUSTER_TLS.set(tls);
 }
 
-/// Server config to apply on the shared control-plane / shuffle listeners.
-///
-/// Returns an owned clone; in Tonic `ServerTlsConfig` wraps atomically
-/// reference-counted internals, so cloning is cheap.
-pub(crate) fn server_tls() -> Option<ServerTlsConfig> {
-    CLUSTER_TLS.read().as_ref().map(|t| t.server.clone())
+/// Server config for the shared control-plane / shuffle listeners.
+pub(crate) fn server_tls() -> Option<&'static ServerTlsConfig> {
+    CLUSTER_TLS.get().map(|t| &t.server)
 }
 
-/// Build a client endpoint for `host_port`, applying control-plane TLS (and the
-/// `https` scheme) when installed; plaintext `http` otherwise.
+/// Client endpoint for `host_port`, using control-plane TLS + `https` when
+/// installed, plaintext `http` otherwise.
 pub(crate) fn client_endpoint(host_port: &str) -> Result<Endpoint, String> {
-    let client = CLUSTER_TLS.read().as_ref().map(|t| t.client.clone());
-    let scheme = if client.is_some() { "https" } else { "http" };
+    let tls = CLUSTER_TLS.get();
+    let scheme = if tls.is_some() { "https" } else { "http" };
     let endpoint =
         Endpoint::from_shared(format!("{scheme}://{host_port}")).map_err(|e| e.to_string())?;
-    match client {
-        Some(c) => endpoint.tls_config(c).map_err(|e| e.to_string()),
+    match tls {
+        Some(t) => endpoint
+            .tls_config(t.client.clone())
+            .map_err(|e| e.to_string()),
         None => Ok(endpoint),
     }
 }
