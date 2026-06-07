@@ -115,6 +115,23 @@ Built on [Apache Arrow](https://arrow.apache.org/) and [DataFusion](https://data
 
 ---
 
+## LaminarDB Console
+
+LaminarDB features a dedicated, high-fidelity administrative and operator web console to author, observe, and manage streaming SQL pipelines. 
+
+The console includes:
+* **Interactive SQL Worksheet**: Author and execute streaming SQL queries with support for live subscription tailing over WebSockets.
+* **Dependency & Lineage DAG**: Interactive visual topology diagram showing active data streams from Sources to Sinks and Materialized Views.
+* **Catalog Schema Browser**: Introspect catalog metadata, schema definitions, and connector options.
+* **Cluster & Partition Monitor**: Live node discovery status and a virtual node (vnode) partition lease assignment heatmap.
+
+The official web console is hosted and ready to use at:
+👉 **[laminardb.github.io/laminardb-console-ui](https://laminardb.github.io/laminardb-console-ui/)**
+
+For source code or local deployment options, see the [`laminardb-console-ui`](https://github.com/laminardb/laminardb-console-ui) repository.
+
+---
+
 ## Cluster Mode & Setup
 
 LaminarDB supports multi-node cluster deployments. In this mode, streaming pipelines are partitioned across virtual nodes (vnodes), and checkpoint state is distributed across the cluster.

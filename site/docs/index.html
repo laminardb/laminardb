@@ -906,7 +906,10 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/http.rs" target="_blank" rel="noopener">crates/laminar-server/src/http.rs</a></div>
 
       <p>
-        The Console UI (Vite-based SPA client) connects to the control-plane APIs exposed by the server. All endpoints are protected by token authentication if <code>server.console_token</code> is configured.
+        The Console UI is a Vite-based SPA client that lets you inspect and administer your streaming SQL nodes, view lineage dependency graphs, and author queries. You can access the officially hosted Console UI directly at <strong><a href="https://laminardb.github.io/laminardb-console-ui/" target="_blank" rel="noopener">laminardb.github.io/laminardb-console-ui</a></strong>.
+      </p>
+      <p>
+        The console connects to the control-plane APIs exposed by the server. All endpoints are protected by token authentication if <code>server.console_token</code> is configured.
       </p>
 
       <h3>Security &amp; Gating</h3>

@@ -918,6 +918,67 @@ INNER JOIN payments p ON o.order_id = p.order_id
       </div>
     </section>
 
+    <!-- Web Console Section -->
+    <section id="console">
+      <div class="container">
+        <div class="split-layout">
+          <div class="split-text">
+            <h2>LaminarDB Web Console</h2>
+            <p>
+              Inspect and administer your streaming SQL nodes from a dedicated, high-fidelity administrative panel. Author queries, inspect schemas, and watch data flow through your operator graphs in real time.
+            </p>
+            <ul class="feature-list" style="margin: 1.5rem 0; padding-left: 1.25rem; color: var(--slate-600); line-height: 1.75;">
+              <li><strong>Interactive SQL Worksheet</strong>: Execute streaming DDL/DML with live tailing subscription panels.</li>
+              <li><strong>Live Lineage DAGs</strong>: Introspect query topologies and watch throughput rates from sources to sinks.</li>
+              <li><strong>Catalog Browser</strong>: Browse active streams, materialized views, schemas, and connector configurations.</li>
+              <li><strong>Cluster Health Heatmaps</strong>: Monitor coordinator leader status, active node gossip, and partition leases.</li>
+            </ul>
+            <a href="https://laminardb.github.io/laminardb-console-ui/" target="_blank" rel="noopener" class="btn btn-primary" style="display: inline-flex; align-items: center; gap: 8px;">
+              Open Web Console
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14L21 3"/></svg>
+            </a>
+          </div>
+
+          <div style="flex: 1; min-width: 300px; display: flex; align-items: center; justify-content: center;">
+            <div style="background: #ffffff; border: 1px solid var(--border-translucent); border-radius: 12px; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.05), 0 8px 10px -6px rgba(0, 0, 0, 0.05); width: 100%; max-width: 520px; overflow: hidden; padding: 20px;">
+              <div style="display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border-translucent); padding-bottom: 12px; margin-bottom: 16px;">
+                <div style="display: flex; align-items: center; gap: 8px;">
+                  <span style="width: 10px; height: 10px; border-radius: 50%; background-color: #ef4444;"></span>
+                  <span style="width: 10px; height: 10px; border-radius: 50%; background-color: #eab308;"></span>
+                  <span style="width: 10px; height: 10px; border-radius: 50%; background-color: #22c55e;"></span>
+                  <span style="font-family: var(--font-sans); font-size: 0.8rem; font-weight: 600; color: var(--slate-700); margin-left: 8px;">LaminarDB Console</span>
+                </div>
+                <span style="font-size: 0.75rem; color: #22c55e; background: rgba(34, 197, 94, 0.08); padding: 2px 8px; border-radius: 12px; font-family: var(--font-mono); font-weight: 500;">Connected</span>
+              </div>
+              
+              <!-- Console Mockup Visuals -->
+              <div style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--slate-800); display: flex; flex-direction: column; gap: 12px;">
+                <!-- SQL Bar -->
+                <div style="background: #f8fafc; border: 1px solid var(--border-translucent); border-radius: 6px; padding: 10px;">
+                  <span style="color: #64748b;">-- Authoring continuous stream join</span><br/>
+                  <span style="color: #0ea5e9; font-weight: bold;">SELECT</span> symbol, price, volume<br/>
+                  <span style="color: #0ea5e9; font-weight: bold;">FROM</span> trades <span style="color: #0ea5e9; font-weight: bold;">ASOF JOIN</span> quotes<br/>
+                  <span style="color: #0ea5e9; font-weight: bold;">ON</span> trades.symbol = quotes.symbol
+                </div>
+                <!-- Nodes/DAG visual mockup -->
+                <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 0;">
+                  <div style="background: #f1f5f9; border: 1px solid var(--border-translucent); border-radius: 6px; padding: 6px 12px; text-align: center; width: 30%;">
+                    <strong style="color: var(--slate-700);">trades</strong><br/><span style="font-size: 0.65rem; color: #64748b;">Source</span>
+                  </div>
+                  <div style="flex: 1; height: 2px; background: linear-gradient(90deg, #0ea5e9 0%, #8b5cf6 100%); margin: 0 8px; position: relative;">
+                    <span style="position: absolute; top: -12px; left: 50%; transform: translateX(-50%); font-size: 0.55rem; color: #8b5cf6; font-weight: bold;">24.5k eps</span>
+                  </div>
+                  <div style="background: #f1f5f9; border: 1px solid var(--border-translucent); border-radius: 6px; padding: 6px 12px; text-align: center; width: 30%;">
+                    <strong style="color: var(--slate-700);">vwap_sink</strong><br/><span style="font-size: 0.65rem; color: #64748b;">Sink</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <!-- AI Functions Section -->
     <section id="ai" style="background:#ffffff;">
       <div class="container">
