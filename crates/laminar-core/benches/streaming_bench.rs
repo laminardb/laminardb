@@ -71,6 +71,13 @@ fn make_batch(size: usize) -> RecordBatch {
 // Source Benchmarks
 
 fn bench_source_push(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = rt.enter();
+
     let mut group = c.benchmark_group("source_push");
     group.throughput(Throughput::Elements(1));
 
@@ -92,6 +99,13 @@ fn bench_source_push(c: &mut Criterion) {
 }
 
 fn bench_source_push_arrow(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = rt.enter();
+
     let mut group = c.benchmark_group("source_push_arrow");
 
     for batch_size in [1, 10, 100, 1000] {
@@ -117,6 +131,13 @@ fn bench_source_push_arrow(c: &mut Criterion) {
 }
 
 fn bench_source_push_batch_drain(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = rt.enter();
+
     let mut group = c.benchmark_group("source_push_batch_drain");
 
     for batch_size in [10, 100, 1000] {
@@ -144,6 +165,13 @@ fn bench_source_push_batch_drain(c: &mut Criterion) {
 // End-to-End Benchmarks
 
 fn bench_end_to_end(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = rt.enter();
+
     let mut group = c.benchmark_group("streaming_end_to_end");
     group.throughput(Throughput::Elements(1));
 
@@ -163,6 +191,13 @@ fn bench_end_to_end(c: &mut Criterion) {
 }
 
 fn bench_end_to_end_throughput(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = rt.enter();
+
     let mut group = c.benchmark_group("streaming_throughput");
 
     for batch_size in [100, 1000, 10000] {
@@ -193,6 +228,13 @@ fn bench_end_to_end_throughput(c: &mut Criterion) {
 }
 
 fn bench_watermark(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = rt.enter();
+
     let mut group = c.benchmark_group("streaming_watermark");
     group.throughput(Throughput::Elements(1));
 
