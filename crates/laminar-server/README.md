@@ -240,6 +240,22 @@ The server watches `pgwire_tls_cert`, `pgwire_tls_key`, and `pgwire_tls_client_c
 psql "host=127.0.0.1 port=5433 dbname=laminardb user=any" -c "SUBSCRIBE avg_price WHERE symbol = 'AAPL'"
 ```
 
+## Cluster Control-Plane TLS (mTLS)
+
+In `mode = "cluster"`, the inter-node control plane (barrier sync, the distributed-query `RemoteScan` service, and the row shuffle) is plaintext and unauthenticated by default — run it on a trusted/isolated network. To require mutual TLS between nodes, set all four `[discovery]` keys together (omit them for plaintext):
+
+```toml
+[discovery]
+strategy = "gossip"
+seeds = ["node-1:7946", "node-2:7946"]
+cluster_tls_cert = "/etc/laminar/node.crt"        # this node's cert (PEM)
+cluster_tls_key  = "/etc/laminar/node.key"        # its key (PEM, PKCS#8 or RSA)
+cluster_tls_client_ca = "/etc/laminar/cluster-ca.pem"  # CA that signed every node cert
+cluster_tls_server_name = "laminar-cluster"       # DNS SAN present in every node cert
+```
+
+Every node both serves and dials, so the CA verifies **both** directions. Because peers connect by IP, issue all node certs with one shared DNS SAN and set `cluster_tls_server_name` to it (rather than per-node IP SANs). Enabling mTLS is a **coordinated cutover**: a TLS node cannot talk to a plaintext peer, so roll it out to all nodes at once. Cert rotation currently requires a restart (no hot reload on the control plane).
+
 ## Hot Reload
 
 Edit the TOML file while the server is running. The file watcher detects changes (500ms debounce), diffs the configuration, and applies incremental DDL:
