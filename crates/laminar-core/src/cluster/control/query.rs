@@ -44,14 +44,17 @@ pub type QueryClientPool =
 /// Node-local provider of table / materialized-view snapshots for remote scans.
 #[async_trait::async_trait]
 pub trait RemoteQueryHandler: Send + Sync + 'static {
-    /// This node's locally-held rows for `table_name`, optionally projected.
+    /// This node's locally-held rows for `table_name`, optionally projected and
+    /// optionally filtered by `filter_sql` (a SQL boolean expression over the
+    /// table's columns) before serialization.
     ///
     /// # Errors
-    /// Unknown table or invalid projection.
+    /// Unknown table, invalid projection, or an un-compilable `filter_sql`.
     async fn remote_scan(
         &self,
         table_name: &str,
         projection: Option<Vec<usize>>,
+        filter_sql: Option<String>,
     ) -> Result<RecordBatch, String>;
 }
 
@@ -86,9 +89,10 @@ impl QueryService for QueryServiceImpl {
         let req = request.into_inner();
         let projection = (!req.projection.is_empty())
             .then(|| req.projection.iter().map(|&p| p as usize).collect());
+        let filter_sql = (!req.filter_sql.is_empty()).then(|| req.filter_sql.clone());
 
         let batch = handler
-            .remote_scan(&req.table_name, projection)
+            .remote_scan(&req.table_name, projection, filter_sql)
             .await
             .map_err(tonic::Status::internal)?;
 
@@ -159,6 +163,7 @@ pub async fn remote_scan_client(
     peer: NodeId,
     table_name: &str,
     projection: Option<Vec<usize>>,
+    filter_sql: Option<String>,
 ) -> Result<RemoteBatchStream, String> {
     let channel = connect(pool, kv, peer).await?;
     let mut client = QueryServiceClient::new(channel);
@@ -172,6 +177,7 @@ pub async fn remote_scan_client(
     let request = RemoteScanRequest {
         table_name: table_name.to_string(),
         projection,
+        filter_sql: filter_sql.unwrap_or_default(),
     };
 
     let stream = match client.remote_scan(request).await {
@@ -210,6 +216,7 @@ mod tests {
             &self,
             _table: &str,
             projection: Option<Vec<usize>>,
+            _filter_sql: Option<String>,
         ) -> Result<RecordBatch, String> {
             match projection {
                 Some(p) => self.0.project(&p).map_err(|e| e.to_string()),
@@ -262,7 +269,7 @@ mod tests {
         let peer = NodeId(7);
         let (pool, kv) = serve(peer, int_batch(values.clone())).await;
 
-        let stream = remote_scan_client(&pool, &kv, peer, "mv", None)
+        let stream = remote_scan_client(&pool, &kv, peer, "mv", None, None)
             .await
             .unwrap();
         let batches = collect_chunks(stream).await;
@@ -279,7 +286,7 @@ mod tests {
         let peer = NodeId(7);
         let (pool, kv) = serve(peer, int_batch(vec![])).await;
 
-        let stream = remote_scan_client(&pool, &kv, peer, "mv", None)
+        let stream = remote_scan_client(&pool, &kv, peer, "mv", None, None)
             .await
             .unwrap();
         let batches = collect_chunks(stream).await;

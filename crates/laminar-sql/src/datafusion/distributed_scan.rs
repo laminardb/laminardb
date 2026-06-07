@@ -20,7 +20,8 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
-use datafusion_expr::{Expr, TableProviderFilterPushDown};
+use datafusion_common::ScalarValue;
+use datafusion_expr::{Expr, Operator, TableProviderFilterPushDown};
 use futures::stream::StreamExt;
 use laminar_core::cluster::control::{remote_scan_client, ClusterController};
 use laminar_core::cluster::discovery::NodeId;
@@ -81,23 +82,39 @@ impl TableProvider for DistributedTableProvider {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        // RemoteScan carries no predicate, so claim none; DataFusion's
-        // FilterExec above the union filters local and remote rows uniformly.
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        // A filter we can render to SQL is sent to peers so they filter their
+        // slice before serialization. It's `Inexact`: DataFusion keeps a
+        // FilterExec above the union that re-applies the exact predicate, so an
+        // over-broad remote result is still correct. Filters we can't render
+        // stay `Unsupported` and are evaluated only on the coordinator.
+        Ok(filters
+            .iter()
+            .map(|f| {
+                if expr_to_sql(f).is_some() {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
     }
 
     async fn scan(
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Local slice; filters/limit are applied above the union by DataFusion.
+        // Local slice; filters/limit are re-applied above the union by
+        // DataFusion (pushdown is `Inexact`), so the local scan stays unfiltered.
         let local = self.inner.scan(state, projection, &[], None).await?;
+
+        // Render the filters we can to one SQL predicate for peers to apply
+        // locally. A filter that doesn't render is simply dropped here (it was
+        // reported `Unsupported`, so the coordinator still evaluates it).
+        let rendered: Vec<String> = filters.iter().filter_map(expr_to_sql).collect();
+        let filter_sql = (!rendered.is_empty()).then(|| rendered.join(" AND "));
 
         let me = self.controller.instance_id();
         let peers: Vec<NodeId> = self
@@ -111,6 +128,7 @@ impl TableProvider for DistributedTableProvider {
             local,
             self.table_name.clone(),
             projection.cloned(),
+            filter_sql,
             Arc::clone(&self.controller),
             peers,
         )))
@@ -123,6 +141,9 @@ pub struct DistributedScanExec {
     local: Arc<dyn ExecutionPlan>,
     table_name: String,
     projection: Option<Vec<usize>>,
+    /// Pushed-down predicate (SQL boolean expression) sent to each peer; `None`
+    /// means no filter is applied remotely.
+    filter_sql: Option<String>,
     controller: Arc<ClusterController>,
     peers: Vec<NodeId>,
     schema: SchemaRef,
@@ -136,6 +157,7 @@ impl DistributedScanExec {
         local: Arc<dyn ExecutionPlan>,
         table_name: String,
         projection: Option<Vec<usize>>,
+        filter_sql: Option<String>,
         controller: Arc<ClusterController>,
         peers: Vec<NodeId>,
     ) -> Self {
@@ -150,6 +172,7 @@ impl DistributedScanExec {
             local,
             table_name,
             projection,
+            filter_sql,
             controller,
             peers,
             schema,
@@ -215,6 +238,7 @@ impl ExecutionPlan for DistributedScanExec {
             children.swap_remove(0),
             self.table_name.clone(),
             self.projection.clone(),
+            self.filter_sql.clone(),
             Arc::clone(&self.controller),
             self.peers.clone(),
         )))
@@ -252,6 +276,7 @@ impl ExecutionPlan for DistributedScanExec {
         let kv = Arc::clone(self.controller.kv());
         let table = self.table_name.clone();
         let projection = self.projection.clone();
+        let filter_sql = self.filter_sql.clone();
         let schema = Arc::clone(&self.schema);
         let remote = futures::stream::iter(self.peers.clone())
             .map(move |peer| {
@@ -259,9 +284,11 @@ impl ExecutionPlan for DistributedScanExec {
                 let kv = Arc::clone(&kv);
                 let table = table.clone();
                 let projection = projection.clone();
+                let filter_sql = filter_sql.clone();
                 let schema = Arc::clone(&schema);
                 async move {
-                    match remote_scan_client(&pool, &kv, peer, &table, projection).await {
+                    match remote_scan_client(&pool, &kv, peer, &table, projection, filter_sql).await
+                    {
                         // Adapt laminar-core's String-error Arrow stream into a
                         // DataFusion record-batch stream of this scan's schema.
                         Ok(chunks) => Box::pin(RecordBatchStreamAdapter::new(
@@ -289,5 +316,136 @@ impl ExecutionPlan for DistributedScanExec {
             Arc::clone(&self.schema),
             stream,
         )))
+    }
+}
+
+/// Render a small, safe subset of DataFusion predicates to a SQL string a peer
+/// can re-compile against its own copy of the table schema; `None` for anything
+/// outside the subset.
+///
+/// Only expressions that round-trip *faithfully* are rendered. Pushdown is
+/// `Inexact`, so the coordinator re-applies the exact predicate above the union:
+/// an over-broad remote result is corrected there, but an under-broad one would
+/// silently drop rows. Every conversion here therefore preserves the original
+/// selectivity exactly, and unconvertible nodes fall back to the coordinator.
+fn expr_to_sql(expr: &Expr) -> Option<String> {
+    match expr {
+        // Emit column names unqualified and double-quoted so the peer resolves
+        // them case-sensitively against its single scanned table; the original
+        // qualifier names the coordinator's table, not the peer's.
+        Expr::Column(col) => Some(format!("\"{}\"", col.name.replace('"', "\"\""))),
+        Expr::Literal(value, _) => scalar_to_sql(value),
+        Expr::BinaryExpr(be) => {
+            let op = binary_op_to_sql(be.op)?;
+            let left = expr_to_sql(be.left.as_ref())?;
+            let right = expr_to_sql(be.right.as_ref())?;
+            Some(format!("({left} {op} {right})"))
+        }
+        Expr::Not(inner) => Some(format!("(NOT {})", expr_to_sql(inner.as_ref())?)),
+        Expr::IsNull(inner) => Some(format!("({} IS NULL)", expr_to_sql(inner.as_ref())?)),
+        Expr::IsNotNull(inner) => Some(format!("({} IS NOT NULL)", expr_to_sql(inner.as_ref())?)),
+        _ => None,
+    }
+}
+
+/// SQL spelling of the binary operators we push down; `None` for the rest.
+fn binary_op_to_sql(op: Operator) -> Option<&'static str> {
+    Some(match op {
+        Operator::Eq => "=",
+        Operator::NotEq => "<>",
+        Operator::Lt => "<",
+        Operator::LtEq => "<=",
+        Operator::Gt => ">",
+        Operator::GtEq => ">=",
+        Operator::And => "AND",
+        Operator::Or => "OR",
+        Operator::Plus => "+",
+        Operator::Minus => "-",
+        Operator::Multiply => "*",
+        Operator::Divide => "/",
+        _ => return None,
+    })
+}
+
+/// Render a scalar literal to SQL, restricted to types that round-trip exactly
+/// (integers, booleans, strings, finite floats); `None` for everything else so
+/// the filter falls back to coordinator-side evaluation.
+// The integer arms look identical but bind differently-typed locals, so they
+// can't be merged with `|`.
+#[allow(clippy::match_same_arms)]
+fn scalar_to_sql(value: &ScalarValue) -> Option<String> {
+    Some(match value {
+        ScalarValue::Boolean(Some(b)) => (if *b { "TRUE" } else { "FALSE" }).to_string(),
+        ScalarValue::Int8(Some(n)) => n.to_string(),
+        ScalarValue::Int16(Some(n)) => n.to_string(),
+        ScalarValue::Int32(Some(n)) => n.to_string(),
+        ScalarValue::Int64(Some(n)) => n.to_string(),
+        ScalarValue::UInt8(Some(n)) => n.to_string(),
+        ScalarValue::UInt16(Some(n)) => n.to_string(),
+        ScalarValue::UInt32(Some(n)) => n.to_string(),
+        ScalarValue::UInt64(Some(n)) => n.to_string(),
+        // Widen f32 to f64 before rendering so the text matches the value the
+        // peer's comparison sees (f32 columns are widened to f64 there too).
+        ScalarValue::Float32(Some(f)) if f.is_finite() => f64::from(*f).to_string(),
+        ScalarValue::Float64(Some(f)) if f.is_finite() => f.to_string(),
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => format!("'{}'", s.replace('\'', "''")),
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion_expr::{col, lit};
+
+    #[test]
+    fn renders_comparison_with_quoted_column() {
+        let e = col("price").gt(lit(100_i64));
+        assert_eq!(expr_to_sql(&e).as_deref(), Some("(\"price\" > 100)"));
+    }
+
+    #[test]
+    fn renders_and_or_not_and_null_checks() {
+        let e = col("a").eq(lit(1_i64)).and(col("b").is_null());
+        assert_eq!(
+            expr_to_sql(&e).as_deref(),
+            Some("((\"a\" = 1) AND (\"b\" IS NULL))")
+        );
+
+        let e = Expr::Not(Box::new(col("flag").is_not_null()));
+        assert_eq!(
+            expr_to_sql(&e).as_deref(),
+            Some("(NOT (\"flag\" IS NOT NULL))")
+        );
+    }
+
+    #[test]
+    fn escapes_string_literals_and_quotes() {
+        let e = col("name").eq(lit("o'brien"));
+        assert_eq!(expr_to_sql(&e).as_deref(), Some("(\"name\" = 'o''brien')"));
+    }
+
+    #[test]
+    fn renders_booleans_and_finite_floats() {
+        assert_eq!(
+            scalar_to_sql(&ScalarValue::Boolean(Some(true))).as_deref(),
+            Some("TRUE")
+        );
+        assert_eq!(
+            scalar_to_sql(&ScalarValue::Float64(Some(0.1))).as_deref(),
+            Some("0.1")
+        );
+    }
+
+    #[test]
+    fn unconvertible_nodes_return_none() {
+        // Non-finite floats can't round-trip through SQL.
+        assert_eq!(scalar_to_sql(&ScalarValue::Float64(Some(f64::NAN))), None);
+        // A node we don't render (LIKE) makes the whole predicate fall back, so
+        // it stays Unsupported and is evaluated only on the coordinator.
+        let e = col("name").like(lit("foo%"));
+        assert_eq!(expr_to_sql(&e), None);
     }
 }

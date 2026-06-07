@@ -720,6 +720,7 @@ impl LaminarDB {
         controller.register_query_handler(Arc::new(DbQueryHandler {
             mv_store: Arc::downgrade(&self.mv_store),
             table_store: Arc::downgrade(&self.table_store),
+            ctx: self.ctx.clone(),
         }));
         self.spawn_subscription_router(&controller);
         *self.cluster_controller.lock() = Some(controller);
@@ -2454,6 +2455,9 @@ impl datafusion::execution::context::QueryPlanner for LookupQueryPlanner {
 struct DbQueryHandler {
     mv_store: std::sync::Weak<parking_lot::RwLock<crate::mv_store::MvStore>>,
     table_store: std::sync::Weak<parking_lot::RwLock<crate::table_store::TableStore>>,
+    /// Session context used to compile a pushed-down `filter_sql` predicate
+    /// against the served table's schema before projection.
+    ctx: SessionContext,
 }
 
 #[cfg(feature = "cluster")]
@@ -2463,6 +2467,7 @@ impl laminar_core::cluster::control::RemoteQueryHandler for DbQueryHandler {
         &self,
         table_name: &str,
         projection: Option<Vec<usize>>,
+        filter_sql: Option<String>,
     ) -> Result<arrow::array::RecordBatch, String> {
         let batch = self
             .mv_store
@@ -2474,6 +2479,22 @@ impl laminar_core::cluster::control::RemoteQueryHandler for DbQueryHandler {
                     .and_then(|s| s.read().to_record_batch(table_name))
             })
             .ok_or_else(|| format!("table '{table_name}' not found"))?;
+
+        // Apply the pushed-down predicate against the full table schema before
+        // projecting, so it can reference columns the projection drops. An empty
+        // result is a valid (schema-only) batch, not an error.
+        let batch = if let Some(sql) = filter_sql {
+            let schema = batch.schema();
+            let expr = crate::filter_compile::compile(&self.ctx, &sql, &schema)
+                .await
+                .map_err(|e| e.to_string())?;
+            match crate::filter_compile::apply(&batch, expr.as_ref()).map_err(|e| e.to_string())? {
+                Some(filtered) => filtered,
+                None => arrow::array::RecordBatch::new_empty(schema),
+            }
+        } else {
+            batch
+        };
 
         match projection {
             Some(proj) => batch.project(&proj).map_err(|e| e.to_string()),
