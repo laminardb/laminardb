@@ -270,9 +270,8 @@ impl ConnectorPipelineCallback {
                 while let Some((stage, batch, targets)) = rx.recv().await {
                     let msg = ShuffleMessage::VnodeData(stage, 0, batch);
                     for node in targets {
-                        // Bound each send so a slow/stalled peer can't head-of-line
-                        // block the others; a timed-out or failed send drops that
-                        // peer's batch (best-effort).
+                        // Bound each send so one slow peer can't head-of-line block
+                        // the others; a failed/timed-out send drops that batch.
                         match tokio::time::timeout(
                             SUB_ROUTE_SEND_TIMEOUT,
                             sender.send_to(node, &msg),

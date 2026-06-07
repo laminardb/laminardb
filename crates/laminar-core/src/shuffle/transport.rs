@@ -1092,10 +1092,8 @@ mod tests {
         }
     }
 
-    /// `drain_staged_with_prefix` lifts every `__sub::`-tagged stage in one lock
-    /// cycle, leaves operator stages staged for their own drainer, and stashes
-    /// barriers (never drops them) — the contract the subscription router relies
-    /// on.
+    /// `drain_staged_with_prefix` lifts `__sub::` stages in one pass while
+    /// leaving operator stages staged for their own drainer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_staged_with_prefix_lifts_subs_and_keeps_operator_stages() {
         use arrow_array::{Int64Array, RecordBatch};

@@ -1086,9 +1086,8 @@ impl laminar_core::cluster::control::ClusterKv for ObjectStoreClusterKv {
         results
     }
 
-    // No-op: subscription routing is disabled on this backend (see
-    // `supports_subscription_routing`), so the router never calls this. Polling a
-    // bucket twice a second would be an S3/GCS LIST+GET cost trap.
+    // No-op: routing is disabled here (see `supports_subscription_routing`), so
+    // the router never calls this; polling a bucket twice a second is a cost trap.
     async fn scan_prefix(&self, _prefix: &str) -> Vec<(NodeId, String, String)> {
         Vec::new()
     }

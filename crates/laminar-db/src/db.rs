@@ -817,11 +817,9 @@ impl LaminarDB {
                     advertised.remove(&name);
                 }
 
-                // Publish remote batches for locally-subscribed streams. One
-                // receiver lock cycle drains every `__sub::` stage at once
-                // (O(1) lock pairs/tick instead of one pair per active sub);
-                // batches for streams no longer subscribed locally fall through
-                // `send_batch` as a no-op rather than accumulating in `staged`.
+                // Publish remote batches for locally-subscribed streams; one lock
+                // cycle drains every `__sub::` stage (dropped subs fall through
+                // `send_batch` as a no-op rather than piling up in `staged`).
                 if !local_names.is_empty() {
                     let receiver = receiver_slot.lock().clone();
                     if let Some(receiver) = receiver {
