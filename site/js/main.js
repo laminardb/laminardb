@@ -173,18 +173,23 @@ document.addEventListener('DOMContentLoaded', () => {
     let width = canvas.width = canvas.offsetWidth;
     let height = canvas.height = canvas.offsetHeight;
 
+    const particles = [];
+    const count = 48;
+
     window.addEventListener('resize', () => {
       width = canvas.width = canvas.offsetWidth;
       height = canvas.height = canvas.offsetHeight;
+      particles.forEach(p => {
+        p.x = p.progress * width;
+        p.baseY = height / 2 + Math.sin(p.progress * Math.PI * 3.5) * 70;
+      });
     });
-
-    const particles = [];
-    const count = 48;
 
     for (let i = 0; i < count; i++) {
       // Create a grid of points moving as a wave across the horizontal span
       const progress = i / count;
       particles.push({
+        progress: progress,
         x: progress * width,
         baseY: height / 2 + Math.sin(progress * Math.PI * 3.5) * 70,
         y: 0,

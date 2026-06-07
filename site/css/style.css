@@ -414,7 +414,7 @@ p:last-child { margin-bottom: 0; }
 /* --- Cards Grid (Features, Deployment, etc) --- */
 .card-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(460px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 460px), 1fr));
   gap: 2rem;
 }
 
