@@ -92,7 +92,24 @@ fn bench_plain_select(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let db = rt.block_on(async {
-                    let db = LaminarDB::open().unwrap();
+                    let db = LaminarDB::builder()
+                        .register_connector(|registry| {
+                            registry.register_source(
+                                "test",
+                                laminar_connectors::config::ConnectorInfo {
+                                    name: "test".to_string(),
+                                    display_name: "Test Source".to_string(),
+                                    version: "0.1.0".to_string(),
+                                    is_source: true,
+                                    is_sink: false,
+                                    config_keys: vec![],
+                                },
+                                std::sync::Arc::new(|_| Box::new(laminar_connectors::testing::MockSourceConnector::new())),
+                            );
+                        })
+                        .build()
+                        .await
+                        .unwrap();
                     db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT) WITH ('connector' = 'test')").await.unwrap();
                     db.execute("CREATE STREAM filtered AS SELECT id, region, price FROM trades WHERE quantity > 10").await.unwrap();
                     db
@@ -131,7 +148,24 @@ fn bench_agg_group_by(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let db = rt.block_on(async {
-                    let db = LaminarDB::open().unwrap();
+                    let db = LaminarDB::builder()
+                        .register_connector(|registry| {
+                            registry.register_source(
+                                "test",
+                                laminar_connectors::config::ConnectorInfo {
+                                    name: "test".to_string(),
+                                    display_name: "Test Source".to_string(),
+                                    version: "0.1.0".to_string(),
+                                    is_source: true,
+                                    is_sink: false,
+                                    config_keys: vec![],
+                                },
+                                std::sync::Arc::new(|_| Box::new(laminar_connectors::testing::MockSourceConnector::new())),
+                            );
+                        })
+                        .build()
+                        .await
+                        .unwrap();
                     db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT) WITH ('connector' = 'test')").await.unwrap();
                     db.execute("CREATE STREAM agg_result AS SELECT region, SUM(price) AS total_price FROM trades GROUP BY region").await.unwrap();
                     db
@@ -169,7 +203,24 @@ fn bench_sort_limit(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let db = rt.block_on(async {
-                    let db = LaminarDB::open().unwrap();
+                    let db = LaminarDB::builder()
+                        .register_connector(|registry| {
+                            registry.register_source(
+                                "test",
+                                laminar_connectors::config::ConnectorInfo {
+                                    name: "test".to_string(),
+                                    display_name: "Test Source".to_string(),
+                                    version: "0.1.0".to_string(),
+                                    is_source: true,
+                                    is_sink: false,
+                                    config_keys: vec![],
+                                },
+                                std::sync::Arc::new(|_| Box::new(laminar_connectors::testing::MockSourceConnector::new())),
+                            );
+                        })
+                        .build()
+                        .await
+                        .unwrap();
                     db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT) WITH ('connector' = 'test')").await.unwrap();
                     db.execute("CREATE STREAM sorted AS SELECT id, price FROM trades ORDER BY price DESC LIMIT 10").await.unwrap();
                     db
@@ -207,7 +258,24 @@ fn bench_query_chain(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let db = rt.block_on(async {
-                    let db = LaminarDB::open().unwrap();
+                    let db = LaminarDB::builder()
+                        .register_connector(|registry| {
+                            registry.register_source(
+                                "test",
+                                laminar_connectors::config::ConnectorInfo {
+                                    name: "test".to_string(),
+                                    display_name: "Test Source".to_string(),
+                                    version: "0.1.0".to_string(),
+                                    is_source: true,
+                                    is_sink: false,
+                                    config_keys: vec![],
+                                },
+                                std::sync::Arc::new(|_| Box::new(laminar_connectors::testing::MockSourceConnector::new())),
+                            );
+                        })
+                        .build()
+                        .await
+                        .unwrap();
                     db.execute("CREATE SOURCE trades (id BIGINT, region VARCHAR, price DOUBLE, quantity BIGINT, ts BIGINT) WITH ('connector' = 'test')").await.unwrap();
                     db.execute("CREATE STREAM step_a AS SELECT id, region, price * quantity AS notional FROM trades WHERE quantity > 5").await.unwrap();
                     db.execute("CREATE STREAM step_b AS SELECT id, notional FROM step_a WHERE notional > 100.0").await.unwrap();
