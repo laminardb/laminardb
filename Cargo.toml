@@ -137,5 +137,5 @@ strip = "debuginfo"
 
 [profile.bench]
 inherits = "release"
-debug = true
-strip = "none"
+debug = false
+strip = "debuginfo"
