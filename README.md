@@ -457,10 +457,10 @@ Runs entirely in-memory within the host application process. Since it does not p
 
 ```mermaid
 graph TD
-    classDef hostClass fill:#eff6ff,stroke:#2563eb,stroke-width:1px,color:#1e3a8a;
-    classDef appClass fill:#eff6ff,stroke:#2563eb,stroke-width:1px,color:#1e3a8a;
-    classDef coordClass fill:#faf5ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95,font-weight:bold;
-    classDef stateClass fill:#ecfeff,stroke:#0891b2,stroke-width:1px,color:#164e63;
+    classDef hostClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
+    classDef appClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
+    classDef coordClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:2px,font-weight:bold;
+    classDef stateClass fill:#06b6d4,fill-opacity:0.15,stroke:#06b6d4,stroke-width:1px;
 
     subgraph HostApp["Host Application Process (Rust/Python/C)"]
         App["Application Logic"]:::appClass
@@ -473,8 +473,8 @@ graph TD
         Coord -->|"Pull Results via Subscription"| App
     end
 
-    style HostApp fill:#eff6ff,stroke:#2563eb,stroke-width:2px,stroke-dasharray: 5 5,color:#1e3a8a
-    style Engine fill:#faf5ff,stroke:#7c3aed,color:#4c1d95
+    style HostApp fill:#3b82f6,fill-opacity:0.05,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 5 5
+    style Engine fill:#8b5cf6,fill-opacity:0.05,stroke:#8b5cf6,stroke-width:1.5px
 ```
 
 ### 2. Embedded Mode (Embedded / Durable Profiles)
@@ -482,11 +482,11 @@ Runs inside the host application process but enables single-node durability. The
 
 ```mermaid
 graph TD
-    classDef appClass fill:#eff6ff,stroke:#2563eb,stroke-width:1px,color:#1e3a8a;
-    classDef coordClass fill:#faf5ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95,font-weight:bold;
-    classDef stateClass fill:#ecfeff,stroke:#0891b2,stroke-width:1px,color:#164e63;
-    classDef recoveryClass fill:#f0fdf4,stroke:#16a34a,stroke-width:1px,color:#14532d;
-    classDef storageClass fill:#fff7ed,stroke:#ea580c,stroke-width:1px,color:#7c2d12;
+    classDef appClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
+    classDef coordClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:2px,font-weight:bold;
+    classDef stateClass fill:#06b6d4,fill-opacity:0.15,stroke:#06b6d4,stroke-width:1px;
+    classDef recoveryClass fill:#10b981,fill-opacity:0.15,stroke:#10b981,stroke-width:1px;
+    classDef storageClass fill:#f97316,fill-opacity:0.15,stroke:#f97316,stroke-width:1px;
 
     subgraph HostApp["Host Application Process (Rust/Python/C)"]
         direction TB
@@ -507,8 +507,8 @@ graph TD
     Checkpoint -->|"Write Epoch WAL and Checkpoints"| Storage["Durable Storage (Local Disk / S3 / GCS)"]:::storageClass
     Storage -->|"Restore Manifest and State"| Recovery
     
-    style HostApp fill:#eff6ff,stroke:#2563eb,stroke-width:2px,stroke-dasharray: 5 5,color:#1e3a8a
-    style Engine fill:#faf5ff,stroke:#7c3aed,color:#4c1d95
+    style HostApp fill:#3b82f6,fill-opacity:0.05,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 5 5
+    style Engine fill:#8b5cf6,fill-opacity:0.05,stroke:#8b5cf6,stroke-width:1.5px
 ```
 
 ### 3. Standalone Server Mode
@@ -516,12 +516,12 @@ Runs as a dedicated native daemon binary (`laminar-server`). It wraps the embedd
 
 ```mermaid
 graph TD
-    classDef clientClass fill:#f0fdf4,stroke:#16a34a,stroke-width:1px,color:#14532d;
-    classDef portClass fill:#eff6ff,stroke:#2563eb,stroke-width:1px,color:#1e3a8a;
-    classDef coordClass fill:#faf5ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95,font-weight:bold;
-    classDef stateClass fill:#ecfeff,stroke:#0891b2,stroke-width:1px,color:#164e63;
-    classDef checkpointClass fill:#f5f5f4,stroke:#78716c,stroke-width:1px,color:#44403c;
-    classDef storageClass fill:#fff7ed,stroke:#ea580c,stroke-width:1px,color:#7c2d12;
+    classDef clientClass fill:#10b981,fill-opacity:0.15,stroke:#10b981,stroke-width:1px;
+    classDef portClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
+    classDef coordClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:2px,font-weight:bold;
+    classDef stateClass fill:#06b6d4,fill-opacity:0.15,stroke:#06b6d4,stroke-width:1px;
+    classDef checkpointClass fill:#78716c,fill-opacity:0.15,stroke:#78716c,stroke-width:1px;
+    classDef storageClass fill:#f97316,fill-opacity:0.15,stroke:#f97316,stroke-width:1px;
 
     Client1["PostgreSQL Clients (pgwire)"]:::clientClass
     Client2["REST API Clients (HTTP)"]:::clientClass
@@ -553,9 +553,9 @@ graph TD
     Client3 -->|"Port 8000 /ws"| WS
     Checkpoint -->|"Write Checkpoints"| Storage["Durable Storage (Local Disk / S3)"]:::storageClass
 
-    style Server fill:#f8fafc,stroke:#334155,stroke-width:2px,color:#0f172a
-    style Ports fill:#eff6ff,stroke:#2563eb,color:#1e3a8a
-    style Engine fill:#faf5ff,stroke:#7c3aed,color:#4c1d95
+    style Server fill:#6b7280,fill-opacity:0.05,stroke:#4b5563,stroke-width:1.5px
+    style Ports fill:#3b82f6,fill-opacity:0.05,stroke:#3b82f6,stroke-width:1.5px
+    style Engine fill:#8b5cf6,fill-opacity:0.05,stroke:#8b5cf6,stroke-width:1.5px
 ```
 
 ### 4. Cluster Mode (Distributed Deployment)
@@ -563,12 +563,12 @@ Runs as a distributed cluster of cooperative nodes. Nodes discover one another p
 
 ```mermaid
 graph TD
-    classDef clientClass fill:#f0fdf4,stroke:#16a34a,stroke-width:1px,color:#14532d;
-    classDef engineClass fill:#faf5ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95,font-weight:bold;
-    classDef raftClass fill:#eff6ff,stroke:#2563eb,stroke-width:1px,color:#1e3a8a;
-    classDef gossipClass fill:#ecfeff,stroke:#0891b2,stroke-width:1px,color:#164e63;
-    classDef vnodeClass fill:#f5f5f4,stroke:#78716c,stroke-width:1px,color:#44403c;
-    classDef storageClass fill:#fff7ed,stroke:#ea580c,stroke-width:1px,color:#7c2d12;
+    classDef clientClass fill:#10b981,fill-opacity:0.15,stroke:#10b981,stroke-width:1px;
+    classDef engineClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:2px,font-weight:bold;
+    classDef raftClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
+    classDef gossipClass fill:#06b6d4,fill-opacity:0.15,stroke:#06b6d4,stroke-width:1px;
+    classDef vnodeClass fill:#78716c,fill-opacity:0.15,stroke:#78716c,stroke-width:1px;
+    classDef storageClass fill:#f97316,fill-opacity:0.15,stroke:#f97316,stroke-width:1px;
 
     Client["Clients / Load Balancer"]:::clientClass
     
@@ -603,8 +603,8 @@ graph TD
     Node1 -->|"Coordinated 2-Phase Commit Checkpoints"| SharedStore["Shared Object Store (S3 / GCS / Azure)"]:::storageClass
     Node2 -->|"Coordinated 2-Phase Commit Checkpoints"| SharedStore:::storageClass
 
-    style Node1 fill:#f8fafc,stroke:#334155,stroke-width:2px,color:#0f172a
-    style Node2 fill:#f8fafc,stroke:#334155,stroke-width:2px,color:#0f172a
+    style Node1 fill:#6b7280,fill-opacity:0.05,stroke:#4b5563,stroke-width:1.5px
+    style Node2 fill:#6b7280,fill-opacity:0.05,stroke:#4b5563,stroke-width:1.5px
 ```
 
 ### 5. Internal Threading Model (Within a Single Node)
@@ -612,14 +612,14 @@ Within any running engine node, CPU-bound streaming computation is strictly isol
 
 ```mermaid
 graph TB
-    classDef computeClass fill:#faf5ff,stroke:#7c3aed,stroke-width:1px,color:#4c1d95;
-    classDef mainClass fill:#eff6ff,stroke:#2563eb,stroke-width:1px,color:#1e3a8a;
-    classDef blockingClass fill:#fff7ed,stroke:#ea580c,stroke-width:1px,color:#7c2d12;
+    classDef computeClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:1px;
+    classDef mainClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
+    classDef blockingClass fill:#f97316,fill-opacity:0.15,stroke:#f97316,stroke-width:1px;
     
-    classDef sourceClass fill:#eff6ff,stroke:#2563eb,stroke-width:1px,color:#1e3a8a;
-    classDef sinkClass fill:#f0fdf4,stroke:#16a34a,stroke-width:1px,color:#14532d;
-    classDef serviceClass fill:#f5f5f4,stroke:#78716c,stroke-width:1px,color:#44403c;
-    classDef coordClass fill:#faf5ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95,font-weight:bold;
+    classDef sourceClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
+    classDef sinkClass fill:#10b981,fill-opacity:0.15,stroke:#10b981,stroke-width:1px;
+    classDef serviceClass fill:#78716c,fill-opacity:0.15,stroke:#78716c,stroke-width:1px;
+    classDef coordClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:2px,font-weight:bold;
 
     subgraph ComputeRuntime["Dedicated 'laminar-compute' Thread (Single-Threaded Tokio Runtime)"]
         subgraph Coord["Streaming Coordinator (Hot Path)"]
@@ -663,10 +663,10 @@ graph TB
     CheckpointCoord -.->|"Trigger Checkpoint Barrier"| Sources
     CheckpointCoord -.->|"Offload Serialization"| Serial
 
-    style ComputeRuntime fill:#faf5ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95
-    style MainRuntime fill:#eff6ff,stroke:#2563eb,stroke-width:2px,color:#1e3a8a
-    style BlockingPool fill:#fff7ed,stroke:#ea580c,stroke-width:2px,color:#7c2d12
-    style Coord fill:#faf5ff,stroke:#7c3aed,color:#4c1d95
+    style ComputeRuntime fill:#8b5cf6,fill-opacity:0.05,stroke:#8b5cf6,stroke-width:1.5px
+    style MainRuntime fill:#3b82f6,fill-opacity:0.05,stroke:#3b82f6,stroke-width:1.5px
+    style BlockingPool fill:#f97316,fill-opacity:0.05,stroke:#f97316,stroke-width:1.5px
+    style Coord fill:#8b5cf6,fill-opacity:0.05,stroke:#8b5cf6,stroke-width:1.5px
 ```
 
 * **Streaming coordinator.** Single tokio task on a dedicated single-threaded runtime (the `laminar-compute` thread), isolating CPU-bound event processing from I/O on the main runtime. Source connectors push batches in via `tokio::sync::mpsc`; the coordinator runs compiled projections or cached logical plans, routes results to sinks, and manages checkpoint barriers. Compiled single-source projections are sub-microsecond; incremental aggregations and cached-plan queries are microseconds; complex queries fall back to DataFusion.
