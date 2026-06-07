@@ -6,8 +6,11 @@ syntax = "proto3";
 package laminar.query.v1;
 
 service QueryService {
-  // Stream the serving node's local rows in row-bounded Arrow IPC chunks; an
-  // empty local slice is one schema-only chunk.
+  // Stream the serving node's local rows in row-bounded chunks. The chunks form
+  // a single Arrow IPC stream: the first chunk carries the schema (plus the
+  // first batch), every later chunk carries only a record-batch message, so the
+  // schema is sent once instead of with every chunk. An empty local slice is one
+  // chunk (schema + empty batch).
   rpc RemoteScan(RemoteScanRequest) returns (stream RemoteScanResponse);
 }
 
@@ -22,6 +25,10 @@ message RemoteScanRequest {
 }
 
 message RemoteScanResponse {
-  // Arrow IPC stream encoding of one RecordBatch (schema + batch).
+  // One slice of a single Arrow IPC stream. The first chunk of a response holds
+  // the schema message followed by the first record batch; every subsequent
+  // chunk holds only a record-batch (and any dictionary) message. Concatenating
+  // a response's chunks in order yields one valid Arrow IPC stream. Produced by
+  // `serialization::BatchStreamEncoder`, consumed by `BatchStreamDecoder`.
   bytes arrow_ipc = 1;
 }

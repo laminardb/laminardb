@@ -5,12 +5,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::record_batch::RecordBatch;
-use futures::{Stream, StreamExt};
+use futures::Stream;
 
 use super::barrier::BARRIER_ADDR_KEY;
 use super::ClusterKv;
 use crate::cluster::discovery::NodeId;
-use crate::serialization::{deserialize_batch_stream, serialize_batch_stream};
+use crate::serialization::{BatchStreamDecoder, BatchStreamEncoder};
 
 #[allow(
     clippy::doc_markdown,
@@ -41,7 +41,7 @@ const REMOTE_SCAN_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// Attempts to *establish* a peer stream before giving up; transient connect
 /// failures evict the channel and re-resolve the peer between tries.
 const REMOTE_SCAN_MAX_ATTEMPTS: u32 = 3;
-/// Backoff between establishment attempts.
+/// Fixed delay between establishment attempts.
 const REMOTE_SCAN_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Handler slot read per request, so registration and server start are
@@ -108,8 +108,11 @@ impl QueryService for QueryServiceImpl {
             .await
             .map_err(tonic::Status::internal)?;
 
-        // Stream the in-memory slice in row-bounded chunks (one IPC encode per
-        // poll); a zero-row slice is one valid empty chunk, never a caller error.
+        // Stream the in-memory slice in row-bounded chunks. The whole result is a
+        // single Arrow IPC stream: one `BatchStreamEncoder` writes the schema into
+        // the first chunk only, so every later chunk carries just the batch bytes
+        // (no per-chunk schema duplication). A zero-row slice is one valid chunk
+        // (schema + empty batch), never a caller error.
         let total = batch.num_rows();
         let ranges: Vec<(usize, usize)> = if total == 0 {
             vec![(0, 0)]
@@ -119,11 +122,28 @@ impl QueryService for QueryServiceImpl {
                 .map(|off| (off, REMOTE_SCAN_CHUNK_ROWS.min(total - off)))
                 .collect()
         };
-        let stream = futures::stream::iter(ranges).map(move |(off, len)| {
-            serialize_batch_stream(&batch.slice(off, len))
-                .map(|arrow_ipc| RemoteScanResponse { arrow_ipc })
-                .map_err(|e| tonic::Status::internal(format!("arrow ipc encode: {e}")))
-        });
+        let encoder = BatchStreamEncoder::new(&batch.schema())
+            .map_err(|e| tonic::Status::internal(format!("arrow ipc schema encode: {e}")))?;
+        let stream = futures::stream::unfold(
+            (encoder, batch, ranges.into_iter().peekable()),
+            |(mut encoder, batch, mut ranges)| async move {
+                let (off, len) = ranges.next()?;
+                // IIFE so the `&mut encoder`/`&mut ranges` borrows end before the
+                // state tuple is moved back out below.
+                let produced = (|| {
+                    let mut bytes = encoder.encode(&batch.slice(off, len))?;
+                    // The end-of-stream marker rides the final chunk.
+                    if ranges.peek().is_none() {
+                        bytes.extend_from_slice(&encoder.finish()?);
+                    }
+                    Ok::<_, arrow_schema::ArrowError>(bytes)
+                })();
+                let item = produced
+                    .map(|arrow_ipc| RemoteScanResponse { arrow_ipc })
+                    .map_err(|e| tonic::Status::internal(format!("arrow ipc encode: {e}")));
+                Some((item, (encoder, batch, ranges)))
+            },
+        );
         Ok(tonic::Response::new(Box::pin(stream)))
     }
 }
@@ -186,8 +206,8 @@ pub async fn remote_scan_client(
 
     // Establish the stream, retrying transient connect failures. Each retry
     // evicts the pooled channel so `connect` re-resolves a possibly-restarted
-    // peer. Bounds time-to-first-response (not the whole call), so a large
-    // multi-chunk result is free to take its time once streaming.
+    // peer. The idle timeout bounds time-to-first-response, not the whole call,
+    // so a large multi-chunk result is free to take its time once streaming.
     let mut attempt = 0u32;
     let stream = loop {
         attempt += 1;
@@ -202,8 +222,8 @@ pub async fn remote_scan_client(
             Ok(Ok(resp)) => break resp.into_inner(),
             Ok(Err(status)) => {
                 pool.lock().remove(&peer);
-                let retryable = status.code() == tonic::Code::Unavailable;
-                if retryable && attempt < REMOTE_SCAN_MAX_ATTEMPTS {
+                // Only `Unavailable` (e.g. a restarting peer) is worth retrying.
+                if status.code() == tonic::Code::Unavailable && attempt < REMOTE_SCAN_MAX_ATTEMPTS {
                     tokio::time::sleep(REMOTE_SCAN_RETRY_BACKOFF).await;
                     continue;
                 }
@@ -223,34 +243,49 @@ pub async fn remote_scan_client(
         }
     };
 
-    // Decode each chunk, bounding the gap between chunks (not total scan time);
-    // a transport error or stall evicts the pooled channel.
+    // One `BatchStreamDecoder` for the whole response: a single gRPC message may
+    // complete zero or more batches, so buffer the surplus and drain it before
+    // pulling the next. The idle timeout bounds the gap between chunks, not total
+    // scan time; a transport error or stall evicts the pooled channel.
     let pool = Arc::clone(pool);
-    let decoded = futures::stream::unfold(Some(stream), move |state| {
-        let pool = Arc::clone(&pool);
-        async move {
-            let mut stream = state?;
-            match tokio::time::timeout(REMOTE_SCAN_IDLE_TIMEOUT, stream.message()).await {
-                Ok(Ok(Some(resp))) => match deserialize_batch_stream(&resp.arrow_ipc) {
-                    Ok(batch) => Some((Ok(batch), Some(stream))),
-                    Err(e) => Some((Err(e.to_string()), None)),
-                },
-                Ok(Ok(None)) => None,
-                Ok(Err(status)) => {
-                    pool.lock().remove(&peer);
-                    Some((Err(status.to_string()), None))
-                }
-                Err(_) => {
-                    pool.lock().remove(&peer);
-                    Some((
-                        Err(format!("remote_scan to peer {} stalled mid-stream", peer.0)),
-                        None,
-                    ))
+    let decoder = BatchStreamDecoder::new();
+    let out = futures::stream::unfold(
+        Some((
+            stream,
+            decoder,
+            std::collections::VecDeque::<RecordBatch>::new(),
+        )),
+        move |state| {
+            let pool = Arc::clone(&pool);
+            async move {
+                let (mut stream, mut decoder, mut pending) = state?;
+                loop {
+                    if let Some(batch) = pending.pop_front() {
+                        return Some((Ok(batch), Some((stream, decoder, pending))));
+                    }
+                    match tokio::time::timeout(REMOTE_SCAN_IDLE_TIMEOUT, stream.message()).await {
+                        Ok(Ok(Some(resp))) => match decoder.decode_chunk(resp.arrow_ipc) {
+                            Ok(batches) => pending.extend(batches),
+                            Err(e) => return Some((Err(e.to_string()), None)),
+                        },
+                        Ok(Ok(None)) => return None,
+                        Ok(Err(status)) => {
+                            pool.lock().remove(&peer);
+                            return Some((Err(status.to_string()), None));
+                        }
+                        Err(_) => {
+                            pool.lock().remove(&peer);
+                            return Some((
+                                Err(format!("remote_scan to peer {} stalled mid-stream", peer.0)),
+                                None,
+                            ));
+                        }
+                    }
                 }
             }
-        }
-    });
-    Ok(Box::pin(decoded))
+        },
+    );
+    Ok(Box::pin(out))
 }
 
 #[cfg(test)]
@@ -259,6 +294,7 @@ mod tests {
     use crate::cluster::control::barrier::InMemoryKv;
     use arrow::array::Int32Array;
     use arrow_schema::{DataType, Field, Schema};
+    use futures::StreamExt;
 
     struct StaticHandler(RecordBatch);
 
@@ -315,7 +351,7 @@ mod tests {
             let mut builder = tonic::transport::Server::builder();
             // Mirror production: apply control-plane TLS when installed.
             if let Some(tls) = crate::cluster::control::tls::server_tls() {
-                builder = builder.tls_config(tls.clone()).unwrap();
+                builder = builder.tls_config(tls).unwrap();
             }
             let _ = builder
                 .add_service(query_service_server(slot))
@@ -359,7 +395,6 @@ mod tests {
             .await
             .unwrap();
         let batches = collect_chunks(stream).await;
-        // More rows than one chunk holds, so the result must span several chunks.
         assert!(batches.len() > 1);
         let got = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
         let col = got.column(0).as_any().downcast_ref::<Int32Array>().unwrap();

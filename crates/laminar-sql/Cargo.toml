@@ -27,6 +27,8 @@ datafusion = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
 datafusion-optimizer = { workspace = true }
+# DataFusion's Expr -> SQL unparser, reused for distributed-scan filter pushdown.
+datafusion-sql = { workspace = true }
 
 # Arrow for columnar data
 arrow = { workspace = true }

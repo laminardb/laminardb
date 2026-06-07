@@ -746,6 +746,17 @@ impl LaminarDB {
         }
 
         let kv = Arc::clone(controller.kv());
+
+        // Skip entirely on backends that can't discover subscription interest
+        // (e.g. object store), rather than advertising interest nothing reads.
+        if !kv.supports_subscription_routing() {
+            tracing::info!(
+                "distributed SUBSCRIBE routing disabled: coordination backend has \
+                 no subscription-interest discovery"
+            );
+            return;
+        }
+
         let active_subs = Arc::downgrade(&self.active_subs);
         let subscription_registry = Arc::downgrade(&self.subscription_registry);
         let shuffle_receiver = Arc::downgrade(&self.shuffle_receiver);
@@ -806,13 +817,24 @@ impl LaminarDB {
                     advertised.remove(&name);
                 }
 
-                // Publish remote batches for locally-subscribed streams.
-                let receiver = receiver_slot.lock().clone();
-                if let Some(receiver) = receiver {
-                    for name in &local_names {
-                        let stage = crate::subscription::remote_stage(name);
-                        for batch in receiver.drain_vnode_data_for(&stage) {
-                            registry.send_batch(name, batch);
+                // Publish remote batches for locally-subscribed streams. One
+                // receiver lock cycle drains every `__sub::` stage at once
+                // (O(1) lock pairs/tick instead of one pair per active sub);
+                // batches for streams no longer subscribed locally fall through
+                // `send_batch` as a no-op rather than accumulating in `staged`.
+                if !local_names.is_empty() {
+                    let receiver = receiver_slot.lock().clone();
+                    if let Some(receiver) = receiver {
+                        for (stage, batches) in receiver
+                            .drain_staged_with_prefix(crate::subscription::REMOTE_STAGE_PREFIX)
+                        {
+                            if let Some(name) =
+                                crate::subscription::stream_from_remote_stage(&stage)
+                            {
+                                for batch in batches {
+                                    registry.send_batch(name, batch);
+                                }
+                            }
                         }
                     }
                 }

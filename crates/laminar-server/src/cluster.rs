@@ -7,7 +7,7 @@ use std::sync::Arc;
 use object_store::ObjectStoreExt;
 use tokio::signal;
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use laminar_core::cluster::discovery::{
     Discovery, DiscoveryError, GossipDiscovery, GossipDiscoveryConfig, NodeId, NodeInfo,
@@ -1086,53 +1086,15 @@ impl laminar_core::cluster::control::ClusterKv for ObjectStoreClusterKv {
         results
     }
 
-    // Object stores can't list by key suffix, so this LISTs all of `kv/` and
-    // filters in memory; the router backs off when idle to bound LIST traffic.
-    async fn scan_prefix(&self, prefix: &str) -> Vec<(NodeId, String, String)> {
-        use futures::StreamExt;
+    // No-op: subscription routing is disabled on this backend (see
+    // `supports_subscription_routing`), so the router never calls this. Polling a
+    // bucket twice a second would be an S3/GCS LIST+GET cost trap.
+    async fn scan_prefix(&self, _prefix: &str) -> Vec<(NodeId, String, String)> {
+        Vec::new()
+    }
 
-        let root = object_store::path::Path::from("kv");
-        let mut entries = self.store.list(Some(&root));
-        let mut keys_to_read = Vec::new();
-
-        while let Some(res) = entries.next().await {
-            let Ok(meta) = res else {
-                continue;
-            };
-            let path_str = meta.location.as_ref();
-            let Some(rest) = path_str.strip_prefix("kv/node=") else {
-                continue;
-            };
-            let Some((node_id_str, key)) = rest.split_once('/') else {
-                continue;
-            };
-            if key.starts_with(prefix) {
-                if let Ok(id) = node_id_str.parse::<u64>() {
-                    keys_to_read.push((NodeId(id), meta.location.clone(), key.to_string()));
-                }
-            }
-        }
-
-        let futures = keys_to_read.into_iter().map(|(node_id, location, key)| {
-            let store = Arc::clone(&self.store);
-            async move {
-                let bytes = match store.get(&location).await {
-                    Ok(res) => res.bytes().await.ok()?,
-                    Err(e) => {
-                        debug!("ObjectStoreClusterKv: scan_prefix get failed for {location}: {e}");
-                        return None;
-                    }
-                };
-                let value = String::from_utf8(bytes.to_vec()).ok()?;
-                Some((node_id, key, value))
-            }
-        });
-
-        futures::future::join_all(futures)
-            .await
-            .into_iter()
-            .flatten()
-            .collect()
+    fn supports_subscription_routing(&self) -> bool {
+        false
     }
 }
 

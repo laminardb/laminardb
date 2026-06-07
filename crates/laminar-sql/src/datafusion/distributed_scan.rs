@@ -21,8 +21,9 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
 };
-use datafusion_common::ScalarValue;
-use datafusion_expr::{Expr, Operator, TableProviderFilterPushDown};
+use datafusion_common::tree_node::{Transformed, TreeNode};
+use datafusion_expr::{Expr, TableProviderFilterPushDown};
+use datafusion_sql::unparser;
 use futures::stream::StreamExt;
 use laminar_core::cluster::control::{remote_scan_client, ClusterController};
 use laminar_core::cluster::discovery::NodeId;
@@ -138,8 +139,7 @@ pub struct DistributedScanExec {
     local: Arc<dyn ExecutionPlan>,
     table_name: String,
     projection: Option<Vec<usize>>,
-    /// Pushed-down predicate (SQL boolean expression) sent to each peer; `None`
-    /// means no filter is applied remotely.
+    /// Pushed-down predicate (SQL boolean expression) sent to each peer.
     filter_sql: Option<String>,
     controller: Arc<ClusterController>,
     peers: Vec<NodeId>,
@@ -332,124 +332,94 @@ impl ExecutionPlan for DistributedScanExec {
     }
 }
 
-/// Render the faithful-round-trip subset of predicates to SQL for a peer to
-/// re-compile (`None` otherwise); pushdown is `Inexact` so over-broad is safe.
+/// Render a predicate to SQL for a peer to re-compile via DataFusion's own
+/// `Expr` -> SQL unparser, or `None` if the unparser can't represent it (e.g. a
+/// UDF we don't push down). Pushdown is `Inexact`, so the coordinator re-applies
+/// the exact predicate above the union — an over-broad render is harmless.
 fn expr_to_sql(expr: &Expr) -> Option<String> {
-    match expr {
-        // Unqualified + double-quoted: the peer resolves against its single
-        // table; the original qualifier names the coordinator's, not the peer's.
-        Expr::Column(col) => Some(format!("\"{}\"", col.name.replace('"', "\"\""))),
-        Expr::Literal(value, _) => scalar_to_sql(value),
-        Expr::BinaryExpr(be) => {
-            let op = binary_op_to_sql(be.op)?;
-            let left = expr_to_sql(be.left.as_ref())?;
-            let right = expr_to_sql(be.right.as_ref())?;
-            Some(format!("({left} {op} {right})"))
-        }
-        Expr::Not(inner) => Some(format!("(NOT {})", expr_to_sql(inner.as_ref())?)),
-        Expr::IsNull(inner) => Some(format!("({} IS NULL)", expr_to_sql(inner.as_ref())?)),
-        Expr::IsNotNull(inner) => Some(format!("({} IS NOT NULL)", expr_to_sql(inner.as_ref())?)),
-        _ => None,
-    }
+    let unqualified = strip_column_qualifiers(expr);
+    unparser::expr_to_sql(&unqualified)
+        .ok()
+        .map(|ast| ast.to_string())
 }
 
-/// SQL spelling of the binary operators we push down; `None` for the rest.
-fn binary_op_to_sql(op: Operator) -> Option<&'static str> {
-    Some(match op {
-        Operator::Eq => "=",
-        Operator::NotEq => "<>",
-        Operator::Lt => "<",
-        Operator::LtEq => "<=",
-        Operator::Gt => ">",
-        Operator::GtEq => ">=",
-        Operator::And => "AND",
-        Operator::Or => "OR",
-        Operator::Plus => "+",
-        Operator::Minus => "-",
-        Operator::Multiply => "*",
-        Operator::Divide => "/",
-        _ => return None,
-    })
-}
-
-/// Render a scalar literal to SQL, restricted to exact-round-trip types
-/// (integers, booleans, strings, finite floats); `None` otherwise.
-// The integer arms look identical but bind differently-typed locals, so they
-// can't be merged with `|`.
-#[allow(clippy::match_same_arms)]
-fn scalar_to_sql(value: &ScalarValue) -> Option<String> {
-    Some(match value {
-        ScalarValue::Boolean(Some(b)) => (if *b { "TRUE" } else { "FALSE" }).to_string(),
-        ScalarValue::Int8(Some(n)) => n.to_string(),
-        ScalarValue::Int16(Some(n)) => n.to_string(),
-        ScalarValue::Int32(Some(n)) => n.to_string(),
-        ScalarValue::Int64(Some(n)) => n.to_string(),
-        ScalarValue::UInt8(Some(n)) => n.to_string(),
-        ScalarValue::UInt16(Some(n)) => n.to_string(),
-        ScalarValue::UInt32(Some(n)) => n.to_string(),
-        ScalarValue::UInt64(Some(n)) => n.to_string(),
-        // Widen f32 to f64 before rendering so the text matches the value the
-        // peer's comparison sees (f32 columns are widened to f64 there too).
-        ScalarValue::Float32(Some(f)) if f.is_finite() => f64::from(*f).to_string(),
-        ScalarValue::Float64(Some(f)) if f.is_finite() => f.to_string(),
-        ScalarValue::Utf8(Some(s))
-        | ScalarValue::LargeUtf8(Some(s))
-        | ScalarValue::Utf8View(Some(s)) => format!("'{}'", s.replace('\'', "''")),
-        _ => return None,
-    })
+/// Strip the relation qualifier from every column so the rendered predicate
+/// resolves against the peer's single (differently-named) table rather than the
+/// coordinator's. The transform is infallible; fall back to the input on the
+/// (unreachable) error path.
+fn strip_column_qualifiers(expr: &Expr) -> Expr {
+    expr.clone()
+        .transform(|e| match e {
+            Expr::Column(mut col) => {
+                col.relation = None;
+                Ok(Transformed::yes(Expr::Column(col)))
+            }
+            other => Ok(Transformed::no(other)),
+        })
+        .map_or_else(|_| expr.clone(), |t| t.data)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion_common::{Column, ScalarValue};
     use datafusion_expr::{col, lit};
 
     #[test]
-    fn renders_comparison_with_quoted_column() {
+    fn renders_comparison() {
         let e = col("price").gt(lit(100_i64));
-        assert_eq!(expr_to_sql(&e).as_deref(), Some("(\"price\" > 100)"));
+        assert_eq!(expr_to_sql(&e).as_deref(), Some("(price > 100)"));
+    }
+
+    #[test]
+    fn strips_column_qualifier() {
+        // A column qualified by the coordinator's table renders unqualified so
+        // the peer can resolve it against its own single table.
+        let e = Expr::Column(Column::new(Some("mv"), "price")).gt(lit(100_i64));
+        assert_eq!(expr_to_sql(&e).as_deref(), Some("(price > 100)"));
     }
 
     #[test]
     fn renders_and_or_not_and_null_checks() {
         let e = col("a").eq(lit(1_i64)).and(col("b").is_null());
-        assert_eq!(
-            expr_to_sql(&e).as_deref(),
-            Some("((\"a\" = 1) AND (\"b\" IS NULL))")
-        );
+        assert_eq!(expr_to_sql(&e).as_deref(), Some("((a = 1) AND b IS NULL)"));
 
         let e = Expr::Not(Box::new(col("flag").is_not_null()));
-        assert_eq!(
-            expr_to_sql(&e).as_deref(),
-            Some("(NOT (\"flag\" IS NOT NULL))")
-        );
+        assert_eq!(expr_to_sql(&e).as_deref(), Some("NOT flag IS NOT NULL"));
     }
 
     #[test]
     fn escapes_string_literals_and_quotes() {
+        // `name` is a SQL keyword, so the unparser double-quotes the identifier;
+        // the single quote inside the literal is doubled.
         let e = col("name").eq(lit("o'brien"));
         assert_eq!(expr_to_sql(&e).as_deref(), Some("(\"name\" = 'o''brien')"));
     }
 
     #[test]
     fn renders_booleans_and_finite_floats() {
-        assert_eq!(
-            scalar_to_sql(&ScalarValue::Boolean(Some(true))).as_deref(),
-            Some("TRUE")
-        );
-        assert_eq!(
-            scalar_to_sql(&ScalarValue::Float64(Some(0.1))).as_deref(),
-            Some("0.1")
-        );
+        assert_eq!(expr_to_sql(&lit(true)).as_deref(), Some("true"));
+        assert_eq!(expr_to_sql(&lit(0.1_f64)).as_deref(), Some("0.1"));
+    }
+
+    #[test]
+    fn like_predicate_now_renders() {
+        // The standard unparser supports LIKE (the hand-rolled renderer did
+        // not); safe because pushdown stays Inexact and the coordinator
+        // re-applies the exact predicate above the union.
+        let e = col("name").like(lit("foo%"));
+        assert!(expr_to_sql(&e).is_some());
     }
 
     #[test]
     fn unconvertible_nodes_return_none() {
-        // Non-finite floats can't round-trip through SQL.
-        assert_eq!(scalar_to_sql(&ScalarValue::Float64(Some(f64::NAN))), None);
-        // A node we don't render (LIKE) makes the whole predicate fall back, so
-        // it stays Unsupported and is evaluated only on the coordinator.
-        let e = col("name").like(lit("foo%"));
+        // A binary literal has no SQL spelling the unparser supports, so the
+        // whole predicate falls back to `None`, stays Unsupported, and is
+        // evaluated only on the coordinator.
+        let e = col("payload").eq(Expr::Literal(
+            ScalarValue::Binary(Some(vec![0xde, 0xad])),
+            None,
+        ));
         assert_eq!(expr_to_sql(&e), None);
     }
 }

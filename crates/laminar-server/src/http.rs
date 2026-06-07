@@ -555,6 +555,8 @@ async fn create_query(
     Json(req): Json<CreateQueryRequest>,
 ) -> impl IntoResponse {
     let name = console_stream_name();
+    // Register as a physical CREATE STREAM (reaped on WS disconnect / TTL): the
+    // `/ws/{name}` subscription path can only bind to a catalog-registered stream.
     let ddl = format!("CREATE STREAM {name} AS {}", req.sql);
 
     match state.db.execute(&ddl).await {
@@ -837,28 +839,25 @@ async fn fan_out_pipeline_control(state: &AppState, local: bool, path: &str) {
             .collect();
         let token = state.current_config.read().server.console_token.clone();
         let client = reqwest::Client::new();
-        let tasks: Vec<_> = peers
-            .into_iter()
-            .map(|peer| {
-                let client = client.clone();
-                let token = token.clone();
-                let url = format!("http://{peer}{path}");
-                tokio::spawn(async move {
-                    let mut req = client
-                        .post(&url)
-                        .timeout(std::time::Duration::from_secs(10));
-                    if let Some(t) = token {
-                        req = req.bearer_auth(t.expose());
-                    }
-                    if let Err(e) = req.send().await {
-                        tracing::warn!("failed to forward pipeline control to {url}: {e}");
-                    }
-                })
-            })
-            .collect();
-        for task in tasks {
-            let _ = task.await;
-        }
+        // Fan out concurrently with `join_all`; these are I/O-bound futures with
+        // no CPU work, so there's nothing to gain from spawning a task each.
+        let futures = peers.into_iter().map(|peer| {
+            let client = client.clone();
+            let token = token.clone();
+            let url = format!("http://{peer}{path}");
+            async move {
+                let mut req = client
+                    .post(&url)
+                    .timeout(std::time::Duration::from_secs(10));
+                if let Some(t) = token {
+                    req = req.bearer_auth(t.expose());
+                }
+                if let Err(e) = req.send().await {
+                    tracing::warn!("failed to forward pipeline control to {url}: {e}");
+                }
+            }
+        });
+        futures::future::join_all(futures).await;
     }
     #[cfg(not(feature = "cluster"))]
     let _ = (state, local, path);
@@ -1159,21 +1158,23 @@ async fn ws_client(
                         if batch.num_rows() == 0 {
                             continue;
                         }
-                        let raw_json = match batches_to_json_raw(&[batch]) {
+                        // Embed the already-serialized data array directly in the
+                        // envelope to skip a RawValue parse + reserialize per frame.
+                        let data_json = match batches_to_json_string(&[batch]) {
                             Ok(j) => j,
                             Err(e) => {
                                 warn!(stream = %name, error = %e, "serialize error");
                                 continue;
                             }
                         };
-                        let out = serde_json::json!({
-                            "type": "data",
-                            "subscription_id": &name,
-                            "data": raw_json,
-                            "sequence": seq,
-                        });
+                        // serde-escape the URL-derived name; data_json is valid JSON.
+                        let subid =
+                            serde_json::to_string(&name).unwrap_or_else(|_| "\"\"".to_string());
+                        let out = format!(
+                            "{{\"type\":\"data\",\"subscription_id\":{subid},\"data\":{data_json},\"sequence\":{seq}}}"
+                        );
                         seq += 1;
-                        if socket.send(Message::Text(out.to_string().into())).await.is_err() {
+                        if socket.send(Message::Text(out.into())).await.is_err() {
                             break;
                         }
                     }
@@ -1189,11 +1190,9 @@ async fn ws_client(
                 }
             }
             _ = heartbeat.tick() => {
-                let hb = serde_json::json!({
-                    "type": "heartbeat",
-                    "server_time": chrono::Utc::now().timestamp_millis(),
-                });
-                if socket.send(Message::Text(hb.to_string().into())).await.is_err() {
+                // Native WebSocket Ping for liveness (client auto-Pongs); no
+                // app-level heartbeat message needed.
+                if socket.send(Message::Ping(bytes::Bytes::new())).await.is_err() {
                     break;
                 }
             }
@@ -1212,16 +1211,22 @@ async fn ws_client(
     }
 }
 
-fn batches_to_json_raw(
-    batches: &[arrow_array::RecordBatch],
-) -> Result<Box<serde_json::value::RawValue>, String> {
+/// Serialize Arrow batches to a JSON array string via `arrow_json::ArrayWriter`.
+/// The single serialization pass shared by `batches_to_json_raw` and the WS path.
+fn batches_to_json_string(batches: &[arrow_array::RecordBatch]) -> Result<String, String> {
     let mut buf = Vec::new();
     let mut writer = arrow_json::ArrayWriter::new(&mut buf);
     for batch in batches {
         writer.write(batch).map_err(|e| e.to_string())?;
     }
     writer.finish().map_err(|e| e.to_string())?;
-    let s = String::from_utf8(buf).map_err(|e| e.to_string())?;
+    String::from_utf8(buf).map_err(|e| e.to_string())
+}
+
+fn batches_to_json_raw(
+    batches: &[arrow_array::RecordBatch],
+) -> Result<Box<serde_json::value::RawValue>, String> {
+    let s = batches_to_json_string(batches)?;
     serde_json::value::RawValue::from_string(s).map_err(|e| e.to_string())
 }
 

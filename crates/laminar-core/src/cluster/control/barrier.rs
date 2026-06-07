@@ -123,6 +123,11 @@ pub trait ClusterKv: Send + Sync + 'static {
     async fn scan(&self, key: &str) -> Vec<(NodeId, String)>;
     /// Every visible instance's key-value pairs where the key starts with the given prefix.
     async fn scan_prefix(&self, prefix: &str) -> Vec<(NodeId, String, String)>;
+    /// Whether the backend supports the subscription-interest scan the
+    /// distributed SUBSCRIBE router needs (object stores return `false`).
+    fn supports_subscription_routing(&self) -> bool {
+        true
+    }
 }
 
 /// In-memory KV for tests.
@@ -537,7 +542,7 @@ impl BarrierCoordinator {
             let incoming_stream = tokio_stream::wrappers::TcpListenerStream::new(tokio_listener);
             let mut builder = Server::builder();
             if let Some(tls) = super::tls::server_tls() {
-                match builder.tls_config(tls.clone()) {
+                match builder.tls_config(tls) {
                     Ok(b) => builder = b,
                     Err(e) => {
                         tracing::error!(error = %e, "cluster control-plane TLS config failed");
