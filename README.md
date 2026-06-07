@@ -497,15 +497,15 @@ graph TD
             Checkpoint["Checkpoint Coordinator"]:::recoveryClass
             Recovery["Recovery Manager"]:::recoveryClass
             
-            Coord <-->|Read/Write State| InMemState
-            Checkpoint -.->|Snapshot State| InMemState
-            Recovery -.->|Restore State| InMemState
+            Coord <-->|"Read/Write State"| InMemState
+            Checkpoint -.->|"Snapshot State"| InMemState
+            Recovery -.->|"Restore State"| InMemState
         end
-        App -->|Push RecordBatches| Coord
-        App <--|Pull Results| Coord
+        App -->|"Push RecordBatches"| Coord
+        App <--|"Pull Results"| Coord
     end
-    Checkpoint -->|Write Epoch WAL & Checkpoints| Storage["Durable Storage (Local Disk / S3 / GCS)"]:::storageClass
-    Storage -->|Restore Manifest & State| Recovery
+    Checkpoint -->|"Write Epoch WAL and Checkpoints"| Storage["Durable Storage (Local Disk / S3 / GCS)"]:::storageClass
+    Storage -->|"Restore Manifest and State"| Recovery
     
     style HostApp fill:#eff6ff,stroke:#2563eb,stroke-width:2px,stroke-dasharray: 5 5,color:#1e3a8a
     style Engine fill:#faf5ff,stroke:#7c3aed,color:#4c1d95
@@ -543,15 +543,15 @@ graph TD
             Checkpoint -.-> State
         end
         
-        REST -->|Push Events / DDL / Admin| Coord
-        WS -->|Streaming Subscription Batches| Coord
-        PgWire -->|SQL DDL / DML Execution| Coord
+        REST -->|"Push Events, DDL, and Admin"| Coord
+        WS -->|"Streaming Subscription Batches"| Coord
+        PgWire -->|"SQL DDL and DML Execution"| Coord
     end
     
     Client1 -->|Port 5432| PgWire
     Client2 -->|Port 8000| REST
     Client3 -->|Port 8000 /ws| WS
-    Checkpoint -->|Write Checkpoints| Storage["Durable Storage (Local Disk / S3)"]:::storageClass
+    Checkpoint -->|"Write Checkpoints"| Storage["Durable Storage (Local Disk / S3)"]:::storageClass
 
     style Server fill:#f8fafc,stroke:#334155,stroke-width:2px,color:#0f172a
     style Ports fill:#eff6ff,stroke:#2563eb,color:#1e3a8a
@@ -591,17 +591,17 @@ graph TD
     end
 
     %% Client Operations
-    Client -->|REST / pgwire| Node1
-    Client -->|REST / pgwire| Node2
+    Client -->|"REST / pgwire"| Node1
+    Client -->|"REST / pgwire"| Node2
 
     %% Node Communication
-    Gossip1 <-->|Peer Discovery| Gossip2
-    Raft1 <-->|Metadata & Partition Leases| Raft2
-    E1 <-->|gRPC & Arrow-Flight (Data Shuffle)| E2
+    Gossip1 <-->|"Peer Discovery"| Gossip2
+    Raft1 <-->|"Metadata and Partition Leases"| Raft2
+    E1 <-->|"gRPC and Arrow-Flight Data Shuffle"| E2
 
     %% Distributed Durability
-    Node1 -->|Coordinated 2-Phase Commit Checkpoints| SharedStore["Shared Object Store (S3 / GCS / Azure)"]:::storageClass
-    Node2 -->|Coordinated 2-Phase Commit Checkpoints| SharedStore:::storageClass
+    Node1 -->|"Coordinated 2-Phase Commit Checkpoints"| SharedStore["Shared Object Store (S3 / GCS / Azure)"]:::storageClass
+    Node2 -->|"Coordinated 2-Phase Commit Checkpoints"| SharedStore:::storageClass
 
     style Node1 fill:#f8fafc,stroke:#334155,stroke-width:2px,color:#0f172a
     style Node2 fill:#f8fafc,stroke:#334155,stroke-width:2px,color:#0f172a
@@ -658,10 +658,10 @@ graph TB
     end
 
     %% Data and Control Paths
-    Sources -->|tokio::sync::mpsc (Arrow RecordBatches)| Proj
-    Join -->|Output Batches| SinkIO
-    CheckpointCoord -.->|Trigger Checkpoint Barrier| Sources
-    CheckpointCoord -.->|Offload Serialization| Serial
+    Sources -->|"tokio::sync::mpsc (Arrow RecordBatches)"| Proj
+    Join -->|"Output Batches"| SinkIO
+    CheckpointCoord -.->|"Trigger Checkpoint Barrier"| Sources
+    CheckpointCoord -.->|"Offload Serialization"| Serial
 
     style ComputeRuntime fill:#faf5ff,stroke:#7c3aed,stroke-width:2px,color:#4c1d95
     style MainRuntime fill:#eff6ff,stroke:#2563eb,stroke-width:2px,color:#1e3a8a
