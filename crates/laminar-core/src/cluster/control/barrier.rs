@@ -538,23 +538,20 @@ impl BarrierCoordinator {
         // The pull-path query service shares this control-plane port; peers
         // reach it at the same address published under `BARRIER_ADDR_KEY`.
         let query_svc = query_service_server(query_handler);
+        // Apply TLS synchronously so a bad cert fails start_server (before
+        // publishing BARRIER_ADDR_KEY) rather than silently never serving.
+        let mut builder = Server::builder();
+        if let Some(tls) = super::tls::server_tls() {
+            builder = builder
+                .tls_config(tls.clone())
+                .map_err(|e| format!("cluster control-plane TLS config: {e}"))?;
+        }
+        let router = builder
+            .add_service(BarrierSyncServer::new(server_impl))
+            .add_service(query_svc);
         let server_task = tokio::spawn(async move {
             let incoming_stream = tokio_stream::wrappers::TcpListenerStream::new(tokio_listener);
-            let mut builder = Server::builder();
-            if let Some(tls) = super::tls::server_tls() {
-                match builder.tls_config(tls.clone()) {
-                    Ok(b) => builder = b,
-                    Err(e) => {
-                        tracing::error!(error = %e, "cluster control-plane TLS config failed");
-                        return;
-                    }
-                }
-            }
-            let _ = builder
-                .add_service(BarrierSyncServer::new(server_impl))
-                .add_service(query_svc)
-                .serve_with_incoming(incoming_stream)
-                .await;
+            let _ = router.serve_with_incoming(incoming_stream).await;
         });
 
         let advertise_addr = if let Some(ref host) = advertise_host {

@@ -401,21 +401,17 @@ mod grpc {
                 };
                 Some((item, listener))
             });
+            // Apply TLS synchronously so a bad cert fails bind() rather than
+            // silently never serving.
+            let mut builder = Server::builder();
+            if let Some(tls) = crate::cluster::control::tls::server_tls() {
+                builder = builder
+                    .tls_config(tls.clone())
+                    .map_err(|e| io::Error::other(format!("cluster shuffle TLS config: {e}")))?;
+            }
+            let router = builder.add_service(ShuffleTransportServer::new(service));
             let server = tokio::spawn(async move {
-                let mut builder = Server::builder();
-                if let Some(tls) = crate::cluster::control::tls::server_tls() {
-                    match builder.tls_config(tls.clone()) {
-                        Ok(b) => builder = b,
-                        Err(e) => {
-                            tracing::error!(error = %e, "cluster shuffle TLS config failed");
-                            return;
-                        }
-                    }
-                }
-                let _ = builder
-                    .add_service(ShuffleTransportServer::new(service))
-                    .serve_with_incoming(incoming)
-                    .await;
+                let _ = router.serve_with_incoming(incoming).await;
             });
 
             Ok(Self {

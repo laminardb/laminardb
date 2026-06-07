@@ -497,7 +497,10 @@ fn validate_cluster_tls(config: &ServerConfig, errors: &mut Vec<String>) {
         d.cluster_tls_cert.is_some(),
         d.cluster_tls_key.is_some(),
         d.cluster_tls_client_ca.is_some(),
-        d.cluster_tls_server_name.is_some(),
+        // A whitespace-only server name is no name.
+        d.cluster_tls_server_name
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty()),
     ];
     if !set.iter().any(|s| *s) {
         return; // TLS disabled

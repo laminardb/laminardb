@@ -66,6 +66,11 @@ fn warn_late_drops(source: &str, column: &str, watermark_ms: i64, dropped: usize
 #[cfg(feature = "cluster")]
 const SUB_ROUTE_CAPACITY: usize = 1024;
 
+/// Per-peer send timeout in the routing consumer, so one slow peer can't
+/// head-of-line block delivery to the others.
+#[cfg(feature = "cluster")]
+const SUB_ROUTE_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Throttled (~once/10s) WARN when subscription routing drops a batch under
 /// backpressure, so silent gaps stay diagnosable.
 #[cfg(feature = "cluster")]
@@ -260,16 +265,29 @@ impl ConnectorPipelineCallback {
             let (tx, mut rx) =
                 tokio::sync::mpsc::channel::<(String, RecordBatch, Vec<u64>)>(SUB_ROUTE_CAPACITY);
             let sender = Arc::clone(&cfg.sender);
+            let prom = Arc::clone(&self.prom);
             tokio::spawn(async move {
                 while let Some((stage, batch, targets)) = rx.recv().await {
                     let msg = ShuffleMessage::VnodeData(stage, 0, batch);
                     for node in targets {
-                        if let Err(e) = sender.send_to(node, &msg).await {
-                            tracing::warn!(
-                                node,
-                                error = %e,
-                                "failed to route subscription batch to remote node"
-                            );
+                        // Bound each send so a slow/stalled peer can't head-of-line
+                        // block the others; a timed-out or failed send drops that
+                        // peer's batch (best-effort).
+                        match tokio::time::timeout(
+                            SUB_ROUTE_SEND_TIMEOUT,
+                            sender.send_to(node, &msg),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                prom.remote_subscription_batches_dropped.inc();
+                                tracing::warn!(node, error = %e, "subscription batch send failed");
+                            }
+                            Err(_) => {
+                                prom.remote_subscription_batches_dropped.inc();
+                                warn_subscription_route_drop();
+                            }
                         }
                     }
                 }

@@ -58,7 +58,7 @@ spec:
               protocol: TCP
             {{- end }}
             {{- $isCluster := or (eq .Values.laminardb.mode "delta") (eq .Values.laminardb.mode "cluster") }}
-            {{- $cluster := .Values.laminardb.cluster | default .Values.laminardb.delta | default dict }}
+            {{- $cluster := ternary (.Values.laminardb.delta | default .Values.laminardb.cluster | default dict) (.Values.laminardb.cluster | default .Values.laminardb.delta | default dict) (eq .Values.laminardb.mode "delta") }}
             {{- if $isCluster }}
             - name: gossip
               containerPort: {{ ($cluster.discovery | default dict).gossipPort | default 7946 }}
