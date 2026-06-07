@@ -71,10 +71,10 @@ const SUB_ROUTE_CAPACITY: usize = 1024;
 #[cfg(feature = "cluster")]
 const SUB_ROUTE_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Throttled (~once/10s) WARN when subscription routing drops a batch under
-/// backpressure, so silent gaps stay diagnosable.
+/// Throttled (~once/10s) WARN when subscription routing drops a batch, tagged
+/// with `cause` so a full queue isn't confused with a slow peer.
 #[cfg(feature = "cluster")]
-fn warn_subscription_route_drop() {
+fn warn_subscription_route_drop(cause: &str) {
     use std::sync::atomic::{AtomicI64, Ordering};
     static LAST_WARN_MS: AtomicI64 = AtomicI64::new(0);
     let now_ms = std::time::SystemTime::now()
@@ -84,7 +84,7 @@ fn warn_subscription_route_drop() {
         return;
     }
     LAST_WARN_MS.store(now_ms, Ordering::Relaxed);
-    tracing::warn!("dropping remote subscription batch: routing queue full (stalled peer?)");
+    tracing::warn!(cause, "dropping remote subscription batch");
 }
 
 /// Clears the in-flight checkpoint flag on drop, so a panicking persist task
@@ -285,7 +285,7 @@ impl ConnectorPipelineCallback {
                             }
                             Err(_) => {
                                 prom.remote_subscription_batches_dropped.inc();
-                                warn_subscription_route_drop();
+                                warn_subscription_route_drop("peer send timed out");
                             }
                         }
                     }
@@ -298,7 +298,7 @@ impl ConnectorPipelineCallback {
         for item in to_send {
             if tx.try_send(item).is_err() {
                 self.prom.remote_subscription_batches_dropped.inc();
-                warn_subscription_route_drop();
+                warn_subscription_route_drop("routing queue full");
             }
         }
     }
