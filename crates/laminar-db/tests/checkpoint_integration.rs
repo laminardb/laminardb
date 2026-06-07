@@ -824,7 +824,7 @@ mod recovery {
         let mut coord = make_coordinator(dir.path()).await;
         let result = coord
             .checkpoint(CheckpointRequest {
-                table_store_checkpoint_path: Some("/data/rocksdb_cp_001".into()),
+                table_store_checkpoint_path: Some("/data/table_store_cp_001".into()),
                 ..CheckpointRequest::default()
             })
             .await
@@ -838,7 +838,7 @@ mod recovery {
 
         assert_eq!(
             manifest.table_store_checkpoint_path.as_deref(),
-            Some("/data/rocksdb_cp_001")
+            Some("/data/table_store_cp_001")
         );
     }
 

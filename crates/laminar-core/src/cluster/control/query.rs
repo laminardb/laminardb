@@ -254,12 +254,37 @@ mod tests {
         }
     }
 
-    /// Start the query service on an ephemeral port, returning a kv that
-    /// resolves `peer` to it.
-    async fn serve(peer: NodeId, batch: RecordBatch) -> (QueryClientPool, Arc<dyn ClusterKv>) {
-        let slot: QueryHandlerSlot = Arc::new(parking_lot::RwLock::new(Some(Arc::new(
-            StaticHandler(batch),
-        ))));
+    /// Records the projection + filter_sql it was called with, so a test can
+    /// assert the request carried them over the wire.
+    type SeenArgs = Arc<parking_lot::Mutex<Option<(Option<Vec<usize>>, Option<String>)>>>;
+    struct RecordingHandler {
+        batch: RecordBatch,
+        seen: SeenArgs,
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteQueryHandler for RecordingHandler {
+        async fn remote_scan(
+            &self,
+            _table: &str,
+            projection: Option<Vec<usize>>,
+            filter_sql: Option<String>,
+        ) -> Result<RecordBatch, String> {
+            *self.seen.lock() = Some((projection.clone(), filter_sql));
+            match projection {
+                Some(p) => self.batch.project(&p).map_err(|e| e.to_string()),
+                None => Ok(self.batch.clone()),
+            }
+        }
+    }
+
+    /// Serve `handler` on an ephemeral port, returning a kv that resolves `peer`
+    /// to it plus an empty client pool.
+    async fn serve_handler(
+        peer: NodeId,
+        handler: Arc<dyn RemoteQueryHandler>,
+    ) -> (QueryClientPool, Arc<dyn ClusterKv>) {
+        let slot: QueryHandlerSlot = Arc::new(parking_lot::RwLock::new(Some(handler)));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -274,6 +299,10 @@ mod tests {
         let pool: QueryClientPool =
             Arc::new(parking_lot::Mutex::new(rustc_hash::FxHashMap::default()));
         (pool, Arc::new(kv))
+    }
+
+    async fn serve(peer: NodeId, batch: RecordBatch) -> (QueryClientPool, Arc<dyn ClusterKv>) {
+        serve_handler(peer, Arc::new(StaticHandler(batch))).await
     }
 
     fn int_batch(values: Vec<i32>) -> RecordBatch {
@@ -321,5 +350,31 @@ mod tests {
         let batches = collect_chunks(stream).await;
         let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total, 0);
+    }
+
+    // Projection and filter_sql reach the serving handler over the wire, and the
+    // projected result streams back.
+    #[tokio::test]
+    async fn remote_scan_forwards_projection_and_filter() {
+        let seen: SeenArgs = Arc::new(parking_lot::Mutex::new(None));
+        let handler = Arc::new(RecordingHandler {
+            batch: int_batch(vec![10, 20, 30]),
+            seen: Arc::clone(&seen),
+        });
+        let peer = NodeId(7);
+        let (pool, kv) = serve_handler(peer, handler).await;
+
+        let stream =
+            remote_scan_client(&pool, &kv, peer, "mv", Some(vec![0]), Some("(\"n\" > 1)".into()))
+                .await
+                .unwrap();
+        let batches = collect_chunks(stream).await;
+        let got = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let col = got.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(col.values(), &[10, 20, 30]);
+
+        let (proj, filter) = seen.lock().clone().expect("handler was called");
+        assert_eq!(proj, Some(vec![0]));
+        assert_eq!(filter.as_deref(), Some("(\"n\" > 1)"));
     }
 }

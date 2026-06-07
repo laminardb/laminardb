@@ -535,7 +535,7 @@ mod tests {
             "instruments".into(),
             ConnectorCheckpoint::with_offsets(1, HashMap::from([("lsn".into(), "0/ABCD".into())])),
         );
-        m.table_store_checkpoint_path = Some("/tmp/rocksdb_cp".into());
+        m.table_store_checkpoint_path = Some("/tmp/table_store_cp".into());
 
         let json = serde_json::to_string(&m).unwrap();
         let restored: CheckpointManifest = serde_json::from_str(&json).unwrap();
@@ -543,7 +543,7 @@ mod tests {
         assert_eq!(restored.table_offsets.len(), 1);
         assert_eq!(
             restored.table_store_checkpoint_path.as_deref(),
-            Some("/tmp/rocksdb_cp")
+            Some("/tmp/table_store_cp")
         );
     }
 

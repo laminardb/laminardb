@@ -2212,7 +2212,7 @@ mod tests {
 
         let result = coord
             .checkpoint(CheckpointRequest {
-                table_store_checkpoint_path: Some("/tmp/rocksdb_cp".into()),
+                table_store_checkpoint_path: Some("/tmp/table_store_cp".into()),
                 ..CheckpointRequest::default()
             })
             .await
@@ -2223,7 +2223,7 @@ mod tests {
         let loaded = coord.store().load_latest().await.unwrap().unwrap();
         assert_eq!(
             loaded.table_store_checkpoint_path.as_deref(),
-            Some("/tmp/rocksdb_cp")
+            Some("/tmp/table_store_cp")
         );
     }
 
