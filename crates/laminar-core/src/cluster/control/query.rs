@@ -152,35 +152,34 @@ pub(crate) fn query_service_server(
     query_v1::query_service_server::QueryServiceServer::new(QueryServiceImpl::new(slot))
 }
 
-/// Resolve (or reuse) the pooled channel to `peer`, connecting lazily.
+/// Pooled channel to `peer`, connecting lazily. `Ok(None)` = no published
+/// address (down / not started / pruned) → the caller skips the peer.
 async fn connect(
     pool: &QueryClientPool,
     kv: &Arc<dyn ClusterKv>,
     peer: NodeId,
-) -> Result<tonic::transport::Channel, String> {
+) -> Result<Option<tonic::transport::Channel>, String> {
     if let Some(chan) = pool.lock().get(&peer).cloned() {
-        return Ok(chan);
+        return Ok(Some(chan));
     }
-    let addr = kv
-        .read_from(peer, BARRIER_ADDR_KEY)
-        .await
-        .ok_or_else(|| format!("no control-plane address for peer {}", peer.0))?;
+    let Some(addr) = kv.read_from(peer, BARRIER_ADDR_KEY).await else {
+        return Ok(None);
+    };
     let channel = super::tls::client_endpoint(&addr)?
         .connect_timeout(REMOTE_SCAN_CONNECT_TIMEOUT)
         .connect_lazy();
-    Ok(pool.lock().entry(peer).or_insert(channel).clone())
+    Ok(Some(pool.lock().entry(peer).or_insert(channel).clone()))
 }
 
 /// Lazily-streamed Arrow [`RecordBatch`] chunks from a peer's `RemoteScan`; a
 /// decode or mid-stream transport error surfaces as an `Err` item.
 pub type RemoteBatchStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, String>> + Send>>;
 
-/// Scan `table_name` on `peer`, returning its Arrow IPC chunks as a lazy stream;
-/// evicts the pooled channel on transport/idle error.
+/// Scan `table_name` on `peer` as a lazy Arrow-IPC stream. `Ok(None)` means the
+/// peer is unreachable (no published address) and should be skipped, not failed.
 ///
 /// # Errors
-/// Discovery/transport/timeout while *establishing* the stream; post-stream
-/// failures (decode, dropped connection, idle timeout) surface as `Err` items.
+/// Transport/timeout while establishing; post-stream failures surface as `Err` items.
 pub async fn remote_scan_client(
     pool: &QueryClientPool,
     kv: &Arc<dyn ClusterKv>,
@@ -188,7 +187,7 @@ pub async fn remote_scan_client(
     table_name: &str,
     projection: Option<Vec<usize>>,
     filter_sql: Option<String>,
-) -> Result<RemoteBatchStream, String> {
+) -> Result<Option<RemoteBatchStream>, String> {
     let projection = projection
         .unwrap_or_default()
         .into_iter()
@@ -208,7 +207,9 @@ pub async fn remote_scan_client(
     let mut attempt = 0u32;
     let stream = loop {
         attempt += 1;
-        let channel = connect(pool, kv, peer).await?;
+        let Some(channel) = connect(pool, kv, peer).await? else {
+            return Ok(None); // peer has no address (down/pruned) — skip it
+        };
         let mut client = QueryServiceClient::new(channel);
         match tokio::time::timeout(
             REMOTE_SCAN_IDLE_TIMEOUT,
@@ -280,7 +281,7 @@ pub async fn remote_scan_client(
             }
         },
     );
-    Ok(Box::pin(out))
+    Ok(Some(Box::pin(out)))
 }
 
 #[cfg(test)]
@@ -388,7 +389,8 @@ mod tests {
 
         let stream = remote_scan_client(&pool, &kv, peer, "mv", None, None)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("peer resolvable");
         let batches = collect_chunks(stream).await;
         assert!(batches.len() > 1);
         let got = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
@@ -404,7 +406,8 @@ mod tests {
 
         let stream = remote_scan_client(&pool, &kv, peer, "mv", None, None)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("peer resolvable");
         let batches = collect_chunks(stream).await;
         let total: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(total, 0);
@@ -431,7 +434,8 @@ mod tests {
             Some("(\"n\" > 1)".into()),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expect("peer resolvable");
         let batches = collect_chunks(stream).await;
         let got = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
         let col = got.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
@@ -481,7 +485,8 @@ mod tests {
             serve_handler(peer, Arc::new(StaticHandler(int_batch(vec![1, 2, 3])))).await;
         let stream = remote_scan_client(&pool, &kv, peer, "mv", None, None)
             .await
-            .unwrap();
+            .unwrap()
+            .expect("peer resolvable");
         let batches = collect_chunks(stream).await;
         let got = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
         let col = got.column(0).as_any().downcast_ref::<Int32Array>().unwrap();

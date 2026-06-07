@@ -297,9 +297,15 @@ impl ExecutionPlan for DistributedScanExec {
                     {
                         // Adapt laminar-core's String-error Arrow stream into a
                         // DataFusion record-batch stream of this scan's schema.
-                        Ok(chunks) => Box::pin(RecordBatchStreamAdapter::new(
+                        Ok(Some(chunks)) => Box::pin(RecordBatchStreamAdapter::new(
                             schema,
                             chunks.map(|batch| batch.map_err(DataFusionError::Execution)),
+                        )) as SendableRecordBatchStream,
+                        // Peer unreachable (down / not yet started): skip it rather
+                        // than failing the whole scan.
+                        Ok(None) => Box::pin(RecordBatchStreamAdapter::new(
+                            schema,
+                            futures::stream::empty::<Result<RecordBatch>>(),
                         )) as SendableRecordBatchStream,
                         // Couldn't even open the stream: surface as a one-item
                         // error stream so flatten() propagates the failure.
