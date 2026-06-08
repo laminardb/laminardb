@@ -18,11 +18,12 @@ env:
   BENCH_ARGS: "--noplot --sample-size 10 --warm-up-time 1 --measurement-time 3"
 
 jobs:
-  # Build once, cache for all benchmark jobs
+  # Build every bench binary once and publish them as an artifact; the run jobs
+  # below download and execute them instead of each recompiling the workspace.
   build:
     name: Build Benchmarks
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
       - name: Free disk space
@@ -39,11 +40,29 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
 
-      - name: Build all benchmarks
-        # `--no-default-features`: the benches use only core engine APIs, so the
-        # default connector stack (deltalake + cloud SDKs, mongodb/mysql/postgres,
-        # iceberg, nats) is dead weight that overran the 30-min build timeout.
-        run: cargo build --release -p laminar-core -p laminar-db --benches --no-default-features
+      - name: Build and stage bench binaries
+        # `--no-default-features`: benches need only core engine APIs; the connector
+        # stack is dead weight that overran the build timeout. JSON output gives each
+        # bench executable's path, which we copy to its stable (de-hashed) name.
+        run: |
+          set -euo pipefail
+          mkdir -p bench-bin
+          cargo build --release -p laminar-core -p laminar-db --benches \
+            --no-default-features --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | index("bench")) and .executable != null) | .executable' \
+            | while read -r exe; do
+                cp "$exe" "bench-bin/$(basename "$exe" | sed -E 's/-[0-9a-f]+$//')"
+              done
+          chmod +x bench-bin/*
+          ls -la bench-bin
+
+      - name: Upload bench binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-benches
+          path: bench-bin/
+          if-no-files-found: error
+          retention-days: 1
 
   # Core latency-critical benchmarks
   bench-latency:
@@ -52,24 +71,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Download bench binaries
+        uses: actions/download-artifact@v8
         with:
-          key: bench-build
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
-
+          name: compiled-benches
+          path: bench-bin
       - name: Run latency benchmarks
         run: |
-          cargo bench -p laminar-core --bench latency_bench --no-default-features -- $BENCH_ARGS 2>&1 | tee results.txt
-          cargo bench -p laminar-core --bench cache_bench --no-default-features -- $BENCH_ARGS 2>&1 | tee -a results.txt
-
+          chmod +x bench-bin/*
+          ./bench-bin/latency_bench --bench $BENCH_ARGS 2>&1 | tee results.txt
+          ./bench-bin/cache_bench --bench $BENCH_ARGS 2>&1 | tee -a results.txt
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
@@ -83,23 +94,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Download bench binaries
+        uses: actions/download-artifact@v8
         with:
-          key: bench-build
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
-
+          name: compiled-benches
+          path: bench-bin
       - name: Run DAG benchmarks
         run: |
-          cargo bench -p laminar-db --bench stream_executor_bench --no-default-features -- $BENCH_ARGS 2>&1 | tee results.txt
-
+          chmod +x bench-bin/*
+          ./bench-bin/stream_executor_bench --bench $BENCH_ARGS 2>&1 | tee results.txt
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
@@ -113,25 +116,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Download bench binaries
+        uses: actions/download-artifact@v8
         with:
-          key: bench-build
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
-
+          name: compiled-benches
+          path: bench-bin
       - name: Run operator benchmarks
         run: |
-          cargo bench -p laminar-core --bench window_bench --no-default-features -- $BENCH_ARGS 2>&1 | tee results.txt
-          cargo bench -p laminar-core --bench lookup_join_bench --no-default-features -- $BENCH_ARGS 2>&1 | tee -a results.txt
-          cargo bench -p laminar-core --bench streaming_bench --no-default-features -- $BENCH_ARGS 2>&1 | tee -a results.txt
-
+          chmod +x bench-bin/*
+          ./bench-bin/window_bench --bench $BENCH_ARGS 2>&1 | tee results.txt
+          ./bench-bin/lookup_join_bench --bench $BENCH_ARGS 2>&1 | tee -a results.txt
+          ./bench-bin/streaming_bench --bench $BENCH_ARGS 2>&1 | tee -a results.txt
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
@@ -145,23 +140,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Download bench binaries
+        uses: actions/download-artifact@v8
         with:
-          key: bench-build
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
-
+          name: compiled-benches
+          path: bench-bin
       - name: Run throughput benchmarks
         run: |
-          cargo bench -p laminar-db --bench hot_path_micro --no-default-features -- $BENCH_ARGS 2>&1 | tee results.txt
-
+          chmod +x bench-bin/*
+          ./bench-bin/hot_path_micro --bench $BENCH_ARGS 2>&1 | tee results.txt
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
@@ -175,23 +162,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Download bench binaries
+        uses: actions/download-artifact@v8
         with:
-          key: bench-build
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
-
+          name: compiled-benches
+          path: bench-bin
       - name: Run storage benchmarks
         run: |
-          cargo bench -p laminar-db --bench recovery_bench --no-default-features -- $BENCH_ARGS 2>&1 | tee results.txt
-
+          chmod +x bench-bin/*
+          ./bench-bin/recovery_bench --bench $BENCH_ARGS 2>&1 | tee results.txt
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
@@ -206,10 +185,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Download all artifacts
+      # `pattern: bench-*` keeps the (large) compiled-benches artifact out of
+      # this download — we only want each job's results.txt.
+      - name: Download result artifacts
         uses: actions/download-artifact@v8
         with:
           path: bench-results
+          pattern: bench-*
 
       - name: Combine results
         run: |
