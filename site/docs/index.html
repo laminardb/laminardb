@@ -6,7 +6,7 @@
   <title>LaminarDB Docs — Configuration Reference</title>
   <meta name="description" content="Complete configuration reference for LaminarDB server, connectors, checkpoints, and deployment. Every field verified against source code.">
   <meta name="robots" content="index, follow, max-image-preview:large">
-  <meta name="theme-color" content="#0a0a0a">
+  <meta name="theme-color" content="#f8fafc">
   <link rel="canonical" href="https://laminardb.io/docs/">
   <link rel="alternate" type="text/plain" title="LLM-friendly site overview" href="/llms.txt">
 
@@ -97,7 +97,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet">
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism.min.css" rel="stylesheet">
   <link rel="stylesheet" href="../css/style.css">
 
   <style>
@@ -420,26 +420,45 @@
     <div class="nav-inner">
       <a href="../" class="nav-brand" aria-label="LaminarDB home">
         <svg viewBox="0 0 40 40" width="28" height="28" aria-hidden="true">
-          <defs><linearGradient id="logo-g" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#00b4d8"/><stop offset="100%" stop-color="#38cbeb"/></linearGradient></defs>
+          <defs>
+            <linearGradient id="logo-g" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0%" stop-color="#0ea5e9"/>
+              <stop offset="100%" stop-color="#8b5cf6"/>
+            </linearGradient>
+          </defs>
           <path d="M4 8 C12 8,14 6,22 6 C30 6,32 10,36 10" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
           <path d="M2 14 C10 14,14 11,22 11 C30 11,32 15,38 15" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".6"/>
           <path d="M0 20 C8 20,14 17,22 17 C30 17,32 21,40 21" stroke="url(#logo-g)" stroke-width="3" fill="none" stroke-linecap="round"/>
           <path d="M2 26 C10 26,14 23,22 23 C30 23,32 27,38 27" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".6"/>
           <path d="M4 32 C12 32,14 30,22 30 C30 30,32 34,36 34" stroke="url(#logo-g)" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
         </svg>
-        <span>LaminarDB</span>
-        <span class="version-badge" data-version="tag">v0.23.0</span>
+        <span>LAMINARDB.IO</span>
+        <span class="version-badge" data-version="tag">v0.25.0</span>
       </a>
 
       <nav class="nav-links" aria-label="Main navigation">
+        <a href="../#features">Features</a>
+        <a href="../#architecture">Architecture</a>
         <a href="../#quick-start">Quick Start</a>
         <a href="./">Docs</a>
-        <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API</a>
-        <a href="https://github.com/laminardb/laminardb" class="github-link" target="_blank" rel="noopener">
-          <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener" class="btn btn-secondary" style="padding: 6px 14px; font-size: 0.8rem;">API Reference</a>
+        <a href="https://github.com/laminardb/laminardb" class="btn btn-primary" target="_blank" rel="noopener" style="padding: 6px 16px; font-size: 0.8rem;">
+          <svg viewBox="0 0 16 16" style="width:14px;height:14px;fill:currentColor;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
           GitHub
         </a>
       </nav>
+
+      <button class="nav-toggle" aria-label="Toggle menu" aria-expanded="false" aria-controls="mobile-menu">
+        <span></span><span></span><span></span>
+      </button>
+
+      <div class="mobile-menu" id="mobile-menu">
+        <a href="../#features">Features</a>
+        <a href="../#architecture">Architecture</a>
+        <a href="../#quick-start">Quick Start</a>
+        <a href="./">Docs</a>
+        <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
+      </div>
     </div>
   </header>
 
@@ -899,7 +918,10 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
       <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-server/src/http.rs" target="_blank" rel="noopener">crates/laminar-server/src/http.rs</a></div>
 
       <p>
-        The Console UI (Vite-based SPA client) connects to the control-plane APIs exposed by the server. All endpoints are protected by token authentication if <code>server.console_token</code> is configured.
+        The Console UI is a web client that lets you inspect your streaming SQL nodes, view lineage dependency graphs, and author queries. You can access the hosted console at <strong><a href="https://laminardb.github.io/laminardb-console-ui/" target="_blank" rel="noopener">laminardb.github.io/laminardb-console-ui</a></strong>.
+      </p>
+      <p>
+        The console connects to the control-plane APIs exposed by the server. All endpoints are protected by token authentication if <code>server.console_token</code> is configured.
       </p>
 
       <h3>Security &amp; Gating</h3>
@@ -1157,7 +1179,7 @@ aws_secret_access_key = "${AWS_SECRET_ACCESS_KEY}"</code></pre>
             <td class="field-name">connector</td>
             <td class="field-type">String</td>
             <td><span class="field-required">required</span></td>
-            <td>"kafka", "postgres_cdc", "mysql_cdc", "mongodb-cdc", "websocket", "files", "delta-lake", "iceberg", "otel", "parquet-lookup", "postgres-lookup"</td>
+            <td>"kafka", "postgres_cdc", "mysql_cdc", "mongodb-cdc", "nats", "websocket", "files", "delta-lake", "iceberg", "otel", "parquet-lookup", "postgres-lookup"</td>
           </tr>
           <tr>
             <td class="field-name">format</td>
@@ -1265,7 +1287,7 @@ max_out_of_orderness = "5s"</code></pre>
             <td class="field-name">connector</td>
             <td class="field-type">String</td>
             <td><span class="field-required">required</span></td>
-            <td>"kafka", "postgres", "mongodb", "delta-lake", "iceberg", "websocket", "files", "stdout"</td>
+            <td>"kafka", "postgres", "mongodb", "nats", "delta-lake", "iceberg", "websocket", "files", "stdout"</td>
           </tr>
           <tr>
             <td class="field-name">delivery</td>
@@ -1342,6 +1364,7 @@ max_out_of_orderness = "5s"</code></pre>
 
       <div class="connector-grid">
         <div class="connector-card"><a href="#kafka-source"><h4>Kafka</h4></a><div class="direction">Source + Sink</div><div class="feature">kafka</div></div>
+        <div class="connector-card"><a href="#nats-source"><h4>NATS</h4></a><div class="direction">Source + Sink</div><div class="feature">nats</div></div>
         <div class="connector-card"><a href="#postgres-cdc"><h4>PostgreSQL CDC</h4></a><div class="direction">Source</div><div class="feature">postgres-cdc</div></div>
         <div class="connector-card"><a href="#mysql-cdc"><h4>MySQL CDC</h4></a><div class="direction">Source</div><div class="feature">mysql-cdc</div></div>
         <div class="connector-card"><a href="#mongodb-cdc"><h4>MongoDB CDC</h4></a><div class="direction">Source + Sink</div><div class="feature">mongodb-cdc</div></div>
@@ -1423,6 +1446,74 @@ max_out_of_orderness = "5s"</code></pre>
           <tr><td class="field-name">linger.ms</td><td class="field-default">5</td><td>Batch linger time</td></tr>
           <tr><td class="field-name">batch.size</td><td class="field-default">16384</td><td>Max batch bytes</td></tr>
           <tr><td class="field-name">transactional.id</td><td></td><td>For exactly-once producer</td></tr>
+        </tbody>
+      </table>
+
+      <!-- NATS SOURCE -->
+      <h3 id="nats-source">NATS Source</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/nats/source.rs" target="_blank" rel="noopener">nats/source.rs</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">servers</td><td><span class="field-required">required</span></td><td>NATS server URLs (comma-separated)</td></tr>
+          <tr><td class="field-name">mode</td><td class="field-default">jetstream</td><td>jetstream, core</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, avro, protobuf</td></tr>
+          <tr><td class="field-name">auth.mode</td><td class="field-default">none</td><td>none, user_pass, token, creds_file</td></tr>
+          <tr><td class="field-name">user</td><td></td><td>Auth username (required for user_pass)</td></tr>
+          <tr><td class="field-name">password</td><td></td><td>Auth password (required for user_pass)</td></tr>
+          <tr><td class="field-name">token</td><td></td><td>Auth token (required for token)</td></tr>
+          <tr><td class="field-name">creds.file</td><td></td><td>Path to creds file (required for creds_file)</td></tr>
+          <tr><td class="field-name">tls.enabled</td><td class="field-default">false</td><td>Enable TLS</td></tr>
+          <tr><td class="field-name">tls.ca.location</td><td></td><td>CA cert path</td></tr>
+          <tr><td class="field-name">tls.cert.location</td><td></td><td>Client certificate path</td></tr>
+          <tr><td class="field-name">tls.key.location</td><td></td><td>Client key path</td></tr>
+          <tr><td class="field-name">stream</td><td></td><td>NATS JetStream stream name (required in jetstream mode)</td></tr>
+          <tr><td class="field-name">subject</td><td></td><td>Subscription subject (required in core mode)</td></tr>
+          <tr><td class="field-name">subject.filters</td><td></td><td>Comma-separated JetStream subject filters</td></tr>
+          <tr><td class="field-name">consumer</td><td></td><td>Pull consumer durable name (required in jetstream mode)</td></tr>
+          <tr><td class="field-name">deliver.policy</td><td class="field-default">all</td><td>all, new, by_start_sequence, by_start_time</td></tr>
+          <tr><td class="field-name">start.sequence</td><td></td><td>Start sequence (required if deliver.policy=by_start_sequence)</td></tr>
+          <tr><td class="field-name">start.time</td><td></td><td>Start RFC3339 timestamp (required if deliver.policy=by_start_time)</td></tr>
+          <tr><td class="field-name">ack.policy</td><td class="field-default">explicit</td><td>explicit, none</td></tr>
+          <tr><td class="field-name">ack.wait.ms</td><td class="field-default">60000</td><td>Ack wait timeout in milliseconds</td></tr>
+          <tr><td class="field-name">max.deliver</td><td class="field-default">5</td><td>Max deliveries</td></tr>
+          <tr><td class="field-name">max.ack.pending</td><td class="field-default">10000</td><td>Max outstanding unacknowledged messages</td></tr>
+          <tr><td class="field-name">fetch.batch</td><td class="field-default">500</td><td>Batch size for fetch operations</td></tr>
+          <tr><td class="field-name">fetch.max.wait.ms</td><td class="field-default">500</td><td>Max wait for fetch operations in milliseconds</td></tr>
+          <tr><td class="field-name">queue.group</td><td></td><td>Queue group (core mode only)</td></tr>
+        </tbody>
+      </table>
+
+      <!-- NATS SINK -->
+      <h3 id="nats-sink">NATS Sink</h3>
+      <div class="source-ref">Source: <a href="https://github.com/laminardb/laminardb/blob/main/crates/laminar-connectors/src/nats/sink.rs" target="_blank" rel="noopener">nats/sink.rs</a></div>
+
+      <table class="config-table">
+        <thead><tr><th>Property</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td class="field-name">servers</td><td><span class="field-required">required</span></td><td>NATS server URLs (comma-separated)</td></tr>
+          <tr><td class="field-name">mode</td><td class="field-default">jetstream</td><td>jetstream, core</td></tr>
+          <tr><td class="field-name">format</td><td class="field-default">json</td><td>json, avro, protobuf</td></tr>
+          <tr><td class="field-name">auth.mode</td><td class="field-default">none</td><td>none, user_pass, token, creds_file</td></tr>
+          <tr><td class="field-name">user</td><td></td><td>Auth username (required for user_pass)</td></tr>
+          <tr><td class="field-name">password</td><td></td><td>Auth password (required for user_pass)</td></tr>
+          <tr><td class="field-name">token</td><td></td><td>Auth token (required for token)</td></tr>
+          <tr><td class="field-name">creds.file</td><td></td><td>Path to creds file (required for creds_file)</td></tr>
+          <tr><td class="field-name">tls.enabled</td><td class="field-default">false</td><td>Enable TLS</td></tr>
+          <tr><td class="field-name">tls.ca.location</td><td></td><td>CA cert path</td></tr>
+          <tr><td class="field-name">tls.cert.location</td><td></td><td>Client certificate path</td></tr>
+          <tr><td class="field-name">tls.key.location</td><td></td><td>Client key path</td></tr>
+          <tr><td class="field-name">stream</td><td></td><td>Target JetStream stream (required if delivery.guarantee=exactly_once)</td></tr>
+          <tr><td class="field-name">subject</td><td></td><td>Literal publishing subject. Mutually exclusive with subject.column.</td></tr>
+          <tr><td class="field-name">subject.column</td><td></td><td>Per-row subject column name. Mutually exclusive with subject.</td></tr>
+          <tr><td class="field-name">expected.stream</td><td></td><td>Optional stream name assertion header</td></tr>
+          <tr><td class="field-name">delivery.guarantee</td><td class="field-default">at-least-once</td><td>at-least-once, exactly-once, at-most-once</td></tr>
+          <tr><td class="field-name">dedup.id.column</td><td></td><td>Column to use for message deduplication ID (required if exactly_once)</td></tr>
+          <tr><td class="field-name">min.duplicate.window.ms</td><td class="field-default">120000</td><td>Minimum duplicate window in milliseconds</td></tr>
+          <tr><td class="field-name">max.pending</td><td class="field-default">4096</td><td>Maximum pending publish futures</td></tr>
+          <tr><td class="field-name">ack.timeout.ms</td><td class="field-default">30000</td><td>Ack timeout in milliseconds</td></tr>
+          <tr><td class="field-name">header.columns</td><td></td><td>Comma-separated column names to map to NATS headers</td></tr>
         </tbody>
       </table>
 
@@ -2110,17 +2201,27 @@ writer.id = "vwap-writer"</code></pre>
   <footer class="footer">
     <div class="container">
       <div class="footer-inner">
-        <div class="footer-left">
-          LaminarDB &middot;
-          <a href="https://github.com/laminardb/laminardb/blob/main/LICENSE" target="_blank" rel="noopener">Apache 2.0</a> &middot;
-          <span data-version="tag">v0.23.0</span>
+        <div class="footer-logo">
+          <svg viewBox="0 0 40 40" width="24" height="24" aria-hidden="true">
+            <path d="M4 8 C12 8,14 6,22 6 C30 6,32 10,36 10" stroke="#0ea5e9" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
+            <path d="M2 14 C10 14,14 11,22 11 C30 11,32 15,38 15" stroke="#0ea5e9" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".6"/>
+            <path d="M0 20 C8 20,14 17,22 17 C30 17,32 21,40 21" stroke="#0ea5e9" stroke-width="3" fill="none" stroke-linecap="round"/>
+            <path d="M2 26 C10 26,14 23,22 23 C30 23,32 27,38 27" stroke="#0ea5e9" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".6"/>
+            <path d="M4 32 C12 32,14 30,22 30 C30 30,32 34,36 34" stroke="#0ea5e9" stroke-width="2.5" fill="none" stroke-linecap="round" opacity=".4"/>
+          </svg>
+          <span>LAMINARDB.IO</span>
         </div>
         <div class="footer-links">
           <a href="https://github.com/laminardb/laminardb" target="_blank" rel="noopener">GitHub</a>
           <a href="https://crates.io/crates/laminar-db" target="_blank" rel="noopener">Crates.io</a>
           <a href="https://laminardb.io/api/laminar_db/" target="_blank" rel="noopener">API Docs</a>
+          <a href="https://github.com/laminardb/laminardb/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a>
           <a href="mailto:support@laminardb.io">Support</a>
         </div>
+      </div>
+      <div class="footer-bottom">
+        <span>© 2026 Laminar Technologies &amp; Contributors. Licensed Apache 2.0.</span>
+        <span>Current version: <span data-version="tag">v0.25.0</span></span>
       </div>
     </div>
   </footer>

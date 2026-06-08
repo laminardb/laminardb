@@ -265,14 +265,14 @@ Enrichment joins via `CREATE LOOKUP TABLE` DDL with hash-probe physical executio
 
 ### Deployment Profiles
 
-Pre-configured deployment tiers (`laminar_db::Profile`). Each tier includes all capabilities of the tiers below it: `BareMetal ⊂ Embedded ⊂ Durable ⊂ Delta`.
+Pre-configured deployment tiers (`laminar_db::Profile`). Each tier includes all capabilities of the tiers below it: `BareMetal ⊂ Embedded ⊂ Durable ⊂ Cluster`.
 
 | Profile | Description |
 |---------|-------------|
 | `BareMetal` | Default. In-memory only, no persistence. Fastest startup. |
 | `Embedded` | Local filesystem checkpoint persistence for single-node embedded use. |
 | `Durable` | Object-store checkpoints (S3/GCS/Azure) for recovery. |
-| `Delta` | Distributed scaffolding (gossip, Raft, gRPC stubs). Not production-ready. Requires the `delta` feature. |
+| `Cluster` | Distributed deployment with Chitchat gossip discovery, Raft partition metadata consensus, and gRPC/Arrow-Flight shuffles. |
 
 The builder can auto-detect the appropriate profile from the configured checkpoint URL and discovery settings.
 
