@@ -12,6 +12,12 @@ fn main() {
     println!("cargo:rerun-if-changed=proto/barrier.proto");
     println!("cargo:rerun-if-changed=proto/query.proto");
 
+    // Use the vendored protoc so codegen doesn't depend on the host's protoc:
+    // stock distro versions (e.g. Ubuntu 22.04's 3.12) predate proto3 `optional`
+    // (protoc 3.15) and reject barrier.proto.
+    let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc binary");
+    std::env::set_var("PROTOC", protoc);
+
     tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)

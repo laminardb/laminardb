@@ -68,10 +68,10 @@ checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sh
 
 {{/*
 Determine if we should use StatefulSet (instead of Deployment).
-Use StatefulSet when: persistence is enabled OR cluster/delta mode is active.
+Use StatefulSet when: persistence is enabled OR cluster mode is active.
 */}}
 {{- define "laminardb.useStatefulSet" -}}
-{{- if or (and .Values.persistence.state.enabled (not .Values.persistence.state.useEmptyDir)) (and .Values.persistence.checkpoints.enabled) (eq .Values.laminardb.mode "delta") (eq .Values.laminardb.mode "cluster") }}
+{{- if or (and .Values.persistence.state.enabled (not .Values.persistence.state.useEmptyDir)) (and .Values.persistence.checkpoints.enabled) (eq .Values.laminardb.mode "cluster") }}
 true
 {{- end }}
 {{- end }}
@@ -85,7 +85,7 @@ Image reference with tag.
 {{- end }}
 
 {{/*
-Headless service name for delta mode discovery.
+Headless service name for cluster mode discovery.
 */}}
 {{- define "laminardb.headlessServiceName" -}}
 {{- printf "%s-headless" (include "laminardb.fullname" .) }}

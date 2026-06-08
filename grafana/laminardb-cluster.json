@@ -1,0 +1,389 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" },
+    { "type": "panel", "id": "stat", "name": "Stat", "version": "" },
+    { "type": "panel", "id": "timeseries", "name": "Time series", "version": "" }
+  ],
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "title": "Cluster Status",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false
+    },
+    {
+      "title": "Active Cluster Nodes",
+      "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
+      "targets": [
+        {
+          "expr": "count(laminardb_uptime_seconds)",
+          "legendFormat": "Nodes"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Global Watermark (epoch ms)",
+      "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
+      "targets": [
+        {
+          "expr": "min(laminardb_pipeline_watermark)",
+          "legendFormat": "Global Watermark"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "dateTimeAsIso"
+        }
+      }
+    },
+    {
+      "title": "Total Cluster Ingestion Rate",
+      "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
+      "targets": [
+        {
+          "expr": "sum(rate(laminardb_events_ingested_total[1m]))",
+          "legendFormat": "Ingested/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      }
+    },
+    {
+      "title": "Total Cluster Emission Rate",
+      "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
+      "targets": [
+        {
+          "expr": "sum(rate(laminardb_events_emitted_total[1m]))",
+          "legendFormat": "Emitted/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops"
+        }
+      }
+    },
+    {
+      "title": "Performance & Throughput",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "collapsed": false
+    },
+    {
+      "title": "Ingested Events (Cluster vs Nodes)",
+      "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "targets": [
+        {
+          "expr": "sum(rate(laminardb_events_ingested_total[1m]))",
+          "legendFormat": "Cluster Total"
+        },
+        {
+          "expr": "rate(laminardb_events_ingested_total[1m])",
+          "legendFormat": "Node {{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "fillOpacity": 10 }
+        }
+      }
+    },
+    {
+      "title": "Emitted Events (Cluster vs Nodes)",
+      "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "targets": [
+        {
+          "expr": "sum(rate(laminardb_events_emitted_total[1m]))",
+          "legendFormat": "Cluster Total"
+        },
+        {
+          "expr": "rate(laminardb_events_emitted_total[1m])",
+          "legendFormat": "Node {{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "fillOpacity": 10 }
+        }
+      }
+    },
+    {
+      "title": "Latency, Congestion & Backpressure",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "collapsed": false
+    },
+    {
+      "title": "Processing Cycle Duration p99 (Node breakdown)",
+      "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(laminardb_cycle_duration_seconds_bucket[1m])) by (le, instance))",
+          "legendFormat": "Node {{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "fillOpacity": 10 }
+        }
+      }
+    },
+    {
+      "title": "Congestion (Backpressured Cycles & Remote Subscription Drops)",
+      "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "targets": [
+        {
+          "expr": "sum(rate(laminardb_cycles_backpressured_total[1m])) by (instance)",
+          "legendFormat": "Backpressured {{instance}}"
+        },
+        {
+          "expr": "sum(rate(laminardb_remote_subscription_batches_dropped_total[1m])) by (instance)",
+          "legendFormat": "Subscription Drops {{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "fillOpacity": 10 }
+        }
+      }
+    },
+    {
+      "title": "Distributed Checkpoints",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
+      "collapsed": false
+    },
+    {
+      "title": "Checkpoint Epoch",
+      "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 24 },
+      "targets": [
+        {
+          "expr": "max(laminardb_checkpoint_epoch)",
+          "legendFormat": "Epoch"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "title": "Checkpoints Progress",
+      "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 24 },
+      "targets": [
+        {
+          "expr": "sum(laminardb_checkpoints_completed_total)",
+          "legendFormat": "Completed"
+        },
+        {
+          "expr": "sum(laminardb_checkpoints_failed_total)",
+          "legendFormat": "Failed"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "title": "Checkpoint Sizes",
+      "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "targets": [
+        {
+          "expr": "sum(laminardb_checkpoint_size_bytes) by (instance)",
+          "legendFormat": "Node {{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "decbytes"
+        }
+      }
+    },
+    {
+      "title": "Materialized Views",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "collapsed": true,
+      "panels": [
+        {
+          "title": "Total Cluster MV Updates Rate",
+          "type": "timeseries",
+          "datasource": "${DS_PROMETHEUS}",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 33 },
+          "targets": [
+            {
+              "expr": "sum(rate(laminardb_mv_updates_total[1m]))",
+              "legendFormat": "Cluster Total"
+            },
+            {
+              "expr": "rate(laminardb_mv_updates_total[1m])",
+              "legendFormat": "Node {{instance}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": { "drawStyle": "line", "fillOpacity": 10 }
+            }
+          }
+        },
+        {
+          "title": "Total Cluster MV Storage Bytes",
+          "type": "timeseries",
+          "datasource": "${DS_PROMETHEUS}",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 33 },
+          "targets": [
+            {
+              "expr": "sum(laminardb_mv_bytes_stored)",
+              "legendFormat": "Cluster Total"
+            },
+            {
+              "expr": "laminardb_mv_bytes_stored",
+              "legendFormat": "Node {{instance}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "decbytes",
+              "custom": { "drawStyle": "line", "fillOpacity": 10 }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "title": "Data Quality & Dropped Rows",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 41 },
+      "collapsed": true,
+      "panels": [
+        {
+          "title": "Late Arrival & Null Timestamp Drops (Cluster Total)",
+          "type": "timeseries",
+          "datasource": "${DS_PROMETHEUS}",
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 42 },
+          "targets": [
+            {
+              "expr": "sum(rate(laminardb_window_late_dropped_total[1m]))",
+              "legendFormat": "Late Dropped"
+            },
+            {
+              "expr": "sum(rate(laminardb_events_null_timestamp_total[1m]))",
+              "legendFormat": "Null Timestamp"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": { "drawStyle": "line", "fillOpacity": 10 }
+            }
+          }
+        },
+        {
+          "title": "Shed Records by Stream (Cluster breakdown)",
+          "type": "timeseries",
+          "datasource": "${DS_PROMETHEUS}",
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 42 },
+          "targets": [
+            {
+              "expr": "sum(rate(laminardb_shed_records_total[1m])) by (stream)",
+              "legendFormat": "Shed {{stream}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": { "drawStyle": "line", "fillOpacity": 10 }
+            }
+          }
+        },
+        {
+          "title": "Sink Filter Rejections (Cluster breakdown)",
+          "type": "timeseries",
+          "datasource": "${DS_PROMETHEUS}",
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 42 },
+          "targets": [
+            {
+              "expr": "sum(rate(laminardb_sink_filter_rejected_rows_total[1m])) by (sink)",
+              "legendFormat": "Rejected {{sink}}"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": { "drawStyle": "line", "fillOpacity": 10 }
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["laminardb", "streaming", "cluster"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "LaminarDB Cluster Dashboard",
+  "uid": "laminardb-cluster-dashboard",
+  "version": 1
+}

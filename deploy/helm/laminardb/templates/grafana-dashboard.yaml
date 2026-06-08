@@ -242,6 +242,119 @@ data:
               "unit": "decbytes"
             }
           }
+        },
+        {
+          "title": "Materialized Views",
+          "type": "row",
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+          "collapsed": true,
+          "panels": [
+            {
+              "title": "Total Cluster MV Updates Rate",
+              "type": "timeseries",
+              "gridPos": { "h": 8, "w": 12, "x": 0, "y": 33 },
+              "targets": [
+                {
+                  "expr": "sum(rate(laminardb_mv_updates_total[1m]))",
+                  "legendFormat": "Cluster Total"
+                },
+                {
+                  "expr": "rate(laminardb_mv_updates_total[1m])",
+                  "legendFormat": "Node {{`{{instance}}`}}"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "ops",
+                  "custom": { "drawStyle": "line", "fillOpacity": 10 }
+                }
+              }
+            },
+            {
+              "title": "Total Cluster MV Storage Bytes",
+              "type": "timeseries",
+              "gridPos": { "h": 8, "w": 12, "x": 12, "y": 33 },
+              "targets": [
+                {
+                  "expr": "sum(laminardb_mv_bytes_stored)",
+                  "legendFormat": "Cluster Total"
+                },
+                {
+                  "expr": "laminardb_mv_bytes_stored",
+                  "legendFormat": "Node {{`{{instance}}`}}"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "decbytes",
+                  "custom": { "drawStyle": "line", "fillOpacity": 10 }
+                }
+              }
+            }
+          ]
+        },
+        {
+          "title": "Data Quality & Dropped Rows",
+          "type": "row",
+          "gridPos": { "h": 1, "w": 24, "x": 0, "y": 41 },
+          "collapsed": true,
+          "panels": [
+            {
+              "title": "Late Arrival & Null Timestamp Drops (Cluster Total)",
+              "type": "timeseries",
+              "gridPos": { "h": 8, "w": 8, "x": 0, "y": 42 },
+              "targets": [
+                {
+                  "expr": "sum(rate(laminardb_window_late_dropped_total[1m]))",
+                  "legendFormat": "Late Dropped"
+                },
+                {
+                  "expr": "sum(rate(laminardb_events_null_timestamp_total[1m]))",
+                  "legendFormat": "Null Timestamp"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "ops",
+                  "custom": { "drawStyle": "line", "fillOpacity": 10 }
+                }
+              }
+            },
+            {
+              "title": "Shed Records by Stream (Cluster breakdown)",
+              "type": "timeseries",
+              "gridPos": { "h": 8, "w": 8, "x": 8, "y": 42 },
+              "targets": [
+                {
+                  "expr": "sum(rate(laminardb_shed_records_total[1m])) by (stream)",
+                  "legendFormat": "Shed {{`{{stream}}`}}"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "ops",
+                  "custom": { "drawStyle": "line", "fillOpacity": 10 }
+                }
+              }
+            },
+            {
+              "title": "Sink Filter Rejections (Cluster breakdown)",
+              "type": "timeseries",
+              "gridPos": { "h": 8, "w": 8, "x": 16, "y": 42 },
+              "targets": [
+                {
+                  "expr": "sum(rate(laminardb_sink_filter_rejected_rows_total[1m])) by (sink)",
+                  "legendFormat": "Rejected {{`{{sink}}`}}"
+                }
+              ],
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "ops",
+                  "custom": { "drawStyle": "line", "fillOpacity": 10 }
+                }
+              }
+            }
+          ]
         }
       ],
       "schemaVersion": 39,

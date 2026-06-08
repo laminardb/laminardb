@@ -1,7 +1,7 @@
 LaminarDB has been deployed!
 
 Mode: {{ .Values.laminardb.mode }}
-{{- $isCluster := or (eq .Values.laminardb.mode "delta") (eq .Values.laminardb.mode "cluster") }}
+{{- $isCluster := eq .Values.laminardb.mode "cluster" }}
 {{- if $isCluster }}
 Replicas: {{ .Values.replicaCount }}
 {{- end }}
@@ -35,7 +35,7 @@ Replicas: {{ .Values.replicaCount }}
   curl -X POST http://localhost:{{ .Values.service.httpPort }}/api/v1/checkpoint
 
 {{- if $isCluster }}
-{{- $cluster := ternary (.Values.laminardb.delta | default .Values.laminardb.cluster | default dict) (.Values.laminardb.cluster | default .Values.laminardb.delta | default dict) (eq .Values.laminardb.mode "delta") }}
+{{- $cluster := .Values.laminardb.cluster | default dict }}
 Cluster mode info:
   Nodes: {{ .Values.replicaCount }}
   Discovery: {{ ($cluster.discovery | default dict).strategy }}

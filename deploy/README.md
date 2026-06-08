@@ -74,11 +74,12 @@ See the root `docker-compose.yml` for a full example with Kafka and PostgreSQL.
 
 ## 3. Helm (Kubernetes)
 
-### Option A: Install from GHCR OCI registry (Cloud/Internet Connected)
+### Option A: Install from the LaminarDB Helm repository (Cloud/Internet Connected)
 
 ```bash
-helm install my-laminardb oci://ghcr.io/laminardb/charts/laminardb \
-  --set image.tag=0.20.2
+helm repo add laminardb https://laminardb.io/charts
+helm repo update
+helm install my-laminardb laminardb/laminardb
 ```
 
 ### Option B: Install from Local Files / Local Tarball (Best for On-Prem / Air-Gapped / Custom AKS)
@@ -122,7 +123,7 @@ All values are documented in [`helm/laminardb/values.yaml`](helm/laminardb/value
 
 | Section | Description |
 |---------|-------------|
-| `laminardb.mode` | `embedded` (single node) or `delta` (multi-node cluster) |
+| `laminardb.mode` | `embedded` (single node) or `cluster` (multi-node) |
 | `laminardb.checkpoint` | Checkpoint interval, storage URL, strategy |
 | `sources` / `sinks` / `pipelines` | Streaming pipeline definitions (rendered to TOML) |
 | `persistence` | PVC sizes for state and checkpoints |
@@ -143,10 +144,10 @@ All values are documented in [`helm/laminardb/values.yaml`](helm/laminardb/value
 | CI | `ci.yml` | push, PR | Format, clippy, test, MSRV, feature matrix |
 | Release | `release.yml` | `v*` tags | Build binaries, create GitHub Release, publish to crates.io |
 | Docker | `docker.yml` | push to main, `v*` tags, PR | Multi-arch Docker images to GHCR + Docker Hub |
-| Helm Publish | `helm-publish.yml` | push to main (helm changes) | Lint and publish Helm chart to GHCR OCI |
+| Helm Lint | `helm-lint.yml` | push/PR (helm changes) | Lint & validate the Helm chart |
 | Benchmarks | `bench.yml` | push to main | Run and track performance benchmarks |
 | Coverage | `coverage.yml` | push, PR | Code coverage with Codecov |
-| Docs | `docs.yml` | push to main (docs/code changes) | Build and deploy API docs to GitHub Pages |
+| Docs | `docs.yml` | push to main (docs/code/helm changes) | Build & deploy the site, API docs, and Helm chart repo (`/charts`) to GitHub Pages |
 | Dependencies | `deps.yml` | weekly (Sunday) | Check for outdated deps, auto-create update PR |
 
 ## Required GitHub Secrets

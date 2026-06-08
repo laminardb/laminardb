@@ -56,8 +56,8 @@ spec:
               containerPort: 5432
               protocol: TCP
             {{- end }}
-            {{- $isCluster := or (eq .Values.laminardb.mode "delta") (eq .Values.laminardb.mode "cluster") }}
-            {{- $cluster := ternary (.Values.laminardb.delta | default .Values.laminardb.cluster | default dict) (.Values.laminardb.cluster | default .Values.laminardb.delta | default dict) (eq .Values.laminardb.mode "delta") }}
+            {{- $isCluster := eq .Values.laminardb.mode "cluster" }}
+            {{- $cluster := .Values.laminardb.cluster | default dict }}
             {{- if $isCluster }}
             - name: gossip
               containerPort: {{ ($cluster.discovery | default dict).gossipPort | default 7946 }}
@@ -100,7 +100,7 @@ spec:
             {{- end }}
           {{- end }}
           env:
-            {{- if or (eq .Values.laminardb.mode "delta") (eq .Values.laminardb.mode "cluster") }}
+            {{- if eq .Values.laminardb.mode "cluster" }}
             - name: HOSTNAME
               valueFrom:
                 fieldRef:

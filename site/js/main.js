@@ -2,6 +2,70 @@
 
 document.addEventListener('DOMContentLoaded', () => {
 
+  // --- Theme Toggling ---
+  const themeToggle = document.getElementById('theme-toggle');
+  
+  function applyTheme(theme) {
+    let resolvedTheme = theme;
+    if (theme === 'system') {
+      resolvedTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+    document.documentElement.setAttribute('data-theme', resolvedTheme);
+    localStorage.setItem('theme', theme);
+    
+    if (themeToggle) {
+      const sunIcon = themeToggle.querySelector('.sun-icon');
+      const moonIcon = themeToggle.querySelector('.moon-icon');
+      const systemIcon = themeToggle.querySelector('.system-icon');
+      
+      if (sunIcon && moonIcon && systemIcon) {
+        sunIcon.style.display = 'none';
+        moonIcon.style.display = 'none';
+        systemIcon.style.display = 'none';
+        
+        if (theme === 'light') {
+          sunIcon.style.display = 'block';
+          themeToggle.setAttribute('title', 'Theme: Light (click to cycle to Dark)');
+          themeToggle.setAttribute('aria-label', 'Theme: Light (click to cycle to Dark)');
+        } else if (theme === 'dark') {
+          moonIcon.style.display = 'block';
+          themeToggle.setAttribute('title', 'Theme: Dark (click to cycle to System)');
+          themeToggle.setAttribute('aria-label', 'Theme: Dark (click to cycle to System)');
+        } else {
+          systemIcon.style.display = 'block';
+          themeToggle.setAttribute('title', 'Theme: System (click to cycle to Light)');
+          themeToggle.setAttribute('aria-label', 'Theme: System (click to cycle to Light)');
+        }
+      }
+    }
+  }
+
+  // Initialize theme from storage or system default
+  const savedTheme = localStorage.getItem('theme') || 'system';
+  applyTheme(savedTheme);
+
+  if (themeToggle) {
+    themeToggle.addEventListener('click', () => {
+      const currentTheme = localStorage.getItem('theme') || 'system';
+      let nextTheme = 'system';
+      if (currentTheme === 'system') {
+        nextTheme = 'light';
+      } else if (currentTheme === 'light') {
+        nextTheme = 'dark';
+      } else {
+        nextTheme = 'system';
+      }
+      applyTheme(nextTheme);
+    });
+  }
+
+  // Monitor system theme changes
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+    if (localStorage.getItem('theme') === 'system' || !localStorage.getItem('theme')) {
+      applyTheme('system');
+    }
+  });
+
   // --- Mobile nav toggle ---
   const navToggle = document.querySelector('.nav-toggle');
   const mobileMenu = document.querySelector('.mobile-menu');

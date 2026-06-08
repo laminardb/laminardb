@@ -414,8 +414,8 @@
               "datasource": "${DS_PROMETHEUS}",
               "gridPos": { "h": 8, "w": 12, "x": 0, "y": 39 },
               "targets": [
-                { "expr": "rate(laminardb_lookup_cache_hits_total{instance=~\"$instance\"}[1m])", "legendFormat": "hits/s ({{`{{table}}`}})" },
-                { "expr": "rate(laminardb_lookup_cache_misses_total{instance=~\"$instance\"}[1m])", "legendFormat": "misses/s ({{`{{table}}`}})" }
+                { "expr": "rate(laminardb_lookup_cache_hits_total{instance=~\"$instance\"}[1m])", "legendFormat": "hits/s ({{table}})" },
+                { "expr": "rate(laminardb_lookup_cache_misses_total{instance=~\"$instance\"}[1m])", "legendFormat": "misses/s ({{table}})" }
               ],
               "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
             },
@@ -425,12 +425,122 @@
               "datasource": "${DS_PROMETHEUS}",
               "gridPos": { "h": 8, "w": 12, "x": 12, "y": 39 },
               "targets": [
-                { "expr": "rate(laminardb_lookup_source_errors_total{instance=~\"$instance\"}[1m])", "legendFormat": "errors/s ({{`{{table}}`}})" },
-                { "expr": "laminardb_lookup_in_flight_rows{instance=~\"$instance\"}", "legendFormat": "in-flight ({{`{{table}}`}})" }
+                { "expr": "rate(laminardb_lookup_source_errors_total{instance=~\"$instance\"}[1m])", "legendFormat": "errors/s ({{table}})" },
+                { "expr": "laminardb_lookup_in_flight_rows{instance=~\"$instance\"}", "legendFormat": "in-flight ({{table}})" }
               ],
               "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
             }
           ]
+        }
+      ]
+    },
+    {
+      "title": "Materialized Views",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 },
+      "collapsed": true,
+      "panels": [
+        {
+          "title": "MV Updates Rate",
+          "type": "timeseries",
+          "datasource": "${DS_PROMETHEUS}",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 49 },
+          "targets": [
+            {
+              "expr": "rate(laminardb_mv_updates_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])",
+              "legendFormat": "updates/s"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": { "drawStyle": "line", "fillOpacity": 10 }
+            }
+          }
+        },
+        {
+          "title": "MV Storage Bytes",
+          "type": "timeseries",
+          "datasource": "${DS_PROMETHEUS}",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 49 },
+          "targets": [
+            {
+              "expr": "laminardb_mv_bytes_stored{instance=~\"$instance\",pipeline=~\"$pipeline\"}",
+              "legendFormat": "bytes stored"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "decbytes",
+              "custom": { "drawStyle": "line", "fillOpacity": 10 }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "title": "Data Quality & Dropped Rows",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 57 },
+      "collapsed": true,
+      "panels": [
+        {
+          "title": "Late Arrival & Null Timestamp Drops",
+          "type": "timeseries",
+          "datasource": "${DS_PROMETHEUS}",
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 58 },
+          "targets": [
+            {
+              "expr": "rate(laminardb_window_late_dropped_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])",
+              "legendFormat": "window late dropped/s"
+            },
+            {
+              "expr": "rate(laminardb_events_null_timestamp_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])",
+              "legendFormat": "null timestamp dropped/s"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": { "drawStyle": "line", "fillOpacity": 10 }
+            }
+          }
+        },
+        {
+          "title": "Shed Records by Stream",
+          "type": "timeseries",
+          "datasource": "${DS_PROMETHEUS}",
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 58 },
+          "targets": [
+            {
+              "expr": "rate(laminardb_shed_records_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])",
+              "legendFormat": "shed/s ({{stream}})"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": { "drawStyle": "line", "fillOpacity": 10 }
+            }
+          }
+        },
+        {
+          "title": "Sink Filter Rejections",
+          "type": "timeseries",
+          "datasource": "${DS_PROMETHEUS}",
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 58 },
+          "targets": [
+            {
+              "expr": "rate(laminardb_sink_filter_rejected_rows_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])",
+              "legendFormat": "rejected/s ({{sink}})"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": { "drawStyle": "line", "fillOpacity": 10 }
+            }
+          }
         }
       ]
     }

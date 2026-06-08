@@ -255,10 +255,12 @@ jobs:
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: "${{ env.GHCR_IMAGE }}:sha-${{ steps.sha.outputs.short }}"
-          # Track the latest Trivy release. Pinning an old binary breaks the
-          # scan once the vulnerability-DB schema advances past it; the action
-          # itself stays pinned for supply-chain reproducibility.
+          # Track the latest Trivy so the vuln DB schema stays current. The
+          # "latest" lookup hits the GitHub API, which is rate-limited for
+          # anonymous callers (caused "unable to find 'latest'"); the token
+          # authenticates it.
           version: "latest"
+          token-setup-trivy: ${{ github.token }}
           format: "sarif"
           output: "trivy-results.sarif"
           severity: "CRITICAL"

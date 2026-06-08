@@ -7,16 +7,15 @@ A Helm chart for deploying [LaminarDB](https://laminardb.dev) (Embedded Streamin
 By default, the chart runs in `embedded` (single-node) mode.
 
 ```bash
-# Add LaminarDB repository (if hosted) or clone this repo locally
-# To install from the local directory (best for air-gapped / custom AKS / on-prem):
-helm install my-laminardb deploy/helm/laminardb
+helm repo add laminardb https://laminardb.io/charts
+helm repo update
+helm install my-laminardb laminardb/laminardb
 ```
 
-Alternatively, package the chart locally into a tarball to ship it to air-gapped systems:
+For air-gapped / on-prem clusters, install from a local clone or a packaged tarball:
 ```bash
-helm package deploy/helm/laminardb
-# Installs from the generated .tgz package (e.g. laminardb-0.1.0.tgz)
-helm install my-laminardb laminardb-*.tgz
+helm install my-laminardb deploy/helm/laminardb
+# or: helm package deploy/helm/laminardb && helm install my-laminardb laminardb-*.tgz
 ```
 
 ---
