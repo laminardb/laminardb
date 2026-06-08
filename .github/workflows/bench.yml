@@ -40,10 +40,19 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libelf-dev zlib1g-dev libcurl4-openssl-dev cmake pkg-config libsasl2-dev libudev-dev protobuf-compiler
 
       - name: Build all benchmarks
+        # `cargo bench --no-run` (NOT `cargo build --benches`): the run jobs
+        # below invoke `cargo bench`, which compiles under the `bench` profile.
+        # `cargo build --benches --release` compiles under the `release` profile,
+        # a DIFFERENT fingerprint even though `[profile.bench] inherits =
+        # "release"` — so those artifacts are never reused and every run job
+        # recompiled the whole laminar-db + DataFusion stack from scratch,
+        # overrunning the 20-min run-job timeout. `--no-run` caches the exact
+        # bench-profile artifacts the run jobs need.
+        #
         # `--no-default-features`: the benches use only core engine APIs, so the
         # default connector stack (deltalake + cloud SDKs, mongodb/mysql/postgres,
         # iceberg, nats) is dead weight that overran the 30-min build timeout.
-        run: cargo build --release -p laminar-core -p laminar-db --benches --no-default-features
+        run: cargo bench --no-run -p laminar-core -p laminar-db --no-default-features
 
   # Core latency-critical benchmarks
   bench-latency:
@@ -81,7 +90,9 @@ jobs:
     name: DAG Benchmarks
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 30 (not 20): safety margin in case the bench-profile cache misses and this
+    # job — the heaviest to compile, full laminar-db deps — has to recompile.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - name: Free disk space
