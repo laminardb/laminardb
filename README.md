@@ -115,6 +115,23 @@ Built on [Apache Arrow](https://arrow.apache.org/) and [DataFusion](https://data
 
 ---
 
+## LaminarDB Console
+
+LaminarDB features a web console to author, observe, and manage streaming SQL pipelines. 
+
+The console includes:
+* **Interactive SQL Worksheet**: Author and execute streaming SQL queries with support for live subscription tailing over WebSockets.
+* **Dependency & Lineage DAG**: Interactive visual topology diagram showing active data streams from Sources to Sinks and Materialized Views.
+* **Catalog Schema Browser**: Introspect catalog metadata, schema definitions, and connector options.
+* **Cluster & Partition Monitor**: Live node discovery status and a virtual node (vnode) partition lease assignment heatmap.
+
+The official web console is hosted and ready to use at:
+👉 **[laminardb.github.io/laminardb-console-ui](https://laminardb.github.io/laminardb-console-ui/)**
+
+For source code or local deployment options, see the [`laminardb-console-ui`](https://github.com/laminardb/laminardb-console-ui) repository.
+
+---
+
 ## Cluster Mode & Setup
 
 LaminarDB supports multi-node cluster deployments. In this mode, streaming pipelines are partitioned across virtual nodes (vnodes), and checkpoint state is distributed across the cluster.
@@ -433,49 +450,228 @@ LaminarDB standalone server supports environment variable interpolation inside t
 
 ---
 
-## Architecture
+LaminarDB supports multiple deployment profiles (In-Process, Embedded, Standalone Server, and Cluster Mode) to match different operational requirements:
 
-```text
-┌──────────────────────────────────────────────────────────────┐
-│                     SOURCE CONNECTORS                        │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐                   │
-│  │  Kafka   │  │ Postgres │  │   File   │  tokio tasks      │
-│  │  Source  │  │   CDC    │  │  Source  │  (main runtime)   │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘                   │
-│       │              │              │                        │
-│       └──── tokio::sync::mpsc ──────┘                         │
-│                      ▼                                        │
-├──────────────────────────────────────────────────────────────┤
-│              STREAMING COORDINATOR                            │
-│  Single tokio task on dedicated `laminar-compute` thread:     │
-│  SQL cycles, compiled projections, cached logical plans,     │
-│  barrier injection and alignment                              │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐    │
-│  │ Compiled │→ │ Operators│→ │  State   │→ │  Sink    │    │
-│  │Projection│  │ (window, │  │ (per-grp │  │ Writers  │    │
-│  │/ Cached  │  │  join,   │  │ FxHashMap│  │          │    │
-│  │  Plans   │  │  filter) │  │ / foyer) │  │          │    │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────┘    │
-├──────────────────────────────────────────────────────────────┤
-│                     BACKGROUND I/O                            │
-│  Main tokio runtime, runs alongside source/sink tasks         │
-│  ┌──────────────┐  ┌──────────────┐                          │
-│  │  Checkpoint  │  │   Sink I/O   │                          │
-│  │ Coordinator  │  │ (Kafka/Delta │                          │
-│  │  (2PC, store)│  │  /Postgres…) │                          │
-│  └──────────────┘  └──────────────┘                          │
-├──────────────────────────────────────────────────────────────┤
-│                      CONTROL PLANE                            │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐                   │
-│  │  Admin   │  │ Metrics  │  │  Config  │                   │
-│  │   API    │  │  Export  │  │ Manager  │                   │
-│  └──────────┘  └──────────┘  └──────────┘                   │
-└──────────────────────────────────────────────────────────────┘
+### 1. In-Process Mode (BareMetal Profile)
+Runs entirely in-memory within the host application process. Since it does not persist state to disk, it has zero I/O overhead and starts up instantly. Ideal for stateless streaming transformations, unit testing, or ephemeral sidecars.
+
+```mermaid
+graph TD
+    classDef hostClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
+    classDef appClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
+    classDef coordClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:2px,font-weight:bold;
+    classDef stateClass fill:#06b6d4,fill-opacity:0.15,stroke:#06b6d4,stroke-width:1px;
+
+    subgraph HostApp["Host Application Process (Rust/Python/C)"]
+        App["Application Logic"]:::appClass
+        subgraph Engine["LaminarDB Engine (In-Process / BareMetal)"]
+            Coord["Streaming Coordinator<br/>('laminar-compute' thread)"]:::coordClass
+            InMemState["In-Memory State Store<br/>(FxHashMap)"]:::stateClass
+            Coord <--> InMemState
+        end
+        App -->|"Push RecordBatches<br/>via Direct API"| Coord
+        Coord -->|"Pull Results<br/>via Subscription"| App
+    end
+
+    style HostApp fill:#3b82f6,fill-opacity:0.05,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 5 5
+    style Engine fill:#8b5cf6,fill-opacity:0.05,stroke:#8b5cf6,stroke-width:1.5px
 ```
 
-- **Streaming coordinator.** Single tokio task on a dedicated single-threaded runtime (the `laminar-compute` thread), isolating CPU-bound event processing from I/O on the main runtime. Source connectors push batches in via `tokio::sync::mpsc`; the coordinator runs compiled projections or cached logical plans, routes results to sinks, and manages checkpoint barriers. Compiled single-source projections are sub-microsecond; incremental aggregations and cached-plan queries are microseconds; complex queries fall back to DataFusion.
-- **Background I/O.** Source connectors, sink writers, and the checkpoint coordinator all run on the main tokio work-stealing runtime.
-- **Admin.** HTTP REST API (Axum), Prometheus metrics, ad-hoc SQL, hot reload, manual checkpoints. No built-in auth on the HTTP API; put it behind a reverse proxy. The Postgres-wire listener has MD5 + TLS + mTLS auth (see above).
+### 2. Embedded Mode (Embedded / Durable Profiles)
+Runs inside the host application process but enables single-node durability. The engine logs checkpoints and state snapshots to the local filesystem (`file://`) or a remote object store (S3, GCS, Azure Blob). If the process crashes, the `RecoveryManager` restores the engine state from the latest completed checkpoint.
+
+```mermaid
+graph TD
+    classDef appClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
+    classDef coordClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:2px,font-weight:bold;
+    classDef stateClass fill:#06b6d4,fill-opacity:0.15,stroke:#06b6d4,stroke-width:1px;
+    classDef recoveryClass fill:#10b981,fill-opacity:0.15,stroke:#10b981,stroke-width:1px;
+    classDef storageClass fill:#f97316,fill-opacity:0.15,stroke:#f97316,stroke-width:1px;
+
+    subgraph HostApp["Host Application Process (Rust/Python/C)"]
+        direction TB
+        App["Application Logic"]:::appClass
+        subgraph Engine["LaminarDB Engine (Embedded Profile)"]
+            Coord["Streaming Coordinator<br/>('laminar-compute' thread)"]:::coordClass
+            InMemState["In-Memory State Store<br/>(foyer / FxHashMap)"]:::stateClass
+            Checkpoint["Checkpoint Coordinator"]:::recoveryClass
+            Recovery["Recovery Manager"]:::recoveryClass
+            
+            Coord <--> InMemState
+            Checkpoint -.->|"Snapshot State"| InMemState
+            Recovery -.->|"Restore State"| InMemState
+        end
+        App -->|"Push RecordBatches"| Coord
+        Coord -->|"Pull Results"| App
+    end
+    Checkpoint -->|"Write Epoch WAL<br/>and Checkpoints"| Storage["Durable Storage (Local Disk / S3 / GCS)"]:::storageClass
+    Storage -->|"Restore Manifest<br/>and State"| Recovery
+    
+    style HostApp fill:#3b82f6,fill-opacity:0.05,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 5 5
+    style Engine fill:#8b5cf6,fill-opacity:0.05,stroke:#8b5cf6,stroke-width:1.5px
+```
+
+### 3. Standalone Server Mode
+Runs as a dedicated native daemon binary (`laminar-server`). It wraps the embedded engine and exposes standard client protocols (PostgreSQL pgwire, REST HTTP API, WebSockets) so external processes can run DDL/DML queries or stream ingest/consume data.
+
+```mermaid
+graph TD
+    classDef clientClass fill:#10b981,fill-opacity:0.15,stroke:#10b981,stroke-width:1px;
+    classDef portClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
+    classDef coordClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:2px,font-weight:bold;
+    classDef stateClass fill:#06b6d4,fill-opacity:0.15,stroke:#06b6d4,stroke-width:1px;
+    classDef checkpointClass fill:#78716c,fill-opacity:0.15,stroke:#78716c,stroke-width:1px;
+    classDef storageClass fill:#f97316,fill-opacity:0.15,stroke:#f97316,stroke-width:1px;
+
+    Client1["PostgreSQL Clients (pgwire)"]:::clientClass
+    Client2["REST API Clients (HTTP)"]:::clientClass
+    Client3["WebSocket Clients (Subscriptions)"]:::clientClass
+    
+    subgraph Server["LaminarDB Standalone Server (laminar-server)"]
+        direction TB
+        subgraph Ports["Interface Listeners"]
+            REST["Axum HTTP REST Listener"]:::portClass
+            WS["WebSocket Listener"]:::portClass
+            PgWire["Postgres Wire Listener"]:::portClass
+        end
+        
+        subgraph Engine["LaminarDB Engine (Embedded Library)"]
+            Coord["Streaming Coordinator<br/>('laminar-compute')"]:::coordClass
+            State["In-Memory State Store<br/>(foyer / FxHashMap)"]:::stateClass
+            Checkpoint["Checkpoint Coordinator"]:::checkpointClass
+            Coord <--> State
+            Checkpoint -.-> State
+        end
+        
+        REST -->|"Push Events, DDL,<br/>and Admin"| Coord
+        WS -->|"Streaming Subscription<br/>Batches"| Coord
+        PgWire -->|"SQL DDL and<br/>DML Execution"| Coord
+    end
+    
+    Client1 -->|"Port 5432"| PgWire
+    Client2 -->|"Port 8000"| REST
+    Client3 -->|"Port 8000 /ws"| WS
+    Checkpoint -->|"Write Checkpoints"| Storage["Durable Storage (Local Disk / S3)"]:::storageClass
+
+    style Server fill:#6b7280,fill-opacity:0.05,stroke:#4b5563,stroke-width:1.5px
+    style Ports fill:#3b82f6,fill-opacity:0.05,stroke:#3b82f6,stroke-width:1.5px
+    style Engine fill:#8b5cf6,fill-opacity:0.05,stroke:#8b5cf6,stroke-width:1.5px
+```
+
+### 4. Cluster Mode (Distributed Deployment)
+Runs as a distributed cluster of cooperative nodes. Nodes discover one another peer-to-peer using **Chitchat Gossip**, coordinate virtual node assignments (VNodes) and metadata leases via **Raft Consensus** (OpenRaft), exchange partition streams via high-performance **gRPC & Arrow-Flight** shuffles, and persist coordinated checkpoints to a shared object store.
+
+```mermaid
+graph TD
+    classDef clientClass fill:#10b981,fill-opacity:0.15,stroke:#10b981,stroke-width:1px;
+    classDef engineClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:2px,font-weight:bold;
+    classDef raftClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
+    classDef gossipClass fill:#06b6d4,fill-opacity:0.15,stroke:#06b6d4,stroke-width:1px;
+    classDef vnodeClass fill:#78716c,fill-opacity:0.15,stroke:#78716c,stroke-width:1px;
+    classDef storageClass fill:#f97316,fill-opacity:0.15,stroke:#f97316,stroke-width:1px;
+
+    Client["Clients / Load Balancer"]:::clientClass
+    
+    subgraph Node1["LaminarDB Node 1 (Coordinator Leader)"]
+        direction TB
+        E1["Streaming Engine"]:::engineClass
+        Raft1["Raft Consensus<br/>(OpenRaft)"]:::raftClass
+        Gossip1["Chitchat Gossip"]:::gossipClass
+        VNodes1["Virtual Nodes<br/>(VNodes 1 - 128)"]:::vnodeClass
+        E1 <--> VNodes1
+    end
+
+    subgraph Node2["LaminarDB Node 2 (Follower)"]
+        direction TB
+        E2["Streaming Engine"]:::engineClass
+        Raft2["Raft Consensus<br/>(OpenRaft)"]:::raftClass
+        Gossip2["Chitchat Gossip"]:::gossipClass
+        VNodes2["Virtual Nodes<br/>(VNodes 129 - 256)"]:::vnodeClass
+        E2 <--> VNodes2
+    end
+
+    %% Client Operations
+    Client -->|"REST / pgwire"| Node1
+    Client -->|"REST / pgwire"| Node2
+
+    %% Node Communication
+    Gossip1 ---|"Peer Discovery"| Gossip2
+    Raft1 ---|"Metadata and<br/>Partition Leases"| Raft2
+    E1 ---|"gRPC and Arrow-Flight<br/>Data Shuffle"| E2
+
+    %% Distributed Durability
+    Node1 -->|"Coordinated 2-Phase<br/>Commit Checkpoints"| SharedStore["Shared Object Store (S3 / GCS / Azure)"]:::storageClass
+    Node2 -->|"Coordinated 2-Phase<br/>Commit Checkpoints"| SharedStore:::storageClass
+
+    style Node1 fill:#6b7280,fill-opacity:0.05,stroke:#4b5563,stroke-width:1.5px
+    style Node2 fill:#6b7280,fill-opacity:0.05,stroke:#4b5563,stroke-width:1.5px
+```
+
+### 5. Internal Threading Model (Within a Single Node)
+Within any running engine node, CPU-bound streaming computation is strictly isolated from I/O tasks. A dedicated execution thread is assigned to stream execution, guaranteeing predictable scheduling and sub-microsecond latencies.
+
+```mermaid
+graph TB
+    classDef computeClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:1px;
+    classDef mainClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
+    classDef blockingClass fill:#f97316,fill-opacity:0.15,stroke:#f97316,stroke-width:1px;
+    
+    classDef sourceClass fill:#3b82f6,fill-opacity:0.1,stroke:#3b82f6,stroke-width:1px;
+    classDef sinkClass fill:#10b981,fill-opacity:0.15,stroke:#10b981,stroke-width:1px;
+    classDef serviceClass fill:#78716c,fill-opacity:0.15,stroke:#78716c,stroke-width:1px;
+    classDef coordClass fill:#8b5cf6,fill-opacity:0.15,stroke:#8b5cf6,stroke-width:2px,font-weight:bold;
+
+    subgraph ComputeRuntime["Dedicated 'laminar-compute' Thread (Single-Threaded Runtime)"]
+        subgraph Coord["Streaming Coordinator (Hot Path)"]
+            direction LR
+            Proj["Projections & Filters"]:::computeClass
+            Window["Window Operators"]:::computeClass
+            Join["Join Operators"]:::computeClass
+            LocalState["Local State (FxHashMap)"]:::computeClass
+            
+            Proj --> Window --> Join
+            Window <--> LocalState
+            Join <--> LocalState
+        end
+    end
+
+    subgraph MainRuntime["Main Tokio Runtime (Multi-Threaded)"]
+        subgraph Sources["Source Connectors (Tokio Tasks)"]
+            S1["Kafka Source"]:::sourceClass
+            S2["Postgres CDC"]:::sourceClass
+            S3["WebSocket Source"]:::sourceClass
+        end
+        
+        subgraph Sinks["Sink Connectors (Tokio Tasks)"]
+            SinkIO["Sinks (Kafka, Delta Lake, PG)"]:::sinkClass
+        end
+        
+        subgraph CoreServices["Background Services"]
+            API["REST & WebSockets API (Axum)"]:::serviceClass
+            CheckpointCoord["Checkpoint Coordinator"]:::serviceClass
+            Metrics["Prometheus Metrics"]:::serviceClass
+        end
+    end
+
+    subgraph BlockingPool["Tokio Blocking Thread Pool"]
+        Serial["State Serialization (rkyv to bytes)"]:::blockingClass
+    end
+
+    %% Data and Control Paths
+    Sources -->|"tokio::sync::mpsc<br/>(Arrow RecordBatches)"| Proj
+    Join -->|"Output Batches"| SinkIO
+    CheckpointCoord -.->|"Trigger Checkpoint<br/>Barrier"| Sources
+    CheckpointCoord -.->|"Offload Serialization"| Serial
+
+    style ComputeRuntime fill:#8b5cf6,fill-opacity:0.05,stroke:#8b5cf6,stroke-width:1.5px
+    style MainRuntime fill:#3b82f6,fill-opacity:0.05,stroke:#3b82f6,stroke-width:1.5px
+    style BlockingPool fill:#f97316,fill-opacity:0.05,stroke:#f97316,stroke-width:1.5px
+    style Coord fill:#8b5cf6,fill-opacity:0.05,stroke:#8b5cf6,stroke-width:1.5px
+```
+
+* **Streaming coordinator.** Single tokio task on a dedicated single-threaded runtime (the `laminar-compute` thread), isolating CPU-bound event processing from I/O on the main runtime. Source connectors push batches in via `tokio::sync::mpsc`; the coordinator runs compiled projections or cached logical plans, routes results to sinks, and manages checkpoint barriers. Compiled single-source projections are sub-microsecond; incremental aggregations and cached-plan queries are microseconds; complex queries fall back to DataFusion.
+* **Background I/O.** Source connectors, sink writers, and the checkpoint coordinator all run on the main tokio work-stealing runtime.
+* **Admin.** HTTP REST API (Axum), Prometheus metrics, ad-hoc SQL, hot reload, manual checkpoints. No built-in auth on the HTTP API; put it behind a reverse proxy. The Postgres-wire listener has MD5 + TLS + mTLS auth (see above).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 
