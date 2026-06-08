@@ -352,9 +352,9 @@ Exactly-once processing works through:
 4. **Two-phase commit** -- Coordinated across exactly-once sinks via `CheckpointCoordinator` (at-most-once sinks receive no pre_commit/commit guarantees)
 5. **Recovery** -- `RecoveryManager` loads the latest checkpoint manifest, restores source offsets, rolls back exactly-once sinks, and resumes from committed state. Falls back to older checkpoints if latest is corrupt
 
-## Delta Architecture (Distributed Mode)
+## Cluster Architecture (Distributed Mode)
 
-With the `delta` feature enabled, multi-node operation:
+With the `cluster` feature enabled, multi-node operation:
 
 - **Discovery** -- Static configuration, gossip-based (chitchat), or Kafka group discovery. Discovery via chitchat gossip is implemented.
 - **Coordination** -- Metadata consensus (scaffolding only, not production-ready)

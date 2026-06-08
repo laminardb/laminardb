@@ -1,4 +1,4 @@
-{{- $isCluster := or (eq .Values.laminardb.mode "delta") (eq .Values.laminardb.mode "cluster") -}}
+{{- $isCluster := eq .Values.laminardb.mode "cluster" -}}
 {{- if or .Values.headlessService.enabled $isCluster }}
 apiVersion: v1
 kind: Service

@@ -174,7 +174,7 @@ pub enum DiscoveryError {
     Io(#[from] std::io::Error),
 }
 
-/// Trait for node discovery in a delta.
+/// Trait for node discovery in a cluster.
 ///
 /// Implementations provide the mechanism by which nodes find and
 /// track each other. The trait is async and designed for long-running

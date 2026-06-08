@@ -18,7 +18,7 @@ fullnameOverride: ""
 
 # -- LaminarDB server configuration
 laminardb:
-  # -- Server mode: "embedded" (single-node) or "cluster" (multi-node clustering, "delta" is also supported as an alias)
+  # -- Server mode: "embedded" (single-node) or "cluster" (multi-node clustering)
   mode: embedded
   # -- Log level: trace, debug, info, warn, error
   logLevel: info
@@ -63,7 +63,7 @@ laminardb:
   # -- If set, this raw TOML string is used as the config file directly.
   configOverride: ""
 
-  # -- Cluster settings (only when mode=cluster or mode=delta)
+  # -- Cluster settings (only when mode=cluster)
   cluster:
     # -- Node ID (auto-generated from pod name if empty)
     nodeId: ""
@@ -84,20 +84,6 @@ laminardb:
       # -- Raft election timeout
       electionTimeout: "1500ms"
       # -- Raft heartbeat interval
-      heartbeatInterval: "300ms"
-
-  # -- Backwards-compatible alias for cluster settings (use 'cluster' instead)
-  delta:
-    nodeId: ""
-    discovery:
-      strategy: dns
-      dnsName: ""
-      gossipPort: 7946
-      seeds: []
-    coordination:
-      strategy: raft
-      raftPort: 7947
-      electionTimeout: "1500ms"
       heartbeatInterval: "300ms"
 
 # -- Pipeline definitions (rendered into laminardb.toml [[pipeline]] sections)
