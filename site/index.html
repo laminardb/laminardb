@@ -31,6 +31,13 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism.min.css" rel="stylesheet">
   <link rel="stylesheet" href="css/style.css">
+  <script>
+    (function() {
+      const theme = localStorage.getItem('theme') || 'system';
+      const isDark = theme === 'dark' || (theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+      document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
+    })();
+  </script>
 
   <style>
     /* FAQ section style adjustments */
@@ -230,6 +237,28 @@
           GitHub
         </a>
       </nav>
+
+      <button id="theme-toggle" class="theme-toggle" aria-label="Toggle theme">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="theme-icon sun-icon" style="display: none;">
+          <circle cx="12" cy="12" r="5"></circle>
+          <line x1="12" y1="1" x2="12" y2="3"></line>
+          <line x1="12" y1="21" x2="12" y2="23"></line>
+          <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+          <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+          <line x1="1" y1="12" x2="3" y2="12"></line>
+          <line x1="21" y1="12" x2="23" y2="12"></line>
+          <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+          <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+        </svg>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="theme-icon moon-icon" style="display: none;">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+        </svg>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="theme-icon system-icon" style="display: none;">
+          <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+          <line x1="8" y1="21" x2="16" y2="21"></line>
+          <line x1="12" y1="17" x2="12" y2="21"></line>
+        </svg>
+      </button>
 
       <button class="nav-toggle" aria-label="Toggle menu">
         <span></span><span></span><span></span>
@@ -720,11 +749,13 @@ curl http://localhost:8080/health</code></pre>
 
               <!-- Helm -->
               <div class="tab-panel" id="qs-helm">
-                <pre><code class="language-bash"># 1. Install the LaminarDB standalone release from GHCR (OCI registry)
-helm install laminar-dev oci://ghcr.io/laminardb/charts/laminardb
+                <pre><code class="language-bash"># 1. Add the LaminarDB Helm repository and install the standalone release
+helm repo add laminardb https://laminardb.io/charts
+helm repo update
+helm install laminar-dev laminardb/laminardb
 
 # 2. For high-availability clustering, install with clustered parameters:
-helm install laminar-prod oci://ghcr.io/laminardb/charts/laminardb \
+helm install laminar-prod laminardb/laminardb \
   --set replicaCount=3 \
   --set cluster.enabled=true \
   --set persistence.size=10Gi</code></pre>
@@ -940,21 +971,21 @@ INNER JOIN payments p ON o.order_id = p.order_id
           </div>
 
           <div style="flex: 1; min-width: 300px; display: flex; align-items: center; justify-content: center;">
-            <div style="background: #ffffff; border: 1px solid var(--border-translucent); border-radius: 12px; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.05), 0 8px 10px -6px rgba(0, 0, 0, 0.05); width: 100%; max-width: 520px; overflow: hidden; padding: 20px;">
-              <div style="display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border-translucent); padding-bottom: 12px; margin-bottom: 16px;">
+            <div class="console-mockup" style="border-radius: 12px; width: 100%; max-width: 520px; overflow: hidden; padding: 20px;">
+              <div class="console-mockup-header" style="display: flex; align-items: center; justify-content: space-between; padding-bottom: 12px; margin-bottom: 16px;">
                 <div style="display: flex; align-items: center; gap: 8px;">
                   <span style="width: 10px; height: 10px; border-radius: 50%; background-color: #ef4444;"></span>
                   <span style="width: 10px; height: 10px; border-radius: 50%; background-color: #eab308;"></span>
                   <span style="width: 10px; height: 10px; border-radius: 50%; background-color: #22c55e;"></span>
-                  <span style="font-family: var(--font-sans); font-size: 0.8rem; font-weight: 600; color: var(--slate-700); margin-left: 8px;">LaminarDB Console</span>
+                  <span class="console-mockup-title" style="font-family: var(--font-sans); font-size: 0.8rem; font-weight: 600; margin-left: 8px;">LaminarDB Console</span>
                 </div>
                 <span style="font-size: 0.75rem; color: #22c55e; background: rgba(34, 197, 94, 0.08); padding: 2px 8px; border-radius: 12px; font-family: var(--font-mono); font-weight: 500;">Connected</span>
               </div>
               
               <!-- Console Mockup Visuals -->
-              <div style="font-family: var(--font-mono); font-size: 0.75rem; color: var(--slate-800); display: flex; flex-direction: column; gap: 12px;">
+              <div class="console-mockup-body" style="font-family: var(--font-mono); font-size: 0.75rem; display: flex; flex-direction: column; gap: 12px;">
                 <!-- SQL Bar -->
-                <div style="background: #f8fafc; border: 1px solid var(--border-translucent); border-radius: 6px; padding: 10px;">
+                <div class="console-mockup-code" style="border-radius: 6px; padding: 10px;">
                   <span style="color: #64748b;">-- Authoring continuous stream join</span><br/>
                   <span style="color: #0ea5e9; font-weight: bold;">SELECT</span> symbol, price, volume<br/>
                   <span style="color: #0ea5e9; font-weight: bold;">FROM</span> trades <span style="color: #0ea5e9; font-weight: bold;">ASOF JOIN</span> quotes<br/>
@@ -962,14 +993,14 @@ INNER JOIN payments p ON o.order_id = p.order_id
                 </div>
                 <!-- Nodes/DAG visual mockup -->
                 <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 0;">
-                  <div style="background: #f1f5f9; border: 1px solid var(--border-translucent); border-radius: 6px; padding: 6px 12px; text-align: center; width: 30%;">
-                    <strong style="color: var(--slate-700);">trades</strong><br/><span style="font-size: 0.65rem; color: #64748b;">Source</span>
+                  <div class="console-mockup-node" style="border-radius: 6px; padding: 6px 12px; text-align: center; width: 30%;">
+                    <strong>trades</strong><br/><span style="font-size: 0.65rem; color: #64748b;">Source</span>
                   </div>
                   <div style="flex: 1; height: 2px; background: linear-gradient(90deg, #0ea5e9 0%, #8b5cf6 100%); margin: 0 8px; position: relative;">
                     <span style="position: absolute; top: -12px; left: 50%; transform: translateX(-50%); font-size: 0.55rem; color: #8b5cf6; font-weight: bold;">24.5k eps</span>
                   </div>
-                  <div style="background: #f1f5f9; border: 1px solid var(--border-translucent); border-radius: 6px; padding: 6px 12px; text-align: center; width: 30%;">
-                    <strong style="color: var(--slate-700);">vwap_sink</strong><br/><span style="font-size: 0.65rem; color: #64748b;">Sink</span>
+                  <div class="console-mockup-node" style="border-radius: 6px; padding: 6px 12px; text-align: center; width: 30%;">
+                    <strong>vwap_sink</strong><br/><span style="font-size: 0.65rem; color: #64748b;">Sink</span>
                   </div>
                 </div>
               </div>

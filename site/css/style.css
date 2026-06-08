@@ -525,20 +525,6 @@ p:last-child { margin-bottom: 0; }
   box-shadow: 0 8px 20px -6px rgba(15, 23, 42, 0.04);
 }
 
-.arch-layer.ring-0 {
-  background: #f8fafc;
-  border-color: rgba(14, 165, 233, 0.4);
-}
-
-.arch-layer.ring-0 .layer-title {
-  color: var(--text);
-}
-
-.arch-layer.ring-0 .layer-badge {
-  background: var(--accent-dim);
-  border-color: rgba(14, 165, 233, 0.3);
-  color: var(--accent);
-}
 
 .layer-header {
   display: flex;
@@ -1253,3 +1239,257 @@ code {
     align-self: center;
   }
 }
+
+/* --- Theme Toggle Styles --- */
+.theme-toggle {
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 8px;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  transition: var(--transition);
+  margin-left: auto; /* Push to right on mobile next to burger */
+  outline: none;
+  width: 36px;
+  height: 36px;
+}
+
+.theme-toggle:hover {
+  background: var(--bg-code);
+  color: var(--text);
+}
+
+.theme-icon {
+  width: 20px;
+  height: 20px;
+  stroke: currentColor;
+  stroke-width: 2;
+  transition: var(--transition);
+}
+
+@media (min-width: 1025px) {
+  .theme-toggle {
+    margin-left: 0.5rem;
+  }
+}
+
+/* --- Dark Theme Variables & Overrides --- */
+html[data-theme="dark"] {
+  --bg: #0b0f19;              /* Deep slate black */
+  --bg-surface: #111827;      /* Dark grey surface */
+  --bg-code: #1f2937;         /* Code background */
+  --border: #1f2937;          /* Darker border */
+  --border-bright: #374151;   /* Medium border */
+  --border-focus: #38bdf8;    /* Sky blue focus */
+
+  --text: #f9fafb;            /* White */
+  --text-secondary: #e5e7eb;  /* Off-white */
+  --text-dim: #9ca3af;        /* Slate grey */
+
+  --accent: #38bdf8;          /* Bright sky blue */
+  --accent-purple: #a78bfa;   /* Bright purple */
+  --accent-bright: #38bdf8;   /* Light blue link */
+  --accent-dim: rgba(56, 189, 248, 0.1);
+  --accent-purple-dim: rgba(167, 139, 250, 0.1);
+
+  --green: #34d399;           /* Bright green */
+  --green-dim: rgba(52, 211, 153, 0.1);
+  --yellow: #fbbf24;          /* Bright yellow */
+  --yellow-dim: rgba(251, 191, 36, 0.1);
+  --red: #f87171;             /* Bright red */
+}
+
+/* Dark mode specific design adjustments */
+html[data-theme="dark"] body {
+  background: var(--bg);
+  color: var(--text-secondary);
+}
+
+html[data-theme="dark"] .hero {
+  background: linear-gradient(180deg, #0e1726 0%, var(--bg) 100%);
+}
+
+html[data-theme="dark"] .nav {
+  background: rgba(11, 15, 25, 0.8);
+  border-bottom-color: var(--border);
+}
+
+html[data-theme="dark"] .mobile-menu {
+  background: var(--bg-surface);
+  border-bottom-color: var(--border);
+  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
+}
+
+html[data-theme="dark"] .footer {
+  background: var(--bg-surface);
+  border-top-color: var(--border);
+}
+
+html[data-theme="dark"] .footer-inner {
+  border-bottom-color: var(--border);
+}
+
+html[data-theme="dark"] #features,
+html[data-theme="dark"] #ai,
+html[data-theme="dark"] #status,
+html[data-theme="dark"] #contributing,
+html[data-theme="dark"] .code-section {
+  background: var(--bg-surface) !important;
+}
+
+html[data-theme="dark"] .editor-body pre[class*="language-"],
+html[data-theme="dark"] .editor-body pre {
+  background: var(--bg-surface) !important;
+}
+
+html[data-theme="dark"] .editor-header {
+  background: var(--bg) !important;
+  border-bottom-color: var(--border);
+}
+
+html[data-theme="dark"] .editor-header span {
+  color: var(--text-dim) !important;
+}
+
+html[data-theme="dark"] .code-tab.active {
+  background: var(--bg-surface);
+}
+
+html[data-theme="dark"] .copy-btn {
+  background: var(--bg-surface);
+  border-color: var(--border);
+}
+
+html[data-theme="dark"] .copy-btn:hover {
+  background: var(--bg);
+}
+
+html[data-theme="dark"] .expand-overlay {
+  background: linear-gradient(180deg, rgba(17, 24, 39, 0) 0%, rgba(17, 24, 39, 0.95) 70%, #111827 100%);
+}
+
+html[data-theme="dark"] .expand-btn {
+  background: var(--bg-code);
+  color: var(--text-secondary);
+  border-color: var(--border);
+}
+
+html[data-theme="dark"] .expand-btn:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+html[data-theme="dark"] .hero-install {
+  background: rgba(17, 24, 39, 0.7);
+}
+
+html[data-theme="dark"] .hero-install:hover {
+  background: #111827;
+}
+
+/* Prism syntax highlighting dark theme overrides */
+html[data-theme="dark"] .token.punctuation {
+  color: #9ca3af !important;
+}
+
+html[data-theme="dark"] .token.property,
+html[data-theme="dark"] .token.tag,
+html[data-theme="dark"] .token.boolean,
+html[data-theme="dark"] .token.number,
+html[data-theme="dark"] .token.constant,
+html[data-theme="dark"] .token.symbol,
+html[data-theme="dark"] .token.deleted {
+  color: #fb923c !important; /* Softer orange */
+}
+
+html[data-theme="dark"] .token.selector,
+html[data-theme="dark"] .token.attr-name,
+html[data-theme="dark"] .token.string,
+html[data-theme="dark"] .token.char,
+html[data-theme="dark"] .token.builtin,
+html[data-theme="dark"] .token.inserted {
+  color: #4ade80 !important; /* Softer green */
+}
+
+html[data-theme="dark"] .token.operator,
+html[data-theme="dark"] .token.entity,
+html[data-theme="dark"] .token.url {
+  color: #f3f4f6 !important;
+}
+
+html[data-theme="dark"] .token.atrule,
+html[data-theme="dark"] .token.attr-value,
+html[data-theme="dark"] .token.keyword {
+  color: #38bdf8 !important; /* Softer Sky Blue */
+}
+
+html[data-theme="dark"] .token.function,
+html[data-theme="dark"] .token.class-name {
+  color: #c084fc !important; /* Softer Violet */
+}
+
+html[data-theme="dark"] .token.regex,
+html[data-theme="dark"] .token.important,
+html[data-theme="dark"] .token.variable {
+  color: #fb7185 !important; /* Softer Rose */
+}
+
+/* Chatbot dark theme overrides */
+html[data-theme="dark"] #ldb-chat-root {
+  --ldb-bg: #0b0f19;
+  --ldb-surface: #111827;
+  --ldb-border: #1f2937;
+  --ldb-accent: #38bdf8;
+  --ldb-accent-dim: rgba(56, 189, 248, 0.1);
+  --ldb-text: #f9fafb;
+  --ldb-muted: #9ca3af;
+}
+
+html[data-theme="dark"] #ldb-close:hover,
+html[data-theme="dark"] #ldb-expand:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+html[data-theme="dark"] .ldb-bubble code {
+  background: rgba(56, 189, 248, 0.1);
+  border-color: rgba(56, 189, 248, 0.2);
+  color: var(--accent);
+}
+
+html[data-theme="dark"] .ldb-bubble pre {
+  background: var(--bg-code);
+}
+
+html[data-theme="dark"] .ldb-source-tag {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+html[data-theme="dark"] .ldb-ex {
+  background: var(--bg-surface);
+}
+
+html[data-theme="dark"] .ldb-ex:hover {
+  border-color: rgba(56, 189, 248, 0.4);
+  color: var(--accent);
+  background: var(--ldb-accent-dim);
+}
+
+/* Console Mockup Dark Theme overrides */
+html[data-theme="dark"] .console-mockup {
+  background: var(--bg-surface);
+  border-color: var(--border);
+  box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5);
+}
+html[data-theme="dark"] .console-mockup-header {
+  border-bottom-color: var(--border);
+}
+html[data-theme="dark"] .console-mockup-code,
+html[data-theme="dark"] .console-mockup-node {
+  background: var(--bg);
+  border-color: var(--border);
+}
+
