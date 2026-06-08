@@ -56,7 +56,7 @@ tokio-stream = { workspace = true, features = ["sync"] }
 async-trait = { workspace = true }
 
 
-# Delta (optional, multi-node distributed mode — server-only)
+# Cluster (optional, multi-node distributed mode — server-only)
 chitchat = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 # anyhow is needed for the chitchat Transport trait impls in the
@@ -87,6 +87,9 @@ crossfire = { workspace = true }
 # runs only when CARGO_FEATURE_CLUSTER_UNSTABLE is set — a default build needs
 # no protoc and skips generation entirely.
 tonic-prost-build = "0.14"
+# Vendored protoc so codegen doesn't depend on the host's protoc version (old
+# distro protoc predates proto3 `optional` and rejects barrier.proto).
+protoc-bin-vendored = "3"
 
 [dev-dependencies]
 criterion = { workspace = true }

@@ -1,15 +1,21 @@
-name: Helm Chart Publish
+name: Helm Chart Lint
+
+# Validates the Helm chart. Publishing is handled by docs.yml, which packages
+# the chart into the GitHub Pages site as a classic Helm repo served at
+# https://laminardb.io/charts (see deploy/README.md).
 
 on:
   push:
     branches: [main]
     paths:
       - "deploy/helm/**"
+  pull_request:
+    paths:
+      - "deploy/helm/**"
   workflow_dispatch:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   lint:
@@ -44,33 +50,3 @@ jobs:
 
       - name: Template with full values
         run: helm template laminardb deploy/helm/laminardb -f deploy/helm/laminardb/ci/full-values.yaml
-
-  publish:
-    name: Publish to GHCR
-    runs-on: ubuntu-latest
-    needs: lint
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Helm
-        uses: azure/setup-helm@v4
-
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
-
-      - name: Sync appVersion from Cargo.toml
-        run: |
-          APP_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-          sed -i "s/^appVersion:.*/appVersion: \"${APP_VERSION}\"/" deploy/helm/laminardb/Chart.yaml
-          echo "Set appVersion to ${APP_VERSION}"
-
-      - name: Package chart
-        run: helm package deploy/helm/laminardb -d .helm-packages
-
-      - name: Push to GHCR
-        run: |
-          for pkg in .helm-packages/*.tgz; do
-            helm push "$pkg" oci://ghcr.io/laminardb/charts
-          done

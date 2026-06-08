@@ -9,6 +9,7 @@ on:
       - 'Cargo.toml'
       - 'site/**'
       - 'examples/**'
+      - 'deploy/helm/**'
       - '.github/workflows/docs.yml'
   release:
     types: [published]
@@ -73,6 +74,21 @@ jobs:
           <body><p>Redirecting to <a href="laminar_db/">laminar_db</a>...</p></body>
           </html>
           EOF
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Publish Helm chart repository
+        # Classic Helm repo served from Pages at https://laminardb.io/charts.
+        # Runs every build so the chart stays in the freshly-rebuilt artifact.
+        run: |
+          set -euo pipefail
+          APP_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          sed -i "s/^appVersion:.*/appVersion: \"${APP_VERSION}\"/" deploy/helm/laminardb/Chart.yaml
+          mkdir -p _site/charts
+          helm package deploy/helm/laminardb -d _site/charts
+          helm repo index _site/charts --url https://laminardb.io/charts
+          ls -la _site/charts
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4

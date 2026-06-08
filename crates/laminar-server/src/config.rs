@@ -678,7 +678,7 @@ pub struct SinkConfig {
     pub properties: toml::Table,
 }
 
-/// `[discovery]` section: delta node discovery.
+/// `[discovery]` section: cluster node discovery.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct DiscoverySection {
     pub strategy: String,
@@ -703,7 +703,7 @@ pub struct DiscoverySection {
     pub cluster_tls_server_name: Option<String>,
 }
 
-/// `[coordination]` section: delta coordination.
+/// `[coordination]` section: cluster coordination.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CoordinationSection {
     #[serde(default = "default_coordination_strategy")]
@@ -990,7 +990,7 @@ topic = "vwap_output"
     }
 
     #[test]
-    fn test_parse_full_delta_config() {
+    fn test_parse_full_cluster_config() {
         let toml = r#"
 node_id = "star-1"
 

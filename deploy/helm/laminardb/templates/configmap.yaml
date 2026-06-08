@@ -9,8 +9,8 @@ data:
     {{- if .Values.laminardb.configOverride }}
     {{ .Values.laminardb.configOverride | nindent 4 }}
     {{- else }}
-    {{- $isCluster := or (eq .Values.laminardb.mode "delta") (eq .Values.laminardb.mode "cluster") }}
-    {{- $cluster := ternary (.Values.laminardb.delta | default .Values.laminardb.cluster | default dict) (.Values.laminardb.cluster | default .Values.laminardb.delta | default dict) (eq .Values.laminardb.mode "delta") }}
+    {{- $isCluster := eq .Values.laminardb.mode "cluster" }}
+    {{- $cluster := .Values.laminardb.cluster | default dict }}
     {{- if $isCluster }}
     node_id = "{{ default "${HOSTNAME}" $cluster.nodeId }}"
     {{- end }}

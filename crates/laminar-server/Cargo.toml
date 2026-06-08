@@ -101,7 +101,7 @@ prometheus = { workspace = true }
 # File watching for hot reload
 notify = { workspace = true }
 
-# Hostname for metrics instance label + delta mode
+# Hostname for metrics instance label + cluster mode
 gethostname = { workspace = true }
 uuid = { workspace = true, optional = true }
 xxhash-rust = { workspace = true, optional = true }
