@@ -513,7 +513,7 @@
           "gridPos": { "h": 8, "w": 8, "x": 8, "y": 58 },
           "targets": [
             {
-              "expr": "rate(laminardb_shed_records_total{instance=~\"$instance\"}[1m])",
+              "expr": "rate(laminardb_shed_records_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])",
               "legendFormat": "shed/s ({{stream}})"
             }
           ],
@@ -531,7 +531,7 @@
           "gridPos": { "h": 8, "w": 8, "x": 16, "y": 58 },
           "targets": [
             {
-              "expr": "rate(laminardb_sink_filter_rejected_rows_total{instance=~\"$instance\"}[1m])",
+              "expr": "rate(laminardb_sink_filter_rejected_rows_total{instance=~\"$instance\",pipeline=~\"$pipeline\"}[1m])",
               "legendFormat": "rejected/s ({{sink}})"
             }
           ],

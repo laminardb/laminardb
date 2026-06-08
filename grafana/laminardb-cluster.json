@@ -1,4 +1,20 @@
 {
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" },
+    { "type": "panel", "id": "stat", "name": "Stat", "version": "" },
+    { "type": "panel", "id": "timeseries", "name": "Time series", "version": "" }
+  ],
   "annotations": { "list": [] },
   "editable": true,
   "fiscalYearStartMonth": 0,
@@ -14,6 +30,7 @@
     {
       "title": "Active Cluster Nodes",
       "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
       "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
       "targets": [
         {
@@ -36,6 +53,7 @@
     {
       "title": "Global Watermark (epoch ms)",
       "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
       "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
       "targets": [
         {
@@ -52,6 +70,7 @@
     {
       "title": "Total Cluster Ingestion Rate",
       "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
       "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
       "targets": [
         {
@@ -68,6 +87,7 @@
     {
       "title": "Total Cluster Emission Rate",
       "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
       "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
       "targets": [
         {
@@ -90,6 +110,7 @@
     {
       "title": "Ingested Events (Cluster vs Nodes)",
       "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
       "targets": [
         {
@@ -111,6 +132,7 @@
     {
       "title": "Emitted Events (Cluster vs Nodes)",
       "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
       "targets": [
         {
@@ -138,6 +160,7 @@
     {
       "title": "Processing Cycle Duration p99 (Node breakdown)",
       "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
       "targets": [
         {
@@ -155,6 +178,7 @@
     {
       "title": "Congestion (Backpressured Cycles & Remote Subscription Drops)",
       "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
       "targets": [
         {
@@ -182,6 +206,7 @@
     {
       "title": "Checkpoint Epoch",
       "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
       "gridPos": { "h": 4, "w": 6, "x": 0, "y": 24 },
       "targets": [
         {
@@ -198,6 +223,7 @@
     {
       "title": "Checkpoints Progress",
       "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
       "gridPos": { "h": 4, "w": 6, "x": 6, "y": 24 },
       "targets": [
         {
@@ -218,6 +244,7 @@
     {
       "title": "Checkpoint Sizes",
       "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
       "targets": [
         {
@@ -240,6 +267,7 @@
         {
           "title": "Total Cluster MV Updates Rate",
           "type": "timeseries",
+          "datasource": "${DS_PROMETHEUS}",
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 33 },
           "targets": [
             {
@@ -261,6 +289,7 @@
         {
           "title": "Total Cluster MV Storage Bytes",
           "type": "timeseries",
+          "datasource": "${DS_PROMETHEUS}",
           "gridPos": { "h": 8, "w": 12, "x": 12, "y": 33 },
           "targets": [
             {
@@ -290,6 +319,7 @@
         {
           "title": "Late Arrival & Null Timestamp Drops (Cluster Total)",
           "type": "timeseries",
+          "datasource": "${DS_PROMETHEUS}",
           "gridPos": { "h": 8, "w": 8, "x": 0, "y": 42 },
           "targets": [
             {
@@ -311,6 +341,7 @@
         {
           "title": "Shed Records by Stream (Cluster breakdown)",
           "type": "timeseries",
+          "datasource": "${DS_PROMETHEUS}",
           "gridPos": { "h": 8, "w": 8, "x": 8, "y": 42 },
           "targets": [
             {
@@ -328,6 +359,7 @@
         {
           "title": "Sink Filter Rejections (Cluster breakdown)",
           "type": "timeseries",
+          "datasource": "${DS_PROMETHEUS}",
           "gridPos": { "h": 8, "w": 8, "x": 16, "y": 42 },
           "targets": [
             {

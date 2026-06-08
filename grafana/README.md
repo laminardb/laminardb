@@ -1,8 +1,8 @@
 # LaminarDB Grafana Dashboards
 
 There are two dashboards available:
-1. **Single-Node/Overview Dashboard:** Import [laminardb.json](file:///C:/Users/sujit/source/laminardb/grafana/laminardb.json) into Grafana (Dashboards > Import > Upload JSON file).
-2. **Cluster-Mode Dashboard:** Import [laminardb-cluster.json](file:///C:/Users/sujit/source/laminardb/grafana/laminardb-cluster.json) into Grafana for cluster-wide aggregates, per-node breakdowns, and distributed checkpoint metrics.
+1. **Single-Node/Overview Dashboard:** Import [laminardb.json](laminardb.json) into Grafana (Dashboards > Import > Upload JSON file).
+2. **Cluster-Mode Dashboard:** Import [laminardb-cluster.json](laminardb-cluster.json) into Grafana for cluster-wide aggregates, per-node breakdowns, and distributed checkpoint metrics.
 
 
 ## Setup
