@@ -233,9 +233,8 @@ persistence:
     emptyDirMedium: ""
   checkpoints:
     # -- Provision a dedicated checkpoints PVC. Off by default — prefer an object
-    # store (laminardb.checkpoint.url); a default install then creates one PVC, not
-    # two, and the local fallback path is backed by a volatile emptyDir so it stays
-    # writable under readOnlyRootFilesystem.
+    # store (laminardb.checkpoint.url); the local fallback path then uses a
+    # volatile emptyDir.
     enabled: false
     # -- Storage class (empty = default)
     storageClass: ""

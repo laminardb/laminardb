@@ -139,9 +139,7 @@ spec:
         - name: tmp
           emptyDir: {}
         {{- if not .Values.persistence.checkpoints.enabled }}
-        # Writable fallback for the default file:// checkpoint path; the root
-        # filesystem is read-only. Volatile — set laminardb.checkpoint.url to an
-        # object store (or enable the PVC) for durable checkpoints.
+        # Volatile fallback so the file:// checkpoint path stays writable.
         - name: checkpoints
           emptyDir: {}
         {{- end }}

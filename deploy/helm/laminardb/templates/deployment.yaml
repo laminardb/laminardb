@@ -150,10 +150,7 @@ spec:
           emptyDir: {}
           {{- end }}
         {{- end }}
-        # Always mounted: the default file:// checkpoint path must be writable
-        # under readOnlyRootFilesystem even with the checkpoints PVC disabled.
-        # (The Deployment never gets a PVC — durable checkpoints need the
-        # StatefulSet or an object-store laminardb.checkpoint.url.)
+        # Volatile; durable checkpoints need the StatefulSet PVC or an object store.
         - name: checkpoints
           emptyDir: {}
         {{- with .Values.extraVolumes }}
