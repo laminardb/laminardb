@@ -13,6 +13,7 @@ use super::barrier::{
 use super::leader::leader_of;
 use super::snapshot::AssignmentSnapshotStore;
 use crate::cluster::discovery::{assignable_node_ids, NodeId, NodeInfo, NodeState};
+use crate::state::Locality;
 
 /// Facade composing the cluster-control primitives.
 pub struct ClusterController {
@@ -33,6 +34,9 @@ pub struct ClusterController {
     draining: Arc<AtomicBool>,
     /// Whether this node has announced itself as Active.
     active: Arc<AtomicBool>,
+    /// This node's own failure-domain locality (peers carry theirs in
+    /// `members_rx`; self is only known by id). Set once at startup.
+    self_locality: parking_lot::RwLock<Locality>,
     /// Handler serving cross-node `RemoteScan`, shared with the query server.
     #[cfg(feature = "cluster")]
     query_handler: super::query::QueryHandlerSlot,
@@ -70,6 +74,7 @@ impl ClusterController {
             cluster_min_watermark: Arc::new(AtomicI64::new(i64::MIN)),
             draining: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicBool::new(true)),
+            self_locality: parking_lot::RwLock::new(Locality::default()),
             #[cfg(feature = "cluster")]
             query_handler: Arc::new(parking_lot::RwLock::new(None)),
             #[cfg(feature = "cluster")]
@@ -208,6 +213,34 @@ impl ClusterController {
         ids.sort_unstable();
         ids.dedup();
         ids
+    }
+
+    /// Record this node's own locality. Call once at startup.
+    pub fn set_self_locality(&self, locality: Locality) {
+        *self.self_locality.write() = locality;
+    }
+
+    /// [`Self::assignable_instances`] paired with each node's [`Locality`]
+    /// (peers' from `members_rx`, self's from [`Self::set_self_locality`]).
+    #[must_use]
+    pub fn assignable_with_locality(&self) -> Vec<(NodeId, Locality)> {
+        let members = self.members_rx.borrow();
+        self.assignable_instances()
+            .into_iter()
+            .map(|id| {
+                let locality = if id == self.instance_id {
+                    self.self_locality.read().clone()
+                } else {
+                    members
+                        .iter()
+                        .find(|m| m.id == id)
+                        .and_then(|m| m.metadata.failure_domain.as_deref())
+                        .map(Locality::parse)
+                        .unwrap_or_default()
+                };
+                (id, locality)
+            })
+            .collect()
     }
 
     /// Cloneable membership watch. Background tasks subscribe to
@@ -378,6 +411,34 @@ mod tests {
         c.begin_drain();
         assert!(c.is_draining());
         assert_eq!(c.assignable_instances(), vec![NodeId(3)]);
+    }
+
+    #[test]
+    fn assignable_with_locality_attaches_self_and_peer_domains() {
+        let mut peer = info(3);
+        peer.metadata.failure_domain = Some("region=r;zone=z2".to_string());
+        let c = ctl(1, vec![peer]);
+        c.set_self_locality(Locality::parse("region=r;zone=z1"));
+
+        let pairs = c.assignable_with_locality();
+        // Same set as assignable_instances (self + active peer), sorted by id.
+        let ids: Vec<NodeId> = pairs.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![NodeId(1), NodeId(3)]);
+        // Self's locality comes from set_self_locality; peer's from gossip.
+        let self_loc = &pairs.iter().find(|(id, _)| *id == NodeId(1)).unwrap().1;
+        let peer_loc = &pairs.iter().find(|(id, _)| *id == NodeId(3)).unwrap().1;
+        assert_eq!(self_loc.domain_at(1), "r;z1");
+        assert_eq!(peer_loc.domain_at(1), "r;z2");
+    }
+
+    #[test]
+    fn assignable_with_locality_defaults_unlabeled_to_empty_domain() {
+        // A peer with no failure_domain and unset self locality both collapse
+        // to the empty "unknown" domain — safe degradation, never a panic.
+        let c = ctl(1, vec![info(3)]);
+        let pairs = c.assignable_with_locality();
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.iter().all(|(_, loc)| loc.domain_at(0).is_empty()));
     }
 
     #[tokio::test]

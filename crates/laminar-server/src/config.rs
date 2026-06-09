@@ -688,6 +688,13 @@ pub struct DiscoverySection {
     pub gossip_port: u16,
     #[serde(default)]
     pub advertise_host: Option<String>,
+    /// Failure-domain locality, gossiped to peers. A flat label (`"rack17"`)
+    /// or coarsest-first `;`-separated tiers (`"region=...;zone=...;rack=..."`).
+    #[serde(default)]
+    pub failure_domain: Option<String>,
+    /// Locality tier the placement/blast-radius metrics group by (0 = coarsest).
+    #[serde(default)]
+    pub placement_isolation_tier: usize,
     /// PEM cert for control-plane (barrier/query/shuffle) mTLS; enable by
     /// setting cert + key + client_ca + server_name together.
     #[serde(default)]
@@ -1012,6 +1019,8 @@ snapshot_strategy = "fork_cow"
 strategy = "static"
 seeds = ["node-1:7946", "node-2:7946"]
 gossip_port = 7946
+failure_domain = "region=us-east-1;zone=us-east-1a;rack=r17"
+placement_isolation_tier = 1
 
 [coordination]
 strategy = "raft"
@@ -1042,6 +1051,13 @@ delivery = "exactly_once"
         assert!(matches!(config.state, StateBackendConfig::Local { .. }));
         assert!(config.discovery.is_some());
         assert!(config.coordination.is_some());
+
+        let disc = config.discovery.as_ref().unwrap();
+        assert_eq!(
+            disc.failure_domain.as_deref(),
+            Some("region=us-east-1;zone=us-east-1a;rack=r17")
+        );
+        assert_eq!(disc.placement_isolation_tier, 1);
 
         let coord = config.coordination.as_ref().unwrap();
         assert_eq!(coord.election_timeout, Duration::from_millis(1500));

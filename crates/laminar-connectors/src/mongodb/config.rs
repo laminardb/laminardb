@@ -16,7 +16,7 @@ use crate::config::ConnectorConfig;
 use crate::error::ConnectorError;
 
 use super::resume_token::ResumeTokenStoreConfig;
-use super::timeseries::CollectionKind;
+use super::timeseries::{CollectionKind, TimeSeriesConfig, TimeSeriesGranularity};
 use super::write_model::WriteMode;
 
 /// Mode for requesting full documents on update events.
@@ -489,6 +489,41 @@ impl MongoDbSinkConfig {
             cfg.write_concern.timeout_ms = Some(timeout);
         }
 
+        if let Some(time_field) = config.get("timeseries.time_field") {
+            let meta_field = config.get("timeseries.meta_field").map(String::from);
+            let granularity = if let Some(gran_str) = config.get("timeseries.granularity") {
+                match gran_str.to_lowercase().as_str() {
+                    "seconds" => TimeSeriesGranularity::Seconds,
+                    "minutes" => TimeSeriesGranularity::Minutes,
+                    "hours" => TimeSeriesGranularity::Hours,
+                    "custom" => {
+                        let span =
+                            config.require_parsed::<u32>("timeseries.bucket_max_span_seconds")?;
+                        let rounding =
+                            config.require_parsed::<u32>("timeseries.bucket_rounding_seconds")?;
+                        TimeSeriesGranularity::custom(span, rounding)?
+                    }
+                    other => {
+                        return Err(ConnectorError::ConfigurationError(format!(
+                            "unknown timeseries granularity: {other}"
+                        )));
+                    }
+                }
+            } else {
+                TimeSeriesGranularity::Seconds
+            };
+
+            let expire_after_seconds =
+                config.get_parsed::<u64>("timeseries.expire_after_seconds")?;
+
+            cfg.collection_kind = CollectionKind::TimeSeries(TimeSeriesConfig {
+                time_field: time_field.to_string(),
+                meta_field,
+                granularity,
+                expire_after_seconds,
+            });
+        }
+
         cfg.validate()?;
         Ok(cfg)
     }
@@ -749,6 +784,53 @@ mod tests {
         let cfg = MongoDbSinkConfig::from_config(&config).unwrap();
         assert_eq!(cfg.batch_size, 1000);
         assert!(!cfg.ordered);
+    }
+
+    #[test]
+    fn test_sink_config_timeseries_parsing() {
+        // Test standard granularity with metadata and TTL
+        let mut config = ConnectorConfig::new("mongodb-sink");
+        config.set("connection.uri", "mongodb://host:27017");
+        config.set("database", "testdb");
+        config.set("collection", "ts_out");
+        config.set("timeseries.time_field", "timestamp");
+        config.set("timeseries.meta_field", "sensor_id");
+        config.set("timeseries.granularity", "minutes");
+        config.set("timeseries.expire_after_seconds", "86400");
+
+        let cfg = MongoDbSinkConfig::from_config(&config).unwrap();
+        if let CollectionKind::TimeSeries(ts) = cfg.collection_kind {
+            assert_eq!(ts.time_field, "timestamp");
+            assert_eq!(ts.meta_field.as_deref(), Some("sensor_id"));
+            assert_eq!(ts.granularity, TimeSeriesGranularity::Minutes);
+            assert_eq!(ts.expire_after_seconds, Some(86400));
+        } else {
+            panic!("Expected TimeSeries collection kind");
+        }
+
+        // Test custom granularity
+        let mut config_custom = ConnectorConfig::new("mongodb-sink");
+        config_custom.set("connection.uri", "mongodb://host:27017");
+        config_custom.set("database", "testdb");
+        config_custom.set("collection", "ts_custom");
+        config_custom.set("timeseries.time_field", "timestamp");
+        config_custom.set("timeseries.granularity", "custom");
+        config_custom.set("timeseries.bucket_max_span_seconds", "3600");
+        config_custom.set("timeseries.bucket_rounding_seconds", "3600");
+
+        let cfg_custom = MongoDbSinkConfig::from_config(&config_custom).unwrap();
+        if let CollectionKind::TimeSeries(ts) = cfg_custom.collection_kind {
+            assert_eq!(ts.time_field, "timestamp");
+            assert_eq!(
+                ts.granularity,
+                TimeSeriesGranularity::Custom {
+                    bucket_max_span_seconds: 3600,
+                    bucket_rounding_seconds: 3600,
+                }
+            );
+        } else {
+            panic!("Expected TimeSeries collection kind");
+        }
     }
 
     #[test]

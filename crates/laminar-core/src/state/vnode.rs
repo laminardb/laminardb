@@ -13,6 +13,7 @@
 //! [`key_hash`] (xxh3) and modulo `vnode_count`. Connectors that
 //! need a vnode ID for an event call [`VnodeRegistry::vnode_for_key`].
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -341,6 +342,78 @@ pub fn rendezvous_assignment(vnode_count: u32, peers: &[NodeId]) -> Arc<[NodeId]
     assignment.into()
 }
 
+/// A node's failure-domain locality: ordered tier values, coarsest first
+/// (e.g. `["us-east-1", "us-east-1a", "r17"]`). Parsed from the node's
+/// `failure_domain` gossip string.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Locality {
+    tiers: Vec<String>,
+}
+
+impl Locality {
+    /// Build from ordered tier values, coarsest first.
+    #[must_use]
+    pub fn new(tiers: Vec<String>) -> Self {
+        Self { tiers }
+    }
+
+    /// Parse `"region=us-east-1;zone=us-east-1a;rack=r17"` (or a bare label
+    /// `"rack17"`) into its tier values. Tier names are ignored.
+    #[must_use]
+    pub fn parse(s: &str) -> Self {
+        let tiers = s
+            .split(';')
+            .map(str::trim)
+            .filter(|seg| !seg.is_empty())
+            .map(|seg| {
+                seg.split_once('=')
+                    .map_or(seg, |(_, v)| v.trim())
+                    .to_string()
+            })
+            .collect();
+        Self { tiers }
+    }
+
+    /// Failure-domain key at `tier`: the `;`-joined value prefix `0..=tier`.
+    /// Two nodes share a domain iff equal; an unlabeled node yields the empty key.
+    #[must_use]
+    pub fn domain_at(&self, tier: usize) -> String {
+        if self.tiers.is_empty() {
+            return String::new();
+        }
+        let end = tier.min(self.tiers.len() - 1);
+        self.tiers[..=end].join(";")
+    }
+}
+
+/// Resolve each node's failure-domain key at `isolation_tier`.
+fn resolve_domains(nodes: &[(NodeId, Locality)], isolation_tier: usize) -> Vec<(NodeId, String)> {
+    nodes
+        .iter()
+        .map(|(id, loc)| (*id, loc.domain_at(isolation_tier)))
+        .collect()
+}
+
+/// Owner counts per failure domain at `isolation_tier`. The largest value over
+/// `vnode_count` is the blast radius — the share of state that goes `Restoring`
+/// if that one domain fails at once.
+#[must_use]
+pub fn owners_per_domain(
+    owners: &[NodeId],
+    nodes: &[(NodeId, Locality)],
+    isolation_tier: usize,
+) -> BTreeMap<String, u32> {
+    let dom: BTreeMap<NodeId, String> =
+        resolve_domains(nodes, isolation_tier).into_iter().collect();
+    let mut counts = BTreeMap::new();
+    for &o in owners {
+        *counts
+            .entry(dom.get(&o).cloned().unwrap_or_default())
+            .or_default() += 1;
+    }
+    counts
+}
+
 /// Vnodes currently assigned to `owner`.
 ///
 /// Used by the checkpoint coordinator to decide which vnodes' durability
@@ -545,5 +618,39 @@ mod tests {
         r.mark_restoring(&[2]);
         r.set_assignment(vec![NodeId(1), NodeId(1), NodeId(1), NodeId(1)].into());
         assert!(r.is_restoring(2));
+    }
+
+    // -- Topology-aware placement --------------------------------------------
+
+    /// A node at (region, zone, rack).
+    fn node(id: u64, region: &str, zone: &str, rack: &str) -> (NodeId, Locality) {
+        (
+            NodeId(id),
+            Locality::new(vec![region.into(), zone.into(), rack.into()]),
+        )
+    }
+
+    const TIER_ZONE: usize = 1;
+
+    #[test]
+    fn locality_parse_and_domain_at() {
+        let l = Locality::parse("region=us-east-1;zone=us-east-1a;rack=r17");
+        assert_eq!(l.domain_at(0), "us-east-1");
+        assert_eq!(l.domain_at(1), "us-east-1;us-east-1a");
+        assert_eq!(l.domain_at(2), "us-east-1;us-east-1a;r17");
+        assert_eq!(l.domain_at(99), "us-east-1;us-east-1a;r17"); // clamps to finest
+        assert_eq!(Locality::parse("rack17").domain_at(0), "rack17"); // bare label
+        assert_eq!(Locality::parse("").domain_at(0), ""); // unknown → empty domain
+    }
+
+    #[test]
+    fn owners_per_domain_counts_by_zone() {
+        let nodes = vec![node(1, "r", "z1", "a"), node(2, "r", "z2", "a")];
+        // z1 owns 2, z2 owns 1, and an unassigned owner folds into the empty domain.
+        let owners = [NodeId(1), NodeId(1), NodeId(2), NodeId::UNASSIGNED];
+        let counts = owners_per_domain(&owners, &nodes, TIER_ZONE);
+        assert_eq!(counts["r;z1"], 2);
+        assert_eq!(counts["r;z2"], 1);
+        assert_eq!(counts[""], 1);
     }
 }

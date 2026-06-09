@@ -375,6 +375,63 @@
           }
         }
       ]
+    },
+    {
+      "title": "Failure-Domain Placement",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 51 },
+      "collapsed": true,
+      "panels": [
+        {
+          "title": "Blast Radius (max domain share)",
+          "type": "stat",
+          "datasource": "${DS_PROMETHEUS}",
+          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 52 },
+          "targets": [
+            { "expr": "max(laminardb_placement_blast_radius_ratio)", "legendFormat": "Blast radius" }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "min": 0,
+              "max": 1,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  { "color": "green", "value": null },
+                  { "color": "yellow", "value": 0.5 },
+                  { "color": "red", "value": 0.7 }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "title": "Failure Domains",
+          "type": "stat",
+          "datasource": "${DS_PROMETHEUS}",
+          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 52 },
+          "targets": [
+            { "expr": "count(laminardb_placement_vnodes_per_domain)", "legendFormat": "Domains" }
+          ],
+          "fieldConfig": { "defaults": { "unit": "short" } }
+        },
+        {
+          "title": "Vnodes per Failure Domain",
+          "type": "timeseries",
+          "datasource": "${DS_PROMETHEUS}",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 52 },
+          "targets": [
+            { "expr": "max(laminardb_placement_vnodes_per_domain) by (domain)", "legendFormat": "{{domain}}" }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "stacking": { "mode": "normal" } }
+            }
+          }
+        }
+      ]
     }
   ],
   "schemaVersion": 39,
