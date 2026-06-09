@@ -16,6 +16,9 @@ use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload}
 
 use super::backend::{StateBackend, StateBackendError};
 
+/// Every Nth prune does a full listing instead of the incremental window.
+const PRUNE_FULL_SCAN_EVERY: u64 = 32;
+
 /// Object-store-backed [`StateBackend`].
 pub struct ObjectStoreBackend {
     store: Arc<dyn ObjectStore>,
@@ -30,6 +33,9 @@ pub struct ObjectStoreBackend {
     /// whole store. `0` = no baseline yet; the first prune does one full
     /// listing, then bounds every subsequent one.
     latest_pruned_epoch: AtomicU64,
+    /// Prune-call counter driving the periodic full-scan re-baseline, which
+    /// bounds how long a straggler write below the cursor can leak.
+    prune_passes: AtomicU64,
     /// Authoritative vnode-assignment version known to this backend.
     /// Split-brain fence: [`write_partial`](Self::write_partial) rejects
     /// any caller whose `assignment_version` is strictly less than this
@@ -66,6 +72,7 @@ impl ObjectStoreBackend {
             committer_bytes,
             vnode_capacity,
             latest_pruned_epoch: AtomicU64::new(0),
+            prune_passes: AtomicU64::new(0),
             authoritative_version: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -220,7 +227,12 @@ impl StateBackend for ObjectStoreBackend {
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {
         use futures::stream::{self, StreamExt};
 
-        let start = self.latest_pruned_epoch.load(Ordering::Acquire);
+        let pass = self.prune_passes.fetch_add(1, Ordering::AcqRel);
+        let start = if pass.is_multiple_of(PRUNE_FULL_SCAN_EVERY) {
+            0
+        } else {
+            self.latest_pruned_epoch.load(Ordering::Acquire)
+        };
 
         let mut victims: Vec<OsPath> = Vec::new();
         if start == 0 {
@@ -644,5 +656,37 @@ mod tests {
         backend.prune_before(5).await.unwrap();
         assert_eq!(backend.latest_pruned_epoch.load(Ordering::Relaxed), 5);
         assert!(backend.read_partial(0, 5).await.unwrap().is_some());
+    }
+
+    /// A straggler write below the cursor is invisible to incremental prunes;
+    /// the periodic full-scan re-baseline must reclaim it.
+    #[tokio::test]
+    async fn periodic_full_scan_reclaims_late_write_below_cursor() {
+        let dir = tempdir().unwrap();
+        let backend = ObjectStoreBackend::new(make_store(dir.path()), "node-0", 4);
+
+        backend
+            .write_partial(0, 1, 0, Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        backend.prune_before(3).await.unwrap();
+        assert!(backend.read_partial(0, 1).await.unwrap().is_none());
+
+        // Straggler lands in an epoch the cursor has already passed.
+        backend
+            .write_partial(0, 1, 0, Bytes::from_static(b"late"))
+            .await
+            .unwrap();
+        backend.prune_before(3).await.unwrap();
+        assert!(
+            backend.read_partial(0, 1).await.unwrap().is_some(),
+            "incremental prune cannot see below the cursor",
+        );
+
+        // Drive past the re-baseline pass; the full scan reclaims it.
+        for _ in 0..PRUNE_FULL_SCAN_EVERY {
+            backend.prune_before(3).await.unwrap();
+        }
+        assert!(backend.read_partial(0, 1).await.unwrap().is_none());
     }
 }
