@@ -1,7 +1,8 @@
 //! Prometheus metrics for the streaming engine.
 
 use prometheus::{
-    Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry,
+    Gauge, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    Registry,
 };
 
 /// Pipeline metrics registered on an explicit prometheus `Registry`.
@@ -91,6 +92,10 @@ pub struct EngineMetrics {
     /// Output batches dropped when a remote subscriber's routing queue is full
     /// (cluster mode, best-effort delivery under backpressure).
     pub remote_subscription_batches_dropped: IntCounter,
+    /// Vnodes owned per failure domain (cluster mode). Label: `domain`.
+    pub placement_vnodes_per_domain: IntGaugeVec,
+    /// Largest single domain's share of all vnodes (`[0, 1]`) — the blast radius.
+    pub placement_blast_radius_ratio: Gauge,
 }
 
 impl EngineMetrics {
@@ -307,6 +312,19 @@ impl EngineMetrics {
             remote_subscription_batches_dropped: reg!(IntCounter::new(
                 "remote_subscription_batches_dropped_total",
                 "Output batches dropped under remote-subscriber backpressure"
+            )
+            .unwrap()),
+            placement_vnodes_per_domain: reg!(IntGaugeVec::new(
+                Opts::new(
+                    "placement_vnodes_per_domain",
+                    "Vnodes owned per failure domain (cluster mode)"
+                ),
+                &["domain"],
+            )
+            .unwrap()),
+            placement_blast_radius_ratio: reg!(Gauge::new(
+                "placement_blast_radius_ratio",
+                "Largest single domain's share of all vnodes (0-1); state that goes Restoring if it fails"
             )
             .unwrap()),
         }

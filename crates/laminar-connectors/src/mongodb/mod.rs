@@ -171,6 +171,61 @@ fn mongodb_sink_config_keys() -> Vec<ConfigKeySpec> {
             "Ordered writes (fail-fast) vs unordered (higher throughput)",
             "true",
         ),
+        ConfigKeySpec::optional(
+            "write.mode",
+            "Write operation mode (insert, upsert, replace, cdc_replay)",
+            "insert",
+        ),
+        ConfigKeySpec::optional(
+            "write.mode.key_fields",
+            "Comma-separated key fields to match documents in upsert mode",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "write.mode.upsert_on_missing",
+            "Insert the document if not found in replace mode",
+            "false",
+        ),
+        ConfigKeySpec::optional(
+            "write_concern.journal",
+            "Request acknowledgment after the write has been journaled",
+            "true",
+        ),
+        ConfigKeySpec::optional(
+            "write_concern.timeout_ms",
+            "Timeout for the write concern to be satisfied",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "timeseries.time_field",
+            "The field in each document containing the date",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "timeseries.meta_field",
+            "An optional field labeling the data source",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "timeseries.granularity",
+            "Bucketing granularity (seconds, minutes, hours, custom)",
+            "seconds",
+        ),
+        ConfigKeySpec::optional(
+            "timeseries.bucket_max_span_seconds",
+            "Max span of a single bucket in seconds (custom granularity)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "timeseries.bucket_rounding_seconds",
+            "Rounding boundary in seconds (custom granularity)",
+            "",
+        ),
+        ConfigKeySpec::optional(
+            "timeseries.expire_after_seconds",
+            "TTL in seconds (automatically delete documents after this span)",
+            "",
+        ),
     ]
 }
 

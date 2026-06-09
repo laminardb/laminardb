@@ -353,7 +353,7 @@ pub async fn start_cluster(
         metadata: NodeMetadata {
             cores: num_cpus(),
             memory_bytes: 0,
-            failure_domain: None,
+            failure_domain: cluster_cfg.discovery.failure_domain.clone(),
             tags: std::collections::HashMap::new(),
             owned_partitions: Vec::new(),
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -503,6 +503,12 @@ pub async fn start_cluster(
                 &advertise_host,
             )
             .await?;
+            // Hand the controller this node's own locality so the topology-
+            // aware rebalancer can place self correctly (peers' localities
+            // arrive via gossip; self is folded in by id only).
+            controller.set_self_locality(laminar_core::state::Locality::parse(
+                local_node.metadata.failure_domain.as_deref().unwrap_or(""),
+            ));
             builder = builder.cluster_controller(Arc::clone(&controller));
             Some(controller)
         }
@@ -611,7 +617,10 @@ pub async fn start_cluster(
     if let (Some(snap_store), Some(controller)) =
         (snapshot_store.clone(), cluster_controller.as_ref())
     {
-        let cfg = laminar_db::rebalance::RebalanceConfig::default();
+        let cfg = laminar_db::rebalance::RebalanceConfig {
+            placement_isolation_tier: cluster_cfg.discovery.placement_isolation_tier,
+            ..laminar_db::rebalance::RebalanceConfig::default()
+        };
         rebalance_tasks.push(laminar_db::rebalance::spawn_snapshot_watcher(
             Arc::clone(&db),
             Arc::clone(&snap_store),

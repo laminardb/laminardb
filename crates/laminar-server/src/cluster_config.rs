@@ -146,6 +146,8 @@ mod tests {
             seeds: vec!["node-1:7946".to_string(), "node-2:7946".to_string()],
             gossip_port: 7946,
             advertise_host: None,
+            failure_domain: None,
+            placement_isolation_tier: 0,
             cluster_tls_cert: None,
             cluster_tls_key: None,
             cluster_tls_client_ca: None,

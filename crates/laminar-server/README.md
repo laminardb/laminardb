@@ -242,6 +242,20 @@ The server watches `pgwire_tls_cert`, `pgwire_tls_key`, and `pgwire_tls_client_c
 psql "host=127.0.0.1 port=5433 dbname=laminardb user=any" -c "SUBSCRIBE avg_price WHERE symbol = 'AAPL'"
 ```
 
+## Failure-Domain Placement (rack/zone awareness)
+
+In `mode = "cluster"`, advertise each node's physical topology with `failure_domain` (a flat label, or hierarchical coarsest-first `;`-separated tiers). It is gossiped to peers and exported as blast-radius metrics so you can see how vnode ownership is spread across racks/zones.
+
+```toml
+[discovery]
+strategy = "gossip"
+seeds = ["node-1:7946", "node-2:7946"]
+failure_domain = "region=us-east-1;zone=us-east-1a;rack=r17"
+placement_isolation_tier = 1     # 0=region, 1=zone, 2=rack — what counts as a "domain"
+```
+
+`placement_vnodes_per_domain{domain}` and `placement_blast_radius_ratio` (the largest domain's share of vnodes — the state that goes into recovery if that domain fails at once) are exported; see the "Failure-Domain Placement" row in the cluster Grafana dashboard. Unlabeled nodes collapse into one shared `unknown` domain. Placement itself is plain rendezvous hashing — this surfaces the blast radius, it does not yet act on it.
+
 ## Cluster Control-Plane TLS (mTLS)
 
 In `mode = "cluster"`, the inter-node control plane (barrier sync, the distributed-query `RemoteScan` service, and the row shuffle) is plaintext and unauthenticated by default — run it on a trusted/isolated network. To require mutual TLS between nodes, set all four `[discovery]` keys together (omit them for plaintext):

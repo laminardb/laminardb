@@ -9,13 +9,16 @@ use std::time::Duration;
 use laminar_core::cluster::control::{
     AssignmentSnapshot, AssignmentSnapshotStore, ClusterController, RotateOutcome,
 };
-use laminar_core::state::{rendezvous_assignment, NodeId, VnodeRegistry};
+use laminar_core::state::{
+    owners_per_domain, rendezvous_assignment, Locality, NodeId, VnodeRegistry,
+};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 use crate::db::{LaminarDB, SnapshotAdoption};
+use crate::engine_metrics::EngineMetrics;
 
 /// Tunables for the rebalance control plane.
 #[derive(Debug, Clone, Copy)]
@@ -28,6 +31,8 @@ pub struct RebalanceConfig {
     pub checkpoint_timeout: Duration,
     /// Delay before retrying a failed rotation.
     pub retry_delay: Duration,
+    /// Locality tier the placement metrics group by (0 = coarsest).
+    pub placement_isolation_tier: usize,
 }
 
 impl Default for RebalanceConfig {
@@ -37,6 +42,7 @@ impl Default for RebalanceConfig {
             rebalance_debounce: Duration::from_secs(5),
             checkpoint_timeout: Duration::from_secs(60),
             retry_delay: Duration::from_secs(10),
+            placement_isolation_tier: 0,
         }
     }
 }
@@ -51,6 +57,7 @@ impl RebalanceConfig {
             rebalance_debounce: Duration::from_millis(500),
             checkpoint_timeout: Duration::from_secs(30),
             retry_delay: Duration::from_millis(500),
+            placement_isolation_tier: 0,
         }
     }
 }
@@ -86,6 +93,7 @@ pub fn spawn_snapshot_watcher(
         let mut ticker = tokio::time::interval(config.watcher_poll);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         ticker.tick().await; // burn the immediate first tick
+        let mut published_version = 0;
         loop {
             tokio::select! {
                 biased;
@@ -114,8 +122,55 @@ pub fn spawn_snapshot_watcher(
                     Err(e) => warn!(error = %e, "snapshot watcher: load failed"),
                 }
             }
+
+            // Refresh placement metrics only when the assignment changed.
+            let version = registry.assignment_version();
+            if version != published_version {
+                published_version = version;
+                if let (Some(c), Some(metrics)) = (controller.as_ref(), db.engine_metrics()) {
+                    let nodes = c.assignable_with_locality();
+                    publish_placement_metrics(
+                        &metrics,
+                        &registry,
+                        &nodes,
+                        config.placement_isolation_tier,
+                    );
+                }
+            }
         }
     })
+}
+
+/// Publish per-domain owner counts and the blast-radius ratio. The gauge vector
+/// is reset so domains that disappear don't leave stale series.
+#[allow(clippy::cast_precision_loss)]
+fn publish_placement_metrics(
+    metrics: &EngineMetrics,
+    registry: &VnodeRegistry,
+    nodes: &[(NodeId, Locality)],
+    isolation_tier: usize,
+) {
+    let owners = registry.snapshot();
+    let total = owners.len().max(1);
+    let counts = owners_per_domain(&owners, nodes, isolation_tier);
+
+    metrics.placement_vnodes_per_domain.reset();
+    let mut max = 0u32;
+    for (domain, &count) in &counts {
+        let label = if domain.is_empty() {
+            "unknown"
+        } else {
+            domain.as_str()
+        };
+        metrics
+            .placement_vnodes_per_domain
+            .with_label_values(&[label])
+            .set(i64::from(count));
+        max = max.max(count);
+    }
+    metrics
+        .placement_blast_radius_ratio
+        .set(f64::from(max) / total as f64);
 }
 
 /// Spawn the leader-gated rebalance controller. Runs on every node;
@@ -234,6 +289,13 @@ async fn try_rebalance(
     live: &[NodeId],
     config: RebalanceConfig,
 ) -> Result<Option<u64>, String> {
+    // No assignable instances (whole cluster draining/joining) — nothing to
+    // rotate to. Hold the current assignment rather than panicking the
+    // placement call on an empty node set.
+    if live.is_empty() {
+        return Ok(None);
+    }
+
     let current = store
         .load()
         .await
@@ -303,6 +365,29 @@ mod tests {
     fn store() -> AssignmentSnapshotStore {
         let mem: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         AssignmentSnapshotStore::new(mem)
+    }
+
+    #[test]
+    fn publish_placement_metrics_labels_by_domain() {
+        let prom = prometheus::Registry::new();
+        let metrics = EngineMetrics::new(&prom);
+
+        // 4 vnodes: node 1 owns two, node 2 owns one, one is unassigned.
+        let vreg = VnodeRegistry::new(4);
+        vreg.set_assignment(vec![NodeId(1), NodeId(1), NodeId(2), NodeId::UNASSIGNED].into());
+        let nodes = vec![
+            (NodeId(1), Locality::parse("region=r;zone=z1")),
+            (NodeId(2), Locality::parse("region=r;zone=z2")),
+        ];
+
+        publish_placement_metrics(&metrics, &vreg, &nodes, 1); // isolation_tier 1 = zone
+
+        let g = &metrics.placement_vnodes_per_domain;
+        assert_eq!(g.with_label_values(&["r;z1"]).get(), 2);
+        assert_eq!(g.with_label_values(&["r;z2"]).get(), 1);
+        assert_eq!(g.with_label_values(&["unknown"]).get(), 1); // the unassigned vnode
+                                                                // Blast radius = largest domain (2) / total vnodes (4).
+        assert!((metrics.placement_blast_radius_ratio.get() - 0.5).abs() < 1e-9);
     }
 
     #[tokio::test]
