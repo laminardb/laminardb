@@ -127,10 +127,8 @@ spec:
             - name: state
               mountPath: /var/lib/laminardb/state
             {{- end }}
-            {{- if .Values.persistence.checkpoints.enabled }}
             - name: checkpoints
               mountPath: /var/lib/laminardb/checkpoints
-            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -140,6 +138,13 @@ spec:
             name: {{ include "laminardb.fullname" . }}
         - name: tmp
           emptyDir: {}
+        {{- if not .Values.persistence.checkpoints.enabled }}
+        # Writable fallback for the default file:// checkpoint path; the root
+        # filesystem is read-only. Volatile — set laminardb.checkpoint.url to an
+        # object store (or enable the PVC) for durable checkpoints.
+        - name: checkpoints
+          emptyDir: {}
+        {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

@@ -128,10 +128,8 @@ spec:
             - name: state
               mountPath: /var/lib/laminardb/state
             {{- end }}
-            {{- if .Values.persistence.checkpoints.enabled }}
             - name: checkpoints
               mountPath: /var/lib/laminardb/checkpoints
-            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -152,10 +150,12 @@ spec:
           emptyDir: {}
           {{- end }}
         {{- end }}
-        {{- if .Values.persistence.checkpoints.enabled }}
+        # Always mounted: the default file:// checkpoint path must be writable
+        # under readOnlyRootFilesystem even with the checkpoints PVC disabled.
+        # (The Deployment never gets a PVC — durable checkpoints need the
+        # StatefulSet or an object-store laminardb.checkpoint.url.)
         - name: checkpoints
           emptyDir: {}
-        {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
