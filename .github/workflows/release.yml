@@ -390,6 +390,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v6
         with:
@@ -430,11 +431,14 @@ jobs:
           BRANCH_NAME="chore/update-compatibility-v${{ needs.verify.outputs.version }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$BRANCH_NAME"
+          # -B + --force so re-running the release for the same version overwrites
+          # any stale branch instead of failing.
+          git checkout -B "$BRANCH_NAME"
           git add compatibility.json
           git commit -m "chore: update compatibility.json for v${{ needs.verify.outputs.version }}" || exit 0
-          git push -u origin "$BRANCH_NAME"
-          gh pr create \
+          git push -u origin "$BRANCH_NAME" --force
+          # Only open a PR if one doesn't already exist for this branch.
+          gh pr view "$BRANCH_NAME" > /dev/null 2>&1 || gh pr create \
             --title "chore: update compatibility.json for v${{ needs.verify.outputs.version }}" \
             --body "Auto-generated compatibility manifest update for release v${{ needs.verify.outputs.version }}." \
             --base main \

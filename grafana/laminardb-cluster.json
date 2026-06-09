@@ -412,7 +412,7 @@
           "datasource": "${DS_PROMETHEUS}",
           "gridPos": { "h": 4, "w": 6, "x": 6, "y": 52 },
           "targets": [
-            { "expr": "count(laminardb_placement_vnodes_per_domain)", "legendFormat": "Domains" }
+            { "expr": "count(max(laminardb_placement_vnodes_per_domain) by (domain))", "legendFormat": "Domains" }
           ],
           "fieldConfig": { "defaults": { "unit": "short" } }
         },

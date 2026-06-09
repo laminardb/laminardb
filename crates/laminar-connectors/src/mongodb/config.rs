@@ -490,6 +490,11 @@ impl MongoDbSinkConfig {
         }
 
         if let Some(time_field) = config.get("timeseries.time_field") {
+            if time_field.trim().is_empty() {
+                return Err(ConnectorError::ConfigurationError(
+                    "timeseries.time_field must not be empty".to_string(),
+                ));
+            }
             let meta_field = config.get("timeseries.meta_field").map(String::from);
             let granularity = if let Some(gran_str) = config.get("timeseries.granularity") {
                 match gran_str.to_lowercase().as_str() {
@@ -831,6 +836,17 @@ mod tests {
         } else {
             panic!("Expected TimeSeries collection kind");
         }
+    }
+
+    #[test]
+    fn test_sink_config_timeseries_empty_time_field_rejected() {
+        let mut config = ConnectorConfig::new("mongodb-sink");
+        config.set("connection.uri", "mongodb://host:27017");
+        config.set("database", "testdb");
+        config.set("collection", "ts");
+        config.set("timeseries.time_field", "  ");
+        let err = MongoDbSinkConfig::from_config(&config).unwrap_err();
+        assert!(err.to_string().contains("time_field"));
     }
 
     #[test]
