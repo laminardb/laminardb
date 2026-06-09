@@ -67,6 +67,7 @@ struct Holdover {
 
 #[cfg(feature = "cluster")]
 mod grpc {
+    use std::collections::hash_map::Entry;
     use std::io;
     use std::net::SocketAddr;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -105,11 +106,10 @@ mod grpc {
         io::Error::other(e.to_string())
     }
 
-    /// Encode a [`ShuffleMessage`] into the wire [`ShuffleFrame`], reusing a
-    /// per-stage [`BatchStreamEncoder`] so the Arrow schema rides only the first
-    /// `VnodeData` of each stage and every later batch on that stage is encoded
-    /// schema-less. Runs in the connection driver task (off the Ring 0 compute
-    /// thread). Fails only on Arrow IPC encoding of a `VnodeData` batch.
+    /// Encode a [`ShuffleMessage`] into the wire [`ShuffleFrame`]. The per-stage
+    /// [`BatchStreamEncoder`] writes the Arrow schema only on a stage's first
+    /// `VnodeData`; later batches are schema-less. Runs in the connection driver
+    /// task, off the Ring 0 compute thread.
     fn encode_message(
         msg: &ShuffleMessage,
         encoders: &mut FxHashMap<String, BatchStreamEncoder>,
@@ -124,17 +124,15 @@ mod grpc {
                 flags: b.flags,
             }),
             ShuffleMessage::VnodeData(stage, vnode, batch) => {
-                // First batch of a stage instantiates its encoder (and so emits
-                // the schema); later batches reuse it and encode schema-less.
-                if !encoders.contains_key(stage) {
-                    let enc = BatchStreamEncoder::new(&batch.schema()).map_err(|e| {
-                        tonic::Status::internal(format!("shuffle ipc encoder init: {e}"))
-                    })?;
-                    encoders.insert(stage.clone(), enc);
-                }
-                let arrow_ipc = encoders
-                    .get_mut(stage)
-                    .expect("encoder inserted above")
+                let encoder = match encoders.entry(stage.clone()) {
+                    Entry::Occupied(e) => e.into_mut(),
+                    Entry::Vacant(v) => {
+                        v.insert(BatchStreamEncoder::new(&batch.schema()).map_err(|e| {
+                            tonic::Status::internal(format!("shuffle ipc encoder init: {e}"))
+                        })?)
+                    }
+                };
+                let arrow_ipc = encoder
                     .encode(batch)
                     .map_err(|e| tonic::Status::internal(format!("shuffle ipc encode: {e}")))?;
                 shuffle_frame::Kind::VnodeData(VnodeData {
@@ -227,8 +225,8 @@ mod grpc {
         /// endpoint cannot be built, or the per-peer stream has shut down.
         pub async fn send_to(&self, peer: ShufflePeerId, msg: &ShuffleMessage) -> io::Result<()> {
             let conn = self.connection_for(peer).await?;
-            // Hand the message off cheaply (a `RecordBatch` clone is an Arc bump);
-            // the driver task serializes it to Arrow IPC off this thread.
+            // The clone is cheap (`RecordBatch` is an Arc bump); the driver
+            // task serializes to Arrow IPC off this thread.
             conn.tx.send(msg.clone()).await.map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::BrokenPipe,
@@ -314,29 +312,27 @@ mod grpc {
         let alive_for_driver = Arc::clone(&alive);
 
         // Request stream: a single `Hello` chained onto an unfold over the
-        // per-peer crossfire receiver (no `async-stream` dependency needed). The
-        // unfold dequeues `ShuffleMessage`s and serializes them here — in the
-        // driver task, off the Ring 0 compute thread — reusing a per-stage
-        // `BatchStreamEncoder` so each stage's schema is written only once.
+        // per-peer crossfire receiver (no `async-stream` dependency needed).
+        // The unfold serializes dequeued messages here, in the driver task.
         let hello = ShuffleFrame {
             kind: Some(shuffle_frame::Kind::Hello(Hello { node_id: local_id })),
         };
         let encoders: FxHashMap<String, BatchStreamEncoder> = FxHashMap::default();
-        let outbound = futures::stream::once(async move { hello }).chain(
-            futures::stream::unfold((rx, encoders), |(rx, mut encoders)| async move {
+        let outbound = futures::stream::once(async move { hello }).chain(futures::stream::unfold(
+            (rx, encoders),
+            |(rx, mut encoders)| async move {
                 let msg = rx.recv().await.ok()?;
                 match encode_message(&msg, &mut encoders) {
                     Ok(frame) => Some((frame, (rx, encoders))),
                     Err(e) => {
-                        // A batch we can't encode would desync this stage's IPC
-                        // stream; half-close so the peer reconnects with a fresh
-                        // encoder/decoder pair rather than mis-decode later frames.
+                        // An unencodable batch would desync the stage's IPC
+                        // stream; half-close so the peer reconnects fresh.
                         tracing::warn!(error = %e, "shuffle frame encode failed; closing stream");
                         None
                     }
                 }
-            }),
-        );
+            },
+        ));
 
         let driver = tokio::spawn(async move {
             let Ok(channel) = endpoint.connect().await else {
@@ -615,12 +611,9 @@ mod grpc {
     }
 
     /// Read the leading `Hello`, then forward each decoded frame onto the bounded
-    /// inbound queue, returning a summary when the client half-closes.
-    ///
-    /// `VnodeData` frames are decoded with a per-stage [`BatchStreamDecoder`] that
-    /// mirrors the sender's per-stage encoder: each stage's schema rides only its
-    /// first chunk, so the decoder is keyed by stage name and reused for every
-    /// later (schema-less) chunk on that stage.
+    /// inbound queue, returning a summary when the client half-closes. `VnodeData`
+    /// is decoded with per-stage [`BatchStreamDecoder`]s mirroring the sender's
+    /// per-stage encoders (schema on a stage's first chunk only).
     async fn run_stream(
         tx: InboundTx,
         mut stream: tonic::Streaming<ShuffleFrame>,
@@ -648,7 +641,11 @@ mod grpc {
                 shuffle_frame::Kind::Close(_) => break,
                 shuffle_frame::Kind::Hello(h) => {
                     frames_received += 1;
-                    if tx.send((peer, ShuffleMessage::Hello(h.node_id))).await.is_err() {
+                    if tx
+                        .send((peer, ShuffleMessage::Hello(h.node_id)))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -665,8 +662,6 @@ mod grpc {
                 }
                 shuffle_frame::Kind::VnodeData(v) => {
                     frames_received += 1;
-                    // Each stage gets its own decoder: the first chunk carries the
-                    // schema, later chunks are schema-less continuations of it.
                     let batches = decoders
                         .entry(v.stage.clone())
                         .or_default()

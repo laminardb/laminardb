@@ -25,17 +25,10 @@ pub struct ObjectStoreBackend {
     /// every commit attempt.
     committer_bytes: Bytes,
     vnode_capacity: u32,
-    /// Highest `before` horizon any prune on this backend has already
-    /// covered. Epochs strictly below it were deleted by an earlier
-    /// [`prune_before`](StateBackend::prune_before), so later prunes skip
-    /// straight to the `[latest_pruned_epoch, before)` window with exact
-    /// `epoch={N}/` prefixes instead of re-listing the entire store.
-    ///
-    /// `0` is the "no baseline yet" sentinel — a freshly constructed
-    /// backend, or one that has recovered durable state it never pruned.
-    /// The first prune from that state takes one full listing to catch
-    /// any leftover epochs, then advances the cursor so every subsequent
-    /// prune is bounded.
+    /// Highest prune horizon already covered cleanly: later prunes list only
+    /// `epoch={N}/` prefixes in `[latest_pruned_epoch, before)` instead of the
+    /// whole store. `0` = no baseline yet; the first prune does one full
+    /// listing, then bounds every subsequent one.
     latest_pruned_epoch: AtomicU64,
     /// Authoritative vnode-assignment version known to this backend.
     /// Split-brain fence: [`write_partial`](Self::write_partial) rejects
@@ -227,19 +220,13 @@ impl StateBackend for ObjectStoreBackend {
     async fn prune_before(&self, before: u64) -> Result<(), StateBackendError> {
         use futures::stream::{self, StreamExt};
 
-        // Epochs strictly below `latest_pruned_epoch` were already deleted
-        // by an earlier prune in this process, so we never re-list them.
         let start = self.latest_pruned_epoch.load(Ordering::Acquire);
 
         let mut victims: Vec<OsPath> = Vec::new();
         if start == 0 {
-            // Cold path — first prune since construction (or recovery).
-            // We have no baseline, so one full listing catches every
-            // leftover epoch regardless of how sparse the survivors are.
-            // `epoch={epoch}/...` has a dynamic first segment, and the
-            // `object_store` API enforces segment-based prefix matching,
-            // so a bare `epoch=` prefix matches nothing — the whole-store
-            // scan (None prefix) is unavoidable for this one call.
+            // No baseline yet: one full listing. `epoch={epoch}/...` has a
+            // dynamic first segment and the `object_store` API matches whole
+            // segments, so a bare `epoch=` prefix would match nothing.
             let mut entries = self.store.list(None);
             while let Some(entry) = entries.next().await {
                 let entry = entry.map_err(|e| StateBackendError::Io(e.to_string()))?;
@@ -251,12 +238,9 @@ impl StateBackend for ObjectStoreBackend {
                 }
             }
         } else {
-            // Hot path — only epochs in `[start, before)` can still hold
-            // objects. List each epoch's own prefix: `epoch={N}/` IS an
-            // exact path segment (so it matches), and the LIST cost is
-            // O(epochs-since-last-prune × vnodes) rather than O(total
-            // objects in the store). The prune horizon advances one
-            // checkpoint at a time, so this window is typically tiny.
+            // Only epochs in `[start, before)` can still hold objects, and
+            // `epoch={N}/` is an exact segment, so per-epoch listings cost
+            // O(epochs-since-last-prune × vnodes) instead of O(store).
             for epoch in start..before {
                 let prefix = OsPath::from(format!("epoch={epoch}/"));
                 let mut entries = self.store.list(Some(&prefix));
@@ -267,12 +251,9 @@ impl StateBackend for ObjectStoreBackend {
             }
         }
 
-        // Batched deletes: `delete_stream` coalesces into bulk-delete API
-        // calls on stores that support them (S3 `DeleteObjects`, etc.) —
-        // one request per ~1000 keys instead of a round trip per object —
-        // and falls back to sequential deletes on stores that don't (e.g.
-        // the local filesystem). A missing object is a no-op, preserving
-        // the old per-object `NotFound` tolerance.
+        // `delete_stream` coalesces into bulk-delete API calls where the store
+        // supports them (S3 `DeleteObjects`); a missing object is a no-op.
+        let mut delete_failed = false;
         if !victims.is_empty() {
             let locations =
                 stream::iter(victims.into_iter().map(Ok::<OsPath, object_store::Error>)).boxed();
@@ -280,16 +261,21 @@ impl StateBackend for ObjectStoreBackend {
             while let Some(res) = deletes.next().await {
                 match res {
                     Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
-                    Err(e) => tracing::warn!(error = %e, "state backend prune: delete failed"),
+                    Err(e) => {
+                        delete_failed = true;
+                        tracing::warn!(error = %e, "state backend prune: delete failed");
+                    }
                 }
             }
         }
 
-        // Advance the horizon so the next prune skips everything we just
-        // covered. `fetch_max` keeps the cursor monotonic even if a
-        // concurrent prune (rebalance vs. checkpoint) commits a different
-        // horizon first.
-        self.latest_pruned_epoch.fetch_max(before, Ordering::AcqRel);
+        // Advance the cursor only on a clean pass: a failed delete must stay
+        // above it so the next prune re-lists that epoch and retries, instead
+        // of orphaning the object until a process restart. `fetch_max` keeps
+        // the cursor monotonic under concurrent prunes.
+        if !delete_failed {
+            self.latest_pruned_epoch.fetch_max(before, Ordering::AcqRel);
+        }
         Ok(())
     }
 
