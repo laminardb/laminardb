@@ -2,8 +2,10 @@
 //!
 //! The wire encoding is gRPC/protobuf (`proto/shuffle.proto`, `ShuffleFrame`);
 //! the `<->` conversion lives in [`super::transport`]. A `VnodeData`'s batch is
-//! encoded as an Arrow IPC single-batch stream via [`crate::serialization`], so a
-//! schema roll on one frame cannot poison the stream.
+//! Arrow IPC-encoded with a per-stage streaming encoder (see
+//! [`crate::serialization::BatchStreamEncoder`]): the schema rides only the first
+//! frame of each stage and later frames are schema-less continuations. This
+//! assumes a stage's schema is stable for the life of a connection.
 
 use arrow_array::RecordBatch;
 
