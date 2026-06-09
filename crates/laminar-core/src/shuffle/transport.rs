@@ -125,7 +125,17 @@ mod grpc {
             }),
             ShuffleMessage::VnodeData(stage, vnode, batch) => {
                 let encoder = match encoders.entry(stage.clone()) {
-                    Entry::Occupied(e) => e.into_mut(),
+                    Entry::Occupied(e) => {
+                        let enc = e.into_mut();
+                        // Fail loudly rather than desync the peer's IPC decoder.
+                        let schema = batch.schema();
+                        if !Arc::ptr_eq(enc.schema(), &schema) && *enc.schema() != schema {
+                            return Err(tonic::Status::internal(format!(
+                                "shuffle stage '{stage}' changed schema mid-connection",
+                            )));
+                        }
+                        enc
+                    }
                     Entry::Vacant(v) => {
                         v.insert(BatchStreamEncoder::new(&batch.schema()).map_err(|e| {
                             tonic::Status::internal(format!("shuffle ipc encoder init: {e}"))
@@ -726,6 +736,33 @@ mod grpc {
             }
         }
         Ok(true)
+    }
+
+    #[cfg(test)]
+    mod encode_tests {
+        use super::*;
+        use arrow_array::Int64Array;
+        use arrow_schema::{DataType, Field, Schema};
+
+        #[test]
+        fn schema_change_on_a_stage_is_rejected() {
+            let batch = |name: &str| {
+                let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)]));
+                arrow_array::RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))])
+                    .unwrap()
+            };
+            let mut encoders = FxHashMap::default();
+            let msg = ShuffleMessage::VnodeData("s".into(), 0, batch("a"));
+            encode_message(&msg, &mut encoders).unwrap();
+
+            let changed = ShuffleMessage::VnodeData("s".into(), 0, batch("b"));
+            let err = encode_message(&changed, &mut encoders).unwrap_err();
+            assert!(err.message().contains("changed schema"), "{err}");
+
+            // A different stage with its own schema is fine.
+            let other = ShuffleMessage::VnodeData("t".into(), 0, batch("b"));
+            encode_message(&other, &mut encoders).unwrap();
+        }
     }
 }
 
