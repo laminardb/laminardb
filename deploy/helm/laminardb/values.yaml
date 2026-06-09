@@ -52,12 +52,17 @@ laminardb:
     enabled: true
     # -- Checkpoint interval (Go/humantime duration)
     interval: "30s"
-    # -- Checkpoint storage URL (file:// or s3://)
-    url: "file:///var/lib/laminardb/checkpoints"
+    # -- Checkpoint storage URL. Use an object store (s3://, gs://, az://) for durable
+    # checkpoints; empty falls back to a local path (non-durable unless checkpoints PVC enabled).
+    url: ""
     # -- Checkpoint mode: "aligned" or "unaligned"
     mode: aligned
     # -- Snapshot strategy: "full", "incremental", or "fork_cow"
     snapshotStrategy: full
+
+  # -- Hot-reload config on file change. Off in K8s: config changes already roll pods
+  # (checksum/config annotation) and the watcher spams reloads on ConfigMap mounts.
+  configWatch: false
 
   # -- Custom laminardb.toml configuration (overrides all above).
   # -- If set, this raw TOML string is used as the config file directly.
@@ -227,8 +232,9 @@ persistence:
     # -- emptyDir medium (set to "Memory" for tmpfs)
     emptyDirMedium: ""
   checkpoints:
-    # -- Enable persistent checkpoint storage
-    enabled: true
+    # -- Provision a dedicated checkpoints PVC. Off by default — prefer an object
+    # store (laminardb.checkpoint.url); a default install then creates one PVC, not two.
+    enabled: false
     # -- Storage class (empty = default)
     storageClass: ""
     # -- Access modes
