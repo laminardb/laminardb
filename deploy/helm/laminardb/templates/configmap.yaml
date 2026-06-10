@@ -24,6 +24,9 @@ data:
     # Resolved from the pod env at config load; the token never enters the ConfigMap.
     console_token = "${LAMINAR_CONSOLE_TOKEN}"
     {{- end }}
+    {{- with .Values.laminardb.consoleCorsAllowedOrigins }}
+    console_cors_allowed_origins = [{{ range $i, $o := . }}{{ if $i }}, {{ end }}"{{ $o }}"{{ end }}]
+    {{- end }}
 
     [state]
     backend = "{{ .Values.laminardb.state.backend }}"

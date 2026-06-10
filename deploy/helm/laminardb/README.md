@@ -165,6 +165,7 @@ prometheusRule:
 | `laminardb.httpBind` | HTTP API bind address | `0.0.0.0:8080` |
 | `laminardb.workers` | Number of worker threads (0 = auto) | `0` |
 | `laminardb.consoleToken.existingSecret` | Secret holding the console API bearer token (key from `secretKey`, default `token`); empty = unauthenticated | `""` |
+| `laminardb.consoleCorsAllowedOrigins` | CORS allow-list of console origins; empty = permissive legacy policy | `[]` |
 | `laminardb.state.backend` | Storage type: `in_process`, `local`, or `object_store` | `local` |
 | `laminardb.state.path` | Path for persistent state (required if backend=local) | `/var/lib/laminardb/state` |
 | `laminardb.state.url` | URL for object storage (required if backend=object_store) | `""` |

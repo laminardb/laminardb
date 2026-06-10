@@ -70,6 +70,10 @@ laminardb:
     existingSecret: ""
     secretKey: "token"
 
+  # -- CORS allow-list of console origins, e.g. ["https://console.example.com"].
+  # -- Empty falls back to the permissive legacy policy (dev only).
+  consoleCorsAllowedOrigins: []
+
   # -- Hot-reload config on file change. Off in K8s: config changes already roll pods
   # (checksum/config annotation) and the watcher spams reloads on ConfigMap mounts.
   configWatch: false
