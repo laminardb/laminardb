@@ -439,6 +439,10 @@ impl CheckpointCoordinator {
         if self.gate_vnode_set.is_empty() {
             self.gate_vnode_set.clone_from(&vnodes);
         }
+        // Drop reference bases for vnodes shed in a rebalance — they
+        // hold refcounts on serialized state this node no longer owns
+        // (and the new owner builds its own bases from a full upload).
+        self.last_vnode_uploads.retain(|v, _| vnodes.contains(v));
         self.vnode_set = vnodes;
     }
 
