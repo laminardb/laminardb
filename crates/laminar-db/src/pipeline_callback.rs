@@ -611,32 +611,26 @@ impl ConnectorPipelineCallback {
         use laminar_core::cluster::control::Phase;
 
         const RESUME_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-        const POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
         if !has_cluster_shuffle {
             return;
         }
-        let start = std::time::Instant::now();
-        loop {
-            match controller.observe_barrier().await.ok().flatten() {
-                Some(a) if a.epoch > epoch => return,
-                Some(a)
-                    if a.epoch == epoch
-                        && matches!(a.phase, Phase::Aligned | Phase::Commit | Phase::Abort) =>
-                {
-                    return;
-                }
-                _ => {}
-            }
-            if start.elapsed() >= RESUME_GATE_TIMEOUT {
-                tracing::warn!(
-                    epoch,
-                    "aligned resume gate timed out — resuming pipeline \
-                     (epoch will abort via the leader's restorable gate)"
-                );
-                return;
-            }
-            tokio::time::sleep(POLL).await;
+        let released = controller
+            .wait_for_barrier(
+                |a| {
+                    a.epoch > epoch
+                        || (a.epoch == epoch
+                            && matches!(a.phase, Phase::Aligned | Phase::Commit | Phase::Abort))
+                },
+                RESUME_GATE_TIMEOUT,
+            )
+            .await;
+        if released.is_none() {
+            tracing::warn!(
+                epoch,
+                "aligned resume gate timed out — resuming pipeline \
+                 (epoch will abort via the leader's restorable gate)"
+            );
         }
     }
 

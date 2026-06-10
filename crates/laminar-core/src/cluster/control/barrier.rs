@@ -812,6 +812,16 @@ impl BarrierCoordinator {
         Ok(())
     }
 
+    /// Watch over gRPC-delivered announcements, for push-driven waits
+    /// (the decision wait and the Aligned resume gate). `None` until
+    /// the gRPC server is started — gossip-KV-only deployments fall
+    /// back to polling [`observe`](Self::observe).
+    #[cfg(feature = "cluster")]
+    #[must_use]
+    pub fn announcement_watch(&self) -> Option<watch::Receiver<Option<BarrierAnnouncement>>> {
+        self.grpc.lock().as_ref().map(|s| s.latest_rx.clone())
+    }
+
     /// Follower-side observe — returns the *latest* announcement
     /// (non-destructive; repeated calls return the same value until a
     /// newer one arrives, matching the gossip-KV fallback). Callers

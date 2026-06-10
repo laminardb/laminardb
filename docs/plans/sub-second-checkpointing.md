@@ -9,9 +9,9 @@ independently deployable and ordered by risk/value; each must keep
 | Phase | Description | Status |
 |-------|-------------|--------|
 | 1 | Two-level completion — resume on `Aligned`, durable tail off the pipeline task | **DONE** (2026-06-10) |
-| 2 | Local staging + async upload + virtual manifest commits | not started |
-| 3 | Incremental (delta) snapshots, opt-in per operator | not started |
-| 4 | Lower the 2s floor to ~100ms + adaptive guard; remove polling floors | not started |
+| 2 | Pipelined epochs: allocate-at-admission ids, pre-mutex quorum stage, in-flight/staged-bytes caps | **DONE** (2026-06-10; see scope notes) |
+| 3 | Incremental snapshots: `Full \| reference` vnode partials | **DONE** v1 (2026-06-10; group-level deltas = follow-up) |
+| 4 | 100ms floor + admission guard; push-driven decision/resume waits | **DONE** (2026-06-10) |
 
 ## Phase 1 — Two-level completion (IMPLEMENTED)
 
@@ -144,48 +144,75 @@ before this change.
   `cluster_integration` (9): unchanged and green — the two-node 2PC
   mirrors exercise the new protocol end-to-end in KV mode.
 
-## Phase 2 — Local staging + async upload + virtual manifests
+## Phase 2 — Pipelined epochs (IMPLEMENTED)
 
-Goal: decouple barrier cadence from upload latency entirely; multiple
-epochs in flight between Aligned and Restorable.
+Barrier cadence is decoupled from upload completion; epochs overlap
+between `Aligned` and restorable, bounded by
+`CheckpointConfig::max_in_flight_epochs` (default 4) and
+`max_staged_bytes` (default 512 MiB; staging is in-memory `Bytes` —
+the ADR allows "local disk (or memory)", and the byte cap is the
+backlog bound). Admission lives in the streaming coordinator and
+pauses at either cap (cadence degrades to upload speed).
 
-- Staging area `<data_dir>/staging/` (ephemeral; wiped at boot; the
-  Helm `persistence.state` volume, never a new mount). Capture writes
-  serialized state there (or memory) and the barrier acks immediately.
-- A background uploader drains staged artifacts to the object store;
-  caps on staged bytes/epochs backpressure the barrier cadence when
-  hit (degrade to upload speed, never OOM).
-- Manifest commits become *virtual*: an epoch is restorable when its
-  manifest commits referencing uploaded artifacts (which may be shared
-  across epochs). Restorability stays strictly in-order and gap-free
-  (N commits only after N−1).
-- Sinks declare `max_in_flight_epochs` (default 1 — a Kafka
-  transactional producer cannot overlap epochs); visibility cadence
-  for capability-1 sinks stays upload-bound until producer pooling.
-- Fence: staged artifacts are stamped with the capture-time
-  `assignment_version`; a `StaleVersion` rejection abandons the
-  backlog (never re-stamp — the new owner rehydrates from the last
-  restorable epoch).
+What made it possible:
+- **Allocate-at-admission ids** (`EpochAllocator`, lock-free): a failed
+  epoch is *abandoned* (Flink semantics), never retried under the same
+  ids, so an epoch's identity no longer depends on its predecessor's
+  outcome. Failure paths consolidated in `fail_epoch` (announce Abort,
+  rollback, begin the next epoch's sink transactions bounded by
+  `rollback_timeout`).
+- **Two-stage tails**: the capture quorum + `Aligned` announce run
+  *before* the coordinator mutex (`run_prepare_quorum`), so resume is
+  never queued behind an earlier epoch's uploads; followers ack
+  pre-mutex for the same reason. The durable remainder serializes on
+  the FIFO mutex → in-order restorability.
+- **Mislabel guard**: `checkpoint_with_barrier` carries the barrier
+  round's `checkpoint_id`; a slow follower round whose announcement
+  was superseded (possible only with abandonment) is rejected instead
+  of attributing its offsets to the newer epoch.
 
-## Phase 3 — Incremental snapshots
+v1 scope notes (deliberate):
+- Exactly-once pipelines are capped at depth 1 (a single-open-
+  transaction sink cannot overlap epochs). Per-sink
+  `max_in_flight_epochs` capability + producer pooling = follow-up.
+- Follower tails serialize uploads *and* decision waits on their
+  coordinator mutex; their backlog is bounded by the leader's caps.
+  Splitting follower upload/commit drivers = follow-up.
+- Concurrent quorum rounds (cadence < quorum RTT) can waste an epoch
+  (one round's Prepare masks the other under latest-wins observation;
+  the loser aborts via quorum timeout) — safe, documented.
+- No fault-injection integration test for depth > 1 yet (existing
+  two-node 2PC suites cover depth 1 end-to-end) — follow-up.
 
-- `VnodePartial` v2: per-operator artifact kind `Full | Delta{base_epoch}`;
-  mixed manifests valid (per-operator slices are independent).
-- Opt-in per operator (agg operator first: dirty-group tracking
-  between barriers); default stays full-snapshot.
-- Compaction: full capture every K epochs bounds recovery replay and
-  delta-chain length. Rebalance rehydration reconstructs base + chain.
-- Pruning must track artifact liveness via manifest references, not
-  `epoch < horizon` (interacts with the incremental prune cursor in
-  `state/object_store.rs`).
+## Phase 3 — Incremental snapshots (v1 IMPLEMENTED)
 
-## Phase 4 — Lower the floor
+Per-vnode artifacts gained the `Full | reference` kind
+(`VnodePartial.base_epoch`): a vnode whose serialized slices are
+byte-identical to its last full upload writes a tiny reference
+instead of re-uploading state — upload cost ∝ changed vnodes, which
+is the dominant win under key skew. References resolve in one hop
+(never chain), are forced back to full before the base ages out of
+the `max_retained` prune window (prune only runs after a successful
+checkpoint, so a restorable epoch's references are always above the
+horizon), and bases are recorded only after every write in the epoch
+lands. Counter: `checkpoint_unchanged_vnodes_total`.
 
-- Drop the 2s cluster minimum (`laminar-server/src/config.rs`) to
-  100ms with a runtime adaptive guard (skip a barrier when the
-  staging backlog or upload lag exceeds caps).
-- Remove the polling floors: the follower decision wait (50ms) and
-  the per-cycle `observe_barrier` become push-driven (the
-  announcement `watch` from Phase 1 is the natural carrier); the
-  resume-gate 10ms poll likewise.
-- Micro-batch cycle time then bounds barrier frequency.
+Follow-up (the ADR's full vision): group-level delta changelogs
+inside the agg operator (`Delta{base_epoch}` carrying changed/removed
+groups), compaction every K epochs, chain reconstruction on
+rehydration, and reference-liveness-aware pruning. The artifact kind
+and reader plumbing landed here are forward-compatible with it.
+
+## Phase 4 — Floor + polling removal (IMPLEMENTED)
+
+- Cluster checkpoint-interval floor lowered 2s → 100ms; the Phase-2
+  admission caps are the runtime guard (a tight interval degrades to
+  upload speed at the caps instead of building an unbounded backlog).
+- The follower decision wait (was a flat 50ms poll) and the Aligned
+  resume gate (was 10ms) are push-driven off the gRPC announcement
+  watch (`ClusterController::wait_for_barrier`), with a 250ms
+  KV-fallback poll (25ms when no gRPC server is wired — gossip-only
+  deployments).
+- The per-cycle `observe_barrier` Prepare pickup remains poll-per-cycle
+  (cheap in-memory read; the micro-batch cycle time bounds barrier
+  frequency, as the ADR notes).

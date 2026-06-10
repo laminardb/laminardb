@@ -219,12 +219,17 @@ fn validate_config(config: &ServerConfig) -> Result<(), ConfigError> {
         if config.node_id.is_none() {
             errors.push("mode = \"cluster\" requires node_id to be set".to_string());
         }
-        // Distributed 2PC has a per-barrier cost of ~1-3s (manifest
-        // persist + durability gate + sink commit). Cadences tighter
-        // than 2s spend more than half their time on coordination.
-        if config.checkpoint.interval < Duration::from_secs(2) {
+        // With two-level completion the barrier critical path is
+        // alignment + capture + one ack round-trip (uploads run in a
+        // bounded background backlog), so cadences down to 100ms are
+        // sustainable; admission caps (`max_in_flight_epochs`,
+        // `max_staged_bytes`) degrade cadence to upload speed instead
+        // of letting a tight interval build an unbounded backlog
+        // (ADR-003 Phase 4). Below 100ms the quorum round-trip itself
+        // dominates.
+        if config.checkpoint.interval < Duration::from_millis(100) {
             errors.push(format!(
-                "mode = \"cluster\": checkpoint.interval = {:?} is too tight; minimum is 2s",
+                "mode = \"cluster\": checkpoint.interval = {:?} is too tight; minimum is 100ms",
                 config.checkpoint.interval,
             ));
         }
@@ -1172,8 +1177,8 @@ sql = "SELECT 2"
 
     #[test]
     fn test_cluster_mode_rejects_tight_checkpoint_interval() {
-        // Two-phase commit in cluster mode can't keep up with sub-2s
-        // cadence.
+        // Below 100ms the capture-quorum round-trip itself dominates
+        // the barrier (ADR-003 Phase 4 floor).
         let toml = r#"
 node_id = "n1"
 
@@ -1181,7 +1186,7 @@ node_id = "n1"
 mode = "cluster"
 
 [checkpoint]
-interval = "500ms"
+interval = "50ms"
 
 [discovery]
 strategy = "static"

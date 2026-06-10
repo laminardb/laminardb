@@ -337,6 +337,57 @@ impl ClusterController {
         self.barrier.ack(ack).await
     }
 
+    /// Wait until [`Self::observe_barrier`] yields an announcement
+    /// matching `pred`, or `timeout` expires (→ `None`). Push-driven
+    /// off the gRPC announcement watch when available; gossip-KV-only
+    /// deployments (and KV-only announcements) are covered by a
+    /// fallback poll — 250ms with the watch, 25ms without (ADR-003
+    /// Phase 4 replaced the old fixed 50ms decision poll).
+    #[cfg(feature = "cluster")]
+    pub async fn wait_for_barrier<F>(
+        &self,
+        mut pred: F,
+        timeout: Duration,
+    ) -> Option<BarrierAnnouncement>
+    where
+        F: FnMut(&BarrierAnnouncement) -> bool,
+    {
+        let mut watch = self.barrier.announcement_watch();
+        let poll = if watch.is_some() {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_millis(25)
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if let Ok(Some(ann)) = self.observe_barrier().await {
+                if pred(&ann) {
+                    return Some(ann);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            let pushed = async {
+                match watch.as_mut() {
+                    Some(w) => w.changed().await.is_ok(),
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                ok = pushed => {
+                    if !ok {
+                        // Sender gone (server shutdown) — degrade to
+                        // polling instead of spinning on the error.
+                        watch = None;
+                    }
+                }
+                () = tokio::time::sleep(poll) => {}
+                () = tokio::time::sleep_until(deadline) => return None,
+            }
+        }
+    }
+
     /// Leader-side: poll until quorum or `deadline`.
     pub async fn wait_for_quorum(
         &self,

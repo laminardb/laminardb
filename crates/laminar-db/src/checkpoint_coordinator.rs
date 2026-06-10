@@ -1559,25 +1559,37 @@ impl CheckpointCoordinator {
             return Err(e);
         }
 
-        // Phase 2: wait for the leader's decision. `Aligned` is not a
-        // decision — only Commit/Abort (or epoch advancement) end the
-        // wait. Observation is latest-wins, so a newer epoch's
-        // announcement can supersede this epoch's Commit: the leader
-        // only advances epochs after a successful commit, so verify via
-        // the durable marker and drive the commit.
+        // Phase 2: wait for the leader's decision — push-driven off the
+        // announcement watch. `Aligned` is not a decision; only
+        // Commit/Abort (or epoch advancement) end the wait. Observation
+        // is latest-wins, so a newer epoch's announcement can supersede
+        // this epoch's Commit: the leader only advances epochs after a
+        // successful commit, so verify via the durable marker.
         let deadline = Instant::now() + decision_timeout;
         loop {
-            match cc.observe_barrier().await.ok().flatten() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let decision = cc
+                .wait_for_barrier(
+                    |a| {
+                        a.epoch > epoch
+                            || (a.epoch == epoch && matches!(a.phase, Phase::Commit | Phase::Abort))
+                    },
+                    remaining,
+                )
+                .await;
+            match decision {
                 Some(a) if a.epoch == epoch && a.phase == Phase::Commit => {
                     return Ok(self.drive_follower_commit(epoch, checkpoint_id).await);
                 }
-                Some(a) if a.epoch == epoch && a.phase == Phase::Abort => {
+                Some(a) if a.epoch == epoch => {
+                    // Abort.
                     self.rollback_sinks(epoch).await.ok();
                     self.checkpoints_failed += 1;
                     self.phase = CheckpointPhase::Idle;
                     return Ok(false);
                 }
-                Some(a) if a.epoch > epoch => {
+                Some(a) => {
+                    // Newer epoch supersedes the decision announcement.
                     let committed = match self.decision_store.as_ref() {
                         Some(ds) => ds.is_committed(epoch).await.unwrap_or(false),
                         None => false,
@@ -1591,40 +1603,40 @@ impl CheckpointCoordinator {
                         );
                         return Ok(self.drive_follower_commit(epoch, checkpoint_id).await);
                     }
-                    // No marker yet — keep waiting for the decision or
-                    // the timeout's marker re-check below.
+                    // No marker yet — keep waiting (the predicate keeps
+                    // matching the newer epoch, so pace the re-check).
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                _ => {}
-            }
-            if Instant::now() >= deadline {
-                let committed = match self.decision_store.as_ref() {
-                    Some(ds) => ds.is_committed(epoch).await.unwrap_or_else(|e| {
+                None => {
+                    // Deadline: one last durable-marker check.
+                    let committed = match self.decision_store.as_ref() {
+                        Some(ds) => ds.is_committed(epoch).await.unwrap_or_else(|e| {
+                            warn!(
+                                epoch, checkpoint_id, error = %e,
+                                "[LDB-6045] decision store read failed — defaulting to Abort",
+                            );
+                            false
+                        }),
+                        None => false,
+                    };
+                    if committed {
                         warn!(
-                            epoch, checkpoint_id, error = %e,
-                            "[LDB-6045] decision store read failed — defaulting to Abort",
+                            epoch,
+                            checkpoint_id,
+                            "[LDB-6046] follower timeout but marker present — driving commit",
                         );
-                        false
-                    }),
-                    None => false,
-                };
-                if committed {
+                        return Ok(self.drive_follower_commit(epoch, checkpoint_id).await);
+                    }
                     warn!(
                         epoch,
-                        checkpoint_id,
-                        "[LDB-6046] follower timeout but marker present — driving commit",
+                        checkpoint_id, "[LDB-6034] follower decision timeout; rolling back",
                     );
-                    return Ok(self.drive_follower_commit(epoch, checkpoint_id).await);
+                    self.rollback_sinks(epoch).await.ok();
+                    self.checkpoints_failed += 1;
+                    self.phase = CheckpointPhase::Idle;
+                    return Ok(false);
                 }
-                warn!(
-                    epoch,
-                    checkpoint_id, "[LDB-6034] follower decision timeout; rolling back",
-                );
-                self.rollback_sinks(epoch).await.ok();
-                self.checkpoints_failed += 1;
-                self.phase = CheckpointPhase::Idle;
-                return Ok(false);
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
