@@ -111,6 +111,13 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name
             {{- end }}
+            {{- with (.Values.laminardb.consoleToken | default dict).existingSecret }}
+            - name: LAMINAR_CONSOLE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.laminardb.consoleToken.secretKey | default "token" }}
+            {{- end }}
             {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

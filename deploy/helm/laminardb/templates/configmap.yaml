@@ -20,6 +20,10 @@ data:
     bind = "{{ .Values.laminardb.httpBind }}"
     workers = {{ .Values.laminardb.workers }}
     log_level = "{{ .Values.laminardb.logLevel }}"
+    {{- if (.Values.laminardb.consoleToken | default dict).existingSecret }}
+    # Resolved from the pod env at config load; the token never enters the ConfigMap.
+    console_token = "${LAMINAR_CONSOLE_TOKEN}"
+    {{- end }}
 
     [state]
     backend = "{{ .Values.laminardb.state.backend }}"

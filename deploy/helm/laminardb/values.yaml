@@ -64,6 +64,12 @@ laminardb:
     # -- Snapshot strategy: "full", "incremental", or "fork_cow"
     snapshotStrategy: full
 
+  # -- Bearer token for the control-plane (console) HTTP API, read from an
+  # -- existing Secret. Empty existingSecret = unauthenticated API (dev only).
+  consoleToken:
+    existingSecret: ""
+    secretKey: "token"
+
   # -- Hot-reload config on file change. Off in K8s: config changes already roll pods
   # (checksum/config annotation) and the watcher spams reloads on ConfigMap mounts.
   configWatch: false
