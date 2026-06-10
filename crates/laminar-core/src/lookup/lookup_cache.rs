@@ -166,9 +166,9 @@ impl LookupMemoryCache {
     ///
     /// When a TTL is configured, an entry older than the TTL is dropped and
     /// reported as a miss (lazy expiry), so the caller re-fetches a fresh value
-    /// from the source. The drop is best-effort: a fresh value racing in
-    /// between the get and the remove may be dropped too, costing one
-    /// redundant re-fetch.
+    /// from the source. The removal re-checks expiry under the shard lock
+    /// (`remove_if`), so a fresh value racing in between the read and the
+    /// removal is preserved.
     #[must_use]
     pub fn get_cached(&self, key: &[u8]) -> LookupResult {
         let ref_key = LookupCacheKeyRef {
@@ -176,17 +176,19 @@ impl LookupMemoryCache {
             key,
         };
         match self.cache.get(&ref_key) {
-            Some(cached)
-                if self
-                    .ttl
-                    .is_some_and(|ttl| cached.inserted_at.elapsed() >= ttl) =>
-            {
-                self.cache.remove(&ref_key);
+            Some(cached) if self.is_expired(&cached) => {
+                self.cache.remove_if(&ref_key, |v| self.is_expired(v));
                 LookupResult::NotFound
             }
             Some(cached) => LookupResult::Hit(cached.batch),
             None => LookupResult::NotFound,
         }
+    }
+
+    /// Whether an entry is past the configured TTL. `None` = never expires.
+    fn is_expired(&self, entry: &CachedBatch) -> bool {
+        self.ttl
+            .is_some_and(|ttl| entry.inserted_at.elapsed() >= ttl)
     }
 
     /// Insert or update a cached entry. The TTL clock starts now.
