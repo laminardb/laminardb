@@ -412,7 +412,10 @@ pub async fn start_cluster(
     // error in cluster mode — fail fast instead of hanging.
     if cluster_cfg.discovery.seeds.is_empty() {
         return Err(ClusterStartupError::Discovery(
-            "cluster mode requires at least one seed address".into(),
+            "cluster mode requires [discovery].seeds — list every node's \
+             gossip address including this one (e.g. [\"node-0:7946\", \
+             \"node-1:7946\"]); expected membership is derived from it"
+                .into(),
         ));
     }
     let expected_peers = cluster_cfg.discovery.seeds.len().saturating_sub(1);
