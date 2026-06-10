@@ -1,7 +1,7 @@
 #![allow(clippy::disallowed_types)]
 //! Cache hit/miss ratio benchmarks
 //!
-//! Measures foyer cache performance under realistic workloads with
+//! Measures lookup cache performance under realistic workloads with
 //! Zipfian access patterns.
 //!
 //! Run with: cargo bench --bench cache_bench
@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::RngExt;
 
-use laminar_core::lookup::foyer_cache::{FoyerMemoryCache, FoyerMemoryCacheConfig};
+use laminar_core::lookup::lookup_cache::{LookupMemoryCache, LookupMemoryCacheConfig};
 
 fn bench_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]))
@@ -24,14 +24,13 @@ fn bench_batch(val: &str) -> RecordBatch {
     RecordBatch::try_new(bench_schema(), vec![Arc::new(StringArray::from(vec![val]))]).unwrap()
 }
 
-/// Build a FoyerMemoryCache pre-populated with `n` entries.
-fn populated_cache(n: usize) -> FoyerMemoryCache {
-    let cache = FoyerMemoryCache::new(
+/// Build a LookupMemoryCache pre-populated with `n` entries.
+fn populated_cache(n: usize) -> LookupMemoryCache {
+    let cache = LookupMemoryCache::new(
         1,
-        FoyerMemoryCacheConfig {
+        LookupMemoryCacheConfig {
             // Generous byte budget so the working set is never evicted mid-bench.
             capacity_bytes: n.saturating_mul(8 * 1024),
-            shards: 16,
             ttl: None,
         },
     );

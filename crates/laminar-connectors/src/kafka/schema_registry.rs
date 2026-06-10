@@ -6,7 +6,7 @@
 
 use std::time::{Duration, Instant};
 
-use foyer::{Cache, CacheBuilder};
+use quick_cache::sync::Cache;
 
 use arrow_schema::{DataType, SchemaRef};
 use reqwest::Client;
@@ -103,7 +103,7 @@ pub struct SchemaRegistryClient {
     client: Client,
     base_url: String,
     auth: Option<SrAuth>,
-    /// Cache by schema ID (foyer LRU with S3-FIFO eviction).
+    /// Cache by schema ID (`quick_cache`, S3-FIFO-style eviction).
     cache: Cache<i32, CachedSchema>,
     /// Cache by subject name (latest version).
     subject_cache: Cache<String, CachedSchema>,
@@ -247,10 +247,8 @@ impl SchemaRegistryClient {
         })?;
 
         let cache_config = SchemaRegistryCacheConfig::default();
-        let cache = CacheBuilder::new(cache_config.max_entries)
-            .with_shards(4)
-            .build();
-        let subject_cache = CacheBuilder::new(256).with_shards(4).build();
+        let cache = Cache::new(cache_config.max_entries);
+        let subject_cache = Cache::new(256);
         Ok(Self {
             client,
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -268,11 +266,9 @@ impl SchemaRegistryClient {
         auth: Option<SrAuth>,
         cache_config: SchemaRegistryCacheConfig,
     ) -> Self {
-        let cache = CacheBuilder::new(cache_config.max_entries)
-            .with_shards(4)
-            .build();
+        let cache = Cache::new(cache_config.max_entries);
         // Subject cache is small — one entry per subject
-        let subject_cache = CacheBuilder::new(256).with_shards(4).build();
+        let subject_cache = Cache::new(256);
         Self {
             client: Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
@@ -303,7 +299,7 @@ impl SchemaRegistryClient {
 
     /// Inserts a schema into the cache.
     ///
-    /// foyer handles LRU eviction internally with S3-FIFO.
+    /// `quick_cache` handles eviction internally (S3-FIFO-style).
     fn cache_insert(&self, id: i32, mut schema: CachedSchema) {
         schema.inserted_at = Instant::now();
         self.cache.insert(id, schema);
@@ -314,17 +310,15 @@ impl SchemaRegistryClient {
     /// TTL is checked lazily on access — expired entries are removed
     /// and treated as cache misses.
     fn cache_get(&self, id: i32) -> Option<CachedSchema> {
-        let entry = self.cache.get(&id)?;
-        let schema = entry.value();
+        let schema = self.cache.get(&id)?;
         if let Some(ttl) = self.cache_config.ttl {
             if schema.inserted_at.elapsed() > ttl {
-                drop(entry);
                 self.cache.remove(&id);
                 return None;
             }
         }
-        // foyer's get() already promotes the entry in the eviction policy
-        Some(schema.clone())
+        // quick_cache's get() already promotes the entry in the eviction policy
+        Some(schema)
     }
 
     /// Fetches a schema by its global ID.
@@ -542,9 +536,9 @@ impl SchemaRegistryClient {
         schema_type: SchemaType,
     ) -> Result<i32, ConnectorError> {
         // Check subject cache — only return cached ID if schema hasn't changed.
-        if let Some(entry) = self.subject_cache.get(subject) {
-            if entry.value().schema_str == schema_str {
-                return Ok(entry.value().id);
+        if let Some(cached) = self.subject_cache.get(subject) {
+            if cached.schema_str == schema_str {
+                return Ok(cached.id);
             }
         }
 
@@ -634,13 +628,13 @@ impl SchemaRegistryClient {
     /// Returns `true` if the schema ID is in the local cache.
     #[must_use]
     pub fn is_cached(&self, id: i32) -> bool {
-        self.cache.contains(&id)
+        self.cache.contains_key(&id)
     }
 
     /// Returns the number of cached schemas.
     #[must_use]
     pub fn cache_size(&self) -> usize {
-        self.cache.usage()
+        self.cache.len()
     }
 
     /// Helper to perform a GET request and deserialize JSON.
@@ -725,8 +719,8 @@ impl std::fmt::Debug for SchemaRegistryClient {
         f.debug_struct("SchemaRegistryClient")
             .field("base_url", &self.base_url)
             .field("has_auth", &self.auth.is_some())
-            .field("cached_schemas", &self.cache.usage())
-            .field("cached_subjects", &self.subject_cache.usage())
+            .field("cached_schemas", &self.cache.len())
+            .field("cached_subjects", &self.subject_cache.len())
             .finish_non_exhaustive()
     }
 }
@@ -1436,7 +1430,7 @@ mod tests {
         client.cache_insert(3, make_cached_schema(3));
         assert_eq!(client.cache_size(), 3);
 
-        // Insert a 4th — should evict one entry (foyer S3-FIFO eviction).
+        // Insert a 4th — should evict one entry (S3-FIFO-style eviction).
         client.cache_insert(4, make_cached_schema(4));
         assert!(client.cache_size() <= 3);
         // The most recently inserted should always be present.

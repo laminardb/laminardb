@@ -1,26 +1,27 @@
-//! foyer-backed in-memory cache for lookup tables.
+//! `quick_cache`-backed in-memory cache for lookup tables.
 //!
-//! ## Ring 0 — [`FoyerMemoryCache`]
+//! ## Ring 0 — [`LookupMemoryCache`]
 //!
-//! Synchronous [`foyer::Cache`] with S3-FIFO eviction. Checked per-event
-//! on the operator hot path — sub-microsecond latency.
+//! Synchronous [`quick_cache::sync::Cache`] with S3-FIFO-style (Clock-PRO)
+//! eviction. Checked per-event on the operator hot path — sub-microsecond
+//! latency.
 //!
 //! `RecordBatch` clone is Arc bumps only (~16-48ns), within Ring 0 budget.
 
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
 use equivalent::Equivalent;
-use foyer::{Cache, CacheBuilder};
+use quick_cache::sync::{Cache, DefaultLifecycle};
+use quick_cache::{DefaultHashBuilder, Weighter};
 
 use crate::lookup::table::LookupResult;
 
 /// Composite cache key: table ID + raw key bytes.
 ///
 /// The `table_id` ensures that caches for different lookup tables
-/// never collide, even if they share a `foyer::Cache` instance.
+/// never collide, even if they share a cache instance.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct LookupCacheKey {
     /// Lookup table identifier.
@@ -31,7 +32,7 @@ pub struct LookupCacheKey {
 
 /// Borrowed view of [`LookupCacheKey`] that avoids heap allocation.
 ///
-/// Used with foyer's `Cache::get<Q>()` where `Q: Hash + Equivalent<K>`.
+/// Used with `quick_cache`'s `Cache::get<Q>()` where `Q: Hash + Equivalent<K>`.
 /// Hashes identically to `LookupCacheKey` because `Vec<u8>` and `[u8]`
 /// produce the same hash output.
 pub(crate) struct LookupCacheKeyRef<'a> {
@@ -55,28 +56,27 @@ impl Equivalent<LookupCacheKey> for LookupCacheKeyRef<'_> {
     }
 }
 
-/// Configuration for [`FoyerMemoryCache`].
+/// Configuration for [`LookupMemoryCache`].
 #[derive(Debug, Clone, Copy)]
-pub struct FoyerMemoryCacheConfig {
+pub struct LookupMemoryCacheConfig {
     /// Memory budget in bytes. Entries are weighted by their `RecordBatch`
     /// array size, so a few wide rows can't blow the bound the way an
-    /// entry-count limit would.
+    /// entry-count limit would. The budget is split across internal shards;
+    /// an entry larger than a shard's slice is rejected rather than admitted
+    /// (it degrades to a re-fetch, never an error).
     pub capacity_bytes: usize,
-    /// Number of shards for concurrent access (should be a power of 2).
-    pub shards: usize,
     /// Optional time-to-live. An entry older than `ttl` is treated as a miss
-    /// on the next [`get`](FoyerMemoryCache::get) (lazy expiry) and dropped, so
-    /// the caller re-fetches from the source. `None` = entries live until the
-    /// byte bound evicts them (eventual freshness via eviction + CDC
-    /// invalidation only).
+    /// on the next [`get_cached`](LookupMemoryCache::get_cached) (lazy expiry)
+    /// and dropped, so the caller re-fetches from the source. `None` = entries
+    /// live until the byte bound evicts them (eventual freshness via eviction
+    /// + CDC invalidation only).
     pub ttl: Option<Duration>,
 }
 
-impl Default for FoyerMemoryCacheConfig {
+impl Default for LookupMemoryCacheConfig {
     fn default() -> Self {
         Self {
             capacity_bytes: 64 * 1024 * 1024, // 64 MiB
-            shards: 16,
             ttl: None,
         }
     }
@@ -90,75 +90,62 @@ struct CachedBatch {
     inserted_at: Instant,
 }
 
-/// foyer-backed in-memory lookup table cache.
+/// Weighs entries by payload bytes (min 1 so tombstones count) so the bound
+/// is memory, not entry count.
+#[derive(Debug, Clone)]
+struct BatchWeighter;
+
+impl Weighter<LookupCacheKey, CachedBatch> for BatchWeighter {
+    fn weight(&self, _key: &LookupCacheKey, val: &CachedBatch) -> u64 {
+        val.batch.get_array_memory_size().max(1) as u64
+    }
+}
+
+type BatchCache = Cache<LookupCacheKey, CachedBatch, BatchWeighter>;
+
+/// `quick_cache`-backed in-memory lookup table cache.
 ///
-/// Wraps [`foyer::Cache`] with hit/miss counters and lookup-table
-/// semantics. Designed for Ring 0 (< 500ns per operation).
+/// Wraps [`quick_cache::sync::Cache`] with lookup-table semantics (composite
+/// table-scoped keys, lazy TTL expiry). Designed for Ring 0 (< 500ns per
+/// operation).
 ///
 /// # Thread safety
 ///
-/// `foyer::Cache` is internally sharded and lock-free on the read path.
-/// `FoyerMemoryCache` is `Send + Sync`.
-pub struct FoyerMemoryCache {
-    cache: Cache<LookupCacheKey, CachedBatch>,
+/// `quick_cache::sync::Cache` is internally sharded with per-shard locks held
+/// only for the duration of a map operation. `LookupMemoryCache` is
+/// `Send + Sync`.
+pub struct LookupMemoryCache {
+    cache: BatchCache,
     table_id: u32,
     ttl: Option<Duration>,
-    hits: AtomicU64,
-    misses: AtomicU64,
 }
 
-impl FoyerMemoryCache {
+impl LookupMemoryCache {
     /// Create a new cache with the given configuration.
     #[must_use]
-    pub fn new(table_id: u32, config: FoyerMemoryCacheConfig) -> Self {
-        let cache = CacheBuilder::new(config.capacity_bytes)
-            .with_shards(config.shards)
-            // Weigh entries by payload bytes (min 1 so tombstones count) so the
-            // bound is memory, not entry count.
-            .with_weighter(|_k: &LookupCacheKey, v: &CachedBatch| {
-                v.batch.get_array_memory_size().max(1)
-            })
-            .build();
+    pub fn new(table_id: u32, config: LookupMemoryCacheConfig) -> Self {
+        // Estimated entry count only sizes internal tables (ghost set, shard
+        // count); within an order of magnitude is fine. Assume ~1 KiB/entry.
+        let estimated_items = (config.capacity_bytes / 1024).max(64);
+        let cache = BatchCache::with(
+            estimated_items,
+            config.capacity_bytes as u64,
+            BatchWeighter,
+            DefaultHashBuilder::default(),
+            DefaultLifecycle::default(),
+        );
 
         Self {
             cache,
             table_id,
             ttl: config.ttl,
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
         }
     }
 
     /// Create a cache with default configuration.
     #[must_use]
     pub fn with_defaults(table_id: u32) -> Self {
-        Self::new(table_id, FoyerMemoryCacheConfig::default())
-    }
-
-    /// Total cache hits since creation.
-    #[must_use]
-    pub fn hit_count(&self) -> u64 {
-        self.hits.load(Ordering::Relaxed)
-    }
-
-    /// Total cache misses since creation.
-    #[must_use]
-    pub fn miss_count(&self) -> u64 {
-        self.misses.load(Ordering::Relaxed)
-    }
-
-    /// Cache hit ratio (0.0 – 1.0).
-    #[must_use]
-    #[allow(clippy::cast_precision_loss)]
-    pub fn hit_ratio(&self) -> f64 {
-        let hits = self.hits.load(Ordering::Relaxed);
-        let misses = self.misses.load(Ordering::Relaxed);
-        let total = hits + misses;
-        if total == 0 {
-            0.0
-        } else {
-            hits as f64 / total as f64
-        }
+        Self::new(table_id, LookupMemoryCacheConfig::default())
     }
 
     /// The table ID this cache is associated with.
@@ -179,40 +166,29 @@ impl FoyerMemoryCache {
     ///
     /// When a TTL is configured, an entry older than the TTL is dropped and
     /// reported as a miss (lazy expiry), so the caller re-fetches a fresh value
-    /// from the source.
+    /// from the source. The removal re-checks expiry under the shard lock
+    /// (`remove_if`), so a fresh value racing in between the read and the
+    /// removal is preserved.
+    #[must_use]
     pub fn get_cached(&self, key: &[u8]) -> LookupResult {
         let ref_key = LookupCacheKeyRef {
             table_id: self.table_id,
             key,
         };
-        if let Some(entry) = self.cache.get(&ref_key) {
-            if self
-                .ttl
-                .is_some_and(|ttl| entry.value().inserted_at.elapsed() >= ttl)
-            {
-                let inserted_at = entry.value().inserted_at;
-                drop(entry);
-                if let Some(new_entry) = self.cache.get(&ref_key) {
-                    if new_entry.value().inserted_at == inserted_at {
-                        drop(new_entry);
-                        self.cache.remove(&ref_key);
-                    }
-                }
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                return LookupResult::NotFound;
+        match self.cache.get(&ref_key) {
+            Some(cached) if self.is_expired(&cached) => {
+                self.cache.remove_if(&ref_key, |v| self.is_expired(v));
+                LookupResult::NotFound
             }
-            let value = entry.value().batch.clone();
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            LookupResult::Hit(value)
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            LookupResult::NotFound
+            Some(cached) => LookupResult::Hit(cached.batch),
+            None => LookupResult::NotFound,
         }
     }
 
-    /// Alias for [`get_cached`](Self::get_cached). No slower storage tiers are wired yet.
-    pub fn get(&self, key: &[u8]) -> LookupResult {
-        self.get_cached(key)
+    /// Whether an entry is past the configured TTL. `None` = never expires.
+    fn is_expired(&self, entry: &CachedBatch) -> bool {
+        self.ttl
+            .is_some_and(|ttl| entry.inserted_at.elapsed() >= ttl)
     }
 
     /// Insert or update a cached entry. The TTL clock starts now.
@@ -237,25 +213,24 @@ impl FoyerMemoryCache {
     }
 
     /// Number of entries currently in the cache.
+    #[must_use]
     pub fn len(&self) -> usize {
-        self.cache.entries()
+        self.cache.len()
     }
 
     /// Whether the cache is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.cache.is_empty()
     }
 }
 
-impl std::fmt::Debug for FoyerMemoryCache {
+impl std::fmt::Debug for LookupMemoryCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FoyerMemoryCache")
+        f.debug_struct("LookupMemoryCache")
             .field("table_id", &self.table_id)
             .field("ttl", &self.ttl)
-            .field("entries", &self.cache.entries())
-            .field("hits", &self.hits.load(Ordering::Relaxed))
-            .field("misses", &self.misses.load(Ordering::Relaxed))
+            .field("entries", &self.cache.len())
             .finish()
     }
 }
@@ -272,42 +247,36 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec![val]))]).unwrap()
     }
 
-    fn small_cache(table_id: u32) -> FoyerMemoryCache {
-        FoyerMemoryCache::new(
+    fn small_cache(table_id: u32) -> LookupMemoryCache {
+        LookupMemoryCache::new(
             table_id,
-            FoyerMemoryCacheConfig {
+            LookupMemoryCacheConfig {
                 capacity_bytes: 64 * 1024,
-                shards: 4,
                 ttl: None,
             },
         )
     }
 
     #[test]
-    fn test_foyer_cache_hit_miss() {
+    fn test_lookup_cache_hit_miss() {
         let cache = small_cache(1);
 
-        let result = cache.get_cached(b"key1");
-        assert!(result.is_not_found());
-        assert_eq!(cache.miss_count(), 1);
+        assert!(cache.get_cached(b"key1").is_not_found());
 
         cache.insert(b"key1", test_batch("value1"));
         let result = cache.get_cached(b"key1");
         assert!(result.is_hit());
-        let batch = result.into_batch().unwrap();
-        assert_eq!(batch.num_rows(), 1);
-        assert_eq!(cache.hit_count(), 1);
+        assert_eq!(result.into_batch().unwrap().num_rows(), 1);
     }
 
     #[test]
-    fn test_foyer_cache_eviction() {
-        // Tiny byte budget: inserting many batches must evict (the bound is
-        // bytes, so the cache can't hold all 200 entries).
-        let cache = FoyerMemoryCache::new(
+    fn test_lookup_cache_eviction() {
+        // Tiny byte budget: inserting many batches must evict or reject (the
+        // bound is bytes, so the cache can't hold all 200 entries).
+        let cache = LookupMemoryCache::new(
             1,
-            FoyerMemoryCacheConfig {
+            LookupMemoryCacheConfig {
                 capacity_bytes: 512,
-                shards: 1,
                 ttl: None,
             },
         );
@@ -324,7 +293,7 @@ mod tests {
     }
 
     #[test]
-    fn test_foyer_cache_invalidation() {
+    fn test_lookup_cache_invalidation() {
         let cache = small_cache(1);
 
         cache.insert(b"key1", test_batch("value1"));
@@ -335,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn test_foyer_cache_table_id_isolation() {
+    fn test_lookup_cache_table_id_isolation() {
         let cache_a = small_cache(1);
         let cache_b = small_cache(2);
 
@@ -350,50 +319,11 @@ mod tests {
         assert_ne!(batch_a, batch_b);
     }
 
-    #[test]
-    fn test_foyer_cache_lookup_methods() {
-        let cache = small_cache(1);
-
-        cache.insert(b"k", test_batch("v"));
-        assert!(!cache.is_empty());
-        assert!(cache.get(b"k").is_hit());
-    }
-
-    #[test]
-    fn test_foyer_cache_hit_ratio() {
-        let cache = small_cache(1);
-        cache.insert(b"k1", test_batch("v1"));
-
-        // 1 hit
-        cache.get_cached(b"k1");
-        // 1 miss
-        cache.get_cached(b"k2");
-
-        assert!((cache.hit_ratio() - 0.5).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_foyer_cache_debug() {
-        let cache = small_cache(42);
-        let debug = format!("{cache:?}");
-        assert!(debug.contains("FoyerMemoryCache"));
-        assert!(debug.contains("table_id: 42"));
-    }
-
-    #[test]
-    fn test_foyer_cache_default_config() {
-        let config = FoyerMemoryCacheConfig::default();
-        assert_eq!(config.capacity_bytes, 64 * 1024 * 1024);
-        assert_eq!(config.shards, 16);
-        assert!(config.ttl.is_none());
-    }
-
-    fn ttl_cache(ttl: Duration) -> FoyerMemoryCache {
-        FoyerMemoryCache::new(
+    fn ttl_cache(ttl: Duration) -> LookupMemoryCache {
+        LookupMemoryCache::new(
             1,
-            FoyerMemoryCacheConfig {
+            LookupMemoryCacheConfig {
                 capacity_bytes: 64 * 1024,
-                shards: 4,
                 ttl: Some(ttl),
             },
         )
@@ -407,7 +337,6 @@ mod tests {
         assert!(cache.get_cached(b"k").is_not_found());
         // The expired entry was evicted, not just skipped.
         assert!(cache.is_empty());
-        assert_eq!(cache.miss_count(), 1);
     }
 
     #[test]
@@ -429,17 +358,5 @@ mod tests {
         cache.insert(b"k", test_batch("v"));
         std::thread::sleep(Duration::from_millis(10));
         assert!(cache.get_cached(b"k").is_hit());
-    }
-
-    #[test]
-    fn test_foyer_cache_recordbatch_clone_is_cheap() {
-        let cache = small_cache(1);
-        let batch = test_batch("value");
-        cache.insert(b"k", batch.clone());
-
-        let hit1 = cache.get_cached(b"k").into_batch().unwrap();
-        let hit2 = cache.get_cached(b"k").into_batch().unwrap();
-        assert_eq!(hit1, hit2);
-        assert_eq!(hit1.num_rows(), 1);
     }
 }

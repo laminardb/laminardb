@@ -64,7 +64,7 @@ WHERE operation = 'create'
 
 -- ── Sentiment scored inline (Ring 1), returns a DOUBLE in [-1, 1] ─────────
 -- One ai_sentiment call per row, batched + deduped through the AI operator and
--- the foyer cache; every call is visible in laminar.ai_calls.
+-- the result cache; every call is visible in laminar.ai_calls.
 CREATE STREAM bsky_crypto AS
 SELECT did, text, ts, ai_sentiment(text) AS sentiment
 FROM bsky_crypto_raw;

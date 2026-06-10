@@ -483,7 +483,7 @@ impl LaminarDB {
 
             if is_persistent {
                 return Err(DbError::InvalidOperation(
-                    "storage = 'persistent' is no longer supported; use in-memory tables with foyer caching instead".to_string(),
+                    "storage = 'persistent' is no longer supported; use in-memory tables with in-memory caching instead".to_string(),
                 ));
             } else if resolved_cache_mode.is_some() {
                 let mut ts = self.table_store.write();

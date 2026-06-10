@@ -37,7 +37,7 @@ use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::Expr;
 use futures::StreamExt;
-use laminar_core::lookup::foyer_cache::FoyerMemoryCache;
+use laminar_core::lookup::lookup_cache::LookupMemoryCache;
 use laminar_core::lookup::source::{ColumnId, LookupSourceDyn};
 use tokio::sync::Semaphore;
 
@@ -63,7 +63,7 @@ pub struct LookupTableRegistry {
 pub enum RegisteredLookup {
     /// Full snapshot: all rows pre-loaded in a single batch.
     Snapshot(Arc<LookupSnapshot>),
-    /// Partial (on-demand): bounded foyer cache with S3-FIFO eviction.
+    /// Partial (on-demand): bounded lookup cache with S3-FIFO eviction.
     Partial(Arc<PartialLookupState>),
     /// Versioned: all versions of all keys for temporal joins.
     Versioned(Arc<VersionedLookupState>),
@@ -98,8 +98,8 @@ pub struct VersionedLookupState {
 
 /// State for a partial (on-demand) lookup table.
 pub struct PartialLookupState {
-    /// Bounded foyer memory cache with S3-FIFO eviction.
-    pub foyer_cache: Arc<FoyerMemoryCache>,
+    /// Bounded in-memory cache with S3-FIFO eviction.
+    pub lookup_cache: Arc<LookupMemoryCache>,
     /// Schema of the lookup table.
     pub schema: SchemaRef,
     /// Key column names for row encoding.
@@ -999,12 +999,12 @@ fn probe_versioned_batch(
 
 // ── Partial Lookup Join Exec ──────────────────────────────────────
 
-/// Physical plan that probes a bounded foyer cache per key for each
+/// Physical plan that probes a bounded lookup cache per key for each
 /// batch from the streaming input. Used for on-demand/partial tables
 /// where the full dataset does not fit in memory.
 pub struct PartialLookupJoinExec {
     input: Arc<dyn ExecutionPlan>,
-    foyer_cache: Arc<FoyerMemoryCache>,
+    lookup_cache: Arc<LookupMemoryCache>,
     stream_key_indices: Vec<usize>,
     join_type: LookupJoinType,
     schema: SchemaRef,
@@ -1027,7 +1027,7 @@ impl PartialLookupJoinExec {
     /// Returns an error if the output schema cannot be constructed.
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
-        foyer_cache: Arc<FoyerMemoryCache>,
+        lookup_cache: Arc<LookupMemoryCache>,
         stream_key_indices: Vec<usize>,
         key_sort_fields: Vec<SortField>,
         join_type: LookupJoinType,
@@ -1036,7 +1036,7 @@ impl PartialLookupJoinExec {
     ) -> Result<Self> {
         Self::try_new_with_source(
             input,
-            foyer_cache,
+            lookup_cache,
             stream_key_indices,
             key_sort_fields,
             join_type,
@@ -1056,7 +1056,7 @@ impl PartialLookupJoinExec {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new_with_source(
         input: Arc<dyn ExecutionPlan>,
-        foyer_cache: Arc<FoyerMemoryCache>,
+        lookup_cache: Arc<LookupMemoryCache>,
         stream_key_indices: Vec<usize>,
         key_sort_fields: Vec<SortField>,
         join_type: LookupJoinType,
@@ -1096,7 +1096,7 @@ impl PartialLookupJoinExec {
 
         Ok(Self {
             input,
-            foyer_cache,
+            lookup_cache,
             stream_key_indices,
             join_type,
             schema: output_schema,
@@ -1116,7 +1116,7 @@ impl Debug for PartialLookupJoinExec {
         f.debug_struct("PartialLookupJoinExec")
             .field("join_type", &self.join_type)
             .field("stream_keys", &self.stream_key_indices)
-            .field("cache_table_id", &self.foyer_cache.table_id())
+            .field("cache_table_id", &self.lookup_cache.table_id())
             .finish_non_exhaustive()
     }
 }
@@ -1130,7 +1130,7 @@ impl DisplayAs for PartialLookupJoinExec {
                     "PartialLookupJoinExec: type={}, stream_keys={:?}, cache_entries={}",
                     self.join_type,
                     self.stream_key_indices,
-                    self.foyer_cache.len(),
+                    self.lookup_cache.len(),
                 )
             }
             DisplayFormatType::TreeRender => write!(f, "PartialLookupJoinExec"),
@@ -1170,7 +1170,7 @@ impl ExecutionPlan for PartialLookupJoinExec {
         }
         Ok(Arc::new(Self {
             input: children.swap_remove(0),
-            foyer_cache: Arc::clone(&self.foyer_cache),
+            lookup_cache: Arc::clone(&self.lookup_cache),
             stream_key_indices: self.stream_key_indices.clone(),
             join_type: self.join_type,
             schema: Arc::clone(&self.schema),
@@ -1191,7 +1191,7 @@ impl ExecutionPlan for PartialLookupJoinExec {
     ) -> Result<SendableRecordBatchStream> {
         let input_stream = self.input.execute(partition, context)?;
         let converter = Arc::clone(&self.converter);
-        let foyer_cache = Arc::clone(&self.foyer_cache);
+        let lookup_cache = Arc::clone(&self.lookup_cache);
         let stream_key_indices = self.stream_key_indices.clone();
         let join_type = self.join_type;
         let schema = self.schema();
@@ -1202,7 +1202,7 @@ impl ExecutionPlan for PartialLookupJoinExec {
         let projection = self.projection.clone();
 
         let output = input_stream.then(move |result| {
-            let foyer_cache = Arc::clone(&foyer_cache);
+            let lookup_cache = Arc::clone(&lookup_cache);
             let converter = Arc::clone(&converter);
             let stream_key_indices = stream_key_indices.clone();
             let schema = Arc::clone(&schema);
@@ -1218,7 +1218,7 @@ impl ExecutionPlan for PartialLookupJoinExec {
                 probe_partial_batch_with_fallback(
                     &batch,
                     &converter,
-                    &foyer_cache,
+                    &lookup_cache,
                     &stream_key_indices,
                     join_type,
                     &schema,
@@ -1263,14 +1263,14 @@ impl datafusion::physical_plan::ExecutionPlanProperties for PartialLookupJoinExe
     }
 }
 
-/// Probes the foyer cache for each row in `stream_batch`, falling back
+/// Probes the lookup cache for each row in `stream_batch`, falling back
 /// to the async source for cache misses. Inserts source results into
 /// the cache before building the output.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn probe_partial_batch_with_fallback(
     stream_batch: &RecordBatch,
     converter: &RowConverter,
-    foyer_cache: &FoyerMemoryCache,
+    lookup_cache: &LookupMemoryCache,
     stream_key_indices: &[usize],
     join_type: LookupJoinType,
     output_schema: &SchemaRef,
@@ -1303,7 +1303,7 @@ async fn probe_partial_batch_with_fallback(
         }
 
         let key = rows.row(row);
-        let result = foyer_cache.get_cached(key.as_ref());
+        let result = lookup_cache.get_cached(key.as_ref());
         if let Some(batch) = result.into_batch() {
             stream_indices.push(row as u32);
             lookup_batches.push(Some(batch));
@@ -1361,7 +1361,7 @@ async fn probe_partial_batch_with_fallback(
 
             for ((idx, key_bytes), maybe_batch) in miss_keys.iter().zip(results) {
                 if let Some(batch) = maybe_batch {
-                    foyer_cache.insert(key_bytes, batch.clone());
+                    lookup_cache.insert(key_bytes, batch.clone());
                     lookup_batches[*idx] = Some(batch);
                 }
             }
@@ -1516,7 +1516,7 @@ impl ExtensionPlanner for LookupJoinExtensionPlanner {
 
                 let exec = PartialLookupJoinExec::try_new_with_source(
                     input,
-                    Arc::clone(&partial_state.foyer_cache),
+                    Arc::clone(&partial_state.lookup_cache),
                     stream_key_indices,
                     partial_state.key_sort_fields.clone(),
                     lookup_node.join_type(),
@@ -2082,14 +2082,13 @@ mod tests {
 
     // ── PartialLookupJoinExec Tests ──────────────────────────────
 
-    use laminar_core::lookup::foyer_cache::FoyerMemoryCacheConfig;
+    use laminar_core::lookup::lookup_cache::LookupMemoryCacheConfig;
 
-    fn make_foyer_cache() -> Arc<FoyerMemoryCache> {
-        Arc::new(FoyerMemoryCache::new(
+    fn make_lookup_cache() -> Arc<LookupMemoryCache> {
+        Arc::new(LookupMemoryCache::new(
             1,
-            FoyerMemoryCacheConfig {
+            LookupMemoryCacheConfig {
                 capacity_bytes: 64 * 1024,
-                shards: 4,
                 ttl: None,
             },
         ))
@@ -2106,7 +2105,7 @@ mod tests {
         .unwrap()
     }
 
-    fn warm_cache(cache: &FoyerMemoryCache) {
+    fn warm_cache(cache: &LookupMemoryCache) {
         let converter = RowConverter::new(vec![SortField::new(DataType::Int64)]).unwrap();
 
         for (id, name) in [(1, "Alice"), (2, "Bob"), (3, "Charlie")] {
@@ -2118,7 +2117,7 @@ mod tests {
     }
 
     fn make_partial_exec(join_type: LookupJoinType) -> PartialLookupJoinExec {
-        let cache = make_foyer_cache();
+        let cache = make_lookup_cache();
         warm_cache(&cache);
 
         let input = batch_exec(orders_batch());
@@ -2176,7 +2175,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_empty_cache_inner_produces_no_rows() {
-        let cache = make_foyer_cache();
+        let cache = make_lookup_cache();
         let input = batch_exec(orders_batch());
         let key_sort_fields = vec![SortField::new(DataType::Int64)];
 
@@ -2199,7 +2198,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_empty_cache_left_outer_preserves_all() {
-        let cache = make_foyer_cache();
+        let cache = make_lookup_cache();
         let input = batch_exec(orders_batch());
         let key_sort_fields = vec![SortField::new(DataType::Int64)];
 
@@ -2241,13 +2240,13 @@ mod tests {
     #[test]
     fn registry_partial_entry() {
         let reg = LookupTableRegistry::new();
-        let cache = make_foyer_cache();
+        let cache = make_lookup_cache();
         let key_sort_fields = vec![SortField::new(DataType::Int64)];
 
         reg.register_partial(
             "customers",
             PartialLookupState {
-                foyer_cache: cache,
+                lookup_cache: cache,
                 schema: customers_schema(),
                 key_columns: vec!["id".into()],
                 key_sort_fields,
@@ -2290,7 +2289,7 @@ mod tests {
             }
         }
 
-        let cache = make_foyer_cache();
+        let cache = make_lookup_cache();
         // Only warm id=1 in cache, id=99 will miss and go to source
         warm_cache(&cache);
 
@@ -2358,7 +2357,7 @@ mod tests {
             }
         }
 
-        let cache = make_foyer_cache();
+        let cache = make_lookup_cache();
         let input = batch_exec(orders_batch());
         let key_sort_fields = vec![SortField::new(DataType::Int64)];
         let source: Arc<dyn LookupSourceDyn> = Arc::new(FailingSource);

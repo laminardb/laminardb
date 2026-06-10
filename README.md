@@ -493,7 +493,7 @@ graph TD
         App["Application Logic"]:::appClass
         subgraph Engine["LaminarDB Engine (Embedded Profile)"]
             Coord["Streaming Coordinator<br/>('laminar-compute' thread)"]:::coordClass
-            InMemState["In-Memory State Store<br/>(foyer / FxHashMap)"]:::stateClass
+            InMemState["In-Memory State Store<br/>(quick_cache / FxHashMap)"]:::stateClass
             Checkpoint["Checkpoint Coordinator"]:::recoveryClass
             Recovery["Recovery Manager"]:::recoveryClass
             
@@ -537,7 +537,7 @@ graph TD
         
         subgraph Engine["LaminarDB Engine (Embedded Library)"]
             Coord["Streaming Coordinator<br/>('laminar-compute')"]:::coordClass
-            State["In-Memory State Store<br/>(foyer / FxHashMap)"]:::stateClass
+            State["In-Memory State Store<br/>(quick_cache / FxHashMap)"]:::stateClass
             Checkpoint["Checkpoint Coordinator"]:::checkpointClass
             Coord <--> State
             Checkpoint -.-> State

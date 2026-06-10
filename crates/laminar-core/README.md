@@ -10,7 +10,7 @@ Core streaming engine for LaminarDB: operators, checkpoint barriers, and streami
 | `time` | Event time extraction, watermark generators |
 | `streaming` | Source/Sink/Subscription API backed by crossfire channels |
 | `checkpoint` | Barrier protocol for consistent snapshots |
-| `lookup` | Lookup table trait, predicate pushdown, foyer cache |
+| `lookup` | Lookup table trait, predicate pushdown, in-memory cache |
 | `mv` | Cascading materialized views |
 | `alloc` | Priority-class enforcement (debug builds) |
 | `error_codes` | Structured `LDB-NNNN` error codes and `HotPathError` |
@@ -23,6 +23,6 @@ Core streaming engine for LaminarDB: operators, checkpoint barriers, and streami
 cargo bench -p laminar-core --bench streaming_bench    # Channel and source throughput
 cargo bench -p laminar-core --bench window_bench       # Window operations
 cargo bench -p laminar-core --bench lookup_join_bench  # Lookup join throughput
-cargo bench -p laminar-core --bench cache_bench        # foyer cache hit/miss
+cargo bench -p laminar-core --bench cache_bench        # lookup cache hit/miss
 cargo bench -p laminar-core --bench latency_bench      # End-to-end event latency
 ```
