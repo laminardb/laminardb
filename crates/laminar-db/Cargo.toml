@@ -52,9 +52,9 @@ remote = ["dep:reqwest", "dep:governor"]
 local = ["dep:ort", "dep:tokenizers", "dep:reqwest", "dep:hf-hub"]
 
 [dependencies]
-laminar-core = { path = "../laminar-core", version = "0.25.0" }
-laminar-sql = { path = "../laminar-sql", version = "0.25.0" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.25.0" }
+laminar-core = { path = "../laminar-core", version = "0.25.1" }
+laminar-sql = { path = "../laminar-sql", version = "0.25.1" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.25.1" }
 
 # AI Inference Dependencies (Consolidated from laminar-ai)
 foyer = { workspace = true }
@@ -138,8 +138,8 @@ tempfile = { workspace = true }
 # no openssl); the `remote` feature exposes the real AnthropicProvider so the
 # test drives the actual HTTP path (request build, 500/retry, response parse).
 wiremock = "0.6"
-laminar-derive = { path = "../laminar-derive", version = "0.25.0" }
-laminar-connectors = { path = "../laminar-connectors", version = "0.25.0", features = ["testing"] }
+laminar-derive = { path = "../laminar-derive", version = "0.25.1" }
+laminar-connectors = { path = "../laminar-connectors", version = "0.25.1", features = ["testing"] }
 criterion = { workspace = true }
 bytes = { workspace = true }
 tracing-subscriber = { workspace = true }

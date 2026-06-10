@@ -48,7 +48,8 @@ laminardb:
     interval: "30s"
     mode: aligned
     snapshotStrategy: incremental
-    url: "file:///var/lib/laminardb/checkpoints"
+    # Object store so checkpoints are recoverable across nodes (credentials via extraEnv).
+    url: "az://laminardb-checkpoints/cluster"
     
   cluster:
     discovery:
@@ -65,10 +66,18 @@ persistence:
     enabled: true
     storageClass: "managed-csi" # Azure Disk CSI / local SSD on-prem
     size: 50Gi
+  # Checkpoints use the object store above — one (state) PVC per pod, not two.
   checkpoints:
-    enabled: true
-    storageClass: "azurefile-csi" # Shared Azure Files CSI / CephFS on-prem
-    size: 100Gi
+    enabled: false
+
+# Object-store credentials (example: Azure).
+extraEnv:
+  - name: AZURE_STORAGE_ACCOUNT_NAME
+    valueFrom:
+      secretKeyRef: { name: laminardb-azure, key: account }
+  - name: AZURE_STORAGE_ACCOUNT_KEY
+    valueFrom:
+      secretKeyRef: { name: laminardb-azure, key: key }
 
 guaranteedQoS: true
 
@@ -159,12 +168,13 @@ prometheusRule:
 | `laminardb.state.url` | URL for object storage (required if backend=object_store) | `""` |
 | `laminardb.checkpoint.enabled` | Enable checkpoint coordination | `true` |
 | `laminardb.checkpoint.interval` | Checkpoint frequency | `30s` |
-| `laminardb.checkpoint.url` | Storage endpoint (`file://` or `s3://`) | `file:///var/lib/laminardb/checkpoints` |
+| `laminardb.checkpoint.url` | Checkpoint storage: object store (`s3://`, `gs://`, `az://`) or local `file://`. Empty = local default. | `""` |
+| `laminardb.configWatch` | Hot-reload config on file change. Off in K8s (config changes roll pods via the checksum annotation); sets `LAMINAR_DISABLE_FILE_WATCH=1`. | `false` |
 | `laminardb.cluster.discovery.strategy` | Discovery method (`dns`, `gossip`, `static`) | `dns` |
 | `laminardb.cluster.coordination.strategy` | Clustering controller coordination (`raft`) | `raft` |
 | `persistence.state.enabled` | Keep local state in Persistent Volume | `true` |
 | `persistence.state.storageClass` | K8s storage class for state PVC | `""` (default) |
-| `persistence.checkpoints.enabled` | Keep checkpoints in Persistent Volume | `true` |
+| `persistence.checkpoints.enabled` | Provision a dedicated checkpoints PVC. Off by default — prefer an object store via `laminardb.checkpoint.url`. | `false` |
 | `guaranteedQoS` | Pin requests == limits for guaranteed CPU/Mem | `false` |
 | `extraEnvFrom` | Inject variables from ConfigMaps / Secrets | `[]` |
 | `extraVolumes` | Additional volumes to mount into pods | `[]` |

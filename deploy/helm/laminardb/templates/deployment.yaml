@@ -100,6 +100,11 @@ spec:
             {{- end }}
           {{- end }}
           env:
+            {{- if not .Values.laminardb.configWatch }}
+            # Config changes roll pods via the checksum annotation; the in-pod watcher is redundant on ConfigMap mounts.
+            - name: LAMINAR_DISABLE_FILE_WATCH
+              value: "1"
+            {{- end }}
             {{- if eq .Values.laminardb.mode "cluster" }}
             - name: HOSTNAME
               valueFrom:
@@ -123,10 +128,8 @@ spec:
             - name: state
               mountPath: /var/lib/laminardb/state
             {{- end }}
-            {{- if .Values.persistence.checkpoints.enabled }}
             - name: checkpoints
               mountPath: /var/lib/laminardb/checkpoints
-            {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -147,10 +150,9 @@ spec:
           emptyDir: {}
           {{- end }}
         {{- end }}
-        {{- if .Values.persistence.checkpoints.enabled }}
+        # Volatile; durable checkpoints need the StatefulSet PVC or an object store.
         - name: checkpoints
           emptyDir: {}
-        {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

@@ -84,6 +84,8 @@ jobs:
         run: |
           set -euo pipefail
           APP_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          # Chart version must change per publish or clients never see updates.
+          sed -i "s/^version:.*/version: ${APP_VERSION}/" deploy/helm/laminardb/Chart.yaml
           sed -i "s/^appVersion:.*/appVersion: \"${APP_VERSION}\"/" deploy/helm/laminardb/Chart.yaml
           mkdir -p _site/charts
           helm package deploy/helm/laminardb -d _site/charts
