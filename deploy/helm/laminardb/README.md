@@ -159,6 +159,7 @@ prometheusRule:
 | Option | Description | Default |
 |--------|-------------|---------|
 | `replicaCount` | Number of pods to run | `1` |
+| `podManagementPolicy` | StatefulSet pod launch ordering: `Parallel` or `OrderedReady` (immutable after creation) | `Parallel` |
 | `laminardb.mode` | Server mode: `embedded` or `cluster` | `embedded` |
 | `laminardb.logLevel` | Log level: `trace`, `debug`, `info`, `warn`, `error` | `info` |
 | `laminardb.httpBind` | HTTP API bind address | `0.0.0.0:8080` |

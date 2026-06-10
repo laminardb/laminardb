@@ -1,6 +1,10 @@
 # -- Number of replicas (use 1 for embedded, >1 for cluster mode)
 replicaCount: 1
 
+# -- StatefulSet pod launch ordering: "Parallel" or "OrderedReady".
+# -- Immutable on a live StatefulSet (delete with --cascade=orphan to change).
+podManagementPolicy: Parallel
+
 image:
   # -- Docker image repository
   repository: laminardb/laminardb-server
